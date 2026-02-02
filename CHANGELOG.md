@@ -52,6 +52,11 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 - `sbc-metrics`: Prometheus metrics (counters, gauges, histograms)
 - `sbc-health`: Kubernetes liveness/readiness probes and health checks
 
+#### Phase 9: Binaries & Integration
+- `sbc-daemon`: Main SBC daemon with configuration loading, health checks, and graceful shutdown
+- `sbc-cli`: Command-line interface with status, config, calls, health, and metrics commands
+- `sbc-integration-tests`: Integration test suite for cross-crate testing
+
 ### Security
 
 - Enforced `#![forbid(unsafe_code)]` across all crates (documented exceptions only)

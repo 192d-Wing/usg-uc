@@ -1,23 +1,27 @@
 [package]
-name = "sbc-cli"
-description = "Command-line interface for SBC management"
+name = "sbc-integration-tests"
+description = "Integration tests for USG SBC"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
+# SBC crates to test
 sbc-types = { path = "../sbc-types" }
 sbc-config = { path = "../sbc-config" }
 sbc-health = { path = "../sbc-health" }
 sbc-metrics = { path = "../sbc-metrics" }
+sbc-policy = { path = "../sbc-policy" }
+sbc-routing = { path = "../sbc-routing" }
+sbc-cdr = { path = "../sbc-cdr" }
+sbc-api = { path = "../sbc-api" }
 
-[[bin]]
-name = "sbc-cli"
-path = "src/main.rs"
+[lib]
+name = "sbc_integration_tests"
+path = "src/lib.rs"

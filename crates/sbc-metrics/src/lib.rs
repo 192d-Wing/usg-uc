@@ -38,7 +38,7 @@ pub mod registry;
 pub use counter::Counter;
 pub use gauge::Gauge;
 pub use histogram::Histogram;
-pub use registry::{MetricRegistry, MetricType};
+pub use registry::{MetricRegistry, MetricType, SbcMetrics};
 
 /// Default histogram buckets for latency (in milliseconds).
 pub const DEFAULT_LATENCY_BUCKETS: &[f64] = &[

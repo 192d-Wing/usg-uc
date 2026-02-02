@@ -1553,6 +1553,9 @@ dependencies = [
 name = "sbc-cli"
 version = "0.1.0"
 dependencies = [
+ "sbc-config",
+ "sbc-health",
+ "sbc-metrics",
  "sbc-types",
 ]
 
@@ -1590,6 +1593,9 @@ dependencies = [
 name = "sbc-daemon"
 version = "0.1.0"
 dependencies = [
+ "sbc-config",
+ "sbc-health",
+ "sbc-metrics",
  "sbc-types",
 ]
 
@@ -1643,6 +1649,20 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "sbc-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "sbc-api",
+ "sbc-cdr",
+ "sbc-config",
+ "sbc-health",
+ "sbc-metrics",
+ "sbc-policy",
+ "sbc-routing",
+ "sbc-types",
 ]
 
 [[package]]

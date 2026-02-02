@@ -49,6 +49,9 @@ members = [
     # Binaries
     "crates/sbc-daemon",
     "crates/sbc-cli",
+
+    # Integration tests
+    "crates/sbc-integration-tests",
 ]
 resolver = "2"
 
