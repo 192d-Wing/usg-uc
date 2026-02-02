@@ -3,14 +3,17 @@
 //! This module handles initialization of the SBC daemon including
 //! configuration loading, logging setup, and component coordination.
 
+use crate::api_server::{ApiServer, ApiServerConfig, AppState};
 use crate::args::Args;
 use crate::server::{Server, ServerError};
 use crate::shutdown::{ShutdownCoordinator, ShutdownSignal};
 use sbc_config::{load_from_file, SbcConfig};
 #[cfg(test)]
 use sbc_config::load_from_str;
+use sbc_metrics::SbcMetrics;
 use std::path::Path;
-use tracing::{info, warn};
+use std::sync::Arc;
+use tracing::{error, info, warn};
 
 /// SBC daemon runtime.
 pub struct Runtime {
@@ -98,20 +101,38 @@ impl Runtime {
 
     /// Runs the SBC daemon.
     pub async fn run(&mut self) -> Result<(), RuntimeError> {
-        // Create and start server
+        // Create and start SIP server
         let signal = self.shutdown.signal().clone();
-        let mut server = Server::new(self.config.clone(), signal);
+        let mut server = Server::new(self.config.clone(), signal.clone());
 
         server.start().await.map_err(|e| RuntimeError::ServerFailed {
             reason: e.to_string(),
         })?;
 
-        // Run main loop
+        // Create API server
+        let api_config = ApiServerConfig::default();
+        let metrics = SbcMetrics::standard();
+        let stats = Arc::clone(server.stats());
+
+        let app_state = Arc::new(AppState::new(metrics, stats));
+        let api_server = ApiServer::new(api_config, app_state, signal.clone());
+
+        // Spawn API server task
+        let api_handle = tokio::spawn(async move {
+            if let Err(e) = api_server.run().await {
+                error!("API server error: {e}");
+            }
+        });
+
+        // Run main SIP server loop
         server.run().await.map_err(|e| RuntimeError::ServerFailed {
             reason: e.to_string(),
         })?;
 
-        // Stop server
+        // Stop API server
+        api_handle.abort();
+
+        // Stop SIP server
         server.stop().await.map_err(|e| RuntimeError::ServerFailed {
             reason: e.to_string(),
         })?;

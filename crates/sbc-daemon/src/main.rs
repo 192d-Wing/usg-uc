@@ -26,6 +26,7 @@
 // Allow dead code for methods that will be used in future integration
 #![allow(dead_code)]
 
+mod api_server;
 mod args;
 mod ice_agent;
 mod media_pipeline;

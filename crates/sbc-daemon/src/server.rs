@@ -90,7 +90,7 @@ impl Server {
     }
 
     /// Returns server statistics.
-    pub fn stats(&self) -> &ServerStats {
+    pub fn stats(&self) -> &Arc<ServerStats> {
         &self.stats
     }
 

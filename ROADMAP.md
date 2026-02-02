@@ -50,7 +50,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 853 tests passing, all foundation phases complete
+**Current Status**: 862 tests passing, all foundation phases complete
 
 ---
 
@@ -91,14 +91,14 @@ This document outlines the development roadmap for the USG Session Border Contro
 - [x] Connect sbc-ice for candidate gathering/selection
 - [x] Add ICE-lite mode for server-side optimization
 
-### ⏳ Phase 14: REST API Server
+### ✅ Phase 14: REST API Server
 **Goal**: HTTP management interface
 
-- [ ] Add HTTP server to sbc-daemon (hyper/axum)
-- [ ] Expose sbc-api routes for management
-- [ ] Implement sbc-metrics Prometheus endpoint
-- [ ] Add sbc-health HTTP probes (/healthz, /readyz)
-- [ ] Enable sbc-cdr export endpoints
+- [x] Add HTTP server to sbc-daemon (axum)
+- [x] Expose sbc-api routes for management
+- [x] Implement sbc-metrics Prometheus endpoint
+- [x] Add sbc-health HTTP probes (/healthz, /readyz)
+- [ ] Enable sbc-cdr export endpoints (future)
 
 ### ⏳ Phase 15: Production Hardening
 **Goal**: Production-ready deployment

@@ -96,6 +96,20 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 - ICE restart support for mid-session renegotiation
 - Session statistics and monitoring
 
+#### Phase 14: REST API Server
+
+- ApiServer module providing HTTP management interface via axum
+- Liveness probe endpoint (`GET /healthz`)
+- Readiness probe endpoint (`GET /readyz`)
+- Health status endpoint (`GET /api/v1/system/health`)
+- Prometheus metrics endpoint (`GET /api/v1/system/metrics`)
+- Server statistics endpoint (`GET /api/v1/system/stats`)
+- Version endpoint (`GET /api/v1/system/version`)
+- Calls listing endpoint (`GET /api/v1/calls`)
+- Registrations listing endpoint (`GET /api/v1/registrations`)
+- Graceful shutdown integration with SIP server
+- JSON serialization for all API responses
+
 ### Security
 
 - Enforced `#![forbid(unsafe_code)]` across all crates (documented exceptions only)
