@@ -31,7 +31,7 @@ tokio-rustls = { version = "0.26", optional = true }
 rustls-pemfile = { version = "2.2", optional = true }
 
 # WebSocket support
-tokio-tungstenite = { version = "0.26", optional = true }
+tokio-tungstenite = { version = "0.28", optional = true }
 
 [lints]
 workspace = true
