@@ -50,7 +50,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 830 tests passing, all foundation phases complete
+**Current Status**: 840 tests passing, all foundation phases complete
 
 ---
 
@@ -74,14 +74,14 @@ This document outlines the development roadmap for the USG Session Border Contro
 - [x] Enable sbc-b2bua for call bridging
 - [x] Integrate sbc-registrar for user registration
 
-### ⏳ Phase 12: Media Pipeline
+### ✅ Phase 12: Media Pipeline
 **Goal**: Enable RTP/SRTP media relay
 
-- [ ] Connect sbc-rtp with UDP transport
-- [ ] Integrate sbc-srtp for encrypted media
-- [ ] Wire sbc-media-engine for relay/pass-through
-- [ ] Add DTLS-SRTP key exchange via sbc-dtls
-- [ ] Enable codec transcoding via sbc-codecs
+- [x] Connect sbc-rtp with UDP transport
+- [x] Integrate sbc-srtp for encrypted media
+- [x] Wire sbc-media-engine for relay/pass-through
+- [x] Add DTLS-SRTP key exchange via sbc-dtls
+- [x] Enable codec transcoding via sbc-codecs
 
 ### ⏳ Phase 13: ICE/NAT Traversal
 **Goal**: Full NAT traversal support

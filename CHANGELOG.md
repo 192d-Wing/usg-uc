@@ -76,6 +76,15 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 - Transaction, dialog, and call state management structures
 - Support for both B2BUA registrar and proxy modes
 
+#### Phase 12: Media Pipeline Integration
+
+- MediaPipeline module coordinating `sbc-rtp`, `sbc-srtp`, `sbc-dtls`, `sbc-media-engine`, and `sbc-codecs`
+- RTP/SRTP packet processing with relay and pass-through modes
+- DTLS-SRTP key exchange for secure media transport
+- Codec negotiation via CodecRegistry
+- Session management with A-leg/B-leg addressing
+- RTP sequence tracking and statistics
+
 ### Security
 
 - Enforced `#![forbid(unsafe_code)]` across all crates (documented exceptions only)
