@@ -2,10 +2,18 @@
 //!
 //! This module contains the server components that handle SIP signaling
 //! and media processing using async/await patterns.
+//!
+//! ## Rate Limiting
+//!
+//! The server integrates with `sbc-dos-protection` to provide:
+//! - Per-IP rate limiting for SIP requests
+//! - Automatic blocking of abusive sources
+//! - Configurable thresholds from `sbc-config`
 
 use crate::shutdown::ShutdownSignal;
 use crate::sip_stack::{ProcessResult, SipStack, SipStackConfig};
 use sbc_config::SbcConfig;
+use sbc_dos_protection::{RateLimitAction, RateLimiter, RateLimiterConfig};
 use sbc_health::{HealthChecker, HealthCheckerConfig};
 use sbc_metrics::{MetricRegistry, SbcMetrics};
 use sbc_registrar::RegistrarMode;
@@ -15,7 +23,7 @@ use sbc_types::address::SbcSocketAddr;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 /// SBC server state.
@@ -34,6 +42,8 @@ pub struct Server {
     udp_transports: RwLock<Vec<Arc<UdpTransport>>>,
     /// SIP stack for message processing.
     sip_stack: Arc<SipStack>,
+    /// Rate limiter for DoS protection.
+    rate_limiter: Arc<Mutex<RateLimiter>>,
 }
 
 impl Server {
@@ -63,6 +73,22 @@ impl Server {
         };
         let sip_stack = Arc::new(SipStack::new(sip_config));
 
+        // Create rate limiter from config
+        let rate_limit_config = RateLimiterConfig::new(
+            config.rate_limit.per_ip_rps,
+            (config.rate_limit.per_ip_rps as f32 * config.rate_limit.burst_multiplier) as u32,
+        )
+        .with_per_ip(true);
+
+        let rate_limiter = Arc::new(Mutex::new(RateLimiter::new(rate_limit_config)));
+
+        info!(
+            enabled = config.rate_limit.enabled,
+            per_ip_rps = config.rate_limit.per_ip_rps,
+            burst_multiplier = config.rate_limit.burst_multiplier,
+            "Rate limiting configured"
+        );
+
         Self {
             config,
             shutdown,
@@ -71,6 +97,7 @@ impl Server {
             stats: Arc::new(ServerStats::default()),
             udp_transports: RwLock::new(Vec::new()),
             sip_stack,
+            rate_limiter,
         }
     }
 
@@ -196,9 +223,20 @@ impl Server {
             let shutdown = self.shutdown.clone();
             let stats = Arc::clone(&self.stats);
             let sip_stack = Arc::clone(&self.sip_stack);
+            let rate_limiter = Arc::clone(&self.rate_limiter);
+            let rate_limit_enabled = self.config.rate_limit.enabled;
 
             let handle = tokio::spawn(async move {
-                Self::transport_receive_loop(idx, transport, shutdown, stats, sip_stack).await
+                Self::transport_receive_loop(
+                    idx,
+                    transport,
+                    shutdown,
+                    stats,
+                    sip_stack,
+                    rate_limiter,
+                    rate_limit_enabled,
+                )
+                .await
             });
             handles.push(handle);
         }
@@ -231,6 +269,8 @@ impl Server {
         shutdown: ShutdownSignal,
         stats: Arc<ServerStats>,
         sip_stack: Arc<SipStack>,
+        rate_limiter: Arc<Mutex<RateLimiter>>,
+        rate_limit_enabled: bool,
     ) {
         debug!(transport_idx = idx, "Starting transport receive loop");
 
@@ -240,6 +280,49 @@ impl Server {
                     match result {
                         Ok(msg) => {
                             stats.messages_received.fetch_add(1, Ordering::Relaxed);
+
+                            // Extract source IP for rate limiting
+                            let source_ip = msg.source.ip();
+
+                            // Check rate limit
+                            if rate_limit_enabled {
+                                let action = {
+                                    let mut limiter = rate_limiter.lock().await;
+                                    limiter.check(source_ip)
+                                };
+
+                                match action {
+                                    RateLimitAction::Allow => {
+                                        // Continue processing
+                                    }
+                                    RateLimitAction::Throttle { delay_ms } => {
+                                        // Log throttling but continue
+                                        debug!(
+                                            source = %source_ip,
+                                            delay_ms,
+                                            "Rate limit throttle suggested"
+                                        );
+                                    }
+                                    RateLimitAction::Reject => {
+                                        stats.rate_limited.fetch_add(1, Ordering::Relaxed);
+                                        debug!(
+                                            source = %source_ip,
+                                            "Rate limit exceeded, rejecting message"
+                                        );
+                                        continue;
+                                    }
+                                    RateLimitAction::Block { duration_secs } => {
+                                        stats.rate_limited.fetch_add(1, Ordering::Relaxed);
+                                        warn!(
+                                            source = %source_ip,
+                                            duration_secs,
+                                            "Source blocked due to rate limit violation"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+
                             debug!(
                                 source = %msg.source,
                                 size = msg.data.len(),
@@ -363,6 +446,8 @@ pub struct ServerStats {
     pub messages_received: AtomicU64,
     /// Messages sent.
     pub messages_sent: AtomicU64,
+    /// Messages rejected due to rate limiting.
+    pub rate_limited: AtomicU64,
 }
 
 /// Server error.

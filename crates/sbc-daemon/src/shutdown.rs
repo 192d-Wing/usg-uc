@@ -1,13 +1,20 @@
 //! Graceful shutdown handling with async signal support.
 //!
+//! This module provides production-grade shutdown coordination with:
+//! - Connection draining with configurable timeout
+//! - Active connection tracking
+//! - Shutdown phases for orderly teardown
+//!
 //! ## NIST 800-53 Rev5: AU-12 (Audit Record Generation)
 //!
 //! Shutdown events are logged for audit trail.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tokio::time::Instant;
+use tracing::{debug, info, warn};
 
 /// Shutdown signal handler with tokio signal support.
 #[derive(Clone)]
@@ -174,6 +181,91 @@ impl std::fmt::Display for ShutdownError {
 
 impl std::error::Error for ShutdownError {}
 
+/// Connection tracker for graceful shutdown draining.
+#[derive(Clone)]
+pub struct ConnectionTracker {
+    /// Active call count.
+    active_calls: Arc<AtomicU32>,
+    /// Active SIP transactions.
+    active_transactions: Arc<AtomicU32>,
+    /// Active registrations being processed.
+    pending_registrations: Arc<AtomicU32>,
+}
+
+impl Default for ConnectionTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConnectionTracker {
+    /// Creates a new connection tracker.
+    pub fn new() -> Self {
+        Self {
+            active_calls: Arc::new(AtomicU32::new(0)),
+            active_transactions: Arc::new(AtomicU32::new(0)),
+            pending_registrations: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    /// Increments the active call count.
+    pub fn call_started(&self) {
+        self.active_calls.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Decrements the active call count.
+    pub fn call_ended(&self) {
+        self.active_calls.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Returns the active call count.
+    pub fn active_calls(&self) -> u32 {
+        self.active_calls.load(Ordering::SeqCst)
+    }
+
+    /// Increments the active transaction count.
+    pub fn transaction_started(&self) {
+        self.active_transactions.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Decrements the active transaction count.
+    pub fn transaction_ended(&self) {
+        self.active_transactions.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Returns the active transaction count.
+    pub fn active_transactions(&self) -> u32 {
+        self.active_transactions.load(Ordering::SeqCst)
+    }
+
+    /// Increments the pending registration count.
+    pub fn registration_started(&self) {
+        self.pending_registrations.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Decrements the pending registration count.
+    pub fn registration_ended(&self) {
+        self.pending_registrations.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Returns the pending registration count.
+    pub fn pending_registrations(&self) -> u32 {
+        self.pending_registrations.load(Ordering::SeqCst)
+    }
+
+    /// Returns the total number of active connections/operations.
+    pub fn total_active(&self) -> u32 {
+        self.active_calls()
+            + self.active_transactions()
+            + self.pending_registrations()
+    }
+
+    /// Returns true if all connections have drained.
+    pub fn is_drained(&self) -> bool {
+        self.total_active() == 0
+    }
+}
+
 /// Shutdown coordinator for graceful shutdown.
 pub struct ShutdownCoordinator {
     /// Shutdown signal.
@@ -182,6 +274,10 @@ pub struct ShutdownCoordinator {
     timeout_secs: u64,
     /// Whether shutdown is in progress.
     in_progress: AtomicBool,
+    /// Connection tracker for draining.
+    connections: ConnectionTracker,
+    /// Drain poll interval in milliseconds.
+    drain_poll_ms: u64,
 }
 
 impl ShutdownCoordinator {
@@ -191,6 +287,8 @@ impl ShutdownCoordinator {
             signal,
             timeout_secs: 30,
             in_progress: AtomicBool::new(false),
+            connections: ConnectionTracker::new(),
+            drain_poll_ms: 100,
         }
     }
 
@@ -200,9 +298,20 @@ impl ShutdownCoordinator {
         self
     }
 
+    /// Sets the drain poll interval.
+    pub fn with_drain_poll_interval(mut self, poll_ms: u64) -> Self {
+        self.drain_poll_ms = poll_ms;
+        self
+    }
+
     /// Returns the shutdown signal.
     pub fn signal(&self) -> &ShutdownSignal {
         &self.signal
+    }
+
+    /// Returns the connection tracker.
+    pub fn connections(&self) -> &ConnectionTracker {
+        &self.connections
     }
 
     /// Initiates graceful shutdown.
@@ -227,7 +336,112 @@ impl ShutdownCoordinator {
     }
 
     /// Performs graceful shutdown with connection draining.
-    pub async fn shutdown_gracefully(&self, active_connections: u32) -> ShutdownPhase {
+    ///
+    /// This method:
+    /// 1. Signals shutdown to stop accepting new connections
+    /// 2. Polls active connections until drained or timeout
+    /// 3. Returns the final shutdown phase with statistics
+    pub async fn shutdown_gracefully(&self) -> DrainResult {
+        let phase = self.initiate_shutdown();
+        if matches!(phase, ShutdownPhase::AlreadyInProgress) {
+            return DrainResult {
+                phase,
+                drained: false,
+                remaining_calls: self.connections.active_calls(),
+                remaining_transactions: self.connections.active_transactions(),
+                drain_duration_ms: 0,
+            };
+        }
+
+        let active = self.connections.total_active();
+        info!(
+            timeout_secs = self.timeout_secs,
+            active_calls = self.connections.active_calls(),
+            active_transactions = self.connections.active_transactions(),
+            pending_registrations = self.connections.pending_registrations(),
+            total_active = active,
+            "Starting graceful shutdown with connection draining"
+        );
+
+        if active == 0 {
+            info!("No active connections, shutdown immediate");
+            return DrainResult {
+                phase: ShutdownPhase::Complete,
+                drained: true,
+                remaining_calls: 0,
+                remaining_transactions: 0,
+                drain_duration_ms: 0,
+            };
+        }
+
+        // Poll for connection drain with timeout
+        let timeout = Duration::from_secs(self.timeout_secs);
+        let poll_interval = Duration::from_millis(self.drain_poll_ms);
+        let start = Instant::now();
+        let deadline = start + timeout;
+
+        let mut last_logged = start;
+        let log_interval = Duration::from_secs(5);
+
+        loop {
+            if self.connections.is_drained() {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                info!(
+                    duration_ms,
+                    "All connections drained successfully"
+                );
+                return DrainResult {
+                    phase: ShutdownPhase::Complete,
+                    drained: true,
+                    remaining_calls: 0,
+                    remaining_transactions: 0,
+                    drain_duration_ms: duration_ms,
+                };
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                let remaining_calls = self.connections.active_calls();
+                let remaining_transactions = self.connections.active_transactions();
+                warn!(
+                    remaining_calls,
+                    remaining_transactions,
+                    timeout_secs = self.timeout_secs,
+                    "Drain timeout exceeded, forcing shutdown"
+                );
+                return DrainResult {
+                    phase: ShutdownPhase::ForcedShutdown {
+                        remaining_calls,
+                        remaining_transactions,
+                    },
+                    drained: false,
+                    remaining_calls,
+                    remaining_transactions,
+                    drain_duration_ms: start.elapsed().as_millis() as u64,
+                };
+            }
+
+            // Log progress periodically
+            if now.duration_since(last_logged) >= log_interval {
+                let remaining = self.connections.total_active();
+                let elapsed = start.elapsed().as_secs();
+                debug!(
+                    remaining,
+                    elapsed_secs = elapsed,
+                    "Draining connections..."
+                );
+                last_logged = now;
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    /// Performs graceful shutdown with the given active connection count.
+    ///
+    /// This is a convenience method for simpler shutdown scenarios where
+    /// connection tracking is managed externally.
+    pub async fn shutdown_gracefully_with_count(&self, active_connections: u32) -> ShutdownPhase {
         let phase = self.initiate_shutdown();
         if matches!(phase, ShutdownPhase::AlreadyInProgress) {
             return phase;
@@ -259,6 +473,21 @@ impl ShutdownCoordinator {
     }
 }
 
+/// Result of a graceful shutdown drain operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainResult {
+    /// Final shutdown phase.
+    pub phase: ShutdownPhase,
+    /// Whether all connections were successfully drained.
+    pub drained: bool,
+    /// Number of calls that remained active.
+    pub remaining_calls: u32,
+    /// Number of transactions that remained active.
+    pub remaining_transactions: u32,
+    /// Total drain duration in milliseconds.
+    pub drain_duration_ms: u64,
+}
+
 /// Shutdown phase indicator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShutdownPhase {
@@ -273,6 +502,13 @@ pub enum ShutdownPhase {
     Draining {
         /// Remaining active connections.
         active_connections: u32,
+    },
+    /// Forced shutdown after timeout.
+    ForcedShutdown {
+        /// Calls that were forcibly terminated.
+        remaining_calls: u32,
+        /// Transactions that were forcibly terminated.
+        remaining_transactions: u32,
     },
     /// Shutdown complete.
     Complete,
@@ -337,11 +573,125 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_graceful_shutdown() {
+    async fn test_graceful_shutdown_no_connections() {
         let signal = ShutdownSignal::new();
         let coordinator = ShutdownCoordinator::new(signal).with_timeout(1);
 
-        let phase = coordinator.shutdown_gracefully(0).await;
+        let result = coordinator.shutdown_gracefully().await;
+        assert!(result.drained);
+        assert_eq!(result.remaining_calls, 0);
+        assert_eq!(result.phase, ShutdownPhase::Complete);
+    }
+
+    #[tokio::test]
+    async fn test_graceful_shutdown_with_count() {
+        let signal = ShutdownSignal::new();
+        let coordinator = ShutdownCoordinator::new(signal).with_timeout(1);
+
+        let phase = coordinator.shutdown_gracefully_with_count(0).await;
         assert_eq!(phase, ShutdownPhase::Complete);
+    }
+
+    #[test]
+    fn test_connection_tracker() {
+        let tracker = ConnectionTracker::new();
+
+        // Initially empty
+        assert_eq!(tracker.total_active(), 0);
+        assert!(tracker.is_drained());
+
+        // Add some calls
+        tracker.call_started();
+        tracker.call_started();
+        assert_eq!(tracker.active_calls(), 2);
+        assert_eq!(tracker.total_active(), 2);
+        assert!(!tracker.is_drained());
+
+        // Add a transaction
+        tracker.transaction_started();
+        assert_eq!(tracker.active_transactions(), 1);
+        assert_eq!(tracker.total_active(), 3);
+
+        // End a call
+        tracker.call_ended();
+        assert_eq!(tracker.active_calls(), 1);
+        assert_eq!(tracker.total_active(), 2);
+
+        // End remaining
+        tracker.call_ended();
+        tracker.transaction_ended();
+        assert!(tracker.is_drained());
+    }
+
+    #[test]
+    fn test_connection_tracker_registrations() {
+        let tracker = ConnectionTracker::new();
+
+        tracker.registration_started();
+        tracker.registration_started();
+        assert_eq!(tracker.pending_registrations(), 2);
+        assert_eq!(tracker.total_active(), 2);
+
+        tracker.registration_ended();
+        assert_eq!(tracker.pending_registrations(), 1);
+
+        tracker.registration_ended();
+        assert!(tracker.is_drained());
+    }
+
+    #[tokio::test]
+    async fn test_graceful_shutdown_with_draining() {
+        let signal = ShutdownSignal::new();
+        let coordinator = ShutdownCoordinator::new(signal)
+            .with_timeout(2)
+            .with_drain_poll_interval(10);
+
+        // Add an active call
+        coordinator.connections().call_started();
+
+        // Spawn a task to end the call after a short delay
+        let tracker = coordinator.connections().clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tracker.call_ended();
+        });
+
+        let result = coordinator.shutdown_gracefully().await;
+        assert!(result.drained);
+        assert_eq!(result.remaining_calls, 0);
+        assert_eq!(result.phase, ShutdownPhase::Complete);
+        assert!(result.drain_duration_ms >= 50);
+    }
+
+    #[tokio::test]
+    async fn test_graceful_shutdown_timeout() {
+        let signal = ShutdownSignal::new();
+        let coordinator = ShutdownCoordinator::new(signal)
+            .with_timeout(1) // 1 second timeout
+            .with_drain_poll_interval(10);
+
+        // Add active connections that won't be drained
+        coordinator.connections().call_started();
+        coordinator.connections().transaction_started();
+
+        let result = coordinator.shutdown_gracefully().await;
+        assert!(!result.drained);
+        assert_eq!(result.remaining_calls, 1);
+        assert_eq!(result.remaining_transactions, 1);
+        assert!(matches!(result.phase, ShutdownPhase::ForcedShutdown { .. }));
+    }
+
+    #[test]
+    fn test_drain_result() {
+        let result = DrainResult {
+            phase: ShutdownPhase::Complete,
+            drained: true,
+            remaining_calls: 0,
+            remaining_transactions: 0,
+            drain_duration_ms: 100,
+        };
+
+        assert!(result.drained);
+        assert_eq!(result.phase, ShutdownPhase::Complete);
     }
 }

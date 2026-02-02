@@ -21,12 +21,17 @@ impl CallId {
 
     /// Creates a unique call ID.
     pub fn generate() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
+            .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        Self(format!("call-{:x}", timestamp))
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        Self(format!("call-{:x}-{:x}", timestamp, counter))
     }
 
     /// Returns the ID as a string slice.

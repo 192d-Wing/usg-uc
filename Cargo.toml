@@ -108,6 +108,8 @@ http = "1.2"
 http-body-util = "0.1"
 hyper = { version = "1.6", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2.2"
 
 # Internal crates
 sbc-types = { path = "crates/sbc-types" }

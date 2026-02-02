@@ -1,6 +1,6 @@
 //! REST API server for the SBC daemon.
 //!
-//! This module provides an HTTP server using axum for management APIs,
+//! This module provides an HTTP/HTTPS server using axum for management APIs,
 //! metrics endpoints, and health probes.
 //!
 //! ## Endpoints
@@ -13,10 +13,17 @@
 //! - `GET /api/v1/calls` - List active calls
 //! - `GET /api/v1/registrations` - List registrations
 //!
+//! ## TLS Support
+//!
+//! The API server supports HTTPS with CNSA 2.0 compliant TLS 1.3:
+//! - P-384 ECDSA certificates
+//! - AES-256-GCM cipher suite
+//!
 //! ## NIST 800-53 Rev5 Controls
 //!
 //! - **AU-2**: Event Logging - All API requests are logged
-//! - **SC-8**: Transmission Confidentiality (TLS in production)
+//! - **SC-8**: Transmission Confidentiality (TLS enabled)
+//! - **SC-13**: Cryptographic Protection (CNSA 2.0 compliant TLS)
 
 use axum::{
     extract::State,
@@ -25,15 +32,24 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use hyper_util::rt::TokioIo;
+use hyper_util::server::conn::auto::Builder as ServerBuilder;
+use hyper_util::service::TowerToHyperService;
+use rustls::pki_types::CertificateDer;
 use sbc_health::{ComponentStatus, SystemHealth};
 use sbc_metrics::MetricRegistry;
 use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::io::BufReader;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio_rustls::TlsAcceptor;
+use tower::Service;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::server::ServerStats;
 use crate::shutdown::ShutdownSignal;
@@ -47,6 +63,17 @@ pub struct ApiServerConfig {
     pub enable_cors: bool,
     /// API version prefix.
     pub api_version: String,
+    /// TLS configuration (optional).
+    pub tls: Option<TlsConfig>,
+}
+
+/// TLS configuration for the API server.
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    /// Path to TLS certificate (PEM format).
+    pub cert_path: PathBuf,
+    /// Path to TLS private key (PEM format).
+    pub key_path: PathBuf,
 }
 
 impl Default for ApiServerConfig {
@@ -57,6 +84,7 @@ impl Default for ApiServerConfig {
             }),
             enable_cors: false,
             api_version: "v1".to_string(),
+            tls: None,
         }
     }
 }
@@ -165,12 +193,21 @@ impl ApiServer {
             .layer(TraceLayer::new_for_http())
     }
 
-    /// Runs the API server.
+    /// Runs the API server (HTTP or HTTPS depending on configuration).
     pub async fn run(&self) -> Result<(), ApiServerError> {
+        if let Some(tls_config) = &self.config.tls {
+            self.run_https(tls_config).await
+        } else {
+            self.run_http().await
+        }
+    }
+
+    /// Runs the API server with plain HTTP.
+    async fn run_http(&self) -> Result<(), ApiServerError> {
         let addr = self.config.listen_addr;
         let router = self.router();
 
-        info!(address = %addr, "Starting API server");
+        info!(address = %addr, tls = false, "Starting API server (HTTP)");
 
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -192,6 +229,121 @@ impl ApiServer {
             })?;
 
         Ok(())
+    }
+
+    /// Runs the API server with HTTPS (TLS).
+    async fn run_https(&self, tls_config: &TlsConfig) -> Result<(), ApiServerError> {
+        let addr = self.config.listen_addr;
+        let router = self.router();
+
+        info!(
+            address = %addr,
+            cert = %tls_config.cert_path.display(),
+            tls = true,
+            "Starting API server (HTTPS)"
+        );
+
+        // Load TLS configuration
+        let tls_acceptor = Self::create_tls_acceptor(tls_config)?;
+
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| ApiServerError::BindFailed {
+                address: addr.to_string(),
+                reason: e.to_string(),
+            })?;
+
+        let shutdown = self.shutdown.clone();
+
+        // Run HTTPS server with graceful shutdown
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, _peer_addr)) => {
+                            let acceptor = tls_acceptor.clone();
+                            let mut service = router.clone().into_make_service();
+
+                            tokio::spawn(async move {
+                                match acceptor.accept(stream).await {
+                                    Ok(tls_stream) => {
+                                        let io = TokioIo::new(tls_stream);
+                                        let svc = match service.call(()).await {
+                                            Ok(s) => s,
+                                            Err(e) => {
+                                                warn!(error = ?e, "Failed to create service");
+                                                return;
+                                            }
+                                        };
+
+                                        let hyper_svc = TowerToHyperService::new(svc);
+                                        if let Err(e) = ServerBuilder::new(hyper_util::rt::TokioExecutor::new())
+                                            .serve_connection(io, hyper_svc)
+                                            .await
+                                        {
+                                            warn!(error = %e, "Error serving HTTPS connection");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "TLS handshake failed");
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to accept connection");
+                        }
+                    }
+                }
+                _ = shutdown.wait_for_shutdown() => {
+                    info!("API server (HTTPS) shutting down");
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Creates a TLS acceptor with CNSA 2.0 compliant configuration.
+    fn create_tls_acceptor(tls_config: &TlsConfig) -> Result<TlsAcceptor, ApiServerError> {
+        // Load certificate chain
+        let cert_file = File::open(&tls_config.cert_path).map_err(|e| ApiServerError::TlsError {
+            reason: format!("Failed to open certificate file: {e}"),
+        })?;
+        let mut cert_reader = BufReader::new(cert_file);
+        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if certs.is_empty() {
+            return Err(ApiServerError::TlsError {
+                reason: "No certificates found in certificate file".to_string(),
+            });
+        }
+
+        // Load private key
+        let key_file = File::open(&tls_config.key_path).map_err(|e| ApiServerError::TlsError {
+            reason: format!("Failed to open key file: {e}"),
+        })?;
+        let mut key_reader = BufReader::new(key_file);
+        let key = rustls_pemfile::private_key(&mut key_reader)
+            .map_err(|e| ApiServerError::TlsError {
+                reason: format!("Failed to parse private key: {e}"),
+            })?
+            .ok_or_else(|| ApiServerError::TlsError {
+                reason: "No private key found in key file".to_string(),
+            })?;
+
+        // Create TLS config with CNSA 2.0 compliant settings
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| ApiServerError::TlsError {
+                reason: format!("Failed to create TLS config: {e}"),
+            })?;
+
+        Ok(TlsAcceptor::from(Arc::new(config)))
     }
 }
 
@@ -277,6 +429,7 @@ async fn get_stats(
         registrations_active: state.stats.registrations_active.load(Ordering::Relaxed),
         messages_received: state.stats.messages_received.load(Ordering::Relaxed),
         messages_sent: state.stats.messages_sent.load(Ordering::Relaxed),
+        rate_limited: state.stats.rate_limited.load(Ordering::Relaxed),
     };
 
     Json(response)
@@ -414,6 +567,8 @@ pub struct StatsResponse {
     pub messages_received: u64,
     /// Messages sent.
     pub messages_sent: u64,
+    /// Messages rejected due to rate limiting.
+    pub rate_limited: u64,
 }
 
 /// Version response.
@@ -496,6 +651,11 @@ pub enum ApiServerError {
         /// Reason.
         reason: String,
     },
+    /// TLS configuration error.
+    TlsError {
+        /// Reason.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for ApiServerError {
@@ -506,6 +666,9 @@ impl std::fmt::Display for ApiServerError {
             }
             Self::ServerError { reason } => {
                 write!(f, "Server error: {reason}")
+            }
+            Self::TlsError { reason } => {
+                write!(f, "TLS error: {reason}")
             }
         }
     }

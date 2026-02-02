@@ -2,6 +2,12 @@
 //!
 //! This module handles initialization of the SBC daemon including
 //! configuration loading, logging setup, and component coordination.
+//!
+//! ## Features
+//!
+//! - **Configuration hot-reload**: SIGHUP triggers config reload without restart
+//! - **Graceful shutdown**: Connection draining on SIGTERM/SIGINT
+//! - **Health monitoring**: Integrated health checks and metrics
 
 use crate::api_server::{ApiServer, ApiServerConfig, AppState};
 use crate::args::Args;
@@ -13,18 +19,22 @@ use sbc_config::load_from_str;
 use sbc_metrics::SbcMetrics;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use std::time::Duration;
+use tokio::sync::RwLock;
+use tracing::{debug, error, info, warn};
 
 /// SBC daemon runtime.
 pub struct Runtime {
     /// Command-line arguments.
     args: Args,
-    /// Configuration.
-    config: SbcConfig,
+    /// Configuration (wrapped in RwLock for hot-reload).
+    config: Arc<RwLock<SbcConfig>>,
     /// Shutdown coordinator.
     shutdown: ShutdownCoordinator,
     /// Server instance.
     server: Option<Server>,
+    /// Configuration reload check interval.
+    reload_check_interval: Duration,
 }
 
 impl Runtime {
@@ -47,9 +57,10 @@ impl Runtime {
 
         Ok(Self {
             args,
-            config,
+            config: Arc::new(RwLock::new(config)),
             shutdown,
             server: None,
+            reload_check_interval: Duration::from_millis(500),
         })
     }
 
@@ -75,35 +86,96 @@ impl Runtime {
         }
     }
 
-    /// Returns the current configuration.
-    pub fn config(&self) -> &SbcConfig {
+    /// Returns the current configuration (read-only snapshot).
+    pub async fn config(&self) -> SbcConfig {
+        self.config.read().await.clone()
+    }
+
+    /// Returns the raw config reference for internal use.
+    fn config_ref(&self) -> &Arc<RwLock<SbcConfig>> {
         &self.config
     }
 
     /// Reloads configuration from file.
-    pub fn reload_config(&mut self) -> Result<(), RuntimeError> {
+    ///
+    /// This is called automatically when SIGHUP is received.
+    /// The configuration is validated before being applied.
+    pub async fn reload_config(&self) -> Result<ConfigReloadResult, RuntimeError> {
         let config_path = self.args.effective_config_path();
 
-        if Path::new(&config_path).exists() {
-            let new_config =
-                load_from_file(&config_path).map_err(|e| RuntimeError::ConfigFailed {
-                    path: config_path.display().to_string(),
-                    reason: e.to_string(),
-                })?;
-
-            // In production, would apply config changes to running server
-            self.config = new_config;
-            info!("Configuration reloaded");
+        if !Path::new(&config_path).exists() {
+            return Ok(ConfigReloadResult {
+                success: false,
+                changes: Vec::new(),
+                message: "Config file not found".to_string(),
+            });
         }
 
-        Ok(())
+        let new_config = load_from_file(&config_path).map_err(|e| RuntimeError::ConfigFailed {
+            path: config_path.display().to_string(),
+            reason: e.to_string(),
+        })?;
+
+        // Compare with current config to identify changes
+        let current = self.config.read().await;
+        let changes = Self::detect_config_changes(&current, &new_config);
+
+        // Log what changed
+        if changes.is_empty() {
+            info!("Configuration reload requested, but no changes detected");
+            return Ok(ConfigReloadResult {
+                success: true,
+                changes: Vec::new(),
+                message: "No changes detected".to_string(),
+            });
+        }
+
+        drop(current); // Release read lock before acquiring write lock
+
+        // Apply the new configuration
+        *self.config.write().await = new_config;
+
+        info!(
+            changes = ?changes,
+            "Configuration reloaded successfully"
+        );
+
+        Ok(ConfigReloadResult {
+            success: true,
+            changes,
+            message: "Configuration reloaded".to_string(),
+        })
+    }
+
+    /// Detects which configuration sections changed.
+    fn detect_config_changes(old: &SbcConfig, new: &SbcConfig) -> Vec<String> {
+        let mut changes = Vec::new();
+
+        if old.general != new.general {
+            changes.push("general".to_string());
+        }
+        if old.transport != new.transport {
+            changes.push("transport".to_string());
+        }
+        if old.media != new.media {
+            changes.push("media".to_string());
+        }
+        if old.security != new.security {
+            changes.push("security".to_string());
+        }
+        if old.logging != new.logging {
+            changes.push("logging".to_string());
+        }
+
+        changes
     }
 
     /// Runs the SBC daemon.
     pub async fn run(&mut self) -> Result<(), RuntimeError> {
         // Create and start SIP server
         let signal = self.shutdown.signal().clone();
-        let mut server = Server::new(self.config.clone(), signal.clone());
+        let config = self.config.read().await.clone();
+        let mut server = Server::new(config, signal.clone());
 
         server.start().await.map_err(|e| RuntimeError::ServerFailed {
             reason: e.to_string(),
@@ -115,7 +187,7 @@ impl Runtime {
         let stats = Arc::clone(server.stats());
 
         let app_state = Arc::new(AppState::new(metrics, stats));
-        let api_server = ApiServer::new(api_config, app_state, signal.clone());
+        let api_server = ApiServer::new(api_config, app_state.clone(), signal.clone());
 
         // Spawn API server task
         let api_handle = tokio::spawn(async move {
@@ -124,13 +196,44 @@ impl Runtime {
             }
         });
 
+        // Spawn configuration reload monitor task
+        let reload_signal = signal.clone();
+        let config_ref = Arc::clone(&self.config);
+        let args = self.args.clone();
+        let reload_interval = self.reload_check_interval;
+
+        let reload_handle = tokio::spawn(async move {
+            Self::config_reload_loop(reload_signal, config_ref, args, reload_interval).await;
+        });
+
         // Run main SIP server loop
         server.run().await.map_err(|e| RuntimeError::ServerFailed {
             reason: e.to_string(),
         })?;
 
+        // Stop reload monitor
+        reload_handle.abort();
+
         // Stop API server
         api_handle.abort();
+
+        // Perform graceful shutdown with connection draining
+        info!("Initiating graceful shutdown with connection draining");
+        let drain_result = self.shutdown.shutdown_gracefully().await;
+
+        if drain_result.drained {
+            info!(
+                duration_ms = drain_result.drain_duration_ms,
+                "All connections drained successfully"
+            );
+        } else {
+            warn!(
+                remaining_calls = drain_result.remaining_calls,
+                remaining_transactions = drain_result.remaining_transactions,
+                duration_ms = drain_result.drain_duration_ms,
+                "Shutdown completed with force-terminated connections"
+            );
+        }
 
         // Stop SIP server
         server.stop().await.map_err(|e| RuntimeError::ServerFailed {
@@ -139,6 +242,49 @@ impl Runtime {
 
         self.server = Some(server);
         Ok(())
+    }
+
+    /// Configuration reload monitoring loop.
+    ///
+    /// Monitors for SIGHUP signals and reloads configuration when triggered.
+    async fn config_reload_loop(
+        signal: ShutdownSignal,
+        config: Arc<RwLock<SbcConfig>>,
+        args: Args,
+        poll_interval: Duration,
+    ) {
+        let mut interval = tokio::time::interval(poll_interval);
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if signal.is_reload_requested() {
+                        signal.clear_reload();
+
+                        let config_path = args.effective_config_path();
+                        info!(path = %config_path.display(), "SIGHUP received, reloading configuration");
+
+                        if Path::new(&config_path).exists() {
+                            match load_from_file(&config_path) {
+                                Ok(new_config) => {
+                                    *config.write().await = new_config;
+                                    info!("Configuration reloaded successfully");
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "Failed to reload configuration");
+                                }
+                            }
+                        } else {
+                            warn!(path = %config_path.display(), "Config file not found during reload");
+                        }
+                    }
+                }
+                _ = signal.wait_for_shutdown() => {
+                    debug!("Config reload loop shutting down");
+                    break;
+                }
+            }
+        }
     }
 
     /// Requests shutdown.
@@ -189,6 +335,17 @@ impl std::fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
+/// Result of a configuration reload operation.
+#[derive(Debug, Clone)]
+pub struct ConfigReloadResult {
+    /// Whether the reload was successful.
+    pub success: bool,
+    /// List of changed configuration sections.
+    pub changes: Vec<String>,
+    /// Human-readable message.
+    pub message: String,
+}
+
 impl From<ServerError> for RuntimeError {
     fn from(e: ServerError) -> Self {
         RuntimeError::ServerFailed {
@@ -236,7 +393,8 @@ mod tests {
         let args = Args::default();
         let runtime = Runtime::new(args).await.unwrap();
         // Check default config values
-        assert_eq!(runtime.config().general.instance_name, "sbc-01");
+        let config = runtime.config().await;
+        assert_eq!(config.general.instance_name, "sbc-01");
     }
 
     #[test]
@@ -245,5 +403,32 @@ mod tests {
         let config = load_from_str(toml).unwrap();
         assert_eq!(config.general.instance_name, "test-sbc");
         assert_eq!(config.general.max_calls, 100);
+    }
+
+    #[test]
+    fn test_detect_config_changes() {
+        let config1 = SbcConfig::default();
+        let mut config2 = SbcConfig::default();
+
+        // No changes
+        let changes = Runtime::detect_config_changes(&config1, &config2);
+        assert!(changes.is_empty());
+
+        // Change general section
+        config2.general.instance_name = "changed-sbc".to_string();
+        let changes = Runtime::detect_config_changes(&config1, &config2);
+        assert!(changes.contains(&"general".to_string()));
+    }
+
+    #[test]
+    fn test_config_reload_result() {
+        let result = ConfigReloadResult {
+            success: true,
+            changes: vec!["general".to_string(), "logging".to_string()],
+            message: "Configuration reloaded".to_string(),
+        };
+
+        assert!(result.success);
+        assert_eq!(result.changes.len(), 2);
     }
 }

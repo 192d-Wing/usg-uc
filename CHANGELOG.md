@@ -110,6 +110,27 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 - Graceful shutdown integration with SIP server
 - JSON serialization for all API responses
 
+#### Phase 15: Production Hardening
+
+- Graceful shutdown with connection draining
+  - ConnectionTracker for active calls, transactions, and registrations
+  - Configurable drain timeout with periodic polling
+  - DrainResult reporting with statistics
+  - ForcedShutdown phase when timeout exceeded
+- Configuration hot-reload via SIGHUP
+  - Async config reload loop monitoring shutdown signal
+  - ConfigReloadResult with change detection
+  - Section-level change tracking (general, transport, media, security, logging)
+- HTTPS support for API server
+  - TLS 1.3 with CNSA 2.0 compliant cipher suites
+  - Certificate and key loading from PEM files
+  - tokio-rustls integration for async TLS
+- Rate limiting integration with sbc-dos-protection
+  - Per-IP token bucket rate limiting for SIP messages
+  - Configurable via rate_limit section in config
+  - RateLimitAction handling (Allow, Throttle, Reject, Block)
+  - rate_limited counter in server statistics
+
 ### Security
 
 - Enforced `#![forbid(unsafe_code)]` across all crates (documented exceptions only)

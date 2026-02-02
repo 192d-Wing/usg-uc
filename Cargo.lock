@@ -779,6 +779,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "h2"
+version = "0.4.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f44da3a8150a6703ed5d34e164b875fd14c2cdab9af1252a9a1020bde2bdc54"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "http",
+ "indexmap",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -857,6 +876,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "httparse",
@@ -1763,11 +1783,16 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
+ "hyper",
+ "hyper-util",
+ "rustls",
+ "rustls-pemfile",
  "sbc-api",
  "sbc-b2bua",
  "sbc-codecs",
  "sbc-config",
  "sbc-dialog",
+ "sbc-dos-protection",
  "sbc-dtls",
  "sbc-health",
  "sbc-ice",
@@ -1785,6 +1810,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tower",
  "tower-http",
  "tracing",
@@ -2383,6 +2409,19 @@ dependencies = [
  "log",
  "tokio",
  "tungstenite",
+]
+
+[[package]]
+name = "tokio-util"
+version = "0.7.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]

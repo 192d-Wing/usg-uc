@@ -50,7 +50,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 862 tests passing, all foundation phases complete
+**Current Status**: 866 tests passing, Phase 15 (Production Hardening) complete
 
 ---
 
@@ -100,14 +100,15 @@ This document outlines the development roadmap for the USG Session Border Contro
 - [x] Add sbc-health HTTP probes (/healthz, /readyz)
 - [ ] Enable sbc-cdr export endpoints (future)
 
-### ⏳ Phase 15: Production Hardening
+### ✅ Phase 15: Production Hardening
 **Goal**: Production-ready deployment
 
-- [ ] Implement graceful shutdown with connection draining
-- [ ] Add configuration hot-reload via SIGHUP
-- [ ] Enable TLS certificate rotation
-- [ ] Add distributed tracing (OpenTelemetry)
-- [ ] Implement rate limiting per sbc-dos-protection
+- [x] Implement graceful shutdown with connection draining
+- [x] Add configuration hot-reload via SIGHUP
+- [x] Enable TLS for API server (HTTPS with CNSA 2.0 compliant config)
+- [x] Implement rate limiting per sbc-dos-protection
+- [ ] Add distributed tracing (OpenTelemetry) (future)
+- [ ] Enable TLS certificate rotation (future)
 
 ### ⏳ Phase 16: Deployment & Operations
 **Goal**: Container and orchestration support
