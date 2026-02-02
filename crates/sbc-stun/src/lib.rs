@@ -3,6 +3,11 @@
 //! This crate implements Session Traversal Utilities for NAT (STUN) per
 //! RFC 5389 and RFC 8489 for discovering public IP addresses and NAT types.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **SC-7**: Boundary Protection (NAT discovery)
+//! - **SC-8**: Transmission Confidentiality and Integrity (message integrity)
+//!
 //! ## RFC Compliance
 //!
 //! - **RFC 5389**: STUN Protocol

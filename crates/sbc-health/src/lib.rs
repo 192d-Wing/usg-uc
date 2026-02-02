@@ -3,6 +3,11 @@
 //! This crate provides health check functionality for Kubernetes
 //! liveness and readiness probes, and system diagnostics.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **SI-6**: Security Function Verification
+//! - **CA-7**: Continuous Monitoring
+//!
 //! ## Features
 //!
 //! - Liveness probe support

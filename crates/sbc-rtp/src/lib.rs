@@ -3,6 +3,10 @@
 //! This crate implements the Real-time Transport Protocol (RTP) and
 //! RTP Control Protocol (RTCP) for media streaming.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **SC-8**: Transmission Confidentiality and Integrity
+//!
 //! ## RFC Compliance
 //!
 //! - **RFC 3550**: RTP: A Transport Protocol for Real-Time Applications

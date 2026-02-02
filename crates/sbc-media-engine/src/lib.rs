@@ -3,6 +3,11 @@
 //! This crate coordinates media handling including codec negotiation,
 //! RTP stream management, and media path setup for the SBC.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **SC-8**: Transmission Confidentiality and Integrity
+//! - **SC-13**: Cryptographic Protection (SRTP)
+//!
 //! ## Media Modes
 //!
 //! The SBC supports two media handling modes:

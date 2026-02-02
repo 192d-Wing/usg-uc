@@ -4,6 +4,12 @@
 //! SHAKEN (Signature-based Handling of Asserted information using toKENs)
 //! for caller ID authentication and robocall prevention.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **IA-2**: Identification and Authentication (Organizational Users)
+//! - **IA-9**: Service Identification and Authentication
+//! - **AU-2**: Event Logging (verification results)
+//!
 //! ## RFC Compliance
 //!
 //! - **RFC 8224**: Authenticated Identity Management in SIP

@@ -3,6 +3,11 @@
 //! This crate implements the B2BUA (Back-to-Back User Agent) pattern for
 //! SIP call handling, providing call control and media anchoring.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **SC-7**: Boundary Protection
+//! - **SC-8**: Transmission Confidentiality and Integrity
+//!
 //! ## RFC Compliance
 //!
 //! - **RFC 3261**: SIP Core

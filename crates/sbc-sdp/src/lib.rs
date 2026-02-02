@@ -3,6 +3,11 @@
 //! This crate provides Session Description Protocol (SDP) parsing and
 //! generation for negotiating media parameters in VoIP sessions.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **SC-8**: Transmission Confidentiality and Integrity (DTLS fingerprints)
+//! - **SC-13**: Cryptographic Protection (crypto attributes)
+//!
 //! ## RFC Compliance
 //!
 //! - **RFC 4566**: SDP: Session Description Protocol

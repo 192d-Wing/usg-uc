@@ -4,6 +4,11 @@
 //! RFC 5766 and RFC 8656 for relaying media when direct connectivity
 //! is not possible.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **SC-7**: Boundary Protection (media relay)
+//! - **SC-8**: Transmission Confidentiality and Integrity
+//!
 //! ## RFC Compliance
 //!
 //! - **RFC 5766**: TURN Protocol

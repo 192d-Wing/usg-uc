@@ -3,6 +3,12 @@
 //! This crate provides metrics instrumentation for monitoring SBC
 //! performance, call statistics, and system health.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **AU-6**: Audit Record Review, Analysis, and Reporting
+//! - **CA-7**: Continuous Monitoring
+//! - **SI-4**: System Monitoring
+//!
 //! ## Features
 //!
 //! - Counter, gauge, and histogram metrics

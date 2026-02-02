@@ -3,6 +3,12 @@
 //! This crate provides access control functionality including IP allowlists,
 //! denylists, and network-based filtering for SBC security.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **AC-3**: Access Enforcement
+//! - **AC-4**: Information Flow Enforcement
+//! - **SC-7**: Boundary Protection
+//!
 //! ## Features
 //!
 //! - IP address and CIDR network filtering

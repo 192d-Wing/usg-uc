@@ -3,6 +3,11 @@
 //! This crate provides call routing logic including dial plan processing,
 //! carrier selection, and failover handling.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **AC-4**: Information Flow Enforcement
+//! - **CP-10**: System Recovery and Reconstitution (failover)
+//!
 //! ## Features
 //!
 //! - Dial plan pattern matching

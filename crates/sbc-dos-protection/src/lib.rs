@@ -3,6 +3,11 @@
 //! This crate provides rate limiting, traffic analysis, and DoS attack
 //! detection mechanisms to protect the SBC infrastructure.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **SC-5**: Denial of Service Protection
+//! - **SI-4**: System Monitoring
+//!
 //! ## Features
 //!
 //! - Token bucket rate limiting

@@ -3,6 +3,12 @@
 //! This crate provides the HTTP API for runtime configuration,
 //! monitoring, and management of the SBC.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **AC-3**: Access Enforcement
+//! - **CM-6**: Configuration Settings
+//! - **AU-2**: Event Logging
+//!
 //! ## Features
 //!
 //! - RESTful API endpoints

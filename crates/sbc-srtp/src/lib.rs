@@ -3,6 +3,11 @@
 //! This crate provides Secure Real-time Transport Protocol (SRTP) encryption
 //! using CNSA 2.0 approved cryptographic algorithms for government-grade security.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **SC-8**: Transmission Confidentiality and Integrity
+//! - **SC-13**: Cryptographic Protection
+//!
 //! ## CNSA 2.0 Compliance
 //!
 //! This implementation uses only CNSA 2.0 approved algorithms:

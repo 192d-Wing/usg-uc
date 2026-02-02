@@ -3,6 +3,11 @@
 //! This crate manages SIP dialog lifecycle including creation, modification,
 //! and termination of call sessions per RFC 3261.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **AU-2**: Event Logging (dialog state changes)
+//! - **SC-10**: Network Disconnect (session termination)
+//!
 //! ## RFC Compliance
 //!
 //! - **RFC 3261**: SIP Dialogs (Section 12)

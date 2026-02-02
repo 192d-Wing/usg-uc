@@ -3,6 +3,11 @@
 //! This crate implements Interactive Connectivity Establishment (ICE) per
 //! RFC 8445 for NAT traversal in VoIP communications.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **SC-7**: Boundary Protection (NAT traversal)
+//! - **SC-8**: Transmission Confidentiality and Integrity
+//!
 //! ## RFC Compliance
 //!
 //! - **RFC 8445**: ICE Protocol

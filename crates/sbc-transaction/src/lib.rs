@@ -3,6 +3,11 @@
 //! This crate implements the SIP transaction layer finite state machine
 //! per RFC 3261 for reliable message delivery and retransmission handling.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **SC-8**: Transmission Confidentiality and Integrity
+//! - **AU-2**: Event Logging (transaction state changes)
+//!
 //! ## RFC Compliance
 //!
 //! - **RFC 3261**: SIP Transaction Layer (Sections 17.1, 17.2)

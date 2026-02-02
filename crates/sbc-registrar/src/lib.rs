@@ -3,6 +3,12 @@
 //! This crate handles SIP REGISTER requests and maintains the location
 //! database for endpoint discovery and routing.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **IA-2**: Identification and Authentication (Organizational Users)
+//! - **IA-4**: Identifier Management
+//! - **IA-5**: Authenticator Management
+//!
 //! ## RFC Compliance
 //!
 //! - **RFC 3261**: SIP Core (Section 10 - Registrations)

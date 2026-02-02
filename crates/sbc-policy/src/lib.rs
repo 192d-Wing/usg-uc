@@ -3,6 +3,11 @@
 //! This crate implements policy-based decision making for call routing,
 //! admission control, and SIP message manipulation.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **AC-3**: Access Enforcement
+//! - **AC-4**: Information Flow Enforcement
+//!
 //! ## Features
 //!
 //! - Call admission control (CAC)

@@ -3,6 +3,12 @@
 //! This crate handles CDR creation, formatting, and export for billing,
 //! compliance, and analytics purposes.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **AU-2**: Event Logging
+//! - **AU-3**: Content of Audit Records
+//! - **AU-9**: Protection of Audit Information
+//!
 //! ## Features
 //!
 //! - CDR record generation

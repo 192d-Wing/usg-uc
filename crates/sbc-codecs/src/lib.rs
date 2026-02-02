@@ -3,6 +3,10 @@
 //! This crate provides audio encoding and decoding functionality for
 //! common VoIP codecs used in real-time communications.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **SC-8**: Transmission Confidentiality and Integrity
+//!
 //! ## Supported Codecs
 //!
 //! - **Opus**: Modern high-quality codec (RFC 6716)
