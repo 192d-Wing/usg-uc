@@ -1,0 +1,23 @@
+[package]
+name = "sbc-config"
+description = "Configuration schema and validation for the USG SBC"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+sbc-types = { workspace = true, features = ["serde"] }
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+validator.workspace = true
+
+[lints]
+workspace = true

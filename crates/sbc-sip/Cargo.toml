@@ -1,0 +1,19 @@
+[package]
+name = "sbc-sip"
+description = "SIP protocol message parsing and generation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+sbc-types.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+
+[lints]
+workspace = true

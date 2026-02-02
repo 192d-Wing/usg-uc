@@ -1,0 +1,16 @@
+[package]
+name = "sbc-stir-shaken"
+description = "STIR/SHAKEN caller ID verification and attestation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sbc-types = { path = "../sbc-types" }

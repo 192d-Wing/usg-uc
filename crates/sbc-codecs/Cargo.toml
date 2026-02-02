@@ -1,0 +1,18 @@
+[package]
+name = "sbc-codecs"
+description = "Audio codec support including Opus, G.711, and G.722"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+sbc-types.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+
+[lints]
+workspace = true

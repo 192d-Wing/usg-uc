@@ -1,0 +1,25 @@
+[package]
+name = "sbc-audit"
+description = "NIST 800-53 Rev5 compliant audit logging for the USG SBC"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+sbc-types = { workspace = true, features = ["serde"] }
+sbc-crypto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

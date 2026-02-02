@@ -1,0 +1,5 @@
+[toolchain]
+# Note: Will migrate to 1.92 when available per CONTRIBUTING.md
+channel = "stable"
+components = ["rustfmt", "clippy", "rust-analyzer"]
+profile = "default"

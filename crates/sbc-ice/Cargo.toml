@@ -1,0 +1,22 @@
+[package]
+name = "sbc-ice"
+description = "ICE protocol for NAT traversal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+sbc-types.workspace = true
+sbc-stun = { path = "../sbc-stun" }
+sbc-turn = { path = "../sbc-turn" }
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+
+[lints]
+workspace = true
