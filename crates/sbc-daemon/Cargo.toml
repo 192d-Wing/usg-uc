@@ -28,6 +28,9 @@ sbc-srtp = { path = "../sbc-srtp" }
 sbc-dtls = { path = "../sbc-dtls" }
 sbc-media-engine = { path = "../sbc-media-engine" }
 sbc-codecs = { path = "../sbc-codecs" }
+sbc-stun = { path = "../sbc-stun" }
+sbc-turn = { path = "../sbc-turn" }
+sbc-ice = { path = "../sbc-ice" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

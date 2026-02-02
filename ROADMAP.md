@@ -50,7 +50,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 840 tests passing, all foundation phases complete
+**Current Status**: 853 tests passing, all foundation phases complete
 
 ---
 
@@ -83,13 +83,13 @@ This document outlines the development roadmap for the USG Session Border Contro
 - [x] Add DTLS-SRTP key exchange via sbc-dtls
 - [x] Enable codec transcoding via sbc-codecs
 
-### ⏳ Phase 13: ICE/NAT Traversal
+### ✅ Phase 13: ICE/NAT Traversal
 **Goal**: Full NAT traversal support
 
-- [ ] Integrate sbc-stun for connectivity checks
-- [ ] Enable sbc-turn for relay allocation
-- [ ] Connect sbc-ice for candidate gathering/selection
-- [ ] Add ICE-lite mode for server-side optimization
+- [x] Integrate sbc-stun for connectivity checks
+- [x] Enable sbc-turn for relay allocation
+- [x] Connect sbc-ice for candidate gathering/selection
+- [x] Add ICE-lite mode for server-side optimization
 
 ### ⏳ Phase 14: REST API Server
 **Goal**: HTTP management interface

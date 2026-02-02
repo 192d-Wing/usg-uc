@@ -85,6 +85,17 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 - Session management with A-leg/B-leg addressing
 - RTP sequence tracking and statistics
 
+#### Phase 13: ICE/NAT Traversal Integration
+
+- IceManager module coordinating `sbc-ice`, `sbc-stun`, and `sbc-turn`
+- ICE session lifecycle management (create, gather, check, close)
+- Candidate gathering with host and server-reflexive candidates
+- Connectivity check state machine integration
+- ICE-lite mode for server-side optimization
+- STUN binding request/response processing
+- ICE restart support for mid-session renegotiation
+- Session statistics and monitoring
+
 ### Security
 
 - Enforced `#![forbid(unsafe_code)]` across all crates (documented exceptions only)

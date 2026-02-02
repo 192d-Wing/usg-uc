@@ -27,6 +27,7 @@
 #![allow(dead_code)]
 
 mod args;
+mod ice_agent;
 mod media_pipeline;
 mod runtime;
 mod server;
