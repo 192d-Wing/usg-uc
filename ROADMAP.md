@@ -50,7 +50,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 822 tests passing, all foundation phases complete
+**Current Status**: 830 tests passing, all foundation phases complete
 
 ---
 
@@ -65,14 +65,14 @@ This document outlines the development roadmap for the USG Session Border Contro
 - [x] Add Unix signal handling (SIGTERM, SIGINT, SIGHUP)
 - [x] Implement async health check polling
 
-### 🔄 Phase 11: SIP Stack Integration
+### ✅ Phase 11: SIP Stack Integration
 **Goal**: Connect SIP components into working call flow
 
-- [ ] Integrate sbc-sip with transport layer
-- [ ] Wire sbc-transaction for request/response handling
-- [ ] Connect sbc-dialog for call state management
-- [ ] Enable sbc-b2bua for call bridging
-- [ ] Integrate sbc-registrar for user registration
+- [x] Integrate sbc-sip with transport layer
+- [x] Wire sbc-transaction for request/response handling
+- [x] Connect sbc-dialog for call state management
+- [x] Enable sbc-b2bua for call bridging
+- [x] Integrate sbc-registrar for user registration
 
 ### ⏳ Phase 12: Media Pipeline
 **Goal**: Enable RTP/SRTP media relay

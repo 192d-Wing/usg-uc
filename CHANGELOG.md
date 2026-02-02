@@ -67,6 +67,15 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 - Health check polling loop with configurable interval
 - Structured logging via tracing and tracing-subscriber
 
+#### Phase 11: SIP Stack Integration
+
+- SipStack module coordinating `sbc-sip`, `sbc-transaction`, `sbc-dialog`, `sbc-b2bua`, and `sbc-registrar`
+- ProcessResult enum for message routing decisions (Response, Forward, NoAction, Error)
+- SIP method handlers: REGISTER, INVITE, ACK, BYE, CANCEL, OPTIONS
+- SIP processing integrated into transport receive loop
+- Transaction, dialog, and call state management structures
+- Support for both B2BUA registrar and proxy modes
+
 ### Security
 
 - Enforced `#![forbid(unsafe_code)]` across all crates (documented exceptions only)
