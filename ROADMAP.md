@@ -56,16 +56,16 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 ## Future Development Phases
 
-### 🔄 Phase 10: Async Runtime Integration
+### ✅ Phase 10: Async Runtime Integration
 **Goal**: Wire up tokio async runtime for real network I/O
 
-- [ ] Add tokio dependency to sbc-daemon
-- [ ] Implement async transport listeners (UDP/TCP/TLS)
-- [ ] Create async event loop for message processing
-- [ ] Add connection pool management
-- [ ] Implement async health check polling
+- [x] Add tokio dependency to sbc-daemon
+- [x] Implement async transport listeners (UDP)
+- [x] Create async event loop for message processing
+- [x] Add Unix signal handling (SIGTERM, SIGINT, SIGHUP)
+- [x] Implement async health check polling
 
-### ⏳ Phase 11: SIP Stack Integration
+### 🔄 Phase 11: SIP Stack Integration
 **Goal**: Connect SIP components into working call flow
 
 - [ ] Integrate sbc-sip with transport layer

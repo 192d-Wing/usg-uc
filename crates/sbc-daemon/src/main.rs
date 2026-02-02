@@ -47,16 +47,50 @@ fn main() {
         return;
     }
 
-    match Runtime::new(args) {
-        Ok(mut runtime) => {
-            if let Err(e) = runtime.run() {
-                eprintln!("Fatal error: {e}");
+    // Initialize tracing subscriber
+    init_tracing(args.verbose);
+
+    // Create tokio runtime and run the daemon
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("sbc-worker")
+        .build()
+        .expect("Failed to create tokio runtime");
+
+    rt.block_on(async {
+        match Runtime::new(args).await {
+            Ok(mut runtime) => {
+                if let Err(e) = runtime.run().await {
+                    tracing::error!("Fatal error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                tracing::error!("Initialization failed: {e}");
                 std::process::exit(1);
             }
         }
-        Err(e) => {
-            eprintln!("Initialization failed: {e}");
-            std::process::exit(1);
-        }
-    }
+    });
+}
+
+/// Initializes the tracing subscriber with appropriate log level.
+fn init_tracing(verbose: u8) {
+    use tracing_subscriber::EnvFilter;
+
+    let level = match verbose {
+        0 => "info",
+        1 => "debug",
+        _ => "trace",
+    };
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(format!("sbc={level},warn")));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_file(true)
+        .with_line_number(true)
+        .init();
 }

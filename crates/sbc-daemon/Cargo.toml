@@ -17,6 +17,10 @@ sbc-types = { path = "../sbc-types" }
 sbc-config = { path = "../sbc-config" }
 sbc-health = { path = "../sbc-health" }
 sbc-metrics = { path = "../sbc-metrics" }
+sbc-transport = { path = "../sbc-transport" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [[bin]]
 name = "sbc-daemon"

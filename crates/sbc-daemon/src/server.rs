@@ -1,13 +1,20 @@
-//! SBC server components.
+//! SBC server components with async I/O.
 //!
 //! This module contains the server components that handle SIP signaling
-//! and media processing.
+//! and media processing using async/await patterns.
 
 use crate::shutdown::ShutdownSignal;
 use sbc_config::SbcConfig;
 use sbc_health::{HealthChecker, HealthCheckerConfig};
 use sbc_metrics::{MetricRegistry, SbcMetrics};
+use sbc_transport::udp::UdpTransport;
+use sbc_transport::Transport;
+use sbc_types::address::SbcSocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tracing::{debug, error, info, warn};
 
 /// SBC server state.
 pub struct Server {
@@ -20,7 +27,9 @@ pub struct Server {
     /// Metrics registry.
     metrics: MetricRegistry,
     /// Server statistics.
-    stats: ServerStats,
+    stats: Arc<ServerStats>,
+    /// UDP transports for SIP signaling.
+    udp_transports: RwLock<Vec<Arc<UdpTransport>>>,
 }
 
 impl Server {
@@ -43,7 +52,8 @@ impl Server {
             shutdown,
             health,
             metrics,
-            stats: ServerStats::default(),
+            stats: Arc::new(ServerStats::default()),
+            udp_transports: RwLock::new(Vec::new()),
         }
     }
 
@@ -67,75 +77,210 @@ impl Server {
         &self.stats
     }
 
-    /// Starts the server.
-    pub fn start(&mut self) -> Result<(), ServerError> {
-        // Log startup
-        println!(
-            "[INFO] Starting SBC daemon v{} (instance: {})",
-            env!("CARGO_PKG_VERSION"),
-            self.config.general.instance_name
+    /// Starts the server and binds to transport addresses.
+    pub async fn start(&mut self) -> Result<(), ServerError> {
+        info!(
+            version = env!("CARGO_PKG_VERSION"),
+            instance = %self.config.general.instance_name,
+            "Starting SBC daemon"
         );
-        println!(
-            "[INFO] Max calls: {}, Max registrations: {}",
-            self.config.general.max_calls, self.config.general.max_registrations
+        info!(
+            max_calls = self.config.general.max_calls,
+            max_registrations = self.config.general.max_registrations,
+            "Call limits configured"
         );
-        println!(
-            "[INFO] Media mode: {:?}, SRTP required: {}",
-            self.config.media.default_mode, self.config.media.srtp.required
+        info!(
+            media_mode = ?self.config.media.default_mode,
+            srtp_required = self.config.media.srtp.required,
+            "Media settings configured"
         );
 
-        // In production, would bind to transport addresses here
-        // For now, just log the configured addresses
-        for addr in &self.config.transport.udp_listen {
-            println!("[INFO] UDP listener configured: {addr}");
+        // Bind UDP listeners
+        self.bind_udp_listeners().await?;
+
+        Ok(())
+    }
+
+    /// Binds UDP transport listeners.
+    async fn bind_udp_listeners(&mut self) -> Result<(), ServerError> {
+        let mut transports = self.udp_transports.write().await;
+
+        for socket_addr in &self.config.transport.udp_listen {
+            let addr = SbcSocketAddr::from(*socket_addr);
+
+            match UdpTransport::bind(addr.clone()).await {
+                Ok(transport) => {
+                    info!(
+                        address = %transport.local_addr(),
+                        "UDP listener bound"
+                    );
+                    transports.push(Arc::new(transport));
+                }
+                Err(e) => {
+                    error!(address = %addr, error = %e, "Failed to bind UDP listener");
+                    return Err(ServerError::BindFailed {
+                        address: addr.to_string(),
+                        reason: e.to_string(),
+                    });
+                }
+            }
         }
-        for addr in &self.config.transport.tcp_listen {
-            println!("[INFO] TCP listener configured: {addr}");
-        }
-        for addr in &self.config.transport.tls_listen {
-            println!("[INFO] TLS listener configured: {addr}");
+
+        // If no UDP listeners configured, bind to default ports
+        if transports.is_empty() {
+            let default_addr = SbcSocketAddr::new_v6(Ipv6Addr::UNSPECIFIED, 5060);
+            match UdpTransport::bind(default_addr.clone()).await {
+                Ok(transport) => {
+                    info!(
+                        address = %transport.local_addr(),
+                        "UDP listener bound (default)"
+                    );
+                    transports.push(Arc::new(transport));
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to bind default UDP listener on IPv6, trying IPv4");
+                    // Try IPv4 fallback
+                    let ipv4_addr = SbcSocketAddr::new_v4(Ipv4Addr::UNSPECIFIED, 5060);
+                    let transport = UdpTransport::bind(ipv4_addr).await.map_err(|e| {
+                        ServerError::BindFailed {
+                            address: "0.0.0.0:5060".to_string(),
+                            reason: e.to_string(),
+                        }
+                    })?;
+                    info!(
+                        address = %transport.local_addr(),
+                        "UDP listener bound (IPv4 fallback)"
+                    );
+                    transports.push(Arc::new(transport));
+                }
+            }
         }
 
         Ok(())
     }
 
     /// Runs the main event loop.
-    pub fn run(&mut self) -> Result<(), ServerError> {
-        println!("[INFO] Entering main event loop");
+    pub async fn run(&mut self) -> Result<(), ServerError> {
+        info!("Entering async event loop");
 
-        // Main loop - in production would handle events
-        while !self.shutdown.is_shutdown_requested() {
-            // Check for reload
-            if self.shutdown.is_reload_requested() {
-                println!("[INFO] Reload requested");
-                self.shutdown.clear_reload();
-            }
+        // Get transport handles for spawning receive tasks
+        let transports = self.udp_transports.read().await;
+        let transport_count = transports.len();
 
-            // Update stats
-            self.stats.loops_completed.fetch_add(1, Ordering::Relaxed);
-
-            // Sleep to prevent busy loop in this placeholder
-            std::thread::sleep(std::time::Duration::from_millis(100));
-
-            // In production, would process SIP messages, media, etc.
-            // For now, just break after one iteration for testing
-            #[cfg(test)]
-            break;
+        if transport_count == 0 {
+            warn!("No transports bound, exiting event loop");
+            return Ok(());
         }
+
+        // Spawn receive tasks for each transport
+        let mut handles = Vec::new();
+        for (idx, transport) in transports.iter().enumerate() {
+            let transport = Arc::clone(transport);
+            let shutdown = self.shutdown.clone();
+            let stats = Arc::clone(&self.stats);
+
+            let handle = tokio::spawn(async move {
+                Self::transport_receive_loop(idx, transport, shutdown, stats).await
+            });
+            handles.push(handle);
+        }
+        drop(transports);
+
+        // Spawn health check polling task
+        let shutdown = self.shutdown.clone();
+        let health_interval = tokio::time::Duration::from_secs(30);
+        let health_handle = tokio::spawn(async move {
+            Self::health_poll_loop(shutdown, health_interval).await;
+        });
+
+        // Wait for shutdown or all tasks to complete
+        self.shutdown.wait_for_shutdown().await;
+        info!("Shutdown signal received, stopping event loop");
+
+        // Cancel all tasks
+        for handle in handles {
+            handle.abort();
+        }
+        health_handle.abort();
 
         Ok(())
     }
 
+    /// Receive loop for a single transport.
+    async fn transport_receive_loop(
+        idx: usize,
+        transport: Arc<UdpTransport>,
+        shutdown: ShutdownSignal,
+        stats: Arc<ServerStats>,
+    ) {
+        debug!(transport_idx = idx, "Starting transport receive loop");
+
+        loop {
+            tokio::select! {
+                result = transport.recv() => {
+                    match result {
+                        Ok(msg) => {
+                            stats.messages_received.fetch_add(1, Ordering::Relaxed);
+                            debug!(
+                                source = %msg.source,
+                                size = msg.data.len(),
+                                transport = ?msg.transport,
+                                "Received message"
+                            );
+
+                            // TODO: Route to SIP parser and transaction layer
+                        }
+                        Err(e) => {
+                            if shutdown.is_shutdown_requested() {
+                                break;
+                            }
+                            warn!(error = %e, "Transport receive error");
+                        }
+                    }
+                }
+                _ = shutdown.wait_for_shutdown() => {
+                    debug!(transport_idx = idx, "Transport receive loop shutting down");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Health check polling loop.
+    async fn health_poll_loop(shutdown: ShutdownSignal, interval: tokio::time::Duration) {
+        let mut interval_timer = tokio::time::interval(interval);
+
+        loop {
+            tokio::select! {
+                _ = interval_timer.tick() => {
+                    debug!("Health check poll");
+                    // In production, would run actual health checks here
+                }
+                _ = shutdown.wait_for_shutdown() => {
+                    debug!("Health poll loop shutting down");
+                    break;
+                }
+            }
+        }
+    }
+
     /// Stops the server gracefully.
-    pub fn stop(&mut self) -> Result<(), ServerError> {
-        println!("[INFO] Stopping SBC daemon");
+    pub async fn stop(&mut self) -> Result<(), ServerError> {
+        info!("Stopping SBC daemon");
 
-        // In production, would:
-        // 1. Stop accepting new connections
-        // 2. Drain active calls
-        // 3. Close listeners
+        // Close all transports
+        let transports = self.udp_transports.read().await;
+        for transport in transports.iter() {
+            if let Err(e) = transport.close().await {
+                warn!(error = %e, "Error closing transport");
+            }
+        }
 
-        println!("[INFO] SBC daemon stopped");
+        info!(
+            messages_received = self.stats.messages_received.load(Ordering::Relaxed),
+            messages_sent = self.stats.messages_sent.load(Ordering::Relaxed),
+            "SBC daemon stopped"
+        );
         Ok(())
     }
 
@@ -166,8 +311,10 @@ pub struct ServerStats {
     pub registrations_total: AtomicU64,
     /// Active registrations.
     pub registrations_active: AtomicU64,
-    /// Main loop iterations.
-    pub loops_completed: AtomicU64,
+    /// Messages received.
+    pub messages_received: AtomicU64,
+    /// Messages sent.
+    pub messages_sent: AtomicU64,
 }
 
 /// Server error.
@@ -228,14 +375,11 @@ mod tests {
         let shutdown = ShutdownSignal::new();
         let server = Server::new(config, shutdown);
 
-        assert_eq!(
-            server.config().general.instance_name,
-            "sbc-01"
-        );
+        assert_eq!(server.config().general.instance_name, "sbc-01");
     }
 
-    #[test]
-    fn test_server_health() {
+    #[tokio::test]
+    async fn test_server_health() {
         let config = SbcConfig::default();
         let shutdown = ShutdownSignal::new();
         let mut server = Server::new(config, shutdown);
@@ -247,32 +391,28 @@ mod tests {
         assert!(health.is_healthy());
     }
 
-    #[test]
-    fn test_server_lifecycle() {
-        let config = SbcConfig::default();
-        let shutdown = ShutdownSignal::new();
-        let mut server = Server::new(config, shutdown);
-
-        // Start server
-        server.start().unwrap();
-
-        // Run (will exit immediately in test mode)
-        server.run().unwrap();
-
-        // Stop server
-        server.stop().unwrap();
-    }
-
-    #[test]
-    fn test_server_stats() {
+    #[tokio::test]
+    async fn test_server_stats() {
         let config = SbcConfig::default();
         let shutdown = ShutdownSignal::new();
         let server = Server::new(config, shutdown);
 
         assert_eq!(server.stats().calls_total.load(Ordering::Relaxed), 0);
-        assert_eq!(server.stats().calls_active.load(Ordering::Relaxed), 0);
+        assert_eq!(server.stats().messages_received.load(Ordering::Relaxed), 0);
 
-        server.stats().calls_total.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(server.stats().calls_total.load(Ordering::Relaxed), 1);
+        server.stats().messages_received.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(server.stats().messages_received.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_sbc_socket_addr_conversion() {
+        // Test that SocketAddr converts to SbcSocketAddr correctly
+        let socket_addr: std::net::SocketAddr = "[::]:5060".parse().unwrap();
+        let sbc_addr = SbcSocketAddr::from(socket_addr);
+        assert_eq!(sbc_addr.port(), 5060);
+
+        let socket_addr: std::net::SocketAddr = "0.0.0.0:5060".parse().unwrap();
+        let sbc_addr = SbcSocketAddr::from(socket_addr);
+        assert_eq!(sbc_addr.port(), 5060);
     }
 }

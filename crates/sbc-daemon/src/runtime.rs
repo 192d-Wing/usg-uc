@@ -10,6 +10,7 @@ use sbc_config::{load_from_file, SbcConfig};
 #[cfg(test)]
 use sbc_config::load_from_str;
 use std::path::Path;
+use tracing::{info, warn};
 
 /// SBC daemon runtime.
 pub struct Runtime {
@@ -25,7 +26,7 @@ pub struct Runtime {
 
 impl Runtime {
     /// Creates a new runtime from command-line arguments.
-    pub fn new(args: Args) -> Result<Self, RuntimeError> {
+    pub async fn new(args: Args) -> Result<Self, RuntimeError> {
         // Load configuration
         let config = Self::load_config(&args)?;
 
@@ -33,6 +34,7 @@ impl Runtime {
         let signal = ShutdownSignal::new();
         signal
             .install_handlers()
+            .await
             .map_err(|e| RuntimeError::InitFailed {
                 component: "shutdown".to_string(),
                 reason: e.to_string(),
@@ -65,7 +67,7 @@ impl Runtime {
             })
         } else {
             // Use default configuration
-            println!("[WARN] Config file not found, using defaults");
+            warn!("Config file not found, using defaults");
             Ok(SbcConfig::default())
         }
     }
@@ -88,51 +90,34 @@ impl Runtime {
 
             // In production, would apply config changes to running server
             self.config = new_config;
-            println!("[INFO] Configuration reloaded");
+            info!("Configuration reloaded");
         }
 
         Ok(())
     }
 
     /// Runs the SBC daemon.
-    pub fn run(&mut self) -> Result<(), RuntimeError> {
-        // Initialize logging based on config and verbosity
-        self.init_logging();
-
+    pub async fn run(&mut self) -> Result<(), RuntimeError> {
         // Create and start server
         let signal = self.shutdown.signal().clone();
         let mut server = Server::new(self.config.clone(), signal);
 
-        server.start().map_err(|e| RuntimeError::ServerFailed {
+        server.start().await.map_err(|e| RuntimeError::ServerFailed {
             reason: e.to_string(),
         })?;
 
         // Run main loop
-        server.run().map_err(|e| RuntimeError::ServerFailed {
+        server.run().await.map_err(|e| RuntimeError::ServerFailed {
             reason: e.to_string(),
         })?;
 
         // Stop server
-        server.stop().map_err(|e| RuntimeError::ServerFailed {
+        server.stop().await.map_err(|e| RuntimeError::ServerFailed {
             reason: e.to_string(),
         })?;
 
         self.server = Some(server);
         Ok(())
-    }
-
-    /// Initializes logging.
-    fn init_logging(&self) {
-        let level = match self.args.verbose {
-            0 => self.config.logging.level.as_str(),
-            1 => "debug",
-            _ => "trace",
-        };
-
-        println!("[INFO] Log level: {level}");
-
-        // In production, would set up proper logging framework here
-        // e.g., tracing, log4rs, or similar
     }
 
     /// Requests shutdown.
@@ -217,18 +202,18 @@ level = "debug"
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_runtime_creation() {
+    #[tokio::test]
+    async fn test_runtime_creation() {
         let args = Args::default();
-        let runtime = Runtime::new(args);
+        let runtime = Runtime::new(args).await;
         // Should use default config since no file exists
         assert!(runtime.is_ok());
     }
 
-    #[test]
-    fn test_runtime_config() {
+    #[tokio::test]
+    async fn test_runtime_config() {
         let args = Args::default();
-        let runtime = Runtime::new(args).unwrap();
+        let runtime = Runtime::new(args).await.unwrap();
         // Check default config values
         assert_eq!(runtime.config().general.instance_name, "sbc-01");
     }

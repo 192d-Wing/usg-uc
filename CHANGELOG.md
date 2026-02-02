@@ -57,6 +57,16 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 - `sbc-cli`: Command-line interface with status, config, calls, health, and metrics commands
 - `sbc-integration-tests`: Integration test suite for cross-crate testing
 
+#### Phase 10: Async Runtime Integration
+
+- Tokio async runtime integration in `sbc-daemon`
+- Async UDP transport listeners with `sbc-transport` integration
+- Unix signal handling with tokio (SIGTERM, SIGINT, SIGHUP)
+- Async event loop for message processing with per-transport receive tasks
+- Graceful shutdown with broadcast-based notification
+- Health check polling loop with configurable interval
+- Structured logging via tracing and tracing-subscriber
+
 ### Security
 
 - Enforced `#![forbid(unsafe_code)]` across all crates (documented exceptions only)

@@ -1,4 +1,4 @@
-//! Graceful shutdown handling.
+//! Graceful shutdown handling with async signal support.
 //!
 //! ## NIST 800-53 Rev5: AU-12 (Audit Record Generation)
 //!
@@ -6,14 +6,18 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::broadcast;
+use tracing::{info, warn};
 
-/// Shutdown signal handler.
+/// Shutdown signal handler with tokio signal support.
 #[derive(Clone)]
 pub struct ShutdownSignal {
     /// Whether shutdown has been requested.
     shutdown_requested: Arc<AtomicBool>,
     /// Whether reload has been requested (SIGHUP).
     reload_requested: Arc<AtomicBool>,
+    /// Broadcast sender for shutdown notification.
+    shutdown_tx: broadcast::Sender<()>,
 }
 
 impl Default for ShutdownSignal {
@@ -25,9 +29,11 @@ impl Default for ShutdownSignal {
 impl ShutdownSignal {
     /// Creates a new shutdown signal handler.
     pub fn new() -> Self {
+        let (shutdown_tx, _) = broadcast::channel(1);
         Self {
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             reload_requested: Arc::new(AtomicBool::new(false)),
+            shutdown_tx,
         }
     }
 
@@ -49,6 +55,8 @@ impl ShutdownSignal {
     /// Requests shutdown.
     pub fn request_shutdown(&self) {
         self.shutdown_requested.store(true, Ordering::SeqCst);
+        // Notify all waiters
+        let _ = self.shutdown_tx.send(());
     }
 
     /// Requests reload.
@@ -56,32 +64,98 @@ impl ShutdownSignal {
         self.reload_requested.store(true, Ordering::SeqCst);
     }
 
-    /// Installs signal handlers.
+    /// Returns a receiver for shutdown notifications.
+    pub fn subscribe(&self) -> broadcast::Receiver<()> {
+        self.shutdown_tx.subscribe()
+    }
+
+    /// Waits for a shutdown signal.
+    ///
+    /// This can be used in select! to wait for shutdown alongside other operations.
+    pub async fn wait_for_shutdown(&self) {
+        let mut rx = self.shutdown_tx.subscribe();
+        // If already shutdown, return immediately
+        if self.is_shutdown_requested() {
+            return;
+        }
+        // Wait for shutdown signal
+        let _ = rx.recv().await;
+    }
+
+    /// Installs signal handlers for graceful shutdown.
     ///
     /// On Unix, this installs handlers for SIGTERM, SIGINT, and SIGHUP.
-    /// On other platforms, this is a no-op.
-    pub fn install_handlers(&self) -> Result<(), ShutdownError> {
-        #[cfg(unix)]
-        {
-            use std::thread;
+    /// On other platforms, only Ctrl+C is handled.
+    pub async fn install_handlers(&self) -> Result<(), ShutdownError> {
+        let shutdown = self.clone();
 
-            let shutdown = self.shutdown_requested.clone();
-            let reload = self.reload_requested.clone();
-
-            // We can't use actual signal handlers without unsafe code,
-            // so we'll use a polling approach in the main loop.
-            // In production, this would use signal-hook or similar.
-            let _ = (shutdown, reload);
-
-            // Spawn a thread to handle Ctrl+C via stdin
-            let shutdown_clone = self.shutdown_requested.clone();
-            thread::spawn(move || {
-                // This is a simplified handler - in production would use signal-hook
-                let _ = shutdown_clone;
-            });
-        }
+        // Spawn signal handler task
+        tokio::spawn(async move {
+            shutdown.signal_handler_loop().await;
+        });
 
         Ok(())
+    }
+
+    /// Internal signal handler loop.
+    #[cfg(unix)]
+    async fn signal_handler_loop(&self) {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to install SIGTERM handler: {e}");
+                return;
+            }
+        };
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to install SIGINT handler: {e}");
+                return;
+            }
+        };
+        let mut sighup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to install SIGHUP handler: {e}");
+                return;
+            }
+        };
+
+        loop {
+            tokio::select! {
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM, initiating shutdown");
+                    self.request_shutdown();
+                    break;
+                }
+                _ = sigint.recv() => {
+                    info!("Received SIGINT, initiating shutdown");
+                    self.request_shutdown();
+                    break;
+                }
+                _ = sighup.recv() => {
+                    info!("Received SIGHUP, requesting configuration reload");
+                    self.request_reload();
+                }
+            }
+        }
+    }
+
+    /// Internal signal handler loop for non-Unix platforms.
+    #[cfg(not(unix))]
+    async fn signal_handler_loop(&self) {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                info!("Received Ctrl+C, initiating shutdown");
+                self.request_shutdown();
+            }
+            Err(e) => {
+                warn!("Failed to listen for Ctrl+C: {e}");
+            }
+        }
     }
 }
 
@@ -152,6 +226,33 @@ impl ShutdownCoordinator {
         }
     }
 
+    /// Performs graceful shutdown with connection draining.
+    pub async fn shutdown_gracefully(&self, active_connections: u32) -> ShutdownPhase {
+        let phase = self.initiate_shutdown();
+        if matches!(phase, ShutdownPhase::AlreadyInProgress) {
+            return phase;
+        }
+
+        info!(
+            timeout_secs = self.timeout_secs,
+            active_connections, "Starting graceful shutdown"
+        );
+
+        if active_connections > 0 {
+            // Wait for connections to drain with timeout
+            let drain_timeout = tokio::time::Duration::from_secs(self.timeout_secs);
+            info!(
+                "Waiting up to {} seconds for {} active connections to drain",
+                self.timeout_secs, active_connections
+            );
+
+            // In production, would poll connection count until 0 or timeout
+            tokio::time::sleep(drain_timeout).await;
+        }
+
+        ShutdownPhase::Complete
+    }
+
     /// Checks if shutdown is in progress.
     pub fn is_in_progress(&self) -> bool {
         self.in_progress.load(Ordering::SeqCst)
@@ -211,5 +312,36 @@ mod tests {
         // Second initiate should return AlreadyInProgress
         let phase2 = coordinator.initiate_shutdown();
         assert_eq!(phase2, ShutdownPhase::AlreadyInProgress);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_wait() {
+        let signal = ShutdownSignal::new();
+        let signal_clone = signal.clone();
+
+        // Spawn a task that will trigger shutdown
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            signal_clone.request_shutdown();
+        });
+
+        // Wait for shutdown - should complete when signal is sent
+        tokio::time::timeout(
+            tokio::time::Duration::from_millis(100),
+            signal.wait_for_shutdown(),
+        )
+        .await
+        .expect("Shutdown wait timed out");
+
+        assert!(signal.is_shutdown_requested());
+    }
+
+    #[tokio::test]
+    async fn test_graceful_shutdown() {
+        let signal = ShutdownSignal::new();
+        let coordinator = ShutdownCoordinator::new(signal).with_timeout(1);
+
+        let phase = coordinator.shutdown_gracefully(0).await;
+        assert_eq!(phase, ShutdownPhase::Complete);
     }
 }
