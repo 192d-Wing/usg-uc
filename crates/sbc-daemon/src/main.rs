@@ -27,6 +27,7 @@
 #![allow(dead_code)]
 
 mod args;
+mod media_pipeline;
 mod runtime;
 mod server;
 mod shutdown;

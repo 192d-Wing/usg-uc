@@ -23,6 +23,11 @@ sbc-transaction = { path = "../sbc-transaction" }
 sbc-dialog = { path = "../sbc-dialog" }
 sbc-b2bua = { path = "../sbc-b2bua" }
 sbc-registrar = { path = "../sbc-registrar" }
+sbc-rtp = { path = "../sbc-rtp" }
+sbc-srtp = { path = "../sbc-srtp" }
+sbc-dtls = { path = "../sbc-dtls" }
+sbc-media-engine = { path = "../sbc-media-engine" }
+sbc-codecs = { path = "../sbc-codecs" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
