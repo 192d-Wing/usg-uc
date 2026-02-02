@@ -4,9 +4,11 @@
 //! and media processing using async/await patterns.
 
 use crate::shutdown::ShutdownSignal;
+use crate::sip_stack::{ProcessResult, SipStack, SipStackConfig};
 use sbc_config::SbcConfig;
 use sbc_health::{HealthChecker, HealthCheckerConfig};
 use sbc_metrics::{MetricRegistry, SbcMetrics};
+use sbc_registrar::RegistrarMode;
 use sbc_transport::udp::UdpTransport;
 use sbc_transport::Transport;
 use sbc_types::address::SbcSocketAddr;
@@ -30,6 +32,8 @@ pub struct Server {
     stats: Arc<ServerStats>,
     /// UDP transports for SIP signaling.
     udp_transports: RwLock<Vec<Arc<UdpTransport>>>,
+    /// SIP stack for message processing.
+    sip_stack: Arc<SipStack>,
 }
 
 impl Server {
@@ -47,6 +51,18 @@ impl Server {
         )));
         health.register(Box::new(sbc_health::check::MemoryCheck::new()));
 
+        // Create SIP stack configuration
+        let sip_config = SipStackConfig {
+            instance_name: config.general.instance_name.clone(),
+            domain: config
+                .general
+                .instance_name
+                .clone(), // Use instance name as domain for now
+            registrar_mode: RegistrarMode::B2bua,
+            b2bua_enabled: true,
+        };
+        let sip_stack = Arc::new(SipStack::new(sip_config));
+
         Self {
             config,
             shutdown,
@@ -54,6 +70,7 @@ impl Server {
             metrics,
             stats: Arc::new(ServerStats::default()),
             udp_transports: RwLock::new(Vec::new()),
+            sip_stack,
         }
     }
 
@@ -178,9 +195,10 @@ impl Server {
             let transport = Arc::clone(transport);
             let shutdown = self.shutdown.clone();
             let stats = Arc::clone(&self.stats);
+            let sip_stack = Arc::clone(&self.sip_stack);
 
             let handle = tokio::spawn(async move {
-                Self::transport_receive_loop(idx, transport, shutdown, stats).await
+                Self::transport_receive_loop(idx, transport, shutdown, stats, sip_stack).await
             });
             handles.push(handle);
         }
@@ -212,6 +230,7 @@ impl Server {
         transport: Arc<UdpTransport>,
         shutdown: ShutdownSignal,
         stats: Arc<ServerStats>,
+        sip_stack: Arc<SipStack>,
     ) {
         debug!(transport_idx = idx, "Starting transport receive loop");
 
@@ -228,7 +247,36 @@ impl Server {
                                 "Received message"
                             );
 
-                            // TODO: Route to SIP parser and transaction layer
+                            // Process through SIP stack
+                            let result = sip_stack.process_message(&msg.data, msg.source.clone()).await;
+
+                            // Handle the processing result
+                            match result {
+                                ProcessResult::Response { message, destination } => {
+                                    let response_bytes = message.to_bytes();
+                                    if let Err(e) = transport.send(&response_bytes, &destination).await {
+                                        warn!(error = %e, "Failed to send response");
+                                    } else {
+                                        stats.messages_sent.fetch_add(1, Ordering::Relaxed);
+                                        debug!(destination = %destination, "Response sent");
+                                    }
+                                }
+                                ProcessResult::Forward { message, destination } => {
+                                    let request_bytes = message.to_bytes();
+                                    if let Err(e) = transport.send(&request_bytes, &destination).await {
+                                        warn!(error = %e, "Failed to forward request");
+                                    } else {
+                                        stats.messages_sent.fetch_add(1, Ordering::Relaxed);
+                                        debug!(destination = %destination, "Request forwarded");
+                                    }
+                                }
+                                ProcessResult::NoAction => {
+                                    debug!("No action required for message");
+                                }
+                                ProcessResult::Error { reason } => {
+                                    warn!(reason = %reason, "Error processing message");
+                                }
+                            }
                         }
                         Err(e) => {
                             if shutdown.is_shutdown_requested() {

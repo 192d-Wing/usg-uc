@@ -1611,9 +1611,15 @@ dependencies = [
 name = "sbc-daemon"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "sbc-b2bua",
  "sbc-config",
+ "sbc-dialog",
  "sbc-health",
  "sbc-metrics",
+ "sbc-registrar",
+ "sbc-sip",
+ "sbc-transaction",
  "sbc-transport",
  "sbc-types",
  "tokio",

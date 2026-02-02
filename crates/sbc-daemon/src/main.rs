@@ -30,6 +30,7 @@ mod args;
 mod runtime;
 mod server;
 mod shutdown;
+mod sip_stack;
 
 use args::Args;
 use runtime::Runtime;
