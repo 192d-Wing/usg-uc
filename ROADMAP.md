@@ -50,11 +50,11 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 866 tests passing, Phase 15 (Production Hardening) complete
+**Current Status**: 854 tests passing, all phases complete
 
 ---
 
-## Future Development Phases
+## Completed Development Phases
 
 ### ✅ Phase 10: Async Runtime Integration
 **Goal**: Wire up tokio async runtime for real network I/O
@@ -110,14 +110,18 @@ This document outlines the development roadmap for the USG Session Border Contro
 - [ ] Add distributed tracing (OpenTelemetry) (future)
 - [ ] Enable TLS certificate rotation (future)
 
-### ⏳ Phase 16: Deployment & Operations
+### ✅ Phase 16: Deployment & Operations
 **Goal**: Container and orchestration support
 
-- [ ] Create multi-stage Dockerfile
-- [ ] Add Kubernetes manifests (Deployment, Service, ConfigMap)
-- [ ] Create Helm chart for parameterized deployment
-- [ ] Add Prometheus ServiceMonitor
-- [ ] Document operational runbook
+- [x] Create multi-stage Dockerfile (non-root, minimal runtime)
+- [x] Add Kubernetes manifests (Namespace, Deployment, Service, ConfigMap, RBAC, PDB, NetworkPolicy)
+- [x] Create Helm chart for parameterized deployment
+- [x] Add Prometheus ServiceMonitor
+- [x] Document operational runbook
+
+---
+
+## Future Development Phases
 
 ### ⏳ Phase 17: Advanced Features
 **Goal**: Enterprise features
@@ -160,9 +164,12 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ AU-2: Event Logging
 - ✅ CM-2: Baseline Configuration
 - ✅ CM-6: Configuration Settings
+- ✅ CM-7: Least Functionality
 - ✅ SC-5: DoS Protection
+- ✅ SC-7: Boundary Protection
 - ✅ SC-13: Cryptographic Protection
 - ✅ IA-9: Service Identification (STIR/SHAKEN)
+- ✅ IR-4: Incident Handling
 
 ---
 

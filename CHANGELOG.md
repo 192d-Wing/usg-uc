@@ -131,11 +131,45 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - RateLimitAction handling (Allow, Throttle, Reject, Block)
   - rate_limited counter in server statistics
 
+#### Phase 16: Deployment & Operations
+
+- Multi-stage Dockerfile for optimized container images
+  - Rust 1.85 builder stage with cmake, pkg-config, libssl-dev
+  - Minimal debian:bookworm-slim runtime image
+  - Non-root user (UID 1000) for security
+  - Health check via `sbc-cli health --quiet`
+  - Exposed ports: SIP (5060/udp, 5060/tcp, 5061/tcp), API (8080, 8443), RTP (16384-16484/udp)
+- Kubernetes manifests for production deployment
+  - Namespace with Pod Security Standards (restricted)
+  - Deployment with security context (non-root, read-only filesystem, dropped capabilities)
+  - Services: LoadBalancer for SIP, ClusterIP for API and metrics
+  - RBAC with minimal ServiceAccount permissions
+  - PodDisruptionBudget (minAvailable: 1)
+  - NetworkPolicies for defense in depth
+- Helm chart for parameterized deployment
+  - Configurable replicas, resources, and autoscaling
+  - HorizontalPodAutoscaler support
+  - ServiceMonitor for Prometheus Operator integration
+  - Full config.toml templating from values.yaml
+  - Network policies and security contexts
+- Operational runbook documentation
+  - Deployment procedures (Docker, Kubernetes, Helm)
+  - Configuration hot-reload instructions
+  - Graceful shutdown procedures
+  - Monitoring and alerting guidance
+  - Troubleshooting guide
+  - Incident response procedures (P1-P4)
+  - CNSA 2.0 compliance checklist
+  - Maintenance procedures (certificate rotation, upgrades, backup/recovery)
+
 ### Security
 
 - Enforced `#![forbid(unsafe_code)]` across all crates (documented exceptions only)
 - CNSA 2.0 algorithm restrictions: AES-256 only, SHA-384+ only, P-384+ curves only
 - Forbidden algorithms compile-time blocked: SHA-256, P-256, AES-128
 - STIR/SHAKEN uses ES384 exclusively (ES256 forbidden)
+- Container security: non-root user, read-only filesystem, dropped capabilities
+- Kubernetes Pod Security Standards: restricted profile enforced
+- Network segmentation via NetworkPolicies
 
 [Unreleased]: https://github.com/usg/usg-uc-sbc/compare/v0.1.0...HEAD
