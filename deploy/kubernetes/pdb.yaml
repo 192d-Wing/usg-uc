@@ -1,0 +1,21 @@
+# USG Unified Communications SBC - Pod Disruption Budget
+#
+# ## NIST 800-53 Rev5 Controls
+# - **CP-2**: Contingency Plan (high availability)
+# - **SC-5**: Denial of Service Protection (availability)
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sbc-daemon
+  namespace: sbc-system
+  labels:
+    app.kubernetes.io/name: sbc
+    app.kubernetes.io/component: daemon
+spec:
+  # At least 1 pod must be available during voluntary disruptions
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sbc
+      app.kubernetes.io/component: daemon

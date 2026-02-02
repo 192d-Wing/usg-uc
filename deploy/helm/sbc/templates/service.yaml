@@ -1,0 +1,77 @@
+---
+# SIP Service (LoadBalancer for external access)
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sbc.fullname" . }}-sip
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sip
+  {{- with .Values.sipService.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.sipService.type }}
+  {{- if eq .Values.sipService.type "LoadBalancer" }}
+  externalTrafficPolicy: {{ .Values.sipService.externalTrafficPolicy }}
+  {{- end }}
+  selector:
+    {{- include "sbc.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: sip-udp
+      port: 5060
+      targetPort: sip-udp
+      protocol: UDP
+    - name: sip-tcp
+      port: 5060
+      targetPort: sip-tcp
+      protocol: TCP
+    - name: sip-tls
+      port: 5061
+      targetPort: sip-tls
+      protocol: TCP
+
+---
+# API Service (ClusterIP for internal access)
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sbc.fullname" . }}-api
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  type: {{ .Values.apiService.type }}
+  selector:
+    {{- include "sbc.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.apiService.httpPort }}
+      targetPort: http-api
+      protocol: TCP
+    - name: https
+      port: {{ .Values.apiService.httpsPort }}
+      targetPort: https-api
+      protocol: TCP
+
+{{- if .Values.metrics.enabled }}
+---
+# Metrics Service (for Prometheus scraping)
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sbc.fullname" . }}-metrics
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: metrics
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "sbc.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+{{- end }}

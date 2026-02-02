@@ -1,0 +1,107 @@
+# USG Unified Communications SBC - Network Policies
+#
+# ## NIST 800-53 Rev5 Controls
+# - **AC-4**: Information Flow Enforcement
+# - **SC-7**: Boundary Protection
+
+---
+# Default deny all ingress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: sbc-system
+  labels:
+    app.kubernetes.io/name: sbc
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+
+---
+# Allow SIP traffic to SBC pods
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-sip-ingress
+  namespace: sbc-system
+  labels:
+    app.kubernetes.io/name: sbc
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: sbc
+      app.kubernetes.io/component: daemon
+  policyTypes:
+    - Ingress
+  ingress:
+    # SIP UDP/TCP
+    - ports:
+        - protocol: UDP
+          port: 5060
+        - protocol: TCP
+          port: 5060
+        - protocol: TCP
+          port: 5061
+    # RTP media (subset for demo, expand as needed)
+    - ports:
+        - protocol: UDP
+          port: 16384
+          endPort: 16484
+
+---
+# Allow API access from within cluster
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-api-ingress
+  namespace: sbc-system
+  labels:
+    app.kubernetes.io/name: sbc
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: sbc
+      app.kubernetes.io/component: daemon
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: sbc-system
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 8443
+
+---
+# Allow Prometheus scraping
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: sbc-system
+  labels:
+    app.kubernetes.io/name: sbc
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: sbc
+      app.kubernetes.io/component: daemon
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              # Adjust to match your monitoring namespace
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9090

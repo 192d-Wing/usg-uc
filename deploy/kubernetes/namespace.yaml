@@ -1,0 +1,17 @@
+# USG Unified Communications SBC - Kubernetes Namespace
+#
+# ## NIST 800-53 Rev5 Controls
+# - **AC-4**: Information Flow Enforcement (network policies)
+# - **SC-7**: Boundary Protection (namespace isolation)
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sbc-system
+  labels:
+    app.kubernetes.io/name: sbc
+    app.kubernetes.io/component: namespace
+    # Enable Pod Security Standards
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

@@ -1,0 +1,211 @@
+# USG Unified Communications SBC - Helm Values
+#
+# ## NIST 800-53 Rev5 Controls
+# - **CM-2**: Baseline Configuration
+# - **CM-6**: Configuration Settings
+
+# -- Number of SBC replicas
+replicaCount: 2
+
+image:
+  # -- Container registry
+  repository: sbc-daemon
+  # -- Image pull policy
+  pullPolicy: IfNotPresent
+  # -- Image tag (defaults to Chart appVersion)
+  tag: ""
+
+# -- Image pull secrets
+imagePullSecrets: []
+
+# -- Override chart name
+nameOverride: ""
+
+# -- Override full name
+fullnameOverride: ""
+
+serviceAccount:
+  # -- Create a service account
+  create: true
+  # -- Annotations for service account
+  annotations: {}
+  # -- Service account name
+  name: ""
+
+# -- Pod annotations
+podAnnotations: {}
+
+# -- Pod security context
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Container security context
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# SIP service configuration
+sipService:
+  # -- Service type (LoadBalancer, NodePort, ClusterIP)
+  type: LoadBalancer
+  # -- External traffic policy
+  externalTrafficPolicy: Local
+  # -- Annotations for cloud provider
+  annotations: {}
+    # service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+
+# API service configuration
+apiService:
+  # -- Service type
+  type: ClusterIP
+  # -- HTTP port
+  httpPort: 8080
+  # -- HTTPS port
+  httpsPort: 8443
+
+# Metrics configuration
+metrics:
+  # -- Enable metrics endpoint
+  enabled: true
+  # -- Metrics port
+  port: 9090
+  # -- Create ServiceMonitor for Prometheus Operator
+  serviceMonitor:
+    enabled: false
+    # -- Additional labels for ServiceMonitor
+    labels: {}
+    # -- Scrape interval
+    interval: 30s
+    # -- Scrape timeout
+    scrapeTimeout: 10s
+
+# Resource limits
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+
+# Autoscaling
+autoscaling:
+  # -- Enable HPA
+  enabled: false
+  # -- Minimum replicas
+  minReplicas: 2
+  # -- Maximum replicas
+  maxReplicas: 10
+  # -- Target CPU utilization
+  targetCPUUtilizationPercentage: 70
+  # -- Target memory utilization
+  targetMemoryUtilizationPercentage: 80
+
+# -- Node selector
+nodeSelector: {}
+
+# -- Tolerations
+tolerations: []
+
+# Pod anti-affinity
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: sbc
+              app.kubernetes.io/component: daemon
+          topologyKey: kubernetes.io/hostname
+
+# Pod disruption budget
+podDisruptionBudget:
+  # -- Enable PDB
+  enabled: true
+  # -- Minimum available pods
+  minAvailable: 1
+
+# Network policies
+networkPolicy:
+  # -- Enable network policies
+  enabled: true
+  # -- Namespace for Prometheus (for scraping access)
+  prometheusNamespace: monitoring
+
+# TLS certificates
+tls:
+  # -- Enable TLS
+  enabled: false
+  # -- Existing secret name for TLS certs
+  existingSecret: ""
+  # -- TLS certificate (base64 encoded)
+  cert: ""
+  # -- TLS private key (base64 encoded)
+  key: ""
+
+# SBC Configuration
+config:
+  general:
+    instanceName: "sbc-k8s"
+    maxCalls: 10000
+    maxRegistrations: 50000
+
+  transport:
+    udpListen:
+      - "[::]:5060"
+    tcpListen:
+      - "[::]:5060"
+    tlsListen:
+      - "[::]:5061"
+    wsListen: []
+    wssListen: []
+    tcpTimeoutSecs: 30
+    tcpIdleTimeoutSecs: 300
+
+  media:
+    defaultMode: "Relay"
+    codecs:
+      - "Opus"
+      - "G722"
+      - "G711Ulaw"
+      - "G711Alaw"
+    rtpPortMin: 16384
+    rtpPortMax: 32768
+    srtp:
+      required: true
+      profile: "AeadAes256Gcm"
+    dtls:
+      fingerprintHash: "Sha384"
+
+  security:
+    curve: "P384"
+    minTlsVersion: "1.3"
+    requireMtls: false
+
+  stirShaken:
+    signingEnabled: false
+    verificationEnabled: true
+    defaultAttestation: "B"
+    maxPassportAgeSecs: 60
+
+  rateLimit:
+    enabled: true
+    globalRps: 10000
+    perIpRps: 100
+    perUserRps: 50
+    burstMultiplier: 2.0
+
+  logging:
+    level: "info"
+    format: "json"
+    output: "stdout"
+    auditEnabled: true

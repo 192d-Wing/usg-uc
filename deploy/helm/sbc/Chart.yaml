@@ -1,0 +1,19 @@
+apiVersion: v2
+name: sbc
+description: USG Unified Communications Session Border Controller
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - sbc
+  - voip
+  - sip
+  - telecommunications
+  - cnsa
+home: https://github.com/example/usg-uc-sbc
+maintainers:
+  - name: USG UC Team
+    email: team@example.com
+annotations:
+  # NIST 800-53 Rev5 compliance
+  nist.gov/800-53-controls: "CM-2,CM-6,CM-7,SC-5,SC-7,SC-13"

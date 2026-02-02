@@ -1,0 +1,53 @@
+Thank you for installing {{ .Chart.Name }}!
+
+Your release is named {{ .Release.Name }}.
+
+## Getting Started
+
+1. Get the SIP service external IP:
+
+   kubectl get svc {{ include "sbc.fullname" . }}-sip -n {{ .Release.Namespace }}
+
+2. Get the API service endpoint:
+
+   kubectl get svc {{ include "sbc.fullname" . }}-api -n {{ .Release.Namespace }}
+
+3. Check the pod status:
+
+   kubectl get pods -l "app.kubernetes.io/name={{ include "sbc.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -n {{ .Release.Namespace }}
+
+4. View logs:
+
+   kubectl logs -l "app.kubernetes.io/name={{ include "sbc.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -n {{ .Release.Namespace }}
+
+## Configuration
+
+The SBC is configured via values.yaml. Key settings:
+
+- config.general.maxCalls: {{ .Values.config.general.maxCalls }}
+- config.media.defaultMode: {{ .Values.config.media.defaultMode }}
+- config.security.curve: {{ .Values.config.security.curve }}
+
+To update configuration:
+
+   helm upgrade {{ .Release.Name }} . -f values.yaml -n {{ .Release.Namespace }}
+
+## Ports
+
+- SIP UDP: 5060
+- SIP TCP: 5060
+- SIP TLS: 5061
+- HTTP API: {{ .Values.apiService.httpPort }}
+- HTTPS API: {{ .Values.apiService.httpsPort }}
+{{- if .Values.metrics.enabled }}
+- Metrics: {{ .Values.metrics.port }}
+{{- end }}
+
+## CNSA 2.0 Compliance
+
+This SBC is configured for CNSA 2.0 compliance:
+- Elliptic Curve: {{ .Values.config.security.curve }}
+- SRTP Profile: {{ .Values.config.media.srtp.profile }}
+- TLS Version: {{ .Values.config.security.minTlsVersion }}+
+
+For more information, see the documentation.

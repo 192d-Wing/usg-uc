@@ -1,0 +1,77 @@
+# USG Unified Communications SBC - Default Configuration
+#
+# This file provides sensible defaults for production deployment.
+# Override values via environment variables or mounted ConfigMaps.
+#
+# ## NIST 800-53 Rev5 Controls
+# - **CM-2**: Baseline Configuration
+# - **CM-6**: Configuration Settings
+# - **SC-13**: Cryptographic Protection (CNSA 2.0)
+
+[general]
+instance_name = "sbc-01"
+# cluster_id = "cluster-01"
+max_calls = 10000
+max_registrations = 50000
+
+[transport]
+# Listen on all interfaces (IPv6 with IPv4 fallback)
+udp_listen = ["[::]:5060"]
+tcp_listen = ["[::]:5060"]
+tls_listen = ["[::]:5061"]
+# WebSocket disabled by default
+ws_listen = []
+wss_listen = []
+tcp_timeout_secs = 30
+tcp_idle_timeout_secs = 300
+
+[media]
+default_mode = "Relay"
+# Per-realm overrides: realm_modes = { "external" = "PassThrough" }
+codecs = ["Opus", "G722", "G711Ulaw", "G711Alaw"]
+rtp_port_min = 16384
+rtp_port_max = 32768
+
+[media.srtp]
+# CNSA 2.0: SRTP required with AES-256-GCM
+required = true
+profile = "AeadAes256Gcm"
+
+[media.dtls]
+# DTLS certificate paths (mount via secrets)
+# cert_path = "/etc/sbc/certs/dtls.crt"
+# key_path = "/etc/sbc/certs/dtls.key"
+fingerprint_hash = "Sha384"
+
+[security]
+# TLS certificate paths (mount via secrets)
+# tls_cert_path = "/etc/sbc/certs/tls.crt"
+# tls_key_path = "/etc/sbc/certs/tls.key"
+# CNSA 2.0: P-384 curve only
+curve = "P384"
+min_tls_version = "1.3"
+require_mtls = false
+
+[stir_shaken]
+signing_enabled = false
+verification_enabled = true
+# certificate_path = "/etc/sbc/certs/sti.crt"
+# private_key_path = "/etc/sbc/certs/sti.key"
+# certificate_url = "https://certs.example.com/sti.crt"
+default_attestation = "B"
+max_passport_age_secs = 60
+# ca_bundle_path = "/etc/sbc/certs/ca-bundle.crt"
+
+[rate_limit]
+enabled = true
+global_rps = 10000
+per_ip_rps = 100
+per_user_rps = 50
+burst_multiplier = 2.0
+
+[logging]
+level = "info"
+format = "json"
+output = "stdout"
+audit_enabled = true
+# audit_path = "/var/log/sbc/audit.log"

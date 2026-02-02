@@ -1,0 +1,68 @@
+# USG Unified Communications SBC - ConfigMap
+#
+# ## NIST 800-53 Rev5 Controls
+# - **CM-2**: Baseline Configuration
+# - **CM-6**: Configuration Settings
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sbc-config
+  namespace: sbc-system
+  labels:
+    app.kubernetes.io/name: sbc
+    app.kubernetes.io/component: config
+data:
+  config.toml: |
+    # SBC Configuration - Override via Helm values or direct edit
+
+    [general]
+    instance_name = "sbc-k8s"
+    max_calls = 10000
+    max_registrations = 50000
+
+    [transport]
+    udp_listen = ["[::]:5060"]
+    tcp_listen = ["[::]:5060"]
+    tls_listen = ["[::]:5061"]
+    ws_listen = []
+    wss_listen = []
+    tcp_timeout_secs = 30
+    tcp_idle_timeout_secs = 300
+
+    [media]
+    default_mode = "Relay"
+    codecs = ["Opus", "G722", "G711Ulaw", "G711Alaw"]
+    rtp_port_min = 16384
+    rtp_port_max = 32768
+
+    [media.srtp]
+    required = true
+    profile = "AeadAes256Gcm"
+
+    [media.dtls]
+    fingerprint_hash = "Sha384"
+
+    [security]
+    curve = "P384"
+    min_tls_version = "1.3"
+    require_mtls = false
+
+    [stir_shaken]
+    signing_enabled = false
+    verification_enabled = true
+    default_attestation = "B"
+    max_passport_age_secs = 60
+
+    [rate_limit]
+    enabled = true
+    global_rps = 10000
+    per_ip_rps = 100
+    per_user_rps = 50
+    burst_multiplier = 2.0
+
+    [logging]
+    level = "info"
+    format = "json"
+    output = "stdout"
+    audit_enabled = true

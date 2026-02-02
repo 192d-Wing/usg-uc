@@ -1,0 +1,56 @@
+# USG Unified Communications SBC - RBAC
+#
+# ## NIST 800-53 Rev5 Controls
+# - **AC-2**: Account Management
+# - **AC-3**: Access Enforcement
+# - **AC-6**: Least Privilege
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sbc-daemon
+  namespace: sbc-system
+  labels:
+    app.kubernetes.io/name: sbc
+    app.kubernetes.io/component: daemon
+
+---
+# Minimal role for SBC daemon (read-only access to own namespace)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sbc-daemon
+  namespace: sbc-system
+  labels:
+    app.kubernetes.io/name: sbc
+    app.kubernetes.io/component: daemon
+rules:
+  # Allow reading own config
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["sbc-config"]
+    verbs: ["get", "watch"]
+  # Allow reading secrets (for TLS certs)
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["sbc-certs"]
+    verbs: ["get", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sbc-daemon
+  namespace: sbc-system
+  labels:
+    app.kubernetes.io/name: sbc
+    app.kubernetes.io/component: daemon
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sbc-daemon
+subjects:
+  - kind: ServiceAccount
+    name: sbc-daemon
+    namespace: sbc-system

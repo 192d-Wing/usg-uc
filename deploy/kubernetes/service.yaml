@@ -1,0 +1,115 @@
+# USG Unified Communications SBC - Services
+#
+# ## NIST 800-53 Rev5 Controls
+# - **SC-7**: Boundary Protection (service exposure)
+# - **SC-8**: Transmission Confidentiality (TLS endpoints)
+
+---
+# Headless service for SIP (UDP needs direct pod access)
+apiVersion: v1
+kind: Service
+metadata:
+  name: sbc-sip-headless
+  namespace: sbc-system
+  labels:
+    app.kubernetes.io/name: sbc
+    app.kubernetes.io/component: sip
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: sbc
+    app.kubernetes.io/component: daemon
+  ports:
+    - name: sip-udp
+      port: 5060
+      targetPort: sip-udp
+      protocol: UDP
+    - name: sip-tcp
+      port: 5060
+      targetPort: sip-tcp
+      protocol: TCP
+    - name: sip-tls
+      port: 5061
+      targetPort: sip-tls
+      protocol: TCP
+
+---
+# LoadBalancer for external SIP access
+apiVersion: v1
+kind: Service
+metadata:
+  name: sbc-sip
+  namespace: sbc-system
+  labels:
+    app.kubernetes.io/name: sbc
+    app.kubernetes.io/component: sip
+  annotations:
+    # Cloud provider specific annotations
+    # AWS: service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    # GCP: cloud.google.com/l4-rbs: "enabled"
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: sbc
+    app.kubernetes.io/component: daemon
+  ports:
+    - name: sip-udp
+      port: 5060
+      targetPort: sip-udp
+      protocol: UDP
+    - name: sip-tcp
+      port: 5060
+      targetPort: sip-tcp
+      protocol: TCP
+    - name: sip-tls
+      port: 5061
+      targetPort: sip-tls
+      protocol: TCP
+
+---
+# ClusterIP service for API (internal access)
+apiVersion: v1
+kind: Service
+metadata:
+  name: sbc-api
+  namespace: sbc-system
+  labels:
+    app.kubernetes.io/name: sbc
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: sbc
+    app.kubernetes.io/component: daemon
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http-api
+      protocol: TCP
+    - name: https
+      port: 8443
+      targetPort: https-api
+      protocol: TCP
+
+---
+# Metrics service for Prometheus scraping
+apiVersion: v1
+kind: Service
+metadata:
+  name: sbc-metrics
+  namespace: sbc-system
+  labels:
+    app.kubernetes.io/name: sbc
+    app.kubernetes.io/component: metrics
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: sbc
+    app.kubernetes.io/component: daemon
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
