@@ -132,7 +132,35 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
     - UDP socket management for media
     - `MediaSessionEvent` for state changes, candidates, credentials, ready notification
 
-- `client-core`: Application core skeleton
+- `client-core`: Application core (Phase 24.4 Complete)
+  - `settings.rs`: TOML-based settings persistence
+    - `Settings`, `GeneralSettings`, `NetworkSettings`, `UiSettings` structs
+    - `SettingsManager` with atomic save (temp file + rename)
+    - Platform-specific paths via `directories` crate
+    - Account management with set/get/remove operations
+    - 6 tests passing
+  - `contact_manager.rs`: JSON-based contact and call history storage
+    - `ContactStore` with HashMap-based contact storage
+    - `ContactManager` with CRUD operations
+    - Contact search by name, phone number, or SIP URI
+    - Partial phone number matching (suffix matching)
+    - Call history with automatic trimming (max 1000 entries)
+    - 8 tests passing
+  - `call_manager.rs`: Call coordination between SIP UA and media
+    - `CallManager` bridging CallAgent, MediaSession, and ContactManager
+    - make_call/hangup with proper state tracking
+    - SDP offer generation with ICE credentials
+    - ICE credential parsing from SDP answers
+    - Call history integration
+    - Mute toggle support
+    - 5 tests passing
+  - `app.rs`: Main application coordinator
+    - `ClientApp` managing registration, calls, settings, contacts
+    - `AppState`: Starting, Ready, Registering, Registered, InCall, ShuttingDown
+    - `AppEvent`: RegistrationStateChanged, CallStateChanged, IncomingCall, CallEnded, Error
+    - Account registration via RegistrationAgent
+    - Event broadcasting to GUI
+    - Graceful shutdown with state persistence
   - `AppError` and `AppResult` types
 
 - `client-gui`: Windows GUI skeleton (egui)

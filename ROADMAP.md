@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1700+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.3 (Secure Media) complete
+**Current Status**: 1700+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.4 (Application Core) complete
 
 ---
 
@@ -594,14 +594,29 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **Tests**: 20 total tests (client-sip-ua crate)
 
-**Phase 24.4: Application Core** (Next)
+**Phase 24.4: Application Core** ✅
 
-- 🚧 Call manager with event broadcasting
-- 🚧 Settings persistence (TOML)
-- 🚧 Smart card certificate enumeration
-- 🚧 Contact and call history storage
+- ✅ `settings.rs` - TOML-based settings persistence
+  - GeneralSettings, NetworkSettings, UiSettings configuration
+  - SettingsManager with atomic save (temp + rename)
+  - Platform-specific paths via `directories` crate
+- ✅ `contact_manager.rs` - Contact and call history storage
+  - JSON-based ContactStore with CRUD operations
+  - Contact search by name, phone number, or SIP URI
+  - Call history with automatic trimming
+- ✅ `call_manager.rs` - Call coordination
+  - Bridges SIP UA and media sessions
+  - SDP offer generation with ICE credentials
+  - Integration with contact manager for history
+- ✅ `app.rs` - Main application coordinator (ClientApp)
+  - Account registration management
+  - Event broadcasting to GUI
+  - Graceful shutdown handling
+- 🚧 Windows CryptoAPI integration for smart card certificates (Phase 24.5 or later)
 
-**Phase 24.5: GUI Implementation**
+**Tests**: 19 total tests (client-core crate)
+
+**Phase 24.5: GUI Implementation** (Next)
 
 - 🚧 egui-based main window
 - 🚧 Dialer, call view, contacts, settings views
