@@ -8,6 +8,7 @@
 //! - **RFC 3261**: SIP Dialogs (Section 12)
 //! - **RFC 3515**: REFER Method
 //! - **RFC 4028**: Session Timers
+//! - **RFC 6665**: SIP-Specific Event Notification (SUBSCRIBE/NOTIFY)
 //!
 //! ## Dialog Lifecycle
 //!
@@ -63,6 +64,7 @@ pub mod error;
 pub mod forking;
 pub mod refer;
 pub mod session_timer;
+pub mod subscription;
 
 pub use dialog::{Dialog, DialogId, DialogRole, DialogState};
 pub use error::{DialogError, DialogResult};
@@ -74,6 +76,11 @@ pub use refer::{
 pub use session_timer::{
     format_min_se, format_session_expires, handle_422_response, negotiate_session_timer,
     parse_min_se, parse_session_expires, RefresherRole, SessionTimer, SessionTimerNegotiation,
+};
+pub use subscription::{
+    format_allow_events, parse_allow_events, EventPackage, Notifier, Subscription,
+    SubscriptionState, SubscriptionStateHeader, TerminationReason, DEFAULT_SUBSCRIPTION_EXPIRES,
+    MIN_SUBSCRIPTION_EXPIRES,
 };
 
 /// Default session expires value (1800 seconds per RFC 4028).

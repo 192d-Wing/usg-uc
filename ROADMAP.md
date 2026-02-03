@@ -159,33 +159,37 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 ## Future Development Phases
 
-### 🔄 Phase 18: RFC Compliance Completion
+### ✅ Phase 18: RFC Compliance Completion
+
 **Goal**: Complete remaining RFC compliance gaps
 
-**Reliable Provisional Responses** (RFC 3262)
+**Reliable Provisional Responses** (RFC 3262) ✅
 
-- [ ] 100rel extension support in proto-transaction
-- [ ] PRACK method transaction state machine
-- [ ] RAck header parsing and validation
-- [ ] Provisional response retransmission
+- [x] 100rel extension support in proto-transaction
+- [x] PRACK method transaction state machine (ReliableProvisionalTracker)
+- [x] RAck header parsing and validation
+- [x] Provisional response retransmission with T1/T2 timers
 
-**Event Framework** (RFC 6665)
+**Event Framework** (RFC 6665) ✅
 
-- [ ] SUBSCRIBE dialog creation in proto-dialog
-- [ ] NOTIFY handling and state updates
-- [ ] Event package subscription lifecycle
+- [x] SUBSCRIBE/NOTIFY dialog support in proto-dialog
+- [x] Subscription and Notifier state management
+- [x] Event package definitions (presence, dialog, message-summary, refer, reg)
+- [x] SubscriptionStateHeader parsing and formatting
 
-**REGISTER Response** (RFC 3261 §10.3)
+**REGISTER Response** (RFC 3261 §10.3) ✅
 
-- [ ] Echo registered contacts in 200 OK
-- [ ] Include expiry for each binding
-- [ ] Service-Route header support
+- [x] format_contacts() echoes registered contacts with expiry
+- [x] remaining_seconds() for binding time-to-expiry
+- [x] Service-Route header support in RegisterResponse
+- [x] Path header support in RegisterRequest/Response
 
-**Path Header Integration** (RFC 3327)
+**Early Media** (RFC 3960) ✅
 
-- [ ] Path header processing in proto-registrar
-- [ ] Path storage in bindings
-- [ ] Path inclusion in routing
+- [x] EarlyMediaHandler for 183 Session Progress
+- [x] EarlyMediaMode: None, LocalRingback, Relay, Gate
+- [x] Per-leg early media session tracking
+- [x] Mode-based early media disposition
 
 ### ⏳ Phase 19: SIP Authentication & Security
 **Goal**: Production-grade SIP security

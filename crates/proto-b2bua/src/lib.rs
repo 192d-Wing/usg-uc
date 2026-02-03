@@ -8,6 +8,7 @@
 //! - **RFC 3261**: SIP Core
 //! - **RFC 7092**: B2BUA Taxonomy
 //! - **RFC 5853**: SBC Requirements
+//! - **RFC 3960**: Early Media (183 Session Progress)
 //!
 //! ## B2BUA Types (RFC 7092)
 //!
@@ -50,12 +51,17 @@
 #![cfg_attr(test, allow(clippy::panic))]
 
 pub mod call;
+pub mod early_media;
 pub mod error;
 pub mod leg;
 pub mod mode;
 pub mod sdp_rewrite;
 
 pub use call::{Call, CallConfig, CallId, CallState};
+pub use early_media::{
+    is_early_media_response, should_setup_early_media, EarlyMediaAction, EarlyMediaConfig,
+    EarlyMediaHandler, EarlyMediaMode, EarlyMediaSession, EarlyMediaState,
+};
 pub use error::{B2buaError, B2buaResult};
 pub use leg::{CallLeg, LegConfig, LegRole, LegState};
 pub use mode::{

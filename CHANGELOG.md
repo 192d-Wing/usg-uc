@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 #### RFC Compliance Improvements
 
-**proto-transaction (RFC 3261 §17)**
+**proto-transaction (RFC 3261 §17, RFC 3262)**
 
 - CSeq validation for transaction matching (RFC 3261 §17.1.3):
   - `CSeqTracker` struct for tracking sequence numbers and methods
@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - Request validation with `validate()` and response correlation with `validate_response()`
 - RFC 3261 branch magic cookie constant (`RFC3261_BRANCH_MAGIC = "z9hG4bK"`)
 - UPDATE method transaction support (RFC 3311) using non-INVITE state machine
+- Reliable provisional responses (RFC 3262 - 100rel):
+  - `RAck` header parsing and formatting
+  - `ReliableProvisionalTracker` for UAS-side PRACK management
+  - `ClientReliableProvisionalTracker` for UAC-side tracking
+  - RSeq sequence management with T1/T2 retransmission timers
+  - `supports_100rel()` and `requires_100rel()` header parsing
 
 **proto-sip (RFC 3261, RFC 3327)**
 
@@ -42,7 +48,7 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - `construct_request_route()` for in-dialog request routing
   - Loose routing (`lr` parameter) detection and handling
 
-**proto-dialog (RFC 3261 §12, RFC 3515, RFC 4028)**
+**proto-dialog (RFC 3261 §12, RFC 3515, RFC 4028, RFC 6665)**
 
 - Multi-dialog forking support (RFC 3261 §12.2.2):
   - `ForkKey` struct for matching forked responses by Call-ID and local tag
@@ -58,8 +64,15 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - `SessionTimerNegotiation` for offer/answer session timer handling
   - `handle_422_response()` for Min-SE negotiation
   - `RefresherRole` enum: UAC, UAS, Unspecified
+- Event notification framework (RFC 6665):
+  - `EventPackage` for event type identification (presence, dialog, message-summary)
+  - `Subscription` for subscriber-side subscription management
+  - `Notifier` for server-side subscription handling
+  - `SubscriptionState`: Pending, Active, Terminated
+  - `SubscriptionStateHeader` parsing and formatting
+  - `TerminationReason` enum for subscription termination causes
 
-**proto-b2bua (RFC 7092, RFC 5853)**
+**proto-b2bua (RFC 7092, RFC 5853, RFC 3960)**
 
 - B2BUA mode characteristics (`mode.rs`):
   - `ModeCharacteristics` with SDP modification, media handling, topology hiding per mode
@@ -74,6 +87,12 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - Hold/Resume SDP direction handling: `rewrite_for_hold()`, `rewrite_for_resume()`
 - Helper functions: `extract_media_address()`, `is_hold_sdp()`, `is_connection_hold()`
 - `SdpRewriteContext` for per-leg address management
+- Early media handling (RFC 3960):
+  - `EarlyMediaHandler` for 183 Session Progress with SDP
+  - `EarlyMediaMode`: None, LocalRingback, Relay, Gate
+  - `EarlyMediaSession` for per-leg early media state
+  - `EarlyMediaAction` enum for handler responses
+  - `is_early_media_response()` and `should_setup_early_media()` helpers
 
 **proto-registrar (RFC 3261 §10, RFC 5626, RFC 5627)**
 
