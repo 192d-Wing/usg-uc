@@ -417,7 +417,10 @@ pub fn parse_refer_to(value: &str) -> DialogResult<String> {
 
 /// Generates a Refer-To header value.
 pub fn format_refer_to(uri: &str, replaces: Option<&str>) -> String {
-    replaces.map_or_else(|| format!("<{uri}>"), |replaces| format!("<{uri}>?Replaces={replaces}"))
+    replaces.map_or_else(
+        || format!("<{uri}>"),
+        |replaces| format!("<{uri}>?Replaces={replaces}"),
+    )
 }
 
 #[cfg(test)]

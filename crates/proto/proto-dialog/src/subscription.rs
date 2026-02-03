@@ -155,9 +155,10 @@ impl EventPackage {
 
     /// Formats as Event header value.
     pub fn to_header_value(&self) -> String {
-        self.id
-            .as_ref()
-            .map_or_else(|| self.event_type.clone(), |id| format!("{};id={}", self.event_type, id))
+        self.id.as_ref().map_or_else(
+            || self.event_type.clone(),
+            |id| format!("{};id={}", self.event_type, id),
+        )
     }
 
     /// Parses from Event header value.

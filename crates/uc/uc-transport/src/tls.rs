@@ -305,13 +305,11 @@ impl Transport for TlsTransport {
                 let mut stream = self.stream.lock().await;
 
                 let mut temp_buffer = [0u8; 4096];
-                let n =
-                    stream
-                        .read(&mut temp_buffer)
-                        .await
-                        .map_err(|e| TransportError::ReceiveFailed {
-                            reason: e.to_string(),
-                        })?;
+                let n = stream.read(&mut temp_buffer).await.map_err(|e| {
+                    TransportError::ReceiveFailed {
+                        reason: e.to_string(),
+                    }
+                })?;
                 drop(stream);
 
                 if n == 0 {

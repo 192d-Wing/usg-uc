@@ -69,7 +69,10 @@ impl MediaCapabilities {
     #[must_use]
     pub const fn all() -> Self {
         Self {
-            flags: Self::TRANSCODING | Self::RECORDING | Self::DTMF_DETECTION | Self::RTP_INSPECTION,
+            flags: Self::TRANSCODING
+                | Self::RECORDING
+                | Self::DTMF_DETECTION
+                | Self::RTP_INSPECTION,
         }
     }
 

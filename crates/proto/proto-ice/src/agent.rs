@@ -545,12 +545,12 @@ impl IceAgent {
     /// # Errors
     /// Returns an error if the operation fails.
     pub fn start_check(&mut self, pair_index: usize) -> IceResult<()> {
-        let pair = self
-            .checklist
-            .get_mut(pair_index)
-            .ok_or_else(|| IceError::InvalidCandidate {
-                reason: "invalid pair index".to_string(),
-            })?;
+        let pair =
+            self.checklist
+                .get_mut(pair_index)
+                .ok_or_else(|| IceError::InvalidCandidate {
+                    reason: "invalid pair index".to_string(),
+                })?;
 
         pair.set_state(PairState::InProgress);
         pair.increment_check_attempts();
@@ -618,12 +618,12 @@ impl IceAgent {
             });
         }
 
-        let pair = self
-            .checklist
-            .get_mut(pair_index)
-            .ok_or_else(|| IceError::InvalidCandidate {
-                reason: "invalid pair index".to_string(),
-            })?;
+        let pair =
+            self.checklist
+                .get_mut(pair_index)
+                .ok_or_else(|| IceError::InvalidCandidate {
+                    reason: "invalid pair index".to_string(),
+                })?;
 
         if pair.state() != PairState::Succeeded {
             return Err(IceError::InvalidStateTransition {

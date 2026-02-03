@@ -8,7 +8,8 @@ use std::pin::Pin;
 use uc_types::address::{SbcSocketAddr, TransportType};
 
 /// Type alias for the accept future return type.
-pub type AcceptFuture<'a, C> = Pin<Box<dyn Future<Output = TransportResult<(C, SbcSocketAddr)>> + Send + 'a>>;
+pub type AcceptFuture<'a, C> =
+    Pin<Box<dyn Future<Output = TransportResult<(C, SbcSocketAddr)>> + Send + 'a>>;
 
 /// Listener for accepting incoming transport connections.
 ///

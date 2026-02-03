@@ -354,8 +354,7 @@ impl TurnClient {
         }
 
         // Extract lifetime from response
-        let new_lifetime = Self::extract_lifetime(&response)
-            .unwrap_or(crate::DEFAULT_LIFETIME);
+        let new_lifetime = Self::extract_lifetime(&response).unwrap_or(crate::DEFAULT_LIFETIME);
 
         // Update allocation
         {
@@ -554,8 +553,8 @@ impl TurnClient {
     async fn handle_allocate_response(&self, response: &StunMessage) -> TurnResult<SocketAddr> {
         if response.msg_type.class == StunClass::ErrorResponse {
             let code = Self::extract_error_code(response).unwrap_or(500);
-            let reason = Self::extract_error_reason(response)
-                .unwrap_or_else(|| "unknown".to_string());
+            let reason =
+                Self::extract_error_reason(response).unwrap_or_else(|| "unknown".to_string());
             return Err(TurnError::AllocationFailed {
                 reason: format!("server error {code}: {reason}"),
             });
@@ -563,14 +562,12 @@ impl TurnClient {
 
         // Extract XOR-RELAYED-ADDRESS
         let relayed_addr =
-            Self::extract_relayed_address(response)
-                .ok_or_else(|| TurnError::AllocationFailed {
-                    reason: "response missing XOR-RELAYED-ADDRESS".to_string(),
-                })?;
+            Self::extract_relayed_address(response).ok_or_else(|| TurnError::AllocationFailed {
+                reason: "response missing XOR-RELAYED-ADDRESS".to_string(),
+            })?;
 
         // Extract lifetime
-        let lifetime = Self::extract_lifetime(response)
-            .unwrap_or(crate::DEFAULT_LIFETIME);
+        let lifetime = Self::extract_lifetime(response).unwrap_or(crate::DEFAULT_LIFETIME);
 
         // Store allocation
         {

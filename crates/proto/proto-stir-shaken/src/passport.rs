@@ -388,7 +388,12 @@ impl PASSporT {
     pub fn encode_header(&self) -> String {
         // Simplified JSON encoding for header
         let json = self.header.ppt.as_ref().map_or_else(
-            || format!(r#"{{"alg":"{}","typ":"{}"}}"#, self.header.alg, self.header.typ),
+            || {
+                format!(
+                    r#"{{"alg":"{}","typ":"{}"}}"#,
+                    self.header.alg, self.header.typ
+                )
+            },
             |ppt| {
                 format!(
                     r#"{{"alg":"{}","typ":"{}","ppt":"{}"}}"#,

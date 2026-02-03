@@ -297,10 +297,12 @@ impl KeepaliveTracker {
             self.keepalive_interval.saturating_sub(elapsed)
         });
 
-        let since_recv = self.last_traffic_received.map_or(self.keepalive_interval, |t| {
-            let elapsed = now.duration_since(t);
-            self.keepalive_interval.saturating_sub(elapsed)
-        });
+        let since_recv = self
+            .last_traffic_received
+            .map_or(self.keepalive_interval, |t| {
+                let elapsed = now.duration_since(t);
+                self.keepalive_interval.saturating_sub(elapsed)
+            });
 
         since_send.min(since_recv)
     }

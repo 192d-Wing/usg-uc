@@ -367,7 +367,10 @@ impl std::fmt::Debug for Authenticator {
             .field("nonce_lifetime", &self.nonce_lifetime)
             .field("default_algorithm", &self.default_algorithm)
             .field("supported_qop", &self.supported_qop)
-            .field("password_lookup", &self.password_lookup.as_ref().map(|_| "<function>"))
+            .field(
+                "password_lookup",
+                &self.password_lookup.as_ref().map(|_| "<function>"),
+            )
             .finish()
     }
 }
@@ -659,8 +662,9 @@ fn compute_digest_response(params: &DigestParams<'_>) -> String {
 
     // Compute HA2 = H(method:uri) or H(method:uri:H(entity-body)) for auth-int
     let ha2 = if qop == Some(AuthQop::AuthInt) {
-        let body_hash =
-            params.entity_body.map_or_else(|| hash_bytes(b"", algorithm), |b| hash_bytes(b, algorithm));
+        let body_hash = params
+            .entity_body
+            .map_or_else(|| hash_bytes(b"", algorithm), |b| hash_bytes(b, algorithm));
         let a2 = format!("{}:{}:{}", params.method, params.uri, body_hash);
         hash_string(&a2, algorithm)
     } else {

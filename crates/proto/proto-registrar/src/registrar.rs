@@ -482,10 +482,7 @@ impl Registrar {
     }
 
     /// Removes all bindings for an AOR.
-    fn remove_all_bindings(
-        &mut self,
-        request: &RegisterRequest,
-    ) -> RegisterResponse {
+    fn remove_all_bindings(&mut self, request: &RegisterRequest) -> RegisterResponse {
         // Wildcard removal requires expires=0
         if request.expires != Some(0) {
             return RegisterResponse::error(400, "Bad Request");

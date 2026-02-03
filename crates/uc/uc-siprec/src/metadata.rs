@@ -471,7 +471,11 @@ impl RecordingMetadata {
         xml.push_str("<recording xmlns=\"urn:ietf:params:xml:ns:recording:1\">\n");
 
         // Session info
-        let _ = writeln!(xml, "  <session id=\"{}\">", self.session.recording_session_id);
+        let _ = writeln!(
+            xml,
+            "  <session id=\"{}\">",
+            self.session.recording_session_id
+        );
         let _ = writeln!(
             xml,
             "    <call-id>{}</call-id>",
@@ -509,7 +513,10 @@ impl RecordingMetadata {
                 let _ = writeln!(xml, "      <ssrc>{ssrc}</ssrc>");
             }
             if let Some(ref participant_id) = stream.participant_id {
-                let _ = writeln!(xml, "      <participant-id>{participant_id}</participant-id>");
+                let _ = writeln!(
+                    xml,
+                    "      <participant-id>{participant_id}</participant-id>"
+                );
             }
             xml.push_str("    </stream>\n");
         }

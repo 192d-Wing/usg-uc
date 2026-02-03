@@ -302,7 +302,10 @@ pub fn parse_min_se(value: &str) -> DialogResult<u32> {
 
 /// Creates a Session-Expires header value.
 pub fn format_session_expires(expires: u32, refresher: Option<RefresherRole>) -> String {
-    refresher.map_or_else(|| format!("{expires}"), |role| format!("{expires};refresher={role}"))
+    refresher.map_or_else(
+        || format!("{expires}"),
+        |role| format!("{expires};refresher={role}"),
+    )
 }
 
 /// Creates a Min-SE header value.

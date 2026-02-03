@@ -357,13 +357,18 @@ pub const fn compute_answer_direction(offer: Direction, local: Direction) -> Dir
         (Direction::Sendrecv, Direction::Sendrecv) => Direction::Sendrecv,
 
         // Offer is sendrecv, we can receive only
-        (Direction::Sendrecv, Direction::Sendonly) | (Direction::Sendonly, Direction::Sendrecv | Direction::Recvonly) => Direction::Recvonly,
+        (Direction::Sendrecv, Direction::Sendonly)
+        | (Direction::Sendonly, Direction::Sendrecv | Direction::Recvonly) => Direction::Recvonly,
 
         // Offer is sendrecv, we can send only
-        (Direction::Sendrecv, Direction::Recvonly) | (Direction::Recvonly, Direction::Sendrecv | Direction::Sendonly) => Direction::Sendonly,
+        (Direction::Sendrecv, Direction::Recvonly)
+        | (Direction::Recvonly, Direction::Sendrecv | Direction::Sendonly) => Direction::Sendonly,
 
         // Both inactive or incompatible directions
-        (Direction::Sendrecv, Direction::Inactive) | (Direction::Sendonly, Direction::Sendonly | Direction::Inactive) | (Direction::Recvonly, Direction::Recvonly | Direction::Inactive) | (Direction::Inactive, _) => Direction::Inactive,
+        (Direction::Sendrecv, Direction::Inactive)
+        | (Direction::Sendonly, Direction::Sendonly | Direction::Inactive)
+        | (Direction::Recvonly, Direction::Recvonly | Direction::Inactive)
+        | (Direction::Inactive, _) => Direction::Inactive,
     }
 }
 
