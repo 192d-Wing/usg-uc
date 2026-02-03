@@ -9,6 +9,72 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ### Added
 
+#### Phase 15: Production Hardening (Completed)
+
+**New Crate**: `uc-telemetry`
+
+- OpenTelemetry distributed tracing integration
+  - `TelemetryConfig` with builder pattern for traces, metrics, OTLP
+  - `TelemetryProvider` managing tracer and meter providers
+  - `SpanContext` with W3C Trace Context (traceparent) support
+  - Standard SIP/VoIP span attributes (call_id, sip_method, etc.)
+  - OTLP exporter support (optional `otlp` feature)
+  - Tracing crate integration (optional `tracing` feature)
+  - 18 tests passing
+
+**TLS Certificate Rotation** (`uc-transport/cert_reload.rs`)
+
+- `ReloadableTlsAcceptor` for hot certificate reloading
+  - Uses `arc-swap` for lock-free atomic acceptor swapping
+  - New connections use updated certificates
+  - Existing connections continue with original certificates
+  - `reload()` method for programmatic reload
+  - `try_reload()` for signal handler use (logs errors)
+  - Reload metrics: count and timestamp tracking
+  - `CertReloadStats` for monitoring
+  - 7 tests passing
+
+#### Phase 22: High Availability - Storage Backends (Completed)
+
+**Redis Backend** (`uc-storage/redis.rs`)
+
+- Full `StorageBackend` implementation with bb8 connection pooling
+  - All trait methods: get, set, delete, keys, increment
+  - Extended methods: exists, set_nx, mget, mset, mdelete, ttl, expire, persist
+  - Connection pool configuration (max size, idle timeout)
+  - Health check via PING command
+  - 20 tests (11 require running Redis server)
+
+**PostgreSQL Backend** (`uc-storage/postgres.rs`)
+
+- Full `StorageBackend` implementation with sqlx
+  - Auto-migration: creates `kv_store` and `kv_counters` tables
+  - TTL via `expires_at` TIMESTAMPTZ column
+  - Pattern matching via `glob_to_like()` conversion
+  - Connection pool configuration via `PgPoolOptions`
+  - Health check via connection acquisition
+  - 21 tests (11 require running PostgreSQL server)
+
+**DNS-based Service Discovery** (`uc-discovery/dns.rs`)
+
+- `DnsDiscovery` provider using hickory-resolver
+  - SRV record lookup with address resolution
+  - A/AAAA record lookup for simple discovery
+  - `sort_peers()` for priority/weight ordering
+  - `select_weighted_peer()` per RFC 2782
+  - Health check via localhost resolution
+  - Integration with `uc-dns` crate
+  - 8 tests (2 require network)
+
+**Dependencies Added**
+
+- `arc-swap` 1.7: Lock-free atomic pointer swapping
+- `chrono` 0.4: Timestamp handling for PostgreSQL TTL
+- `bb8` 0.8: Connection pooling for Redis
+- `bb8-redis` 0.18: Redis backend for bb8
+- `redis` 0.27: Redis client
+- `sqlx` 0.8: PostgreSQL async driver
+
 #### Phase 24: SIP Soft Client (In Progress)
 
 **New Crates** (`crates/client/`)

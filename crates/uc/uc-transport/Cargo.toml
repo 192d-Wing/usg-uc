@@ -13,7 +13,7 @@ categories.workspace = true
 default = ["udp", "tcp", "tls"]
 udp = []
 tcp = []
-tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pki-types"]
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pki-types", "dep:arc-swap"]
 websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
 sctp = []  # SCTP transport (RFC 4168) - stub implementation
 
@@ -30,10 +30,14 @@ socket2.workspace = true
 rustls = { workspace = true, optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 rustls-pki-types = { workspace = true, optional = true }
+arc-swap = { version = "1.7", optional = true }
 
 # WebSocket support
 tokio-tungstenite = { version = "0.28", optional = true }
 futures-util = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

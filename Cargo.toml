@@ -43,6 +43,7 @@ members = [
     "crates/uc/uc-api",
     "crates/uc/uc-metrics",
     "crates/uc/uc-health",
+    "crates/uc/uc-telemetry",
 
     # Layer 8: High Availability & Clustering (uc-* = reusable)
     "crates/uc/uc-cluster",

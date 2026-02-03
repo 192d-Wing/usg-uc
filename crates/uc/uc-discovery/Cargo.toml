@@ -11,7 +11,7 @@ categories.workspace = true
 
 [features]
 default = []
-dns = ["dep:trust-dns-resolver"]
+dns = ["uc-dns/resolver"]
 kubernetes = ["dep:kube", "dep:k8s-openapi"]
 
 [dependencies]
@@ -34,9 +34,7 @@ chrono.workspace = true
 # Types from workspace
 uc-types = { workspace = true, features = ["serde"] }
 uc-cluster.workspace = true
-
-# DNS resolution (optional)
-trust-dns-resolver = { version = "0.23", optional = true }
+uc-dns = { path = "../uc-dns" }
 
 # Kubernetes (optional)
 kube = { version = "0.98", features = ["runtime", "client"], optional = true }

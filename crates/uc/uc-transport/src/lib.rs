@@ -44,6 +44,9 @@ pub mod tcp;
 #[cfg(feature = "tls")]
 pub mod tls;
 
+#[cfg(feature = "tls")]
+pub mod cert_reload;
+
 #[cfg(feature = "websocket")]
 pub mod websocket;
 

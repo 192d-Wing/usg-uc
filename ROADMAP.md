@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1669+ tests passing, Phases 1-23 complete, Hickory-resolver DNS integration complete, Phase 24.3 (Secure Media) complete
+**Current Status**: 1700+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.3 (Secure Media) complete
 
 ---
 
@@ -123,8 +123,8 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ Add configuration hot-reload via SIGHUP
 - ✅ Enable TLS for API server (HTTPS with CNSA 2.0 compliant config)
 - ✅ Implement rate limiting per sbc-dos-protection
-- [ ] Add distributed tracing (OpenTelemetry) (future)
-- [ ] Enable TLS certificate rotation (future)
+- ✅ Add distributed tracing (OpenTelemetry) via `uc-telemetry` crate
+- ✅ Enable TLS certificate rotation via `ReloadableTlsAcceptor`
 
 ### ✅ Phase 16: Deployment & Operations
 
@@ -464,16 +464,17 @@ This document outlines the development roadmap for the USG Session Border Contro
 **Service Discovery**
 
 - ✅ `StaticDiscovery` for configured peer lists
-- ✅ `DnsDiscovery` stub for DNS SRV/A lookup (feature-gated)
+- ✅ `DnsDiscovery` with SRV and A/AAAA lookup via hickory-resolver
 - ✅ `KubernetesDiscovery` stub for K8s API (feature-gated)
 - ✅ `GossipProtocol` for SWIM-style failure detection
+- ✅ Weighted peer selection per RFC 2782
 
 **Storage Backends**
 
 - ✅ `StorageBackend` trait with get/set/delete/keys/increment
 - ✅ `InMemoryBackend` with TTL support and pattern matching
-- ✅ `RedisBackend` stub (feature-gated)
-- ✅ `PostgresBackend` stub (feature-gated)
+- ✅ `RedisBackend` with bb8 connection pooling (feature = "redis")
+- ✅ `PostgresBackend` with sqlx and auto-migration (feature = "postgres")
 
 **State Synchronization**
 
