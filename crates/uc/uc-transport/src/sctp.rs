@@ -21,7 +21,7 @@
 //! kernel-level SCTP or a userspace SCTP implementation (e.g., usrsctp).
 
 use crate::error::{TransportError, TransportResult};
-use crate::{ReceivedMessage, StreamTransport, Transport, MAX_STREAM_MESSAGE_SIZE};
+use crate::{MAX_STREAM_MESSAGE_SIZE, ReceivedMessage, StreamTransport, Transport};
 use bytes::Bytes;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -151,11 +151,7 @@ impl SctpAssociation {
     /// This is a stub implementation. Actual SCTP support requires
     /// platform-specific SCTP libraries.
     #[must_use]
-    pub fn new(
-        local_addr: SbcSocketAddr,
-        peer_addr: SbcSocketAddr,
-        config: SctpConfig,
-    ) -> Self {
+    pub fn new(local_addr: SbcSocketAddr, peer_addr: SbcSocketAddr, config: SctpConfig) -> Self {
         Self {
             local_addr,
             peer_addr: peer_addr.clone(),

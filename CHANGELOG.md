@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ### Added
 
+#### DNS Integration
+
+**uc-dns - DNS Resolution for SIP (New Crate)**
+
+- New crate for DNS-based SIP routing:
+  - `SipResolver` implementing RFC 3263 NAPTR → SRV → A/AAAA resolution chain
+  - `SipTarget` with address, transport, hostname, priority, weight
+  - `TransportPreference` enum: Any, Udp, Tcp, Tls, Sctp, WebSocket, WebSocketSecure
+  - Support for numeric IP addresses (bypass DNS)
+  - Cache-aware resolution with configurable TTL
+
+- `SrvResolver` for SRV record handling (RFC 2782):
+  - `SrvRecord` with priority, weight, port, target, addresses
+  - Weighted selection algorithm per RFC 2782
+  - `sip_srv_name()` for constructing SRV query names
+  - SRV record parsing from DNS response strings
+
+- `NaptrResolver` for NAPTR record handling (RFC 3403):
+  - `NaptrRecord` with order, preference, flags, service, regexp, replacement
+  - `NaptrService` enum: SipUdp, SipTcp, SipsTcp, SipSctp, SipWs, SipsWs
+  - Transport selection from NAPTR service field
+  - NAPTR record parsing from DNS response strings
+
+- `EnumResolver` for ENUM lookup (RFC 6116):
+  - E.164 number to ENUM domain conversion
+  - `EnumResult` with number, URI, service, order, preference
+  - NAPTR regexp application for URI derivation
+  - Multi-domain support (e164.arpa, e164.org)
+
+- `DnsCache` for TTL-based caching:
+  - `CachedRecord<T>` with TTL tracking, expiration, age
+  - `CacheEntry` enum: Address, Srv, Naptr, Enum, Negative
+  - Configurable min/max TTL bounds
+  - Negative cache for NXDOMAIN responses
+  - LRU-style eviction when at capacity
+  - `CacheStats` for utilization monitoring
+
+- Configuration structures:
+  - `DnsConfig` with server addresses, timeout, retries, cache settings
+  - `SipResolverConfig` with transport preferences, NAPTR/SRV flags
+  - `EnumConfig` with domain suffixes, preferred services
+  - `TransportPref` with `naptr_service()` and `srv_prefix()` methods
+  - `DefaultPorts` for transport-specific default ports
+
+**Tests**: 38 new tests for DNS crate
+
 #### Phase 23: Specialized Protocols
 
 **uc-t38 - T.38 Fax Relay (RFC 4612)**

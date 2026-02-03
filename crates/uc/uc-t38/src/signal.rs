@@ -88,7 +88,10 @@ impl T30Signal {
     /// Returns true if this is a call establishment signal.
     #[must_use]
     pub const fn is_call_establishment(&self) -> bool {
-        matches!(self, Self::Cng | Self::Ced | Self::V21Preamble | Self::Cm | Self::Jm)
+        matches!(
+            self,
+            Self::Cng | Self::Ced | Self::V21Preamble | Self::Cm | Self::Jm
+        )
     }
 
     /// Returns true if this is a negotiation signal.
@@ -236,11 +239,7 @@ impl SignalDetector {
         }
 
         // Calculate energy
-        let energy: i64 = self
-            .samples
-            .iter()
-            .map(|&s| (s as i64) * (s as i64))
-            .sum();
+        let energy: i64 = self.samples.iter().map(|&s| (s as i64) * (s as i64)).sum();
         let avg_energy = energy / self.samples.len() as i64;
 
         // If energy is too low, no signal

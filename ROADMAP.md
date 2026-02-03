@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1594 tests passing, Phases 1-23 complete
+**Current Status**: 1643 tests passing, Phases 1-23 complete, DNS Integration complete
 
 ---
 
@@ -429,12 +429,13 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ Bandwidth management per trunk
 - ✅ Call admission control by capacity (`uc-policy/cac.rs`)
 
-**DNS Integration** (Deferred to Phase 22)
+**DNS Integration** (`uc-dns` crate) ✅
 
-- [ ] ENUM lookup (RFC 6116)
-- [ ] DNS SRV for SIP routing (RFC 3263)
-- [ ] NAPTR records support
-- [ ] DNS caching and TTL management
+- ✅ ENUM lookup (RFC 6116) with number-to-domain conversion
+- ✅ DNS SRV for SIP routing (RFC 3263) with weighted selection
+- ✅ NAPTR records support for transport selection
+- ✅ DNS caching with TTL management
+- ✅ SIP resolver combining NAPTR → SRV → A/AAAA lookups
 
 ### ✅ Phase 22: High Availability & Clustering
 

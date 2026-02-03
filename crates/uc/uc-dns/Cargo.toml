@@ -1,0 +1,43 @@
+[package]
+name = "uc-dns"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "DNS integration for SIP routing (RFC 3263, RFC 6116 ENUM)"
+repository = "https://github.com/usg/usg-uc"
+keywords = ["dns", "sip", "srv", "naptr", "enum"]
+categories = ["network-programming"]
+
+[features]
+default = []
+# Enable actual DNS resolution (requires hickory-resolver)
+resolver = ["dep:hickory-resolver"]
+
+[dependencies]
+# Internal dependencies
+uc-types = { path = "../uc-types" }
+
+# Error handling
+thiserror = "2"
+
+# Async runtime
+tokio = { version = "1", features = ["sync", "time"] }
+
+# Logging
+tracing = "0.1"
+
+# DNS resolver (optional - for actual resolution)
+hickory-resolver = { version = "0.25", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"

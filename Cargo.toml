@@ -59,6 +59,9 @@ members = [
     # Layer 10: Specialized Protocols
     "crates/uc/uc-t38",
 
+    # Layer 11: DNS Integration
+    "crates/uc/uc-dns",
+
     # SBC Application
     "crates/sbc/sbc-config",
     "crates/sbc/sbc-daemon",
@@ -146,6 +149,7 @@ uc-aaa = { path = "crates/uc/uc-aaa" }
 uc-snmp = { path = "crates/uc/uc-snmp" }
 uc-syslog = { path = "crates/uc/uc-syslog" }
 uc-webrtc = { path = "crates/uc/uc-webrtc" }
+uc-dns = { path = "crates/uc/uc-dns" }
 
 # Internal crates - Protocol (proto/*)
 proto-sip = { path = "crates/proto/proto-sip" }

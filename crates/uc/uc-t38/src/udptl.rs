@@ -359,7 +359,10 @@ impl UdptlTransport {
                 }
                 None
             }
-            ErrorCorrectionData::Fec { span: _, entries: _ } => {
+            ErrorCorrectionData::Fec {
+                span: _,
+                entries: _,
+            } => {
                 // FEC recovery would require XOR operations across span
                 warn!("FEC recovery not yet implemented");
                 None
@@ -399,10 +402,7 @@ mod tests {
     #[test]
     fn test_udptl_packet_with_redundancy() {
         let ifp = IfpPacket::new(3, DataType::V21, vec![0x03]);
-        let redundant = vec![
-            Bytes::from_static(&[0x01]),
-            Bytes::from_static(&[0x02]),
-        ];
+        let redundant = vec![Bytes::from_static(&[0x01]), Bytes::from_static(&[0x02])];
         let packet = UdptlPacket::with_redundancy(3, ifp, redundant);
 
         let encoded = packet.encode();

@@ -235,9 +235,12 @@ impl T38Session {
     ///
     /// Returns an error if the transport is not established or sending fails.
     pub async fn send_ifp(&mut self, data_type: DataType, data: Vec<u8>) -> T38Result<()> {
-        let transport = self.transport.as_ref().ok_or_else(|| T38Error::TransportError {
-            reason: "transport not established".to_string(),
-        })?;
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or_else(|| T38Error::TransportError {
+                reason: "transport not established".to_string(),
+            })?;
 
         let data_len = data.len();
         let ifp = IfpPacket::new(self.seq_num, data_type, data);
@@ -263,9 +266,12 @@ impl T38Session {
     ///
     /// Returns an error if the transport is not established or sending fails.
     pub async fn send_indication(&mut self, indication: T30Indication) -> T38Result<()> {
-        let transport = self.transport.as_ref().ok_or_else(|| T38Error::TransportError {
-            reason: "transport not established".to_string(),
-        })?;
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or_else(|| T38Error::TransportError {
+                reason: "transport not established".to_string(),
+            })?;
 
         let ifp = IfpPacket::indication(self.seq_num, indication);
         self.seq_num = self.seq_num.wrapping_add(1);
@@ -284,9 +290,12 @@ impl T38Session {
     ///
     /// Returns an error if the transport is not established or receiving fails.
     pub async fn recv_ifp(&mut self) -> T38Result<IfpPacket> {
-        let transport = self.transport.as_ref().ok_or_else(|| T38Error::TransportError {
-            reason: "transport not established".to_string(),
-        })?;
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or_else(|| T38Error::TransportError {
+                reason: "transport not established".to_string(),
+            })?;
 
         let ifp = transport.recv().await?;
 
@@ -426,7 +435,10 @@ impl T38SessionManager {
 
         if sessions.len() >= self.config.session.max_sessions {
             return Err(T38Error::SessionNotFound {
-                session_id: format!("max sessions ({}) reached", self.config.session.max_sessions),
+                session_id: format!(
+                    "max sessions ({}) reached",
+                    self.config.session.max_sessions
+                ),
             });
         }
 
