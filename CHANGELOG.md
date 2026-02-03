@@ -200,6 +200,37 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
     - Menu items: Show window, Exit
     - `TrayAction` enum for event handling
     - Icon generation for tray display
+  - `notifications.rs`: Windows toast notifications (Phase 24.6)
+    - `NotificationManager` for toast notifications
+    - `NotificationType` enum: IncomingCall, MissedCall, CallEnded, Error, RegistrationChanged
+    - Uses `winrt-notification` on Windows
+    - Integrated with app event handling
+
+- `client-core`: Certificate store and security (Phase 24.6)
+  - `cert_store.rs`: Certificate store access
+    - `CertificateStore` for Windows Certificate Store
+    - `CertStoreError` error types
+    - Auto-select prefers ECDSA P-384 (CNSA 2.0)
+    - Find by thumbprint, list, refresh operations
+    - Stub data for cross-platform development
+    - 8 tests for certificate operations
+
+- `client-types`: Sensitive data types (Phase 24.6)
+  - `sensitive.rs`: Memory-safe credential storage
+    - `SmartCardPin` with zeroize-on-drop
+    - `SessionToken` for SRTP/session secrets
+    - `SrtpKeyMaterial` for SRTP master keys
+    - `SensitiveString` for general sensitive data
+    - All types implement Debug with [REDACTED]
+    - 7 tests for sensitive types
+
+**CNSA 2.0 Compliance Documentation**
+
+- `CNSA_COMPLIANCE.md` in crates/client/
+  - Algorithm restrictions (AES-256, P-384, SHA-384)
+  - Crate-by-crate compliance status
+  - Smart card authentication requirements
+  - Key management practices
 
 **Security**
 

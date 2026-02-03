@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.5 (GUI Implementation) complete
+**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.6 (Polish & Security Hardening) complete
 
 ---
 
@@ -626,13 +626,22 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ System tray integration with show/exit menu items
 - ✅ Event-driven architecture connecting GUI to client-core
 
-**Phase 24.6: Polish & Security Hardening** (Next)
+**Phase 24.6: Polish & Security Hardening** ✅
 
-- 🚧 Windows toast notifications for incoming calls
-- 🚧 Certificate selection from Windows Certificate Store
-- 🚧 CNSA 2.0 compliance audit
-- 🚧 Memory zeroization for credentials (zeroize crate)
+- ✅ Windows toast notifications (NotificationManager with winrt-notification)
+- ✅ Certificate store access (CertificateStore with auto-select for P-384)
+- ✅ Memory zeroization (SmartCardPin, SessionToken, SrtpKeyMaterial)
+- ✅ CNSA 2.0 compliance audit (CNSA_COMPLIANCE.md documentation)
+- ✅ Sensitive types with [REDACTED] debug output
+
+**Tests**: 69 total tests (client crates)
+
+**Phase 24.7: Deployment & Packaging** (Next)
+
 - 🚧 MSI installer via WiX
+- 🚧 Windows code signing
+- 🚧 Auto-update mechanism
+- 🚧 User documentation
 
 ---
 
