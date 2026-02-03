@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1643 tests passing, Phases 1-23 complete, DNS Integration complete
+**Current Status**: 1655 tests passing, Phases 1-23 complete, DNS Integration complete, CDR Export Endpoints complete
 
 ---
 
@@ -113,7 +113,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ Expose sbc-api routes for management
 - ✅ Implement sbc-metrics Prometheus endpoint
 - ✅ Add sbc-health HTTP probes (/healthz, /readyz)
-- [ ] Enable sbc-cdr export endpoints (future)
+- ✅ CDR export endpoints (list, export, stats, search, purge)
 
 ### ✅ Phase 15: Production Hardening
 

@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ### Added
 
+#### CDR Export Endpoints
+
+**uc-api - CDR Export Routes (NIST 800-53: AU-2, AU-3, AU-9)**
+
+- New CDR management routes (`/api/v1/cdrs/*`):
+  - `GET /` - List CDRs with pagination and filtering
+  - `GET /:id` - Get specific CDR by call ID
+  - `GET /export` - Bulk export CDRs in JSON or CSV format
+  - `GET /stats` - Get CDR statistics and summary metrics
+  - `GET /search` - Search CDRs by caller, callee, or criteria
+  - `GET /correlation/:correlation_id` - Get related calls by correlation ID
+  - `DELETE /purge` - Purge CDRs older than specified date
+
+- CDR API types (`cdr.rs`):
+  - `CdrQueryParams` with filtering: time range, caller, callee, status, trunk, direction, duration, IPs
+  - `CdrExportFormat` enum: Json, Csv with content type and extension helpers
+  - `CdrExportRequest` with filters, format, header inclusion, field selection, limit
+  - `CdrStats` with totals, ASR, failure rate, calls by status/cause/trunk
+  - `CdrSearchResult` for search response items
+  - `CdrPurgeRequest` / `CdrPurgeResponse` for maintenance operations
+  - Query parameter parsing from HTTP query strings
+
+- Permissions: `cdr:read`, `cdr:export`, `cdr:admin`
+- `SbcRoutes::cdrs()` added to `SbcRoutes::all()` aggregate
+
+**Tests**: 11 new tests for CDR routes and types
+
 #### DNS Integration
 
 **uc-dns - DNS Resolution for SIP (New Crate)**

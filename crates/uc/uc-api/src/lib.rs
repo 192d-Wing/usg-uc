@@ -36,15 +36,17 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![cfg_attr(test, allow(clippy::panic))]
 
+pub mod cdr;
 pub mod error;
 pub mod request;
 pub mod response;
 pub mod routes;
 
+pub use cdr::{CdrExportFormat, CdrExportRequest, CdrQueryParams, CdrStats};
 pub use error::{ApiError, ApiResult};
 pub use request::{ApiRequest, PaginationParams};
 pub use response::{ApiResponse, ListResponse};
-pub use routes::{Route, Router};
+pub use routes::{Route, Router, SbcRoutes};
 
 /// Default API version.
 pub const DEFAULT_API_VERSION: &str = "v1";

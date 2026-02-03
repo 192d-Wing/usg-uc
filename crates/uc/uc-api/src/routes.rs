@@ -321,6 +321,65 @@ impl SbcRoutes {
         router
     }
 
+    /// Creates CDR (Call Detail Record) export routes.
+    ///
+    /// ## NIST 800-53 Rev5: AU-2, AU-3, AU-9
+    ///
+    /// Provides endpoints for:
+    /// - Listing and querying call detail records
+    /// - Exporting CDRs in various formats (JSON, CSV)
+    /// - Retrieving individual CDR details
+    /// - Bulk export with filtering
+    pub fn cdrs() -> Router {
+        let mut router = Router::with_prefix("/api/v1/cdrs");
+        // NOTE: Order matters! Specific paths must come before parameter paths
+        // to avoid /:id matching /export, /stats, etc.
+        router
+            // List CDRs with filtering
+            .route(
+                Route::get("", "list_cdrs")
+                    .with_description("List call detail records with pagination and filtering")
+                    .with_permission("cdr:read"),
+            )
+            // Export CDRs (bulk download) - before /:id
+            .route(
+                Route::get("/export", "export_cdrs")
+                    .with_description("Export CDRs in specified format (JSON or CSV)")
+                    .with_permission("cdr:export"),
+            )
+            // Get CDR statistics/summary - before /:id
+            .route(
+                Route::get("/stats", "cdr_stats")
+                    .with_description("Get CDR statistics and summary metrics")
+                    .with_permission("cdr:read"),
+            )
+            // Search CDRs by caller/callee - before /:id
+            .route(
+                Route::get("/search", "search_cdrs")
+                    .with_description("Search CDRs by caller, callee, or other criteria")
+                    .with_permission("cdr:read"),
+            )
+            // Get CDRs by correlation ID (related calls) - before /:id
+            .route(
+                Route::get("/correlation/:correlation_id", "get_cdrs_by_correlation")
+                    .with_description("Get all CDRs with the same correlation ID")
+                    .with_permission("cdr:read"),
+            )
+            // Delete old CDRs (maintenance) - before /:id
+            .route(
+                Route::delete("/purge", "purge_cdrs")
+                    .with_description("Purge CDRs older than specified date")
+                    .with_permission("cdr:admin"),
+            )
+            // Get single CDR - LAST because /:id matches anything
+            .route(
+                Route::get("/:id", "get_cdr")
+                    .with_description("Get a specific call detail record by ID")
+                    .with_permission("cdr:read"),
+            );
+        router
+    }
+
     /// Creates all standard SBC routes.
     pub fn all() -> Router {
         let mut router = Router::new();
@@ -329,7 +388,8 @@ impl SbcRoutes {
             .merge(Self::routes())
             .merge(Self::calls())
             .merge(Self::system())
-            .merge(Self::cluster());
+            .merge(Self::cluster())
+            .merge(Self::cdrs());
         router
     }
 }
@@ -517,7 +577,7 @@ mod tests {
         let router = SbcRoutes::all();
 
         // Should have routes from all routers
-        assert!(router.route_count() > 15); // trunks(5) + routes(5) + calls(3) + system(4) + cluster(10)
+        assert!(router.route_count() > 15); // trunks(5) + routes(5) + calls(3) + system(4) + cluster(10) + cdrs(7)
 
         // Test that routes from different routers are accessible
         let result = router.find(HttpMethod::Get, "/api/v1/trunks");
@@ -525,5 +585,78 @@ mod tests {
 
         let result = router.find(HttpMethod::Get, "/api/v1/cluster/status");
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_sbc_routes_cdrs() {
+        let router = SbcRoutes::cdrs();
+
+        // Test list CDRs route
+        let result = router.find(HttpMethod::Get, "/api/v1/cdrs");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0.name, "list_cdrs");
+
+        // Test get single CDR route with path param
+        let result = router.find(HttpMethod::Get, "/api/v1/cdrs/call-123");
+        assert!(result.is_some());
+        let (route, params) = result.unwrap();
+        assert_eq!(route.name, "get_cdr");
+        assert_eq!(params.get("id"), Some(&"call-123".to_string()));
+
+        // Test export CDRs route
+        let result = router.find(HttpMethod::Get, "/api/v1/cdrs/export");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0.name, "export_cdrs");
+
+        // Test stats route
+        let result = router.find(HttpMethod::Get, "/api/v1/cdrs/stats");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0.name, "cdr_stats");
+
+        // Test search route
+        let result = router.find(HttpMethod::Get, "/api/v1/cdrs/search");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0.name, "search_cdrs");
+
+        // Test correlation route
+        let result = router.find(HttpMethod::Get, "/api/v1/cdrs/correlation/corr-456");
+        assert!(result.is_some());
+        let (route, params) = result.unwrap();
+        assert_eq!(route.name, "get_cdrs_by_correlation");
+        assert_eq!(params.get("correlation_id"), Some(&"corr-456".to_string()));
+
+        // Test purge route
+        let result = router.find(HttpMethod::Delete, "/api/v1/cdrs/purge");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0.name, "purge_cdrs");
+    }
+
+    #[test]
+    fn test_sbc_routes_cdrs_permissions() {
+        let router = SbcRoutes::cdrs();
+
+        // list_cdrs should have cdr:read permission
+        let result = router.find(HttpMethod::Get, "/api/v1/cdrs");
+        assert!(result.is_some());
+        let route = result.unwrap().0;
+        assert!(route.permissions.contains(&"cdr:read".to_string()));
+
+        // export_cdrs should have cdr:export permission
+        let result = router.find(HttpMethod::Get, "/api/v1/cdrs/export");
+        assert!(result.is_some());
+        let route = result.unwrap().0;
+        assert!(route.permissions.contains(&"cdr:export".to_string()));
+
+        // purge_cdrs should have cdr:admin permission
+        let result = router.find(HttpMethod::Delete, "/api/v1/cdrs/purge");
+        assert!(result.is_some());
+        let route = result.unwrap().0;
+        assert!(route.permissions.contains(&"cdr:admin".to_string()));
+    }
+
+    #[test]
+    fn test_sbc_routes_cdrs_count() {
+        let router = SbcRoutes::cdrs();
+        assert_eq!(router.route_count(), 7);
     }
 }
