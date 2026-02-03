@@ -22,6 +22,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, trace, warn};
 
+#[cfg(feature = "resolver")]
+use crate::hickory::HickoryDnsResolver;
+
 /// Transport preference for resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TransportPreference {
@@ -118,6 +121,10 @@ impl SipTarget {
 ///
 /// Resolves SIP URIs to socket addresses using the DNS procedures
 /// defined in RFC 3263.
+///
+/// When the `resolver` feature is enabled, this resolver can perform
+/// actual DNS lookups using hickory-resolver. Without the feature,
+/// it relies on pre-cached records or returns errors for hostnames.
 pub struct SipResolver {
     /// Configuration.
     config: SipResolverConfig,
@@ -129,6 +136,9 @@ pub struct SipResolver {
     /// SRV resolver (used during SRV record processing).
     #[allow(dead_code)]
     srv_resolver: SrvResolver,
+    /// Optional hickory DNS resolver for actual DNS queries.
+    #[cfg(feature = "resolver")]
+    dns_resolver: Option<HickoryDnsResolver>,
 }
 
 impl SipResolver {
@@ -137,9 +147,11 @@ impl SipResolver {
     pub fn new(config: SipResolverConfig, cache: Arc<DnsCache>) -> Self {
         Self {
             config,
-            cache,
+            cache: cache.clone(),
             naptr_resolver: NaptrResolver::new(),
             srv_resolver: SrvResolver::new(),
+            #[cfg(feature = "resolver")]
+            dns_resolver: HickoryDnsResolver::new(cache).ok(),
         }
     }
 
@@ -147,6 +159,38 @@ impl SipResolver {
     #[must_use]
     pub fn with_defaults() -> Self {
         Self::new(SipResolverConfig::default(), Arc::new(DnsCache::default()))
+    }
+
+    /// Creates a SIP resolver with actual DNS resolution enabled.
+    ///
+    /// This method is only available when the `resolver` feature is enabled.
+    #[cfg(feature = "resolver")]
+    #[must_use]
+    pub fn with_dns_resolver(
+        config: SipResolverConfig,
+        cache: Arc<DnsCache>,
+        dns_resolver: HickoryDnsResolver,
+    ) -> Self {
+        Self {
+            config,
+            cache,
+            naptr_resolver: NaptrResolver::new(),
+            srv_resolver: SrvResolver::new(),
+            dns_resolver: Some(dns_resolver),
+        }
+    }
+
+    /// Returns whether actual DNS resolution is available.
+    #[must_use]
+    pub fn has_dns_resolver(&self) -> bool {
+        #[cfg(feature = "resolver")]
+        {
+            self.dns_resolver.is_some()
+        }
+        #[cfg(not(feature = "resolver"))]
+        {
+            false
+        }
     }
 
     /// Returns the default transport from configuration.
@@ -316,9 +360,25 @@ impl SipResolver {
             return self.process_naptr_records(host, &records, transport).await;
         }
 
-        // In production, this would query DNS for NAPTR records
-        // For now, return None to fall through to SRV
-        trace!(host = %host, "No cached NAPTR records, trying SRV");
+        // Try actual DNS lookup if available
+        #[cfg(feature = "resolver")]
+        if let Some(ref resolver) = self.dns_resolver {
+            match resolver.lookup_naptr(host).await {
+                Ok(records) => {
+                    return self.process_naptr_records(host, &records, transport).await;
+                }
+                Err(DnsError::NoRecords { .. }) => {
+                    // No NAPTR records, fall through to SRV
+                    trace!(host = %host, "No NAPTR records found, trying SRV");
+                }
+                Err(e) => {
+                    warn!(host = %host, error = %e, "NAPTR lookup failed, trying SRV");
+                }
+            }
+        }
+
+        // No NAPTR records or no resolver
+        trace!(host = %host, "No NAPTR records, trying SRV");
         Ok(None)
     }
 
@@ -398,7 +458,25 @@ impl SipResolver {
                 .await;
         }
 
-        // In production, this would query DNS for SRV records
+        // Try actual DNS lookup if available
+        #[cfg(feature = "resolver")]
+        if let Some(ref resolver) = self.dns_resolver {
+            match resolver.lookup_sip_srv(host, transport_pref).await {
+                Ok(records) => {
+                    return self
+                        .process_srv_records(host, &records, transport_pref)
+                        .await;
+                }
+                Err(DnsError::NoRecords { .. }) => {
+                    // No SRV records, fall through to A/AAAA
+                    trace!(srv = %srv_name, "No SRV records found, falling back to A/AAAA");
+                }
+                Err(e) => {
+                    warn!(srv = %srv_name, error = %e, "SRV lookup failed, falling back to A/AAAA");
+                }
+            }
+        }
+
         trace!(srv = %srv_name, "No cached SRV records");
         Ok(None)
     }
@@ -478,8 +556,22 @@ impl SipResolver {
             return Ok(records);
         }
 
-        // In production, this would query DNS
-        // For now, return empty
+        // Try actual DNS lookup if available
+        #[cfg(feature = "resolver")]
+        if let Some(ref resolver) = self.dns_resolver {
+            match resolver.lookup_srv(name).await {
+                Ok(records) => {
+                    return Ok(records);
+                }
+                Err(DnsError::NoRecords { .. }) => {
+                    trace!(name = %name, "No SRV records found");
+                }
+                Err(e) => {
+                    warn!(name = %name, error = %e, "SRV lookup failed");
+                }
+            }
+        }
+
         Ok(Vec::new())
     }
 
@@ -495,12 +587,17 @@ impl SipResolver {
             return Ok(addrs);
         }
 
-        // In production, this would query DNS
-        // For stub implementation, return error
-        warn!(host = %host, "DNS resolution not implemented (stub)");
+        // Try actual DNS resolution if available
+        #[cfg(feature = "resolver")]
+        if let Some(ref resolver) = self.dns_resolver {
+            return resolver.lookup_addresses(host).await;
+        }
+
+        // No DNS resolver available
+        warn!(host = %host, "DNS resolution not available (enable 'resolver' feature)");
         Err(DnsError::ResolutionFailed {
             domain: host.to_string(),
-            reason: "DNS resolution not implemented".to_string(),
+            reason: "DNS resolution not available".to_string(),
         })
     }
 

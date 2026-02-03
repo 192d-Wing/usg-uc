@@ -36,6 +36,9 @@ pub mod naptr;
 pub mod resolver;
 pub mod srv;
 
+#[cfg(feature = "resolver")]
+pub mod hickory;
+
 pub use cache::{CachedRecord, DnsCache};
 pub use config::DnsConfig;
 pub use r#enum::{EnumResolver, EnumResult};
@@ -43,6 +46,9 @@ pub use error::{DnsError, DnsResult};
 pub use naptr::{NaptrRecord, NaptrService};
 pub use resolver::{SipResolver, SipTarget, TransportPreference};
 pub use srv::{SrvRecord, SrvResolver};
+
+#[cfg(feature = "resolver")]
+pub use hickory::HickoryDnsResolver;
 
 #[cfg(test)]
 mod tests {

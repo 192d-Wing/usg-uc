@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1655 tests passing, Phases 1-23 complete, Phase 24 (SIP Soft Client) in progress
+**Current Status**: 1659 tests passing, Phases 1-23 complete, Hickory-resolver DNS integration complete, Phase 24 (SIP Soft Client) in progress
 
 ---
 
