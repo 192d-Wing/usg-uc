@@ -19,6 +19,7 @@ pub mod audio;
 pub mod call;
 pub mod contact;
 pub mod error;
+pub mod sensitive;
 
 pub use account::{
     CertificateConfig, CertificateInfo, CertificateSelectionMode, RegistrationState, SipAccount,
@@ -30,3 +31,4 @@ pub use call::{
 };
 pub use contact::{Contact, PhoneNumber, PhoneNumberType};
 pub use error::{ClientError, ClientResult};
+pub use sensitive::{SensitiveString, SessionToken, SmartCardPin, SrtpKeyMaterial};

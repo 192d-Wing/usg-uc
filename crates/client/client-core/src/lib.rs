@@ -19,12 +19,13 @@
 
 pub mod app;
 pub mod call_manager;
+pub mod cert_store;
 pub mod contact_manager;
 pub mod settings;
-// pub mod smartcard; // To be implemented for Windows smart card support
 
 pub use app::{AppEvent, AppState, ClientApp};
 pub use call_manager::{CallManager, CallManagerEvent};
+pub use cert_store::{CertStoreError, CertStoreResult, CertificateStore};
 pub use contact_manager::{create_contact, ContactManager, ContactStore};
 pub use settings::{GeneralSettings, NetworkSettings, Settings, SettingsManager, UiSettings};
 

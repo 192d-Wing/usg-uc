@@ -18,6 +18,7 @@
 )]
 
 mod app;
+mod notifications;
 mod tray;
 mod views;
 

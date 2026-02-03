@@ -2,6 +2,7 @@
 //!
 //! Manages the egui window and coordinates between views.
 
+use crate::notifications::NotificationManager;
 use crate::tray::TrayAction;
 use crate::views::{CallView, ContactsView, DialerView, SettingsView};
 use client_core::{AppEvent, ClientApp};
@@ -60,6 +61,8 @@ pub struct SipClientApp {
     show_error_dialog: bool,
     /// Whether a tray exit was requested.
     exit_requested: bool,
+    /// Notification manager for toast notifications.
+    notifications: NotificationManager,
 }
 
 impl SipClientApp {
@@ -120,6 +123,7 @@ impl SipClientApp {
             error_message: None,
             show_error_dialog: false,
             exit_requested: false,
+            notifications: NotificationManager::new("USG SIP Client"),
         }
     }
 
@@ -152,6 +156,15 @@ impl SipClientApp {
             match event {
                 AppEvent::RegistrationStateChanged { account_id, state } => {
                     info!(account_id = %account_id, state = ?state, "Registration state changed");
+                    let was_registered = self.registration_state == RegistrationState::Registered;
+                    let is_registered = state == RegistrationState::Registered;
+
+                    // Show notification on registration state change
+                    if was_registered != is_registered {
+                        self.notifications
+                            .notify_registration(is_registered, account_id.clone());
+                    }
+
                     self.registration_state = state;
                     self.status_message = format!("Registration: {}", state);
                 }
@@ -190,12 +203,21 @@ impl SipClientApp {
                         "Incoming call from {}",
                         remote_display_name.as_deref().unwrap_or(&remote_uri)
                     );
-                    // TODO: Show incoming call notification
+
+                    // Show toast notification for incoming call
+                    self.notifications
+                        .notify_incoming_call(remote_display_name.clone(), remote_uri.clone());
                 }
                 AppEvent::CallEnded {
                     call_id: _,
                     duration_secs,
                 } => {
+                    // Get remote name before clearing active_call
+                    let remote_name = self
+                        .active_call
+                        .as_ref()
+                        .and_then(|c| c.remote_display_name.clone());
+
                     self.active_call = None;
                     if let Some(duration) = duration_secs {
                         self.status_message = format!("Call ended ({duration}s)");
@@ -205,11 +227,17 @@ impl SipClientApp {
                     if self.active_view == ActiveView::Call {
                         self.active_view = ActiveView::Dialer;
                     }
+
+                    // Show notification for call ended
+                    self.notifications.notify_call_ended(remote_name, duration_secs);
                 }
                 AppEvent::Error { message } => {
                     error!(message = %message, "Application error");
-                    self.error_message = Some(message);
+                    self.error_message = Some(message.clone());
                     self.show_error_dialog = true;
+
+                    // Show toast notification for error
+                    self.notifications.notify_error("Error", &message);
                 }
                 AppEvent::SettingsChanged => {
                     self.status_message = "Settings saved".to_string();
