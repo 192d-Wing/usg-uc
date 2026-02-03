@@ -43,6 +43,9 @@ pub mod tcp;
 #[cfg(feature = "tls")]
 pub mod tls;
 
+#[cfg(feature = "websocket")]
+pub mod websocket;
+
 pub use error::{TransportError, TransportResult};
 pub use listener::TransportListener;
 pub use qos::{

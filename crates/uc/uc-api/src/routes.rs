@@ -244,6 +244,94 @@ impl SbcRoutes {
             .put("/config", "update_config");
         router
     }
+
+    /// Creates cluster management routes.
+    ///
+    /// ## NIST 800-53 Rev5: SC-24 (Fail in Known State)
+    ///
+    /// Provides endpoints for:
+    /// - Cluster status and membership
+    /// - Manual failover operations
+    /// - Node draining for maintenance
+    /// - State synchronization status
+    pub fn cluster() -> Router {
+        let mut router = Router::with_prefix("/api/v1/cluster");
+        router
+            // Cluster status
+            .route(
+                Route::get("/status", "cluster_status")
+                    .with_description("Get overall cluster status and quorum information")
+                    .with_permission("cluster:read"),
+            )
+            // Member management
+            .route(
+                Route::get("/members", "list_members")
+                    .with_description("List all cluster members")
+                    .with_permission("cluster:read"),
+            )
+            .route(
+                Route::get("/members/:id", "get_member")
+                    .with_description("Get details for a specific cluster member")
+                    .with_permission("cluster:read"),
+            )
+            // Failover operations
+            .route(
+                Route::post("/failover", "initiate_failover")
+                    .with_description("Initiate failover from a failed node")
+                    .with_permission("cluster:admin"),
+            )
+            .route(
+                Route::post("/failover/manual", "manual_failover")
+                    .with_description("Manually failover to a specific target node")
+                    .with_permission("cluster:admin"),
+            )
+            // Node lifecycle
+            .route(
+                Route::post("/drain", "drain_node")
+                    .with_description("Drain sessions from local node for maintenance")
+                    .with_permission("cluster:admin"),
+            )
+            .route(
+                Route::post("/rejoin", "rejoin_cluster")
+                    .with_description("Rejoin the cluster after maintenance")
+                    .with_permission("cluster:admin"),
+            )
+            // State synchronization
+            .route(
+                Route::get("/state/sync-status", "sync_status")
+                    .with_description("Get state synchronization status")
+                    .with_permission("cluster:read"),
+            )
+            .route(
+                Route::post("/state/force-sync", "force_sync")
+                    .with_description("Force state synchronization with peers")
+                    .with_permission("cluster:admin"),
+            )
+            // Snapshot management
+            .route(
+                Route::get("/state/snapshot", "get_snapshot")
+                    .with_description("Get current state snapshot")
+                    .with_permission("cluster:read"),
+            )
+            .route(
+                Route::post("/state/snapshot/restore", "restore_snapshot")
+                    .with_description("Restore state from a snapshot")
+                    .with_permission("cluster:admin"),
+            );
+        router
+    }
+
+    /// Creates all standard SBC routes.
+    pub fn all() -> Router {
+        let mut router = Router::new();
+        router
+            .merge(Self::trunks())
+            .merge(Self::routes())
+            .merge(Self::calls())
+            .merge(Self::system())
+            .merge(Self::cluster());
+        router
+    }
 }
 
 #[cfg(test)]
@@ -385,5 +473,57 @@ mod tests {
         let result = router.find(HttpMethod::Get, "/api/v1/system/health");
         assert!(result.is_some());
         assert_eq!(result.unwrap().0.name, "health_check");
+    }
+
+    #[test]
+    fn test_sbc_routes_cluster() {
+        let router = SbcRoutes::cluster();
+
+        // Test cluster status route
+        let result = router.find(HttpMethod::Get, "/api/v1/cluster/status");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0.name, "cluster_status");
+
+        // Test members list route
+        let result = router.find(HttpMethod::Get, "/api/v1/cluster/members");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0.name, "list_members");
+
+        // Test get member route with path param
+        let result = router.find(HttpMethod::Get, "/api/v1/cluster/members/node-01");
+        assert!(result.is_some());
+        let (route, params) = result.unwrap();
+        assert_eq!(route.name, "get_member");
+        assert_eq!(params.get("id"), Some(&"node-01".to_string()));
+
+        // Test failover route
+        let result = router.find(HttpMethod::Post, "/api/v1/cluster/failover");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0.name, "initiate_failover");
+
+        // Test drain route
+        let result = router.find(HttpMethod::Post, "/api/v1/cluster/drain");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0.name, "drain_node");
+
+        // Test sync status route
+        let result = router.find(HttpMethod::Get, "/api/v1/cluster/state/sync-status");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0.name, "sync_status");
+    }
+
+    #[test]
+    fn test_sbc_routes_all() {
+        let router = SbcRoutes::all();
+
+        // Should have routes from all routers
+        assert!(router.route_count() > 15); // trunks(5) + routes(5) + calls(3) + system(4) + cluster(10)
+
+        // Test that routes from different routers are accessible
+        let result = router.find(HttpMethod::Get, "/api/v1/trunks");
+        assert!(result.is_some());
+
+        let result = router.find(HttpMethod::Get, "/api/v1/cluster/status");
+        assert!(result.is_some());
     }
 }

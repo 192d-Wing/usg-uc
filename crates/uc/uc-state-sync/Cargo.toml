@@ -1,0 +1,41 @@
+[package]
+name = "uc-state-sync"
+description = "State replication engine for USG SBC clustering"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# Async runtime
+tokio.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Time handling
+chrono.workspace = true
+
+# Bytes handling
+bytes = { workspace = true, features = ["serde"] }
+
+# Internal crates
+uc-cluster.workspace = true
+uc-storage.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

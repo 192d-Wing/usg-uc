@@ -11,6 +11,16 @@ categories.workspace = true
 
 [features]
 default = []
+# Enable clustering features
+cluster = ["uc-cluster", "uc-discovery", "uc-storage", "uc-state-sync"]
+# Enable AAA features (RADIUS/Diameter)
+aaa = ["uc-aaa"]
+# Enable SNMP monitoring
+snmp = ["uc-snmp"]
+# Enable syslog forwarding
+syslog = ["uc-syslog"]
+# Enable all optional features
+full = ["cluster", "aaa", "snmp", "syslog"]
 
 [dependencies]
 uc-types = { workspace = true, features = ["serde"] }
@@ -18,6 +28,17 @@ serde.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 validator.workspace = true
+
+# Optional clustering dependencies
+uc-cluster = { workspace = true, optional = true }
+uc-discovery = { workspace = true, optional = true }
+uc-storage = { workspace = true, optional = true }
+uc-state-sync = { workspace = true, optional = true }
+
+# Optional monitoring dependencies
+uc-aaa = { workspace = true, optional = true }
+uc-snmp = { workspace = true, optional = true }
+uc-syslog = { workspace = true, optional = true }
 
 [lints]
 workspace = true

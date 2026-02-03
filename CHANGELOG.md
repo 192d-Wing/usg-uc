@@ -9,6 +9,174 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ### Added
 
+#### Phase 20: WebRTC & Modern Transports
+
+**uc-transport - WebSocket Transport (RFC 7118)**
+
+- New WebSocket transport module (`websocket.rs`):
+  - `WebSocketTransport` implementing `Transport` and `StreamTransport` traits
+  - `WebSocketListener` for accepting incoming connections
+  - `WebSocketState` enum: Connecting, Open, Closing, Closed
+  - SIP-over-WebSocket framing (text frames for SIP messages)
+  - Binary frame support for SDP bodies
+  - Ping/pong keepalive handling
+  - Secure WebSocket (WSS) support with TLS
+  - `SIP_SUBPROTOCOL` constant ("sip") per RFC 7118
+- New feature flag `websocket` with dependencies:
+  - `tokio-tungstenite` for WebSocket protocol
+  - `futures-util` for stream combinators
+
+**uc-webrtc - WebRTC Gateway (New Crate)**
+
+- New crate for SIP-to-WebRTC interworking:
+  - `WebRtcGateway` for SIP-to-WebRTC call bridging
+  - `GatewayResponse` with session ID, SDP, ICE credentials, DTLS fingerprint
+  - `GatewayStats` for monitoring (sessions created/completed/failed, active sessions)
+  - Session creation from SIP calls
+  - Bidirectional SDP processing (SIP-to-WebRTC, WebRTC-to-SIP)
+  - ICE candidate handling for remote candidates
+
+- `WebRtcSession` session management:
+  - `WebRtcSessionState` enum: New, HaveLocalDescription, HaveRemoteDescription, Connecting, DtlsHandshaking, Connected, Disconnected, Failed, Closed
+  - Local and remote SDP storage
+  - ICE candidate tracking (local and remote)
+  - ICE credentials (ufrag, pwd) management
+  - DTLS fingerprint storage
+  - SIP Call-ID association
+  - Session age and idle time tracking
+  - `SessionManager` for multi-session management with configurable limits
+
+- `SdpMunger` for SDP transformation:
+  - `WebRtcSdpMode` enum: SipToWebRtc, WebRtcToSip
+  - RTP-to-SRTP profile conversion (RTP/AVP to RTP/SAVPF)
+  - ICE credential extraction from SDP
+  - DTLS fingerprint extraction
+  - Configurable SDP transformation rules
+
+- `TrickleIce` for ICE candidate trickling (RFC 8838):
+  - `TrickleCandidate` with candidate string, m-line index, mid, ufrag
+  - `TrickleState` enum: Idle, Gathering, Receiving, Complete
+  - Local and remote candidate management
+  - Broadcast channel for new candidate notifications
+  - End-of-candidates indicator support
+  - `TrickleManager` for multi-session trickle ICE handling
+
+- Configuration structures:
+  - `WebRtcConfig` with enabled flag and sub-configs
+  - `IceConfig` for ICE parameters (STUN servers, trickle, lite mode)
+  - `DtlsConfig` for DTLS parameters (fingerprint algorithm, role)
+  - `SessionConfig` for session limits (max sessions, idle timeout)
+  - `SdpConfig` for SDP transformation options
+
+**Tests**: 24 new tests across WebRTC components
+
+#### Phase 22: High Availability & Clustering
+
+**uc-cluster - Core Clustering Primitives**
+
+- New crate for cluster management:
+  - `NodeId`, `NodeRole` (Primary/Secondary/Witness), `NodeState` types
+  - `ClusterNode` with endpoints, health score, zone/region awareness
+  - `ClusterMembership` manager with add/remove/get node operations
+  - `QuorumPolicy` enum: Majority, All, Count, Weighted
+  - `HealthChecker` with heartbeat tracking and suspect/dead thresholds
+  - `HealthStatus` enum: Healthy, Suspect, Dead
+  - `FailoverCoordinator` with automatic and manual failover
+  - `SessionTakeoverHandler` trait for session migration
+  - `FailoverPhase` enum for failover state tracking
+  - `TakeoverResult` with transfer statistics
+  - Failover strategies: PreferSameZone, PreferSameRegion, LeastLoaded, Priority
+
+**uc-discovery - Service Discovery**
+
+- New crate for peer discovery:
+  - `DiscoveryProvider` trait with async discover method
+  - `StaticDiscovery` for configured peer lists
+  - `DnsDiscovery` stub for DNS SRV/A lookup (feature-gated)
+  - `KubernetesDiscovery` stub for K8s API (feature-gated)
+  - `GossipProtocol` for SWIM-style failure detection
+  - `MemberStatus` enum: Alive, Suspect, Dead
+  - `GossipMessage` variants: Ping, Ack, PingReq, Membership
+
+**uc-storage - Storage Backends**
+
+- New crate for pluggable storage:
+  - `StorageBackend` trait with get/set/delete/keys/increment
+  - `InMemoryBackend` with TTL support and glob-style pattern matching
+  - `RedisBackend` stub (feature-gated)
+  - `PostgresBackend` stub (feature-gated)
+  - `StorageManager` with health checking
+
+**uc-state-sync - State Replication Engine**
+
+- New crate for distributed state:
+  - CRDT implementations: `GCounter`, `PNCounter`, `LWWRegister`
+  - `Replicable` trait for state that can be replicated
+  - `StateReplicator` with configurable replication modes
+  - `ReplicationMode` enum: Sync, Async, SemiSync
+  - `ReplicationMessage` protocol for wire format
+  - `StateSnapshot` for bulk state transfer
+  - `SnapshotWriter` and `SnapshotReader` for chunked transfers
+  - `EntryType` enum: KeyValue, Registration, CallState, Crdt, Config
+
+**uc-aaa - AAA Integration**
+
+- New crate for authentication/authorization/accounting:
+  - `AaaProvider` trait with authenticate/authorize/accounting methods
+  - `RadiusClient` for RADIUS server communication
+  - `AuthRequest` and `AuthResponse` types
+  - `AccountingRecord` for CDR-style accounting
+  - `AccountingType` enum: Start, Stop, Interim
+
+**uc-snmp - SNMP Trap Generation**
+
+- New crate for SNMP monitoring:
+  - `TrapSender` for SNMPv2c trap generation
+  - `SnmpTrap` struct with OID, values, and timestamp
+  - `TrapType` enum with 14 trap types:
+    - NodeUp, NodeDown, NodeDegraded
+    - CallStart, CallEnd, CallFailed
+    - RegistrationAdded, RegistrationRemoved, RegistrationExpired
+    - QuorumLost, QuorumRestored
+    - HighCpuUsage, HighMemoryUsage
+    - CertificateExpiring
+
+**uc-syslog - Syslog Forwarding**
+
+- New crate for log forwarding:
+  - `SyslogForwarder` with UDP and TCP transport
+  - `SyslogMessage` with RFC 5424 and BSD format support
+  - `Severity` enum: Emergency through Debug
+  - `Facility` enum: Kern, User, Mail, Daemon, Auth, Syslog, etc.
+  - Automatic hostname and process ID detection
+
+**sbc-config - Configuration Integration**
+
+- Feature flags for optional clustering components:
+  - `cluster` feature enables uc-cluster, uc-discovery, uc-storage, uc-state-sync
+  - `aaa` feature enables uc-aaa
+  - `snmp` feature enables uc-snmp
+  - `syslog` feature enables uc-syslog
+  - `full` feature enables all optional features
+- `MonitoringConfig` struct with metrics endpoint and per-call metrics options
+- Re-exports for cluster config types when features enabled
+
+**uc-api - Cluster API Endpoints**
+
+- New cluster management routes (`/api/v1/cluster/*`):
+  - `GET /status` - Cluster status and quorum information
+  - `GET /members` - List all cluster members
+  - `GET /members/:id` - Get specific member details
+  - `POST /failover` - Initiate automatic failover
+  - `POST /failover/manual` - Manual failover to specific target
+  - `POST /drain` - Drain sessions for maintenance
+  - `POST /rejoin` - Rejoin cluster after maintenance
+  - `GET /state/sync-status` - State synchronization status
+  - `POST /state/force-sync` - Force state synchronization
+  - `GET /state/snapshot` - Get current state snapshot
+  - `POST /state/snapshot/restore` - Restore from snapshot
+- `SbcRoutes::all()` method combining all route groups
+
 #### P0 Critical RFC Compliance Gaps
 
 **proto-dtls (RFC 6347 §4.2.4, §4.2.6)**

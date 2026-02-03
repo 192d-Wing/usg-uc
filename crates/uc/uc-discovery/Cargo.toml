@@ -1,0 +1,50 @@
+[package]
+name = "uc-discovery"
+description = "Service discovery for USG SBC clustering"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+dns = ["dep:trust-dns-resolver"]
+kubernetes = ["dep:kube", "dep:k8s-openapi"]
+
+[dependencies]
+# Async runtime
+tokio.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Time handling
+chrono.workspace = true
+
+# Types from workspace
+uc-types = { workspace = true, features = ["serde"] }
+uc-cluster.workspace = true
+
+# DNS resolution (optional)
+trust-dns-resolver = { version = "0.23", optional = true }
+
+# Kubernetes (optional)
+kube = { version = "0.98", features = ["runtime", "client"], optional = true }
+k8s-openapi = { version = "0.24", features = ["v1_31"], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

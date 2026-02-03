@@ -10,6 +10,27 @@ use uc_types::codec::CodecId;
 use uc_types::media::MediaMode;
 use uc_types::protocol::{CnsaCurve, CnsaHash, CnsaSrtpProfile};
 
+// Re-export cluster config types (feature-gated)
+#[cfg(feature = "cluster")]
+pub use uc_cluster::{
+    ClusterConfig, FailoverConfig, FailoverStrategy, HeartbeatConfig, NodeRole, ReplicationConfig,
+};
+#[cfg(feature = "cluster")]
+pub use uc_discovery::{
+    DiscoveryConfig, DiscoveryMethod, DnsConfig, GossipConfig, KubernetesConfig,
+};
+#[cfg(feature = "cluster")]
+pub use uc_storage::{PostgresConfig, RedisConfig, StorageBackendType, StorageConfig};
+
+#[cfg(feature = "aaa")]
+pub use uc_aaa::{AaaConfig, AaaProviderType, RadiusConfig};
+
+#[cfg(feature = "snmp")]
+pub use uc_snmp::SnmpConfig;
+
+#[cfg(feature = "syslog")]
+pub use uc_syslog::SyslogConfig;
+
 /// Root SBC configuration.
 ///
 /// ## NIST 800-53 Rev5: CM-2 (Baseline Configuration)
@@ -37,6 +58,29 @@ pub struct SbcConfig {
 
     /// Logging settings.
     pub logging: LoggingConfig,
+
+    /// Cluster settings for high availability.
+    ///
+    /// ## NIST 800-53 Rev5: SC-24 (Fail in Known State)
+    #[cfg(feature = "cluster")]
+    pub cluster: Option<ClusterConfig>,
+
+    /// Storage backend settings.
+    ///
+    /// ## NIST 800-53 Rev5: CP-9 (System Backup)
+    #[cfg(feature = "cluster")]
+    pub storage: Option<StorageConfig>,
+
+    /// AAA (Authentication, Authorization, Accounting) settings.
+    ///
+    /// ## NIST 800-53 Rev5: AC-2 (Account Management)
+    #[cfg(feature = "aaa")]
+    pub aaa: Option<AaaConfig>,
+
+    /// Monitoring settings.
+    ///
+    /// ## NIST 800-53 Rev5: AU-6 (Audit Record Review)
+    pub monitoring: Option<MonitoringConfig>,
 }
 
 /// General SBC settings.
@@ -356,6 +400,44 @@ impl Default for LoggingConfig {
     }
 }
 
+/// Monitoring configuration.
+///
+/// ## NIST 800-53 Rev5: AU-6 (Audit Record Review)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MonitoringConfig {
+    /// Enable SNMP trap sending.
+    #[cfg(feature = "snmp")]
+    pub snmp: Option<SnmpConfig>,
+
+    /// Enable syslog forwarding.
+    #[cfg(feature = "syslog")]
+    pub syslog: Option<SyslogConfig>,
+
+    /// Prometheus metrics endpoint bind address.
+    pub metrics_bind: Option<SocketAddr>,
+
+    /// Enable detailed per-call metrics.
+    pub per_call_metrics: bool,
+
+    /// Metrics scrape interval in seconds.
+    pub scrape_interval_secs: u64,
+}
+
+impl Default for MonitoringConfig {
+    fn default() -> Self {
+        Self {
+            #[cfg(feature = "snmp")]
+            snmp: None,
+            #[cfg(feature = "syslog")]
+            syslog: None,
+            metrics_bind: None,
+            per_call_metrics: false,
+            scrape_interval_secs: 15,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -391,5 +473,13 @@ mod tests {
         assert_eq!(config.general.instance_name, "test-sbc");
         assert_eq!(config.general.max_calls, 5000);
         assert_eq!(config.media.default_mode, MediaMode::PassThrough);
+    }
+
+    #[test]
+    fn test_monitoring_config_defaults() {
+        let monitoring = MonitoringConfig::default();
+        assert!(monitoring.metrics_bind.is_none());
+        assert!(!monitoring.per_call_metrics);
+        assert_eq!(monitoring.scrape_interval_secs, 15);
     }
 }

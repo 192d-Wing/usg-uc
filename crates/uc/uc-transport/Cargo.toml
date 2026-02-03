@@ -14,7 +14,7 @@ default = ["udp", "tcp", "tls"]
 udp = []
 tcp = []
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pki-types"]
-websocket = ["dep:tokio-tungstenite"]
+websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
 
 [dependencies]
 uc-types.workspace = true
@@ -32,6 +32,7 @@ rustls-pki-types = { workspace = true, optional = true }
 
 # WebSocket support
 tokio-tungstenite = { version = "0.28", optional = true }
+futures-util = { version = "0.3", optional = true }
 
 [lints]
 workspace = true

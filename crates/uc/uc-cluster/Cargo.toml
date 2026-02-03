@@ -1,0 +1,40 @@
+[package]
+name = "uc-cluster"
+description = "High availability clustering for USG SBC"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# Async runtime
+tokio.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Time handling
+chrono.workspace = true
+
+# Bytes handling
+bytes.workspace = true
+
+# Types from workspace
+uc-types = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

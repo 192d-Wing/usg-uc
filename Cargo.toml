@@ -44,6 +44,18 @@ members = [
     "crates/uc/uc-metrics",
     "crates/uc/uc-health",
 
+    # Layer 8: High Availability & Clustering (uc-* = reusable)
+    "crates/uc/uc-cluster",
+    "crates/uc/uc-discovery",
+    "crates/uc/uc-storage",
+    "crates/uc/uc-state-sync",
+    "crates/uc/uc-aaa",
+    "crates/uc/uc-snmp",
+    "crates/uc/uc-syslog",
+
+    # Layer 9: WebRTC (uc-* = reusable)
+    "crates/uc/uc-webrtc",
+
     # SBC Application
     "crates/sbc/sbc-config",
     "crates/sbc/sbc-daemon",
@@ -123,6 +135,14 @@ uc-api = { path = "crates/uc/uc-api" }
 uc-metrics = { path = "crates/uc/uc-metrics" }
 uc-health = { path = "crates/uc/uc-health" }
 uc-siprec = { path = "crates/uc/uc-siprec" }
+uc-cluster = { path = "crates/uc/uc-cluster" }
+uc-discovery = { path = "crates/uc/uc-discovery" }
+uc-storage = { path = "crates/uc/uc-storage" }
+uc-state-sync = { path = "crates/uc/uc-state-sync" }
+uc-aaa = { path = "crates/uc/uc-aaa" }
+uc-snmp = { path = "crates/uc/uc-snmp" }
+uc-syslog = { path = "crates/uc/uc-syslog" }
+uc-webrtc = { path = "crates/uc/uc-webrtc" }
 
 # Internal crates - Protocol (proto/*)
 proto-sip = { path = "crates/proto/proto-sip" }
