@@ -1,0 +1,37 @@
+[package]
+name = "uc-transport"
+description = "Transport layer abstraction for UDP, TCP, TLS, and WebSocket protocols"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["udp", "tcp", "tls"]
+udp = []
+tcp = []
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
+websocket = ["dep:tokio-tungstenite"]
+
+[dependencies]
+uc-types.workspace = true
+uc-crypto.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+socket2.workspace = true
+
+# TLS support
+rustls = { workspace = true, optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+rustls-pemfile = { version = "2.2", optional = true }
+
+# WebSocket support
+tokio-tungstenite = { version = "0.28", optional = true }
+
+[lints]
+workspace = true

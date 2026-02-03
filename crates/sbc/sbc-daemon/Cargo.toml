@@ -1,0 +1,53 @@
+[package]
+name = "sbc-daemon"
+description = "Main SBC daemon process"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+uc-types.workspace = true
+sbc-config = { path = "../sbc-config" }
+uc-health.workspace = true
+uc-metrics.workspace = true
+uc-transport.workspace = true
+proto-sip.workspace = true
+proto-transaction.workspace = true
+proto-dialog.workspace = true
+proto-b2bua.workspace = true
+proto-registrar.workspace = true
+proto-rtp.workspace = true
+proto-srtp.workspace = true
+proto-dtls.workspace = true
+uc-media-engine.workspace = true
+uc-codecs.workspace = true
+proto-stun.workspace = true
+proto-turn.workspace = true
+proto-ice.workspace = true
+uc-api.workspace = true
+uc-dos-protection.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+bytes.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+
+[[bin]]
+name = "sbc-daemon"
+path = "src/main.rs"

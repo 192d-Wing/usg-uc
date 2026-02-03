@@ -1008,10 +1008,56 @@ dependencies = [
 ]
 
 [[package]]
+name = "proto-dtls"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uc-crypto",
+ "uc-types",
+]
+
+[[package]]
+name = "proto-ice"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "proto-stun",
+ "proto-turn",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uc-crypto",
+ "uc-types",
+]
+
+[[package]]
 name = "proto-registrar"
 version = "0.1.0"
 dependencies = [
  "thiserror",
+]
+
+[[package]]
+name = "proto-rtp"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror",
+ "tracing",
+ "uc-types",
+]
+
+[[package]]
+name = "proto-sdp"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "tracing",
+ "uc-types",
 ]
 
 [[package]]
@@ -1023,11 +1069,56 @@ dependencies = [
 ]
 
 [[package]]
+name = "proto-srtp"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "proto-rtp",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uc-crypto",
+ "uc-types",
+]
+
+[[package]]
+name = "proto-stir-shaken"
+version = "0.1.0"
+dependencies = [
+ "uc-types",
+]
+
+[[package]]
+name = "proto-stun"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uc-crypto",
+ "uc-types",
+]
+
+[[package]]
 name = "proto-transaction"
 version = "0.1.0"
 dependencies = [
  "proto-sip",
  "thiserror",
+]
+
+[[package]]
+name = "proto-turn"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "proto-stun",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uc-crypto",
+ "uc-types",
 ]
 
 [[package]]
@@ -1190,85 +1281,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a50f4cf475b65d88e057964e0e9bb1f0aa9bbb2036dc65c64596b42932536984"
 
 [[package]]
-name = "sbc-acl"
-version = "0.1.0"
-dependencies = [
- "sbc-types",
-]
-
-[[package]]
-name = "sbc-api"
-version = "0.1.0"
-dependencies = [
- "sbc-types",
-]
-
-[[package]]
-name = "sbc-audit"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "sbc-crypto",
- "sbc-types",
- "serde",
- "serde_json",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "sbc-b2bua"
-version = "0.1.0"
-dependencies = [
- "proto-b2bua",
-]
-
-[[package]]
-name = "sbc-cdr"
-version = "0.1.0"
-dependencies = [
- "sbc-types",
-]
-
-[[package]]
 name = "sbc-cli"
 version = "0.1.0"
 dependencies = [
  "sbc-config",
- "sbc-health",
- "sbc-metrics",
- "sbc-types",
-]
-
-[[package]]
-name = "sbc-codecs"
-version = "0.1.0"
-dependencies = [
- "audiopus",
- "bytes",
- "sbc-types",
- "thiserror",
+ "uc-health",
+ "uc-metrics",
+ "uc-types",
 ]
 
 [[package]]
 name = "sbc-config"
 version = "0.1.0"
 dependencies = [
- "sbc-types",
  "serde",
  "thiserror",
  "toml",
+ "uc-types",
  "validator",
-]
-
-[[package]]
-name = "sbc-crypto"
-version = "0.1.0"
-dependencies = [
- "aws-lc-rs",
- "sbc-types",
- "thiserror",
- "zeroize",
 ]
 
 [[package]]
@@ -1279,28 +1309,20 @@ dependencies = [
  "bytes",
  "hyper",
  "hyper-util",
+ "proto-b2bua",
+ "proto-dialog",
+ "proto-dtls",
+ "proto-ice",
+ "proto-registrar",
+ "proto-rtp",
  "proto-sip",
+ "proto-srtp",
+ "proto-stun",
+ "proto-transaction",
+ "proto-turn",
  "rustls",
  "rustls-pemfile",
- "sbc-api",
- "sbc-b2bua",
- "sbc-codecs",
  "sbc-config",
- "sbc-dialog",
- "sbc-dos-protection",
- "sbc-dtls",
- "sbc-health",
- "sbc-ice",
- "sbc-media-engine",
- "sbc-metrics",
- "sbc-registrar",
- "sbc-rtp",
- "sbc-srtp",
- "sbc-stun",
- "sbc-transaction",
- "sbc-transport",
- "sbc-turn",
- "sbc-types",
  "serde",
  "serde_json",
  "tokio",
@@ -1309,205 +1331,28 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "sbc-dialog"
-version = "0.1.0"
-dependencies = [
- "proto-dialog",
-]
-
-[[package]]
-name = "sbc-dos-protection"
-version = "0.1.0"
-dependencies = [
- "sbc-types",
-]
-
-[[package]]
-name = "sbc-dtls"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "sbc-crypto",
- "sbc-types",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "sbc-health"
-version = "0.1.0"
-dependencies = [
- "sbc-types",
-]
-
-[[package]]
-name = "sbc-ice"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "sbc-stun",
- "sbc-turn",
- "sbc-types",
- "thiserror",
- "tokio",
- "tracing",
+ "uc-api",
+ "uc-codecs",
+ "uc-dos-protection",
+ "uc-health",
+ "uc-media-engine",
+ "uc-metrics",
+ "uc-transport",
+ "uc-types",
 ]
 
 [[package]]
 name = "sbc-integration-tests"
 version = "0.1.0"
 dependencies = [
- "sbc-api",
- "sbc-cdr",
  "sbc-config",
- "sbc-health",
- "sbc-metrics",
- "sbc-policy",
- "sbc-routing",
- "sbc-types",
-]
-
-[[package]]
-name = "sbc-media-engine"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "sbc-codecs",
- "sbc-rtp",
- "sbc-srtp",
- "sbc-types",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "sbc-metrics"
-version = "0.1.0"
-dependencies = [
- "sbc-types",
-]
-
-[[package]]
-name = "sbc-policy"
-version = "0.1.0"
-dependencies = [
- "sbc-types",
-]
-
-[[package]]
-name = "sbc-registrar"
-version = "0.1.0"
-dependencies = [
- "proto-registrar",
-]
-
-[[package]]
-name = "sbc-routing"
-version = "0.1.0"
-dependencies = [
- "sbc-types",
-]
-
-[[package]]
-name = "sbc-rtp"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "sbc-types",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "sbc-sdp"
-version = "0.1.0"
-dependencies = [
- "sbc-types",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "sbc-srtp"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "sbc-crypto",
- "sbc-rtp",
- "sbc-types",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "sbc-stir-shaken"
-version = "0.1.0"
-dependencies = [
- "sbc-types",
-]
-
-[[package]]
-name = "sbc-stun"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "sbc-crypto",
- "sbc-types",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "sbc-transaction"
-version = "0.1.0"
-dependencies = [
- "proto-transaction",
-]
-
-[[package]]
-name = "sbc-transport"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "rustls",
- "rustls-pemfile",
- "sbc-crypto",
- "sbc-types",
- "socket2",
- "thiserror",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "tracing",
-]
-
-[[package]]
-name = "sbc-turn"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "sbc-crypto",
- "sbc-stun",
- "sbc-types",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "sbc-types"
-version = "0.1.0"
-dependencies = [
- "serde",
- "thiserror",
+ "uc-api",
+ "uc-cdr",
+ "uc-health",
+ "uc-metrics",
+ "uc-policy",
+ "uc-routing",
+ "uc-types",
 ]
 
 [[package]]
@@ -1964,6 +1809,134 @@ name = "typenum"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
+
+[[package]]
+name = "uc-acl"
+version = "0.1.0"
+dependencies = [
+ "uc-types",
+]
+
+[[package]]
+name = "uc-api"
+version = "0.1.0"
+dependencies = [
+ "uc-types",
+]
+
+[[package]]
+name = "uc-audit"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+ "uc-crypto",
+ "uc-types",
+]
+
+[[package]]
+name = "uc-cdr"
+version = "0.1.0"
+dependencies = [
+ "uc-types",
+]
+
+[[package]]
+name = "uc-codecs"
+version = "0.1.0"
+dependencies = [
+ "audiopus",
+ "bytes",
+ "thiserror",
+ "uc-types",
+]
+
+[[package]]
+name = "uc-crypto"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "thiserror",
+ "uc-types",
+ "zeroize",
+]
+
+[[package]]
+name = "uc-dos-protection"
+version = "0.1.0"
+dependencies = [
+ "uc-types",
+]
+
+[[package]]
+name = "uc-health"
+version = "0.1.0"
+dependencies = [
+ "uc-types",
+]
+
+[[package]]
+name = "uc-media-engine"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "proto-rtp",
+ "proto-srtp",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uc-codecs",
+ "uc-types",
+]
+
+[[package]]
+name = "uc-metrics"
+version = "0.1.0"
+dependencies = [
+ "uc-types",
+]
+
+[[package]]
+name = "uc-policy"
+version = "0.1.0"
+dependencies = [
+ "uc-types",
+]
+
+[[package]]
+name = "uc-routing"
+version = "0.1.0"
+dependencies = [
+ "uc-types",
+]
+
+[[package]]
+name = "uc-transport"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "rustls",
+ "rustls-pemfile",
+ "socket2",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tracing",
+ "uc-crypto",
+ "uc-types",
+]
+
+[[package]]
+name = "uc-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+]
 
 [[package]]
 name = "unicode-ident"

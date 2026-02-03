@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ### Added
 
+#### RFC Compliance Gaps - Phase 18 Completion
+
+**proto-ice (RFC 8445 §6.2, §9-10, RFC 7675)**
+
+- ICE connectivity check implementation (`connectivity.rs`):
+  - `ConnectivityCheck` struct for STUN-based connectivity verification
+  - `ConnectivityChecker` with triggered check queue per RFC 8445 §6.1.4
+  - `IceStunServer` for processing STUN Binding requests/responses
+  - `CheckResult` states: Success, Failure, Timeout, RoleConflict, InvalidCredentials
+  - USE-CANDIDATE nomination for controlled/controlling role
+  - Role conflict handling with 487 error response
+  - Transaction ID generation and tracking
+
+- ICE consent and keepalive implementation (`consent.rs`):
+  - `ConsentTracker` with 5-second check interval per RFC 7675
+  - 30-second consent timeout with automatic expiration
+  - `KeepaliveTracker` with 15-second STUN Binding indications
+  - `ConsentKeepaliveManager` combining consent and keepalive logic
+  - `ConsentState` enum: Pending, Granted, Expired
+  - `ConsentKeepaliveAction` enum for poll-based state machine
+
+**proto-dtls (RFC 5764)**
+
+- SRTP keying material export (`srtp_export.rs`):
+  - `SrtpKeyExporter` for DTLS-SRTP key derivation
+  - `EXTRACTOR-dtls_srtp` exporter label per RFC 5764 §4.2
+  - 88-byte keying material layout (2×32-byte keys + 2×12-byte salts)
+  - `UseSrtpExtension` encode/decode for use_srtp TLS extension
+  - HKDF-SHA384 PRF for CNSA 2.0 compliant key derivation
+  - Support for AEAD_AES_256_GCM profile (profile ID 0x0008)
+
 #### Crate Extraction: Complete proto-* Stack
 
 - Extracted all SIP application crates into standalone `proto-*` crates for reuse:

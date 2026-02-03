@@ -52,7 +52,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 950+ tests passing, Phase 17 complete + proto-* crate extraction with RFC compliance
+**Current Status**: 1000+ tests passing, Phase 18 complete + proto-* crate extraction with RFC compliance
 
 ---
 
@@ -191,6 +191,30 @@ This document outlines the development roadmap for the USG Session Border Contro
 - [x] Per-leg early media session tracking
 - [x] Mode-based early media disposition
 
+**ICE Connectivity Checks** (RFC 8445 §6.2) ✅
+
+- [x] STUN-based connectivity check implementation in proto-ice
+- [x] ConnectivityChecker with triggered check queue
+- [x] IceStunServer for Binding request/response handling
+- [x] USE-CANDIDATE nomination and role conflict (487) handling
+- [x] CheckResult states: Success, Failure, Timeout, RoleConflict, InvalidCredentials
+
+**ICE Consent & Keepalives** (RFC 8445 §9-10, RFC 7675) ✅
+
+- [x] ConsentTracker with 5-second check interval
+- [x] 30-second consent timeout per RFC 7675
+- [x] KeepaliveTracker with 15-second STUN Binding indications
+- [x] ConsentKeepaliveManager combining consent and keepalive logic
+- [x] ConsentState: Pending, Granted, Expired
+
+**DTLS-SRTP Key Export** (RFC 5764) ✅
+
+- [x] SrtpKeyExporter for keying material derivation
+- [x] EXTRACTOR-dtls_srtp label per RFC 5764 §4.2
+- [x] 88-byte keying material layout (2×32 keys + 2×12 salts)
+- [x] UseSrtpExtension encode/decode for use_srtp negotiation
+- [x] HKDF-SHA384 PRF for CNSA 2.0 compliance
+
 ### ⏳ Phase 19: SIP Authentication & Security
 **Goal**: Production-grade SIP security
 
@@ -314,9 +338,12 @@ This document outlines the development roadmap for the USG Session Border Contro
 | RFC 3264 | Offer/Answer | ✅ Implemented |
 | RFC 3550 | RTP | ✅ Implemented |
 | RFC 3711 | SRTP | ✅ Implemented (CNSA 2.0) |
+| RFC 5764 | DTLS-SRTP | ✅ Implemented (key export) |
 | RFC 5853 | SBC Requirements | ✅ Implemented |
+| RFC 6347 | DTLS 1.2 | ✅ Implemented (replay protection) |
 | RFC 7092 | B2BUA Taxonomy | ✅ Implemented |
-| RFC 8445 | ICE | ✅ Implemented |
+| RFC 7675 | STUN Consent | ✅ Implemented |
+| RFC 8445 | ICE | ✅ Enhanced (connectivity, consent, keepalives) |
 | RFC 8224 | STIR | ✅ Implemented (ES384) |
 | RFC 8225 | PASSporT | ✅ Implemented (ES384) |
 

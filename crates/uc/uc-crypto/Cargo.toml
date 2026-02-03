@@ -1,0 +1,29 @@
+[package]
+name = "uc-crypto"
+description = "CNSA 2.0 compliant cryptographic abstraction layer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["fips"]
+# Enable FIPS 140-3 validated mode via aws-lc-rs
+fips = ["aws-lc-rs/fips"]
+# Prepare for post-quantum (ML-KEM) integration
+pqc = []
+
+[dependencies]
+aws-lc-rs.workspace = true
+uc-types = { workspace = true, features = ["serde"] }
+zeroize.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# For testing with known test vectors
+
+[lints]
+workspace = true

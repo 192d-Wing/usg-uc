@@ -1,0 +1,29 @@
+[package]
+name = "uc-codecs"
+description = "Audio codec support including Opus, G.711, and G.722"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+# Enable Opus FFI bindings (requires libopus installed on the system)
+# macOS: brew install opus
+# Ubuntu/Debian: apt install libopus-dev
+# RHEL/Fedora: dnf install opus-devel
+opus-ffi = ["dep:audiopus"]
+
+[dependencies]
+uc-types.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+
+# Optional Opus FFI bindings
+audiopus = { version = "0.2", optional = true }
+
+[lints]
+workspace = true

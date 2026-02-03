@@ -1,0 +1,23 @@
+[package]
+name = "sbc-cli"
+description = "Command-line interface for SBC management"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+uc-types.workspace = true
+sbc-config = { path = "../sbc-config" }
+uc-health.workspace = true
+uc-metrics.workspace = true
+
+[[bin]]
+name = "sbc-cli"
+path = "src/main.rs"
