@@ -1,0 +1,17 @@
+[package]
+name = "proto-transaction"
+description = "RFC 3261 SIP transaction layer state machine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+repository = "https://github.com/usg/usg-uc-sbc"
+keywords = ["sip", "transaction", "voip", "rfc3261"]
+categories = ["network-programming"]
+
+[dependencies]
+proto-sip = { path = "../proto-sip" }
+thiserror = "2.0"
+
+[lints]
+workspace = true

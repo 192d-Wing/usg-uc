@@ -1,6 +1,6 @@
 [package]
 name = "sbc-registrar"
-description = "SIP registration and location service"
+description = "SIP registration and location service for SBC"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,8 +9,8 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[dependencies]
+proto-registrar = { path = "../proto-registrar" }
+
 [lints]
 workspace = true
-
-[dependencies]
-sbc-types = { path = "../sbc-types" }

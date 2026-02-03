@@ -1,7 +1,7 @@
 //! SIP stack integration layer.
 //!
 //! This module coordinates all SIP components into a working call flow:
-//! - Message parsing via `sbc-sip`
+//! - Message parsing via `proto-sip`
 //! - Transaction handling via `sbc-transaction`
 //! - Dialog management via `sbc-dialog`
 //! - B2BUA call control via `sbc-b2bua`
@@ -14,10 +14,10 @@
 //! - **SC-8**: Transmission Confidentiality and Integrity
 
 use bytes::Bytes;
+use proto_sip::{Header, HeaderName, Method, SipMessage, StatusCode};
 use sbc_b2bua::{Call, CallId};
 use sbc_dialog::{Dialog, DialogId};
 use sbc_registrar::{LocationService, Registrar, RegistrarConfig, RegistrarMode};
-use sbc_sip::{Header, HeaderName, Method, SipMessage, StatusCode};
 use sbc_transaction::{
     ClientInviteTransaction, ClientNonInviteTransaction, ServerInviteTransaction,
     ServerNonInviteTransaction, TransactionKey,
@@ -203,7 +203,7 @@ impl SipStack {
             };
         };
 
-        let method = req.method;
+        let method = req.method.clone();
         let call_id = req.headers.call_id().map(String::from);
 
         info!(
@@ -220,7 +220,7 @@ impl SipStack {
             Method::Bye => self.handle_bye(message, source).await,
             Method::Cancel => self.handle_cancel(message, source).await,
             Method::Options => self.handle_options(message, source).await,
-            _ => self.handle_other_request(message, source).await,
+            Method::Extension(_) | _ => self.handle_other_request(message, source).await,
         }
     }
 
@@ -256,7 +256,7 @@ impl SipStack {
 
         // Create 200 OK response for now
         // In production, would validate and store bindings
-        let mut response = sbc_sip::message::SipResponse::new(StatusCode::OK);
+        let mut response = proto_sip::message::SipResponse::new(StatusCode::OK);
 
         // Copy required headers from request
         if let Some(via) = req.headers.get_value(&HeaderName::Via) {
@@ -481,10 +481,10 @@ impl SipStack {
 
 /// Creates a response from a request, copying required headers.
 fn create_response_from_request(
-    req: &sbc_sip::message::SipRequest,
+    req: &proto_sip::message::SipRequest,
     status: StatusCode,
-) -> sbc_sip::message::SipResponse {
-    let mut response = sbc_sip::message::SipResponse::new(status);
+) -> proto_sip::message::SipResponse {
+    let mut response = proto_sip::message::SipResponse::new(status);
 
     // Copy Via headers
     if let Some(via) = req.headers.get_value(&HeaderName::Via) {

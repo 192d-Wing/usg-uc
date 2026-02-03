@@ -1,6 +1,6 @@
 [package]
 name = "sbc-dialog"
-description = "SIP dialog state management"
+description = "SIP dialog state management for SBC"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,11 +10,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-sbc-types.workspace = true
-sbc-sip = { path = "../sbc-sip" }
-tokio.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
+proto-dialog = { path = "../proto-dialog" }
 
 [lints]
 workspace = true

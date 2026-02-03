@@ -148,6 +148,37 @@ impl SipUri {
         self.has_param("lr")
     }
 
+    /// Returns the user parameter (e.g., "phone" or "ip") per RFC 3261 Section 19.1.1.
+    #[must_use]
+    pub fn user_param(&self) -> Option<&str> {
+        self.get_param("user")
+    }
+
+    /// Returns true if this is a telephone URI (user=phone).
+    #[must_use]
+    pub fn is_phone(&self) -> bool {
+        self.user_param()
+            .is_some_and(|u| u.eq_ignore_ascii_case("phone"))
+    }
+
+    /// Returns the method parameter if set.
+    #[must_use]
+    pub fn method_param(&self) -> Option<&str> {
+        self.get_param("method")
+    }
+
+    /// Returns the ttl parameter (for multicast) per RFC 3261 Section 19.1.1.
+    #[must_use]
+    pub fn ttl(&self) -> Option<u8> {
+        self.get_param("ttl").and_then(|v| v.parse().ok())
+    }
+
+    /// Returns the maddr parameter (multicast address) per RFC 3261 Section 19.1.1.
+    #[must_use]
+    pub fn maddr(&self) -> Option<&str> {
+        self.get_param("maddr")
+    }
+
     /// Returns the effective port (default 5060 for sip, 5061 for sips).
     #[must_use]
     pub fn effective_port(&self) -> u16 {
@@ -214,7 +245,17 @@ impl fmt::Display for SipUri {
 impl FromStr for SipUri {
     type Err = SipError;
 
+    /// Parses a SIP URI string.
+    ///
+    /// # Loop Bounds (Power of 10 Rule 2)
+    ///
+    /// - `split(';')` bounded by input length
+    /// - `split('&')` bounded by input length
+    /// - All iterations terminate in O(n) where n = input length
     fn from_str(s: &str) -> SipResult<Self> {
+        // Power of 10 Rule 5: Assert precondition
+        debug_assert!(!s.is_empty(), "empty URI string");
+
         // Split scheme
         let (scheme_str, rest) = s.split_once(':').ok_or_else(|| SipError::InvalidUri {
             reason: "missing scheme separator".to_string(),
@@ -230,7 +271,12 @@ impl FromStr for SipUri {
         };
 
         // Split params
+        // Loop bound: split(';') bounded by rest.len()
         let parts: Vec<&str> = rest.split(';').collect();
+
+        // Power of 10 Rule 5: Assert parts is non-empty
+        debug_assert!(!parts.is_empty(), "split always produces at least one element");
+
         let user_host_port = parts.first().ok_or_else(|| SipError::InvalidUri {
             reason: "missing host".to_string(),
         })?;

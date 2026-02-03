@@ -1,4 +1,10 @@
 //! SIP response status codes per RFC 3261.
+//!
+//! # Safety-Critical Code Compliance (Power of 10)
+//!
+//! - All functions have bounded execution
+//! - Functions include debug assertions for invariant checking
+//! - No recursion is used
 
 use crate::error::{SipError, SipResult};
 use std::fmt;
@@ -125,6 +131,13 @@ impl StatusCode {
         if !(100..=699).contains(&code) {
             return Err(SipError::InvalidStatusCode { code });
         }
+
+        // Power of 10 Rule 5: Assert post-condition after validation
+        debug_assert!(
+            (100..=699).contains(&code),
+            "validated status code should be in range"
+        );
+
         Ok(Self(code))
     }
 
@@ -227,7 +240,7 @@ impl StatusCode {
             600 => "Busy Everywhere",
             603 => "Decline",
             604 => "Does Not Exist Anywhere",
-            606 => "Not Acceptable",
+            606 => "Not Acceptable (Global)",
             _ => "Unknown",
         }
     }

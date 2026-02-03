@@ -392,15 +392,12 @@ impl ClientNonInviteTransaction {
                 }
 
                 // Check Timer E
+                // RFC 3261 Section 17.1.2.2: Timer E caps at T2 in both Trying and Proceeding states
                 if let Some(deadline) = self.timer_e_deadline {
                     if now >= deadline {
                         self.retransmit_count += 1;
-                        let t2 = if self.state == ClientNonInviteState::Proceeding {
-                            self.timer_config.t2
-                        } else {
-                            self.timer_config.t4
-                        };
-                        self.timer_e_value = next_retransmit_interval(self.timer_e_value, t2);
+                        self.timer_e_value =
+                            next_retransmit_interval(self.timer_e_value, self.timer_config.t2);
                         self.timer_e_deadline = Some(now + self.timer_e_value);
                         return Some(TimerType::TimerE);
                     }
@@ -514,6 +511,31 @@ mod tests {
 
         // Receive 200
         assert!(tx.receive_response(200).unwrap());
+        assert_eq!(tx.state(), ClientNonInviteState::Completed);
+    }
+
+    #[test]
+    fn test_client_update_transaction() {
+        // RFC 3311: UPDATE uses non-INVITE transaction state machine
+        let key = TransactionKey::client("z9hG4bK776asdhds", "UPDATE");
+        let mut tx = ClientNonInviteTransaction::new(key, TransportType::Unreliable);
+
+        assert_eq!(tx.state(), ClientNonInviteState::Trying);
+        assert_eq!(tx.key().method, "UPDATE");
+
+        // Receive 200 OK (session modified)
+        assert!(tx.receive_response(200).unwrap());
+        assert_eq!(tx.state(), ClientNonInviteState::Completed);
+    }
+
+    #[test]
+    fn test_client_update_with_session_timer_refresh() {
+        // RFC 4028: UPDATE can be used for session timer refresh
+        let key = TransactionKey::client("z9hG4bK776asdhds", "UPDATE");
+        let mut tx = ClientNonInviteTransaction::new(key, TransportType::Unreliable);
+
+        // Receive 422 (Session Interval Too Small)
+        assert!(tx.receive_response(422).unwrap());
         assert_eq!(tx.state(), ClientNonInviteState::Completed);
     }
 }

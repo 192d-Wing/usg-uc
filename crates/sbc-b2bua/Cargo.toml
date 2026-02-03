@@ -1,6 +1,6 @@
 [package]
 name = "sbc-b2bua"
-description = "Back-to-back user agent core implementation"
+description = "Back-to-back user agent implementation for SBC"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,8 +9,8 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[dependencies]
+proto-b2bua = { path = "../proto-b2bua" }
+
 [lints]
 workspace = true
-
-[dependencies]
-sbc-types = { path = "../sbc-types" }

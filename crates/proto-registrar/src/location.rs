@@ -137,6 +137,51 @@ impl LocationService {
         })
     }
 
+    /// Gets all bindings for a specific instance-id (RFC 5626).
+    ///
+    /// This is useful for finding all flows from a single UA instance.
+    /// Returns bindings sorted by reg-id.
+    pub fn get_bindings_by_instance(&self, aor: &str, instance_id: &str) -> Vec<&Binding> {
+        let mut result: Vec<&Binding> = self
+            .bindings
+            .get(aor)
+            .map(|bindings| {
+                bindings
+                    .iter()
+                    .filter(|b| b.instance_id() == Some(instance_id))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Sort by reg-id
+        result.sort_by_key(|b| b.reg_id());
+        result
+    }
+
+    /// Removes a binding by its binding key (instance-id + reg-id for outbound).
+    pub fn remove_binding_by_key(&mut self, aor: &str, binding_key: &str) -> RegistrarResult<()> {
+        let bindings = self
+            .bindings
+            .get_mut(aor)
+            .ok_or_else(|| RegistrarError::AorNotFound { aor: aor.to_string() })?;
+
+        let pos = bindings
+            .iter()
+            .position(|b| b.binding_key() == binding_key)
+            .ok_or_else(|| RegistrarError::BindingNotFound {
+                contact: binding_key.to_string(),
+            })?;
+
+        bindings.remove(pos);
+
+        // Remove AOR if no more bindings
+        if bindings.is_empty() {
+            self.bindings.remove(aor);
+        }
+
+        Ok(())
+    }
+
     /// Checks if an AOR has any bindings.
     pub fn has_bindings(&self, aor: &str) -> bool {
         self.bindings
@@ -379,5 +424,90 @@ mod tests {
             .get_binding("sip:alice@example.com", "sip:alice@192.168.1.100:5060")
             .unwrap();
         assert!((binding.q_value() - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_outbound_binding_key() {
+        let mut service = LocationService::new();
+
+        // Create two outbound bindings with same instance-id but different reg-ids
+        let mut binding1 = test_binding("sip:alice@example.com", "sip:alice@192.168.1.100:5060");
+        binding1.set_instance_id("<urn:uuid:test-instance>");
+        binding1.set_reg_id(1);
+
+        let mut binding2 = test_binding("sip:alice@example.com", "sip:alice@192.168.1.200:5060");
+        binding2.set_instance_id("<urn:uuid:test-instance>");
+        binding2.set_reg_id(2);
+
+        service.add_binding(binding1).unwrap();
+        service.add_binding(binding2).unwrap();
+
+        // Should have 2 separate bindings
+        assert_eq!(service.binding_count("sip:alice@example.com"), 2);
+
+        // Update binding with same instance-id and reg-id
+        let mut binding3 = test_binding("sip:alice@example.com", "sip:alice@10.0.0.50:5060");
+        binding3.set_instance_id("<urn:uuid:test-instance>");
+        binding3.set_reg_id(1);
+        binding3.set_q_value(0.5);
+
+        service.add_binding(binding3).unwrap();
+
+        // Should still have 2 bindings (binding1 was updated, not added)
+        assert_eq!(service.binding_count("sip:alice@example.com"), 2);
+    }
+
+    #[test]
+    fn test_get_bindings_by_instance() {
+        let mut service = LocationService::new();
+
+        // Create bindings with different instance-ids
+        let mut binding1 = test_binding("sip:alice@example.com", "sip:alice@192.168.1.100:5060");
+        binding1.set_instance_id("<urn:uuid:instance-1>");
+        binding1.set_reg_id(1);
+
+        let mut binding2 = test_binding("sip:alice@example.com", "sip:alice@192.168.1.200:5060");
+        binding2.set_instance_id("<urn:uuid:instance-1>");
+        binding2.set_reg_id(2);
+
+        let mut binding3 = test_binding("sip:alice@example.com", "sip:alice@192.168.2.100:5060");
+        binding3.set_instance_id("<urn:uuid:instance-2>");
+        binding3.set_reg_id(1);
+
+        service.add_binding(binding1).unwrap();
+        service.add_binding(binding2).unwrap();
+        service.add_binding(binding3).unwrap();
+
+        // Get bindings for instance-1
+        let instance1_bindings =
+            service.get_bindings_by_instance("sip:alice@example.com", "<urn:uuid:instance-1>");
+        assert_eq!(instance1_bindings.len(), 2);
+
+        // Should be sorted by reg-id
+        assert_eq!(instance1_bindings[0].reg_id(), Some(1));
+        assert_eq!(instance1_bindings[1].reg_id(), Some(2));
+
+        // Get bindings for instance-2
+        let instance2_bindings =
+            service.get_bindings_by_instance("sip:alice@example.com", "<urn:uuid:instance-2>");
+        assert_eq!(instance2_bindings.len(), 1);
+    }
+
+    #[test]
+    fn test_remove_binding_by_key() {
+        let mut service = LocationService::new();
+
+        let mut binding = test_binding("sip:alice@example.com", "sip:alice@192.168.1.100:5060");
+        binding.set_instance_id("<urn:uuid:test>");
+        binding.set_reg_id(1);
+
+        service.add_binding(binding).unwrap();
+        assert_eq!(service.binding_count("sip:alice@example.com"), 1);
+
+        // Remove by binding key
+        service
+            .remove_binding_by_key("sip:alice@example.com", "<urn:uuid:test>:1")
+            .unwrap();
+        assert_eq!(service.binding_count("sip:alice@example.com"), 0);
     }
 }

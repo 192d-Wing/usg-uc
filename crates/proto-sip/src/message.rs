@@ -26,6 +26,9 @@ impl SipMessage {
     ///
     /// Returns an error if parsing fails.
     pub fn parse(data: &[u8]) -> SipResult<Self> {
+        // Power of 10 Rule 5: Assert preconditions
+        debug_assert!(!data.is_empty(), "empty data passed to parse");
+
         if data.len() > MAX_MESSAGE_SIZE {
             return Err(SipError::MessageTooLarge {
                 size: data.len(),
@@ -36,6 +39,9 @@ impl SipMessage {
         let text = std::str::from_utf8(data).map_err(|e| SipError::ParseError {
             reason: format!("invalid UTF-8: {e}"),
         })?;
+
+        // Power of 10 Rule 5: Assert post-parse invariant
+        debug_assert!(!text.is_empty(), "UTF-8 conversion produced empty string");
 
         text.parse()
     }
@@ -84,7 +90,7 @@ impl SipMessage {
         self.headers().call_id()
     }
 
-    /// Returns the CSeq.
+    /// Returns the `CSeq`.
     #[must_use]
     pub fn cseq(&self) -> Option<&str> {
         self.headers().cseq()
@@ -167,8 +173,17 @@ impl SipRequest {
     }
 
     /// Parses request from first line and rest of message.
+    ///
+    /// # Loop Bounds (Power of 10 Rule 2)
+    ///
+    /// - `split_whitespace()` is bounded by input length
+    /// - Header parsing loops bounded by message size
     fn parse_with_rest(first_line: &str, rest: &str) -> SipResult<Self> {
+        // Power of 10 Rule 5: Assert preconditions
+        debug_assert!(!first_line.is_empty(), "empty first line");
+
         // Parse: METHOD uri SIP/2.0
+        // Loop bound: split_whitespace iterates at most first_line.len() times
         let parts: Vec<&str> = first_line.split_whitespace().collect();
         if parts.len() != 3 {
             return Err(SipError::ParseError {
@@ -176,7 +191,13 @@ impl SipRequest {
             });
         }
 
-        let method: Method = parts[0].parse()?;
+        // Power of 10 Rule 5: Assert parts count
+        debug_assert_eq!(parts.len(), 3, "request line must have exactly 3 parts");
+
+        // Method parsing is infallible - unknown methods become Extension variants
+        let method: Method = parts[0]
+            .parse()
+            .unwrap_or_else(|e: std::convert::Infallible| match e {});
         let uri: SipUri = parts[1].parse()?;
 
         if parts[2] != SIP_VERSION {
@@ -186,6 +207,9 @@ impl SipRequest {
         }
 
         let (headers, body) = parse_headers_and_body(rest)?;
+
+        // Power of 10 Rule 5: Assert post-conditions
+        debug_assert!(!method.as_str().is_empty(), "method cannot be empty");
 
         Ok(Self {
             method,
@@ -293,7 +317,7 @@ impl SipResponse {
         })?;
 
         let status = StatusCode::new(code)?;
-        let reason = parts.get(2).map(|s| s.to_string());
+        let reason = parts.get(2).map(ToString::to_string);
 
         let (headers, body) = parse_headers_and_body(rest)?;
 
@@ -337,6 +361,11 @@ impl fmt::Display for SipResponse {
 }
 
 /// Parses headers and body from message rest.
+///
+/// # Loop Bounds (Power of 10 Rule 2)
+///
+/// - `header_section.lines()` is bounded by input string length
+/// - Maximum iterations: `header_section.len()` (one per character worst case)
 fn parse_headers_and_body(rest: &str) -> SipResult<(Headers, Option<Bytes>)> {
     let mut headers = Headers::new();
 
@@ -350,6 +379,7 @@ fn parse_headers_and_body(rest: &str) -> SipResult<(Headers, Option<Bytes>)> {
     };
 
     // Parse headers
+    // Power of 10 Rule 2: Loop bounded by header_section.lines() count
     let mut current_header: Option<String> = None;
 
     for line in header_section.lines() {
@@ -384,7 +414,12 @@ fn parse_headers_and_body(rest: &str) -> SipResult<(Headers, Option<Bytes>)> {
 
     // Validate Content-Length if present
     if let Some(expected) = headers.content_length() {
-        let actual = body.as_ref().map(|b| b.len()).unwrap_or(0);
+        let actual = body.as_ref().map_or(0, Bytes::len);
+        // Power of 10 Rule 5: Assert content length invariant
+        debug_assert!(
+            expected <= crate::MAX_MESSAGE_SIZE,
+            "Content-Length exceeds max message size"
+        );
         if expected != actual {
             return Err(SipError::ContentLengthMismatch {
                 header: expected,

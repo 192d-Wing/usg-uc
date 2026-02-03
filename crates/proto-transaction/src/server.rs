@@ -100,7 +100,10 @@ impl ServerInviteTransaction {
                     // 1xx - stay in Proceeding
                     Ok(())
                 } else if (200..300).contains(&status_code) {
-                    // 2xx - terminate (handled by TU for INVITE)
+                    // RFC 3261 Section 17.2.1: 2xx responses are NOT handled by the
+                    // server INVITE transaction. The TU (Transaction User) is responsible
+                    // for retransmitting 2xx responses and receiving the ACK directly.
+                    // The transaction terminates immediately and the dialog layer takes over.
                     self.state = ServerInviteState::Terminated;
                     Ok(())
                 } else if (300..700).contains(&status_code) {

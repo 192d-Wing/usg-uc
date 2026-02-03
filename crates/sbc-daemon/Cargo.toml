@@ -18,7 +18,7 @@ sbc-config = { path = "../sbc-config" }
 sbc-health = { path = "../sbc-health" }
 sbc-metrics = { path = "../sbc-metrics" }
 sbc-transport = { path = "../sbc-transport" }
-sbc-sip = { path = "../sbc-sip" }
+proto-sip = { path = "../proto-sip" }
 sbc-transaction = { path = "../sbc-transaction" }
 sbc-dialog = { path = "../sbc-dialog" }
 sbc-b2bua = { path = "../sbc-b2bua" }

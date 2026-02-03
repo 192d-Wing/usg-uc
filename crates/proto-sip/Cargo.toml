@@ -1,0 +1,29 @@
+[package]
+name = "proto-sip"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+description = "RFC 3261 compliant SIP protocol message parsing and generation"
+repository = "https://github.com/usg/proto-sip"
+keywords = ["sip", "voip", "rfc3261", "protocol", "parser"]
+categories = ["network-programming", "parser-implementations"]
+readme = "README.md"
+
+[dependencies]
+thiserror = "2.0"
+bytes = "1.9"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[package.metadata.docs.rs]
+all-features = true

@@ -11,7 +11,11 @@ members = [
     "crates/sbc-dtls",
 
     # Layer 2: Protocol Core
-    "crates/sbc-sip",
+    "crates/proto-sip",
+    "crates/proto-transaction",
+    "crates/proto-dialog",
+    "crates/proto-b2bua",
+    "crates/proto-registrar",
     "crates/sbc-sdp",
     "crates/sbc-rtp",
     "crates/sbc-srtp",
@@ -127,6 +131,10 @@ sbc-stun = { path = "crates/sbc-stun" }
 sbc-turn = { path = "crates/sbc-turn" }
 sbc-codecs = { path = "crates/sbc-codecs" }
 sbc-media-engine = { path = "crates/sbc-media-engine" }
+proto-transaction = { path = "crates/proto-transaction" }
+proto-dialog = { path = "crates/proto-dialog" }
+proto-b2bua = { path = "crates/proto-b2bua" }
+proto-registrar = { path = "crates/proto-registrar" }
 sbc-transaction = { path = "crates/sbc-transaction" }
 sbc-dialog = { path = "crates/sbc-dialog" }
 sbc-b2bua = { path = "crates/sbc-b2bua" }

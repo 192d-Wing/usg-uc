@@ -58,7 +58,7 @@ pub enum TransactionError {
 
     /// SIP error.
     #[error("SIP error: {0}")]
-    Sip(#[from] sbc_sip::SipError),
+    Sip(#[from] proto_sip::SipError),
 }
 
 #[cfg(test)]

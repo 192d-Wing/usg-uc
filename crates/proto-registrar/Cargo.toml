@@ -1,0 +1,16 @@
+[package]
+name = "proto-registrar"
+description = "RFC 3261 SIP Registrar and Location Service"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/usg/usg-uc-sbc"
+keywords = ["sip", "registrar", "voip", "rfc3261"]
+categories = ["network-programming"]
+
+[dependencies]
+thiserror = "2.0"
+
+[lints]
+workspace = true

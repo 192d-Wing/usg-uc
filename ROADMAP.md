@@ -5,14 +5,14 @@ This document outlines the development roadmap for the USG Session Border Contro
 ## Completed Phases
 
 ### ✅ Phase 1-2: Foundation & Transport
-- Workspace structure with 28 crates in 9 layers
+- Workspace structure with 27 crates in 9 layers
 - Foundation crates: `sbc-types`, `sbc-crypto`, `sbc-audit`, `sbc-config`
 - CNSA 2.0 cryptographic compliance enforcement
 - NIST 800-53 Rev5 audit logging infrastructure
 - Transport crates: `sbc-transport`, `sbc-dtls`
 
 ### ✅ Phase 3: Protocol Core
-- `sbc-sip`: SIP message parsing and generation
+- `proto-sip`: RFC 3261 SIP message parsing and generation (standalone, reusable)
 - `sbc-sdp`: SDP offer/answer model
 - `sbc-rtp`: RTP packet handling
 - `sbc-srtp`: Custom CNSA 2.0 compliant SRTP (AES-256-GCM, SHA-384 KDF)
@@ -26,11 +26,13 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-codecs`: Opus, G.711 (pure Rust), G.722 codec support
 - `sbc-media-engine`: Media relay and pass-through modes
 
-### ✅ Phase 6: SIP Application
-- `sbc-transaction`: SIP transaction state machine
-- `sbc-dialog`: SIP dialog management with session timers
-- `sbc-b2bua`: B2BUA core per RFC 7092
-- `sbc-registrar`: SIP registration with B2BUA and proxy modes
+### ✅ Phase 6: SIP Application (Extracted to proto-* crates)
+- `proto-sip`: RFC 3261 SIP parsing, RFC 2617 digest auth, RFC 3327 Path header
+- `proto-transaction`: RFC 3261 §17 transaction FSM, CSeq validation, RFC 3311 UPDATE
+- `proto-dialog`: RFC 3261 §12 dialogs, RFC 3515 REFER, RFC 4028 session timers, forking support
+- `proto-b2bua`: RFC 7092 B2BUA modes, RFC 5853 SBC, SDP rewriting, topology hiding
+- `proto-registrar`: RFC 3261 §10 registration, RFC 5626 outbound, RFC 5627 GRUU
+- `sbc-transaction`, `sbc-dialog`, `sbc-b2bua`, `sbc-registrar`: Thin wrappers re-exporting proto-* crates
 
 ### ✅ Phase 7: Security Services
 - `sbc-stir-shaken`: STIR/SHAKEN with ES384 only (CNSA 2.0)
@@ -50,7 +52,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 909 tests passing, Phase 17 in progress
+**Current Status**: 950+ tests passing, Phase 17 complete + proto-* crate extraction with RFC compliance
 
 ---
 
@@ -68,7 +70,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 ### ✅ Phase 11: SIP Stack Integration
 **Goal**: Connect SIP components into working call flow
 
-- [x] Integrate sbc-sip with transport layer
+- [x] Integrate proto-sip with transport layer
 - [x] Wire sbc-transaction for request/response handling
 - [x] Connect sbc-dialog for call state management
 - [x] Enable sbc-b2bua for call bridging
@@ -157,42 +159,76 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 ## Future Development Phases
 
-### ⏳ Phase 18: SIP Authentication & Security
+### 🔄 Phase 18: RFC Compliance Completion
+**Goal**: Complete remaining RFC compliance gaps
+
+**Reliable Provisional Responses** (RFC 3262)
+
+- [ ] 100rel extension support in proto-transaction
+- [ ] PRACK method transaction state machine
+- [ ] RAck header parsing and validation
+- [ ] Provisional response retransmission
+
+**Event Framework** (RFC 6665)
+
+- [ ] SUBSCRIBE dialog creation in proto-dialog
+- [ ] NOTIFY handling and state updates
+- [ ] Event package subscription lifecycle
+
+**REGISTER Response** (RFC 3261 §10.3)
+
+- [ ] Echo registered contacts in 200 OK
+- [ ] Include expiry for each binding
+- [ ] Service-Route header support
+
+**Path Header Integration** (RFC 3327)
+
+- [ ] Path header processing in proto-registrar
+- [ ] Path storage in bindings
+- [ ] Path inclusion in routing
+
+### ⏳ Phase 19: SIP Authentication & Security
 **Goal**: Production-grade SIP security
 
 **SIP Digest Authentication** (RFC 3261 Section 22)
-- [ ] Implement HTTP Digest authentication for SIP
-- [ ] Add nonce generation and validation
-- [ ] Support qop=auth and qop=auth-int
-- [ ] Add authentication state to registrar
+
+- [x] HTTP Digest computation (MD5, SHA-256, SHA-512-256) in proto-sip
+- [ ] Nonce generation and validation in proto-registrar
+- [ ] qop=auth and qop=auth-int support
+- [ ] Authentication state management
 
 **Topology Hiding** (RFC 5765)
-- [ ] Via header stripping/rewriting
+
+- [x] TopologyHidingConfig in proto-b2bua
+- [ ] Via header stripping/rewriting implementation
 - [ ] Contact header anonymization
 - [ ] Record-Route manipulation
 - [ ] Call-ID obfuscation
 
 **SRTP-SDES Key Exchange** (RFC 4568)
+
 - [ ] Parse crypto attributes from SDP
 - [ ] Generate SRTP keys from SDES
 - [ ] Support fallback from DTLS-SRTP to SDES
 
-### ⏳ Phase 19: WebRTC & Modern Transports
+### ⏳ Phase 20: WebRTC & Modern Transports
 **Goal**: WebRTC gateway support
 
 **WebSocket SIP Transport** (RFC 7118)
+
 - [ ] Add WebSocket listener to sbc-transport
 - [ ] Implement SIP-over-WebSocket framing
 - [ ] Add secure WebSocket (WSS) support
 - [ ] Handle WebSocket ping/pong keepalives
 
 **WebRTC Gateway**
+
 - [ ] SIP-to-WebRTC call bridging
 - [ ] SDP munging for WebRTC compatibility
 - [ ] ICE candidate trickling support
 - [ ] SRTP-to-DTLS-SRTP interworking
 
-### ⏳ Phase 20: Advanced SBC Features
+### ⏳ Phase 21: Advanced SBC Features
 **Goal**: Enterprise-grade SBC functionality
 
 **Header Manipulation Engine**
@@ -269,7 +305,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 | RFC | Title | Status |
 |-----|-------|--------|
-| RFC 3261 | SIP Core | ✅ Implemented |
+| RFC 3261 | SIP Core | ✅ Enhanced (~90% compliant) |
 | RFC 4566 | SDP | ✅ Implemented |
 | RFC 3264 | Offer/Answer | ✅ Implemented |
 | RFC 3550 | RTP | ✅ Implemented |

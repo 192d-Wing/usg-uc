@@ -993,6 +993,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "proto-b2bua"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "proto-dialog"
+version = "0.1.0"
+dependencies = [
+ "proto-sip",
+ "thiserror",
+]
+
+[[package]]
+name = "proto-registrar"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "proto-sip"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror",
+]
+
+[[package]]
+name = "proto-transaction"
+version = "0.1.0"
+dependencies = [
+ "proto-sip",
+ "thiserror",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1182,7 +1220,7 @@ dependencies = [
 name = "sbc-b2bua"
 version = "0.1.0"
 dependencies = [
- "sbc-types",
+ "proto-b2bua",
 ]
 
 [[package]]
@@ -1241,6 +1279,7 @@ dependencies = [
  "bytes",
  "hyper",
  "hyper-util",
+ "proto-sip",
  "rustls",
  "rustls-pemfile",
  "sbc-api",
@@ -1256,7 +1295,6 @@ dependencies = [
  "sbc-metrics",
  "sbc-registrar",
  "sbc-rtp",
- "sbc-sip",
  "sbc-srtp",
  "sbc-stun",
  "sbc-transaction",
@@ -1277,11 +1315,7 @@ dependencies = [
 name = "sbc-dialog"
 version = "0.1.0"
 dependencies = [
- "sbc-sip",
- "sbc-types",
- "thiserror",
- "tokio",
- "tracing",
+ "proto-dialog",
 ]
 
 [[package]]
@@ -1370,7 +1404,7 @@ dependencies = [
 name = "sbc-registrar"
 version = "0.1.0"
 dependencies = [
- "sbc-types",
+ "proto-registrar",
 ]
 
 [[package]]
@@ -1394,16 +1428,6 @@ dependencies = [
 name = "sbc-sdp"
 version = "0.1.0"
 dependencies = [
- "sbc-types",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "sbc-sip"
-version = "0.1.0"
-dependencies = [
- "bytes",
  "sbc-types",
  "thiserror",
  "tracing",
@@ -1445,11 +1469,7 @@ dependencies = [
 name = "sbc-transaction"
 version = "0.1.0"
 dependencies = [
- "sbc-sip",
- "sbc-types",
- "thiserror",
- "tokio",
- "tracing",
+ "proto-transaction",
 ]
 
 [[package]]
