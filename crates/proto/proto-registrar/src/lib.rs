@@ -58,7 +58,10 @@ pub mod registrar;
 
 pub use binding::{Binding, BindingState};
 pub use error::{RegistrarError, RegistrarResult};
-pub use gruu::{is_gruu, parse_gr_parameter, GruuEntry, GruuGenerator, GruuService};
+pub use gruu::{
+    extract_gruu_info, is_gruu, parse_gr_parameter, GruuEntry, GruuGenerator, GruuRouter,
+    GruuRoutingResult, GruuService,
+};
 pub use location::LocationService;
 pub use outbound::{
     Flow, FlowAction, FlowId, FlowState, FlowToken, FlowTransport, OutboundFlowManager,

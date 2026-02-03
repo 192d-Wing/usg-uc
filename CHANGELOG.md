@@ -110,6 +110,61 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - `create_stale_nonce_response()` for 438 generation
   - Configurable nonce lifetime (default 10 minutes per RFC 5389)
 
+#### P2 Medium Priority RFC Compliance Gaps
+
+**proto-registrar (RFC 5627 §5.1)**
+
+- Proxy GRUU routing (`gruu.rs`):
+  - `GruuRouter` for RFC 5627 §5.1 compliant GRUU routing
+  - `GruuRoutingResult` enum: Resolved, RegistrationExpired, NotFound, NotAGruu
+  - `route()` - resolves GRUU URI to routing target
+  - `route_to_binding()` - returns full Binding for GRUU
+  - `is_gruu_active()` - checks if GRUU has active registration
+  - `get_aor_for_gruu()` - extracts AOR for authorization
+  - `extract_gruu_info()` - parses GRUU type (public vs temporary)
+  - Path header forwarding for outbound flows
+  - Lowest reg-id selection per RFC 5627 §5.1 for multiple flows
+
+**proto-rtp (RFC 3550 §6.3.5)**
+
+- RTCP transmission scheduling (`scheduler.rs`):
+  - `RtcpScheduler` implementing RFC 3550 Appendix A.7 algorithm
+  - `SessionParams` for bandwidth, members, senders configuration
+  - `compute_deterministic_interval()` based on RTCP bandwidth and participants
+  - `compute_interval()` with [0.5, 1.5] randomization per §6.3.5
+  - Sender/receiver bandwidth separation (25%/75%) per §6.3.1
+  - Initial interval halving per §6.3.6
+  - Timer reconsideration for membership changes
+  - `IntervalBounds` for interval validation
+  - Constants: `RTCP_MIN_INTERVAL_SECS`, `RTCP_BANDWIDTH_FRACTION`, `RTCP_COMPENSATION_FACTOR`
+
+**proto-dialog (RFC 6665 §7.2)**
+
+- Event package validation (`subscription.rs`):
+  - `EventPackageRegistry` for IANA registration validation per RFC 6665 §7.2
+  - `EventPackageValidation` enum: Valid, UnregisteredAllowed, Invalid
+  - `IANA_REGISTERED_EVENT_PACKAGES` constant with all known packages
+  - `validate()` - validates event type against registry
+  - `is_iana_registered()` - checks IANA registration status
+  - `add_custom_package()` / `remove_custom_package()` - extension support
+  - Strict mode (rejects unregistered) vs permissive mode (warns only)
+  - Case-insensitive validation
+  - Convenience functions: `validate_event_package()`, `is_event_package_registered()`
+
+**proto-sdp (RFC 4566 §5.11)**
+
+- Repeat times r= line support (`session.rs`):
+  - `RepeatTimes` struct per RFC 4566 §5.11
+  - `TimeValue` with compact notation support (d/h/m/s suffixes)
+  - `Timing` extended with `repeat_times` field
+  - `RepeatTimes::parse()` / `to_string()` for r= line handling
+  - `TimeValue::from_days()`, `from_hours()`, `from_minutes()`, `from_seconds()`
+  - `TimeValue::to_compact_string()` for efficient encoding
+  - `RepeatTimes::daily()` / `weekly()` convenience constructors
+  - `is_valid()` validation (interval, duration, offsets)
+  - Full SDP parsing/generation roundtrip support
+  - Exported `Origin`, `Timing`, `RepeatTimes`, `TimeValue` from lib.rs
+
 #### RFC Compliance Gaps - Phase 18 Completion
 
 **proto-ice (RFC 8445 §6.2, §9-10, RFC 7675)**

@@ -17,7 +17,13 @@
 //! - `message-summary` (RFC 3842) - Message waiting indication
 //! - `refer` (RFC 3515) - REFER implicit subscription
 //! - `reg` (RFC 3680) - Registration state
+//!
+//! ## Event Package Validation (RFC 6665 §7.2)
+//!
+//! Per RFC 6665 §7.2, event packages MUST be registered with IANA.
+//! This module provides validation against known IANA registrations.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 /// Default subscription expiration (3600 seconds per RFC 6665).
@@ -604,6 +610,287 @@ pub fn format_allow_events(events: &[String]) -> String {
     events.join(", ")
 }
 
+// ============================================================================
+// RFC 6665 §7.2 - Event Package Validation
+// ============================================================================
+
+/// IANA-registered SIP event packages per RFC 6665 §7.2.
+///
+/// This list contains event packages registered with IANA as of 2024.
+/// See: https://www.iana.org/assignments/sip-events/sip-events.xhtml
+pub const IANA_REGISTERED_EVENT_PACKAGES: &[&str] = &[
+    // RFC 3265/6665 - SIP-Specific Event Notification
+    "presence",
+    // RFC 3515 - REFER Method
+    "refer",
+    // RFC 3680 - Registration Event Package
+    "reg",
+    // RFC 3842 - Message Waiting Indication
+    "message-summary",
+    // RFC 3856 - Presence Event Package
+    "presence",
+    // RFC 3857 - Watcher Information
+    "presence.winfo",
+    // RFC 4235 - Dialog Event Package
+    "dialog",
+    // RFC 4538 - Media Authorization
+    "ua-profile",
+    // RFC 4575 - Conference Event Package
+    "conference",
+    // RFC 4730 - KPML (Key Press Markup Language)
+    "kpml",
+    // RFC 5070 - Consent Event Package
+    "consent-pending-additions",
+    // RFC 5362 - Resource Lists Event Package
+    "presence.rl",
+    // RFC 5359 - Line Event Package
+    "line-seize",
+    // RFC 5373 - Call Completion
+    "call-completion",
+    // RFC 5628 - Media Description Changes
+    "Mediadesc",
+    // RFC 6446 - Session Recording
+    "session-recording",
+    // RFC 6665 - SIP Events
+    "poc-settings",
+    // RFC 6910 - Auto-Configuration
+    "as-feature-event",
+    // RFC 7614 - Location Conveyance
+    "held",
+    // RFC 7840 - Registration for Multiple Phone Numbers
+    "reg",
+    // RFC 8068 - Pending Additions
+    "pending-additions",
+    // Additional commonly used packages
+    "vq-rtcpxr", // VoIP metrics (RFC 6035)
+    "xcap-diff", // XCAP Diff Event (RFC 5875)
+    "spirits-INDPs",
+    "spirits-user-prof",
+    "dialog.winfo",
+    "reg.winfo",
+    "message-summary.winfo",
+    "pres", // Alias for presence
+];
+
+/// Result of event package validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventPackageValidation {
+    /// Event package is IANA-registered and valid.
+    Valid,
+    /// Event package is not IANA-registered but allowed (warn).
+    UnregisteredAllowed {
+        /// Warning message.
+        warning: String,
+    },
+    /// Event package is not IANA-registered and not allowed.
+    Invalid {
+        /// Error reason.
+        reason: String,
+    },
+}
+
+/// Event package registry for validation per RFC 6665 §7.2.
+///
+/// Per RFC 6665, event packages MUST be registered with IANA.
+/// This registry provides validation against known registrations
+/// and can be configured to allow or reject unknown packages.
+///
+/// ## Example
+///
+/// ```
+/// use proto_dialog::subscription::{EventPackageRegistry, EventPackageValidation};
+///
+/// let registry = EventPackageRegistry::new();
+///
+/// // Validate known package
+/// assert!(matches!(
+///     registry.validate("presence"),
+///     EventPackageValidation::Valid
+/// ));
+///
+/// // Unknown package
+/// let result = registry.validate("unknown-event");
+/// assert!(matches!(result, EventPackageValidation::UnregisteredAllowed { .. }));
+///
+/// // Strict mode rejects unknown packages
+/// let strict = EventPackageRegistry::strict();
+/// let result = strict.validate("unknown-event");
+/// assert!(matches!(result, EventPackageValidation::Invalid { .. }));
+/// ```
+#[derive(Debug, Clone)]
+pub struct EventPackageRegistry {
+    /// Set of known IANA-registered packages.
+    registered: HashSet<String>,
+    /// Whether to allow unregistered packages (with warning).
+    allow_unregistered: bool,
+    /// Additional custom packages allowed.
+    custom_packages: HashSet<String>,
+}
+
+impl Default for EventPackageRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EventPackageRegistry {
+    /// Creates a new registry with IANA-registered packages.
+    ///
+    /// By default, allows unregistered packages with a warning.
+    #[must_use]
+    pub fn new() -> Self {
+        let registered: HashSet<String> = IANA_REGISTERED_EVENT_PACKAGES
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect();
+
+        Self {
+            registered,
+            allow_unregistered: true,
+            custom_packages: HashSet::new(),
+        }
+    }
+
+    /// Creates a strict registry that rejects unregistered packages.
+    #[must_use]
+    pub fn strict() -> Self {
+        Self {
+            allow_unregistered: false,
+            ..Self::new()
+        }
+    }
+
+    /// Creates a permissive registry that allows any event package.
+    #[must_use]
+    pub fn permissive() -> Self {
+        Self {
+            allow_unregistered: true,
+            ..Self::new()
+        }
+    }
+
+    /// Adds a custom event package to the allowed list.
+    pub fn add_custom_package(&mut self, package: impl Into<String>) {
+        self.custom_packages.insert(package.into().to_lowercase());
+    }
+
+    /// Removes a custom event package from the allowed list.
+    pub fn remove_custom_package(&mut self, package: &str) -> bool {
+        self.custom_packages.remove(&package.to_lowercase())
+    }
+
+    /// Sets whether unregistered packages are allowed.
+    pub fn set_allow_unregistered(&mut self, allow: bool) {
+        self.allow_unregistered = allow;
+    }
+
+    /// Checks if a package is IANA-registered.
+    #[must_use]
+    pub fn is_iana_registered(&self, event_type: &str) -> bool {
+        self.registered.contains(&event_type.to_lowercase())
+    }
+
+    /// Checks if a package is custom-allowed.
+    #[must_use]
+    pub fn is_custom_allowed(&self, event_type: &str) -> bool {
+        self.custom_packages.contains(&event_type.to_lowercase())
+    }
+
+    /// Checks if a package is allowed (registered or custom).
+    #[must_use]
+    pub fn is_allowed(&self, event_type: &str) -> bool {
+        let lower = event_type.to_lowercase();
+        self.registered.contains(&lower)
+            || self.custom_packages.contains(&lower)
+            || self.allow_unregistered
+    }
+
+    /// Validates an event package per RFC 6665 §7.2.
+    ///
+    /// Returns the validation result indicating whether the package
+    /// is valid, allowed with warning, or rejected.
+    #[must_use]
+    pub fn validate(&self, event_type: &str) -> EventPackageValidation {
+        let lower = event_type.to_lowercase();
+
+        // Check IANA registration
+        if self.registered.contains(&lower) {
+            return EventPackageValidation::Valid;
+        }
+
+        // Check custom packages
+        if self.custom_packages.contains(&lower) {
+            return EventPackageValidation::Valid;
+        }
+
+        // Unregistered package
+        if self.allow_unregistered {
+            EventPackageValidation::UnregisteredAllowed {
+                warning: format!(
+                    "Event package '{}' is not IANA-registered per RFC 6665 §7.2",
+                    event_type
+                ),
+            }
+        } else {
+            EventPackageValidation::Invalid {
+                reason: format!(
+                    "Event package '{}' is not IANA-registered per RFC 6665 §7.2. \
+                     Registered packages must be used for interoperability.",
+                    event_type
+                ),
+            }
+        }
+    }
+
+    /// Validates an EventPackage struct.
+    #[must_use]
+    pub fn validate_package(&self, package: &EventPackage) -> EventPackageValidation {
+        self.validate(&package.event_type)
+    }
+
+    /// Returns all IANA-registered packages.
+    #[must_use]
+    pub fn registered_packages(&self) -> Vec<&str> {
+        IANA_REGISTERED_EVENT_PACKAGES.to_vec()
+    }
+
+    /// Returns all custom packages.
+    #[must_use]
+    pub fn custom_packages(&self) -> Vec<String> {
+        self.custom_packages.iter().cloned().collect()
+    }
+}
+
+/// Validates an event package against IANA registrations.
+///
+/// This is a convenience function using the default (permissive) registry.
+///
+/// # Arguments
+///
+/// * `event_type` - The event type to validate
+///
+/// # Returns
+///
+/// The validation result.
+#[must_use]
+pub fn validate_event_package(event_type: &str) -> EventPackageValidation {
+    EventPackageRegistry::new().validate(event_type)
+}
+
+/// Validates an event package strictly (rejects unregistered).
+///
+/// # Arguments
+///
+/// * `event_type` - The event type to validate
+///
+/// # Returns
+///
+/// `true` if the package is IANA-registered.
+#[must_use]
+pub fn is_event_package_registered(event_type: &str) -> bool {
+    EventPackageRegistry::new().is_iana_registered(event_type)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -814,5 +1101,173 @@ mod tests {
             "dialog".to_string(),
         ];
         assert_eq!(format_allow_events(&events), "presence, dialog");
+    }
+
+    // ========================================================================
+    // RFC 6665 §7.2 - Event Package Validation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_event_package_registry_creation() {
+        let registry = EventPackageRegistry::new();
+
+        // Common packages should be registered
+        assert!(registry.is_iana_registered("presence"));
+        assert!(registry.is_iana_registered("dialog"));
+        assert!(registry.is_iana_registered("message-summary"));
+        assert!(registry.is_iana_registered("refer"));
+        assert!(registry.is_iana_registered("reg"));
+    }
+
+    #[test]
+    fn test_event_package_registry_case_insensitive() {
+        let registry = EventPackageRegistry::new();
+
+        // Should be case-insensitive
+        assert!(registry.is_iana_registered("PRESENCE"));
+        assert!(registry.is_iana_registered("Presence"));
+        assert!(registry.is_iana_registered("Dialog"));
+    }
+
+    #[test]
+    fn test_event_package_validation_valid() {
+        let registry = EventPackageRegistry::new();
+
+        let result = registry.validate("presence");
+        assert!(matches!(result, EventPackageValidation::Valid));
+
+        let result = registry.validate("dialog");
+        assert!(matches!(result, EventPackageValidation::Valid));
+
+        let result = registry.validate("conference");
+        assert!(matches!(result, EventPackageValidation::Valid));
+    }
+
+    #[test]
+    fn test_event_package_validation_unregistered_allowed() {
+        let registry = EventPackageRegistry::new(); // Default: permissive
+
+        let result = registry.validate("my-custom-event");
+        match result {
+            EventPackageValidation::UnregisteredAllowed { warning } => {
+                assert!(warning.contains("not IANA-registered"));
+            }
+            _ => panic!("Expected UnregisteredAllowed, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_event_package_validation_strict_rejects() {
+        let registry = EventPackageRegistry::strict();
+
+        let result = registry.validate("my-custom-event");
+        match result {
+            EventPackageValidation::Invalid { reason } => {
+                assert!(reason.contains("not IANA-registered"));
+            }
+            _ => panic!("Expected Invalid, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_event_package_registry_custom() {
+        let mut registry = EventPackageRegistry::strict();
+
+        // Add custom package
+        registry.add_custom_package("my-enterprise-event");
+
+        // Should now be allowed
+        assert!(registry.is_custom_allowed("my-enterprise-event"));
+        assert!(registry.is_allowed("my-enterprise-event"));
+
+        let result = registry.validate("my-enterprise-event");
+        assert!(matches!(result, EventPackageValidation::Valid));
+
+        // Other unknown packages still rejected
+        let result = registry.validate("another-unknown");
+        assert!(matches!(result, EventPackageValidation::Invalid { .. }));
+    }
+
+    #[test]
+    fn test_event_package_registry_remove_custom() {
+        let mut registry = EventPackageRegistry::strict();
+
+        registry.add_custom_package("temp-event");
+        assert!(registry.is_custom_allowed("temp-event"));
+
+        let removed = registry.remove_custom_package("temp-event");
+        assert!(removed);
+        assert!(!registry.is_custom_allowed("temp-event"));
+    }
+
+    #[test]
+    fn test_event_package_validate_package_struct() {
+        let registry = EventPackageRegistry::new();
+
+        let presence = EventPackage::presence();
+        assert!(matches!(
+            registry.validate_package(&presence),
+            EventPackageValidation::Valid
+        ));
+
+        let unknown = EventPackage::new("unknown-event");
+        assert!(matches!(
+            registry.validate_package(&unknown),
+            EventPackageValidation::UnregisteredAllowed { .. }
+        ));
+    }
+
+    #[test]
+    fn test_validate_event_package_convenience() {
+        // Valid package
+        assert!(matches!(
+            validate_event_package("presence"),
+            EventPackageValidation::Valid
+        ));
+
+        // Unknown package (allowed with warning in default mode)
+        assert!(matches!(
+            validate_event_package("unknown"),
+            EventPackageValidation::UnregisteredAllowed { .. }
+        ));
+    }
+
+    #[test]
+    fn test_is_event_package_registered() {
+        assert!(is_event_package_registered("presence"));
+        assert!(is_event_package_registered("dialog"));
+        assert!(!is_event_package_registered("unknown-event"));
+    }
+
+    #[test]
+    fn test_event_package_registry_all_iana_packages() {
+        let registry = EventPackageRegistry::new();
+        let packages = registry.registered_packages();
+
+        // Should have a reasonable number of packages
+        assert!(packages.len() >= 10);
+
+        // Key packages should be present
+        assert!(packages.contains(&"presence"));
+        assert!(packages.contains(&"dialog"));
+        assert!(packages.contains(&"refer"));
+    }
+
+    #[test]
+    fn test_event_package_registry_permissive() {
+        let registry = EventPackageRegistry::permissive();
+
+        // Should allow any package
+        assert!(registry.is_allowed("any-random-event"));
+    }
+
+    #[test]
+    fn test_event_package_winfo_variants() {
+        let registry = EventPackageRegistry::new();
+
+        // Watcher info packages
+        assert!(registry.is_iana_registered("presence.winfo"));
+        assert!(registry.is_iana_registered("dialog.winfo"));
+        assert!(registry.is_iana_registered("reg.winfo"));
     }
 }

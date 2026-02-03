@@ -48,7 +48,7 @@ pub use offer_answer::{
     LocalMediaCapability, MediaModification, MediaModificationType, MediaModificationValidator,
     MediaNegotiationResult, NegotiationResult,
 };
-pub use session::SessionDescription;
+pub use session::{Origin, RepeatTimes, SessionDescription, TimeValue, Timing};
 
 /// SDP protocol version (always 0 per RFC 4566).
 pub const SDP_VERSION: u8 = 0;

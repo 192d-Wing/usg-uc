@@ -78,9 +78,10 @@ pub use session_timer::{
     parse_min_se, parse_session_expires, RefresherRole, SessionTimer, SessionTimerNegotiation,
 };
 pub use subscription::{
-    format_allow_events, parse_allow_events, EventPackage, Notifier, Subscription,
+    format_allow_events, is_event_package_registered, parse_allow_events, validate_event_package,
+    EventPackage, EventPackageRegistry, EventPackageValidation, Notifier, Subscription,
     SubscriptionState, SubscriptionStateHeader, TerminationReason, DEFAULT_SUBSCRIPTION_EXPIRES,
-    MIN_SUBSCRIPTION_EXPIRES,
+    IANA_REGISTERED_EVENT_PACKAGES, MIN_SUBSCRIPTION_EXPIRES,
 };
 
 /// Default session expires value (1800 seconds per RFC 4028).

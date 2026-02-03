@@ -52,7 +52,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1000+ tests passing, Phase 18 complete + proto-* crate extraction with RFC compliance + P0/P1 compliance gaps addressed
+**Current Status**: 1000+ tests passing, Phase 18.6 complete + proto-* crate extraction with RFC compliance + P0/P1/P2 compliance gaps addressed
 
 ---
 
@@ -270,6 +270,40 @@ This document outlines the development roadmap for the USG Session Border Contro
 - [x] Stale nonce detection and refresh
 - [x] CNSA 2.0 compliant (SHA-384 instead of MD5)
 
+### ✅ Phase 18.6: P2 Medium Priority RFC Compliance
+
+**Goal**: Address medium priority RFC compliance gaps for feature completeness
+
+**P2 Medium - Proxy GRUU Routing** (RFC 5627 §5.1) ✅
+
+- [x] GruuRouter for GRUU-based request routing
+- [x] AOR and instance-id extraction from GRUU
+- [x] Lowest reg-id selection for multiple flows
+- [x] Path header forwarding support
+- [x] Routing result types: Resolved, Expired, NotFound
+
+**P2 Medium - RTCP Timing Rules** (RFC 3550 §6.3.5) ✅
+
+- [x] RtcpScheduler implementing Appendix A.7 algorithm
+- [x] Deterministic interval based on bandwidth/members
+- [x] [0.5, 1.5] randomization per RFC 3550 §6.3.5
+- [x] Sender/receiver bandwidth separation (25%/75%)
+- [x] Timer reconsideration for membership changes
+
+**P2 Medium - Event Package Validation** (RFC 6665 §7.2) ✅
+
+- [x] EventPackageRegistry with IANA registrations
+- [x] Validation result types: Valid, UnregisteredAllowed, Invalid
+- [x] Custom package extension support
+- [x] Strict vs permissive validation modes
+
+**P2 Medium - SDP Repeat Times** (RFC 4566 §5.11) ✅
+
+- [x] RepeatTimes (r= line) support
+- [x] TimeValue with compact notation (d/h/m/s)
+- [x] Parsing and generation roundtrip
+- [x] Validation (interval, duration, offsets)
+
 ### ⏳ Phase 19: SIP Authentication & Security
 **Goal**: Production-grade SIP security
 
@@ -390,15 +424,17 @@ This document outlines the development roadmap for the USG Session Border Contro
 |-----|-------|--------|
 | RFC 3261 | SIP Core | ✅ Enhanced (~95% compliant, redirect handling) |
 | RFC 3264 | Offer/Answer | ✅ Enhanced (media modification rules) |
-| RFC 4566 | SDP | ✅ Implemented |
-| RFC 3550 | RTP | ✅ Implemented |
+| RFC 3550 | RTP | ✅ Enhanced (RTCP timing rules) |
 | RFC 3711 | SRTP | ✅ Implemented (CNSA 2.0) |
+| RFC 4566 | SDP | ✅ Enhanced (repeat times r= line) |
 | RFC 5389 | STUN | ✅ Enhanced (long-term credential) |
 | RFC 5626 | SIP Outbound | ✅ Enhanced (flow maintenance) |
+| RFC 5627 | GRUU | ✅ Enhanced (proxy GRUU routing) |
 | RFC 5764 | DTLS-SRTP | ✅ Implemented (key export) |
 | RFC 5766 | TURN | ✅ Enhanced (Send/Data indications) |
 | RFC 5853 | SBC Requirements | ✅ Implemented |
 | RFC 6347 | DTLS 1.2 | ✅ Enhanced (certificate verification, Finished validation) |
+| RFC 6665 | SIP Events | ✅ Enhanced (event package validation) |
 | RFC 7092 | B2BUA Taxonomy | ✅ Implemented |
 | RFC 7675 | STUN Consent | ✅ Enhanced (consent revocation) |
 | RFC 8445 | ICE | ✅ Enhanced (aggressive nomination, consent, keepalives) |
