@@ -44,6 +44,7 @@ pub mod builder;
 pub mod error;
 pub mod header;
 pub mod header_params;
+pub mod manipulation;
 pub mod message;
 pub mod method;
 pub mod proxy;
@@ -82,6 +83,12 @@ pub use proxy::{
     create_loop_detected_response, create_too_many_hops_response, create_trying_response,
     ForkingMode, ForwardingTarget, ProxyContext, ProxyValidation, RequestForwarder,
     ResponseProcessor,
+};
+
+// Header Manipulation Engine (Enterprise SBC feature)
+pub use manipulation::{
+    HeaderManipulator, ManipulationAction, ManipulationCondition, ManipulationContext,
+    ManipulationDirection, ManipulationPolicy, ManipulationPresets, ManipulationRule, MessageType,
 };
 
 /// Maximum SIP message size per RFC 3261.

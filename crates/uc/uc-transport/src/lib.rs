@@ -34,6 +34,7 @@
 
 pub mod error;
 pub mod listener;
+pub mod qos;
 pub mod udp;
 
 #[cfg(feature = "tcp")]
@@ -44,6 +45,10 @@ pub mod tls;
 
 pub use error::{TransportError, TransportResult};
 pub use listener::TransportListener;
+pub use qos::{
+    apply_dscp, apply_qos_config, DscpValue, QosConfig, QosPolicyManager, TrafficType,
+    TrunkQosPolicy,
+};
 pub use uc_types::address::{SbcSocketAddr, TransportType};
 
 use bytes::Bytes;

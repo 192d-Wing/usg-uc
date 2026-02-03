@@ -37,14 +37,19 @@
 #![cfg_attr(test, allow(clippy::panic))]
 
 pub mod action;
+pub mod cac;
 pub mod condition;
 pub mod engine;
 pub mod error;
 pub mod rule;
 
-pub use action::{PolicyAction, HeaderAction};
+pub use action::{HeaderAction, PolicyAction};
+pub use cac::{
+    AdmissionDecision, CallAdmissionController, CallPriority, CodecBandwidth, RejectionReason,
+    TrunkCacLimits, TrunkStats,
+};
 pub use condition::{Condition, ConditionMatch};
-pub use engine::{PolicyEngine, PolicyDecision};
+pub use engine::{PolicyDecision, PolicyEngine};
 pub use error::{PolicyError, PolicyResult};
 pub use rule::{PolicyRule, RuleSet};
 

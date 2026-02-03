@@ -1910,6 +1910,7 @@ dependencies = [
 name = "uc-policy"
 version = "0.1.0"
 dependencies = [
+ "tracing",
  "uc-types",
 ]
 
@@ -1917,6 +1918,17 @@ dependencies = [
 name = "uc-routing"
 version = "0.1.0"
 dependencies = [
+ "uc-types",
+]
+
+[[package]]
+name = "uc-siprec"
+version = "0.1.0"
+dependencies = [
+ "proto-sdp",
+ "proto-sip",
+ "thiserror",
+ "tracing",
  "uc-types",
 ]
 

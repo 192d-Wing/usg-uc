@@ -1,6 +1,6 @@
 [package]
-name = "uc-policy"
-description = "Policy engine for call admission and routing control"
+name = "uc-siprec"
+description = "SIPREC call recording support per RFC 7865/7866"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,9 +9,12 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-[lints]
-workspace = true
-
 [dependencies]
 uc-types.workspace = true
+proto-sip.workspace = true
+proto-sdp.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
+
+[lints]
+workspace = true

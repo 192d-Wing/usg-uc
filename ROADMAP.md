@@ -400,30 +400,30 @@ This document outlines the development roadmap for the USG Session Border Contro
 - [ ] ICE candidate trickling support
 - [ ] SRTP-to-DTLS-SRTP interworking
 
-### ⏳ Phase 21: Advanced SBC Features
+### ✅ Phase 21: Advanced SBC Features
 
 **Goal**: Enterprise-grade SBC functionality
 
 **Header Manipulation Engine**
 
-- [ ] Configurable header rewrite rules
-- [ ] Regular expression substitution
-- [ ] Header insertion/deletion policies
-- [ ] Per-trunk header manipulation
+- ✅ Configurable header rewrite rules (`proto-sip/manipulation.rs`)
+- ✅ Regular expression substitution (basic pattern support)
+- ✅ Header insertion/deletion policies
+- ✅ Per-trunk header manipulation
 
-**Call Recording & Forking** (RFC 7866)
+**Call Recording & Forking** (RFC 7865/7866)
 
-- [ ] SIPREC support for call recording
-- [ ] Media forking to recording server
-- [ ] Metadata generation for recordings
+- ✅ SIPREC support for call recording (`uc-siprec` crate)
+- ✅ Media forking to recording server
+- ✅ Metadata generation for recordings (XML per RFC 7865)
 
 **QoS & Traffic Management**
 
-- [ ] DSCP marking for SIP/RTP packets
-- [ ] Bandwidth management per trunk
-- [ ] Call admission control by capacity
+- ✅ DSCP marking for SIP/RTP packets (`uc-transport/qos.rs`)
+- ✅ Bandwidth management per trunk
+- ✅ Call admission control by capacity (`uc-policy/cac.rs`)
 
-**DNS Integration**
+**DNS Integration** (Deferred to Phase 22)
 
 - [ ] ENUM lookup (RFC 6116)
 - [ ] DNS SRV for SIP routing (RFC 3263)

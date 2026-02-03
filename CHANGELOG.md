@@ -200,6 +200,86 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
     - Best response selection for forked requests (6xx > 2xx > 3xx priority)
   - Helper functions: `create_trying_response()`, `create_too_many_hops_response()`, `create_loop_detected_response()`
 
+#### Phase 21: Advanced SBC Features
+
+**proto-sip Header Manipulation Engine**
+
+- Header manipulation engine (`manipulation.rs`):
+  - `ManipulationAction` enum: Add, Set, Remove, RemoveMatching, Replace, RegexReplace, Rename, Copy, Prepend, Append
+  - `ManipulationCondition` enum: Always, HeaderExists, HeaderMissing, HeaderContains, HeaderEquals, HeaderMatches, MethodEquals, Any, All, Not
+  - `ManipulationRule` with priority ordering and enable/disable
+  - `ManipulationPolicy` per-direction and per-message-type policies
+  - `HeaderManipulator` with global and per-trunk policy management
+  - `ManipulationContext` for request/response/trunk filtering
+  - `ManipulationPresets` for common rules (normalize UA, strip PAI, RPID-to-PAI)
+  - Basic regex pattern matching (^anchor, $anchor, capture groups)
+  - Exported from lib.rs for public API access
+
+**uc-siprec - SIPREC Call Recording (RFC 7865/7866)**
+
+New crate for session recording:
+- `config.rs` - Recording configuration:
+  - `SrsEndpoint` for recording server (primary/backup, weight, health)
+  - `RecordingMode` enum: Selective, AllCalls, OnDemand, Disabled
+  - `RecordingTrigger` conditions (trunk, caller/callee pattern, header match, time window)
+  - `RecordingMediaOptions` for audio/video/DTMF settings
+  - `RecordingConfig` with max sessions, retry, exempt trunks
+
+- `metadata.rs` - Recording metadata per RFC 7865:
+  - `RecordingMetadata` top-level container
+  - `SessionMetadata` with recording session ID, state, timestamps
+  - `Participant` with AoR, display name, role, join/leave times
+  - `MediaStream` with codec, SSRC, direction, participant association
+  - `ParticipantRole` enum: Caller, Callee, Observer, Supervisor
+  - `StreamDirection` enum: Send, Receive, SendReceive, Inactive
+  - `to_xml()` method for RFC 7865 compliant XML generation
+
+- `forking.rs` - Media forking:
+  - `MediaForker` for RTP stream duplication management
+  - `StreamFork` with source/dest/fork addresses and SSRC
+  - `ForkingMode` enum: BothDirections, InboundOnly, OutboundOnly, Disabled
+  - `ForkerState` lifecycle: Uninitialized, Initialized, Active, Paused, Stopped, Error
+  - Packet/byte counting statistics per stream
+
+- `session.rs` - Recording session management:
+  - `RecordingSession` with full lifecycle state machine
+  - `RecordingSessionState`: Created, Inviting, Proceeding, Active, OnHold, Terminating, Terminated, Failed
+  - `SessionRecordingClient` (SRC) for managing recording sessions
+  - `RecordingContext` for trigger evaluation
+  - `SessionRecordingEvent` for session lifecycle notifications
+  - Participant and stream management
+
+**uc-transport QoS Module (RFC 2474/4594)**
+
+- QoS DSCP marking (`qos.rs`):
+  - `DscpValue` enum with all standard classes: BE, CS1-7, AF11-43, EF
+  - `to_tos()` conversion (DSCP << 2)
+  - `TrafficType` classification: VoiceMedia, VideoMedia, VoiceSignaling, VideoSignaling, Management
+  - `QosConfig` with traffic type and enable flag
+  - `TrunkQosPolicy` for per-trunk signaling/media QoS settings
+  - `QosPolicyManager` with global defaults and trunk overrides
+  - `apply_dscp()` for IPv4 (`IP_TOS`) and IPv6 (`IPV6_TCLASS`) sockets
+  - Preset configs: `voice_signaling()`, `voice_media()`, `video_signaling()`, `video_media()`
+
+**uc-policy Call Admission Control**
+
+- CAC and bandwidth management (`cac.rs`):
+  - `CallAdmissionController` central admission control:
+    - Per-trunk and global session limits
+    - Bandwidth tracking with codec estimation
+    - Call rate limiting (CPS)
+    - Emergency call bypass per RFC 4412
+  - `TrunkCacLimits` configuration:
+    - `max_sessions`, `max_bandwidth_kbps`, `max_cps`
+    - `emergency_reserve_percent` for priority calls
+    - `allowed_codecs` for codec restriction
+  - `AdmissionDecision` enum: Admitted, Rejected, Queued
+  - `RejectionReason` enum: MaxSessionsExceeded, BandwidthExceeded, RateLimitExceeded, TrunkDisabled, CodecNotAllowed
+  - `CallPriority` per RFC 4412: Emergency, Critical, Priority, Normal, NonUrgent, BestEffort
+  - `CodecBandwidth` estimates (G.711: 90kbps, G.729: 32kbps, G.722: 90kbps, Opus: 50kbps)
+  - `TrunkStats` with session/bandwidth utilization metrics
+  - Commit/release call tracking for real-time counters
+
 #### P2 Medium Priority RFC Compliance Gaps
 
 **proto-registrar (RFC 5627 §5.1)**

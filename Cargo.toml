@@ -36,6 +36,9 @@ members = [
     "crates/uc/uc-routing",
     "crates/uc/uc-cdr",
 
+    # Layer 6: Recording (uc-* = reusable)
+    "crates/uc/uc-siprec",
+
     # Layer 7: Management (uc-* = reusable)
     "crates/uc/uc-api",
     "crates/uc/uc-metrics",
@@ -120,6 +123,7 @@ uc-cdr = { path = "crates/uc/uc-cdr" }
 uc-api = { path = "crates/uc/uc-api" }
 uc-metrics = { path = "crates/uc/uc-metrics" }
 uc-health = { path = "crates/uc/uc-health" }
+uc-siprec = { path = "crates/uc/uc-siprec" }
 
 # Internal crates - Protocol (proto/*)
 proto-sip = { path = "crates/proto/proto-sip" }
