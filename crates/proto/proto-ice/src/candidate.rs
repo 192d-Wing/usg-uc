@@ -342,7 +342,14 @@ impl Candidate {
 /// Parses the core SDP candidate fields (foundation through candidate type).
 fn parse_sdp_core_fields(
     parts: &[&str],
-) -> IceResult<(String, u16, TransportProtocol, u32, SocketAddr, CandidateType)> {
+) -> IceResult<(
+    String,
+    u16,
+    TransportProtocol,
+    u32,
+    SocketAddr,
+    CandidateType,
+)> {
     let foundation = parts[0].to_string();
 
     let component: u16 = parts[1].parse().map_err(|_| IceError::ParseError {
@@ -368,7 +375,14 @@ fn parse_sdp_core_fields(
             reason: format!("unknown candidate type: {}", parts[7]),
         })?;
 
-    Ok((foundation, component, transport, priority, address, candidate_type))
+    Ok((
+        foundation,
+        component,
+        transport,
+        priority,
+        address,
+        candidate_type,
+    ))
 }
 
 /// Parses the transport protocol from SDP.

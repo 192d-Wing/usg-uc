@@ -6,7 +6,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::fmt;
 
 /// Parses the first byte of an RTP header.
-/// Returns (padding, extension, csrc_count).
+/// Returns (padding, extension, `csrc_count`).
 fn parse_first_byte(byte: u8) -> RtpResult<(bool, bool, usize)> {
     let version = (byte >> 6) & 0x03;
     if version != RTP_VERSION {
@@ -21,7 +21,7 @@ fn parse_first_byte(byte: u8) -> RtpResult<(bool, bool, usize)> {
 }
 
 /// Parses the second byte of an RTP header.
-/// Returns (marker, payload_type).
+/// Returns (marker, `payload_type`).
 fn parse_second_byte(byte: u8) -> (bool, u8) {
     let marker = (byte & 0x80) != 0;
     let payload_type = byte & 0x7F;
@@ -38,7 +38,7 @@ fn parse_csrc_list(cursor: &mut &[u8], count: usize) -> Vec<u32> {
 }
 
 /// Parses the extension header if present.
-/// Returns (extension_header, total_header_size).
+/// Returns (`extension_header`, `total_header_size`).
 fn parse_extension_header(
     data: &[u8],
     header_size: usize,

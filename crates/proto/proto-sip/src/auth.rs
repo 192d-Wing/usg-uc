@@ -252,10 +252,7 @@ fn get_required_param(
 }
 
 /// Filters out known parameters and returns extra parameters.
-fn filter_extra_params(
-    params: HashMap<String, String>,
-    known: &[&str],
-) -> HashMap<String, String> {
+fn filter_extra_params(params: HashMap<String, String>, known: &[&str]) -> HashMap<String, String> {
     params
         .into_iter()
         .filter(|(k, _)| !known.iter().any(|&known_key| k == known_key))
@@ -292,7 +289,15 @@ impl FromStr for DigestChallenge {
 
         let extra_params = filter_extra_params(
             params.clone(),
-            &["realm", "nonce", "algorithm", "opaque", "domain", "stale", "qop"],
+            &[
+                "realm",
+                "nonce",
+                "algorithm",
+                "opaque",
+                "domain",
+                "stale",
+                "qop",
+            ],
         );
 
         Ok(Self {
@@ -453,8 +458,16 @@ impl FromStr for DigestCredentials {
         let extra_params = filter_extra_params(
             params.clone(),
             &[
-                "username", "realm", "nonce", "uri", "response", "algorithm",
-                "opaque", "cnonce", "qop", "nc",
+                "username",
+                "realm",
+                "nonce",
+                "uri",
+                "response",
+                "algorithm",
+                "opaque",
+                "cnonce",
+                "qop",
+                "nc",
             ],
         );
 
@@ -467,7 +480,9 @@ impl FromStr for DigestCredentials {
             algorithm,
             cnonce: params.get("cnonce").cloned(),
             qop: params.get("qop").map(|s| s.parse()).transpose()?,
-            nc: params.get("nc").and_then(|s| u32::from_str_radix(s, 16).ok()),
+            nc: params
+                .get("nc")
+                .and_then(|s| u32::from_str_radix(s, 16).ok()),
             opaque: params.get("opaque").cloned(),
             params: extra_params,
         })

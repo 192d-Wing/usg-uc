@@ -209,8 +209,9 @@ impl Router {
             None
         };
 
-        let trunk_group_id = self.resolve_trunk_group(&dial_plan_result, destination)?;
-        let (trunk_id, trunk_uri, failover_trunks) = self.select_trunk_from_group(&trunk_group_id)?;
+        let trunk_group_id = self.resolve_trunk_group(dial_plan_result.as_ref(), destination)?;
+        let (trunk_id, trunk_uri, failover_trunks) =
+            self.select_trunk_from_group(&trunk_group_id)?;
 
         let final_destination = dial_plan_result
             .as_ref()
@@ -233,11 +234,10 @@ impl Router {
     /// Resolves the trunk group ID from dial plan result or default config.
     fn resolve_trunk_group(
         &self,
-        dial_plan_result: &Option<DialPlanResult>,
+        dial_plan_result: Option<&DialPlanResult>,
         destination: &str,
     ) -> RoutingResult<String> {
         dial_plan_result
-            .as_ref()
             .map(|r| r.trunk_group.as_str())
             .or(self.config.default_trunk_group.as_deref())
             .ok_or_else(|| RoutingError::NoRoute {
@@ -263,12 +263,13 @@ impl Router {
             }
         })?;
 
-        let trunk_id = trunk_group
-            .select_trunk()
-            .map(String::from)
-            .ok_or(RoutingError::AllTrunksFailed {
-                trunks_tried: trunk_count,
-            })?;
+        let trunk_id =
+            trunk_group
+                .select_trunk()
+                .map(String::from)
+                .ok_or(RoutingError::AllTrunksFailed {
+                    trunks_tried: trunk_count,
+                })?;
 
         let failover_trunks: Vec<String> = trunk_group
             .failover_order()
@@ -278,11 +279,12 @@ impl Router {
             .map(String::from)
             .collect();
 
-        let trunk = trunk_group
-            .get_trunk(&trunk_id)
-            .ok_or_else(|| RoutingError::TrunkNotFound {
-                trunk_id: trunk_id.clone(),
-            })?;
+        let trunk =
+            trunk_group
+                .get_trunk(&trunk_id)
+                .ok_or_else(|| RoutingError::TrunkNotFound {
+                    trunk_id: trunk_id.clone(),
+                })?;
 
         let trunk_uri = trunk.sip_uri();
 

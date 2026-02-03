@@ -254,18 +254,19 @@ pub struct TcpListener {
 }
 
 /// Creates a TCP socket with the appropriate domain.
-fn create_tcp_socket(socket_addr: &SocketAddr, bind_address: SbcSocketAddr) -> TransportResult<Socket> {
+fn create_tcp_socket(
+    socket_addr: &SocketAddr,
+    bind_address: SbcSocketAddr,
+) -> TransportResult<Socket> {
     let domain = if socket_addr.is_ipv6() {
         Domain::IPV6
     } else {
         Domain::IPV4
     };
 
-    Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(|e| {
-        TransportError::BindFailed {
-            address: bind_address,
-            reason: e.to_string(),
-        }
+    Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(|e| TransportError::BindFailed {
+        address: bind_address,
+        reason: e.to_string(),
     })
 }
 
@@ -312,7 +313,11 @@ fn configure_socket_options(
 }
 
 /// Binds and starts listening on the socket.
-fn bind_and_listen(socket: &Socket, socket_addr: &SocketAddr, config: &ListenerConfig) -> TransportResult<()> {
+fn bind_and_listen(
+    socket: &Socket,
+    socket_addr: &SocketAddr,
+    config: &ListenerConfig,
+) -> TransportResult<()> {
     socket
         .bind(&(*socket_addr).into())
         .map_err(|e| TransportError::BindFailed {
@@ -328,8 +333,11 @@ fn bind_and_listen(socket: &Socket, socket_addr: &SocketAddr, config: &ListenerC
         })
 }
 
-/// Converts a socket2 socket to a tokio TcpListener.
-fn socket_to_tokio_listener(socket: Socket, bind_address: SbcSocketAddr) -> TransportResult<TokioTcpListener> {
+/// Converts a socket2 socket to a tokio `TcpListener`.
+fn socket_to_tokio_listener(
+    socket: Socket,
+    bind_address: SbcSocketAddr,
+) -> TransportResult<TokioTcpListener> {
     let std_listener: std::net::TcpListener = socket.into();
     TokioTcpListener::from_std(std_listener).map_err(|e| TransportError::BindFailed {
         address: bind_address,

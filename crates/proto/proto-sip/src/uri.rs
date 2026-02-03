@@ -322,7 +322,9 @@ impl FromStr for SipUri {
         })?;
 
         let scheme: UriScheme = scheme_str.parse()?;
-        let (rest, headers_str) = rest.split_once('?').map_or((rest, None), |(r, h)| (r, Some(h)));
+        let (rest, headers_str) = rest
+            .split_once('?')
+            .map_or((rest, None), |(r, h)| (r, Some(h)));
         let parts: Vec<&str> = rest.split(';').collect();
 
         let user_host_port = parts.first().ok_or_else(|| SipError::InvalidUri {

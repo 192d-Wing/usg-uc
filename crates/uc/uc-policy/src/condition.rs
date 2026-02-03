@@ -237,6 +237,7 @@ impl Condition {
     }
 
     /// Evaluates a header condition.
+    #[allow(clippy::unused_self)]
     fn evaluate_header(
         &self,
         ctx: &RequestContext,
@@ -251,6 +252,7 @@ impl Condition {
     }
 
     /// Evaluates a time-of-day condition.
+    #[allow(clippy::unused_self)]
     fn evaluate_time_of_day(
         &self,
         ctx: &RequestContext,
@@ -265,6 +267,7 @@ impl Condition {
     }
 
     /// Evaluates a day-of-week condition.
+    #[allow(clippy::unused_self)]
     fn evaluate_day_of_week(&self, ctx: &RequestContext, days: &[u8]) -> ConditionMatch {
         match ctx.current_day {
             Some(day) if days.contains(&day) => ConditionMatch::Matched,
@@ -274,6 +277,7 @@ impl Condition {
     }
 
     /// Evaluates a NOT condition.
+    #[allow(clippy::unused_self)]
     fn evaluate_not(&self, inner: &Condition, ctx: &RequestContext) -> ConditionMatch {
         match inner.evaluate(ctx) {
             ConditionMatch::Matched => ConditionMatch::NotMatched,
