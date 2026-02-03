@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1569 tests passing, Phases 1-22 complete including Phase 20 (WebRTC), ready for Phase 23 (Specialized Protocols)
+**Current Status**: 1594 tests passing, Phases 1-23 complete
 
 ---
 
@@ -493,20 +493,32 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **Tests**: 125 new tests across all Phase 22 crates
 
-### ⏳ Phase 23: Specialized Protocols
+### ✅ Phase 23: Specialized Protocols
 
 **Goal**: Complete protocol coverage
 
+**New Crate**: `uc-t38`
+
 **T.38 Fax Relay** (RFC 4612)
 
-- [ ] T.38 over UDP/TCP
-- [ ] Audio-to-T.38 gateway
-- [ ] Error correction modes
+- ✅ T.38 over UDPTL transport with redundancy/FEC
+- ✅ Audio-to-T.38 gateway with signal detection (CNG/CED)
+- ✅ Error correction modes (none, redundancy, FEC)
+- ✅ IFP packet encoding/decoding per ITU-T T.38
+- ✅ T.30 signal handling (all phases A-E)
+- ✅ T38Session management with state machine
+- ✅ Goertzel algorithm for tone detection
 
 **SIP over SCTP** (RFC 4168)
 
-- [ ] SCTP transport support
-- [ ] Multi-homing for reliability
+- ✅ SCTP transport in `uc-transport/sctp.rs` (stub implementation)
+- ✅ Multi-homing support (add_peer_address, set_primary_path)
+- ✅ Multi-stream support (StreamId, send_on_stream)
+- ✅ SctpConfig with full SCTP parameters
+- ✅ SctpAssociation implementing Transport trait
+- ✅ TransportType::Sctp added to uc-types
+
+**Tests**: 25 new tests (T.38 crate)
 
 ---
 

@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ### Added
 
+#### Phase 23: Specialized Protocols
+
+**uc-t38 - T.38 Fax Relay (RFC 4612)**
+
+- New crate for T.38 real-time fax relay:
+  - `UdptlTransport` for UDP Transport Layer with error correction
+  - `UdptlPacket` encode/decode with redundancy and FEC support
+  - `ErrorCorrectionMode` enum: None, Redundancy, Fec
+  - `IfpPacket` per ITU-T T.38 with 16 data types
+  - `T30Indication` for fax signal indications (CNG, CED, training, etc.)
+  - `DataType` enum with V.21, V.27ter, V.29, V.17, V.34 support
+  - `SignalDetector` with Goertzel algorithm for CNG/CED tone detection
+  - `T30Signal` enum with 22 T.30 signal types
+  - `FaxPhase` enum: PhaseA through PhaseE
+  - `T38Session` with full state machine and session statistics
+  - `T38SessionManager` for multi-session management
+  - `T38Config` with UDPTL, session, and error correction settings
+  - Auto-switch from audio to T.38 on CNG/CED detection
+
+**uc-transport - SCTP Transport (RFC 4168)**
+
+- New feature `sctp` for SCTP transport support:
+  - `SctpAssociation` implementing `Transport` and `StreamTransport` traits
+  - `SctpState` enum: Closed, CookieWait, CookieEchoed, Established, ShutdownPending, ShutdownSent, ShutdownAckSent
+  - `SctpConfig` with full SCTP parameters (streams, retransmissions, heartbeat, RTO, MTU)
+  - `StreamId` for multi-stream support
+  - Multi-homing with `add_peer_address()` and `set_primary_path()`
+  - `SctpListener` for accepting incoming associations (stub)
+
+**uc-types - Transport Type Extension**
+
+- Added `TransportType::Sctp` variant for SCTP transport
+
+**Tests**: 25 new tests for T.38 crate
+
 #### Phase 20: WebRTC & Modern Transports
 
 **uc-transport - WebSocket Transport (RFC 7118)**

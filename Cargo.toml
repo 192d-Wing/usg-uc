@@ -56,6 +56,9 @@ members = [
     # Layer 9: WebRTC (uc-* = reusable)
     "crates/uc/uc-webrtc",
 
+    # Layer 10: Specialized Protocols
+    "crates/uc/uc-t38",
+
     # SBC Application
     "crates/sbc/sbc-config",
     "crates/sbc/sbc-daemon",

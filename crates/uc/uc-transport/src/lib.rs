@@ -7,6 +7,7 @@
 //! - TCP (connection-oriented, reliable)
 //! - TLS (encrypted TCP)
 //! - WebSocket (HTTP upgrade based)
+//! - SCTP (multi-homed, multi-stream - RFC 4168)
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
@@ -45,6 +46,9 @@ pub mod tls;
 
 #[cfg(feature = "websocket")]
 pub mod websocket;
+
+#[cfg(feature = "sctp")]
+pub mod sctp;
 
 pub use error::{TransportError, TransportResult};
 pub use listener::TransportListener;

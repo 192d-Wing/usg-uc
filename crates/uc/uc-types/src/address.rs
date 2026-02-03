@@ -149,6 +149,8 @@ pub enum TransportType {
     WebSocket,
     /// Secure WebSocket (TLS).
     WebSocketSecure,
+    /// SCTP (multi-homed, multi-stream - RFC 4168).
+    Sctp,
 }
 
 impl TransportType {
@@ -168,7 +170,7 @@ impl TransportType {
     #[must_use]
     pub const fn default_sip_port(&self) -> u16 {
         match self {
-            Self::Udp | Self::Tcp => 5060,
+            Self::Udp | Self::Tcp | Self::Sctp => 5060,
             Self::Tls | Self::WebSocketSecure => 5061,
             Self::WebSocket => 80,
         }
@@ -183,6 +185,7 @@ impl fmt::Display for TransportType {
             Self::Tls => write!(f, "TLS"),
             Self::WebSocket => write!(f, "WS"),
             Self::WebSocketSecure => write!(f, "WSS"),
+            Self::Sctp => write!(f, "SCTP"),
         }
     }
 }

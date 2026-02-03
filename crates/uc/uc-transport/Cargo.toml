@@ -15,6 +15,7 @@ udp = []
 tcp = []
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pki-types"]
 websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
+sctp = []  # SCTP transport (RFC 4168) - stub implementation
 
 [dependencies]
 uc-types.workspace = true
