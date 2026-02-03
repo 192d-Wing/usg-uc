@@ -238,6 +238,9 @@ impl Dialog {
     }
 
     /// Confirms the dialog (2xx received/sent).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn confirm(&mut self) -> DialogResult<()> {
         match self.state {
             DialogState::Early => {
@@ -254,6 +257,9 @@ impl Dialog {
     }
 
     /// Terminates the dialog.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn terminate(&mut self) -> DialogResult<()> {
         match self.state {
             DialogState::Terminated => Ok(()), // Already terminated
@@ -273,6 +279,9 @@ impl Dialog {
     /// Updates the remote CSeq.
     ///
     /// Returns error if CSeq is lower than expected (possible replay).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn update_remote_cseq(&mut self, cseq: u32) -> DialogResult<()> {
         if let Some(current) = self.remote_cseq
             && cseq < current {

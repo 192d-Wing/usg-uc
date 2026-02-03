@@ -35,24 +35,28 @@ impl Default for CdrWriterConfig {
 
 impl CdrWriterConfig {
     /// Sets the format.
+    #[must_use]
     pub fn with_format(mut self, format: CdrFormat) -> Self {
         self.format = format;
         self
     }
 
     /// Sets the buffer size.
+    #[must_use]
     pub fn with_buffer_size(mut self, size: usize) -> Self {
         self.buffer_size = size;
         self
     }
 
     /// Sets the flush interval.
+    #[must_use]
     pub fn with_flush_interval(mut self, secs: u64) -> Self {
         self.flush_interval_secs = secs;
         self
     }
 
     /// Sets the output path.
+    #[must_use]
     pub fn with_output_path(mut self, path: impl Into<String>) -> Self {
         self.output_path = Some(path.into());
         self
@@ -136,6 +140,9 @@ impl CdrWriter {
     }
 
     /// Writes a record.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn write(&mut self, record: CallRecord) -> CdrResult<()> {
         if self.is_buffer_full() {
             return Err(CdrError::BufferFull {
@@ -154,12 +161,15 @@ impl CdrWriter {
     }
 
     /// Flushes the buffer.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn flush(&mut self) -> CdrResult<()> {
         if self.buffer.is_empty() {
             return Ok(());
         }
 
-        let formatted = self.format_buffer()?;
+        let formatted = self.format_buffer();
 
         // In a real implementation, this would write to file/network
         // For now, we store in memory for testing
@@ -177,7 +187,7 @@ impl CdrWriter {
     }
 
     /// Formats the buffer contents.
-    fn format_buffer(&self) -> CdrResult<Vec<String>> {
+    fn format_buffer(&self) -> Vec<String> {
         let mut output = Vec::new();
 
         // Add header if needed (for CSV)
@@ -191,7 +201,7 @@ impl CdrWriter {
             output.push(self.get_formatter().format(record));
         }
 
-        Ok(output)
+        output
     }
 
     /// Returns the appropriate formatter.
@@ -214,12 +224,14 @@ impl CdrWriter {
     }
 
     /// Sets the JSON formatter.
+    #[must_use]
     pub fn with_json_formatter(mut self, formatter: JsonFormatter) -> Self {
         self.json_formatter = formatter;
         self
     }
 
     /// Sets the CSV formatter.
+    #[must_use]
     pub fn with_csv_formatter(mut self, formatter: CsvFormatter) -> Self {
         self.csv_formatter = formatter;
         self

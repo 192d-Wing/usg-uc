@@ -37,6 +37,9 @@ impl LocationService {
     }
 
     /// Adds or updates a binding.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn add_binding(&mut self, binding: Binding) -> RegistrarResult<()> {
         let aor = binding.aor().to_string();
         let bindings = self.bindings.entry(aor).or_default();
@@ -60,6 +63,9 @@ impl LocationService {
     }
 
     /// Removes a binding.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn remove_binding(&mut self, aor: &str, contact_uri: &str) -> RegistrarResult<()> {
         let bindings = self
             .bindings
@@ -86,6 +92,9 @@ impl LocationService {
     }
 
     /// Removes all bindings for an AOR.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn remove_all_bindings(&mut self, aor: &str) -> RegistrarResult<usize> {
         let bindings = self
             .bindings
@@ -163,6 +172,9 @@ impl LocationService {
     }
 
     /// Removes a binding by its binding key (instance-id + reg-id for outbound).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn remove_binding_by_key(&mut self, aor: &str, binding_key: &str) -> RegistrarResult<()> {
         let bindings = self
             .bindings

@@ -266,6 +266,7 @@ impl RequestForwarder {
 
     /// Gets the Max-Forwards header value.
     fn get_max_forwards(&self, request: &SipRequest) -> Option<MaxForwardsHeader> {
+        let _ = self; // Silence unused_self - method may use self in future for caching
         request
             .headers
             .get(&HeaderName::MaxForwards)
@@ -274,6 +275,7 @@ impl RequestForwarder {
 
     /// Counts Via headers in the request.
     fn count_via_headers(&self, request: &SipRequest) -> usize {
+        let _ = self; // Silence unused_self - method may use self in future for caching
         request.headers.get_all(&HeaderName::Via).len()
     }
 
@@ -295,8 +297,7 @@ impl RequestForwarder {
 
                 let port_match = match (via.port, our_port) {
                     (Some(vp), Some(op)) => vp == op,
-                    (None, None) => true,
-                    (None, Some(5060)) | (Some(5060), None) => true, // Default port
+                    (None | Some(5060), None | Some(5060)) => true, // Default port
                     _ => false,
                 };
 
@@ -407,6 +408,7 @@ impl RequestForwarder {
 
     /// Prepends a Via header to the beginning of the Via headers list.
     fn prepend_via_header(&self, request: &mut SipRequest, value: String) {
+        let _ = self; // Silence unused_self - method may use self in future for caching
         // Collect all existing headers
         let existing: Vec<Header> = request.headers.iter().cloned().collect();
 
@@ -500,6 +502,12 @@ impl ResponseProcessor {
     /// 1. Find matching Via header
     /// 2. Remove topmost Via (our Via)
     /// 3. Forward response upstream
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn process_response(&self, response: &SipResponse) -> SipResult<SipResponse> {
         let mut processed = response.clone();
 

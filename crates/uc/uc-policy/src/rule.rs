@@ -89,18 +89,21 @@ impl PolicyRule {
     }
 
     /// Sets the description.
+    #[must_use]
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
         self
     }
 
     /// Sets the priority.
+    #[must_use]
     pub fn with_priority(mut self, priority: RulePriority) -> Self {
         self.priority = priority;
         self
     }
 
     /// Sets whether the rule is enabled.
+    #[must_use]
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
         self
@@ -181,6 +184,7 @@ impl RuleSet {
     }
 
     /// Sets the default action.
+    #[must_use]
     pub fn with_default_action(mut self, action: PolicyAction) -> Self {
         self.default_action = action;
         self

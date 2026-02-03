@@ -113,7 +113,7 @@ impl RequestBuilder {
 
     /// Sets the Via header.
     #[must_use]
-    pub fn via(mut self, via: ViaHeader) -> Self {
+    pub fn via(mut self, via: &ViaHeader) -> Self {
         self.headers.set(HeaderName::Via, via.to_string());
         self
     }
@@ -125,12 +125,12 @@ impl RequestBuilder {
         if let Some(p) = port {
             via = via.with_port(p);
         }
-        self.via(via)
+        self.via(&via)
     }
 
     /// Sets the From header.
     #[must_use]
-    pub fn from(mut self, from: NameAddr) -> Self {
+    pub fn from(mut self, from: &NameAddr) -> Self {
         self.headers.set(HeaderName::From, from.to_string());
         self
     }
@@ -142,12 +142,12 @@ impl RequestBuilder {
         if let Some(name) = display_name {
             from = from.with_display_name(name);
         }
-        self.from(from)
+        self.from(&from)
     }
 
     /// Sets the To header.
     #[must_use]
-    pub fn to(mut self, to: NameAddr) -> Self {
+    pub fn to(mut self, to: &NameAddr) -> Self {
         self.headers.set(HeaderName::To, to.to_string());
         self
     }
@@ -159,7 +159,7 @@ impl RequestBuilder {
         if let Some(name) = display_name {
             to = to.with_display_name(name);
         }
-        self.to(to)
+        self.to(&to)
     }
 
     /// Sets the Call-ID header.
@@ -192,7 +192,7 @@ impl RequestBuilder {
 
     /// Sets the Contact header.
     #[must_use]
-    pub fn contact(mut self, contact: NameAddr) -> Self {
+    pub fn contact(mut self, contact: &NameAddr) -> Self {
         self.headers.set(HeaderName::Contact, contact.to_string());
         self
     }
@@ -200,7 +200,7 @@ impl RequestBuilder {
     /// Sets the Contact header from a URI.
     #[must_use]
     pub fn contact_uri(self, uri: SipUri) -> Self {
-        self.contact(NameAddr::new(uri))
+        self.contact(&NameAddr::new(uri))
     }
 
     /// Sets the Expires header.
@@ -257,6 +257,9 @@ impl RequestBuilder {
     /// # Errors
     ///
     /// Returns an error if required headers are missing.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn build(mut self) -> SipResult<SipRequest> {
         // Auto-generate Content-Length if needed
         if self.auto_content_length {
@@ -279,6 +282,9 @@ impl RequestBuilder {
     /// # Errors
     ///
     /// Returns an error if required headers are missing.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn build_with_defaults(mut self) -> SipResult<SipRequest> {
         // Add default Max-Forwards if not present
         if !self.headers.contains(&HeaderName::MaxForwards) {
@@ -434,7 +440,7 @@ impl ResponseBuilder {
 
     /// Sets the Contact header.
     #[must_use]
-    pub fn contact(mut self, contact: NameAddr) -> Self {
+    pub fn contact(mut self, contact: &NameAddr) -> Self {
         self.headers.set(HeaderName::Contact, contact.to_string());
         self
     }
@@ -494,6 +500,9 @@ impl ResponseBuilder {
     /// # Errors
     ///
     /// Returns an error if required headers are missing.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn build(mut self) -> SipResult<SipResponse> {
         // Auto-generate Content-Length if needed
         if self.auto_content_length {

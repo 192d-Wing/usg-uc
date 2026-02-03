@@ -164,6 +164,9 @@ impl Binding {
     }
 
     /// Sets the expiration time.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn set_expires(&mut self, expires: u32) -> RegistrarResult<()> {
         if expires > 0 && expires < MIN_EXPIRES {
             return Err(RegistrarError::InvalidExpires {
@@ -209,6 +212,9 @@ impl Binding {
     ///
     /// Updates the binding if the Call-ID matches and CSeq is higher,
     /// or if the Call-ID is different.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn refresh(&mut self, call_id: &str, cseq: u32, expires: u32) -> RegistrarResult<()> {
         // Check if this is a valid refresh
         if call_id == self.call_id && cseq <= self.cseq {
@@ -246,7 +252,8 @@ impl Binding {
         if elapsed >= expires {
             Duration::ZERO
         } else {
-            expires.checked_sub(elapsed).unwrap()
+            // Safe because we checked elapsed < expires above
+            expires.saturating_sub(elapsed)
         }
     }
 

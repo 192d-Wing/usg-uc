@@ -31,6 +31,9 @@ impl P384EphemeralKeyPair {
     /// ## Errors
     ///
     /// Returns an error if key generation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn generate() -> CryptoResult<Self> {
         let rng = SystemRandom::new();
         let private_key = EphemeralPrivateKey::generate(&ECDH_P384, &rng)
@@ -73,6 +76,9 @@ impl P384EphemeralKeyPair {
     /// ## Errors
     ///
     /// Returns an error if key agreement fails (invalid peer key, etc.).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn agree(self, peer_public_key: &[u8]) -> CryptoResult<SharedSecret> {
         let peer_key = UnparsedPublicKey::new(&ECDH_P384, peer_public_key);
 

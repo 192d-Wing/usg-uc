@@ -43,6 +43,9 @@ impl IdentityHeader {
     }
 
     /// Creates from a PASSporT.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn from_passport(passport: &PASSporT) -> StirShakenResult<Self> {
         let token = passport.to_compact()?;
 
@@ -85,6 +88,9 @@ impl IdentityHeader {
     }
 
     /// Parses from SIP header value.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(value: &str) -> StirShakenResult<Self> {
         // Find the token (everything before first ';')
         let parts: Vec<&str> = value.splitn(2, ';').collect();

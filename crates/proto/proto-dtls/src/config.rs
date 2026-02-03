@@ -128,6 +128,9 @@ impl DtlsConfig {
     /// ## Errors
     ///
     /// Returns an error if the configuration is invalid.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn validate(&self) -> DtlsResult<()> {
         if self.certificate_chain.is_empty() {
             return Err(DtlsError::InvalidConfig {
@@ -231,6 +234,8 @@ fn base64_decode(input: &str) -> DtlsResult<Vec<u8>> {
             break;
         }
 
+        // Position returns usize which fits in u32 for base64 alphabet (max 63)
+        #[allow(clippy::cast_possible_truncation)]
         let value = ALPHABET.iter().position(|&x| x == c as u8).ok_or_else(|| {
             DtlsError::CertificateError {
                 reason: format!("invalid base64 character: {c}"),
@@ -242,6 +247,8 @@ fn base64_decode(input: &str) -> DtlsResult<Vec<u8>> {
 
         if bits >= 8 {
             bits -= 8;
+            // Value is always < 256 after masking with (1 << 8) - 1
+            #[allow(clippy::cast_possible_truncation)]
             output.push((buffer >> bits) as u8);
             buffer &= (1 << bits) - 1;
         }

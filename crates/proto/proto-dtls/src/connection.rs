@@ -180,11 +180,16 @@ impl DtlsConnection {
 
     /// Creates and binds a UDP socket for the connection.
     async fn ensure_socket(&self) -> DtlsResult<Arc<UdpSocket>> {
-        let mut socket_guard = self.socket.lock().await;
+        let existing = {
+            let socket_guard = self.socket.lock().await;
+            socket_guard.clone()
+        };
 
-        if let Some(ref socket) = *socket_guard {
-            return Ok(Arc::clone(socket));
+        if let Some(socket) = existing {
+            return Ok(socket);
         }
+
+        let mut socket_guard = self.socket.lock().await;
 
         // Bind to local address
         let local_std_addr: SocketAddr = self.local_addr.into();
@@ -299,7 +304,7 @@ impl DtlsConnection {
         }
 
         let km = self.keying_material.lock().await;
-        km.clone().ok_or(DtlsError::SrtpKeyExportFailed {
+        km.clone().ok_or_else(|| DtlsError::SrtpKeyExportFailed {
             reason: "keying material not available".to_string(),
         })
     }
@@ -353,10 +358,9 @@ impl DtlsConnection {
     /// Returns an error if the connection is not established, receive fails, or times out.
     #[instrument(skip(self))]
     pub async fn recv_timeout(&self, duration: Duration) -> DtlsResult<Bytes> {
-        match timeout(duration, self.recv()).await {
-            Ok(result) => result,
-            Err(_) => Err(DtlsError::Timeout),
-        }
+        timeout(duration, self.recv())
+            .await
+            .map_or(Err(DtlsError::Timeout), |result| result)
     }
 
     /// Closes the DTLS connection.
@@ -403,7 +407,7 @@ impl std::fmt::Debug for DtlsConnection {
             .field("role", &self.config.role)
             .field("state", &self.state())
             .field("local_fingerprint", &self.local_fingerprint)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -434,11 +438,12 @@ impl DtlsConnectionManager {
         remote_addr: SbcSocketAddr,
     ) -> DtlsResult<Arc<DtlsConnection>> {
         let conn = DtlsConnection::new(self.default_config.clone(), local_addr, remote_addr)?;
-
         let conn = Arc::new(conn);
 
-        let mut connections = self.connections.lock().await;
-        connections.push(Arc::clone(&conn));
+        {
+            let mut connections = self.connections.lock().await;
+            connections.push(Arc::clone(&conn));
+        }
 
         Ok(conn)
     }

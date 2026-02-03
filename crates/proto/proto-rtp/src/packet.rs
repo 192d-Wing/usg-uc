@@ -91,6 +91,9 @@ impl RtpHeader {
     /// ## Errors
     ///
     /// Returns an error if the data is too short or invalid.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(data: &[u8]) -> RtpResult<(Self, usize)> {
         if data.len() < RTP_HEADER_MIN_SIZE {
             return Err(RtpError::PacketTooShort {
@@ -247,6 +250,9 @@ impl RtpPacket {
     /// ## Errors
     ///
     /// Returns an error if the packet is invalid.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(data: &[u8]) -> RtpResult<Self> {
         let (header, header_size) = RtpHeader::parse(data)?;
 

@@ -145,6 +145,9 @@ impl ConnectivityCheck {
     /// - USE-CANDIDATE: if nominating (controlling only)
     /// - MESSAGE-INTEGRITY using remote password
     /// - FINGERPRINT
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn create_request(&self) -> IceResult<StunMessage> {
         let mut msg = StunMessage::new(StunMessageType::binding_request(), self.transaction_id);
 
@@ -189,6 +192,9 @@ impl ConnectivityCheck {
     /// - Success responses: Extract XOR-MAPPED-ADDRESS
     /// - Error responses: Handle role conflicts (487)
     /// - Validate MESSAGE-INTEGRITY
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn process_response(&self, response: &StunMessage) -> IceResult<CheckResult> {
         // Verify transaction ID
         if response.transaction_id != self.transaction_id {

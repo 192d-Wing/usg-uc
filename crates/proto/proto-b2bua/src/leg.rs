@@ -260,6 +260,9 @@ impl CallLeg {
     }
 
     /// Updates the remote CSeq.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn update_remote_cseq(&mut self, cseq: u32) -> B2buaResult<()> {
         if let Some(current) = self.remote_cseq
             && cseq < current {
@@ -272,6 +275,9 @@ impl CallLeg {
     }
 
     /// Starts inviting (INVITE sent/received).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn start_invite(&mut self) -> B2buaResult<()> {
         match self.state {
             LegState::Created => {
@@ -286,6 +292,9 @@ impl CallLeg {
     }
 
     /// Processes a provisional response (1xx).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn receive_provisional(&mut self, status_code: u16) -> B2buaResult<()> {
         self.last_response_code = Some(status_code);
 
@@ -302,6 +311,9 @@ impl CallLeg {
     }
 
     /// Establishes early media.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn establish_early_media(&mut self) -> B2buaResult<()> {
         match self.state {
             LegState::Inviting | LegState::Proceeding => {
@@ -317,6 +329,9 @@ impl CallLeg {
     }
 
     /// Activates the leg (2xx received/sent).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn activate(&mut self, status_code: u16) -> B2buaResult<()> {
         self.last_response_code = Some(status_code);
 
@@ -335,6 +350,9 @@ impl CallLeg {
     }
 
     /// Puts the leg on hold.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn hold(&mut self) -> B2buaResult<()> {
         match self.state {
             LegState::Active => {
@@ -350,6 +368,9 @@ impl CallLeg {
     }
 
     /// Resumes from hold.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn resume(&mut self) -> B2buaResult<()> {
         if self.state == LegState::OnHold {
             self.state = LegState::Active;
@@ -363,6 +384,9 @@ impl CallLeg {
     }
 
     /// Starts termination (BYE sent).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn start_termination(&mut self) -> B2buaResult<()> {
         match self.state {
             LegState::Active | LegState::OnHold | LegState::EarlyMedia => {
@@ -379,13 +403,15 @@ impl CallLeg {
     }
 
     /// Completes termination.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn terminate(&mut self) -> B2buaResult<()> {
-        match self.state {
-            LegState::Terminated => Ok(()), // Already terminated
-            _ => {
-                self.state = LegState::Terminated;
-                Ok(())
-            }
+        if self.state == LegState::Terminated {
+            Ok(()) // Already terminated
+        } else {
+            self.state = LegState::Terminated;
+            Ok(())
         }
     }
 

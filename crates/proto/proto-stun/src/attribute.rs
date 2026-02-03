@@ -142,6 +142,9 @@ impl StunAttribute {
     /// Parses an attribute from bytes.
     ///
     /// The `transaction_id` is needed for XOR operations.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(data: &[u8], transaction_id: &[u8; 12]) -> StunResult<(Self, usize)> {
         if data.len() < 4 {
             return Err(StunError::InvalidAttribute {
@@ -369,6 +372,9 @@ impl XorMappedAddress {
     }
 
     /// Parses from raw bytes.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(data: &[u8], transaction_id: &[u8; 12]) -> StunResult<Self> {
         if data.len() < 4 {
             return Err(StunError::InvalidAttribute {

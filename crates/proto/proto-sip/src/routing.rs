@@ -121,6 +121,12 @@ impl RouteSet {
     }
 
     /// Creates a route set from Route header values.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn from_route_headers(headers: &[String]) -> SipResult<Self> {
         let mut routes = Vec::new();
 
@@ -139,6 +145,12 @@ impl RouteSet {
     ///
     /// Per RFC 3261 Section 12.1.1, the route set is constructed by
     /// copying the Record-Route headers in reverse order.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn from_record_route_headers(headers: &[String]) -> SipResult<Self> {
         let mut routes = Vec::new();
 
@@ -282,6 +294,12 @@ pub fn compute_request_target(
 ///
 /// Per RFC 3261 Section 12.1.1, the UAS copies Record-Route headers
 /// in reverse order to form its route set.
+///
+/// # Errors
+/// Returns an error if the operation fails.
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn process_record_route_for_uas(record_routes: &[String]) -> SipResult<RouteSet> {
     RouteSet::from_record_route_headers(record_routes)
 }
@@ -290,6 +308,12 @@ pub fn process_record_route_for_uas(record_routes: &[String]) -> SipResult<Route
 ///
 /// Per RFC 3261 Section 12.1.2, the UAC copies Record-Route headers
 /// in order to form its route set (already in correct order from response).
+///
+/// # Errors
+/// Returns an error if the operation fails.
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn process_record_route_for_uac(record_routes: &[String]) -> SipResult<RouteSet> {
     let mut routes = Vec::new();
 
@@ -317,6 +341,12 @@ pub fn create_record_route(proxy_uri: SipUri, loose_route: bool) -> RouteEntry {
 }
 
 /// Parses a `NameAddr` from a Route/Record-Route header value.
+///
+/// # Errors
+/// Returns an error if the operation fails.
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn parse_route_name_addr(value: &str) -> SipResult<NameAddr> {
     value.parse()
 }

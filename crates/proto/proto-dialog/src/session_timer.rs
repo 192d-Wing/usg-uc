@@ -263,6 +263,9 @@ pub fn negotiate_session_timer(
 ///
 /// - "1800" -> (1800, None)
 /// - "1800;refresher=uac" -> (1800, Some(RefresherRole::Uac))
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn parse_session_expires(value: &str) -> DialogResult<(u32, Option<RefresherRole>)> {
     let parts: Vec<&str> = value.split(';').collect();
 
@@ -288,6 +291,9 @@ pub fn parse_session_expires(value: &str) -> DialogResult<(u32, Option<Refresher
 /// Parses a Min-SE header value.
 ///
 /// Format: `<delta-seconds>`
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn parse_min_se(value: &str) -> DialogResult<u32> {
     value
         .trim()

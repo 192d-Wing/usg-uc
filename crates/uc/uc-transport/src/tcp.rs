@@ -49,6 +49,12 @@ impl TcpTransport {
     ///
     /// This is typically called after accepting a connection from a listener.
     #[instrument(skip(stream))]
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn from_stream(stream: TcpStream) -> TransportResult<Self> {
         let local_addr = stream
             .local_addr()
@@ -377,6 +383,12 @@ impl TcpListener {
     }
 
     /// Closes the listener.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn close(&self) -> TransportResult<()> {
         if self
             .closed

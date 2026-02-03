@@ -286,6 +286,9 @@ impl Verifier {
     ///
     /// Note: This is a structural verification. Full cryptographic verification
     /// requires access to the certificate and would be done at a higher level.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn verify_identity(&self, header: &IdentityHeader) -> StirShakenResult<VerificationResult> {
         // Parse the token
         let token = header.token();
@@ -314,6 +317,9 @@ impl Verifier {
     }
 
     /// Verifies the PASSporT age.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn verify_age(&self, iat: u64) -> StirShakenResult<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

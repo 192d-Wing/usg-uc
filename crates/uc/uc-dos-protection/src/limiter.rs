@@ -74,18 +74,21 @@ impl RateLimiterConfig {
     }
 
     /// Sets the block duration.
+    #[must_use]
     pub fn with_block_duration(mut self, secs: u64) -> Self {
         self.block_duration_secs = secs;
         self
     }
 
     /// Sets the block threshold multiplier.
+    #[must_use]
     pub fn with_block_threshold(mut self, multiplier: f64) -> Self {
         self.block_threshold_multiplier = multiplier;
         self
     }
 
     /// Sets per-IP tracking.
+    #[must_use]
     pub fn with_per_ip(mut self, per_ip: bool) -> Self {
         self.per_ip = per_ip;
         self
@@ -212,11 +215,7 @@ impl RateLimiter {
 
     /// Checks if a source is blocked.
     pub fn is_blocked(&self, source: IpAddr) -> bool {
-        if let Some(entry) = self.blocked.get(&source) {
-            !entry.is_expired()
-        } else {
-            false
-        }
+        self.blocked.get(&source).is_some_and(|entry| !entry.is_expired())
     }
 
     /// Returns the remaining block time for a source.
@@ -269,6 +268,8 @@ impl RateLimiter {
             // Check if we should warn/throttle
             if rate > self.config.rps as f64 * 0.8 {
                 // Over 80% of limit, suggest throttling
+                // The calculation is always positive when rate > 80% of RPS
+                #[allow(clippy::cast_sign_loss)]
                 let delay_ms = ((self.config.rps as f64).mul_add(-0.8, rate) * 10.0) as u64;
                 RateLimitAction::Throttle { delay_ms }
             } else {

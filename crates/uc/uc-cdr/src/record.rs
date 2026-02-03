@@ -207,16 +207,16 @@ pub struct CallRecord {
 impl CallRecord {
     /// Creates a new call record.
     pub fn new(
-        call_id: impl Into<String>,
-        caller: impl Into<String>,
-        callee: impl Into<String>,
+        call_identifier: impl Into<String>,
+        from_number: impl Into<String>,
+        to_number: impl Into<String>,
     ) -> Self {
         Self {
-            call_id: call_id.into(),
+            call_id: call_identifier.into(),
             correlation_id: None,
             direction: CallDirection::default(),
-            caller: caller.into(),
-            callee: callee.into(),
+            caller: from_number.into(),
+            callee: to_number.into(),
             original_callee: None,
             source_ip: String::new(),
             dest_ip: String::new(),
@@ -235,36 +235,42 @@ impl CallRecord {
     }
 
     /// Sets the direction.
+    #[must_use]
     pub fn with_direction(mut self, direction: CallDirection) -> Self {
         self.direction = direction;
         self
     }
 
     /// Sets the source IP.
+    #[must_use]
     pub fn with_source_ip(mut self, ip: impl Into<String>) -> Self {
         self.source_ip = ip.into();
         self
     }
 
     /// Sets the destination IP.
+    #[must_use]
     pub fn with_dest_ip(mut self, ip: impl Into<String>) -> Self {
         self.dest_ip = ip.into();
         self
     }
 
     /// Sets the trunk ID.
+    #[must_use]
     pub fn with_trunk(mut self, trunk_id: impl Into<String>) -> Self {
         self.trunk_id = Some(trunk_id.into());
         self
     }
 
     /// Sets the start time.
+    #[must_use]
     pub fn with_start_time(mut self, start_ms: u64) -> Self {
         self.start_time_ms = start_ms;
         self
     }
 
     /// Sets a custom field.
+    #[must_use]
     pub fn with_custom_field(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.custom_fields.insert(key.into(), value.into());
         self

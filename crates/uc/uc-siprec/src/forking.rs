@@ -222,6 +222,9 @@ impl MediaForker {
     }
 
     /// Initializes the forker.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn initialize(&mut self) -> SiprecResult<()> {
         if self.state != ForkerState::Uninitialized {
             return Err(SiprecError::InvalidState {
@@ -235,6 +238,9 @@ impl MediaForker {
     }
 
     /// Adds a stream fork.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn add_fork(&mut self, fork: StreamFork) -> SiprecResult<()> {
         if self.state == ForkerState::Uninitialized {
             return Err(SiprecError::InvalidState {
@@ -280,6 +286,9 @@ impl MediaForker {
     }
 
     /// Activates all forks and starts forking.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn start(&mut self) -> SiprecResult<()> {
         match self.state {
             ForkerState::Initialized | ForkerState::Paused => {
@@ -303,6 +312,9 @@ impl MediaForker {
     }
 
     /// Pauses all forks.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn pause(&mut self) -> SiprecResult<()> {
         if self.state != ForkerState::Active {
             return Err(SiprecError::InvalidState {
@@ -320,6 +332,9 @@ impl MediaForker {
     }
 
     /// Stops all forks.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn stop(&mut self) -> SiprecResult<()> {
         // Aggregate stats before stopping
         for fork in self.forks.values() {

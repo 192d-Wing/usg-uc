@@ -40,14 +40,15 @@ impl OutputFormatter {
                 format!("{{\n{}\n}}", pairs.join(",\n"))
             }
             OutputFormat::Table => {
+                use std::fmt::Write;
                 let mut output = String::new();
-                output.push_str(&format!("+{:-<22}+{:-<42}+\n", "", ""));
-                output.push_str(&format!("| {:^20} | {:^40} |\n", "Key", "Value"));
-                output.push_str(&format!("+{:-<22}+{:-<42}+\n", "", ""));
+                let _ = writeln!(output, "+{:-<22}+{:-<42}+", "", "");
+                let _ = writeln!(output, "| {:^20} | {:^40} |", "Key", "Value");
+                let _ = writeln!(output, "+{:-<22}+{:-<42}+", "", "");
                 for (k, v) in map {
-                    output.push_str(&format!("| {k:<20} | {v:<40} |\n"));
+                    let _ = writeln!(output, "| {k:<20} | {v:<40} |");
                 }
-                output.push_str(&format!("+{:-<22}+{:-<42}+", "", ""));
+                let _ = write!(output, "+{:-<22}+{:-<42}+", "", "");
                 output
             }
         }

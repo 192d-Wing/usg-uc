@@ -48,12 +48,14 @@ impl HealthCheckResult {
     }
 
     /// Sets the duration.
+    #[must_use]
     pub fn with_duration(mut self, duration: Duration) -> Self {
         self.duration = duration;
         self
     }
 
     /// Sets additional data.
+    #[must_use]
     pub fn with_data(mut self, data: impl Into<String>) -> Self {
         self.data = Some(data.into());
         self
@@ -110,6 +112,7 @@ where
     }
 
     /// Sets whether this check is critical.
+    #[must_use]
     pub fn with_critical(mut self, critical: bool) -> Self {
         self.critical = critical;
         self
@@ -180,12 +183,14 @@ impl MemoryCheck {
     }
 
     /// Sets the warning threshold.
+    #[must_use]
     pub fn with_warn_threshold(mut self, threshold: f64) -> Self {
         self.warn_threshold = threshold;
         self
     }
 
     /// Sets the critical threshold.
+    #[must_use]
     pub fn with_critical_threshold(mut self, threshold: f64) -> Self {
         self.critical_threshold = threshold;
         self
@@ -241,12 +246,14 @@ impl DiskCheck {
     }
 
     /// Sets the warning threshold.
+    #[must_use]
     pub fn with_warn_threshold(mut self, threshold: f64) -> Self {
         self.warn_threshold = threshold;
         self
     }
 
     /// Sets the critical threshold.
+    #[must_use]
     pub fn with_critical_threshold(mut self, threshold: f64) -> Self {
         self.critical_threshold = threshold;
         self

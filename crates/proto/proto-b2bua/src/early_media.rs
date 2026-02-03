@@ -339,24 +339,28 @@ impl EarlyMediaConfig {
     }
 
     /// Sets the early media mode.
+    #[must_use]
     pub fn with_mode(mut self, mode: EarlyMediaMode) -> Self {
         self.mode = mode;
         self
     }
 
     /// Sets the ringback file.
+    #[must_use]
     pub fn with_ringback(mut self, path: impl Into<String>) -> Self {
         self.ringback_file = Some(path.into());
         self
     }
 
     /// Sets the timeout.
+    #[must_use]
     pub fn with_timeout(mut self, timeout: u32) -> Self {
         self.timeout = timeout;
         self
     }
 
     /// Disables 183 forwarding.
+    #[must_use]
     pub fn without_183_forward(mut self) -> Self {
         self.forward_183 = false;
         self

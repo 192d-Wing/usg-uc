@@ -113,6 +113,9 @@ impl FromStr for Transport {
 /// # Errors
 ///
 /// Returns an error if the transport is not recognized.
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn validate_transport(transport: &str) -> SipResult<Transport> {
     transport.parse()
 }

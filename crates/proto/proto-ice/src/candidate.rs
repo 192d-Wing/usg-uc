@@ -306,6 +306,9 @@ impl Candidate {
     }
 
     /// Parses from SDP candidate attribute.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn from_sdp(sdp: &str) -> IceResult<Self> {
         let sdp = sdp.strip_prefix("candidate:").unwrap_or(sdp);
         let parts: Vec<&str> = sdp.split_whitespace().collect();

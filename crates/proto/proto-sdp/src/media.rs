@@ -171,6 +171,12 @@ impl ConnectionData {
     }
 
     /// Parses connection data from the c= line value.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(s: &str) -> SdpResult<Self> {
         let parts: Vec<&str> = s.split_whitespace().collect();
         if parts.len() != 3 {
@@ -314,6 +320,12 @@ impl MediaDescription {
     }
 
     /// Parses a media description from an m= line.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse_mline(line: &str) -> SdpResult<Self> {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 4 {

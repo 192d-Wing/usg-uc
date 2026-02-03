@@ -32,6 +32,9 @@ impl<'a> SrtpProtect<'a> {
     /// ## Errors
     ///
     /// Returns an error if encryption fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn protect_rtp(&self, packet: &RtpPacket) -> SrtpResult<Bytes> {
         // Compute packet index from sequence number (matches how receiver computes it)
         let index = self
@@ -74,6 +77,9 @@ impl<'a> SrtpProtect<'a> {
     /// ## Errors
     ///
     /// Returns an error if encryption fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn protect_rtcp(&self, rtcp_data: &[u8]) -> SrtpResult<Bytes> {
         if rtcp_data.len() < 8 {
             return Err(SrtpError::InvalidPacket {

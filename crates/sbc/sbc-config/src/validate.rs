@@ -6,7 +6,7 @@
 
 use crate::error::{ConfigError, ConfigResult};
 use crate::schema::SbcConfig;
-use uc_types::protocol::{CnsaCurve, CnsaHash, CnsaSrtpProfile};
+use uc_types::protocol::{CnsaCurve, CnsaHash};
 
 /// Validates the entire configuration.
 ///
@@ -15,6 +15,9 @@ use uc_types::protocol::{CnsaCurve, CnsaHash, CnsaSrtpProfile};
 /// ## Errors
 ///
 /// Returns an error if validation fails.
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn validate_config(config: &SbcConfig) -> ConfigResult<()> {
     validate_general(&config.general)?;
     validate_transport(&config.transport)?;
@@ -88,17 +91,17 @@ fn validate_media(config: &crate::schema::MediaConfig) -> ConfigResult<()> {
     }
 
     // CNSA 2.0: Validate SRTP profile
-    validate_cnsa_srtp(&config.srtp)?;
+    validate_cnsa_srtp(&config.srtp);
 
     // CNSA 2.0: Validate DTLS fingerprint hash
-    validate_cnsa_hash(config.dtls.fingerprint_hash)?;
+    validate_cnsa_hash(config.dtls.fingerprint_hash);
 
     Ok(())
 }
 
 fn validate_security(config: &crate::schema::SecurityConfig) -> ConfigResult<()> {
     // CNSA 2.0: Validate curve
-    validate_cnsa_curve(config.curve)?;
+    validate_cnsa_curve(config.curve);
 
     // CNSA 2.0: Validate TLS version
     match config.min_tls_version.as_str() {
@@ -164,25 +167,18 @@ fn validate_rate_limit(config: &crate::schema::RateLimitConfig) -> ConfigResult<
 }
 
 /// Validates CNSA 2.0 SRTP profile compliance.
-const fn validate_cnsa_srtp(config: &crate::schema::SrtpConfig) -> ConfigResult<()> {
-    // Only AEAD_AES_256_GCM is permitted
-    match config.profile {
-        CnsaSrtpProfile::AeadAes256Gcm => Ok(()),
-    }
+const fn validate_cnsa_srtp(_config: &crate::schema::SrtpConfig) {
+    // Only AEAD_AES_256_GCM is permitted - the type system enforces this
 }
 
 /// Validates CNSA 2.0 hash algorithm compliance.
-const fn validate_cnsa_hash(hash: CnsaHash) -> ConfigResult<()> {
-    match hash {
-        CnsaHash::Sha384 | CnsaHash::Sha512 => Ok(()),
-    }
+const fn validate_cnsa_hash(_hash: CnsaHash) {
+    // Only SHA-384 and SHA-512 are permitted - the type system enforces this
 }
 
 /// Validates CNSA 2.0 elliptic curve compliance.
-const fn validate_cnsa_curve(curve: CnsaCurve) -> ConfigResult<()> {
-    match curve {
-        CnsaCurve::P384 | CnsaCurve::P521 => Ok(()),
-    }
+const fn validate_cnsa_curve(_curve: CnsaCurve) {
+    // Only P-384 and P-521 are permitted - the type system enforces this
 }
 
 #[cfg(test)]

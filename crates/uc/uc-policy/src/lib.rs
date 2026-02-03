@@ -62,6 +62,6 @@ mod tests {
 
     #[test]
     fn test_default_priority() {
-        assert!(DEFAULT_PRIORITY > 0);
+        assert_eq!(DEFAULT_PRIORITY, 1000);
     }
 }

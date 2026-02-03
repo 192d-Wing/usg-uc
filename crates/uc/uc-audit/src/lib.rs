@@ -111,6 +111,9 @@ impl AuditLogger {
 /// ## Errors
 ///
 /// Returns an error if the logger is already initialized.
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn init() -> Result<(), AuditError> {
     init_with_sink(Box::new(sink::TracingSink))
 }
@@ -120,6 +123,9 @@ pub fn init() -> Result<(), AuditError> {
 /// ## Errors
 ///
 /// Returns an error if the logger is already initialized.
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn init_with_sink(sink: Box<dyn sink::AuditSink>) -> Result<(), AuditError> {
     AUDIT_LOGGER
         .set(Arc::new(AuditLogger::new(sink)))

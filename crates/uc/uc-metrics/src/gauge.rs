@@ -1,6 +1,7 @@
 //! Gauge metric type.
 
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 /// A gauge that can go up and down.
@@ -131,24 +132,25 @@ impl Gauge {
         let mut output = String::new();
 
         // Help line
-        output.push_str(&format!("# HELP {} {}\n", self.name, self.help));
+        let _ = writeln!(output, "# HELP {} {}", self.name, self.help);
         // Type line
-        output.push_str(&format!("# TYPE {} gauge\n", self.name));
+        let _ = writeln!(output, "# TYPE {} gauge", self.name);
 
         // Default value
         if self.label_names.is_empty() {
-            output.push_str(&format!("{} {}\n", self.name, self.get()));
+            let _ = writeln!(output, "{} {}", self.name, self.get());
         }
 
         // Labeled values
         for (labels, value) in &self.values {
             let label_str = self.format_labels(labels);
-            output.push_str(&format!(
-                "{}{} {}\n",
+            let _ = writeln!(
+                output,
+                "{}{} {}",
                 self.name,
                 label_str,
                 value.load(Ordering::Relaxed)
-            ));
+            );
         }
 
         output

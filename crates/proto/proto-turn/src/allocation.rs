@@ -119,6 +119,9 @@ impl Allocation {
     }
 
     /// Refreshes the allocation with a new lifetime.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn refresh(&mut self, lifetime: Option<u32>) -> TurnResult<u32> {
         if self.state() == AllocationState::Expired {
             return Err(TurnError::AllocationExpired);
@@ -138,6 +141,9 @@ impl Allocation {
     }
 
     /// Adds or refreshes a permission for a peer address.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn add_permission(&mut self, peer_addr: SocketAddr) -> TurnResult<()> {
         if self.state() == AllocationState::Expired {
             return Err(TurnError::AllocationExpired);
@@ -164,6 +170,9 @@ impl Allocation {
     }
 
     /// Binds a channel to a peer address.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn bind_channel(&mut self, channel: u16, peer_addr: SocketAddr) -> TurnResult<()> {
         if self.state() == AllocationState::Expired {
             return Err(TurnError::AllocationExpired);

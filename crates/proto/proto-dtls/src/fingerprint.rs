@@ -66,6 +66,9 @@ impl CertificateFingerprint {
     /// ## Errors
     ///
     /// Returns an error if the byte length doesn't match the algorithm.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn new(algorithm: FingerprintAlgorithm, bytes: Vec<u8>) -> DtlsResult<Self> {
         if bytes.len() != algorithm.output_len() {
             return Err(DtlsError::InvalidConfig {
@@ -114,6 +117,9 @@ impl CertificateFingerprint {
     /// ## Errors
     ///
     /// Returns an error if parsing fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn from_sdp(sdp: &str) -> DtlsResult<Self> {
         let parts: Vec<&str> = sdp.splitn(2, ' ').collect();
         if parts.len() != 2 {
@@ -173,6 +179,9 @@ impl CertificateFingerprint {
     /// ## Errors
     ///
     /// Returns an error if the fingerprint doesn't match.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn verify(&self, cert_der: &[u8]) -> DtlsResult<()> {
         let computed = match self.algorithm {
             FingerprintAlgorithm::Sha384 => Self::from_certificate_sha384(cert_der),
@@ -195,7 +204,7 @@ impl std::fmt::Debug for CertificateFingerprint {
         f.debug_struct("CertificateFingerprint")
             .field("algorithm", &self.algorithm)
             .field("fingerprint", &self.to_sdp())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

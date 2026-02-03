@@ -47,6 +47,19 @@ pub enum TopologyHiding {
     Full,
 }
 
+/// Media processing capabilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MediaCapabilities {
+    /// Whether transcoding is supported.
+    pub transcoding: bool,
+    /// Whether media recording is supported.
+    pub recording: bool,
+    /// Whether DTMF detection is supported.
+    pub dtmf_detection: bool,
+    /// Whether RTP inspection is supported.
+    pub rtp_inspection: bool,
+}
+
 /// Mode-specific behavioral characteristics.
 #[derive(Debug, Clone)]
 pub struct ModeCharacteristics {
@@ -56,14 +69,8 @@ pub struct ModeCharacteristics {
     pub media_handling: MediaHandling,
     /// Topology hiding level.
     pub topology_hiding: TopologyHiding,
-    /// Whether transcoding is supported.
-    pub transcoding_supported: bool,
-    /// Whether media recording is supported.
-    pub recording_supported: bool,
-    /// Whether DTMF detection is supported.
-    pub dtmf_detection_supported: bool,
-    /// Whether RTP inspection is supported.
-    pub rtp_inspection_supported: bool,
+    /// Media processing capabilities.
+    pub capabilities: MediaCapabilities,
 }
 
 impl ModeCharacteristics {
@@ -80,37 +87,35 @@ impl ModeCharacteristics {
                 sdp_modification: SdpModification::Passthrough,
                 media_handling: MediaHandling::Direct,
                 topology_hiding: TopologyHiding::SignalingOnly,
-                transcoding_supported: false,
-                recording_supported: false,
-                dtmf_detection_supported: false,
-                rtp_inspection_supported: false,
+                capabilities: MediaCapabilities::default(),
             },
             B2buaMode::MediaRelay => Self {
                 sdp_modification: SdpModification::RewriteConnection,
                 media_handling: MediaHandling::Relay,
                 topology_hiding: TopologyHiding::Full,
-                transcoding_supported: false,
-                recording_supported: false,
-                dtmf_detection_supported: false,
-                rtp_inspection_supported: false,
+                capabilities: MediaCapabilities::default(),
             },
             B2buaMode::MediaAware => Self {
                 sdp_modification: SdpModification::RewriteConnection,
                 media_handling: MediaHandling::Inspect,
                 topology_hiding: TopologyHiding::Full,
-                transcoding_supported: false,
-                recording_supported: true,
-                dtmf_detection_supported: true,
-                rtp_inspection_supported: true,
+                capabilities: MediaCapabilities {
+                    transcoding: false,
+                    recording: true,
+                    dtmf_detection: true,
+                    rtp_inspection: true,
+                },
             },
             B2buaMode::MediaTermination => Self {
                 sdp_modification: SdpModification::FullModification,
                 media_handling: MediaHandling::Terminate,
                 topology_hiding: TopologyHiding::Full,
-                transcoding_supported: true,
-                recording_supported: true,
-                dtmf_detection_supported: true,
-                rtp_inspection_supported: true,
+                capabilities: MediaCapabilities {
+                    transcoding: true,
+                    recording: true,
+                    dtmf_detection: true,
+                    rtp_inspection: true,
+                },
             },
         }
     }
@@ -135,7 +140,7 @@ impl ModeCharacteristics {
 
     /// Returns true if the mode can transcode.
     pub fn can_transcode(&self) -> bool {
-        self.transcoding_supported
+        self.capabilities.transcoding
     }
 }
 
@@ -265,21 +270,35 @@ impl SdpRewriteContext {
     }
 }
 
+/// Header hiding flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HeaderHiding {
+    /// Replace Via headers.
+    pub via: bool,
+    /// Replace Record-Route headers.
+    pub record_route: bool,
+    /// Replace Contact header.
+    pub contact: bool,
+    /// Strip internal headers (e.g., P-Asserted-Identity).
+    pub internal_headers: bool,
+}
+
+/// Identity hiding flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IdentityHiding {
+    /// Replace Call-ID on B-leg.
+    pub call_id: bool,
+    /// Anonymize From/To display names.
+    pub display_names: bool,
+}
+
 /// Topology hiding configuration.
 #[derive(Debug, Clone)]
 pub struct TopologyHidingConfig {
-    /// Replace Via headers.
-    pub hide_via: bool,
-    /// Replace Record-Route headers.
-    pub hide_record_route: bool,
-    /// Replace Contact header.
-    pub hide_contact: bool,
-    /// Strip internal headers (e.g., P-Asserted-Identity).
-    pub strip_internal_headers: bool,
-    /// Replace Call-ID on B-leg.
-    pub replace_call_id: bool,
-    /// Anonymize From/To display names.
-    pub anonymize_display_names: bool,
+    /// Header replacement configuration.
+    pub headers: HeaderHiding,
+    /// Identity hiding configuration.
+    pub identity: IdentityHiding,
 }
 
 impl TopologyHidingConfig {
@@ -287,28 +306,20 @@ impl TopologyHidingConfig {
     pub fn for_level(level: TopologyHiding) -> Self {
         match level {
             TopologyHiding::None => Self {
-                hide_via: false,
-                hide_record_route: false,
-                hide_contact: false,
-                strip_internal_headers: false,
-                replace_call_id: false,
-                anonymize_display_names: false,
+                headers: HeaderHiding::default(),
+                identity: IdentityHiding::default(),
             },
-            TopologyHiding::SignalingOnly => Self {
-                hide_via: true,
-                hide_record_route: true,
-                hide_contact: true,
-                strip_internal_headers: true,
-                replace_call_id: true,
-                anonymize_display_names: false,
-            },
-            TopologyHiding::Full => Self {
-                hide_via: true,
-                hide_record_route: true,
-                hide_contact: true,
-                strip_internal_headers: true,
-                replace_call_id: true,
-                anonymize_display_names: false,
+            TopologyHiding::SignalingOnly | TopologyHiding::Full => Self {
+                headers: HeaderHiding {
+                    via: true,
+                    record_route: true,
+                    contact: true,
+                    internal_headers: true,
+                },
+                identity: IdentityHiding {
+                    call_id: true,
+                    display_names: false,
+                },
             },
         }
     }
@@ -321,12 +332,12 @@ impl TopologyHidingConfig {
 
     /// Returns true if any topology hiding is enabled.
     pub fn is_enabled(&self) -> bool {
-        self.hide_via
-            || self.hide_record_route
-            || self.hide_contact
-            || self.strip_internal_headers
-            || self.replace_call_id
-            || self.anonymize_display_names
+        self.headers.via
+            || self.headers.record_route
+            || self.headers.contact
+            || self.headers.internal_headers
+            || self.identity.call_id
+            || self.identity.display_names
     }
 }
 

@@ -39,6 +39,12 @@ impl Origin {
     }
 
     /// Parses origin from o= line value.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(s: &str) -> SdpResult<Self> {
         let parts: Vec<&str> = s.split_whitespace().collect();
         if parts.len() != 6 {
@@ -131,6 +137,12 @@ impl Timing {
     }
 
     /// Parses timing from t= line value.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(s: &str) -> SdpResult<Self> {
         let parts: Vec<&str> = s.split_whitespace().collect();
         if parts.len() != 2 {
@@ -216,6 +228,12 @@ impl TimeValue {
     }
 
     /// Parses a time value from a string (compact form supported).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(s: &str) -> SdpResult<Self> {
         let s = s.trim();
         if s.is_empty() {
@@ -225,17 +243,13 @@ impl TimeValue {
         }
 
         // Check for unit suffix
-        let (value_str, multiplier) = if let Some(num) = s.strip_suffix('d') {
-            (num, 86400u64)
-        } else if let Some(num) = s.strip_suffix('h') {
-            (num, 3600u64)
-        } else if let Some(num) = s.strip_suffix('m') {
-            (num, 60u64)
-        } else if let Some(num) = s.strip_suffix('s') {
-            (num, 1u64)
-        } else {
-            (s, 1u64)
-        };
+        let (value_str, multiplier) = s
+            .strip_suffix('d')
+            .map(|num| (num, 86400u64))
+            .or_else(|| s.strip_suffix('h').map(|num| (num, 3600u64)))
+            .or_else(|| s.strip_suffix('m').map(|num| (num, 60u64)))
+            .or_else(|| s.strip_suffix('s').map(|num| (num, 1u64)))
+            .unwrap_or((s, 1u64));
 
         let value: u64 = value_str.parse().map_err(|_| SdpError::ParseError {
             reason: format!("invalid time value: {s}"),
@@ -350,6 +364,12 @@ impl RepeatTimes {
     }
 
     /// Parses repeat times from r= line value.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(s: &str) -> SdpResult<Self> {
         let parts: Vec<&str> = s.split_whitespace().collect();
         if parts.len() < 3 {
@@ -610,6 +630,7 @@ impl fmt::Display for SessionDescription {
 impl FromStr for SessionDescription {
     type Err = SdpError;
 
+    #[allow(clippy::too_many_lines)]
     fn from_str(s: &str) -> SdpResult<Self> {
         let mut version: Option<u8> = None;
         let mut origin: Option<Origin> = None;
@@ -722,7 +743,7 @@ impl FromStr for SessionDescription {
         }
 
         // Validate required fields
-        let version = version.ok_or(SdpError::MissingField {
+        let version = version.ok_or_else(|| SdpError::MissingField {
             field: "v (version)".to_string(),
         })?;
 
@@ -730,15 +751,15 @@ impl FromStr for SessionDescription {
             return Err(SdpError::UnsupportedVersion { version });
         }
 
-        let origin = origin.ok_or(SdpError::MissingField {
+        let origin = origin.ok_or_else(|| SdpError::MissingField {
             field: "o (origin)".to_string(),
         })?;
 
-        let session_name = session_name.ok_or(SdpError::MissingField {
+        let session_name = session_name.ok_or_else(|| SdpError::MissingField {
             field: "s (session name)".to_string(),
         })?;
 
-        let timing = timing.ok_or(SdpError::MissingField {
+        let timing = timing.ok_or_else(|| SdpError::MissingField {
             field: "t (timing)".to_string(),
         })?;
 

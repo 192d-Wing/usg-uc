@@ -1,6 +1,7 @@
 //! Counter metric type.
 
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A monotonically increasing counter.
@@ -107,24 +108,25 @@ impl Counter {
         let mut output = String::new();
 
         // Help line
-        output.push_str(&format!("# HELP {} {}\n", self.name, self.help));
+        let _ = writeln!(output, "# HELP {} {}", self.name, self.help);
         // Type line
-        output.push_str(&format!("# TYPE {} counter\n", self.name));
+        let _ = writeln!(output, "# TYPE {} counter", self.name);
 
         // Default value
         if self.label_names.is_empty() {
-            output.push_str(&format!("{} {}\n", self.name, self.get()));
+            let _ = writeln!(output, "{} {}", self.name, self.get());
         }
 
         // Labeled values
         for (labels, value) in &self.values {
             let label_str = self.format_labels(labels);
-            output.push_str(&format!(
-                "{}{} {}\n",
+            let _ = writeln!(
+                output,
+                "{}{} {}",
                 self.name,
                 label_str,
                 value.load(Ordering::Relaxed)
-            ));
+            );
         }
 
         output

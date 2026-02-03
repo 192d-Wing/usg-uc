@@ -42,6 +42,9 @@ impl Aes256GcmKey {
     /// ## Errors
     ///
     /// Returns an error if the key length is not 32 bytes.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn new(key_bytes: [u8; KEY_LEN]) -> CryptoResult<Self> {
         Ok(Self { key_bytes })
     }
@@ -51,6 +54,9 @@ impl Aes256GcmKey {
     /// ## Errors
     ///
     /// Returns an error if random generation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn generate() -> CryptoResult<Self> {
         let key_bytes = random::generate_key_256()?;
         Ok(Self { key_bytes })

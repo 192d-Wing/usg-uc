@@ -70,6 +70,7 @@ impl MetricRegistry {
     }
 
     /// Sets the subsystem.
+    #[must_use]
     pub fn with_subsystem(mut self, subsystem: impl Into<String>) -> Self {
         self.subsystem = Some(subsystem.into());
         self

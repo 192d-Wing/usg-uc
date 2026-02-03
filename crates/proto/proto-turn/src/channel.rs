@@ -45,6 +45,9 @@ impl ChannelData {
     /// Returns an error if:
     /// - Channel number is out of valid range
     /// - Data exceeds maximum size
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn new(channel: u16, data: Bytes) -> TurnResult<Self> {
         if !(MIN_CHANNEL_NUMBER..=MAX_CHANNEL_NUMBER).contains(&channel) {
             return Err(TurnError::InvalidChannel { channel });
@@ -97,6 +100,9 @@ impl ChannelData {
     /// - Buffer is too small
     /// - Channel number is invalid
     /// - Length field exceeds buffer
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn decode(data: &[u8]) -> TurnResult<Self> {
         if data.len() < CHANNEL_DATA_HEADER_SIZE {
             return Err(TurnError::BufferTooSmall {

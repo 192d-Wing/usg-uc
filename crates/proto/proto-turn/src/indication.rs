@@ -71,6 +71,9 @@ impl SendIndication {
     /// The client sends a Send indication to the server when it
     /// wants to send data to a peer but does not have a channel
     /// binding for that peer.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn new(peer_address: SocketAddr, data: Bytes) -> TurnResult<Self> {
         if data.len() > MAX_INDICATION_DATA_SIZE {
             return Err(TurnError::DataTooLarge {
@@ -121,6 +124,9 @@ impl SendIndication {
     /// ## RFC 5766 §9
     ///
     /// The Send indication uses method 0x0006 with class Indication (0x10).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn encode(&self) -> TurnResult<Bytes> {
         let mut transaction_id = [0u8; 12];
         uc_crypto::random::fill_random(&mut transaction_id).map_err(|_| {
@@ -174,6 +180,9 @@ impl SendIndication {
     /// ## Errors
     ///
     /// Returns an error if required attributes are missing.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(msg: &StunMessage, raw_data: &[u8]) -> TurnResult<Self> {
         if msg.msg_type.method != StunMethod::Send {
             return Err(TurnError::InvalidRequest {
@@ -268,6 +277,9 @@ impl DataIndication {
     /// ## Errors
     ///
     /// Returns an error if data exceeds maximum size.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn new(peer_address: SocketAddr, data: Bytes) -> TurnResult<Self> {
         if data.len() > MAX_INDICATION_DATA_SIZE {
             return Err(TurnError::DataTooLarge {
@@ -302,6 +314,9 @@ impl DataIndication {
     /// ## RFC 5766 §12
     ///
     /// The Data indication uses method 0x0007 with class Indication (0x10).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn encode(&self) -> TurnResult<Bytes> {
         let mut transaction_id = [0u8; 12];
         uc_crypto::random::fill_random(&mut transaction_id).map_err(|_| {
@@ -347,6 +362,9 @@ impl DataIndication {
     /// ## Errors
     ///
     /// Returns an error if required attributes are missing.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(msg: &StunMessage, raw_data: &[u8]) -> TurnResult<Self> {
         if msg.msg_type.method != StunMethod::Data {
             return Err(TurnError::InvalidRequest {

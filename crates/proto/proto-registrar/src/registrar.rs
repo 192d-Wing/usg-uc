@@ -78,24 +78,28 @@ impl RegistrarConfig {
     }
 
     /// Sets the operation mode.
+    #[must_use]
     pub fn with_mode(mut self, mode: RegistrarMode) -> Self {
         self.mode = mode;
         self
     }
 
     /// Sets the default expiration.
+    #[must_use]
     pub fn with_default_expires(mut self, expires: u32) -> Self {
         self.default_expires = expires;
         self
     }
 
     /// Sets the realm.
+    #[must_use]
     pub fn with_realm(mut self, realm: impl Into<String>) -> Self {
         self.realm = realm.into();
         self
     }
 
     /// Enables authentication requirement.
+    #[must_use]
     pub fn with_auth_required(mut self, required: bool) -> Self {
         self.require_auth = required;
         self
@@ -142,24 +146,28 @@ impl RegisterRequest {
     }
 
     /// Sets the contacts.
+    #[must_use]
     pub fn with_contacts(mut self, contacts: Vec<ContactInfo>) -> Self {
         self.contacts = contacts;
         self
     }
 
     /// Sets the Call-ID.
+    #[must_use]
     pub fn with_call_id(mut self, call_id: impl Into<String>) -> Self {
         self.call_id = call_id.into();
         self
     }
 
     /// Sets the CSeq.
+    #[must_use]
     pub fn with_cseq(mut self, cseq: u32) -> Self {
         self.cseq = cseq;
         self
     }
 
     /// Sets the Authorization header.
+    #[must_use]
     pub fn with_authorization(mut self, auth: impl Into<String>) -> Self {
         self.authorization = Some(auth.into());
         self
@@ -201,12 +209,14 @@ impl ContactInfo {
     }
 
     /// Sets the expires value.
+    #[must_use]
     pub fn with_expires(mut self, expires: u32) -> Self {
         self.expires = Some(expires);
         self
     }
 
     /// Sets the q-value.
+    #[must_use]
     pub fn with_q_value(mut self, q: f32) -> Self {
         self.q_value = Some(q);
         self
@@ -319,12 +329,14 @@ impl RegisterResponse {
     }
 
     /// Sets authentication info for successful auth response.
+    #[must_use]
     pub fn with_authentication_info(mut self, info: impl Into<String>) -> Self {
         self.authentication_info = Some(info.into());
         self
     }
 
     /// Adds Service-Route headers.
+    #[must_use]
     pub fn with_service_route(mut self, routes: Vec<String>) -> Self {
         self.service_route = routes;
         self
@@ -342,22 +354,27 @@ impl RegisterResponse {
                 let mut contact = format!("<{}>", binding.contact_uri());
 
                 // Add expires parameter
-                contact.push_str(&format!(";expires={remaining}"));
+                contact.push_str(";expires=");
+                contact.push_str(&remaining.to_string());
 
                 // Add q-value if not default (1.0)
                 let q = binding.q_value();
                 if (q - 1.0).abs() > f32::EPSILON {
-                    contact.push_str(&format!(";q={q:.1}"));
+                    use std::fmt::Write;
+                    let _ = write!(contact, ";q={q:.1}");
                 }
 
                 // Add instance-id if present (RFC 5626)
                 if let Some(instance) = binding.instance_id() {
-                    contact.push_str(&format!(";+sip.instance=\"{instance}\""));
+                    contact.push_str(";+sip.instance=\"");
+                    contact.push_str(instance);
+                    contact.push('"');
                 }
 
                 // Add reg-id if present (RFC 5626)
                 if let Some(reg_id) = binding.reg_id() {
-                    contact.push_str(&format!(";reg-id={reg_id}"));
+                    contact.push_str(";reg-id=");
+                    contact.push_str(&reg_id.to_string());
                 }
 
                 contact
@@ -578,6 +595,7 @@ impl AuthenticatedRegistrar {
     }
 
     /// Sets the password lookup function.
+    #[must_use]
     pub fn with_password_lookup<F>(mut self, lookup: F) -> Self
     where
         F: Fn(&str, &str) -> Option<String> + Send + Sync + 'static,

@@ -131,6 +131,12 @@ impl HandshakeHeader {
     pub const SIZE: usize = 12;
 
     /// Parses a handshake header.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(data: &[u8]) -> DtlsResult<Self> {
         if data.len() < Self::SIZE {
             return Err(DtlsError::HandshakeFailed {
@@ -205,8 +211,8 @@ pub struct Handshake {
     peer_cert_chain: Vec<Vec<u8>>,
     /// Peer's public key extracted from certificate.
     peer_public_key: Option<Vec<u8>>,
-    /// `ServerKeyExchange` ECDH params (for signature verification).
-    server_ecdh_params: Option<Vec<u8>>,
+    /// ECDH params (for signature verification).
+    ecdh_params: Option<Vec<u8>>,
     /// Expected certificate fingerprint (for DTLS-SRTP).
     expected_fingerprint: Option<[u8; 48]>,
     /// Whether to allow self-signed certificates.
@@ -262,7 +268,7 @@ impl Handshake {
             cookie: Vec::new(),
             peer_cert_chain: Vec::new(),
             peer_public_key: None,
-            server_ecdh_params: None,
+            ecdh_params: None,
             expected_fingerprint: None,
             allow_self_signed: true, // Default for DTLS-SRTP
         })
@@ -308,7 +314,7 @@ impl Handshake {
         debug!("Starting client handshake");
 
         // Send ClientHello
-        let client_hello = self.build_client_hello()?;
+        let client_hello = self.build_client_hello();
         self.send_handshake_message(socket, HandshakeType::ClientHello, &client_hello)
             .await?;
         self.state = HandshakeState::WaitHelloVerifyRequest;
@@ -322,7 +328,7 @@ impl Handshake {
             // Extract cookie and resend ClientHello
             self.process_hello_verify_request(&msg.1)?;
 
-            let client_hello_with_cookie = self.build_client_hello()?;
+            let client_hello_with_cookie = self.build_client_hello();
             self.send_handshake_message(
                 socket,
                 HandshakeType::ClientHello,
@@ -469,12 +475,12 @@ impl Handshake {
         self.verify_client_hello_cookie(&ch_msg2.1)?;
 
         // Send ServerHello
-        let sh = self.build_server_hello()?;
+        let sh = self.build_server_hello();
         self.send_handshake_message(socket, HandshakeType::ServerHello, &sh)
             .await?;
 
         // Send Certificate
-        let cert = self.build_certificate()?;
+        let cert = self.build_certificate();
         self.send_handshake_message(socket, HandshakeType::Certificate, &cert)
             .await?;
 
@@ -544,7 +550,7 @@ impl Handshake {
     }
 
     /// Builds a `ClientHello` message.
-    fn build_client_hello(&self) -> DtlsResult<Vec<u8>> {
+    fn build_client_hello(&self) -> Vec<u8> {
         let mut msg = Vec::new();
 
         // Client version (DTLS 1.2)
@@ -556,7 +562,8 @@ impl Handshake {
         // Session ID (empty for new session)
         msg.push(0);
 
-        // Cookie
+        // Cookie length is always <= 255, so truncation is safe
+        #[allow(clippy::cast_possible_truncation)]
         msg.push(self.cookie.len() as u8);
         msg.extend_from_slice(&self.cookie);
 
@@ -572,7 +579,7 @@ impl Handshake {
         // We'd need to add supported_groups (P-384) and signature_algorithms here
         msg.extend_from_slice(&0u16.to_be_bytes()); // No extensions for now
 
-        Ok(msg)
+        msg
     }
 
     /// Processes a `HelloVerifyRequest`.
@@ -699,7 +706,7 @@ impl Handshake {
     }
 
     /// Builds a `ServerHello` message.
-    fn build_server_hello(&self) -> DtlsResult<Vec<u8>> {
+    fn build_server_hello(&self) -> Vec<u8> {
         let mut msg = Vec::new();
 
         // Server version
@@ -720,28 +727,31 @@ impl Handshake {
         // No extensions
         msg.extend_from_slice(&0u16.to_be_bytes());
 
-        Ok(msg)
+        msg
     }
 
     /// Builds a Certificate message.
-    fn build_certificate(&self) -> DtlsResult<Vec<u8>> {
+    fn build_certificate(&self) -> Vec<u8> {
         let mut msg = Vec::new();
 
         // Calculate total certificates length
         let total_len: usize = self.local_cert_chain.iter().map(|c| 3 + c.len()).sum();
 
-        // Certificates length (3 bytes)
+        // Certificates length (3 bytes) - total_len fits in 24 bits for valid certs
+        #[allow(clippy::cast_possible_truncation)]
         let len_bytes = (total_len as u32).to_be_bytes();
         msg.extend_from_slice(&len_bytes[1..4]);
 
         // Each certificate
         for cert in &self.local_cert_chain {
+            // cert.len() fits in 24 bits for valid certificates
+            #[allow(clippy::cast_possible_truncation)]
             let cert_len = (cert.len() as u32).to_be_bytes();
             msg.extend_from_slice(&cert_len[1..4]);
             msg.extend_from_slice(cert);
         }
 
-        Ok(msg)
+        msg
     }
 
     /// Builds a `ServerKeyExchange` message.
@@ -763,7 +773,8 @@ impl Handshake {
         // Named curve: secp384r1 (24)
         msg.extend_from_slice(&24u16.to_be_bytes());
 
-        // Public key length and data
+        // Public key length and data - P-384 public key is 97 bytes, fits in u8
+        #[allow(clippy::cast_possible_truncation)]
         msg.push(public_key.len() as u8);
         msg.extend_from_slice(&public_key);
 
@@ -790,7 +801,8 @@ impl Handshake {
 
         // Signature algorithm: ecdsa_secp384r1_sha384 (0x0503)
         msg.extend_from_slice(&[0x05, 0x03]);
-        // Signature length (2 bytes)
+        // Signature length (2 bytes) - ECDSA P-384 signature fits in u16
+        #[allow(clippy::cast_possible_truncation)]
         msg.extend_from_slice(&(signature.len() as u16).to_be_bytes());
         // Signature
         msg.extend_from_slice(&signature);
@@ -833,7 +845,7 @@ impl Handshake {
         self.peer_ecdhe_public = Some(data[4..4 + pk_len].to_vec());
 
         // Store ECDH params for signature verification
-        self.server_ecdh_params = Some(data[..4 + pk_len].to_vec());
+        self.ecdh_params = Some(data[..4 + pk_len].to_vec());
 
         // Check for signature (if present)
         if data.len() > 4 + pk_len {
@@ -954,7 +966,7 @@ impl Handshake {
     /// verify_data = PRF(master_secret, finished_label, Hash(handshake_messages))[0..11]
     /// ```
     fn verify_finished(&self, data: &[u8], is_client_finished: bool) -> DtlsResult<()> {
-        let master_secret = self.master_secret.ok_or(DtlsError::HandshakeFailed {
+        let master_secret = self.master_secret.ok_or_else(|| DtlsError::HandshakeFailed {
             reason: "no master secret for Finished verification".to_string(),
         })?;
 
@@ -987,6 +999,8 @@ impl Handshake {
         self.local_ecdhe = Some(ecdhe);
 
         let mut msg = Vec::new();
+        // P-384 public key is 97 bytes, fits in u8
+        #[allow(clippy::cast_possible_truncation)]
         msg.push(public_key.len() as u8);
         msg.extend_from_slice(&public_key);
 
@@ -1020,14 +1034,14 @@ impl Handshake {
         let ecdhe = self
             .local_ecdhe
             .take()
-            .ok_or(DtlsError::KeyDerivationFailed {
+            .ok_or_else(|| DtlsError::KeyDerivationFailed {
                 reason: "no local ECDHE key".to_string(),
             })?;
 
         let peer_public =
             self.peer_ecdhe_public
                 .as_ref()
-                .ok_or(DtlsError::KeyDerivationFailed {
+                .ok_or_else(|| DtlsError::KeyDerivationFailed {
                     reason: "no peer ECDHE public key".to_string(),
                 })?;
 
@@ -1047,7 +1061,7 @@ impl Handshake {
         seed.extend_from_slice(&self.client_random);
         seed.extend_from_slice(&self.server_random);
 
-        let master_secret = prf_sha384(&shared_bytes, b"master secret", &seed, 48)?;
+        let master_secret = prf_sha384(&shared_bytes, b"master secret", &seed, 48);
         let mut ms = [0u8; 48];
         ms.copy_from_slice(&master_secret);
         self.master_secret = Some(ms);
@@ -1058,7 +1072,7 @@ impl Handshake {
 
     /// Activates the cipher suite.
     fn activate_cipher(&mut self) -> DtlsResult<()> {
-        let master_secret = self.master_secret.ok_or(DtlsError::KeyDerivationFailed {
+        let master_secret = self.master_secret.ok_or_else(|| DtlsError::KeyDerivationFailed {
             reason: "no master secret".to_string(),
         })?;
 
@@ -1068,7 +1082,7 @@ impl Handshake {
         seed.extend_from_slice(&self.client_random);
 
         // For AES-256-GCM: 32 byte key + 4 byte IV for each direction
-        let key_material = prf_sha384(&master_secret, b"key expansion", &seed, 72)?;
+        let key_material = prf_sha384(&master_secret, b"key expansion", &seed, 72);
 
         let client_key_bytes: [u8; 32] =
             key_material[0..32]
@@ -1119,7 +1133,7 @@ impl Handshake {
 
     /// Builds a Finished message.
     fn build_finished(&self) -> DtlsResult<Vec<u8>> {
-        let master_secret = self.master_secret.ok_or(DtlsError::KeyDerivationFailed {
+        let master_secret = self.master_secret.ok_or_else(|| DtlsError::KeyDerivationFailed {
             reason: "no master secret".to_string(),
         })?;
 
@@ -1132,7 +1146,7 @@ impl Handshake {
         // Hash of all handshake messages
         let handshake_hash = uc_crypto::hash::sha384(&self.handshake_hash);
 
-        let verify_data = prf_sha384(&master_secret, label, &handshake_hash, 12)?;
+        let verify_data = prf_sha384(&master_secret, label, &handshake_hash, 12);
 
         Ok(verify_data)
     }
@@ -1144,7 +1158,8 @@ impl Handshake {
         msg_type: HandshakeType,
         payload: &[u8],
     ) -> DtlsResult<()> {
-        // Build handshake header
+        // Build handshake header - payload length fits in 24 bits for valid handshake messages
+        #[allow(clippy::cast_possible_truncation)]
         let header = HandshakeHeader {
             msg_type,
             length: payload.len() as u32,
@@ -1258,8 +1273,14 @@ impl Handshake {
     }
 
     /// Exports SRTP keying material per RFC 5764.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn export_srtp_keying_material(&self) -> DtlsResult<Vec<u8>> {
-        let master_secret = self.master_secret.ok_or(DtlsError::SrtpKeyExportFailed {
+        let master_secret = self.master_secret.ok_or_else(|| DtlsError::SrtpKeyExportFailed {
             reason: "no master secret".to_string(),
         })?;
 
@@ -1268,14 +1289,14 @@ impl Handshake {
         seed.extend_from_slice(&self.server_random);
 
         // SRTP keying material: 2 * (32 byte key + 12 byte salt) = 88 bytes
-        let keying_material = prf_sha384(&master_secret, b"EXTRACTOR-dtls_srtp", &seed, 88)?;
+        let keying_material = prf_sha384(&master_secret, b"EXTRACTOR-dtls_srtp", &seed, 88);
 
         Ok(keying_material)
     }
 }
 
 /// TLS 1.2 PRF using HMAC-SHA-384.
-fn prf_sha384(secret: &[u8], label: &[u8], seed: &[u8], length: usize) -> DtlsResult<Vec<u8>> {
+fn prf_sha384(secret: &[u8], label: &[u8], seed: &[u8], length: usize) -> Vec<u8> {
     // P_SHA384(secret, seed) = HMAC_SHA384(secret, A(1) + seed) +
     //                          HMAC_SHA384(secret, A(2) + seed) + ...
     // where A(0) = seed, A(i) = HMAC_SHA384(secret, A(i-1))
@@ -1304,7 +1325,7 @@ fn prf_sha384(secret: &[u8], label: &[u8], seed: &[u8], length: usize) -> DtlsRe
     }
 
     result.truncate(length);
-    Ok(result)
+    result
 }
 
 #[cfg(test)]
@@ -1361,8 +1382,8 @@ mod tests {
         let label = b"test label";
         let seed = b"seed data";
 
-        let result1 = prf_sha384(secret, label, seed, 32).unwrap();
-        let result2 = prf_sha384(secret, label, seed, 32).unwrap();
+        let result1 = prf_sha384(secret, label, seed, 32);
+        let result2 = prf_sha384(secret, label, seed, 32);
 
         assert_eq!(result1, result2);
         assert_eq!(result1.len(), 32);

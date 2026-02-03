@@ -233,6 +233,9 @@ impl MediaStream {
     }
 
     /// Starts the stream.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn start(&mut self) -> MediaResult<()> {
         match self.state {
             StreamState::Created | StreamState::Stopped => {
@@ -249,6 +252,9 @@ impl MediaStream {
     }
 
     /// Stops the stream.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn stop(&mut self) -> MediaResult<()> {
         match self.state {
             StreamState::Active | StreamState::OnHold => {
@@ -265,6 +271,9 @@ impl MediaStream {
     }
 
     /// Puts the stream on hold.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn hold(&mut self) -> MediaResult<()> {
         if self.state == StreamState::Active {
             self.state = StreamState::OnHold;
@@ -278,6 +287,9 @@ impl MediaStream {
     }
 
     /// Resumes from hold.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn resume(&mut self) -> MediaResult<()> {
         if self.state == StreamState::OnHold {
             self.state = StreamState::Active;

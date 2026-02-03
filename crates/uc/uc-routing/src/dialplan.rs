@@ -125,15 +125,15 @@ impl DialPattern {
     /// X = single digit (0-9)
     /// . = any remaining digits
     fn match_wildcard(pattern: &str, number: &str) -> bool {
-        let pattern_chars = pattern.chars().peekable();
-        let mut number_chars = number.chars().peekable();
+        let pattern_chars = pattern.chars();
+        let mut number_chars = number.chars();
 
         for p in pattern_chars {
             match p {
                 'X' => {
                     // Match any single digit
                     match number_chars.next() {
-                        Some(c) if c.is_ascii_digit() => continue,
+                        Some(c) if c.is_ascii_digit() => {}
                         _ => return false,
                     }
                 }
@@ -211,30 +211,35 @@ impl DialPlanEntry {
     }
 
     /// Sets the entry name.
+    #[must_use]
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
     }
 
     /// Sets the transformation.
+    #[must_use]
     pub fn with_transform(mut self, transform: NumberTransform) -> Self {
         self.transform = transform;
         self
     }
 
     /// Sets the priority.
+    #[must_use]
     pub fn with_priority(mut self, priority: u32) -> Self {
         self.priority = priority;
         self
     }
 
     /// Sets whether enabled.
+    #[must_use]
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
         self
     }
 
     /// Adds a tag.
+    #[must_use]
     pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
         self.tags.push(tag.into());
         self

@@ -72,12 +72,14 @@ impl TurnCredentials {
     }
 
     /// Sets the realm.
+    #[must_use]
     pub fn with_realm(mut self, realm: impl Into<String>) -> Self {
         self.realm = Some(realm.into());
         self
     }
 
     /// Sets the nonce.
+    #[must_use]
     pub fn with_nonce(mut self, nonce: impl Into<String>) -> Self {
         self.nonce = Some(nonce.into());
         self
@@ -167,18 +169,23 @@ impl TurnClient {
     }
 
     /// Sets the request timeout.
+    #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
     /// Sets the maximum number of retries.
+    #[must_use]
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
         self
     }
 
     /// Returns the local address of the socket.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn local_addr(&self) -> TurnResult<SocketAddr> {
         self.socket
             .local_addr()

@@ -101,18 +101,23 @@ impl StunClient {
     }
 
     /// Sets the request timeout.
+    #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
     /// Sets the maximum number of retries.
+    #[must_use]
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
         self
     }
 
     /// Returns the local address of the socket.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn local_addr(&self) -> StunResult<SocketAddr> {
         self.socket
             .local_addr()
@@ -277,7 +282,7 @@ impl std::fmt::Debug for StunClient {
             .field("server", &self.server)
             .field("timeout", &self.timeout)
             .field("max_retries", &self.max_retries)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

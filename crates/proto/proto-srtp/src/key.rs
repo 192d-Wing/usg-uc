@@ -87,6 +87,9 @@ impl SrtpKeyMaterial {
     /// ## Errors
     ///
     /// Returns an error if key derivation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn derive_session_key(&self, label: KeyDerivationLabel) -> SrtpResult<Vec<u8>> {
         let key_len = self.profile.session_key_len();
         let mut output = vec![0u8; key_len];
@@ -112,6 +115,9 @@ impl SrtpKeyMaterial {
     /// ## Errors
     ///
     /// Returns an error if derivation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn derive_session_salt(&self, label: KeyDerivationLabel) -> SrtpResult<Vec<u8>> {
         let salt_len = self.profile.master_salt_len();
         let mut output = vec![0u8; salt_len];
@@ -201,6 +207,9 @@ impl SessionKeys {
     /// ## Errors
     ///
     /// Returns an error if key derivation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn derive(material: &SrtpKeyMaterial) -> SrtpResult<Self> {
         Ok(Self {
             rtp_key: material.derive_session_key(KeyDerivationLabel::RtpEncryption)?,

@@ -397,6 +397,9 @@ impl ConsentKeepaliveManager {
     ///
     /// Per RFC 7675 §6, returns an error when consent has expired.
     /// Callers should use this to guard media transmission.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn check_consent(&self) -> Result<(), ConsentRevoked> {
         if self.consent.is_revoked() {
             Err(ConsentRevoked)
@@ -479,6 +482,9 @@ impl ConsentKeepaliveManager {
     }
 
     /// Processes a STUN response (consent check response or keepalive response).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn process_response(&mut self, response: &StunMessage) -> IceResult<()> {
         // Check if this is a response to our consent check
         if let Some(expected_tid) = self.current_transaction

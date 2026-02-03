@@ -54,18 +54,21 @@ impl Route {
     }
 
     /// Sets the description.
+    #[must_use]
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
         self
     }
 
     /// Sets whether authentication is required.
+    #[must_use]
     pub fn with_auth(mut self, required: bool) -> Self {
         self.auth_required = required;
         self
     }
 
     /// Adds a required permission.
+    #[must_use]
     pub fn with_permission(mut self, permission: impl Into<String>) -> Self {
         self.permissions.push(permission.into());
         self

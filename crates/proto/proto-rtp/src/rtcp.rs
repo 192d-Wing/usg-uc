@@ -93,6 +93,9 @@ impl RtcpHeader {
     /// ## Errors
     ///
     /// Returns an error if the data is invalid.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(data: &[u8]) -> RtpResult<Self> {
         if data.len() < 4 {
             return Err(RtpError::InvalidRtcp {
@@ -169,6 +172,9 @@ impl RtcpPacket {
     /// ## Errors
     ///
     /// Returns an error if the packet is invalid.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(data: &[u8]) -> RtpResult<Self> {
         let header = RtcpHeader::parse(data)?;
         let payload_len = header.payload_length();
@@ -189,6 +195,9 @@ impl RtcpPacket {
     /// ## Errors
     ///
     /// Returns an error if any packet is invalid.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse_compound(data: &[u8]) -> RtpResult<Vec<Self>> {
         let mut packets = Vec::new();
         let mut offset = 0;
@@ -266,6 +275,9 @@ impl SenderInfo {
     /// ## Errors
     ///
     /// Returns an error if the data is too short.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(data: &[u8]) -> RtpResult<Self> {
         if data.len() < 24 {
             return Err(RtpError::InvalidRtcp {
@@ -310,6 +322,9 @@ impl ReceptionReport {
     /// ## Errors
     ///
     /// Returns an error if the data is too short.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(data: &[u8]) -> RtpResult<Self> {
         if data.len() < 24 {
             return Err(RtpError::InvalidRtcp {

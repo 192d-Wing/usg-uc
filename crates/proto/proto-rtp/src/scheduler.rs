@@ -353,7 +353,7 @@ fn random_f64() -> f64 {
     SEED.with(|cell| {
         // LCG parameters (same as glibc)
         let seed = cell.get();
-        let new_seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+        let new_seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
         cell.set(new_seed);
 
         // Extract bits and convert to [0, 1)

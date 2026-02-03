@@ -240,7 +240,7 @@ impl TopologyHider {
                 // In aggressive mode, strip internal Vias entirely
                 return None;
             }
-            anonymized.host = self.config.external_host.clone();
+            anonymized.host.clone_from(&self.config.external_host);
             anonymized.port = self.config.external_port;
         }
 
@@ -265,7 +265,7 @@ impl TopologyHider {
     /// Rewrites Via headers in a header collection for outbound requests.
     ///
     /// This adds the proxy's Via and optionally hides internal Via headers.
-    pub fn rewrite_vias_for_outbound(&self, headers: &mut Headers, proxy_via: ViaHeader) {
+    pub fn rewrite_vias_for_outbound(&self, headers: &mut Headers, proxy_via: &ViaHeader) {
         if self.config.mode == TopologyHidingMode::None {
             // Just add proxy Via without hiding - insert at beginning
             let existing_vias = headers.via_all_parsed();
@@ -298,6 +298,12 @@ impl TopologyHider {
     ///
     /// This removes the topmost Via (proxy's own) and optionally hides
     /// remaining internal Vias.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn rewrite_vias_for_inbound(&self, headers: &mut Headers) -> SipResult<ViaHeader> {
         // Parse all Vias
         let vias = headers.via_all_parsed();
@@ -534,13 +540,19 @@ impl TopologyHider {
             return;
         }
 
-        self.rewrite_vias_for_outbound(headers, proxy_via);
+        self.rewrite_vias_for_outbound(headers, &proxy_via);
         self.rewrite_contacts(headers);
         self.rewrite_call_id(headers);
         // Note: Record-Route is typically added by the proxy, not rewritten here
     }
 
     /// Applies all topology hiding transformations to inbound response headers.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn hide_inbound_response(&mut self, headers: &mut Headers) -> SipResult<ViaHeader> {
         let proxy_via = self.rewrite_vias_for_inbound(headers)?;
 

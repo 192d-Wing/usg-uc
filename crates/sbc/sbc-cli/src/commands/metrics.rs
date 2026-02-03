@@ -30,10 +30,10 @@ pub fn run(_args: &Args) -> CommandResult {
         gauge.set(84_i64);
     }
     if let Some(counter) = registry.counter("sip_requests_total") {
-        counter.inc_by(123456_u64);
+        counter.inc_by(123_456_u64);
     }
     if let Some(counter) = registry.counter("sip_responses_total") {
-        counter.inc_by(123400_u64);
+        counter.inc_by(123_400_u64);
     }
 
     // Observe some histogram values

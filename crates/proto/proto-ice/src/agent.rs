@@ -305,6 +305,9 @@ impl IceAgent {
     }
 
     /// Adds a remote candidate.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn add_remote_candidate(&mut self, candidate: Candidate) -> IceResult<()> {
         // Add to remote candidates
         self.remote_candidates.push(candidate.clone());
@@ -325,6 +328,9 @@ impl IceAgent {
     }
 
     /// Starts candidate gathering.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn gather_candidates(&mut self, local_addresses: &[SocketAddr]) -> IceResult<()> {
         if self.state != IceState::New {
             return Err(IceError::InvalidStateTransition {
@@ -504,6 +510,9 @@ impl IceAgent {
     }
 
     /// Starts connectivity checks.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn start_checks(&mut self) -> IceResult<()> {
         if self.local_candidates.is_empty() {
             return Err(IceError::NoCandidates);
@@ -532,6 +541,9 @@ impl IceAgent {
     }
 
     /// Marks a connectivity check as started.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn start_check(&mut self, pair_index: usize) -> IceResult<()> {
         let pair = self
             .checklist
@@ -547,6 +559,9 @@ impl IceAgent {
     }
 
     /// Handles a successful connectivity check.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn check_succeeded(&mut self, pair_index: usize) -> IceResult<()> {
         self.checklist.mark_succeeded(pair_index)?;
 
@@ -576,6 +591,9 @@ impl IceAgent {
     }
 
     /// Handles a failed connectivity check.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn check_failed(&mut self, pair_index: usize) -> IceResult<()> {
         self.checklist.mark_failed(pair_index)?;
 
@@ -589,6 +607,9 @@ impl IceAgent {
     }
 
     /// Nominates a candidate pair (controlling agent only).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn nominate(&mut self, pair_index: usize) -> IceResult<()> {
         if self.role != IceRole::Controlling {
             return Err(IceError::InvalidStateTransition {
@@ -719,6 +740,9 @@ impl IceAgent {
     }
 
     /// Handles an ICE restart.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn restart(&mut self) -> IceResult<()> {
         // Generate new credentials
         self.local_credentials = IceCredentials::generate();

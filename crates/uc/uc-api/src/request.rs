@@ -37,6 +37,7 @@ impl HttpMethod {
     }
 
     /// Parses from a string.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
             "GET" => Some(Self::Get),
@@ -91,12 +92,13 @@ impl PaginationParams {
     pub fn new(page: usize, page_size: usize) -> Self {
         Self {
             page: page.max(1),
-            page_size: page_size.min(MAX_PAGE_SIZE).max(1),
+            page_size: page_size.clamp(1, MAX_PAGE_SIZE),
             ..Default::default()
         }
     }
 
     /// Sets the sort field.
+    #[must_use]
     pub fn with_sort(mut self, field: impl Into<String>, order: SortOrder) -> Self {
         self.sort_by = Some(field.into());
         self.sort_order = order;
@@ -190,30 +192,35 @@ impl ApiRequest {
     }
 
     /// Adds a query parameter.
+    #[must_use]
     pub fn with_query(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.query.insert(key.into(), value.into());
         self
     }
 
     /// Adds a header.
+    #[must_use]
     pub fn with_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.insert(key.into(), value.into());
         self
     }
 
     /// Sets the body.
+    #[must_use]
     pub fn with_body(mut self, body: impl Into<String>) -> Self {
         self.body = Some(body.into());
         self
     }
 
     /// Sets the request ID.
+    #[must_use]
     pub fn with_request_id(mut self, id: impl Into<String>) -> Self {
         self.request_id = Some(id.into());
         self
     }
 
     /// Sets the client IP.
+    #[must_use]
     pub fn with_client_ip(mut self, ip: impl Into<String>) -> Self {
         self.client_ip = Some(ip.into());
         self

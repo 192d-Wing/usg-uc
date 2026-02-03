@@ -216,6 +216,9 @@ impl ReliableProvisionalTracker {
     ///
     /// Returns `Ok(rseq)` if the PRACK matches a pending provisional,
     /// or `Err` with a description if the PRACK is invalid.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn receive_prack(&mut self, rack: &RAck) -> Result<u32, &'static str> {
         // Validate CSeq matches
         if rack.cseq_num != self.invite_cseq {

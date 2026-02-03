@@ -102,6 +102,9 @@ fn compute_hash_chain(
 mod hex_array {
     use serde::{Deserialize, Deserializer, Serializer};
 
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn serialize<S>(bytes: &[u8; 48], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -110,6 +113,9 @@ mod hex_array {
         serializer.serialize_str(&hex)
     }
 
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 48], D::Error>
     where
         D: Deserializer<'de>,

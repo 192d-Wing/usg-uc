@@ -47,6 +47,7 @@ impl JsonFormatter {
     }
 
     /// Enables pretty printing.
+    #[must_use]
     pub fn with_pretty(mut self, pretty: bool) -> Self {
         self.pretty = pretty;
         self
@@ -217,12 +218,14 @@ impl CsvFormatter {
     }
 
     /// Sets the delimiter.
+    #[must_use]
     pub fn with_delimiter(mut self, delimiter: char) -> Self {
         self.delimiter = delimiter;
         self
     }
 
     /// Sets the fields to include.
+    #[must_use]
     pub fn with_fields(mut self, fields: Vec<String>) -> Self {
         self.fields = fields;
         self
@@ -240,6 +243,7 @@ impl CsvFormatter {
 
     /// Gets a field value from the record.
     fn get_field(&self, record: &CallRecord, field: &str) -> String {
+        let _ = self; // Silence unused_self - method may use self in future for caching
         match field {
             "call_id" => record.call_id.clone(),
             "correlation_id" => record.correlation_id.clone().unwrap_or_default(),

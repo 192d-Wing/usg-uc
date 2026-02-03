@@ -72,6 +72,7 @@ pub enum NumericOp {
 
 impl NumericOp {
     /// Compares two values.
+    #[allow(clippy::needless_pass_by_value)] // Generic parameter T requires owned values for comparison
     pub fn compare<T: PartialOrd>(&self, a: T, b: T) -> bool {
         match self {
             Self::Eq => a == b,
@@ -162,6 +163,7 @@ impl Condition {
     }
 
     /// Evaluates the condition against a request context.
+    #[allow(clippy::option_if_let_else)] // Complex match arms with multiple conditions
     pub fn evaluate(&self, ctx: &RequestContext) -> ConditionMatch {
         match self {
             Self::Always => ConditionMatch::Matched,
@@ -295,7 +297,7 @@ impl Condition {
                     match cond.evaluate(ctx) {
                         ConditionMatch::NotMatched => return ConditionMatch::NotMatched,
                         ConditionMatch::Unknown => return ConditionMatch::Unknown,
-                        ConditionMatch::Matched => continue,
+                        ConditionMatch::Matched => {}
                     }
                 }
                 ConditionMatch::Matched
@@ -306,7 +308,7 @@ impl Condition {
                     match cond.evaluate(ctx) {
                         ConditionMatch::Matched => return ConditionMatch::Matched,
                         ConditionMatch::Unknown => has_unknown = true,
-                        ConditionMatch::NotMatched => continue,
+                        ConditionMatch::NotMatched => {}
                     }
                 }
                 if has_unknown {
@@ -358,66 +360,77 @@ impl RequestContext {
     }
 
     /// Sets the source IP.
+    #[must_use]
     pub fn with_source_ip(mut self, ip: impl Into<String>) -> Self {
         self.source_ip = Some(ip.into());
         self
     }
 
     /// Sets the SIP method.
+    #[must_use]
     pub fn with_method(mut self, method: impl Into<String>) -> Self {
         self.method = Some(method.into());
         self
     }
 
     /// Sets the caller ID.
+    #[must_use]
     pub fn with_caller_id(mut self, caller_id: impl Into<String>) -> Self {
         self.caller_id = Some(caller_id.into());
         self
     }
 
     /// Sets the called number.
+    #[must_use]
     pub fn with_called_number(mut self, called: impl Into<String>) -> Self {
         self.called_number = Some(called.into());
         self
     }
 
     /// Sets the destination IP.
+    #[must_use]
     pub fn with_dest_ip(mut self, ip: impl Into<String>) -> Self {
         self.dest_ip = Some(ip.into());
         self
     }
 
     /// Sets the From URI.
+    #[must_use]
     pub fn with_from_uri(mut self, uri: impl Into<String>) -> Self {
         self.from_uri = Some(uri.into());
         self
     }
 
     /// Sets the To URI.
+    #[must_use]
     pub fn with_to_uri(mut self, uri: impl Into<String>) -> Self {
         self.to_uri = Some(uri.into());
         self
     }
 
     /// Sets the Request-URI.
+    #[must_use]
     pub fn with_request_uri(mut self, uri: impl Into<String>) -> Self {
         self.request_uri = Some(uri.into());
         self
     }
 
     /// Sets the current hour.
+    #[must_use]
     pub fn with_current_hour(mut self, hour: u8) -> Self {
         self.current_hour = Some(hour);
         self
     }
 
     /// Sets the current day of week.
+    #[must_use]
     pub fn with_current_day(mut self, day: u8) -> Self {
         self.current_day = Some(day);
         self
     }
 
     /// Adds a header.
+    #[must_use]
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.insert(name.into(), value.into());
         self

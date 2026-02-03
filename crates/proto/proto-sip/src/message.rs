@@ -25,6 +25,9 @@ impl SipMessage {
     /// ## Errors
     ///
     /// Returns an error if parsing fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(data: &[u8]) -> SipResult<Self> {
         // Power of 10 Rule 5: Assert preconditions
         debug_assert!(!data.is_empty(), "empty data passed to parse");

@@ -348,6 +348,9 @@ impl RecordingSession {
     }
 
     /// Starts the recording session (transitions to Inviting).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn start(&mut self) -> SiprecResult<SessionRecordingEvent> {
         if self.state != RecordingSessionState::Created {
             return Err(SiprecError::InvalidState {
@@ -369,6 +372,9 @@ impl RecordingSession {
     }
 
     /// Handles provisional response from SRS.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn on_provisional(&mut self, code: u16) -> SiprecResult<SessionRecordingEvent> {
         if self.state != RecordingSessionState::Inviting {
             return Err(SiprecError::InvalidState {
@@ -386,6 +392,9 @@ impl RecordingSession {
     }
 
     /// Handles 200 OK from SRS - session established.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn on_established(&mut self) -> SiprecResult<SessionRecordingEvent> {
         if !matches!(
             self.state,
@@ -428,6 +437,9 @@ impl RecordingSession {
     }
 
     /// Pauses recording.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn pause(&mut self) -> SiprecResult<SessionRecordingEvent> {
         if self.state != RecordingSessionState::Active {
             return Err(SiprecError::InvalidState {
@@ -446,6 +458,9 @@ impl RecordingSession {
     }
 
     /// Resumes recording.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn resume(&mut self) -> SiprecResult<SessionRecordingEvent> {
         if self.state != RecordingSessionState::OnHold {
             return Err(SiprecError::InvalidState {
@@ -464,6 +479,9 @@ impl RecordingSession {
     }
 
     /// Terminates the recording session.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn terminate(&mut self) -> SiprecResult<SessionRecordingEvent> {
         if matches!(
             self.state,

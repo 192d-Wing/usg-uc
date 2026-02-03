@@ -269,7 +269,7 @@ pub fn generate_answer(
 
     // Process each media description
     for (index, offer_media) in offer.media.iter().enumerate() {
-        let answer_media = generate_media_answer(offer_media, local_capabilities, index)?;
+        let answer_media = generate_media_answer(offer_media, local_capabilities, index);
         answer.media.push(answer_media);
     }
 
@@ -283,7 +283,7 @@ fn generate_media_answer(
     offer_media: &MediaDescription,
     capabilities: &LocalCapabilities,
     _index: usize,
-) -> SdpResult<MediaDescription> {
+) -> MediaDescription {
     // Check if we support this media type
     let supported = capabilities
         .supported_media
@@ -326,7 +326,7 @@ fn generate_media_answer(
         }
     }
 
-    Ok(answer_media)
+    answer_media
 }
 
 /// Computes the answer direction based on offer direction and local capability.
@@ -354,16 +354,12 @@ pub const fn compute_answer_direction(offer: Direction, local: Direction) -> Dir
         (Direction::Sendrecv, Direction::Inactive) => Direction::Inactive,
 
         // Offer is sendonly, we can only receive
-        (Direction::Sendonly, Direction::Sendrecv) => Direction::Recvonly,
-        (Direction::Sendonly, Direction::Recvonly) => Direction::Recvonly,
-        (Direction::Sendonly, Direction::Sendonly) => Direction::Inactive, // Can't both send
-        (Direction::Sendonly, Direction::Inactive) => Direction::Inactive,
+        (Direction::Sendonly, Direction::Sendrecv | Direction::Recvonly) => Direction::Recvonly,
+        (Direction::Sendonly, Direction::Sendonly | Direction::Inactive) => Direction::Inactive, // Can't both send
 
         // Offer is recvonly, we can only send
-        (Direction::Recvonly, Direction::Sendrecv) => Direction::Sendonly,
-        (Direction::Recvonly, Direction::Sendonly) => Direction::Sendonly,
-        (Direction::Recvonly, Direction::Recvonly) => Direction::Inactive, // Can't both receive
-        (Direction::Recvonly, Direction::Inactive) => Direction::Inactive,
+        (Direction::Recvonly, Direction::Sendrecv | Direction::Sendonly) => Direction::Sendonly,
+        (Direction::Recvonly, Direction::Recvonly | Direction::Inactive) => Direction::Inactive, // Can't both receive
 
         // Offer is inactive
         (Direction::Inactive, _) => Direction::Inactive,
@@ -407,6 +403,7 @@ impl LocalCapabilities {
     }
 
     /// Sets ICE credentials.
+    #[must_use]
     pub fn with_ice_credentials(
         mut self,
         ufrag: impl Into<String>,
@@ -450,6 +447,7 @@ impl LocalMediaCapability {
     }
 
     /// Adds a supported format.
+    #[must_use]
     pub fn with_format(mut self, format: impl Into<String>) -> Self {
         self.formats.push(format.into());
         self
@@ -542,6 +540,12 @@ pub enum HoldType {
 ///
 /// A stream is disabled by setting its port to 0. The m= line MUST
 /// remain in the SDP to preserve ordering.
+///
+/// # Errors
+/// Returns an error if the operation fails.
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn disable_media_stream(sdp: &mut SessionDescription, media_index: usize) -> SdpResult<()> {
     let media = sdp
         .media

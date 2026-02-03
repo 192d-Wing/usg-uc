@@ -123,6 +123,9 @@ impl ClientInviteTransaction {
     /// Processes a received response.
     ///
     /// Returns true if the response was accepted.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn receive_response(&mut self, status_code: u16) -> TransactionResult<bool> {
         self.last_response_code = Some(status_code);
 
@@ -339,6 +342,9 @@ impl ClientNonInviteTransaction {
     }
 
     /// Processes a received response.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn receive_response(&mut self, status_code: u16) -> TransactionResult<bool> {
         self.last_response_code = Some(status_code);
 

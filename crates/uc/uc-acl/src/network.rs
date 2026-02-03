@@ -14,6 +14,9 @@ pub struct IpNetwork {
 
 impl IpNetwork {
     /// Creates a new IPv4 network.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn v4(addr: Ipv4Addr, prefix: u8) -> AclResult<Self> {
         if prefix > 32 {
             return Err(AclError::InvalidPrefix { prefix, max: 32 });
@@ -25,6 +28,9 @@ impl IpNetwork {
     }
 
     /// Creates a new IPv6 network.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn v6(addr: Ipv6Addr, prefix: u8) -> AclResult<Self> {
         if prefix > 128 {
             return Err(AclError::InvalidPrefix { prefix, max: 128 });
@@ -36,6 +42,9 @@ impl IpNetwork {
     }
 
     /// Creates a network from an IP address and prefix.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn new(addr: IpAddr, prefix: u8) -> AclResult<Self> {
         match addr {
             IpAddr::V4(v4) => Self::v4(v4, prefix),
@@ -53,6 +62,9 @@ impl IpNetwork {
     }
 
     /// Parses from CIDR notation (e.g., "192.168.1.0/24").
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(s: &str) -> AclResult<Self> {
         if let Some(pos) = s.find('/') {
             let addr_str = &s[..pos];

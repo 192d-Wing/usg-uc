@@ -182,7 +182,7 @@ impl DtlsSession {
 
         self.keying_material
             .clone()
-            .ok_or(DtlsError::SrtpKeyExportFailed {
+            .ok_or_else(|| DtlsError::SrtpKeyExportFailed {
                 reason: "keying material not available".to_string(),
             })
     }
@@ -268,7 +268,7 @@ impl std::fmt::Debug for DtlsSession {
         f.debug_struct("DtlsSession")
             .field("role", &self.role)
             .field("established", &self.established)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

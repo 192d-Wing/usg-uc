@@ -56,6 +56,9 @@ pub struct FfiOpusEncoder {
 
 impl FfiOpusEncoder {
     /// Creates a new Opus FFI encoder with the given configuration.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn new(config: OpusConfig) -> CodecResult<Self> {
         config.validate()?;
 
@@ -125,6 +128,9 @@ impl FfiOpusEncoder {
     /// Encodes PCM samples to Opus.
     ///
     /// Returns the number of bytes written to the output buffer.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn encode(&self, pcm: &[i16], output: &mut [u8]) -> CodecResult<usize> {
         let mut encoder = self
             .encoder
@@ -170,6 +176,9 @@ pub struct FfiOpusDecoder {
 
 impl FfiOpusDecoder {
     /// Creates a new Opus FFI decoder.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn new(sample_rate: u32, channels: u8) -> CodecResult<Self> {
         let sample_rate_enum = to_audiopus_sample_rate(sample_rate)?;
         let channels_enum = to_audiopus_channels(channels)?;
@@ -190,6 +199,9 @@ impl FfiOpusDecoder {
     /// Decodes Opus to PCM samples.
     ///
     /// Returns the number of samples decoded.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn decode(&self, encoded: &[u8], output: &mut [i16]) -> CodecResult<usize> {
         let mut decoder = self
             .decoder
@@ -211,6 +223,9 @@ impl FfiOpusDecoder {
     /// Decodes with Forward Error Correction for lost packets.
     ///
     /// Call this when a packet is lost to attempt FEC recovery.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn decode_fec(&self, output: &mut [i16]) -> CodecResult<usize> {
         let mut decoder = self
             .decoder
@@ -289,16 +304,25 @@ impl FfiOpusCodec {
     }
 
     /// Encodes PCM samples to Opus.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn encode(&self, pcm: &[i16], output: &mut [u8]) -> CodecResult<usize> {
         self.get_encoder()?.encode(pcm, output)
     }
 
     /// Decodes Opus to PCM samples.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn decode(&self, encoded: &[u8], output: &mut [i16]) -> CodecResult<usize> {
         self.get_decoder()?.decode(encoded, output)
     }
 
     /// Decodes with FEC for lost packets.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn decode_fec(&self, output: &mut [i16]) -> CodecResult<usize> {
         self.get_decoder()?.decode_fec(output)
     }

@@ -72,6 +72,12 @@ impl MulticastAddress {
     /// # Errors
     ///
     /// Returns error if address is not a valid IPv4 multicast address.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn new_ipv4(address: &str, ttl: u8) -> SdpResult<Self> {
         let addr: Ipv4Addr = address.parse().map_err(|_| SdpError::InvalidConnection {
             reason: format!("invalid IPv4 address: {address}"),
@@ -100,6 +106,12 @@ impl MulticastAddress {
     /// # Errors
     ///
     /// Returns error if address is not a valid IPv6 multicast address.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn new_ipv6(address: &str) -> SdpResult<Self> {
         let addr: Ipv6Addr = address.parse().map_err(|_| SdpError::InvalidConnection {
             reason: format!("invalid IPv6 address: {address}"),
@@ -124,6 +136,12 @@ impl MulticastAddress {
     /// Handles formats:
     /// - IPv4: `<address>/<ttl>` or `<address>/<ttl>/<num>`
     /// - IPv6: `<address>` or `<address>/<num>`
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(addr_field: &str, is_ipv6: bool) -> SdpResult<Self> {
         let parts: Vec<&str> = addr_field.split('/').collect();
 
@@ -486,7 +504,7 @@ impl MulticastNegotiator {
                 .or_else(|| session_conn.cloned());
 
             // Copy formats (intersection would be done by caller)
-            answer.formats = offer_media.formats.clone();
+            answer.formats.clone_from(&offer_media.formats);
 
             // Set our direction
             answer.add_attribute(validation.answer_direction.to_attribute());
@@ -555,8 +573,7 @@ impl MulticastScope {
             0x02 => Self::LinkLocal,
             0x05 => Self::SiteLocal,
             0x08 => Self::OrganizationLocal,
-            0x0e => Self::Global,
-            _ => Self::Global, // Unknown scope treated as global
+            0x0e | _ => Self::Global, // Unknown scope treated as global
         })
     }
 

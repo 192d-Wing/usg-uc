@@ -96,22 +96,18 @@ pub struct TransportConfig {
 
 impl Default for TransportConfig {
     fn default() -> Self {
+        // Use unwrap for hardcoded valid addresses in Default impl
+        #[allow(clippy::unwrap_used)]
+        let udp = "[::]:5060".parse().unwrap();
+        #[allow(clippy::unwrap_used)]
+        let tcp = "[::]:5060".parse().unwrap();
+        #[allow(clippy::unwrap_used)]
+        let tls = "[::]:5061".parse().unwrap();
+
         Self {
-            udp_listen: vec![
-                "[::]:5060"
-                    .parse()
-                    .unwrap_or_else(|_| "[::1]:5060".parse().unwrap()),
-            ],
-            tcp_listen: vec![
-                "[::]:5060"
-                    .parse()
-                    .unwrap_or_else(|_| "[::1]:5060".parse().unwrap()),
-            ],
-            tls_listen: vec![
-                "[::]:5061"
-                    .parse()
-                    .unwrap_or_else(|_| "[::1]:5061".parse().unwrap()),
-            ],
+            udp_listen: vec![udp],
+            tcp_listen: vec![tcp],
+            tls_listen: vec![tls],
             ws_listen: Vec::new(),
             wss_listen: Vec::new(),
             tcp_timeout_secs: 30,

@@ -127,6 +127,9 @@ impl StatusCode {
     /// ## Errors
     ///
     /// Returns an error if the code is not in valid range (100-699).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn new(code: u16) -> SipResult<Self> {
         if !(100..=699).contains(&code) {
             return Err(SipError::InvalidStatusCode { code });

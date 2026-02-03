@@ -24,6 +24,9 @@ use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 /// let mut key = [0u8; 32];
 /// fill_random(&mut key).expect("RNG failure");
 /// ```
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn fill_random(dest: &mut [u8]) -> CryptoResult<()> {
     let rng = SystemRandom::new();
     rng.fill(dest).map_err(|_| CryptoError::RandomFailed)
@@ -42,6 +45,9 @@ pub fn fill_random(dest: &mut [u8]) -> CryptoResult<()> {
 ///
 /// let key: [u8; 32] = generate_random().expect("RNG failure");
 /// ```
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn generate_random<const N: usize>() -> CryptoResult<[u8; N]> {
     let mut output = [0u8; N];
     fill_random(&mut output)?;
@@ -53,6 +59,9 @@ pub fn generate_random<const N: usize>() -> CryptoResult<[u8; N]> {
 /// ## Errors
 ///
 /// Returns an error if the system random number generator fails.
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn generate_nonce() -> CryptoResult<[u8; 12]> {
     generate_random()
 }
@@ -62,6 +71,9 @@ pub fn generate_nonce() -> CryptoResult<[u8; 12]> {
 /// ## Errors
 ///
 /// Returns an error if the system random number generator fails.
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn generate_key_256() -> CryptoResult<[u8; 32]> {
     generate_random()
 }

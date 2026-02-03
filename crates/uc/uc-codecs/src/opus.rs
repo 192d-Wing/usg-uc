@@ -156,6 +156,9 @@ impl OpusConfig {
     }
 
     /// Validates the configuration.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn validate(&self) -> CodecResult<()> {
         // Validate sample rate
         match self.sample_rate {

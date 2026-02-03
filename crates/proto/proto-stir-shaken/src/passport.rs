@@ -42,6 +42,9 @@ impl Attestation {
     }
 
     /// Parses from string.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn from_str(s: &str) -> StirShakenResult<Self> {
         match s.to_uppercase().as_str() {
             "A" => Ok(Self::Full),
@@ -122,6 +125,9 @@ impl PASSporTHeader {
     }
 
     /// Validates the header.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn validate(&self) -> StirShakenResult<()> {
         // CNSA 2.0: Only ES384 is allowed
         if self.alg != PASSPORT_ALGORITHM {
@@ -155,6 +161,9 @@ pub struct TelephoneNumber {
 
 impl TelephoneNumber {
     /// Creates a new telephone number.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn new(number: impl Into<String>) -> StirShakenResult<Self> {
         let number = number.into();
         let normalized = Self::normalize(&number);
@@ -244,6 +253,9 @@ impl PASSporTClaims {
     }
 
     /// Validates the claims.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn validate(&self, max_age_seconds: u64) -> StirShakenResult<()> {
         // Check expiration
         let now = SystemTime::now()
@@ -334,6 +346,9 @@ impl PASSporT {
     }
 
     /// Validates the PASSporT structure.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn validate(&self, max_age_seconds: u64) -> StirShakenResult<()> {
         self.header.validate()?;
         self.claims.validate(max_age_seconds)?;
@@ -411,6 +426,9 @@ impl PASSporT {
     }
 
     /// Encodes as compact serialization (header.claims.signature).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn to_compact(&self) -> StirShakenResult<String> {
         let signature = self
             .signature

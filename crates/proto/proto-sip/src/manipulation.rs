@@ -250,6 +250,7 @@ impl ManipulationCondition {
 
     /// Creates a NOT condition.
     #[must_use]
+    #[allow(clippy::should_implement_trait)]
     pub fn not(condition: ManipulationCondition) -> Self {
         Self::Not(Box::new(condition))
     }
@@ -515,6 +516,12 @@ impl HeaderManipulator {
     }
 
     /// Applies all matching policies to headers.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn apply(&self, headers: &mut Headers, context: &ManipulationContext) -> SipResult<usize> {
         let mut applied_count = 0;
 
@@ -553,7 +560,7 @@ impl HeaderManipulator {
             }
 
             if self.evaluate_condition(&rule.condition, headers, context) {
-                self.apply_action(&rule.action, headers)?;
+                self.apply_action(&rule.action, headers);
                 applied_count += 1;
             }
         }
@@ -568,6 +575,7 @@ impl HeaderManipulator {
         headers: &Headers,
         context: &ManipulationContext,
     ) -> bool {
+        let _ = self; // Silence unused_self - method may use self in future for caching
         match condition {
             ManipulationCondition::Always => true,
 
@@ -619,7 +627,8 @@ impl HeaderManipulator {
     }
 
     /// Applies an action to headers.
-    fn apply_action(&self, action: &ManipulationAction, headers: &mut Headers) -> SipResult<()> {
+    fn apply_action(&self, action: &ManipulationAction, headers: &mut Headers) {
+        let _ = self; // Silence unused_self - method may use self in future for caching
         match action {
             ManipulationAction::Add { name, value } => {
                 headers.add(Header::new(name.clone(), value.clone()));
@@ -694,8 +703,6 @@ impl HeaderManipulator {
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Simplified regex replacement.
@@ -705,6 +712,8 @@ impl HeaderManipulator {
     /// - `^` - start anchor
     /// - `$` - end anchor
     fn regex_replace(&self, value: &str, pattern: &str, replacement: &str) -> String {
+        let _ = self; // Silence unused_self - method may use self in future for caching
+
         // Simple implementation without full regex support
         // In production, would use the regex crate
 
@@ -715,20 +724,18 @@ impl HeaderManipulator {
         }
 
         // Handle prefix pattern: ^prefix(.*)
-        if pattern.starts_with('^') && pattern.ends_with("(.*)") {
-            let prefix = &pattern[1..pattern.len() - 4];
-            if let Some(captured) = value.strip_prefix(prefix) {
-                return replacement.replace("$1", captured);
-            }
-        }
+        if let Some(inner) = pattern.strip_prefix('^')
+            && let Some(prefix) = inner.strip_suffix("(.*)")
+                && let Some(captured) = value.strip_prefix(prefix) {
+                    return replacement.replace("$1", captured);
+                }
 
         // Handle suffix pattern: (.*)suffix$
-        if pattern.starts_with("(.*)") && pattern.ends_with('$') {
-            let suffix = &pattern[4..pattern.len() - 1];
-            if let Some(captured) = value.strip_suffix(suffix) {
-                return replacement.replace("$1", captured);
-            }
-        }
+        if let Some(inner) = pattern.strip_prefix("(.*)")
+            && let Some(suffix) = inner.strip_suffix('$')
+                && let Some(captured) = value.strip_suffix(suffix) {
+                    return replacement.replace("$1", captured);
+                }
 
         // Fallback: simple string replacement
         value.replace(pattern, replacement)

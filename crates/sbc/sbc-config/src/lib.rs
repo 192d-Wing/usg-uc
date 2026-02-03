@@ -50,6 +50,9 @@ use std::path::Path;
 /// ## Errors
 ///
 /// Returns an error if the file cannot be read or parsed.
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn load_from_file(path: impl AsRef<Path>) -> ConfigResult<SbcConfig> {
     let path = path.as_ref();
     let content = std::fs::read_to_string(path).map_err(|e| ConfigError::FileRead {
@@ -65,6 +68,9 @@ pub fn load_from_file(path: impl AsRef<Path>) -> ConfigResult<SbcConfig> {
 /// ## Errors
 ///
 /// Returns an error if the string cannot be parsed.
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn load_from_str(content: &str) -> ConfigResult<SbcConfig> {
     let config: SbcConfig = toml::from_str(content).map_err(|e| ConfigError::Parse {
         reason: e.to_string(),

@@ -257,7 +257,7 @@ impl FromStr for DigestChallenge {
             s
         };
 
-        let params = parse_auth_params(params_str)?;
+        let params = parse_auth_params(params_str);
 
         let realm = params
             .get("realm")
@@ -453,7 +453,7 @@ impl FromStr for DigestCredentials {
             s
         };
 
-        let params = parse_auth_params(params_str)?;
+        let params = parse_auth_params(params_str);
 
         let username = params
             .get("username")
@@ -553,7 +553,7 @@ impl FromStr for DigestCredentials {
 ///
 /// - Outer loop bounded by number of commas in input
 /// - Inner quote scanning bounded by parameter length
-fn parse_auth_params(s: &str) -> SipResult<HashMap<String, String>> {
+fn parse_auth_params(s: &str) -> HashMap<String, String> {
     let mut params = HashMap::new();
 
     // Simple state machine for parsing
@@ -597,7 +597,7 @@ fn parse_auth_params(s: &str) -> SipResult<HashMap<String, String>> {
             params.insert(name, value);
         }
 
-    Ok(params)
+    params
 }
 
 /// Parses a single `name=value` or `name="value"` parameter.

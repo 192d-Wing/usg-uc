@@ -85,6 +85,9 @@ pub use error::{CryptoError, CryptoResult};
 /// ## Errors
 ///
 /// Returns an error if FIPS initialization fails.
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn init_fips_mode() -> CryptoResult<()> {
     // aws-lc-rs automatically runs FIPS self-tests on first use
     // when compiled with the fips feature.

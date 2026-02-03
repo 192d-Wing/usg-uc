@@ -80,6 +80,12 @@ impl SrtpKeyExporter {
     /// ## Errors
     ///
     /// Returns an error if the exported material is the wrong length.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse_keying_material(&self, exported: &[u8]) -> DtlsResult<SrtpKeyingMaterial> {
         let expected_len = self.keying_material_length();
 
@@ -195,7 +201,7 @@ impl SrtpKeyExporter {
         seed.extend_from_slice(server_random);
 
         // Use HKDF-SHA384 for CNSA 2.0 compliance
-        let exported = prf_sha384(master_secret, &seed, output_len)?;
+        let exported = prf_sha384(master_secret, &seed, output_len);
 
         self.parse_keying_material(&exported)
     }
@@ -205,7 +211,7 @@ impl SrtpKeyExporter {
 ///
 /// This is a simplified PRF that uses HKDF instead of the traditional
 /// TLS PRF. A full implementation would match the exact TLS 1.2 PRF.
-fn prf_sha384(secret: &[u8], seed: &[u8], output_len: usize) -> DtlsResult<Vec<u8>> {
+fn prf_sha384(secret: &[u8], seed: &[u8], output_len: usize) -> Vec<u8> {
     // Use HKDF-Expand with SHA-384
     // Note: Full TLS 1.2 PRF is P_SHA384 which is more complex
 
@@ -232,7 +238,7 @@ fn prf_sha384(secret: &[u8], seed: &[u8], output_len: usize) -> DtlsResult<Vec<u
     }
 
     output.truncate(output_len);
-    Ok(output)
+    output
 }
 
 /// SRTP protection profile extension for `use_srtp`.
@@ -270,9 +276,12 @@ impl UseSrtpExtension {
     pub fn encode(&self) -> Vec<u8> {
         let mut data = Vec::new();
 
-        // Profile IDs length (2 bytes per profile)
+        // Profile IDs length (2 bytes per profile) - profiles list is small, fits in u16
+        #[allow(clippy::cast_possible_truncation)]
         let profiles_len = (self.profiles.len() * 2) as u16;
+        #[allow(clippy::cast_possible_truncation)]
         data.push((profiles_len >> 8) as u8);
+        #[allow(clippy::cast_possible_truncation)]
         data.push((profiles_len & 0xFF) as u8);
 
         // Profile IDs
@@ -282,7 +291,8 @@ impl UseSrtpExtension {
             data.push((id & 0xFF) as u8);
         }
 
-        // MKI length and value
+        // MKI length and value - MKI is typically small, fits in u8
+        #[allow(clippy::cast_possible_truncation)]
         data.push(self.mki.len() as u8);
         data.extend_from_slice(&self.mki);
 
@@ -290,6 +300,12 @@ impl UseSrtpExtension {
     }
 
     /// Decodes the extension from bytes.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn decode(data: &[u8]) -> DtlsResult<Self> {
         if data.len() < 3 {
             return Err(DtlsError::HandshakeFailed {

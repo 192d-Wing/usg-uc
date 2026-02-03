@@ -68,7 +68,10 @@ impl TrunkStats {
         if self.calls_attempted == 0 {
             1.0
         } else {
-            self.calls_succeeded as f64 / self.calls_attempted as f64
+            // Allow precision loss for statistics calculation
+            #[allow(clippy::cast_precision_loss)]
+            let rate = self.calls_succeeded as f64 / self.calls_attempted as f64;
+            rate
         }
     }
 
@@ -156,36 +159,42 @@ impl TrunkConfig {
     }
 
     /// Sets the name.
+    #[must_use]
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
     }
 
     /// Sets the port.
+    #[must_use]
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
         self
     }
 
     /// Sets the protocol.
+    #[must_use]
     pub fn with_protocol(mut self, protocol: TrunkProtocol) -> Self {
         self.protocol = protocol;
         self
     }
 
     /// Sets the priority.
+    #[must_use]
     pub fn with_priority(mut self, priority: u32) -> Self {
         self.priority = priority;
         self
     }
 
     /// Sets the weight.
+    #[must_use]
     pub fn with_weight(mut self, weight: u32) -> Self {
         self.weight = weight;
         self
     }
 
     /// Sets the maximum calls.
+    #[must_use]
     pub fn with_max_calls(mut self, max: u32) -> Self {
         self.max_calls = max;
         self
@@ -385,6 +394,7 @@ impl TrunkGroup {
     }
 
     /// Sets the selection strategy.
+    #[must_use]
     pub fn with_strategy(mut self, strategy: SelectionStrategy) -> Self {
         self.strategy = strategy;
         self

@@ -50,18 +50,21 @@ impl Default for RouterConfig {
 
 impl RouterConfig {
     /// Sets the maximum failover attempts.
+    #[must_use]
     pub fn with_max_failover(mut self, max: usize) -> Self {
         self.max_failover_attempts = max;
         self
     }
 
     /// Sets whether to use dial plan.
+    #[must_use]
     pub fn with_dial_plan(mut self, use_dp: bool) -> Self {
         self.use_dial_plan = use_dp;
         self
     }
 
     /// Sets the default trunk group.
+    #[must_use]
     pub fn with_default_trunk_group(mut self, group: impl Into<String>) -> Self {
         self.default_trunk_group = Some(group.into());
         self
@@ -152,6 +155,9 @@ impl Router {
     }
 
     /// Sets the active dial plan.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn set_active_dial_plan(&mut self, id: &str) -> RoutingResult<()> {
         if self.dial_plans.contains_key(id) {
             self.active_dial_plan = Some(id.to_string());
@@ -191,6 +197,9 @@ impl Router {
     }
 
     /// Routes a call to the given destination.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn route(&mut self, destination: &str) -> RoutingResult<RoutingDecision> {
         self.stats.requests += 1;
 

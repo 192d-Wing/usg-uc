@@ -109,6 +109,9 @@ impl StunMessageType {
     }
 
     /// Parses from the 16-bit message type field.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn from_u16(value: u16) -> StunResult<Self> {
         // Class bits: C0 at bit 4, C1 at bit 8
         let c0 = (value & 0x0010) != 0;
@@ -161,6 +164,9 @@ impl StunMessage {
     }
 
     /// Creates a Binding Request with a random transaction ID.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn binding_request() -> StunResult<Self> {
         let mut transaction_id = [0u8; 12];
         uc_crypto::random::fill_random(&mut transaction_id).map_err(|_| {
@@ -211,6 +217,9 @@ impl StunMessage {
     }
 
     /// Parses a STUN message from bytes.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(data: &[u8]) -> StunResult<Self> {
         if data.len() < HEADER_SIZE {
             return Err(StunError::MessageTooShort {
@@ -301,6 +310,9 @@ impl StunMessage {
     /// Encodes with MESSAGE-INTEGRITY attribute.
     ///
     /// The key should be derived from the password per RFC 5389.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn encode_with_integrity(&self, key: &[u8]) -> StunResult<Bytes> {
         let mut msg = self.clone();
 
@@ -350,6 +362,9 @@ impl StunMessage {
     /// Per RFC 5389, the FINGERPRINT is computed over the message
     /// up to (but not including) the FINGERPRINT attribute, with
     /// the length field as it appears in the actual message.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn verify_fingerprint(&self, raw_data: &[u8]) -> StunResult<bool> {
         // Find fingerprint attribute
         let fp_attr = self

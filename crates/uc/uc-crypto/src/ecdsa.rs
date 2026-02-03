@@ -36,6 +36,9 @@ impl P384KeyPair {
     /// ## Errors
     ///
     /// Returns an error if key generation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn generate() -> CryptoResult<Self> {
         let rng = SystemRandom::new();
         let pkcs8_bytes = EcdsaKeyPair::generate_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, &rng)
@@ -55,6 +58,9 @@ impl P384KeyPair {
     /// ## Errors
     ///
     /// Returns an error if the key material is invalid.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn from_pkcs8(pkcs8_bytes: &[u8]) -> CryptoResult<Self> {
         let inner = EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, pkcs8_bytes)
             .map_err(|_| CryptoError::InvalidKeyMaterial)?;
@@ -74,6 +80,9 @@ impl P384KeyPair {
     /// ## Errors
     ///
     /// Returns an error if signing fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn sign(&self, message: &[u8]) -> CryptoResult<Vec<u8>> {
         let rng = SystemRandom::new();
         let signature = self
@@ -120,6 +129,9 @@ impl std::fmt::Debug for P384KeyPair {
 /// ## Errors
 ///
 /// Returns an error if verification fails (invalid signature, wrong key, etc.).
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn verify_p384(public_key: &[u8], message: &[u8], signature: &[u8]) -> CryptoResult<()> {
     let public_key = UnparsedPublicKey::new(&ECDSA_P384_SHA384_ASN1, public_key);
     public_key
@@ -138,6 +150,9 @@ impl P384PublicKey {
     /// ## Errors
     ///
     /// Returns an error if the public key is invalid.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn from_bytes(bytes: &[u8]) -> CryptoResult<Self> {
         // Basic validation: P-384 uncompressed public key is 97 bytes (0x04 || x || y)
         if bytes.len() != 97 || bytes[0] != 0x04 {
@@ -153,6 +168,9 @@ impl P384PublicKey {
     /// ## Errors
     ///
     /// Returns an error if verification fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn verify(&self, message: &[u8], signature: &[u8]) -> CryptoResult<()> {
         verify_p384(&self.bytes, message, signature)
     }

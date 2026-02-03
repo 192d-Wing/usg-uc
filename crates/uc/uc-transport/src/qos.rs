@@ -397,6 +397,9 @@ impl QosConfig {
 /// # Errors
 ///
 /// Returns an error if the socket option cannot be set.
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn apply_dscp(socket: &Socket, dscp: DscpValue, is_ipv6: bool) -> io::Result<()> {
     let tos = u32::from(dscp.to_tos());
 
@@ -421,6 +424,9 @@ pub fn apply_dscp(socket: &Socket, dscp: DscpValue, is_ipv6: bool) -> io::Result
 /// # Errors
 ///
 /// Returns an error if `QoS` marking cannot be applied.
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn apply_qos_config(socket: &Socket, config: &QosConfig, is_ipv6: bool) -> io::Result<()> {
     if !config.enabled {
         return Ok(());

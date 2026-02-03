@@ -291,6 +291,9 @@ impl CheckList {
     }
 
     /// Marks a pair as succeeded and handles nomination.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn mark_succeeded(&mut self, index: usize) -> IceResult<()> {
         let pair = self
             .pairs
@@ -309,6 +312,9 @@ impl CheckList {
     }
 
     /// Marks a pair as failed.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn mark_failed(&mut self, index: usize) -> IceResult<()> {
         let pair = self
             .pairs
@@ -323,6 +329,9 @@ impl CheckList {
     }
 
     /// Selects a pair for a component.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn select_pair(&mut self, component: u16, index: usize) -> IceResult<()> {
         if index >= self.pairs.len() {
             return Err(IceError::InvalidCandidate {

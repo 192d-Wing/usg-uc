@@ -87,7 +87,10 @@ impl TrackingEntry {
 
         let window_secs = window.as_secs_f64();
         if window_secs > 0.0 {
-            self.timestamps.len() as f64 / window_secs
+            // Allow precision loss for rate calculation
+            #[allow(clippy::cast_precision_loss)]
+            let rate = self.timestamps.len() as f64 / window_secs;
+            rate
         } else {
             0.0
         }

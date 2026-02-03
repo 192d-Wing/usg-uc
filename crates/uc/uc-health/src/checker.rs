@@ -31,18 +31,21 @@ impl Default for HealthCheckerConfig {
 
 impl HealthCheckerConfig {
     /// Sets the timeout.
+    #[must_use]
     pub fn with_timeout(mut self, timeout_ms: u64) -> Self {
         self.timeout_ms = timeout_ms;
         self
     }
 
     /// Sets the interval.
+    #[must_use]
     pub fn with_interval(mut self, interval_secs: u64) -> Self {
         self.interval_secs = interval_secs;
         self
     }
 
     /// Sets whether to include details.
+    #[must_use]
     pub fn with_details(mut self, include: bool) -> Self {
         self.include_details = include;
         self
@@ -97,6 +100,7 @@ impl HealthChecker {
     }
 
     /// Sets the version string.
+    #[must_use]
     pub fn with_version(mut self, version: impl Into<String>) -> Self {
         self.version = Some(version.into());
         self
@@ -184,6 +188,7 @@ impl HealthChecker {
 
     /// Returns the current timestamp in milliseconds.
     fn current_timestamp(&self) -> u64 {
+        let _ = self; // Silence unused_self - method may use self in future for caching
         // In production, would use proper time
         0
     }
@@ -249,6 +254,7 @@ impl ReadinessResponse {
     }
 
     /// Sets the reason.
+    #[must_use]
     pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
         self.reason = Some(reason.into());
         self

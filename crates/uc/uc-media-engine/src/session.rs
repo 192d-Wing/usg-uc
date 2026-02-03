@@ -206,6 +206,9 @@ impl MediaSession {
     }
 
     /// Negotiates codecs with remote.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn negotiate_codecs(&mut self, remote_codecs: &[CodecCapability]) -> MediaResult<()> {
         if self.state != SessionState::Created && self.state != SessionState::Negotiating {
             return Err(MediaError::InvalidStateTransition {
@@ -240,11 +243,17 @@ impl MediaSession {
     }
 
     /// Adds an A-leg stream.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn add_a_leg_stream(&mut self, config: StreamConfig) -> MediaResult<u32> {
         self.add_stream(config, true)
     }
 
     /// Adds a B-leg stream.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn add_b_leg_stream(&mut self, config: StreamConfig) -> MediaResult<u32> {
         self.add_stream(config, false)
     }
@@ -299,6 +308,9 @@ impl MediaSession {
     }
 
     /// Activates the session.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn activate(&mut self) -> MediaResult<()> {
         match self.state {
             SessionState::Negotiating | SessionState::Created => {
@@ -327,6 +339,9 @@ impl MediaSession {
     }
 
     /// Puts the session on hold.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn hold(&mut self) -> MediaResult<()> {
         if self.state == SessionState::Active {
             self.state = SessionState::OnHold;
@@ -349,6 +364,9 @@ impl MediaSession {
     }
 
     /// Resumes the session from hold.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn resume(&mut self) -> MediaResult<()> {
         if self.state == SessionState::OnHold {
             self.state = SessionState::Active;
@@ -371,6 +389,9 @@ impl MediaSession {
     }
 
     /// Closes the session.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn close(&mut self) -> MediaResult<()> {
         if self.state == SessionState::Closed {
             return Ok(());

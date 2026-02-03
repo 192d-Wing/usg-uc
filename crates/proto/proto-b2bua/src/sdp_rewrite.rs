@@ -206,11 +206,14 @@ impl SdpRewriter {
             if line.starts_with("c=") {
                 // Replace connection line
                 // Format: c=<nettype> <addrtype> <connection-address>
-                result.push_str(&format!("c=IN {} {}", addr_type, local_address.address));
+                result.push_str("c=IN ");
+                result.push_str(addr_type);
+                result.push(' ');
+                result.push_str(&local_address.address);
             } else if line.starts_with("m=") {
                 // Replace port in media line
                 // Format: m=<media> <port> <proto> <fmt> ...
-                if let Some(rewritten) = self.rewrite_media_line(line, local_address.port) {
+                if let Some(rewritten) = Self::rewrite_media_line(line, local_address.port) {
                     result.push_str(&rewritten);
                 } else {
                     result.push_str(line);
@@ -225,7 +228,7 @@ impl SdpRewriter {
     }
 
     /// Rewrites an m= line with a new port.
-    fn rewrite_media_line(&self, line: &str, port: u16) -> Option<String> {
+    fn rewrite_media_line(line: &str, port: u16) -> Option<String> {
         // m=audio 49170 RTP/SAVP 0 8 97
         let parts: Vec<&str> = line.splitn(4, ' ').collect();
         if parts.len() < 4 {

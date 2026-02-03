@@ -311,6 +311,9 @@ impl ReferHandler {
     }
 
     /// Accepts the REFER (sends 202 Accepted).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn accept(&mut self) -> DialogResult<()> {
         if self.subscription_state != ReferSubscriptionState::Pending {
             return Err(DialogError::InvalidStateTransition {
@@ -323,6 +326,9 @@ impl ReferHandler {
     }
 
     /// Rejects the REFER.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn reject(&mut self) -> DialogResult<()> {
         self.subscription_state = ReferSubscriptionState::Terminated;
         self.current_status = ReferStatus::Failed;
@@ -376,6 +382,9 @@ impl ReferHandler {
 }
 
 /// Parses a Refer-To header value.
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn parse_refer_to(value: &str) -> DialogResult<String> {
     let value = value.trim();
     // Handle <uri> format

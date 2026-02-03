@@ -389,6 +389,9 @@ impl Header {
     /// # Errors
     ///
     /// Returns an error if the header line is malformed (missing colon separator).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(line: &str) -> SipResult<Self> {
         // Power of 10 Rule 5: Assert precondition
         debug_assert!(!line.is_empty(), "empty header line");
@@ -707,6 +710,9 @@ impl Headers {
     /// # Errors
     ///
     /// Returns [`SipError::MissingHeader`] if any required header is absent.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn validate_request_headers(&self) -> SipResult<()> {
         // Power of 10 Rule 2: Fixed-size array ensures bounded iteration
         const REQUIRED_COUNT: usize = 6;
@@ -749,6 +755,9 @@ impl Headers {
     /// # Errors
     ///
     /// Returns [`SipError::MissingHeader`] if any required header is absent.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn validate_response_headers(&self) -> SipResult<()> {
         // Power of 10 Rule 2: Fixed-size array ensures bounded iteration
         const REQUIRED_COUNT: usize = 5;

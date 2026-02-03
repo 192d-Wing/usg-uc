@@ -45,6 +45,9 @@ impl HkdfSha384Output {
     /// ## Errors
     ///
     /// Returns an error if the output length is too large.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn expand(&self, info: &[&[u8]], output: &mut [u8]) -> CryptoResult<()> {
         let okm = self
             .prk
@@ -102,6 +105,9 @@ impl HkdfSha512Output {
     /// ## Errors
     ///
     /// Returns an error if the output length is too large.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn expand(&self, info: &[&[u8]], output: &mut [u8]) -> CryptoResult<()> {
         let okm = self
             .prk

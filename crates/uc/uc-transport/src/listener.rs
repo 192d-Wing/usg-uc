@@ -99,6 +99,9 @@ impl ListenerConfig {
     /// ## Errors
     ///
     /// Returns an error if the configuration is invalid.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn validate(&self) -> TransportResult<()> {
         if self.backlog == 0 {
             return Err(TransportError::InvalidAddress {

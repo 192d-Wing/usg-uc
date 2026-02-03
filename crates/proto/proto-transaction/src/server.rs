@@ -91,6 +91,9 @@ impl ServerInviteTransaction {
     /// Sends a response.
     ///
     /// The transaction layer calls this when the TU wants to send a response.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn send_response(&mut self, status_code: u16) -> TransactionResult<()> {
         self.last_response_code = Some(status_code);
 
@@ -130,6 +133,9 @@ impl ServerInviteTransaction {
     /// Receives a request retransmission.
     ///
     /// Returns true if a response should be retransmitted.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn receive_request(&mut self) -> TransactionResult<bool> {
         match self.state {
             ServerInviteState::Proceeding => {
@@ -150,6 +156,9 @@ impl ServerInviteTransaction {
     }
 
     /// Receives an ACK.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn receive_ack(&mut self) -> TransactionResult<()> {
         match self.state {
             ServerInviteState::Completed => {
@@ -311,6 +320,9 @@ impl ServerNonInviteTransaction {
     }
 
     /// Sends a response.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn send_response(&mut self, status_code: u16) -> TransactionResult<()> {
         self.last_response_code = Some(status_code);
 
@@ -349,6 +361,9 @@ impl ServerNonInviteTransaction {
     }
 
     /// Receives a request retransmission.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn receive_request(&mut self) -> TransactionResult<bool> {
         match self.state {
             ServerNonInviteState::Trying => {

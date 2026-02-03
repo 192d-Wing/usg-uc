@@ -143,6 +143,12 @@ impl CertificateValidator {
     /// Extracts the public key from a DER-encoded X.509 certificate.
     ///
     /// This is a simplified extraction that handles ECDSA P-384 certificates.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn extract_public_key(&self, cert_der: &[u8]) -> DtlsResult<Vec<u8>> {
         // X.509 certificate structure (simplified):
         // SEQUENCE {
@@ -256,6 +262,7 @@ impl CertificateValidator {
 
     /// Extracts TBS certificate and signature from a DER-encoded certificate.
     fn extract_tbs_and_signature<'a>(&self, cert_der: &'a [u8]) -> DtlsResult<(&'a [u8], Vec<u8>)> {
+        let _ = self; // Silence unused_self warning - method may use self in future
         // X.509 structure:
         // SEQUENCE {
         //   SEQUENCE { ... }  -- TBSCertificate
@@ -363,7 +370,7 @@ impl FinishedVerifier {
             b"server finished"
         };
 
-        let verify_data = prf_sha384(master_secret, label, handshake_hash, 12)?;
+        let verify_data = prf_sha384(master_secret, label, handshake_hash, 12);
 
         let mut result = [0u8; 12];
         result.copy_from_slice(&verify_data);
@@ -458,7 +465,7 @@ impl ServerKeyExchangeVerifier {
 }
 
 /// TLS 1.2 PRF using HMAC-SHA-384.
-fn prf_sha384(secret: &[u8], label: &[u8], seed: &[u8], length: usize) -> DtlsResult<Vec<u8>> {
+fn prf_sha384(secret: &[u8], label: &[u8], seed: &[u8], length: usize) -> Vec<u8> {
     let mut result = Vec::with_capacity(length);
 
     // Combine label and seed
@@ -483,7 +490,7 @@ fn prf_sha384(secret: &[u8], label: &[u8], seed: &[u8], length: usize) -> DtlsRe
     }
 
     result.truncate(length);
-    Ok(result)
+    result
 }
 
 /// Constant-time byte comparison to prevent timing attacks.
@@ -515,14 +522,15 @@ fn parse_der_length(data: &[u8]) -> DtlsResult<(usize, usize)> {
     }
 
     let first = data[0];
-    if first < 0x80 {
-        // Short form
-        Ok((first as usize, 1))
-    } else if first == 0x80 {
-        Err(DtlsError::CertificateError {
+    match first.cmp(&0x80) {
+        std::cmp::Ordering::Less => {
+            // Short form
+            Ok((first as usize, 1))
+        }
+        std::cmp::Ordering::Equal => Err(DtlsError::CertificateError {
             reason: "indefinite length not supported".to_string(),
-        })
-    } else {
+        }),
+        std::cmp::Ordering::Greater => {
         // Long form
         let num_bytes = (first & 0x7F) as usize;
         if num_bytes > 4 || data.len() < 1 + num_bytes {
@@ -545,7 +553,8 @@ fn parse_der_length(data: &[u8]) -> DtlsResult<(usize, usize)> {
                 })?;
         }
 
-        Ok((len, 1 + num_bytes))
+            Ok((len, 1 + num_bytes))
+        }
     }
 }
 

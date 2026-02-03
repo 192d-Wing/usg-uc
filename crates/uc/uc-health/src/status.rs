@@ -40,6 +40,7 @@ impl HealthStatus {
     }
 
     /// Combines two statuses (takes the worse one).
+    #[must_use]
     pub fn combine(self, other: Self) -> Self {
         match (self, other) {
             (Self::Unhealthy, _) | (_, Self::Unhealthy) => Self::Unhealthy,
@@ -107,24 +108,28 @@ impl ComponentStatus {
     }
 
     /// Sets the message.
+    #[must_use]
     pub fn with_message(mut self, message: impl Into<String>) -> Self {
         self.message = Some(message.into());
         self
     }
 
     /// Sets the last check time.
+    #[must_use]
     pub fn with_last_check(mut self, instant: Instant) -> Self {
         self.last_check = Some(instant);
         self
     }
 
     /// Sets the check duration.
+    #[must_use]
     pub fn with_duration(mut self, duration_ms: u64) -> Self {
         self.check_duration_ms = Some(duration_ms);
         self
     }
 
     /// Adds a detail.
+    #[must_use]
     pub fn with_detail(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.details.insert(key.into(), value.into());
         self
@@ -185,18 +190,21 @@ impl SystemHealth {
     }
 
     /// Sets the uptime.
+    #[must_use]
     pub fn with_uptime(mut self, secs: u64) -> Self {
         self.uptime_secs = Some(secs);
         self
     }
 
     /// Sets the version.
+    #[must_use]
     pub fn with_version(mut self, version: impl Into<String>) -> Self {
         self.version = Some(version.into());
         self
     }
 
     /// Sets the timestamp.
+    #[must_use]
     pub fn with_timestamp(mut self, timestamp: u64) -> Self {
         self.timestamp = timestamp;
         self

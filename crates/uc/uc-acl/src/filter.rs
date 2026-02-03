@@ -188,6 +188,9 @@ impl AclFilter {
     }
 
     /// Adds a rule.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn add_rule(&mut self, rule: AclRule) -> AclResult<()> {
         if self.rules.len() >= MAX_RULES {
             return Err(AclError::MaxRulesExceeded { max: MAX_RULES });
@@ -222,6 +225,9 @@ impl AclFilter {
     }
 
     /// Removes a rule by ID.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn remove_rule(&mut self, id: &str) -> AclResult<AclRule> {
         let idx = self
             .rule_index

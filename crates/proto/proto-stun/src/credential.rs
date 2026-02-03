@@ -62,12 +62,14 @@ impl LongTermCredentials {
     }
 
     /// Sets the realm (typically from server challenge).
+    #[must_use]
     pub fn with_realm(mut self, realm: impl Into<String>) -> Self {
         self.realm = Some(realm.into());
         self
     }
 
     /// Sets the nonce (typically from server challenge).
+    #[must_use]
     pub fn with_nonce(mut self, nonce: impl Into<String>) -> Self {
         self.nonce = Some(nonce.into());
         self
@@ -79,6 +81,9 @@ impl LongTermCredentials {
     ///
     /// When receiving a 401, the client MUST look for REALM and NONCE
     /// attributes and use them in the retry.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn update_from_challenge(&mut self, response: &StunMessage) -> StunResult<()> {
         let mut found_realm = false;
         let mut found_nonce = false;
@@ -122,6 +127,9 @@ impl LongTermCredentials {
     ///
     /// Note: SASLprep is simplified here; full RFC 4013 compliance
     /// would require more complex Unicode normalization.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn compute_key(&self) -> StunResult<Vec<u8>> {
         let realm = self
             .realm
@@ -143,6 +151,9 @@ impl LongTermCredentials {
     ///
     /// The request MUST include USERNAME, REALM, NONCE, and
     /// MESSAGE-INTEGRITY attributes.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn add_to_message(&self, msg: &mut StunMessage) -> StunResult<()> {
         let realm = self
             .realm
@@ -211,6 +222,9 @@ pub struct LongTermCredentialValidator {
 
 impl LongTermCredentialValidator {
     /// Creates a new validator with the given realm.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn new(realm: impl Into<String>) -> StunResult<Self> {
         let mut nonce_secret = [0u8; 32];
         uc_crypto::random::fill_random(&mut nonce_secret).map_err(|_| {
@@ -236,6 +250,7 @@ impl LongTermCredentialValidator {
     }
 
     /// Sets the nonce lifetime.
+    #[must_use]
     pub fn with_nonce_lifetime(mut self, lifetime: Duration) -> Self {
         self.nonce_lifetime = lifetime.max(MIN_NONCE_LIFETIME);
         self
@@ -271,6 +286,9 @@ impl LongTermCredentialValidator {
     /// Returns `Ok(true)` if valid and not stale,
     /// `Ok(false)` if stale (signature valid but expired),
     /// `Err` if invalid signature.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn validate_nonce(&self, nonce: &str) -> StunResult<bool> {
         let (timestamp_str, sig) =
             nonce
@@ -423,13 +441,10 @@ impl LongTermCredentialValidator {
             .with_realm(&realm)
             .with_nonce(&nonce);
 
-        let key = match creds.compute_key() {
-            Ok(k) => k,
-            Err(_) => {
-                return AuthResult::Failed {
-                    reason: "failed to compute key".to_string(),
-                };
-            }
+        let Ok(key) = creds.compute_key() else {
+            return AuthResult::Failed {
+                reason: "failed to compute key".to_string(),
+            };
         };
 
         // Verify MESSAGE-INTEGRITY

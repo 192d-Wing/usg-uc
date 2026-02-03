@@ -320,7 +320,8 @@ impl Flow {
         if elapsed >= self.keepalive_interval {
             Duration::ZERO
         } else {
-            self.keepalive_interval.checked_sub(elapsed).unwrap()
+            // Safe because we checked elapsed < keepalive_interval above
+            self.keepalive_interval.saturating_sub(elapsed)
         }
     }
 
@@ -655,7 +656,8 @@ impl OutboundFlowManager {
                             if elapsed >= self.keepalive_timeout {
                                 Duration::ZERO
                             } else {
-                                self.keepalive_timeout.checked_sub(elapsed).unwrap()
+                                // Safe because we checked elapsed < timeout above
+                                self.keepalive_timeout.saturating_sub(elapsed)
                             }
                         })
                 } else {

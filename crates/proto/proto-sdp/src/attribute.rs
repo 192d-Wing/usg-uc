@@ -161,6 +161,12 @@ impl Attribute {
     }
 
     /// Parses an attribute from a line (without 'a=' prefix).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(line: &str) -> SdpResult<Self> {
         if let Some((name, value)) = line.split_once(':') {
             let name: AttributeName = name.parse()?;

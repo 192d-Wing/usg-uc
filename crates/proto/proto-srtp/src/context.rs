@@ -114,6 +114,9 @@ impl SrtpContext {
     /// ## Errors
     ///
     /// Returns an error if the index overflows.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn next_rtp_index(&self) -> SrtpResult<u64> {
         let index = self.rtp_index.fetch_add(1, Ordering::SeqCst);
         if index > MAX_PACKET_INDEX {
@@ -166,6 +169,9 @@ impl SrtpContext {
     /// ## Errors
     ///
     /// Returns an error if the index overflows.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn next_rtcp_index(&self) -> SrtpResult<u32> {
         let index = self.rtcp_index.fetch_add(1, Ordering::SeqCst);
         if index > 0x7FFFFFFF {

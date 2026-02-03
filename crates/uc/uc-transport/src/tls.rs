@@ -81,6 +81,12 @@ pub fn create_server_config(
 /// ## Errors
 ///
 /// Returns an error if the configuration cannot be created.
+///
+/// # Errors
+/// Returns an error if the operation fails.
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn create_client_config(root_certs: rustls::RootCertStore) -> TransportResult<ClientConfig> {
     let provider = rustls::crypto::aws_lc_rs::default_provider();
 
@@ -100,6 +106,12 @@ pub fn create_client_config(root_certs: rustls::RootCertStore) -> TransportResul
 /// ## Errors
 ///
 /// Returns an error if the file cannot be read or parsed.
+///
+/// # Errors
+/// Returns an error if the operation fails.
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn load_certs(path: &Path) -> TransportResult<Vec<CertificateDer<'static>>> {
     use rustls::pki_types::pem::PemObject;
 
@@ -126,6 +138,12 @@ pub fn load_certs(path: &Path) -> TransportResult<Vec<CertificateDer<'static>>> 
 /// ## Errors
 ///
 /// Returns an error if the file cannot be read or parsed.
+///
+/// # Errors
+/// Returns an error if the operation fails.
+///
+/// # Errors
+/// Returns an error if the operation fails.
 pub fn load_private_key(path: &Path) -> TransportResult<PrivateKeyDer<'static>> {
     use rustls::pki_types::pem::PemObject;
 
@@ -511,6 +529,12 @@ impl TlsListener {
     }
 
     /// Closes the listener.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn close(&self) -> TransportResult<()> {
         if self
             .closed

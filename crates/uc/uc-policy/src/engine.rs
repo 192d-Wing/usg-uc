@@ -38,6 +38,7 @@ impl PolicyDecision {
     }
 
     /// Adds an additional action.
+    #[must_use]
     pub fn with_additional_action(mut self, action: PolicyAction) -> Self {
         self.additional_actions.push(action);
         self
@@ -103,12 +104,14 @@ impl PolicyEngineConfig {
     }
 
     /// Sets whether policy evaluation is enabled.
+    #[must_use]
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
         self
     }
 
     /// Sets whether to collect all matching rules.
+    #[must_use]
     pub fn with_collect_all_matches(mut self, collect: bool) -> Self {
         self.collect_all_matches = collect;
         self
@@ -175,6 +178,9 @@ impl PolicyEngine {
     }
 
     /// Adds a global rule.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn add_global_rule(&mut self, rule: PolicyRule) -> PolicyResult<()> {
         if self.global_rules.len() >= self.config.max_rules_per_set {
             return Err(PolicyError::TooManyRules {
@@ -197,6 +203,9 @@ impl PolicyEngine {
     }
 
     /// Creates a new named rule set.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn create_rule_set(&mut self, name: impl Into<String>) -> PolicyResult<()> {
         let name = name.into();
         if self.rule_sets.contains_key(&name) {
@@ -222,6 +231,9 @@ impl PolicyEngine {
     }
 
     /// Adds a rule to a named rule set.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn add_rule_to_set(&mut self, set_name: &str, rule: PolicyRule) -> PolicyResult<()> {
         let rule_set =
             self.rule_sets
@@ -349,6 +361,7 @@ impl PolicyEngine {
         rule_set: &'a RuleSet,
         context: &RequestContext,
     ) -> Option<(&'a PolicyAction, &'a str)> {
+        let _ = self; // Silence unused_self - method may use self in future for caching
         for rule in rule_set.rules() {
             if let Some(action) = rule.evaluate(context) {
                 return Some((action, rule.id()));

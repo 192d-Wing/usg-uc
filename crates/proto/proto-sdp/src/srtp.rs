@@ -55,8 +55,10 @@ impl CipherSuite {
     #[must_use]
     pub const fn master_key_length(&self) -> usize {
         match self {
-            Self::AesCm128HmacSha1_80 | Self::AesCm128HmacSha1_32 | Self::F8128HmacSha1_80 => 16,
-            Self::AeadAes128Gcm => 16,
+            Self::AesCm128HmacSha1_80
+            | Self::AesCm128HmacSha1_32
+            | Self::F8128HmacSha1_80
+            | Self::AeadAes128Gcm => 16,
             Self::AeadAes256Gcm => 32,
         }
     }
@@ -156,6 +158,12 @@ impl KeyParams {
     }
 
     /// Creates key parameters from base64-encoded keying material.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn from_base64(encoded: &str) -> SdpResult<Self> {
         let key_material = BASE64
             .decode(encoded)
@@ -240,6 +248,12 @@ impl KeyParams {
     }
 
     /// Validates the keying material length against a cipher suite.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn validate_for_cipher(&self, cipher: CipherSuite) -> SdpResult<()> {
         let expected = cipher.keying_material_length();
         let actual = self.key_material.len();
@@ -261,9 +275,14 @@ impl fmt::Display for KeyParams {
 
         if let Some(lifetime) = self.lifetime {
             // Find the power of 2 representation
+            // This cast is intentional: we want approximate log2 for display purposes
+            #[allow(clippy::cast_precision_loss)]
             let log2 = (lifetime as f64).log2();
             if (log2.fract().abs() < 0.001) && log2 >= 1.0 {
-                write!(f, "|2^{}", log2 as u32)?;
+                // Safe truncation: log2 of u64 max is ~63, fits in u32
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let log2_int = log2 as u32;
+                write!(f, "|2^{log2_int}")?;
             } else {
                 write!(f, "|{lifetime}")?;
             }
@@ -341,6 +360,12 @@ impl SessionParams {
     }
 
     /// Parses session parameters from a space-separated string.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(s: &str) -> SdpResult<Self> {
         let mut params = Self::new();
 
@@ -450,6 +475,12 @@ impl CryptoAttribute {
     }
 
     /// Parses a crypto attribute value (without the "crypto:" prefix).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(value: &str) -> SdpResult<Self> {
         let parts: Vec<&str> = value.splitn(4, ' ').collect();
 
@@ -561,6 +592,12 @@ impl CryptoAttribute {
     }
 
     /// Validates this crypto attribute.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn validate(&self) -> SdpResult<()> {
         // Tag must be 1-9 digits
         if self.tag > 999_999_999 {
@@ -676,7 +713,11 @@ impl SrtpNegotiator {
         for (i, byte) in material.iter_mut().enumerate() {
             // Use modulo to prevent shift overflow (128 bits in u128)
             let shift = (i * 8) % 128;
-            *byte = ((timestamp >> shift) ^ (i as u128).wrapping_mul(17)) as u8;
+            // Truncation is intentional: extracting byte from u128
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                *byte = ((timestamp >> shift) ^ (i as u128).wrapping_mul(17)) as u8;
+            }
         }
 
         material

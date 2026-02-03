@@ -139,12 +139,14 @@ impl CallConfig {
     }
 
     /// Sets the call ID.
+    #[must_use]
     pub fn with_call_id(mut self, call_id: CallId) -> Self {
         self.call_id = call_id;
         self
     }
 
     /// Sets the B2BUA mode.
+    #[must_use]
     pub fn with_mode(mut self, mode: B2buaMode) -> Self {
         self.mode = mode;
         self
@@ -277,6 +279,9 @@ impl Call {
     }
 
     /// Marks the call as received (A-leg INVITE received).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn receive(&mut self) -> B2buaResult<()> {
         match self.state {
             CallState::Initializing => {
@@ -292,6 +297,9 @@ impl Call {
     }
 
     /// Starts routing (B-leg INVITE being sent).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn start_routing(&mut self) -> B2buaResult<()> {
         match self.state {
             CallState::Received => {
@@ -307,6 +315,9 @@ impl Call {
     }
 
     /// Processes a provisional response from B-leg.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn receive_provisional(&mut self, status_code: u16) -> B2buaResult<()> {
         match self.state {
             CallState::Routing | CallState::Proceeding => {
@@ -322,6 +333,9 @@ impl Call {
     }
 
     /// Establishes early media.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn establish_early_media(&mut self) -> B2buaResult<()> {
         match self.state {
             CallState::Routing | CallState::Proceeding => {
@@ -339,6 +353,9 @@ impl Call {
     }
 
     /// Activates the call (B-leg 200 OK received).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn activate(&mut self) -> B2buaResult<()> {
         match self.state {
             CallState::Routing | CallState::Proceeding | CallState::EarlyMedia => {
@@ -357,6 +374,9 @@ impl Call {
     }
 
     /// Puts the call on hold.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn hold(&mut self) -> B2buaResult<()> {
         match self.state {
             CallState::Active => {
@@ -374,6 +394,9 @@ impl Call {
     }
 
     /// Resumes the call from hold.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn resume(&mut self) -> B2buaResult<()> {
         if self.state == CallState::OnHold {
             self.a_leg.resume()?;
@@ -389,6 +412,9 @@ impl Call {
     }
 
     /// Starts termination.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn start_termination(&mut self) -> B2buaResult<()> {
         match self.state {
             CallState::Terminated | CallState::Failed => Ok(()), // Already done
@@ -409,16 +435,16 @@ impl Call {
     }
 
     /// Completes termination.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn terminate(&mut self) -> B2buaResult<()> {
-        match self.state {
-            CallState::Terminated => Ok(()), // Already terminated
-            _ => {
-                let _ = self.a_leg.terminate();
-                let _ = self.b_leg.terminate();
-                self.state = CallState::Terminated;
-                Ok(())
-            }
+        if self.state != CallState::Terminated {
+            let _ = self.a_leg.terminate();
+            let _ = self.b_leg.terminate();
+            self.state = CallState::Terminated;
         }
+        Ok(())
     }
 
     /// Fails the call with a status code and reason.

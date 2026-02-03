@@ -35,6 +35,7 @@ impl<T> ApiResponse<T> {
     }
 
     /// Adds a header.
+    #[must_use]
     pub fn with_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.insert(key.into(), value.into());
         self
@@ -135,6 +136,7 @@ impl<T> ResourceResponse<T> {
     }
 
     /// Sets the metadata.
+    #[must_use]
     pub fn with_metadata(mut self, metadata: ResourceMetadata) -> Self {
         self.metadata = metadata;
         self
@@ -163,30 +165,35 @@ impl ResourceMetadata {
     }
 
     /// Sets the ID.
+    #[must_use]
     pub fn with_id(mut self, id: impl Into<String>) -> Self {
         self.id = Some(id.into());
         self
     }
 
     /// Sets the created timestamp.
+    #[must_use]
     pub fn with_created_at(mut self, timestamp: u64) -> Self {
         self.created_at = Some(timestamp);
         self
     }
 
     /// Sets the updated timestamp.
+    #[must_use]
     pub fn with_updated_at(mut self, timestamp: u64) -> Self {
         self.updated_at = Some(timestamp);
         self
     }
 
     /// Sets the version.
+    #[must_use]
     pub fn with_version(mut self, version: impl Into<String>) -> Self {
         self.version = Some(version.into());
         self
     }
 
     /// Adds a link.
+    #[must_use]
     pub fn with_link(mut self, rel: impl Into<String>, href: impl Into<String>) -> Self {
         self.links.insert(rel.into(), href.into());
         self
@@ -218,6 +225,7 @@ impl ErrorResponse {
     }
 
     /// Adds a field error.
+    #[must_use]
     pub fn with_field_error(
         mut self,
         field: impl Into<String>,
@@ -231,6 +239,7 @@ impl ErrorResponse {
     }
 
     /// Sets the request ID.
+    #[must_use]
     pub fn with_request_id(mut self, id: impl Into<String>) -> Self {
         self.request_id = Some(id.into());
         self

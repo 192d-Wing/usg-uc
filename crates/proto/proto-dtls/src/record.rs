@@ -86,6 +86,9 @@ impl RecordHeader {
     /// ## Errors
     ///
     /// Returns an error if the buffer is too small or contains invalid data.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn parse(data: &[u8]) -> DtlsResult<Self> {
         if data.len() < RECORD_HEADER_LEN {
             return Err(DtlsError::RecordError {
@@ -250,7 +253,8 @@ impl RecordLayer {
             aad[3..5].copy_from_slice(&header.epoch.to_be_bytes());
             let seq_bytes = header.sequence_number.to_be_bytes();
             aad[5..11].copy_from_slice(&seq_bytes[2..8]);
-            // Length in AAD is the plaintext length
+            // Length in AAD is the plaintext length - fragment len is bounded by MAX_FRAGMENT_SIZE
+            #[allow(clippy::cast_possible_truncation)]
             aad[11..13].copy_from_slice(&(fragment.len() as u16).to_be_bytes());
 
             // Encrypt
@@ -263,7 +267,11 @@ impl RecordLayer {
             // Build output: header + explicit_nonce + ciphertext_with_tag
             let total_len = explicit_nonce.len() + ciphertext.len();
             let mut header_with_len = header;
-            header_with_len.length = total_len as u16;
+            // total_len is bounded by MAX_FRAGMENT_SIZE + TAG_LEN + 8 which fits in u16
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                header_with_len.length = total_len as u16;
+            }
 
             let mut output = Vec::with_capacity(RECORD_HEADER_LEN + total_len);
             output.extend_from_slice(&header_with_len.serialize());
@@ -273,7 +281,11 @@ impl RecordLayer {
         } else {
             // Plaintext mode
             let mut header_with_len = header;
-            header_with_len.length = fragment.len() as u16;
+            // fragment.len() is bounded by MAX_FRAGMENT_SIZE which fits in u16
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                header_with_len.length = fragment.len() as u16;
+            }
 
             let mut output = Vec::with_capacity(RECORD_HEADER_LEN + fragment.len());
             output.extend_from_slice(&header_with_len.serialize());
@@ -294,6 +306,9 @@ impl RecordLayer {
     /// ## Errors
     ///
     /// Returns an error if decryption fails or replay is detected.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn decrypt_record(&mut self, record: &[u8]) -> DtlsResult<(ContentType, Vec<u8>)> {
         let header = RecordHeader::parse(record)?;
 
@@ -344,6 +359,8 @@ impl RecordLayer {
             aad[3..5].copy_from_slice(&header.epoch.to_be_bytes());
             let seq_bytes = header.sequence_number.to_be_bytes();
             aad[5..11].copy_from_slice(&seq_bytes[2..8]);
+            // plaintext_len is bounded by ciphertext length which fits in u16
+            #[allow(clippy::cast_possible_truncation)]
             aad[11..13].copy_from_slice(&(plaintext_len as u16).to_be_bytes());
 
             // Decrypt

@@ -34,7 +34,7 @@ fn test_histogram_observations() {
     histogram.observe(30.0);
 
     assert_eq!(histogram.count(), 3);
-    assert_eq!(histogram.sum(), 60.0);
+    assert!((histogram.sum() - 60.0).abs() < f64::EPSILON);
 }
 
 #[test]

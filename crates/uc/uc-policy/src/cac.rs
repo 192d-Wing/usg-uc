@@ -298,6 +298,7 @@ impl TrunkCacLimits {
 
     /// Returns effective max sessions accounting for emergency reserve.
     #[must_use]
+    #[allow(clippy::cast_sign_loss)] // Percentage calculation always yields non-negative result
     pub fn effective_max_sessions(&self, priority: CallPriority) -> u32 {
         if priority.is_critical_or_higher() {
             self.max_sessions
@@ -357,17 +358,14 @@ impl TrunkCacState {
     /// Calculates current CPS.
     fn calculate_cps(&self) -> f64 {
         let guard = self.last_cps_reset.lock();
-        match guard {
-            Ok(last_reset) => {
-                let elapsed = last_reset.elapsed().as_secs_f64();
-                let count = self.call_counter.load(Ordering::Relaxed) as f64;
-                // Use at least 1 second for calculation to avoid division by near-zero
-                // If we just reset, the count will be 0 or very low anyway
-                let effective_elapsed = elapsed.max(1.0);
-                count / effective_elapsed
-            }
-            Err(_) => 0.0,
-        }
+        guard.map_or(0.0, |last_reset| {
+            let elapsed = last_reset.elapsed().as_secs_f64();
+            let count = self.call_counter.load(Ordering::Relaxed) as f64;
+            // Use at least 1 second for calculation to avoid division by near-zero
+            // If we just reset, the count will be 0 or very low anyway
+            let effective_elapsed = elapsed.max(1.0);
+            count / effective_elapsed
+        })
     }
 
     /// Resets CPS counter if enough time has passed.
@@ -690,6 +688,7 @@ impl TrunkStats {
 
     /// Returns bandwidth utilization (0.0 - 1.0).
     #[must_use]
+    #[allow(clippy::cast_precision_loss)] // Precision loss is acceptable for utilization calculation
     pub fn bandwidth_utilization(&self) -> f64 {
         if self.max_bandwidth_kbps == 0 {
             0.0
@@ -723,7 +722,7 @@ mod tests {
 
         assert_eq!(limits.max_sessions, 100);
         assert_eq!(limits.max_bandwidth_kbps, 50_000);
-        assert_eq!(limits.max_cps, 10.0);
+        assert!((limits.max_cps - 10.0).abs() < f64::EPSILON);
         assert_eq!(limits.emergency_reserve_percent, 20);
 
         // Effective max for normal calls

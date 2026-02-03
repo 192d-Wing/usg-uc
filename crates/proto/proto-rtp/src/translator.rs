@@ -168,6 +168,12 @@ impl RtpTranslator {
     /// However, if SSRC translation is enabled, the SSRC will be mapped.
     ///
     /// Returns the forwarded packet or an error if the packet should be dropped.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn forward_packet(&mut self, packet: &RtpPacket) -> RtpResult<RtpPacket> {
         let ssrc = packet.header.ssrc;
 
@@ -300,7 +306,7 @@ impl RtpMixer {
         // Use SSRC-derived values for initial sequence/timestamp
         // This provides some randomization without requiring rand crate
         let initial_seq = (mixer_ssrc >> 16) as u16;
-        let initial_ts = mixer_ssrc.wrapping_mul(0x5BD1E995);
+        let initial_ts = mixer_ssrc.wrapping_mul(0x5BD1_E995);
 
         Self {
             mixer_ssrc,
@@ -379,6 +385,12 @@ impl RtpMixer {
     ///
     /// This updates the source state but does not produce output.
     /// Use `create_mixed_packet` to generate output.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn process_input(&mut self, packet: &RtpPacket) -> RtpResult<()> {
         let ssrc = packet.header.ssrc;
 
@@ -486,13 +498,13 @@ impl RtpMixer {
     /// individual contributors MUST send RTCP SR packets."
     #[must_use]
     pub fn generate_sender_report(&self, ntp_timestamp: u64) -> SenderInfo {
-        let ntp_msw = (ntp_timestamp >> 32) as u32;
-        let ntp_lsw = ntp_timestamp as u32;
+        let ntp_high = (ntp_timestamp >> 32) as u32;
+        let ntp_low = ntp_timestamp as u32;
 
         SenderInfo {
             ssrc: self.mixer_ssrc,
-            ntp_timestamp_msw: ntp_msw,
-            ntp_timestamp_lsw: ntp_lsw,
+            ntp_timestamp_msw: ntp_high,
+            ntp_timestamp_lsw: ntp_low,
             rtp_timestamp: self.output_timestamp,
             sender_packet_count: self.packets_sent as u32,
             sender_octet_count: self.octets_sent as u32,
@@ -618,6 +630,12 @@ impl SsrcCollisionDetector {
     ///
     /// Per RFC 3550 §8.2: "If an SSRC collision is detected, each participant
     /// chooses a new SSRC value."
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn check(&mut self, ssrc: u32, source_addr: &str) -> RtpResult<()> {
         if let Some(known_addr) = self.known_sources.get(&ssrc) {
             if known_addr != source_addr {

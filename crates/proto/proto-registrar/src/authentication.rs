@@ -180,16 +180,21 @@ impl AuthChallenge {
         let mut value = format!("Digest realm=\"{}\", nonce=\"{}\"", self.realm, self.nonce);
 
         if let Some(ref opaque) = self.opaque {
-            value.push_str(&format!(", opaque=\"{opaque}\""));
+            value.push_str(", opaque=\"");
+            value.push_str(opaque);
+            value.push('"');
         }
 
         if self.algorithm != AuthAlgorithm::Md5 {
-            value.push_str(&format!(", algorithm={}", self.algorithm.as_str()));
+            value.push_str(", algorithm=");
+            value.push_str(self.algorithm.as_str());
         }
 
         if !self.qop.is_empty() {
             let qop_str: Vec<&str> = self.qop.iter().map(AuthQop::as_str).collect();
-            value.push_str(&format!(", qop=\"{}\"", qop_str.join(",")));
+            value.push_str(", qop=\"");
+            value.push_str(&qop_str.join(","));
+            value.push('"');
         }
 
         if self.stale {
@@ -385,24 +390,28 @@ impl Authenticator {
     }
 
     /// Sets the nonce lifetime.
+    #[must_use]
     pub fn with_nonce_lifetime(mut self, lifetime: Duration) -> Self {
         self.nonce_lifetime = lifetime;
         self
     }
 
     /// Sets the default algorithm.
+    #[must_use]
     pub fn with_algorithm(mut self, algorithm: AuthAlgorithm) -> Self {
         self.default_algorithm = algorithm;
         self
     }
 
     /// Sets the supported qop options.
+    #[must_use]
     pub fn with_qop(mut self, qop: Vec<AuthQop>) -> Self {
         self.supported_qop = qop;
         self
     }
 
     /// Sets the password lookup function.
+    #[must_use]
     pub fn with_password_lookup<F>(mut self, lookup: F) -> Self
     where
         F: Fn(&str, &str) -> Option<String> + Send + Sync + 'static,
