@@ -22,6 +22,7 @@ proto-stun.workspace = true
 proto-turn.workspace = true
 uc-crypto.workspace = true
 uc-transport.workspace = true
+uc-types.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

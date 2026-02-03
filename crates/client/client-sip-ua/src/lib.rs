@@ -21,9 +21,15 @@
 #![cfg_attr(test, allow(clippy::panic))]
 
 pub mod call_agent;
+pub mod dtls_handler;
+pub mod ice_handler;
+pub mod media_session;
 pub mod registration;
 
 pub use call_agent::{CallAgent, CallEvent};
+pub use dtls_handler::{DtlsEvent, DtlsHandler};
+pub use ice_handler::{IceEvent, IceHandler};
+pub use media_session::{MediaSession, MediaSessionEvent, MediaSessionState};
 pub use registration::{RegistrationAgent, RegistrationEvent};
 
 use thiserror::Error;
