@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1655 tests passing, Phases 1-23 complete, DNS Integration complete, CDR Export Endpoints complete
+**Current Status**: 1655 tests passing, Phases 1-23 complete, Phase 24 (SIP Soft Client) in progress
 
 ---
 
@@ -436,6 +436,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ NAPTR records support for transport selection
 - ✅ DNS caching with TTL management
 - ✅ SIP resolver combining NAPTR → SRV → A/AAAA lookups
+- ✅ Hickory-resolver integration for actual DNS queries (optional `resolver` feature)
 
 ### ✅ Phase 22: High Availability & Clustering
 
@@ -520,6 +521,71 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ TransportType::Sctp added to uc-types
 
 **Tests**: 25 new tests (T.38 crate)
+
+### 🚧 Phase 24: SIP Soft Client (In Progress)
+
+**Goal**: Native Windows SIP soft client for enterprise/government use
+
+**New Crates** (`crates/client/`)
+
+- 🚧 `client-types`: Shared types (CallState, SipAccount, AudioConfig, Contact)
+- 🚧 `client-audio`: CPAL audio I/O, jitter buffer, RTP/SRTP pipeline
+- 🚧 `client-sip-ua`: SIP User Agent (registration, call control, ICE/DTLS)
+- 🚧 `client-core`: Application logic, settings persistence, event coordination
+- 🚧 `client-gui`: Windows GUI (egui), system tray, notifications
+
+**Key Features**
+
+- ✅ Smart card authentication only (CAC/PIV/SIPR token via mutual TLS)
+- ✅ NO password-based digest auth (CNSA 2.0 compliance)
+- ✅ TLS 1.3 only for signaling
+- 🚧 CPAL for cross-platform audio I/O
+- 🚧 Jitter buffer with adaptive sizing
+- 🚧 ICE/STUN/TURN NAT traversal
+- 🚧 DTLS-SRTP with AES-256-GCM
+- 🚧 egui-based Windows GUI
+- 🚧 System tray and Windows notifications
+- 🚧 Certificate selection from Windows Certificate Store
+
+**Phase 24.1: Foundation** ✅
+
+- ✅ `client-types` crate with all shared types
+- ✅ `CallState` enum (Idle → Dialing → Ringing → Connected → Terminated)
+- ✅ `SipAccount` with `CertificateConfig` (no password fields)
+- ✅ `CertificateSelectionMode`: PromptUser, SpecificCertificate, AutoSelect
+- ✅ `RegistrationState` with smart card states (WaitingForPin, SmartCardNotPresent)
+- ✅ `AudioConfig` with device selection and jitter buffer settings
+- ✅ `Contact` and `CallHistoryEntry` for persistence
+- ✅ Crate skeletons for client-audio, client-sip-ua, client-core, client-gui
+
+**Phase 24.2: SIP User Agent** (Next)
+
+- 🚧 `RegistrationAgent` using `proto-transaction::ClientNonInviteTransaction`
+- 🚧 `CallAgent` using `proto-transaction::ClientInviteTransaction`
+- 🚧 Windows CryptoAPI integration for smart card certificates
+- 🚧 Mutual TLS client authentication
+- 🚧 SDP offer/answer via `proto-sdp`
+
+**Phase 24.3: Secure Media**
+
+- 🚧 ICE candidate gathering via `proto-ice`
+- 🚧 DTLS handshake via `proto-dtls`
+- 🚧 SRTP context creation via `proto-srtp`
+- 🚧 RTP/SRTP pipeline with jitter buffer
+
+**Phase 24.4: Application Core**
+
+- 🚧 Call manager with event broadcasting
+- 🚧 Settings persistence (TOML)
+- 🚧 Smart card certificate enumeration
+- 🚧 Contact and call history storage
+
+**Phase 24.5: GUI Implementation**
+
+- 🚧 egui-based main window
+- 🚧 Dialer, call view, contacts, settings views
+- 🚧 System tray integration
+- 🚧 Windows toast notifications
 
 ---
 

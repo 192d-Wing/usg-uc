@@ -1,0 +1,33 @@
+[package]
+name = "client-core"
+description = "Application core for USG SIP Soft Client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+client-types = { path = "../client-types" }
+client-sip-ua = { path = "../client-sip-ua" }
+client-audio = { path = "../client-audio" }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+
+# Platform utilities
+directories.workspace = true
+
+# Windows smart card/PKI support
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

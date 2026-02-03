@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ### Added
 
+#### Phase 24: SIP Soft Client (In Progress)
+
+**New Crates** (`crates/client/`)
+
+- `client-types`: Shared types for SIP soft client
+  - `CallState` enum with full call lifecycle (Idle → Dialing → Ringing → Connected → Terminated)
+  - `CallInfo` and `CallHistoryEntry` for call tracking and persistence
+  - `CallFailureReason` and `CallEndReason` for detailed call disposition
+  - `SipAccount` with smart card certificate configuration (NO password fields)
+  - `CertificateConfig` for smart card (CAC/PIV) certificate selection
+  - `CertificateSelectionMode`: PromptUser, SpecificCertificate, AutoSelect
+  - `CertificateInfo` for certificate details (thumbprint, subject, issuer, validity)
+  - `RegistrationState` with smart card states (WaitingForPin, SmartCardNotPresent, CertificateInvalid)
+  - `TransportPreference::TlsOnly` (CNSA 2.0 - no UDP/TCP fallback)
+  - `AudioConfig` with device selection and jitter buffer settings
+  - `AudioDevice` and `AudioStatistics` for audio monitoring
+  - `CodecPreference` enum: Opus, G722, G711Ulaw, G711Alaw
+  - `Contact` and `PhoneNumber` types for contact management
+  - `ClientError` and `ClientResult` error handling
+
+- `client-audio`: Audio pipeline skeleton (CPAL integration planned)
+  - `AudioError` and `AudioResult` types
+
+- `client-sip-ua`: SIP User Agent skeleton
+  - `SipUaError` with smart card error types (SmartCardNotPresent, CertificateError)
+  - `SipUaResult` type
+
+- `client-core`: Application core skeleton
+  - `AppError` and `AppResult` types
+
+- `client-gui`: Windows GUI skeleton (egui)
+  - Main application entry point
+
+**Security**
+
+- Smart card authentication ONLY (CAC/PIV/SIPR token)
+- NO password-based digest authentication
+- Mutual TLS with client certificates from Windows Certificate Store
+- TLS 1.3 only for signaling (CNSA 2.0 compliance)
+
+**Dependencies Added**
+
+- `cpal` 0.17: Cross-platform audio I/O
+- `ringbuf` 0.4: Lock-free ring buffers for audio threads
+- `egui` 0.33: Immediate mode GUI
+- `eframe` 0.33: egui framework with wgpu backend
+- `directories` 6: Platform-specific config paths
+- `tray-icon` 0.21: System tray integration
+- `rfd` 0.17: Native file dialogs
+- `winrt-notification` 0.5: Windows toast notifications
+- `windows` 0.62: Windows CryptoAPI for smart card access
+
 #### CDR Export Endpoints
 
 **uc-api - CDR Export Routes (NIST 800-53: AU-2, AU-3, AU-9)**
@@ -80,7 +132,17 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - `TransportPref` with `naptr_service()` and `srv_prefix()` methods
   - `DefaultPorts` for transport-specific default ports
 
-**Tests**: 38 new tests for DNS crate
+- Hickory-resolver integration (optional `resolver` feature):
+  - `HickoryDnsResolver` for actual DNS queries using hickory-resolver 0.25
+  - A/AAAA lookup with `lookup_addresses()`
+  - SRV lookup with `lookup_srv()` and `lookup_sip_srv()`
+  - NAPTR lookup with `lookup_naptr()`
+  - Combined SRV + address resolution with `lookup_srv_with_addresses()`
+  - Integration with `SipResolver` for full RFC 3263 resolution
+  - TTL-based caching with hickory responses
+  - IP passthrough for numeric addresses
+
+**Tests**: 46 tests for DNS crate (38 base + 8 hickory integration)
 
 #### Phase 23: Specialized Protocols
 

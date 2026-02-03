@@ -1,0 +1,34 @@
+[package]
+name = "client-sip-ua"
+description = "SIP User Agent for USG SIP Soft Client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+client-types = { path = "../client-types" }
+proto-sip.workspace = true
+proto-transaction.workspace = true
+proto-dialog.workspace = true
+proto-registrar.workspace = true
+proto-sdp.workspace = true
+proto-rtp.workspace = true
+proto-srtp.workspace = true
+proto-dtls.workspace = true
+proto-ice.workspace = true
+proto-stun.workspace = true
+proto-turn.workspace = true
+uc-crypto.workspace = true
+uc-transport.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true
