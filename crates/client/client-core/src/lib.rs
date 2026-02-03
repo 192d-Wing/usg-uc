@@ -17,12 +17,16 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![cfg_attr(test, allow(clippy::panic))]
 
-// Modules will be added as implementation progresses
-// pub mod app;
-// pub mod call_manager;
-// pub mod contact_manager;
-// pub mod settings;
-// pub mod smartcard;
+pub mod app;
+pub mod call_manager;
+pub mod contact_manager;
+pub mod settings;
+// pub mod smartcard; // To be implemented for Windows smart card support
+
+pub use app::{AppEvent, AppState, ClientApp};
+pub use call_manager::{CallManager, CallManagerEvent};
+pub use contact_manager::{create_contact, ContactManager, ContactStore};
+pub use settings::{GeneralSettings, NetworkSettings, Settings, SettingsManager, UiSettings};
 
 use thiserror::Error;
 

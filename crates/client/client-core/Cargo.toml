@@ -11,12 +11,14 @@ repository.workspace = true
 client-types = { path = "../client-types" }
 client-sip-ua = { path = "../client-sip-ua" }
 client-audio = { path = "../client-audio" }
+proto-ice.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+chrono.workspace = true
 zeroize.workspace = true
 
 # Platform utilities
@@ -28,6 +30,7 @@ windows.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile.workspace = true
 
 [lints]
 workspace = true
