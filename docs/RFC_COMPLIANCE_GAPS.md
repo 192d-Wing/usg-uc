@@ -24,7 +24,7 @@ This document maps each proto-* crate to its relevant RFCs and identifies specif
 | §11 | Querying Capabilities | Missing | OPTIONS processing logic |
 | §12 | Dialogs | Partial | Delegated to proto-dialog |
 | §13 | Initiating a Session | Partial | INVITE construction only |
-| §13.2.2.4 | 3xx Redirect Responses | **Missing** | No redirect handling |
+| §13.2.2.4 | 3xx Redirect Responses | Complete | `redirect.rs` |
 | §14 | Modifying an Existing Session | Partial | re-INVITE parsing only |
 | §15 | Terminating a Session | Partial | BYE construction only |
 | §16.4 | Route Information Preprocessing | Complete | `routing.rs` |
@@ -35,27 +35,6 @@ This document maps each proto-* crate to its relevant RFCs and identifies specif
 | §19 | SIP URI | Complete | `uri.rs` |
 | §20 | Header Fields | Complete | All 44 headers in `header.rs` |
 | §22 | Authentication | Complete | `auth.rs` (RFC 2617) |
-
-### Critical Gap: §13.2.2.4 - Redirect Responses
-
-**RFC Text**: "If the response is a 3xx, the UAC SHOULD use the Contact header field URIs to retry the request."
-
-**Implementation Needed**:
-```rust
-// proto-sip/src/redirect.rs
-pub struct RedirectHandler {
-    max_redirects: u8,
-    current_count: u8,
-}
-
-impl RedirectHandler {
-    pub fn process_3xx(&mut self, response: &SipResponse) -> RedirectAction {
-        // Extract Contact headers
-        // Validate redirect count
-        // Return RedirectAction::Retry(uri) or RedirectAction::TooManyRedirects
-    }
-}
-```
 
 ---
 
@@ -128,13 +107,7 @@ impl RedirectHandler {
 | §4.2 | NOTIFY Processing | Complete | Notifier implementation |
 | §4.3 | Subscription State | Complete | State machine |
 | §4.4 | Forking | Partial | Basic forking support |
-| §7.2 | Event Package Registration | **Missing** | No IANA validation |
-
-### Gap: RFC 6665 §7.2 - Event Package Validation
-
-**RFC Text**: "Event packages MUST be registered with IANA."
-
-**Implementation Needed**: Validate event packages against known IANA registrations.
+| §7.2 | Event Package Registration | Complete | `package.rs` EventPackageRegistry |
 
 ---
 
@@ -157,9 +130,9 @@ impl RedirectHandler {
 | §4.2 | Instance-ID | Complete | Binding tracking |
 | §4.3 | Reg-ID | Complete | Registration ID |
 | §4.4 | Flow Token | Partial | Generation only |
-| §5.1 | Outbound Proxy Discovery | **Missing** | No discovery |
-| §5.2 | Registrar Flow Maintenance | **Missing** | No keepalive |
-| §5.3 | Edge Proxy Routing | **Missing** | No flow routing |
+| §5.1 | Outbound Proxy Discovery | Partial | Basic support |
+| §5.2 | Registrar Flow Maintenance | Complete | `outbound.rs` FlowManager |
+| §5.3 | Edge Proxy Routing | Complete | Flow token routing |
 
 ### RFC 5627 Section Mapping (GRUU)
 
@@ -168,27 +141,8 @@ impl RedirectHandler {
 | §3.1 | Public GRUU | Complete | `gruu.rs` generation |
 | §3.2 | Temporary GRUU | Complete | `gruu.rs` generation |
 | §4.1 | Requesting a GRUU | Complete | sip.instance handling |
-| §4.2 | GRUU in Contact | **Missing** | Not added to responses |
-| §5.1 | Proxy GRUU Routing | **Missing** | No routing logic |
-
-### Critical Gap: RFC 5626 §5.2 - Flow Maintenance
-
-**RFC Text**: "The edge proxy MUST send periodic keepalives on the flow."
-
-**Implementation Needed**:
-```rust
-// proto-registrar/src/outbound.rs
-pub struct OutboundFlowManager {
-    flows: HashMap<FlowToken, FlowState>,
-    keepalive_interval: Duration,
-}
-
-impl OutboundFlowManager {
-    pub fn maintain_flow(&mut self, token: &FlowToken) -> FlowAction {
-        // Send STUN keepalive or CRLF ping
-    }
-}
-```
+| §4.2 | GRUU in Contact | Complete | Response generation |
+| §5.1 | Proxy GRUU Routing | Complete | `gruu.rs` GruuRouter |
 
 ---
 
@@ -205,7 +159,7 @@ impl OutboundFlowManager {
 | §6.1.4 | Triggered Checks | Complete | Queue implemented |
 | §7.2 | Nominating | Partial | USE-CANDIDATE only |
 | §7.2.1 | Regular Nomination | Complete | Basic nomination |
-| §7.2.2 | Aggressive Nomination | **Missing** | Not implemented |
+| §7.2.2 | Aggressive Nomination | Complete | `connectivity.rs` |
 | §8.1 | Updating States | Complete | State machine |
 | §9 | Consent | Partial | ConsentTracker exists |
 | §10 | Keepalives | Complete | KeepaliveTracker |
@@ -221,29 +175,7 @@ impl OutboundFlowManager {
 | §4.2 | Consent Timeout | Complete | 30 seconds |
 | §5.1 | Sending Consent | Complete | `create_consent_check()` |
 | §5.2 | Receiving Consent | Partial | Response handling |
-| §6 | Consent Revocation | **Missing** | No revocation action |
-
-### Critical Gap: RFC 7675 §6 - Consent Revocation
-
-**RFC Text**: "When consent expires, the agent MUST cease transmission immediately."
-
-**Implementation Needed**:
-```rust
-// Update consent.rs
-impl ConsentTracker {
-    pub fn check_consent(&self) -> ConsentResult {
-        match self.state {
-            ConsentState::Expired => ConsentResult::MustStop,
-            ConsentState::Fresh => ConsentResult::Continue,
-            _ => ConsentResult::Pending,
-        }
-    }
-}
-```
-
-### Gap: RFC 8445 §7.2.2 - Aggressive Nomination
-
-**RFC Text**: "With aggressive nomination, the controlling agent includes the USE-CANDIDATE attribute in every check."
+| §6 | Consent Revocation | Complete | `consent.rs` |
 
 ---
 
@@ -258,8 +190,8 @@ impl ConsentTracker {
 | §4.1.1 | Anti-Replay | Complete | Sliding window |
 | §4.2 | Handshake Protocol | Partial | `handshake.rs` |
 | §4.2.1 | HelloVerifyRequest | Complete | Cookie DoS protection |
-| §4.2.4 | CertificateVerify | **Missing** | No signature verification |
-| §4.2.6 | Finished Validation | **Missing** | TODO in code |
+| §4.2.4 | CertificateVerify | Complete | `verify.rs` |
+| §4.2.6 | Finished Validation | Complete | `verify.rs` FinishedVerifier |
 | §4.3 | Timeout/Retransmission | Partial | Basic retransmission |
 
 ### RFC 5764 Section Mapping (DTLS-SRTP)
@@ -270,49 +202,6 @@ impl ConsentTracker {
 | §4.1.2 | Profile Negotiation | Complete | AES-256-GCM only |
 | §4.2 | Key Export | Complete | HKDF-SHA384 |
 | §5 | Security Considerations | Partial | CNSA 2.0 only |
-
-### Critical Gap: RFC 6347 §4.2.4 - Certificate Verification
-
-**RFC Text**: "The server MUST validate the client's certificate if requested."
-
-**Code TODO Location**: `handshake.rs:330`
-
-```rust
-// TODO: Implement
-fn verify_certificate_chain(certs: &[Certificate]) -> DtlsResult<()> {
-    // 1. Verify certificate signatures
-    // 2. Check certificate validity period
-    // 3. Validate trust chain to root CA
-    // 4. Check revocation status (CRL/OCSP)
-}
-```
-
-### Critical Gap: RFC 6347 §4.2.6 - Finished Validation
-
-**RFC Text**: "Each party MUST verify the Finished message."
-
-**Code TODO Locations**: `handshake.rs:383`, `handshake.rs:471`
-
-```rust
-// TODO: Implement
-fn verify_finished(
-    received: &[u8],
-    handshake_hash: &[u8],
-    master_secret: &[u8],
-    is_client: bool,
-) -> DtlsResult<()> {
-    let expected = prf_sha384(
-        master_secret,
-        if is_client { b"client finished" } else { b"server finished" },
-        handshake_hash,
-        12,
-    )?;
-    if received != expected {
-        return Err(DtlsError::HandshakeFailed { reason: "Finished mismatch" });
-    }
-    Ok(())
-}
-```
 
 ---
 
@@ -327,28 +216,9 @@ fn verify_finished(
 | §7.2 | Sending a Request | Complete | StunClient |
 | §7.3 | Receiving a Response | Complete | Response parsing |
 | §10.1 | Short-Term Credential | Partial | USERNAME/INTEGRITY |
-| §10.2 | Long-Term Credential | **Missing** | No implementation |
+| §10.2 | Long-Term Credential | Complete | `credential.rs` |
 | §14 | FINGERPRINT Mechanism | Complete | CRC-32 |
 | §15 | Attribute Definitions | Partial | Core attributes only |
-
-### Gap: RFC 5389 §10.2 - Long-Term Credential
-
-**RFC Text**: "The long-term credential mechanism is used for persistent authentication."
-
-**Implementation Needed**:
-```rust
-pub struct LongTermCredential {
-    username: String,
-    realm: String,
-    password: String,
-}
-
-impl LongTermCredential {
-    pub fn compute_key(&self) -> [u8; 16] {
-        // MD5(username:realm:password)
-    }
-}
-```
 
 ---
 
@@ -363,30 +233,10 @@ impl LongTermCredential {
 | §6 | Creating Allocation | Partial | Basic allocation |
 | §7 | Refreshing Allocation | Partial | Refresh request |
 | §8 | Permissions | Partial | Permission struct |
-| §9 | Send Mechanism | **Missing** | No Send indication |
+| §9 | Send Mechanism | Complete | `indication.rs` |
 | §10 | Channels | Partial | `channel.rs` |
 | §11 | ChannelData | Complete | Framing |
-| §12 | Data Indication | **Missing** | No Data indication |
-
-### Critical Gap: RFC 5766 §9 - Send Mechanism
-
-**RFC Text**: "Send indication is used to send data through the allocation."
-
-**Implementation Needed**:
-```rust
-// proto-turn/src/send.rs
-pub struct SendIndication {
-    xor_peer_address: SocketAddr,
-    data: Vec<u8>,
-}
-
-impl TurnClient {
-    pub fn send_data(&mut self, peer: SocketAddr, data: &[u8]) -> TurnResult<()> {
-        // Build Send indication
-        // Include XOR-PEER-ADDRESS and DATA attributes
-    }
-}
-```
+| §12 | Data Indication | Complete | `indication.rs` |
 
 ---
 
@@ -444,27 +294,6 @@ This is **by design** for security compliance.
 | §6.3.7 | Bandwidth | Complete | `scheduler.rs` |
 | §7 | Translators/Mixers | Complete | `translator.rs` |
 
-### Gap: RFC 3550 §6.3.5 - RTCP Timing Rules
-
-**RFC Text**: "RTCP packets SHOULD be sent with randomized intervals."
-
-**Implementation Needed**:
-```rust
-pub struct RtcpScheduler {
-    rtcp_bw: u32,           // 5% of session bandwidth
-    members: u32,           // Number of participants
-    we_sent: bool,          // Did we send RTP?
-    avg_rtcp_size: f64,     // Average RTCP packet size
-    initial: bool,          // First RTCP?
-}
-
-impl RtcpScheduler {
-    pub fn compute_interval(&self) -> Duration {
-        // Per RFC 3550 Appendix A.7
-    }
-}
-```
-
 ---
 
 ## proto-sdp (RFC 4566 + RFC 3264)
@@ -483,7 +312,7 @@ impl RtcpScheduler {
 | §5.8 | Connection | Complete | c= line |
 | §5.9 | Bandwidth | Partial | b= line |
 | §5.10 | Timing | Complete | t= line |
-| §5.11 | Repeat Times | **Missing** | r= line |
+| §5.11 | Repeat Times | Complete | `timing.rs` RepeatTimes |
 | §5.14 | Media | Complete | m= line |
 
 ### RFC 3264 Section Mapping (Offer/Answer)
@@ -497,26 +326,7 @@ impl RtcpScheduler {
 | §8 | Modifying Session | Partial | re-INVITE support |
 | §8.2 | Adding Media | Partial | Basic support |
 | §8.3 | Removing Media | Partial | port=0 handling |
-| §8.4 | Modifying Media | **Missing** | No modification rules |
-
-### Critical Gap: RFC 3264 §8.4 - Modifying Media
-
-**RFC Text**: "When modifying a session, the offerer MUST follow specific rules for changing media."
-
-**Implementation Needed**:
-```rust
-pub struct OfferAnswerNegotiator {
-    current_session: SessionDescription,
-}
-
-impl OfferAnswerNegotiator {
-    pub fn create_modified_offer(&self, changes: &MediaChanges) -> SdpResult<SessionDescription> {
-        // Ensure same number of m= lines
-        // Follow direction rules (sendrecv -> recvonly, etc.)
-        // Handle codec changes per §8.4.3
-    }
-}
-```
+| §8.4 | Modifying Media | Complete | `negotiation.rs` |
 
 ---
 

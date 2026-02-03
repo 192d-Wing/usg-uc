@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1000+ tests passing, Phase 19 complete + proto-* crate extraction with RFC compliance + ALL RFC compliance gaps addressed + SIP Authentication & Security
+**Current Status**: 1000+ tests passing, Phases 1-19 and 21 complete, ready for Phase 22 (High Availability & Clustering)
 
 ---
 
@@ -138,9 +138,9 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 ---
 
-## Current Development Phase
+## Completed Development Phase
 
-### 🔄 Phase 17: Complete Stub Implementations
+### ✅ Phase 17: Complete Stub Implementations
 
 **Goal**: Make placeholder implementations functional
 
@@ -474,14 +474,15 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 | Location | Description | Priority | Status |
 |----------|-------------|----------|--------|
-| `sbc-dtls/connection.rs` | DTLS handshake is placeholder | High | Done |
-| `sbc-dtls/connection.rs` | send/recv not implemented | High | Done |
-| `sbc-ice/agent.rs` | Server-reflexive/relay gathering | High | Done |
-| `sbc-codecs/opus.rs` | Opus encode/decode stubs | Medium | Done |
-| `sbc-codecs/g722.rs` | G.722 encode/decode stubs | Medium | Done |
-| `sbc-dtls/handshake.rs` | Certificate validation | Medium | Pending |
-| `sbc-dtls/handshake.rs` | Signature verification | Medium | Pending |
-| `sbc-registrar/registrar.rs` | Digest authentication | High | Pending |
+| `proto-dtls/connection.rs` | DTLS handshake is placeholder | High | ✅ Done |
+| `proto-dtls/connection.rs` | send/recv not implemented | High | ✅ Done |
+| `proto-ice/agent.rs` | Server-reflexive/relay gathering | High | ✅ Done |
+| `uc-codecs/opus.rs` | Opus encode/decode stubs | Medium | ✅ Done |
+| `uc-codecs/g722.rs` | G.722 encode/decode stubs | Medium | ✅ Done |
+| `proto-dtls/verify.rs` | Certificate validation | Medium | ✅ Done |
+| `proto-dtls/verify.rs` | Signature verification | Medium | ✅ Done |
+| `proto-registrar/authentication.rs` | Digest authentication | High | ✅ Done |
+| Various crates (17) | Cleanup clippy warning allows (cosmetic) | Low | Pending |
 
 ---
 
@@ -489,11 +490,16 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 | RFC | Title | Status |
 |-----|-------|--------|
+| RFC 2474 | Differentiated Services | ✅ Implemented (DSCP marking) |
+| RFC 2617 | HTTP Digest Authentication | ✅ Implemented (MD5, SHA-256, SHA-512-256) |
 | RFC 3261 | SIP Core | ✅ Enhanced (~98% compliant, redirect + proxy forwarding) |
 | RFC 3264 | Offer/Answer | ✅ Enhanced (media modification, multicast streams) |
 | RFC 3550 | RTP | ✅ Enhanced (RTCP timing, translators/mixers) |
 | RFC 3711 | SRTP | ✅ Implemented (CNSA 2.0) |
+| RFC 4412 | SIP Priority | ✅ Implemented (emergency call priority) |
 | RFC 4566 | SDP | ✅ Enhanced (repeat times r= line) |
+| RFC 4568 | SDES Key Exchange | ✅ Implemented (crypto attribute parsing) |
+| RFC 4594 | DSCP Configuration | ✅ Implemented (QoS policy manager) |
 | RFC 5389 | STUN | ✅ Enhanced (long-term credential) |
 | RFC 5626 | SIP Outbound | ✅ Enhanced (flow maintenance) |
 | RFC 5627 | GRUU | ✅ Enhanced (proxy GRUU routing) |
@@ -504,6 +510,8 @@ This document outlines the development roadmap for the USG Session Border Contro
 | RFC 6665 | SIP Events | ✅ Enhanced (event package validation) |
 | RFC 7092 | B2BUA Taxonomy | ✅ Implemented |
 | RFC 7675 | STUN Consent | ✅ Enhanced (consent revocation) |
+| RFC 7865 | SIPREC Metadata | ✅ Implemented (recording metadata XML) |
+| RFC 7866 | SIPREC Protocol | ✅ Implemented (session recording) |
 | RFC 8445 | ICE | ✅ Enhanced (aggressive nomination, consent, keepalives) |
 | RFC 8224 | STIR | ✅ Implemented (ES384) |
 | RFC 8225 | PASSporT | ✅ Implemented (ES384) |
