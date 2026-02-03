@@ -321,47 +321,8 @@ impl Candidate {
             });
         }
 
-        let foundation = parts[0].to_string();
-
-        let component: u16 = parts[1].parse().map_err(|_| IceError::ParseError {
-            reason: "invalid component".to_string(),
-        })?;
-
-        let transport = match parts[2].to_uppercase().as_str() {
-            "UDP" => TransportProtocol::Udp,
-            "TCP" => TransportProtocol::TcpPassive,
-            _ => {
-                return Err(IceError::ParseError {
-                    reason: format!("unknown transport: {}", parts[2]),
-                });
-            }
-        };
-
-        let priority: u32 = parts[3].parse().map_err(|_| IceError::ParseError {
-            reason: "invalid priority".to_string(),
-        })?;
-
-        let ip: std::net::IpAddr = parts[4].parse().map_err(|_| IceError::ParseError {
-            reason: "invalid IP address".to_string(),
-        })?;
-
-        let port: u16 = parts[5].parse().map_err(|_| IceError::ParseError {
-            reason: "invalid port".to_string(),
-        })?;
-
-        let address = SocketAddr::new(ip, port);
-
-        // parts[6] should be "typ"
-        if parts[6] != "typ" {
-            return Err(IceError::ParseError {
-                reason: "expected 'typ' keyword".to_string(),
-            });
-        }
-
-        let candidate_type =
-            CandidateType::from_sdp_str(parts[7]).ok_or_else(|| IceError::ParseError {
-                reason: format!("unknown candidate type: {}", parts[7]),
-            })?;
+        let (foundation, component, transport, priority, address, candidate_type) =
+            parse_sdp_core_fields(&parts)?;
 
         let mut candidate = Candidate::new(
             foundation,
@@ -372,31 +333,94 @@ impl Candidate {
             candidate_type,
         );
 
-        // Parse optional fields
-        let mut i = 8;
-        while i + 1 < parts.len() {
-            if parts[i] == "raddr" {
-                if i + 3 < parts.len() && parts[i + 2] == "rport" {
-                    let rip: std::net::IpAddr =
-                        parts[i + 1].parse().map_err(|_| IceError::ParseError {
-                            reason: "invalid raddr".to_string(),
-                        })?;
-                    let rport: u16 = parts[i + 3].parse().map_err(|_| IceError::ParseError {
-                        reason: "invalid rport".to_string(),
-                    })?;
-                    candidate.related_address = Some(SocketAddr::new(rip, rport));
-                    i += 4;
-                } else {
-                    i += 2;
-                }
-            } else {
-                // Extension attribute
-                candidate.add_extension(parts[i].to_string(), parts[i + 1].to_string());
-                i += 2;
-            }
-        }
+        parse_sdp_optional_fields(&mut candidate, &parts[8..]);
 
         Ok(candidate)
+    }
+}
+
+/// Parses the core SDP candidate fields (foundation through candidate type).
+fn parse_sdp_core_fields(
+    parts: &[&str],
+) -> IceResult<(String, u16, TransportProtocol, u32, SocketAddr, CandidateType)> {
+    let foundation = parts[0].to_string();
+
+    let component: u16 = parts[1].parse().map_err(|_| IceError::ParseError {
+        reason: "invalid component".to_string(),
+    })?;
+
+    let transport = parse_sdp_transport(parts[2])?;
+
+    let priority: u32 = parts[3].parse().map_err(|_| IceError::ParseError {
+        reason: "invalid priority".to_string(),
+    })?;
+
+    let address = parse_sdp_address(parts[4], parts[5])?;
+
+    if parts[6] != "typ" {
+        return Err(IceError::ParseError {
+            reason: "expected 'typ' keyword".to_string(),
+        });
+    }
+
+    let candidate_type =
+        CandidateType::from_sdp_str(parts[7]).ok_or_else(|| IceError::ParseError {
+            reason: format!("unknown candidate type: {}", parts[7]),
+        })?;
+
+    Ok((foundation, component, transport, priority, address, candidate_type))
+}
+
+/// Parses the transport protocol from SDP.
+fn parse_sdp_transport(s: &str) -> IceResult<TransportProtocol> {
+    match s.to_uppercase().as_str() {
+        "UDP" => Ok(TransportProtocol::Udp),
+        "TCP" => Ok(TransportProtocol::TcpPassive),
+        _ => Err(IceError::ParseError {
+            reason: format!("unknown transport: {s}"),
+        }),
+    }
+}
+
+/// Parses IP address and port from SDP fields.
+fn parse_sdp_address(ip_str: &str, port_str: &str) -> IceResult<SocketAddr> {
+    let ip: std::net::IpAddr = ip_str.parse().map_err(|_| IceError::ParseError {
+        reason: "invalid IP address".to_string(),
+    })?;
+
+    let port: u16 = port_str.parse().map_err(|_| IceError::ParseError {
+        reason: "invalid port".to_string(),
+    })?;
+
+    Ok(SocketAddr::new(ip, port))
+}
+
+/// Parses optional SDP fields (raddr/rport and extensions).
+fn parse_sdp_optional_fields(candidate: &mut Candidate, parts: &[&str]) {
+    let mut i = 0;
+    while i + 1 < parts.len() {
+        if parts[i] == "raddr" {
+            if let Some(addr) = parse_related_address(&parts[i..]) {
+                candidate.related_address = Some(addr);
+                i += 4;
+            } else {
+                i += 2;
+            }
+        } else {
+            candidate.add_extension(parts[i].to_string(), parts[i + 1].to_string());
+            i += 2;
+        }
+    }
+}
+
+/// Parses related address (raddr/rport) from SDP parts.
+fn parse_related_address(parts: &[&str]) -> Option<SocketAddr> {
+    if parts.len() >= 4 && parts[2] == "rport" {
+        let rip: std::net::IpAddr = parts[1].parse().ok()?;
+        let rport: u16 = parts[3].parse().ok()?;
+        Some(SocketAddr::new(rip, rport))
+    } else {
+        None
     }
 }
 

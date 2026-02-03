@@ -338,96 +338,95 @@ impl fmt::Display for NameAddr {
     }
 }
 
+/// Parses a quoted display name from a name-addr string.
+fn parse_quoted_display_name(s: &str) -> SipResult<(String, &str)> {
+    let mut end = 1;
+    let chars: Vec<char> = s.chars().collect();
+    while end < chars.len() {
+        if chars[end] == '"' && (end == 0 || chars[end - 1] != '\\') {
+            break;
+        }
+        end += 1;
+    }
+
+    if end >= chars.len() {
+        return Err(SipError::InvalidHeader {
+            name: "From/To".to_string(),
+            reason: "unclosed display name quote".to_string(),
+        });
+    }
+
+    let name: String = chars[1..end].iter().collect();
+    let name = name.replace("\\\"", "\"");
+    Ok((name, &s[end + 1..]))
+}
+
+/// Extracts display name and remaining string from a name-addr.
+fn extract_display_name(s: &str) -> SipResult<(Option<String>, &str)> {
+    if s.starts_with('"') {
+        let (name, rest) = parse_quoted_display_name(s)?;
+        Ok((Some(name), rest))
+    } else if let Some(pos) = s.find('<') {
+        let name = s[..pos].trim();
+        if name.is_empty() {
+            Ok((None, &s[pos..]))
+        } else {
+            Ok((Some(name.to_string()), &s[pos..]))
+        }
+    } else {
+        Ok((None, s))
+    }
+}
+
+/// Extracts the URI string and parameters string from the remaining input.
+fn extract_uri_and_params(rest: &str) -> SipResult<(&str, &str)> {
+    if rest.starts_with('<') {
+        let end = rest.find('>').ok_or_else(|| SipError::InvalidHeader {
+            name: "From/To".to_string(),
+            reason: "unclosed angle bracket".to_string(),
+        })?;
+        Ok((&rest[1..end], &rest[end + 1..]))
+    } else if let Some(pos) = rest.find(';') {
+        Ok((&rest[..pos], &rest[pos..]))
+    } else {
+        Ok((rest, ""))
+    }
+}
+
+/// Parses name-addr parameters into tag and other params.
+fn parse_nameaddr_params(params_str: &str) -> (Option<String>, HashMap<String, Option<String>>) {
+    let mut tag = None;
+    let mut params = HashMap::new();
+
+    for param in params_str.split(';').filter(|p| !p.is_empty()) {
+        let (name, value) = if let Some((n, v)) = param.split_once('=') {
+            (n.trim().to_lowercase(), Some(v.trim().to_string()))
+        } else {
+            (param.trim().to_lowercase(), None)
+        };
+
+        if name == "tag" {
+            tag = value;
+        } else {
+            params.insert(name, value);
+        }
+    }
+
+    (tag, params)
+}
+
 impl FromStr for NameAddr {
     type Err = SipError;
 
-    /// Parses a name-addr (From/To) header string.
-    ///
-    /// # Loop Bounds (Power of 10 Rule 2)
-    ///
-    /// - Quote scanning: bounded by `chars.len()` (input length)
-    /// - Parameter parsing: bounded by input length
     fn from_str(s: &str) -> SipResult<Self> {
         let s = s.trim();
-
-        // Power of 10 Rule 5: Assert precondition
         debug_assert!(!s.is_empty(), "empty name-addr string");
 
-        // Check for display name in quotes
-        let (display_name, rest) = if s.starts_with('"') {
-            // Find closing quote (handling escaped quotes)
-            // Power of 10 Rule 2: Loop bounded by chars.len()
-            let mut end = 1;
-            let chars: Vec<char> = s.chars().collect();
-            // Loop bound: end < chars.len() ensures termination
-            while end < chars.len() {
-                if chars[end] == '"' && (end == 0 || chars[end - 1] != '\\') {
-                    break;
-                }
-                end += 1;
-            }
-            // Power of 10 Rule 5: Assert loop termination condition
-            debug_assert!(end <= chars.len(), "quote search exceeded bounds");
-
-            if end >= chars.len() {
-                return Err(SipError::InvalidHeader {
-                    name: "From/To".to_string(),
-                    reason: "unclosed display name quote".to_string(),
-                });
-            }
-            let name: String = chars[1..end].iter().collect();
-            let name = name.replace("\\\"", "\"");
-            (Some(name), &s[end + 1..])
-        } else if let Some(pos) = s.find('<') {
-            // Display name before <
-            let name = s[..pos].trim();
-            if name.is_empty() {
-                (None, &s[pos..])
-            } else {
-                (Some(name.to_string()), &s[pos..])
-            }
-        } else {
-            (None, s)
-        };
-
+        let (display_name, rest) = extract_display_name(s)?;
         let rest = rest.trim();
-
-        // Parse URI (may or may not be in angle brackets)
-        let (uri_str, params_str) = if rest.starts_with('<') {
-            // URI in angle brackets
-            let end = rest.find('>').ok_or_else(|| SipError::InvalidHeader {
-                name: "From/To".to_string(),
-                reason: "unclosed angle bracket".to_string(),
-            })?;
-            (&rest[1..end], &rest[end + 1..])
-        } else {
-            // URI without angle brackets - find first semicolon
-            if let Some(pos) = rest.find(';') {
-                (&rest[..pos], &rest[pos..])
-            } else {
-                (rest, "")
-            }
-        };
-
+        let (uri_str, params_str) = extract_uri_and_params(rest)?;
         let uri: SipUri = uri_str.parse()?;
-
-        // Parse parameters
-        let mut tag = None;
-        let mut params = HashMap::new();
-
-        for param in params_str.split(';').filter(|p| !p.is_empty()) {
-            let (name, value) = if let Some((n, v)) = param.split_once('=') {
-                (n.trim().to_lowercase(), Some(v.trim().to_string()))
-            } else {
-                (param.trim().to_lowercase(), None)
-            };
-
-            if name == "tag" {
-                tag = value;
-            } else {
-                params.insert(name, value);
-            }
-        }
+        let (tag, params) = parse_nameaddr_params(params_str);
 
         Ok(Self {
             display_name,

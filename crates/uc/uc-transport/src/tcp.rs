@@ -253,6 +253,90 @@ pub struct TcpListener {
     closed: AtomicBool,
 }
 
+/// Creates a TCP socket with the appropriate domain.
+fn create_tcp_socket(socket_addr: &SocketAddr, bind_address: SbcSocketAddr) -> TransportResult<Socket> {
+    let domain = if socket_addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+
+    Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(|e| {
+        TransportError::BindFailed {
+            address: bind_address,
+            reason: e.to_string(),
+        }
+    })
+}
+
+/// Configures socket options based on the listener config.
+fn configure_socket_options(
+    socket: &Socket,
+    socket_addr: &SocketAddr,
+    config: &ListenerConfig,
+) -> TransportResult<()> {
+    if config.reuse_address {
+        socket
+            .set_reuse_address(true)
+            .map_err(|e| TransportError::BindFailed {
+                address: config.bind_address,
+                reason: format!("failed to set SO_REUSEADDR: {e}"),
+            })?;
+    }
+
+    #[cfg(unix)]
+    if config.reuse_port {
+        socket
+            .set_reuse_port(true)
+            .map_err(|e| TransportError::BindFailed {
+                address: config.bind_address,
+                reason: format!("failed to set SO_REUSEPORT: {e}"),
+            })?;
+    }
+
+    if socket_addr.is_ipv6() {
+        socket
+            .set_only_v6(false)
+            .map_err(|e| TransportError::BindFailed {
+                address: config.bind_address,
+                reason: format!("failed to set IPV6_V6ONLY: {e}"),
+            })?;
+    }
+
+    socket
+        .set_nonblocking(true)
+        .map_err(|e| TransportError::BindFailed {
+            address: config.bind_address,
+            reason: format!("failed to set non-blocking: {e}"),
+        })
+}
+
+/// Binds and starts listening on the socket.
+fn bind_and_listen(socket: &Socket, socket_addr: &SocketAddr, config: &ListenerConfig) -> TransportResult<()> {
+    socket
+        .bind(&(*socket_addr).into())
+        .map_err(|e| TransportError::BindFailed {
+            address: config.bind_address,
+            reason: e.to_string(),
+        })?;
+
+    socket
+        .listen(i32::try_from(config.backlog).unwrap_or(128))
+        .map_err(|e| TransportError::BindFailed {
+            address: config.bind_address,
+            reason: format!("failed to listen: {e}"),
+        })
+}
+
+/// Converts a socket2 socket to a tokio TcpListener.
+fn socket_to_tokio_listener(socket: Socket, bind_address: SbcSocketAddr) -> TransportResult<TokioTcpListener> {
+    let std_listener: std::net::TcpListener = socket.into();
+    TokioTcpListener::from_std(std_listener).map_err(|e| TransportError::BindFailed {
+        address: bind_address,
+        reason: e.to_string(),
+    })
+}
+
 impl TcpListener {
     /// Binds a TCP listener to the specified address.
     ///
@@ -274,77 +358,11 @@ impl TcpListener {
         config.validate()?;
 
         let socket_addr: SocketAddr = config.bind_address.into();
-        let domain = if socket_addr.is_ipv6() {
-            Domain::IPV6
-        } else {
-            Domain::IPV4
-        };
+        let socket = create_tcp_socket(&socket_addr, config.bind_address)?;
+        configure_socket_options(&socket, &socket_addr, &config)?;
+        bind_and_listen(&socket, &socket_addr, &config)?;
 
-        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(|e| {
-            TransportError::BindFailed {
-                address: config.bind_address,
-                reason: e.to_string(),
-            }
-        })?;
-
-        // Configure socket options
-        if config.reuse_address {
-            socket
-                .set_reuse_address(true)
-                .map_err(|e| TransportError::BindFailed {
-                    address: config.bind_address,
-                    reason: format!("failed to set SO_REUSEADDR: {e}"),
-                })?;
-        }
-
-        #[cfg(unix)]
-        if config.reuse_port {
-            socket
-                .set_reuse_port(true)
-                .map_err(|e| TransportError::BindFailed {
-                    address: config.bind_address,
-                    reason: format!("failed to set SO_REUSEPORT: {e}"),
-                })?;
-        }
-
-        // For IPv6, enable dual-stack mode
-        if socket_addr.is_ipv6() {
-            socket
-                .set_only_v6(false)
-                .map_err(|e| TransportError::BindFailed {
-                    address: config.bind_address,
-                    reason: format!("failed to set IPV6_V6ONLY: {e}"),
-                })?;
-        }
-
-        socket
-            .set_nonblocking(true)
-            .map_err(|e| TransportError::BindFailed {
-                address: config.bind_address,
-                reason: format!("failed to set non-blocking: {e}"),
-            })?;
-
-        socket
-            .bind(&socket_addr.into())
-            .map_err(|e| TransportError::BindFailed {
-                address: config.bind_address,
-                reason: e.to_string(),
-            })?;
-
-        socket
-            .listen(i32::try_from(config.backlog).unwrap_or(128))
-            .map_err(|e| TransportError::BindFailed {
-                address: config.bind_address,
-                reason: format!("failed to listen: {e}"),
-            })?;
-
-        let std_listener: std::net::TcpListener = socket.into();
-        let tokio_listener =
-            TokioTcpListener::from_std(std_listener).map_err(|e| TransportError::BindFailed {
-                address: config.bind_address,
-                reason: e.to_string(),
-            })?;
-
+        let tokio_listener = socket_to_tokio_listener(socket, config.bind_address)?;
         let local_addr = tokio_listener
             .local_addr()
             .map_err(|e| TransportError::BindFailed {

@@ -203,65 +203,15 @@ impl Router {
     pub fn route(&mut self, destination: &str) -> RoutingResult<RoutingDecision> {
         self.stats.requests += 1;
 
-        // First, try dial plan if enabled
         let dial_plan_result = if self.config.use_dial_plan {
             self.match_dial_plan(destination)
         } else {
             None
         };
 
-        // Determine trunk group
-        let trunk_group_id = dial_plan_result
-            .as_ref()
-            .map(|r| r.trunk_group.as_str())
-            .or(self.config.default_trunk_group.as_deref())
-            .ok_or_else(|| RoutingError::NoRoute {
-                destination: destination.to_string(),
-            })?
-            .to_string();
+        let trunk_group_id = self.resolve_trunk_group(&dial_plan_result, destination)?;
+        let (trunk_id, trunk_uri, failover_trunks) = self.select_trunk_from_group(&trunk_group_id)?;
 
-        // Get trunk count for error message before mutable borrow
-        let trunk_count = self
-            .trunk_groups
-            .get(&trunk_group_id)
-            .map_or(0, super::trunk::TrunkGroup::trunk_count);
-
-        // Get the trunk group
-        let trunk_group = self.trunk_groups.get_mut(&trunk_group_id).ok_or_else(|| {
-            RoutingError::TrunkGroupNotFound {
-                group_id: trunk_group_id.clone(),
-            }
-        })?;
-
-        // Select a trunk
-        let trunk_id =
-            trunk_group
-                .select_trunk()
-                .map(String::from)
-                .ok_or(RoutingError::AllTrunksFailed {
-                    trunks_tried: trunk_count,
-                })?;
-
-        // Get failover trunks
-        let failover_trunks: Vec<String> = trunk_group
-            .failover_order()
-            .into_iter()
-            .filter(|id| *id != trunk_id)
-            .take(self.config.max_failover_attempts)
-            .map(String::from)
-            .collect();
-
-        // Get trunk details
-        let trunk =
-            trunk_group
-                .get_trunk(&trunk_id)
-                .ok_or_else(|| RoutingError::TrunkNotFound {
-                    trunk_id: trunk_id.clone(),
-                })?;
-
-        let trunk_uri = trunk.sip_uri();
-
-        // Determine final destination
         let final_destination = dial_plan_result
             .as_ref()
             .map_or_else(|| destination.to_string(), |r| r.transformed_number.clone());
@@ -278,6 +228,65 @@ impl Router {
             destination: final_destination,
             failover_trunks,
         })
+    }
+
+    /// Resolves the trunk group ID from dial plan result or default config.
+    fn resolve_trunk_group(
+        &self,
+        dial_plan_result: &Option<DialPlanResult>,
+        destination: &str,
+    ) -> RoutingResult<String> {
+        dial_plan_result
+            .as_ref()
+            .map(|r| r.trunk_group.as_str())
+            .or(self.config.default_trunk_group.as_deref())
+            .ok_or_else(|| RoutingError::NoRoute {
+                destination: destination.to_string(),
+            })
+            .map(String::from)
+    }
+
+    /// Selects a trunk from the specified trunk group.
+    /// Returns (trunk_id, trunk_uri, failover_trunks).
+    fn select_trunk_from_group(
+        &mut self,
+        trunk_group_id: &str,
+    ) -> RoutingResult<(String, String, Vec<String>)> {
+        let trunk_count = self
+            .trunk_groups
+            .get(trunk_group_id)
+            .map_or(0, super::trunk::TrunkGroup::trunk_count);
+
+        let trunk_group = self.trunk_groups.get_mut(trunk_group_id).ok_or_else(|| {
+            RoutingError::TrunkGroupNotFound {
+                group_id: trunk_group_id.to_string(),
+            }
+        })?;
+
+        let trunk_id = trunk_group
+            .select_trunk()
+            .map(String::from)
+            .ok_or(RoutingError::AllTrunksFailed {
+                trunks_tried: trunk_count,
+            })?;
+
+        let failover_trunks: Vec<String> = trunk_group
+            .failover_order()
+            .into_iter()
+            .filter(|id| *id != trunk_id)
+            .take(self.config.max_failover_attempts)
+            .map(String::from)
+            .collect();
+
+        let trunk = trunk_group
+            .get_trunk(&trunk_id)
+            .ok_or_else(|| RoutingError::TrunkNotFound {
+                trunk_id: trunk_id.clone(),
+            })?;
+
+        let trunk_uri = trunk.sip_uri();
+
+        Ok((trunk_id, trunk_uri, failover_trunks))
     }
 
     /// Routes directly to a specific trunk group.

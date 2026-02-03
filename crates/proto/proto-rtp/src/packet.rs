@@ -5,6 +5,74 @@ use crate::{RTP_HEADER_MIN_SIZE, RTP_VERSION};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::fmt;
 
+/// Parses the first byte of an RTP header.
+/// Returns (padding, extension, csrc_count).
+fn parse_first_byte(byte: u8) -> RtpResult<(bool, bool, usize)> {
+    let version = (byte >> 6) & 0x03;
+    if version != RTP_VERSION {
+        return Err(RtpError::InvalidVersion { version });
+    }
+
+    let padding = (byte & 0x20) != 0;
+    let extension = (byte & 0x10) != 0;
+    let csrc_count = (byte & 0x0F) as usize;
+
+    Ok((padding, extension, csrc_count))
+}
+
+/// Parses the second byte of an RTP header.
+/// Returns (marker, payload_type).
+fn parse_second_byte(byte: u8) -> (bool, u8) {
+    let marker = (byte & 0x80) != 0;
+    let payload_type = byte & 0x7F;
+    (marker, payload_type)
+}
+
+/// Parses the CSRC list from the RTP header.
+fn parse_csrc_list(cursor: &mut &[u8], count: usize) -> Vec<u32> {
+    let mut csrc = Vec::with_capacity(count);
+    for _ in 0..count {
+        csrc.push(cursor.get_u32());
+    }
+    csrc
+}
+
+/// Parses the extension header if present.
+/// Returns (extension_header, total_header_size).
+fn parse_extension_header(
+    data: &[u8],
+    header_size: usize,
+    has_extension: bool,
+) -> RtpResult<(Option<ExtensionHeader>, usize)> {
+    if !has_extension {
+        return Ok((None, header_size));
+    }
+
+    if data.len() < header_size + 4 {
+        return Err(RtpError::InvalidExtension {
+            reason: "extension header too short".to_string(),
+        });
+    }
+
+    let ext_data = &data[header_size..];
+    let profile = u16::from_be_bytes([ext_data[0], ext_data[1]]);
+    let length = u16::from_be_bytes([ext_data[2], ext_data[3]]) as usize * 4;
+
+    if data.len() < header_size + 4 + length {
+        return Err(RtpError::InvalidExtension {
+            reason: "extension data too short".to_string(),
+        });
+    }
+
+    let total_header_size = header_size + 4 + length;
+    let extension_header = ExtensionHeader {
+        profile,
+        data: Bytes::copy_from_slice(&ext_data[4..4 + length]),
+    };
+
+    Ok((Some(extension_header), total_header_size))
+}
+
 /// RTP header per RFC 3550.
 ///
 /// ```text
@@ -102,27 +170,14 @@ impl RtpHeader {
             });
         }
 
-        let first_byte = data[0];
-        let version = (first_byte >> 6) & 0x03;
-
-        if version != RTP_VERSION {
-            return Err(RtpError::InvalidVersion { version });
-        }
-
-        let padding = (first_byte & 0x20) != 0;
-        let extension = (first_byte & 0x10) != 0;
-        let csrc_count = (first_byte & 0x0F) as usize;
-
-        let second_byte = data[1];
-        let marker = (second_byte & 0x80) != 0;
-        let payload_type = second_byte & 0x7F;
+        let (padding, extension, csrc_count) = parse_first_byte(data[0])?;
+        let (marker, payload_type) = parse_second_byte(data[1]);
 
         let mut cursor = &data[2..];
         let sequence_number = cursor.get_u16();
         let timestamp = cursor.get_u32();
         let ssrc = cursor.get_u32();
 
-        // Parse CSRCs
         let header_size = RTP_HEADER_MIN_SIZE + csrc_count * 4;
         if data.len() < header_size {
             return Err(RtpError::PacketTooShort {
@@ -131,38 +186,9 @@ impl RtpHeader {
             });
         }
 
-        let mut csrc = Vec::with_capacity(csrc_count);
-        for _ in 0..csrc_count {
-            csrc.push(cursor.get_u32());
-        }
-
-        // Parse extension header
-        let mut total_header_size = header_size;
-        let extension_header = if extension {
-            if data.len() < total_header_size + 4 {
-                return Err(RtpError::InvalidExtension {
-                    reason: "extension header too short".to_string(),
-                });
-            }
-
-            let ext_data = &data[total_header_size..];
-            let profile = u16::from_be_bytes([ext_data[0], ext_data[1]]);
-            let length = u16::from_be_bytes([ext_data[2], ext_data[3]]) as usize * 4;
-
-            if data.len() < total_header_size + 4 + length {
-                return Err(RtpError::InvalidExtension {
-                    reason: "extension data too short".to_string(),
-                });
-            }
-
-            total_header_size += 4 + length;
-            Some(ExtensionHeader {
-                profile,
-                data: Bytes::copy_from_slice(&ext_data[4..4 + length]),
-            })
-        } else {
-            None
-        };
+        let csrc = parse_csrc_list(&mut cursor, csrc_count);
+        let (extension_header, total_header_size) =
+            parse_extension_header(data, header_size, extension)?;
 
         Ok((
             Self {

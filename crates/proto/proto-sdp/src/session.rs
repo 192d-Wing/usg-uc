@@ -627,123 +627,136 @@ impl fmt::Display for SessionDescription {
     }
 }
 
-impl FromStr for SessionDescription {
-    type Err = SdpError;
+/// Parser state for SDP session description.
+#[derive(Default)]
+struct SdpParseState {
+    version: Option<u8>,
+    origin: Option<Origin>,
+    session_name: Option<String>,
+    session_info: Option<String>,
+    uri: Option<String>,
+    emails: Vec<String>,
+    phones: Vec<String>,
+    connection: Option<ConnectionData>,
+    timing: Option<Timing>,
+    attributes: Vec<Attribute>,
+    media: Vec<MediaDescription>,
+    current_media: Option<MediaDescription>,
+}
 
-    #[allow(clippy::too_many_lines)]
-    fn from_str(s: &str) -> SdpResult<Self> {
-        let mut version: Option<u8> = None;
-        let mut origin: Option<Origin> = None;
-        let mut session_name: Option<String> = None;
-        let mut session_info: Option<String> = None;
-        let mut uri: Option<String> = None;
-        let mut emails: Vec<String> = Vec::new();
-        let mut phones: Vec<String> = Vec::new();
-        let mut connection: Option<ConnectionData> = None;
-        let mut timing: Option<Timing> = None;
-        let mut attributes: Vec<Attribute> = Vec::new();
-        let mut media: Vec<MediaDescription> = Vec::new();
-        let mut current_media: Option<MediaDescription> = None;
+impl SdpParseState {
+    /// Parses a single SDP line.
+    fn parse_line(&mut self, line_type: char, value: &str, line_num: usize) -> SdpResult<()> {
+        match line_type {
+            'v' => self.parse_version(value, line_num),
+            'o' => self.parse_origin(value),
+            's' => self.parse_session_name(value),
+            'i' => self.parse_info(value),
+            'u' => self.parse_uri(value),
+            'e' => self.parse_email(value),
+            'p' => self.parse_phone(value),
+            'c' => self.parse_connection(value),
+            't' => self.parse_timing(value),
+            'r' => self.parse_repeat(value, line_num),
+            'a' => self.parse_attribute(value),
+            'm' => self.parse_media(value),
+            _ => Ok(()), // Ignore unknown line types
+        }
+    }
 
-        for (line_num, line) in s.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
+    fn parse_version(&mut self, value: &str, line_num: usize) -> SdpResult<()> {
+        self.version = Some(value.parse().map_err(|_| SdpError::InvalidLine {
+            line: line_num + 1,
+            reason: "invalid version".to_string(),
+        })?);
+        Ok(())
+    }
 
-            // Parse type=value
-            if line.len() < 2 || line.chars().nth(1) != Some('=') {
-                return Err(SdpError::InvalidLine {
-                    line: line_num + 1,
-                    reason: "invalid line format".to_string(),
-                });
-            }
+    fn parse_origin(&mut self, value: &str) -> SdpResult<()> {
+        self.origin = Some(Origin::parse(value)?);
+        Ok(())
+    }
 
-            let line_type = line.chars().next().ok_or_else(|| SdpError::InvalidLine {
+    fn parse_session_name(&mut self, value: &str) -> SdpResult<()> {
+        self.session_name = Some(value.to_string());
+        Ok(())
+    }
+
+    fn parse_info(&mut self, value: &str) -> SdpResult<()> {
+        if self.current_media.is_none() {
+            self.session_info = Some(value.to_string());
+        }
+        Ok(())
+    }
+
+    fn parse_uri(&mut self, value: &str) -> SdpResult<()> {
+        self.uri = Some(value.to_string());
+        Ok(())
+    }
+
+    fn parse_email(&mut self, value: &str) -> SdpResult<()> {
+        self.emails.push(value.to_string());
+        Ok(())
+    }
+
+    fn parse_phone(&mut self, value: &str) -> SdpResult<()> {
+        self.phones.push(value.to_string());
+        Ok(())
+    }
+
+    fn parse_connection(&mut self, value: &str) -> SdpResult<()> {
+        let conn = ConnectionData::parse(value)?;
+        if let Some(ref mut m) = self.current_media {
+            m.connection = Some(conn);
+        } else {
+            self.connection = Some(conn);
+        }
+        Ok(())
+    }
+
+    fn parse_timing(&mut self, value: &str) -> SdpResult<()> {
+        self.timing = Some(Timing::parse(value)?);
+        Ok(())
+    }
+
+    fn parse_repeat(&mut self, value: &str, line_num: usize) -> SdpResult<()> {
+        if let Some(ref mut t) = self.timing {
+            t.add_repeat(RepeatTimes::parse(value)?);
+            Ok(())
+        } else {
+            Err(SdpError::InvalidLine {
                 line: line_num + 1,
-                reason: "empty line".to_string(),
-            })?;
-            let value = &line[2..];
-
-            match line_type {
-                'v' => {
-                    version = Some(value.parse().map_err(|_| SdpError::InvalidLine {
-                        line: line_num + 1,
-                        reason: "invalid version".to_string(),
-                    })?);
-                }
-                'o' => {
-                    origin = Some(Origin::parse(value)?);
-                }
-                's' => {
-                    session_name = Some(value.to_string());
-                }
-                'i' => {
-                    if current_media.is_some() {
-                        // Media-level info (ignored for now)
-                    } else {
-                        session_info = Some(value.to_string());
-                    }
-                }
-                'u' => {
-                    uri = Some(value.to_string());
-                }
-                'e' => {
-                    emails.push(value.to_string());
-                }
-                'p' => {
-                    phones.push(value.to_string());
-                }
-                'c' => {
-                    let conn = ConnectionData::parse(value)?;
-                    if let Some(ref mut m) = current_media {
-                        m.connection = Some(conn);
-                    } else {
-                        connection = Some(conn);
-                    }
-                }
-                't' => {
-                    timing = Some(Timing::parse(value)?);
-                }
-                'r' => {
-                    // r= lines must follow t= lines
-                    if let Some(ref mut t) = timing {
-                        t.add_repeat(RepeatTimes::parse(value)?);
-                    } else {
-                        return Err(SdpError::InvalidLine {
-                            line: line_num + 1,
-                            reason: "r= line must follow t= line".to_string(),
-                        });
-                    }
-                }
-                'a' => {
-                    let attr = Attribute::parse(value)?;
-                    if let Some(ref mut m) = current_media {
-                        m.attributes.push(attr);
-                    } else {
-                        attributes.push(attr);
-                    }
-                }
-                'm' => {
-                    // Finish previous media section
-                    if let Some(m) = current_media.take() {
-                        media.push(m);
-                    }
-                    current_media = Some(MediaDescription::parse_mline(value)?);
-                }
-                _ => {
-                    // Ignore unknown line types
-                }
-            }
+                reason: "r= line must follow t= line".to_string(),
+            })
         }
+    }
 
+    fn parse_attribute(&mut self, value: &str) -> SdpResult<()> {
+        let attr = Attribute::parse(value)?;
+        if let Some(ref mut m) = self.current_media {
+            m.attributes.push(attr);
+        } else {
+            self.attributes.push(attr);
+        }
+        Ok(())
+    }
+
+    fn parse_media(&mut self, value: &str) -> SdpResult<()> {
+        if let Some(m) = self.current_media.take() {
+            self.media.push(m);
+        }
+        self.current_media = Some(MediaDescription::parse_mline(value)?);
+        Ok(())
+    }
+
+    /// Finalizes parsing and builds the session description.
+    fn build(mut self) -> SdpResult<SessionDescription> {
         // Finish last media section
-        if let Some(m) = current_media {
-            media.push(m);
+        if let Some(m) = self.current_media.take() {
+            self.media.push(m);
         }
 
-        // Validate required fields
-        let version = version.ok_or_else(|| SdpError::MissingField {
+        let version = self.version.ok_or_else(|| SdpError::MissingField {
             field: "v (version)".to_string(),
         })?;
 
@@ -751,31 +764,68 @@ impl FromStr for SessionDescription {
             return Err(SdpError::UnsupportedVersion { version });
         }
 
-        let origin = origin.ok_or_else(|| SdpError::MissingField {
+        let origin = self.origin.ok_or_else(|| SdpError::MissingField {
             field: "o (origin)".to_string(),
         })?;
 
-        let session_name = session_name.ok_or_else(|| SdpError::MissingField {
+        let session_name = self.session_name.ok_or_else(|| SdpError::MissingField {
             field: "s (session name)".to_string(),
         })?;
 
-        let timing = timing.ok_or_else(|| SdpError::MissingField {
+        let timing = self.timing.ok_or_else(|| SdpError::MissingField {
             field: "t (timing)".to_string(),
         })?;
 
-        Ok(Self {
+        Ok(SessionDescription {
             version,
             origin,
             session_name,
-            session_info,
-            uri,
-            emails,
-            phones,
-            connection,
+            session_info: self.session_info,
+            uri: self.uri,
+            emails: self.emails,
+            phones: self.phones,
+            connection: self.connection,
             timing,
-            attributes,
-            media,
+            attributes: self.attributes,
+            media: self.media,
         })
+    }
+}
+
+/// Parses the line type and value from an SDP line.
+fn parse_sdp_line(line: &str, line_num: usize) -> SdpResult<(char, &str)> {
+    if line.len() < 2 || line.chars().nth(1) != Some('=') {
+        return Err(SdpError::InvalidLine {
+            line: line_num + 1,
+            reason: "invalid line format".to_string(),
+        });
+    }
+
+    let line_type = line.chars().next().ok_or_else(|| SdpError::InvalidLine {
+        line: line_num + 1,
+        reason: "empty line".to_string(),
+    })?;
+
+    Ok((line_type, &line[2..]))
+}
+
+impl FromStr for SessionDescription {
+    type Err = SdpError;
+
+    fn from_str(s: &str) -> SdpResult<Self> {
+        let mut state = SdpParseState::default();
+
+        for (line_num, line) in s.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            let (line_type, value) = parse_sdp_line(line, line_num)?;
+            state.parse_line(line_type, value, line_num)?;
+        }
+
+        state.build()
     }
 }
 

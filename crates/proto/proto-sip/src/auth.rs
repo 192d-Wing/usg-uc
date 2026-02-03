@@ -236,44 +236,48 @@ impl fmt::Display for DigestChallenge {
     }
 }
 
+/// Extracts a required parameter from parsed auth parameters.
+fn get_required_param(
+    params: &HashMap<String, String>,
+    name: &str,
+    header: &str,
+) -> SipResult<String> {
+    params
+        .get(name)
+        .cloned()
+        .ok_or_else(|| SipError::InvalidHeader {
+            name: header.to_string(),
+            reason: format!("missing {name}"),
+        })
+}
+
+/// Filters out known parameters and returns extra parameters.
+fn filter_extra_params(
+    params: HashMap<String, String>,
+    known: &[&str],
+) -> HashMap<String, String> {
+    params
+        .into_iter()
+        .filter(|(k, _)| !known.iter().any(|&known_key| k == known_key))
+        .collect()
+}
+
 impl FromStr for DigestChallenge {
     type Err = SipError;
 
-    /// Parses a digest challenge string.
-    ///
-    /// # Loop Bounds (Power of 10 Rule 2)
-    ///
-    /// - Parameter parsing bounded by input length
     fn from_str(s: &str) -> SipResult<Self> {
-        // Power of 10 Rule 5: Assert precondition
         debug_assert!(!s.is_empty(), "empty challenge string");
 
         let s = s.trim();
-
-        // Check for Digest scheme
-        let params_str = if s.to_lowercase().starts_with("digest ") {
-            &s[7..]
-        } else {
-            s
-        };
+        let params_str = s
+            .strip_prefix("Digest ")
+            .or_else(|| s.strip_prefix("digest "))
+            .unwrap_or(s);
 
         let params = parse_auth_params(params_str);
 
-        let realm = params
-            .get("realm")
-            .ok_or_else(|| SipError::InvalidHeader {
-                name: "WWW-Authenticate".to_string(),
-                reason: "missing realm".to_string(),
-            })?
-            .clone();
-
-        let nonce = params
-            .get("nonce")
-            .ok_or_else(|| SipError::InvalidHeader {
-                name: "WWW-Authenticate".to_string(),
-                reason: "missing nonce".to_string(),
-            })?
-            .clone();
+        let realm = get_required_param(&params, "realm", "WWW-Authenticate")?;
+        let nonce = get_required_param(&params, "nonce", "WWW-Authenticate")?;
 
         let algorithm = params
             .get("algorithm")
@@ -281,38 +285,26 @@ impl FromStr for DigestChallenge {
             .transpose()?
             .unwrap_or_default();
 
-        let opaque = params.get("opaque").cloned();
-        let domain = params.get("domain").cloned();
-
-        let stale = params
-            .get("stale")
-            .is_some_and(|s| s.eq_ignore_ascii_case("true"));
-
-        // Parse qop (comma-separated list)
         let qop: Vec<Qop> = params
             .get("qop")
             .map(|s| s.split(',').filter_map(|q| q.trim().parse().ok()).collect())
             .unwrap_or_default();
 
-        // Collect remaining params
-        let mut extra_params = HashMap::new();
-        for (k, v) in params {
-            if !matches!(
-                k.as_str(),
-                "realm" | "nonce" | "algorithm" | "opaque" | "domain" | "stale" | "qop"
-            ) {
-                extra_params.insert(k, v);
-            }
-        }
+        let extra_params = filter_extra_params(
+            params.clone(),
+            &["realm", "nonce", "algorithm", "opaque", "domain", "stale", "qop"],
+        );
 
         Ok(Self {
             realm,
             nonce,
-            opaque,
+            opaque: params.get("opaque").cloned(),
             algorithm,
             qop,
-            domain,
-            stale,
+            domain: params.get("domain").cloned(),
+            stale: params
+                .get("stale")
+                .is_some_and(|s| s.eq_ignore_ascii_case("true")),
             params: extra_params,
         })
     }
@@ -435,65 +427,22 @@ impl fmt::Display for DigestCredentials {
 impl FromStr for DigestCredentials {
     type Err = SipError;
 
-    /// Parses digest credentials string.
-    ///
-    /// # Loop Bounds (Power of 10 Rule 2)
-    ///
-    /// - Parameter parsing bounded by input length
     fn from_str(s: &str) -> SipResult<Self> {
-        // Power of 10 Rule 5: Assert precondition
         debug_assert!(!s.is_empty(), "empty credentials string");
 
         let s = s.trim();
-
-        // Check for Digest scheme
-        let params_str = if s.to_lowercase().starts_with("digest ") {
-            &s[7..]
-        } else {
-            s
-        };
+        let params_str = s
+            .strip_prefix("Digest ")
+            .or_else(|| s.strip_prefix("digest "))
+            .unwrap_or(s);
 
         let params = parse_auth_params(params_str);
 
-        let username = params
-            .get("username")
-            .ok_or_else(|| SipError::InvalidHeader {
-                name: "Authorization".to_string(),
-                reason: "missing username".to_string(),
-            })?
-            .clone();
-
-        let realm = params
-            .get("realm")
-            .ok_or_else(|| SipError::InvalidHeader {
-                name: "Authorization".to_string(),
-                reason: "missing realm".to_string(),
-            })?
-            .clone();
-
-        let nonce = params
-            .get("nonce")
-            .ok_or_else(|| SipError::InvalidHeader {
-                name: "Authorization".to_string(),
-                reason: "missing nonce".to_string(),
-            })?
-            .clone();
-
-        let uri = params
-            .get("uri")
-            .ok_or_else(|| SipError::InvalidHeader {
-                name: "Authorization".to_string(),
-                reason: "missing uri".to_string(),
-            })?
-            .clone();
-
-        let response = params
-            .get("response")
-            .ok_or_else(|| SipError::InvalidHeader {
-                name: "Authorization".to_string(),
-                reason: "missing response".to_string(),
-            })?
-            .clone();
+        let username = get_required_param(&params, "username", "Authorization")?;
+        let realm = get_required_param(&params, "realm", "Authorization")?;
+        let nonce = get_required_param(&params, "nonce", "Authorization")?;
+        let uri = get_required_param(&params, "uri", "Authorization")?;
+        let response = get_required_param(&params, "response", "Authorization")?;
 
         let algorithm = params
             .get("algorithm")
@@ -501,33 +450,13 @@ impl FromStr for DigestCredentials {
             .transpose()?
             .unwrap_or_default();
 
-        let opaque = params.get("opaque").cloned();
-        let cnonce = params.get("cnonce").cloned();
-        let qop = params.get("qop").map(|s| s.parse()).transpose()?;
-
-        let nc = params
-            .get("nc")
-            .and_then(|s| u32::from_str_radix(s, 16).ok());
-
-        // Collect remaining params
-        let mut extra_params = HashMap::new();
-        for (k, v) in params {
-            if !matches!(
-                k.as_str(),
-                "username"
-                    | "realm"
-                    | "nonce"
-                    | "uri"
-                    | "response"
-                    | "algorithm"
-                    | "opaque"
-                    | "cnonce"
-                    | "qop"
-                    | "nc"
-            ) {
-                extra_params.insert(k, v);
-            }
-        }
+        let extra_params = filter_extra_params(
+            params.clone(),
+            &[
+                "username", "realm", "nonce", "uri", "response", "algorithm",
+                "opaque", "cnonce", "qop", "nc",
+            ],
+        );
 
         Ok(Self {
             username,
@@ -536,10 +465,10 @@ impl FromStr for DigestCredentials {
             uri,
             response,
             algorithm,
-            cnonce,
-            qop,
-            nc,
-            opaque,
+            cnonce: params.get("cnonce").cloned(),
+            qop: params.get("qop").map(|s| s.parse()).transpose()?,
+            nc: params.get("nc").and_then(|s| u32::from_str_radix(s, 16).ok()),
+            opaque: params.get("opaque").cloned(),
             params: extra_params,
         })
     }

@@ -68,24 +68,13 @@ impl JsonFormatter {
     }
 }
 
-impl CdrFormatter for JsonFormatter {
-    fn format(&self, record: &CallRecord) -> String {
-        let sep = if self.pretty { ",\n  " } else { "," };
-        let start = if self.pretty { "{\n  " } else { "{" };
-        let end = if self.pretty { "\n}" } else { "}" };
-
-        let mut parts = Vec::new();
-
+impl JsonFormatter {
+    /// Adds required fields to the JSON parts.
+    fn add_required_fields(parts: &mut Vec<String>, record: &CallRecord) {
         parts.push(format!(
             "\"call_id\":\"{}\"",
             Self::escape_string(&record.call_id)
         ));
-        if let Some(ref corr_id) = record.correlation_id {
-            parts.push(format!(
-                "\"correlation_id\":\"{}\"",
-                Self::escape_string(corr_id)
-            ));
-        }
         parts.push(format!("\"direction\":\"{}\"", record.direction));
         parts.push(format!(
             "\"caller\":\"{}\"",
@@ -95,12 +84,6 @@ impl CdrFormatter for JsonFormatter {
             "\"callee\":\"{}\"",
             Self::escape_string(&record.callee)
         ));
-        if let Some(ref orig) = record.original_callee {
-            parts.push(format!(
-                "\"original_callee\":\"{}\"",
-                Self::escape_string(orig)
-            ));
-        }
         parts.push(format!(
             "\"source_ip\":\"{}\"",
             Self::escape_string(&record.source_ip)
@@ -109,15 +92,41 @@ impl CdrFormatter for JsonFormatter {
             "\"dest_ip\":\"{}\"",
             Self::escape_string(&record.dest_ip)
         ));
-        if let Some(ref trunk) = record.trunk_id {
-            parts.push(format!("\"trunk_id\":\"{}\"", Self::escape_string(trunk)));
-        }
         parts.push(format!("\"status\":\"{}\"", record.status));
         parts.push(format!(
             "\"disconnect_cause\":\"{}\"",
             record.disconnect_cause
         ));
         parts.push(format!("\"start_time_ms\":{}", record.start_time_ms));
+    }
+
+    /// Adds optional string fields to the JSON parts.
+    fn add_optional_fields(parts: &mut Vec<String>, record: &CallRecord) {
+        if let Some(ref corr_id) = record.correlation_id {
+            parts.push(format!(
+                "\"correlation_id\":\"{}\"",
+                Self::escape_string(corr_id)
+            ));
+        }
+        if let Some(ref orig) = record.original_callee {
+            parts.push(format!(
+                "\"original_callee\":\"{}\"",
+                Self::escape_string(orig)
+            ));
+        }
+        if let Some(ref trunk) = record.trunk_id {
+            parts.push(format!("\"trunk_id\":\"{}\"", Self::escape_string(trunk)));
+        }
+        if let Some(ref codec) = record.codec {
+            parts.push(format!("\"codec\":\"{}\"", Self::escape_string(codec)));
+        }
+        if let Some(ref media) = record.media_type {
+            parts.push(format!("\"media_type\":\"{}\"", Self::escape_string(media)));
+        }
+    }
+
+    /// Adds optional numeric fields to the JSON parts.
+    fn add_timing_fields(parts: &mut Vec<String>, record: &CallRecord) {
         if let Some(connect_ms) = record.connect_time_ms {
             parts.push(format!("\"connect_time_ms\":{connect_ms}"));
         }
@@ -130,37 +139,52 @@ impl CdrFormatter for JsonFormatter {
         if let Some(duration) = record.duration_secs {
             parts.push(format!("\"duration_secs\":{duration}"));
         }
-        if let Some(ref codec) = record.codec {
-            parts.push(format!("\"codec\":\"{}\"", Self::escape_string(codec)));
+    }
+
+    /// Formats custom fields as a nested JSON object.
+    fn format_custom_fields(&self, record: &CallRecord) -> Option<String> {
+        if record.custom_fields.is_empty() {
+            return None;
         }
-        if let Some(ref media) = record.media_type {
-            parts.push(format!("\"media_type\":\"{}\"", Self::escape_string(media)));
-        }
 
-        // Custom fields
-        if !record.custom_fields.is_empty() {
-            let custom_sep = if self.pretty { ",\n    " } else { "," };
-            let custom_start = if self.pretty { "{\n    " } else { "{" };
-            let custom_end = if self.pretty { "\n  }" } else { "}" };
+        let custom_sep = if self.pretty { ",\n    " } else { "," };
+        let custom_start = if self.pretty { "{\n    " } else { "{" };
+        let custom_end = if self.pretty { "\n  }" } else { "}" };
 
-            let custom_parts: Vec<String> = record
-                .custom_fields
-                .iter()
-                .map(|(k, v)| {
-                    format!(
-                        "\"{}\":\"{}\"",
-                        Self::escape_string(k),
-                        Self::escape_string(v)
-                    )
-                })
-                .collect();
+        let custom_parts: Vec<String> = record
+            .custom_fields
+            .iter()
+            .map(|(k, v)| {
+                format!(
+                    "\"{}\":\"{}\"",
+                    Self::escape_string(k),
+                    Self::escape_string(v)
+                )
+            })
+            .collect();
 
-            parts.push(format!(
-                "\"custom_fields\":{}{}{}",
-                custom_start,
-                custom_parts.join(custom_sep),
-                custom_end
-            ));
+        Some(format!(
+            "\"custom_fields\":{}{}{}",
+            custom_start,
+            custom_parts.join(custom_sep),
+            custom_end
+        ))
+    }
+}
+
+impl CdrFormatter for JsonFormatter {
+    fn format(&self, record: &CallRecord) -> String {
+        let sep = if self.pretty { ",\n  " } else { "," };
+        let start = if self.pretty { "{\n  " } else { "{" };
+        let end = if self.pretty { "\n}" } else { "}" };
+
+        let mut parts = Vec::new();
+        Self::add_required_fields(&mut parts, record);
+        Self::add_optional_fields(&mut parts, record);
+        Self::add_timing_fields(&mut parts, record);
+
+        if let Some(custom) = self.format_custom_fields(record) {
+            parts.push(custom);
         }
 
         format!("{}{}{}", start, parts.join(sep), end)

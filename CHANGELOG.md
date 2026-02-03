@@ -542,6 +542,17 @@ New crate for session recording:
 - Debug assertions for invariant checking (Rule 5)
 - Loop bounds documentation (Rule 2)
 - All functions have bounded execution
+- Power of 10 Rule 4 compliance: Refactored 10 functions exceeding 60 lines into smaller helpers:
+  - `uc-policy/condition.rs`: Extracted `match_ip()`, `match_optional_string()`, `evaluate_all()`, `evaluate_any()` helpers
+  - `proto-sdp/session.rs`: Created `SdpParseState` struct with 13 helper methods for SDP parsing
+  - `proto-sip/auth.rs`: Extracted `get_required_param()`, `filter_extra_params()` for digest auth parsing
+  - `proto-sip/uri.rs`: Extracted `parse_uri_params()`, `parse_user_info()`, `parse_host_port()`, `parse_uri_headers()`
+  - `proto-sip/header_params.rs`: Extracted `parse_quoted_display_name()`, `extract_display_name()`, `extract_uri_and_params()`, `parse_nameaddr_params()`
+  - `uc-cdr/format.rs`: Extracted `add_required_fields()`, `add_optional_fields()`, `add_timing_fields()`, `format_custom_fields()`
+  - `uc-transport/tcp.rs`: Extracted `create_tcp_socket()`, `configure_socket_options()`, `bind_and_listen()`, `socket_to_tokio_listener()`
+  - `proto-ice/candidate.rs`: Extracted `parse_sdp_core_fields()`, `parse_sdp_transport()`, `parse_sdp_address()`, `parse_sdp_optional_fields()`, `parse_related_address()`
+  - `proto-rtp/packet.rs`: Extracted `parse_first_byte()`, `parse_second_byte()`, `parse_csrc_list()`, `parse_extension_header()`
+  - `uc-routing/router.rs`: Extracted `resolve_trunk_group()`, `select_trunk_from_group()`
 
 ### Fixed
 

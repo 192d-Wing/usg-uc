@@ -244,107 +244,95 @@ impl fmt::Display for SipUri {
     }
 }
 
+/// Parses URI parameters from a list of parameter strings.
+fn parse_uri_params(parts: &[&str]) -> Vec<(String, Option<String>)> {
+    parts
+        .iter()
+        .map(|p| {
+            if let Some((name, value)) = p.split_once('=') {
+                (name.to_string(), Some(value.to_string()))
+            } else {
+                (p.to_string(), None)
+            }
+        })
+        .collect()
+}
+
+/// Parses user info from a URI (user:password@host).
+fn parse_user_info(user_host_port: &str) -> (Option<String>, Option<String>, &str) {
+    if let Some((userinfo, hp)) = user_host_port.split_once('@') {
+        let (user, password) = if let Some((u, p)) = userinfo.split_once(':') {
+            (Some(u.to_string()), Some(p.to_string()))
+        } else {
+            (Some(userinfo.to_string()), None)
+        };
+        (user, password, hp)
+    } else {
+        (None, None, user_host_port)
+    }
+}
+
+/// Parses host and port, handling IPv6 addresses.
+fn parse_host_port(host_port: &str) -> SipResult<(String, Option<u16>)> {
+    if host_port.starts_with('[') {
+        // IPv6
+        if let Some((h, p)) = host_port.split_once(']') {
+            let host = h.trim_start_matches('[');
+            let port = p.strip_prefix(':').and_then(|p| p.parse().ok());
+            Ok((host.to_string(), port))
+        } else {
+            Err(SipError::InvalidUri {
+                reason: "invalid IPv6 address".to_string(),
+            })
+        }
+    } else if let Some((h, p)) = host_port.rsplit_once(':') {
+        // IPv4 or hostname with port
+        if let Ok(port) = p.parse() {
+            Ok((h.to_string(), Some(port)))
+        } else {
+            Ok((host_port.to_string(), None))
+        }
+    } else {
+        Ok((host_port.to_string(), None))
+    }
+}
+
+/// Parses URI headers from a header string.
+fn parse_uri_headers(headers_str: Option<&str>) -> Vec<(String, String)> {
+    headers_str
+        .map(|h| {
+            h.split('&')
+                .filter_map(|pair| {
+                    pair.split_once('=')
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 impl FromStr for SipUri {
     type Err = SipError;
 
-    /// Parses a SIP URI string.
-    ///
-    /// # Loop Bounds (Power of 10 Rule 2)
-    ///
-    /// - `split(';')` bounded by input length
-    /// - `split('&')` bounded by input length
-    /// - All iterations terminate in O(n) where n = input length
     fn from_str(s: &str) -> SipResult<Self> {
-        // Power of 10 Rule 5: Assert precondition
         debug_assert!(!s.is_empty(), "empty URI string");
 
-        // Split scheme
         let (scheme_str, rest) = s.split_once(':').ok_or_else(|| SipError::InvalidUri {
             reason: "missing scheme separator".to_string(),
         })?;
 
         let scheme: UriScheme = scheme_str.parse()?;
-
-        // Split headers
-        let (rest, headers_str) = if let Some((r, h)) = rest.split_once('?') {
-            (r, Some(h))
-        } else {
-            (rest, None)
-        };
-
-        // Split params
-        // Loop bound: split(';') bounded by rest.len()
+        let (rest, headers_str) = rest.split_once('?').map_or((rest, None), |(r, h)| (r, Some(h)));
         let parts: Vec<&str> = rest.split(';').collect();
-
-        // Power of 10 Rule 5: Assert parts is non-empty
-        debug_assert!(
-            !parts.is_empty(),
-            "split always produces at least one element"
-        );
 
         let user_host_port = parts.first().ok_or_else(|| SipError::InvalidUri {
             reason: "missing host".to_string(),
         })?;
 
-        // Parse params
-        let params: Vec<(String, Option<String>)> = parts[1..]
-            .iter()
-            .map(|p| {
-                if let Some((name, value)) = p.split_once('=') {
-                    (name.to_string(), Some(value.to_string()))
-                } else {
-                    (p.to_string(), None)
-                }
-            })
-            .collect();
-
-        // Parse user@host:port
-        let (user, password, host_port) =
-            if let Some((userinfo, hp)) = user_host_port.split_once('@') {
-                let (user, password) = if let Some((u, p)) = userinfo.split_once(':') {
-                    (Some(u.to_string()), Some(p.to_string()))
-                } else {
-                    (Some(userinfo.to_string()), None)
-                };
-                (user, password, hp)
-            } else {
-                (None, None, *user_host_port)
-            };
-
-        // Parse host:port (handle IPv6)
-        let (host, port) = if host_port.starts_with('[') {
-            // IPv6
-            if let Some((h, p)) = host_port.split_once(']') {
-                let host = h.trim_start_matches('[');
-                let port = p.strip_prefix(':').and_then(|p| p.parse().ok());
-                (host.to_string(), port)
-            } else {
-                return Err(SipError::InvalidUri {
-                    reason: "invalid IPv6 address".to_string(),
-                });
-            }
-        } else if let Some((h, p)) = host_port.rsplit_once(':') {
-            // IPv4 or hostname with port
-            if let Ok(port) = p.parse() {
-                (h.to_string(), Some(port))
-            } else {
-                (host_port.to_string(), None)
-            }
-        } else {
-            (host_port.to_string(), None)
-        };
-
-        // Parse headers
-        let headers = headers_str
-            .map(|h| {
-                h.split('&')
-                    .filter_map(|pair| {
-                        pair.split_once('=')
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let params = parse_uri_params(&parts[1..]);
+        let (user, password, host_port) = parse_user_info(user_host_port);
+        let (host, port) = parse_host_port(host_port)?;
+        let headers = parse_uri_headers(headers_str);
 
         Ok(SipUri {
             scheme,

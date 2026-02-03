@@ -135,6 +135,53 @@ pub enum Condition {
     Not(Box<Condition>),
 }
 
+/// Matches an IP address against a pattern with wildcard support.
+fn match_ip(value: Option<&str>, pattern: &str) -> ConditionMatch {
+    match value {
+        Some(ip) if ip.contains(pattern) || pattern == "*" => ConditionMatch::Matched,
+        Some(_) => ConditionMatch::NotMatched,
+        None => ConditionMatch::Unknown,
+    }
+}
+
+/// Matches an optional string value against a pattern.
+fn match_optional_string(value: Option<&str>, pattern: &StringMatch) -> ConditionMatch {
+    match value {
+        Some(v) if pattern.matches(v) => ConditionMatch::Matched,
+        Some(_) => ConditionMatch::NotMatched,
+        None => ConditionMatch::Unknown,
+    }
+}
+
+/// Evaluates all conditions (AND logic).
+fn evaluate_all(conditions: &[Condition], ctx: &RequestContext) -> ConditionMatch {
+    for cond in conditions {
+        match cond.evaluate(ctx) {
+            ConditionMatch::NotMatched => return ConditionMatch::NotMatched,
+            ConditionMatch::Unknown => return ConditionMatch::Unknown,
+            ConditionMatch::Matched => {}
+        }
+    }
+    ConditionMatch::Matched
+}
+
+/// Evaluates any condition (OR logic).
+fn evaluate_any(conditions: &[Condition], ctx: &RequestContext) -> ConditionMatch {
+    let mut has_unknown = false;
+    for cond in conditions {
+        match cond.evaluate(ctx) {
+            ConditionMatch::Matched => return ConditionMatch::Matched,
+            ConditionMatch::Unknown => has_unknown = true,
+            ConditionMatch::NotMatched => {}
+        }
+    }
+    if has_unknown {
+        ConditionMatch::Unknown
+    } else {
+        ConditionMatch::NotMatched
+    }
+}
+
 impl Condition {
     /// Creates an always-true condition.
     pub fn always() -> Self {
@@ -163,165 +210,75 @@ impl Condition {
     }
 
     /// Evaluates the condition against a request context.
-    #[allow(clippy::option_if_let_else)] // Complex match arms with multiple conditions
     pub fn evaluate(&self, ctx: &RequestContext) -> ConditionMatch {
         match self {
             Self::Always => ConditionMatch::Matched,
             Self::Never => ConditionMatch::NotMatched,
-            Self::SourceIp(pattern) => {
-                if let Some(ref ip) = ctx.source_ip {
-                    if ip.contains(pattern) || pattern == "*" {
-                        ConditionMatch::Matched
-                    } else {
-                        ConditionMatch::NotMatched
-                    }
-                } else {
-                    ConditionMatch::Unknown
-                }
-            }
-            Self::DestIp(pattern) => {
-                if let Some(ref ip) = ctx.dest_ip {
-                    if ip.contains(pattern) || pattern == "*" {
-                        ConditionMatch::Matched
-                    } else {
-                        ConditionMatch::NotMatched
-                    }
-                } else {
-                    ConditionMatch::Unknown
-                }
-            }
-            Self::Method(pattern) => {
-                if let Some(ref method) = ctx.method {
-                    if pattern.matches(method) {
-                        ConditionMatch::Matched
-                    } else {
-                        ConditionMatch::NotMatched
-                    }
-                } else {
-                    ConditionMatch::Unknown
-                }
-            }
-            Self::FromUri(pattern) => {
-                if let Some(ref uri) = ctx.from_uri {
-                    if pattern.matches(uri) {
-                        ConditionMatch::Matched
-                    } else {
-                        ConditionMatch::NotMatched
-                    }
-                } else {
-                    ConditionMatch::Unknown
-                }
-            }
-            Self::ToUri(pattern) => {
-                if let Some(ref uri) = ctx.to_uri {
-                    if pattern.matches(uri) {
-                        ConditionMatch::Matched
-                    } else {
-                        ConditionMatch::NotMatched
-                    }
-                } else {
-                    ConditionMatch::Unknown
-                }
-            }
-            Self::RequestUri(pattern) => {
-                if let Some(ref uri) = ctx.request_uri {
-                    if pattern.matches(uri) {
-                        ConditionMatch::Matched
-                    } else {
-                        ConditionMatch::NotMatched
-                    }
-                } else {
-                    ConditionMatch::Unknown
-                }
-            }
-            Self::Header { name, pattern } => {
-                if let Some(value) = ctx.headers.get(name) {
-                    if pattern.matches(value) {
-                        ConditionMatch::Matched
-                    } else {
-                        ConditionMatch::NotMatched
-                    }
-                } else {
-                    ConditionMatch::NotMatched
-                }
-            }
-            Self::CallerId(pattern) => {
-                if let Some(ref caller_id) = ctx.caller_id {
-                    if pattern.matches(caller_id) {
-                        ConditionMatch::Matched
-                    } else {
-                        ConditionMatch::NotMatched
-                    }
-                } else {
-                    ConditionMatch::Unknown
-                }
-            }
+            Self::SourceIp(pattern) => match_ip(ctx.source_ip.as_deref(), pattern),
+            Self::DestIp(pattern) => match_ip(ctx.dest_ip.as_deref(), pattern),
+            Self::Method(pattern) => match_optional_string(ctx.method.as_deref(), pattern),
+            Self::FromUri(pattern) => match_optional_string(ctx.from_uri.as_deref(), pattern),
+            Self::ToUri(pattern) => match_optional_string(ctx.to_uri.as_deref(), pattern),
+            Self::RequestUri(pattern) => match_optional_string(ctx.request_uri.as_deref(), pattern),
+            Self::Header { name, pattern } => self.evaluate_header(ctx, name, pattern),
+            Self::CallerId(pattern) => match_optional_string(ctx.caller_id.as_deref(), pattern),
             Self::CalledNumber(pattern) => {
-                if let Some(ref called) = ctx.called_number {
-                    if pattern.matches(called) {
-                        ConditionMatch::Matched
-                    } else {
-                        ConditionMatch::NotMatched
-                    }
-                } else {
-                    ConditionMatch::Unknown
-                }
+                match_optional_string(ctx.called_number.as_deref(), pattern)
             }
             Self::TimeOfDay {
                 start_hour,
                 end_hour,
-            } => {
-                if let Some(hour) = ctx.current_hour {
-                    if hour >= *start_hour && hour <= *end_hour {
-                        ConditionMatch::Matched
-                    } else {
-                        ConditionMatch::NotMatched
-                    }
-                } else {
-                    ConditionMatch::Unknown
-                }
-            }
-            Self::DayOfWeek { days } => {
-                if let Some(day) = ctx.current_day {
-                    if days.contains(&day) {
-                        ConditionMatch::Matched
-                    } else {
-                        ConditionMatch::NotMatched
-                    }
-                } else {
-                    ConditionMatch::Unknown
-                }
-            }
-            Self::All(conditions) => {
-                for cond in conditions {
-                    match cond.evaluate(ctx) {
-                        ConditionMatch::NotMatched => return ConditionMatch::NotMatched,
-                        ConditionMatch::Unknown => return ConditionMatch::Unknown,
-                        ConditionMatch::Matched => {}
-                    }
-                }
-                ConditionMatch::Matched
-            }
-            Self::Any(conditions) => {
-                let mut has_unknown = false;
-                for cond in conditions {
-                    match cond.evaluate(ctx) {
-                        ConditionMatch::Matched => return ConditionMatch::Matched,
-                        ConditionMatch::Unknown => has_unknown = true,
-                        ConditionMatch::NotMatched => {}
-                    }
-                }
-                if has_unknown {
-                    ConditionMatch::Unknown
-                } else {
-                    ConditionMatch::NotMatched
-                }
-            }
-            Self::Not(inner) => match inner.evaluate(ctx) {
-                ConditionMatch::Matched => ConditionMatch::NotMatched,
-                ConditionMatch::NotMatched => ConditionMatch::Matched,
-                ConditionMatch::Unknown => ConditionMatch::Unknown,
-            },
+            } => self.evaluate_time_of_day(ctx, *start_hour, *end_hour),
+            Self::DayOfWeek { days } => self.evaluate_day_of_week(ctx, days),
+            Self::All(conditions) => evaluate_all(conditions, ctx),
+            Self::Any(conditions) => evaluate_any(conditions, ctx),
+            Self::Not(inner) => self.evaluate_not(inner, ctx),
+        }
+    }
+
+    /// Evaluates a header condition.
+    fn evaluate_header(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        pattern: &StringMatch,
+    ) -> ConditionMatch {
+        match ctx.headers.get(name) {
+            Some(value) if pattern.matches(value) => ConditionMatch::Matched,
+            Some(_) => ConditionMatch::NotMatched,
+            None => ConditionMatch::NotMatched,
+        }
+    }
+
+    /// Evaluates a time-of-day condition.
+    fn evaluate_time_of_day(
+        &self,
+        ctx: &RequestContext,
+        start_hour: u8,
+        end_hour: u8,
+    ) -> ConditionMatch {
+        match ctx.current_hour {
+            Some(hour) if hour >= start_hour && hour <= end_hour => ConditionMatch::Matched,
+            Some(_) => ConditionMatch::NotMatched,
+            None => ConditionMatch::Unknown,
+        }
+    }
+
+    /// Evaluates a day-of-week condition.
+    fn evaluate_day_of_week(&self, ctx: &RequestContext, days: &[u8]) -> ConditionMatch {
+        match ctx.current_day {
+            Some(day) if days.contains(&day) => ConditionMatch::Matched,
+            Some(_) => ConditionMatch::NotMatched,
+            None => ConditionMatch::Unknown,
+        }
+    }
+
+    /// Evaluates a NOT condition.
+    fn evaluate_not(&self, inner: &Condition, ctx: &RequestContext) -> ConditionMatch {
+        match inner.evaluate(ctx) {
+            ConditionMatch::Matched => ConditionMatch::NotMatched,
+            ConditionMatch::NotMatched => ConditionMatch::Matched,
+            ConditionMatch::Unknown => ConditionMatch::Unknown,
         }
     }
 }
