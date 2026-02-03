@@ -342,22 +342,22 @@ impl RegisterResponse {
                 let mut contact = format!("<{}>", binding.contact_uri());
 
                 // Add expires parameter
-                contact.push_str(&format!(";expires={}", remaining));
+                contact.push_str(&format!(";expires={remaining}"));
 
                 // Add q-value if not default (1.0)
                 let q = binding.q_value();
                 if (q - 1.0).abs() > f32::EPSILON {
-                    contact.push_str(&format!(";q={:.1}", q));
+                    contact.push_str(&format!(";q={q:.1}"));
                 }
 
                 // Add instance-id if present (RFC 5626)
                 if let Some(instance) = binding.instance_id() {
-                    contact.push_str(&format!(";+sip.instance=\"{}\"", instance));
+                    contact.push_str(&format!(";+sip.instance=\"{instance}\""));
                 }
 
                 // Add reg-id if present (RFC 5626)
                 if let Some(reg_id) = binding.reg_id() {
-                    contact.push_str(&format!(";reg-id={}", reg_id));
+                    contact.push_str(&format!(";reg-id={reg_id}"));
                 }
 
                 contact
@@ -376,7 +376,7 @@ impl RegisterResponse {
 
         // RFC 1123 date format (simplified)
         // In production, use a proper date formatting library
-        format!("SIP-Date: {}", now)
+        format!("SIP-Date: {now}")
     }
 }
 
@@ -629,7 +629,7 @@ impl AuthenticatedRegistrar {
                 AuthResult::Failed { reason } => {
                     return Ok(RegisterResponse::error(
                         403,
-                        format!("Forbidden: {}", reason),
+                        format!("Forbidden: {reason}"),
                     ));
                 }
             }

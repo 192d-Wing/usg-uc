@@ -62,19 +62,19 @@ pub enum FailureReason {
 impl std::fmt::Display for FailureReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidFormat(reason) => write!(f, "Invalid format: {}", reason),
-            Self::SignatureFailed(reason) => write!(f, "Signature failed: {}", reason),
-            Self::CertificateError(reason) => write!(f, "Certificate error: {}", reason),
+            Self::InvalidFormat(reason) => write!(f, "Invalid format: {reason}"),
+            Self::SignatureFailed(reason) => write!(f, "Signature failed: {reason}"),
+            Self::CertificateError(reason) => write!(f, "Certificate error: {reason}"),
             Self::Expired {
                 age_seconds,
                 max_age,
             } => {
-                write!(f, "Expired: {}s > {}s", age_seconds, max_age)
+                write!(f, "Expired: {age_seconds}s > {max_age}s")
             }
             Self::NumberMismatch { claim, actual } => {
-                write!(f, "Number mismatch: claim={}, actual={}", claim, actual)
+                write!(f, "Number mismatch: claim={claim}, actual={actual}")
             }
-            Self::InvalidAlgorithm(alg) => write!(f, "Invalid algorithm: {}", alg),
+            Self::InvalidAlgorithm(alg) => write!(f, "Invalid algorithm: {alg}"),
         }
     }
 }

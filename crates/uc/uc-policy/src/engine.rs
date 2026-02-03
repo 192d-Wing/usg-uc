@@ -257,9 +257,7 @@ impl PolicyEngine {
         // First, evaluate global rules
         if self.config.collect_all_matches {
             for (rule, action) in self.global_rules.evaluate_all(context) {
-                if !action.is_terminal() {
-                    additional_actions.push(action.clone());
-                } else {
+                if action.is_terminal() {
                     self.stats.rules_matched += 1;
                     let mut decision =
                         PolicyDecision::new(action.clone(), Some(rule.id().to_string()));
@@ -269,6 +267,7 @@ impl PolicyEngine {
                     self.update_stats(&decision);
                     return decision;
                 }
+                additional_actions.push(action.clone());
             }
         } else if let Some(action) = self.evaluate_first_match(&self.global_rules, context) {
             self.stats.rules_matched += 1;
@@ -278,12 +277,10 @@ impl PolicyEngine {
         }
 
         // Then evaluate named rule sets (in arbitrary order)
-        for (_name, rule_set) in &self.rule_sets {
+        for rule_set in self.rule_sets.values() {
             if self.config.collect_all_matches {
                 for (rule, action) in rule_set.evaluate_all(context) {
-                    if !action.is_terminal() {
-                        additional_actions.push(action.clone());
-                    } else {
+                    if action.is_terminal() {
                         self.stats.rules_matched += 1;
                         let mut decision =
                             PolicyDecision::new(action.clone(), Some(rule.id().to_string()));
@@ -293,6 +290,7 @@ impl PolicyEngine {
                         self.update_stats(&decision);
                         return decision;
                     }
+                    additional_actions.push(action.clone());
                 }
             } else if let Some(action) = self.evaluate_first_match(rule_set, context) {
                 self.stats.rules_matched += 1;

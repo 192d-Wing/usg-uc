@@ -91,9 +91,8 @@ impl Route {
         let mut params = HashMap::new();
 
         for (pattern, actual) in pattern_parts.iter().zip(path_parts.iter()) {
-            if pattern.starts_with(':') {
+            if let Some(param_name) = pattern.strip_prefix(':') {
                 // Path parameter
-                let param_name = &pattern[1..];
                 params.insert(param_name.to_string(), (*actual).to_string());
             } else if pattern.starts_with('{') && pattern.ends_with('}') {
                 // Path parameter (alternative syntax)

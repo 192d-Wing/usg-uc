@@ -221,7 +221,7 @@ impl MediaPipeline {
     ) -> Result<(), MediaPipelineError> {
         let config = DtlsConfig::new(role).with_identity(vec![vec![0u8; 32]], vec![0u8; 32]); // Placeholder cert
 
-        let connection = DtlsConnection::new(config, local_addr.clone(), remote_addr)
+        let connection = DtlsConnection::new(config, local_addr, remote_addr)
             .map_err(|e| MediaPipelineError::DtlsHandshakeFailed(e.to_string()))?;
 
         let context = DtlsConnectionContext {
@@ -230,7 +230,7 @@ impl MediaPipeline {
             keys_exported: false,
         };
 
-        let key = format!("{}:{}", call_id, local_addr);
+        let key = format!("{call_id}:{local_addr}");
         let mut connections = self.dtls_connections.write().await;
         connections.insert(key.clone(), context);
 
@@ -252,7 +252,7 @@ impl MediaPipeline {
         is_a_leg: bool,
         role: DtlsRole,
     ) -> Result<(), MediaPipelineError> {
-        let key = format!("{}:{}", call_id, local_addr);
+        let key = format!("{call_id}:{local_addr}");
 
         let mut connections = self.dtls_connections.write().await;
         let context = connections
@@ -279,8 +279,7 @@ impl MediaPipeline {
         let sessions = self.sessions.read().await;
         let ssrc = sessions
             .get(call_id)
-            .map(|s| if is_a_leg { s.a_leg_ssrc } else { s.b_leg_ssrc })
-            .unwrap_or(0x12345678);
+            .map_or(0x12345678, |s| if is_a_leg { s.a_leg_ssrc } else { s.b_leg_ssrc });
         drop(sessions);
 
         // Create SRTP contexts
@@ -361,7 +360,7 @@ impl MediaPipeline {
         // Determine destination based on leg
         let destination = if is_a_leg {
             match &session_ctx.b_leg_remote {
-                Some(addr) => addr.clone(),
+                Some(addr) => *addr,
                 None => {
                     return RtpProcessResult::Error {
                         reason: "B-leg not connected".to_string(),
@@ -370,7 +369,7 @@ impl MediaPipeline {
             }
         } else {
             match &session_ctx.a_leg_remote {
-                Some(addr) => addr.clone(),
+                Some(addr) => *addr,
                 None => {
                     return RtpProcessResult::Error {
                         reason: "A-leg not connected".to_string(),
@@ -484,9 +483,9 @@ impl MediaPipeline {
             .ok_or(MediaPipelineError::SessionNotFound)?;
 
         if is_a_leg {
-            session_ctx.a_leg_remote = Some(address.clone());
+            session_ctx.a_leg_remote = Some(address);
         } else {
-            session_ctx.b_leg_remote = Some(address.clone());
+            session_ctx.b_leg_remote = Some(address);
         }
 
         debug!(

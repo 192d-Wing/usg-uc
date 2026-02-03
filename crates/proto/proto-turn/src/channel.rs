@@ -46,7 +46,7 @@ impl ChannelData {
     /// - Channel number is out of valid range
     /// - Data exceeds maximum size
     pub fn new(channel: u16, data: Bytes) -> TurnResult<Self> {
-        if channel < MIN_CHANNEL_NUMBER || channel > MAX_CHANNEL_NUMBER {
+        if !(MIN_CHANNEL_NUMBER..=MAX_CHANNEL_NUMBER).contains(&channel) {
             return Err(TurnError::InvalidChannel { channel });
         }
 
@@ -110,7 +110,7 @@ impl ChannelData {
         let length = buf.get_u16() as usize;
 
         // Validate channel number
-        if channel < MIN_CHANNEL_NUMBER || channel > MAX_CHANNEL_NUMBER {
+        if !(MIN_CHANNEL_NUMBER..=MAX_CHANNEL_NUMBER).contains(&channel) {
             return Err(TurnError::InvalidChannel { channel });
         }
 

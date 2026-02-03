@@ -25,6 +25,7 @@ pub struct RouteEntry {
 
 impl RouteEntry {
     /// Creates a new route entry.
+    #[must_use] 
     pub fn new(uri: SipUri) -> Self {
         let loose_route = uri.is_loose_router();
 
@@ -32,6 +33,7 @@ impl RouteEntry {
     }
 
     /// Creates a loose route entry.
+    #[must_use] 
     pub fn loose(mut uri: SipUri) -> Self {
         // Add lr parameter if not present
         if !uri.is_loose_router() {
@@ -45,26 +47,31 @@ impl RouteEntry {
     }
 
     /// Returns the URI.
+    #[must_use] 
     pub fn uri(&self) -> &SipUri {
         &self.uri
     }
 
     /// Returns true if this is a loose router.
+    #[must_use] 
     pub fn is_loose_route(&self) -> bool {
         self.loose_route
     }
 
     /// Returns the host portion.
+    #[must_use] 
     pub fn host(&self) -> &str {
         &self.uri.host
     }
 
     /// Returns the port if specified.
+    #[must_use] 
     pub fn port(&self) -> Option<u16> {
         self.uri.port
     }
 
     /// Returns the transport parameter if specified.
+    #[must_use] 
     pub fn transport(&self) -> Option<&str> {
         self.uri.transport()
     }
@@ -108,6 +115,7 @@ pub struct RouteSet {
 
 impl RouteSet {
     /// Creates an empty route set.
+    #[must_use] 
     pub fn new() -> Self {
         Self::default()
     }
@@ -165,16 +173,19 @@ impl RouteSet {
     }
 
     /// Returns the first route entry.
+    #[must_use] 
     pub fn first(&self) -> Option<&RouteEntry> {
         self.routes.first()
     }
 
     /// Returns true if the route set is empty.
+    #[must_use] 
     pub fn is_empty(&self) -> bool {
         self.routes.is_empty()
     }
 
     /// Returns the number of routes.
+    #[must_use] 
     pub fn len(&self) -> usize {
         self.routes.len()
     }
@@ -185,14 +196,16 @@ impl RouteSet {
     }
 
     /// Converts to Route header values.
+    #[must_use] 
     pub fn to_route_headers(&self) -> Vec<String> {
-        self.routes.iter().map(|r| r.to_string()).collect()
+        self.routes.iter().map(std::string::ToString::to_string).collect()
     }
 
     /// Converts to Record-Route header values.
+    #[must_use] 
     pub fn to_record_route_headers(&self) -> Vec<String> {
         // For responses, preserve order
-        self.routes.iter().map(|r| r.to_string()).collect()
+        self.routes.iter().map(std::string::ToString::to_string).collect()
     }
 }
 
@@ -222,7 +235,8 @@ impl IntoIterator for RouteSet {
 ///
 /// # Returns
 ///
-/// A tuple of (next_hop_uri, new_request_uri, remaining_routes)
+/// A tuple of (`next_hop_uri`, `new_request_uri`, `remaining_routes`)
+#[must_use] 
 pub fn compute_request_target(
     request_uri: &SipUri,
     route_set: &RouteSet,
@@ -293,6 +307,7 @@ pub fn process_record_route_for_uac(record_routes: &[String]) -> SipResult<Route
 ///
 /// Per RFC 3261 Section 16.6, a proxy that wishes to stay in the
 /// path must add a Record-Route header with its URI.
+#[must_use] 
 pub fn create_record_route(proxy_uri: SipUri, loose_route: bool) -> RouteEntry {
     if loose_route {
         RouteEntry::loose(proxy_uri)
@@ -301,7 +316,7 @@ pub fn create_record_route(proxy_uri: SipUri, loose_route: bool) -> RouteEntry {
     }
 }
 
-/// Parses a NameAddr from a Route/Record-Route header value.
+/// Parses a `NameAddr` from a Route/Record-Route header value.
 pub fn parse_route_name_addr(value: &str) -> SipResult<NameAddr> {
     value.parse()
 }

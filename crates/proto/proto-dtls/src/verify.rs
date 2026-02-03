@@ -2,7 +2,7 @@
 //!
 //! ## RFC 6347 Compliance
 //!
-//! - **§4.2.4**: CertificateVerify - signature validation
+//! - **§4.2.4**: `CertificateVerify` - signature validation
 //! - **§4.2.6**: Finished message verification
 //!
 //! ## CNSA 2.0 Compliance
@@ -41,7 +41,8 @@ pub struct CertificateValidator {
 
 impl CertificateValidator {
     /// Creates a new certificate validator.
-    pub fn new() -> Self {
+    #[must_use] 
+    pub const fn new() -> Self {
         Self {
             allow_self_signed: false,
             expected_fingerprint: None,
@@ -53,7 +54,7 @@ impl CertificateValidator {
     /// This is required for DTLS-SRTP where certificates are validated
     /// by fingerprint rather than PKI chain.
     #[must_use]
-    pub fn allow_self_signed(mut self) -> Self {
+    pub const fn allow_self_signed(mut self) -> Self {
         self.allow_self_signed = true;
         self
     }
@@ -62,7 +63,7 @@ impl CertificateValidator {
     ///
     /// For DTLS-SRTP, the fingerprint is provided in the SDP and must match.
     #[must_use]
-    pub fn with_fingerprint(mut self, fingerprint: [u8; 48]) -> Self {
+    pub const fn with_fingerprint(mut self, fingerprint: [u8; 48]) -> Self {
         self.expected_fingerprint = Some(fingerprint);
         self
     }
@@ -82,6 +83,7 @@ impl CertificateValidator {
     /// ## Returns
     ///
     /// The validation result indicating success or failure reason.
+    #[must_use] 
     pub fn validate(&self, cert_chain: &[Vec<u8>]) -> CertificateValidationResult {
         if cert_chain.is_empty() {
             return CertificateValidationResult::Invalid("empty certificate chain".to_string());
@@ -108,11 +110,10 @@ impl CertificateValidator {
                     Ok(()) => return CertificateValidationResult::SelfSigned,
                     Err(e) => return CertificateValidationResult::Invalid(e.to_string()),
                 }
-            } else {
-                return CertificateValidationResult::Invalid(
-                    "self-signed certificate not allowed".to_string(),
-                );
             }
+            return CertificateValidationResult::Invalid(
+                "self-signed certificate not allowed".to_string(),
+            );
         }
 
         // Validate certificate chain
@@ -123,8 +124,7 @@ impl CertificateValidator {
 
             if let Err(e) = self.verify_certificate_signature(cert, issuer_cert) {
                 return CertificateValidationResult::Invalid(format!(
-                    "certificate {} signature invalid: {}",
-                    i, e
+                    "certificate {i} signature invalid: {e}"
                 ));
             }
         }
@@ -133,8 +133,7 @@ impl CertificateValidator {
         let root = &cert_chain[cert_chain.len() - 1];
         if let Err(e) = self.verify_self_signed(root) {
             return CertificateValidationResult::Invalid(format!(
-                "root certificate validation failed: {}",
-                e
+                "root certificate validation failed: {e}"
             ));
         }
 
@@ -331,18 +330,18 @@ impl Default for CertificateValidator {
 
 /// Finished message verifier per RFC 6347 §4.2.6.
 ///
-/// The Finished message contains a verify_data field computed as:
+/// The Finished message contains a `verify_data` field computed as:
 /// ```text
 /// verify_data = PRF(master_secret, finished_label, Hash(handshake_messages))
 /// ```
 ///
 /// Where:
 /// - `finished_label` is "client finished" or "server finished"
-/// - `Hash` is SHA-384 for TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+/// - `Hash` is SHA-384 for `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`
 pub struct FinishedVerifier;
 
 impl FinishedVerifier {
-    /// Computes the expected verify_data for a Finished message.
+    /// Computes the expected `verify_data` for a Finished message.
     ///
     /// ## Arguments
     ///
@@ -352,7 +351,7 @@ impl FinishedVerifier {
     ///
     /// ## Returns
     ///
-    /// The 12-byte verify_data.
+    /// The 12-byte `verify_data`.
     pub fn compute_verify_data(
         master_secret: &[u8; 48],
         handshake_hash: &[u8],
@@ -378,7 +377,7 @@ impl FinishedVerifier {
     ///
     /// ## Arguments
     ///
-    /// * `received` - The received verify_data (12 bytes)
+    /// * `received` - The received `verify_data` (12 bytes)
     /// * `master_secret` - The 48-byte master secret
     /// * `handshake_hash` - SHA-384 hash of all handshake messages (excluding the Finished)
     /// * `is_client` - Whether this is the client's Finished (true) or server's (false)
@@ -414,16 +413,16 @@ impl FinishedVerifier {
     }
 }
 
-/// ServerKeyExchange signature verifier per RFC 6347.
+/// `ServerKeyExchange` signature verifier per RFC 6347.
 ///
-/// For ECDHE_ECDSA, the server signs the exchange parameters:
+/// For `ECDHE_ECDSA`, the server signs the exchange parameters:
 /// ```text
 /// signed_params = SHA384(client_random + server_random + ServerECDHParams)
 /// ```
 pub struct ServerKeyExchangeVerifier;
 
 impl ServerKeyExchangeVerifier {
-    /// Verifies the ServerKeyExchange signature.
+    /// Verifies the `ServerKeyExchange` signature.
     ///
     /// ## Arguments
     ///
@@ -533,7 +532,7 @@ fn parse_der_length(data: &[u8]) -> DtlsResult<(usize, usize)> {
         }
 
         let mut len = 0usize;
-        for &byte in &data[1..1 + num_bytes] {
+        for &byte in &data[1..=num_bytes] {
             len = len
                 .checked_mul(256)
                 .ok_or_else(|| DtlsError::CertificateError {

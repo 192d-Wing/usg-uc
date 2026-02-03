@@ -53,25 +53,25 @@ impl fmt::Display for AclError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidNetwork { network, reason } => {
-                write!(f, "Invalid network '{}': {}", network, reason)
+                write!(f, "Invalid network '{network}': {reason}")
             }
             Self::InvalidIpAddress { address } => {
-                write!(f, "Invalid IP address: {}", address)
+                write!(f, "Invalid IP address: {address}")
             }
             Self::InvalidPrefix { prefix, max } => {
-                write!(f, "Invalid prefix /{} (max {})", prefix, max)
+                write!(f, "Invalid prefix /{prefix} (max {max})")
             }
             Self::RuleNotFound { rule_id } => {
-                write!(f, "Rule not found: {}", rule_id)
+                write!(f, "Rule not found: {rule_id}")
             }
             Self::MaxRulesExceeded { max } => {
-                write!(f, "Maximum rules exceeded: {}", max)
+                write!(f, "Maximum rules exceeded: {max}")
             }
             Self::InvalidRule { reason } => {
-                write!(f, "Invalid rule: {}", reason)
+                write!(f, "Invalid rule: {reason}")
             }
             Self::DuplicateRule { rule_id } => {
-                write!(f, "Duplicate rule: {}", rule_id)
+                write!(f, "Duplicate rule: {rule_id}")
             }
         }
     }

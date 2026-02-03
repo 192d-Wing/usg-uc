@@ -4,8 +4,10 @@ use crate::record::CallRecord;
 
 /// CDR output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum CdrFormat {
     /// JSON format.
+    #[default]
     Json,
     /// CSV format.
     Csv,
@@ -13,11 +15,6 @@ pub enum CdrFormat {
     Custom,
 }
 
-impl Default for CdrFormat {
-    fn default() -> Self {
-        Self::Json
-    }
-}
 
 /// Trait for CDR formatters.
 pub trait CdrFormatter {
@@ -123,16 +120,16 @@ impl CdrFormatter for JsonFormatter {
         ));
         parts.push(format!("\"start_time_ms\":{}", record.start_time_ms));
         if let Some(connect_ms) = record.connect_time_ms {
-            parts.push(format!("\"connect_time_ms\":{}", connect_ms));
+            parts.push(format!("\"connect_time_ms\":{connect_ms}"));
         }
         if let Some(end_ms) = record.end_time_ms {
-            parts.push(format!("\"end_time_ms\":{}", end_ms));
+            parts.push(format!("\"end_time_ms\":{end_ms}"));
         }
         if let Some(setup_ms) = record.setup_duration_ms {
-            parts.push(format!("\"setup_duration_ms\":{}", setup_ms));
+            parts.push(format!("\"setup_duration_ms\":{setup_ms}"));
         }
         if let Some(duration) = record.duration_secs {
-            parts.push(format!("\"duration_secs\":{}", duration));
+            parts.push(format!("\"duration_secs\":{duration}"));
         }
         if let Some(ref codec) = record.codec {
             parts.push(format!("\"codec\":\"{}\"", Self::escape_string(codec)));

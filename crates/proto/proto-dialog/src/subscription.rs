@@ -81,7 +81,7 @@ impl std::fmt::Display for TerminationReason {
             Self::NoResource => write!(f, "noresource"),
             Self::Rejected => write!(f, "rejected"),
             Self::InternalError => write!(f, "probation"),
-            Self::Other(reason) => write!(f, "{}", reason),
+            Self::Other(reason) => write!(f, "{reason}"),
         }
     }
 }
@@ -246,15 +246,15 @@ impl SubscriptionStateHeader {
         let mut value = self.state.to_string();
 
         if let Some(ref reason) = self.reason {
-            value.push_str(&format!(";reason={}", reason));
+            value.push_str(&format!(";reason={reason}"));
         }
 
         if let Some(expires) = self.expires {
-            value.push_str(&format!(";expires={}", expires));
+            value.push_str(&format!(";expires={expires}"));
         }
 
         if let Some(retry_after) = self.retry_after {
-            value.push_str(&format!(";retry-after={}", retry_after));
+            value.push_str(&format!(";retry-after={retry_after}"));
         }
 
         value
@@ -417,7 +417,7 @@ impl Subscription {
         if elapsed >= expires {
             Duration::ZERO
         } else {
-            expires - elapsed
+            expires.checked_sub(elapsed).unwrap()
         }
     }
 
@@ -558,7 +558,7 @@ impl Notifier {
         if elapsed >= expires {
             0
         } else {
-            (expires - elapsed).as_secs() as u32
+            expires.checked_sub(elapsed).unwrap().as_secs() as u32
         }
     }
 
@@ -829,16 +829,14 @@ impl EventPackageRegistry {
         if self.allow_unregistered {
             EventPackageValidation::UnregisteredAllowed {
                 warning: format!(
-                    "Event package '{}' is not IANA-registered per RFC 6665 §7.2",
-                    event_type
+                    "Event package '{event_type}' is not IANA-registered per RFC 6665 §7.2"
                 ),
             }
         } else {
             EventPackageValidation::Invalid {
                 reason: format!(
-                    "Event package '{}' is not IANA-registered per RFC 6665 §7.2. \
-                     Registered packages must be used for interoperability.",
-                    event_type
+                    "Event package '{event_type}' is not IANA-registered per RFC 6665 §7.2. \
+                     Registered packages must be used for interoperability."
                 ),
             }
         }

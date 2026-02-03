@@ -68,34 +68,34 @@ impl fmt::Display for RegistrarError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::AorNotFound { aor } => {
-                write!(f, "AOR not found: {}", aor)
+                write!(f, "AOR not found: {aor}")
             }
             Self::BindingNotFound { contact } => {
-                write!(f, "Binding not found: {}", contact)
+                write!(f, "Binding not found: {contact}")
             }
             Self::TooManyContacts { max } => {
-                write!(f, "Too many contacts (max {})", max)
+                write!(f, "Too many contacts (max {max})")
             }
             Self::InvalidExpires { requested, min } => {
-                write!(f, "Invalid expires value {} (minimum {})", requested, min)
+                write!(f, "Invalid expires value {requested} (minimum {min})")
             }
             Self::RegistrationExpired { contact } => {
-                write!(f, "Registration expired: {}", contact)
+                write!(f, "Registration expired: {contact}")
             }
             Self::InvalidContact { contact, reason } => {
-                write!(f, "Invalid contact {}: {}", contact, reason)
+                write!(f, "Invalid contact {contact}: {reason}")
             }
             Self::AuthRequired { realm } => {
-                write!(f, "Authorization required for realm: {}", realm)
+                write!(f, "Authorization required for realm: {realm}")
             }
             Self::AuthFailed { reason } => {
-                write!(f, "Authorization failed: {}", reason)
+                write!(f, "Authorization failed: {reason}")
             }
             Self::NotAllowed { reason } => {
-                write!(f, "Registration not allowed: {}", reason)
+                write!(f, "Registration not allowed: {reason}")
             }
             Self::Internal { message } => {
-                write!(f, "Internal error: {}", message)
+                write!(f, "Internal error: {message}")
             }
         }
     }

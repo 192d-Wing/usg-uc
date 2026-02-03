@@ -356,8 +356,7 @@ impl MediaForker {
         }
         self.forks
             .get(stream_id)
-            .map(|f| f.active && f.mode != ForkingMode::Disabled)
-            .unwrap_or(false)
+            .is_some_and(|f| f.active && f.mode != ForkingMode::Disabled)
     }
 
     /// Gets fork destination for a stream.

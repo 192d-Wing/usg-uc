@@ -94,7 +94,7 @@ pub struct Timing {
 impl Timing {
     /// Creates timing for a permanent session.
     #[must_use]
-    pub fn permanent() -> Self {
+    pub const fn permanent() -> Self {
         Self {
             start_time: 0,
             stop_time: 0,
@@ -104,7 +104,7 @@ impl Timing {
 
     /// Creates timing with specific start/stop times.
     #[must_use]
-    pub fn with_times(start_time: u64, stop_time: u64) -> Self {
+    pub const fn with_times(start_time: u64, stop_time: u64) -> Self {
         Self {
             start_time,
             stop_time,
@@ -126,7 +126,7 @@ impl Timing {
 
     /// Returns whether this timing has repeat times.
     #[must_use]
-    pub fn has_repeats(&self) -> bool {
+    pub const fn has_repeats(&self) -> bool {
         !self.repeat_times.is_empty()
     }
 
@@ -159,7 +159,7 @@ impl fmt::Display for Timing {
         write!(f, "t={} {}", self.start_time, self.stop_time)?;
         // Write r= lines for repeat times
         for repeat in &self.repeat_times {
-            write!(f, "\n{}", repeat)?;
+            write!(f, "\n{repeat}")?;
         }
         Ok(())
     }
@@ -187,13 +187,13 @@ pub struct TimeValue {
 impl TimeValue {
     /// Creates a new time value from seconds.
     #[must_use]
-    pub fn from_seconds(seconds: u64) -> Self {
+    pub const fn from_seconds(seconds: u64) -> Self {
         Self { seconds }
     }
 
     /// Creates a time value from days.
     #[must_use]
-    pub fn from_days(days: u64) -> Self {
+    pub const fn from_days(days: u64) -> Self {
         Self {
             seconds: days * 86400,
         }
@@ -201,7 +201,7 @@ impl TimeValue {
 
     /// Creates a time value from hours.
     #[must_use]
-    pub fn from_hours(hours: u64) -> Self {
+    pub const fn from_hours(hours: u64) -> Self {
         Self {
             seconds: hours * 3600,
         }
@@ -209,7 +209,7 @@ impl TimeValue {
 
     /// Creates a time value from minutes.
     #[must_use]
-    pub fn from_minutes(minutes: u64) -> Self {
+    pub const fn from_minutes(minutes: u64) -> Self {
         Self {
             seconds: minutes * 60,
         }
@@ -238,7 +238,7 @@ impl TimeValue {
         };
 
         let value: u64 = value_str.parse().map_err(|_| SdpError::ParseError {
-            reason: format!("invalid time value: {}", s),
+            reason: format!("invalid time value: {s}"),
         })?;
 
         Ok(Self {
@@ -248,13 +248,13 @@ impl TimeValue {
 
     /// Returns the value in seconds.
     #[must_use]
-    pub fn as_seconds(&self) -> u64 {
+    pub const fn as_seconds(&self) -> u64 {
         self.seconds
     }
 
     /// Returns the value as a Duration.
     #[must_use]
-    pub fn as_duration(&self) -> std::time::Duration {
+    pub const fn as_duration(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.seconds)
     }
 
@@ -262,11 +262,11 @@ impl TimeValue {
     #[must_use]
     pub fn to_compact_string(&self) -> String {
         // Use compact form for clean divisibility
-        if self.seconds % 86400 == 0 && self.seconds >= 86400 {
+        if self.seconds.is_multiple_of(86400) && self.seconds >= 86400 {
             format!("{}d", self.seconds / 86400)
-        } else if self.seconds % 3600 == 0 && self.seconds >= 3600 {
+        } else if self.seconds.is_multiple_of(3600) && self.seconds >= 3600 {
             format!("{}h", self.seconds / 3600)
-        } else if self.seconds % 60 == 0 && self.seconds >= 60 {
+        } else if self.seconds.is_multiple_of(60) && self.seconds >= 60 {
             format!("{}m", self.seconds / 60)
         } else {
             self.seconds.to_string()
@@ -329,7 +329,7 @@ pub struct RepeatTimes {
 impl RepeatTimes {
     /// Creates new repeat times.
     #[must_use]
-    pub fn new(interval: TimeValue, duration: TimeValue, offsets: Vec<TimeValue>) -> Self {
+    pub const fn new(interval: TimeValue, duration: TimeValue, offsets: Vec<TimeValue>) -> Self {
         Self {
             interval,
             duration,
@@ -397,12 +397,12 @@ impl RepeatTimes {
     /// Returns all offsets in seconds.
     #[must_use]
     pub fn offset_seconds(&self) -> Vec<u64> {
-        self.offsets.iter().map(|o| o.as_seconds()).collect()
+        self.offsets.iter().map(TimeValue::as_seconds).collect()
     }
 
     /// Checks if the repeat times are valid.
     #[must_use]
-    pub fn is_valid(&self) -> bool {
+    pub const fn is_valid(&self) -> bool {
         // Interval must be positive
         if self.interval.seconds == 0 {
             return false;
@@ -427,7 +427,7 @@ impl fmt::Display for RepeatTimes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "r={} {}", self.interval, self.duration)?;
         for offset in &self.offsets {
-            write!(f, " {}", offset)?;
+            write!(f, " {offset}")?;
         }
         Ok(())
     }

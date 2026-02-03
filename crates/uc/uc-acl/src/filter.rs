@@ -203,7 +203,7 @@ impl AclFilter {
         self.rules.push(rule);
 
         // Sort by priority
-        self.rules.sort_by_key(|r| r.priority());
+        self.rules.sort_by_key(super::rule::AclRule::priority);
 
         // Rebuild index
         self.rule_index.clear();

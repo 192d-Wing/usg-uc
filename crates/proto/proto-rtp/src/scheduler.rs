@@ -134,7 +134,7 @@ impl RtcpScheduler {
     /// Updates the average RTCP packet size with exponential weighting.
     ///
     /// Per RFC 3550 A.7, the estimate is:
-    /// avg_rtcp_size = (1/16) * packet_size + (15/16) * avg_rtcp_size
+    /// `avg_rtcp_size` = (1/16) * `packet_size` + (15/16) * `avg_rtcp_size`
     pub fn update_avg_size(&mut self, packet_size: usize) {
         self.avg_rtcp_size = (packet_size as f64 / 16.0) + (15.0 * self.avg_rtcp_size / 16.0);
     }
@@ -214,7 +214,7 @@ impl RtcpScheduler {
         let det_interval = self.compute_deterministic_interval();
 
         // Apply randomization: [0.5, 1.5] × interval
-        let random_factor = 0.5 + random_f64() * 1.0;
+        let random_factor = random_f64().mul_add(1.0, 0.5);
         let randomized = det_interval.mul_f64(random_factor);
 
         // Apply compensation factor for timer reconsideration
@@ -262,7 +262,7 @@ impl RtcpScheduler {
     /// Returns `true` if the scheduled time has passed.
     #[must_use]
     pub fn is_time_to_send(&self) -> bool {
-        self.tn.map(|tn| Instant::now() >= tn).unwrap_or(true) // Send if never scheduled
+        self.tn.is_none_or(|tn| Instant::now() >= tn) // Send if never scheduled
     }
 
     /// Returns the next scheduled transmission time.

@@ -24,7 +24,7 @@ pub enum MediaType {
 impl MediaType {
     /// Returns the media type string.
     #[must_use]
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Audio => "audio",
             Self::Video => "video",
@@ -82,7 +82,7 @@ pub enum TransportProtocol {
 impl TransportProtocol {
     /// Returns the protocol string.
     #[must_use]
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::RtpAvp => "RTP/AVP",
             Self::RtpSavp => "RTP/SAVP",
@@ -97,7 +97,7 @@ impl TransportProtocol {
 
     /// Returns true if this protocol uses SRTP.
     #[must_use]
-    pub fn is_secure(&self) -> bool {
+    pub const fn is_secure(&self) -> bool {
         matches!(
             self,
             Self::RtpSavp | Self::RtpSavpf | Self::UdpTlsRtpSavp | Self::UdpTlsRtpSavpf
@@ -106,13 +106,13 @@ impl TransportProtocol {
 
     /// Returns true if this protocol uses DTLS.
     #[must_use]
-    pub fn uses_dtls(&self) -> bool {
+    pub const fn uses_dtls(&self) -> bool {
         matches!(self, Self::UdpTlsRtpSavp | Self::UdpTlsRtpSavpf)
     }
 
     /// Returns true if this protocol supports feedback.
     #[must_use]
-    pub fn supports_feedback(&self) -> bool {
+    pub const fn supports_feedback(&self) -> bool {
         matches!(self, Self::RtpAvpf | Self::RtpSavpf | Self::UdpTlsRtpSavpf)
     }
 }
@@ -221,7 +221,7 @@ pub struct MediaDescription {
 impl MediaDescription {
     /// Creates a new media description.
     #[must_use]
-    pub fn new(media_type: MediaType, port: u16, protocol: TransportProtocol) -> Self {
+    pub const fn new(media_type: MediaType, port: u16, protocol: TransportProtocol) -> Self {
         Self {
             media_type,
             port,
@@ -341,7 +341,7 @@ impl MediaDescription {
         };
 
         let protocol: TransportProtocol = parts[2].parse()?;
-        let formats: Vec<String> = parts[3..].iter().map(|s| s.to_string()).collect();
+        let formats: Vec<String> = parts[3..].iter().map(std::string::ToString::to_string).collect();
 
         Ok(Self {
             media_type,

@@ -58,8 +58,10 @@ impl HeaderAction {
 
 /// Policy action.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum PolicyAction {
     /// Allow the request to proceed.
+    #[default]
     Allow,
     /// Deny the request with a status code.
     Deny {
@@ -179,11 +181,6 @@ impl PolicyAction {
     }
 }
 
-impl Default for PolicyAction {
-    fn default() -> Self {
-        Self::Allow
-    }
-}
 
 #[cfg(test)]
 mod tests {

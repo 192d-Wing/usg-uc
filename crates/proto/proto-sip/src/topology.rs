@@ -211,6 +211,7 @@ impl TopologyHider {
     ///
     /// The proxy MUST strip its own Via header from the response. For topology
     /// hiding, we additionally strip Via headers that reveal internal addresses.
+    #[must_use] 
     pub fn strip_internal_vias(&self, vias: &[ViaHeader]) -> Vec<ViaHeader> {
         if self.config.mode == TopologyHidingMode::None {
             return vias.to_vec();
@@ -225,6 +226,7 @@ impl TopologyHider {
     /// Anonymizes a Via header by replacing internal addresses.
     ///
     /// Returns None if the Via should be stripped entirely.
+    #[must_use] 
     pub fn anonymize_via(&self, via: &ViaHeader) -> Option<ViaHeader> {
         if self.config.mode == TopologyHidingMode::None {
             return Some(via.clone());
@@ -330,7 +332,8 @@ impl TopologyHider {
 
     /// Anonymizes a Contact header by replacing the URI.
     ///
-    /// Returns an anonymized NameAddr that hides the actual contact address.
+    /// Returns an anonymized `NameAddr` that hides the actual contact address.
+    #[must_use] 
     pub fn anonymize_contact(&self, contact: &NameAddr) -> NameAddr {
         if self.config.mode == TopologyHidingMode::None {
             return contact.clone();
@@ -342,7 +345,7 @@ impl TopologyHider {
         if self.config.is_internal_address(&contact.uri.host) {
             // Create anonymized URI
             let mut anon_uri = SipUri::new(&self.config.external_host);
-            anon_uri.scheme = contact.uri.scheme.clone();
+            anon_uri.scheme = contact.uri.scheme;
             if let Some(ref user) = contact.uri.user {
                 // Keep the user part but change the host
                 anon_uri.user = Some(user.clone());
@@ -508,11 +511,10 @@ impl TopologyHider {
             return;
         }
 
-        if let Some(call_id) = headers.get(&HeaderName::CallId) {
-            if let Some(original) = self.restore_call_id(&call_id.value) {
+        if let Some(call_id) = headers.get(&HeaderName::CallId)
+            && let Some(original) = self.restore_call_id(&call_id.value) {
                 headers.set(HeaderName::CallId, original);
             }
-        }
     }
 
     // =========================================================================

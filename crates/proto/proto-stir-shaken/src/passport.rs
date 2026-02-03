@@ -48,7 +48,7 @@ impl Attestation {
             "B" => Ok(Self::Partial),
             "C" => Ok(Self::Gateway),
             _ => Err(StirShakenError::AttestationError {
-                reason: format!("Unknown attestation level: {}", s),
+                reason: format!("Unknown attestation level: {s}"),
             }),
         }
     }
@@ -76,7 +76,7 @@ impl OrigId {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        Self(format!("{:x}", timestamp))
+        Self(format!("{timestamp:x}"))
     }
 
     /// Returns the ID as a string slice.
@@ -179,7 +179,7 @@ impl TelephoneNumber {
 
     /// Normalizes a phone number.
     fn normalize(number: &str) -> String {
-        number.chars().filter(|c| c.is_ascii_digit()).collect()
+        number.chars().filter(char::is_ascii_digit).collect()
     }
 
     /// Returns the number.
@@ -278,7 +278,7 @@ impl PASSporTClaims {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        if now > self.iat { now - self.iat } else { 0 }
+        now.saturating_sub(self.iat)
     }
 }
 

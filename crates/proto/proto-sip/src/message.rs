@@ -234,11 +234,10 @@ impl fmt::Display for SipRequest {
         write!(f, "\r\n")?;
 
         // Body
-        if let Some(ref body) = self.body {
-            if let Ok(text) = std::str::from_utf8(body) {
+        if let Some(ref body) = self.body
+            && let Ok(text) = std::str::from_utf8(body) {
                 write!(f, "{text}")?;
             }
-        }
 
         Ok(())
     }
@@ -350,11 +349,10 @@ impl fmt::Display for SipResponse {
         write!(f, "\r\n")?;
 
         // Body
-        if let Some(ref body) = self.body {
-            if let Ok(text) = std::str::from_utf8(body) {
+        if let Some(ref body) = self.body
+            && let Ok(text) = std::str::from_utf8(body) {
                 write!(f, "{text}")?;
             }
-        }
 
         Ok(())
     }
@@ -514,7 +512,7 @@ mod tests {
                    test";
 
         let parsed: SipMessage = msg.parse().unwrap();
-        assert_eq!(parsed.body().map(|b| b.as_ref()), Some(b"test".as_slice()));
+        assert_eq!(parsed.body().map(std::convert::AsRef::as_ref), Some(b"test".as_slice()));
     }
 
     #[test]

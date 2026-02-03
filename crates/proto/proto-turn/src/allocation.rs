@@ -148,7 +148,7 @@ impl Allocation {
 
         self.permissions
             .entry(peer_ip)
-            .and_modify(|p| p.refresh())
+            .and_modify(Permission::refresh)
             .or_insert_with(Permission::new);
 
         Ok(())
@@ -160,8 +160,7 @@ impl Allocation {
 
         self.permissions
             .get(&peer_ip)
-            .map(|p| !p.is_expired())
-            .unwrap_or(false)
+            .is_some_and(|p| !p.is_expired())
     }
 
     /// Binds a channel to a peer address.
@@ -171,7 +170,7 @@ impl Allocation {
         }
 
         // Validate channel number
-        if channel < MIN_CHANNEL_NUMBER || channel > MAX_CHANNEL_NUMBER {
+        if !(MIN_CHANNEL_NUMBER..=MAX_CHANNEL_NUMBER).contains(&channel) {
             return Err(TurnError::InvalidChannel { channel });
         }
 
@@ -183,16 +182,15 @@ impl Allocation {
                 });
             }
             // Refresh existing binding
-            self.channel_bindings.get_mut(&channel).map(|b| b.refresh());
+            self.channel_bindings.get_mut(&channel).map(ChannelBinding::refresh);
         } else {
             // Check if peer already has a different channel
-            if let Some(&existing_channel) = self.peer_to_channel.get(&peer_addr) {
-                if existing_channel != channel {
+            if let Some(&existing_channel) = self.peer_to_channel.get(&peer_addr)
+                && existing_channel != channel {
                     return Err(TurnError::ChannelBindFailed {
                         reason: "peer already bound to different channel".to_string(),
                     });
                 }
-            }
 
             // Create new binding
             self.channel_bindings
@@ -216,8 +214,7 @@ impl Allocation {
         self.peer_to_channel.get(peer_addr).copied().filter(|&ch| {
             self.channel_bindings
                 .get(&ch)
-                .map(|b| !b.is_expired())
-                .unwrap_or(false)
+                .is_some_and(|b| !b.is_expired())
         })
     }
 

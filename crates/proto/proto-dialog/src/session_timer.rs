@@ -139,7 +139,7 @@ impl SessionTimer {
         if elapsed >= expires {
             Duration::ZERO
         } else {
-            expires - elapsed
+            expires.checked_sub(elapsed).unwrap()
         }
     }
 
@@ -301,8 +301,8 @@ pub fn parse_min_se(value: &str) -> DialogResult<u32> {
 /// Creates a Session-Expires header value.
 pub fn format_session_expires(expires: u32, refresher: Option<RefresherRole>) -> String {
     match refresher {
-        Some(role) => format!("{};refresher={}", expires, role),
-        None => format!("{}", expires),
+        Some(role) => format!("{expires};refresher={role}"),
+        None => format!("{expires}"),
     }
 }
 
@@ -322,8 +322,7 @@ pub fn handle_422_response(
     if min_se_from_response < MIN_SESSION_EXPIRES {
         return Err(DialogError::InvalidSessionTimer {
             reason: format!(
-                "Min-SE {} below RFC minimum {}",
-                min_se_from_response, MIN_SESSION_EXPIRES
+                "Min-SE {min_se_from_response} below RFC minimum {MIN_SESSION_EXPIRES}"
             ),
         });
     }

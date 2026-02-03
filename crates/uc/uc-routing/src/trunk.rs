@@ -6,8 +6,10 @@ use std::time::Instant;
 
 /// Trunk state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum TrunkState {
     /// Trunk is available.
+    #[default]
     Available,
     /// Trunk is busy (at capacity).
     Busy,
@@ -26,28 +28,20 @@ impl TrunkState {
     }
 }
 
-impl Default for TrunkState {
-    fn default() -> Self {
-        Self::Available
-    }
-}
 
 /// Trunk protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum TrunkProtocol {
     /// UDP transport.
     Udp,
     /// TCP transport.
     Tcp,
     /// TLS transport.
+    #[default]
     Tls,
 }
 
-impl Default for TrunkProtocol {
-    fn default() -> Self {
-        Self::Tls
-    }
-}
 
 /// Trunk statistics.
 #[derive(Debug, Clone, Default)]
@@ -240,13 +234,11 @@ impl Trunk {
     /// Returns the current state.
     pub fn state(&self) -> TrunkState {
         // Check if cooldown has expired
-        if self.state == TrunkState::Cooldown {
-            if let Some(until) = self.cooldown_until {
-                if Instant::now() >= until {
+        if self.state == TrunkState::Cooldown
+            && let Some(until) = self.cooldown_until
+                && Instant::now() >= until {
                     return TrunkState::Available;
                 }
-            }
-        }
         self.state
     }
 
@@ -339,8 +331,10 @@ impl Trunk {
 
 /// Trunk selection strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum SelectionStrategy {
     /// Select by priority (lowest first).
+    #[default]
     Priority,
     /// Round-robin selection.
     RoundRobin,
@@ -352,11 +346,6 @@ pub enum SelectionStrategy {
     BestSuccessRate,
 }
 
-impl Default for SelectionStrategy {
-    fn default() -> Self {
-        Self::Priority
-    }
-}
 
 /// A group of trunks for failover and load balancing.
 #[derive(Debug)]

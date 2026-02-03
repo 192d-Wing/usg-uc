@@ -244,13 +244,13 @@ impl RateLimiter {
     pub fn check(&mut self, source: IpAddr) -> RateLimitAction {
         // Check if blocked
         if let Some(entry) = self.blocked.get(&source) {
-            if !entry.is_expired() {
+            if entry.is_expired() {
+                // Clean up expired block
+                self.blocked.remove(&source);
+            } else {
                 return RateLimitAction::Block {
                     duration_secs: entry.remaining().as_secs(),
                 };
-            } else {
-                // Clean up expired block
-                self.blocked.remove(&source);
             }
         }
 
@@ -269,7 +269,7 @@ impl RateLimiter {
             // Check if we should warn/throttle
             if rate > self.config.rps as f64 * 0.8 {
                 // Over 80% of limit, suggest throttling
-                let delay_ms = ((rate - self.config.rps as f64 * 0.8) * 10.0) as u64;
+                let delay_ms = ((self.config.rps as f64).mul_add(-0.8, rate) * 10.0) as u64;
                 RateLimitAction::Throttle { delay_ms }
             } else {
                 RateLimitAction::Allow
@@ -310,7 +310,7 @@ impl RateLimiter {
     /// Returns the current token count for a source.
     pub fn token_count(&self, source: IpAddr) -> Option<f64> {
         if self.config.per_ip {
-            self.buckets.get(&source).map(|b| b.token_count())
+            self.buckets.get(&source).map(TokenBucket::token_count)
         } else {
             Some(self.global_bucket.token_count())
         }

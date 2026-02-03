@@ -263,7 +263,7 @@ impl LongTermCredentialValidator {
         let timestamp_str = timestamp.to_string();
         let sig = self.compute_nonce_signature(&timestamp_str);
 
-        format!("{}:{}", timestamp_str, sig)
+        format!("{timestamp_str}:{sig}")
     }
 
     /// Validates a nonce and checks if it's stale.
@@ -520,7 +520,7 @@ fn hex_encode(data: &[u8]) -> String {
     let mut result = String::with_capacity(data.len() * 2);
     for byte in data {
         use std::fmt::Write;
-        let _ = write!(result, "{:02x}", byte);
+        let _ = write!(result, "{byte:02x}");
     }
     result
 }

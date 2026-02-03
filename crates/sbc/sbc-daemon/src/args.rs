@@ -39,7 +39,7 @@ impl Default for Args {
 impl Args {
     /// Parses arguments from the command line.
     pub fn parse() -> Self {
-        let mut args = Args::default();
+        let mut args = Self::default();
         let mut iter = env::args().skip(1);
 
         while let Some(arg) = iter.next() {
@@ -94,7 +94,7 @@ impl Args {
     /// Prints help information.
     pub fn print_help() {
         println!(
-            r#"sbc-daemon - USG Session Border Controller
+            r"sbc-daemon - USG Session Border Controller
 
 USAGE:
     sbc-daemon [OPTIONS]
@@ -122,7 +122,7 @@ SIGNALS:
     SIGTERM, SIGINT        Graceful shutdown
     SIGHUP                 Reload configuration
 
-For more information, see the documentation at https://github.com/usg/usg-uc-sbc"#
+For more information, see the documentation at https://github.com/usg/usg-uc-sbc"
         );
     }
 

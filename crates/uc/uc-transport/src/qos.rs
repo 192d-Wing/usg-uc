@@ -32,8 +32,10 @@ use std::io;
 /// Per RFC 4594, these are recommended values for various traffic types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum DscpValue {
     /// Best Effort (default, no marking).
+    #[default]
     BestEffort = 0,
 
     // Class Selector (CS) PHBs - RFC 2474
@@ -195,11 +197,6 @@ impl DscpValue {
     }
 }
 
-impl Default for DscpValue {
-    fn default() -> Self {
-        Self::BestEffort
-    }
-}
 
 impl fmt::Display for DscpValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -401,7 +398,7 @@ impl QosConfig {
 ///
 /// Returns an error if the socket option cannot be set.
 pub fn apply_dscp(socket: &Socket, dscp: DscpValue, is_ipv6: bool) -> io::Result<()> {
-    let tos = dscp.to_tos() as u32;
+    let tos = u32::from(dscp.to_tos());
 
     if is_ipv6 {
         socket.set_tclass_v6(tos)?;
@@ -540,8 +537,7 @@ impl QosPolicyManager {
     pub fn signaling_config(&self, trunk_id: Option<&str>) -> &QosConfig {
         trunk_id
             .and_then(|id| self.trunk_policies.get(id))
-            .map(|p| &p.signaling)
-            .unwrap_or(&self.default_signaling)
+            .map_or(&self.default_signaling, |p| &p.signaling)
     }
 
     /// Gets the media QoS config for a trunk.
@@ -549,8 +545,7 @@ impl QosPolicyManager {
     pub fn media_config(&self, trunk_id: Option<&str>) -> &QosConfig {
         trunk_id
             .and_then(|id| self.trunk_policies.get(id))
-            .map(|p| &p.media)
-            .unwrap_or(&self.default_media)
+            .map_or(&self.default_media, |p| &p.media)
     }
 }
 

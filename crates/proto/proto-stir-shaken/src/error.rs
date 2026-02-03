@@ -82,20 +82,19 @@ impl fmt::Display for StirShakenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidPASSporT { reason } => {
-                write!(f, "Invalid PASSporT: {}", reason)
+                write!(f, "Invalid PASSporT: {reason}")
             }
             Self::InvalidAlgorithm { algorithm } => {
                 write!(
                     f,
-                    "Invalid algorithm '{}' (only ES384 is supported for CNSA 2.0)",
-                    algorithm
+                    "Invalid algorithm '{algorithm}' (only ES384 is supported for CNSA 2.0)"
                 )
             }
             Self::SignatureVerificationFailed { reason } => {
-                write!(f, "Signature verification failed: {}", reason)
+                write!(f, "Signature verification failed: {reason}")
             }
             Self::CertificateError { reason } => {
-                write!(f, "Certificate error: {}", reason)
+                write!(f, "Certificate error: {reason}")
             }
             Self::Expired {
                 age_seconds,
@@ -103,30 +102,29 @@ impl fmt::Display for StirShakenError {
             } => {
                 write!(
                     f,
-                    "PASSporT expired: age {}s exceeds maximum {}s",
-                    age_seconds, max_age
+                    "PASSporT expired: age {age_seconds}s exceeds maximum {max_age}s"
                 )
             }
             Self::InvalidPhoneNumber { number, reason } => {
-                write!(f, "Invalid phone number '{}': {}", number, reason)
+                write!(f, "Invalid phone number '{number}': {reason}")
             }
             Self::InvalidClaim { claim, reason } => {
-                write!(f, "Invalid claim '{}': {}", claim, reason)
+                write!(f, "Invalid claim '{claim}': {reason}")
             }
             Self::MissingField { field } => {
-                write!(f, "Missing required field: {}", field)
+                write!(f, "Missing required field: {field}")
             }
             Self::AttestationError { reason } => {
-                write!(f, "Attestation error: {}", reason)
+                write!(f, "Attestation error: {reason}")
             }
             Self::CryptoError { message } => {
-                write!(f, "Crypto error: {}", message)
+                write!(f, "Crypto error: {message}")
             }
             Self::EncodingError { message } => {
-                write!(f, "Encoding error: {}", message)
+                write!(f, "Encoding error: {message}")
             }
             Self::NetworkError { url, message } => {
-                write!(f, "Network error fetching '{}': {}", url, message)
+                write!(f, "Network error fetching '{url}': {message}")
             }
         }
     }

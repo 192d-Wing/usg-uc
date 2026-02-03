@@ -59,7 +59,7 @@ pub fn run(args: &Args) -> CommandResult {
     }
 
     if let Some(uptime) = health.uptime_secs {
-        println!("Uptime:  {}s", uptime);
+        println!("Uptime:  {uptime}s");
     }
 
     // Liveness and readiness

@@ -112,7 +112,7 @@ impl ServerInviteTransaction {
                     Ok(())
                 } else {
                     Err(TransactionError::InvalidResponse {
-                        reason: format!("invalid status code: {}", status_code),
+                        reason: format!("invalid status code: {status_code}"),
                     })
                 }
             }
@@ -174,32 +174,29 @@ impl ServerInviteTransaction {
         match self.state {
             ServerInviteState::Completed => {
                 // Check Timer H first (ACK wait timeout)
-                if let Some(deadline) = self.timer_h_deadline {
-                    if now >= deadline {
+                if let Some(deadline) = self.timer_h_deadline
+                    && now >= deadline {
                         self.state = ServerInviteState::Terminated;
                         return Some(TimerType::TimerH);
                     }
-                }
 
                 // Check Timer G (response retransmit)
-                if let Some(deadline) = self.timer_g_deadline {
-                    if now >= deadline {
+                if let Some(deadline) = self.timer_g_deadline
+                    && now >= deadline {
                         self.retransmit_count += 1;
                         self.timer_g_value =
                             next_retransmit_interval(self.timer_g_value, self.timer_config.t2);
                         self.timer_g_deadline = Some(now + self.timer_g_value);
                         return Some(TimerType::TimerG);
                     }
-                }
             }
             ServerInviteState::Confirmed => {
                 // Check Timer I
-                if let Some(deadline) = self.timer_i_deadline {
-                    if now >= deadline {
+                if let Some(deadline) = self.timer_i_deadline
+                    && now >= deadline {
                         self.state = ServerInviteState::Terminated;
                         return Some(TimerType::TimerI);
                     }
-                }
             }
             _ => {}
         }
@@ -327,7 +324,7 @@ impl ServerNonInviteTransaction {
                     Ok(())
                 } else {
                     Err(TransactionError::InvalidResponse {
-                        reason: format!("invalid status code: {}", status_code),
+                        reason: format!("invalid status code: {status_code}"),
                     })
                 }
             }
@@ -339,7 +336,7 @@ impl ServerNonInviteTransaction {
                     Ok(())
                 } else {
                     Err(TransactionError::InvalidResponse {
-                        reason: format!("invalid status code: {}", status_code),
+                        reason: format!("invalid status code: {status_code}"),
                     })
                 }
             }
@@ -368,14 +365,12 @@ impl ServerNonInviteTransaction {
 
     /// Processes timer expirations.
     pub fn check_timers(&mut self) -> Option<TimerType> {
-        if self.state == ServerNonInviteState::Completed {
-            if let Some(deadline) = self.timer_j_deadline {
-                if Instant::now() >= deadline {
+        if self.state == ServerNonInviteState::Completed
+            && let Some(deadline) = self.timer_j_deadline
+                && Instant::now() >= deadline {
                     self.state = ServerNonInviteState::Terminated;
                     return Some(TimerType::TimerJ);
                 }
-            }
-        }
         None
     }
 

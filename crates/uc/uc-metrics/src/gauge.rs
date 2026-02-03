@@ -123,8 +123,7 @@ impl Gauge {
         let key: Vec<String> = labels.iter().map(|s| (*s).to_string()).collect();
         self.values
             .get(&key)
-            .map(|v| v.load(Ordering::Relaxed))
-            .unwrap_or(0)
+            .map_or(0, |v| v.load(Ordering::Relaxed))
     }
 
     /// Exports in Prometheus format.

@@ -180,7 +180,7 @@ impl AuthChallenge {
         let mut value = format!("Digest realm=\"{}\", nonce=\"{}\"", self.realm, self.nonce);
 
         if let Some(ref opaque) = self.opaque {
-            value.push_str(&format!(", opaque=\"{}\"", opaque));
+            value.push_str(&format!(", opaque=\"{opaque}\""));
         }
 
         if self.algorithm != AuthAlgorithm::Md5 {
@@ -289,8 +289,8 @@ impl AuthCredentials {
             uri: params.get("uri")?.clone(),
             response: params.get("response")?.clone(),
             algorithm: match params.get("algorithm").map(String::as_str) {
-                Some("SHA-256") | Some("sha-256") => AuthAlgorithm::Sha256,
-                Some("SHA-512-256") | Some("sha-512-256") => AuthAlgorithm::Sha512_256,
+                Some("SHA-256" | "sha-256") => AuthAlgorithm::Sha256,
+                Some("SHA-512-256" | "sha-512-256") => AuthAlgorithm::Sha512_256,
                 _ => AuthAlgorithm::Md5,
             },
             cnonce: params.get("cnonce").cloned(),
@@ -460,11 +460,10 @@ impl Authenticator {
         }
 
         // Check username binding if specified
-        if let (Some(bound_user), Some(provided_user)) = (&state.username, username) {
-            if bound_user != provided_user {
+        if let (Some(bound_user), Some(provided_user)) = (&state.username, username)
+            && bound_user != provided_user {
                 return NonceValidation::UsernameMismatch;
             }
-        }
 
         // Validate nonce count if qop is used
         if let Some(nc_value) = nc {
@@ -480,11 +479,10 @@ impl Authenticator {
         }
 
         // Bind to user on first use
-        if state.username.is_none() {
-            if let Some(user) = username {
+        if state.username.is_none()
+            && let Some(user) = username {
                 state.bind_to_user(user);
             }
-        }
 
         NonceValidation::Valid
     }
@@ -609,7 +607,7 @@ fn generate_random_nonce() -> String {
     // In production, use a proper CSPRNG
     let random_part: u64 = {
         // Simple PRNG based on timestamp and memory address
-        let addr = &timestamp as *const _ as u64;
+        let addr = &raw const timestamp as u64;
         timestamp as u64 ^ addr.wrapping_mul(0x517cc1b727220a95)
     };
 
@@ -638,44 +636,36 @@ fn compute_digest_response(
     entity_body: Option<&[u8]>,
 ) -> String {
     // Compute HA1 = H(username:realm:password)
-    let a1 = format!("{}:{}:{}", username, realm, password);
+    let a1 = format!("{username}:{realm}:{password}");
     let ha1 = hash_string(&a1, algorithm);
 
     // Compute HA2 = H(method:uri) or H(method:uri:H(entity-body)) for auth-int
-    let ha2 = match qop {
-        Some(AuthQop::AuthInt) => {
-            let body_hash = entity_body
-                .map(|b| hash_bytes(b, algorithm))
-                .unwrap_or_else(|| hash_bytes(b"", algorithm));
-            let a2 = format!("{}:{}:{}", method, uri, body_hash);
-            hash_string(&a2, algorithm)
-        }
-        _ => {
-            let a2 = format!("{}:{}", method, uri);
-            hash_string(&a2, algorithm)
-        }
+    let ha2 = if qop == Some(AuthQop::AuthInt) {
+        let body_hash = entity_body.map_or_else(|| hash_bytes(b"", algorithm), |b| hash_bytes(b, algorithm));
+        let a2 = format!("{method}:{uri}:{body_hash}");
+        hash_string(&a2, algorithm)
+    } else {
+        let a2 = format!("{method}:{uri}");
+        hash_string(&a2, algorithm)
     };
 
     // Compute response
-    match (qop, nc, cnonce) {
-        (Some(qop_val), Some(nc_val), Some(cnonce_val)) => {
-            // With qop: response = H(HA1:nonce:nc:cnonce:qop:HA2)
-            let data = format!(
-                "{}:{}:{:08x}:{}:{}:{}",
-                ha1,
-                nonce,
-                nc_val,
-                cnonce_val,
-                qop_val.as_str(),
-                ha2
-            );
-            hash_string(&data, algorithm)
-        }
-        _ => {
-            // Without qop: response = H(HA1:nonce:HA2)
-            let data = format!("{}:{}:{}", ha1, nonce, ha2);
-            hash_string(&data, algorithm)
-        }
+    if let (Some(qop_val), Some(nc_val), Some(cnonce_val)) = (qop, nc, cnonce) {
+        // With qop: response = H(HA1:nonce:nc:cnonce:qop:HA2)
+        let data = format!(
+            "{}:{}:{:08x}:{}:{}:{}",
+            ha1,
+            nonce,
+            nc_val,
+            cnonce_val,
+            qop_val.as_str(),
+            ha2
+        );
+        hash_string(&data, algorithm)
+    } else {
+        // Without qop: response = H(HA1:nonce:HA2)
+        let data = format!("{ha1}:{nonce}:{ha2}");
+        hash_string(&data, algorithm)
     }
 }
 

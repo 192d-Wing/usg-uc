@@ -40,13 +40,13 @@ pub enum CdrError {
 impl fmt::Display for CdrError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::WriteError { message } => write!(f, "Write error: {}", message),
-            Self::FormatError { message } => write!(f, "Format error: {}", message),
+            Self::WriteError { message } => write!(f, "Write error: {message}"),
+            Self::FormatError { message } => write!(f, "Format error: {message}"),
             Self::InvalidField { field, reason } => {
-                write!(f, "Invalid field '{}': {}", field, reason)
+                write!(f, "Invalid field '{field}': {reason}")
             }
-            Self::BufferFull { size } => write!(f, "Buffer full: {} records", size),
-            Self::IoError { message } => write!(f, "IO error: {}", message),
+            Self::BufferFull { size } => write!(f, "Buffer full: {size} records"),
+            Self::IoError { message } => write!(f, "IO error: {message}"),
         }
     }
 }

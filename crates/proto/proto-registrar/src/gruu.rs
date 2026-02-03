@@ -205,18 +205,16 @@ impl GruuService {
     /// Returns the associated (AOR, instance-id) if found.
     pub fn lookup_gruu(&self, gruu: &str) -> Option<(&str, &str)> {
         // Try public GRUU first
-        if let Some(entry) = self.pub_gruu_map.get(gruu) {
-            if !entry.is_expired() {
+        if let Some(entry) = self.pub_gruu_map.get(gruu)
+            && !entry.is_expired() {
                 return Some((entry.aor(), entry.instance_id()));
             }
-        }
 
         // Try temporary GRUU
-        if let Some(entry) = self.temp_gruu_map.get(gruu) {
-            if !entry.is_expired() {
+        if let Some(entry) = self.temp_gruu_map.get(gruu)
+            && !entry.is_expired() {
                 return Some((entry.aor(), entry.instance_id()));
             }
-        }
 
         None
     }
@@ -316,7 +314,7 @@ impl GruuService {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
 
-        let random_part = simple_hash(&format!("{}{}", instance_id, timestamp));
+        let random_part = simple_hash(&format!("{instance_id}{timestamp}"));
 
         format!("sip:{}@{};gr", random_part, self.domain)
     }
@@ -338,7 +336,7 @@ fn simple_hash(input: &str) -> String {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x01000193);
     }
-    format!("{:016x}", hash)
+    format!("{hash:016x}")
 }
 
 /// Parses the "gr" parameter from a GRUU URI.
@@ -822,7 +820,7 @@ mod tests {
                 assert_eq!(aor, "sip:alice@example.com");
                 assert_eq!(instance_id, "<urn:uuid:test-instance>");
             }
-            _ => panic!("Expected Resolved, got {:?}", result),
+            _ => panic!("Expected Resolved, got {result:?}"),
         }
     }
 
@@ -866,7 +864,7 @@ mod tests {
                 assert_eq!(path[0], "<sip:edge.example.com;lr>");
                 assert_eq!(path[1], "<sip:proxy.example.com;lr>");
             }
-            _ => panic!("Expected Resolved, got {:?}", result),
+            _ => panic!("Expected Resolved, got {result:?}"),
         }
     }
 
@@ -926,7 +924,7 @@ mod tests {
             GruuRoutingResult::Resolved { contact_uri, .. } => {
                 assert_eq!(contact_uri, "sip:alice@192.168.1.200:5060");
             }
-            _ => panic!("Expected Resolved, got {:?}", result),
+            _ => panic!("Expected Resolved, got {result:?}"),
         }
     }
 
@@ -966,7 +964,7 @@ mod tests {
                 assert_eq!(aor, "sip:alice@example.com");
                 assert_eq!(instance_id, "<urn:uuid:test-instance>");
             }
-            _ => panic!("Expected RegistrationExpired, got {:?}", result),
+            _ => panic!("Expected RegistrationExpired, got {result:?}"),
         }
     }
 
@@ -1004,7 +1002,7 @@ mod tests {
             GruuRoutingResult::Resolved { contact_uri, .. } => {
                 assert_eq!(contact_uri, "sip:alice@192.168.1.100:5060");
             }
-            _ => panic!("Expected Resolved, got {:?}", result),
+            _ => panic!("Expected Resolved, got {result:?}"),
         }
     }
 

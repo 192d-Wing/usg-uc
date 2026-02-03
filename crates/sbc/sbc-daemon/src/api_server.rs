@@ -128,7 +128,7 @@ impl AppState {
     /// Sets the ready state.
     pub fn set_ready(&self, ready: bool) {
         self.ready
-            .store(if ready { 1 } else { 0 }, Ordering::Relaxed);
+            .store(u64::from(ready), Ordering::Relaxed);
     }
 
     /// Performs a health check.
@@ -294,7 +294,7 @@ impl ApiServer {
                         }
                     }
                 }
-                _ = shutdown.wait_for_shutdown() => {
+                () = shutdown.wait_for_shutdown() => {
                     info!("API server (HTTPS) shutting down");
                     break;
                 }
@@ -313,7 +313,7 @@ impl ApiServer {
             })?;
         let mut cert_reader = BufReader::new(cert_file);
         let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
-            .filter_map(|r| r.ok())
+            .filter_map(std::result::Result::ok)
             .collect();
 
         if certs.is_empty() {

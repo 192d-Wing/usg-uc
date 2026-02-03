@@ -592,11 +592,10 @@ fn parse_auth_params(s: &str) -> SipResult<HashMap<String, String>> {
     debug_assert_eq!(i, chars.len(), "parse loop should consume all chars");
 
     // Handle last parameter
-    if !current.is_empty() {
-        if let Some((name, value)) = parse_single_param(&current) {
+    if !current.is_empty()
+        && let Some((name, value)) = parse_single_param(&current) {
             params.insert(name, value);
         }
-    }
 
     Ok(params)
 }
@@ -1011,7 +1010,7 @@ mod tests {
             // Uses FNV-1a like algorithm to ensure different inputs produce different outputs
             let mut hash: u64 = 0xcbf29ce484222325;
             for byte in input {
-                hash ^= *byte as u64;
+                hash ^= u64::from(*byte);
                 hash = hash.wrapping_mul(0x100000001b3);
             }
             // Use all 128 bits (two 64-bit values) to match MD5 output length

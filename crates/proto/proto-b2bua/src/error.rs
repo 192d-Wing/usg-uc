@@ -66,34 +66,34 @@ impl fmt::Display for B2buaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidStateTransition { from, to } => {
-                write!(f, "Invalid state transition from {} to {}", from, to)
+                write!(f, "Invalid state transition from {from} to {to}")
             }
             Self::CallNotFound { call_id } => {
-                write!(f, "Call not found: {}", call_id)
+                write!(f, "Call not found: {call_id}")
             }
             Self::LegNotFound { leg_id } => {
-                write!(f, "Leg not found: {}", leg_id)
+                write!(f, "Leg not found: {leg_id}")
             }
             Self::InvalidLegOperation { reason } => {
-                write!(f, "Invalid leg operation: {}", reason)
+                write!(f, "Invalid leg operation: {reason}")
             }
             Self::CallAlreadyExists { call_id } => {
-                write!(f, "Call already exists: {}", call_id)
+                write!(f, "Call already exists: {call_id}")
             }
             Self::MaxCallsExceeded { max } => {
-                write!(f, "Maximum calls exceeded: {}", max)
+                write!(f, "Maximum calls exceeded: {max}")
             }
             Self::DialogError { message } => {
-                write!(f, "Dialog error: {}", message)
+                write!(f, "Dialog error: {message}")
             }
             Self::MediaError { message } => {
-                write!(f, "Media error: {}", message)
+                write!(f, "Media error: {message}")
             }
             Self::CodecNegotiationFailed { reason } => {
-                write!(f, "Codec negotiation failed: {}", reason)
+                write!(f, "Codec negotiation failed: {reason}")
             }
             Self::Timeout { operation } => {
-                write!(f, "Timeout: {}", operation)
+                write!(f, "Timeout: {operation}")
             }
         }
     }

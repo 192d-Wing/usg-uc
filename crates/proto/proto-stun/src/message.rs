@@ -237,7 +237,7 @@ impl StunMessage {
         }
 
         // Length must be multiple of 4
-        if length % 4 != 0 {
+        if !length.is_multiple_of(4) {
             return Err(StunError::InvalidMessage {
                 reason: "message length not multiple of 4".to_string(),
             });

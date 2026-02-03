@@ -221,13 +221,13 @@ impl TlsTransport {
         server_name: &str,
         config: Arc<ClientConfig>,
     ) -> TransportResult<Self> {
-        let dest_addr: SocketAddr = dest.clone().into();
+        let dest_addr: SocketAddr = dest.into();
 
         let tcp_stream =
             TcpStream::connect(dest_addr)
                 .await
                 .map_err(|e| TransportError::ConnectFailed {
-                    address: dest.clone(),
+                    address: dest,
                     reason: e.to_string(),
                 })?;
 
@@ -283,7 +283,7 @@ impl Transport for TlsTransport {
                 .write_all(data)
                 .await
                 .map_err(|e| TransportError::SendFailed {
-                    address: self.peer_addr.clone(),
+                    address: self.peer_addr,
                     reason: e.to_string(),
                 })?;
 
@@ -291,7 +291,7 @@ impl Transport for TlsTransport {
                 .flush()
                 .await
                 .map_err(|e| TransportError::SendFailed {
-                    address: self.peer_addr.clone(),
+                    address: self.peer_addr,
                     reason: e.to_string(),
                 })?;
 
@@ -329,7 +329,7 @@ impl Transport for TlsTransport {
 
             Ok(ReceivedMessage {
                 data,
-                source: self.peer_addr.clone(),
+                source: self.peer_addr,
                 transport: TransportType::Tls,
             })
         })
@@ -409,7 +409,7 @@ impl TlsListener {
     ) -> TransportResult<Self> {
         config.validate()?;
 
-        let socket_addr: SocketAddr = config.bind_address.clone().into();
+        let socket_addr: SocketAddr = config.bind_address.into();
         let domain = if socket_addr.is_ipv6() {
             Domain::IPV6
         } else {
@@ -418,7 +418,7 @@ impl TlsListener {
 
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(|e| {
             TransportError::BindFailed {
-                address: config.bind_address.clone(),
+                address: config.bind_address,
                 reason: e.to_string(),
             }
         })?;
@@ -427,7 +427,7 @@ impl TlsListener {
             socket
                 .set_reuse_address(true)
                 .map_err(|e| TransportError::BindFailed {
-                    address: config.bind_address.clone(),
+                    address: config.bind_address,
                     reason: format!("failed to set SO_REUSEADDR: {e}"),
                 })?;
         }
@@ -437,7 +437,7 @@ impl TlsListener {
             socket
                 .set_reuse_port(true)
                 .map_err(|e| TransportError::BindFailed {
-                    address: config.bind_address.clone(),
+                    address: config.bind_address,
                     reason: format!("failed to set SO_REUSEPORT: {e}"),
                 })?;
         }
@@ -446,7 +446,7 @@ impl TlsListener {
             socket
                 .set_only_v6(false)
                 .map_err(|e| TransportError::BindFailed {
-                    address: config.bind_address.clone(),
+                    address: config.bind_address,
                     reason: format!("failed to set IPV6_V6ONLY: {e}"),
                 })?;
         }
@@ -454,35 +454,35 @@ impl TlsListener {
         socket
             .set_nonblocking(true)
             .map_err(|e| TransportError::BindFailed {
-                address: config.bind_address.clone(),
+                address: config.bind_address,
                 reason: format!("failed to set non-blocking: {e}"),
             })?;
 
         socket
             .bind(&socket_addr.into())
             .map_err(|e| TransportError::BindFailed {
-                address: config.bind_address.clone(),
+                address: config.bind_address,
                 reason: e.to_string(),
             })?;
 
         socket
             .listen(config.backlog as i32)
             .map_err(|e| TransportError::BindFailed {
-                address: config.bind_address.clone(),
+                address: config.bind_address,
                 reason: format!("failed to listen: {e}"),
             })?;
 
         let std_listener: std::net::TcpListener = socket.into();
         let tokio_listener =
             TokioTcpListener::from_std(std_listener).map_err(|e| TransportError::BindFailed {
-                address: config.bind_address.clone(),
+                address: config.bind_address,
                 reason: e.to_string(),
             })?;
 
         let local_addr = tokio_listener
             .local_addr()
             .map_err(|e| TransportError::BindFailed {
-                address: config.bind_address.clone(),
+                address: config.bind_address,
                 reason: format!("failed to get local address: {e}"),
             })?;
 

@@ -141,11 +141,11 @@ pub enum RecordingTrigger {
     /// Record outbound calls only.
     OutboundOnly,
     /// Multiple conditions (any must match).
-    Any(Vec<RecordingTrigger>),
+    Any(Vec<Self>),
     /// Multiple conditions (all must match).
-    All(Vec<RecordingTrigger>),
+    All(Vec<Self>),
     /// Negation of a condition.
-    Not(Box<RecordingTrigger>),
+    Not(Box<Self>),
 }
 
 impl RecordingTrigger {
@@ -181,19 +181,19 @@ impl RecordingTrigger {
 
     /// Creates an ANY trigger combining multiple triggers.
     #[must_use]
-    pub fn any(triggers: Vec<RecordingTrigger>) -> Self {
+    pub fn any(triggers: Vec<Self>) -> Self {
         Self::Any(triggers)
     }
 
     /// Creates an ALL trigger requiring all conditions.
     #[must_use]
-    pub fn all(triggers: Vec<RecordingTrigger>) -> Self {
+    pub fn all(triggers: Vec<Self>) -> Self {
         Self::All(triggers)
     }
 
     /// Creates a NOT trigger.
     #[must_use]
-    pub fn not(trigger: RecordingTrigger) -> Self {
+    pub fn not(trigger: Self) -> Self {
         Self::Not(Box::new(trigger))
     }
 }

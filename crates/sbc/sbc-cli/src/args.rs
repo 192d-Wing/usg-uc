@@ -91,7 +91,7 @@ pub enum OutputFormat {
 impl Args {
     /// Parses arguments from the command line.
     pub fn parse() -> Self {
-        let mut args = Args::default();
+        let mut args = Self::default();
         let mut iter = env::args().skip(1).peekable();
 
         // Parse global flags first
@@ -181,7 +181,7 @@ impl Args {
     /// Prints help information.
     pub fn print_help() {
         println!(
-            r#"sbc-cli - USG Session Border Controller CLI
+            r"sbc-cli - USG Session Border Controller CLI
 
 USAGE:
     sbc-cli [OPTIONS] <COMMAND>
@@ -218,7 +218,7 @@ EXAMPLES:
     sbc-cli health
     sbc-cli metrics
 
-For more information, see the documentation at https://github.com/usg/usg-uc-sbc"#
+For more information, see the documentation at https://github.com/usg/usg-uc-sbc"
         );
     }
 }

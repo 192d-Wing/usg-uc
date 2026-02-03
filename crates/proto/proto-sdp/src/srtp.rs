@@ -53,7 +53,7 @@ pub enum CipherSuite {
 impl CipherSuite {
     /// Returns the master key length in bytes for this cipher suite.
     #[must_use]
-    pub fn master_key_length(&self) -> usize {
+    pub const fn master_key_length(&self) -> usize {
         match self {
             Self::AesCm128HmacSha1_80 | Self::AesCm128HmacSha1_32 | Self::F8128HmacSha1_80 => 16,
             Self::AeadAes128Gcm => 16,
@@ -63,7 +63,7 @@ impl CipherSuite {
 
     /// Returns the master salt length in bytes for this cipher suite.
     #[must_use]
-    pub fn master_salt_length(&self) -> usize {
+    pub const fn master_salt_length(&self) -> usize {
         match self {
             Self::AesCm128HmacSha1_80
             | Self::AesCm128HmacSha1_32
@@ -81,7 +81,7 @@ impl CipherSuite {
 
     /// Returns the authentication tag length in bits.
     #[must_use]
-    pub fn auth_tag_bits(&self) -> usize {
+    pub const fn auth_tag_bits(&self) -> usize {
         match self {
             Self::AesCm128HmacSha1_80 | Self::F8128HmacSha1_80 => 80,
             Self::AesCm128HmacSha1_32 => 32,
@@ -91,7 +91,7 @@ impl CipherSuite {
 
     /// Returns true if this is an AEAD cipher suite.
     #[must_use]
-    pub fn is_aead(&self) -> bool {
+    pub const fn is_aead(&self) -> bool {
         matches!(self, Self::AeadAes128Gcm | Self::AeadAes256Gcm)
     }
 }
@@ -146,7 +146,7 @@ impl KeyParams {
     ///
     /// The keying material should be the concatenation of master key and master salt.
     #[must_use]
-    pub fn new(key_material: Vec<u8>) -> Self {
+    pub const fn new(key_material: Vec<u8>) -> Self {
         Self {
             key_material,
             lifetime: None,
@@ -168,14 +168,14 @@ impl KeyParams {
 
     /// Sets the key lifetime.
     #[must_use]
-    pub fn with_lifetime(mut self, lifetime: u64) -> Self {
+    pub const fn with_lifetime(mut self, lifetime: u64) -> Self {
         self.lifetime = Some(lifetime);
         self
     }
 
     /// Sets the MKI (Master Key Identifier).
     #[must_use]
-    pub fn with_mki(mut self, value: u32, length: u8) -> Self {
+    pub const fn with_mki(mut self, value: u32, length: u8) -> Self {
         self.mki_value = Some(value);
         self.mki_length = Some(length);
         self
@@ -217,19 +217,19 @@ impl KeyParams {
 
     /// Returns the key lifetime in packets.
     #[must_use]
-    pub fn lifetime(&self) -> Option<u64> {
+    pub const fn lifetime(&self) -> Option<u64> {
         self.lifetime
     }
 
     /// Returns the MKI value if present.
     #[must_use]
-    pub fn mki_value(&self) -> Option<u32> {
+    pub const fn mki_value(&self) -> Option<u32> {
         self.mki_value
     }
 
     /// Returns the MKI length in bytes if present.
     #[must_use]
-    pub fn mki_length(&self) -> Option<u8> {
+    pub const fn mki_length(&self) -> Option<u8> {
         self.mki_length
     }
 
@@ -303,9 +303,9 @@ pub struct SessionParams {
 /// FEC ordering relative to SRTP encryption/authentication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FecOrder {
-    /// FEC applied before SRTP (FEC_SRTP).
+    /// FEC applied before SRTP (`FEC_SRTP`).
     FecSrtp,
-    /// SRTP applied before FEC (SRTP_FEC).
+    /// SRTP applied before FEC (`SRTP_FEC`).
     SrtpFec,
 }
 
@@ -374,7 +374,7 @@ impl SessionParams {
 
     /// Returns true if any non-default session parameters are set.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.kdr.is_none()
             && !self.unencrypted_srtp
             && !self.unencrypted_srtcp
@@ -684,15 +684,15 @@ impl SrtpNegotiator {
 }
 
 /// Extracts crypto attributes from SDP media description.
+#[must_use] 
 pub fn extract_crypto_attributes(sdp_lines: &[&str]) -> Vec<CryptoAttribute> {
     let mut cryptos = Vec::new();
 
     for line in sdp_lines {
-        if let Some(crypto_value) = line.strip_prefix("a=crypto:") {
-            if let Ok(crypto) = CryptoAttribute::parse(crypto_value) {
+        if let Some(crypto_value) = line.strip_prefix("a=crypto:")
+            && let Ok(crypto) = CryptoAttribute::parse(crypto_value) {
                 cryptos.push(crypto);
             }
-        }
     }
 
     cryptos

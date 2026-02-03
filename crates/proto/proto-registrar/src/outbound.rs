@@ -169,7 +169,7 @@ impl FlowToken {
         flow_id.hash(&mut hasher);
         let hash = hasher.finish();
 
-        Self(format!("f-{:016x}", hash))
+        Self(format!("f-{hash:016x}"))
     }
 
     /// Creates a flow token from a string.
@@ -320,7 +320,7 @@ impl Flow {
         if elapsed >= self.keepalive_interval {
             Duration::ZERO
         } else {
-            self.keepalive_interval - elapsed
+            self.keepalive_interval.checked_sub(elapsed).unwrap()
         }
     }
 
@@ -358,8 +358,7 @@ impl Flow {
         }
 
         self.last_probe
-            .map(|t| t.elapsed() >= timeout)
-            .unwrap_or(false)
+            .is_some_and(|t| t.elapsed() >= timeout)
     }
 
     /// Returns true if the flow has failed.
@@ -483,7 +482,7 @@ impl OutboundFlowManager {
     /// Called when a registration is received to track the flow.
     pub fn add_flow(&mut self, flow_id: FlowId) -> &Flow {
         let token = FlowToken::from_flow_id(&flow_id);
-        self.token_index.insert(token.clone(), flow_id.clone());
+        self.token_index.insert(token, flow_id.clone());
 
         self.flows.entry(flow_id.clone()).or_insert_with(|| {
             let mut flow = Flow::new(flow_id);
@@ -500,7 +499,7 @@ impl OutboundFlowManager {
         reg_id: u32,
     ) -> &Flow {
         let token = FlowToken::from_flow_id(&flow_id);
-        self.token_index.insert(token.clone(), flow_id.clone());
+        self.token_index.insert(token, flow_id.clone());
 
         self.flows.entry(flow_id.clone()).or_insert_with(|| {
             let mut flow = Flow::new(flow_id);
@@ -651,15 +650,14 @@ impl OutboundFlowManager {
                 if f.state == FlowState::Probing {
                     // Waiting for probe response
                     f.last_probe
-                        .map(|t| {
+                        .map_or(Duration::ZERO, |t| {
                             let elapsed = t.elapsed();
                             if elapsed >= self.keepalive_timeout {
                                 Duration::ZERO
                             } else {
-                                self.keepalive_timeout - elapsed
+                                self.keepalive_timeout.checked_sub(elapsed).unwrap()
                             }
                         })
-                        .unwrap_or(Duration::ZERO)
                 } else {
                     f.time_until_keepalive()
                 }

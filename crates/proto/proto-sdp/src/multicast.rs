@@ -7,7 +7,7 @@
 //! Multicast streams differ from unicast in several key ways:
 //!
 //! 1. **Multicast Addresses**: Connection addresses in the 224.0.0.0/4 (IPv4)
-//!    or ff00::/8 (IPv6) ranges indicate multicast sessions.
+//!    or `ff00::/8` (IPv6) ranges indicate multicast sessions.
 //!
 //! 2. **TTL Specification**: Multicast addresses may include TTL values
 //!    in the format "address/ttl" (e.g., "224.2.1.1/127").
@@ -95,7 +95,7 @@ impl MulticastAddress {
     ///
     /// # Arguments
     ///
-    /// * `address` - IPv6 multicast address (ff00::/8)
+    /// * `address` - IPv6 multicast address (`ff00::/8`)
     ///
     /// # Errors
     ///
@@ -218,19 +218,19 @@ impl MulticastAddress {
 
     /// Returns the TTL (IPv4 only).
     #[must_use]
-    pub fn ttl(&self) -> Option<u8> {
+    pub const fn ttl(&self) -> Option<u8> {
         self.ttl
     }
 
     /// Returns the number of addresses.
     #[must_use]
-    pub fn num_addresses(&self) -> u16 {
+    pub const fn num_addresses(&self) -> u16 {
         self.num_addresses
     }
 
     /// Returns true if this is an IPv6 multicast address.
     #[must_use]
-    pub fn is_ipv6(&self) -> bool {
+    pub const fn is_ipv6(&self) -> bool {
         self.is_ipv6
     }
 
@@ -253,7 +253,7 @@ impl MulticastAddress {
         }
     }
 
-    /// Creates ConnectionData from this multicast address.
+    /// Creates `ConnectionData` from this multicast address.
     #[must_use]
     pub fn to_connection_data(&self) -> ConnectionData {
         ConnectionData {
@@ -272,7 +272,8 @@ impl MulticastAddress {
 ///
 /// Per RFC 4566, multicast addresses are:
 /// - IPv4: 224.0.0.0/4 (224.0.0.0 - 239.255.255.255)
-/// - IPv6: ff00::/8
+/// - IPv6: `ff00::/8`
+#[must_use] 
 pub fn is_multicast_address(connection: &ConnectionData) -> bool {
     // Extract the base address (before any /)
     let addr_part = connection
@@ -285,16 +286,16 @@ pub fn is_multicast_address(connection: &ConnectionData) -> bool {
         if let Ok(addr) = Ipv4Addr::from_str(addr_part) {
             return addr.is_multicast();
         }
-    } else if connection.addr_type == "IP6" {
-        if let Ok(addr) = Ipv6Addr::from_str(addr_part) {
+    } else if connection.addr_type == "IP6"
+        && let Ok(addr) = Ipv6Addr::from_str(addr_part) {
             return addr.is_multicast();
         }
-    }
 
     false
 }
 
 /// Checks if a media description uses multicast.
+#[must_use] 
 pub fn is_multicast_media(
     media: &MediaDescription,
     session_connection: Option<&ConnectionData>,
@@ -341,11 +342,13 @@ impl Default for MulticastNegotiator {
 
 impl MulticastNegotiator {
     /// Creates a new multicast negotiator.
+    #[must_use] 
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Sets the local multicast address for sending.
+    #[must_use] 
     pub fn with_send_address(mut self, address: MulticastAddress) -> Self {
         self.local_address = Some(address);
         self.can_send = true;
@@ -353,13 +356,15 @@ impl MulticastNegotiator {
     }
 
     /// Sets whether we can receive multicast.
-    pub fn with_receive(mut self, can_receive: bool) -> Self {
+    #[must_use] 
+    pub const fn with_receive(mut self, can_receive: bool) -> Self {
         self.can_receive = can_receive;
         self
     }
 
     /// Sets the preferred TTL.
-    pub fn with_ttl(mut self, ttl: u8) -> Self {
+    #[must_use] 
+    pub const fn with_ttl(mut self, ttl: u8) -> Self {
         self.preferred_ttl = ttl;
         self
     }
@@ -419,7 +424,7 @@ impl MulticastNegotiator {
     /// - sendonly: Only send to multicast group
     /// - recvonly: Only receive from multicast group
     /// - inactive: Do not participate
-    fn compute_answer_direction(&self, offer_direction: Direction) -> (bool, Direction) {
+    const fn compute_answer_direction(&self, offer_direction: Direction) -> (bool, Direction) {
         match offer_direction {
             Direction::Sendrecv => {
                 // Offer wants both directions in multicast group
@@ -509,22 +514,22 @@ pub struct MulticastValidation {
 /// Per RFC 2365 (Administratively Scoped IP Multicast).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MulticastScope {
-    /// Node-local (TTL=0 or ff01::/16).
+    /// Node-local (TTL=0 or `ff01::/16`).
     NodeLocal,
-    /// Link-local (TTL=1 or ff02::/16).
+    /// Link-local (TTL=1 or `ff02::/16`).
     LinkLocal,
-    /// Site-local (TTL=32 or less, or ff05::/16).
+    /// Site-local (TTL=32 or less, or `ff05::/16`).
     SiteLocal,
-    /// Organization-local (TTL=64 or less, or ff08::/16).
+    /// Organization-local (TTL=64 or less, or `ff08::/16`).
     OrganizationLocal,
-    /// Global (TTL>64 or ff0e::/16).
+    /// Global (TTL>64 or `ff0e::/16`).
     Global,
 }
 
 impl MulticastScope {
     /// Determines scope from TTL value (IPv4).
     #[must_use]
-    pub fn from_ttl(ttl: u8) -> Self {
+    pub const fn from_ttl(ttl: u8) -> Self {
         match ttl {
             0 => Self::NodeLocal,
             1 => Self::LinkLocal,
@@ -536,7 +541,7 @@ impl MulticastScope {
 
     /// Determines scope from IPv6 multicast address.
     #[must_use]
-    pub fn from_ipv6(addr: &Ipv6Addr) -> Option<Self> {
+    pub const fn from_ipv6(addr: &Ipv6Addr) -> Option<Self> {
         if !addr.is_multicast() {
             return None;
         }
@@ -557,7 +562,7 @@ impl MulticastScope {
 
     /// Returns the recommended TTL for this scope.
     #[must_use]
-    pub fn recommended_ttl(&self) -> u8 {
+    pub const fn recommended_ttl(&self) -> u8 {
         match self {
             Self::NodeLocal => 0,
             Self::LinkLocal => 1,

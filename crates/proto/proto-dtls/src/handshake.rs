@@ -4,7 +4,7 @@
 //!
 //! ## Supported Cipher Suite
 //!
-//! TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 (0xC02C)
+//! `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` (0xC02C)
 //! - ECDHE with P-384 for key exchange
 //! - ECDSA with P-384 for authentication
 //! - AES-256-GCM for encryption
@@ -29,7 +29,7 @@ use uc_crypto::aead::Aes256GcmKey;
 use uc_crypto::ecdh::P384EphemeralKeyPair;
 use uc_crypto::hkdf;
 
-/// TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 cipher suite ID.
+/// `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` cipher suite ID.
 pub const TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384: u16 = 0xC02C;
 
 /// DTLS handshake message types.
@@ -63,16 +63,16 @@ impl TryFrom<u8> for HandshakeType {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            1 => Ok(HandshakeType::ClientHello),
-            2 => Ok(HandshakeType::ServerHello),
-            3 => Ok(HandshakeType::HelloVerifyRequest),
-            11 => Ok(HandshakeType::Certificate),
-            12 => Ok(HandshakeType::ServerKeyExchange),
-            13 => Ok(HandshakeType::CertificateRequest),
-            14 => Ok(HandshakeType::ServerHelloDone),
-            15 => Ok(HandshakeType::CertificateVerify),
-            16 => Ok(HandshakeType::ClientKeyExchange),
-            20 => Ok(HandshakeType::Finished),
+            1 => Ok(Self::ClientHello),
+            2 => Ok(Self::ServerHello),
+            3 => Ok(Self::HelloVerifyRequest),
+            11 => Ok(Self::Certificate),
+            12 => Ok(Self::ServerKeyExchange),
+            13 => Ok(Self::CertificateRequest),
+            14 => Ok(Self::ServerHelloDone),
+            15 => Ok(Self::CertificateVerify),
+            16 => Ok(Self::ClientKeyExchange),
+            20 => Ok(Self::Finished),
             _ => Err(DtlsError::HandshakeFailed {
                 reason: format!("unknown handshake type: {value}"),
             }),
@@ -85,23 +85,23 @@ impl TryFrom<u8> for HandshakeType {
 pub enum HandshakeState {
     /// Initial state.
     Start,
-    /// Waiting for ClientHello.
+    /// Waiting for `ClientHello`.
     WaitClientHello,
-    /// Waiting for HelloVerifyRequest.
+    /// Waiting for `HelloVerifyRequest`.
     WaitHelloVerifyRequest,
-    /// Waiting for ServerHello.
+    /// Waiting for `ServerHello`.
     WaitServerHello,
     /// Waiting for Certificate.
     WaitCertificate,
-    /// Waiting for ServerKeyExchange.
+    /// Waiting for `ServerKeyExchange`.
     WaitServerKeyExchange,
-    /// Waiting for ServerHelloDone.
+    /// Waiting for `ServerHelloDone`.
     WaitServerHelloDone,
-    /// Waiting for ClientKeyExchange.
+    /// Waiting for `ClientKeyExchange`.
     WaitClientKeyExchange,
-    /// Waiting for CertificateVerify.
+    /// Waiting for `CertificateVerify`.
     WaitCertificateVerify,
-    /// Waiting for ChangeCipherSpec.
+    /// Waiting for `ChangeCipherSpec`.
     WaitChangeCipherSpec,
     /// Waiting for Finished.
     WaitFinished,
@@ -154,6 +154,7 @@ impl HandshakeHeader {
     }
 
     /// Serializes the header.
+    #[must_use] 
     pub fn serialize(&self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
         buf[0] = self.msg_type as u8;
@@ -198,13 +199,13 @@ pub struct Handshake {
     local_private_key: Vec<u8>,
     /// Handshake hash (for Finished message).
     handshake_hash: Vec<u8>,
-    /// Cookie from HelloVerifyRequest.
+    /// Cookie from `HelloVerifyRequest`.
     cookie: Vec<u8>,
     /// Peer certificate chain (received during handshake).
     peer_cert_chain: Vec<Vec<u8>>,
     /// Peer's public key extracted from certificate.
     peer_public_key: Option<Vec<u8>>,
-    /// ServerKeyExchange ECDH params (for signature verification).
+    /// `ServerKeyExchange` ECDH params (for signature verification).
     server_ecdh_params: Option<Vec<u8>>,
     /// Expected certificate fingerprint (for DTLS-SRTP).
     expected_fingerprint: Option<[u8; 48]>,
@@ -269,7 +270,7 @@ impl Handshake {
 
     /// Returns the current state.
     #[must_use]
-    pub fn state(&self) -> HandshakeState {
+    pub const fn state(&self) -> HandshakeState {
         self.state
     }
 
@@ -542,7 +543,7 @@ impl Handshake {
         Ok(())
     }
 
-    /// Builds a ClientHello message.
+    /// Builds a `ClientHello` message.
     fn build_client_hello(&self) -> DtlsResult<Vec<u8>> {
         let mut msg = Vec::new();
 
@@ -574,7 +575,7 @@ impl Handshake {
         Ok(msg)
     }
 
-    /// Processes a HelloVerifyRequest.
+    /// Processes a `HelloVerifyRequest`.
     fn process_hello_verify_request(&mut self, data: &[u8]) -> DtlsResult<()> {
         if data.len() < 3 {
             return Err(DtlsError::HandshakeFailed {
@@ -595,7 +596,7 @@ impl Handshake {
         Ok(())
     }
 
-    /// Processes a ServerHello message.
+    /// Processes a `ServerHello` message.
     fn process_server_hello(&mut self, data: &[u8]) -> DtlsResult<()> {
         if data.len() < 38 {
             return Err(DtlsError::HandshakeFailed {
@@ -630,7 +631,7 @@ impl Handshake {
         Ok(())
     }
 
-    /// Processes a ClientHello message (server side).
+    /// Processes a `ClientHello` message (server side).
     fn process_client_hello(&mut self, data: &[u8]) -> DtlsResult<()> {
         if data.len() < 34 {
             return Err(DtlsError::HandshakeFailed {
@@ -680,7 +681,7 @@ impl Handshake {
         Ok(())
     }
 
-    /// Builds a HelloVerifyRequest message.
+    /// Builds a `HelloVerifyRequest` message.
     fn build_hello_verify_request(&mut self) -> DtlsResult<Vec<u8>> {
         // Generate cookie
         let mut cookie = [0u8; 32];
@@ -697,7 +698,7 @@ impl Handshake {
         Ok(msg)
     }
 
-    /// Builds a ServerHello message.
+    /// Builds a `ServerHello` message.
     fn build_server_hello(&self) -> DtlsResult<Vec<u8>> {
         let mut msg = Vec::new();
 
@@ -743,7 +744,7 @@ impl Handshake {
         Ok(msg)
     }
 
-    /// Builds a ServerKeyExchange message.
+    /// Builds a `ServerKeyExchange` message.
     fn build_server_key_exchange(&mut self) -> DtlsResult<Vec<u8>> {
         // Generate ECDHE key pair
         let ecdhe = P384EphemeralKeyPair::generate().map_err(|e| DtlsError::HandshakeFailed {
@@ -797,7 +798,7 @@ impl Handshake {
         Ok(msg)
     }
 
-    /// Processes a ServerKeyExchange message.
+    /// Processes a `ServerKeyExchange` message.
     fn process_server_key_exchange(&mut self, data: &[u8]) -> DtlsResult<()> {
         if data.len() < 4 {
             return Err(DtlsError::HandshakeFailed {
@@ -948,7 +949,7 @@ impl Handshake {
 
     /// Verifies a received Finished message.
     ///
-    /// Per RFC 6347 §4.2.6, the Finished message contains verify_data computed as:
+    /// Per RFC 6347 §4.2.6, the Finished message contains `verify_data` computed as:
     /// ```text
     /// verify_data = PRF(master_secret, finished_label, Hash(handshake_messages))[0..11]
     /// ```
@@ -974,7 +975,7 @@ impl Handshake {
         Ok(())
     }
 
-    /// Builds a ClientKeyExchange message.
+    /// Builds a `ClientKeyExchange` message.
     fn build_client_key_exchange(&mut self) -> DtlsResult<Vec<u8>> {
         // Generate ECDHE key pair
         let ecdhe = P384EphemeralKeyPair::generate().map_err(|e| DtlsError::HandshakeFailed {
@@ -992,7 +993,7 @@ impl Handshake {
         Ok(msg)
     }
 
-    /// Processes a ClientKeyExchange message.
+    /// Processes a `ClientKeyExchange` message.
     fn process_client_key_exchange(&mut self, data: &[u8]) -> DtlsResult<()> {
         if data.is_empty() {
             return Err(DtlsError::HandshakeFailed {
@@ -1007,7 +1008,7 @@ impl Handshake {
             });
         }
 
-        self.peer_ecdhe_public = Some(data[1..1 + pk_len].to_vec());
+        self.peer_ecdhe_public = Some(data[1..=pk_len].to_vec());
 
         debug!(pk_len = pk_len, "Processed ClientKeyExchange");
         Ok(())
@@ -1178,7 +1179,7 @@ impl Handshake {
         Ok(())
     }
 
-    /// Sends a ChangeCipherSpec message.
+    /// Sends a `ChangeCipherSpec` message.
     async fn send_change_cipher_spec(&mut self, socket: &Arc<UdpSocket>) -> DtlsResult<()> {
         let record = self
             .record_layer
@@ -1218,14 +1219,13 @@ impl Handshake {
                 }
 
                 return Ok((header.msg_type, payload));
-            } else if content_type == ContentType::Alert {
-                if fragment.len() >= 2 {
+            } else if content_type == ContentType::Alert
+                && fragment.len() >= 2 {
                     return Err(DtlsError::AlertReceived {
                         level: fragment[0],
                         description: fragment[1],
                     });
                 }
-            }
             // Ignore other message types
         }
     }

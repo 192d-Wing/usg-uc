@@ -278,7 +278,7 @@ impl Candidate {
         let type_pref = candidate_type.type_preference();
         let local_pref = local_pref.min(65535); // 16 bits max
 
-        (type_pref << 24) | ((local_pref as u32) << 8) | (256 - component as u32)
+        (type_pref << 24) | (local_pref << 8) | (256 - component as u32)
     }
 
     /// Formats as SDP candidate attribute.
@@ -299,7 +299,7 @@ impl Candidate {
         }
 
         for (name, value) in &self.extensions {
-            sdp.push_str(&format!(" {} {}", name, value));
+            sdp.push_str(&format!(" {name} {value}"));
         }
 
         sdp
@@ -370,28 +370,25 @@ impl Candidate {
         // Parse optional fields
         let mut i = 8;
         while i + 1 < parts.len() {
-            match parts[i] {
-                "raddr" => {
-                    if i + 3 < parts.len() && parts[i + 2] == "rport" {
-                        let rip: std::net::IpAddr =
-                            parts[i + 1].parse().map_err(|_| IceError::ParseError {
-                                reason: "invalid raddr".to_string(),
-                            })?;
-                        let rport: u16 =
-                            parts[i + 3].parse().map_err(|_| IceError::ParseError {
-                                reason: "invalid rport".to_string(),
-                            })?;
-                        candidate.related_address = Some(SocketAddr::new(rip, rport));
-                        i += 4;
-                    } else {
-                        i += 2;
-                    }
-                }
-                _ => {
-                    // Extension attribute
-                    candidate.add_extension(parts[i].to_string(), parts[i + 1].to_string());
+            if parts[i] == "raddr" {
+                if i + 3 < parts.len() && parts[i + 2] == "rport" {
+                    let rip: std::net::IpAddr =
+                        parts[i + 1].parse().map_err(|_| IceError::ParseError {
+                            reason: "invalid raddr".to_string(),
+                        })?;
+                    let rport: u16 =
+                        parts[i + 3].parse().map_err(|_| IceError::ParseError {
+                            reason: "invalid rport".to_string(),
+                        })?;
+                    candidate.related_address = Some(SocketAddr::new(rip, rport));
+                    i += 4;
+                } else {
                     i += 2;
                 }
+            } else {
+                // Extension attribute
+                candidate.add_extension(parts[i].to_string(), parts[i + 1].to_string());
+                i += 2;
             }
         }
 

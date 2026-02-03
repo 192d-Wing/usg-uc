@@ -261,13 +261,12 @@ impl CallLeg {
 
     /// Updates the remote CSeq.
     pub fn update_remote_cseq(&mut self, cseq: u32) -> B2buaResult<()> {
-        if let Some(current) = self.remote_cseq {
-            if cseq < current {
+        if let Some(current) = self.remote_cseq
+            && cseq < current {
                 return Err(B2buaError::InvalidLegOperation {
-                    reason: format!("CSeq {} is less than current {}", cseq, current),
+                    reason: format!("CSeq {cseq} is less than current {current}"),
                 });
             }
-        }
         self.remote_cseq = Some(cseq);
         Ok(())
     }
@@ -425,7 +424,7 @@ fn generate_call_id(prefix: &str) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{}-{:x}@b2bua", prefix, timestamp)
+    format!("{prefix}-{timestamp:x}@b2bua")
 }
 
 /// Generates a unique tag.
@@ -435,7 +434,7 @@ fn generate_tag() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{:x}", timestamp)
+    format!("{timestamp:x}")
 }
 
 #[cfg(test)]

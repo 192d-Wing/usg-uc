@@ -5,8 +5,10 @@ use std::time::Duration;
 
 /// Call status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum CallStatus {
     /// Call is in progress.
+    #[default]
     InProgress,
     /// Call completed successfully.
     Completed,
@@ -42,11 +44,6 @@ impl CallStatus {
     }
 }
 
-impl Default for CallStatus {
-    fn default() -> Self {
-        Self::InProgress
-    }
-}
 
 impl std::fmt::Display for CallStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -56,6 +53,7 @@ impl std::fmt::Display for CallStatus {
 
 /// Disconnect cause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum DisconnectCause {
     /// Normal clearing.
     NormalClearing,
@@ -76,6 +74,7 @@ pub enum DisconnectCause {
     /// Timeout.
     Timeout,
     /// Unknown.
+    #[default]
     Unknown,
 }
 
@@ -120,18 +119,13 @@ impl DisconnectCause {
             480 | 408 => Self::NoAnswer,
             603 | 403 | 401 => Self::CallRejected,
             404 => Self::DestinationUnreachable,
-            503 | 502 | 501 => Self::ServiceUnavailable,
+            501..=503 => Self::ServiceUnavailable,
             500 => Self::NetworkError,
             _ => Self::Unknown,
         }
     }
 }
 
-impl Default for DisconnectCause {
-    fn default() -> Self {
-        Self::Unknown
-    }
-}
 
 impl std::fmt::Display for DisconnectCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -141,8 +135,10 @@ impl std::fmt::Display for DisconnectCause {
 
 /// Direction of the call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum CallDirection {
     /// Inbound call.
+    #[default]
     Inbound,
     /// Outbound call.
     Outbound,
@@ -158,11 +154,6 @@ impl CallDirection {
     }
 }
 
-impl Default for CallDirection {
-    fn default() -> Self {
-        Self::Inbound
-    }
-}
 
 impl std::fmt::Display for CallDirection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

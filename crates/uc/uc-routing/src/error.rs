@@ -56,28 +56,28 @@ impl fmt::Display for RoutingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoRoute { destination } => {
-                write!(f, "No route found for: {}", destination)
+                write!(f, "No route found for: {destination}")
             }
             Self::AllTrunksFailed { trunks_tried } => {
-                write!(f, "All {} trunks failed", trunks_tried)
+                write!(f, "All {trunks_tried} trunks failed")
             }
             Self::TrunkNotFound { trunk_id } => {
-                write!(f, "Trunk not found: {}", trunk_id)
+                write!(f, "Trunk not found: {trunk_id}")
             }
             Self::TrunkGroupNotFound { group_id } => {
-                write!(f, "Trunk group not found: {}", group_id)
+                write!(f, "Trunk group not found: {group_id}")
             }
             Self::DialPlanNotFound { plan_id } => {
-                write!(f, "Dial plan not found: {}", plan_id)
+                write!(f, "Dial plan not found: {plan_id}")
             }
             Self::InvalidPattern { pattern, reason } => {
-                write!(f, "Invalid pattern '{}': {}", pattern, reason)
+                write!(f, "Invalid pattern '{pattern}': {reason}")
             }
             Self::Blocked { reason } => {
-                write!(f, "Route blocked: {}", reason)
+                write!(f, "Route blocked: {reason}")
             }
             Self::ConfigError { reason } => {
-                write!(f, "Configuration error: {}", reason)
+                write!(f, "Configuration error: {reason}")
             }
         }
     }

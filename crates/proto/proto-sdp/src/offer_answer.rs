@@ -82,12 +82,14 @@ pub struct MediaModificationValidator {
 
 impl MediaModificationValidator {
     /// Creates a new validator with default (strict) settings.
+    #[must_use] 
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Allows adding media streams.
-    pub fn allow_add(mut self) -> Self {
+    #[must_use] 
+    pub const fn allow_add(mut self) -> Self {
         self.allow_add = true;
         self
     }
@@ -340,7 +342,8 @@ fn generate_media_answer(
 /// | sendonly        | *                | recvonly or inactive |
 /// | recvonly        | *                | sendonly or inactive |
 /// | inactive        | *                | inactive         |
-pub fn compute_answer_direction(offer: Direction, local: Direction) -> Direction {
+#[must_use] 
+pub const fn compute_answer_direction(offer: Direction, local: Direction) -> Direction {
     match (offer, local) {
         // Both want bidirectional
         (Direction::Sendrecv, Direction::Sendrecv) => Direction::Sendrecv,
@@ -393,6 +396,7 @@ impl Default for LocalCapabilities {
 
 impl LocalCapabilities {
     /// Creates new local capabilities.
+    #[must_use] 
     pub fn new() -> Self {
         Self::default()
     }
@@ -431,6 +435,7 @@ pub struct LocalMediaCapability {
 
 impl LocalMediaCapability {
     /// Creates a new media capability.
+    #[must_use] 
     pub fn new(media_type: MediaType) -> Self {
         Self {
             media_type,
@@ -451,7 +456,8 @@ impl LocalMediaCapability {
     }
 
     /// Sets the preferred direction.
-    pub fn with_direction(mut self, direction: Direction) -> Self {
+    #[must_use] 
+    pub const fn with_direction(mut self, direction: Direction) -> Self {
         self.direction = direction;
         self
     }
@@ -473,7 +479,7 @@ pub fn hold_media_stream(
         .media
         .get_mut(media_index)
         .ok_or_else(|| SdpError::InvalidModification {
-            reason: format!("media index {} out of bounds", media_index),
+            reason: format!("media index {media_index} out of bounds"),
         })?;
 
     // Remove existing direction attribute
@@ -506,7 +512,7 @@ pub fn resume_media_stream(
         .media
         .get_mut(media_index)
         .ok_or_else(|| SdpError::InvalidModification {
-            reason: format!("media index {} out of bounds", media_index),
+            reason: format!("media index {media_index} out of bounds"),
         })?;
 
     // Remove existing direction attribute
@@ -541,7 +547,7 @@ pub fn disable_media_stream(sdp: &mut SessionDescription, media_index: usize) ->
         .media
         .get_mut(media_index)
         .ok_or_else(|| SdpError::InvalidModification {
-            reason: format!("media index {} out of bounds", media_index),
+            reason: format!("media index {media_index} out of bounds"),
         })?;
 
     media.port = 0;
@@ -572,7 +578,7 @@ pub fn enable_media_stream(
         .media
         .get_mut(media_index)
         .ok_or_else(|| SdpError::InvalidModification {
-            reason: format!("media index {} out of bounds", media_index),
+            reason: format!("media index {media_index} out of bounds"),
         })?;
 
     media.port = port;
@@ -640,8 +646,7 @@ pub fn validate_answer(
                 if !offer_media.formats.contains(fmt) {
                     result.success = false;
                     result.errors.push(format!(
-                        "RFC 3264 §6: Answer format '{}' not in offer at index {}",
-                        fmt, index
+                        "RFC 3264 §6: Answer format '{fmt}' not in offer at index {index}"
                     ));
                 }
             }

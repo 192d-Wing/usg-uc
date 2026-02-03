@@ -215,8 +215,7 @@ impl Router {
         let trunk_count = self
             .trunk_groups
             .get(&trunk_group_id)
-            .map(|g| g.trunk_count())
-            .unwrap_or(0);
+            .map_or(0, super::trunk::TrunkGroup::trunk_count);
 
         // Get the trunk group
         let trunk_group = self.trunk_groups.get_mut(&trunk_group_id).ok_or_else(|| {
@@ -255,9 +254,7 @@ impl Router {
 
         // Determine final destination
         let final_destination = dial_plan_result
-            .as_ref()
-            .map(|r| r.transformed_number.clone())
-            .unwrap_or_else(|| destination.to_string());
+            .as_ref().map_or_else(|| destination.to_string(), |r| r.transformed_number.clone());
 
         self.stats.successes += 1;
         if !failover_trunks.is_empty() {
@@ -285,8 +282,7 @@ impl Router {
         let trunk_count = self
             .trunk_groups
             .get(group_id)
-            .map(|g| g.trunk_count())
-            .unwrap_or(0);
+            .map_or(0, super::trunk::TrunkGroup::trunk_count);
 
         let trunk_group = self.trunk_groups.get_mut(group_id).ok_or_else(|| {
             RoutingError::TrunkGroupNotFound {
@@ -338,20 +334,18 @@ impl Router {
 
     /// Records a successful call on a trunk.
     pub fn record_success(&mut self, group_id: &str, trunk_id: &str, setup_time_ms: u64) {
-        if let Some(group) = self.trunk_groups.get_mut(group_id) {
-            if let Some(trunk) = group.get_trunk_mut(trunk_id) {
+        if let Some(group) = self.trunk_groups.get_mut(group_id)
+            && let Some(trunk) = group.get_trunk_mut(trunk_id) {
                 trunk.complete_call(setup_time_ms);
             }
-        }
     }
 
     /// Records a failed call on a trunk.
     pub fn record_failure(&mut self, group_id: &str, trunk_id: &str) {
-        if let Some(group) = self.trunk_groups.get_mut(group_id) {
-            if let Some(trunk) = group.get_trunk_mut(trunk_id) {
+        if let Some(group) = self.trunk_groups.get_mut(group_id)
+            && let Some(trunk) = group.get_trunk_mut(trunk_id) {
                 trunk.fail_call();
             }
-        }
     }
 
     /// Returns a trunk for a failover attempt.

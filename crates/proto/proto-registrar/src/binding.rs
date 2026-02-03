@@ -246,7 +246,7 @@ impl Binding {
         if elapsed >= expires {
             Duration::ZERO
         } else {
-            expires - elapsed
+            expires.checked_sub(elapsed).unwrap()
         }
     }
 
@@ -282,7 +282,7 @@ impl Binding {
     /// Otherwise, uses the contact URI.
     pub fn binding_key(&self) -> String {
         if let (Some(instance_id), Some(reg_id)) = (&self.instance_id, self.reg_id) {
-            format!("{}:{}", instance_id, reg_id)
+            format!("{instance_id}:{reg_id}")
         } else {
             self.contact_uri.clone()
         }

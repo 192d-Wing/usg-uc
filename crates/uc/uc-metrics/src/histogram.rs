@@ -1,6 +1,7 @@
 //! Histogram metric type.
 
 use crate::DEFAULT_LATENCY_BUCKETS;
+use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A histogram for tracking value distributions.
@@ -60,6 +61,7 @@ impl Histogram {
     }
 
     /// Observes a value.
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     pub fn observe(&self, value: f64) {
         // Increment appropriate bucket(s)
         for (i, bucket) in self.buckets.iter().enumerate() {
@@ -77,6 +79,7 @@ impl Histogram {
     }
 
     /// Gets the sum of all observations.
+    #[allow(clippy::cast_precision_loss)]
     pub fn sum(&self) -> f64 {
         self.sum.load(Ordering::Relaxed) as f64 / 1000.0
     }
@@ -95,6 +98,7 @@ impl Histogram {
     }
 
     /// Calculates the mean.
+    #[allow(clippy::cast_precision_loss)]
     pub fn mean(&self) -> f64 {
         let count = self.count();
         if count == 0 {
@@ -109,53 +113,57 @@ impl Histogram {
         let mut output = String::new();
 
         // Help line
-        output.push_str(&format!("# HELP {} {}\n", self.name, self.help));
+        let _ = writeln!(output, "# HELP {} {}", self.name, self.help);
         // Type line
-        output.push_str(&format!("# TYPE {} histogram\n", self.name));
+        let _ = writeln!(output, "# TYPE {} histogram", self.name);
 
         // Bucket values (already cumulative from observe())
         for (i, bucket) in self.buckets.iter().enumerate() {
             let count = self.bucket_counts[i].load(Ordering::Relaxed);
-            output.push_str(&format!(
-                "{}_bucket{{le=\"{}\"}} {}\n",
+            let _ = writeln!(
+                output,
+                "{}_bucket{{le=\"{}\"}} {count}",
                 self.name,
                 Self::format_bucket_le(*bucket),
-                count
-            ));
+            );
         }
 
         // +Inf bucket
-        output.push_str(&format!(
-            "{}_bucket{{le=\"+Inf\"}} {}\n",
+        let _ = writeln!(
+            output,
+            "{}_bucket{{le=\"+Inf\"}} {}",
             self.name,
             self.count()
-        ));
+        );
 
         // Sum and count
-        output.push_str(&format!("{}_sum {}\n", self.name, self.sum()));
-        output.push_str(&format!("{}_count {}\n", self.name, self.count()));
+        let _ = writeln!(output, "{}_sum {}", self.name, self.sum());
+        let _ = write!(output, "{}_count {}", self.name, self.count());
 
         output
     }
 
     /// Formats a bucket le value.
+    #[allow(clippy::cast_possible_truncation)]
     fn format_bucket_le(value: f64) -> String {
         if value == f64::INFINITY {
             "+Inf".to_string()
-        } else if value == value.floor() {
+        } else if (value - value.floor()).abs() < f64::EPSILON {
             format!("{}", value as i64)
         } else {
-            format!("{}", value)
+            format!("{value}")
         }
     }
 }
 
 /// Helper to create linear bucket boundaries.
+#[allow(clippy::cast_precision_loss)]
 pub fn linear_buckets(start: f64, width: f64, count: usize) -> Vec<f64> {
-    (0..count).map(|i| start + (i as f64 * width)).collect()
+    (0..count).map(|i| (i as f64).mul_add(width, start)).collect()
 }
 
 /// Helper to create exponential bucket boundaries.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_wrap)]
 pub fn exponential_buckets(start: f64, factor: f64, count: usize) -> Vec<f64> {
     (0..count).map(|i| start * factor.powi(i as i32)).collect()
 }
@@ -214,7 +222,7 @@ mod tests {
     #[test]
     fn test_histogram_mean_empty() {
         let histogram = Histogram::new("test_histogram", "Test");
-        assert_eq!(histogram.mean(), 0.0);
+        assert!((histogram.mean() - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]

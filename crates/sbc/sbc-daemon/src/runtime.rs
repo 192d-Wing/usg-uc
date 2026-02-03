@@ -285,7 +285,7 @@ impl Runtime {
                         }
                     }
                 }
-                _ = signal.wait_for_shutdown() => {
+                () = signal.wait_for_shutdown() => {
                     debug!("Config reload loop shutting down");
                     break;
                 }
@@ -354,7 +354,7 @@ pub struct ConfigReloadResult {
 
 impl From<ServerError> for RuntimeError {
     fn from(e: ServerError) -> Self {
-        RuntimeError::ServerFailed {
+        Self::ServerFailed {
             reason: e.to_string(),
         }
     }

@@ -61,31 +61,31 @@ impl fmt::Display for PolicyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RuleNotFound { rule_id } => {
-                write!(f, "Rule not found: {}", rule_id)
+                write!(f, "Rule not found: {rule_id}")
             }
             Self::RuleSetNotFound { name } => {
-                write!(f, "Rule set not found: {}", name)
+                write!(f, "Rule set not found: {name}")
             }
             Self::RuleSetExists { name } => {
-                write!(f, "Rule set already exists: {}", name)
+                write!(f, "Rule set already exists: {name}")
             }
             Self::TooManyRules { count, max } => {
-                write!(f, "Too many rules: {} (max {})", count, max)
+                write!(f, "Too many rules: {count} (max {max})")
             }
             Self::InvalidCondition { reason } => {
-                write!(f, "Invalid condition: {}", reason)
+                write!(f, "Invalid condition: {reason}")
             }
             Self::InvalidAction { reason } => {
-                write!(f, "Invalid action: {}", reason)
+                write!(f, "Invalid action: {reason}")
             }
             Self::EvaluationFailed { reason } => {
-                write!(f, "Policy evaluation failed: {}", reason)
+                write!(f, "Policy evaluation failed: {reason}")
             }
             Self::DuplicateRule { rule_id } => {
-                write!(f, "Duplicate rule: {}", rule_id)
+                write!(f, "Duplicate rule: {rule_id}")
             }
             Self::InvalidConfig { reason } => {
-                write!(f, "Invalid configuration: {}", reason)
+                write!(f, "Invalid configuration: {reason}")
             }
         }
     }

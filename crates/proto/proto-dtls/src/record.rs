@@ -54,10 +54,10 @@ impl TryFrom<u8> for ContentType {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            20 => Ok(ContentType::ChangeCipherSpec),
-            21 => Ok(ContentType::Alert),
-            22 => Ok(ContentType::Handshake),
-            23 => Ok(ContentType::ApplicationData),
+            20 => Ok(Self::ChangeCipherSpec),
+            21 => Ok(Self::Alert),
+            22 => Ok(Self::Handshake),
+            23 => Ok(Self::ApplicationData),
             _ => Err(DtlsError::RecordError {
                 reason: format!("invalid content type: {value}"),
             }),
@@ -113,6 +113,7 @@ impl RecordHeader {
     }
 
     /// Serializes the header to bytes.
+    #[must_use] 
     pub fn serialize(&self) -> [u8; RECORD_HEADER_LEN] {
         let mut header = [0u8; RECORD_HEADER_LEN];
 
@@ -133,7 +134,8 @@ impl RecordHeader {
     ///
     /// Per RFC 5288, the nonce is constructed as:
     /// - 4 bytes: implicit IV from key derivation
-    /// - 8 bytes: explicit nonce = epoch (2) + sequence_number (6)
+    /// - 8 bytes: explicit nonce = epoch (2) + `sequence_number` (6)
+    #[must_use] 
     pub fn explicit_nonce(&self) -> [u8; 8] {
         let mut nonce = [0u8; 8];
         nonce[0..2].copy_from_slice(&self.epoch.to_be_bytes());
@@ -183,7 +185,7 @@ impl RecordLayer {
 
     /// Activates encryption with the given keys.
     ///
-    /// This should be called after the ChangeCipherSpec message.
+    /// This should be called after the `ChangeCipherSpec` message.
     pub fn activate_cipher(
         &mut self,
         write_key: Aes256GcmKey,
@@ -203,7 +205,7 @@ impl RecordLayer {
 
     /// Checks if encryption is active.
     #[must_use]
-    pub fn is_encrypted(&self) -> bool {
+    pub const fn is_encrypted(&self) -> bool {
         self.write_key.is_some()
     }
 
@@ -365,7 +367,7 @@ impl RecordLayer {
 
     /// Returns the current write epoch and sequence number.
     #[must_use]
-    pub fn write_sequence(&self) -> (u16, u64) {
+    pub const fn write_sequence(&self) -> (u16, u64) {
         (self.write_epoch, self.write_seq)
     }
 }
@@ -390,7 +392,7 @@ impl ReplayWindow {
     /// Window size in bits.
     const WINDOW_SIZE: u64 = 64;
 
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             max_seq: 0,
             bitmap: 0,
@@ -398,7 +400,7 @@ impl ReplayWindow {
     }
 
     /// Checks if a sequence number is acceptable (not a replay).
-    fn check(&self, seq: u64) -> bool {
+    const fn check(&self, seq: u64) -> bool {
         if seq > self.max_seq {
             // New sequence number, always acceptable
             true
@@ -413,7 +415,7 @@ impl ReplayWindow {
     }
 
     /// Updates the window with a verified sequence number.
-    fn update(&mut self, seq: u64) {
+    const fn update(&mut self, seq: u64) {
         if seq > self.max_seq {
             // Shift window
             let shift = seq - self.max_seq;

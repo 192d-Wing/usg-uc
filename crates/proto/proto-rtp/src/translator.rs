@@ -206,13 +206,11 @@ impl RtpTranslator {
         let mut forwarded_header = packet.header.clone();
 
         // Apply SSRC translation if enabled
-        if self.translate_ssrc {
-            if let Some(ref mapping) = self.ssrc_mapping {
-                if let Some(&new_ssrc) = mapping.get(&ssrc) {
+        if self.translate_ssrc
+            && let Some(ref mapping) = self.ssrc_mapping
+                && let Some(&new_ssrc) = mapping.get(&ssrc) {
                     forwarded_header.ssrc = new_ssrc;
                 }
-            }
-        }
 
         Ok(RtpPacket::new(forwarded_header, packet.payload.clone()))
     }

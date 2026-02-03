@@ -78,7 +78,7 @@ impl<T> ListResponse<T> {
     /// Creates a new list response.
     pub fn new(items: Vec<T>, total: usize, page: usize, page_size: usize) -> Self {
         let total_pages = if page_size > 0 {
-            (total + page_size - 1) / page_size
+            total.div_ceil(page_size)
         } else {
             0
         };

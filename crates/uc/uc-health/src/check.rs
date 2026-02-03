@@ -208,11 +208,11 @@ impl HealthCheck for MemoryCheck {
         let usage_percent = 50.0; // Simulated
 
         if usage_percent >= self.critical_threshold {
-            HealthCheckResult::unhealthy(format!("Memory usage critical: {:.1}%", usage_percent))
+            HealthCheckResult::unhealthy(format!("Memory usage critical: {usage_percent:.1}%"))
         } else if usage_percent >= self.warn_threshold {
-            HealthCheckResult::degraded(format!("Memory usage high: {:.1}%", usage_percent))
+            HealthCheckResult::degraded(format!("Memory usage high: {usage_percent:.1}%"))
         } else {
-            HealthCheckResult::healthy().with_data(format!("Memory usage: {:.1}%", usage_percent))
+            HealthCheckResult::healthy().with_data(format!("Memory usage: {usage_percent:.1}%"))
         }
     }
 }

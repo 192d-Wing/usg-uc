@@ -47,7 +47,7 @@ use uc_types::address::SbcSocketAddr;
 /// ## CNSA 2.0 Compliance
 ///
 /// All cryptographic operations use CNSA 2.0 compliant algorithms:
-/// - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 cipher suite
+/// - `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` cipher suite
 /// - P-384 ECDHE key exchange
 /// - P-384 ECDSA certificates
 pub struct DtlsConnection {
@@ -147,25 +147,25 @@ impl DtlsConnection {
 
     /// Returns the DTLS role.
     #[must_use]
-    pub fn role(&self) -> DtlsRole {
+    pub const fn role(&self) -> DtlsRole {
         self.config.role
     }
 
     /// Returns the local address.
     #[must_use]
-    pub fn local_addr(&self) -> &SbcSocketAddr {
+    pub const fn local_addr(&self) -> &SbcSocketAddr {
         &self.local_addr
     }
 
     /// Returns the remote address.
     #[must_use]
-    pub fn remote_addr(&self) -> &SbcSocketAddr {
+    pub const fn remote_addr(&self) -> &SbcSocketAddr {
         &self.remote_addr
     }
 
     /// Returns the local certificate fingerprint.
     #[must_use]
-    pub fn local_fingerprint(&self) -> &CertificateFingerprint {
+    pub const fn local_fingerprint(&self) -> &CertificateFingerprint {
         &self.local_fingerprint
     }
 
@@ -187,7 +187,7 @@ impl DtlsConnection {
         }
 
         // Bind to local address
-        let local_std_addr: SocketAddr = self.local_addr.clone().into();
+        let local_std_addr: SocketAddr = self.local_addr.into();
         let socket = UdpSocket::bind(local_std_addr)
             .await
             .map_err(|e| DtlsError::Io {
@@ -195,7 +195,7 @@ impl DtlsConnection {
             })?;
 
         // Connect to remote address
-        let remote_std_addr: SocketAddr = self.remote_addr.clone().into();
+        let remote_std_addr: SocketAddr = self.remote_addr.into();
         socket
             .connect(remote_std_addr)
             .await
@@ -220,7 +220,7 @@ impl DtlsConnection {
     /// ## CNSA 2.0 Compliance
     ///
     /// The handshake enforces CNSA 2.0 cipher suite negotiation.
-    /// If the peer doesn't support TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+    /// If the peer doesn't support `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`,
     /// the handshake will fail.
     ///
     /// ## Errors
@@ -473,8 +473,8 @@ impl Clone for DtlsConnection {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
-            local_addr: self.local_addr.clone(),
-            remote_addr: self.remote_addr.clone(),
+            local_addr: self.local_addr,
+            remote_addr: self.remote_addr,
             state: AtomicU8::new(self.state.load(Ordering::Acquire)),
             local_fingerprint: self.local_fingerprint.clone(),
             remote_fingerprint: Mutex::new(None),

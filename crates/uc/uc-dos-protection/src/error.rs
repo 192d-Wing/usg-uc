@@ -46,8 +46,7 @@ impl fmt::Display for DosError {
             } => {
                 write!(
                     f,
-                    "Rate limit exceeded for {}: {} > {}",
-                    source, current_rate, limit
+                    "Rate limit exceeded for {source}: {current_rate} > {limit}"
                 )
             }
             Self::Blocked {
@@ -56,15 +55,14 @@ impl fmt::Display for DosError {
             } => {
                 write!(
                     f,
-                    "Source {} blocked for {} more seconds",
-                    source, remaining_secs
+                    "Source {source} blocked for {remaining_secs} more seconds"
                 )
             }
             Self::InvalidConfig { reason } => {
-                write!(f, "Invalid configuration: {}", reason)
+                write!(f, "Invalid configuration: {reason}")
             }
             Self::TrackerError { message } => {
-                write!(f, "Tracker error: {}", message)
+                write!(f, "Tracker error: {message}")
             }
         }
     }

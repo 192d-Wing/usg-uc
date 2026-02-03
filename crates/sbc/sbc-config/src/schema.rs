@@ -15,6 +15,7 @@ use uc_types::protocol::{CnsaCurve, CnsaHash, CnsaSrtpProfile};
 /// ## NIST 800-53 Rev5: CM-2 (Baseline Configuration)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct SbcConfig {
     /// General settings.
     pub general: GeneralConfig,
@@ -38,22 +39,9 @@ pub struct SbcConfig {
     pub logging: LoggingConfig,
 }
 
-impl Default for SbcConfig {
-    fn default() -> Self {
-        Self {
-            general: GeneralConfig::default(),
-            transport: TransportConfig::default(),
-            media: MediaConfig::default(),
-            security: SecurityConfig::default(),
-            stir_shaken: StirShakenConfig::default(),
-            rate_limit: RateLimitConfig::default(),
-            logging: LoggingConfig::default(),
-        }
-    }
-}
 
 /// General SBC settings.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GeneralConfig {
     /// Instance name for identification.
@@ -81,7 +69,7 @@ impl Default for GeneralConfig {
 }
 
 /// Transport layer configuration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TransportConfig {
     /// UDP listen addresses.
@@ -133,7 +121,7 @@ impl Default for TransportConfig {
 }
 
 /// Media processing configuration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MediaConfig {
     /// Default media mode for calls.
@@ -181,8 +169,8 @@ impl Default for MediaConfig {
 ///
 /// ## CNSA 2.0 Compliance
 ///
-/// Only AEAD_AES_256_GCM is permitted.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Only `AEAD_AES_256_GCM` is permitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SrtpConfig {
     /// Require SRTP for all calls.
@@ -202,7 +190,7 @@ impl Default for SrtpConfig {
 }
 
 /// DTLS configuration for DTLS-SRTP key exchange.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DtlsConfig {
     /// Path to DTLS certificate (P-384).
@@ -228,7 +216,7 @@ impl Default for DtlsConfig {
 /// Security configuration.
 ///
 /// ## NIST 800-53 Rev5: SC-13 (Cryptographic Protection)
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SecurityConfig {
     /// Path to TLS certificate (P-384).
@@ -262,7 +250,7 @@ impl Default for SecurityConfig {
 /// STIR/SHAKEN configuration.
 ///
 /// ## NIST 800-53 Rev5: IA-9 (Service Identification)
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StirShakenConfig {
     /// Enable STIR/SHAKEN signing for outbound calls.
@@ -283,7 +271,7 @@ pub struct StirShakenConfig {
     /// Default attestation level for signing.
     pub default_attestation: String,
 
-    /// Maximum PASSporT age in seconds.
+    /// Maximum `PASSporT` age in seconds.
     pub max_passport_age_secs: u64,
 
     /// CA bundle path for certificate verification.
@@ -342,7 +330,7 @@ impl Default for RateLimitConfig {
 /// Logging configuration.
 ///
 /// ## NIST 800-53 Rev5: AU-2 (Event Logging)
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoggingConfig {
     /// Log level (trace, debug, info, warn, error).

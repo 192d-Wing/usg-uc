@@ -64,7 +64,7 @@ impl std::fmt::Display for RuleAction {
         match self {
             Self::Allow => write!(f, "allow"),
             Self::Deny => write!(f, "deny"),
-            Self::RateLimit { rps } => write!(f, "rate-limit({}rps)", rps),
+            Self::RateLimit { rps } => write!(f, "rate-limit({rps}rps)"),
             Self::LogAllow => write!(f, "log-allow"),
             Self::LogDeny => write!(f, "log-deny"),
         }
@@ -190,7 +190,7 @@ impl AclRule {
     pub fn allow_source(id: impl Into<String>, source: IpNetwork) -> Self {
         Self::new(
             id,
-            format!("Allow {}", source),
+            format!("Allow {source}"),
             RuleMatch::SourceIp(source),
             RuleAction::Allow,
         )
@@ -200,7 +200,7 @@ impl AclRule {
     pub fn deny_source(id: impl Into<String>, source: IpNetwork) -> Self {
         Self::new(
             id,
-            format!("Deny {}", source),
+            format!("Deny {source}"),
             RuleMatch::SourceIp(source),
             RuleAction::Deny,
         )
@@ -279,18 +279,16 @@ impl AclRule {
         }
 
         // Check dest IP if provided
-        if let Some(dest) = dest_ip {
-            if !self.match_criteria.matches_dest_ip(dest) {
+        if let Some(dest) = dest_ip
+            && !self.match_criteria.matches_dest_ip(dest) {
                 return false;
             }
-        }
 
         // Check method if provided
-        if let Some(m) = method {
-            if !self.match_criteria.matches_method(m) {
+        if let Some(m) = method
+            && !self.match_criteria.matches_method(m) {
                 return false;
             }
-        }
 
         true
     }

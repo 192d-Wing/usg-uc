@@ -181,11 +181,10 @@ impl CdrWriter {
         let mut output = Vec::new();
 
         // Add header if needed (for CSV)
-        if self.config.include_header && self.stats.records_written == 0 {
-            if let Some(header) = self.get_formatter().header() {
+        if self.config.include_header && self.stats.records_written == 0
+            && let Some(header) = self.get_formatter().header() {
                 output.push(header);
             }
-        }
 
         // Format each record
         for record in &self.buffer {

@@ -367,11 +367,10 @@ impl ClientReliableProvisionalTracker {
         status_code: u16,
     ) -> Result<RAck, &'static str> {
         // RFC 3262 Section 4: RSeq must be greater than the previous one
-        if let Some(last) = self.last_rseq {
-            if rseq <= last {
+        if let Some(last) = self.last_rseq
+            && rseq <= last {
                 return Err("RSeq out of order (must be greater than previous)");
             }
-        }
 
         self.last_rseq = Some(rseq);
 

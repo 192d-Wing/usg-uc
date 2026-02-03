@@ -274,14 +274,13 @@ impl Dialog {
     ///
     /// Returns error if CSeq is lower than expected (possible replay).
     pub fn update_remote_cseq(&mut self, cseq: u32) -> DialogResult<()> {
-        if let Some(current) = self.remote_cseq {
-            if cseq < current {
+        if let Some(current) = self.remote_cseq
+            && cseq < current {
                 return Err(DialogError::InvalidCSeq {
                     expected: current,
                     actual: cseq,
                 });
             }
-        }
         self.remote_cseq = Some(cseq);
         Ok(())
     }
@@ -312,8 +311,7 @@ impl Dialog {
     pub fn is_session_expired(&self) -> bool {
         self.session_timer
             .as_ref()
-            .map(|t| t.is_expired())
-            .unwrap_or(false)
+            .is_some_and(super::session_timer::SessionTimer::is_expired)
     }
 }
 

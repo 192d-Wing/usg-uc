@@ -31,7 +31,7 @@ impl CallId {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
         let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-        Self(format!("call-{:x}-{:x}", timestamp, counter))
+        Self(format!("call-{timestamp:x}-{counter:x}"))
     }
 
     /// Returns the ID as a string slice.
@@ -471,11 +471,10 @@ impl Call {
             }
         }
         // If both legs are active, call is active
-        else if self.a_leg.is_active() && self.b_leg.is_active() {
-            if self.state != CallState::OnHold {
+        else if self.a_leg.is_active() && self.b_leg.is_active()
+            && self.state != CallState::OnHold {
                 self.state = CallState::Active;
             }
-        }
     }
 }
 

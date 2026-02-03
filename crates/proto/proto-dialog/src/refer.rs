@@ -55,7 +55,7 @@ impl std::str::FromStr for ReferSubscriptionState {
             "terminated" => Ok(Self::Terminated),
             _ => Err(DialogError::InvalidParameter {
                 name: "subscription-state".to_string(),
-                reason: format!("unknown state: {}", s),
+                reason: format!("unknown state: {s}"),
             }),
         }
     }
@@ -89,7 +89,7 @@ impl ReferStatus {
     pub fn from_status_code(code: u16) -> Self {
         match code {
             100 => Self::Trying,
-            180 | 181 | 182 | 183 => Self::Ringing,
+            180..=183 => Self::Ringing,
             200..=299 => Self::Success,
             _ => Self::Failed,
         }
@@ -222,7 +222,7 @@ impl ReferRequest {
 
     /// Checks if the transfer is complete (final status received).
     pub fn is_complete(&self) -> bool {
-        self.current_status.map(|s| s.is_final()).unwrap_or(false)
+        self.current_status.is_some_and(|s| s.is_final())
     }
 
     /// Returns the Refer-To header value for the SIP message.
@@ -404,9 +404,9 @@ pub fn parse_refer_to(value: &str) -> DialogResult<String> {
 /// Generates a Refer-To header value.
 pub fn format_refer_to(uri: &str, replaces: Option<&str>) -> String {
     if let Some(replaces) = replaces {
-        format!("<{}>?Replaces={}", uri, replaces)
+        format!("<{uri}>?Replaces={replaces}")
     } else {
-        format!("<{}>", uri)
+        format!("<{uri}>")
     }
 }
 

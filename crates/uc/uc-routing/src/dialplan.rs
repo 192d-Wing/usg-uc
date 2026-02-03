@@ -5,8 +5,10 @@ use std::collections::HashMap;
 
 /// Number transformation operation.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum NumberTransform {
     /// No transformation.
+    #[default]
     None,
     /// Strip leading digits.
     StripPrefix {
@@ -34,11 +36,6 @@ pub enum NumberTransform {
     Chain(Vec<NumberTransform>),
 }
 
-impl Default for NumberTransform {
-    fn default() -> Self {
-        Self::None
-    }
-}
 
 impl NumberTransform {
     /// Applies the transformation to a number.
@@ -52,7 +49,7 @@ impl NumberTransform {
                     number.to_string()
                 }
             }
-            Self::AddPrefix { prefix } => format!("{}{}", prefix, number),
+            Self::AddPrefix { prefix } => format!("{prefix}{number}"),
             Self::ReplacePrefix { from, to } => {
                 if number.starts_with(from) {
                     format!("{}{}", to, &number[from.len()..])
@@ -128,10 +125,10 @@ impl DialPattern {
     /// X = single digit (0-9)
     /// . = any remaining digits
     fn match_wildcard(pattern: &str, number: &str) -> bool {
-        let mut pattern_chars = pattern.chars().peekable();
+        let pattern_chars = pattern.chars().peekable();
         let mut number_chars = number.chars().peekable();
 
-        while let Some(p) = pattern_chars.next() {
+        for p in pattern_chars {
             match p {
                 'X' => {
                     // Match any single digit
@@ -352,13 +349,11 @@ impl DialPlan {
             let pa = self
                 .entries
                 .get(a)
-                .map(|e| e.priority())
-                .unwrap_or(u32::MAX);
+                .map_or(u32::MAX, DialPlanEntry::priority);
             let pb = self
                 .entries
                 .get(b)
-                .map(|e| e.priority())
-                .unwrap_or(u32::MAX);
+                .map_or(u32::MAX, DialPlanEntry::priority);
             pa.cmp(&pb)
         });
     }
@@ -382,8 +377,8 @@ impl DialPlan {
     /// Matches a number against the dial plan.
     pub fn match_number(&self, number: &str) -> Option<DialPlanResult> {
         for id in &self.sorted_ids {
-            if let Some(entry) = self.entries.get(id) {
-                if entry.matches(number) {
+            if let Some(entry) = self.entries.get(id)
+                && entry.matches(number) {
                     return Some(DialPlanResult {
                         entry_id: entry.id().to_string(),
                         original_number: number.to_string(),
@@ -391,7 +386,6 @@ impl DialPlan {
                         trunk_group: entry.trunk_group().to_string(),
                     });
                 }
-            }
         }
         None
     }

@@ -131,7 +131,7 @@ impl CandidatePair {
 
         let min = g.min(d);
         let max = g.max(d);
-        let tie_breaker = if g > d { 1u64 } else { 0u64 };
+        let tie_breaker = u64::from(g > d);
 
         (min << 32) + (max << 1) + tie_breaker
     }
@@ -399,11 +399,10 @@ impl CheckList {
     fn unfreeze_foundation(&mut self, foundation: &str) {
         if let Some(indices) = self.by_foundation.get(foundation) {
             for &i in indices {
-                if let Some(pair) = self.pairs.get_mut(i) {
-                    if pair.state() == PairState::Frozen {
+                if let Some(pair) = self.pairs.get_mut(i)
+                    && pair.state() == PairState::Frozen {
                         pair.set_state(PairState::Waiting);
                     }
-                }
             }
         }
     }

@@ -124,7 +124,7 @@ impl LocationService {
 
     /// Gets all bindings for an AOR (including expired).
     pub fn get_bindings(&self, aor: &str) -> Option<&[Binding]> {
-        self.bindings.get(aor).map(|v| v.as_slice())
+        self.bindings.get(aor).map(std::vec::Vec::as_slice)
     }
 
     /// Gets a specific binding.
@@ -192,18 +192,17 @@ impl LocationService {
     pub fn has_bindings(&self, aor: &str) -> bool {
         self.bindings
             .get(aor)
-            .map(|bindings| !bindings.is_empty())
-            .unwrap_or(false)
+            .is_some_and(|bindings| !bindings.is_empty())
     }
 
     /// Returns the number of bindings for an AOR.
     pub fn binding_count(&self, aor: &str) -> usize {
-        self.bindings.get(aor).map(|b| b.len()).unwrap_or(0)
+        self.bindings.get(aor).map_or(0, std::vec::Vec::len)
     }
 
     /// Returns the total number of bindings.
     pub fn total_bindings(&self) -> usize {
-        self.bindings.values().map(|b| b.len()).sum()
+        self.bindings.values().map(std::vec::Vec::len).sum()
     }
 
     /// Returns the number of registered AORs.
@@ -213,7 +212,7 @@ impl LocationService {
 
     /// Returns all registered AORs.
     pub fn aors(&self) -> impl Iterator<Item = &str> {
-        self.bindings.keys().map(|s| s.as_str())
+        self.bindings.keys().map(std::string::String::as_str)
     }
 
     /// Removes expired bindings.
@@ -223,7 +222,7 @@ impl LocationService {
         let mut removed = 0;
         let mut empty_aors = Vec::new();
 
-        for (aor, bindings) in self.bindings.iter_mut() {
+        for (aor, bindings) in &mut self.bindings {
             let before = bindings.len();
             bindings.retain(|b| !b.is_expired());
             removed += before - bindings.len();

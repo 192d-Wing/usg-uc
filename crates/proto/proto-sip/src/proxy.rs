@@ -242,14 +242,13 @@ impl RequestForwarder {
     #[must_use]
     pub fn validate_request(&self, request: &SipRequest) -> ProxyValidation {
         // §16.3 Step 1: Check Max-Forwards
-        if let Some(max_forwards) = self.get_max_forwards(request) {
-            if max_forwards.is_zero() {
+        if let Some(max_forwards) = self.get_max_forwards(request)
+            && max_forwards.is_zero() {
                 return ProxyValidation::invalid(
                     "Max-Forwards is zero - loop detected",
                     483, // Too Many Hops
                 );
             }
-        }
 
         // §16.3 Step 4: Loop detection via Via headers
         if let Some(loop_error) = self.detect_loop(request) {
@@ -423,26 +422,23 @@ impl RequestForwarder {
         }
 
         // Re-add headers with new Via in correct position
-        match via_pos {
-            Some(idx) => {
-                // Add headers before Via position
-                for header in existing.iter().take(idx) {
-                    request.headers.add(header.clone());
-                }
-                // Add new Via
-                request.headers.add(new_via);
-                // Add remaining headers (including existing Via headers)
-                for header in existing.iter().skip(idx) {
-                    request.headers.add(header.clone());
-                }
+        if let Some(idx) = via_pos {
+            // Add headers before Via position
+            for header in existing.iter().take(idx) {
+                request.headers.add(header.clone());
             }
-            None => {
-                // No existing Via, just add ours at the end
-                for header in existing {
-                    request.headers.add(header);
-                }
-                request.headers.add(new_via);
+            // Add new Via
+            request.headers.add(new_via);
+            // Add remaining headers (including existing Via headers)
+            for header in existing.iter().skip(idx) {
+                request.headers.add(header.clone());
             }
+        } else {
+            // No existing Via, just add ours at the end
+            for header in existing {
+                request.headers.add(header);
+            }
+            request.headers.add(new_via);
         }
     }
 
@@ -573,7 +569,7 @@ impl ResponseProcessor {
 
         for response in responses {
             let code = response.status.code();
-            let best_code = best.map(|r| r.status.code()).unwrap_or(0);
+            let best_code = best.map_or(0, |r| r.status.code());
 
             let is_better = match (code / 100, best_code / 100) {
                 // 6xx always wins

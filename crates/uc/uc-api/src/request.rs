@@ -116,18 +116,15 @@ impl PaginationParams {
 
 /// Sort order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum SortOrder {
     /// Ascending order.
+    #[default]
     Ascending,
     /// Descending order.
     Descending,
 }
 
-impl Default for SortOrder {
-    fn default() -> Self {
-        Self::Ascending
-    }
-}
 
 impl SortOrder {
     /// Returns as SQL string.
@@ -224,12 +221,12 @@ impl ApiRequest {
 
     /// Gets a query parameter.
     pub fn query_param(&self, key: &str) -> Option<&str> {
-        self.query.get(key).map(|s| s.as_str())
+        self.query.get(key).map(std::string::String::as_str)
     }
 
     /// Gets a header.
     pub fn header(&self, key: &str) -> Option<&str> {
-        self.headers.get(key).map(|s| s.as_str())
+        self.headers.get(key).map(std::string::String::as_str)
     }
 
     /// Gets the Authorization header.

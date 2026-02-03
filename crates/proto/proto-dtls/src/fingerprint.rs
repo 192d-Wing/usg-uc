@@ -27,7 +27,7 @@ pub enum FingerprintAlgorithm {
 impl FingerprintAlgorithm {
     /// Returns the SDP attribute name for this algorithm.
     #[must_use]
-    pub fn sdp_name(&self) -> &'static str {
+    pub const fn sdp_name(&self) -> &'static str {
         match self {
             Self::Sha384 => "sha-384",
             Self::Sha512 => "sha-512",
@@ -36,7 +36,7 @@ impl FingerprintAlgorithm {
 
     /// Returns the output length in bytes.
     #[must_use]
-    pub fn output_len(&self) -> usize {
+    pub const fn output_len(&self) -> usize {
         match self {
             Self::Sha384 => 48,
             Self::Sha512 => 64,
@@ -142,7 +142,7 @@ impl CertificateFingerprint {
 
     /// Returns the hash algorithm.
     #[must_use]
-    pub fn algorithm(&self) -> FingerprintAlgorithm {
+    pub const fn algorithm(&self) -> FingerprintAlgorithm {
         self.algorithm
     }
 
@@ -207,7 +207,7 @@ impl std::fmt::Display for CertificateFingerprint {
 
 /// Decode hex string to bytes.
 fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err("odd length hex string".to_string());
     }
 

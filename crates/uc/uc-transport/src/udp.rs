@@ -84,7 +84,7 @@ impl UdpTransport {
         // Use socket2 for advanced socket options
         let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).map_err(|e| {
             TransportError::BindFailed {
-                address: config.bind_address.clone(),
+                address: config.bind_address,
                 reason: e.to_string(),
             }
         })?;
@@ -94,7 +94,7 @@ impl UdpTransport {
             socket
                 .set_reuse_address(true)
                 .map_err(|e| TransportError::BindFailed {
-                    address: config.bind_address.clone(),
+                    address: config.bind_address,
                     reason: format!("failed to set SO_REUSEADDR: {e}"),
                 })?;
         }
@@ -104,7 +104,7 @@ impl UdpTransport {
             socket
                 .set_reuse_port(true)
                 .map_err(|e| TransportError::BindFailed {
-                    address: config.bind_address.clone(),
+                    address: config.bind_address,
                     reason: format!("failed to set SO_REUSEPORT: {e}"),
                 })?;
         }
@@ -114,7 +114,7 @@ impl UdpTransport {
             socket
                 .set_only_v6(false)
                 .map_err(|e| TransportError::BindFailed {
-                    address: config.bind_address.clone(),
+                    address: config.bind_address,
                     reason: format!("failed to set IPV6_V6ONLY: {e}"),
                 })?;
         }
@@ -123,7 +123,7 @@ impl UdpTransport {
         socket
             .set_nonblocking(true)
             .map_err(|e| TransportError::BindFailed {
-                address: config.bind_address.clone(),
+                address: config.bind_address,
                 reason: format!("failed to set non-blocking: {e}"),
             })?;
 
@@ -131,7 +131,7 @@ impl UdpTransport {
         socket
             .bind(&socket_addr.into())
             .map_err(|e| TransportError::BindFailed {
-                address: config.bind_address.clone(),
+                address: config.bind_address,
                 reason: e.to_string(),
             })?;
 
@@ -139,7 +139,7 @@ impl UdpTransport {
         let std_socket: std::net::UdpSocket = socket.into();
         let tokio_socket =
             UdpSocket::from_std(std_socket).map_err(|e| TransportError::BindFailed {
-                address: config.bind_address.clone(),
+                address: config.bind_address,
                 reason: e.to_string(),
             })?;
 
@@ -147,7 +147,7 @@ impl UdpTransport {
         let local_addr = tokio_socket
             .local_addr()
             .map_err(|e| TransportError::BindFailed {
-                address: config.bind_address.clone(),
+                address: config.bind_address,
                 reason: format!("failed to get local address: {e}"),
             })?;
 
@@ -191,14 +191,14 @@ impl Transport for UdpTransport {
                 });
             }
 
-            let dest_addr: SocketAddr = dest.clone().into();
+            let dest_addr: SocketAddr = (*dest).into();
             trace!(dest = %dest_addr, size = data.len(), "sending UDP packet");
 
             self.socket
                 .send_to(data, dest_addr)
                 .await
                 .map_err(|e| TransportError::SendFailed {
-                    address: dest.clone(),
+                    address: *dest,
                     reason: e.to_string(),
                 })?;
 

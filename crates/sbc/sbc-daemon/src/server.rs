@@ -149,7 +149,7 @@ impl Server {
         for socket_addr in &self.config.transport.udp_listen {
             let addr = SbcSocketAddr::from(*socket_addr);
 
-            match UdpTransport::bind(addr.clone()).await {
+            match UdpTransport::bind(addr).await {
                 Ok(transport) => {
                     info!(
                         address = %transport.local_addr(),
@@ -170,7 +170,7 @@ impl Server {
         // If no UDP listeners configured, bind to default ports
         if transports.is_empty() {
             let default_addr = SbcSocketAddr::new_v6(Ipv6Addr::UNSPECIFIED, 5060);
-            match UdpTransport::bind(default_addr.clone()).await {
+            match UdpTransport::bind(default_addr).await {
                 Ok(transport) => {
                     info!(
                         address = %transport.local_addr(),
@@ -233,7 +233,7 @@ impl Server {
                     rate_limiter,
                     rate_limit_enabled,
                 )
-                .await
+                .await;
             });
             handles.push(handle);
         }
@@ -328,7 +328,7 @@ impl Server {
                             );
 
                             // Process through SIP stack
-                            let result = sip_stack.process_message(&msg.data, msg.source.clone()).await;
+                            let result = sip_stack.process_message(&msg.data, msg.source).await;
 
                             // Handle the processing result
                             match result {
@@ -366,7 +366,7 @@ impl Server {
                         }
                     }
                 }
-                _ = shutdown.wait_for_shutdown() => {
+                () = shutdown.wait_for_shutdown() => {
                     debug!(transport_idx = idx, "Transport receive loop shutting down");
                     break;
                 }
@@ -384,7 +384,7 @@ impl Server {
                     debug!("Health check poll");
                     // In production, would run actual health checks here
                 }
-                _ = shutdown.wait_for_shutdown() => {
+                () = shutdown.wait_for_shutdown() => {
                     debug!("Health poll loop shutting down");
                     break;
                 }

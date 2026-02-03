@@ -470,18 +470,16 @@ impl ManipulationPolicy {
     #[must_use]
     pub fn applies_to(&self, context: &ManipulationContext) -> bool {
         // Check direction
-        if let Some(dir) = self.direction {
-            if dir != ManipulationDirection::Both && dir != context.direction {
+        if let Some(dir) = self.direction
+            && dir != ManipulationDirection::Both && dir != context.direction {
                 return false;
             }
-        }
 
         // Check message type
-        if let Some(msg_type) = self.message_type {
-            if msg_type != MessageType::Both && msg_type != context.message_type {
+        if let Some(msg_type) = self.message_type
+            && msg_type != MessageType::Both && msg_type != context.message_type {
                 return false;
             }
-        }
 
         true
     }
@@ -528,15 +526,14 @@ impl HeaderManipulator {
         }
 
         // Apply trunk-specific policies
-        if let Some(trunk_id) = &context.trunk_id {
-            if let Some(trunk_policies) = self.trunk_policies.get(trunk_id) {
+        if let Some(trunk_id) = &context.trunk_id
+            && let Some(trunk_policies) = self.trunk_policies.get(trunk_id) {
                 for policy in trunk_policies {
                     if policy.applies_to(context) {
                         applied_count += self.apply_policy(headers, policy, context)?;
                     }
                 }
             }
-        }
 
         Ok(applied_count)
     }
@@ -638,11 +635,10 @@ impl HeaderManipulator {
 
             ManipulationAction::RemoveMatching { name, pattern } => {
                 // Get current value and only remove if it matches
-                if let Some(header) = headers.get(name) {
-                    if header.value.contains(pattern) {
+                if let Some(header) = headers.get(name)
+                    && header.value.contains(pattern) {
                         headers.remove(name);
                     }
-                }
             }
 
             ManipulationAction::Replace {
@@ -721,8 +717,7 @@ impl HeaderManipulator {
         // Handle prefix pattern: ^prefix(.*)
         if pattern.starts_with('^') && pattern.ends_with("(.*)") {
             let prefix = &pattern[1..pattern.len() - 4];
-            if value.starts_with(prefix) {
-                let captured = &value[prefix.len()..];
+            if let Some(captured) = value.strip_prefix(prefix) {
                 return replacement.replace("$1", captured);
             }
         }
@@ -730,8 +725,7 @@ impl HeaderManipulator {
         // Handle suffix pattern: (.*)suffix$
         if pattern.starts_with("(.*)") && pattern.ends_with('$') {
             let suffix = &pattern[4..pattern.len() - 1];
-            if value.ends_with(suffix) {
-                let captured = &value[..value.len() - suffix.len()];
+            if let Some(captured) = value.strip_suffix(suffix) {
                 return replacement.replace("$1", captured);
             }
         }

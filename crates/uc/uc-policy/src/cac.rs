@@ -372,12 +372,11 @@ impl TrunkCacState {
 
     /// Resets CPS counter if enough time has passed.
     fn maybe_reset_cps(&self) {
-        if let Ok(mut last_reset) = self.last_cps_reset.lock() {
-            if last_reset.elapsed() >= Duration::from_secs(1) {
+        if let Ok(mut last_reset) = self.last_cps_reset.lock()
+            && last_reset.elapsed() >= Duration::from_secs(1) {
                 *last_reset = Instant::now();
                 self.call_counter.store(0, Ordering::Relaxed);
             }
-        }
     }
 
     /// Increments session and bandwidth counters.
@@ -504,8 +503,7 @@ impl CallAdmissionController {
 
         // Estimate bandwidth
         let estimated_bandwidth = codec
-            .map(|c| self.codec_bandwidth.estimate(c))
-            .unwrap_or(self.codec_bandwidth.default);
+            .map_or(self.codec_bandwidth.default, |c| self.codec_bandwidth.estimate(c));
 
         // Emergency calls bypass CAC (unless trunk is disabled)
         if priority.bypasses_cac() {
@@ -515,8 +513,8 @@ impl CallAdmissionController {
         }
 
         // Check codec allowlist
-        if let Some(codec_name) = codec {
-            if !limits.allowed_codecs.is_empty()
+        if let Some(codec_name) = codec
+            && !limits.allowed_codecs.is_empty()
                 && !limits
                     .allowed_codecs
                     .iter()
@@ -529,7 +527,6 @@ impl CallAdmissionController {
                     retry_after_secs: None,
                 };
             }
-        }
 
         // Get state for this trunk
         let state = self.get_or_create_state(trunk_id);

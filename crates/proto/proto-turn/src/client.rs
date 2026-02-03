@@ -220,12 +220,11 @@ impl TurnClient {
         // Check if we already have a valid allocation
         {
             let alloc = self.allocation.lock().await;
-            if let Some(ref a) = *alloc {
-                if a.is_valid() {
+            if let Some(ref a) = *alloc
+                && a.is_valid() {
                     debug!(relayed_addr = %a.relayed_addr, "Using existing allocation");
                     return Ok(a.relayed_addr);
                 }
-            }
         }
 
         // Create Allocate request
@@ -264,7 +263,7 @@ impl TurnClient {
         // Verify we have an allocation
         {
             let alloc = self.allocation.lock().await;
-            if alloc.as_ref().map_or(true, |a| !a.is_valid()) {
+            if alloc.as_ref().is_none_or(|a| !a.is_valid()) {
                 return Err(TurnError::NoAllocation);
             }
         }
@@ -297,13 +296,13 @@ impl TurnClient {
         // Verify we have an allocation
         {
             let alloc = self.allocation.lock().await;
-            if alloc.as_ref().map_or(true, |a| !a.is_valid()) {
+            if alloc.as_ref().is_none_or(|a| !a.is_valid()) {
                 return Err(TurnError::NoAllocation);
             }
         }
 
         // Validate channel number
-        if channel < crate::MIN_CHANNEL_NUMBER || channel > crate::MAX_CHANNEL_NUMBER {
+        if !(crate::MIN_CHANNEL_NUMBER..=crate::MAX_CHANNEL_NUMBER).contains(&channel) {
             return Err(TurnError::InvalidChannel { channel });
         }
 
@@ -488,15 +487,13 @@ impl TurnClient {
             match timeout(wait_time, self.recv_response(&transaction_id)).await {
                 Ok(Ok(response)) => {
                     // Check for 401 Unauthorized
-                    if response.msg_type.class == StunClass::ErrorResponse {
-                        if let Some(code) = self.extract_error_code(&response) {
-                            if code == 401 {
+                    if response.msg_type.class == StunClass::ErrorResponse
+                        && let Some(code) = self.extract_error_code(&response)
+                            && code == 401 {
                                 // Update credentials from response
                                 self.update_credentials_from_response(&response).await;
                                 return Err(TurnError::AuthenticationFailed);
                             }
-                        }
-                    }
                     return Ok(response);
                 }
                 Ok(Err(e)) => return Err(e),

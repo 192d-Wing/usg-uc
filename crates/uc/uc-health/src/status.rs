@@ -5,6 +5,7 @@ use std::time::Instant;
 
 /// Overall health status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum HealthStatus {
     /// System is healthy and operational.
     Healthy,
@@ -13,6 +14,7 @@ pub enum HealthStatus {
     /// System is unhealthy.
     Unhealthy,
     /// Health status is unknown.
+    #[default]
     Unknown,
 }
 
@@ -48,11 +50,6 @@ impl HealthStatus {
     }
 }
 
-impl Default for HealthStatus {
-    fn default() -> Self {
-        Self::Unknown
-    }
-}
 
 impl std::fmt::Display for HealthStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
