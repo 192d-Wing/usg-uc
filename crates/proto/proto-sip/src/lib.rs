@@ -46,6 +46,7 @@ pub mod header;
 pub mod header_params;
 pub mod message;
 pub mod method;
+pub mod proxy;
 pub mod redirect;
 pub mod response;
 pub mod routing;
@@ -73,6 +74,13 @@ pub use routing::{
 };
 pub use transport::Transport;
 pub use uri::{SipUri, UriScheme};
+
+// RFC 3261 §16.6 Proxy forwarding
+pub use proxy::{
+    create_loop_detected_response, create_too_many_hops_response, create_trying_response,
+    ForkingMode, ForwardingTarget, ProxyContext, ProxyValidation, RequestForwarder,
+    ResponseProcessor,
+};
 
 /// Maximum SIP message size per RFC 3261.
 pub const MAX_MESSAGE_SIZE: usize = 65535;

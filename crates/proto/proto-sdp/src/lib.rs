@@ -36,6 +36,7 @@
 pub mod attribute;
 pub mod error;
 pub mod media;
+pub mod multicast;
 pub mod offer_answer;
 pub mod session;
 
@@ -49,6 +50,12 @@ pub use offer_answer::{
     MediaNegotiationResult, NegotiationResult,
 };
 pub use session::{Origin, RepeatTimes, SessionDescription, TimeValue, Timing};
+
+// RFC 3264 §6.2 Multicast stream negotiation
+pub use multicast::{
+    is_multicast_address, is_multicast_media, MulticastAddress, MulticastNegotiator,
+    MulticastScope, MulticastValidation,
+};
 
 /// SDP protocol version (always 0 per RFC 4566).
 pub const SDP_VERSION: u8 = 0;

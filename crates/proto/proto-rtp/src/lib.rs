@@ -40,6 +40,7 @@ pub mod packet;
 pub mod rtcp;
 pub mod scheduler;
 pub mod sequence;
+pub mod translator;
 
 pub use error::{RtpError, RtpResult};
 pub use packet::{RtpHeader, RtpPacket};
@@ -49,6 +50,12 @@ pub use scheduler::{
     RTCP_COMPENSATION_FACTOR, RTCP_MIN_INTERVAL_SECS, RTCP_SENDER_BANDWIDTH_FRACTION,
 };
 pub use sequence::SequenceTracker;
+
+// RFC 3550 §7 Translator/Mixer support
+pub use translator::{
+    validate_csrc_list, CsrcValidation, RtpMixer, RtpTranslator, SourceState,
+    SsrcCollisionDetector, TranslatorRtcpBuilder, MAX_CSRC_COUNT,
+};
 
 /// RTP version (always 2 per RFC 3550).
 pub const RTP_VERSION: u8 = 2;

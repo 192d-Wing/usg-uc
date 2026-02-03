@@ -28,7 +28,7 @@ This document maps each proto-* crate to its relevant RFCs and identifies specif
 | §14 | Modifying an Existing Session | Partial | re-INVITE parsing only |
 | §15 | Terminating a Session | Partial | BYE construction only |
 | §16.4 | Route Information Preprocessing | Complete | `routing.rs` |
-| §16.6 | Request Forwarding | Missing | No proxy forwarding logic |
+| §16.6 | Request Forwarding | Complete | `proxy.rs` |
 | §16.12.1 | Loose Routing | Complete | `routing.rs` |
 | §17 | Transactions | Partial | Delegated to proto-transaction |
 | §18 | Transport | Partial | Enum defined, no socket impl |
@@ -440,9 +440,9 @@ This is **by design** for security compliance.
 | §6.5 | SDES | Complete | Source Description |
 | §6.6 | BYE | Complete | Goodbye |
 | §6.7 | APP | Complete | Application-Specific |
-| §6.3.5 | Timing Rules | **Missing** | No RTCP timing |
-| §6.3.7 | Bandwidth | **Missing** | No bandwidth calc |
-| §7 | Translators/Mixers | **Missing** | Not implemented |
+| §6.3.5 | Timing Rules | Complete | `scheduler.rs` |
+| §6.3.7 | Bandwidth | Complete | `scheduler.rs` |
+| §7 | Translators/Mixers | Complete | `translator.rs` |
 
 ### Gap: RFC 3550 §6.3.5 - RTCP Timing Rules
 
@@ -493,7 +493,7 @@ impl RtcpScheduler {
 | §5 | Generating Offer | Partial | Basic generation |
 | §6 | Generating Answer | Partial | Basic answering |
 | §6.1 | Unicast Streams | Partial | Basic handling |
-| §6.2 | Multicast Streams | **Missing** | Not implemented |
+| §6.2 | Multicast Streams | Complete | `multicast.rs` |
 | §8 | Modifying Session | Partial | re-INVITE support |
 | §8.2 | Adding Media | Partial | Basic support |
 | §8.3 | Removing Media | Partial | port=0 handling |
@@ -551,13 +551,13 @@ impl OfferAnswerNegotiator {
 | proto-dialog | RFC 6665 | §7.2 | Event package validation | ✅ Done |
 | proto-sdp | RFC 4566 | §5.11 | Repeat times (r= line) | ✅ Done |
 
-### P3 - Low (Edge Cases)
+### P3 - Low (Edge Cases) ✅ COMPLETE
 
 | Crate | RFC | Section | Gap | Status |
 |-------|-----|---------|-----|--------|
-| proto-sdp | RFC 3264 | §6.2 | Multicast streams | Pending |
-| proto-rtp | RFC 3550 | §7 | Translators/mixers | Pending |
-| proto-sip | RFC 3261 | §16.6 | Full proxy forwarding | Pending |
+| proto-sdp | RFC 3264 | §6.2 | Multicast streams | ✅ Done |
+| proto-rtp | RFC 3550 | §7 | Translators/mixers | ✅ Done |
+| proto-sip | RFC 3261 | §16.6 | Full proxy forwarding | ✅ Done |
 
 ---
 
