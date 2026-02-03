@@ -30,12 +30,17 @@ impl RecordingId {
     /// Generates a new unique recording ID.
     #[must_use]
     pub fn generate() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
-            .as_nanos();
-        Self(format!("rec-{timestamp:x}"))
+            .as_nanos() as u64;
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        Self(format!("rec-{:x}-{counter:x}", timestamp))
     }
 
     /// Returns the ID as a string.
