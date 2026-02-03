@@ -5,6 +5,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 ## Completed Phases
 
 ### ✅ Phase 1-2: Foundation & Transport
+
 - Workspace structure with 27 crates in 9 layers
 - Foundation crates: `sbc-types`, `sbc-crypto`, `sbc-audit`, `sbc-config`
 - CNSA 2.0 cryptographic compliance enforcement
@@ -12,21 +13,25 @@ This document outlines the development roadmap for the USG Session Border Contro
 - Transport crates: `sbc-transport`, `sbc-dtls`
 
 ### ✅ Phase 3: Protocol Core
+
 - `proto-sip`: RFC 3261 SIP message parsing and generation (standalone, reusable)
 - `sbc-sdp`: SDP offer/answer model
 - `sbc-rtp`: RTP packet handling
 - `sbc-srtp`: Custom CNSA 2.0 compliant SRTP (AES-256-GCM, SHA-384 KDF)
 
 ### ✅ Phase 4: NAT/ICE
+
 - `sbc-stun`: STUN client/server
 - `sbc-turn`: TURN relay
 - `sbc-ice`: Full ICE implementation (RFC 8445)
 
 ### ✅ Phase 5: Media Engine
+
 - `sbc-codecs`: Opus, G.711 (pure Rust), G.722 codec support
 - `sbc-media-engine`: Media relay and pass-through modes
 
 ### ✅ Phase 6: SIP Application (Extracted to proto-* crates)
+
 - `proto-sip`: RFC 3261 SIP parsing, RFC 2617 digest auth, RFC 3327 Path header
 - `proto-transaction`: RFC 3261 §17 transaction FSM, CSeq validation, RFC 3311 UPDATE
 - `proto-dialog`: RFC 3261 §12 dialogs, RFC 3515 REFER, RFC 4028 session timers, forking support
@@ -35,11 +40,13 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-transaction`, `sbc-dialog`, `sbc-b2bua`, `sbc-registrar`: Thin wrappers re-exporting proto-* crates
 
 ### ✅ Phase 7: Security Services
+
 - `sbc-stir-shaken`: STIR/SHAKEN with ES384 only (CNSA 2.0)
 - `sbc-acl`: Access control lists with CIDR network matching
 - `sbc-dos-protection`: Token bucket rate limiting
 
 ### ✅ Phase 8: Orchestration & Management
+
 - `sbc-policy`: Policy engine with conditions, actions, rules
 - `sbc-routing`: Dial plans, trunk management, LCR, failover
 - `sbc-cdr`: Call Detail Records with JSON/CSV export
@@ -48,6 +55,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-health`: Kubernetes liveness/readiness probes
 
 ### ✅ Phase 9: Binaries & Integration
+
 - `sbc-daemon`: Main SBC daemon
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
@@ -59,67 +67,74 @@ This document outlines the development roadmap for the USG Session Border Contro
 ## Completed Development Phases
 
 ### ✅ Phase 10: Async Runtime Integration
+
 **Goal**: Wire up tokio async runtime for real network I/O
 
-- [x] Add tokio dependency to sbc-daemon
-- [x] Implement async transport listeners (UDP)
-- [x] Create async event loop for message processing
-- [x] Add Unix signal handling (SIGTERM, SIGINT, SIGHUP)
-- [x] Implement async health check polling
+- ✅ Add tokio dependency to sbc-daemon
+- ✅ Implement async transport listeners (UDP)
+- ✅ Create async event loop for message processing
+- ✅ Add Unix signal handling (SIGTERM, SIGINT, SIGHUP)
+- ✅ Implement async health check polling
 
 ### ✅ Phase 11: SIP Stack Integration
+
 **Goal**: Connect SIP components into working call flow
 
-- [x] Integrate proto-sip with transport layer
-- [x] Wire sbc-transaction for request/response handling
-- [x] Connect sbc-dialog for call state management
-- [x] Enable sbc-b2bua for call bridging
-- [x] Integrate sbc-registrar for user registration
+- ✅ Integrate proto-sip with transport layer
+- ✅ Wire sbc-transaction for request/response handling
+- ✅ Connect sbc-dialog for call state management
+- ✅ Enable sbc-b2bua for call bridging
+- ✅ Integrate sbc-registrar for user registration
 
 ### ✅ Phase 12: Media Pipeline
+
 **Goal**: Enable RTP/SRTP media relay
 
-- [x] Connect sbc-rtp with UDP transport
-- [x] Integrate sbc-srtp for encrypted media
-- [x] Wire sbc-media-engine for relay/pass-through
-- [x] Add DTLS-SRTP key exchange via sbc-dtls
-- [x] Enable codec transcoding via sbc-codecs
+- ✅ Connect sbc-rtp with UDP transport
+- ✅ Integrate sbc-srtp for encrypted media
+- ✅ Wire sbc-media-engine for relay/pass-through
+- ✅ Add DTLS-SRTP key exchange via sbc-dtls
+- ✅ Enable codec transcoding via sbc-codecs
 
 ### ✅ Phase 13: ICE/NAT Traversal
+
 **Goal**: Full NAT traversal support
 
-- [x] Integrate sbc-stun for connectivity checks
-- [x] Enable sbc-turn for relay allocation
-- [x] Connect sbc-ice for candidate gathering/selection
-- [x] Add ICE-lite mode for server-side optimization
+- ✅ Integrate sbc-stun for connectivity checks
+- ✅ Enable sbc-turn for relay allocation
+- ✅ Connect sbc-ice for candidate gathering/selection
+- ✅ Add ICE-lite mode for server-side optimization
 
 ### ✅ Phase 14: REST API Server
+
 **Goal**: HTTP management interface
 
-- [x] Add HTTP server to sbc-daemon (axum)
-- [x] Expose sbc-api routes for management
-- [x] Implement sbc-metrics Prometheus endpoint
-- [x] Add sbc-health HTTP probes (/healthz, /readyz)
+- ✅ Add HTTP server to sbc-daemon (axum)
+- ✅ Expose sbc-api routes for management
+- ✅ Implement sbc-metrics Prometheus endpoint
+- ✅ Add sbc-health HTTP probes (/healthz, /readyz)
 - [ ] Enable sbc-cdr export endpoints (future)
 
 ### ✅ Phase 15: Production Hardening
+
 **Goal**: Production-ready deployment
 
-- [x] Implement graceful shutdown with connection draining
-- [x] Add configuration hot-reload via SIGHUP
-- [x] Enable TLS for API server (HTTPS with CNSA 2.0 compliant config)
-- [x] Implement rate limiting per sbc-dos-protection
+- ✅ Implement graceful shutdown with connection draining
+- ✅ Add configuration hot-reload via SIGHUP
+- ✅ Enable TLS for API server (HTTPS with CNSA 2.0 compliant config)
+- ✅ Implement rate limiting per sbc-dos-protection
 - [ ] Add distributed tracing (OpenTelemetry) (future)
 - [ ] Enable TLS certificate rotation (future)
 
 ### ✅ Phase 16: Deployment & Operations
+
 **Goal**: Container and orchestration support
 
-- [x] Create multi-stage Dockerfile (non-root, minimal runtime)
-- [x] Add Kubernetes manifests (Namespace, Deployment, Service, ConfigMap, RBAC, PDB, NetworkPolicy)
-- [x] Create Helm chart for parameterized deployment
-- [x] Add Prometheus ServiceMonitor
-- [x] Document operational runbook
+- ✅ Create multi-stage Dockerfile (non-root, minimal runtime)
+- ✅ Add Kubernetes manifests (Namespace, Deployment, Service, ConfigMap, RBAC, PDB, NetworkPolicy)
+- ✅ Create Helm chart for parameterized deployment
+- ✅ Add Prometheus ServiceMonitor
+- ✅ Document operational runbook
 
 ---
 
@@ -131,29 +146,29 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **DTLS Integration** (sbc-dtls) ✅
 
-- [x] Custom DTLS 1.2 implementation with aws-lc-rs (replaced webrtc-dtls)
-- [x] DTLS record layer with AES-256-GCM encryption
-- [x] Full handshake state machine (client and server)
-- [x] TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 cipher suite (0xC02C)
-- [x] P-384 ECDHE key exchange
-- [x] TLS 1.2 PRF with HMAC-SHA384
-- [x] SRTP keying material export (RFC 5764)
-- [x] Anti-replay protection with sliding window
-- [x] Cookie-based DoS protection (HelloVerifyRequest)
+- ✅ Custom DTLS 1.2 implementation with aws-lc-rs (replaced webrtc-dtls)
+- ✅ DTLS record layer with AES-256-GCM encryption
+- ✅ Full handshake state machine (client and server)
+- ✅ TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 cipher suite (0xC02C)
+- ✅ P-384 ECDHE key exchange
+- ✅ TLS 1.2 PRF with HMAC-SHA384
+- ✅ SRTP keying material export (RFC 5764)
+- ✅ Anti-replay protection with sliding window
+- ✅ Cookie-based DoS protection (HelloVerifyRequest)
 
 **ICE Candidate Gathering** (sbc-ice) ✅
 
-- [x] STUN client implementation for server-reflexive candidates
-- [x] TURN client implementation for relay candidates
-- [x] Candidate gathering state machine in ICE agent
-- [x] TURN authentication support
+- ✅ STUN client implementation for server-reflexive candidates
+- ✅ TURN client implementation for relay candidates
+- ✅ Candidate gathering state machine in ICE agent
+- ✅ TURN authentication support
 
 **Codec Implementations** (sbc-codecs) ✅
 
-- [x] G.722 ADPCM encoder/decoder (pure Rust implementation)
-- [x] QMF filter banks for sub-band splitting
-- [x] Opus FFI bindings (optional `opus-ffi` feature via audiopus)
-- [x] Fixed clippy warnings across codec modules
+- ✅ G.722 ADPCM encoder/decoder (pure Rust implementation)
+- ✅ QMF filter banks for sub-band splitting
+- ✅ Opus FFI bindings (optional `opus-ffi` feature via audiopus)
+- ✅ Fixed clippy warnings across codec modules
 
 ---
 
@@ -165,55 +180,55 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **Reliable Provisional Responses** (RFC 3262) ✅
 
-- [x] 100rel extension support in proto-transaction
-- [x] PRACK method transaction state machine (ReliableProvisionalTracker)
-- [x] RAck header parsing and validation
-- [x] Provisional response retransmission with T1/T2 timers
+- ✅ 100rel extension support in proto-transaction
+- ✅ PRACK method transaction state machine (ReliableProvisionalTracker)
+- ✅ RAck header parsing and validation
+- ✅ Provisional response retransmission with T1/T2 timers
 
 **Event Framework** (RFC 6665) ✅
 
-- [x] SUBSCRIBE/NOTIFY dialog support in proto-dialog
-- [x] Subscription and Notifier state management
-- [x] Event package definitions (presence, dialog, message-summary, refer, reg)
-- [x] SubscriptionStateHeader parsing and formatting
+- ✅ SUBSCRIBE/NOTIFY dialog support in proto-dialog
+- ✅ Subscription and Notifier state management
+- ✅ Event package definitions (presence, dialog, message-summary, refer, reg)
+- ✅ SubscriptionStateHeader parsing and formatting
 
 **REGISTER Response** (RFC 3261 §10.3) ✅
 
-- [x] format_contacts() echoes registered contacts with expiry
-- [x] remaining_seconds() for binding time-to-expiry
-- [x] Service-Route header support in RegisterResponse
-- [x] Path header support in RegisterRequest/Response
+- ✅ format_contacts() echoes registered contacts with expiry
+- ✅ remaining_seconds() for binding time-to-expiry
+- ✅ Service-Route header support in RegisterResponse
+- ✅ Path header support in RegisterRequest/Response
 
 **Early Media** (RFC 3960) ✅
 
-- [x] EarlyMediaHandler for 183 Session Progress
-- [x] EarlyMediaMode: None, LocalRingback, Relay, Gate
-- [x] Per-leg early media session tracking
-- [x] Mode-based early media disposition
+- ✅ EarlyMediaHandler for 183 Session Progress
+- ✅ EarlyMediaMode: None, LocalRingback, Relay, Gate
+- ✅ Per-leg early media session tracking
+- ✅ Mode-based early media disposition
 
 **ICE Connectivity Checks** (RFC 8445 §6.2) ✅
 
-- [x] STUN-based connectivity check implementation in proto-ice
-- [x] ConnectivityChecker with triggered check queue
-- [x] IceStunServer for Binding request/response handling
-- [x] USE-CANDIDATE nomination and role conflict (487) handling
-- [x] CheckResult states: Success, Failure, Timeout, RoleConflict, InvalidCredentials
+- ✅ STUN-based connectivity check implementation in proto-ice
+- ✅ ConnectivityChecker with triggered check queue
+- ✅ IceStunServer for Binding request/response handling
+- ✅ USE-CANDIDATE nomination and role conflict (487) handling
+- ✅ CheckResult states: Success, Failure, Timeout, RoleConflict, InvalidCredentials
 
 **ICE Consent & Keepalives** (RFC 8445 §9-10, RFC 7675) ✅
 
-- [x] ConsentTracker with 5-second check interval
-- [x] 30-second consent timeout per RFC 7675
-- [x] KeepaliveTracker with 15-second STUN Binding indications
-- [x] ConsentKeepaliveManager combining consent and keepalive logic
-- [x] ConsentState: Pending, Granted, Expired
+- ✅ ConsentTracker with 5-second check interval
+- ✅ 30-second consent timeout per RFC 7675
+- ✅ KeepaliveTracker with 15-second STUN Binding indications
+- ✅ ConsentKeepaliveManager combining consent and keepalive logic
+- ✅ ConsentState: Pending, Granted, Expired
 
 **DTLS-SRTP Key Export** (RFC 5764) ✅
 
-- [x] SrtpKeyExporter for keying material derivation
-- [x] EXTRACTOR-dtls_srtp label per RFC 5764 §4.2
-- [x] 88-byte keying material layout (2×32 keys + 2×12 salts)
-- [x] UseSrtpExtension encode/decode for use_srtp negotiation
-- [x] HKDF-SHA384 PRF for CNSA 2.0 compliance
+- ✅ SrtpKeyExporter for keying material derivation
+- ✅ EXTRACTOR-dtls_srtp label per RFC 5764 §4.2
+- ✅ 88-byte keying material layout (2×32 keys + 2×12 salts)
+- ✅ UseSrtpExtension encode/decode for use_srtp negotiation
+- ✅ HKDF-SHA384 PRF for CNSA 2.0 compliance
 
 ### ✅ Phase 18.5: RFC Compliance Gap Resolution
 
@@ -221,54 +236,54 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **P0 Critical - DTLS Security** (RFC 6347 §4.2.4, §4.2.6) ✅
 
-- [x] Certificate chain verification with trusted CA store
-- [x] Self-signed certificate fingerprint validation for WebRTC
-- [x] Finished message verification with PRF-based verify_data
-- [x] CNSA 2.0 compliant (SHA-384, P-384/P-521 only)
+- ✅ Certificate chain verification with trusted CA store
+- ✅ Self-signed certificate fingerprint validation for WebRTC
+- ✅ Finished message verification with PRF-based verify_data
+- ✅ CNSA 2.0 compliant (SHA-384, P-384/P-521 only)
 
 **P0 Critical - ICE Consent** (RFC 7675 §6) ✅
 
-- [x] Consent revocation with explicit state management
-- [x] Revocation reasons (UserInitiated, SecurityConcern, etc.)
-- [x] Immediate media transmission stop on revocation
+- ✅ Consent revocation with explicit state management
+- ✅ Revocation reasons (UserInitiated, SecurityConcern, etc.)
+- ✅ Immediate media transmission stop on revocation
 
 **P0 Critical - TURN Indications** (RFC 5766 §9, §12) ✅
 
-- [x] Send indication for client-to-peer data
-- [x] Data indication for peer-to-client data
-- [x] XOR-PEER-ADDRESS and DATA attribute handling
+- ✅ Send indication for client-to-peer data
+- ✅ Data indication for peer-to-client data
+- ✅ XOR-PEER-ADDRESS and DATA attribute handling
 
 **P0 Critical - SIP Redirect** (RFC 3261 §13.2.2.4) ✅
 
-- [x] 3xx response processing with Contact parsing
-- [x] Priority-based target selection (q-value)
-- [x] Loop detection and max redirect limits
+- ✅ 3xx response processing with Contact parsing
+- ✅ Priority-based target selection (q-value)
+- ✅ Loop detection and max redirect limits
 
 **P1 High - Flow Maintenance** (RFC 5626 §5.2) ✅
 
-- [x] Multi-transport keepalive (STUN, CRLF, WebSocket)
-- [x] Flow state machine (Active, Probing, Suspect, Failed)
-- [x] Flow token generation and tracking
+- ✅ Multi-transport keepalive (STUN, CRLF, WebSocket)
+- ✅ Flow state machine (Active, Probing, Suspect, Failed)
+- ✅ Flow token generation and tracking
 
 **P1 High - Aggressive Nomination** (RFC 8445 §7.2.2) ✅
 
-- [x] USE-CANDIDATE in every check for controlling agent
-- [x] Configuration flag and automatic application
-- [x] Explicit nomination control methods
+- ✅ USE-CANDIDATE in every check for controlling agent
+- ✅ Configuration flag and automatic application
+- ✅ Explicit nomination control methods
 
 **P1 High - Media Modification** (RFC 3264 §8.4) ✅
 
-- [x] Offer/answer validation rules
-- [x] Direction negotiation table
-- [x] Hold/resume support
-- [x] Stream enable/disable (port=0)
+- ✅ Offer/answer validation rules
+- ✅ Direction negotiation table
+- ✅ Hold/resume support
+- ✅ Stream enable/disable (port=0)
 
 **P1 High - Long-Term Credential** (RFC 5389 §10.2) ✅
 
-- [x] Challenge-response authentication flow
-- [x] Nonce generation with HMAC signatures
-- [x] Stale nonce detection and refresh
-- [x] CNSA 2.0 compliant (SHA-384 instead of MD5)
+- ✅ Challenge-response authentication flow
+- ✅ Nonce generation with HMAC signatures
+- ✅ Stale nonce detection and refresh
+- ✅ CNSA 2.0 compliant (SHA-384 instead of MD5)
 
 ### ✅ Phase 18.6: P2 Medium Priority RFC Compliance
 
@@ -276,33 +291,33 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **P2 Medium - Proxy GRUU Routing** (RFC 5627 §5.1) ✅
 
-- [x] GruuRouter for GRUU-based request routing
-- [x] AOR and instance-id extraction from GRUU
-- [x] Lowest reg-id selection for multiple flows
-- [x] Path header forwarding support
-- [x] Routing result types: Resolved, Expired, NotFound
+- ✅ GruuRouter for GRUU-based request routing
+- ✅ AOR and instance-id extraction from GRUU
+- ✅ Lowest reg-id selection for multiple flows
+- ✅ Path header forwarding support
+- ✅ Routing result types: Resolved, Expired, NotFound
 
 **P2 Medium - RTCP Timing Rules** (RFC 3550 §6.3.5) ✅
 
-- [x] RtcpScheduler implementing Appendix A.7 algorithm
-- [x] Deterministic interval based on bandwidth/members
-- [x] [0.5, 1.5] randomization per RFC 3550 §6.3.5
-- [x] Sender/receiver bandwidth separation (25%/75%)
-- [x] Timer reconsideration for membership changes
+- ✅ RtcpScheduler implementing Appendix A.7 algorithm
+- ✅ Deterministic interval based on bandwidth/members
+- ✅ [0.5, 1.5] randomization per RFC 3550 §6.3.5
+- ✅ Sender/receiver bandwidth separation (25%/75%)
+- ✅ Timer reconsideration for membership changes
 
 **P2 Medium - Event Package Validation** (RFC 6665 §7.2) ✅
 
-- [x] EventPackageRegistry with IANA registrations
-- [x] Validation result types: Valid, UnregisteredAllowed, Invalid
-- [x] Custom package extension support
-- [x] Strict vs permissive validation modes
+- ✅ EventPackageRegistry with IANA registrations
+- ✅ Validation result types: Valid, UnregisteredAllowed, Invalid
+- ✅ Custom package extension support
+- ✅ Strict vs permissive validation modes
 
 **P2 Medium - SDP Repeat Times** (RFC 4566 §5.11) ✅
 
-- [x] RepeatTimes (r= line) support
-- [x] TimeValue with compact notation (d/h/m/s)
-- [x] Parsing and generation roundtrip
-- [x] Validation (interval, duration, offsets)
+- ✅ RepeatTimes (r= line) support
+- ✅ TimeValue with compact notation (d/h/m/s)
+- ✅ Parsing and generation roundtrip
+- ✅ Validation (interval, duration, offsets)
 
 ### ✅ Phase 18.7: P3 Low Priority RFC Compliance
 
@@ -310,63 +325,65 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **P3 Low - Multicast Streams** (RFC 3264 §6.2) ✅
 
-- [x] MulticastAddress struct with IPv4/IPv6 scope detection
-- [x] MulticastNegotiator for offer/answer multicast validation
-- [x] MulticastScope enum (NodeLocal to Global)
-- [x] is_multicast_address() and is_multicast_media() helpers
-- [x] TTL validation and administrative scope checking
+- ✅ MulticastAddress struct with IPv4/IPv6 scope detection
+- ✅ MulticastNegotiator for offer/answer multicast validation
+- ✅ MulticastScope enum (NodeLocal to Global)
+- ✅ is_multicast_address() and is_multicast_media() helpers
+- ✅ TTL validation and administrative scope checking
 
 **P3 Low - Translators/Mixers** (RFC 3550 §7) ✅
 
-- [x] RtpTranslator for SSRC-preserving packet forwarding
-- [x] RtpMixer for multi-source mixing with CSRC list
-- [x] SsrcCollisionDetector for loop prevention
-- [x] TranslatorRtcpBuilder for combined RTCP reports
-- [x] MAX_CSRC_COUNT constant (15) per RFC 3550
-- [x] validate_csrc_list() for CSRC validation
+- ✅ RtpTranslator for SSRC-preserving packet forwarding
+- ✅ RtpMixer for multi-source mixing with CSRC list
+- ✅ SsrcCollisionDetector for loop prevention
+- ✅ TranslatorRtcpBuilder for combined RTCP reports
+- ✅ MAX_CSRC_COUNT constant (15) per RFC 3550
+- ✅ validate_csrc_list() for CSRC validation
 
 **P3 Low - Proxy Forwarding** (RFC 3261 §16.6) ✅
 
-- [x] ProxyContext for proxy configuration
-- [x] RequestForwarder with full §16.6 compliance
-- [x] Max-Forwards validation and decrement
-- [x] Via header insertion at correct position
-- [x] Record-Route header insertion
-- [x] Loop detection via Via inspection
-- [x] ResponseProcessor for upstream forwarding
-- [x] ForkingMode enum (None, Parallel, Sequential)
-- [x] Best response selection (6xx > 2xx > 3xx priority)
+- ✅ ProxyContext for proxy configuration
+- ✅ RequestForwarder with full §16.6 compliance
+- ✅ Max-Forwards validation and decrement
+- ✅ Via header insertion at correct position
+- ✅ Record-Route header insertion
+- ✅ Loop detection via Via inspection
+- ✅ ResponseProcessor for upstream forwarding
+- ✅ ForkingMode enum (None, Parallel, Sequential)
+- ✅ Best response selection (6xx > 2xx > 3xx priority)
 
 ### ✅ Phase 19: SIP Authentication & Security
+
 **Goal**: Production-grade SIP security
 
 **SIP Digest Authentication** (RFC 3261 Section 22) ✅
 
-- [x] HTTP Digest computation (MD5, SHA-256, SHA-512-256) in proto-sip
-- [x] Nonce generation and validation in proto-registrar
-- [x] qop=auth and qop=auth-int support
-- [x] Authentication state management with nonce count tracking
-- [x] Stale nonce detection and renewal
-- [x] AuthenticatedRegistrar combining registrar + authenticator
+- ✅ HTTP Digest computation (MD5, SHA-256, SHA-512-256) in proto-sip
+- ✅ Nonce generation and validation in proto-registrar
+- ✅ qop=auth and qop=auth-int support
+- ✅ Authentication state management with nonce count tracking
+- ✅ Stale nonce detection and renewal
+- ✅ AuthenticatedRegistrar combining registrar + authenticator
 
 **Topology Hiding** (RFC 3323/RFC 5765) ✅
 
-- [x] TopologyHidingConfig in proto-b2bua
-- [x] TopologyHider in proto-sip with Basic/Aggressive modes
-- [x] Via header stripping/rewriting implementation
-- [x] Contact header anonymization
-- [x] Record-Route manipulation with external host substitution
-- [x] Call-ID obfuscation with bidirectional mapping
+- ✅ TopologyHidingConfig in proto-b2bua
+- ✅ TopologyHider in proto-sip with Basic/Aggressive modes
+- ✅ Via header stripping/rewriting implementation
+- ✅ Contact header anonymization
+- ✅ Record-Route manipulation with external host substitution
+- ✅ Call-ID obfuscation with bidirectional mapping
 
 **SRTP-SDES Key Exchange** (RFC 4568) ✅
 
-- [x] Parse crypto attributes from SDP (CryptoAttribute struct)
-- [x] CipherSuite enum (AES_CM_128_HMAC_SHA1_80/32, AEAD_AES_128/256_GCM)
-- [x] KeyParams with master key/salt extraction
-- [x] SrtpNegotiator for cipher suite selection
-- [x] DTLS-SRTP vs SDES protocol detection helpers
+- ✅ Parse crypto attributes from SDP (CryptoAttribute struct)
+- ✅ CipherSuite enum (AES_CM_128_HMAC_SHA1_80/32, AEAD_AES_128/256_GCM)
+- ✅ KeyParams with master key/salt extraction
+- ✅ SrtpNegotiator for cipher suite selection
+- ✅ DTLS-SRTP vs SDES protocol detection helpers
 
 ### ⏳ Phase 20: WebRTC & Modern Transports
+
 **Goal**: WebRTC gateway support
 
 **WebSocket SIP Transport** (RFC 7118)
@@ -384,58 +401,70 @@ This document outlines the development roadmap for the USG Session Border Contro
 - [ ] SRTP-to-DTLS-SRTP interworking
 
 ### ⏳ Phase 21: Advanced SBC Features
+
 **Goal**: Enterprise-grade SBC functionality
 
 **Header Manipulation Engine**
+
 - [ ] Configurable header rewrite rules
 - [ ] Regular expression substitution
 - [ ] Header insertion/deletion policies
 - [ ] Per-trunk header manipulation
 
 **Call Recording & Forking** (RFC 7866)
+
 - [ ] SIPREC support for call recording
 - [ ] Media forking to recording server
 - [ ] Metadata generation for recordings
 
 **QoS & Traffic Management**
+
 - [ ] DSCP marking for SIP/RTP packets
 - [ ] Bandwidth management per trunk
 - [ ] Call admission control by capacity
 
 **DNS Integration**
+
 - [ ] ENUM lookup (RFC 6116)
 - [ ] DNS SRV for SIP routing (RFC 3263)
 - [ ] NAPTR records support
 - [ ] DNS caching and TTL management
 
-### ⏳ Phase 21: High Availability & Clustering
+### ⏳ Phase 22: High Availability & Clustering
+
 **Goal**: Carrier-grade reliability
 
 **State Replication**
+
 - [ ] Call state synchronization between nodes
 - [ ] Registration database replication
 - [ ] Distributed rate limiting state
 
 **Geographic Redundancy**
+
 - [ ] Active-active clustering
 - [ ] Session takeover on failover
 - [ ] Load balancing strategies
 
 **External Integrations**
+
 - [ ] RADIUS/Diameter for AAA
 - [ ] External database backends (PostgreSQL, Redis)
 - [ ] SNMP traps and monitoring
 - [ ] Syslog forwarding
 
-### ⏳ Phase 22: Specialized Protocols
+### ⏳ Phase 23: Specialized Protocols
+
 **Goal**: Complete protocol coverage
 
 **T.38 Fax Relay** (RFC 4612)
+
 - [ ] T.38 over UDP/TCP
 - [ ] Audio-to-T.38 gateway
 - [ ] Error correction modes
 
 **SIP over SCTP** (RFC 4168)
+
 - [ ] SCTP transport support
 - [ ] Multi-homing for reliability
 
@@ -484,6 +513,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 ## Security Compliance
 
 ### CNSA 2.0
+
 - ✅ AES-256-GCM only (AES-128 forbidden)
 - ✅ SHA-384/SHA-512 only (SHA-256 forbidden)
 - ✅ P-384/P-521 curves only (P-256 forbidden)
@@ -491,6 +521,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ TLS 1.3 with TLS_AES_256_GCM_SHA384
 
 ### NIST 800-53 Rev5
+
 - ✅ AU-2: Event Logging
 - ✅ CM-2: Baseline Configuration
 - ✅ CM-6: Configuration Settings
