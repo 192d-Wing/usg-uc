@@ -19,8 +19,10 @@ aaa = ["uc-aaa"]
 snmp = ["uc-snmp"]
 # Enable syslog forwarding
 syslog = ["uc-syslog"]
+# Enable telemetry (OpenTelemetry)
+telemetry = ["uc-telemetry"]
 # Enable all optional features
-full = ["cluster", "aaa", "snmp", "syslog"]
+full = ["cluster", "aaa", "snmp", "syslog", "telemetry"]
 
 [dependencies]
 uc-types = { workspace = true, features = ["serde"] }
@@ -39,6 +41,7 @@ uc-state-sync = { workspace = true, optional = true }
 uc-aaa = { workspace = true, optional = true }
 uc-snmp = { workspace = true, optional = true }
 uc-syslog = { workspace = true, optional = true }
+uc-telemetry = { workspace = true, optional = true }
 
 [lints]
 workspace = true

@@ -31,6 +31,9 @@ pub use uc_snmp::SnmpConfig;
 #[cfg(feature = "syslog")]
 pub use uc_syslog::SyslogConfig;
 
+#[cfg(feature = "telemetry")]
+pub use uc_telemetry::TelemetryConfig;
+
 /// Root SBC configuration.
 ///
 /// ## NIST 800-53 Rev5: CM-2 (Baseline Configuration)
@@ -81,6 +84,13 @@ pub struct SbcConfig {
     ///
     /// ## NIST 800-53 Rev5: AU-6 (Audit Record Review)
     pub monitoring: Option<MonitoringConfig>,
+
+    /// OpenTelemetry distributed tracing configuration.
+    ///
+    /// ## NIST 800-53 Rev5: AU-2 (Audit Events)
+    #[cfg(feature = "telemetry")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<TelemetryConfig>,
 }
 
 /// General SBC settings.

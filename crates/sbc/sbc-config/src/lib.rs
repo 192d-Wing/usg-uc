@@ -40,6 +40,8 @@ pub mod validate;
 
 pub use error::{ConfigError, ConfigResult};
 pub use schema::SbcConfig;
+#[cfg(feature = "telemetry")]
+pub use schema::TelemetryConfig;
 
 use std::path::Path;
 

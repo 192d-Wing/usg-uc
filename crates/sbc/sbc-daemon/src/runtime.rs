@@ -15,13 +15,14 @@ use crate::server::{Server, ServerError};
 use crate::shutdown::{ShutdownCoordinator, ShutdownSignal};
 #[cfg(test)]
 use sbc_config::load_from_str;
-use sbc_config::{SbcConfig, load_from_file};
+use sbc_config::{SbcConfig, TelemetryConfig, load_from_file};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uc_metrics::SbcMetrics;
+use uc_telemetry::TelemetryProvider;
 
 /// SBC daemon runtime.
 pub struct Runtime {
@@ -35,6 +36,8 @@ pub struct Runtime {
     server: Option<Server>,
     /// Configuration reload check interval.
     reload_check_interval: Duration,
+    /// Telemetry provider for distributed tracing.
+    telemetry: Option<TelemetryProvider>,
 }
 
 impl Runtime {
@@ -42,6 +45,9 @@ impl Runtime {
     pub async fn new(args: Args) -> Result<Self, RuntimeError> {
         // Load configuration
         let config = Self::load_config(&args)?;
+
+        // Initialize telemetry provider
+        let telemetry = Self::init_telemetry(&config)?;
 
         // Set up shutdown handling
         let signal = ShutdownSignal::new();
@@ -61,7 +67,41 @@ impl Runtime {
             shutdown,
             server: None,
             reload_check_interval: Duration::from_millis(500),
+            telemetry,
         })
+    }
+
+    /// Initializes the telemetry provider from configuration.
+    fn init_telemetry(config: &SbcConfig) -> Result<Option<TelemetryProvider>, RuntimeError> {
+        // Get telemetry config, or create default if not specified
+        let telemetry_config = config.telemetry.clone().unwrap_or_else(|| TelemetryConfig {
+            service_name: "sbc-daemon".to_string(),
+            service_version: env!("CARGO_PKG_VERSION").to_string(),
+            service_instance_id: Some(config.general.instance_name.clone()),
+            ..TelemetryConfig::default()
+        });
+
+        if !telemetry_config.enabled {
+            info!("Telemetry disabled by configuration");
+            return Ok(None);
+        }
+
+        let provider =
+            TelemetryProvider::new(telemetry_config).map_err(|e| RuntimeError::InitFailed {
+                component: "telemetry".to_string(),
+                reason: e.to_string(),
+            })?;
+
+        // Set as global provider
+        provider
+            .init_global()
+            .map_err(|e| RuntimeError::InitFailed {
+                component: "telemetry".to_string(),
+                reason: format!("Failed to set global telemetry provider: {e}"),
+            })?;
+
+        info!("Telemetry provider initialized");
+        Ok(Some(provider))
     }
 
     /// Loads configuration from file or uses defaults.
@@ -245,6 +285,15 @@ impl Runtime {
             .map_err(|e| RuntimeError::ServerFailed {
                 reason: e.to_string(),
             })?;
+
+        // Shutdown telemetry provider (flush pending spans/metrics)
+        if let Some(ref telemetry) = self.telemetry {
+            if let Err(e) = telemetry.shutdown() {
+                warn!(error = %e, "Error shutting down telemetry provider");
+            } else {
+                info!("Telemetry provider shut down successfully");
+            }
+        }
 
         self.server = Some(server);
         Ok(())

@@ -1,6 +1,8 @@
 //! Span context and utilities for distributed tracing.
 
-use opentelemetry::trace::{SpanContext as OtelSpanContext, SpanId, TraceFlags, TraceId, TraceState};
+use opentelemetry::trace::{
+    SpanContext as OtelSpanContext, SpanId, TraceFlags, TraceId, TraceState,
+};
 use serde::{Deserialize, Serialize};
 
 /// Span kind for categorizing operations.
@@ -86,8 +88,10 @@ impl SpanContext {
     /// # Errors
     /// Returns an error if the trace ID or span ID are invalid.
     pub fn to_otel(&self) -> Result<OtelSpanContext, SpanContextError> {
-        let trace_id = TraceId::from_hex(&self.trace_id).map_err(|_| SpanContextError::InvalidTraceId)?;
-        let span_id = SpanId::from_hex(&self.span_id).map_err(|_| SpanContextError::InvalidSpanId)?;
+        let trace_id =
+            TraceId::from_hex(&self.trace_id).map_err(|_| SpanContextError::InvalidTraceId)?;
+        let span_id =
+            SpanId::from_hex(&self.span_id).map_err(|_| SpanContextError::InvalidSpanId)?;
         let flags = TraceFlags::new(self.flags);
 
         Ok(OtelSpanContext::new(
@@ -117,10 +121,7 @@ impl SpanContext {
     /// Encodes the span context for W3C Trace Context header.
     #[must_use]
     pub fn to_traceparent(&self) -> String {
-        format!(
-            "00-{}-{}-{:02x}",
-            self.trace_id, self.span_id, self.flags
-        )
+        format!("00-{}-{}-{:02x}", self.trace_id, self.span_id, self.flags)
     }
 
     /// Decodes a span context from W3C Trace Context header.
@@ -183,10 +184,7 @@ mod tests {
 
     #[test]
     fn test_span_context_creation() {
-        let ctx = SpanContext::new(
-            "00000000000000000000000000000001",
-            "0000000000000001",
-        );
+        let ctx = SpanContext::new("00000000000000000000000000000001", "0000000000000001");
         assert_eq!(ctx.trace_id, "00000000000000000000000000000001");
         assert_eq!(ctx.span_id, "0000000000000001");
         assert_eq!(ctx.flags, 0);
@@ -195,10 +193,7 @@ mod tests {
 
     #[test]
     fn test_traceparent_encoding() {
-        let mut ctx = SpanContext::new(
-            "0af7651916cd43dd8448eb211c80319c",
-            "b7ad6b7169203331",
-        );
+        let mut ctx = SpanContext::new("0af7651916cd43dd8448eb211c80319c", "b7ad6b7169203331");
         ctx.set_sampled(true);
 
         let traceparent = ctx.to_traceparent();

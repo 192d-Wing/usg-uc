@@ -14,10 +14,11 @@ workspace = true
 
 [dependencies]
 uc-types.workspace = true
-sbc-config = { path = "../sbc-config" }
+sbc-config = { path = "../sbc-config", features = ["telemetry"] }
 uc-health.workspace = true
 uc-metrics.workspace = true
 uc-transport.workspace = true
+uc-telemetry.workspace = true
 proto-sip.workspace = true
 proto-transaction.workspace = true
 proto-dialog.workspace = true

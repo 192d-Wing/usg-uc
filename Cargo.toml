@@ -158,6 +158,7 @@ uc-snmp = { path = "crates/uc/uc-snmp" }
 uc-syslog = { path = "crates/uc/uc-syslog" }
 uc-webrtc = { path = "crates/uc/uc-webrtc" }
 uc-dns = { path = "crates/uc/uc-dns" }
+uc-telemetry = { path = "crates/uc/uc-telemetry" }
 
 # Internal crates - Protocol (proto/*)
 proto-sip = { path = "crates/proto/proto-sip" }

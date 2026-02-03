@@ -5692,6 +5692,7 @@ dependencies = [
  "uc-state-sync",
  "uc-storage",
  "uc-syslog",
+ "uc-telemetry",
  "uc-types",
  "validator",
 ]
@@ -5732,6 +5733,7 @@ dependencies = [
  "uc-health",
  "uc-media-engine",
  "uc-metrics",
+ "uc-telemetry",
  "uc-transport",
  "uc-types",
 ]

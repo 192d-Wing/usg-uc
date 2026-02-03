@@ -3,9 +3,9 @@
 use crate::config::TelemetryConfig;
 use crate::error::{TelemetryError, TelemetryResult};
 use opentelemetry::global;
-use opentelemetry_sdk::metrics::SdkMeterProvider;
-use opentelemetry_sdk::trace::{SdkTracerProvider, Sampler};
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use tracing::{debug, info};
 
 /// Telemetry provider that manages OpenTelemetry tracing and metrics.
@@ -79,12 +79,11 @@ impl TelemetryProvider {
             attrs.push(KeyValue::new("deployment.environment", env.clone()));
         }
 
-        Resource::builder()
-            .with_attributes(attrs)
-            .build()
+        Resource::builder().with_attributes(attrs).build()
     }
 
     /// Builds the tracer provider.
+    #[allow(clippy::unnecessary_wraps)] // Returns Result when otlp feature is enabled
     fn build_tracer_provider(
         config: &TelemetryConfig,
         resource: Resource,
@@ -139,6 +138,7 @@ impl TelemetryProvider {
     }
 
     /// Builds the meter provider.
+    #[allow(clippy::unnecessary_wraps)] // Returns Result when otlp feature is enabled
     fn build_meter_provider(
         config: &TelemetryConfig,
         resource: Resource,
@@ -238,15 +238,19 @@ impl TelemetryProvider {
     /// Returns an error if shutdown fails.
     pub fn shutdown(&self) -> TelemetryResult<()> {
         if let Some(ref provider) = self.tracer_provider {
-            provider.shutdown().map_err(|e| TelemetryError::ShutdownError {
-                reason: format!("Tracer shutdown failed: {e}"),
-            })?;
+            provider
+                .shutdown()
+                .map_err(|e| TelemetryError::ShutdownError {
+                    reason: format!("Tracer shutdown failed: {e}"),
+                })?;
         }
 
         if let Some(ref provider) = self.meter_provider {
-            provider.shutdown().map_err(|e| TelemetryError::ShutdownError {
-                reason: format!("Meter shutdown failed: {e}"),
-            })?;
+            provider
+                .shutdown()
+                .map_err(|e| TelemetryError::ShutdownError {
+                    reason: format!("Meter shutdown failed: {e}"),
+                })?;
         }
 
         info!("Telemetry provider shut down");
@@ -291,9 +295,7 @@ mod tests {
 
     #[test]
     fn test_provider_config() {
-        let config = TelemetryConfig::builder()
-            .service_name("test")
-            .build();
+        let config = TelemetryConfig::builder().service_name("test").build();
 
         let provider = TelemetryProvider::new(config).unwrap();
         assert_eq!(provider.config().service_name, "test");

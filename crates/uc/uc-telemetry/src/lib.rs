@@ -80,71 +80,85 @@ pub mod attributes {
     use opentelemetry::KeyValue;
 
     /// Creates a span attribute for Call-ID.
+    #[must_use]
     pub fn call_id(id: impl Into<String>) -> KeyValue {
         KeyValue::new("sip.call_id", id.into())
     }
 
     /// Creates a span attribute for SIP method.
+    #[must_use]
     pub fn sip_method(method: impl Into<String>) -> KeyValue {
         KeyValue::new("sip.method", method.into())
     }
 
     /// Creates a span attribute for SIP status code.
+    #[must_use]
     pub fn sip_status_code(code: u16) -> KeyValue {
         KeyValue::new("sip.status_code", i64::from(code))
     }
 
     /// Creates a span attribute for transaction ID.
+    #[must_use]
     pub fn transaction_id(id: impl Into<String>) -> KeyValue {
         KeyValue::new("sip.transaction_id", id.into())
     }
 
     /// Creates a span attribute for dialog ID.
+    #[must_use]
     pub fn dialog_id(id: impl Into<String>) -> KeyValue {
         KeyValue::new("sip.dialog_id", id.into())
     }
 
     /// Creates a span attribute for source IP.
+    #[must_use]
     pub fn source_ip(ip: impl Into<String>) -> KeyValue {
         KeyValue::new("net.peer.ip", ip.into())
     }
 
     /// Creates a span attribute for source port.
+    #[must_use]
     pub fn source_port(port: u16) -> KeyValue {
         KeyValue::new("net.peer.port", i64::from(port))
     }
 
     /// Creates a span attribute for destination IP.
+    #[must_use]
     pub fn destination_ip(ip: impl Into<String>) -> KeyValue {
         KeyValue::new("net.host.ip", ip.into())
     }
 
     /// Creates a span attribute for destination port.
+    #[must_use]
     pub fn destination_port(port: u16) -> KeyValue {
         KeyValue::new("net.host.port", i64::from(port))
     }
 
     /// Creates a span attribute for transport protocol.
+    #[must_use]
     pub fn transport(protocol: impl Into<String>) -> KeyValue {
         KeyValue::new("net.transport", protocol.into())
     }
 
     /// Creates a span attribute for codec.
+    #[must_use]
     pub fn codec(name: impl Into<String>) -> KeyValue {
         KeyValue::new("media.codec", name.into())
     }
 
     /// Creates a span attribute for RTP SSRC.
+    #[must_use]
     pub fn rtp_ssrc(ssrc: u32) -> KeyValue {
         KeyValue::new("rtp.ssrc", i64::from(ssrc))
     }
 
     /// Creates a span attribute for error type.
+    #[must_use]
     pub fn error_type(error: impl Into<String>) -> KeyValue {
         KeyValue::new("error.type", error.into())
     }
 
     /// Creates a span attribute for error message.
+    #[must_use]
     pub fn error_message(message: impl Into<String>) -> KeyValue {
         KeyValue::new("error.message", message.into())
     }

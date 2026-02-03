@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// Telemetry configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TelemetryConfig {
     /// Whether telemetry is enabled.
@@ -127,7 +127,7 @@ impl TelemetryConfigBuilder {
 }
 
 /// Trace configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TraceConfig {
     /// Whether tracing is enabled.
@@ -158,7 +158,7 @@ impl Default for TraceConfig {
 }
 
 /// Metrics configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MetricsConfig {
     /// Whether metrics are enabled.
@@ -188,7 +188,7 @@ impl MetricsConfig {
 }
 
 /// Prometheus configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PrometheusConfig {
     /// Whether Prometheus export is enabled.
@@ -207,7 +207,7 @@ impl Default for PrometheusConfig {
 }
 
 /// Batch export configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BatchConfig {
     /// Maximum number of spans in a batch.
@@ -246,7 +246,7 @@ impl BatchConfig {
 }
 
 /// OTLP exporter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OtlpConfig {
     /// OTLP endpoint URL.
@@ -306,7 +306,7 @@ impl std::fmt::Display for OtlpProtocol {
 }
 
 /// OTLP TLS configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OtlpTlsConfig {
     /// Path to CA certificate.
     pub ca_cert_path: Option<String>,
