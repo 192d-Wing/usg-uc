@@ -755,6 +755,7 @@ pub fn uses_dtls_srtp(protocol: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

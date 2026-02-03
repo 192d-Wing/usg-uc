@@ -25,6 +25,16 @@
 #![deny(warnings)]
 // Allow dead code for methods that will be used in future integration
 #![allow(dead_code)]
+// Allow significant_drop_tightening for async RwLock guards that are legitimately held
+#![allow(clippy::significant_drop_tightening)]
+// Allow future_not_send for async functions that don't need Send bounds
+#![allow(clippy::future_not_send)]
+// Allow unused_async for functions that are part of async trait implementations
+#![allow(clippy::unused_async)]
+// Allow needless_pass_by_ref_mut for async methods that may need mutation in future
+#![allow(clippy::needless_pass_by_ref_mut)]
+// Allow unused_self for methods that are part of trait implementations or future use
+#![allow(clippy::unused_self)]
 
 mod api_server;
 mod args;
@@ -59,7 +69,10 @@ fn main() {
         .enable_all()
         .thread_name("sbc-worker")
         .build()
-        .expect("Failed to create tokio runtime");
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to create tokio runtime: {e}");
+            std::process::exit(1);
+        });
 
     rt.block_on(async {
         match Runtime::new(args).await {

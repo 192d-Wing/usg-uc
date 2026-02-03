@@ -301,6 +301,7 @@ impl Runtime {
 
 /// Runtime error.
 #[derive(Debug)]
+#[allow(clippy::enum_variant_names)]
 pub enum RuntimeError {
     /// Configuration loading failed.
     ConfigFailed {
@@ -383,6 +384,7 @@ level = "debug"
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

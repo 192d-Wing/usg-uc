@@ -563,6 +563,7 @@ fn parse_der_length(data: &[u8]) -> DtlsResult<(usize, usize)> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

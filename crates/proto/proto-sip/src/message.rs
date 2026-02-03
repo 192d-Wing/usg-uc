@@ -435,6 +435,7 @@ fn parse_headers_and_body(rest: &str) -> SipResult<(Headers, Option<Bytes>)> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::header::HeaderName;

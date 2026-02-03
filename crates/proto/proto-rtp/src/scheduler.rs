@@ -362,6 +362,7 @@ fn random_f64() -> f64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::unreadable_literal)]
 mod tests {
     use super::*;
 
@@ -399,13 +400,16 @@ mod tests {
 
     #[test]
     fn test_interval_scales_with_members() {
-        let mut params = SessionParams::default();
-        params.initial = false;
+        let scheduler_small = RtcpScheduler::new(SessionParams {
+            initial: false,
+            ..SessionParams::default()
+        });
 
-        let scheduler_small = RtcpScheduler::new(params.clone());
-
-        params.members = 100;
-        let scheduler_large = RtcpScheduler::new(params);
+        let scheduler_large = RtcpScheduler::new(SessionParams {
+            initial: false,
+            members: 100,
+            ..SessionParams::default()
+        });
 
         let interval_small = scheduler_small.compute_deterministic_interval();
         let interval_large = scheduler_large.compute_deterministic_interval();
@@ -416,18 +420,23 @@ mod tests {
 
     #[test]
     fn test_sender_receiver_separation() {
-        let mut params = SessionParams::default();
-        params.members = 100;
-        params.senders = 10; // 10% senders
-        params.initial = false;
-
         // As a sender
-        params.we_sent = true;
-        let scheduler_sender = RtcpScheduler::new(params.clone());
+        let scheduler_sender = RtcpScheduler::new(SessionParams {
+            members: 100,
+            senders: 10, // 10% senders
+            initial: false,
+            we_sent: true,
+            ..SessionParams::default()
+        });
 
         // As a receiver
-        params.we_sent = false;
-        let scheduler_receiver = RtcpScheduler::new(params);
+        let scheduler_receiver = RtcpScheduler::new(SessionParams {
+            members: 100,
+            senders: 10,
+            initial: false,
+            we_sent: false,
+            ..SessionParams::default()
+        });
 
         let interval_sender = scheduler_sender.compute_deterministic_interval();
         let interval_receiver = scheduler_receiver.compute_deterministic_interval();

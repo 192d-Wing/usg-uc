@@ -72,7 +72,6 @@ pub use session::{
 mod tests {
     #[test]
     fn test_crate_loads() {
-        // Basic sanity test
-        assert!(true);
+        // Placeholder test - crate compiles if this runs
     }
 }

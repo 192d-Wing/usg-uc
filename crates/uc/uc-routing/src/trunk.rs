@@ -487,6 +487,7 @@ impl TrunkGroup {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 
@@ -500,13 +501,13 @@ mod tests {
     #[test]
     fn test_trunk_stats_success_rate() {
         let mut stats = TrunkStats::default();
-        assert_eq!(stats.success_rate(), 1.0);
+        assert!((stats.success_rate() - 1.0).abs() < f64::EPSILON);
 
         stats.record_success(100);
-        assert_eq!(stats.success_rate(), 1.0);
+        assert!((stats.success_rate() - 1.0).abs() < f64::EPSILON);
 
         stats.record_failure();
-        assert_eq!(stats.success_rate(), 0.5);
+        assert!((stats.success_rate() - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]

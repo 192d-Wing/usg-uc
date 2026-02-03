@@ -109,6 +109,7 @@ pub const DEFAULT_SIPS_PORT: u16 = 5061;
 pub const SIP_VERSION: &str = "SIP/2.0";
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

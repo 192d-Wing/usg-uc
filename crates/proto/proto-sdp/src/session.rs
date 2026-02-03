@@ -324,9 +324,9 @@ impl fmt::Display for TimeValue {
 /// For a session active on Monday 10:00-11:00 and Tuesday 10:00-11:00:
 /// ```text
 /// t=3034423619 3042462419
-/// r=604800 3600 0 90000
+/// r=604_800 3600 0 90000
 /// ```
-/// - 604800s = 7 days (weekly repeat)
+/// - `604_800s` = 7 days (weekly repeat)
 /// - 3600s = 1 hour duration
 /// - 0 = first occurrence at start time
 /// - 90000 = 25 hours (Tuesday 10:00, offset from Monday 9:00)
@@ -780,6 +780,7 @@ impl FromStr for SessionDescription {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -871,7 +872,7 @@ mod tests {
     #[test]
     fn test_time_value_from_days() {
         let tv = TimeValue::from_days(7);
-        assert_eq!(tv.as_seconds(), 604800); // 7 * 86400
+        assert_eq!(tv.as_seconds(), 604_800); // 7 * 86400
     }
 
     #[test]
@@ -894,7 +895,7 @@ mod tests {
 
     #[test]
     fn test_time_value_parse_with_suffix() {
-        assert_eq!(TimeValue::parse("7d").unwrap().as_seconds(), 604800);
+        assert_eq!(TimeValue::parse("7d").unwrap().as_seconds(), 604_800);
         assert_eq!(TimeValue::parse("2h").unwrap().as_seconds(), 7200);
         assert_eq!(TimeValue::parse("30m").unwrap().as_seconds(), 1800);
         assert_eq!(TimeValue::parse("60s").unwrap().as_seconds(), 60);
@@ -916,7 +917,7 @@ mod tests {
             vec![TimeValue::from_seconds(0)],
         );
 
-        assert_eq!(repeat.interval_seconds(), 604800);
+        assert_eq!(repeat.interval_seconds(), 604_800);
         assert_eq!(repeat.duration_seconds(), 3600);
         assert!(repeat.is_valid());
     }
@@ -939,16 +940,16 @@ mod tests {
             vec![TimeValue::from_seconds(0), TimeValue::from_days(1)],
         );
 
-        assert_eq!(repeat.interval_seconds(), 604800);
+        assert_eq!(repeat.interval_seconds(), 604_800);
         assert!(repeat.is_valid());
     }
 
     #[test]
     fn test_repeat_times_parse_simple() {
         // Weekly, 1 hour, starting at offset 0
-        let repeat = RepeatTimes::parse("604800 3600 0").unwrap();
+        let repeat = RepeatTimes::parse("604_800 3600 0").unwrap();
 
-        assert_eq!(repeat.interval.as_seconds(), 604800);
+        assert_eq!(repeat.interval.as_seconds(), 604_800);
         assert_eq!(repeat.duration.as_seconds(), 3600);
         assert_eq!(repeat.offsets.len(), 1);
         assert_eq!(repeat.offsets[0].as_seconds(), 0);
@@ -959,7 +960,7 @@ mod tests {
         // Weekly (7d), 1 hour (1h), offsets at 0 and 25h
         let repeat = RepeatTimes::parse("7d 1h 0 25h").unwrap();
 
-        assert_eq!(repeat.interval.as_seconds(), 604800);
+        assert_eq!(repeat.interval.as_seconds(), 604_800);
         assert_eq!(repeat.duration.as_seconds(), 3600);
         assert_eq!(repeat.offsets.len(), 2);
         assert_eq!(repeat.offsets[0].as_seconds(), 0);
@@ -969,9 +970,9 @@ mod tests {
     #[test]
     fn test_repeat_times_parse_rfc_example() {
         // RFC 4566 example: weekly, 1 hour, offsets at 0 and 90000
-        let repeat = RepeatTimes::parse("604800 3600 0 90000").unwrap();
+        let repeat = RepeatTimes::parse("604_800 3600 0 90000").unwrap();
 
-        assert_eq!(repeat.interval_seconds(), 604800);
+        assert_eq!(repeat.interval_seconds(), 604_800);
         assert_eq!(repeat.duration_seconds(), 3600);
         assert_eq!(repeat.offset_seconds(), vec![0, 90000]);
     }
@@ -1041,11 +1042,12 @@ mod tests {
 
     #[test]
     fn test_timing_with_repeat() {
-        let timing = Timing::with_times(3034423619, 3042462419).with_repeat(RepeatTimes::new(
-            TimeValue::from_days(7),
-            TimeValue::from_hours(1),
-            vec![TimeValue::from_seconds(0), TimeValue::from_hours(25)],
-        ));
+        let timing =
+            Timing::with_times(3_034_423_619, 3_042_462_419).with_repeat(RepeatTimes::new(
+                TimeValue::from_days(7),
+                TimeValue::from_hours(1),
+                vec![TimeValue::from_seconds(0), TimeValue::from_hours(25)],
+            ));
 
         assert!(timing.has_repeats());
         assert_eq!(timing.repeat_times.len(), 1);
@@ -1070,7 +1072,7 @@ mod tests {
                    o=- 123456 1 IN IP6 ::1\r\n\
                    s=Weekly Broadcast\r\n\
                    t=3034423619 3042462419\r\n\
-                   r=604800 3600 0 90000\r\n\
+                   r=604_800 3600 0 90000\r\n\
                    m=audio 5000 RTP/SAVP 0\r\n";
 
         let session: SessionDescription = sdp.parse().unwrap();
@@ -1078,7 +1080,7 @@ mod tests {
         assert_eq!(session.timing.repeat_times.len(), 1);
 
         let repeat = &session.timing.repeat_times[0];
-        assert_eq!(repeat.interval_seconds(), 604800);
+        assert_eq!(repeat.interval_seconds(), 604_800);
         assert_eq!(repeat.duration_seconds(), 3600);
         assert_eq!(repeat.offset_seconds(), vec![0, 90000]);
     }
@@ -1097,7 +1099,7 @@ mod tests {
         assert_eq!(session.timing.repeat_times.len(), 2);
 
         // First repeat: weekly, 1 hour
-        assert_eq!(session.timing.repeat_times[0].interval_seconds(), 604800);
+        assert_eq!(session.timing.repeat_times[0].interval_seconds(), 604_800);
         assert_eq!(session.timing.repeat_times[0].duration_seconds(), 3600);
 
         // Second repeat: daily, 30 min, at 9am and 2pm
@@ -1120,7 +1122,7 @@ mod tests {
         let reparsed: SessionDescription = sdp.parse().unwrap();
 
         assert!(reparsed.timing.has_repeats());
-        assert_eq!(reparsed.timing.repeat_times[0].interval_seconds(), 604800);
+        assert_eq!(reparsed.timing.repeat_times[0].interval_seconds(), 604_800);
     }
 
     #[test]

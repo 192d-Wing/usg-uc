@@ -64,7 +64,9 @@ mod tests {
 
     #[test]
     fn test_constants() {
-        assert!(DEFAULT_RPS > 0);
-        assert!(DEFAULT_BURST >= DEFAULT_RPS);
+        const _: () = {
+            assert!(DEFAULT_RPS > 0);
+            assert!(DEFAULT_BURST >= DEFAULT_RPS);
+        };
     }
 }

@@ -387,7 +387,6 @@ mod tests {
         tracker.record(test_ip());
         tracker.record(test_ip2());
 
-        let sources: Vec<_> = tracker.sources().collect();
-        assert_eq!(sources.len(), 2);
+        assert_eq!(tracker.sources().count(), 2);
     }
 }

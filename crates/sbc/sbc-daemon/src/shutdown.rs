@@ -339,6 +339,7 @@ impl ShutdownCoordinator {
     /// 1. Signals shutdown to stop accepting new connections
     /// 2. Polls active connections until drained or timeout
     /// 3. Returns the final shutdown phase with statistics
+    #[allow(clippy::cast_possible_truncation)]
     pub async fn shutdown_gracefully(&self) -> DrainResult {
         let phase = self.initiate_shutdown();
         if matches!(phase, ShutdownPhase::AlreadyInProgress) {
@@ -506,6 +507,7 @@ pub enum ShutdownPhase {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

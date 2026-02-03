@@ -357,6 +357,7 @@ impl Default for LoggingConfig {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -371,7 +372,7 @@ mod tests {
     #[test]
     fn test_config_serialization() {
         let config = SbcConfig::default();
-        let toml_str = toml::to_string(&config).unwrap();
+        let toml_str = toml::to_string(&config).expect("serialize config");
         assert!(toml_str.contains("instance_name"));
     }
 
@@ -386,7 +387,7 @@ mod tests {
             default_mode = "PassThrough"
         "#;
 
-        let config: SbcConfig = toml::from_str(toml_str).unwrap();
+        let config: SbcConfig = toml::from_str(toml_str).expect("parse config");
         assert_eq!(config.general.instance_name, "test-sbc");
         assert_eq!(config.general.max_calls, 5000);
         assert_eq!(config.media.default_mode, MediaMode::PassThrough);

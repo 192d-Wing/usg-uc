@@ -384,9 +384,7 @@ async fn get_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let system_health = state.check_health();
     let response = HealthResponse::from(system_health);
 
-    let status = if response.status == "healthy" {
-        StatusCode::OK
-    } else if response.status == "degraded" {
+    let status = if response.status == "healthy" || response.status == "degraded" {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -662,6 +660,7 @@ impl std::fmt::Display for ApiServerError {
 impl std::error::Error for ApiServerError {}
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use axum::body::Body;

@@ -59,10 +59,13 @@ pub const MAX_PAGE_SIZE: usize = 1000;
 mod tests {
     use super::*;
 
+    const _: () = {
+        assert!(DEFAULT_PAGE_SIZE > 0);
+        assert!(MAX_PAGE_SIZE >= DEFAULT_PAGE_SIZE);
+    };
+
     #[test]
     fn test_constants() {
         assert!(!DEFAULT_API_VERSION.is_empty());
-        assert!(DEFAULT_PAGE_SIZE > 0);
-        assert!(MAX_PAGE_SIZE >= DEFAULT_PAGE_SIZE);
     }
 }

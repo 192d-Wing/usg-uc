@@ -58,7 +58,9 @@ mod tests {
 
     #[test]
     fn test_constants() {
-        assert!(DEFAULT_BUFFER_SIZE > 0);
-        assert!(DEFAULT_FLUSH_INTERVAL_SECS > 0);
+        const _: () = {
+            assert!(DEFAULT_BUFFER_SIZE > 0);
+            assert!(DEFAULT_FLUSH_INTERVAL_SECS > 0);
+        };
     }
 }

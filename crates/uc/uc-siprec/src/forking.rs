@@ -446,6 +446,7 @@ pub struct ForkerStats {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
@@ -479,39 +480,39 @@ mod tests {
 
         assert_eq!(forker.state(), ForkerState::Uninitialized);
 
-        forker.initialize().unwrap();
+        forker.initialize().expect("initialize");
         assert_eq!(forker.state(), ForkerState::Initialized);
 
         let fork = StreamFork::new("s1", test_addr(5000), test_addr(5002), test_addr(6000));
-        forker.add_fork(fork).unwrap();
+        forker.add_fork(fork).expect("add_fork");
         assert_eq!(forker.fork_count(), 1);
 
-        forker.start().unwrap();
+        forker.start().expect("start");
         assert_eq!(forker.state(), ForkerState::Active);
         assert!(forker.should_fork("s1"));
 
-        forker.pause().unwrap();
+        forker.pause().expect("pause");
         assert_eq!(forker.state(), ForkerState::Paused);
         assert!(!forker.should_fork("s1"));
 
-        forker.start().unwrap();
+        forker.start().expect("resume");
         assert_eq!(forker.state(), ForkerState::Active);
 
-        forker.stop().unwrap();
+        forker.stop().expect("stop");
         assert_eq!(forker.state(), ForkerState::Stopped);
     }
 
     #[test]
     fn test_fork_stats() {
         let mut forker = MediaForker::new("session-456");
-        forker.initialize().unwrap();
+        forker.initialize().expect("initialize");
 
         let fork1 = StreamFork::new("s1", test_addr(5000), test_addr(5002), test_addr(6000));
         let fork2 = StreamFork::new("s2", test_addr(5004), test_addr(5006), test_addr(6002));
-        forker.add_fork(fork1).unwrap();
-        forker.add_fork(fork2).unwrap();
+        forker.add_fork(fork1).expect("add_fork1");
+        forker.add_fork(fork2).expect("add_fork2");
 
-        forker.start().unwrap();
+        forker.start().expect("start");
 
         // Simulate forked packets
         forker.record_forked("s1", 160);
@@ -536,26 +537,29 @@ mod tests {
     #[test]
     fn test_fork_destination() {
         let mut forker = MediaForker::new("session-789");
-        forker.initialize().unwrap();
+        forker.initialize().expect("initialize");
 
         let fork = StreamFork::new("s1", test_addr(5000), test_addr(5002), test_addr(6000));
-        forker.add_fork(fork).unwrap();
+        forker.add_fork(fork).expect("add_fork");
 
         // Not active yet
         assert!(forker.fork_destination("s1").is_none());
 
-        forker.start().unwrap();
-        assert_eq!(forker.fork_destination("s1").unwrap().port(), 6000);
+        forker.start().expect("start");
+        assert_eq!(
+            forker.fork_destination("s1").expect("fork dest").port(),
+            6000
+        );
     }
 
     #[test]
     fn test_error_state() {
         let mut forker = MediaForker::new("session-error");
-        forker.initialize().unwrap();
+        forker.initialize().expect("initialize");
 
         let fork = StreamFork::new("s1", test_addr(5000), test_addr(5002), test_addr(6000));
-        forker.add_fork(fork).unwrap();
-        forker.start().unwrap();
+        forker.add_fork(fork).expect("add_fork");
+        forker.start().expect("start");
 
         forker.set_error("connection lost to recording server");
 

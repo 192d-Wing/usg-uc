@@ -436,12 +436,10 @@ mod tests {
             RecordingTrigger::inbound_only(),
         ]);
 
-        match trigger {
-            RecordingTrigger::All(conditions) => {
-                assert_eq!(conditions.len(), 2);
-            }
-            _ => panic!("Expected All trigger"),
-        }
+        assert!(
+            matches!(trigger, RecordingTrigger::All(ref conditions) if conditions.len() == 2),
+            "Expected All trigger with 2 conditions"
+        );
     }
 
     #[test]

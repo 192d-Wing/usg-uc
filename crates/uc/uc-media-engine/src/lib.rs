@@ -68,7 +68,9 @@ mod tests {
 
     #[test]
     fn test_constants() {
-        assert!(DEFAULT_JITTER_BUFFER_SIZE > 0);
-        assert!(DEFAULT_PACKET_TIMEOUT_MS > 0);
+        const _: () = {
+            assert!(DEFAULT_JITTER_BUFFER_SIZE > 0);
+            assert!(DEFAULT_PACKET_TIMEOUT_MS > 0);
+        };
     }
 }

@@ -266,6 +266,7 @@ impl std::fmt::Debug for UdpTransport {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::net::Ipv6Addr;

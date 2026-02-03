@@ -335,6 +335,7 @@ pub struct SystemShutdown {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -344,7 +345,7 @@ mod tests {
             call_id: CallId::new("test"),
             from_uri: "sip:a@example.com".to_string(),
             to_uri: "sip:b@example.com".to_string(),
-            source_ip: "::1".parse().unwrap(),
+            source_ip: "::1".parse().expect("valid loopback"),
             attestation: None,
         });
 
@@ -355,13 +356,13 @@ mod tests {
     fn test_event_serialization() {
         let event = AuditEvent::AuthenticationAttempt(AuthenticationAttempt {
             identity: "alice".to_string(),
-            source_ip: "::1".parse().unwrap(),
+            source_ip: "::1".parse().expect("valid loopback"),
             success: true,
             failure_reason: None,
             method: AuthMethod::Digest,
         });
 
-        let json = serde_json::to_string(&event).unwrap();
+        let json = serde_json::to_string(&event).expect("serialize event");
         assert!(json.contains("authentication_attempt"));
         assert!(json.contains("alice"));
     }

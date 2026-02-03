@@ -263,19 +263,20 @@ impl fmt::Display for Direction {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_attribute_parse() {
-        let attr = Attribute::parse("rtpmap:0 PCMU/8000").unwrap();
+        let attr = Attribute::parse("rtpmap:0 PCMU/8000").expect("valid rtpmap");
         assert_eq!(attr.name, AttributeName::Rtpmap);
         assert_eq!(attr.value, Some("0 PCMU/8000".to_string()));
     }
 
     #[test]
     fn test_attribute_flag() {
-        let attr = Attribute::parse("sendrecv").unwrap();
+        let attr = Attribute::parse("sendrecv").expect("valid flag");
         assert_eq!(attr.name, AttributeName::Sendrecv);
         assert!(attr.value.is_none());
     }

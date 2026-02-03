@@ -96,6 +96,6 @@ mod tests {
 
     #[test]
     fn test_session_timer_defaults() {
-        assert!(DEFAULT_SESSION_EXPIRES >= MIN_SESSION_EXPIRES);
+        const _: () = assert!(DEFAULT_SESSION_EXPIRES >= MIN_SESSION_EXPIRES);
     }
 }

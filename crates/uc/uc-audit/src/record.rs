@@ -138,6 +138,7 @@ mod hex_array {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::event::{AuthMethod, AuthenticationAttempt};
@@ -145,7 +146,7 @@ mod tests {
     fn sample_event() -> AuditEvent {
         AuditEvent::AuthenticationAttempt(AuthenticationAttempt {
             identity: "test".to_string(),
-            source_ip: "::1".parse().unwrap(),
+            source_ip: "::1".parse().expect("valid loopback"),
             success: true,
             failure_reason: None,
             method: AuthMethod::Digest,
@@ -202,8 +203,8 @@ mod tests {
         let timestamp = Utc::now();
         let record = AuditRecord::new(1, event, timestamp, [0u8; 48]);
 
-        let json = serde_json::to_string(&record).unwrap();
-        let deserialized: AuditRecord = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&record).expect("serialize record");
+        let deserialized: AuditRecord = serde_json::from_str(&json).expect("deserialize record");
 
         assert_eq!(record.sequence, deserialized.sequence);
         assert_eq!(record.hash_chain, deserialized.hash_chain);

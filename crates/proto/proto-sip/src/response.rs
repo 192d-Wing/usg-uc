@@ -270,6 +270,7 @@ impl TryFrom<u16> for StatusCode {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

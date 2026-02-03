@@ -525,6 +525,7 @@ impl ResponseBuilder {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -600,7 +601,7 @@ mod tests {
         let response = ResponseBuilder::ok()
             .copy_headers_from(&request)
             .to_tag_auto()
-            .contact(NameAddr::new(SipUri::new("192.168.1.2").with_user("bob")))
+            .contact(&NameAddr::new(SipUri::new("192.168.1.2").with_user("bob")))
             .build()
             .unwrap();
 

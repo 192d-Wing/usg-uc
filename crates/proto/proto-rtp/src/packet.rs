@@ -325,6 +325,7 @@ impl fmt::Display for RtpPacket {
 }
 
 #[cfg(test)]
+#[allow(clippy::unreadable_literal, clippy::unwrap_used)]
 mod tests {
     use super::*;
 

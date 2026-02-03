@@ -70,6 +70,7 @@ impl Default for SipStackConfig {
 
 /// Store for active transactions.
 #[derive(Default)]
+#[allow(clippy::struct_field_names)]
 struct TransactionStore {
     /// Server INVITE transactions.
     server_invite: HashMap<TransactionKey, ServerInviteState>,
@@ -220,7 +221,7 @@ impl SipStack {
             Method::Bye => self.handle_bye(message, source).await,
             Method::Cancel => self.handle_cancel(message, source).await,
             Method::Options => self.handle_options(message, source).await,
-            Method::Extension(_) | _ => self.handle_other_request(message, source).await,
+            _ => self.handle_other_request(message, source).await,
         }
     }
 
@@ -533,6 +534,7 @@ fn generate_tag() -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

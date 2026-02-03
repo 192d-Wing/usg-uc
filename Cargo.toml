@@ -93,7 +93,7 @@ chrono = { version = "0.4", features = ["serde"] }
 validator = { version = "0.20", features = ["derive"] }
 
 # Networking
-bytes = "1.9"
+bytes = "1.11.1"
 socket2 = { version = "0.6", features = ["all"] }
 
 # HTTP server

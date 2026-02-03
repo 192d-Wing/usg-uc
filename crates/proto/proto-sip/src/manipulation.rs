@@ -861,6 +861,7 @@ impl ManipulationPresets {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -886,7 +887,7 @@ mod tests {
 
         let action =
             ManipulationAction::add(HeaderName::Custom("X-New-Header".to_string()), "new-value");
-        manipulator.apply_action(&action, &mut headers).unwrap();
+        manipulator.apply_action(&action, &mut headers);
 
         assert!(
             headers
@@ -901,7 +902,7 @@ mod tests {
         let manipulator = HeaderManipulator::new();
 
         let action = ManipulationAction::set(HeaderName::UserAgent, "NewAgent/2.0");
-        manipulator.apply_action(&action, &mut headers).unwrap();
+        manipulator.apply_action(&action, &mut headers);
 
         assert_eq!(
             headers.get(&HeaderName::UserAgent).unwrap().value,
@@ -915,7 +916,7 @@ mod tests {
         let manipulator = HeaderManipulator::new();
 
         let action = ManipulationAction::remove(HeaderName::UserAgent);
-        manipulator.apply_action(&action, &mut headers).unwrap();
+        manipulator.apply_action(&action, &mut headers);
 
         assert!(headers.get(&HeaderName::UserAgent).is_none());
     }
@@ -926,7 +927,7 @@ mod tests {
         let manipulator = HeaderManipulator::new();
 
         let action = ManipulationAction::replace(HeaderName::UserAgent, "OldPhone", "NewPhone");
-        manipulator.apply_action(&action, &mut headers).unwrap();
+        manipulator.apply_action(&action, &mut headers);
 
         assert_eq!(
             headers.get(&HeaderName::UserAgent).unwrap().value,
@@ -943,7 +944,7 @@ mod tests {
             HeaderName::Custom("X-Custom".to_string()),
             HeaderName::Custom("X-Renamed".to_string()),
         );
-        manipulator.apply_action(&action, &mut headers).unwrap();
+        manipulator.apply_action(&action, &mut headers);
 
         assert!(
             headers
@@ -966,7 +967,7 @@ mod tests {
             HeaderName::UserAgent,
             HeaderName::Custom("X-Original-UA".to_string()),
         );
-        manipulator.apply_action(&action, &mut headers).unwrap();
+        manipulator.apply_action(&action, &mut headers);
 
         assert_eq!(
             headers
@@ -988,7 +989,7 @@ mod tests {
             name: HeaderName::UserAgent,
             prefix: "Gateway/".to_string(),
         };
-        manipulator.apply_action(&action, &mut headers).unwrap();
+        manipulator.apply_action(&action, &mut headers);
 
         assert_eq!(
             headers.get(&HeaderName::UserAgent).unwrap().value,

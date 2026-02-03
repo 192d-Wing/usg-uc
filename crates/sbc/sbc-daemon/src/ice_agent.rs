@@ -128,8 +128,10 @@ impl IceManager {
             ice_lite,
         };
 
-        let mut sessions = self.sessions.write().await;
-        sessions.insert(call_id.to_string(), context);
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.insert(call_id.to_string(), context);
+        }
 
         info!(
             call_id = %call_id,
@@ -545,6 +547,7 @@ impl std::fmt::Display for IceManagerError {
 impl std::error::Error for IceManagerError {}
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use proto_ice::CandidateType;

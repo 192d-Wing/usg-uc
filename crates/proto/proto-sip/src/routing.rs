@@ -394,6 +394,7 @@ fn split_header_list(header: &str) -> Vec<&str> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

@@ -135,6 +135,7 @@ pub fn all_transports() -> &'static [Transport] {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

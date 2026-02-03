@@ -375,6 +375,7 @@ impl Default for Router {
 }
 
 #[cfg(test)]
+#[allow(clippy::similar_names)]
 mod tests {
     use super::*;
     use crate::dialplan::{DialPattern, DialPlanEntry, NumberTransform};

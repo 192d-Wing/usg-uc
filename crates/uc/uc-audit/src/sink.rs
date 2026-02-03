@@ -44,6 +44,13 @@ pub struct MemorySink {
 }
 
 #[cfg(test)]
+impl Default for MemorySink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
 impl MemorySink {
     /// Creates a new memory sink.
     #[must_use]
@@ -78,6 +85,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::event::{AuditEvent, AuthMethod, AuthenticationAttempt};

@@ -492,9 +492,9 @@ mod tests {
         assert_eq!(Attestation::Partial.as_str(), "B");
         assert_eq!(Attestation::Gateway.as_str(), "C");
 
-        assert_eq!(Attestation::from_str("a").unwrap(), Attestation::Full);
-        assert_eq!(Attestation::from_str("B").unwrap(), Attestation::Partial);
-        assert!(Attestation::from_str("X").is_err());
+        assert_eq!(Attestation::parse("a").unwrap(), Attestation::Full);
+        assert_eq!(Attestation::parse("B").unwrap(), Attestation::Partial);
+        assert!(Attestation::parse("X").is_err());
     }
 
     #[test]

@@ -222,6 +222,7 @@ pub fn verify_hmac_sha512(key: &[u8], data: &[u8], tag: &[u8]) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

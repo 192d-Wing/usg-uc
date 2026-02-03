@@ -692,6 +692,7 @@ fn copy_required_headers(request: &SipRequest, response: &mut SipResponse) {
 }
 
 #[cfg(test)]
+#[allow(clippy::similar_names, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::method::Method;

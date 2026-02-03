@@ -106,8 +106,10 @@ mod tests {
     #[test]
     fn test_type_preferences() {
         // Host should have highest preference
-        assert!(type_preference::HOST > type_preference::SERVER_REFLEXIVE);
-        assert!(type_preference::SERVER_REFLEXIVE > type_preference::RELAY);
+        const _: () = {
+            assert!(type_preference::HOST > type_preference::SERVER_REFLEXIVE);
+            assert!(type_preference::SERVER_REFLEXIVE > type_preference::RELAY);
+        };
     }
 
     #[test]

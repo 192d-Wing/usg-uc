@@ -61,8 +61,10 @@ mod tests {
 
     #[test]
     fn test_constants() {
-        assert!(DEFAULT_PRIORITY > 0);
-        assert!(DEFAULT_WEIGHT > 0);
-        assert!(DEFAULT_FAILOVER_TIMEOUT_MS > 0);
+        const _: () = {
+            assert!(DEFAULT_PRIORITY > 0);
+            assert!(DEFAULT_WEIGHT > 0);
+            assert!(DEFAULT_FAILOVER_TIMEOUT_MS > 0);
+        };
     }
 }

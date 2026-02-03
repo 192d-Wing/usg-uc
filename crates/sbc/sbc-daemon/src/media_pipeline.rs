@@ -277,7 +277,7 @@ impl MediaPipeline {
 
         // Get SSRC from session
         let sessions = self.sessions.read().await;
-        let ssrc = sessions.get(call_id).map_or(0x12345678, |s| {
+        let ssrc = sessions.get(call_id).map_or(0x1234_5678, |s| {
             if is_a_leg { s.a_leg_ssrc } else { s.b_leg_ssrc }
         });
         drop(sessions);
@@ -348,13 +348,10 @@ impl MediaPipeline {
         is_a_leg: bool,
     ) -> RtpProcessResult {
         let sessions = self.sessions.read().await;
-        let session_ctx = match sessions.get(call_id) {
-            Some(ctx) => ctx,
-            None => {
-                return RtpProcessResult::Error {
-                    reason: "Session not found".to_string(),
-                };
-            }
+        let Some(session_ctx) = sessions.get(call_id) else {
+            return RtpProcessResult::Error {
+                reason: "Session not found".to_string(),
+            };
         };
 
         // Determine destination based on leg
@@ -529,6 +526,7 @@ impl MediaPipeline {
 }
 
 /// Generates a random SSRC.
+#[allow(clippy::cast_possible_truncation)]
 fn generate_ssrc() -> u32 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
@@ -593,6 +591,7 @@ impl std::fmt::Display for MediaPipelineError {
 impl std::error::Error for MediaPipelineError {}
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

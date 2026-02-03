@@ -860,7 +860,7 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5060),
             1,
         );
-        agent.add_remote_candidate(remote).unwrap();
+        agent.add_remote_candidate(&remote).unwrap();
 
         assert!(!agent.remote_candidates().is_empty());
     }
@@ -877,7 +877,7 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5060),
             1,
         );
-        agent.add_remote_candidate(remote).unwrap();
+        agent.add_remote_candidate(&remote).unwrap();
 
         agent.set_remote_credentials(IceCredentials::generate());
         agent.start_checks().unwrap();

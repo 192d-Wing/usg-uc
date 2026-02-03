@@ -230,6 +230,7 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

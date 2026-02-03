@@ -71,11 +71,15 @@ impl Server {
         let sip_stack = Arc::new(SipStack::new(sip_config));
 
         // Create rate limiter from config
-        let rate_limit_config = RateLimiterConfig::new(
-            config.rate_limit.per_ip_rps,
-            (config.rate_limit.per_ip_rps as f32 * config.rate_limit.burst_multiplier) as u32,
-        )
-        .with_per_ip(true);
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let burst_size = (f64::from(config.rate_limit.per_ip_rps)
+            * f64::from(config.rate_limit.burst_multiplier)) as u32;
+        let rate_limit_config =
+            RateLimiterConfig::new(config.rate_limit.per_ip_rps, burst_size).with_per_ip(true);
 
         let rate_limiter = Arc::new(Mutex::new(RateLimiter::new(rate_limit_config)));
 
@@ -496,6 +500,7 @@ impl std::fmt::Display for ServerError {
 impl std::error::Error for ServerError {}
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

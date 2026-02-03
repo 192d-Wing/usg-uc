@@ -730,6 +730,7 @@ impl TranslatorRtcpBuilder {
 }
 
 #[cfg(test)]
+#[allow(clippy::unreadable_literal, clippy::unwrap_used)]
 mod tests {
     use super::*;
 

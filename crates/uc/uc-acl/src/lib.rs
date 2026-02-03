@@ -61,7 +61,9 @@ mod tests {
 
     #[test]
     fn test_constants() {
-        assert!(DEFAULT_PRIORITY > 0);
-        assert!(MAX_RULES > 0);
+        const _: () = {
+            assert!(DEFAULT_PRIORITY > 0);
+            assert!(MAX_RULES > 0);
+        };
     }
 }

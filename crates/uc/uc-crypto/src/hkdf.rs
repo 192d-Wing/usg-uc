@@ -256,6 +256,7 @@ pub fn hmac_sha384_multi(key: &[u8], data: &[&[u8]]) -> [u8; 48] {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

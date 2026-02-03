@@ -355,6 +355,7 @@ impl UseSrtpExtension {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -370,13 +371,15 @@ mod tests {
         let exporter = SrtpKeyExporter::new(SrtpProfile::AeadAes256Gcm);
 
         // Create test material: 32 + 32 + 12 + 12 = 88 bytes
-        let mut exported = Vec::new();
-        exported.extend_from_slice(&[1u8; 32]); // client key
-        exported.extend_from_slice(&[2u8; 32]); // server key
-        exported.extend_from_slice(&[3u8; 12]); // client salt
-        exported.extend_from_slice(&[4u8; 12]); // server salt
+        let mut raw_keying_material = Vec::new();
+        raw_keying_material.extend_from_slice(&[1u8; 32]); // client key
+        raw_keying_material.extend_from_slice(&[2u8; 32]); // server key
+        raw_keying_material.extend_from_slice(&[3u8; 12]); // client salt
+        raw_keying_material.extend_from_slice(&[4u8; 12]); // server salt
 
-        let material = exporter.parse_keying_material(&exported).unwrap();
+        let material = exporter
+            .parse_keying_material(&raw_keying_material)
+            .unwrap();
 
         assert_eq!(material.client_write_key, vec![1u8; 32]);
         assert_eq!(material.server_write_key, vec![2u8; 32]);
@@ -388,8 +391,12 @@ mod tests {
     fn test_parse_keying_material_wrong_length() {
         let exporter = SrtpKeyExporter::new(SrtpProfile::AeadAes256Gcm);
 
-        let exported = vec![0u8; 50]; // Wrong length
-        assert!(exporter.parse_keying_material(&exported).is_err());
+        let wrong_length_material = vec![0u8; 50]; // Wrong length
+        assert!(
+            exporter
+                .parse_keying_material(&wrong_length_material)
+                .is_err()
+        );
     }
 
     #[test]

@@ -709,6 +709,7 @@ fn validate_answer_direction(offer: Direction, answer: Direction) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::session::Origin;

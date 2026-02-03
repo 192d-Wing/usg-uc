@@ -90,10 +90,11 @@ pub const CHANNEL_DATA_HEADER_SIZE: usize = 4;
 mod tests {
     use super::*;
 
+    const _: () = assert!(MIN_CHANNEL_NUMBER < MAX_CHANNEL_NUMBER);
+
     #[test]
     fn test_constants() {
         assert_eq!(DEFAULT_PORT, 3478);
         assert_eq!(DEFAULT_LIFETIME, 600);
-        assert!(MIN_CHANNEL_NUMBER < MAX_CHANNEL_NUMBER);
     }
 }

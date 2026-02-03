@@ -401,6 +401,7 @@ impl Candidate {
 }
 
 #[cfg(test)]
+#[allow(clippy::similar_names)]
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
@@ -457,9 +458,9 @@ mod tests {
         assert!(host_priority > relay_priority);
 
         // Component 1 (RTP) should have higher priority than component 2 (RTCP)
-        let rtp_priority = Candidate::compute_priority(CandidateType::Host, 1, 0);
-        let rtcp_priority = Candidate::compute_priority(CandidateType::Host, 2, 0);
-        assert!(rtp_priority > rtcp_priority);
+        let rtp_prio = Candidate::compute_priority(CandidateType::Host, 1, 0);
+        let rtcp_prio = Candidate::compute_priority(CandidateType::Host, 2, 0);
+        assert!(rtp_prio > rtcp_prio);
     }
 
     #[test]

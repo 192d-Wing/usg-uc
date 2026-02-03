@@ -482,7 +482,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 | `proto-dtls/verify.rs` | Certificate validation | Medium | ✅ Done |
 | `proto-dtls/verify.rs` | Signature verification | Medium | ✅ Done |
 | `proto-registrar/authentication.rs` | Digest authentication | High | ✅ Done |
-| Various crates (17) | Cleanup clippy warning allows (cosmetic) | Low | Pending |
+| Various crates (73 files) | Cleanup clippy warning allows (cosmetic) | Low | ✅ Done |
 
 ---
 

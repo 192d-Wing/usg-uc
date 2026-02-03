@@ -543,6 +543,25 @@ New crate for session recording:
 - Loop bounds documentation (Rule 2)
 - All functions have bounded execution
 
+### Fixed
+
+- Comprehensive clippy lint fixes across 73 files in proto-*, uc-*, and sbc-daemon crates:
+  - Added `#[allow(clippy::unwrap_used, clippy::expect_used)]` to test modules
+  - Fixed `Attestation::from_str()` to use `Attestation::parse()` in proto-stir-shaken
+  - Fixed type mismatches for `&NameAddr` and `&Candidate` parameters
+  - Removed `.unwrap()` calls on unit type returns
+  - Added numeric literal separators (e.g., `604_800`, `0x1234_5678`)
+  - Fixed float comparisons to use epsilon-based comparison
+  - Added `Default` implementations for types with `new()` constructors
+  - Converted constant assertions to `const _: () = { assert!(...) };` blocks
+  - Fixed similar variable name warnings with `#[allow(clippy::similar_names)]`
+  - Fixed wildcard patterns in match arms
+  - Added crate-level allows for `significant_drop_tightening`, `future_not_send`, `unused_async`
+  - Converted `match` expressions to `let...else` where appropriate
+  - Fixed cast truncation warnings with explicit `#[allow]` attributes
+  - Fixed enum variant name warnings with `#[allow(clippy::enum_variant_names)]`
+  - Fixed struct field name warnings with `#[allow(clippy::struct_field_names)]`
+
 ### Removed
 
 - `sbc-sip` crate (replaced by `proto-sip`)
