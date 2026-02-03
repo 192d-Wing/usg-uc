@@ -57,7 +57,17 @@ pub mod location;
 pub mod outbound;
 pub mod registrar;
 
+// Storage feature: async location service with external backends
+#[cfg(feature = "storage")]
+pub mod async_location;
+
 pub use binding::{Binding, BindingState};
+
+// Storage feature exports
+#[cfg(feature = "storage")]
+pub use async_location::{AsyncLocationService, AsyncLocationStats};
+#[cfg(feature = "storage")]
+pub use binding::{StorableBinding, StorableBindingState};
 pub use error::{RegistrarError, RegistrarResult};
 pub use gruu::{
     GruuEntry, GruuGenerator, GruuRouter, GruuRoutingResult, GruuService, extract_gruu_info,

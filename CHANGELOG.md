@@ -66,6 +66,33 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - Integration with `uc-dns` crate
   - 8 tests (2 require network)
 
+**Kubernetes Service Discovery** (`uc-discovery/kubernetes.rs`)
+
+- `KubernetesDiscovery` provider using kube-rs
+  - In-cluster and kubeconfig client initialization
+  - Kubernetes Endpoints API for service discovery
+  - Named port and numeric port resolution
+  - Metadata enrichment (pod name, node name, namespace, service)
+  - Ready/not-ready endpoint distinction with priority weighting
+  - Health check via namespace list API
+  - 7 unit tests + integration tests (require K8s cluster)
+
+**Registrar Storage Integration** (`proto-registrar`)
+
+- `StorableBinding` DTO for serializing SIP bindings
+  - Converts `std::time::Instant` to Unix timestamps
+  - Full round-trip support with `to_binding()` conversion
+  - Serializable binding state for external storage
+- `AsyncLocationService` cache-aside wrapper
+  - Wraps synchronous `LocationService` for async storage access
+  - Cache-first reads with storage fallback
+  - Write-through to storage with TTL (expires + 60s buffer)
+  - Key format: `sip:binding:{aor}:{binding_key}`
+  - `sync_cache()` for cache warming from storage
+  - Health check via storage backend ping
+  - Storage feature flag (`storage`) for optional dependency
+  - 6 tests for StorableBinding + AsyncLocationService
+
 **Dependencies Added**
 
 - `arc-swap` 1.7: Lock-free atomic pointer swapping

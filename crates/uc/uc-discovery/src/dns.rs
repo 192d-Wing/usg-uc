@@ -43,10 +43,11 @@ impl DnsDiscovery {
         );
 
         let cache = Arc::new(DnsCache::default());
-        let resolver = HickoryDnsResolver::new(cache).map_err(|e| DiscoveryError::DnsResolutionFailed {
-            name: "resolver_init".to_string(),
-            reason: format!("Failed to create DNS resolver: {e}"),
-        })?;
+        let resolver =
+            HickoryDnsResolver::new(cache).map_err(|e| DiscoveryError::DnsResolutionFailed {
+                name: "resolver_init".to_string(),
+                reason: format!("Failed to create DNS resolver: {e}"),
+            })?;
 
         Ok(Self {
             resolver,
@@ -143,10 +144,7 @@ impl DiscoveryProvider for DnsDiscovery {
                 DiscoveryMethod::DnsSrv => self.discover_srv().await,
                 DiscoveryMethod::DnsA => self.discover_a().await,
                 _ => Err(DiscoveryError::ConfigError {
-                    reason: format!(
-                        "Invalid discovery method for DNS provider: {}",
-                        self.method
-                    ),
+                    reason: format!("Invalid discovery method for DNS provider: {}", self.method),
                 }),
             }
         })

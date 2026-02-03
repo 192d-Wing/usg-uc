@@ -9,8 +9,19 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+storage = ["dep:uc-storage", "dep:serde", "dep:serde_json", "dep:tokio", "dep:tracing"]
+
 [dependencies]
 thiserror = "2.0"
+
+# Optional storage dependencies
+serde = { workspace = true, features = ["derive"], optional = true }
+serde_json = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["sync"], optional = true }
+tracing = { workspace = true, optional = true }
+uc-storage = { path = "../../uc/uc-storage", optional = true }
 
 [lints]
 workspace = true

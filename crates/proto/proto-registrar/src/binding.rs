@@ -296,6 +296,250 @@ impl Binding {
     }
 }
 
+// ============================================================================
+// Storage feature: Serializable binding types
+// ============================================================================
+
+#[cfg(feature = "storage")]
+mod storable {
+    use super::{Binding, BindingState};
+    use serde::{Deserialize, Serialize};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Serializable version of `BindingState` for storage backends.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum StorableBindingState {
+        /// Binding is active.
+        Active,
+        /// Binding is refreshing.
+        Refreshing,
+        /// Binding has expired.
+        Expired,
+        /// Binding was removed.
+        Removed,
+    }
+
+    impl From<BindingState> for StorableBindingState {
+        fn from(state: BindingState) -> Self {
+            match state {
+                BindingState::Active => Self::Active,
+                BindingState::Refreshing => Self::Refreshing,
+                BindingState::Expired => Self::Expired,
+                BindingState::Removed => Self::Removed,
+            }
+        }
+    }
+
+    impl From<StorableBindingState> for BindingState {
+        fn from(state: StorableBindingState) -> Self {
+            match state {
+                StorableBindingState::Active => Self::Active,
+                StorableBindingState::Refreshing => Self::Refreshing,
+                StorableBindingState::Expired => Self::Expired,
+                StorableBindingState::Removed => Self::Removed,
+            }
+        }
+    }
+
+    /// Serializable version of `Binding` for storage backends.
+    ///
+    /// This struct mirrors `Binding` but uses Unix timestamps instead of `Instant`,
+    /// making it suitable for serialization to Redis, PostgreSQL, or other backends.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct StorableBinding {
+        /// Address of record (canonical URI).
+        pub aor: String,
+        /// Contact URI.
+        pub contact_uri: String,
+        /// Call-ID from REGISTER request.
+        pub call_id: String,
+        /// CSeq from REGISTER request.
+        pub cseq: u32,
+        /// Expiration time in seconds.
+        pub expires: u32,
+        /// Unix timestamp (seconds since epoch) when created.
+        pub created_at_unix: u64,
+        /// Unix timestamp when last updated.
+        pub updated_at_unix: u64,
+        /// Current state.
+        pub state: StorableBindingState,
+        /// Q-value (priority) 0-1.
+        pub q_value: f32,
+        /// Source address of the registration (serialized as string).
+        pub source_addr: Option<String>,
+        /// Instance ID (RFC 5626).
+        pub instance_id: Option<String>,
+        /// Reg-ID (RFC 5626).
+        pub reg_id: Option<u32>,
+        /// User-Agent header.
+        pub user_agent: Option<String>,
+        /// Path header (RFC 3327).
+        pub path: Vec<String>,
+    }
+
+    impl StorableBinding {
+        /// Creates a `StorableBinding` from a `Binding`.
+        ///
+        /// Converts `Instant` timestamps to Unix timestamps by calculating
+        /// the elapsed time from now.
+        #[must_use]
+        pub fn from_binding(binding: &Binding) -> Self {
+            let now_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            // Calculate Unix timestamps from Instant elapsed times
+            let created_at_unix = now_unix.saturating_sub(binding.created_at.elapsed().as_secs());
+            let updated_at_unix = now_unix.saturating_sub(binding.updated_at.elapsed().as_secs());
+
+            Self {
+                aor: binding.aor.clone(),
+                contact_uri: binding.contact_uri.clone(),
+                call_id: binding.call_id.clone(),
+                cseq: binding.cseq,
+                expires: binding.expires,
+                created_at_unix,
+                updated_at_unix,
+                state: binding.state.into(),
+                q_value: binding.q_value,
+                source_addr: binding.source_addr.map(|a| a.to_string()),
+                instance_id: binding.instance_id.clone(),
+                reg_id: binding.reg_id,
+                user_agent: binding.user_agent.clone(),
+                path: binding.path.clone(),
+            }
+        }
+
+        /// Converts this `StorableBinding` back to a `Binding`.
+        ///
+        /// Note: The `created_at` and `updated_at` `Instant` values are approximated
+        /// based on the difference between the stored Unix timestamp and the current time.
+        /// This means the exact original `Instant` values cannot be recovered, but the
+        /// relative timing for expiration calculations will be preserved.
+        #[must_use]
+        pub fn to_binding(&self) -> Binding {
+            let now_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            // Create a new binding with basic fields
+            let mut binding = Binding::new(&self.aor, &self.contact_uri, &self.call_id, self.cseq);
+
+            // Set expires (ignore error, it will be clamped)
+            let _ = binding.set_expires(self.expires);
+
+            // Set q-value
+            binding.set_q_value(self.q_value);
+
+            // Set source address if present
+            if let Some(ref addr_str) = self.source_addr
+                && let Ok(addr) = addr_str.parse()
+            {
+                binding.set_source_addr(addr);
+            }
+
+            // Set RFC 5626 outbound fields
+            if let Some(ref instance_id) = self.instance_id {
+                binding.set_instance_id(instance_id);
+            }
+            if let Some(reg_id) = self.reg_id {
+                binding.set_reg_id(reg_id);
+            }
+
+            // Set user agent
+            if let Some(ref ua) = self.user_agent {
+                binding.set_user_agent(ua);
+            }
+
+            // Set path
+            binding.set_path(self.path.clone());
+
+            // Set state (need to handle specially since we can't directly set it)
+            match self.state {
+                StorableBindingState::Expired => binding.expire(),
+                StorableBindingState::Removed => binding.remove(),
+                _ => {} // Active and Refreshing are default states
+            }
+
+            // Adjust the updated_at to reflect stored time
+            // We can approximate by checking if significant time has passed
+            // The binding's internal updated_at is set to now, but for expiration
+            // calculations we need to account for stored elapsed time
+            if self.updated_at_unix < now_unix {
+                // The binding was updated in the past; we need to simulate
+                // the elapsed time for correct expiration calculation.
+                // Since we can't mutate updated_at directly, we adjust expires
+                // to account for already-elapsed time.
+                let elapsed_since_update = now_unix.saturating_sub(self.updated_at_unix);
+                if elapsed_since_update < self.expires as u64 {
+                    // Adjust expires to reflect remaining time
+                    let remaining = self.expires.saturating_sub(elapsed_since_update as u32);
+                    let _ = binding.set_expires(remaining);
+                } else {
+                    // Already expired
+                    binding.expire();
+                }
+            }
+
+            binding
+        }
+
+        /// Returns the binding key for storage lookups.
+        ///
+        /// For outbound bindings (RFC 5626), uses `{instance_id}:{reg_id}`.
+        /// Otherwise, uses the contact URI.
+        #[must_use]
+        pub fn binding_key(&self) -> String {
+            if let (Some(instance_id), Some(reg_id)) = (&self.instance_id, self.reg_id) {
+                format!("{instance_id}:{reg_id}")
+            } else {
+                self.contact_uri.clone()
+            }
+        }
+
+        /// Checks if the binding has expired based on stored timestamps.
+        #[must_use]
+        pub fn is_expired(&self) -> bool {
+            if matches!(self.state, StorableBindingState::Removed) {
+                return true;
+            }
+            if self.expires == 0 {
+                return true;
+            }
+
+            let now_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            let expiry_time = self.updated_at_unix + self.expires as u64;
+            now_unix >= expiry_time
+        }
+
+        /// Returns remaining seconds until expiry.
+        #[must_use]
+        pub fn remaining_seconds(&self) -> u32 {
+            if self.is_expired() {
+                return 0;
+            }
+
+            let now_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            let expiry_time = self.updated_at_unix + self.expires as u64;
+            expiry_time.saturating_sub(now_unix) as u32
+        }
+    }
+}
+
+#[cfg(feature = "storage")]
+pub use storable::{StorableBinding, StorableBindingState};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,5 +693,121 @@ mod tests {
 
         binding.set_user_agent("TestPhone/1.0");
         assert_eq!(binding.user_agent(), Some("TestPhone/1.0"));
+    }
+
+    #[cfg(feature = "storage")]
+    mod storage_tests {
+        use super::*;
+
+        #[test]
+        fn test_storable_binding_roundtrip() {
+            let mut binding = test_binding();
+            binding.set_q_value(0.8);
+            binding.set_instance_id("<urn:uuid:test-123>");
+            binding.set_reg_id(1);
+            binding.set_user_agent("TestUA/1.0");
+            binding.set_path(vec!["<sip:proxy@example.com;lr>".to_string()]);
+
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5060);
+            binding.set_source_addr(addr);
+
+            // Convert to storable
+            let storable = StorableBinding::from_binding(&binding);
+
+            // Verify fields
+            assert_eq!(storable.aor, "sip:alice@example.com");
+            assert_eq!(storable.contact_uri, "sip:alice@192.168.1.100:5060");
+            assert_eq!(storable.call_id, "call-123@client");
+            assert_eq!(storable.cseq, 1);
+            assert!((storable.q_value - 0.8).abs() < f32::EPSILON);
+            assert_eq!(
+                storable.instance_id,
+                Some("<urn:uuid:test-123>".to_string())
+            );
+            assert_eq!(storable.reg_id, Some(1));
+            assert_eq!(storable.user_agent, Some("TestUA/1.0".to_string()));
+            assert_eq!(storable.path.len(), 1);
+            assert_eq!(storable.source_addr, Some("192.168.1.100:5060".to_string()));
+
+            // Convert back to binding
+            let recovered = storable.to_binding();
+
+            assert_eq!(recovered.aor(), binding.aor());
+            assert_eq!(recovered.contact_uri(), binding.contact_uri());
+            assert_eq!(recovered.call_id(), binding.call_id());
+            assert_eq!(recovered.cseq(), binding.cseq());
+            assert!((recovered.q_value() - binding.q_value()).abs() < f32::EPSILON);
+            assert_eq!(recovered.instance_id(), binding.instance_id());
+            assert_eq!(recovered.reg_id(), binding.reg_id());
+            assert_eq!(recovered.user_agent(), binding.user_agent());
+            assert_eq!(recovered.path(), binding.path());
+        }
+
+        #[test]
+        fn test_storable_binding_state_conversion() {
+            assert_eq!(
+                StorableBindingState::from(BindingState::Active),
+                StorableBindingState::Active
+            );
+            assert_eq!(
+                StorableBindingState::from(BindingState::Refreshing),
+                StorableBindingState::Refreshing
+            );
+            assert_eq!(
+                StorableBindingState::from(BindingState::Expired),
+                StorableBindingState::Expired
+            );
+            assert_eq!(
+                StorableBindingState::from(BindingState::Removed),
+                StorableBindingState::Removed
+            );
+
+            // And back
+            assert_eq!(
+                BindingState::from(StorableBindingState::Active),
+                BindingState::Active
+            );
+        }
+
+        #[test]
+        fn test_storable_binding_key() {
+            let binding = test_binding();
+            let storable = StorableBinding::from_binding(&binding);
+
+            // Without outbound params, key is contact URI
+            assert_eq!(storable.binding_key(), "sip:alice@192.168.1.100:5060");
+
+            // With outbound params
+            let mut outbound_binding = test_binding();
+            outbound_binding.set_instance_id("<urn:uuid:test>");
+            outbound_binding.set_reg_id(1);
+            let storable_outbound = StorableBinding::from_binding(&outbound_binding);
+            assert_eq!(storable_outbound.binding_key(), "<urn:uuid:test>:1");
+        }
+
+        #[test]
+        fn test_storable_binding_expiration() {
+            let binding = test_binding();
+            let storable = StorableBinding::from_binding(&binding);
+
+            // Should not be expired (default expires is 3600)
+            assert!(!storable.is_expired());
+            assert!(storable.remaining_seconds() > 0);
+        }
+
+        #[test]
+        fn test_storable_binding_serialization() {
+            let binding = test_binding();
+            let storable = StorableBinding::from_binding(&binding);
+
+            // Serialize to JSON
+            let json = serde_json::to_string(&storable).unwrap();
+            assert!(json.contains("sip:alice@example.com"));
+
+            // Deserialize back
+            let deserialized: StorableBinding = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized.aor, storable.aor);
+            assert_eq!(deserialized.contact_uri, storable.contact_uri);
+        }
     }
 }

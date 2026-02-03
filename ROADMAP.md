@@ -465,7 +465,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 - ✅ `StaticDiscovery` for configured peer lists
 - ✅ `DnsDiscovery` with SRV and A/AAAA lookup via hickory-resolver
-- ✅ `KubernetesDiscovery` stub for K8s API (feature-gated)
+- ✅ `KubernetesDiscovery` with Kubernetes Endpoints API (feature-gated)
 - ✅ `GossipProtocol` for SWIM-style failure detection
 - ✅ Weighted peer selection per RFC 2782
 
@@ -475,6 +475,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ `InMemoryBackend` with TTL support and pattern matching
 - ✅ `RedisBackend` with bb8 connection pooling (feature = "redis")
 - ✅ `PostgresBackend` with sqlx and auto-migration (feature = "postgres")
+- ✅ `AsyncLocationService` in proto-registrar for cache-aside storage integration
 
 **State Synchronization**
 
