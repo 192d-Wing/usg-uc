@@ -378,12 +378,12 @@ mod tests {
         // First 5 requests should be allowed (burst)
         for _ in 0..5 {
             let action = limiter.check(ip);
-            assert!(action.is_allowed(), "Expected allowed, got {:?}", action);
+            assert!(action.is_allowed(), "Expected allowed, got {action:?}");
         }
 
         // Next request should be rejected (out of tokens)
         let action = limiter.check(ip);
-        assert!(action.is_rejected(), "Expected rejected, got {:?}", action);
+        assert!(action.is_rejected(), "Expected rejected, got {action:?}");
     }
 
     #[test]

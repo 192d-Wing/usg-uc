@@ -157,7 +157,7 @@ pub struct ApiServer {
 
 impl ApiServer {
     /// Creates a new API server.
-    pub fn new(config: ApiServerConfig, state: Arc<AppState>, shutdown: ShutdownSignal) -> Self {
+    pub const fn new(config: ApiServerConfig, state: Arc<AppState>, shutdown: ShutdownSignal) -> Self {
         Self {
             config,
             state,

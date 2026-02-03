@@ -291,24 +291,24 @@ impl ShutdownCoordinator {
     }
 
     /// Sets the shutdown timeout.
-    pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
+    pub const fn with_timeout(mut self, timeout_secs: u64) -> Self {
         self.timeout_secs = timeout_secs;
         self
     }
 
     /// Sets the drain poll interval.
-    pub fn with_drain_poll_interval(mut self, poll_ms: u64) -> Self {
+    pub const fn with_drain_poll_interval(mut self, poll_ms: u64) -> Self {
         self.drain_poll_ms = poll_ms;
         self
     }
 
     /// Returns the shutdown signal.
-    pub fn signal(&self) -> &ShutdownSignal {
+    pub const fn signal(&self) -> &ShutdownSignal {
         &self.signal
     }
 
     /// Returns the connection tracker.
-    pub fn connections(&self) -> &ConnectionTracker {
+    pub const fn connections(&self) -> &ConnectionTracker {
         &self.connections
     }
 

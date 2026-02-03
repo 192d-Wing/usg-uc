@@ -42,7 +42,7 @@ pub struct Server {
     udp_transports: RwLock<Vec<Arc<UdpTransport>>>,
     /// SIP stack for message processing.
     sip_stack: Arc<SipStack>,
-    /// Rate limiter for DoS protection.
+    /// Rate limiter for `DoS` protection.
     rate_limiter: Arc<Mutex<RateLimiter>>,
 }
 
@@ -99,22 +99,22 @@ impl Server {
     }
 
     /// Returns the server configuration.
-    pub fn config(&self) -> &SbcConfig {
+    pub const fn config(&self) -> &SbcConfig {
         &self.config
     }
 
     /// Returns the health checker.
-    pub fn health(&mut self) -> &mut HealthChecker {
+    pub const fn health(&mut self) -> &mut HealthChecker {
         &mut self.health
     }
 
     /// Returns the metrics registry.
-    pub fn metrics(&self) -> &MetricRegistry {
+    pub const fn metrics(&self) -> &MetricRegistry {
         &self.metrics
     }
 
     /// Returns server statistics.
-    pub fn stats(&self) -> &Arc<ServerStats> {
+    pub const fn stats(&self) -> &Arc<ServerStats> {
         &self.stats
     }
 

@@ -19,7 +19,7 @@
 //!
 //! - **AU-2**: Event Logging - All significant events are logged
 //! - **CM-2**: Baseline Configuration - Configuration loaded at startup
-//! - **SC-5**: DoS Protection - Rate limiting enabled
+//! - **SC-5**: `DoS` Protection - Rate limiting enabled
 
 #![forbid(unsafe_code)]
 #![deny(warnings)]

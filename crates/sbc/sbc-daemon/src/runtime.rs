@@ -27,7 +27,7 @@ use uc_metrics::SbcMetrics;
 pub struct Runtime {
     /// Command-line arguments.
     args: Args,
-    /// Configuration (wrapped in RwLock for hot-reload).
+    /// Configuration (wrapped in `RwLock` for hot-reload).
     config: Arc<RwLock<SbcConfig>>,
     /// Shutdown coordinator.
     shutdown: ShutdownCoordinator,
@@ -92,7 +92,7 @@ impl Runtime {
     }
 
     /// Returns the raw config reference for internal use.
-    fn config_ref(&self) -> &Arc<RwLock<SbcConfig>> {
+    const fn config_ref(&self) -> &Arc<RwLock<SbcConfig>> {
         &self.config
     }
 
@@ -362,7 +362,7 @@ impl From<ServerError> for RuntimeError {
 
 /// Creates a test configuration as a TOML string.
 #[cfg(test)]
-fn test_config_toml() -> &'static str {
+const fn test_config_toml() -> &'static str {
     r#"
 [general]
 instance_name = "test-sbc"
