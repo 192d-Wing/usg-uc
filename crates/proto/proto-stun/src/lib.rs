@@ -52,11 +52,16 @@
 
 pub mod attribute;
 pub mod client;
+pub mod credential;
 pub mod error;
 pub mod message;
 
 pub use attribute::{StunAttribute, XorMappedAddress};
 pub use client::StunClient;
+pub use credential::{
+    AuthResult, LongTermCredentialValidator, LongTermCredentials, DEFAULT_NONCE_LIFETIME,
+    MIN_NONCE_LIFETIME,
+};
 pub use error::{StunError, StunResult};
 pub use message::{StunClass, StunMessage, StunMessageType, StunMethod};
 

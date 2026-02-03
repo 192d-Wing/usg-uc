@@ -60,4 +60,11 @@ pub enum SdpError {
         /// The version number.
         version: u8,
     },
+
+    /// Invalid media modification per RFC 3264 §8.4.
+    #[error("invalid media modification: {reason}")]
+    InvalidModification {
+        /// Error description.
+        reason: String,
+    },
 }

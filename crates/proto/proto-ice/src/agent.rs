@@ -606,6 +606,103 @@ impl IceAgent {
         self.checklist.selected_pair(component)
     }
 
+    /// Returns whether aggressive nomination is enabled.
+    ///
+    /// Per RFC 8445 §7.2.2, with aggressive nomination the controlling agent
+    /// includes the USE-CANDIDATE attribute in every connectivity check.
+    pub fn aggressive_nomination(&self) -> bool {
+        self.config.aggressive_nomination
+    }
+
+    /// Returns the configuration.
+    pub fn config(&self) -> &IceConfig {
+        &self.config
+    }
+
+    /// Returns whether this check should include nomination (USE-CANDIDATE).
+    ///
+    /// ## RFC 8445 §7.2.2 Aggressive Nomination
+    ///
+    /// With aggressive nomination, the controlling agent includes the
+    /// USE-CANDIDATE attribute in every check it sends. This is faster
+    /// but may result in suboptimal pair selection.
+    ///
+    /// With regular nomination, the controlling agent first performs
+    /// checks without USE-CANDIDATE, then sends a separate check with
+    /// USE-CANDIDATE for the selected pair.
+    ///
+    /// ## Returns
+    ///
+    /// `true` if nomination should be included, `false` otherwise.
+    /// For controlled agents, always returns `false` since only the
+    /// controlling agent can nominate pairs.
+    pub fn should_nominate_check(&self) -> bool {
+        // Only the controlling agent can nominate
+        if self.role != IceRole::Controlling {
+            return false;
+        }
+
+        // With aggressive nomination, every check includes USE-CANDIDATE
+        self.config.aggressive_nomination
+    }
+
+    /// Creates a connectivity check for a candidate pair.
+    ///
+    /// This is a convenience method that properly configures nomination
+    /// based on the agent's role and nomination strategy.
+    ///
+    /// ## RFC 8445 §7.2.2 Aggressive Nomination
+    ///
+    /// When aggressive nomination is enabled for a controlling agent,
+    /// the USE-CANDIDATE attribute is automatically included in the check.
+    pub fn create_connectivity_check(
+        &self,
+        local: &Candidate,
+        remote: &Candidate,
+    ) -> Option<crate::connectivity::ConnectivityCheck> {
+        let remote_credentials = self.remote_credentials.as_ref()?;
+
+        let check = crate::connectivity::ConnectivityCheck::new(
+            local.clone(),
+            remote.clone(),
+            self.local_credentials.clone(),
+            remote_credentials.clone(),
+            self.role,
+            self.tie_breaker,
+        );
+
+        // Apply aggressive nomination if enabled and we're controlling
+        Some(check.with_nomination(self.should_nominate_check()))
+    }
+
+    /// Creates a connectivity check with explicit nomination control.
+    ///
+    /// Use this method when you need to override the automatic nomination
+    /// behavior, such as when performing regular nomination for a specific
+    /// pair after initial checks.
+    pub fn create_connectivity_check_with_nomination(
+        &self,
+        local: &Candidate,
+        remote: &Candidate,
+        nominate: bool,
+    ) -> Option<crate::connectivity::ConnectivityCheck> {
+        let remote_credentials = self.remote_credentials.as_ref()?;
+
+        // Only controlling agent can actually nominate
+        let effective_nominate = nominate && self.role == IceRole::Controlling;
+
+        let check = crate::connectivity::ConnectivityCheck::new(
+            local.clone(),
+            remote.clone(),
+            self.local_credentials.clone(),
+            remote_credentials.clone(),
+            self.role,
+            self.tie_breaker,
+        );
+
+        Some(check.with_nomination(effective_nominate))
+    }
+
     /// Handles an ICE restart.
     pub fn restart(&mut self) -> IceResult<()> {
         // Generate new credentials
@@ -782,5 +879,170 @@ mod tests {
 
         agent.close();
         assert_eq!(agent.state(), IceState::Closed);
+    }
+
+    #[test]
+    fn test_aggressive_nomination_disabled_by_default() {
+        let config = IceConfig::default();
+        let agent = IceAgent::controlling(config);
+
+        assert!(!agent.aggressive_nomination());
+        // Controlling agent without aggressive nomination should not nominate
+        assert!(!agent.should_nominate_check());
+    }
+
+    #[test]
+    fn test_aggressive_nomination_enabled() {
+        let config = IceConfig {
+            aggressive_nomination: true,
+            ..Default::default()
+        };
+        let agent = IceAgent::controlling(config);
+
+        assert!(agent.aggressive_nomination());
+        // Controlling agent with aggressive nomination should nominate every check
+        assert!(agent.should_nominate_check());
+    }
+
+    #[test]
+    fn test_controlled_agent_never_nominates() {
+        // Even with aggressive nomination enabled, controlled agent cannot nominate
+        let config = IceConfig {
+            aggressive_nomination: true,
+            ..Default::default()
+        };
+        let agent = IceAgent::controlled(config);
+
+        assert!(agent.aggressive_nomination()); // Config is set
+        assert!(!agent.should_nominate_check()); // But controlled agent can't nominate
+    }
+
+    #[test]
+    fn test_create_connectivity_check_with_aggressive_nomination() {
+        let config = IceConfig {
+            aggressive_nomination: true,
+            ..Default::default()
+        };
+        let mut agent = IceAgent::controlling(config);
+
+        // Gather local candidates
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5060);
+        agent.gather_candidates(&[local_addr]).unwrap();
+
+        // Set remote credentials (required for check creation)
+        agent.set_remote_credentials(IceCredentials::generate());
+
+        // Create a remote candidate
+        let remote = Candidate::host(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5060),
+            1,
+        );
+
+        let local = &agent.local_candidates()[0];
+        let check = agent.create_connectivity_check(local, &remote).unwrap();
+
+        // The check should have nomination enabled due to aggressive nomination
+        let request = check.create_request().unwrap();
+        let has_use_candidate = request
+            .attributes
+            .iter()
+            .any(|a| matches!(a, proto_stun::StunAttribute::UseCandidate));
+        assert!(has_use_candidate, "Aggressive nomination should set USE-CANDIDATE");
+    }
+
+    #[test]
+    fn test_create_connectivity_check_without_aggressive_nomination() {
+        let config = IceConfig::default(); // aggressive_nomination = false
+        let mut agent = IceAgent::controlling(config);
+
+        // Gather local candidates
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5060);
+        agent.gather_candidates(&[local_addr]).unwrap();
+
+        // Set remote credentials
+        agent.set_remote_credentials(IceCredentials::generate());
+
+        // Create a remote candidate
+        let remote = Candidate::host(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5060),
+            1,
+        );
+
+        let local = &agent.local_candidates()[0];
+        let check = agent.create_connectivity_check(local, &remote).unwrap();
+
+        // The check should NOT have nomination (regular nomination mode)
+        let request = check.create_request().unwrap();
+        let has_use_candidate = request
+            .attributes
+            .iter()
+            .any(|a| matches!(a, proto_stun::StunAttribute::UseCandidate));
+        assert!(!has_use_candidate, "Regular nomination should not set USE-CANDIDATE initially");
+    }
+
+    #[test]
+    fn test_create_connectivity_check_with_explicit_nomination() {
+        let config = IceConfig::default(); // aggressive_nomination = false
+        let mut agent = IceAgent::controlling(config);
+
+        // Gather local candidates
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5060);
+        agent.gather_candidates(&[local_addr]).unwrap();
+
+        // Set remote credentials
+        agent.set_remote_credentials(IceCredentials::generate());
+
+        // Create a remote candidate
+        let remote = Candidate::host(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5060),
+            1,
+        );
+
+        let local = &agent.local_candidates()[0];
+
+        // Explicitly request nomination (for regular nomination after check succeeds)
+        let check = agent
+            .create_connectivity_check_with_nomination(local, &remote, true)
+            .unwrap();
+
+        let request = check.create_request().unwrap();
+        let has_use_candidate = request
+            .attributes
+            .iter()
+            .any(|a| matches!(a, proto_stun::StunAttribute::UseCandidate));
+        assert!(has_use_candidate, "Explicit nomination should set USE-CANDIDATE");
+    }
+
+    #[test]
+    fn test_controlled_cannot_nominate_even_with_explicit_request() {
+        let config = IceConfig::default();
+        let mut agent = IceAgent::controlled(config);
+
+        // Gather local candidates
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5060);
+        agent.gather_candidates(&[local_addr]).unwrap();
+
+        // Set remote credentials
+        agent.set_remote_credentials(IceCredentials::generate());
+
+        // Create a remote candidate
+        let remote = Candidate::host(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5060),
+            1,
+        );
+
+        let local = &agent.local_candidates()[0];
+
+        // Try to explicitly request nomination as controlled agent
+        let check = agent
+            .create_connectivity_check_with_nomination(local, &remote, true)
+            .unwrap();
+
+        let request = check.create_request().unwrap();
+        let has_use_candidate = request
+            .attributes
+            .iter()
+            .any(|a| matches!(a, proto_stun::StunAttribute::UseCandidate));
+        assert!(!has_use_candidate, "Controlled agent cannot nominate");
     }
 }

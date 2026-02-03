@@ -46,6 +46,7 @@ pub mod header;
 pub mod header_params;
 pub mod message;
 pub mod method;
+pub mod redirect;
 pub mod response;
 pub mod routing;
 pub mod transport;
@@ -62,6 +63,10 @@ pub use header_params::{CSeqHeader, MaxForwardsHeader, NameAddr, ViaHeader, VIA_
 pub use message::{SipMessage, SipRequest, SipResponse};
 pub use method::Method;
 pub use response::StatusCode;
+pub use redirect::{
+    parse_redirect_response, RedirectContact, RedirectHandler, RedirectHeaders, RedirectResult,
+    DEFAULT_MAX_REDIRECT_DEPTH,
+};
 pub use routing::{
     compute_request_target, create_record_route, process_record_route_for_uac,
     process_record_route_for_uas, RouteEntry, RouteSet,

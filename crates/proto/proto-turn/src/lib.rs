@@ -56,12 +56,14 @@ pub mod attribute;
 pub mod channel;
 pub mod client;
 pub mod error;
+pub mod indication;
 
 pub use allocation::{Allocation, AllocationState};
 pub use attribute::TurnAttribute;
 pub use channel::ChannelData;
 pub use client::{TurnClient, TurnCredentials};
 pub use error::{TurnError, TurnResult};
+pub use indication::{DataIndication, IndicationType, SendIndication};
 
 /// Default TURN port (same as STUN).
 pub const DEFAULT_PORT: u16 = 3478;

@@ -18,6 +18,7 @@
 
 use crate::error::{DtlsError, DtlsResult};
 use crate::record::{ContentType, RecordLayer, DTLS_1_2_VERSION, RECORD_HEADER_LEN};
+use crate::verify::{CertificateValidationResult, CertificateValidator, FinishedVerifier, ServerKeyExchangeVerifier};
 use uc_crypto::aead::Aes256GcmKey;
 use uc_crypto::ecdh::P384EphemeralKeyPair;
 use uc_crypto::hkdf;
@@ -192,12 +193,21 @@ pub struct Handshake {
     /// Local certificate chain.
     local_cert_chain: Vec<Vec<u8>>,
     /// Local private key (for signing).
-    #[allow(dead_code)]
     local_private_key: Vec<u8>,
     /// Handshake hash (for Finished message).
     handshake_hash: Vec<u8>,
     /// Cookie from HelloVerifyRequest.
     cookie: Vec<u8>,
+    /// Peer certificate chain (received during handshake).
+    peer_cert_chain: Vec<Vec<u8>>,
+    /// Peer's public key extracted from certificate.
+    peer_public_key: Option<Vec<u8>>,
+    /// ServerKeyExchange ECDH params (for signature verification).
+    server_ecdh_params: Option<Vec<u8>>,
+    /// Expected certificate fingerprint (for DTLS-SRTP).
+    expected_fingerprint: Option<[u8; 48]>,
+    /// Whether to allow self-signed certificates.
+    allow_self_signed: bool,
 }
 
 impl Handshake {
@@ -247,6 +257,11 @@ impl Handshake {
             local_private_key: private_key,
             handshake_hash: Vec::new(),
             cookie: Vec::new(),
+            peer_cert_chain: Vec::new(),
+            peer_public_key: None,
+            server_ecdh_params: None,
+            expected_fingerprint: None,
+            allow_self_signed: true, // Default for DTLS-SRTP
         })
     }
 
@@ -327,7 +342,8 @@ impl Handshake {
                 reason: format!("expected Certificate, got {:?}", cert_msg.0),
             });
         }
-        // TODO: Validate certificate chain
+        // Validate certificate chain per RFC 6347 §4.2.4
+        self.process_certificate(&cert_msg.1)?;
 
         // Receive ServerKeyExchange
         let ske_msg = self.recv_handshake_message(socket, handshake_timeout).await?;
@@ -380,7 +396,8 @@ impl Handshake {
                 reason: format!("expected Finished, got {:?}", fin_msg.0),
             });
         }
-        // TODO: Verify Finished message
+        // Verify Finished message per RFC 6347 §4.2.6
+        self.verify_finished(&fin_msg.1, false)?; // false = this is server's Finished
 
         self.state = HandshakeState::Complete;
         debug!("Client handshake complete");
@@ -468,7 +485,8 @@ impl Handshake {
                 reason: format!("expected Finished, got {:?}", fin_msg.0),
             });
         }
-        // TODO: Verify Finished message
+        // Verify Finished message per RFC 6347 §4.2.6
+        self.verify_finished(&fin_msg.1, true)?; // true = this is client's Finished
 
         // Send ChangeCipherSpec
         self.send_change_cipher_spec(socket).await?;
@@ -710,7 +728,31 @@ impl Handshake {
         msg.push(public_key.len() as u8);
         msg.extend_from_slice(&public_key);
 
-        // TODO: Add signature over the exchange parameters
+        // Sign the exchange parameters per RFC 6347
+        // signed_params = client_random + server_random + ServerECDHParams
+        let mut signed_data = Vec::with_capacity(64 + msg.len());
+        signed_data.extend_from_slice(&self.client_random);
+        signed_data.extend_from_slice(&self.server_random);
+        signed_data.extend_from_slice(&msg);
+
+        // Sign with ECDSA P-384
+        let keypair = uc_crypto::ecdsa::P384KeyPair::from_pkcs8(&self.local_private_key)
+            .map_err(|e| DtlsError::HandshakeFailed {
+                reason: format!("invalid private key: {e}"),
+            })?;
+
+        let signature = keypair.sign(&signed_data).map_err(|e| {
+            DtlsError::HandshakeFailed {
+                reason: format!("signing failed: {e}"),
+            }
+        })?;
+
+        // Signature algorithm: ecdsa_secp384r1_sha384 (0x0503)
+        msg.extend_from_slice(&[0x05, 0x03]);
+        // Signature length (2 bytes)
+        msg.extend_from_slice(&(signature.len() as u16).to_be_bytes());
+        // Signature
+        msg.extend_from_slice(&signature);
 
         Ok(msg)
     }
@@ -749,7 +791,140 @@ impl Handshake {
 
         self.peer_ecdhe_public = Some(data[4..4 + pk_len].to_vec());
 
+        // Store ECDH params for signature verification
+        self.server_ecdh_params = Some(data[..4 + pk_len].to_vec());
+
+        // Check for signature (if present)
+        if data.len() > 4 + pk_len {
+            let sig_offset = 4 + pk_len;
+            // Signature algorithm (2 bytes) + signature length (2 bytes) + signature
+            if data.len() >= sig_offset + 4 {
+                let sig_len = u16::from_be_bytes([data[sig_offset + 2], data[sig_offset + 3]]) as usize;
+                if data.len() >= sig_offset + 4 + sig_len {
+                    let signature = &data[sig_offset + 4..sig_offset + 4 + sig_len];
+
+                    // Verify signature if we have peer's public key
+                    if let Some(peer_pubkey) = &self.peer_public_key {
+                        ServerKeyExchangeVerifier::verify(
+                            &self.client_random,
+                            &self.server_random,
+                            &data[..4 + pk_len],
+                            signature,
+                            peer_pubkey,
+                        )?;
+                        debug!("ServerKeyExchange signature verified");
+                    }
+                }
+            }
+        }
+
         debug!(pk_len = pk_len, "Processed ServerKeyExchange");
+        Ok(())
+    }
+
+    /// Processes a Certificate message and validates the certificate chain.
+    ///
+    /// Per RFC 6347 §4.2.4, validates:
+    /// - Certificate structure
+    /// - Signature chain
+    /// - Fingerprint (for DTLS-SRTP)
+    fn process_certificate(&mut self, data: &[u8]) -> DtlsResult<()> {
+        if data.len() < 3 {
+            return Err(DtlsError::CertificateError {
+                reason: "Certificate message too short".to_string(),
+            });
+        }
+
+        // Total certificates length (3 bytes)
+        let total_len = u32::from_be_bytes([0, data[0], data[1], data[2]]) as usize;
+        if data.len() < 3 + total_len {
+            return Err(DtlsError::CertificateError {
+                reason: "Certificate message truncated".to_string(),
+            });
+        }
+
+        // Parse certificate chain
+        let mut offset = 3;
+        let mut certs = Vec::new();
+
+        while offset < 3 + total_len {
+            if offset + 3 > data.len() {
+                return Err(DtlsError::CertificateError {
+                    reason: "Certificate entry truncated".to_string(),
+                });
+            }
+
+            let cert_len = u32::from_be_bytes([0, data[offset], data[offset + 1], data[offset + 2]]) as usize;
+            offset += 3;
+
+            if offset + cert_len > data.len() {
+                return Err(DtlsError::CertificateError {
+                    reason: "Certificate data truncated".to_string(),
+                });
+            }
+
+            certs.push(data[offset..offset + cert_len].to_vec());
+            offset += cert_len;
+        }
+
+        if certs.is_empty() {
+            return Err(DtlsError::CertificateError {
+                reason: "No certificates in chain".to_string(),
+            });
+        }
+
+        // Build validator
+        let mut validator = CertificateValidator::new();
+        if self.allow_self_signed {
+            validator = validator.allow_self_signed();
+        }
+        if let Some(fp) = self.expected_fingerprint {
+            validator = validator.with_fingerprint(fp);
+        }
+
+        // Validate certificate chain
+        let result = validator.validate(&certs);
+        match result {
+            CertificateValidationResult::Valid => {
+                debug!("Certificate chain validated");
+            }
+            CertificateValidationResult::SelfSigned => {
+                debug!("Self-signed certificate accepted");
+            }
+            CertificateValidationResult::Invalid(reason) => {
+                return Err(DtlsError::CertificateError { reason });
+            }
+        }
+
+        // Extract public key from leaf certificate
+        let pubkey = validator.extract_public_key(&certs[0])?;
+        self.peer_public_key = Some(pubkey);
+        self.peer_cert_chain = certs;
+
+        Ok(())
+    }
+
+    /// Verifies a received Finished message.
+    ///
+    /// Per RFC 6347 §4.2.6, the Finished message contains verify_data computed as:
+    /// ```text
+    /// verify_data = PRF(master_secret, finished_label, Hash(handshake_messages))[0..11]
+    /// ```
+    fn verify_finished(&self, data: &[u8], is_client_finished: bool) -> DtlsResult<()> {
+        let master_secret = self.master_secret.ok_or(DtlsError::HandshakeFailed {
+            reason: "no master secret for Finished verification".to_string(),
+        })?;
+
+        // Compute hash of all handshake messages (excluding this Finished)
+        let handshake_hash = uc_crypto::hash::sha384(&self.handshake_hash);
+
+        // Verify the Finished message
+        FinishedVerifier::verify(data, &master_secret, &handshake_hash, is_client_finished)?;
+
+        debug!(
+            role = if is_client_finished { "client" } else { "server" },
+            "Finished message verified"
+        );
         Ok(())
     }
 

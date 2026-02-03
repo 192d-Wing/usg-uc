@@ -39,6 +39,7 @@ pub mod handshake;
 pub mod record;
 pub mod session;
 pub mod srtp_export;
+pub mod verify;
 
 pub use cipher_suite::{cnsa_cipher_suites, is_cnsa_compliant};
 pub use config::DtlsConfig;
@@ -49,6 +50,7 @@ pub use handshake::{Handshake, HandshakeState};
 pub use record::{RecordHeader, RecordLayer};
 pub use session::DtlsSession;
 pub use srtp_export::{SrtpKeyExporter, UseSrtpExtension, SRTP_EXPORTER_LABEL};
+pub use verify::{CertificateValidationResult, CertificateValidator, FinishedVerifier, ServerKeyExchangeVerifier};
 
 /// DTLS role in the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

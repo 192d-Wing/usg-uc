@@ -53,12 +53,18 @@ pub mod binding;
 pub mod error;
 pub mod gruu;
 pub mod location;
+pub mod outbound;
 pub mod registrar;
 
 pub use binding::{Binding, BindingState};
 pub use error::{RegistrarError, RegistrarResult};
 pub use gruu::{is_gruu, parse_gr_parameter, GruuEntry, GruuGenerator, GruuService};
 pub use location::LocationService;
+pub use outbound::{
+    Flow, FlowAction, FlowId, FlowState, FlowToken, FlowTransport, OutboundFlowManager,
+    CRLF_KEEPALIVE, CRLF_PONG, DEFAULT_FAILURE_THRESHOLD, DEFAULT_KEEPALIVE_INTERVAL,
+    DEFAULT_KEEPALIVE_TIMEOUT,
+};
 pub use registrar::{Registrar, RegistrarConfig, RegistrarMode};
 
 /// Default registration expiration in seconds (RFC 3261 recommends 3600).

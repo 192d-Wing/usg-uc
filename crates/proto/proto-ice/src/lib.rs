@@ -58,7 +58,7 @@ pub mod connectivity;
 pub mod consent;
 pub mod error;
 
-pub use agent::{IceAgent, IceCredentials, IceRole};
+pub use agent::{IceAgent, IceConfig, IceCredentials, IceRole};
 pub use candidate::{Candidate, CandidateType, TransportProtocol};
 pub use checklist::{CandidatePair, CheckList, PairState};
 pub use connectivity::{CheckResult, ConnectivityCheck, ConnectivityChecker, IceStunServer, TriggeredCheckInfo};

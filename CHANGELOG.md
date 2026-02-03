@@ -9,6 +9,107 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ### Added
 
+#### P0 Critical RFC Compliance Gaps
+
+**proto-dtls (RFC 6347 §4.2.4, §4.2.6)**
+
+- DTLS certificate verification (`verify.rs`):
+  - `DtlsCertificateVerifier` with RFC 6347 §4.2.4 compliant verification
+  - `CertificateChainValidator` for X.509 chain validation
+  - `verify_certificate_chain()` with trusted CA store
+  - `verify_self_signed()` for fingerprint-based WebRTC validation
+  - `VerificationMode` enum: FullChain, FingerprintOnly, SelfSignedAllowed
+  - `CertificateInfo` extraction (subject, issuer, validity, fingerprint)
+  - CNSA 2.0 compliant: SHA-384 fingerprints, P-384/P-521 curves only
+
+- DTLS Finished message validation:
+  - `verify_finished_message()` per RFC 6347 §4.2.6
+  - PRF-based verify_data computation with HMAC-SHA384
+  - Handshake transcript hashing for verification
+  - `FinishedMessageError` variants for specific failure modes
+
+**proto-ice (RFC 7675 §6)**
+
+- ICE consent revocation (`consent.rs`):
+  - `revoke_consent()` for explicit consent withdrawal per RFC 7675 §6
+  - `ConsentState::Revoked` for distinguishing revocation from expiration
+  - `ConsentRevocationReason` enum: UserInitiated, SecurityConcern, SessionTerminating, MediaTimeout, PolicyViolation
+  - `is_revoked()` and `revocation_reason()` accessors
+  - Revoked state immediately stops all media transmission
+
+**proto-turn (RFC 5766 §9, §12)**
+
+- TURN Send/Data indications (`indication.rs`):
+  - `SendIndication` struct per RFC 5766 §9
+  - `DataIndication` struct per RFC 5766 §12
+  - XOR-PEER-ADDRESS and DATA attribute handling
+  - `encode()` methods for wire format generation
+  - Indication class (0x10) message type handling
+
+**proto-sip (RFC 3261 §13.2.2.4)**
+
+- SIP redirect handling (`redirect.rs`):
+  - `RedirectHandler` for 3xx response processing
+  - `RedirectContact` with q-value priority parsing
+  - `RedirectResult` enum: Redirect, TooManyRedirects, Failure, NoAlternatives
+  - `process_redirect_response()` for 300-305 handling
+  - `select_next_target()` with priority-based selection
+  - Loop detection via visited URI tracking
+  - Configurable max_redirects limit
+
+#### P1 High Priority RFC Compliance Gaps
+
+**proto-registrar (RFC 5626 §5.2)**
+
+- SIP Outbound flow maintenance (`outbound.rs`):
+  - `FlowTransport` enum: Udp, Tcp, Tls, WebSocket, WebSocketSecure
+  - `FlowState` enum: Active, Probing, Suspect, Failed, Recovering
+  - `FlowId` and `FlowToken` types for flow identification
+  - `Flow` struct with keepalive tracking and health monitoring
+  - `OutboundFlowManager` for multi-flow management
+  - `FlowAction` enum for keepalive actions (STUN, CRLF, WebSocket ping)
+  - Transport-specific keepalive selection per RFC 5626
+  - Configurable intervals and failure thresholds
+
+**proto-ice (RFC 8445 §7.2.2)**
+
+- ICE aggressive nomination support:
+  - `IceConfig.aggressive_nomination` flag (was already present)
+  - `IceAgent::aggressive_nomination()` accessor
+  - `IceAgent::should_nominate_check()` - determines USE-CANDIDATE inclusion
+  - `IceAgent::create_connectivity_check()` - auto-applies nomination strategy
+  - `IceAgent::create_connectivity_check_with_nomination()` - explicit control
+  - Controlling agent only: controlled agents cannot nominate
+  - Exported `IceConfig` from lib.rs
+
+**proto-sdp (RFC 3264 §8.4)**
+
+- SDP offer/answer media modification rules (`offer_answer.rs`):
+  - `MediaModificationValidator` for RFC 3264 compliance validation
+  - `MediaModification` and `MediaModificationType` for change description
+  - `generate_answer()` - creates answer from offer with capability matching
+  - `validate_answer()` - validates answer against offer
+  - `compute_answer_direction()` - direction negotiation per §6.1
+  - `hold_media_stream()` / `resume_media_stream()` - call hold support
+  - `disable_media_stream()` / `enable_media_stream()` - port=0 handling
+  - `LocalCapabilities` and `LocalMediaCapability` for endpoint configuration
+  - `NegotiationResult` and `MediaNegotiationResult` for validation results
+  - `HoldType` enum: SendOnly, Inactive
+
+**proto-stun (RFC 5389 §10.2)**
+
+- STUN long-term credential mechanism (`credential.rs`):
+  - `LongTermCredentials` for client-side authentication
+  - `LongTermCredentialValidator` for server-side validation
+  - `AuthResult` enum: Success, ChallengeRequired, Failed, StaleNonce
+  - `update_from_challenge()` for 401 response handling
+  - `compute_key()` using SHA-384 (CNSA 2.0 compliant deviation from MD5)
+  - `generate_nonce()` with HMAC-SHA384 signatures and timestamps
+  - `validate_nonce()` with expiration checking
+  - `create_challenge_response()` for 401 generation
+  - `create_stale_nonce_response()` for 438 generation
+  - Configurable nonce lifetime (default 10 minutes per RFC 5389)
+
 #### RFC Compliance Gaps - Phase 18 Completion
 
 **proto-ice (RFC 8445 §6.2, §9-10, RFC 7675)**

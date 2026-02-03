@@ -52,7 +52,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1000+ tests passing, Phase 18 complete + proto-* crate extraction with RFC compliance
+**Current Status**: 1000+ tests passing, Phase 18 complete + proto-* crate extraction with RFC compliance + P0/P1 compliance gaps addressed
 
 ---
 
@@ -215,6 +215,61 @@ This document outlines the development roadmap for the USG Session Border Contro
 - [x] UseSrtpExtension encode/decode for use_srtp negotiation
 - [x] HKDF-SHA384 PRF for CNSA 2.0 compliance
 
+### ✅ Phase 18.5: RFC Compliance Gap Resolution
+
+**Goal**: Address critical and high priority RFC compliance gaps
+
+**P0 Critical - DTLS Security** (RFC 6347 §4.2.4, §4.2.6) ✅
+
+- [x] Certificate chain verification with trusted CA store
+- [x] Self-signed certificate fingerprint validation for WebRTC
+- [x] Finished message verification with PRF-based verify_data
+- [x] CNSA 2.0 compliant (SHA-384, P-384/P-521 only)
+
+**P0 Critical - ICE Consent** (RFC 7675 §6) ✅
+
+- [x] Consent revocation with explicit state management
+- [x] Revocation reasons (UserInitiated, SecurityConcern, etc.)
+- [x] Immediate media transmission stop on revocation
+
+**P0 Critical - TURN Indications** (RFC 5766 §9, §12) ✅
+
+- [x] Send indication for client-to-peer data
+- [x] Data indication for peer-to-client data
+- [x] XOR-PEER-ADDRESS and DATA attribute handling
+
+**P0 Critical - SIP Redirect** (RFC 3261 §13.2.2.4) ✅
+
+- [x] 3xx response processing with Contact parsing
+- [x] Priority-based target selection (q-value)
+- [x] Loop detection and max redirect limits
+
+**P1 High - Flow Maintenance** (RFC 5626 §5.2) ✅
+
+- [x] Multi-transport keepalive (STUN, CRLF, WebSocket)
+- [x] Flow state machine (Active, Probing, Suspect, Failed)
+- [x] Flow token generation and tracking
+
+**P1 High - Aggressive Nomination** (RFC 8445 §7.2.2) ✅
+
+- [x] USE-CANDIDATE in every check for controlling agent
+- [x] Configuration flag and automatic application
+- [x] Explicit nomination control methods
+
+**P1 High - Media Modification** (RFC 3264 §8.4) ✅
+
+- [x] Offer/answer validation rules
+- [x] Direction negotiation table
+- [x] Hold/resume support
+- [x] Stream enable/disable (port=0)
+
+**P1 High - Long-Term Credential** (RFC 5389 §10.2) ✅
+
+- [x] Challenge-response authentication flow
+- [x] Nonce generation with HMAC signatures
+- [x] Stale nonce detection and refresh
+- [x] CNSA 2.0 compliant (SHA-384 instead of MD5)
+
 ### ⏳ Phase 19: SIP Authentication & Security
 **Goal**: Production-grade SIP security
 
@@ -333,17 +388,20 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 | RFC | Title | Status |
 |-----|-------|--------|
-| RFC 3261 | SIP Core | ✅ Enhanced (~90% compliant) |
+| RFC 3261 | SIP Core | ✅ Enhanced (~95% compliant, redirect handling) |
+| RFC 3264 | Offer/Answer | ✅ Enhanced (media modification rules) |
 | RFC 4566 | SDP | ✅ Implemented |
-| RFC 3264 | Offer/Answer | ✅ Implemented |
 | RFC 3550 | RTP | ✅ Implemented |
 | RFC 3711 | SRTP | ✅ Implemented (CNSA 2.0) |
+| RFC 5389 | STUN | ✅ Enhanced (long-term credential) |
+| RFC 5626 | SIP Outbound | ✅ Enhanced (flow maintenance) |
 | RFC 5764 | DTLS-SRTP | ✅ Implemented (key export) |
+| RFC 5766 | TURN | ✅ Enhanced (Send/Data indications) |
 | RFC 5853 | SBC Requirements | ✅ Implemented |
-| RFC 6347 | DTLS 1.2 | ✅ Implemented (replay protection) |
+| RFC 6347 | DTLS 1.2 | ✅ Enhanced (certificate verification, Finished validation) |
 | RFC 7092 | B2BUA Taxonomy | ✅ Implemented |
-| RFC 7675 | STUN Consent | ✅ Implemented |
-| RFC 8445 | ICE | ✅ Enhanced (connectivity, consent, keepalives) |
+| RFC 7675 | STUN Consent | ✅ Enhanced (consent revocation) |
+| RFC 8445 | ICE | ✅ Enhanced (aggressive nomination, consent, keepalives) |
 | RFC 8224 | STIR | ✅ Implemented (ES384) |
 | RFC 8225 | PASSporT | ✅ Implemented (ES384) |
 

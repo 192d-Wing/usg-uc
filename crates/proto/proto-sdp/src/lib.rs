@@ -36,11 +36,18 @@
 pub mod attribute;
 pub mod error;
 pub mod media;
+pub mod offer_answer;
 pub mod session;
 
-pub use attribute::{Attribute, AttributeName};
+pub use attribute::{Attribute, AttributeName, Direction};
 pub use error::{SdpError, SdpResult};
 pub use media::{MediaDescription, MediaType, TransportProtocol};
+pub use offer_answer::{
+    compute_answer_direction, disable_media_stream, enable_media_stream, generate_answer,
+    hold_media_stream, resume_media_stream, validate_answer, HoldType, LocalCapabilities,
+    LocalMediaCapability, MediaModification, MediaModificationType, MediaModificationValidator,
+    MediaNegotiationResult, NegotiationResult,
+};
 pub use session::SessionDescription;
 
 /// SDP protocol version (always 0 per RFC 4566).

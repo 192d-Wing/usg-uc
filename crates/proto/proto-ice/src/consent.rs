@@ -26,10 +26,21 @@ const CONSENT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Keepalive interval per RFC 8445 §10 (15 seconds for STUN).
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Error indicating consent has been revoked per RFC 7675 §6.
+///
+/// When consent expires, the agent MUST immediately cease sending data.
+/// This error type represents that condition and should be used to
+/// prevent any further media transmission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsentRevoked;
+
 /// Maximum time without any traffic before sending keepalive.
 const TRAFFIC_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// State of consent freshness.
+///
+/// Per RFC 7675, consent represents the peer's willingness to receive traffic.
+/// When consent expires, the sending agent MUST stop all transmission immediately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsentState {
     /// Consent is fresh (recently verified).
@@ -37,6 +48,9 @@ pub enum ConsentState {
     /// Consent verification in progress.
     Pending,
     /// Consent has expired (no response within timeout).
+    ///
+    /// **RFC 7675 §6**: When consent expires, the agent MUST cease
+    /// sending media traffic immediately. This is a consent revocation.
     Expired,
 }
 
@@ -112,6 +126,24 @@ impl ConsentTracker {
     /// Returns whether consent is currently valid.
     pub fn is_consented(&self) -> bool {
         self.state == ConsentState::Fresh
+    }
+
+    /// Returns whether consent has been revoked and transmission MUST stop.
+    ///
+    /// Per RFC 7675 §6: "When consent expires, the agent MUST immediately
+    /// cease sending data on the ICE candidate pair."
+    ///
+    /// Callers MUST check this and stop all media transmission when it returns true.
+    pub fn is_revoked(&self) -> bool {
+        self.state == ConsentState::Expired
+    }
+
+    /// Returns whether transmission is allowed.
+    ///
+    /// Per RFC 7675 §6, this returns false when consent has expired,
+    /// indicating that the agent MUST NOT send any media data.
+    pub fn can_send(&self) -> bool {
+        self.state != ConsentState::Expired
     }
 
     /// Returns the time since last consent verification.
@@ -340,6 +372,39 @@ impl ConsentKeepaliveManager {
     /// Returns whether consent is valid.
     pub fn is_consented(&self) -> bool {
         self.consent.is_consented()
+    }
+
+    /// Returns whether consent has been revoked and transmission MUST stop.
+    ///
+    /// Per RFC 7675 §6: "When consent expires, the agent MUST immediately
+    /// cease sending data on the ICE candidate pair."
+    ///
+    /// When this returns true:
+    /// - MUST stop sending all media (RTP/RTCP)
+    /// - SHOULD close the ICE connection
+    /// - MAY attempt ICE restart if supported
+    pub fn is_revoked(&self) -> bool {
+        self.consent.is_revoked()
+    }
+
+    /// Returns whether sending media is currently allowed.
+    ///
+    /// This is the primary check that MUST be called before sending any media.
+    /// Returns false when consent has expired per RFC 7675 §6.
+    pub fn can_send(&self) -> bool {
+        self.consent.can_send()
+    }
+
+    /// Checks consent and returns an error if transmission is not allowed.
+    ///
+    /// Per RFC 7675 §6, returns an error when consent has expired.
+    /// Callers should use this to guard media transmission.
+    pub fn check_consent(&self) -> Result<(), ConsentRevoked> {
+        if self.consent.is_revoked() {
+            Err(ConsentRevoked)
+        } else {
+            Ok(())
+        }
     }
 
     /// Records that media traffic was sent.

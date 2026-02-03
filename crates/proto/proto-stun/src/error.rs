@@ -81,6 +81,13 @@ pub enum StunError {
         /// Error reason.
         reason: String,
     },
+
+    /// Authentication failed (RFC 5389 §10.2).
+    #[error("authentication failed: {reason}")]
+    AuthenticationFailed {
+        /// Error description.
+        reason: String,
+    },
 }
 
 /// STUN error codes per RFC 5389.
