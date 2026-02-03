@@ -27,3 +27,5 @@ coverage/
 
 # Documentation build
 /docs/build/
+
+.claude/
