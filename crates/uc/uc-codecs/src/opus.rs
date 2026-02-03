@@ -163,7 +163,7 @@ impl OpusConfig {
             _ => {
                 return Err(CodecError::UnsupportedSampleRate {
                     rate: self.sample_rate,
-                })
+                });
             }
         }
 
@@ -180,7 +180,7 @@ impl OpusConfig {
             _ => {
                 return Err(CodecError::InvalidConfig {
                     reason: format!("unsupported frame duration: {}ms", self.frame_duration_ms),
-                })
+                });
             }
         }
 

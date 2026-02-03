@@ -8,8 +8,8 @@
 //! ## NIST 800-53 Rev5: SC-12 (Cryptographic Key Establishment)
 
 use crate::error::{CryptoError, CryptoResult};
-use aws_lc_rs::hkdf::{self, Prk, Salt, HKDF_SHA384, HKDF_SHA512};
-use aws_lc_rs::hmac::{self, Key as HmacKey, HMAC_SHA384};
+use aws_lc_rs::hkdf::{self, HKDF_SHA384, HKDF_SHA512, Prk, Salt};
+use aws_lc_rs::hmac::{self, HMAC_SHA384, Key as HmacKey};
 
 /// HKDF-SHA384 output key material.
 pub struct HkdfSha384Output {
@@ -67,7 +67,12 @@ impl HkdfSha384Output {
     /// ## Errors
     ///
     /// Returns an error if key derivation fails.
-    pub fn derive(salt: Option<&[u8]>, ikm: &[u8], info: &[&[u8]], output: &mut [u8]) -> CryptoResult<()> {
+    pub fn derive(
+        salt: Option<&[u8]>,
+        ikm: &[u8],
+        info: &[&[u8]],
+        output: &mut [u8],
+    ) -> CryptoResult<()> {
         let extracted = Self::extract(salt, ikm);
         extracted.expand(info, output)
     }
@@ -112,7 +117,12 @@ impl HkdfSha512Output {
     /// ## Errors
     ///
     /// Returns an error if key derivation fails.
-    pub fn derive(salt: Option<&[u8]>, ikm: &[u8], info: &[&[u8]], output: &mut [u8]) -> CryptoResult<()> {
+    pub fn derive(
+        salt: Option<&[u8]>,
+        ikm: &[u8],
+        info: &[&[u8]],
+        output: &mut [u8],
+    ) -> CryptoResult<()> {
         let extracted = Self::extract(salt, ikm);
         extracted.expand(info, output)
     }
@@ -154,7 +164,12 @@ impl hkdf::KeyType for HkdfLen {
 ///
 /// hkdf_sha384(Some(salt), ikm, &[info], &mut output).expect("HKDF failed");
 /// ```
-pub fn hkdf_sha384(salt: Option<&[u8]>, ikm: &[u8], info: &[&[u8]], output: &mut [u8]) -> CryptoResult<()> {
+pub fn hkdf_sha384(
+    salt: Option<&[u8]>,
+    ikm: &[u8],
+    info: &[&[u8]],
+    output: &mut [u8],
+) -> CryptoResult<()> {
     HkdfSha384Output::derive(salt, ikm, info, output)
 }
 
@@ -165,7 +180,12 @@ pub fn hkdf_sha384(salt: Option<&[u8]>, ikm: &[u8], info: &[&[u8]], output: &mut
 /// ## Errors
 ///
 /// Returns an error if key derivation fails.
-pub fn hkdf_sha512(salt: Option<&[u8]>, ikm: &[u8], info: &[&[u8]], output: &mut [u8]) -> CryptoResult<()> {
+pub fn hkdf_sha512(
+    salt: Option<&[u8]>,
+    ikm: &[u8],
+    info: &[&[u8]],
+    output: &mut [u8],
+) -> CryptoResult<()> {
     HkdfSha512Output::derive(salt, ikm, info, output)
 }
 

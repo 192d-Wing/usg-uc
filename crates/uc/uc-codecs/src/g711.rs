@@ -5,7 +5,7 @@
 //! - a-law (PCMA) - Europe/rest of world
 
 use crate::error::{CodecError, CodecResult};
-use crate::{payload_types, AudioCodec, PayloadType};
+use crate::{AudioCodec, PayloadType, payload_types};
 
 /// G.711 mu-law codec.
 #[derive(Debug, Clone, Default)]

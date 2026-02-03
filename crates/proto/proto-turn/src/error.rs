@@ -157,7 +157,10 @@ mod tests {
     #[test]
     fn test_error_codes() {
         assert_eq!(TurnErrorCode::AllocationMismatch.code(), 437);
-        assert_eq!(TurnErrorCode::from_code(486), Some(TurnErrorCode::AllocationQuotaReached));
+        assert_eq!(
+            TurnErrorCode::from_code(486),
+            Some(TurnErrorCode::AllocationQuotaReached)
+        );
         assert_eq!(TurnErrorCode::from_code(999), None);
     }
 }

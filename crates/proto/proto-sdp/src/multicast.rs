@@ -275,7 +275,11 @@ impl MulticastAddress {
 /// - IPv6: ff00::/8
 pub fn is_multicast_address(connection: &ConnectionData) -> bool {
     // Extract the base address (before any /)
-    let addr_part = connection.address.split('/').next().unwrap_or(&connection.address);
+    let addr_part = connection
+        .address
+        .split('/')
+        .next()
+        .unwrap_or(&connection.address);
 
     if connection.addr_type == "IP4" {
         if let Ok(addr) = Ipv4Addr::from_str(addr_part) {
@@ -291,7 +295,10 @@ pub fn is_multicast_address(connection: &ConnectionData) -> bool {
 }
 
 /// Checks if a media description uses multicast.
-pub fn is_multicast_media(media: &MediaDescription, session_connection: Option<&ConnectionData>) -> bool {
+pub fn is_multicast_media(
+    media: &MediaDescription,
+    session_connection: Option<&ConnectionData>,
+) -> bool {
     // Check media-level connection first
     if let Some(ref conn) = media.connection {
         return is_multicast_address(conn);
@@ -364,9 +371,15 @@ impl MulticastNegotiator {
     /// 1. The answerer MUST NOT change the multicast address
     /// 2. The answerer MUST NOT change the TTL (for IPv4)
     /// 3. Direction indicates sender/receiver role in multicast group
-    pub fn validate_offer(&self, media: &MediaDescription, session_conn: Option<&ConnectionData>) -> SdpResult<MulticastValidation> {
-        let connection = media.connection.as_ref().or(session_conn).ok_or_else(|| SdpError::InvalidConnection {
-            reason: "multicast media requires connection data".to_string(),
+    pub fn validate_offer(
+        &self,
+        media: &MediaDescription,
+        session_conn: Option<&ConnectionData>,
+    ) -> SdpResult<MulticastValidation> {
+        let connection = media.connection.as_ref().or(session_conn).ok_or_else(|| {
+            SdpError::InvalidConnection {
+                reason: "multicast media requires connection data".to_string(),
+            }
         })?;
 
         if !is_multicast_address(connection) {
@@ -462,7 +475,10 @@ impl MulticastNegotiator {
 
         if validation.can_participate {
             // Copy the multicast connection data exactly (RFC 3264 §6.2 requirement)
-            answer.connection = offer_media.connection.clone().or_else(|| session_conn.cloned());
+            answer.connection = offer_media
+                .connection
+                .clone()
+                .or_else(|| session_conn.cloned());
 
             // Copy formats (intersection would be done by caller)
             answer.formats = offer_media.formats.clone();
@@ -690,7 +706,10 @@ mod tests {
         assert_eq!(MulticastScope::from_ttl(0), MulticastScope::NodeLocal);
         assert_eq!(MulticastScope::from_ttl(1), MulticastScope::LinkLocal);
         assert_eq!(MulticastScope::from_ttl(32), MulticastScope::SiteLocal);
-        assert_eq!(MulticastScope::from_ttl(64), MulticastScope::OrganizationLocal);
+        assert_eq!(
+            MulticastScope::from_ttl(64),
+            MulticastScope::OrganizationLocal
+        );
         assert_eq!(MulticastScope::from_ttl(128), MulticastScope::Global);
     }
 

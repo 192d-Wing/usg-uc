@@ -1,8 +1,8 @@
 //! Health check integration tests.
 
 use uc_health::{
-    check::{AlwaysHealthyCheck, FnHealthCheck, HealthCheck, HealthCheckResult, MemoryCheck},
     HealthChecker, HealthCheckerConfig, HealthStatus,
+    check::{AlwaysHealthyCheck, FnHealthCheck, HealthCheck, HealthCheckResult, MemoryCheck},
 };
 
 #[test]

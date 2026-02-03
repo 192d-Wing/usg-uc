@@ -3,9 +3,9 @@
 //! ## NIST 800-53 Rev5: SC-8 (Transmission Confidentiality and Integrity)
 
 use crate::error::{TransportError, TransportResult};
-use uc_types::address::{SbcSocketAddr, TransportType};
 use std::future::Future;
 use std::pin::Pin;
+use uc_types::address::{SbcSocketAddr, TransportType};
 
 /// Listener for accepting incoming transport connections.
 ///

@@ -244,7 +244,11 @@ impl TopologyHider {
 
         // Hide received/rport if configured
         if self.config.hide_via_params {
-            if anonymized.received.as_ref().is_some_and(|r| self.config.is_internal_address(r)) {
+            if anonymized
+                .received
+                .as_ref()
+                .is_some_and(|r| self.config.is_internal_address(r))
+            {
                 anonymized.received = None;
             }
             // Always hide rport for internal addresses since it can reveal port allocation
@@ -389,7 +393,8 @@ impl TopologyHider {
         uri.params.push(("lr".to_string(), None));
 
         if let Some(t) = transport {
-            uri.params.push(("transport".to_string(), Some(t.to_string())));
+            uri.params
+                .push(("transport".to_string(), Some(t.to_string())));
         }
 
         format!("<{uri}>")
@@ -427,17 +432,11 @@ impl TopologyHider {
                     ));
                 } else {
                     // Keep external routes as-is
-                    headers.add(Header::new(
-                        HeaderName::RecordRoute,
-                        route.clone(),
-                    ));
+                    headers.add(Header::new(HeaderName::RecordRoute, route.clone()));
                 }
             } else {
                 // If we can't parse it, keep it as-is
-                headers.add(Header::new(
-                    HeaderName::RecordRoute,
-                    route.clone(),
-                ));
+                headers.add(Header::new(HeaderName::RecordRoute, route.clone()));
             }
         }
     }
@@ -475,8 +474,10 @@ impl TopologyHider {
         let obfuscated = self.generate_obfuscated_call_id(original);
 
         // Store both mappings
-        self.call_id_map.insert(original.to_string(), obfuscated.clone());
-        self.reverse_call_id_map.insert(obfuscated.clone(), original.to_string());
+        self.call_id_map
+            .insert(original.to_string(), obfuscated.clone());
+        self.reverse_call_id_map
+            .insert(obfuscated.clone(), original.to_string());
 
         obfuscated
     }
@@ -609,8 +610,8 @@ mod tests {
 
     #[test]
     fn test_via_anonymization_basic() {
-        let config = TopologyHidingConfig::new("proxy.example.com")
-            .with_mode(TopologyHidingMode::Basic);
+        let config =
+            TopologyHidingConfig::new("proxy.example.com").with_mode(TopologyHidingMode::Basic);
         let hider = TopologyHider::new(config);
 
         let internal_via = ViaHeader::new("UDP", "192.168.1.100")
@@ -630,8 +631,7 @@ mod tests {
             .with_mode(TopologyHidingMode::Aggressive);
         let hider = TopologyHider::new(config);
 
-        let internal_via = ViaHeader::new("UDP", "192.168.1.100")
-            .with_port(5060);
+        let internal_via = ViaHeader::new("UDP", "192.168.1.100").with_port(5060);
 
         // Internal Via should be stripped entirely in aggressive mode
         let anonymized = hider.anonymize_via(&internal_via);
@@ -645,8 +645,8 @@ mod tests {
 
     #[test]
     fn test_via_no_hiding() {
-        let config = TopologyHidingConfig::new("proxy.example.com")
-            .with_mode(TopologyHidingMode::None);
+        let config =
+            TopologyHidingConfig::new("proxy.example.com").with_mode(TopologyHidingMode::None);
         let hider = TopologyHider::new(config);
 
         let internal_via = ViaHeader::new("UDP", "192.168.1.100");
@@ -659,8 +659,8 @@ mod tests {
 
     #[test]
     fn test_strip_internal_vias() {
-        let config = TopologyHidingConfig::new("proxy.example.com")
-            .with_mode(TopologyHidingMode::Basic);
+        let config =
+            TopologyHidingConfig::new("proxy.example.com").with_mode(TopologyHidingMode::Basic);
         let hider = TopologyHider::new(config);
 
         let vias = vec![
@@ -676,13 +676,12 @@ mod tests {
 
     #[test]
     fn test_contact_anonymization() {
-        let config = TopologyHidingConfig::new("proxy.example.com")
-            .with_mode(TopologyHidingMode::Basic);
+        let config =
+            TopologyHidingConfig::new("proxy.example.com").with_mode(TopologyHidingMode::Basic);
         let hider = TopologyHider::new(config);
 
         let uri = SipUri::new("192.168.1.100");
-        let contact = NameAddr::new(uri.clone())
-            .with_display_name("Alice");
+        let contact = NameAddr::new(uri.clone()).with_display_name("Alice");
 
         let anonymized = hider.anonymize_contact(&contact);
         assert_eq!(anonymized.uri.host, "proxy.example.com");
@@ -696,8 +695,7 @@ mod tests {
         let hider = TopologyHider::new(config);
 
         let uri = SipUri::new("192.168.1.100");
-        let contact = NameAddr::new(uri)
-            .with_display_name("Alice");
+        let contact = NameAddr::new(uri).with_display_name("Alice");
 
         let anonymized = hider.anonymize_contact(&contact);
         assert_eq!(anonymized.uri.host, "proxy.example.com");
@@ -706,8 +704,8 @@ mod tests {
 
     #[test]
     fn test_call_id_obfuscation() {
-        let config = TopologyHidingConfig::new("proxy.example.com")
-            .with_mode(TopologyHidingMode::Basic);
+        let config =
+            TopologyHidingConfig::new("proxy.example.com").with_mode(TopologyHidingMode::Basic);
         let mut hider = TopologyHider::new(config);
 
         let original = "abc123@192.168.1.100";
@@ -729,8 +727,8 @@ mod tests {
 
     #[test]
     fn test_call_id_no_obfuscation() {
-        let config = TopologyHidingConfig::new("proxy.example.com")
-            .with_mode(TopologyHidingMode::None);
+        let config =
+            TopologyHidingConfig::new("proxy.example.com").with_mode(TopologyHidingMode::None);
         let mut hider = TopologyHider::new(config);
 
         let original = "abc123@192.168.1.100";

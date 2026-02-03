@@ -177,10 +177,7 @@ pub struct AuthChallenge {
 impl AuthChallenge {
     /// Formats as WWW-Authenticate header value.
     pub fn to_header_value(&self) -> String {
-        let mut value = format!(
-            "Digest realm=\"{}\", nonce=\"{}\"",
-            self.realm, self.nonce
-        );
+        let mut value = format!("Digest realm=\"{}\", nonce=\"{}\"", self.realm, self.nonce);
 
         if let Some(ref opaque) = self.opaque {
             value.push_str(&format!(", opaque=\"{}\"", opaque));
@@ -302,7 +299,9 @@ impl AuthCredentials {
                 "auth-int" => Some(AuthQop::AuthInt),
                 _ => None,
             }),
-            nc: params.get("nc").and_then(|s| u32::from_str_radix(s, 16).ok()),
+            nc: params
+                .get("nc")
+                .and_then(|s| u32::from_str_radix(s, 16).ok()),
             opaque: params.get("opaque").cloned(),
         })
     }
@@ -508,11 +507,7 @@ impl Authenticator {
         };
 
         // Validate nonce
-        let nonce_result = self.validate_nonce(
-            &creds.nonce,
-            Some(&creds.username),
-            creds.nc,
-        );
+        let nonce_result = self.validate_nonce(&creds.nonce, Some(&creds.username), creds.nc);
 
         match nonce_result {
             NonceValidation::Valid => {}
@@ -756,8 +751,7 @@ mod tests {
 
     #[test]
     fn test_nonce_expiration() {
-        let mut auth = Authenticator::new()
-            .with_nonce_lifetime(Duration::from_millis(1));
+        let mut auth = Authenticator::new().with_nonce_lifetime(Duration::from_millis(1));
 
         let nonce = auth.generate_nonce("example.com");
 
@@ -830,14 +824,13 @@ mod tests {
 
     #[test]
     fn test_authenticate_with_password_lookup() {
-        let mut auth = Authenticator::new()
-            .with_password_lookup(|username, _realm| {
-                if username == "alice" {
-                    Some("secret".to_string())
-                } else {
-                    None
-                }
-            });
+        let mut auth = Authenticator::new().with_password_lookup(|username, _realm| {
+            if username == "alice" {
+                Some("secret".to_string())
+            } else {
+                None
+            }
+        });
 
         // Generate a nonce first
         let nonce = auth.generate_nonce("example.com");
@@ -869,8 +862,7 @@ mod tests {
 
     #[test]
     fn test_authenticate_user_not_found() {
-        let mut auth = Authenticator::new()
-            .with_password_lookup(|_username, _realm| None);
+        let mut auth = Authenticator::new().with_password_lookup(|_username, _realm| None);
 
         let nonce = auth.generate_nonce("example.com");
 
@@ -899,8 +891,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_expired() {
-        let mut auth = Authenticator::new()
-            .with_nonce_lifetime(Duration::from_millis(1));
+        let mut auth = Authenticator::new().with_nonce_lifetime(Duration::from_millis(1));
 
         auth.generate_nonce("example.com");
         auth.generate_nonce("example.com");
@@ -932,7 +923,8 @@ mod tests {
 
     #[test]
     fn test_split_auth_params() {
-        let params = split_auth_params(r#"username="alice", realm="example.com", qop="auth,auth-int""#);
+        let params =
+            split_auth_params(r#"username="alice", realm="example.com", qop="auth,auth-int""#);
 
         assert_eq!(params.len(), 3);
         assert!(params[0].contains("username"));
@@ -974,8 +966,7 @@ mod tests {
 
     #[test]
     fn test_qop_auth_int_challenge() {
-        let mut auth = Authenticator::new()
-            .with_qop(vec![AuthQop::Auth, AuthQop::AuthInt]);
+        let mut auth = Authenticator::new().with_qop(vec![AuthQop::Auth, AuthQop::AuthInt]);
 
         let challenge = auth.create_challenge("example.com");
 

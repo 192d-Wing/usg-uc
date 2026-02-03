@@ -88,9 +88,9 @@ impl TrunkStats {
         if self.calls_succeeded == 1 {
             self.avg_setup_time_ms = setup_time_ms;
         } else {
-            self.avg_setup_time_ms =
-                (self.avg_setup_time_ms * (self.calls_succeeded - 1) + setup_time_ms)
-                    / self.calls_succeeded;
+            self.avg_setup_time_ms = (self.avg_setup_time_ms * (self.calls_succeeded - 1)
+                + setup_time_ms)
+                / self.calls_succeeded;
         }
     }
 
@@ -325,9 +325,8 @@ impl Trunk {
     /// Enters cooldown state.
     fn enter_cooldown(&mut self) {
         self.state = TrunkState::Cooldown;
-        self.cooldown_until = Some(
-            Instant::now() + std::time::Duration::from_secs(self.config.cooldown_secs),
-        );
+        self.cooldown_until =
+            Some(Instant::now() + std::time::Duration::from_secs(self.config.cooldown_secs));
     }
 
     /// Resets the trunk state.
@@ -434,23 +433,17 @@ impl TrunkGroup {
 
     /// Selects a trunk for routing.
     pub fn select_trunk(&mut self) -> Option<&str> {
-        let usable: Vec<_> = self
-            .trunks
-            .iter()
-            .filter(|(_, t)| t.is_usable())
-            .collect();
+        let usable: Vec<_> = self.trunks.iter().filter(|(_, t)| t.is_usable()).collect();
 
         if usable.is_empty() {
             return None;
         }
 
         match self.strategy {
-            SelectionStrategy::Priority => {
-                usable
-                    .iter()
-                    .min_by_key(|(_, t)| t.priority())
-                    .map(|(id, _)| id.as_str())
-            }
+            SelectionStrategy::Priority => usable
+                .iter()
+                .min_by_key(|(_, t)| t.priority())
+                .map(|(id, _)| id.as_str()),
             SelectionStrategy::RoundRobin => {
                 let idx = self.round_robin_idx % usable.len();
                 self.round_robin_idx = self.round_robin_idx.wrapping_add(1);
@@ -474,33 +467,25 @@ impl TrunkGroup {
                 }
                 usable.last().map(|(id, _)| id.as_str())
             }
-            SelectionStrategy::LeastConnections => {
-                usable
-                    .iter()
-                    .min_by_key(|(_, t)| t.stats().active_calls)
-                    .map(|(id, _)| id.as_str())
-            }
-            SelectionStrategy::BestSuccessRate => {
-                usable
-                    .iter()
-                    .max_by(|(_, a), (_, b)| {
-                        a.stats()
-                            .success_rate()
-                            .partial_cmp(&b.stats().success_rate())
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .map(|(id, _)| id.as_str())
-            }
+            SelectionStrategy::LeastConnections => usable
+                .iter()
+                .min_by_key(|(_, t)| t.stats().active_calls)
+                .map(|(id, _)| id.as_str()),
+            SelectionStrategy::BestSuccessRate => usable
+                .iter()
+                .max_by(|(_, a), (_, b)| {
+                    a.stats()
+                        .success_rate()
+                        .partial_cmp(&b.stats().success_rate())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(id, _)| id.as_str()),
         }
     }
 
     /// Returns an ordered list of trunk IDs for failover.
     pub fn failover_order(&self) -> Vec<&str> {
-        let mut usable: Vec<_> = self
-            .trunks
-            .iter()
-            .filter(|(_, t)| t.is_usable())
-            .collect();
+        let mut usable: Vec<_> = self.trunks.iter().filter(|(_, t)| t.is_usable()).collect();
 
         usable.sort_by_key(|(_, t)| t.priority());
         usable.into_iter().map(|(id, _)| id.as_str()).collect()
@@ -582,8 +567,7 @@ mod tests {
 
     #[test]
     fn test_trunk_cooldown() {
-        let config = TrunkConfig::new("trunk-1", "sip.example.com")
-            .with_max_calls(10);
+        let config = TrunkConfig::new("trunk-1", "sip.example.com").with_max_calls(10);
         let mut trunk = Trunk::new(config);
 
         // Fail 3 times (default max_failures)
@@ -631,15 +615,13 @@ mod tests {
 
     #[test]
     fn test_trunk_group_select_priority() {
-        let mut group = TrunkGroup::new("group-1", "Test Group")
-            .with_strategy(SelectionStrategy::Priority);
+        let mut group =
+            TrunkGroup::new("group-1", "Test Group").with_strategy(SelectionStrategy::Priority);
 
-        let low_priority = Trunk::new(
-            TrunkConfig::new("low", "low.example.com").with_priority(200),
-        );
-        let high_priority = Trunk::new(
-            TrunkConfig::new("high", "high.example.com").with_priority(50),
-        );
+        let low_priority =
+            Trunk::new(TrunkConfig::new("low", "low.example.com").with_priority(200));
+        let high_priority =
+            Trunk::new(TrunkConfig::new("high", "high.example.com").with_priority(50));
 
         group.add_trunk(low_priority);
         group.add_trunk(high_priority);

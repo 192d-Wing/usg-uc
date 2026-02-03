@@ -59,8 +59,8 @@ pub mod sdp_rewrite;
 
 pub use call::{Call, CallConfig, CallId, CallState};
 pub use early_media::{
-    is_early_media_response, should_setup_early_media, EarlyMediaAction, EarlyMediaConfig,
-    EarlyMediaHandler, EarlyMediaMode, EarlyMediaSession, EarlyMediaState,
+    EarlyMediaAction, EarlyMediaConfig, EarlyMediaHandler, EarlyMediaMode, EarlyMediaSession,
+    EarlyMediaState, is_early_media_response, should_setup_early_media,
 };
 pub use error::{B2buaError, B2buaResult};
 pub use leg::{CallLeg, LegConfig, LegRole, LegState};
@@ -69,7 +69,9 @@ pub use mode::{
     ModeCharacteristics, ModeConfig, SdpModification, SdpRewriteContext, TopologyHiding,
     TopologyHidingConfig,
 };
-pub use sdp_rewrite::{extract_media_address, is_connection_hold, is_hold_sdp, SdpRewriter, SdpRewriteResult};
+pub use sdp_rewrite::{
+    SdpRewriteResult, SdpRewriter, extract_media_address, is_connection_hold, is_hold_sdp,
+};
 
 /// B2BUA operation mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

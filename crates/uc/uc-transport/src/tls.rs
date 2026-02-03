@@ -20,24 +20,24 @@
 
 use crate::error::{TransportError, TransportResult};
 use crate::listener::ListenerConfig;
-use crate::{ReceivedMessage, StreamTransport, Transport, MAX_STREAM_MESSAGE_SIZE};
+use crate::{MAX_STREAM_MESSAGE_SIZE, ReceivedMessage, StreamTransport, Transport};
 use bytes::BytesMut;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, ServerConfig};
-use uc_types::address::{SbcSocketAddr, TransportType};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::future::Future;
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use tracing::{debug, instrument, trace};
+use uc_types::address::{SbcSocketAddr, TransportType};
 
 /// Creates a CNSA 2.0 compliant TLS server configuration.
 ///
@@ -82,9 +82,7 @@ pub fn create_server_config(
 /// ## Errors
 ///
 /// Returns an error if the configuration cannot be created.
-pub fn create_client_config(
-    root_certs: rustls::RootCertStore,
-) -> TransportResult<ClientConfig> {
+pub fn create_client_config(root_certs: rustls::RootCertStore) -> TransportResult<ClientConfig> {
     let provider = rustls::crypto::aws_lc_rs::default_provider();
 
     let config = ClientConfig::builder_with_provider(Arc::new(provider))
@@ -225,12 +223,13 @@ impl TlsTransport {
     ) -> TransportResult<Self> {
         let dest_addr: SocketAddr = dest.clone().into();
 
-        let tcp_stream = TcpStream::connect(dest_addr)
-            .await
-            .map_err(|e| TransportError::ConnectFailed {
-                address: dest.clone(),
-                reason: e.to_string(),
-            })?;
+        let tcp_stream =
+            TcpStream::connect(dest_addr)
+                .await
+                .map_err(|e| TransportError::ConnectFailed {
+                    address: dest.clone(),
+                    reason: e.to_string(),
+                })?;
 
         let server_name: rustls::pki_types::ServerName<'static> = server_name
             .to_string()
@@ -288,10 +287,13 @@ impl Transport for TlsTransport {
                     reason: e.to_string(),
                 })?;
 
-            stream.flush().await.map_err(|e| TransportError::SendFailed {
-                address: self.peer_addr.clone(),
-                reason: e.to_string(),
-            })?;
+            stream
+                .flush()
+                .await
+                .map_err(|e| TransportError::SendFailed {
+                    address: self.peer_addr.clone(),
+                    reason: e.to_string(),
+                })?;
 
             Ok(())
         })
@@ -307,12 +309,13 @@ impl Transport for TlsTransport {
             let mut stream = self.stream.lock().await;
 
             let mut temp_buffer = [0u8; 4096];
-            let n = stream
-                .read(&mut temp_buffer)
-                .await
-                .map_err(|e| TransportError::ReceiveFailed {
-                    reason: e.to_string(),
-                })?;
+            let n =
+                stream
+                    .read(&mut temp_buffer)
+                    .await
+                    .map_err(|e| TransportError::ReceiveFailed {
+                        reason: e.to_string(),
+                    })?;
 
             if n == 0 {
                 return Err(TransportError::ConnectionClosed);
@@ -413,48 +416,47 @@ impl TlsListener {
             Domain::IPV4
         };
 
-        let socket =
-            Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(|e| {
-                TransportError::BindFailed {
-                    address: config.bind_address.clone(),
-                    reason: e.to_string(),
-                }
-            })?;
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(|e| {
+            TransportError::BindFailed {
+                address: config.bind_address.clone(),
+                reason: e.to_string(),
+            }
+        })?;
 
         if config.reuse_address {
-            socket.set_reuse_address(true).map_err(|e| {
-                TransportError::BindFailed {
+            socket
+                .set_reuse_address(true)
+                .map_err(|e| TransportError::BindFailed {
                     address: config.bind_address.clone(),
                     reason: format!("failed to set SO_REUSEADDR: {e}"),
-                }
-            })?;
+                })?;
         }
 
         #[cfg(unix)]
         if config.reuse_port {
-            socket.set_reuse_port(true).map_err(|e| {
-                TransportError::BindFailed {
+            socket
+                .set_reuse_port(true)
+                .map_err(|e| TransportError::BindFailed {
                     address: config.bind_address.clone(),
                     reason: format!("failed to set SO_REUSEPORT: {e}"),
-                }
-            })?;
+                })?;
         }
 
         if socket_addr.is_ipv6() {
-            socket.set_only_v6(false).map_err(|e| {
-                TransportError::BindFailed {
+            socket
+                .set_only_v6(false)
+                .map_err(|e| TransportError::BindFailed {
                     address: config.bind_address.clone(),
                     reason: format!("failed to set IPV6_V6ONLY: {e}"),
-                }
-            })?;
+                })?;
         }
 
-        socket.set_nonblocking(true).map_err(|e| {
-            TransportError::BindFailed {
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| TransportError::BindFailed {
                 address: config.bind_address.clone(),
                 reason: format!("failed to set non-blocking: {e}"),
-            }
-        })?;
+            })?;
 
         socket
             .bind(&socket_addr.into())
@@ -477,12 +479,12 @@ impl TlsListener {
                 reason: e.to_string(),
             })?;
 
-        let local_addr = tokio_listener.local_addr().map_err(|e| {
-            TransportError::BindFailed {
+        let local_addr = tokio_listener
+            .local_addr()
+            .map_err(|e| TransportError::BindFailed {
                 address: config.bind_address.clone(),
                 reason: format!("failed to get local address: {e}"),
-            }
-        })?;
+            })?;
 
         debug!(local_addr = %local_addr, "TLS listener bound");
 
@@ -506,23 +508,21 @@ impl TlsListener {
             return Err(TransportError::AlreadyClosed);
         }
 
-        let (tcp_stream, peer_addr) = self
-            .listener
-            .accept()
-            .await
-            .map_err(|e| TransportError::ReceiveFailed {
-                reason: format!("accept failed: {e}"),
-            })?;
+        let (tcp_stream, peer_addr) =
+            self.listener
+                .accept()
+                .await
+                .map_err(|e| TransportError::ReceiveFailed {
+                    reason: format!("accept failed: {e}"),
+                })?;
 
         debug!(peer = %peer_addr, "accepted TCP connection, starting TLS handshake");
 
-        let tls_stream = self
-            .acceptor
-            .accept(tcp_stream)
-            .await
-            .map_err(|e| TransportError::TlsHandshakeFailed {
+        let tls_stream = self.acceptor.accept(tcp_stream).await.map_err(|e| {
+            TransportError::TlsHandshakeFailed {
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
 
         debug!(peer = %peer_addr, "TLS handshake completed");
 

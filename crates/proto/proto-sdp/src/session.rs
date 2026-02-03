@@ -1,9 +1,9 @@
 //! SDP session description per RFC 4566.
 
+use crate::SDP_VERSION;
 use crate::attribute::{Attribute, AttributeName};
 use crate::error::{SdpError, SdpResult};
 use crate::media::{ConnectionData, MediaDescription};
-use crate::SDP_VERSION;
 use std::fmt;
 use std::str::FromStr;
 
@@ -798,8 +798,11 @@ mod tests {
         let mut session = SessionDescription::new(origin);
         session.add_attribute(Attribute::flag(AttributeName::IceOptions));
 
-        let mut media =
-            MediaDescription::new(crate::media::MediaType::Audio, 5000, crate::media::TransportProtocol::RtpSavp);
+        let mut media = MediaDescription::new(
+            crate::media::MediaType::Audio,
+            5000,
+            crate::media::TransportProtocol::RtpSavp,
+        );
         media.formats.push("0".to_string());
         session.add_media(media);
 

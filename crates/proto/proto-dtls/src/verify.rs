@@ -394,7 +394,10 @@ impl FinishedVerifier {
     ) -> DtlsResult<()> {
         if received.len() != 12 {
             return Err(DtlsError::HandshakeFailed {
-                reason: format!("Finished verify_data wrong length: expected 12, got {}", received.len()),
+                reason: format!(
+                    "Finished verify_data wrong length: expected 12, got {}",
+                    received.len()
+                ),
             });
         }
 
@@ -531,12 +534,16 @@ fn parse_der_length(data: &[u8]) -> DtlsResult<(usize, usize)> {
 
         let mut len = 0usize;
         for &byte in &data[1..1 + num_bytes] {
-            len = len.checked_mul(256).ok_or_else(|| DtlsError::CertificateError {
-                reason: "length overflow".to_string(),
-            })?;
-            len = len.checked_add(byte as usize).ok_or_else(|| DtlsError::CertificateError {
-                reason: "length overflow".to_string(),
-            })?;
+            len = len
+                .checked_mul(256)
+                .ok_or_else(|| DtlsError::CertificateError {
+                    reason: "length overflow".to_string(),
+                })?;
+            len = len
+                .checked_add(byte as usize)
+                .ok_or_else(|| DtlsError::CertificateError {
+                    reason: "length overflow".to_string(),
+                })?;
         }
 
         Ok((len, 1 + num_bytes))
@@ -552,24 +559,15 @@ mod tests {
         let master_secret = [0xABu8; 48];
         let handshake_hash = uc_crypto::hash::sha384(b"test handshake messages");
 
-        let client_finished = FinishedVerifier::compute_verify_data(
-            &master_secret,
-            &handshake_hash,
-            true,
-        ).unwrap();
+        let client_finished =
+            FinishedVerifier::compute_verify_data(&master_secret, &handshake_hash, true).unwrap();
 
-        let server_finished = FinishedVerifier::compute_verify_data(
-            &master_secret,
-            &handshake_hash,
-            false,
-        ).unwrap();
+        let server_finished =
+            FinishedVerifier::compute_verify_data(&master_secret, &handshake_hash, false).unwrap();
 
         // Should be deterministic
-        let client_finished2 = FinishedVerifier::compute_verify_data(
-            &master_secret,
-            &handshake_hash,
-            true,
-        ).unwrap();
+        let client_finished2 =
+            FinishedVerifier::compute_verify_data(&master_secret, &handshake_hash, true).unwrap();
 
         assert_eq!(client_finished, client_finished2);
 
@@ -582,22 +580,23 @@ mod tests {
         let master_secret = [0xABu8; 48];
         let handshake_hash = uc_crypto::hash::sha384(b"test handshake messages");
 
-        let verify_data = FinishedVerifier::compute_verify_data(
-            &master_secret,
-            &handshake_hash,
-            true,
-        ).unwrap();
+        let verify_data =
+            FinishedVerifier::compute_verify_data(&master_secret, &handshake_hash, true).unwrap();
 
         // Should verify correctly
         FinishedVerifier::verify(&verify_data, &master_secret, &handshake_hash, true).unwrap();
 
         // Wrong role should fail
-        assert!(FinishedVerifier::verify(&verify_data, &master_secret, &handshake_hash, false).is_err());
+        assert!(
+            FinishedVerifier::verify(&verify_data, &master_secret, &handshake_hash, false).is_err()
+        );
 
         // Tampered data should fail
         let mut tampered = verify_data;
         tampered[0] ^= 0xFF;
-        assert!(FinishedVerifier::verify(&tampered, &master_secret, &handshake_hash, true).is_err());
+        assert!(
+            FinishedVerifier::verify(&tampered, &master_secret, &handshake_hash, true).is_err()
+        );
     }
 
     #[test]

@@ -517,10 +517,16 @@ mod tests {
 
         // In signaling-only mode, pass through remote addresses
         let addr_for_a = ctx.address_for_a_leg().cloned();
-        assert_eq!(addr_for_a.as_ref().map(|a| a.address.as_str()), Some("172.16.0.10"));
+        assert_eq!(
+            addr_for_a.as_ref().map(|a| a.address.as_str()),
+            Some("172.16.0.10")
+        );
 
         let addr_for_b = ctx.address_for_b_leg().cloned();
-        assert_eq!(addr_for_b.as_ref().map(|a| a.address.as_str()), Some("192.168.1.10"));
+        assert_eq!(
+            addr_for_b.as_ref().map(|a| a.address.as_str()),
+            Some("192.168.1.10")
+        );
     }
 
     #[test]
@@ -535,11 +541,17 @@ mod tests {
 
         // In media-relay mode, use B2BUA's local addresses
         let addr_for_a = ctx.address_for_a_leg().cloned();
-        assert_eq!(addr_for_a.as_ref().map(|a| a.address.as_str()), Some("10.0.0.1"));
+        assert_eq!(
+            addr_for_a.as_ref().map(|a| a.address.as_str()),
+            Some("10.0.0.1")
+        );
         assert_eq!(addr_for_a.as_ref().map(|a| a.port), Some(20000));
 
         let addr_for_b = ctx.address_for_b_leg().cloned();
-        assert_eq!(addr_for_b.as_ref().map(|a| a.address.as_str()), Some("10.0.0.1"));
+        assert_eq!(
+            addr_for_b.as_ref().map(|a| a.address.as_str()),
+            Some("10.0.0.1")
+        );
         assert_eq!(addr_for_b.as_ref().map(|a| a.port), Some(20002));
     }
 
@@ -612,9 +624,11 @@ mod tests {
         for mode in modes {
             let chars = ModeCharacteristics::for_mode(mode);
             // Verify each mode has valid characteristics
-            assert!(chars.sdp_modification == SdpModification::Passthrough
-                || chars.sdp_modification == SdpModification::RewriteConnection
-                || chars.sdp_modification == SdpModification::FullModification);
+            assert!(
+                chars.sdp_modification == SdpModification::Passthrough
+                    || chars.sdp_modification == SdpModification::RewriteConnection
+                    || chars.sdp_modification == SdpModification::FullModification
+            );
         }
     }
 }

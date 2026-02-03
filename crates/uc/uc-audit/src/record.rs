@@ -62,7 +62,8 @@ impl AuditRecord {
     /// ## NIST 800-53 Rev5: AU-9 (Protection of Audit Information)
     #[must_use]
     pub fn verify(&self, previous_hash: &[u8; 48]) -> bool {
-        let expected = compute_hash_chain(previous_hash, self.sequence, &self.timestamp, &self.event);
+        let expected =
+            compute_hash_chain(previous_hash, self.sequence, &self.timestamp, &self.event);
         self.hash_chain == expected
     }
 }
@@ -128,7 +129,7 @@ mod hex_array {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{AuthenticationAttempt, AuthMethod};
+    use crate::event::{AuthMethod, AuthenticationAttempt};
 
     fn sample_event() -> AuditEvent {
         AuditEvent::AuthenticationAttempt(AuthenticationAttempt {

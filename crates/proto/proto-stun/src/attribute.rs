@@ -1,7 +1,7 @@
 //! STUN attributes per RFC 5389/8489.
 
-use crate::error::{StunError, StunResult};
 use crate::MAGIC_COOKIE;
+use crate::error::{StunError, StunResult};
 use bytes::{BufMut, Bytes, BytesMut};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -157,7 +157,11 @@ impl StunAttribute {
 
         if data.len() < 4 + padded_len {
             return Err(StunError::InvalidAttribute {
-                reason: format!("attribute value truncated: need {}, got {}", padded_len, data.len() - 4),
+                reason: format!(
+                    "attribute value truncated: need {}, got {}",
+                    padded_len,
+                    data.len() - 4
+                ),
             });
         }
 
@@ -178,14 +182,13 @@ impl StunAttribute {
                 Ok(Self::MappedAddress(addr))
             }
             Some(AttributeType::Username) => {
-                let s = String::from_utf8(value.to_vec()).map_err(|_| StunError::InvalidAttribute {
-                    reason: "invalid UTF-8 in USERNAME".to_string(),
-                })?;
+                let s =
+                    String::from_utf8(value.to_vec()).map_err(|_| StunError::InvalidAttribute {
+                        reason: "invalid UTF-8 in USERNAME".to_string(),
+                    })?;
                 Ok(Self::Username(s))
             }
-            Some(AttributeType::MessageIntegrity) => {
-                Ok(Self::MessageIntegrity(value.to_vec()))
-            }
+            Some(AttributeType::MessageIntegrity) => Ok(Self::MessageIntegrity(value.to_vec())),
             Some(AttributeType::ErrorCode) => {
                 if value.len() < 4 {
                     return Err(StunError::InvalidAttribute {
@@ -199,21 +202,24 @@ impl StunAttribute {
                 Ok(Self::ErrorCode { code, reason })
             }
             Some(AttributeType::Realm) => {
-                let s = String::from_utf8(value.to_vec()).map_err(|_| StunError::InvalidAttribute {
-                    reason: "invalid UTF-8 in REALM".to_string(),
-                })?;
+                let s =
+                    String::from_utf8(value.to_vec()).map_err(|_| StunError::InvalidAttribute {
+                        reason: "invalid UTF-8 in REALM".to_string(),
+                    })?;
                 Ok(Self::Realm(s))
             }
             Some(AttributeType::Nonce) => {
-                let s = String::from_utf8(value.to_vec()).map_err(|_| StunError::InvalidAttribute {
-                    reason: "invalid UTF-8 in NONCE".to_string(),
-                })?;
+                let s =
+                    String::from_utf8(value.to_vec()).map_err(|_| StunError::InvalidAttribute {
+                        reason: "invalid UTF-8 in NONCE".to_string(),
+                    })?;
                 Ok(Self::Nonce(s))
             }
             Some(AttributeType::Software) => {
-                let s = String::from_utf8(value.to_vec()).map_err(|_| StunError::InvalidAttribute {
-                    reason: "invalid UTF-8 in SOFTWARE".to_string(),
-                })?;
+                let s =
+                    String::from_utf8(value.to_vec()).map_err(|_| StunError::InvalidAttribute {
+                        reason: "invalid UTF-8 in SOFTWARE".to_string(),
+                    })?;
                 Ok(Self::Software(s))
             }
             Some(AttributeType::Fingerprint) => {
@@ -234,9 +240,7 @@ impl StunAttribute {
                 let priority = u32::from_be_bytes([value[0], value[1], value[2], value[3]]);
                 Ok(Self::Priority(priority))
             }
-            Some(AttributeType::UseCandidate) => {
-                Ok(Self::UseCandidate)
-            }
+            Some(AttributeType::UseCandidate) => Ok(Self::UseCandidate),
             Some(AttributeType::IceControlled) => {
                 if value.len() != 8 {
                     return Err(StunError::InvalidAttribute {
@@ -244,8 +248,7 @@ impl StunAttribute {
                     });
                 }
                 let tie_breaker = u64::from_be_bytes([
-                    value[0], value[1], value[2], value[3],
-                    value[4], value[5], value[6], value[7],
+                    value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
                 ]);
                 Ok(Self::IceControlled(tie_breaker))
             }
@@ -256,8 +259,7 @@ impl StunAttribute {
                     });
                 }
                 let tie_breaker = u64::from_be_bytes([
-                    value[0], value[1], value[2], value[3],
-                    value[4], value[5], value[6], value[7],
+                    value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
                 ]);
                 Ok(Self::IceControlling(tie_breaker))
             }

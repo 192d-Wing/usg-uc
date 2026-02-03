@@ -177,11 +177,17 @@ mod tests {
 
     #[test]
     fn test_api_error_helpers() {
-        assert_eq!(ApiError::unauthorized("test").status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            ApiError::unauthorized("test").status,
+            StatusCode::UNAUTHORIZED
+        );
         assert_eq!(ApiError::forbidden("test").status, StatusCode::FORBIDDEN);
         assert_eq!(ApiError::not_found("User").status, StatusCode::NOT_FOUND);
         assert_eq!(ApiError::conflict("test").status, StatusCode::CONFLICT);
-        assert_eq!(ApiError::internal("test").status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            ApiError::internal("test").status,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]

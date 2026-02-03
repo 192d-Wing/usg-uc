@@ -1,8 +1,8 @@
 //! ACL filter implementation.
 
+use crate::MAX_RULES;
 use crate::error::{AclError, AclResult};
 use crate::rule::{AclRule, RuleAction};
-use crate::MAX_RULES;
 use std::collections::HashMap;
 use std::net::IpAddr;
 
@@ -74,10 +74,7 @@ impl FilterResult {
 
     /// Creates a result from a rule.
     pub fn from_rule(rule: &AclRule) -> Self {
-        let should_log = matches!(
-            rule.action(),
-            RuleAction::LogAllow | RuleAction::LogDeny
-        );
+        let should_log = matches!(rule.action(), RuleAction::LogAllow | RuleAction::LogDeny);
 
         Self {
             action: rule.action().into(),
@@ -381,7 +378,9 @@ mod tests {
 
         let net = IpNetwork::parse("192.168.1.0/24").unwrap();
         filter
-            .add_rule(AclRule::allow_source("allow-local", net).with_priority(RulePriority::new(100)))
+            .add_rule(
+                AclRule::allow_source("allow-local", net).with_priority(RulePriority::new(100)),
+            )
             .unwrap();
         filter
             .add_rule(AclRule::deny_all("deny-all").with_priority(RulePriority::new(1000)))
@@ -432,7 +431,9 @@ mod tests {
     fn test_filter_is_allowed() {
         let mut filter = AclFilter::new("test");
         let net = IpNetwork::parse("192.168.1.0/24").unwrap();
-        filter.add_rule(AclRule::allow_source("allow", net)).unwrap();
+        filter
+            .add_rule(AclRule::allow_source("allow", net))
+            .unwrap();
 
         assert!(filter.is_allowed(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100))));
         assert!(!filter.is_allowed(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
@@ -461,11 +462,7 @@ mod tests {
         assert!(result.is_denied());
 
         // INVITE should use default (deny since no default-allow)
-        let result = filter.filter(
-            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
-            None,
-            Some("INVITE"),
-        );
+        let result = filter.filter(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), None, Some("INVITE"));
         assert!(result.is_denied()); // No matching rule, default deny
     }
 }

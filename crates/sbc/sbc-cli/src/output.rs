@@ -27,12 +27,11 @@ impl OutputFormatter {
     /// Formats a map of key-value pairs.
     pub fn format_map(&self, map: &HashMap<String, String>) -> String {
         match self.format {
-            OutputFormat::Text => {
-                map.iter()
-                    .map(|(k, v)| format!("{k}: {v}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
+            OutputFormat::Text => map
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
             OutputFormat::Json => {
                 let pairs: Vec<String> = map
                     .iter()
@@ -42,25 +41,13 @@ impl OutputFormatter {
             }
             OutputFormat::Table => {
                 let mut output = String::new();
-                output.push_str(&format!(
-                    "+{:-<22}+{:-<42}+\n",
-                    "", ""
-                ));
-                output.push_str(&format!(
-                    "| {:^20} | {:^40} |\n",
-                    "Key", "Value"
-                ));
-                output.push_str(&format!(
-                    "+{:-<22}+{:-<42}+\n",
-                    "", ""
-                ));
+                output.push_str(&format!("+{:-<22}+{:-<42}+\n", "", ""));
+                output.push_str(&format!("| {:^20} | {:^40} |\n", "Key", "Value"));
+                output.push_str(&format!("+{:-<22}+{:-<42}+\n", "", ""));
                 for (k, v) in map {
                     output.push_str(&format!("| {k:<20} | {v:<40} |\n"));
                 }
-                output.push_str(&format!(
-                    "+{:-<22}+{:-<42}+",
-                    "", ""
-                ));
+                output.push_str(&format!("+{:-<22}+{:-<42}+", "", ""));
                 output
             }
         }
@@ -95,24 +82,20 @@ impl OutputFormatter {
     /// Formats a list of items.
     pub fn format_list<T: std::fmt::Display>(&self, items: &[T]) -> String {
         match self.format {
-            OutputFormat::Text => {
-                items
-                    .iter()
-                    .map(|i| format!("  - {i}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
+            OutputFormat::Text => items
+                .iter()
+                .map(|i| format!("  - {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
             OutputFormat::Json => {
                 let json_items: Vec<String> = items.iter().map(|i| format!(r#""{i}""#)).collect();
                 format!("[{}]", json_items.join(", "))
             }
-            OutputFormat::Table => {
-                items
-                    .iter()
-                    .map(|i| format!("| {i:<62} |"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
+            OutputFormat::Table => items
+                .iter()
+                .map(|i| format!("| {i:<62} |"))
+                .collect::<Vec<_>>()
+                .join("\n"),
         }
     }
 }

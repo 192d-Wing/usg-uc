@@ -48,7 +48,10 @@ impl Transport {
     /// Returns true if this transport is reliable (connection-oriented).
     #[must_use]
     pub fn is_reliable(&self) -> bool {
-        matches!(self, Self::Tcp | Self::Tls | Self::Sctp | Self::Ws | Self::Wss)
+        matches!(
+            self,
+            Self::Tcp | Self::Tls | Self::Sctp | Self::Ws | Self::Wss
+        )
     }
 
     /// Returns true if this transport provides encryption.

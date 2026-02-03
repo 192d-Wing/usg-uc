@@ -146,11 +146,7 @@ impl Candidate {
     }
 
     /// Creates a server reflexive candidate.
-    pub fn server_reflexive(
-        address: SocketAddr,
-        base_address: SocketAddr,
-        component: u16,
-    ) -> Self {
+    pub fn server_reflexive(address: SocketAddr, base_address: SocketAddr, component: u16) -> Self {
         let foundation =
             Self::compute_foundation(CandidateType::ServerReflexive, &base_address, None);
         let priority = Self::compute_priority(CandidateType::ServerReflexive, component, 0);
@@ -168,11 +164,7 @@ impl Candidate {
     }
 
     /// Creates a relay candidate.
-    pub fn relay(
-        address: SocketAddr,
-        base_address: SocketAddr,
-        component: u16,
-    ) -> Self {
+    pub fn relay(address: SocketAddr, base_address: SocketAddr, component: u16) -> Self {
         let foundation = Self::compute_foundation(CandidateType::Relay, &base_address, None);
         let priority = Self::compute_priority(CandidateType::Relay, component, 0);
 
@@ -271,7 +263,9 @@ impl Candidate {
         // Simple hash-like foundation
         let mut hash: u32 = type_byte as u32;
         for (i, byte) in ip_bytes.iter().enumerate() {
-            hash = hash.wrapping_mul(31).wrapping_add((*byte as u32) << (i % 4));
+            hash = hash
+                .wrapping_mul(31)
+                .wrapping_add((*byte as u32) << (i % 4));
         }
 
         format!("{hash:08x}")
@@ -334,7 +328,7 @@ impl Candidate {
             _ => {
                 return Err(IceError::ParseError {
                     reason: format!("unknown transport: {}", parts[2]),
-                })
+                });
             }
         };
 
@@ -412,15 +406,24 @@ mod tests {
 
     #[test]
     fn test_candidate_type_preference() {
-        assert!(CandidateType::Host.type_preference() > CandidateType::ServerReflexive.type_preference());
-        assert!(CandidateType::ServerReflexive.type_preference() > CandidateType::Relay.type_preference());
+        assert!(
+            CandidateType::Host.type_preference()
+                > CandidateType::ServerReflexive.type_preference()
+        );
+        assert!(
+            CandidateType::ServerReflexive.type_preference()
+                > CandidateType::Relay.type_preference()
+        );
     }
 
     #[test]
     fn test_candidate_type_sdp() {
         assert_eq!(CandidateType::Host.as_sdp_str(), "host");
         assert_eq!(CandidateType::ServerReflexive.as_sdp_str(), "srflx");
-        assert_eq!(CandidateType::from_sdp_str("srflx"), Some(CandidateType::ServerReflexive));
+        assert_eq!(
+            CandidateType::from_sdp_str("srflx"),
+            Some(CandidateType::ServerReflexive)
+        );
     }
 
     #[test]

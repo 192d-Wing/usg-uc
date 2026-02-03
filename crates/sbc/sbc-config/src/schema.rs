@@ -2,13 +2,13 @@
 //!
 //! ## NIST 800-53 Rev5: CM-6 (Configuration Settings)
 
-use uc_types::codec::CodecId;
-use uc_types::media::MediaMode;
-use uc_types::protocol::{CnsaCurve, CnsaHash, CnsaSrtpProfile};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use uc_types::codec::CodecId;
+use uc_types::media::MediaMode;
+use uc_types::protocol::{CnsaCurve, CnsaHash, CnsaSrtpProfile};
 
 /// Root SBC configuration.
 ///
@@ -109,9 +109,21 @@ pub struct TransportConfig {
 impl Default for TransportConfig {
     fn default() -> Self {
         Self {
-            udp_listen: vec!["[::]:5060".parse().unwrap_or_else(|_| "[::1]:5060".parse().unwrap())],
-            tcp_listen: vec!["[::]:5060".parse().unwrap_or_else(|_| "[::1]:5060".parse().unwrap())],
-            tls_listen: vec!["[::]:5061".parse().unwrap_or_else(|_| "[::1]:5061".parse().unwrap())],
+            udp_listen: vec![
+                "[::]:5060"
+                    .parse()
+                    .unwrap_or_else(|_| "[::1]:5060".parse().unwrap()),
+            ],
+            tcp_listen: vec![
+                "[::]:5060"
+                    .parse()
+                    .unwrap_or_else(|_| "[::1]:5060".parse().unwrap()),
+            ],
+            tls_listen: vec![
+                "[::]:5061"
+                    .parse()
+                    .unwrap_or_else(|_| "[::1]:5061".parse().unwrap()),
+            ],
             ws_listen: Vec::new(),
             wss_listen: Vec::new(),
             tcp_timeout_secs: 30,

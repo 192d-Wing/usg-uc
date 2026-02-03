@@ -80,8 +80,12 @@ impl AttestationLevel {
     pub const fn description(&self) -> &'static str {
         match self {
             Self::Full => "Full attestation: Caller authenticated and authorized for number",
-            Self::Partial => "Partial attestation: Caller authenticated but number authorization unverified",
-            Self::Gateway => "Gateway attestation: Call received from trusted source, originator unknown",
+            Self::Partial => {
+                "Partial attestation: Caller authenticated but number authorization unverified"
+            }
+            Self::Gateway => {
+                "Gateway attestation: Call received from trusted source, originator unknown"
+            }
         }
     }
 
@@ -219,10 +223,22 @@ mod tests {
 
     #[test]
     fn test_attestation_from_code() {
-        assert_eq!(AttestationLevel::from_code('A'), Some(AttestationLevel::Full));
-        assert_eq!(AttestationLevel::from_code('a'), Some(AttestationLevel::Full));
-        assert_eq!(AttestationLevel::from_code('B'), Some(AttestationLevel::Partial));
-        assert_eq!(AttestationLevel::from_code('C'), Some(AttestationLevel::Gateway));
+        assert_eq!(
+            AttestationLevel::from_code('A'),
+            Some(AttestationLevel::Full)
+        );
+        assert_eq!(
+            AttestationLevel::from_code('a'),
+            Some(AttestationLevel::Full)
+        );
+        assert_eq!(
+            AttestationLevel::from_code('B'),
+            Some(AttestationLevel::Partial)
+        );
+        assert_eq!(
+            AttestationLevel::from_code('C'),
+            Some(AttestationLevel::Gateway)
+        );
         assert_eq!(AttestationLevel::from_code('D'), None);
     }
 
@@ -237,8 +253,14 @@ mod tests {
 
     #[test]
     fn test_attestation_parse() {
-        assert_eq!("A".parse::<AttestationLevel>().ok(), Some(AttestationLevel::Full));
-        assert_eq!("B".parse::<AttestationLevel>().ok(), Some(AttestationLevel::Partial));
+        assert_eq!(
+            "A".parse::<AttestationLevel>().ok(),
+            Some(AttestationLevel::Full)
+        );
+        assert_eq!(
+            "B".parse::<AttestationLevel>().ok(),
+            Some(AttestationLevel::Partial)
+        );
         assert!("AB".parse::<AttestationLevel>().is_err());
         assert!("X".parse::<AttestationLevel>().is_err());
     }

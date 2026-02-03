@@ -88,7 +88,12 @@ impl AttributeName {
     pub fn has_value(&self) -> bool {
         !matches!(
             self,
-            Self::Sendrecv | Self::Sendonly | Self::Recvonly | Self::Inactive | Self::RtcpMux | Self::RtcpRsize
+            Self::Sendrecv
+                | Self::Sendonly
+                | Self::Recvonly
+                | Self::Inactive
+                | Self::RtcpMux
+                | Self::RtcpRsize
         )
     }
 }
@@ -198,9 +203,7 @@ impl Attribute {
             return None;
         }
 
-        self.value
-            .as_ref()
-            .and_then(|v| v.split_once(' '))
+        self.value.as_ref().and_then(|v| v.split_once(' '))
     }
 }
 

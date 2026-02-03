@@ -18,9 +18,7 @@
 //! - **SC-7**: Boundary Protection (NAT traversal)
 //! - **SC-8**: Transmission Confidentiality (via DTLS-SRTP)
 
-use proto_ice::agent::{
-    GatheringState, IceConfig, IceCredentials, IceState, TurnServerConfig,
-};
+use proto_ice::agent::{GatheringState, IceConfig, IceCredentials, IceState, TurnServerConfig};
 use proto_ice::{Candidate, IceAgent, IceRole};
 use proto_stun::{StunClass, StunMessage};
 use std::collections::HashMap;
@@ -51,9 +49,9 @@ impl Default for IceManagerConfig {
     fn default() -> Self {
         Self {
             stun_servers: vec![
-                "stun.l.google.com:19302".parse().unwrap_or_else(|_| {
-                    SocketAddr::from(([74, 125, 250, 129], 19302))
-                }),
+                "stun.l.google.com:19302"
+                    .parse()
+                    .unwrap_or_else(|_| SocketAddr::from(([74, 125, 250, 129], 19302))),
             ],
             turn_servers: Vec::new(),
             ice_lite: false,
@@ -373,9 +371,10 @@ impl IceManager {
             .get(call_id)
             .ok_or(IceManagerError::SessionNotFound)?;
 
-        Ok(context.agent.selected_pair(component).map(|pair| {
-            (pair.local().address(), pair.remote().address())
-        }))
+        Ok(context
+            .agent
+            .selected_pair(component)
+            .map(|pair| (pair.local().address(), pair.remote().address())))
     }
 
     /// Gets the current ICE state for a session.
@@ -635,9 +634,11 @@ mod tests {
 
         // Should have at least one host candidate
         assert!(!candidates.is_empty());
-        assert!(candidates
-            .iter()
-            .any(|c| c.candidate_type() == CandidateType::Host));
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.candidate_type() == CandidateType::Host)
+        );
     }
 
     #[tokio::test]

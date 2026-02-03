@@ -17,8 +17,8 @@
 //! - **Relay**: Relay early media from B-leg to A-leg
 //! - **Gate**: Hold early media until call is confirmed
 
-use crate::mode::MediaAddress;
 use crate::B2buaMode;
+use crate::mode::MediaAddress;
 
 /// Early media disposition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -246,7 +246,11 @@ impl EarlyMediaHandler {
     /// Processes 183 from B-leg.
     ///
     /// Returns the SDP to forward to A-leg (if any).
-    pub fn receive_b_leg_183(&mut self, sdp: String, remote_address: MediaAddress) -> Option<EarlyMediaAction> {
+    pub fn receive_b_leg_183(
+        &mut self,
+        sdp: String,
+        remote_address: MediaAddress,
+    ) -> Option<EarlyMediaAction> {
         self.b_leg.receive_183_with_sdp(sdp, remote_address);
 
         match self.early_media_mode {
@@ -439,7 +443,10 @@ mod tests {
         let action = handler.receive_b_leg_183("v=0...".to_string(), remote);
 
         assert!(handler.b_leg().is_active());
-        assert!(matches!(action, Some(EarlyMediaAction::ForwardToALeg { .. })));
+        assert!(matches!(
+            action,
+            Some(EarlyMediaAction::ForwardToALeg { .. })
+        ));
     }
 
     #[test]
@@ -468,7 +475,10 @@ mod tests {
             .with_timeout(120);
 
         assert_eq!(config.mode, EarlyMediaMode::LocalRingback);
-        assert_eq!(config.ringback_file, Some("/audio/ringback.wav".to_string()));
+        assert_eq!(
+            config.ringback_file,
+            Some("/audio/ringback.wav".to_string())
+        );
         assert_eq!(config.timeout, 120);
     }
 

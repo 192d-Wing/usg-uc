@@ -13,15 +13,15 @@ use crate::api_server::{ApiServer, ApiServerConfig, AppState};
 use crate::args::Args;
 use crate::server::{Server, ServerError};
 use crate::shutdown::{ShutdownCoordinator, ShutdownSignal};
-use sbc_config::{load_from_file, SbcConfig};
 #[cfg(test)]
 use sbc_config::load_from_str;
-use uc_metrics::SbcMetrics;
+use sbc_config::{SbcConfig, load_from_file};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
+use uc_metrics::SbcMetrics;
 
 /// SBC daemon runtime.
 pub struct Runtime {
@@ -177,9 +177,12 @@ impl Runtime {
         let config = self.config.read().await.clone();
         let mut server = Server::new(config, signal.clone());
 
-        server.start().await.map_err(|e| RuntimeError::ServerFailed {
-            reason: e.to_string(),
-        })?;
+        server
+            .start()
+            .await
+            .map_err(|e| RuntimeError::ServerFailed {
+                reason: e.to_string(),
+            })?;
 
         // Create API server
         let api_config = ApiServerConfig::default();
@@ -236,9 +239,12 @@ impl Runtime {
         }
 
         // Stop SIP server
-        server.stop().await.map_err(|e| RuntimeError::ServerFailed {
-            reason: e.to_string(),
-        })?;
+        server
+            .stop()
+            .await
+            .map_err(|e| RuntimeError::ServerFailed {
+                reason: e.to_string(),
+            })?;
 
         self.server = Some(server);
         Ok(())

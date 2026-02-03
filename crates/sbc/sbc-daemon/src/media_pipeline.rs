@@ -13,16 +13,18 @@
 //! - **SC-12**: Cryptographic Key Establishment (DTLS-SRTP)
 //! - **SC-13**: Cryptographic Protection (CNSA 2.0)
 
-use uc_codecs::{CodecCapability, CodecRegistry};
 use proto_dtls::{DtlsConfig, DtlsConnection, DtlsRole, DtlsState, SrtpKeyingMaterial};
-use uc_media_engine::session::SessionState;
-use uc_media_engine::{MediaMode, MediaSession, MediaSessionConfig};
 use proto_rtp::{RtpHeader, RtpPacket, SequenceTracker};
-use proto_srtp::{SrtpContext, SrtpDirection, SrtpKeyMaterial, SrtpProfile, SrtpProtect, SrtpUnprotect};
-use uc_types::address::SbcSocketAddr;
+use proto_srtp::{
+    SrtpContext, SrtpDirection, SrtpKeyMaterial, SrtpProfile, SrtpProtect, SrtpUnprotect,
+};
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 use tracing::{debug, info, trace, warn};
+use uc_codecs::{CodecCapability, CodecRegistry};
+use uc_media_engine::session::SessionState;
+use uc_media_engine::{MediaMode, MediaSession, MediaSessionConfig};
+use uc_types::address::SbcSocketAddr;
 
 /// Media pipeline configuration.
 #[derive(Debug, Clone)]
@@ -217,8 +219,7 @@ impl MediaPipeline {
         remote_addr: SbcSocketAddr,
         role: DtlsRole,
     ) -> Result<(), MediaPipelineError> {
-        let config = DtlsConfig::new(role)
-            .with_identity(vec![vec![0u8; 32]], vec![0u8; 32]); // Placeholder cert
+        let config = DtlsConfig::new(role).with_identity(vec![vec![0u8; 32]], vec![0u8; 32]); // Placeholder cert
 
         let connection = DtlsConnection::new(config, local_addr.clone(), remote_addr)
             .map_err(|e| MediaPipelineError::DtlsHandshakeFailed(e.to_string()))?;
@@ -283,7 +284,8 @@ impl MediaPipeline {
         drop(sessions);
 
         // Create SRTP contexts
-        let (outbound_ctx, inbound_ctx) = self.create_srtp_contexts(&keying_material, role, ssrc)?;
+        let (outbound_ctx, inbound_ctx) =
+            self.create_srtp_contexts(&keying_material, role, ssrc)?;
 
         // Store in session
         let mut sessions = self.sessions.write().await;
@@ -317,12 +319,9 @@ impl MediaPipeline {
         let outbound_key = keying.local_key(role).to_vec();
         let outbound_salt = keying.local_salt(role).to_vec();
 
-        let outbound_material = SrtpKeyMaterial::new(
-            SrtpProfile::AeadAes256Gcm,
-            outbound_key,
-            outbound_salt,
-        )
-        .map_err(|e| MediaPipelineError::SrtpContextCreationFailed(e.to_string()))?;
+        let outbound_material =
+            SrtpKeyMaterial::new(SrtpProfile::AeadAes256Gcm, outbound_key, outbound_salt)
+                .map_err(|e| MediaPipelineError::SrtpContextCreationFailed(e.to_string()))?;
 
         let outbound = SrtpContext::new(&outbound_material, SrtpDirection::Outbound, ssrc)
             .map_err(|e| MediaPipelineError::SrtpContextCreationFailed(e.to_string()))?;
@@ -331,12 +330,9 @@ impl MediaPipeline {
         let inbound_key = keying.remote_key(role).to_vec();
         let inbound_salt = keying.remote_salt(role).to_vec();
 
-        let inbound_material = SrtpKeyMaterial::new(
-            SrtpProfile::AeadAes256Gcm,
-            inbound_key,
-            inbound_salt,
-        )
-        .map_err(|e| MediaPipelineError::SrtpContextCreationFailed(e.to_string()))?;
+        let inbound_material =
+            SrtpKeyMaterial::new(SrtpProfile::AeadAes256Gcm, inbound_key, inbound_salt)
+                .map_err(|e| MediaPipelineError::SrtpContextCreationFailed(e.to_string()))?;
 
         let inbound = SrtpContext::new(&inbound_material, SrtpDirection::Inbound, ssrc)
             .map_err(|e| MediaPipelineError::SrtpContextCreationFailed(e.to_string()))?;
@@ -358,7 +354,7 @@ impl MediaPipeline {
             None => {
                 return RtpProcessResult::Error {
                     reason: "Session not found".to_string(),
-                }
+                };
             }
         };
 
@@ -369,7 +365,7 @@ impl MediaPipeline {
                 None => {
                     return RtpProcessResult::Error {
                         reason: "B-leg not connected".to_string(),
-                    }
+                    };
                 }
             }
         } else {
@@ -378,7 +374,7 @@ impl MediaPipeline {
                 None => {
                     return RtpProcessResult::Error {
                         reason: "A-leg not connected".to_string(),
-                    }
+                    };
                 }
             }
         };
@@ -395,9 +391,7 @@ impl MediaPipeline {
             }
             MediaMode::Relay | MediaMode::EarlyRelay => {
                 // Relay mode: decrypt, process, encrypt
-                let processed = self
-                    .relay_rtp_packet(session_ctx, data, is_a_leg)
-                    .await;
+                let processed = self.relay_rtp_packet(session_ctx, data, is_a_leg).await;
 
                 match processed {
                     Ok(packet_data) => RtpProcessResult::Forward {
@@ -448,7 +442,11 @@ impl MediaPipeline {
 
         let is_valid = tracker.update(packet.header.sequence_number);
         if !is_valid {
-            warn!(ssrc = packet.header.ssrc, seq = packet.header.sequence_number, "Duplicate or old packet");
+            warn!(
+                ssrc = packet.header.ssrc,
+                seq = packet.header.sequence_number,
+                "Duplicate or old packet"
+            );
         }
         drop(trackers);
 
@@ -621,10 +619,7 @@ mod tests {
     async fn test_create_session() {
         let pipeline = MediaPipeline::new(MediaPipelineConfig::default());
 
-        pipeline
-            .create_session("test-call-1", None)
-            .await
-            .unwrap();
+        pipeline.create_session("test-call-1", None).await.unwrap();
 
         assert_eq!(pipeline.active_session_count().await, 1);
     }
@@ -633,10 +628,7 @@ mod tests {
     async fn test_remove_session() {
         let pipeline = MediaPipeline::new(MediaPipelineConfig::default());
 
-        pipeline
-            .create_session("test-call-1", None)
-            .await
-            .unwrap();
+        pipeline.create_session("test-call-1", None).await.unwrap();
 
         pipeline.remove_session("test-call-1").await.unwrap();
         assert_eq!(pipeline.active_session_count().await, 0);
@@ -676,9 +668,7 @@ mod tests {
         // Remote only supports G.711
         let remote_codecs = vec![CodecCapability::pcmu()];
 
-        let result = pipeline
-            .negotiate_codecs("test-call", &remote_codecs)
-            .await;
+        let result = pipeline.negotiate_codecs("test-call", &remote_codecs).await;
 
         assert!(matches!(
             result,
@@ -690,10 +680,7 @@ mod tests {
     async fn test_set_remote_address() {
         let pipeline = MediaPipeline::new(MediaPipelineConfig::default());
 
-        pipeline
-            .create_session("test-call", None)
-            .await
-            .unwrap();
+        pipeline.create_session("test-call", None).await.unwrap();
 
         let addr = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
         pipeline

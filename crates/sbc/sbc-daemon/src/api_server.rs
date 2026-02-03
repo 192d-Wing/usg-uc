@@ -26,30 +26,30 @@
 //! - **SC-13**: Cryptographic Protection (CNSA 2.0 compliant TLS)
 
 use axum::{
+    Json, Router,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
-    Json, Router,
 };
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use hyper_util::service::TowerToHyperService;
 use rustls::pki_types::CertificateDer;
-use uc_health::{ComponentStatus, SystemHealth};
-use uc_metrics::MetricRegistry;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio_rustls::TlsAcceptor;
 use tower::Service;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
+use uc_health::{ComponentStatus, SystemHealth};
+use uc_metrics::MetricRegistry;
 
 use crate::server::ServerStats;
 use crate::shutdown::ShutdownSignal;
@@ -79,9 +79,9 @@ pub struct TlsConfig {
 impl Default for ApiServerConfig {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:8080".parse().unwrap_or_else(|_| {
-                SocketAddr::from(([0, 0, 0, 0], 8080))
-            }),
+            listen_addr: "0.0.0.0:8080"
+                .parse()
+                .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 8080))),
             enable_cors: false,
             api_version: "v1".to_string(),
             tls: None,
@@ -127,7 +127,8 @@ impl AppState {
 
     /// Sets the ready state.
     pub fn set_ready(&self, ready: bool) {
-        self.ready.store(if ready { 1 } else { 0 }, Ordering::Relaxed);
+        self.ready
+            .store(if ready { 1 } else { 0 }, Ordering::Relaxed);
     }
 
     /// Performs a health check.
@@ -156,11 +157,7 @@ pub struct ApiServer {
 
 impl ApiServer {
     /// Creates a new API server.
-    pub fn new(
-        config: ApiServerConfig,
-        state: Arc<AppState>,
-        shutdown: ShutdownSignal,
-    ) -> Self {
+    pub fn new(config: ApiServerConfig, state: Arc<AppState>, shutdown: ShutdownSignal) -> Self {
         Self {
             config,
             state,
@@ -209,12 +206,13 @@ impl ApiServer {
 
         info!(address = %addr, tls = false, "Starting API server (HTTP)");
 
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|e| ApiServerError::BindFailed {
-                address: addr.to_string(),
-                reason: e.to_string(),
-            })?;
+        let listener =
+            tokio::net::TcpListener::bind(addr)
+                .await
+                .map_err(|e| ApiServerError::BindFailed {
+                    address: addr.to_string(),
+                    reason: e.to_string(),
+                })?;
 
         let shutdown = self.shutdown.clone();
 
@@ -246,12 +244,13 @@ impl ApiServer {
         // Load TLS configuration
         let tls_acceptor = Self::create_tls_acceptor(tls_config)?;
 
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|e| ApiServerError::BindFailed {
-                address: addr.to_string(),
-                reason: e.to_string(),
-            })?;
+        let listener =
+            tokio::net::TcpListener::bind(addr)
+                .await
+                .map_err(|e| ApiServerError::BindFailed {
+                    address: addr.to_string(),
+                    reason: e.to_string(),
+                })?;
 
         let shutdown = self.shutdown.clone();
 
@@ -308,9 +307,10 @@ impl ApiServer {
     /// Creates a TLS acceptor with CNSA 2.0 compliant configuration.
     fn create_tls_acceptor(tls_config: &TlsConfig) -> Result<TlsAcceptor, ApiServerError> {
         // Load certificate chain
-        let cert_file = File::open(&tls_config.cert_path).map_err(|e| ApiServerError::TlsError {
-            reason: format!("Failed to open certificate file: {e}"),
-        })?;
+        let cert_file =
+            File::open(&tls_config.cert_path).map_err(|e| ApiServerError::TlsError {
+                reason: format!("Failed to open certificate file: {e}"),
+            })?;
         let mut cert_reader = BufReader::new(cert_file);
         let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
             .filter_map(|r| r.ok())
@@ -361,9 +361,7 @@ async fn liveness_probe() -> impl IntoResponse {
 /// Readiness probe handler.
 ///
 /// Returns 200 OK if the server is ready to accept traffic.
-async fn readiness_probe(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn readiness_probe(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let is_ready = state.is_ready();
 
     let response = ReadinessResponse {
@@ -383,9 +381,7 @@ async fn readiness_probe(
 // ============================================================================
 
 /// Get detailed health status.
-async fn get_health(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn get_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let system_health = state.check_health();
     let response = HealthResponse::from(system_health);
 
@@ -401,9 +397,7 @@ async fn get_health(
 }
 
 /// Get Prometheus metrics.
-async fn get_metrics(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn get_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let metrics_text = state.metrics.export();
 
     Response::builder()
@@ -419,9 +413,7 @@ async fn get_metrics(
 }
 
 /// Get server statistics.
-async fn get_stats(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn get_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let response = StatsResponse {
         calls_total: state.stats.calls_total.load(Ordering::Relaxed),
         calls_active: state.stats.calls_active.load(Ordering::Relaxed),
@@ -436,9 +428,7 @@ async fn get_stats(
 }
 
 /// Get version information.
-async fn get_version(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn get_version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(VersionResponse {
         version: state.version.clone(),
         name: "sbc-daemon".to_string(),
@@ -450,9 +440,7 @@ async fn get_version(
 // ============================================================================
 
 /// List active calls.
-async fn get_calls(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn get_calls(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // For now, return empty list
     // In production, would query B2BUA for active calls
     let response = CallListResponse {
@@ -469,9 +457,7 @@ async fn get_calls(
 // ============================================================================
 
 /// List registrations.
-async fn get_registrations(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn get_registrations(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // For now, return empty list
     // In production, would query registrar for active registrations
     let response = RegistrationListResponse {
@@ -681,8 +667,8 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
-    use uc_metrics::SbcMetrics;
     use tower::ServiceExt;
+    use uc_metrics::SbcMetrics;
 
     fn test_state() -> Arc<AppState> {
         let metrics = SbcMetrics::standard();
@@ -703,7 +689,12 @@ mod tests {
         let router = server.router();
 
         let response = router
-            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -716,7 +707,12 @@ mod tests {
         let router = server.router();
 
         let response = router
-            .oneshot(Request::builder().uri("/readyz").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 

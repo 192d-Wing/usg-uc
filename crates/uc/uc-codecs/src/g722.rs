@@ -11,7 +11,7 @@
 
 use crate::error::CodecResult;
 use crate::g722_adpcm::{G722Decoder, G722Encoder};
-use crate::{payload_types, AudioCodec, PayloadType};
+use crate::{AudioCodec, PayloadType, payload_types};
 use std::sync::Mutex;
 
 /// G.722 codec modes (bit rates).
@@ -155,16 +155,22 @@ impl AudioCodec for G722Codec {
     }
 
     fn encode(&self, pcm: &[i16], output: &mut [u8]) -> CodecResult<usize> {
-        let mut encoder = self.encoder.lock().map_err(|_| crate::error::CodecError::EncodingFailed {
-            reason: "failed to acquire encoder lock".to_string(),
-        })?;
+        let mut encoder =
+            self.encoder
+                .lock()
+                .map_err(|_| crate::error::CodecError::EncodingFailed {
+                    reason: "failed to acquire encoder lock".to_string(),
+                })?;
         Ok(encoder.encode(pcm, output))
     }
 
     fn decode(&self, encoded: &[u8], output: &mut [i16]) -> CodecResult<usize> {
-        let mut decoder = self.decoder.lock().map_err(|_| crate::error::CodecError::DecodingFailed {
-            reason: "failed to acquire decoder lock".to_string(),
-        })?;
+        let mut decoder =
+            self.decoder
+                .lock()
+                .map_err(|_| crate::error::CodecError::DecodingFailed {
+                    reason: "failed to acquire decoder lock".to_string(),
+                })?;
         Ok(decoder.decode(encoded, output))
     }
 }

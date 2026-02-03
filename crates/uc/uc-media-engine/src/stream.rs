@@ -304,7 +304,8 @@ impl MediaStream {
     /// Records a received packet.
     pub fn record_received(&self, bytes: usize) {
         self.packets_received.fetch_add(1, Ordering::Relaxed);
-        self.bytes_received.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.bytes_received
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     /// Returns current statistics.
@@ -347,7 +348,10 @@ mod tests {
             media_type: MediaType::Audio,
             direction: StreamDirection::SendRecv,
             local_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5004),
-            remote_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5004)),
+            remote_addr: Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                5004,
+            )),
             payload_type: 0,
             clock_rate: 8000,
             ssrc: 0x12345678,
@@ -366,7 +370,10 @@ mod tests {
 
     #[test]
     fn test_stream_direction_sdp() {
-        assert_eq!(StreamDirection::from_sdp("sendrecv"), Some(StreamDirection::SendRecv));
+        assert_eq!(
+            StreamDirection::from_sdp("sendrecv"),
+            Some(StreamDirection::SendRecv)
+        );
         assert_eq!(StreamDirection::SendRecv.as_sdp(), "sendrecv");
     }
 

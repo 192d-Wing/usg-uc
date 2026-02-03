@@ -70,18 +70,18 @@ pub use dialog::{Dialog, DialogId, DialogRole, DialogState};
 pub use error::{DialogError, DialogResult};
 pub use forking::{ForkKey, ForkedDialogSet};
 pub use refer::{
-    format_refer_to, parse_refer_to, ReferHandler, ReferRequest, ReferStatus,
-    ReferSubscriptionState,
+    ReferHandler, ReferRequest, ReferStatus, ReferSubscriptionState, format_refer_to,
+    parse_refer_to,
 };
 pub use session_timer::{
-    format_min_se, format_session_expires, handle_422_response, negotiate_session_timer,
-    parse_min_se, parse_session_expires, RefresherRole, SessionTimer, SessionTimerNegotiation,
+    RefresherRole, SessionTimer, SessionTimerNegotiation, format_min_se, format_session_expires,
+    handle_422_response, negotiate_session_timer, parse_min_se, parse_session_expires,
 };
 pub use subscription::{
-    format_allow_events, is_event_package_registered, parse_allow_events, validate_event_package,
-    EventPackage, EventPackageRegistry, EventPackageValidation, Notifier, Subscription,
-    SubscriptionState, SubscriptionStateHeader, TerminationReason, DEFAULT_SUBSCRIPTION_EXPIRES,
-    IANA_REGISTERED_EVENT_PACKAGES, MIN_SUBSCRIPTION_EXPIRES,
+    DEFAULT_SUBSCRIPTION_EXPIRES, EventPackage, EventPackageRegistry, EventPackageValidation,
+    IANA_REGISTERED_EVENT_PACKAGES, MIN_SUBSCRIPTION_EXPIRES, Notifier, Subscription,
+    SubscriptionState, SubscriptionStateHeader, TerminationReason, format_allow_events,
+    is_event_package_registered, parse_allow_events, validate_event_package,
 };
 
 /// Default session expires value (1800 seconds per RFC 4028).

@@ -179,9 +179,12 @@ impl RtpTranslator {
             self.sources.insert(ssrc, SourceState::new(ssrc));
         }
 
-        let state = self.sources.get_mut(&ssrc).ok_or_else(|| RtpError::InvalidRtcp {
-            reason: "source state not found".to_string(),
-        })?;
+        let state = self
+            .sources
+            .get_mut(&ssrc)
+            .ok_or_else(|| RtpError::InvalidRtcp {
+                reason: "source state not found".to_string(),
+            })?;
 
         // Update sequence tracking
         let is_valid = state.sequence_tracker.update(packet.header.sequence_number);
@@ -382,7 +385,10 @@ impl RtpMixer {
         let ssrc = packet.header.ssrc;
 
         // Get or create source state
-        let state = self.sources.entry(ssrc).or_insert_with(|| SourceState::new(ssrc));
+        let state = self
+            .sources
+            .entry(ssrc)
+            .or_insert_with(|| SourceState::new(ssrc));
 
         // Update sequence tracking
         state.sequence_tracker.update(packet.header.sequence_number);
@@ -856,16 +862,15 @@ mod tests {
 
     #[test]
     fn test_rtcp_builder() {
-        let builder = TranslatorRtcpBuilder::new(0x11111111)
-            .with_report(ReceptionReport {
-                ssrc: 0x22222222,
-                fraction_lost: 25,
-                cumulative_lost: 10,
-                extended_highest_seq: 1000,
-                jitter: 100,
-                last_sr: 0,
-                delay_since_last_sr: 0,
-            });
+        let builder = TranslatorRtcpBuilder::new(0x11111111).with_report(ReceptionReport {
+            ssrc: 0x22222222,
+            fraction_lost: 25,
+            cumulative_lost: 10,
+            extended_highest_seq: 1000,
+            jitter: 100,
+            last_sr: 0,
+            delay_since_last_sr: 0,
+        });
 
         let packet = builder.build_receiver_report();
 

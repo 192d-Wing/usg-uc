@@ -26,7 +26,7 @@
 //! generally preferred for end-to-end security when possible.
 
 use crate::error::{SdpError, SdpResult};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use std::fmt;
 use std::str::FromStr;
 
@@ -157,10 +157,12 @@ impl KeyParams {
 
     /// Creates key parameters from base64-encoded keying material.
     pub fn from_base64(encoded: &str) -> SdpResult<Self> {
-        let key_material = BASE64.decode(encoded).map_err(|e| SdpError::InvalidAttribute {
-            name: "crypto".to_string(),
-            reason: format!("invalid base64 key material: {e}"),
-        })?;
+        let key_material = BASE64
+            .decode(encoded)
+            .map_err(|e| SdpError::InvalidAttribute {
+                name: "crypto".to_string(),
+                reason: format!("invalid base64 key material: {e}"),
+            })?;
         Ok(Self::new(key_material))
     }
 
@@ -522,10 +524,12 @@ impl CryptoAttribute {
                 })?;
                 2u64.pow(exp)
             } else {
-                lifetime_str.parse().map_err(|_| SdpError::InvalidAttribute {
-                    name: "crypto".to_string(),
-                    reason: format!("invalid lifetime: {lifetime_str}"),
-                })?
+                lifetime_str
+                    .parse()
+                    .map_err(|_| SdpError::InvalidAttribute {
+                        name: "crypto".to_string(),
+                        reason: format!("invalid lifetime: {lifetime_str}"),
+                    })?
             };
             key_params.lifetime = Some(lifetime);
         }
@@ -534,14 +538,20 @@ impl CryptoAttribute {
         if parts.len() > 2 && !parts[2].is_empty() {
             let mki_parts: Vec<&str> = parts[2].split(':').collect();
             if mki_parts.len() == 2 {
-                let mki_value: u32 = mki_parts[0].parse().map_err(|_| SdpError::InvalidAttribute {
-                    name: "crypto".to_string(),
-                    reason: format!("invalid MKI value: {}", mki_parts[0]),
-                })?;
-                let mki_length: u8 = mki_parts[1].parse().map_err(|_| SdpError::InvalidAttribute {
-                    name: "crypto".to_string(),
-                    reason: format!("invalid MKI length: {}", mki_parts[1]),
-                })?;
+                let mki_value: u32 =
+                    mki_parts[0]
+                        .parse()
+                        .map_err(|_| SdpError::InvalidAttribute {
+                            name: "crypto".to_string(),
+                            reason: format!("invalid MKI value: {}", mki_parts[0]),
+                        })?;
+                let mki_length: u8 =
+                    mki_parts[1]
+                        .parse()
+                        .map_err(|_| SdpError::InvalidAttribute {
+                            name: "crypto".to_string(),
+                            reason: format!("invalid MKI length: {}", mki_parts[1]),
+                        })?;
                 key_params.mki_value = Some(mki_value);
                 key_params.mki_length = Some(mki_length);
             }
@@ -575,11 +585,7 @@ impl CryptoAttribute {
 
 impl fmt::Display for CryptoAttribute {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} {} {}",
-            self.tag, self.cipher_suite, self.key_params
-        )?;
+        write!(f, "{} {} {}", self.tag, self.cipher_suite, self.key_params)?;
 
         if !self.session_params.is_empty() {
             write!(f, " {}", self.session_params)?;
@@ -635,7 +641,10 @@ impl SrtpNegotiator {
     ///
     /// Returns the selected offer attribute that should be echoed in the answer.
     #[must_use]
-    pub fn select_crypto<'a>(&self, offer_cryptos: &'a [CryptoAttribute]) -> Option<&'a CryptoAttribute> {
+    pub fn select_crypto<'a>(
+        &self,
+        offer_cryptos: &'a [CryptoAttribute],
+    ) -> Option<&'a CryptoAttribute> {
         // Find the first offer cipher that matches our preferences (in preference order)
         for preferred in &self.preferred_ciphers {
             for crypto in offer_cryptos {
@@ -729,10 +738,7 @@ mod tests {
             CipherSuite::AesCm128HmacSha1_80.to_string(),
             "AES_CM_128_HMAC_SHA1_80"
         );
-        assert_eq!(
-            CipherSuite::AeadAes128Gcm.to_string(),
-            "AEAD_AES_128_GCM"
-        );
+        assert_eq!(CipherSuite::AeadAes128Gcm.to_string(), "AEAD_AES_128_GCM");
     }
 
     #[test]
@@ -770,7 +776,11 @@ mod tests {
         let params = KeyParams::from_base64(base64_key).unwrap();
 
         assert_eq!(params.key_material().len(), 30);
-        assert!(params.validate_for_cipher(CipherSuite::AesCm128HmacSha1_80).is_ok());
+        assert!(
+            params
+                .validate_for_cipher(CipherSuite::AesCm128HmacSha1_80)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -788,7 +798,8 @@ mod tests {
 
     #[test]
     fn test_crypto_attribute_parsing() {
-        let attr_str = "1 AES_CM_128_HMAC_SHA1_80 inline:d0RmdmcmVCspeEc3QGZiNWpVLFJhQX1cfHAwJSoj|2^20";
+        let attr_str =
+            "1 AES_CM_128_HMAC_SHA1_80 inline:d0RmdmcmVCspeEc3QGZiNWpVLFJhQX1cfHAwJSoj|2^20";
         let crypto = CryptoAttribute::parse(attr_str).unwrap();
 
         assert_eq!(crypto.tag, 1);
@@ -798,7 +809,8 @@ mod tests {
 
     #[test]
     fn test_crypto_attribute_parsing_with_mki() {
-        let attr_str = "2 AES_CM_128_HMAC_SHA1_32 inline:d0RmdmcmVCspeEc3QGZiNWpVLFJhQX1cfHAwJSoj|2^31|1:4";
+        let attr_str =
+            "2 AES_CM_128_HMAC_SHA1_32 inline:d0RmdmcmVCspeEc3QGZiNWpVLFJhQX1cfHAwJSoj|2^31|1:4";
         let crypto = CryptoAttribute::parse(attr_str).unwrap();
 
         assert_eq!(crypto.tag, 2);

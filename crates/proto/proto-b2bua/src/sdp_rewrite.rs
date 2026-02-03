@@ -13,8 +13,8 @@
 //! - **RFC 3264**: Offer/Answer model
 //! - **RFC 7092**: B2BUA behavior
 
-use crate::mode::{MediaAddress, ModeCharacteristics, SdpModification};
 use crate::B2buaMode;
+use crate::mode::{MediaAddress, ModeCharacteristics, SdpModification};
 
 /// SDP connection rewrite result.
 #[derive(Debug, Clone)]

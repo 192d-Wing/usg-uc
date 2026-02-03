@@ -29,7 +29,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::time::{timeout, Instant};
+use tokio::time::{Instant, timeout};
 use tracing::{debug, instrument, warn};
 
 /// Default timeout for STUN requests (3 seconds per RFC 5389).
@@ -91,11 +91,11 @@ impl StunClient {
     ///
     /// Returns an error if socket binding fails.
     pub async fn bind(local_addr: SocketAddr, server: SocketAddr) -> StunResult<Self> {
-        let socket = UdpSocket::bind(local_addr).await.map_err(|e| {
-            StunError::NetworkError {
+        let socket = UdpSocket::bind(local_addr)
+            .await
+            .map_err(|e| StunError::NetworkError {
                 reason: format!("failed to bind socket: {e}"),
-            }
-        })?;
+            })?;
 
         Ok(Self::new(Arc::new(socket), server))
     }
@@ -114,9 +114,11 @@ impl StunClient {
 
     /// Returns the local address of the socket.
     pub fn local_addr(&self) -> StunResult<SocketAddr> {
-        self.socket.local_addr().map_err(|e| StunError::NetworkError {
-            reason: format!("failed to get local address: {e}"),
-        })
+        self.socket
+            .local_addr()
+            .map_err(|e| StunError::NetworkError {
+                reason: format!("failed to get local address: {e}"),
+            })
     }
 
     /// Returns the server address.
@@ -207,11 +209,13 @@ impl StunClient {
         let mut buf = [0u8; 1500];
 
         loop {
-            let (n, from) = self.socket.recv_from(&mut buf).await.map_err(|e| {
-                StunError::NetworkError {
-                    reason: format!("recv failed: {e}"),
-                }
-            })?;
+            let (n, from) =
+                self.socket
+                    .recv_from(&mut buf)
+                    .await
+                    .map_err(|e| StunError::NetworkError {
+                        reason: format!("recv failed: {e}"),
+                    })?;
 
             // Verify it's from the expected server
             if from != self.server {
@@ -256,11 +260,11 @@ impl StunClient {
             }
 
             // Extract XOR-MAPPED-ADDRESS
-            let addr = response.xor_mapped_address().ok_or_else(|| {
-                StunError::InvalidMessage {
+            let addr = response
+                .xor_mapped_address()
+                .ok_or_else(|| StunError::InvalidMessage {
                     reason: "response missing XOR-MAPPED-ADDRESS".to_string(),
-                }
-            })?;
+                })?;
 
             return Ok(addr);
         }

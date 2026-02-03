@@ -260,7 +260,10 @@ impl CsvFormatter {
                 .connect_time_ms
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
-            "end_time_ms" => record.end_time_ms.map(|v| v.to_string()).unwrap_or_default(),
+            "end_time_ms" => record
+                .end_time_ms
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
             "setup_duration_ms" => record
                 .setup_duration_ms
                 .map(|v| v.to_string())
@@ -271,11 +274,7 @@ impl CsvFormatter {
                 .unwrap_or_default(),
             "codec" => record.codec.clone().unwrap_or_default(),
             "media_type" => record.media_type.clone().unwrap_or_default(),
-            _ => record
-                .custom_fields
-                .get(field)
-                .cloned()
-                .unwrap_or_default(),
+            _ => record.custom_fields.get(field).cloned().unwrap_or_default(),
         }
     }
 }

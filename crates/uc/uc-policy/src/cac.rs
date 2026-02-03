@@ -23,8 +23,8 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Reason for rejecting call admission.
@@ -77,7 +77,10 @@ impl fmt::Display for RejectionReason {
                 current_kbps,
                 max_kbps,
             } => write!(f, "bandwidth exceeded ({current_kbps}/{max_kbps} kbps)"),
-            Self::RateLimitExceeded { current_cps, max_cps } => {
+            Self::RateLimitExceeded {
+                current_cps,
+                max_cps,
+            } => {
                 write!(f, "rate limit exceeded ({current_cps:.1}/{max_cps:.1} CPS)")
             }
             Self::TrunkDisabled => write!(f, "trunk disabled"),
@@ -187,10 +190,10 @@ pub struct CodecBandwidth {
 impl Default for CodecBandwidth {
     fn default() -> Self {
         Self {
-            g711: 90,   // 64 kbps + ~26 kbps overhead
-            g729: 32,   // 8 kbps + ~24 kbps overhead
-            g722: 90,   // 64 kbps + overhead
-            opus: 50,   // Variable, assume mid-range
+            g711: 90,     // 64 kbps + ~26 kbps overhead
+            g729: 32,     // 8 kbps + ~24 kbps overhead
+            g722: 90,     // 64 kbps + overhead
+            opus: 50,     // Variable, assume mid-range
             default: 100, // Conservative default
         }
     }
@@ -201,7 +204,10 @@ impl CodecBandwidth {
     #[must_use]
     pub fn estimate(&self, codec: &str) -> u32 {
         let codec_lower = codec.to_lowercase();
-        if codec_lower.contains("g711") || codec_lower.contains("pcmu") || codec_lower.contains("pcma") {
+        if codec_lower.contains("g711")
+            || codec_lower.contains("pcmu")
+            || codec_lower.contains("pcma")
+        {
             self.g711
         } else if codec_lower.contains("g729") {
             self.g729
@@ -296,7 +302,8 @@ impl TrunkCacLimits {
         if priority.is_critical_or_higher() {
             self.max_sessions
         } else {
-            let reserve = (self.max_sessions as f64 * (self.emergency_reserve_percent as f64 / 100.0)) as u32;
+            let reserve =
+                (self.max_sessions as f64 * (self.emergency_reserve_percent as f64 / 100.0)) as u32;
             self.max_sessions.saturating_sub(reserve)
         }
     }
@@ -481,7 +488,11 @@ impl CallAdmissionController {
         priority: CallPriority,
     ) -> AdmissionDecision {
         // Extract limits values to avoid borrow conflicts
-        let limits = self.limits.get(trunk_id).cloned().unwrap_or_else(|| self.global_limits.clone());
+        let limits = self
+            .limits
+            .get(trunk_id)
+            .cloned()
+            .unwrap_or_else(|| self.global_limits.clone());
 
         // Check if trunk is enabled
         if !limits.enabled {
@@ -794,7 +805,10 @@ mod tests {
         assert!(decision.is_rejected(), "third call should be rejected");
         match decision {
             AdmissionDecision::Rejected { reason, .. } => {
-                assert!(matches!(reason, RejectionReason::MaxSessionsExceeded { .. }));
+                assert!(matches!(
+                    reason,
+                    RejectionReason::MaxSessionsExceeded { .. }
+                ));
             }
             _ => panic!("expected rejection"),
         }

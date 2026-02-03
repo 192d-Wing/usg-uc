@@ -25,8 +25,8 @@
 //! ```
 
 use crate::error::{TurnError, TurnResult};
-use proto_stun::message::{StunClass, StunMessage, StunMessageType, StunMethod};
 use proto_stun::StunAttribute;
+use proto_stun::message::{StunClass, StunMessage, StunMessageType, StunMethod};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -156,11 +156,12 @@ impl TurnClient {
         server: SocketAddr,
         credentials: TurnCredentials,
     ) -> TurnResult<Self> {
-        let socket = UdpSocket::bind(local_addr)
-            .await
-            .map_err(|e| TurnError::AllocationFailed {
-                reason: format!("failed to bind socket: {e}"),
-            })?;
+        let socket =
+            UdpSocket::bind(local_addr)
+                .await
+                .map_err(|e| TurnError::AllocationFailed {
+                    reason: format!("failed to bind socket: {e}"),
+                })?;
 
         Ok(Self::new(Arc::new(socket), server, credentials))
     }
@@ -194,7 +195,10 @@ impl TurnClient {
     /// Returns the current allocation's relayed address, if any.
     pub async fn relayed_addr(&self) -> Option<SocketAddr> {
         let alloc = self.allocation.lock().await;
-        alloc.as_ref().filter(|a| a.is_valid()).map(|a| a.relayed_addr)
+        alloc
+            .as_ref()
+            .filter(|a| a.is_valid())
+            .map(|a| a.relayed_addr)
     }
 
     /// Allocates a relayed transport address.
@@ -343,7 +347,9 @@ impl TurnClient {
         }
 
         // Extract lifetime from response
-        let new_lifetime = self.extract_lifetime(&response).unwrap_or(crate::DEFAULT_LIFETIME);
+        let new_lifetime = self
+            .extract_lifetime(&response)
+            .unwrap_or(crate::DEFAULT_LIFETIME);
 
         // Update allocation
         {
@@ -496,7 +502,11 @@ impl TurnClient {
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
                     // Timeout - retransmit
-                    debug!(attempt = attempts, rto_ms = rto.as_millis(), "Request timed out, retransmitting");
+                    debug!(
+                        attempt = attempts,
+                        rto_ms = rto.as_millis(),
+                        "Request timed out, retransmitting"
+                    );
                     rto = (rto * 2).min(MAX_RTO);
                     attempts += 1;
                 }
@@ -540,21 +550,25 @@ impl TurnClient {
     async fn handle_allocate_response(&self, response: &StunMessage) -> TurnResult<SocketAddr> {
         if response.msg_type.class == StunClass::ErrorResponse {
             let code = self.extract_error_code(response).unwrap_or(500);
-            let reason = self.extract_error_reason(response).unwrap_or_else(|| "unknown".to_string());
+            let reason = self
+                .extract_error_reason(response)
+                .unwrap_or_else(|| "unknown".to_string());
             return Err(TurnError::AllocationFailed {
                 reason: format!("server error {code}: {reason}"),
             });
         }
 
         // Extract XOR-RELAYED-ADDRESS
-        let relayed_addr = self.extract_relayed_address(response).ok_or_else(|| {
-            TurnError::AllocationFailed {
-                reason: "response missing XOR-RELAYED-ADDRESS".to_string(),
-            }
-        })?;
+        let relayed_addr =
+            self.extract_relayed_address(response)
+                .ok_or_else(|| TurnError::AllocationFailed {
+                    reason: "response missing XOR-RELAYED-ADDRESS".to_string(),
+                })?;
 
         // Extract lifetime
-        let lifetime = self.extract_lifetime(response).unwrap_or(crate::DEFAULT_LIFETIME);
+        let lifetime = self
+            .extract_lifetime(response)
+            .unwrap_or(crate::DEFAULT_LIFETIME);
 
         // Store allocation
         {

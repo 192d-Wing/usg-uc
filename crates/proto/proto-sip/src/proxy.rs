@@ -259,10 +259,7 @@ impl RequestForwarder {
         // Check Via count doesn't exceed reasonable limit
         let via_count = self.count_via_headers(request);
         if via_count > MAX_VIA_COUNT {
-            return ProxyValidation::invalid(
-                "Too many Via headers - possible loop",
-                483,
-            );
+            return ProxyValidation::invalid("Too many Via headers - possible loop", 483);
         }
 
         ProxyValidation::valid()
@@ -294,8 +291,8 @@ impl RequestForwarder {
                 let via_host = via.host.to_lowercase();
 
                 // Check if this Via is from us
-                let host_match = via_host == our_host
-                    || self.context.trusted_domains.contains(&via_host);
+                let host_match =
+                    via_host == our_host || self.context.trusted_domains.contains(&via_host);
 
                 let port_match = match (via.port, our_port) {
                     (Some(vp), Some(op)) => vp == op,
@@ -466,9 +463,11 @@ impl RequestForwarder {
         // Sort targets by priority (ascending) and q-value (descending)
         let mut sorted_targets: Vec<_> = targets.iter().collect();
         sorted_targets.sort_by(|a, b| {
-            a.priority
-                .cmp(&b.priority)
-                .then_with(|| b.q_value.partial_cmp(&a.q_value).unwrap_or(std::cmp::Ordering::Equal))
+            a.priority.cmp(&b.priority).then_with(|| {
+                b.q_value
+                    .partial_cmp(&a.q_value)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         });
 
         let mut requests = Vec::with_capacity(sorted_targets.len());
@@ -561,7 +560,10 @@ impl ResponseProcessor {
     /// - Then 2xx responses
     /// - Then lowest numbered response class
     #[must_use]
-    pub fn choose_best_response<'a>(&self, responses: &'a [SipResponse]) -> Option<&'a SipResponse> {
+    pub fn choose_best_response<'a>(
+        &self,
+        responses: &'a [SipResponse],
+    ) -> Option<&'a SipResponse> {
         if responses.is_empty() {
             return None;
         }
@@ -747,17 +749,13 @@ mod tests {
         let context = create_proxy_context();
         let forwarder = RequestForwarder::new(context);
 
-        let target_uri = SipUri::new("biloxi.example.com")
-            .with_user("bob");
+        let target_uri = SipUri::new("biloxi.example.com").with_user("bob");
         let target = ForwardingTarget::new(target_uri);
 
         let forwarded = forwarder.forward_request(&request, &target).unwrap();
 
         // Check Max-Forwards was decremented
-        let mf = forwarded
-            .headers
-            .get(&HeaderName::MaxForwards)
-            .unwrap();
+        let mf = forwarded.headers.get(&HeaderName::MaxForwards).unwrap();
         assert_eq!(mf.value.parse::<u8>().unwrap(), 69);
 
         // Check Via was added
@@ -854,8 +852,8 @@ mod tests {
         let processor = ResponseProcessor::new(context);
 
         let responses = vec![
-            SipResponse::new(crate::response::StatusCode::OK),             // 200
-            SipResponse::new(crate::response::StatusCode::DECLINE),        // 603
+            SipResponse::new(crate::response::StatusCode::OK), // 200
+            SipResponse::new(crate::response::StatusCode::DECLINE), // 603
         ];
 
         let best = processor.choose_best_response(&responses).unwrap();

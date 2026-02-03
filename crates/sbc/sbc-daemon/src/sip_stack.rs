@@ -14,19 +14,19 @@
 //! - **SC-8**: Transmission Confidentiality and Integrity
 
 use bytes::Bytes;
-use proto_sip::{Header, HeaderName, Method, SipMessage, StatusCode};
 use proto_b2bua::{Call, CallId};
 use proto_dialog::{Dialog, DialogId};
 use proto_registrar::{LocationService, Registrar, RegistrarConfig, RegistrarMode};
+use proto_sip::{Header, HeaderName, Method, SipMessage, StatusCode};
 use proto_transaction::{
     ClientInviteTransaction, ClientNonInviteTransaction, ServerInviteTransaction,
     ServerNonInviteTransaction, TransactionKey,
 };
-use uc_types::address::SbcSocketAddr;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+use uc_types::address::SbcSocketAddr;
 
 /// SIP stack for processing SIP messages.
 pub struct SipStack {

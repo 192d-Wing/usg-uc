@@ -49,8 +49,10 @@ pub use fingerprint::CertificateFingerprint;
 pub use handshake::{Handshake, HandshakeState};
 pub use record::{RecordHeader, RecordLayer};
 pub use session::DtlsSession;
-pub use srtp_export::{SrtpKeyExporter, UseSrtpExtension, SRTP_EXPORTER_LABEL};
-pub use verify::{CertificateValidationResult, CertificateValidator, FinishedVerifier, ServerKeyExchangeVerifier};
+pub use srtp_export::{SRTP_EXPORTER_LABEL, SrtpKeyExporter, UseSrtpExtension};
+pub use verify::{
+    CertificateValidationResult, CertificateValidator, FinishedVerifier, ServerKeyExchangeVerifier,
+};
 
 /// DTLS role in the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

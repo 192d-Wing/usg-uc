@@ -29,8 +29,14 @@ fn show_config(args: &Args) -> CommandResult {
     println!("General");
     println!("-------");
     let mut general = HashMap::new();
-    general.insert("Instance Name".to_string(), config.general.instance_name.clone());
-    general.insert("Max Calls".to_string(), config.general.max_calls.to_string());
+    general.insert(
+        "Instance Name".to_string(),
+        config.general.instance_name.clone(),
+    );
+    general.insert(
+        "Max Calls".to_string(),
+        config.general.max_calls.to_string(),
+    );
     general.insert(
         "Max Registrations".to_string(),
         config.general.max_registrations.to_string(),
@@ -41,8 +47,14 @@ fn show_config(args: &Args) -> CommandResult {
     println!("Media");
     println!("-----");
     let mut media = HashMap::new();
-    media.insert("Default Mode".to_string(), format!("{:?}", config.media.default_mode));
-    media.insert("SRTP Required".to_string(), config.media.srtp.required.to_string());
+    media.insert(
+        "Default Mode".to_string(),
+        format!("{:?}", config.media.default_mode),
+    );
+    media.insert(
+        "SRTP Required".to_string(),
+        config.media.srtp.required.to_string(),
+    );
     media.insert(
         "Codecs".to_string(),
         config
@@ -60,8 +72,14 @@ fn show_config(args: &Args) -> CommandResult {
     println!("--------");
     let mut security = HashMap::new();
     security.insert("Curve".to_string(), format!("{:?}", config.security.curve));
-    security.insert("Min TLS".to_string(), config.security.min_tls_version.clone());
-    security.insert("Require mTLS".to_string(), config.security.require_mtls.to_string());
+    security.insert(
+        "Min TLS".to_string(),
+        config.security.min_tls_version.clone(),
+    );
+    security.insert(
+        "Require mTLS".to_string(),
+        config.security.require_mtls.to_string(),
+    );
     println!("{}", formatter.format_map(&security));
 
     Ok(())
@@ -84,7 +102,10 @@ fn validate_config(args: &Args, path: Option<String>) -> CommandResult {
             println!("Summary:");
             let mut summary = HashMap::new();
             summary.insert("Instance".to_string(), config.general.instance_name);
-            summary.insert("Max Calls".to_string(), config.general.max_calls.to_string());
+            summary.insert(
+                "Max Calls".to_string(),
+                config.general.max_calls.to_string(),
+            );
             summary.insert(
                 "Media Mode".to_string(),
                 format!("{:?}", config.media.default_mode),
@@ -93,7 +114,10 @@ fn validate_config(args: &Args, path: Option<String>) -> CommandResult {
             Ok(())
         }
         Err(e) => {
-            println!("{}", formatter.format_status("Configuration invalid", false));
+            println!(
+                "{}",
+                formatter.format_status("Configuration invalid", false)
+            );
             println!();
             Err(CommandError::new(format!("Validation failed: {e}")))
         }
@@ -109,7 +133,10 @@ fn reload_config(args: &Args) -> CommandResult {
 
     // Simulated response
     println!();
-    println!("{}", formatter.format_status("Configuration reloaded", true));
+    println!(
+        "{}",
+        formatter.format_status("Configuration reloaded", true)
+    );
 
     Ok(())
 }

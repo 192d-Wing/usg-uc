@@ -578,9 +578,9 @@ impl HeaderManipulator {
 
             ManipulationCondition::HeaderMissing(name) => headers.get(name).is_none(),
 
-            ManipulationCondition::HeaderContains { name, pattern } => headers
-                .get(name)
-                .is_some_and(|h| h.value.contains(pattern)),
+            ManipulationCondition::HeaderContains { name, pattern } => {
+                headers.get(name).is_some_and(|h| h.value.contains(pattern))
+            }
 
             ManipulationCondition::HeaderEquals { name, value } => {
                 headers.get(name).is_some_and(|h| h.value == *value)
@@ -617,9 +617,7 @@ impl HeaderManipulator {
                 .iter()
                 .all(|c| self.evaluate_condition(c, headers, context)),
 
-            ManipulationCondition::Not(inner) => {
-                !self.evaluate_condition(inner, headers, context)
-            }
+            ManipulationCondition::Not(inner) => !self.evaluate_condition(inner, headers, context),
         }
     }
 
@@ -859,10 +857,16 @@ mod tests {
 
     fn create_test_headers() -> Headers {
         let mut headers = Headers::new();
-        headers.add(Header::new(HeaderName::From, "\"Alice\" <sip:alice@example.com>;tag=abc123"));
+        headers.add(Header::new(
+            HeaderName::From,
+            "\"Alice\" <sip:alice@example.com>;tag=abc123",
+        ));
         headers.add(Header::new(HeaderName::To, "<sip:bob@example.com>"));
         headers.add(Header::new(HeaderName::UserAgent, "OldPhone/1.0"));
-        headers.add(Header::new(HeaderName::Custom("X-Custom".to_string()), "custom-value"));
+        headers.add(Header::new(
+            HeaderName::Custom("X-Custom".to_string()),
+            "custom-value",
+        ));
         headers
     }
 
@@ -871,13 +875,15 @@ mod tests {
         let mut headers = create_test_headers();
         let manipulator = HeaderManipulator::new();
 
-        let action = ManipulationAction::add(
-            HeaderName::Custom("X-New-Header".to_string()),
-            "new-value",
-        );
+        let action =
+            ManipulationAction::add(HeaderName::Custom("X-New-Header".to_string()), "new-value");
         manipulator.apply_action(&action, &mut headers).unwrap();
 
-        assert!(headers.get(&HeaderName::Custom("X-New-Header".to_string())).is_some());
+        assert!(
+            headers
+                .get(&HeaderName::Custom("X-New-Header".to_string()))
+                .is_some()
+        );
     }
 
     #[test]
@@ -930,8 +936,16 @@ mod tests {
         );
         manipulator.apply_action(&action, &mut headers).unwrap();
 
-        assert!(headers.get(&HeaderName::Custom("X-Custom".to_string())).is_none());
-        assert!(headers.get(&HeaderName::Custom("X-Renamed".to_string())).is_some());
+        assert!(
+            headers
+                .get(&HeaderName::Custom("X-Custom".to_string()))
+                .is_none()
+        );
+        assert!(
+            headers
+                .get(&HeaderName::Custom("X-Renamed".to_string()))
+                .is_some()
+        );
     }
 
     #[test]
@@ -946,7 +960,10 @@ mod tests {
         manipulator.apply_action(&action, &mut headers).unwrap();
 
         assert_eq!(
-            headers.get(&HeaderName::Custom("X-Original-UA".to_string())).unwrap().value,
+            headers
+                .get(&HeaderName::Custom("X-Original-UA".to_string()))
+                .unwrap()
+                .value,
             "OldPhone/1.0"
         );
         // Original should still exist
@@ -976,11 +993,7 @@ mod tests {
         let context = ManipulationContext::for_request("INVITE", ManipulationDirection::Outbound);
         let manipulator = HeaderManipulator::new();
 
-        assert!(manipulator.evaluate_condition(
-            &ManipulationCondition::Always,
-            &headers,
-            &context
-        ));
+        assert!(manipulator.evaluate_condition(&ManipulationCondition::Always, &headers, &context));
     }
 
     #[test]
@@ -1155,7 +1168,10 @@ mod tests {
         manipulator.apply(&mut headers, &context).unwrap();
 
         assert_eq!(
-            headers.get(&HeaderName::Custom("X-Trunk".to_string())).unwrap().value,
+            headers
+                .get(&HeaderName::Custom("X-Trunk".to_string()))
+                .unwrap()
+                .value,
             "trunk-a"
         );
 
@@ -1165,7 +1181,11 @@ mod tests {
             .with_trunk("trunk-b");
         manipulator.apply(&mut headers2, &context2).unwrap();
 
-        assert!(headers2.get(&HeaderName::Custom("X-Trunk".to_string())).is_none());
+        assert!(
+            headers2
+                .get(&HeaderName::Custom("X-Trunk".to_string()))
+                .is_none()
+        );
     }
 
     #[test]

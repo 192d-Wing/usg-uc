@@ -59,7 +59,7 @@ pub mod message;
 pub use attribute::{StunAttribute, XorMappedAddress};
 pub use client::StunClient;
 pub use credential::{
-    AuthResult, LongTermCredentialValidator, LongTermCredentials, DEFAULT_NONCE_LIFETIME,
+    AuthResult, DEFAULT_NONCE_LIFETIME, LongTermCredentialValidator, LongTermCredentials,
     MIN_NONCE_LIFETIME,
 };
 pub use error::{StunError, StunResult};

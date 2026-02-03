@@ -61,8 +61,12 @@ pub mod error;
 pub use agent::{IceAgent, IceConfig, IceCredentials, IceRole};
 pub use candidate::{Candidate, CandidateType, TransportProtocol};
 pub use checklist::{CandidatePair, CheckList, PairState};
-pub use connectivity::{CheckResult, ConnectivityCheck, ConnectivityChecker, IceStunServer, TriggeredCheckInfo};
-pub use consent::{ConsentKeepaliveAction, ConsentKeepaliveManager, ConsentState, ConsentTracker, KeepaliveTracker};
+pub use connectivity::{
+    CheckResult, ConnectivityCheck, ConnectivityChecker, IceStunServer, TriggeredCheckInfo,
+};
+pub use consent::{
+    ConsentKeepaliveAction, ConsentKeepaliveManager, ConsentState, ConsentTracker, KeepaliveTracker,
+};
 pub use error::{IceError, IceResult};
 
 /// Default ICE timeout in seconds.
@@ -72,7 +76,8 @@ pub const DEFAULT_TIMEOUT: u64 = 30;
 pub const DEFAULT_TA: u64 = 50;
 
 /// ICE foundation characters.
-pub const FOUNDATION_CHARS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
+pub const FOUNDATION_CHARS: &str =
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
 
 /// Type preference values per RFC 8445 Section 5.1.2.2
 pub mod type_preference {

@@ -198,7 +198,8 @@ impl SendIndication {
 
         while offset + 4 <= attrs_data.len() {
             let attr_type = u16::from_be_bytes([attrs_data[offset], attrs_data[offset + 1]]);
-            let attr_len = u16::from_be_bytes([attrs_data[offset + 2], attrs_data[offset + 3]]) as usize;
+            let attr_len =
+                u16::from_be_bytes([attrs_data[offset + 2], attrs_data[offset + 3]]) as usize;
             offset += 4;
 
             if offset + attr_len > attrs_data.len() {
@@ -207,7 +208,9 @@ impl SendIndication {
 
             let attr_value = &attrs_data[offset..offset + attr_len];
 
-            if let Some(turn_attr) = TurnAttribute::parse(attr_type, attr_value, &msg.transaction_id)? {
+            if let Some(turn_attr) =
+                TurnAttribute::parse(attr_type, attr_value, &msg.transaction_id)?
+            {
                 match turn_attr {
                     TurnAttribute::XorPeerAddress(addr) => peer_address = Some(addr),
                     TurnAttribute::Data(d) => data = Some(d),
@@ -367,7 +370,8 @@ impl DataIndication {
 
         while offset + 4 <= attrs_data.len() {
             let attr_type = u16::from_be_bytes([attrs_data[offset], attrs_data[offset + 1]]);
-            let attr_len = u16::from_be_bytes([attrs_data[offset + 2], attrs_data[offset + 3]]) as usize;
+            let attr_len =
+                u16::from_be_bytes([attrs_data[offset + 2], attrs_data[offset + 3]]) as usize;
             offset += 4;
 
             if offset + attr_len > attrs_data.len() {
@@ -376,7 +380,9 @@ impl DataIndication {
 
             let attr_value = &attrs_data[offset..offset + attr_len];
 
-            if let Some(turn_attr) = TurnAttribute::parse(attr_type, attr_value, &msg.transaction_id)? {
+            if let Some(turn_attr) =
+                TurnAttribute::parse(attr_type, attr_value, &msg.transaction_id)?
+            {
                 match turn_attr {
                     TurnAttribute::XorPeerAddress(addr) => peer_address = Some(addr),
                     TurnAttribute::Data(d) => data = Some(d),

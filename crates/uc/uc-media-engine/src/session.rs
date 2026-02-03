@@ -1,11 +1,11 @@
 //! Media session management.
 
+use crate::MAX_STREAMS_PER_SESSION;
 use crate::error::{MediaError, MediaResult};
 use crate::stream::{MediaStream, StreamConfig, StreamDirection, StreamState};
-use crate::MAX_STREAMS_PER_SESSION;
-use uc_codecs::CodecCapability;
 use std::collections::HashMap;
 use std::time::Instant;
+use uc_codecs::CodecCapability;
 
 /// Media handling mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -430,7 +430,10 @@ mod tests {
             media_type: MediaType::Audio,
             direction: StreamDirection::SendRecv,
             local_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5004),
-            remote_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5004)),
+            remote_addr: Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                5004,
+            )),
             payload_type: 0,
             clock_rate: 8000,
             ssrc: 0x12345678,
@@ -455,10 +458,7 @@ mod tests {
     fn test_codec_negotiation() {
         let mut session = MediaSession::new(test_session_config());
 
-        let remote_codecs = vec![
-            CodecCapability::pcmu(),
-            CodecCapability::opus(111),
-        ];
+        let remote_codecs = vec![CodecCapability::pcmu(), CodecCapability::opus(111)];
 
         session.negotiate_codecs(&remote_codecs).unwrap();
 
@@ -497,7 +497,9 @@ mod tests {
         session.add_b_leg_stream(test_stream_config()).unwrap();
 
         // Negotiate
-        session.negotiate_codecs(&[CodecCapability::pcmu()]).unwrap();
+        session
+            .negotiate_codecs(&[CodecCapability::pcmu()])
+            .unwrap();
         assert_eq!(session.state(), SessionState::Negotiating);
 
         // Activate

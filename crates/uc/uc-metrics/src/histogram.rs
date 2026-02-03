@@ -157,9 +157,7 @@ pub fn linear_buckets(start: f64, width: f64, count: usize) -> Vec<f64> {
 
 /// Helper to create exponential bucket boundaries.
 pub fn exponential_buckets(start: f64, factor: f64, count: usize) -> Vec<f64> {
-    (0..count)
-        .map(|i| start * factor.powi(i as i32))
-        .collect()
+    (0..count).map(|i| start * factor.powi(i as i32)).collect()
 }
 
 #[cfg(test)]
@@ -175,11 +173,8 @@ mod tests {
 
     #[test]
     fn test_histogram_observe() {
-        let histogram = Histogram::with_buckets(
-            "test_histogram",
-            "Test",
-            vec![10.0, 50.0, 100.0, 500.0],
-        );
+        let histogram =
+            Histogram::with_buckets("test_histogram", "Test", vec![10.0, 50.0, 100.0, 500.0]);
 
         histogram.observe(25.0);
         histogram.observe(75.0);
@@ -191,15 +186,11 @@ mod tests {
 
     #[test]
     fn test_histogram_buckets() {
-        let histogram = Histogram::with_buckets(
-            "test_histogram",
-            "Test",
-            vec![10.0, 50.0, 100.0],
-        );
+        let histogram = Histogram::with_buckets("test_histogram", "Test", vec![10.0, 50.0, 100.0]);
 
-        histogram.observe(5.0);   // <= 10, <= 50, <= 100
-        histogram.observe(25.0);  // <= 50, <= 100
-        histogram.observe(75.0);  // <= 100
+        histogram.observe(5.0); // <= 10, <= 50, <= 100
+        histogram.observe(25.0); // <= 50, <= 100
+        histogram.observe(75.0); // <= 100
         histogram.observe(150.0); // none
 
         let counts = histogram.bucket_counts();
@@ -210,11 +201,8 @@ mod tests {
 
     #[test]
     fn test_histogram_mean() {
-        let histogram = Histogram::with_buckets(
-            "test_histogram",
-            "Test",
-            vec![100.0, 200.0, 300.0],
-        );
+        let histogram =
+            Histogram::with_buckets("test_histogram", "Test", vec![100.0, 200.0, 300.0]);
 
         histogram.observe(100.0);
         histogram.observe(200.0);

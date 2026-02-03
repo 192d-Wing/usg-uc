@@ -110,7 +110,9 @@ pub mod forbidden {
 pub fn forbidden_reason(cipher_suite_id: u16) -> Option<&'static str> {
     match cipher_suite_id {
         forbidden::AES_128_GCM_SHA256 => Some("AES-128 forbidden by CNSA 2.0 - requires AES-256"),
-        forbidden::RSA_AES_256_GCM => Some("RSA key exchange not recommended - use ECDHE with P-384"),
+        forbidden::RSA_AES_256_GCM => {
+            Some("RSA key exchange not recommended - use ECDHE with P-384")
+        }
         forbidden::AES_256_CBC_SHA384 => Some("CBC mode not recommended - use AEAD (GCM)"),
         id if id & 0xFF00 == 0xC000 && id < TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 => {
             Some("Cipher suite uses algorithms weaker than CNSA 2.0 requirements")
@@ -138,8 +140,12 @@ mod tests {
     #[test]
     fn test_is_cnsa_compliant() {
         assert!(is_cnsa_compliant(CipherSuiteId::AES_256_GCM_SHA384));
-        assert!(!is_cnsa_compliant(CipherSuiteId(forbidden::AES_128_GCM_SHA256)));
-        assert!(!is_cnsa_compliant(CipherSuiteId(forbidden::RSA_AES_256_GCM)));
+        assert!(!is_cnsa_compliant(CipherSuiteId(
+            forbidden::AES_128_GCM_SHA256
+        )));
+        assert!(!is_cnsa_compliant(CipherSuiteId(
+            forbidden::RSA_AES_256_GCM
+        )));
     }
 
     #[test]

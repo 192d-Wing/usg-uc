@@ -1,8 +1,8 @@
 //! ICE check list and candidate pair management.
 
+use crate::IceRole;
 use crate::candidate::Candidate;
 use crate::error::{IceError, IceResult};
-use crate::IceRole;
 use std::collections::HashMap;
 
 /// State of a candidate pair.
@@ -188,10 +188,7 @@ impl CheckList {
 
         self.pairs.push(pair);
 
-        self.by_component
-            .entry(component)
-            .or_default()
-            .push(index);
+        self.by_component.entry(component).or_default().push(index);
 
         self.by_foundation
             .entry(foundation)
@@ -295,9 +292,12 @@ impl CheckList {
 
     /// Marks a pair as succeeded and handles nomination.
     pub fn mark_succeeded(&mut self, index: usize) -> IceResult<()> {
-        let pair = self.pairs.get_mut(index).ok_or(IceError::InvalidCandidate {
-            reason: "pair index out of bounds".to_string(),
-        })?;
+        let pair = self
+            .pairs
+            .get_mut(index)
+            .ok_or(IceError::InvalidCandidate {
+                reason: "pair index out of bounds".to_string(),
+            })?;
 
         pair.set_state(PairState::Succeeded);
 
@@ -310,9 +310,12 @@ impl CheckList {
 
     /// Marks a pair as failed.
     pub fn mark_failed(&mut self, index: usize) -> IceResult<()> {
-        let pair = self.pairs.get_mut(index).ok_or(IceError::InvalidCandidate {
-            reason: "pair index out of bounds".to_string(),
-        })?;
+        let pair = self
+            .pairs
+            .get_mut(index)
+            .ok_or(IceError::InvalidCandidate {
+                reason: "pair index out of bounds".to_string(),
+            })?;
 
         pair.set_state(PairState::Failed);
 
@@ -340,16 +343,15 @@ impl CheckList {
 
     /// Returns the selected pair for a component.
     pub fn selected_pair(&self, component: u16) -> Option<&CandidatePair> {
-        self.selected.get(&component).and_then(|&i| self.pairs.get(i))
+        self.selected
+            .get(&component)
+            .and_then(|&i| self.pairs.get(i))
     }
 
     /// Checks if all components have a selected pair.
     pub fn is_complete(&self) -> bool {
-        let components: std::collections::HashSet<u16> = self
-            .pairs
-            .iter()
-            .map(|p| p.local().component())
-            .collect();
+        let components: std::collections::HashSet<u16> =
+            self.pairs.iter().map(|p| p.local().component()).collect();
 
         components.iter().all(|c| self.selected.contains_key(c))
     }
@@ -372,10 +374,7 @@ impl CheckList {
             let component = pair.local().component();
             let foundation = pair.foundation().to_string();
 
-            self.by_component
-                .entry(component)
-                .or_default()
-                .push(index);
+            self.by_component.entry(component).or_default().push(index);
 
             self.by_foundation
                 .entry(foundation)
@@ -465,7 +464,8 @@ mod tests {
             CandidateType::ServerReflexive,
         );
 
-        let pair_controlling = CandidatePair::new(local.clone(), remote.clone(), IceRole::Controlling);
+        let pair_controlling =
+            CandidatePair::new(local.clone(), remote.clone(), IceRole::Controlling);
         let pair_controlled = CandidatePair::new(local, remote, IceRole::Controlled);
 
         // Priority should differ based on role when G != D

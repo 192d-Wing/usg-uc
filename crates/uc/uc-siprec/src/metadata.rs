@@ -487,10 +487,7 @@ impl RecordingMetadata {
         // Participants
         xml.push_str("  <participants>\n");
         for participant in &self.participants {
-            xml.push_str(&format!(
-                "    <participant id=\"{}\">\n",
-                participant.id
-            ));
+            xml.push_str(&format!("    <participant id=\"{}\">\n", participant.id));
             xml.push_str(&format!("      <aor>{}</aor>\n", participant.aor));
             if let Some(ref name) = participant.display_name {
                 xml.push_str(&format!("      <name>{name}</name>\n"));
@@ -511,7 +508,10 @@ impl RecordingMetadata {
             if let Some(ref codec) = stream.codec {
                 xml.push_str(&format!("      <codec>{codec}</codec>\n"));
             }
-            xml.push_str(&format!("      <direction>{}</direction>\n", stream.direction));
+            xml.push_str(&format!(
+                "      <direction>{}</direction>\n",
+                stream.direction
+            ));
             if let Some(ssrc) = stream.ssrc {
                 xml.push_str(&format!("      <ssrc>{ssrc}</ssrc>\n"));
             }

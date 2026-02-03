@@ -22,9 +22,24 @@ fn list_calls(_args: &Args) -> CommandResult {
 
     // Simulated call list
     let calls = vec![
-        ("call-001", "sip:alice@example.com", "sip:bob@example.com", "00:05:23"),
-        ("call-002", "sip:charlie@example.com", "sip:dave@example.com", "00:12:45"),
-        ("call-003", "sip:eve@example.com", "sip:frank@example.com", "00:01:12"),
+        (
+            "call-001",
+            "sip:alice@example.com",
+            "sip:bob@example.com",
+            "00:05:23",
+        ),
+        (
+            "call-002",
+            "sip:charlie@example.com",
+            "sip:dave@example.com",
+            "00:12:45",
+        ),
+        (
+            "call-003",
+            "sip:eve@example.com",
+            "sip:frank@example.com",
+            "00:01:12",
+        ),
     ];
 
     if calls.is_empty() {
@@ -65,7 +80,10 @@ fn show_call(args: &Args, call_id: &str) -> CommandResult {
     details.insert("State".to_string(), "Confirmed".to_string());
     details.insert("From".to_string(), "sip:alice@example.com".to_string());
     details.insert("To".to_string(), "sip:bob@example.com".to_string());
-    details.insert("Start Time".to_string(), "2024-01-15 10:30:45 UTC".to_string());
+    details.insert(
+        "Start Time".to_string(),
+        "2024-01-15 10:30:45 UTC".to_string(),
+    );
     details.insert("Duration".to_string(), "00:05:23".to_string());
     details.insert("Codec".to_string(), "Opus".to_string());
     details.insert("SRTP".to_string(), "Enabled (AES-256-GCM)".to_string());

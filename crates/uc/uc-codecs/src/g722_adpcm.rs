@@ -18,9 +18,8 @@
 /// QMF filter coefficients for analysis (encoder).
 /// These are the coefficients from ITU-T G.722 Section 3.2.2
 const QMF_COEFF: [i32; 24] = [
-    3, -11, -11, 53, 12, -156, 32, 362,
-    -210, -805, 951, 3876, 3876, 951, -805, -210,
-    362, 32, -156, 12, 53, -11, -11, 3,
+    3, -11, -11, 53, 12, -156, 32, 362, -210, -805, 951, 3876, 3876, 951, -805, -210, 362, 32,
+    -156, 12, 53, -11, -11, 3,
 ];
 
 /// Lower band quantizer step sizes (6-bit ADPCM).
@@ -37,8 +36,7 @@ const UPPER_STEP_SIZES: [i32; 2] = [256, 256];
 /// Reserved for future enhanced quantization.
 #[allow(dead_code)]
 const LOWER_QUANT_TABLE: [i32; 16] = [
-    -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
 ];
 
 /// G.722 encoder state.

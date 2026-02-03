@@ -155,12 +155,10 @@ impl ConsentTracker {
     pub fn should_check(&self) -> bool {
         match self.state {
             ConsentState::Expired => false,
-            ConsentState::Fresh | ConsentState::Pending => {
-                match self.last_check_sent {
-                    None => true,
-                    Some(t) => t.elapsed() >= self.consent_interval,
-                }
-            }
+            ConsentState::Fresh | ConsentState::Pending => match self.last_check_sent {
+                None => true,
+                Some(t) => t.elapsed() >= self.consent_interval,
+            },
         }
     }
 
@@ -477,10 +475,7 @@ impl ConsentKeepaliveManager {
         self.current_transaction = Some(transaction_id);
         self.consent.check_sent();
 
-        StunMessage::new(
-            StunMessageType::binding_request(),
-            transaction_id,
-        )
+        StunMessage::new(StunMessageType::binding_request(), transaction_id)
     }
 
     /// Processes a STUN response (consent check response or keepalive response).
@@ -566,10 +561,8 @@ mod tests {
 
     #[test]
     fn test_consent_tracker_check_failure() {
-        let mut tracker = ConsentTracker::with_settings(
-            Duration::from_millis(100),
-            Duration::from_millis(300),
-        );
+        let mut tracker =
+            ConsentTracker::with_settings(Duration::from_millis(100), Duration::from_millis(300));
 
         // Fail enough checks to expire
         for _ in 0..tracker.max_failed_checks {
@@ -643,10 +636,8 @@ mod tests {
         let request = manager.create_consent_check();
 
         // Simulate success response
-        let response = StunMessage::new(
-            StunMessageType::binding_response(),
-            request.transaction_id,
-        );
+        let response =
+            StunMessage::new(StunMessageType::binding_response(), request.transaction_id);
         manager.process_response(&response).unwrap();
 
         assert!(manager.is_consented());

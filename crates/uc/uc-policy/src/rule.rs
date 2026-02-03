@@ -338,8 +338,13 @@ mod tests {
 
     #[test]
     fn test_policy_rule_disabled() {
-        let rule = PolicyRule::new("rule-1", "Disabled Rule", Condition::Always, PolicyAction::Allow)
-            .with_enabled(false);
+        let rule = PolicyRule::new(
+            "rule-1",
+            "Disabled Rule",
+            Condition::Always,
+            PolicyAction::Allow,
+        )
+        .with_enabled(false);
 
         let context = test_context();
         let action = rule.evaluate(&context);
@@ -410,8 +415,13 @@ mod tests {
         let mut rule_set = RuleSet::new();
 
         rule_set.add_rule(
-            PolicyRule::new("low", "Low Priority", Condition::Always, PolicyAction::Allow)
-                .with_priority(RulePriority::low()),
+            PolicyRule::new(
+                "low",
+                "Low Priority",
+                Condition::Always,
+                PolicyAction::Allow,
+            )
+            .with_priority(RulePriority::low()),
         );
         rule_set.add_rule(
             PolicyRule::new(
@@ -515,8 +525,13 @@ mod tests {
         );
 
         rule_set.add_rule(
-            PolicyRule::new("allow-second", "Allow Second", Condition::Always, PolicyAction::Allow)
-                .with_priority(RulePriority::normal()),
+            PolicyRule::new(
+                "allow-second",
+                "Allow Second",
+                Condition::Always,
+                PolicyAction::Allow,
+            )
+            .with_priority(RulePriority::normal()),
         );
 
         let context = test_context();

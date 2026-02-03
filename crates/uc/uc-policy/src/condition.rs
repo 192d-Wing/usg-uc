@@ -265,7 +265,10 @@ impl Condition {
                     ConditionMatch::Unknown
                 }
             }
-            Self::TimeOfDay { start_hour, end_hour } => {
+            Self::TimeOfDay {
+                start_hour,
+                end_hour,
+            } => {
                 if let Some(hour) = ctx.current_hour {
                     if hour >= *start_hour && hour <= *end_hour {
                         ConditionMatch::Matched
@@ -496,16 +499,10 @@ mod tests {
     fn test_condition_any() {
         let ctx = RequestContext::new().with_method("INVITE");
 
-        let cond = Condition::Any(vec![
-            Condition::method("INVITE"),
-            Condition::method("BYE"),
-        ]);
+        let cond = Condition::Any(vec![Condition::method("INVITE"), Condition::method("BYE")]);
         assert!(cond.evaluate(&ctx).is_match());
 
-        let cond_fail = Condition::Any(vec![
-            Condition::method("BYE"),
-            Condition::method("CANCEL"),
-        ]);
+        let cond_fail = Condition::Any(vec![Condition::method("BYE"), Condition::method("CANCEL")]);
         assert!(!cond_fail.evaluate(&ctx).is_match());
     }
 

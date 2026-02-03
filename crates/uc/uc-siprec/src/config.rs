@@ -338,11 +338,8 @@ impl RecordingConfig {
     /// Gets available recording servers (primary first, then backup).
     #[must_use]
     pub fn available_servers(&self) -> Vec<&SrsEndpoint> {
-        let mut servers: Vec<&SrsEndpoint> = self
-            .primary_servers
-            .iter()
-            .filter(|s| s.healthy)
-            .collect();
+        let mut servers: Vec<&SrsEndpoint> =
+            self.primary_servers.iter().filter(|s| s.healthy).collect();
 
         if servers.is_empty() {
             // Fall back to backup servers
@@ -370,7 +367,10 @@ mod tests {
             .with_weight(50);
 
         assert_eq!(endpoint.address, "192.168.1.100:5060");
-        assert_eq!(endpoint.sip_uri.as_deref(), Some("sip:recorder@example.com"));
+        assert_eq!(
+            endpoint.sip_uri.as_deref(),
+            Some("sip:recorder@example.com")
+        );
         assert_eq!(endpoint.weight, 50);
         assert!(endpoint.is_primary);
     }
@@ -380,9 +380,12 @@ mod tests {
         let endpoint = SrsEndpoint::new("192.168.1.100:5060");
         assert_eq!(endpoint.effective_uri(), "sip:192.168.1.100:5060");
 
-        let endpoint_with_uri = SrsEndpoint::new("192.168.1.100:5060")
-            .with_sip_uri("sip:recorder@example.com");
-        assert_eq!(endpoint_with_uri.effective_uri(), "sip:recorder@example.com");
+        let endpoint_with_uri =
+            SrsEndpoint::new("192.168.1.100:5060").with_sip_uri("sip:recorder@example.com");
+        assert_eq!(
+            endpoint_with_uri.effective_uri(),
+            "sip:recorder@example.com"
+        );
     }
 
     #[test]

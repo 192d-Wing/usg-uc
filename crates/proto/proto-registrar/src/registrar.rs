@@ -167,7 +167,9 @@ impl RegisterRequest {
 
     /// Parses authorization credentials if present.
     pub fn credentials(&self) -> Option<AuthCredentials> {
-        self.authorization.as_ref().and_then(|a| AuthCredentials::parse(a))
+        self.authorization
+            .as_ref()
+            .and_then(|a| AuthCredentials::parse(a))
     }
 }
 
@@ -417,7 +419,10 @@ impl Registrar {
     }
 
     /// Processes a REGISTER request.
-    pub fn process_register(&mut self, request: RegisterRequest) -> RegistrarResult<RegisterResponse> {
+    pub fn process_register(
+        &mut self,
+        request: RegisterRequest,
+    ) -> RegistrarResult<RegisterResponse> {
         // Check if this is a fetch (no contacts)
         if request.contacts.is_empty() {
             return self.fetch_bindings(&request.aor);
@@ -434,14 +439,14 @@ impl Registrar {
 
             // Check for interval too brief
             if expires > 0 && expires < self.config.min_expires {
-                return Ok(RegisterResponse::interval_too_brief(self.config.min_expires));
+                return Ok(RegisterResponse::interval_too_brief(
+                    self.config.min_expires,
+                ));
             }
 
             if expires == 0 {
                 // Remove binding
-                let _ = self
-                    .location
-                    .remove_binding(&request.aor, &contact.uri);
+                let _ = self.location.remove_binding(&request.aor, &contact.uri);
             } else {
                 // Add or update binding
                 self.add_or_update_binding(&request, contact, expires)?;
@@ -454,18 +459,16 @@ impl Registrar {
 
     /// Fetches current bindings for an AOR.
     fn fetch_bindings(&self, aor: &str) -> RegistrarResult<RegisterResponse> {
-        let bindings: Vec<Binding> = self
-            .location
-            .lookup(aor)
-            .into_iter()
-            .cloned()
-            .collect();
+        let bindings: Vec<Binding> = self.location.lookup(aor).into_iter().cloned().collect();
 
         Ok(RegisterResponse::ok(bindings))
     }
 
     /// Removes all bindings for an AOR.
-    fn remove_all_bindings(&mut self, request: &RegisterRequest) -> RegistrarResult<RegisterResponse> {
+    fn remove_all_bindings(
+        &mut self,
+        request: &RegisterRequest,
+    ) -> RegistrarResult<RegisterResponse> {
         // Wildcard removal requires expires=0
         if request.expires != Some(0) {
             return Ok(RegisterResponse::error(400, "Bad Request"));
@@ -492,12 +495,8 @@ impl Registrar {
             }
         } else {
             // Create new binding
-            let mut binding = Binding::new(
-                &request.aor,
-                &contact.uri,
-                &request.call_id,
-                request.cseq,
-            );
+            let mut binding =
+                Binding::new(&request.aor, &contact.uri, &request.call_id, request.cseq);
             binding.set_expires(expires)?;
 
             if let Some(q) = contact.q_value {
@@ -601,7 +600,10 @@ impl AuthenticatedRegistrar {
     ///
     /// If authentication is required and credentials are missing or invalid,
     /// returns a 401 Unauthorized response with a challenge.
-    pub fn process_register(&mut self, request: RegisterRequest) -> RegistrarResult<RegisterResponse> {
+    pub fn process_register(
+        &mut self,
+        request: RegisterRequest,
+    ) -> RegistrarResult<RegisterResponse> {
         let config = self.registrar.config();
 
         // Check if authentication is required
@@ -625,7 +627,10 @@ impl AuthenticatedRegistrar {
                     return Ok(RegisterResponse::unauthorized(&challenge));
                 }
                 AuthResult::Failed { reason } => {
-                    return Ok(RegisterResponse::error(403, format!("Forbidden: {}", reason)));
+                    return Ok(RegisterResponse::error(
+                        403,
+                        format!("Forbidden: {}", reason),
+                    ));
                 }
             }
         }
@@ -719,10 +724,8 @@ mod tests {
     fn test_process_register() {
         let mut registrar = Registrar::with_defaults();
 
-        let request = test_register_request(
-            "sip:alice@example.com",
-            "sip:alice@192.168.1.100:5060",
-        );
+        let request =
+            test_register_request("sip:alice@example.com", "sip:alice@192.168.1.100:5060");
 
         let response = registrar.process_register(request).unwrap();
         assert!(response.success);
@@ -759,10 +762,8 @@ mod tests {
         let mut registrar = Registrar::with_defaults();
 
         // First register
-        let request = test_register_request(
-            "sip:alice@example.com",
-            "sip:alice@192.168.1.100:5060",
-        );
+        let request =
+            test_register_request("sip:alice@example.com", "sip:alice@192.168.1.100:5060");
         registrar.process_register(request).unwrap();
 
         // Then fetch (no contacts)
@@ -788,10 +789,8 @@ mod tests {
         let mut registrar = Registrar::with_defaults();
 
         // First register
-        let request = test_register_request(
-            "sip:alice@example.com",
-            "sip:alice@192.168.1.100:5060",
-        );
+        let request =
+            test_register_request("sip:alice@example.com", "sip:alice@192.168.1.100:5060");
         registrar.process_register(request).unwrap();
 
         // Then remove with expires=0
@@ -817,10 +816,8 @@ mod tests {
         let mut registrar = Registrar::with_defaults();
 
         // First register
-        let request = test_register_request(
-            "sip:alice@example.com",
-            "sip:alice@192.168.1.100:5060",
-        );
+        let request =
+            test_register_request("sip:alice@example.com", "sip:alice@192.168.1.100:5060");
         registrar.process_register(request).unwrap();
 
         // Remove all with wildcard
@@ -885,8 +882,7 @@ mod tests {
         // Update with higher CSeq
         let request2 = RegisterRequest {
             aor: "sip:alice@example.com".to_string(),
-            contacts: vec![ContactInfo::new("sip:alice@192.168.1.100:5060")
-                .with_q_value(0.5)],
+            contacts: vec![ContactInfo::new("sip:alice@192.168.1.100:5060").with_q_value(0.5)],
             call_id: "call-123@client".to_string(),
             cseq: 2,
             expires: Some(7200),

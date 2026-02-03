@@ -312,8 +312,11 @@ impl IceAgent {
         // Form pairs with existing local candidates
         for local in &self.local_candidates {
             if self.can_pair(local, &candidate) {
-                let pair =
-                    crate::checklist::CandidatePair::new(local.clone(), candidate.clone(), self.role);
+                let pair = crate::checklist::CandidatePair::new(
+                    local.clone(),
+                    candidate.clone(),
+                    self.role,
+                );
                 self.checklist.add_pair(pair);
             }
         }
@@ -424,9 +427,12 @@ impl IceAgent {
 
         // Create STUN client and discover srflx address
         let client = StunClient::new(Arc::new(socket), stun_server);
-        let srflx_addr = client.discover_srflx().await.map_err(|e| IceError::NetworkError {
-            reason: format!("STUN discovery failed: {e}"),
-        })?;
+        let srflx_addr = client
+            .discover_srflx()
+            .await
+            .map_err(|e| IceError::NetworkError {
+                reason: format!("STUN discovery failed: {e}"),
+            })?;
 
         debug!(
             srflx_addr = %srflx_addr,
@@ -474,9 +480,12 @@ impl IceAgent {
 
         // Create TURN client and allocate relay address
         let client = TurnClient::new(Arc::new(socket), turn_config.address, credentials);
-        let relay_addr = client.allocate().await.map_err(|e| IceError::NetworkError {
-            reason: format!("TURN allocation failed: {e}"),
-        })?;
+        let relay_addr = client
+            .allocate()
+            .await
+            .map_err(|e| IceError::NetworkError {
+                reason: format!("TURN allocation failed: {e}"),
+            })?;
 
         debug!(
             relay_addr = %relay_addr,
@@ -505,11 +514,8 @@ impl IceAgent {
         }
 
         // Form the check list
-        self.checklist = CheckList::form_pairs(
-            &self.local_candidates,
-            &self.remote_candidates,
-            self.role,
-        );
+        self.checklist =
+            CheckList::form_pairs(&self.local_candidates, &self.remote_candidates, self.role);
 
         if self.checklist.is_empty() {
             return Err(IceError::NoCandidates);
@@ -527,9 +533,12 @@ impl IceAgent {
 
     /// Marks a connectivity check as started.
     pub fn start_check(&mut self, pair_index: usize) -> IceResult<()> {
-        let pair = self.checklist.get_mut(pair_index).ok_or(IceError::InvalidCandidate {
-            reason: "invalid pair index".to_string(),
-        })?;
+        let pair = self
+            .checklist
+            .get_mut(pair_index)
+            .ok_or(IceError::InvalidCandidate {
+                reason: "invalid pair index".to_string(),
+            })?;
 
         pair.set_state(PairState::InProgress);
         pair.increment_check_attempts();
@@ -547,9 +556,12 @@ impl IceAgent {
         }
 
         // Check if we should select this pair
-        let pair = self.checklist.get(pair_index).ok_or(IceError::InvalidCandidate {
-            reason: "invalid pair index".to_string(),
-        })?;
+        let pair = self
+            .checklist
+            .get(pair_index)
+            .ok_or(IceError::InvalidCandidate {
+                reason: "invalid pair index".to_string(),
+            })?;
         let component = pair.local().component();
 
         // If no pair selected for this component, select this one
@@ -585,9 +597,12 @@ impl IceAgent {
             });
         }
 
-        let pair = self.checklist.get_mut(pair_index).ok_or(IceError::InvalidCandidate {
-            reason: "invalid pair index".to_string(),
-        })?;
+        let pair = self
+            .checklist
+            .get_mut(pair_index)
+            .ok_or(IceError::InvalidCandidate {
+                reason: "invalid pair index".to_string(),
+            })?;
 
         if pair.state() != PairState::Succeeded {
             return Err(IceError::InvalidStateTransition {
@@ -798,9 +813,10 @@ mod tests {
         let config = IceConfig::default();
         let mut agent = IceAgent::controlling(config);
 
-        let local_addrs = vec![
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5060),
-        ];
+        let local_addrs = vec![SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)),
+            5060,
+        )];
 
         agent.gather_candidates(&local_addrs).unwrap();
 
@@ -947,7 +963,10 @@ mod tests {
             .attributes
             .iter()
             .any(|a| matches!(a, proto_stun::StunAttribute::UseCandidate));
-        assert!(has_use_candidate, "Aggressive nomination should set USE-CANDIDATE");
+        assert!(
+            has_use_candidate,
+            "Aggressive nomination should set USE-CANDIDATE"
+        );
     }
 
     #[test]
@@ -977,7 +996,10 @@ mod tests {
             .attributes
             .iter()
             .any(|a| matches!(a, proto_stun::StunAttribute::UseCandidate));
-        assert!(!has_use_candidate, "Regular nomination should not set USE-CANDIDATE initially");
+        assert!(
+            !has_use_candidate,
+            "Regular nomination should not set USE-CANDIDATE initially"
+        );
     }
 
     #[test]
@@ -1010,7 +1032,10 @@ mod tests {
             .attributes
             .iter()
             .any(|a| matches!(a, proto_stun::StunAttribute::UseCandidate));
-        assert!(has_use_candidate, "Explicit nomination should set USE-CANDIDATE");
+        assert!(
+            has_use_candidate,
+            "Explicit nomination should set USE-CANDIDATE"
+        );
     }
 
     #[test]

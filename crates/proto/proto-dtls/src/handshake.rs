@@ -17,15 +17,17 @@
 //! - **SC-13**: Cryptographic Protection
 
 use crate::error::{DtlsError, DtlsResult};
-use crate::record::{ContentType, RecordLayer, DTLS_1_2_VERSION, RECORD_HEADER_LEN};
-use crate::verify::{CertificateValidationResult, CertificateValidator, FinishedVerifier, ServerKeyExchangeVerifier};
+use crate::record::{ContentType, DTLS_1_2_VERSION, RECORD_HEADER_LEN, RecordLayer};
+use crate::verify::{
+    CertificateValidationResult, CertificateValidator, FinishedVerifier, ServerKeyExchangeVerifier,
+};
+use std::sync::Arc;
+use tokio::net::UdpSocket;
+use tokio::time::{Duration, timeout};
+use tracing::debug;
 use uc_crypto::aead::Aes256GcmKey;
 use uc_crypto::ecdh::P384EphemeralKeyPair;
 use uc_crypto::hkdf;
-use std::sync::Arc;
-use tokio::net::UdpSocket;
-use tokio::time::{timeout, Duration};
-use tracing::debug;
 
 /// TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 cipher suite ID.
 pub const TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384: u16 = 0xC02C;
@@ -282,9 +284,11 @@ impl Handshake {
         handshake_timeout: Duration,
     ) -> DtlsResult<()> {
         let result = if self.is_client {
-            self.perform_client_handshake(socket, handshake_timeout).await
+            self.perform_client_handshake(socket, handshake_timeout)
+                .await
         } else {
-            self.perform_server_handshake(socket, handshake_timeout).await
+            self.perform_server_handshake(socket, handshake_timeout)
+                .await
         };
 
         if result.is_err() {
@@ -304,21 +308,31 @@ impl Handshake {
 
         // Send ClientHello
         let client_hello = self.build_client_hello()?;
-        self.send_handshake_message(socket, HandshakeType::ClientHello, &client_hello).await?;
+        self.send_handshake_message(socket, HandshakeType::ClientHello, &client_hello)
+            .await?;
         self.state = HandshakeState::WaitHelloVerifyRequest;
 
         // Receive HelloVerifyRequest or ServerHello
-        let msg = self.recv_handshake_message(socket, handshake_timeout).await?;
+        let msg = self
+            .recv_handshake_message(socket, handshake_timeout)
+            .await?;
 
         if msg.0 == HandshakeType::HelloVerifyRequest {
             // Extract cookie and resend ClientHello
             self.process_hello_verify_request(&msg.1)?;
 
             let client_hello_with_cookie = self.build_client_hello()?;
-            self.send_handshake_message(socket, HandshakeType::ClientHello, &client_hello_with_cookie).await?;
+            self.send_handshake_message(
+                socket,
+                HandshakeType::ClientHello,
+                &client_hello_with_cookie,
+            )
+            .await?;
 
             // Wait for ServerHello
-            let server_hello_msg = self.recv_handshake_message(socket, handshake_timeout).await?;
+            let server_hello_msg = self
+                .recv_handshake_message(socket, handshake_timeout)
+                .await?;
             if server_hello_msg.0 != HandshakeType::ServerHello {
                 return Err(DtlsError::HandshakeFailed {
                     reason: format!("expected ServerHello, got {:?}", server_hello_msg.0),
@@ -329,14 +343,19 @@ impl Handshake {
             self.process_server_hello(&msg.1)?;
         } else {
             return Err(DtlsError::HandshakeFailed {
-                reason: format!("expected HelloVerifyRequest or ServerHello, got {:?}", msg.0),
+                reason: format!(
+                    "expected HelloVerifyRequest or ServerHello, got {:?}",
+                    msg.0
+                ),
             });
         }
 
         self.state = HandshakeState::WaitCertificate;
 
         // Receive Certificate
-        let cert_msg = self.recv_handshake_message(socket, handshake_timeout).await?;
+        let cert_msg = self
+            .recv_handshake_message(socket, handshake_timeout)
+            .await?;
         if cert_msg.0 != HandshakeType::Certificate {
             return Err(DtlsError::HandshakeFailed {
                 reason: format!("expected Certificate, got {:?}", cert_msg.0),
@@ -346,7 +365,9 @@ impl Handshake {
         self.process_certificate(&cert_msg.1)?;
 
         // Receive ServerKeyExchange
-        let ske_msg = self.recv_handshake_message(socket, handshake_timeout).await?;
+        let ske_msg = self
+            .recv_handshake_message(socket, handshake_timeout)
+            .await?;
         if ske_msg.0 != HandshakeType::ServerKeyExchange {
             return Err(DtlsError::HandshakeFailed {
                 reason: format!("expected ServerKeyExchange, got {:?}", ske_msg.0),
@@ -355,7 +376,9 @@ impl Handshake {
         self.process_server_key_exchange(&ske_msg.1)?;
 
         // Receive ServerHelloDone
-        let shd_msg = self.recv_handshake_message(socket, handshake_timeout).await?;
+        let shd_msg = self
+            .recv_handshake_message(socket, handshake_timeout)
+            .await?;
         if shd_msg.0 != HandshakeType::ServerHelloDone {
             return Err(DtlsError::HandshakeFailed {
                 reason: format!("expected ServerHelloDone, got {:?}", shd_msg.0),
@@ -364,7 +387,8 @@ impl Handshake {
 
         // Generate and send ClientKeyExchange
         let cke = self.build_client_key_exchange()?;
-        self.send_handshake_message(socket, HandshakeType::ClientKeyExchange, &cke).await?;
+        self.send_handshake_message(socket, HandshakeType::ClientKeyExchange, &cke)
+            .await?;
 
         // Derive keys
         self.derive_keys()?;
@@ -377,7 +401,8 @@ impl Handshake {
 
         // Send Finished
         let finished = self.build_finished()?;
-        self.send_handshake_message(socket, HandshakeType::Finished, &finished).await?;
+        self.send_handshake_message(socket, HandshakeType::Finished, &finished)
+            .await?;
 
         self.state = HandshakeState::WaitChangeCipherSpec;
 
@@ -390,7 +415,9 @@ impl Handshake {
         }
 
         // Receive Finished
-        let fin_msg = self.recv_handshake_message(socket, handshake_timeout).await?;
+        let fin_msg = self
+            .recv_handshake_message(socket, handshake_timeout)
+            .await?;
         if fin_msg.0 != HandshakeType::Finished {
             return Err(DtlsError::HandshakeFailed {
                 reason: format!("expected Finished, got {:?}", fin_msg.0),
@@ -414,7 +441,9 @@ impl Handshake {
         debug!("Starting server handshake");
 
         // Receive ClientHello
-        let ch_msg = self.recv_handshake_message(socket, handshake_timeout).await?;
+        let ch_msg = self
+            .recv_handshake_message(socket, handshake_timeout)
+            .await?;
         if ch_msg.0 != HandshakeType::ClientHello {
             return Err(DtlsError::HandshakeFailed {
                 reason: format!("expected ClientHello, got {:?}", ch_msg.0),
@@ -424,10 +453,13 @@ impl Handshake {
 
         // Send HelloVerifyRequest with cookie
         let hvr = self.build_hello_verify_request()?;
-        self.send_handshake_message(socket, HandshakeType::HelloVerifyRequest, &hvr).await?;
+        self.send_handshake_message(socket, HandshakeType::HelloVerifyRequest, &hvr)
+            .await?;
 
         // Receive ClientHello with cookie
-        let ch_msg2 = self.recv_handshake_message(socket, handshake_timeout).await?;
+        let ch_msg2 = self
+            .recv_handshake_message(socket, handshake_timeout)
+            .await?;
         if ch_msg2.0 != HandshakeType::ClientHello {
             return Err(DtlsError::HandshakeFailed {
                 reason: format!("expected ClientHello, got {:?}", ch_msg2.0),
@@ -437,23 +469,29 @@ impl Handshake {
 
         // Send ServerHello
         let sh = self.build_server_hello()?;
-        self.send_handshake_message(socket, HandshakeType::ServerHello, &sh).await?;
+        self.send_handshake_message(socket, HandshakeType::ServerHello, &sh)
+            .await?;
 
         // Send Certificate
         let cert = self.build_certificate()?;
-        self.send_handshake_message(socket, HandshakeType::Certificate, &cert).await?;
+        self.send_handshake_message(socket, HandshakeType::Certificate, &cert)
+            .await?;
 
         // Send ServerKeyExchange
         let ske = self.build_server_key_exchange()?;
-        self.send_handshake_message(socket, HandshakeType::ServerKeyExchange, &ske).await?;
+        self.send_handshake_message(socket, HandshakeType::ServerKeyExchange, &ske)
+            .await?;
 
         // Send ServerHelloDone
-        self.send_handshake_message(socket, HandshakeType::ServerHelloDone, &[]).await?;
+        self.send_handshake_message(socket, HandshakeType::ServerHelloDone, &[])
+            .await?;
 
         self.state = HandshakeState::WaitClientKeyExchange;
 
         // Receive ClientKeyExchange
-        let cke_msg = self.recv_handshake_message(socket, handshake_timeout).await?;
+        let cke_msg = self
+            .recv_handshake_message(socket, handshake_timeout)
+            .await?;
         if cke_msg.0 != HandshakeType::ClientKeyExchange {
             return Err(DtlsError::HandshakeFailed {
                 reason: format!("expected ClientKeyExchange, got {:?}", cke_msg.0),
@@ -479,7 +517,9 @@ impl Handshake {
         self.activate_cipher()?;
 
         // Receive Finished
-        let fin_msg = self.recv_handshake_message(socket, handshake_timeout).await?;
+        let fin_msg = self
+            .recv_handshake_message(socket, handshake_timeout)
+            .await?;
         if fin_msg.0 != HandshakeType::Finished {
             return Err(DtlsError::HandshakeFailed {
                 reason: format!("expected Finished, got {:?}", fin_msg.0),
@@ -493,7 +533,8 @@ impl Handshake {
 
         // Send Finished
         let finished = self.build_finished()?;
-        self.send_handshake_message(socket, HandshakeType::Finished, &finished).await?;
+        self.send_handshake_message(socket, HandshakeType::Finished, &finished)
+            .await?;
 
         self.state = HandshakeState::Complete;
         debug!("Server handshake complete");
@@ -582,7 +623,10 @@ impl Handshake {
             return Err(DtlsError::UnsupportedCipherSuite(cipher_suite));
         }
 
-        debug!("ServerHello processed, cipher suite: 0x{:04X}", cipher_suite);
+        debug!(
+            "ServerHello processed, cipher suite: 0x{:04X}",
+            cipher_suite
+        );
         Ok(())
     }
 
@@ -640,10 +684,8 @@ impl Handshake {
     fn build_hello_verify_request(&mut self) -> DtlsResult<Vec<u8>> {
         // Generate cookie
         let mut cookie = [0u8; 32];
-        uc_crypto::random::fill_random(&mut cookie).map_err(|e| {
-            DtlsError::HandshakeFailed {
-                reason: format!("failed to generate cookie: {e}"),
-            }
+        uc_crypto::random::fill_random(&mut cookie).map_err(|e| DtlsError::HandshakeFailed {
+            reason: format!("failed to generate cookie: {e}"),
         })?;
         self.cookie = cookie.to_vec();
 
@@ -685,9 +727,7 @@ impl Handshake {
         let mut msg = Vec::new();
 
         // Calculate total certificates length
-        let total_len: usize = self.local_cert_chain.iter()
-            .map(|c| 3 + c.len())
-            .sum();
+        let total_len: usize = self.local_cert_chain.iter().map(|c| 3 + c.len()).sum();
 
         // Certificates length (3 bytes)
         let len_bytes = (total_len as u32).to_be_bytes();
@@ -706,10 +746,8 @@ impl Handshake {
     /// Builds a ServerKeyExchange message.
     fn build_server_key_exchange(&mut self) -> DtlsResult<Vec<u8>> {
         // Generate ECDHE key pair
-        let ecdhe = P384EphemeralKeyPair::generate().map_err(|e| {
-            DtlsError::HandshakeFailed {
-                reason: format!("failed to generate ECDHE key: {e}"),
-            }
+        let ecdhe = P384EphemeralKeyPair::generate().map_err(|e| DtlsError::HandshakeFailed {
+            reason: format!("failed to generate ECDHE key: {e}"),
         })?;
 
         let public_key = ecdhe.public_key_bytes().to_vec();
@@ -736,16 +774,18 @@ impl Handshake {
         signed_data.extend_from_slice(&msg);
 
         // Sign with ECDSA P-384
-        let keypair = uc_crypto::ecdsa::P384KeyPair::from_pkcs8(&self.local_private_key)
-            .map_err(|e| DtlsError::HandshakeFailed {
-                reason: format!("invalid private key: {e}"),
+        let keypair =
+            uc_crypto::ecdsa::P384KeyPair::from_pkcs8(&self.local_private_key).map_err(|e| {
+                DtlsError::HandshakeFailed {
+                    reason: format!("invalid private key: {e}"),
+                }
             })?;
 
-        let signature = keypair.sign(&signed_data).map_err(|e| {
-            DtlsError::HandshakeFailed {
+        let signature = keypair
+            .sign(&signed_data)
+            .map_err(|e| DtlsError::HandshakeFailed {
                 reason: format!("signing failed: {e}"),
-            }
-        })?;
+            })?;
 
         // Signature algorithm: ecdsa_secp384r1_sha384 (0x0503)
         msg.extend_from_slice(&[0x05, 0x03]);
@@ -799,7 +839,8 @@ impl Handshake {
             let sig_offset = 4 + pk_len;
             // Signature algorithm (2 bytes) + signature length (2 bytes) + signature
             if data.len() >= sig_offset + 4 {
-                let sig_len = u16::from_be_bytes([data[sig_offset + 2], data[sig_offset + 3]]) as usize;
+                let sig_len =
+                    u16::from_be_bytes([data[sig_offset + 2], data[sig_offset + 3]]) as usize;
                 if data.len() >= sig_offset + 4 + sig_len {
                     let signature = &data[sig_offset + 4..sig_offset + 4 + sig_len];
 
@@ -854,7 +895,8 @@ impl Handshake {
                 });
             }
 
-            let cert_len = u32::from_be_bytes([0, data[offset], data[offset + 1], data[offset + 2]]) as usize;
+            let cert_len =
+                u32::from_be_bytes([0, data[offset], data[offset + 1], data[offset + 2]]) as usize;
             offset += 3;
 
             if offset + cert_len > data.len() {
@@ -922,7 +964,11 @@ impl Handshake {
         FinishedVerifier::verify(data, &master_secret, &handshake_hash, is_client_finished)?;
 
         debug!(
-            role = if is_client_finished { "client" } else { "server" },
+            role = if is_client_finished {
+                "client"
+            } else {
+                "server"
+            },
             "Finished message verified"
         );
         Ok(())
@@ -931,10 +977,8 @@ impl Handshake {
     /// Builds a ClientKeyExchange message.
     fn build_client_key_exchange(&mut self) -> DtlsResult<Vec<u8>> {
         // Generate ECDHE key pair
-        let ecdhe = P384EphemeralKeyPair::generate().map_err(|e| {
-            DtlsError::HandshakeFailed {
-                reason: format!("failed to generate ECDHE key: {e}"),
-            }
+        let ecdhe = P384EphemeralKeyPair::generate().map_err(|e| DtlsError::HandshakeFailed {
+            reason: format!("failed to generate ECDHE key: {e}"),
         })?;
 
         let public_key = ecdhe.public_key_bytes().to_vec();
@@ -972,20 +1016,27 @@ impl Handshake {
     /// Derives the master secret and traffic keys.
     fn derive_keys(&mut self) -> DtlsResult<()> {
         // Take the ECDHE key pair (consumes it for the agreement)
-        let ecdhe = self.local_ecdhe.take().ok_or(DtlsError::KeyDerivationFailed {
-            reason: "no local ECDHE key".to_string(),
-        })?;
+        let ecdhe = self
+            .local_ecdhe
+            .take()
+            .ok_or(DtlsError::KeyDerivationFailed {
+                reason: "no local ECDHE key".to_string(),
+            })?;
 
-        let peer_public = self.peer_ecdhe_public.as_ref().ok_or(DtlsError::KeyDerivationFailed {
-            reason: "no peer ECDHE public key".to_string(),
-        })?;
+        let peer_public =
+            self.peer_ecdhe_public
+                .as_ref()
+                .ok_or(DtlsError::KeyDerivationFailed {
+                    reason: "no peer ECDHE public key".to_string(),
+                })?;
 
         // Compute shared secret (consumes the ephemeral key)
-        let shared_secret = ecdhe.agree(peer_public).map_err(|e| {
-            DtlsError::KeyDerivationFailed {
-                reason: format!("ECDHE key agreement failed: {e}"),
-            }
-        })?;
+        let shared_secret =
+            ecdhe
+                .agree(peer_public)
+                .map_err(|e| DtlsError::KeyDerivationFailed {
+                    reason: format!("ECDHE key agreement failed: {e}"),
+                })?;
 
         let shared_bytes = shared_secret.as_bytes().to_vec();
         self.premaster_secret = Some(shared_bytes.clone());
@@ -1018,43 +1069,47 @@ impl Handshake {
         // For AES-256-GCM: 32 byte key + 4 byte IV for each direction
         let key_material = prf_sha384(&master_secret, b"key expansion", &seed, 72)?;
 
-        let client_key_bytes: [u8; 32] = key_material[0..32].try_into().map_err(|_| {
-            DtlsError::KeyDerivationFailed {
-                reason: "key slice error".to_string(),
-            }
-        })?;
-        let server_key_bytes: [u8; 32] = key_material[32..64].try_into().map_err(|_| {
-            DtlsError::KeyDerivationFailed {
-                reason: "key slice error".to_string(),
-            }
-        })?;
-        let client_iv: [u8; 4] = key_material[64..68].try_into().map_err(|_| {
-            DtlsError::KeyDerivationFailed {
-                reason: "IV slice error".to_string(),
-            }
-        })?;
-        let server_iv: [u8; 4] = key_material[68..72].try_into().map_err(|_| {
-            DtlsError::KeyDerivationFailed {
-                reason: "IV slice error".to_string(),
-            }
-        })?;
+        let client_key_bytes: [u8; 32] =
+            key_material[0..32]
+                .try_into()
+                .map_err(|_| DtlsError::KeyDerivationFailed {
+                    reason: "key slice error".to_string(),
+                })?;
+        let server_key_bytes: [u8; 32] =
+            key_material[32..64]
+                .try_into()
+                .map_err(|_| DtlsError::KeyDerivationFailed {
+                    reason: "key slice error".to_string(),
+                })?;
+        let client_iv: [u8; 4] =
+            key_material[64..68]
+                .try_into()
+                .map_err(|_| DtlsError::KeyDerivationFailed {
+                    reason: "IV slice error".to_string(),
+                })?;
+        let server_iv: [u8; 4] =
+            key_material[68..72]
+                .try_into()
+                .map_err(|_| DtlsError::KeyDerivationFailed {
+                    reason: "IV slice error".to_string(),
+                })?;
 
-        let client_key = Aes256GcmKey::new(client_key_bytes).map_err(|e| {
-            DtlsError::KeyDerivationFailed {
+        let client_key =
+            Aes256GcmKey::new(client_key_bytes).map_err(|e| DtlsError::KeyDerivationFailed {
                 reason: format!("invalid client key: {e}"),
-            }
-        })?;
-        let server_key = Aes256GcmKey::new(server_key_bytes).map_err(|e| {
-            DtlsError::KeyDerivationFailed {
+            })?;
+        let server_key =
+            Aes256GcmKey::new(server_key_bytes).map_err(|e| DtlsError::KeyDerivationFailed {
                 reason: format!("invalid server key: {e}"),
-            }
-        })?;
+            })?;
 
         // Activate cipher with correct key direction based on role
         if self.is_client {
-            self.record_layer.activate_cipher(client_key, server_key, client_iv, server_iv);
+            self.record_layer
+                .activate_cipher(client_key, server_key, client_iv, server_iv);
         } else {
-            self.record_layer.activate_cipher(server_key, client_key, server_iv, client_iv);
+            self.record_layer
+                .activate_cipher(server_key, client_key, server_iv, client_iv);
         }
 
         debug!("Cipher activated");
@@ -1107,12 +1162,17 @@ impl Handshake {
         self.handshake_hash.extend_from_slice(&fragment);
 
         // Encrypt and frame
-        let record = self.record_layer.encrypt_record(ContentType::Handshake, &fragment)?;
+        let record = self
+            .record_layer
+            .encrypt_record(ContentType::Handshake, &fragment)?;
 
         // Send
-        socket.send(&record).await.map_err(|e| DtlsError::SendFailed {
-            reason: e.to_string(),
-        })?;
+        socket
+            .send(&record)
+            .await
+            .map_err(|e| DtlsError::SendFailed {
+                reason: e.to_string(),
+            })?;
 
         debug!(msg_type = ?msg_type, len = payload.len(), "Sent handshake message");
         Ok(())
@@ -1120,10 +1180,15 @@ impl Handshake {
 
     /// Sends a ChangeCipherSpec message.
     async fn send_change_cipher_spec(&mut self, socket: &Arc<UdpSocket>) -> DtlsResult<()> {
-        let record = self.record_layer.encrypt_record(ContentType::ChangeCipherSpec, &[1])?;
-        socket.send(&record).await.map_err(|e| DtlsError::SendFailed {
-            reason: e.to_string(),
-        })?;
+        let record = self
+            .record_layer
+            .encrypt_record(ContentType::ChangeCipherSpec, &[1])?;
+        socket
+            .send(&record)
+            .await
+            .map_err(|e| DtlsError::SendFailed {
+                reason: e.to_string(),
+            })?;
         debug!("Sent ChangeCipherSpec");
         Ok(())
     }
@@ -1268,9 +1333,18 @@ mod tests {
 
     #[test]
     fn test_handshake_type_conversion() {
-        assert_eq!(HandshakeType::try_from(1).unwrap(), HandshakeType::ClientHello);
-        assert_eq!(HandshakeType::try_from(2).unwrap(), HandshakeType::ServerHello);
-        assert_eq!(HandshakeType::try_from(20).unwrap(), HandshakeType::Finished);
+        assert_eq!(
+            HandshakeType::try_from(1).unwrap(),
+            HandshakeType::ClientHello
+        );
+        assert_eq!(
+            HandshakeType::try_from(2).unwrap(),
+            HandshakeType::ServerHello
+        );
+        assert_eq!(
+            HandshakeType::try_from(20).unwrap(),
+            HandshakeType::Finished
+        );
         assert!(HandshakeType::try_from(99).is_err());
     }
 

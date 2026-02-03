@@ -46,8 +46,8 @@ pub mod tls;
 pub use error::{TransportError, TransportResult};
 pub use listener::TransportListener;
 pub use qos::{
-    apply_dscp, apply_qos_config, DscpValue, QosConfig, QosPolicyManager, TrafficType,
-    TrunkQosPolicy,
+    DscpValue, QosConfig, QosPolicyManager, TrafficType, TrunkQosPolicy, apply_dscp,
+    apply_qos_config,
 };
 pub use uc_types::address::{SbcSocketAddr, TransportType};
 

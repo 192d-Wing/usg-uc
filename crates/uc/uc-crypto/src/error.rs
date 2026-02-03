@@ -5,8 +5,8 @@
 //! Error messages are designed to provide sufficient diagnostic information
 //! without leaking sensitive cryptographic details that could aid attackers.
 
-use uc_types::error::CryptoError as TypesCryptoError;
 use thiserror::Error;
+use uc_types::error::CryptoError as TypesCryptoError;
 
 /// Result type for cryptographic operations.
 pub type CryptoResult<T> = Result<T, CryptoError>;

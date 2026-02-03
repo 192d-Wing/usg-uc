@@ -255,11 +255,7 @@ pub fn compute_request_target(
                 // Append original Request-URI to end of route set
                 remaining.push(RouteEntry::new(request_uri.clone()));
 
-                (
-                    first.uri.clone(),
-                    first.uri.clone(),
-                    remaining,
-                )
+                (first.uri.clone(), first.uri.clone(), remaining)
             } else {
                 (request_uri.clone(), request_uri.clone(), RouteSet::new())
             }
@@ -373,9 +369,7 @@ mod tests {
 
     #[test]
     fn test_route_set_from_headers() {
-        let headers = vec![
-            "<sip:p1.example.com;lr>, <sip:p2.example.com;lr>".to_string(),
-        ];
+        let headers = vec!["<sip:p1.example.com;lr>, <sip:p2.example.com;lr>".to_string()];
         let route_set = RouteSet::from_route_headers(&headers).unwrap();
         assert_eq!(route_set.len(), 2);
         assert!(route_set.first().unwrap().is_loose_route());

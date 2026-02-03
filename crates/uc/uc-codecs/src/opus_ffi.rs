@@ -82,9 +82,11 @@ impl FfiOpusEncoder {
             crate::opus::OpusSignal::Voice => Signal::Voice,
             crate::opus::OpusSignal::Music => Signal::Music,
         };
-        encoder.set_signal(signal).map_err(|e| CodecError::InvalidConfig {
-            reason: format!("failed to set signal type: {e}"),
-        })?;
+        encoder
+            .set_signal(signal)
+            .map_err(|e| CodecError::InvalidConfig {
+                reason: format!("failed to set signal type: {e}"),
+            })?;
 
         // Set complexity
         encoder
@@ -94,14 +96,18 @@ impl FfiOpusEncoder {
             })?;
 
         // Set FEC
-        encoder.set_inband_fec(config.fec).map_err(|e| CodecError::InvalidConfig {
-            reason: format!("failed to set FEC: {e}"),
-        })?;
+        encoder
+            .set_inband_fec(config.fec)
+            .map_err(|e| CodecError::InvalidConfig {
+                reason: format!("failed to set FEC: {e}"),
+            })?;
 
         // Set DTX
-        encoder.set_dtx(config.dtx).map_err(|e| CodecError::InvalidConfig {
-            reason: format!("failed to set DTX: {e}"),
-        })?;
+        encoder
+            .set_dtx(config.dtx)
+            .map_err(|e| CodecError::InvalidConfig {
+                reason: format!("failed to set DTX: {e}"),
+            })?;
 
         // Set packet loss percentage for FEC optimization
         encoder
@@ -120,13 +126,18 @@ impl FfiOpusEncoder {
     ///
     /// Returns the number of bytes written to the output buffer.
     pub fn encode(&self, pcm: &[i16], output: &mut [u8]) -> CodecResult<usize> {
-        let mut encoder = self.encoder.lock().map_err(|_| CodecError::EncodingFailed {
-            reason: "failed to acquire encoder lock".to_string(),
-        })?;
+        let mut encoder = self
+            .encoder
+            .lock()
+            .map_err(|_| CodecError::EncodingFailed {
+                reason: "failed to acquire encoder lock".to_string(),
+            })?;
 
-        let result = encoder.encode(pcm, output).map_err(|e| CodecError::EncodingFailed {
-            reason: format!("Opus encoding failed: {e}"),
-        })?;
+        let result = encoder
+            .encode(pcm, output)
+            .map_err(|e| CodecError::EncodingFailed {
+                reason: format!("Opus encoding failed: {e}"),
+            })?;
 
         Ok(result.len())
     }
@@ -180,16 +191,19 @@ impl FfiOpusDecoder {
     ///
     /// Returns the number of samples decoded.
     pub fn decode(&self, encoded: &[u8], output: &mut [i16]) -> CodecResult<usize> {
-        let mut decoder = self.decoder.lock().map_err(|_| CodecError::DecodingFailed {
-            reason: "failed to acquire decoder lock".to_string(),
-        })?;
+        let mut decoder = self
+            .decoder
+            .lock()
+            .map_err(|_| CodecError::DecodingFailed {
+                reason: "failed to acquire decoder lock".to_string(),
+            })?;
 
         // Use FEC=false for normal decoding
-        let result = decoder
-            .decode(Some(encoded), output, false)
-            .map_err(|e| CodecError::DecodingFailed {
+        let result = decoder.decode(Some(encoded), output, false).map_err(|e| {
+            CodecError::DecodingFailed {
                 reason: format!("Opus decoding failed: {e}"),
-            })?;
+            }
+        })?;
 
         Ok(result.len())
     }
@@ -198,16 +212,19 @@ impl FfiOpusDecoder {
     ///
     /// Call this when a packet is lost to attempt FEC recovery.
     pub fn decode_fec(&self, output: &mut [i16]) -> CodecResult<usize> {
-        let mut decoder = self.decoder.lock().map_err(|_| CodecError::DecodingFailed {
-            reason: "failed to acquire decoder lock".to_string(),
-        })?;
+        let mut decoder = self
+            .decoder
+            .lock()
+            .map_err(|_| CodecError::DecodingFailed {
+                reason: "failed to acquire decoder lock".to_string(),
+            })?;
 
         // Pass None for lost packet, use FEC=true
-        let result = decoder
-            .decode(None::<&[u8]>, output, true)
-            .map_err(|e| CodecError::DecodingFailed {
+        let result = decoder.decode(None::<&[u8]>, output, true).map_err(|e| {
+            CodecError::DecodingFailed {
                 reason: format!("Opus FEC decoding failed: {e}"),
-            })?;
+            }
+        })?;
 
         Ok(result.len())
     }

@@ -56,23 +56,28 @@ pub mod transport;
 pub mod uri;
 
 pub use auth::{
+    DigestAlgorithm, DigestChallenge, DigestCredentials, DigestHasher, Qop,
     compute_digest_response, compute_ha1, compute_ha2, compute_response, create_credentials,
-    verify_credentials, DigestAlgorithm, DigestChallenge, DigestCredentials, DigestHasher, Qop,
+    verify_credentials,
 };
-pub use builder::{generate_branch, generate_call_id, generate_tag, RequestBuilder, ResponseBuilder};
+pub use builder::{
+    RequestBuilder, ResponseBuilder, generate_branch, generate_call_id, generate_tag,
+};
 pub use error::{SipError, SipResult};
 pub use header::{Header, HeaderName, Headers};
-pub use header_params::{CSeqHeader, MaxForwardsHeader, NameAddr, ViaHeader, VIA_BRANCH_MAGIC_COOKIE};
+pub use header_params::{
+    CSeqHeader, MaxForwardsHeader, NameAddr, VIA_BRANCH_MAGIC_COOKIE, ViaHeader,
+};
 pub use message::{SipMessage, SipRequest, SipResponse};
 pub use method::Method;
-pub use response::StatusCode;
 pub use redirect::{
-    parse_redirect_response, RedirectContact, RedirectHandler, RedirectHeaders, RedirectResult,
-    DEFAULT_MAX_REDIRECT_DEPTH,
+    DEFAULT_MAX_REDIRECT_DEPTH, RedirectContact, RedirectHandler, RedirectHeaders, RedirectResult,
+    parse_redirect_response,
 };
+pub use response::StatusCode;
 pub use routing::{
-    compute_request_target, create_record_route, process_record_route_for_uac,
-    process_record_route_for_uas, RouteEntry, RouteSet,
+    RouteEntry, RouteSet, compute_request_target, create_record_route,
+    process_record_route_for_uac, process_record_route_for_uas,
 };
 pub use topology::{TopologyHider, TopologyHidingConfig, TopologyHidingMode};
 pub use transport::Transport;
@@ -80,9 +85,9 @@ pub use uri::{SipUri, UriScheme};
 
 // RFC 3261 §16.6 Proxy forwarding
 pub use proxy::{
-    create_loop_detected_response, create_too_many_hops_response, create_trying_response,
     ForkingMode, ForwardingTarget, ProxyContext, ProxyValidation, RequestForwarder,
-    ResponseProcessor,
+    ResponseProcessor, create_loop_detected_response, create_too_many_hops_response,
+    create_trying_response,
 };
 
 // Header Manipulation Engine (Enterprise SBC feature)

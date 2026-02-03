@@ -218,7 +218,11 @@ impl ErrorResponse {
     }
 
     /// Adds a field error.
-    pub fn with_field_error(mut self, field: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn with_field_error(
+        mut self,
+        field: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         self.field_errors.push(FieldError {
             field: field.into(),
             message: message.into(),
@@ -267,8 +271,8 @@ mod tests {
 
     #[test]
     fn test_api_response_with_header() {
-        let response: ApiResponse<String> = ApiResponse::ok("test".to_string())
-            .with_header("X-Custom", "value");
+        let response: ApiResponse<String> =
+            ApiResponse::ok("test".to_string()).with_header("X-Custom", "value");
         assert_eq!(response.headers.get("X-Custom"), Some(&"value".to_string()));
     }
 

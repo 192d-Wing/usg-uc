@@ -13,10 +13,10 @@
 //! - Security-relevant events
 
 use chrono::{DateTime, Utc};
-use uc_types::attestation::AttestationLevel;
-use uc_types::identifier::CallId;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
+use uc_types::attestation::AttestationLevel;
+use uc_types::identifier::CallId;
 
 /// Audit event category.
 ///
@@ -101,9 +101,9 @@ impl AuditEvent {
             Self::AuthorizationDecision(_) => AuditEventType::Authorization,
             Self::ConfigurationChange(_) => AuditEventType::Configuration,
             Self::CryptoKeyOperation(_) => AuditEventType::Cryptographic,
-            Self::DosDetected(_) | Self::StirShakenVerification(_) | Self::RateLimitTriggered(_) => {
-                AuditEventType::Security
-            }
+            Self::DosDetected(_)
+            | Self::StirShakenVerification(_)
+            | Self::RateLimitTriggered(_) => AuditEventType::Security,
             Self::SystemStartup(_) | Self::SystemShutdown(_) => AuditEventType::System,
         }
     }

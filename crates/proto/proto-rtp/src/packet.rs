@@ -283,7 +283,8 @@ impl RtpPacket {
     /// Serializes the packet to bytes.
     #[must_use]
     pub fn to_bytes(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(self.header.size() + self.payload.len() + self.padding_size);
+        let mut buf =
+            BytesMut::with_capacity(self.header.size() + self.payload.len() + self.padding_size);
 
         buf.put(self.header.to_bytes());
         buf.put(self.payload.clone());
@@ -367,7 +368,10 @@ mod tests {
         data[0] = 0xC0; // Version 3
 
         let result = RtpHeader::parse(&data);
-        assert!(matches!(result, Err(RtpError::InvalidVersion { version: 3 })));
+        assert!(matches!(
+            result,
+            Err(RtpError::InvalidVersion { version: 3 })
+        ));
     }
 
     #[test]

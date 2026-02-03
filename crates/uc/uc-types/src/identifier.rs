@@ -85,7 +85,11 @@ pub struct DialogId {
 impl DialogId {
     /// Creates a new Dialog-ID from components.
     #[must_use]
-    pub fn new(call_id: CallId, local_tag: impl Into<String>, remote_tag: impl Into<String>) -> Self {
+    pub fn new(
+        call_id: CallId,
+        local_tag: impl Into<String>,
+        remote_tag: impl Into<String>,
+    ) -> Self {
         Self {
             call_id,
             local_tag: local_tag.into(),
@@ -114,11 +118,7 @@ impl DialogId {
 
 impl fmt::Display for DialogId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}:{}:{}",
-            self.call_id, self.local_tag, self.remote_tag
-        )
+        write!(f, "{}:{}:{}", self.call_id, self.local_tag, self.remote_tag)
     }
 }
 

@@ -215,7 +215,11 @@ pub struct CallRecord {
 
 impl CallRecord {
     /// Creates a new call record.
-    pub fn new(call_id: impl Into<String>, caller: impl Into<String>, callee: impl Into<String>) -> Self {
+    pub fn new(
+        call_id: impl Into<String>,
+        caller: impl Into<String>,
+        callee: impl Into<String>,
+    ) -> Self {
         Self {
             call_id: call_id.into(),
             correlation_id: None,
@@ -318,7 +322,10 @@ impl CallRecord {
 
     /// Returns whether the call is complete.
     pub fn is_complete(&self) -> bool {
-        matches!(self.status, CallStatus::Completed | CallStatus::Failed | CallStatus::Cancelled)
+        matches!(
+            self.status,
+            CallStatus::Completed | CallStatus::Failed | CallStatus::Cancelled
+        )
     }
 }
 
@@ -347,9 +354,18 @@ mod tests {
 
     #[test]
     fn test_disconnect_cause_from_sip() {
-        assert_eq!(DisconnectCause::from_sip_code(200), DisconnectCause::NormalClearing);
-        assert_eq!(DisconnectCause::from_sip_code(486), DisconnectCause::UserBusy);
-        assert_eq!(DisconnectCause::from_sip_code(999), DisconnectCause::Unknown);
+        assert_eq!(
+            DisconnectCause::from_sip_code(200),
+            DisconnectCause::NormalClearing
+        );
+        assert_eq!(
+            DisconnectCause::from_sip_code(486),
+            DisconnectCause::UserBusy
+        );
+        assert_eq!(
+            DisconnectCause::from_sip_code(999),
+            DisconnectCause::Unknown
+        );
     }
 
     #[test]
@@ -375,8 +391,7 @@ mod tests {
 
     #[test]
     fn test_call_record_connect() {
-        let mut record = CallRecord::new("call-123", "alice", "bob")
-            .with_start_time(1000);
+        let mut record = CallRecord::new("call-123", "alice", "bob").with_start_time(1000);
 
         record.connect(1500);
 
@@ -386,8 +401,7 @@ mod tests {
 
     #[test]
     fn test_call_record_complete() {
-        let mut record = CallRecord::new("call-123", "alice", "bob")
-            .with_start_time(1000);
+        let mut record = CallRecord::new("call-123", "alice", "bob").with_start_time(1000);
 
         record.connect(1500);
         record.complete(61500, DisconnectCause::NormalClearing);
@@ -399,8 +413,7 @@ mod tests {
 
     #[test]
     fn test_call_record_fail() {
-        let mut record = CallRecord::new("call-123", "alice", "bob")
-            .with_start_time(1000);
+        let mut record = CallRecord::new("call-123", "alice", "bob").with_start_time(1000);
 
         record.fail(5000, DisconnectCause::UserBusy);
 
@@ -411,8 +424,7 @@ mod tests {
 
     #[test]
     fn test_call_record_duration() {
-        let mut record = CallRecord::new("call-123", "alice", "bob")
-            .with_start_time(0);
+        let mut record = CallRecord::new("call-123", "alice", "bob").with_start_time(0);
 
         record.connect(1000);
         record.complete(61000, DisconnectCause::NormalClearing);
@@ -430,7 +442,13 @@ mod tests {
             .with_custom_field("tenant_id", "tenant-1")
             .with_custom_field("account_code", "12345");
 
-        assert_eq!(record.custom_fields.get("tenant_id"), Some(&"tenant-1".to_string()));
-        assert_eq!(record.custom_fields.get("account_code"), Some(&"12345".to_string()));
+        assert_eq!(
+            record.custom_fields.get("tenant_id"),
+            Some(&"tenant-1".to_string())
+        );
+        assert_eq!(
+            record.custom_fields.get("account_code"),
+            Some(&"12345".to_string())
+        );
     }
 }

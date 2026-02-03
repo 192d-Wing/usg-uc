@@ -60,7 +60,10 @@ fn test_cnsa_compliance_defaults() {
     let config = default_config();
 
     // CNSA 2.0 requirements
-    assert!(matches!(config.security.curve, CnsaCurve::P384 | CnsaCurve::P521));
+    assert!(matches!(
+        config.security.curve,
+        CnsaCurve::P384 | CnsaCurve::P521
+    ));
     assert_eq!(config.security.min_tls_version, "1.3");
     assert!(config.media.srtp.required);
 }

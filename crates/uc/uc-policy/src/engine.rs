@@ -223,11 +223,12 @@ impl PolicyEngine {
 
     /// Adds a rule to a named rule set.
     pub fn add_rule_to_set(&mut self, set_name: &str, rule: PolicyRule) -> PolicyResult<()> {
-        let rule_set = self.rule_sets.get_mut(set_name).ok_or_else(|| {
-            PolicyError::RuleSetNotFound {
-                name: set_name.to_string(),
-            }
-        })?;
+        let rule_set =
+            self.rule_sets
+                .get_mut(set_name)
+                .ok_or_else(|| PolicyError::RuleSetNotFound {
+                    name: set_name.to_string(),
+                })?;
 
         if rule_set.len() >= self.config.max_rules_per_set {
             return Err(PolicyError::TooManyRules {
@@ -317,11 +318,12 @@ impl PolicyEngine {
         set_name: &str,
         context: &RequestContext,
     ) -> PolicyResult<PolicyDecision> {
-        let rule_set = self.rule_sets.get(set_name).ok_or_else(|| {
-            PolicyError::RuleSetNotFound {
-                name: set_name.to_string(),
-            }
-        })?;
+        let rule_set =
+            self.rule_sets
+                .get(set_name)
+                .ok_or_else(|| PolicyError::RuleSetNotFound {
+                    name: set_name.to_string(),
+                })?;
 
         self.stats.requests_evaluated += 1;
 
@@ -506,7 +508,12 @@ mod tests {
         engine
             .add_rule_to_set(
                 "test",
-                PolicyRule::new("allow-all", "Allow All", Condition::Always, PolicyAction::Allow),
+                PolicyRule::new(
+                    "allow-all",
+                    "Allow All",
+                    Condition::Always,
+                    PolicyAction::Allow,
+                ),
             )
             .unwrap();
 
@@ -683,8 +690,13 @@ mod tests {
         // Add allow rule (terminal)
         engine
             .add_global_rule(
-                PolicyRule::new("allow-all", "Allow All", Condition::Always, PolicyAction::Allow)
-                    .with_priority(RulePriority::normal()),
+                PolicyRule::new(
+                    "allow-all",
+                    "Allow All",
+                    Condition::Always,
+                    PolicyAction::Allow,
+                )
+                .with_priority(RulePriority::normal()),
             )
             .unwrap();
 

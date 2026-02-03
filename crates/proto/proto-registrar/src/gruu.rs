@@ -155,11 +155,12 @@ impl GruuService {
             let new_temp_gruu = self.generate_temp_gruu(aor, instance_id);
 
             // Now get mutable access and update
-            let entry = self.binding_map.get_mut(&key).ok_or_else(|| {
-                RegistrarError::BindingNotFound {
-                    contact: instance_id.to_string(),
-                }
-            })?;
+            let entry =
+                self.binding_map
+                    .get_mut(&key)
+                    .ok_or_else(|| RegistrarError::BindingNotFound {
+                        contact: instance_id.to_string(),
+                    })?;
 
             // Remove old temp-gruu mapping
             let old_temp_gruu = entry.temp_gruu.clone();
@@ -173,9 +174,12 @@ impl GruuService {
             let updated_entry = entry.clone();
             self.temp_gruu_map.insert(new_temp_gruu, updated_entry);
 
-            return self.binding_map.get(&key).ok_or_else(|| RegistrarError::BindingNotFound {
-                contact: instance_id.to_string(),
-            });
+            return self
+                .binding_map
+                .get(&key)
+                .ok_or_else(|| RegistrarError::BindingNotFound {
+                    contact: instance_id.to_string(),
+                });
         }
 
         // Generate new GRUUs
@@ -189,9 +193,11 @@ impl GruuService {
         self.temp_gruu_map.insert(temp_gruu, entry.clone());
         self.binding_map.insert(key.clone(), entry);
 
-        self.binding_map.get(&key).ok_or_else(|| RegistrarError::BindingNotFound {
-            contact: instance_id.to_string(),
-        })
+        self.binding_map
+            .get(&key)
+            .ok_or_else(|| RegistrarError::BindingNotFound {
+                contact: instance_id.to_string(),
+            })
     }
 
     /// Looks up a GRUU (either public or temporary).
@@ -318,7 +324,9 @@ impl GruuService {
 
 /// Extracts the user part from a SIP AOR.
 fn extract_user_from_aor(aor: &str) -> Option<&str> {
-    let aor = aor.strip_prefix("sip:").or_else(|| aor.strip_prefix("sips:"))?;
+    let aor = aor
+        .strip_prefix("sip:")
+        .or_else(|| aor.strip_prefix("sips:"))?;
     aor.split('@').next()
 }
 

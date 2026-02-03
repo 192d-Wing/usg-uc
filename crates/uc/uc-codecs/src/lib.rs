@@ -186,8 +186,7 @@ impl CodecCapability {
 
     /// Creates capability for Opus.
     pub fn opus(payload_type: u8) -> Self {
-        Self::new("opus", payload_type, 48000, 2)
-            .with_fmtp("minptime=10;useinbandfec=1")
+        Self::new("opus", payload_type, 48000, 2).with_fmtp("minptime=10;useinbandfec=1")
     }
 
     /// Formats as SDP rtpmap attribute.
@@ -207,9 +206,9 @@ impl CodecCapability {
 
     /// Formats as SDP fmtp attribute if present.
     pub fn to_fmtp(&self) -> Option<String> {
-        self.fmtp.as_ref().map(|fmtp| {
-            format!("a=fmtp:{} {}", self.payload_type, fmtp)
-        })
+        self.fmtp
+            .as_ref()
+            .map(|fmtp| format!("a=fmtp:{} {}", self.payload_type, fmtp))
     }
 }
 
@@ -248,7 +247,9 @@ impl CodecRegistry {
 
     /// Finds a capability by name.
     pub fn find_by_name(&self, name: &str) -> Option<&CodecCapability> {
-        self.capabilities.iter().find(|c| c.name.eq_ignore_ascii_case(name))
+        self.capabilities
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
     }
 
     /// Finds a capability by payload type.
@@ -334,10 +335,7 @@ mod tests {
     fn test_codec_negotiation() {
         let local = CodecRegistry::with_defaults();
 
-        let remote = vec![
-            CodecCapability::opus(96),
-            CodecCapability::pcmu(),
-        ];
+        let remote = vec![CodecCapability::opus(96), CodecCapability::pcmu()];
 
         let negotiated = local.negotiate(&remote);
 

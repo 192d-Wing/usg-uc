@@ -226,12 +226,13 @@ impl Router {
         })?;
 
         // Select a trunk
-        let trunk_id = trunk_group
-            .select_trunk()
-            .map(String::from)
-            .ok_or(RoutingError::AllTrunksFailed {
-                trunks_tried: trunk_count,
-            })?;
+        let trunk_id =
+            trunk_group
+                .select_trunk()
+                .map(String::from)
+                .ok_or(RoutingError::AllTrunksFailed {
+                    trunks_tried: trunk_count,
+                })?;
 
         // Get failover trunks
         let failover_trunks: Vec<String> = trunk_group
@@ -243,11 +244,12 @@ impl Router {
             .collect();
 
         // Get trunk details
-        let trunk = trunk_group.get_trunk(&trunk_id).ok_or_else(|| {
-            RoutingError::TrunkNotFound {
-                trunk_id: trunk_id.clone(),
-            }
-        })?;
+        let trunk =
+            trunk_group
+                .get_trunk(&trunk_id)
+                .ok_or_else(|| RoutingError::TrunkNotFound {
+                    trunk_id: trunk_id.clone(),
+                })?;
 
         let trunk_uri = trunk.sip_uri();
 
@@ -292,12 +294,13 @@ impl Router {
             }
         })?;
 
-        let trunk_id = trunk_group
-            .select_trunk()
-            .map(String::from)
-            .ok_or(RoutingError::AllTrunksFailed {
-                trunks_tried: trunk_count,
-            })?;
+        let trunk_id =
+            trunk_group
+                .select_trunk()
+                .map(String::from)
+                .ok_or(RoutingError::AllTrunksFailed {
+                    trunks_tried: trunk_count,
+                })?;
 
         let failover_trunks: Vec<String> = trunk_group
             .failover_order()
@@ -307,11 +310,12 @@ impl Router {
             .map(String::from)
             .collect();
 
-        let trunk = trunk_group.get_trunk(&trunk_id).ok_or_else(|| {
-            RoutingError::TrunkNotFound {
-                trunk_id: trunk_id.clone(),
-            }
-        })?;
+        let trunk =
+            trunk_group
+                .get_trunk(&trunk_id)
+                .ok_or_else(|| RoutingError::TrunkNotFound {
+                    trunk_id: trunk_id.clone(),
+                })?;
 
         let trunk_uri = trunk.sip_uri();
 
@@ -367,7 +371,7 @@ impl Default for Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dialplan::{DialPlanEntry, DialPattern, NumberTransform};
+    use crate::dialplan::{DialPattern, DialPlanEntry, NumberTransform};
     use crate::trunk::{Trunk, TrunkConfig};
 
     fn setup_test_router() -> Router {

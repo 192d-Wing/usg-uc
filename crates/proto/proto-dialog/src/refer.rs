@@ -367,7 +367,11 @@ impl ReferHandler {
 
     /// Generates the NOTIFY body (sipfrag).
     pub fn notify_body(&self) -> String {
-        format!("SIP/2.0 {} {}", self.current_status.status_code(), self.current_status)
+        format!(
+            "SIP/2.0 {} {}",
+            self.current_status.status_code(),
+            self.current_status
+        )
     }
 }
 
@@ -379,14 +383,18 @@ pub fn parse_refer_to(value: &str) -> DialogResult<String> {
         Ok(value[1..value.len() - 1].to_string())
     } else if value.contains('<') && value.contains('>') {
         // "Name" <uri> format
-        let start = value.find('<').ok_or_else(|| DialogError::InvalidParameter {
-            name: "Refer-To".to_string(),
-            reason: "missing URI".to_string(),
-        })?;
-        let end = value.find('>').ok_or_else(|| DialogError::InvalidParameter {
-            name: "Refer-To".to_string(),
-            reason: "missing URI".to_string(),
-        })?;
+        let start = value
+            .find('<')
+            .ok_or_else(|| DialogError::InvalidParameter {
+                name: "Refer-To".to_string(),
+                reason: "missing URI".to_string(),
+            })?;
+        let end = value
+            .find('>')
+            .ok_or_else(|| DialogError::InvalidParameter {
+                name: "Refer-To".to_string(),
+                reason: "missing URI".to_string(),
+            })?;
         Ok(value[start + 1..end].to_string())
     } else {
         Ok(value.to_string())
@@ -424,12 +432,15 @@ mod tests {
 
     #[test]
     fn test_refer_request() {
-        let request = ReferRequest::new("sip:bob@example.com")
-            .with_referred_by("sip:alice@example.com");
+        let request =
+            ReferRequest::new("sip:bob@example.com").with_referred_by("sip:alice@example.com");
 
         assert_eq!(request.refer_to(), "sip:bob@example.com");
         assert_eq!(request.referred_by(), Some("sip:alice@example.com"));
-        assert_eq!(request.subscription_state(), ReferSubscriptionState::Pending);
+        assert_eq!(
+            request.subscription_state(),
+            ReferSubscriptionState::Pending
+        );
     }
 
     #[test]
@@ -441,7 +452,10 @@ mod tests {
         assert!(!request.is_complete());
 
         request.update_status(ReferStatus::Success);
-        assert_eq!(request.subscription_state(), ReferSubscriptionState::Terminated);
+        assert_eq!(
+            request.subscription_state(),
+            ReferSubscriptionState::Terminated
+        );
         assert!(request.is_complete());
     }
 
@@ -449,7 +463,10 @@ mod tests {
     fn test_refer_handler() {
         let mut handler = ReferHandler::new("sip:bob@example.com");
 
-        assert_eq!(handler.subscription_state(), ReferSubscriptionState::Pending);
+        assert_eq!(
+            handler.subscription_state(),
+            ReferSubscriptionState::Pending
+        );
 
         handler.accept().unwrap();
         assert_eq!(handler.subscription_state(), ReferSubscriptionState::Active);

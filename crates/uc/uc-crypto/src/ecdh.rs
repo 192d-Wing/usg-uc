@@ -10,7 +10,7 @@
 //! ## NIST 800-53 Rev5: SC-12 (Cryptographic Key Establishment)
 
 use crate::error::{CryptoError, CryptoResult};
-use aws_lc_rs::agreement::{self, EphemeralPrivateKey, UnparsedPublicKey, ECDH_P384};
+use aws_lc_rs::agreement::{self, ECDH_P384, EphemeralPrivateKey, UnparsedPublicKey};
 use aws_lc_rs::rand::SystemRandom;
 use zeroize::Zeroize;
 
@@ -80,7 +80,11 @@ impl P384EphemeralKeyPair {
             self.private_key,
             &peer_key,
             CryptoError::KeyDerivationFailed,
-            |key_material: &[u8]| Ok(SharedSecret { bytes: key_material.to_vec() }),
+            |key_material: &[u8]| {
+                Ok(SharedSecret {
+                    bytes: key_material.to_vec(),
+                })
+            },
         )
         .map_err(|_| CryptoError::KeyDerivationFailed)
     }

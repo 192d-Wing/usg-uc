@@ -146,10 +146,7 @@ impl ConnectivityCheck {
     /// - MESSAGE-INTEGRITY using remote password
     /// - FINGERPRINT
     pub fn create_request(&self) -> IceResult<StunMessage> {
-        let mut msg = StunMessage::new(
-            StunMessageType::binding_request(),
-            self.transaction_id,
-        );
+        let mut msg = StunMessage::new(StunMessageType::binding_request(), self.transaction_id);
 
         // USERNAME: remote-ufrag:local-ufrag (per RFC 8445 §7.1.1)
         let username = format!(
@@ -203,11 +200,12 @@ impl ConnectivityCheck {
         match response.msg_type.class {
             StunClass::SuccessResponse => {
                 // Extract XOR-MAPPED-ADDRESS
-                let mapped_address = response.xor_mapped_address().ok_or_else(|| {
-                    IceError::ProtocolError {
-                        reason: "missing XOR-MAPPED-ADDRESS in response".to_string(),
-                    }
-                })?;
+                let mapped_address =
+                    response
+                        .xor_mapped_address()
+                        .ok_or_else(|| IceError::ProtocolError {
+                            reason: "missing XOR-MAPPED-ADDRESS in response".to_string(),
+                        })?;
 
                 Ok(CheckResult::Success {
                     mapped_address,
@@ -302,11 +300,12 @@ impl ConnectivityChecker {
         let request = check.create_request()?;
 
         // Encode with MESSAGE-INTEGRITY and FINGERPRINT
-        let request_bytes = request
-            .encode_with_integrity(password)
-            .map_err(|e| IceError::ProtocolError {
-                reason: format!("failed to encode request: {e}"),
-            })?;
+        let request_bytes =
+            request
+                .encode_with_integrity(password)
+                .map_err(|e| IceError::ProtocolError {
+                    reason: format!("failed to encode request: {e}"),
+                })?;
 
         let remote_addr = check.remote().address();
 
@@ -331,7 +330,11 @@ impl ConnectivityChecker {
                 continue;
             }
 
-            trace!(attempt = attempts, rto_ms = rto.as_millis(), "Sent STUN request");
+            trace!(
+                attempt = attempts,
+                rto_ms = rto.as_millis(),
+                "Sent STUN request"
+            );
 
             // Wait for response
             let wait_time = rto.min(self.timeout.saturating_sub(start.elapsed()));
@@ -370,11 +373,13 @@ impl ConnectivityChecker {
         let mut buf = [0u8; 1500];
 
         loop {
-            let (n, from) = self.socket.recv_from(&mut buf).await.map_err(|e| {
-                IceError::NetworkError {
-                    reason: format!("recv failed: {e}"),
-                }
-            })?;
+            let (n, from) =
+                self.socket
+                    .recv_from(&mut buf)
+                    .await
+                    .map_err(|e| IceError::NetworkError {
+                        reason: format!("recv failed: {e}"),
+                    })?;
 
             // Parse the response
             let response = match StunMessage::parse(&buf[..n]) {
@@ -498,27 +503,30 @@ impl IceStunServer {
         let role_conflict = self.check_role_conflict(request)?;
         if let Some(new_role) = role_conflict {
             // Return 487 error
-            let error_response = StunMessage::binding_error(
-                request,
-                487,
-                "Role Conflict",
-            );
-            return Ok((error_response, Some(TriggeredCheckInfo {
-                source_addr,
-                priority: 0,
-                use_candidate: false,
-                role_conflict: Some(new_role),
-            })));
+            let error_response = StunMessage::binding_error(request, 487, "Role Conflict");
+            return Ok((
+                error_response,
+                Some(TriggeredCheckInfo {
+                    source_addr,
+                    priority: 0,
+                    use_candidate: false,
+                    role_conflict: Some(new_role),
+                }),
+            ));
         }
 
         // Extract PRIORITY for triggered check
-        let priority = request.attributes.iter().find_map(|a| {
-            if let StunAttribute::Priority(p) = a {
-                Some(*p)
-            } else {
-                None
-            }
-        }).unwrap_or(0);
+        let priority = request
+            .attributes
+            .iter()
+            .find_map(|a| {
+                if let StunAttribute::Priority(p) = a {
+                    Some(*p)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
 
         // Check for USE-CANDIDATE
         let use_candidate = request
@@ -766,10 +774,8 @@ mod tests {
         );
 
         // Create mock success response
-        let mut response = StunMessage::new(
-            StunMessageType::binding_response(),
-            check.transaction_id,
-        );
+        let mut response =
+            StunMessage::new(StunMessageType::binding_response(), check.transaction_id);
         let mapped_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)), 32853);
         response.add_attribute(StunAttribute::XorMappedAddress(
             proto_stun::XorMappedAddress::new(mapped_addr),
@@ -843,7 +849,9 @@ mod tests {
         let source_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5060);
         let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5060);
 
-        let (response, triggered) = server.process_request(&request, source_addr, local_addr).unwrap();
+        let (response, triggered) = server
+            .process_request(&request, source_addr, local_addr)
+            .unwrap();
 
         // Verify response is a success
         assert_eq!(response.msg_type.class, StunClass::SuccessResponse);

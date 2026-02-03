@@ -151,9 +151,7 @@ impl Args {
     fn parse_config_command(iter: &mut impl Iterator<Item = String>) -> Command {
         match iter.next().as_deref() {
             Some("show") | None => Command::Config(ConfigCommand::Show),
-            Some("validate") => Command::Config(ConfigCommand::Validate {
-                path: iter.next(),
-            }),
+            Some("validate") => Command::Config(ConfigCommand::Validate { path: iter.next() }),
             Some("reload") => Command::Config(ConfigCommand::Reload),
             Some(other) => {
                 eprintln!("Unknown config subcommand: {other}");
@@ -246,10 +244,7 @@ mod tests {
 
     #[test]
     fn test_config_command() {
-        assert!(matches!(
-            ConfigCommand::Show,
-            ConfigCommand::Show
-        ));
+        assert!(matches!(ConfigCommand::Show, ConfigCommand::Show));
     }
 
     #[test]

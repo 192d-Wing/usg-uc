@@ -278,10 +278,7 @@ impl RateLimiter {
             // Check if we should block
             let block_threshold = self.config.rps as f64 * self.config.block_threshold_multiplier;
             if rate >= block_threshold {
-                self.block(
-                    source,
-                    Duration::from_secs(self.config.block_duration_secs),
-                );
+                self.block(source, Duration::from_secs(self.config.block_duration_secs));
                 RateLimitAction::Block {
                     duration_secs: self.config.block_duration_secs,
                 }
@@ -381,11 +378,7 @@ mod tests {
         // First 5 requests should be allowed (burst)
         for _ in 0..5 {
             let action = limiter.check(ip);
-            assert!(
-                action.is_allowed(),
-                "Expected allowed, got {:?}",
-                action
-            );
+            assert!(action.is_allowed(), "Expected allowed, got {:?}", action);
         }
 
         // Next request should be rejected (out of tokens)

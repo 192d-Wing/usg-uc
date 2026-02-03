@@ -67,8 +67,8 @@ pub mod timer;
 pub use client::{ClientInviteTransaction, ClientNonInviteTransaction};
 pub use error::{TransactionError, TransactionResult};
 pub use prack::{
-    requires_100rel, supports_100rel, ClientReliableProvisionalTracker, RAck,
-    ReliableProvisionalState, ReliableProvisionalTracker, EXTENSION_100REL,
+    ClientReliableProvisionalTracker, EXTENSION_100REL, RAck, ReliableProvisionalState,
+    ReliableProvisionalTracker, requires_100rel, supports_100rel,
 };
 pub use server::{ServerInviteTransaction, ServerNonInviteTransaction};
 pub use timer::TimerConfig;

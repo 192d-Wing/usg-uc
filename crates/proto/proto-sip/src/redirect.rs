@@ -440,14 +440,11 @@ impl RedirectHeaders for crate::header::Headers {
     }
 
     fn retry_after_value(&self) -> Option<u32> {
-        self.get_value(&HeaderName::RetryAfter)
-            .and_then(|v| {
-                // Retry-After may be a date or seconds
-                // We only parse the seconds form
-                v.split_whitespace()
-                    .next()
-                    .and_then(|s| s.parse().ok())
-            })
+        self.get_value(&HeaderName::RetryAfter).and_then(|v| {
+            // Retry-After may be a date or seconds
+            // We only parse the seconds form
+            v.split_whitespace().next().and_then(|s| s.parse().ok())
+        })
     }
 }
 
@@ -462,9 +459,24 @@ mod tests {
         let uri3: SipUri = "sip:alice@example3.com".parse().unwrap();
 
         let mut contacts = vec![
-            RedirectContact { uri: uri1, display_name: None, q_value: 0.5, expires: None },
-            RedirectContact { uri: uri2, display_name: None, q_value: 1.0, expires: None },
-            RedirectContact { uri: uri3, display_name: None, q_value: 0.8, expires: None },
+            RedirectContact {
+                uri: uri1,
+                display_name: None,
+                q_value: 0.5,
+                expires: None,
+            },
+            RedirectContact {
+                uri: uri2,
+                display_name: None,
+                q_value: 1.0,
+                expires: None,
+            },
+            RedirectContact {
+                uri: uri3,
+                display_name: None,
+                q_value: 0.8,
+                expires: None,
+            },
         ];
 
         contacts.sort();
@@ -495,9 +507,8 @@ mod tests {
 
     #[test]
     fn test_parse_redirect_multiple_in_header() {
-        let contacts = vec![
-            "<sip:alice@example1.com>;q=0.5, <sip:alice@example2.com>;q=0.8".to_string(),
-        ];
+        let contacts =
+            vec!["<sip:alice@example1.com>;q=0.5, <sip:alice@example2.com>;q=0.8".to_string()];
 
         let result = parse_redirect_response(301, &contacts, None).unwrap();
 

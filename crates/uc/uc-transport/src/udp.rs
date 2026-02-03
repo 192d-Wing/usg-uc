@@ -12,18 +12,18 @@
 
 use crate::error::{TransportError, TransportResult};
 use crate::listener::ListenerConfig;
-use crate::{ReceivedMessage, Transport, MAX_UDP_MESSAGE_SIZE};
+use crate::{MAX_UDP_MESSAGE_SIZE, ReceivedMessage, Transport};
 use bytes::Bytes;
-use uc_types::address::{SbcSocketAddr, TransportType};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tracing::{debug, instrument, trace, warn};
+use uc_types::address::{SbcSocketAddr, TransportType};
 
 /// UDP transport for connectionless SIP messaging.
 ///
@@ -91,41 +91,41 @@ impl UdpTransport {
 
         // Configure socket options
         if config.reuse_address {
-            socket.set_reuse_address(true).map_err(|e| {
-                TransportError::BindFailed {
+            socket
+                .set_reuse_address(true)
+                .map_err(|e| TransportError::BindFailed {
                     address: config.bind_address.clone(),
                     reason: format!("failed to set SO_REUSEADDR: {e}"),
-                }
-            })?;
+                })?;
         }
 
         #[cfg(unix)]
         if config.reuse_port {
-            socket.set_reuse_port(true).map_err(|e| {
-                TransportError::BindFailed {
+            socket
+                .set_reuse_port(true)
+                .map_err(|e| TransportError::BindFailed {
                     address: config.bind_address.clone(),
                     reason: format!("failed to set SO_REUSEPORT: {e}"),
-                }
-            })?;
+                })?;
         }
 
         // For IPv6, enable dual-stack mode (accept IPv4-mapped addresses)
         if socket_addr.is_ipv6() {
-            socket.set_only_v6(false).map_err(|e| {
-                TransportError::BindFailed {
+            socket
+                .set_only_v6(false)
+                .map_err(|e| TransportError::BindFailed {
                     address: config.bind_address.clone(),
                     reason: format!("failed to set IPV6_V6ONLY: {e}"),
-                }
-            })?;
+                })?;
         }
 
         // Set non-blocking before binding
-        socket.set_nonblocking(true).map_err(|e| {
-            TransportError::BindFailed {
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| TransportError::BindFailed {
                 address: config.bind_address.clone(),
                 reason: format!("failed to set non-blocking: {e}"),
-                }
-        })?;
+            })?;
 
         // Bind the socket
         socket
@@ -144,12 +144,12 @@ impl UdpTransport {
             })?;
 
         // Get the actual bound address (in case port was 0)
-        let local_addr = tokio_socket.local_addr().map_err(|e| {
-            TransportError::BindFailed {
+        let local_addr = tokio_socket
+            .local_addr()
+            .map_err(|e| TransportError::BindFailed {
                 address: config.bind_address.clone(),
                 reason: format!("failed to get local address: {e}"),
-            }
-        })?;
+            })?;
 
         debug!(local_addr = %local_addr, "UDP transport bound");
 
@@ -214,13 +214,11 @@ impl Transport for UdpTransport {
 
             let mut buffer = self.recv_buffer.lock().await;
 
-            let (len, source) = self
-                .socket
-                .recv_from(&mut buffer)
-                .await
-                .map_err(|e| TransportError::ReceiveFailed {
+            let (len, source) = self.socket.recv_from(&mut buffer).await.map_err(|e| {
+                TransportError::ReceiveFailed {
                     reason: e.to_string(),
-                })?;
+                }
+            })?;
 
             trace!(source = %source, size = len, "received UDP packet");
 
@@ -320,7 +318,10 @@ mod tests {
         let dest = SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 5060);
 
         let result = transport.send(&large_data, &dest).await;
-        assert!(matches!(result, Err(TransportError::MessageTooLarge { .. })));
+        assert!(matches!(
+            result,
+            Err(TransportError::MessageTooLarge { .. })
+        ));
     }
 
     #[tokio::test]

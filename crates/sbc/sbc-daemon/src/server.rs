@@ -12,19 +12,19 @@
 
 use crate::shutdown::ShutdownSignal;
 use crate::sip_stack::{ProcessResult, SipStack, SipStackConfig};
+use proto_registrar::RegistrarMode;
 use sbc_config::SbcConfig;
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{Mutex, RwLock};
+use tracing::{debug, error, info, warn};
 use uc_dos_protection::{RateLimitAction, RateLimiter, RateLimiterConfig};
 use uc_health::{HealthChecker, HealthCheckerConfig};
 use uc_metrics::{MetricRegistry, SbcMetrics};
-use proto_registrar::RegistrarMode;
-use uc_transport::udp::UdpTransport;
 use uc_transport::Transport;
+use uc_transport::udp::UdpTransport;
 use uc_types::address::SbcSocketAddr;
-use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, error, info, warn};
 
 /// SBC server state.
 pub struct Server {
@@ -64,10 +64,7 @@ impl Server {
         // Create SIP stack configuration
         let sip_config = SipStackConfig {
             instance_name: config.general.instance_name.clone(),
-            domain: config
-                .general
-                .instance_name
-                .clone(), // Use instance name as domain for now
+            domain: config.general.instance_name.clone(), // Use instance name as domain for now
             registrar_mode: RegistrarMode::B2bua,
             b2bua_enabled: true,
         };
@@ -533,7 +530,10 @@ mod tests {
         assert_eq!(server.stats().calls_total.load(Ordering::Relaxed), 0);
         assert_eq!(server.stats().messages_received.load(Ordering::Relaxed), 0);
 
-        server.stats().messages_received.fetch_add(1, Ordering::Relaxed);
+        server
+            .stats()
+            .messages_received
+            .fetch_add(1, Ordering::Relaxed);
         assert_eq!(server.stats().messages_received.load(Ordering::Relaxed), 1);
     }
 

@@ -11,7 +11,9 @@
 
 use crate::error::{CryptoError, CryptoResult};
 use crate::random;
-use aws_lc_rs::aead::{self, Aad, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, AES_256_GCM};
+use aws_lc_rs::aead::{
+    self, AES_256_GCM, Aad, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey,
+};
 use zeroize::ZeroizeOnDrop;
 
 /// AES-256-GCM key length in bytes.
@@ -71,7 +73,12 @@ impl Aes256GcmKey {
     /// ## Errors
     ///
     /// Returns an error if encryption fails.
-    pub fn seal(&self, nonce: &[u8; NONCE_LEN], aad: &[u8], plaintext: &[u8]) -> CryptoResult<Vec<u8>> {
+    pub fn seal(
+        &self,
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> CryptoResult<Vec<u8>> {
         let unbound_key = aead::UnboundKey::new(&AES_256_GCM, &self.key_bytes)
             .map_err(|_| CryptoError::InvalidKeyMaterial)?;
 
@@ -98,7 +105,12 @@ impl Aes256GcmKey {
     /// ## Errors
     ///
     /// Returns an error if decryption fails (wrong key, tampered data, etc.).
-    pub fn open(&self, nonce: &[u8; NONCE_LEN], aad: &[u8], ciphertext: &[u8]) -> CryptoResult<Vec<u8>> {
+    pub fn open(
+        &self,
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        ciphertext: &[u8],
+    ) -> CryptoResult<Vec<u8>> {
         if ciphertext.len() < TAG_LEN {
             return Err(CryptoError::OpenFailed);
         }

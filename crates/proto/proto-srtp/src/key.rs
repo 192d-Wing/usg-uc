@@ -5,8 +5,8 @@
 //! Key derivation uses HKDF-SHA384 instead of the standard SRTP KDF
 //! which uses SHA-1. This provides CNSA 2.0 compliance.
 
-use crate::error::{SrtpError, SrtpResult};
 use crate::SrtpProfile;
+use crate::error::{SrtpError, SrtpResult};
 
 /// Master key material for SRTP.
 ///
@@ -236,12 +236,7 @@ mod tests {
     use super::*;
 
     fn test_key_material() -> SrtpKeyMaterial {
-        SrtpKeyMaterial::new(
-            SrtpProfile::AeadAes256Gcm,
-            vec![1u8; 32],
-            vec![2u8; 12],
-        )
-        .unwrap()
+        SrtpKeyMaterial::new(SrtpProfile::AeadAes256Gcm, vec![1u8; 32], vec![2u8; 12]).unwrap()
     }
 
     #[test]
@@ -265,7 +260,9 @@ mod tests {
     #[test]
     fn test_session_key_derivation() {
         let material = test_key_material();
-        let rtp_key = material.derive_session_key(KeyDerivationLabel::RtpEncryption).unwrap();
+        let rtp_key = material
+            .derive_session_key(KeyDerivationLabel::RtpEncryption)
+            .unwrap();
         assert_eq!(rtp_key.len(), 32);
     }
 

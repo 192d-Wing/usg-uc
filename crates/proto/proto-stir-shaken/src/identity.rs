@@ -221,7 +221,8 @@ mod tests {
 
     #[test]
     fn test_identity_header_parse() {
-        let value = "header.claims.sig;info=<https://cert.example.com/cert.pem>;alg=ES384;ppt=shaken";
+        let value =
+            "header.claims.sig;info=<https://cert.example.com/cert.pem>;alg=ES384;ppt=shaken";
         let header = IdentityHeader::parse(value).unwrap();
 
         assert_eq!(header.token(), "header.claims.sig");
@@ -252,8 +253,7 @@ mod tests {
             .with_iat(1234567890)
             .with_origid(OrigId::new("test-id"));
 
-        let header = PASSporTHeader::new()
-            .with_x5u("https://cert.example.com/cert.pem");
+        let header = PASSporTHeader::new().with_x5u("https://cert.example.com/cert.pem");
 
         let mut passport = PASSporT::new(header, claims);
         passport.set_signature("test-signature");
@@ -270,7 +270,10 @@ mod tests {
         );
 
         let identity = Identity::new(header);
-        assert_eq!(identity.certificate_url(), "https://cert.example.com/cert.pem");
+        assert_eq!(
+            identity.certificate_url(),
+            "https://cert.example.com/cert.pem"
+        );
         assert_eq!(identity.token(), "test-token");
     }
 }

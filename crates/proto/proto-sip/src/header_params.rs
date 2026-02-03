@@ -493,10 +493,15 @@ impl FromStr for CSeqHeader {
         })?;
 
         // Power of 10 Rule 5: Assert sequence range (RFC 3261: 0 to 2^31-1)
-        debug_assert!(sequence <= 0x7FFF_FFFF, "CSeq sequence exceeds RFC 3261 max");
+        debug_assert!(
+            sequence <= 0x7FFF_FFFF,
+            "CSeq sequence exceeds RFC 3261 max"
+        );
 
         // Method parsing is infallible - unknown methods become Extension variants
-        let method: Method = parts[1].parse().unwrap_or_else(|e: std::convert::Infallible| match e {});
+        let method: Method = parts[1]
+            .parse()
+            .unwrap_or_else(|e: std::convert::Infallible| match e {});
 
         Ok(Self { sequence, method })
     }

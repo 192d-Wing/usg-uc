@@ -105,12 +105,7 @@ impl Method {
     pub fn is_rfc3261_core(&self) -> bool {
         matches!(
             self,
-            Self::Invite
-                | Self::Ack
-                | Self::Bye
-                | Self::Cancel
-                | Self::Register
-                | Self::Options
+            Self::Invite | Self::Ack | Self::Bye | Self::Cancel | Self::Register | Self::Options
         )
     }
 

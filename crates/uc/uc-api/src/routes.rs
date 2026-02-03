@@ -167,7 +167,11 @@ impl Router {
     }
 
     /// Finds a matching route.
-    pub fn find(&self, method: HttpMethod, path: &str) -> Option<(&Route, HashMap<String, String>)> {
+    pub fn find(
+        &self,
+        method: HttpMethod,
+        path: &str,
+    ) -> Option<(&Route, HashMap<String, String>)> {
         for route in &self.routes {
             if let Some(params) = route.matches(method, path) {
                 return Some((route, params));

@@ -3,7 +3,7 @@
 //! Per RFC 3261 Section 17.1.
 
 use crate::error::TransactionResult;
-use crate::timer::{next_retransmit_interval, TimerConfig, TimerType};
+use crate::timer::{TimerConfig, TimerType, next_retransmit_interval};
 use crate::{TransactionKey, TransportType};
 use std::time::{Duration, Instant};
 
@@ -193,10 +193,8 @@ impl ClientInviteTransaction {
                 if let Some(deadline) = self.timer_a_deadline {
                     if now >= deadline {
                         self.retransmit_count += 1;
-                        self.timer_a_value = next_retransmit_interval(
-                            self.timer_a_value,
-                            self.timer_config.t2,
-                        );
+                        self.timer_a_value =
+                            next_retransmit_interval(self.timer_a_value, self.timer_config.t2);
                         self.timer_a_deadline = Some(now + self.timer_a_value);
                         return Some(TimerType::TimerA);
                     }

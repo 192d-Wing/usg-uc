@@ -289,10 +289,13 @@ pub fn parse_session_expires(value: &str) -> DialogResult<(u32, Option<Refresher
 ///
 /// Format: `<delta-seconds>`
 pub fn parse_min_se(value: &str) -> DialogResult<u32> {
-    value.trim().parse().map_err(|_| DialogError::InvalidParameter {
-        name: "Min-SE".to_string(),
-        reason: "invalid delta-seconds".to_string(),
-    })
+    value
+        .trim()
+        .parse()
+        .map_err(|_| DialogError::InvalidParameter {
+            name: "Min-SE".to_string(),
+            reason: "invalid delta-seconds".to_string(),
+        })
 }
 
 /// Creates a Session-Expires header value.

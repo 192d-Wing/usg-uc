@@ -393,10 +393,12 @@ impl Header {
         // Power of 10 Rule 5: Assert precondition
         debug_assert!(!line.is_empty(), "empty header line");
 
-        let (name, value) = line.split_once(':').ok_or_else(|| SipError::InvalidHeader {
-            name: "unknown".to_string(),
-            reason: "missing colon separator".to_string(),
-        })?;
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| SipError::InvalidHeader {
+                name: "unknown".to_string(),
+                reason: "missing colon separator".to_string(),
+            })?;
 
         let name: HeaderName = name.trim().parse()?;
         let value = value.trim().to_string();
@@ -538,8 +540,7 @@ impl Headers {
     /// Returns the To header as a structured type.
     #[must_use]
     pub fn to_parsed(&self) -> Option<NameAddr> {
-        self.get_value(&HeaderName::To)
-            .and_then(|v| v.parse().ok())
+        self.get_value(&HeaderName::To).and_then(|v| v.parse().ok())
     }
 
     /// Returns the Max-Forwards header as a structured type.
@@ -615,7 +616,10 @@ impl Headers {
     pub fn prepend_route(&mut self, value: impl Into<String>) {
         let value = value.into();
         // Find position of first Route header or insert at beginning
-        let pos = self.headers.iter().position(|h| h.name == HeaderName::Route);
+        let pos = self
+            .headers
+            .iter()
+            .position(|h| h.name == HeaderName::Route);
         let header = Header::new(HeaderName::Route, value);
         match pos {
             Some(idx) => self.headers.insert(idx, header),
@@ -716,7 +720,11 @@ impl Headers {
         ];
 
         // Power of 10 Rule 5: Assert array size matches constant
-        debug_assert_eq!(required.len(), REQUIRED_COUNT, "required headers count mismatch");
+        debug_assert_eq!(
+            required.len(),
+            REQUIRED_COUNT,
+            "required headers count mismatch"
+        );
 
         // Loop bound: exactly REQUIRED_COUNT iterations
         for name in &required {
@@ -753,7 +761,11 @@ impl Headers {
         ];
 
         // Power of 10 Rule 5: Assert array size matches constant
-        debug_assert_eq!(required.len(), REQUIRED_COUNT, "required headers count mismatch");
+        debug_assert_eq!(
+            required.len(),
+            REQUIRED_COUNT,
+            "required headers count mismatch"
+        );
 
         // Loop bound: exactly REQUIRED_COUNT iterations
         for name in &required {
@@ -873,10 +885,7 @@ mod tests {
             HeaderName::From,
             "\"Alice\" <sip:alice@example.com>;tag=1234",
         ));
-        headers.add(Header::new(
-            HeaderName::To,
-            "<sip:bob@example.com>",
-        ));
+        headers.add(Header::new(HeaderName::To, "<sip:bob@example.com>"));
 
         let from = headers.from_parsed().unwrap();
         assert_eq!(from.display_name, Some("Alice".to_string()));
@@ -936,31 +945,19 @@ mod tests {
             "User-Agent".parse::<HeaderName>().unwrap(),
             HeaderName::UserAgent
         );
-        assert_eq!(
-            "Server".parse::<HeaderName>().unwrap(),
-            HeaderName::Server
-        );
+        assert_eq!("Server".parse::<HeaderName>().unwrap(), HeaderName::Server);
         assert_eq!(
             "Priority".parse::<HeaderName>().unwrap(),
             HeaderName::Priority
         );
-        assert_eq!(
-            "Reason".parse::<HeaderName>().unwrap(),
-            HeaderName::Reason
-        );
+        assert_eq!("Reason".parse::<HeaderName>().unwrap(), HeaderName::Reason);
     }
 
     #[test]
     fn test_path_header() {
         // RFC 3327 Path header support
-        assert_eq!(
-            "Path".parse::<HeaderName>().unwrap(),
-            HeaderName::Path
-        );
-        assert_eq!(
-            "path".parse::<HeaderName>().unwrap(),
-            HeaderName::Path
-        );
+        assert_eq!("Path".parse::<HeaderName>().unwrap(), HeaderName::Path);
+        assert_eq!("path".parse::<HeaderName>().unwrap(), HeaderName::Path);
         assert_eq!(HeaderName::Path.as_str(), "Path");
         assert!(HeaderName::Path.allows_multiple());
     }

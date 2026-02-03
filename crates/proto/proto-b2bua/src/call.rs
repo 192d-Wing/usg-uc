@@ -4,9 +4,9 @@
 //! - A-leg: Connection to the caller
 //! - B-leg: Connection to the callee
 
+use crate::B2buaMode;
 use crate::error::{B2buaError, B2buaResult};
 use crate::leg::{CallLeg, LegConfig, LegRole, LegState};
-use crate::B2buaMode;
 use std::time::Instant;
 
 /// Unique call identifier.

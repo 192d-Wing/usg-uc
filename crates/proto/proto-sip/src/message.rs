@@ -525,6 +525,9 @@ mod tests {
                    test";
 
         let result: SipResult<SipMessage> = msg.parse();
-        assert!(matches!(result, Err(SipError::ContentLengthMismatch { .. })));
+        assert!(matches!(
+            result,
+            Err(SipError::ContentLengthMismatch { .. })
+        ));
     }
 }

@@ -163,11 +163,16 @@ impl StunMessage {
     /// Creates a Binding Request with a random transaction ID.
     pub fn binding_request() -> StunResult<Self> {
         let mut transaction_id = [0u8; 12];
-        uc_crypto::random::fill_random(&mut transaction_id).map_err(|_| StunError::InvalidMessage {
-            reason: "failed to generate transaction ID".to_string(),
+        uc_crypto::random::fill_random(&mut transaction_id).map_err(|_| {
+            StunError::InvalidMessage {
+                reason: "failed to generate transaction ID".to_string(),
+            }
         })?;
 
-        Ok(Self::new(StunMessageType::binding_request(), transaction_id))
+        Ok(Self::new(
+            StunMessageType::binding_request(),
+            transaction_id,
+        ))
     }
 
     /// Creates a Binding Response for a request.

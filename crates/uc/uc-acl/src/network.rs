@@ -213,7 +213,9 @@ mod tests {
         assert!(net.is_ipv6());
 
         assert!(net.contains(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))));
-        assert!(net.contains(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xffff, 0xffff, 0, 0, 0, 1))));
+        assert!(net.contains(IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0xdb8, 0xffff, 0xffff, 0, 0, 0, 1
+        ))));
         assert!(!net.contains(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb9, 0, 0, 0, 0, 0, 1))));
     }
 

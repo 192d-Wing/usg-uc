@@ -123,9 +123,12 @@ impl LongTermCredentials {
     /// Note: SASLprep is simplified here; full RFC 4013 compliance
     /// would require more complex Unicode normalization.
     pub fn compute_key(&self) -> StunResult<Vec<u8>> {
-        let realm = self.realm.as_ref().ok_or_else(|| StunError::AuthenticationFailed {
-            reason: "realm required for long-term credential key".to_string(),
-        })?;
+        let realm = self
+            .realm
+            .as_ref()
+            .ok_or_else(|| StunError::AuthenticationFailed {
+                reason: "realm required for long-term credential key".to_string(),
+            })?;
 
         // SHA384(username:realm:password) for CNSA 2.0 compliance
         let input = format!("{}:{}:{}", self.username, realm, self.password);
@@ -141,13 +144,19 @@ impl LongTermCredentials {
     /// The request MUST include USERNAME, REALM, NONCE, and
     /// MESSAGE-INTEGRITY attributes.
     pub fn add_to_message(&self, msg: &mut StunMessage) -> StunResult<()> {
-        let realm = self.realm.as_ref().ok_or_else(|| StunError::AuthenticationFailed {
-            reason: "realm required".to_string(),
-        })?;
+        let realm = self
+            .realm
+            .as_ref()
+            .ok_or_else(|| StunError::AuthenticationFailed {
+                reason: "realm required".to_string(),
+            })?;
 
-        let nonce = self.nonce.as_ref().ok_or_else(|| StunError::AuthenticationFailed {
-            reason: "nonce required".to_string(),
-        })?;
+        let nonce = self
+            .nonce
+            .as_ref()
+            .ok_or_else(|| StunError::AuthenticationFailed {
+                reason: "nonce required".to_string(),
+            })?;
 
         msg.add_attribute(StunAttribute::Username(self.username.clone()));
         msg.add_attribute(StunAttribute::Realm(realm.clone()));
@@ -204,8 +213,10 @@ impl LongTermCredentialValidator {
     /// Creates a new validator with the given realm.
     pub fn new(realm: impl Into<String>) -> StunResult<Self> {
         let mut nonce_secret = [0u8; 32];
-        uc_crypto::random::fill_random(&mut nonce_secret).map_err(|_| StunError::AuthenticationFailed {
-            reason: "failed to generate nonce secret".to_string(),
+        uc_crypto::random::fill_random(&mut nonce_secret).map_err(|_| {
+            StunError::AuthenticationFailed {
+                reason: "failed to generate nonce secret".to_string(),
+            }
         })?;
 
         Ok(Self {
@@ -261,9 +272,12 @@ impl LongTermCredentialValidator {
     /// `Ok(false)` if stale (signature valid but expired),
     /// `Err` if invalid signature.
     pub fn validate_nonce(&self, nonce: &str) -> StunResult<bool> {
-        let (timestamp_str, sig) = nonce.split_once(':').ok_or_else(|| StunError::AuthenticationFailed {
-            reason: "invalid nonce format".to_string(),
-        })?;
+        let (timestamp_str, sig) =
+            nonce
+                .split_once(':')
+                .ok_or_else(|| StunError::AuthenticationFailed {
+                    reason: "invalid nonce format".to_string(),
+                })?;
 
         // Verify signature
         let expected_sig = self.compute_nonce_signature(timestamp_str);
@@ -274,9 +288,12 @@ impl LongTermCredentialValidator {
         }
 
         // Check timestamp
-        let timestamp: u64 = timestamp_str.parse().map_err(|_| StunError::AuthenticationFailed {
-            reason: "invalid nonce timestamp".to_string(),
-        })?;
+        let timestamp: u64 =
+            timestamp_str
+                .parse()
+                .map_err(|_| StunError::AuthenticationFailed {
+                    reason: "invalid nonce timestamp".to_string(),
+                })?;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -533,10 +550,7 @@ mod tests {
         let mut creds = LongTermCredentials::new("user", "password");
 
         // Create 401 response with REALM and NONCE
-        let mut response = StunMessage::new(
-            StunMessageType::binding_error(),
-            [0u8; 12],
-        );
+        let mut response = StunMessage::new(StunMessageType::binding_error(), [0u8; 12]);
         response.add_attribute(StunAttribute::ErrorCode {
             code: 401,
             reason: "Unauthorized".to_string(),
@@ -554,10 +568,7 @@ mod tests {
     fn test_update_from_challenge_missing_realm() {
         let mut creds = LongTermCredentials::new("user", "password");
 
-        let mut response = StunMessage::new(
-            StunMessageType::binding_error(),
-            [0u8; 12],
-        );
+        let mut response = StunMessage::new(StunMessageType::binding_error(), [0u8; 12]);
         response.add_attribute(StunAttribute::Nonce("abc123".to_string()));
 
         let result = creds.update_from_challenge(&response);
@@ -566,10 +577,7 @@ mod tests {
 
     #[test]
     fn test_validator_generate_nonce() {
-        let validator = LongTermCredentialValidator::with_nonce_secret(
-            "example.com",
-            [0u8; 32],
-        );
+        let validator = LongTermCredentialValidator::with_nonce_secret("example.com", [0u8; 32]);
 
         let nonce = validator.generate_nonce();
         assert!(nonce.contains(':'));
@@ -580,10 +588,7 @@ mod tests {
 
     #[test]
     fn test_validator_invalid_nonce_signature() {
-        let validator = LongTermCredentialValidator::with_nonce_secret(
-            "example.com",
-            [0u8; 32],
-        );
+        let validator = LongTermCredentialValidator::with_nonce_secret("example.com", [0u8; 32]);
 
         // Create nonce with wrong signature
         let fake_nonce = "12345:badsignature";
@@ -592,10 +597,8 @@ mod tests {
 
     #[test]
     fn test_validator_stale_nonce() {
-        let validator = LongTermCredentialValidator::with_nonce_secret(
-            "example.com",
-            [0u8; 32],
-        ).with_nonce_lifetime(Duration::from_secs(1));
+        let validator = LongTermCredentialValidator::with_nonce_secret("example.com", [0u8; 32])
+            .with_nonce_lifetime(Duration::from_secs(1));
 
         // Create nonce with old timestamp
         let old_timestamp = SystemTime::now()
@@ -615,21 +618,21 @@ mod tests {
 
     #[test]
     fn test_validator_challenge_response() {
-        let validator = LongTermCredentialValidator::with_nonce_secret(
-            "example.com",
-            [0u8; 32],
-        );
+        let validator = LongTermCredentialValidator::with_nonce_secret("example.com", [0u8; 32]);
 
-        let request = StunMessage::new(
-            StunMessageType::binding_request(),
-            [0u8; 12],
-        );
+        let request = StunMessage::new(StunMessageType::binding_request(), [0u8; 12]);
 
         let response = validator.create_challenge_response(&request);
 
         // Should have REALM and NONCE
-        let has_realm = response.attributes.iter().any(|a| matches!(a, StunAttribute::Realm(_)));
-        let has_nonce = response.attributes.iter().any(|a| matches!(a, StunAttribute::Nonce(_)));
+        let has_realm = response
+            .attributes
+            .iter()
+            .any(|a| matches!(a, StunAttribute::Realm(_)));
+        let has_nonce = response
+            .attributes
+            .iter()
+            .any(|a| matches!(a, StunAttribute::Nonce(_)));
 
         assert!(has_realm);
         assert!(has_nonce);
@@ -637,15 +640,9 @@ mod tests {
 
     #[test]
     fn test_validate_request_no_integrity() {
-        let validator = LongTermCredentialValidator::with_nonce_secret(
-            "example.com",
-            [0u8; 32],
-        );
+        let validator = LongTermCredentialValidator::with_nonce_secret("example.com", [0u8; 32]);
 
-        let request = StunMessage::new(
-            StunMessageType::binding_request(),
-            [0u8; 12],
-        );
+        let request = StunMessage::new(StunMessageType::binding_request(), [0u8; 12]);
 
         let result = validator.validate_request(&request, &[], |_| Some("password".to_string()));
 
@@ -658,17 +655,23 @@ mod tests {
             .with_realm("example.com")
             .with_nonce("abc123");
 
-        let mut msg = StunMessage::new(
-            StunMessageType::binding_request(),
-            [0u8; 12],
-        );
+        let mut msg = StunMessage::new(StunMessageType::binding_request(), [0u8; 12]);
 
         creds.add_to_message(&mut msg).unwrap();
 
         // Should have USERNAME, REALM, NONCE
-        let has_username = msg.attributes.iter().any(|a| matches!(a, StunAttribute::Username(_)));
-        let has_realm = msg.attributes.iter().any(|a| matches!(a, StunAttribute::Realm(_)));
-        let has_nonce = msg.attributes.iter().any(|a| matches!(a, StunAttribute::Nonce(_)));
+        let has_username = msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, StunAttribute::Username(_)));
+        let has_realm = msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, StunAttribute::Realm(_)));
+        let has_nonce = msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, StunAttribute::Nonce(_)));
 
         assert!(has_username);
         assert!(has_realm);

@@ -77,11 +77,7 @@ impl fmt::Display for RegistrarError {
                 write!(f, "Too many contacts (max {})", max)
             }
             Self::InvalidExpires { requested, min } => {
-                write!(
-                    f,
-                    "Invalid expires value {} (minimum {})",
-                    requested, min
-                )
+                write!(f, "Invalid expires value {} (minimum {})", requested, min)
             }
             Self::RegistrationExpired { contact } => {
                 write!(f, "Registration expired: {}", contact)

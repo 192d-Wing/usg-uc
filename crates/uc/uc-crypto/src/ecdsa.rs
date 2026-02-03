@@ -12,8 +12,8 @@
 use crate::error::{CryptoError, CryptoResult};
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{
-    EcdsaKeyPair, KeyPair, UnparsedPublicKey, ECDSA_P384_SHA384_ASN1,
-    ECDSA_P384_SHA384_ASN1_SIGNING,
+    ECDSA_P384_SHA384_ASN1, ECDSA_P384_SHA384_ASN1_SIGNING, EcdsaKeyPair, KeyPair,
+    UnparsedPublicKey,
 };
 use zeroize::ZeroizeOnDrop;
 

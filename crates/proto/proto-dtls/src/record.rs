@@ -98,9 +98,8 @@ impl RecordHeader {
         let epoch = u16::from_be_bytes([data[3], data[4]]);
 
         // Sequence number is 6 bytes (uint48)
-        let sequence_number = u64::from_be_bytes([
-            0, 0, data[5], data[6], data[7], data[8], data[9], data[10],
-        ]);
+        let sequence_number =
+            u64::from_be_bytes([0, 0, data[5], data[6], data[7], data[8], data[9], data[10]]);
 
         let length = u16::from_be_bytes([data[11], data[12]]);
 
@@ -220,7 +219,10 @@ impl RecordLayer {
     ) -> DtlsResult<Vec<u8>> {
         if fragment.len() > MAX_FRAGMENT_SIZE {
             return Err(DtlsError::RecordError {
-                reason: format!("fragment too large: {} > {MAX_FRAGMENT_SIZE}", fragment.len()),
+                reason: format!(
+                    "fragment too large: {} > {MAX_FRAGMENT_SIZE}",
+                    fragment.len()
+                ),
             });
         }
 
@@ -250,11 +252,11 @@ impl RecordLayer {
             aad[11..13].copy_from_slice(&(fragment.len() as u16).to_be_bytes());
 
             // Encrypt
-            let ciphertext = key.seal(&nonce, &aad, fragment).map_err(|e| {
-                DtlsError::EncryptionFailed {
-                    reason: format!("AES-256-GCM seal failed: {e}"),
-                }
-            })?;
+            let ciphertext =
+                key.seal(&nonce, &aad, fragment)
+                    .map_err(|e| DtlsError::EncryptionFailed {
+                        reason: format!("AES-256-GCM seal failed: {e}"),
+                    })?;
 
             // Build output: header + explicit_nonce + ciphertext_with_tag
             let total_len = explicit_nonce.len() + ciphertext.len();
@@ -343,11 +345,11 @@ impl RecordLayer {
             aad[11..13].copy_from_slice(&(plaintext_len as u16).to_be_bytes());
 
             // Decrypt
-            let plaintext = key.open(&nonce, &aad, ciphertext).map_err(|_| {
-                DtlsError::DecryptionFailed {
-                    reason: "AES-256-GCM authentication failed".to_string(),
-                }
-            })?;
+            let plaintext =
+                key.open(&nonce, &aad, ciphertext)
+                    .map_err(|_| DtlsError::DecryptionFailed {
+                        reason: "AES-256-GCM authentication failed".to_string(),
+                    })?;
 
             // Update replay window
             self.replay_window.update(header.sequence_number);
@@ -455,10 +457,16 @@ mod tests {
 
     #[test]
     fn test_content_type_conversion() {
-        assert_eq!(ContentType::try_from(20).unwrap(), ContentType::ChangeCipherSpec);
+        assert_eq!(
+            ContentType::try_from(20).unwrap(),
+            ContentType::ChangeCipherSpec
+        );
         assert_eq!(ContentType::try_from(21).unwrap(), ContentType::Alert);
         assert_eq!(ContentType::try_from(22).unwrap(), ContentType::Handshake);
-        assert_eq!(ContentType::try_from(23).unwrap(), ContentType::ApplicationData);
+        assert_eq!(
+            ContentType::try_from(23).unwrap(),
+            ContentType::ApplicationData
+        );
         assert!(ContentType::try_from(99).is_err());
     }
 
@@ -494,7 +502,9 @@ mod tests {
         let mut layer = RecordLayer::new();
 
         let plaintext = b"Hello, DTLS!";
-        let record = layer.encrypt_record(ContentType::ApplicationData, plaintext).unwrap();
+        let record = layer
+            .encrypt_record(ContentType::ApplicationData, plaintext)
+            .unwrap();
 
         assert!(record.len() >= RECORD_HEADER_LEN + plaintext.len());
 
@@ -517,7 +527,9 @@ mod tests {
         assert!(layer.is_encrypted());
 
         let plaintext = b"Secret message";
-        let record = layer.encrypt_record(ContentType::ApplicationData, plaintext).unwrap();
+        let record = layer
+            .encrypt_record(ContentType::ApplicationData, plaintext)
+            .unwrap();
 
         // Encrypted record should be larger (explicit nonce + tag)
         assert!(record.len() > RECORD_HEADER_LEN + plaintext.len());

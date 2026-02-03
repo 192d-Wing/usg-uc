@@ -175,20 +175,17 @@ impl TurnAttribute {
                     Self::XorRelayedAddress(addr)
                 }
             }
-            TurnAttributeType::Data => {
-                Self::Data(Bytes::copy_from_slice(value))
-            }
+            TurnAttributeType::Data => Self::Data(Bytes::copy_from_slice(value)),
             TurnAttributeType::RequestedAddressFamily => {
                 if value.is_empty() {
                     return Err(TurnError::InvalidRequest {
                         reason: "REQUESTED-ADDRESS-FAMILY too short".to_string(),
                     });
                 }
-                let family = AddressFamily::from_u8(value[0]).ok_or_else(|| {
-                    TurnError::InvalidRequest {
+                let family =
+                    AddressFamily::from_u8(value[0]).ok_or_else(|| TurnError::InvalidRequest {
                         reason: format!("unknown address family: {}", value[0]),
-                    }
-                })?;
+                    })?;
                 Self::RequestedAddressFamily(family)
             }
             TurnAttributeType::EvenPort => {
@@ -208,9 +205,7 @@ impl TurnAttribute {
                 })?;
                 Self::RequestedTransport(proto)
             }
-            TurnAttributeType::DontFragment => {
-                Self::DontFragment
-            }
+            TurnAttributeType::DontFragment => Self::DontFragment,
             TurnAttributeType::ReservationToken => {
                 if value.len() < 8 {
                     return Err(TurnError::InvalidRequest {
@@ -414,13 +409,10 @@ mod tests {
 
         let encoded = attr.encode(&transaction_id);
         let value = &encoded[4..];
-        let parsed = TurnAttribute::parse(
-            TurnAttributeType::Lifetime as u16,
-            value,
-            &transaction_id,
-        )
-        .unwrap()
-        .unwrap();
+        let parsed =
+            TurnAttribute::parse(TurnAttributeType::Lifetime as u16, value, &transaction_id)
+                .unwrap()
+                .unwrap();
 
         if let TurnAttribute::Lifetime(lt) = parsed {
             assert_eq!(lt, 600);

@@ -201,7 +201,11 @@ impl DigestChallenge {
 
 impl fmt::Display for DigestChallenge {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Digest realm=\"{}\", nonce=\"{}\"", self.realm, self.nonce)?;
+        write!(
+            f,
+            "Digest realm=\"{}\", nonce=\"{}\"",
+            self.realm, self.nonce
+        )?;
 
         if self.algorithm != DigestAlgorithm::Md5 {
             write!(f, ", algorithm={}", self.algorithm)?;
@@ -287,11 +291,7 @@ impl FromStr for DigestChallenge {
         // Parse qop (comma-separated list)
         let qop: Vec<Qop> = params
             .get("qop")
-            .map(|s| {
-                s.split(',')
-                    .filter_map(|q| q.trim().parse().ok())
-                    .collect()
-            })
+            .map(|s| s.split(',').filter_map(|q| q.trim().parse().ok()).collect())
             .unwrap_or_default();
 
         // Collect remaining params
@@ -505,7 +505,9 @@ impl FromStr for DigestCredentials {
         let cnonce = params.get("cnonce").cloned();
         let qop = params.get("qop").map(|s| s.parse()).transpose()?;
 
-        let nc = params.get("nc").and_then(|s| u32::from_str_radix(s, 16).ok());
+        let nc = params
+            .get("nc")
+            .and_then(|s| u32::from_str_radix(s, 16).ok());
 
         // Collect remaining params
         let mut extra_params = HashMap::new();
@@ -880,14 +882,9 @@ pub fn create_credentials(
         entity_body,
     )?;
 
-    let mut creds = DigestCredentials::new(
-        username,
-        &challenge.realm,
-        &challenge.nonce,
-        uri,
-        response,
-    )
-    .with_algorithm(challenge.algorithm);
+    let mut creds =
+        DigestCredentials::new(username, &challenge.realm, &challenge.nonce, uri, response)
+            .with_algorithm(challenge.algorithm);
 
     if let Some(ref opaque) = challenge.opaque {
         creds = creds.with_opaque(opaque);
@@ -1055,8 +1052,14 @@ mod tests {
     #[test]
     fn test_compute_ha2_auth() {
         let hasher = MockHasher;
-        let ha2 = compute_ha2(&hasher, "INVITE", "sip:bob@example.com", Some(Qop::Auth), None)
-            .unwrap();
+        let ha2 = compute_ha2(
+            &hasher,
+            "INVITE",
+            "sip:bob@example.com",
+            Some(Qop::Auth),
+            None,
+        )
+        .unwrap();
 
         assert!(!ha2.is_empty());
     }

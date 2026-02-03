@@ -45,23 +45,23 @@ pub use attribute::{Attribute, AttributeName, Direction};
 pub use error::{SdpError, SdpResult};
 pub use media::{MediaDescription, MediaType, TransportProtocol};
 pub use offer_answer::{
+    HoldType, LocalCapabilities, LocalMediaCapability, MediaModification, MediaModificationType,
+    MediaModificationValidator, MediaNegotiationResult, NegotiationResult,
     compute_answer_direction, disable_media_stream, enable_media_stream, generate_answer,
-    hold_media_stream, resume_media_stream, validate_answer, HoldType, LocalCapabilities,
-    LocalMediaCapability, MediaModification, MediaModificationType, MediaModificationValidator,
-    MediaNegotiationResult, NegotiationResult,
+    hold_media_stream, resume_media_stream, validate_answer,
 };
 pub use session::{Origin, RepeatTimes, SessionDescription, TimeValue, Timing};
 
 // RFC 3264 §6.2 Multicast stream negotiation
 pub use multicast::{
-    is_multicast_address, is_multicast_media, MulticastAddress, MulticastNegotiator,
-    MulticastScope, MulticastValidation,
+    MulticastAddress, MulticastNegotiator, MulticastScope, MulticastValidation,
+    is_multicast_address, is_multicast_media,
 };
 
 // RFC 4568 SRTP-SDES Key Exchange
 pub use srtp::{
-    extract_crypto_attributes, supports_sdes, uses_dtls_srtp, CipherSuite, CryptoAttribute,
-    FecOrder, KeyParams, SessionParams, SrtpNegotiator,
+    CipherSuite, CryptoAttribute, FecOrder, KeyParams, SessionParams, SrtpNegotiator,
+    extract_crypto_attributes, supports_sdes, uses_dtls_srtp,
 };
 
 /// SDP protocol version (always 0 per RFC 4566).

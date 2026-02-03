@@ -300,9 +300,10 @@ mod tests {
     #[test]
     fn test_error_display() {
         let err = SbcError::Crypto(CryptoError::CnsaViolation);
-        assert!(err
-            .to_string()
-            .contains("cnsa 2.0 violation: algorithm not permitted"));
+        assert!(
+            err.to_string()
+                .contains("cnsa 2.0 violation: algorithm not permitted")
+        );
     }
 
     #[test]

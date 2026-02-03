@@ -1,9 +1,9 @@
 //! PASSporT verification.
 
+use crate::MAX_PASSPORT_AGE;
 use crate::error::{StirShakenError, StirShakenResult};
 use crate::identity::IdentityHeader;
 use crate::passport::Attestation;
-use crate::MAX_PASSPORT_AGE;
 
 /// Verification status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,7 +65,10 @@ impl std::fmt::Display for FailureReason {
             Self::InvalidFormat(reason) => write!(f, "Invalid format: {}", reason),
             Self::SignatureFailed(reason) => write!(f, "Signature failed: {}", reason),
             Self::CertificateError(reason) => write!(f, "Certificate error: {}", reason),
-            Self::Expired { age_seconds, max_age } => {
+            Self::Expired {
+                age_seconds,
+                max_age,
+            } => {
                 write!(f, "Expired: {}s > {}s", age_seconds, max_age)
             }
             Self::NumberMismatch { claim, actual } => {
@@ -374,7 +377,8 @@ mod tests {
 
     #[test]
     fn test_verification_result_failed() {
-        let result = VerificationResult::failed(FailureReason::InvalidAlgorithm("ES256".to_string()));
+        let result =
+            VerificationResult::failed(FailureReason::InvalidAlgorithm("ES256".to_string()));
 
         assert!(!result.is_valid());
         assert_eq!(result.status(), VerificationStatus::Failed);

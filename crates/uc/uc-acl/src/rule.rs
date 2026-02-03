@@ -141,7 +141,8 @@ impl RuleMatch {
             Self::Any => true,
             Self::Domain(d) => {
                 // Simple domain matching (could be enhanced with wildcards)
-                d.eq_ignore_ascii_case(domain) || domain.ends_with(&format!(".{}", d.to_lowercase()))
+                d.eq_ignore_ascii_case(domain)
+                    || domain.ends_with(&format!(".{}", d.to_lowercase()))
             }
             Self::All(rules) => rules.iter().all(|r| r.matches_domain(domain)),
             Self::AnyOf(rules) => rules.iter().any(|r| r.matches_domain(domain)),
@@ -262,7 +263,12 @@ impl AclRule {
     }
 
     /// Checks if this rule matches a request.
-    pub fn matches(&self, source_ip: IpAddr, dest_ip: Option<IpAddr>, method: Option<&str>) -> bool {
+    pub fn matches(
+        &self,
+        source_ip: IpAddr,
+        dest_ip: Option<IpAddr>,
+        method: Option<&str>,
+    ) -> bool {
         if !self.enabled {
             return false;
         }
@@ -309,7 +315,10 @@ mod tests {
     fn test_rule_action_display() {
         assert_eq!(RuleAction::Allow.to_string(), "allow");
         assert_eq!(RuleAction::Deny.to_string(), "deny");
-        assert_eq!(RuleAction::RateLimit { rps: 100 }.to_string(), "rate-limit(100rps)");
+        assert_eq!(
+            RuleAction::RateLimit { rps: 100 }.to_string(),
+            "rate-limit(100rps)"
+        );
     }
 
     #[test]
@@ -394,8 +403,7 @@ mod tests {
 
     #[test]
     fn test_rule_priority_setting() {
-        let rule = AclRule::allow_all("rule-1")
-            .with_priority(RulePriority::new(100));
+        let rule = AclRule::allow_all("rule-1").with_priority(RulePriority::new(100));
 
         assert_eq!(rule.priority().0, 100);
     }

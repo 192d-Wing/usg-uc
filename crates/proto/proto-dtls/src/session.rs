@@ -180,9 +180,11 @@ impl DtlsSession {
             return Err(DtlsError::NotConnected);
         }
 
-        self.keying_material.clone().ok_or(DtlsError::SrtpKeyExportFailed {
-            reason: "keying material not available".to_string(),
-        })
+        self.keying_material
+            .clone()
+            .ok_or(DtlsError::SrtpKeyExportFailed {
+                reason: "keying material not available".to_string(),
+            })
     }
 
     /// Sends encrypted data through the DTLS session.
@@ -201,11 +203,13 @@ impl DtlsSession {
             return Err(DtlsError::NotConnected);
         }
 
-        let written = self.socket.send(data).await.map_err(|e| {
-            DtlsError::SendFailed {
+        let written = self
+            .socket
+            .send(data)
+            .await
+            .map_err(|e| DtlsError::SendFailed {
                 reason: e.to_string(),
-            }
-        })?;
+            })?;
 
         debug!(bytes = written, "DTLS send completed");
         Ok(written)
@@ -228,11 +232,13 @@ impl DtlsSession {
         }
 
         let mut buf = vec![0u8; 8192];
-        let n = self.socket.recv(&mut buf).await.map_err(|e| {
-            DtlsError::ReceiveFailed {
+        let n = self
+            .socket
+            .recv(&mut buf)
+            .await
+            .map_err(|e| DtlsError::ReceiveFailed {
                 reason: e.to_string(),
-            }
-        })?;
+            })?;
 
         buf.truncate(n);
         debug!(bytes = n, "DTLS recv completed");

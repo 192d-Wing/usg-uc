@@ -21,14 +21,14 @@ use crate::fingerprint::CertificateFingerprint;
 use crate::session::DtlsSession;
 use crate::{DtlsRole, DtlsState, SrtpKeyingMaterial};
 use bytes::Bytes;
-use uc_types::address::SbcSocketAddr;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 use tracing::{debug, instrument, warn};
+use uc_types::address::SbcSocketAddr;
 
 /// DTLS connection for secure media transport.
 ///
@@ -188,19 +188,20 @@ impl DtlsConnection {
 
         // Bind to local address
         let local_std_addr: SocketAddr = self.local_addr.clone().into();
-        let socket = UdpSocket::bind(local_std_addr).await.map_err(|e| {
-            DtlsError::Io {
+        let socket = UdpSocket::bind(local_std_addr)
+            .await
+            .map_err(|e| DtlsError::Io {
                 reason: format!("failed to bind UDP socket: {e}"),
-            }
-        })?;
+            })?;
 
         // Connect to remote address
         let remote_std_addr: SocketAddr = self.remote_addr.clone().into();
-        socket.connect(remote_std_addr).await.map_err(|e| {
-            DtlsError::Io {
+        socket
+            .connect(remote_std_addr)
+            .await
+            .map_err(|e| DtlsError::Io {
                 reason: format!("failed to connect UDP socket: {e}"),
-            }
-        })?;
+            })?;
 
         let socket = Arc::new(socket);
         *socket_guard = Some(Arc::clone(&socket));
@@ -432,11 +433,7 @@ impl DtlsConnectionManager {
         local_addr: SbcSocketAddr,
         remote_addr: SbcSocketAddr,
     ) -> DtlsResult<Arc<DtlsConnection>> {
-        let conn = DtlsConnection::new(
-            self.default_config.clone(),
-            local_addr,
-            remote_addr,
-        )?;
+        let conn = DtlsConnection::new(self.default_config.clone(), local_addr, remote_addr)?;
 
         let conn = Arc::new(conn);
 
@@ -494,8 +491,7 @@ mod tests {
     use std::net::Ipv6Addr;
 
     fn test_config() -> DtlsConfig {
-        DtlsConfig::default()
-            .with_identity(vec![vec![1, 2, 3, 4, 5]], vec![6, 7, 8, 9, 10])
+        DtlsConfig::default().with_identity(vec![vec![1, 2, 3, 4, 5]], vec![6, 7, 8, 9, 10])
     }
 
     #[tokio::test]

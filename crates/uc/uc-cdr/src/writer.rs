@@ -371,8 +371,8 @@ mod tests {
     #[test]
     fn test_writer_custom_formatter() {
         let config = CdrWriterConfig::default().with_format(CdrFormat::Json);
-        let mut writer = CdrWriter::new(config)
-            .with_json_formatter(JsonFormatter::new().with_pretty(true));
+        let mut writer =
+            CdrWriter::new(config).with_json_formatter(JsonFormatter::new().with_pretty(true));
 
         writer.write(test_record("call-1")).unwrap();
         writer.flush().unwrap();

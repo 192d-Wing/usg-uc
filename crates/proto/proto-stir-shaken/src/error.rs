@@ -97,7 +97,10 @@ impl fmt::Display for StirShakenError {
             Self::CertificateError { reason } => {
                 write!(f, "Certificate error: {}", reason)
             }
-            Self::Expired { age_seconds, max_age } => {
+            Self::Expired {
+                age_seconds,
+                max_age,
+            } => {
                 write!(
                     f,
                     "PASSporT expired: age {}s exceeds maximum {}s",

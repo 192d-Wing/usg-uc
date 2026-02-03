@@ -300,7 +300,10 @@ impl SbcMetrics {
             "call_setup_duration_seconds",
             "Call setup duration in seconds",
         );
-        registry.register_histogram("sip_request_duration_seconds", "SIP request processing time");
+        registry.register_histogram(
+            "sip_request_duration_seconds",
+            "SIP request processing time",
+        );
 
         registry
     }

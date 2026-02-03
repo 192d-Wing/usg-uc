@@ -60,21 +60,21 @@ pub mod registrar;
 pub use binding::{Binding, BindingState};
 pub use error::{RegistrarError, RegistrarResult};
 pub use gruu::{
-    extract_gruu_info, is_gruu, parse_gr_parameter, GruuEntry, GruuGenerator, GruuRouter,
-    GruuRoutingResult, GruuService,
+    GruuEntry, GruuGenerator, GruuRouter, GruuRoutingResult, GruuService, extract_gruu_info,
+    is_gruu, parse_gr_parameter,
 };
 pub use location::LocationService;
 pub use outbound::{
-    Flow, FlowAction, FlowId, FlowState, FlowToken, FlowTransport, OutboundFlowManager,
     CRLF_KEEPALIVE, CRLF_PONG, DEFAULT_FAILURE_THRESHOLD, DEFAULT_KEEPALIVE_INTERVAL,
-    DEFAULT_KEEPALIVE_TIMEOUT,
+    DEFAULT_KEEPALIVE_TIMEOUT, Flow, FlowAction, FlowId, FlowState, FlowToken, FlowTransport,
+    OutboundFlowManager,
 };
 pub use registrar::{Registrar, RegistrarConfig, RegistrarMode};
 
 // RFC 3261 §22 Digest Authentication
 pub use authentication::{
     AuthAlgorithm, AuthChallenge, AuthCredentials, AuthQop, AuthResult, Authenticator,
-    NonceState, NonceValidation, DEFAULT_NONCE_LIFETIME_SECS, MAX_NONCE_COUNT,
+    DEFAULT_NONCE_LIFETIME_SECS, MAX_NONCE_COUNT, NonceState, NonceValidation,
 };
 
 /// Default registration expiration in seconds (RFC 3261 recommends 3600).

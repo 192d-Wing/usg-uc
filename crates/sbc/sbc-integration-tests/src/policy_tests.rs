@@ -40,13 +40,8 @@ fn test_policy_rule_allow_all() {
 fn test_rule_set() {
     let mut rule_set = RuleSet::new();
 
-    let rule1 = PolicyRule::new(
-        "rule-1",
-        "Rule 1",
-        Condition::Always,
-        PolicyAction::Allow,
-    )
-    .with_priority(RulePriority::high());
+    let rule1 = PolicyRule::new("rule-1", "Rule 1", Condition::Always, PolicyAction::Allow)
+        .with_priority(RulePriority::high());
 
     let rule2 = PolicyRule::new(
         "rule-2",

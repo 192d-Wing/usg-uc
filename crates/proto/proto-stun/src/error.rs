@@ -151,7 +151,10 @@ mod tests {
     fn test_error_codes() {
         assert_eq!(StunErrorCode::BadRequest.code(), 400);
         assert_eq!(StunErrorCode::Unauthorized.code(), 401);
-        assert_eq!(StunErrorCode::from_code(401), Some(StunErrorCode::Unauthorized));
+        assert_eq!(
+            StunErrorCode::from_code(401),
+            Some(StunErrorCode::Unauthorized)
+        );
         assert_eq!(StunErrorCode::from_code(999), None);
     }
 

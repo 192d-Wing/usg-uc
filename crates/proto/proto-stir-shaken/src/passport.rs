@@ -2,8 +2,8 @@
 //!
 //! Per RFC 8225, a PASSporT is a JWT-like token containing caller identity claims.
 
-use crate::error::{StirShakenError, StirShakenResult};
 use crate::PASSPORT_ALGORITHM;
+use crate::error::{StirShakenError, StirShakenResult};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Attestation level per SHAKEN.
@@ -179,10 +179,7 @@ impl TelephoneNumber {
 
     /// Normalizes a phone number.
     fn normalize(number: &str) -> String {
-        number
-            .chars()
-            .filter(|c| c.is_ascii_digit())
-            .collect()
+        number.chars().filter(|c| c.is_ascii_digit()).collect()
     }
 
     /// Returns the number.
@@ -219,11 +216,7 @@ pub struct PASSporTClaims {
 
 impl PASSporTClaims {
     /// Creates new claims.
-    pub fn new(
-        orig: TelephoneNumber,
-        dest: Vec<TelephoneNumber>,
-        attest: Attestation,
-    ) -> Self {
+    pub fn new(orig: TelephoneNumber, dest: Vec<TelephoneNumber>, attest: Attestation) -> Self {
         let iat = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -285,11 +278,7 @@ impl PASSporTClaims {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        if now > self.iat {
-            now - self.iat
-        } else {
-            0
-        }
+        if now > self.iat { now - self.iat } else { 0 }
     }
 }
 
@@ -423,9 +412,12 @@ impl PASSporT {
 
     /// Encodes as compact serialization (header.claims.signature).
     pub fn to_compact(&self) -> StirShakenResult<String> {
-        let signature = self.signature.as_ref().ok_or(StirShakenError::MissingField {
-            field: "signature".to_string(),
-        })?;
+        let signature = self
+            .signature
+            .as_ref()
+            .ok_or(StirShakenError::MissingField {
+                field: "signature".to_string(),
+            })?;
 
         Ok(format!("{}.{}", self.signing_input(), signature))
     }
@@ -549,7 +541,7 @@ mod tests {
 
         let header_enc = passport.encode_header();
         assert!(!header_enc.is_empty());
-        assert!(!header_enc.contains('='));  // No padding
+        assert!(!header_enc.contains('=')); // No padding
 
         let claims_enc = passport.encode_claims();
         assert!(!claims_enc.is_empty());
@@ -572,7 +564,7 @@ mod tests {
         // With signature
         passport.set_signature("test-signature");
         let compact = passport.to_compact().unwrap();
-        assert_eq!(compact.matches('.').count(), 2);  // header.claims.signature
+        assert_eq!(compact.matches('.').count(), 2); // header.claims.signature
     }
 
     #[test]
@@ -585,9 +577,11 @@ mod tests {
 
     #[test]
     fn test_passport_header_with_x5u() {
-        let header = PASSporTHeader::new()
-            .with_x5u("https://cert.example.com/cert.pem");
+        let header = PASSporTHeader::new().with_x5u("https://cert.example.com/cert.pem");
 
-        assert_eq!(header.x5u.as_deref(), Some("https://cert.example.com/cert.pem"));
+        assert_eq!(
+            header.x5u.as_deref(),
+            Some("https://cert.example.com/cert.pem")
+        );
     }
 }

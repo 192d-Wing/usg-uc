@@ -54,7 +54,11 @@ impl fmt::Display for DosError {
                 source,
                 remaining_secs,
             } => {
-                write!(f, "Source {} blocked for {} more seconds", source, remaining_secs)
+                write!(
+                    f,
+                    "Source {} blocked for {} more seconds",
+                    source, remaining_secs
+                )
             }
             Self::InvalidConfig { reason } => {
                 write!(f, "Invalid configuration: {}", reason)

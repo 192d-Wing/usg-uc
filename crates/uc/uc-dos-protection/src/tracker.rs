@@ -108,7 +108,10 @@ impl TrackingEntry {
 
         let total_requests = requests_in_window.len() as u64;
         let requests_per_second = self.calculate_rps(window);
-        let last_seen = requests_in_window.last().copied().unwrap_or(self.first_seen);
+        let last_seen = requests_in_window
+            .last()
+            .copied()
+            .unwrap_or(self.first_seen);
 
         SourceStats {
             total_requests,

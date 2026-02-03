@@ -133,7 +133,9 @@ impl SipUri {
     /// Returns true if the parameter exists (even without value).
     #[must_use]
     pub fn has_param(&self, name: &str) -> bool {
-        self.params.iter().any(|(n, _)| n.eq_ignore_ascii_case(name))
+        self.params
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case(name))
     }
 
     /// Returns the transport parameter if set.
@@ -275,7 +277,10 @@ impl FromStr for SipUri {
         let parts: Vec<&str> = rest.split(';').collect();
 
         // Power of 10 Rule 5: Assert parts is non-empty
-        debug_assert!(!parts.is_empty(), "split always produces at least one element");
+        debug_assert!(
+            !parts.is_empty(),
+            "split always produces at least one element"
+        );
 
         let user_host_port = parts.first().ok_or_else(|| SipError::InvalidUri {
             reason: "missing host".to_string(),
@@ -294,16 +299,17 @@ impl FromStr for SipUri {
             .collect();
 
         // Parse user@host:port
-        let (user, password, host_port) = if let Some((userinfo, hp)) = user_host_port.split_once('@') {
-            let (user, password) = if let Some((u, p)) = userinfo.split_once(':') {
-                (Some(u.to_string()), Some(p.to_string()))
+        let (user, password, host_port) =
+            if let Some((userinfo, hp)) = user_host_port.split_once('@') {
+                let (user, password) = if let Some((u, p)) = userinfo.split_once(':') {
+                    (Some(u.to_string()), Some(p.to_string()))
+                } else {
+                    (Some(userinfo.to_string()), None)
+                };
+                (user, password, hp)
             } else {
-                (Some(userinfo.to_string()), None)
+                (None, None, *user_host_port)
             };
-            (user, password, hp)
-        } else {
-            (None, None, *user_host_port)
-        };
 
         // Parse host:port (handle IPv6)
         let (host, port) = if host_port.starts_with('[') {

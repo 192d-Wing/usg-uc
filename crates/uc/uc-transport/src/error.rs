@@ -1,7 +1,7 @@
 //! Transport error types.
 
-use uc_types::address::SbcSocketAddr;
 use thiserror::Error;
+use uc_types::address::SbcSocketAddr;
 
 /// Result type for transport operations.
 pub type TransportResult<T> = Result<T, TransportError>;

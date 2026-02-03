@@ -113,10 +113,7 @@ impl TransportProtocol {
     /// Returns true if this protocol supports feedback.
     #[must_use]
     pub fn supports_feedback(&self) -> bool {
-        matches!(
-            self,
-            Self::RtpAvpf | Self::RtpSavpf | Self::UdpTlsRtpSavpf
-        )
+        matches!(self, Self::RtpAvpf | Self::RtpSavpf | Self::UdpTlsRtpSavpf)
     }
 }
 
@@ -400,10 +397,12 @@ mod tests {
     #[test]
     fn test_transport_protocol() {
         assert!("RTP/SAVP".parse::<TransportProtocol>().unwrap().is_secure());
-        assert!("UDP/TLS/RTP/SAVPF"
-            .parse::<TransportProtocol>()
-            .unwrap()
-            .uses_dtls());
+        assert!(
+            "UDP/TLS/RTP/SAVPF"
+                .parse::<TransportProtocol>()
+                .unwrap()
+                .uses_dtls()
+        );
     }
 
     #[test]

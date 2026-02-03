@@ -631,10 +631,7 @@ impl SessionRecordingClient {
     /// Evaluates a single trigger.
     fn evaluate_trigger(&self, trigger: &RecordingTrigger, context: &RecordingContext) -> bool {
         match trigger {
-            RecordingTrigger::Trunk(trunk) => context
-                .trunk_id
-                .as_ref()
-                .is_some_and(|t| t == trunk),
+            RecordingTrigger::Trunk(trunk) => context.trunk_id.as_ref().is_some_and(|t| t == trunk),
 
             RecordingTrigger::CallerPattern(pattern) => {
                 // Simple substring matching (would use regex in production)
@@ -676,7 +673,10 @@ impl SessionRecordingClient {
     }
 
     /// Creates a recording session for a call.
-    pub fn create_session(&mut self, call_id: impl Into<String>) -> SiprecResult<&mut RecordingSession> {
+    pub fn create_session(
+        &mut self,
+        call_id: impl Into<String>,
+    ) -> SiprecResult<&mut RecordingSession> {
         let call_id = call_id.into();
 
         if self.sessions.contains_key(&call_id) {
@@ -698,13 +698,18 @@ impl SessionRecordingClient {
         session.set_srs_endpoint(srs.clone());
 
         // Track session count per SRS
-        *self.sessions_per_srs.entry(srs.address.clone()).or_insert(0) += 1;
+        *self
+            .sessions_per_srs
+            .entry(srs.address.clone())
+            .or_insert(0) += 1;
 
         self.sessions.insert(call_id.clone(), session);
 
-        self.sessions.get_mut(&call_id).ok_or(SiprecError::SessionNotFound {
-            session_id: call_id,
-        })
+        self.sessions
+            .get_mut(&call_id)
+            .ok_or(SiprecError::SessionNotFound {
+                session_id: call_id,
+            })
     }
 
     /// Gets a session by call ID.
@@ -761,7 +766,11 @@ pub struct RecordingContext {
 impl RecordingContext {
     /// Creates a new recording context.
     #[must_use]
-    pub fn new(call_id: impl Into<String>, caller: impl Into<String>, callee: impl Into<String>) -> Self {
+    pub fn new(
+        call_id: impl Into<String>,
+        caller: impl Into<String>,
+        callee: impl Into<String>,
+    ) -> Self {
         Self {
             call_id: call_id.into(),
             caller: caller.into(),
@@ -886,8 +895,8 @@ mod tests {
 
     #[test]
     fn test_session_recording_client() {
-        let config = RecordingConfig::all_calls()
-            .with_primary_server(SrsEndpoint::new("10.0.0.1:5060"));
+        let config =
+            RecordingConfig::all_calls().with_primary_server(SrsEndpoint::new("10.0.0.1:5060"));
 
         let mut client = SessionRecordingClient::new(config);
 
@@ -947,8 +956,7 @@ mod tests {
     fn test_on_demand_recording() {
         let config = RecordingConfig {
             mode: RecordingMode::OnDemand,
-            ..RecordingConfig::all_calls()
-                .with_primary_server(SrsEndpoint::new("10.0.0.1:5060"))
+            ..RecordingConfig::all_calls().with_primary_server(SrsEndpoint::new("10.0.0.1:5060"))
         };
 
         let client = SessionRecordingClient::new(config);

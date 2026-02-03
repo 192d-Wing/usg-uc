@@ -361,7 +361,11 @@ impl ClientReliableProvisionalTracker {
     ///
     /// Returns `Ok(RAck)` if PRACK should be sent, or `Err` if the response
     /// should be discarded (e.g., out of order RSeq).
-    pub fn receive_provisional(&mut self, rseq: u32, status_code: u16) -> Result<RAck, &'static str> {
+    pub fn receive_provisional(
+        &mut self,
+        rseq: u32,
+        status_code: u16,
+    ) -> Result<RAck, &'static str> {
         // RFC 3262 Section 4: RSeq must be greater than the previous one
         if let Some(last) = self.last_rseq {
             if rseq <= last {

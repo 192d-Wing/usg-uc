@@ -220,7 +220,10 @@ pub struct LivenessResponse {
 impl LivenessResponse {
     /// Creates a new liveness response.
     pub fn new(alive: bool) -> Self {
-        Self { alive, timestamp: 0 }
+        Self {
+            alive,
+            timestamp: 0,
+        }
     }
 }
 
@@ -402,8 +405,8 @@ mod tests {
 
     #[test]
     fn test_readiness_response() {
-        let response = ReadinessResponse::new(false, HealthStatus::Unhealthy)
-            .with_reason("Database down");
+        let response =
+            ReadinessResponse::new(false, HealthStatus::Unhealthy).with_reason("Database down");
 
         assert!(!response.ready);
         assert_eq!(response.reason, Some("Database down".to_string()));

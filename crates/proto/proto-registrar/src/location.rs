@@ -3,9 +3,9 @@
 //! The location service maintains a database of registered endpoints
 //! and provides lookup functionality for call routing.
 
+use crate::MAX_CONTACTS_PER_AOR;
 use crate::binding::{Binding, BindingState};
 use crate::error::{RegistrarError, RegistrarResult};
-use crate::MAX_CONTACTS_PER_AOR;
 use std::collections::HashMap;
 
 /// Location service.
@@ -64,7 +64,9 @@ impl LocationService {
         let bindings = self
             .bindings
             .get_mut(aor)
-            .ok_or_else(|| RegistrarError::AorNotFound { aor: aor.to_string() })?;
+            .ok_or_else(|| RegistrarError::AorNotFound {
+                aor: aor.to_string(),
+            })?;
 
         let pos = bindings
             .iter()
@@ -88,7 +90,9 @@ impl LocationService {
         let bindings = self
             .bindings
             .remove(aor)
-            .ok_or_else(|| RegistrarError::AorNotFound { aor: aor.to_string() })?;
+            .ok_or_else(|| RegistrarError::AorNotFound {
+                aor: aor.to_string(),
+            })?;
 
         Ok(bindings.len())
     }
@@ -125,16 +129,16 @@ impl LocationService {
 
     /// Gets a specific binding.
     pub fn get_binding(&self, aor: &str, contact_uri: &str) -> Option<&Binding> {
-        self.bindings.get(aor).and_then(|bindings| {
-            bindings.iter().find(|b| b.contact_uri() == contact_uri)
-        })
+        self.bindings
+            .get(aor)
+            .and_then(|bindings| bindings.iter().find(|b| b.contact_uri() == contact_uri))
     }
 
     /// Gets a mutable reference to a binding.
     pub fn get_binding_mut(&mut self, aor: &str, contact_uri: &str) -> Option<&mut Binding> {
-        self.bindings.get_mut(aor).and_then(|bindings| {
-            bindings.iter_mut().find(|b| b.contact_uri() == contact_uri)
-        })
+        self.bindings
+            .get_mut(aor)
+            .and_then(|bindings| bindings.iter_mut().find(|b| b.contact_uri() == contact_uri))
     }
 
     /// Gets all bindings for a specific instance-id (RFC 5626).
@@ -163,7 +167,9 @@ impl LocationService {
         let bindings = self
             .bindings
             .get_mut(aor)
-            .ok_or_else(|| RegistrarError::AorNotFound { aor: aor.to_string() })?;
+            .ok_or_else(|| RegistrarError::AorNotFound {
+                aor: aor.to_string(),
+            })?;
 
         let pos = bindings
             .iter()
@@ -360,7 +366,9 @@ mod tests {
         service.add_binding(binding1).unwrap();
         service.add_binding(binding2).unwrap();
 
-        let removed = service.remove_all_bindings("sip:alice@example.com").unwrap();
+        let removed = service
+            .remove_all_bindings("sip:alice@example.com")
+            .unwrap();
         assert_eq!(removed, 2);
         assert!(!service.has_bindings("sip:alice@example.com"));
     }

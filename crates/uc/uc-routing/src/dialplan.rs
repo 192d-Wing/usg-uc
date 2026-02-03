@@ -60,7 +60,9 @@ impl NumberTransform {
                     number.to_string()
                 }
             }
-            Self::Replace { number: replacement } => replacement.clone(),
+            Self::Replace {
+                number: replacement,
+            } => replacement.clone(),
             Self::Chain(transforms) => {
                 let mut result = number.to_string();
                 for transform in transforms {
@@ -347,8 +349,16 @@ impl DialPlan {
         // Re-sort entries by priority
         self.sorted_ids.push(id);
         self.sorted_ids.sort_by(|a, b| {
-            let pa = self.entries.get(a).map(|e| e.priority()).unwrap_or(u32::MAX);
-            let pb = self.entries.get(b).map(|e| e.priority()).unwrap_or(u32::MAX);
+            let pa = self
+                .entries
+                .get(a)
+                .map(|e| e.priority())
+                .unwrap_or(u32::MAX);
+            let pb = self
+                .entries
+                .get(b)
+                .map(|e| e.priority())
+                .unwrap_or(u32::MAX);
             pa.cmp(&pb)
         });
     }
@@ -482,8 +492,7 @@ mod tests {
 
     #[test]
     fn test_dial_plan_entry_disabled() {
-        let entry = DialPlanEntry::new("test", DialPattern::Any, "trunk")
-            .with_enabled(false);
+        let entry = DialPlanEntry::new("test", DialPattern::Any, "trunk").with_enabled(false);
 
         assert!(!entry.matches("+15551234567"));
     }
@@ -500,8 +509,7 @@ mod tests {
         let mut plan = DialPlan::new("default", "Default Plan");
 
         plan.add_entry(
-            DialPlanEntry::new("entry-1", DialPattern::prefix("+1"), "us-trunk")
-                .with_priority(100),
+            DialPlanEntry::new("entry-1", DialPattern::prefix("+1"), "us-trunk").with_priority(100),
         );
         plan.add_entry(
             DialPlanEntry::new("entry-2", DialPattern::prefix("+44"), "uk-trunk")

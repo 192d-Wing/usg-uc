@@ -37,12 +37,7 @@ pub fn generate_call_id(host: &str) -> String {
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
 
     // Combine timestamp with counter for uniqueness
-    format!(
-        "{:x}{:x}@{}",
-        (timestamp & 0xFFFF_FFFF) as u64,
-        count,
-        host
-    )
+    format!("{:x}{:x}@{}", (timestamp & 0xFFFF_FFFF) as u64, count, host)
 }
 
 /// Generates a unique branch parameter with RFC 3261 magic cookie.
@@ -191,8 +186,7 @@ impl RequestBuilder {
     /// Sets the Max-Forwards header.
     #[must_use]
     pub fn max_forwards(mut self, value: u8) -> Self {
-        self.headers
-            .set(HeaderName::MaxForwards, value.to_string());
+        self.headers.set(HeaderName::MaxForwards, value.to_string());
         self
     }
 
@@ -267,8 +261,7 @@ impl RequestBuilder {
         // Auto-generate Content-Length if needed
         if self.auto_content_length {
             let len = self.body.as_ref().map_or(0, Bytes::len);
-            self.headers
-                .set(HeaderName::ContentLength, len.to_string());
+            self.headers.set(HeaderName::ContentLength, len.to_string());
         }
 
         // Validate required headers
@@ -505,8 +498,7 @@ impl ResponseBuilder {
         // Auto-generate Content-Length if needed
         if self.auto_content_length {
             let len = self.body.as_ref().map_or(0, Bytes::len);
-            self.headers
-                .set(HeaderName::ContentLength, len.to_string());
+            self.headers.set(HeaderName::ContentLength, len.to_string());
         }
 
         // Validate required headers
@@ -561,7 +553,9 @@ mod tests {
     #[test]
     fn test_request_builder_register() {
         let uri = SipUri::new("example.com");
-        let contact_uri = SipUri::new("192.168.1.1").with_user("alice").with_port(5060);
+        let contact_uri = SipUri::new("192.168.1.1")
+            .with_user("alice")
+            .with_port(5060);
 
         let request = RequestBuilder::register(uri)
             .via_auto("UDP", "192.168.1.1", Some(5060))
@@ -627,10 +621,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status, StatusCode::UNAUTHORIZED);
-        assert!(response
-            .headers
-            .get_value(&HeaderName::WwwAuthenticate)
-            .is_some());
+        assert!(
+            response
+                .headers
+                .get_value(&HeaderName::WwwAuthenticate)
+                .is_some()
+        );
     }
 
     #[test]

@@ -403,7 +403,11 @@ impl LocalCapabilities {
     }
 
     /// Sets ICE credentials.
-    pub fn with_ice_credentials(mut self, ufrag: impl Into<String>, pwd: impl Into<String>) -> Self {
+    pub fn with_ice_credentials(
+        mut self,
+        ufrag: impl Into<String>,
+        pwd: impl Into<String>,
+    ) -> Self {
         self.ice_ufrag = ufrag.into();
         self.ice_pwd = pwd.into();
         self
@@ -433,7 +437,10 @@ impl LocalMediaCapability {
             formats: Vec::new(),
             direction: Direction::Sendrecv,
             supports_rtcp_mux: true,
-            protocols: vec![TransportProtocol::RtpSavp, TransportProtocol::UdpTlsRtpSavpf],
+            protocols: vec![
+                TransportProtocol::RtpSavp,
+                TransportProtocol::UdpTlsRtpSavpf,
+            ],
         }
     }
 
@@ -462,9 +469,12 @@ pub fn hold_media_stream(
     media_index: usize,
     hold_type: HoldType,
 ) -> SdpResult<()> {
-    let media = sdp.media.get_mut(media_index).ok_or_else(|| SdpError::InvalidModification {
-        reason: format!("media index {} out of bounds", media_index),
-    })?;
+    let media = sdp
+        .media
+        .get_mut(media_index)
+        .ok_or_else(|| SdpError::InvalidModification {
+            reason: format!("media index {} out of bounds", media_index),
+        })?;
 
     // Remove existing direction attribute
     media.attributes.retain(|a| !a.is_direction());
@@ -492,9 +502,12 @@ pub fn resume_media_stream(
     media_index: usize,
     direction: Direction,
 ) -> SdpResult<()> {
-    let media = sdp.media.get_mut(media_index).ok_or_else(|| SdpError::InvalidModification {
-        reason: format!("media index {} out of bounds", media_index),
-    })?;
+    let media = sdp
+        .media
+        .get_mut(media_index)
+        .ok_or_else(|| SdpError::InvalidModification {
+            reason: format!("media index {} out of bounds", media_index),
+        })?;
 
     // Remove existing direction attribute
     media.attributes.retain(|a| !a.is_direction());
@@ -524,9 +537,12 @@ pub enum HoldType {
 /// A stream is disabled by setting its port to 0. The m= line MUST
 /// remain in the SDP to preserve ordering.
 pub fn disable_media_stream(sdp: &mut SessionDescription, media_index: usize) -> SdpResult<()> {
-    let media = sdp.media.get_mut(media_index).ok_or_else(|| SdpError::InvalidModification {
-        reason: format!("media index {} out of bounds", media_index),
-    })?;
+    let media = sdp
+        .media
+        .get_mut(media_index)
+        .ok_or_else(|| SdpError::InvalidModification {
+            reason: format!("media index {} out of bounds", media_index),
+        })?;
 
     media.port = 0;
 
@@ -552,9 +568,12 @@ pub fn enable_media_stream(
         });
     }
 
-    let media = sdp.media.get_mut(media_index).ok_or_else(|| SdpError::InvalidModification {
-        reason: format!("media index {} out of bounds", media_index),
-    })?;
+    let media = sdp
+        .media
+        .get_mut(media_index)
+        .ok_or_else(|| SdpError::InvalidModification {
+            reason: format!("media index {} out of bounds", media_index),
+        })?;
 
     media.port = port;
 
@@ -573,7 +592,10 @@ pub fn enable_media_stream(
 /// 2. Media types match at each index
 /// 3. Formats are a subset of offered formats
 /// 4. Direction is valid for the offer direction
-pub fn validate_answer(offer: &SessionDescription, answer: &SessionDescription) -> SdpResult<NegotiationResult> {
+pub fn validate_answer(
+    offer: &SessionDescription,
+    answer: &SessionDescription,
+) -> SdpResult<NegotiationResult> {
     let mut result = NegotiationResult {
         success: true,
         media_results: Vec::new(),
@@ -591,7 +613,9 @@ pub fn validate_answer(offer: &SessionDescription, answer: &SessionDescription) 
         return Ok(result);
     }
 
-    for (index, (offer_media, answer_media)) in offer.media.iter().zip(answer.media.iter()).enumerate() {
+    for (index, (offer_media, answer_media)) in
+        offer.media.iter().zip(answer.media.iter()).enumerate()
+    {
         let media_result = MediaNegotiationResult {
             index,
             media_type: offer_media.media_type,
@@ -625,7 +649,8 @@ pub fn validate_answer(offer: &SessionDescription, answer: &SessionDescription) 
 
         // Rule 4: Direction must be valid
         if answer_media.port != 0 {
-            let valid_direction = validate_answer_direction(offer_media.direction(), answer_media.direction());
+            let valid_direction =
+                validate_answer_direction(offer_media.direction(), answer_media.direction());
             if !valid_direction {
                 result.success = false;
                 result.errors.push(format!(
@@ -711,20 +736,50 @@ mod tests {
     #[test]
     fn test_validate_answer_direction() {
         // Sendrecv offer accepts any direction
-        assert!(validate_answer_direction(Direction::Sendrecv, Direction::Sendrecv));
-        assert!(validate_answer_direction(Direction::Sendrecv, Direction::Sendonly));
-        assert!(validate_answer_direction(Direction::Sendrecv, Direction::Recvonly));
-        assert!(validate_answer_direction(Direction::Sendrecv, Direction::Inactive));
+        assert!(validate_answer_direction(
+            Direction::Sendrecv,
+            Direction::Sendrecv
+        ));
+        assert!(validate_answer_direction(
+            Direction::Sendrecv,
+            Direction::Sendonly
+        ));
+        assert!(validate_answer_direction(
+            Direction::Sendrecv,
+            Direction::Recvonly
+        ));
+        assert!(validate_answer_direction(
+            Direction::Sendrecv,
+            Direction::Inactive
+        ));
 
         // Sendonly offer only accepts recvonly or inactive
-        assert!(!validate_answer_direction(Direction::Sendonly, Direction::Sendrecv));
-        assert!(!validate_answer_direction(Direction::Sendonly, Direction::Sendonly));
-        assert!(validate_answer_direction(Direction::Sendonly, Direction::Recvonly));
-        assert!(validate_answer_direction(Direction::Sendonly, Direction::Inactive));
+        assert!(!validate_answer_direction(
+            Direction::Sendonly,
+            Direction::Sendrecv
+        ));
+        assert!(!validate_answer_direction(
+            Direction::Sendonly,
+            Direction::Sendonly
+        ));
+        assert!(validate_answer_direction(
+            Direction::Sendonly,
+            Direction::Recvonly
+        ));
+        assert!(validate_answer_direction(
+            Direction::Sendonly,
+            Direction::Inactive
+        ));
 
         // Inactive offer only accepts inactive
-        assert!(validate_answer_direction(Direction::Inactive, Direction::Inactive));
-        assert!(!validate_answer_direction(Direction::Inactive, Direction::Sendrecv));
+        assert!(validate_answer_direction(
+            Direction::Inactive,
+            Direction::Inactive
+        ));
+        assert!(!validate_answer_direction(
+            Direction::Inactive,
+            Direction::Sendrecv
+        ));
     }
 
     #[test]
@@ -733,17 +788,21 @@ mod tests {
         let mut modified = original.clone();
 
         // Valid modification: change direction
-        modified.media[0]
-            .attributes
-            .retain(|a| !a.is_direction());
+        modified.media[0].attributes.retain(|a| !a.is_direction());
         modified.media[0].add_attribute(Attribute::flag(AttributeName::Sendonly));
 
         let validator = MediaModificationValidator::new();
         let modifications = validator.validate(&original, &modified).unwrap();
 
         assert_eq!(modifications.len(), 2);
-        assert_eq!(modifications[0].modification_type, MediaModificationType::DirectionChanged);
-        assert_eq!(modifications[1].modification_type, MediaModificationType::Unchanged);
+        assert_eq!(
+            modifications[0].modification_type,
+            MediaModificationType::DirectionChanged
+        );
+        assert_eq!(
+            modifications[1].modification_type,
+            MediaModificationType::Unchanged
+        );
     }
 
     #[test]
@@ -788,7 +847,10 @@ mod tests {
         let modifications = validator.validate(&original, &modified).unwrap();
 
         assert_eq!(modifications.len(), 3);
-        assert_eq!(modifications[2].modification_type, MediaModificationType::Added);
+        assert_eq!(
+            modifications[2].modification_type,
+            MediaModificationType::Added
+        );
     }
 
     #[test]
@@ -803,7 +865,12 @@ mod tests {
         let result = validator.validate(&original, &modified);
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Media type cannot change"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Media type cannot change")
+        );
     }
 
     #[test]
@@ -862,8 +929,8 @@ mod tests {
     fn test_generate_answer() {
         let offer = create_test_offer();
 
-        let mut capabilities = LocalCapabilities::new()
-            .with_ice_credentials("localufrag", "localpassword");
+        let mut capabilities =
+            LocalCapabilities::new().with_ice_credentials("localufrag", "localpassword");
         capabilities.add_media(
             LocalMediaCapability::new(MediaType::Audio)
                 .with_format("0")
@@ -885,8 +952,7 @@ mod tests {
         let offer = create_test_offer();
 
         // Only support audio
-        let mut capabilities = LocalCapabilities::new()
-            .with_ice_credentials("ufrag", "pwd");
+        let mut capabilities = LocalCapabilities::new().with_ice_credentials("ufrag", "pwd");
         capabilities.add_media(LocalMediaCapability::new(MediaType::Audio).with_format("0"));
 
         let answer = generate_answer(&offer, &capabilities).unwrap();

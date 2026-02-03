@@ -13,11 +13,13 @@ pub fn run(args: &Args) -> CommandResult {
     println!("============\n");
 
     // Create a health checker with simulated checks
-    let mut checker = HealthChecker::new(HealthCheckerConfig::default())
-        .with_version(env!("CARGO_PKG_VERSION"));
+    let mut checker =
+        HealthChecker::new(HealthCheckerConfig::default()).with_version(env!("CARGO_PKG_VERSION"));
 
     // Add checks
-    checker.register(Box::new(uc_health::check::AlwaysHealthyCheck::new("sbc_core")));
+    checker.register(Box::new(uc_health::check::AlwaysHealthyCheck::new(
+        "sbc_core",
+    )));
     checker.register(Box::new(uc_health::check::MemoryCheck::new()));
     checker.register(Box::new(uc_health::check::DiskCheck::new("/")));
 
@@ -27,7 +29,10 @@ pub fn run(args: &Args) -> CommandResult {
     // Overall status
     let status_str = health.status.as_str();
     let is_healthy = health.is_healthy();
-    println!("Overall Status: {}", formatter.format_status(status_str, is_healthy));
+    println!(
+        "Overall Status: {}",
+        formatter.format_status(status_str, is_healthy)
+    );
     println!();
 
     // Component statuses
@@ -35,10 +40,7 @@ pub fn run(args: &Args) -> CommandResult {
     println!("----------");
     for component in &health.components {
         let healthy = component.status == HealthStatus::Healthy;
-        println!(
-            "  {}",
-            formatter.format_status(&component.name, healthy)
-        );
+        println!("  {}", formatter.format_status(&component.name, healthy));
         if let Some(ref msg) = component.message {
             println!("    Message: {msg}");
         }

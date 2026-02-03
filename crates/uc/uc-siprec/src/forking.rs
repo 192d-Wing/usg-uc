@@ -442,9 +442,14 @@ mod tests {
 
     #[test]
     fn test_stream_fork_creation() {
-        let fork = StreamFork::new("stream-1", test_addr(5000), test_addr(5002), test_addr(6000))
-            .with_mode(ForkingMode::BothDirections)
-            .with_fork_ssrc(12345);
+        let fork = StreamFork::new(
+            "stream-1",
+            test_addr(5000),
+            test_addr(5002),
+            test_addr(6000),
+        )
+        .with_mode(ForkingMode::BothDirections)
+        .with_fork_ssrc(12345);
 
         assert_eq!(fork.stream_id, "stream-1");
         assert_eq!(fork.source_addr.port(), 5000);

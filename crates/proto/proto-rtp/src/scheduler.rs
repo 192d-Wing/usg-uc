@@ -262,9 +262,7 @@ impl RtcpScheduler {
     /// Returns `true` if the scheduled time has passed.
     #[must_use]
     pub fn is_time_to_send(&self) -> bool {
-        self.tn
-            .map(|tn| Instant::now() >= tn)
-            .unwrap_or(true) // Send if never scheduled
+        self.tn.map(|tn| Instant::now() >= tn).unwrap_or(true) // Send if never scheduled
     }
 
     /// Returns the next scheduled transmission time.
@@ -278,11 +276,7 @@ impl RtcpScheduler {
     pub fn time_until_next(&self) -> Option<Duration> {
         self.tn.and_then(|tn| {
             let now = Instant::now();
-            if tn > now {
-                Some(tn - now)
-            } else {
-                None
-            }
+            if tn > now { Some(tn - now) } else { None }
         })
     }
 

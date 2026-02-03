@@ -453,7 +453,8 @@ impl OutboundFlowManager {
         Self {
             flows: HashMap::new(),
             token_index: HashMap::new(),
-            keepalive_interval: keepalive_interval.clamp(MIN_KEEPALIVE_INTERVAL, MAX_KEEPALIVE_INTERVAL),
+            keepalive_interval: keepalive_interval
+                .clamp(MIN_KEEPALIVE_INTERVAL, MAX_KEEPALIVE_INTERVAL),
             keepalive_timeout,
             failure_threshold: failure_threshold.max(1),
         }
@@ -598,11 +599,9 @@ impl OutboundFlowManager {
                             transaction_id,
                         }
                     }
-                    FlowTransport::Tcp | FlowTransport::Tls => {
-                        FlowAction::SendCrlfKeepalive {
-                            remote_addr: flow.id.remote_addr,
-                        }
-                    }
+                    FlowTransport::Tcp | FlowTransport::Tls => FlowAction::SendCrlfKeepalive {
+                        remote_addr: flow.id.remote_addr,
+                    },
                     FlowTransport::WebSocket | FlowTransport::WebSocketSecure => {
                         FlowAction::SendWebSocketPing {
                             remote_addr: flow.id.remote_addr,

@@ -379,11 +379,7 @@ impl QosConfig {
     /// Returns the TOS byte value.
     #[must_use]
     pub fn tos_byte(&self) -> u8 {
-        if self.enabled {
-            self.dscp.to_tos()
-        } else {
-            0
-        }
+        if self.enabled { self.dscp.to_tos() } else { 0 }
     }
 }
 

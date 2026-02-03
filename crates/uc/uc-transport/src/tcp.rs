@@ -11,19 +11,19 @@
 
 use crate::error::{TransportError, TransportResult};
 use crate::listener::ListenerConfig;
-use crate::{ReceivedMessage, StreamTransport, Transport, MAX_STREAM_MESSAGE_SIZE};
+use crate::{MAX_STREAM_MESSAGE_SIZE, ReceivedMessage, StreamTransport, Transport};
 use bytes::BytesMut;
-use uc_types::address::{SbcSocketAddr, TransportType};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tracing::{debug, instrument, trace};
+use uc_types::address::{SbcSocketAddr, TransportType};
 
 /// TCP transport for connection-oriented SIP messaging.
 ///
@@ -84,12 +84,13 @@ impl TcpTransport {
     pub async fn connect(dest: SbcSocketAddr) -> TransportResult<Self> {
         let dest_addr: SocketAddr = dest.clone().into();
 
-        let stream = TcpStream::connect(dest_addr)
-            .await
-            .map_err(|e| TransportError::ConnectFailed {
-                address: dest,
-                reason: e.to_string(),
-            })?;
+        let stream =
+            TcpStream::connect(dest_addr)
+                .await
+                .map_err(|e| TransportError::ConnectFailed {
+                    address: dest,
+                    reason: e.to_string(),
+                })?;
 
         Self::from_stream(stream)
     }
@@ -130,10 +131,13 @@ impl Transport for TcpTransport {
                     reason: e.to_string(),
                 })?;
 
-            stream.flush().await.map_err(|e| TransportError::SendFailed {
-                address: self.peer_addr.clone(),
-                reason: e.to_string(),
-            })?;
+            stream
+                .flush()
+                .await
+                .map_err(|e| TransportError::SendFailed {
+                    address: self.peer_addr.clone(),
+                    reason: e.to_string(),
+                })?;
 
             Ok(())
         })
@@ -150,12 +154,13 @@ impl Transport for TcpTransport {
 
             // Read available data
             let mut temp_buffer = [0u8; 4096];
-            let n = stream
-                .read(&mut temp_buffer)
-                .await
-                .map_err(|e| TransportError::ReceiveFailed {
-                    reason: e.to_string(),
-                })?;
+            let n =
+                stream
+                    .read(&mut temp_buffer)
+                    .await
+                    .map_err(|e| TransportError::ReceiveFailed {
+                        reason: e.to_string(),
+                    })?;
 
             if n == 0 {
                 return Err(TransportError::ConnectionClosed);
@@ -260,50 +265,49 @@ impl TcpListener {
             Domain::IPV4
         };
 
-        let socket =
-            Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(|e| {
-                TransportError::BindFailed {
-                    address: config.bind_address.clone(),
-                    reason: e.to_string(),
-                }
-            })?;
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(|e| {
+            TransportError::BindFailed {
+                address: config.bind_address.clone(),
+                reason: e.to_string(),
+            }
+        })?;
 
         // Configure socket options
         if config.reuse_address {
-            socket.set_reuse_address(true).map_err(|e| {
-                TransportError::BindFailed {
+            socket
+                .set_reuse_address(true)
+                .map_err(|e| TransportError::BindFailed {
                     address: config.bind_address.clone(),
                     reason: format!("failed to set SO_REUSEADDR: {e}"),
-                }
-            })?;
+                })?;
         }
 
         #[cfg(unix)]
         if config.reuse_port {
-            socket.set_reuse_port(true).map_err(|e| {
-                TransportError::BindFailed {
+            socket
+                .set_reuse_port(true)
+                .map_err(|e| TransportError::BindFailed {
                     address: config.bind_address.clone(),
                     reason: format!("failed to set SO_REUSEPORT: {e}"),
-                }
-            })?;
+                })?;
         }
 
         // For IPv6, enable dual-stack mode
         if socket_addr.is_ipv6() {
-            socket.set_only_v6(false).map_err(|e| {
-                TransportError::BindFailed {
+            socket
+                .set_only_v6(false)
+                .map_err(|e| TransportError::BindFailed {
                     address: config.bind_address.clone(),
                     reason: format!("failed to set IPV6_V6ONLY: {e}"),
-                }
-            })?;
+                })?;
         }
 
-        socket.set_nonblocking(true).map_err(|e| {
-            TransportError::BindFailed {
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| TransportError::BindFailed {
                 address: config.bind_address.clone(),
                 reason: format!("failed to set non-blocking: {e}"),
-            }
-        })?;
+            })?;
 
         socket
             .bind(&socket_addr.into())
@@ -326,12 +330,12 @@ impl TcpListener {
                 reason: e.to_string(),
             })?;
 
-        let local_addr = tokio_listener.local_addr().map_err(|e| {
-            TransportError::BindFailed {
+        let local_addr = tokio_listener
+            .local_addr()
+            .map_err(|e| TransportError::BindFailed {
                 address: config.bind_address.clone(),
                 reason: format!("failed to get local address: {e}"),
-            }
-        })?;
+            })?;
 
         debug!(local_addr = %local_addr, "TCP listener bound");
 
@@ -352,13 +356,13 @@ impl TcpListener {
             return Err(TransportError::AlreadyClosed);
         }
 
-        let (stream, peer_addr) = self
-            .listener
-            .accept()
-            .await
-            .map_err(|e| TransportError::ReceiveFailed {
-                reason: format!("accept failed: {e}"),
-            })?;
+        let (stream, peer_addr) =
+            self.listener
+                .accept()
+                .await
+                .map_err(|e| TransportError::ReceiveFailed {
+                    reason: format!("accept failed: {e}"),
+                })?;
 
         debug!(peer = %peer_addr, "accepted TCP connection");
 

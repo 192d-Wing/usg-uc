@@ -212,8 +212,7 @@ impl HealthCheck for MemoryCheck {
         } else if usage_percent >= self.warn_threshold {
             HealthCheckResult::degraded(format!("Memory usage high: {:.1}%", usage_percent))
         } else {
-            HealthCheckResult::healthy()
-                .with_data(format!("Memory usage: {:.1}%", usage_percent))
+            HealthCheckResult::healthy().with_data(format!("Memory usage: {:.1}%", usage_percent))
         }
     }
 }
@@ -274,8 +273,10 @@ impl HealthCheck for DiskCheck {
                 self.path, usage_percent
             ))
         } else {
-            HealthCheckResult::healthy()
-                .with_data(format!("Disk usage on {}: {:.1}%", self.path, usage_percent))
+            HealthCheckResult::healthy().with_data(format!(
+                "Disk usage on {}: {:.1}%",
+                self.path, usage_percent
+            ))
         }
     }
 }
@@ -310,8 +311,7 @@ mod tests {
 
     #[test]
     fn test_health_check_result_to_component() {
-        let result = HealthCheckResult::healthy()
-            .with_duration(Duration::from_millis(50));
+        let result = HealthCheckResult::healthy().with_duration(Duration::from_millis(50));
 
         let component = result.to_component_status("database");
         assert_eq!(component.name, "database");

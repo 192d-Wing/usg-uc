@@ -366,12 +366,9 @@ mod tests {
     fn test_create_keying_material() {
         let exporter = SrtpKeyExporter::new(SrtpProfile::AeadAes256Gcm);
 
-        let material = exporter.create_keying_material(
-            vec![1u8; 32],
-            vec![2u8; 32],
-            vec![3u8; 12],
-            vec![4u8; 12],
-        ).unwrap();
+        let material = exporter
+            .create_keying_material(vec![1u8; 32], vec![2u8; 32], vec![3u8; 12], vec![4u8; 12])
+            .unwrap();
 
         assert_eq!(material.profile, SrtpProfile::AeadAes256Gcm);
     }
@@ -428,11 +425,9 @@ mod tests {
         let client_random = [0x01u8; 32];
         let server_random = [0x02u8; 32];
 
-        let material = exporter.derive_keying_material(
-            &master_secret,
-            &client_random,
-            &server_random,
-        ).unwrap();
+        let material = exporter
+            .derive_keying_material(&master_secret, &client_random, &server_random)
+            .unwrap();
 
         // Verify key lengths
         assert_eq!(material.client_write_key.len(), 32);

@@ -7,8 +7,8 @@
 use crate::context::SrtpContext;
 use crate::error::{SrtpError, SrtpResult};
 use bytes::{BufMut, Bytes, BytesMut};
-use uc_crypto::aead::Aes256GcmKey;
 use proto_rtp::packet::{RtpHeader, RtpPacket};
+use uc_crypto::aead::Aes256GcmKey;
 
 /// SRTP protection (encryption).
 pub struct SrtpProtect<'a> {
@@ -34,7 +34,9 @@ impl<'a> SrtpProtect<'a> {
     /// Returns an error if encryption fails.
     pub fn protect_rtp(&self, packet: &RtpPacket) -> SrtpResult<Bytes> {
         // Compute packet index from sequence number (matches how receiver computes it)
-        let index = self.context.compute_rtp_index(packet.header.sequence_number);
+        let index = self
+            .context
+            .compute_rtp_index(packet.header.sequence_number);
         // Update state to track highest sequence
         self.context.update_rtp_state(packet.header.sequence_number);
 
@@ -53,11 +55,11 @@ impl<'a> SrtpProtect<'a> {
         let key = create_key(self.context.rtp_key())?;
 
         // Encrypt payload with AES-256-GCM
-        let ciphertext = key.seal(&nonce, aad, &packet.payload).map_err(|_| {
-            SrtpError::EncryptionFailed {
-                reason: "AES-256-GCM encryption failed".to_string(),
-            }
-        })?;
+        let ciphertext =
+            key.seal(&nonce, aad, &packet.payload)
+                .map_err(|_| SrtpError::EncryptionFailed {
+                    reason: "AES-256-GCM encryption failed".to_string(),
+                })?;
 
         // Construct SRTP packet: header + encrypted payload (includes tag)
         let mut output = BytesMut::with_capacity(header_bytes.len() + ciphertext.len());
@@ -93,11 +95,11 @@ impl<'a> SrtpProtect<'a> {
 
         // Create key and encrypt
         let key = create_key(self.context.rtcp_key())?;
-        let ciphertext = key.seal(&nonce, aad, plaintext).map_err(|_| {
-            SrtpError::EncryptionFailed {
-                reason: "SRTCP encryption failed".to_string(),
-            }
-        })?;
+        let ciphertext =
+            key.seal(&nonce, aad, plaintext)
+                .map_err(|_| SrtpError::EncryptionFailed {
+                    reason: "SRTCP encryption failed".to_string(),
+                })?;
 
         // Construct SRTCP packet: header + encrypted + E flag + index + tag
         let mut output = BytesMut::with_capacity(aad.len() + ciphertext.len() + 4);
@@ -136,9 +138,10 @@ impl<'a> SrtpUnprotect<'a> {
         }
 
         // Parse RTP header to get sequence number and SSRC
-        let (header, header_size) = RtpHeader::parse(data).map_err(|e| SrtpError::InvalidPacket {
-            reason: e.to_string(),
-        })?;
+        let (header, header_size) =
+            RtpHeader::parse(data).map_err(|e| SrtpError::InvalidPacket {
+                reason: e.to_string(),
+            })?;
 
         // Compute packet index
         let index = self.context.compute_rtp_index(header.sequence_number);
@@ -187,8 +190,12 @@ impl<'a> SrtpUnprotect<'a> {
         // Extract index from trailer
         let trailer_offset = data.len() - 4 - auth_tag_len;
         let index_bytes = &data[trailer_offset..trailer_offset + 4];
-        let index_word =
-            u32::from_be_bytes([index_bytes[0], index_bytes[1], index_bytes[2], index_bytes[3]]);
+        let index_word = u32::from_be_bytes([
+            index_bytes[0],
+            index_bytes[1],
+            index_bytes[2],
+            index_bytes[3],
+        ]);
 
         let e_flag = (index_word & 0x80000000) != 0;
         if !e_flag {
@@ -305,9 +312,7 @@ mod tests {
         tampered[20] ^= 0xFF;
 
         // Should fail authentication
-        let result = SrtpUnprotect::new(&receiver)
-            .unprotect_rtp(&tampered)
-            .await;
+        let result = SrtpUnprotect::new(&receiver).unprotect_rtp(&tampered).await;
 
         assert!(matches!(result, Err(SrtpError::AuthenticationFailed)));
     }

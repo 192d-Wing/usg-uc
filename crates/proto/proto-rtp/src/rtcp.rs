@@ -1,7 +1,7 @@
 //! RTCP packet handling per RFC 3550.
 
-use crate::error::{RtpError, RtpResult};
 use crate::RTP_VERSION;
+use crate::error::{RtpError, RtpResult};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::fmt;
 
@@ -135,9 +135,8 @@ impl RtcpHeader {
     pub fn to_bytes(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(4);
 
-        let first_byte = (RTP_VERSION << 6)
-            | (if self.padding { 0x20 } else { 0 })
-            | (self.count & 0x1F);
+        let first_byte =
+            (RTP_VERSION << 6) | (if self.padding { 0x20 } else { 0 }) | (self.count & 0x1F);
         buf.put_u8(first_byte);
         buf.put_u8(self.packet_type.packet_type());
         buf.put_u16(self.length);

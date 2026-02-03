@@ -231,12 +231,11 @@ fn base64_decode(input: &str) -> DtlsResult<Vec<u8>> {
             break;
         }
 
-        let value = ALPHABET
-            .iter()
-            .position(|&x| x == c as u8)
-            .ok_or_else(|| DtlsError::CertificateError {
+        let value = ALPHABET.iter().position(|&x| x == c as u8).ok_or_else(|| {
+            DtlsError::CertificateError {
                 reason: format!("invalid base64 character: {c}"),
-            })? as u32;
+            }
+        })? as u32;
 
         buffer = (buffer << 6) | value;
         bits += 6;
@@ -270,8 +269,7 @@ mod tests {
         // Should fail - no certs
         assert!(config.validate().is_err());
 
-        let config = DtlsConfig::default()
-            .with_identity(vec![vec![1, 2, 3]], vec![4, 5, 6]);
+        let config = DtlsConfig::default().with_identity(vec![vec![1, 2, 3]], vec![4, 5, 6]);
         assert!(config.validate().is_ok());
     }
 

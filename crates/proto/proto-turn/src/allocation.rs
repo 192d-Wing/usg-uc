@@ -183,9 +183,7 @@ impl Allocation {
                 });
             }
             // Refresh existing binding
-            self.channel_bindings
-                .get_mut(&channel)
-                .map(|b| b.refresh());
+            self.channel_bindings.get_mut(&channel).map(|b| b.refresh());
         } else {
             // Check if peer already has a different channel
             if let Some(&existing_channel) = self.peer_to_channel.get(&peer_addr) {
@@ -315,7 +313,13 @@ mod tests {
         let relayed = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 49152);
         let client = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5060);
 
-        Allocation::new(relayed, client, "alice".to_string(), "example.com".to_string(), None)
+        Allocation::new(
+            relayed,
+            client,
+            "alice".to_string(),
+            "example.com".to_string(),
+            None,
+        )
     }
 
     #[test]

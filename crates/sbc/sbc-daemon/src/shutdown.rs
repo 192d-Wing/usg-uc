@@ -9,8 +9,8 @@
 //!
 //! Shutdown events are logged for audit trail.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::time::Instant;
@@ -107,7 +107,7 @@ impl ShutdownSignal {
     /// Internal signal handler loop.
     #[cfg(unix)]
     async fn signal_handler_loop(&self) {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let mut sigterm = match signal(SignalKind::terminate()) {
             Ok(s) => s,
@@ -255,9 +255,7 @@ impl ConnectionTracker {
 
     /// Returns the total number of active connections/operations.
     pub fn total_active(&self) -> u32 {
-        self.active_calls()
-            + self.active_transactions()
-            + self.pending_registrations()
+        self.active_calls() + self.active_transactions() + self.pending_registrations()
     }
 
     /// Returns true if all connections have drained.
@@ -386,10 +384,7 @@ impl ShutdownCoordinator {
         loop {
             if self.connections.is_drained() {
                 let duration_ms = start.elapsed().as_millis() as u64;
-                info!(
-                    duration_ms,
-                    "All connections drained successfully"
-                );
+                info!(duration_ms, "All connections drained successfully");
                 return DrainResult {
                     phase: ShutdownPhase::Complete,
                     drained: true,
@@ -425,11 +420,7 @@ impl ShutdownCoordinator {
             if now.duration_since(last_logged) >= log_interval {
                 let remaining = self.connections.total_active();
                 let elapsed = start.elapsed().as_secs();
-                debug!(
-                    remaining,
-                    elapsed_secs = elapsed,
-                    "Draining connections..."
-                );
+                debug!(remaining, elapsed_secs = elapsed, "Draining connections...");
                 last_logged = now;
             }
 

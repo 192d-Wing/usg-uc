@@ -323,7 +323,13 @@ mod tests {
 
     fn test_dialog() -> Dialog {
         let id = DialogId::new("call-123", "local-tag", "remote-tag");
-        Dialog::new(id, DialogRole::Uac, "sip:alice@example.com", "sip:bob@example.com", 1)
+        Dialog::new(
+            id,
+            DialogRole::Uac,
+            "sip:alice@example.com",
+            "sip:bob@example.com",
+            1,
+        )
     }
 
     #[test]

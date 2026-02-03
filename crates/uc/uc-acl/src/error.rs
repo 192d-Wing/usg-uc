@@ -94,7 +94,10 @@ mod tests {
 
     #[test]
     fn test_invalid_prefix() {
-        let error = AclError::InvalidPrefix { prefix: 33, max: 32 };
+        let error = AclError::InvalidPrefix {
+            prefix: 33,
+            max: 32,
+        };
         assert!(error.to_string().contains("33"));
         assert!(error.to_string().contains("32"));
     }

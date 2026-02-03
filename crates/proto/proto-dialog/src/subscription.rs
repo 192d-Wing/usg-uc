@@ -570,7 +570,9 @@ impl Notifier {
     /// Generates the Subscription-State header for a NOTIFY.
     pub fn generate_state_header(&self) -> SubscriptionStateHeader {
         match self.state {
-            SubscriptionState::Pending => SubscriptionStateHeader::pending(self.remaining_seconds()),
+            SubscriptionState::Pending => {
+                SubscriptionStateHeader::pending(self.remaining_seconds())
+            }
             SubscriptionState::Active => SubscriptionStateHeader::active(self.remaining_seconds()),
             SubscriptionState::Terminated => {
                 SubscriptionStateHeader::terminated(TerminationReason::Timeout)
@@ -975,10 +977,7 @@ mod tests {
 
         let header = SubscriptionStateHeader::parse("terminated;reason=timeout").unwrap();
         assert_eq!(header.state, SubscriptionState::Terminated);
-        assert!(matches!(
-            header.reason,
-            Some(TerminationReason::Timeout)
-        ));
+        assert!(matches!(header.reason, Some(TerminationReason::Timeout)));
     }
 
     #[test]
@@ -1096,10 +1095,7 @@ mod tests {
 
     #[test]
     fn test_format_allow_events() {
-        let events = vec![
-            "presence".to_string(),
-            "dialog".to_string(),
-        ];
+        let events = vec!["presence".to_string(), "dialog".to_string()];
         assert_eq!(format_allow_events(&events), "presence, dialog");
     }
 

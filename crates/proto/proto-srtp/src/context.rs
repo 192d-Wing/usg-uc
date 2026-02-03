@@ -2,10 +2,10 @@
 
 use crate::error::{SrtpError, SrtpResult};
 use crate::key::{SessionKeys, SrtpKeyMaterial};
-use crate::{SrtpProfile, DEFAULT_REPLAY_WINDOW_SIZE, MAX_PACKET_INDEX};
+use crate::{DEFAULT_REPLAY_WINDOW_SIZE, MAX_PACKET_INDEX, SrtpProfile};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
 /// SRTP direction.
@@ -287,12 +287,8 @@ mod tests {
     use super::*;
 
     fn test_context() -> SrtpContext {
-        let material = SrtpKeyMaterial::new(
-            SrtpProfile::AeadAes256Gcm,
-            vec![1u8; 32],
-            vec![2u8; 12],
-        )
-        .unwrap();
+        let material =
+            SrtpKeyMaterial::new(SrtpProfile::AeadAes256Gcm, vec![1u8; 32], vec![2u8; 12]).unwrap();
 
         SrtpContext::new(&material, SrtpDirection::Outbound, 0x12345678).unwrap()
     }
