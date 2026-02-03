@@ -282,7 +282,8 @@ impl AudioCodec for OpusCodec {
 
     fn samples_per_frame(&self) -> usize {
         // Samples at configured sample rate
-        (self.config.sample_rate as f32 * self.config.frame_duration_ms / 1000.0) as usize
+        // Use integer math to avoid precision loss
+        (self.config.sample_rate * self.config.frame_duration_ms as u32 / 1000) as usize
     }
 
     fn encode(&self, _pcm: &[i16], _output: &mut [u8]) -> CodecResult<usize> {
@@ -366,12 +367,16 @@ mod tests {
         let config = OpusConfig::default();
         assert!(config.validate().is_ok());
 
-        let mut invalid = OpusConfig::default();
-        invalid.sample_rate = 44100;
+        let invalid = OpusConfig {
+            sample_rate: 44100,
+            ..OpusConfig::default()
+        };
         assert!(invalid.validate().is_err());
 
-        let mut invalid = OpusConfig::default();
-        invalid.channels = 3;
+        let invalid = OpusConfig {
+            channels: 3,
+            ..OpusConfig::default()
+        };
         assert!(invalid.validate().is_err());
     }
 
@@ -390,7 +395,10 @@ mod tests {
         let fmtp = "minptime=20;useinbandfec=1;stereo=1";
         let config = parse_fmtp(fmtp);
 
-        assert_eq!(config.frame_duration_ms, 20.0);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(config.frame_duration_ms, 20.0);
+        }
         assert!(config.fec);
         assert_eq!(config.channels, 2);
     }

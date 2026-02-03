@@ -66,6 +66,13 @@ pub enum IceError {
     #[error("network error: {0}")]
     Network(#[from] std::io::Error),
 
+    /// Network error with reason.
+    #[error("network error: {reason}")]
+    NetworkError {
+        /// Error description.
+        reason: String,
+    },
+
     /// Missing required attribute.
     #[error("missing required attribute: {attribute}")]
     MissingAttribute {

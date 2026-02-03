@@ -72,6 +72,15 @@ pub enum StunError {
         /// Error description.
         reason: String,
     },
+
+    /// Server returned an error.
+    #[error("server error {code}: {reason}")]
+    ServerError {
+        /// Error code.
+        code: u16,
+        /// Error reason.
+        reason: String,
+    },
 }
 
 /// STUN error codes per RFC 5389.

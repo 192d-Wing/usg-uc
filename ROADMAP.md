@@ -50,7 +50,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 854 tests passing, all phases complete
+**Current Status**: 909 tests passing, Phase 17 in progress
 
 ---
 
@@ -121,16 +121,147 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 ---
 
+## Current Development Phase
+
+### 🔄 Phase 17: Complete Stub Implementations
+
+**Goal**: Make placeholder implementations functional
+
+**DTLS Integration** (sbc-dtls) ✅
+
+- [x] Custom DTLS 1.2 implementation with aws-lc-rs (replaced webrtc-dtls)
+- [x] DTLS record layer with AES-256-GCM encryption
+- [x] Full handshake state machine (client and server)
+- [x] TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 cipher suite (0xC02C)
+- [x] P-384 ECDHE key exchange
+- [x] TLS 1.2 PRF with HMAC-SHA384
+- [x] SRTP keying material export (RFC 5764)
+- [x] Anti-replay protection with sliding window
+- [x] Cookie-based DoS protection (HelloVerifyRequest)
+
+**ICE Candidate Gathering** (sbc-ice) ✅
+
+- [x] STUN client implementation for server-reflexive candidates
+- [x] TURN client implementation for relay candidates
+- [x] Candidate gathering state machine in ICE agent
+- [x] TURN authentication support
+
+**Codec Implementations** (sbc-codecs) ✅
+
+- [x] G.722 ADPCM encoder/decoder (pure Rust implementation)
+- [x] QMF filter banks for sub-band splitting
+- [x] Opus FFI bindings (optional `opus-ffi` feature via audiopus)
+- [x] Fixed clippy warnings across codec modules
+
+---
+
 ## Future Development Phases
 
-### ⏳ Phase 17: Advanced Features
-**Goal**: Enterprise features
+### ⏳ Phase 18: SIP Authentication & Security
+**Goal**: Production-grade SIP security
 
-- [ ] High availability with state replication
-- [ ] Geographic redundancy support
-- [ ] Advanced call routing (time-of-day, caller-based)
-- [ ] Integration with external databases
-- [ ] SNMP monitoring support
+**SIP Digest Authentication** (RFC 3261 Section 22)
+- [ ] Implement HTTP Digest authentication for SIP
+- [ ] Add nonce generation and validation
+- [ ] Support qop=auth and qop=auth-int
+- [ ] Add authentication state to registrar
+
+**Topology Hiding** (RFC 5765)
+- [ ] Via header stripping/rewriting
+- [ ] Contact header anonymization
+- [ ] Record-Route manipulation
+- [ ] Call-ID obfuscation
+
+**SRTP-SDES Key Exchange** (RFC 4568)
+- [ ] Parse crypto attributes from SDP
+- [ ] Generate SRTP keys from SDES
+- [ ] Support fallback from DTLS-SRTP to SDES
+
+### ⏳ Phase 19: WebRTC & Modern Transports
+**Goal**: WebRTC gateway support
+
+**WebSocket SIP Transport** (RFC 7118)
+- [ ] Add WebSocket listener to sbc-transport
+- [ ] Implement SIP-over-WebSocket framing
+- [ ] Add secure WebSocket (WSS) support
+- [ ] Handle WebSocket ping/pong keepalives
+
+**WebRTC Gateway**
+- [ ] SIP-to-WebRTC call bridging
+- [ ] SDP munging for WebRTC compatibility
+- [ ] ICE candidate trickling support
+- [ ] SRTP-to-DTLS-SRTP interworking
+
+### ⏳ Phase 20: Advanced SBC Features
+**Goal**: Enterprise-grade SBC functionality
+
+**Header Manipulation Engine**
+- [ ] Configurable header rewrite rules
+- [ ] Regular expression substitution
+- [ ] Header insertion/deletion policies
+- [ ] Per-trunk header manipulation
+
+**Call Recording & Forking** (RFC 7866)
+- [ ] SIPREC support for call recording
+- [ ] Media forking to recording server
+- [ ] Metadata generation for recordings
+
+**QoS & Traffic Management**
+- [ ] DSCP marking for SIP/RTP packets
+- [ ] Bandwidth management per trunk
+- [ ] Call admission control by capacity
+
+**DNS Integration**
+- [ ] ENUM lookup (RFC 6116)
+- [ ] DNS SRV for SIP routing (RFC 3263)
+- [ ] NAPTR records support
+- [ ] DNS caching and TTL management
+
+### ⏳ Phase 21: High Availability & Clustering
+**Goal**: Carrier-grade reliability
+
+**State Replication**
+- [ ] Call state synchronization between nodes
+- [ ] Registration database replication
+- [ ] Distributed rate limiting state
+
+**Geographic Redundancy**
+- [ ] Active-active clustering
+- [ ] Session takeover on failover
+- [ ] Load balancing strategies
+
+**External Integrations**
+- [ ] RADIUS/Diameter for AAA
+- [ ] External database backends (PostgreSQL, Redis)
+- [ ] SNMP traps and monitoring
+- [ ] Syslog forwarding
+
+### ⏳ Phase 22: Specialized Protocols
+**Goal**: Complete protocol coverage
+
+**T.38 Fax Relay** (RFC 4612)
+- [ ] T.38 over UDP/TCP
+- [ ] Audio-to-T.38 gateway
+- [ ] Error correction modes
+
+**SIP over SCTP** (RFC 4168)
+- [ ] SCTP transport support
+- [ ] Multi-homing for reliability
+
+---
+
+## Known TODOs in Code
+
+| Location | Description | Priority | Status |
+|----------|-------------|----------|--------|
+| `sbc-dtls/connection.rs` | DTLS handshake is placeholder | High | Done |
+| `sbc-dtls/connection.rs` | send/recv not implemented | High | Done |
+| `sbc-ice/agent.rs` | Server-reflexive/relay gathering | High | Done |
+| `sbc-codecs/opus.rs` | Opus encode/decode stubs | Medium | Done |
+| `sbc-codecs/g722.rs` | G.722 encode/decode stubs | Medium | Done |
+| `sbc-dtls/handshake.rs` | Certificate validation | Medium | Pending |
+| `sbc-dtls/handshake.rs` | Signature verification | Medium | Pending |
+| `sbc-registrar/registrar.rs` | Digest authentication | High | Pending |
 
 ---
 

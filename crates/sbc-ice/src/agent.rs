@@ -1,9 +1,14 @@
 //! ICE agent for managing connectivity establishment.
 
-use crate::candidate::Candidate;
+use crate::candidate::{Candidate, CandidateType};
 use crate::checklist::{CheckList, CheckListState, PairState};
 use crate::error::{IceError, IceResult};
+use sbc_stun::StunClient;
+use sbc_turn::{TurnClient, TurnCredentials};
 use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::net::UdpSocket;
+use tracing::{debug, warn};
 
 /// ICE agent role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,10 +354,142 @@ impl IceAgent {
             self.local_candidates.push(rtp_candidate);
         }
 
-        // TODO: Gather server-reflexive and relay candidates
-        // This would involve async STUN/TURN requests
-
         self.gathering_state = GatheringState::Complete;
+
+        Ok(())
+    }
+
+    /// Gathers server-reflexive and relay candidates asynchronously.
+    ///
+    /// This method should be called after `gather_candidates()` to add
+    /// srflx and relay candidates using configured STUN/TURN servers.
+    ///
+    /// ## RFC 8445 Candidate Gathering
+    ///
+    /// - Server-reflexive (srflx): Discovered via STUN Binding requests
+    /// - Relay: Allocated via TURN Allocate requests
+    ///
+    /// ## Example
+    ///
+    /// ```ignore
+    /// agent.gather_candidates(&local_addrs)?;
+    /// agent.gather_async_candidates().await?;
+    /// ```
+    pub async fn gather_async_candidates(&mut self) -> IceResult<()> {
+        // Gather server-reflexive candidates from STUN servers
+        for stun_server in &self.config.stun_servers.clone() {
+            if let Err(e) = self.gather_srflx_from_server(*stun_server).await {
+                warn!(server = %stun_server, error = %e, "Failed to gather srflx candidate");
+            }
+        }
+
+        // Gather relay candidates from TURN servers
+        for turn_config in &self.config.turn_servers.clone() {
+            if let Err(e) = self.gather_relay_from_server(turn_config.clone()).await {
+                warn!(server = %turn_config.address, error = %e, "Failed to gather relay candidate");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Gathers a server-reflexive candidate from a STUN server.
+    async fn gather_srflx_from_server(&mut self, stun_server: SocketAddr) -> IceResult<()> {
+        // Find a host candidate to use as the base
+        let host_candidate = self
+            .local_candidates
+            .iter()
+            .find(|c| c.candidate_type() == CandidateType::Host)
+            .ok_or(IceError::NoCandidates)?
+            .clone();
+
+        let base_addr = host_candidate.address();
+
+        // Create UDP socket bound to an ephemeral port
+        let socket = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| IceError::NetworkError {
+                reason: format!("failed to bind socket: {e}"),
+            })?;
+
+        let local_addr = socket.local_addr().map_err(|e| IceError::NetworkError {
+            reason: format!("failed to get local addr: {e}"),
+        })?;
+
+        debug!(
+            stun_server = %stun_server,
+            local_addr = %local_addr,
+            "Discovering server-reflexive address"
+        );
+
+        // Create STUN client and discover srflx address
+        let client = StunClient::new(Arc::new(socket), stun_server);
+        let srflx_addr = client.discover_srflx().await.map_err(|e| IceError::NetworkError {
+            reason: format!("STUN discovery failed: {e}"),
+        })?;
+
+        debug!(
+            srflx_addr = %srflx_addr,
+            base_addr = %base_addr,
+            "Discovered server-reflexive address"
+        );
+
+        // Create srflx candidate
+        let component = host_candidate.component();
+        let srflx_candidate = Candidate::server_reflexive(srflx_addr, base_addr, component);
+
+        // Add to local candidates
+        self.local_candidates.push(srflx_candidate);
+
+        Ok(())
+    }
+
+    /// Gathers a relay candidate from a TURN server.
+    async fn gather_relay_from_server(&mut self, turn_config: TurnServerConfig) -> IceResult<()> {
+        // Find a host candidate to use as the base
+        let host_candidate = self
+            .local_candidates
+            .iter()
+            .find(|c| c.candidate_type() == CandidateType::Host)
+            .ok_or(IceError::NoCandidates)?
+            .clone();
+
+        let base_addr = host_candidate.address();
+
+        // Create UDP socket
+        let socket = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| IceError::NetworkError {
+                reason: format!("failed to bind socket: {e}"),
+            })?;
+
+        debug!(
+            turn_server = %turn_config.address,
+            "Allocating relay address"
+        );
+
+        // Create TURN credentials
+        let credentials = TurnCredentials::new(&turn_config.username, &turn_config.password)
+            .with_realm(&turn_config.realm);
+
+        // Create TURN client and allocate relay address
+        let client = TurnClient::new(Arc::new(socket), turn_config.address, credentials);
+        let relay_addr = client.allocate().await.map_err(|e| IceError::NetworkError {
+            reason: format!("TURN allocation failed: {e}"),
+        })?;
+
+        debug!(
+            relay_addr = %relay_addr,
+            base_addr = %base_addr,
+            "Allocated relay address"
+        );
+
+        // Create relay candidate
+        let component = host_candidate.component();
+        let relay_candidate = Candidate::relay(relay_addr, base_addr, component);
+
+        // Add to local candidates
+        self.local_candidates.push(relay_candidate);
 
         Ok(())
     }

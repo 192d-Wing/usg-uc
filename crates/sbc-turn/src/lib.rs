@@ -54,11 +54,13 @@
 pub mod allocation;
 pub mod attribute;
 pub mod channel;
+pub mod client;
 pub mod error;
 
 pub use allocation::{Allocation, AllocationState};
 pub use attribute::TurnAttribute;
 pub use channel::ChannelData;
+pub use client::{TurnClient, TurnCredentials};
 pub use error::{TurnError, TurnResult};
 
 /// Default TURN port (same as STUN).

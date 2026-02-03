@@ -325,7 +325,7 @@ mod tests {
 
             // G.711 is lossy, but should be close
             let diff = (original - decoded).abs();
-            assert!(diff < 1000, "diff too large for {}: got {}", original, decoded);
+            assert!(diff < 1000, "diff too large for {original}: got {decoded}");
         }
 
         // Test frame encoding
@@ -342,7 +342,7 @@ mod tests {
         // Verify roundtrip is reasonably close
         for i in 0..8 {
             let diff = (pcm[i] - decoded[i]).abs();
-            assert!(diff < 1000, "sample {} diff too large", i);
+            assert!(diff < 1000, "sample {i} diff too large");
         }
     }
 
@@ -357,7 +357,7 @@ mod tests {
             let decoded = G711Alaw::decode_sample(encoded);
 
             let diff = (original - decoded).abs();
-            assert!(diff < 1000, "diff too large for {}: got {}", original, decoded);
+            assert!(diff < 1000, "diff too large for {original}: got {decoded}");
         }
 
         // Test frame encoding
@@ -381,7 +381,7 @@ mod tests {
 
         // G.711 mu-law bias causes small values to have quantization offset
         // The decoded value should be small but not necessarily < 100
-        assert!(decoded.abs() < 500, "silence decoded to {}", decoded);
+        assert!(decoded.abs() < 500, "silence decoded to {decoded}");
     }
 
     #[test]
@@ -390,7 +390,7 @@ mod tests {
         let decoded = G711Alaw::decode_sample(encoded);
 
         // A-law also has quantization effects on small values
-        assert!(decoded.abs() < 500, "silence decoded to {}", decoded);
+        assert!(decoded.abs() < 500, "silence decoded to {decoded}");
     }
 
     #[test]

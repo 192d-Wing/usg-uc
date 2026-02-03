@@ -30,15 +30,23 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 
+pub mod cipher_suite;
 pub mod config;
 pub mod connection;
 pub mod error;
 pub mod fingerprint;
+pub mod handshake;
+pub mod record;
+pub mod session;
 
+pub use cipher_suite::{cnsa_cipher_suites, is_cnsa_compliant};
 pub use config::DtlsConfig;
-pub use connection::DtlsConnection;
+pub use connection::{DtlsConnection, DtlsConnectionManager};
 pub use error::{DtlsError, DtlsResult};
 pub use fingerprint::CertificateFingerprint;
+pub use handshake::{Handshake, HandshakeState};
+pub use record::{RecordHeader, RecordLayer};
+pub use session::DtlsSession;
 
 /// DTLS role in the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

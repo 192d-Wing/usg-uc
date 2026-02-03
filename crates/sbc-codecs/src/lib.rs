@@ -22,8 +22,13 @@
 //! ## Note
 //!
 //! This crate provides codec abstractions and pure-Rust implementations
-//! for G.711. For production Opus support, external FFI bindings to
-//! libopus would be required (documented exception to pure-Rust policy).
+//! for G.711 and G.722. For production Opus support, enable the `opus-ffi`
+//! feature which provides FFI bindings to libopus (documented exception
+//! to pure-Rust policy).
+//!
+//! ## Feature Flags
+//!
+//! - `opus-ffi`: Enable Opus FFI bindings (requires libopus installed)
 
 #![forbid(unsafe_code)]
 #![deny(warnings)]
@@ -52,12 +57,17 @@
 pub mod error;
 pub mod g711;
 pub mod g722;
+pub mod g722_adpcm;
 pub mod opus;
+#[cfg(feature = "opus-ffi")]
+pub mod opus_ffi;
 
 pub use error::{CodecError, CodecResult};
 pub use g711::{G711Alaw, G711Ulaw};
 pub use g722::G722Codec;
 pub use opus::OpusCodec;
+#[cfg(feature = "opus-ffi")]
+pub use opus_ffi::{FfiOpusCodec, FfiOpusDecoder, FfiOpusEncoder};
 
 /// Audio codec trait.
 pub trait AudioCodec: Send + Sync {
@@ -153,6 +163,7 @@ impl CodecCapability {
     }
 
     /// Sets format parameters.
+    #[must_use]
     pub fn with_fmtp(mut self, fmtp: &str) -> Self {
         self.fmtp = Some(fmtp.to_string());
         self

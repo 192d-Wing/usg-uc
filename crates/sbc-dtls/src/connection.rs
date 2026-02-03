@@ -4,6 +4,12 @@
 //!
 //! Connections use CNSA 2.0 compliant cipher suites only.
 //!
+//! ## NIST 800-53 Rev5 Controls
+//!
+//! - **SC-8**: Transmission Confidentiality and Integrity
+//! - **SC-12**: Cryptographic Key Establishment
+//! - **SC-13**: Cryptographic Protection
+//!
 //! ## RFC Compliance
 //!
 //! - RFC 6347: DTLS 1.2
@@ -12,13 +18,17 @@
 use crate::config::DtlsConfig;
 use crate::error::{DtlsError, DtlsResult};
 use crate::fingerprint::CertificateFingerprint;
-use crate::{DtlsRole, DtlsState, SrtpKeyingMaterial, SrtpProfile};
+use crate::session::DtlsSession;
+use crate::{DtlsRole, DtlsState, SrtpKeyingMaterial};
 use bytes::Bytes;
 use sbc_types::address::SbcSocketAddr;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
-use tracing::{debug, instrument};
+use tokio::time::{timeout, Duration};
+use tracing::{debug, instrument, warn};
 
 /// DTLS connection for secure media transport.
 ///
@@ -36,7 +46,10 @@ use tracing::{debug, instrument};
 ///
 /// ## CNSA 2.0 Compliance
 ///
-/// All cryptographic operations use CNSA 2.0 compliant algorithms.
+/// All cryptographic operations use CNSA 2.0 compliant algorithms:
+/// - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 cipher suite
+/// - P-384 ECDHE key exchange
+/// - P-384 ECDSA certificates
 pub struct DtlsConnection {
     config: DtlsConfig,
     local_addr: SbcSocketAddr,
@@ -45,6 +58,8 @@ pub struct DtlsConnection {
     local_fingerprint: CertificateFingerprint,
     remote_fingerprint: Mutex<Option<CertificateFingerprint>>,
     keying_material: Mutex<Option<SrtpKeyingMaterial>>,
+    session: Mutex<Option<DtlsSession>>,
+    socket: Mutex<Option<Arc<UdpSocket>>>,
 }
 
 impl DtlsConnection {
@@ -84,7 +99,32 @@ impl DtlsConnection {
             local_fingerprint,
             remote_fingerprint: Mutex::new(None),
             keying_material: Mutex::new(None),
+            session: Mutex::new(None),
+            socket: Mutex::new(None),
         })
+    }
+
+    /// Creates a new DTLS connection with an existing UDP socket.
+    ///
+    /// Use this when you already have a bound socket.
+    #[instrument(skip(config, socket), fields(local = %local_addr, remote = %remote_addr))]
+    pub fn with_socket(
+        config: DtlsConfig,
+        local_addr: SbcSocketAddr,
+        remote_addr: SbcSocketAddr,
+        socket: Arc<UdpSocket>,
+    ) -> DtlsResult<Self> {
+        let conn = Self::new(config, local_addr, remote_addr)?;
+        {
+            let rt = tokio::runtime::Handle::try_current();
+            if let Ok(handle) = rt {
+                handle.block_on(async {
+                    let mut sock = conn.socket.lock().await;
+                    *sock = Some(socket);
+                });
+            }
+        }
+        Ok(conn)
     }
 
     /// Returns the current connection state.
@@ -138,11 +178,53 @@ impl DtlsConnection {
         *remote = Some(fingerprint);
     }
 
+    /// Creates and binds a UDP socket for the connection.
+    async fn ensure_socket(&self) -> DtlsResult<Arc<UdpSocket>> {
+        let mut socket_guard = self.socket.lock().await;
+
+        if let Some(ref socket) = *socket_guard {
+            return Ok(Arc::clone(socket));
+        }
+
+        // Bind to local address
+        let local_std_addr: SocketAddr = self.local_addr.clone().into();
+        let socket = UdpSocket::bind(local_std_addr).await.map_err(|e| {
+            DtlsError::Io {
+                reason: format!("failed to bind UDP socket: {e}"),
+            }
+        })?;
+
+        // Connect to remote address
+        let remote_std_addr: SocketAddr = self.remote_addr.clone().into();
+        socket.connect(remote_std_addr).await.map_err(|e| {
+            DtlsError::Io {
+                reason: format!("failed to connect UDP socket: {e}"),
+            }
+        })?;
+
+        let socket = Arc::new(socket);
+        *socket_guard = Some(Arc::clone(&socket));
+
+        debug!(
+            local = %self.local_addr,
+            remote = %self.remote_addr,
+            "UDP socket bound and connected"
+        );
+
+        Ok(socket)
+    }
+
     /// Performs the DTLS handshake.
+    ///
+    /// ## CNSA 2.0 Compliance
+    ///
+    /// The handshake enforces CNSA 2.0 cipher suite negotiation.
+    /// If the peer doesn't support TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+    /// the handshake will fail.
     ///
     /// ## Errors
     ///
-    /// Returns an error if the handshake fails.
+    /// Returns an error if the handshake fails or times out.
     #[instrument(skip(self))]
     pub async fn handshake(&self) -> DtlsResult<()> {
         if self.state() != DtlsState::New {
@@ -153,60 +235,54 @@ impl DtlsConnection {
 
         self.set_state(DtlsState::Connecting);
 
-        // TODO: Implement actual DTLS handshake using webrtc-dtls
-        // For now, this is a placeholder that simulates success
-
         debug!(
             role = ?self.config.role,
-            "DTLS handshake initiated (placeholder)"
+            timeout_secs = self.config.handshake_timeout.as_secs(),
+            "Starting DTLS handshake"
         );
 
-        // Simulate generating keying material after handshake
-        let keying_material = self.generate_placeholder_keying_material();
+        // Ensure we have a socket
+        let socket = self.ensure_socket().await?;
+
+        // Perform handshake with timeout
+        let is_client = self.config.role.is_client();
+        let handshake_result = timeout(
+            self.config.handshake_timeout,
+            DtlsSession::new(&self.config, socket, is_client),
+        )
+        .await;
+
+        let dtls_session = match handshake_result {
+            Ok(Ok(session)) => session,
+            Ok(Err(e)) => {
+                self.set_state(DtlsState::Failed);
+                warn!(error = %e, "DTLS handshake failed");
+                return Err(e);
+            }
+            Err(_) => {
+                self.set_state(DtlsState::Failed);
+                warn!("DTLS handshake timed out");
+                return Err(DtlsError::Timeout);
+            }
+        };
+
+        // Export SRTP keying material
+        let keying_material = dtls_session.export_srtp_keying_material().await?;
+
+        // Store session and keying material
+        {
+            let mut session = self.session.lock().await;
+            *session = Some(dtls_session);
+        }
         {
             let mut km = self.keying_material.lock().await;
             *km = Some(keying_material);
         }
 
         self.set_state(DtlsState::Connected);
-        debug!("DTLS handshake completed");
+        debug!("DTLS handshake completed successfully");
 
         Ok(())
-    }
-
-    /// Generates placeholder keying material for testing.
-    ///
-    /// In production, this would be derived from the DTLS handshake.
-    fn generate_placeholder_keying_material(&self) -> SrtpKeyingMaterial {
-        let profile = self
-            .config
-            .srtp_profiles
-            .first()
-            .copied()
-            .unwrap_or(SrtpProfile::AeadAes256Gcm);
-
-        let key_len = profile.key_len();
-        let salt_len = profile.salt_len();
-
-        // Generate random keys for placeholder
-        let mut client_key = vec![0u8; key_len];
-        let mut server_key = vec![0u8; key_len];
-        let mut client_salt = vec![0u8; salt_len];
-        let mut server_salt = vec![0u8; salt_len];
-
-        // Use crypto random for placeholder values
-        let _ = sbc_crypto::random::fill_random(&mut client_key);
-        let _ = sbc_crypto::random::fill_random(&mut server_key);
-        let _ = sbc_crypto::random::fill_random(&mut client_salt);
-        let _ = sbc_crypto::random::fill_random(&mut server_salt);
-
-        SrtpKeyingMaterial {
-            client_write_key: client_key,
-            server_write_key: server_key,
-            client_write_salt: client_salt,
-            server_write_salt: server_salt,
-            profile,
-        }
     }
 
     /// Exports SRTP keying material.
@@ -238,9 +314,14 @@ impl DtlsConnection {
             return Err(DtlsError::NotConnected);
         }
 
-        // TODO: Implement actual DTLS send
-        debug!(size = data.len(), "DTLS send (placeholder)");
-        Ok(())
+        let session = self.session.lock().await;
+        if let Some(ref sess) = *session {
+            sess.send(data).await?;
+            debug!(size = data.len(), "DTLS send completed");
+            Ok(())
+        } else {
+            Err(DtlsError::NotConnected)
+        }
     }
 
     /// Receives decrypted data.
@@ -254,9 +335,27 @@ impl DtlsConnection {
             return Err(DtlsError::NotConnected);
         }
 
-        // TODO: Implement actual DTLS receive
-        debug!("DTLS recv (placeholder)");
-        Err(DtlsError::Timeout)
+        let session = self.session.lock().await;
+        if let Some(ref sess) = *session {
+            let data = sess.recv().await?;
+            debug!(size = data.len(), "DTLS recv completed");
+            Ok(data)
+        } else {
+            Err(DtlsError::NotConnected)
+        }
+    }
+
+    /// Receives decrypted data with timeout.
+    ///
+    /// ## Errors
+    ///
+    /// Returns an error if the connection is not established, receive fails, or times out.
+    #[instrument(skip(self))]
+    pub async fn recv_timeout(&self, duration: Duration) -> DtlsResult<Bytes> {
+        match timeout(duration, self.recv()).await {
+            Ok(result) => result,
+            Err(_) => Err(DtlsError::Timeout),
+        }
     }
 
     /// Closes the DTLS connection.
@@ -272,6 +371,15 @@ impl DtlsConnection {
         }
 
         self.set_state(DtlsState::Closing);
+
+        // Close the session
+        {
+            let mut session = self.session.lock().await;
+            if let Some(ref mut sess) = *session {
+                let _ = sess.close().await;
+            }
+            *session = None;
+        }
 
         // Clear keying material
         {
@@ -338,15 +446,27 @@ impl DtlsConnectionManager {
         Ok(conn)
     }
 
-    /// Removes a closed connection.
-    pub async fn remove_connection(&self, conn: &DtlsConnection) {
+    /// Removes a closed connection from the manager.
+    pub async fn remove_connection(&self, conn: &Arc<DtlsConnection>) {
         let mut connections = self.connections.lock().await;
-        connections.retain(|c| !Arc::ptr_eq(c, &Arc::new(conn.clone())));
+        connections.retain(|c| !Arc::ptr_eq(c, conn));
     }
 
     /// Returns the number of active connections.
     pub async fn connection_count(&self) -> usize {
         self.connections.lock().await.len()
+    }
+
+    /// Closes all connections.
+    pub async fn close_all(&self) {
+        let connections = {
+            let mut conns = self.connections.lock().await;
+            std::mem::take(&mut *conns)
+        };
+
+        for conn in connections {
+            let _ = conn.close().await;
+        }
     }
 }
 
@@ -362,6 +482,8 @@ impl Clone for DtlsConnection {
             local_fingerprint: self.local_fingerprint.clone(),
             remote_fingerprint: Mutex::new(None),
             keying_material: Mutex::new(None),
+            session: Mutex::new(None),
+            socket: Mutex::new(None),
         }
     }
 }
@@ -388,49 +510,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handshake() {
+    async fn test_connection_state_transitions() {
         let config = test_config();
-        let local = SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 5000);
-        let remote = SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 5001);
+        let local = SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 5002);
+        let remote = SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 5003);
 
         let conn = DtlsConnection::new(config, local, remote).unwrap();
-        conn.handshake().await.unwrap();
+        assert_eq!(conn.state(), DtlsState::New);
 
+        conn.set_state(DtlsState::Connecting);
+        assert_eq!(conn.state(), DtlsState::Connecting);
+
+        conn.set_state(DtlsState::Connected);
         assert_eq!(conn.state(), DtlsState::Connected);
     }
 
     #[tokio::test]
-    async fn test_export_keying_material() {
+    async fn test_send_recv_without_handshake() {
         let config = test_config();
-        let local = SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 5000);
-        let remote = SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 5001);
+        let local = SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 5004);
+        let remote = SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 5005);
 
         let conn = DtlsConnection::new(config, local, remote).unwrap();
 
-        // Should fail before handshake
+        // Should fail - not connected
+        assert!(conn.send(b"test").await.is_err());
+        assert!(conn.recv().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_export_keying_material_without_handshake() {
+        let config = test_config();
+        let local = SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 5006);
+        let remote = SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 5007);
+
+        let conn = DtlsConnection::new(config, local, remote).unwrap();
+
+        // Should fail - not connected
         assert!(conn.export_srtp_keying_material().await.is_err());
-
-        conn.handshake().await.unwrap();
-
-        // Should succeed after handshake
-        let km = conn.export_srtp_keying_material().await.unwrap();
-        assert_eq!(km.profile, SrtpProfile::AeadAes256Gcm);
-        assert_eq!(km.client_write_key.len(), 32);
     }
 
     #[tokio::test]
     async fn test_close() {
         let config = test_config();
-        let local = SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 5000);
-        let remote = SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 5001);
+        let local = SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 5008);
+        let remote = SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 5009);
 
         let conn = DtlsConnection::new(config, local, remote).unwrap();
-        conn.handshake().await.unwrap();
-        conn.close().await.unwrap();
 
+        // Close should work even without handshake
+        conn.close().await.unwrap();
         assert_eq!(conn.state(), DtlsState::Closed);
 
         // Second close should fail
         assert!(conn.close().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_connection_manager() {
+        let config = test_config();
+        let manager = DtlsConnectionManager::new(config);
+
+        let local = SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 5010);
+        let remote = SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 5011);
+
+        let conn = manager.create_connection(local, remote).await.unwrap();
+        assert_eq!(manager.connection_count().await, 1);
+
+        manager.remove_connection(&conn).await;
+        assert_eq!(manager.connection_count().await, 0);
     }
 }

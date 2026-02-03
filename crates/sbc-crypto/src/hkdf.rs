@@ -9,6 +9,7 @@
 
 use crate::error::{CryptoError, CryptoResult};
 use aws_lc_rs::hkdf::{self, Prk, Salt, HKDF_SHA384, HKDF_SHA512};
+use aws_lc_rs::hmac::{self, Key as HmacKey, HMAC_SHA384};
 
 /// HKDF-SHA384 output key material.
 pub struct HkdfSha384Output {
@@ -168,6 +169,66 @@ pub fn hkdf_sha512(salt: Option<&[u8]>, ikm: &[u8], info: &[&[u8]], output: &mut
     HkdfSha512Output::derive(salt, ikm, info, output)
 }
 
+/// Computes HMAC-SHA384 over the given data.
+///
+/// This function is used for TLS 1.2 PRF and other CNSA 2.0 compliant
+/// message authentication.
+///
+/// ## NIST 800-53 Rev5: SC-13 (Cryptographic Protection)
+///
+/// ## Arguments
+///
+/// * `key` - The HMAC key.
+/// * `data` - The data to authenticate.
+///
+/// ## Returns
+///
+/// The 48-byte HMAC-SHA384 tag.
+///
+/// ## Example
+///
+/// ```
+/// use sbc_crypto::hkdf::hmac_sha384;
+///
+/// let key = b"secret key";
+/// let data = b"message to authenticate";
+/// let tag = hmac_sha384(key, data);
+/// assert_eq!(tag.len(), 48);
+/// ```
+#[must_use]
+pub fn hmac_sha384(key: &[u8], data: &[u8]) -> [u8; 48] {
+    let hmac_key = HmacKey::new(HMAC_SHA384, key);
+    let tag = hmac::sign(&hmac_key, data);
+    let mut output = [0u8; 48];
+    output.copy_from_slice(tag.as_ref());
+    output
+}
+
+/// Computes HMAC-SHA384 over multiple data segments.
+///
+/// This is useful for TLS 1.2 PRF which requires HMAC over concatenated data.
+///
+/// ## Arguments
+///
+/// * `key` - The HMAC key.
+/// * `data` - Slice of data segments to authenticate.
+///
+/// ## Returns
+///
+/// The 48-byte HMAC-SHA384 tag.
+#[must_use]
+pub fn hmac_sha384_multi(key: &[u8], data: &[&[u8]]) -> [u8; 48] {
+    let hmac_key = HmacKey::new(HMAC_SHA384, key);
+    let mut ctx = hmac::Context::with_key(&hmac_key);
+    for segment in data {
+        ctx.update(segment);
+    }
+    let tag = ctx.sign();
+    let mut output = [0u8; 48];
+    output.copy_from_slice(tag.as_ref());
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +307,74 @@ mod tests {
         // Multiple info segments
         hkdf_sha384(Some(salt), ikm, &[b"part1", b"part2"], &mut output).unwrap();
         assert_ne!(output, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_hmac_sha384_basic() {
+        let key = b"secret key";
+        let data = b"message to authenticate";
+        let tag = hmac_sha384(key, data);
+
+        // Tag should be 48 bytes
+        assert_eq!(tag.len(), 48);
+
+        // Tag should not be all zeros
+        assert_ne!(tag, [0u8; 48]);
+    }
+
+    #[test]
+    fn test_hmac_sha384_deterministic() {
+        let key = b"secret key";
+        let data = b"message to authenticate";
+
+        let tag1 = hmac_sha384(key, data);
+        let tag2 = hmac_sha384(key, data);
+
+        assert_eq!(tag1, tag2);
+    }
+
+    #[test]
+    fn test_hmac_sha384_different_key_different_tag() {
+        let data = b"message to authenticate";
+
+        let tag1 = hmac_sha384(b"key1", data);
+        let tag2 = hmac_sha384(b"key2", data);
+
+        assert_ne!(tag1, tag2);
+    }
+
+    #[test]
+    fn test_hmac_sha384_different_data_different_tag() {
+        let key = b"secret key";
+
+        let tag1 = hmac_sha384(key, b"message1");
+        let tag2 = hmac_sha384(key, b"message2");
+
+        assert_ne!(tag1, tag2);
+    }
+
+    #[test]
+    fn test_hmac_sha384_multi() {
+        let key = b"secret key";
+
+        // Single call with concatenated data
+        let tag1 = hmac_sha384(key, b"part1part2");
+
+        // Multi call with segments
+        let tag2 = hmac_sha384_multi(key, &[b"part1", b"part2"]);
+
+        // Should produce the same result
+        assert_eq!(tag1, tag2);
+    }
+
+    #[test]
+    fn test_hmac_sha384_multi_empty_segments() {
+        let key = b"secret key";
+
+        // Multi call with empty segments interspersed
+        let tag1 = hmac_sha384_multi(key, &[b"", b"data", b""]);
+        let tag2 = hmac_sha384(key, b"data");
+
+        assert_eq!(tag1, tag2);
     }
 }

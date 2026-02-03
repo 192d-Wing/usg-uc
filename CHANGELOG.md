@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ### Added
 
+#### Phase 17: Complete Stub Implementations
+
+- Custom DTLS 1.2 implementation with aws-lc-rs replacing webrtc-dtls
+  - `sbc-dtls/record.rs`: DTLS record layer with AES-256-GCM encryption
+  - `sbc-dtls/handshake.rs`: Full handshake state machine (client and server)
+  - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 cipher suite (0xC02C)
+  - P-384 ECDHE key exchange via `sbc-crypto`
+  - TLS 1.2 PRF using HMAC-SHA384
+  - SRTP keying material export per RFC 5764
+  - Anti-replay protection with 64-bit sliding window
+  - Cookie-based DoS protection (HelloVerifyRequest)
+- STUN client implementation for server-reflexive candidate gathering
+- TURN client implementation for relay candidate gathering
+- ICE candidate gathering state machine updates
+- G.722 ADPCM codec (pure Rust implementation)
+  - QMF filter banks for sub-band splitting
+  - Lower and higher band ADPCM encoding/decoding
+- Opus FFI bindings via optional `opus-ffi` feature (audiopus crate)
+- HMAC-SHA384 functions in `sbc-crypto/hkdf.rs` for TLS PRF
+
+### Changed
+
+- `sbc-dtls/cipher_suite.rs`: Rewritten for CNSA 2.0 compliance (only AES-256-GCM-SHA384)
+- `sbc-dtls/Cargo.toml`: Removed webrtc-dtls dependency
+- `sbc-codecs/g722.rs`: Now uses pure Rust ADPCM implementation via `G722AdpcmCodec`
+
+### Fixed
+
+- Clippy warnings in `sbc-codecs` (format strings, bool_to_int_with_if, similar_names)
+- Thread safety for `G722Codec` using `Mutex` instead of `RefCell`
+
+---
+
 #### Phase 1-2: Foundation & Transport
 - Initial workspace structure with 27 crates organized in 9 layers
 - Foundation crates: `sbc-types`, `sbc-crypto`, `sbc-audit`, `sbc-config`

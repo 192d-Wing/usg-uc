@@ -9,10 +9,21 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+# Enable Opus FFI bindings (requires libopus installed on the system)
+# macOS: brew install opus
+# Ubuntu/Debian: apt install libopus-dev
+# RHEL/Fedora: dnf install opus-devel
+opus-ffi = ["dep:audiopus"]
+
 [dependencies]
 sbc-types.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
+
+# Optional Opus FFI bindings
+audiopus = { version = "0.2", optional = true }
 
 [lints]
 workspace = true

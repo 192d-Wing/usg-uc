@@ -77,6 +77,51 @@ pub enum DtlsError {
         /// Error description.
         reason: String,
     },
+
+    /// Record layer error.
+    #[error("record error: {reason}")]
+    RecordError {
+        /// Error description.
+        reason: String,
+    },
+
+    /// Encryption failed.
+    #[error("encryption failed: {reason}")]
+    EncryptionFailed {
+        /// Error description.
+        reason: String,
+    },
+
+    /// Decryption failed.
+    #[error("decryption failed: {reason}")]
+    DecryptionFailed {
+        /// Error description.
+        reason: String,
+    },
+
+    /// Replay attack detected.
+    #[error("replay attack detected")]
+    ReplayDetected,
+
+    /// Key derivation failed.
+    #[error("key derivation failed: {reason}")]
+    KeyDerivationFailed {
+        /// Error description.
+        reason: String,
+    },
+
+    /// Unsupported cipher suite.
+    #[error("unsupported cipher suite: {0}")]
+    UnsupportedCipherSuite(u16),
+
+    /// Alert received.
+    #[error("alert received: {level:?} {description:?}")]
+    AlertReceived {
+        /// Alert level.
+        level: u8,
+        /// Alert description.
+        description: u8,
+    },
 }
 
 impl From<std::io::Error> for DtlsError {
