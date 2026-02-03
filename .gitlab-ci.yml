@@ -24,6 +24,8 @@ variables:
 # Base image for Rust jobs
 .rust-base:
   image: rust:latest
+  tags:
+    - saas-linux-medium-amd64
   <<: *cargo-cache
   before_script:
     - rustc --version
