@@ -67,6 +67,13 @@ members = [
     "crates/sbc/sbc-daemon",
     "crates/sbc/sbc-cli",
     "crates/sbc/sbc-integration-tests",
+
+    # SIP Soft Client
+    "crates/client/client-types",
+    "crates/client/client-audio",
+    "crates/client/client-sip-ua",
+    "crates/client/client-core",
+    "crates/client/client-gui",
 ]
 resolver = "2"
 
@@ -76,7 +83,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
 license = "Apache-2.0"
-repository = "https://github.com/usg/usg-uc-sbc"
+repository = "https://gitlab.com/192d-wing/usg-uc"
 keywords = ["sip", "sbc", "voip", "session-border-controller", "cnsa"]
 categories = ["network-programming", "multimedia"]
 
@@ -168,6 +175,32 @@ proto-stir-shaken = { path = "crates/proto/proto-stir-shaken" }
 
 # Internal crates - SBC Application
 sbc-config = { path = "crates/sbc/sbc-config" }
+
+# Internal crates - SIP Soft Client
+client-types = { path = "crates/client/client-types" }
+client-audio = { path = "crates/client/client-audio" }
+client-sip-ua = { path = "crates/client/client-sip-ua" }
+client-core = { path = "crates/client/client-core" }
+client-gui = { path = "crates/client/client-gui" }
+
+# Audio (for soft client)
+cpal = "0.17"
+ringbuf = "0.4"
+
+# GUI (for soft client)
+egui = "0.33"
+eframe = { version = "0.33", features = ["wgpu"] }
+
+# Windows integration (for soft client)
+directories = "6"
+tray-icon = "0.21"
+image = "0.25"
+rfd = "0.17"
+winrt-notification = "0.5"
+windows = { version = "0.62", features = [
+    "Win32_Security_Cryptography",
+    "Win32_Foundation",
+] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
