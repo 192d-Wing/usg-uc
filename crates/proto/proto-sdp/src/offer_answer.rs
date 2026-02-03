@@ -82,13 +82,13 @@ pub struct MediaModificationValidator {
 
 impl MediaModificationValidator {
     /// Creates a new validator with default (strict) settings.
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Allows adding media streams.
-    #[must_use] 
+    #[must_use]
     pub const fn allow_add(mut self) -> Self {
         self.allow_add = true;
         self
@@ -342,7 +342,7 @@ fn generate_media_answer(
 /// | sendonly        | *                | recvonly or inactive |
 /// | recvonly        | *                | sendonly or inactive |
 /// | inactive        | *                | inactive         |
-#[must_use] 
+#[must_use]
 pub const fn compute_answer_direction(offer: Direction, local: Direction) -> Direction {
     match (offer, local) {
         // Both want bidirectional
@@ -392,7 +392,7 @@ impl Default for LocalCapabilities {
 
 impl LocalCapabilities {
     /// Creates new local capabilities.
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -432,7 +432,7 @@ pub struct LocalMediaCapability {
 
 impl LocalMediaCapability {
     /// Creates a new media capability.
-    #[must_use] 
+    #[must_use]
     pub fn new(media_type: MediaType) -> Self {
         Self {
             media_type,
@@ -454,7 +454,7 @@ impl LocalMediaCapability {
     }
 
     /// Sets the preferred direction.
-    #[must_use] 
+    #[must_use]
     pub const fn with_direction(mut self, direction: Direction) -> Self {
         self.direction = direction;
         self

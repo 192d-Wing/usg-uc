@@ -41,7 +41,7 @@ pub struct CertificateValidator {
 
 impl CertificateValidator {
     /// Creates a new certificate validator.
-    #[must_use] 
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             allow_self_signed: false,
@@ -83,7 +83,7 @@ impl CertificateValidator {
     /// ## Returns
     ///
     /// The validation result indicating success or failure reason.
-    #[must_use] 
+    #[must_use]
     pub fn validate(&self, cert_chain: &[Vec<u8>]) -> CertificateValidationResult {
         if cert_chain.is_empty() {
             return CertificateValidationResult::Invalid("empty certificate chain".to_string());
@@ -531,27 +531,27 @@ fn parse_der_length(data: &[u8]) -> DtlsResult<(usize, usize)> {
             reason: "indefinite length not supported".to_string(),
         }),
         std::cmp::Ordering::Greater => {
-        // Long form
-        let num_bytes = (first & 0x7F) as usize;
-        if num_bytes > 4 || data.len() < 1 + num_bytes {
-            return Err(DtlsError::CertificateError {
-                reason: "invalid length encoding".to_string(),
-            });
-        }
+            // Long form
+            let num_bytes = (first & 0x7F) as usize;
+            if num_bytes > 4 || data.len() < 1 + num_bytes {
+                return Err(DtlsError::CertificateError {
+                    reason: "invalid length encoding".to_string(),
+                });
+            }
 
-        let mut len = 0usize;
-        for &byte in &data[1..=num_bytes] {
-            len = len
-                .checked_mul(256)
-                .ok_or_else(|| DtlsError::CertificateError {
-                    reason: "length overflow".to_string(),
-                })?;
-            len = len
-                .checked_add(byte as usize)
-                .ok_or_else(|| DtlsError::CertificateError {
-                    reason: "length overflow".to_string(),
-                })?;
-        }
+            let mut len = 0usize;
+            for &byte in &data[1..=num_bytes] {
+                len = len
+                    .checked_mul(256)
+                    .ok_or_else(|| DtlsError::CertificateError {
+                        reason: "length overflow".to_string(),
+                    })?;
+                len =
+                    len.checked_add(byte as usize)
+                        .ok_or_else(|| DtlsError::CertificateError {
+                            reason: "length overflow".to_string(),
+                        })?;
+            }
 
             Ok((len, 1 + num_bytes))
         }

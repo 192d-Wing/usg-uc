@@ -50,7 +50,7 @@ pub struct RedirectContact {
 
 impl RedirectContact {
     /// Creates a new redirect contact.
-    #[must_use] 
+    #[must_use]
     pub fn new(uri: SipUri) -> Self {
         Self {
             uri,
@@ -65,7 +65,7 @@ impl RedirectContact {
     /// ## RFC 3261 Section 20.10
     ///
     /// The q parameter indicates relative preference (0.0-1.0).
-    #[must_use] 
+    #[must_use]
     pub fn from_name_addr(name_addr: &NameAddr, raw_value: &str) -> Self {
         let mut q_value = DEFAULT_Q_VALUE;
         let mut expires = None;
@@ -341,7 +341,7 @@ pub struct RedirectHandler {
 
 impl RedirectHandler {
     /// Creates a new redirect handler with default settings.
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             max_depth: DEFAULT_MAX_REDIRECT_DEPTH,
@@ -351,7 +351,7 @@ impl RedirectHandler {
     }
 
     /// Creates a handler with a custom maximum depth.
-    #[must_use] 
+    #[must_use]
     pub fn with_max_depth(max_depth: u8) -> Self {
         Self {
             max_depth,
@@ -462,7 +462,8 @@ mod tests {
         let uri2: SipUri = "sip:alice@example2.com".parse().unwrap();
         let uri3: SipUri = "sip:alice@example3.com".parse().unwrap();
 
-        let mut contacts = [RedirectContact {
+        let mut contacts = [
+            RedirectContact {
                 uri: uri1,
                 display_name: None,
                 q_value: 0.5,
@@ -479,7 +480,8 @@ mod tests {
                 display_name: None,
                 q_value: 0.8,
                 expires: None,
-            }];
+            },
+        ];
 
         contacts.sort();
 

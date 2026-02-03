@@ -614,9 +614,10 @@ impl SessionRecordingClient {
 
         // Check exempt trunks
         if let Some(ref trunk_id) = context.trunk_id
-            && self.config.is_trunk_exempt(trunk_id) {
-                return false;
-            }
+            && self.config.is_trunk_exempt(trunk_id)
+        {
+            return false;
+        }
 
         // Evaluate triggers based on mode
         match self.config.mode {
@@ -714,10 +715,7 @@ impl SessionRecordingClient {
         session.set_srs_endpoint(srs.clone());
 
         // Track session count per SRS
-        *self
-            .sessions_per_srs
-            .entry(srs.address)
-            .or_insert(0) += 1;
+        *self.sessions_per_srs.entry(srs.address).or_insert(0) += 1;
 
         self.sessions.insert(call_id.clone(), session);
 
@@ -744,9 +742,10 @@ impl SessionRecordingClient {
         if let Some(session) = self.sessions.remove(call_id) {
             // Update SRS session count
             if let Some(srs) = session.srs_endpoint()
-                && let Some(count) = self.sessions_per_srs.get_mut(&srs.address) {
-                    *count = count.saturating_sub(1);
-                }
+                && let Some(count) = self.sessions_per_srs.get_mut(&srs.address)
+            {
+                *count = count.saturating_sub(1);
+            }
             Some(session)
         } else {
             None

@@ -593,9 +593,10 @@ fn parse_auth_params(s: &str) -> HashMap<String, String> {
 
     // Handle last parameter
     if !current.is_empty()
-        && let Some((name, value)) = parse_single_param(&current) {
-            params.insert(name, value);
-        }
+        && let Some((name, value)) = parse_single_param(&current)
+    {
+        params.insert(name, value);
+    }
 
     params
 }

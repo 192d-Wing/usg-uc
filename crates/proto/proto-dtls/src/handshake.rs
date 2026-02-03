@@ -160,7 +160,7 @@ impl HandshakeHeader {
     }
 
     /// Serializes the header.
-    #[must_use] 
+    #[must_use]
     pub fn serialize(&self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
         buf[0] = self.msg_type as u8;
@@ -966,9 +966,11 @@ impl Handshake {
     /// verify_data = PRF(master_secret, finished_label, Hash(handshake_messages))[0..11]
     /// ```
     fn verify_finished(&self, data: &[u8], is_client_finished: bool) -> DtlsResult<()> {
-        let master_secret = self.master_secret.ok_or_else(|| DtlsError::HandshakeFailed {
-            reason: "no master secret for Finished verification".to_string(),
-        })?;
+        let master_secret = self
+            .master_secret
+            .ok_or_else(|| DtlsError::HandshakeFailed {
+                reason: "no master secret for Finished verification".to_string(),
+            })?;
 
         // Compute hash of all handshake messages (excluding this Finished)
         let handshake_hash = uc_crypto::hash::sha384(&self.handshake_hash);
@@ -1072,9 +1074,11 @@ impl Handshake {
 
     /// Activates the cipher suite.
     fn activate_cipher(&mut self) -> DtlsResult<()> {
-        let master_secret = self.master_secret.ok_or_else(|| DtlsError::KeyDerivationFailed {
-            reason: "no master secret".to_string(),
-        })?;
+        let master_secret = self
+            .master_secret
+            .ok_or_else(|| DtlsError::KeyDerivationFailed {
+                reason: "no master secret".to_string(),
+            })?;
 
         // Key expansion
         let mut seed = Vec::with_capacity(64);
@@ -1133,9 +1137,11 @@ impl Handshake {
 
     /// Builds a Finished message.
     fn build_finished(&self) -> DtlsResult<Vec<u8>> {
-        let master_secret = self.master_secret.ok_or_else(|| DtlsError::KeyDerivationFailed {
-            reason: "no master secret".to_string(),
-        })?;
+        let master_secret = self
+            .master_secret
+            .ok_or_else(|| DtlsError::KeyDerivationFailed {
+                reason: "no master secret".to_string(),
+            })?;
 
         let label = if self.is_client {
             b"client finished"
@@ -1234,13 +1240,12 @@ impl Handshake {
                 }
 
                 return Ok((header.msg_type, payload));
-            } else if content_type == ContentType::Alert
-                && fragment.len() >= 2 {
-                    return Err(DtlsError::AlertReceived {
-                        level: fragment[0],
-                        description: fragment[1],
-                    });
-                }
+            } else if content_type == ContentType::Alert && fragment.len() >= 2 {
+                return Err(DtlsError::AlertReceived {
+                    level: fragment[0],
+                    description: fragment[1],
+                });
+            }
             // Ignore other message types
         }
     }
@@ -1280,9 +1285,11 @@ impl Handshake {
     /// # Errors
     /// Returns an error if the operation fails.
     pub fn export_srtp_keying_material(&self) -> DtlsResult<Vec<u8>> {
-        let master_secret = self.master_secret.ok_or_else(|| DtlsError::SrtpKeyExportFailed {
-            reason: "no master secret".to_string(),
-        })?;
+        let master_secret = self
+            .master_secret
+            .ok_or_else(|| DtlsError::SrtpKeyExportFailed {
+                reason: "no master secret".to_string(),
+            })?;
 
         let mut seed = Vec::with_capacity(64);
         seed.extend_from_slice(&self.client_random);

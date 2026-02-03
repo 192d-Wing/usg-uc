@@ -197,7 +197,6 @@ impl DscpValue {
     }
 }
 
-
 impl fmt::Display for DscpValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} ({})", self.name(), self.value())

@@ -284,12 +284,13 @@ impl Dialog {
     /// Returns an error if the operation fails.
     pub fn update_remote_cseq(&mut self, cseq: u32) -> DialogResult<()> {
         if let Some(current) = self.remote_cseq
-            && cseq < current {
-                return Err(DialogError::InvalidCSeq {
-                    expected: current,
-                    actual: cseq,
-                });
-            }
+            && cseq < current
+        {
+            return Err(DialogError::InvalidCSeq {
+                expected: current,
+                actual: cseq,
+            });
+        }
         self.remote_cseq = Some(cseq);
         Ok(())
     }

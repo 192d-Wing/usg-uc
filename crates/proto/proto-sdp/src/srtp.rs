@@ -725,15 +725,16 @@ impl SrtpNegotiator {
 }
 
 /// Extracts crypto attributes from SDP media description.
-#[must_use] 
+#[must_use]
 pub fn extract_crypto_attributes(sdp_lines: &[&str]) -> Vec<CryptoAttribute> {
     let mut cryptos = Vec::new();
 
     for line in sdp_lines {
         if let Some(crypto_value) = line.strip_prefix("a=crypto:")
-            && let Ok(crypto) = CryptoAttribute::parse(crypto_value) {
-                cryptos.push(crypto);
-            }
+            && let Ok(crypto) = CryptoAttribute::parse(crypto_value)
+        {
+            cryptos.push(crypto);
+        }
     }
 
     cryptos

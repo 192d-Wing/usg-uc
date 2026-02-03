@@ -159,7 +159,9 @@ impl Histogram {
 /// Helper to create linear bucket boundaries.
 #[allow(clippy::cast_precision_loss)]
 pub fn linear_buckets(start: f64, width: f64, count: usize) -> Vec<f64> {
-    (0..count).map(|i| (i as f64).mul_add(width, start)).collect()
+    (0..count)
+        .map(|i| (i as f64).mul_add(width, start))
+        .collect()
 }
 
 /// Helper to create exponential bucket boundaries.

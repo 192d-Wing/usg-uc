@@ -57,8 +57,7 @@ impl HeaderAction {
 }
 
 /// Policy action.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub enum PolicyAction {
     /// Allow the request to proceed.
     #[default]
@@ -180,7 +179,6 @@ impl PolicyAction {
         matches!(self, Self::Deny { .. })
     }
 }
-
 
 #[cfg(test)]
 mod tests {

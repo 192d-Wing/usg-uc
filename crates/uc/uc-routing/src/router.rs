@@ -263,7 +263,8 @@ impl Router {
 
         // Determine final destination
         let final_destination = dial_plan_result
-            .as_ref().map_or_else(|| destination.to_string(), |r| r.transformed_number.clone());
+            .as_ref()
+            .map_or_else(|| destination.to_string(), |r| r.transformed_number.clone());
 
         self.stats.successes += 1;
         if !failover_trunks.is_empty() {
@@ -344,17 +345,19 @@ impl Router {
     /// Records a successful call on a trunk.
     pub fn record_success(&mut self, group_id: &str, trunk_id: &str, setup_time_ms: u64) {
         if let Some(group) = self.trunk_groups.get_mut(group_id)
-            && let Some(trunk) = group.get_trunk_mut(trunk_id) {
-                trunk.complete_call(setup_time_ms);
-            }
+            && let Some(trunk) = group.get_trunk_mut(trunk_id)
+        {
+            trunk.complete_call(setup_time_ms);
+        }
     }
 
     /// Records a failed call on a trunk.
     pub fn record_failure(&mut self, group_id: &str, trunk_id: &str) {
         if let Some(group) = self.trunk_groups.get_mut(group_id)
-            && let Some(trunk) = group.get_trunk_mut(trunk_id) {
-                trunk.fail_call();
-            }
+            && let Some(trunk) = group.get_trunk_mut(trunk_id)
+        {
+            trunk.fail_call();
+        }
     }
 
     /// Returns a trunk for a failover attempt.

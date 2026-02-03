@@ -39,7 +39,6 @@ pub struct SbcConfig {
     pub logging: LoggingConfig,
 }
 
-
 /// General SBC settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]

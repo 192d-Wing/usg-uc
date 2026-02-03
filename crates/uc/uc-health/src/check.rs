@@ -339,8 +339,8 @@ mod tests {
 
     #[test]
     fn test_fn_health_check_non_critical() {
-        let check = FnHealthCheck::new("optional_check", HealthCheckResult::healthy)
-            .with_critical(false);
+        let check =
+            FnHealthCheck::new("optional_check", HealthCheckResult::healthy).with_critical(false);
 
         assert!(!check.is_critical());
     }

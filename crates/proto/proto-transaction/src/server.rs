@@ -184,28 +184,31 @@ impl ServerInviteTransaction {
             ServerInviteState::Completed => {
                 // Check Timer H first (ACK wait timeout)
                 if let Some(deadline) = self.timer_h_deadline
-                    && now >= deadline {
-                        self.state = ServerInviteState::Terminated;
-                        return Some(TimerType::TimerH);
-                    }
+                    && now >= deadline
+                {
+                    self.state = ServerInviteState::Terminated;
+                    return Some(TimerType::TimerH);
+                }
 
                 // Check Timer G (response retransmit)
                 if let Some(deadline) = self.timer_g_deadline
-                    && now >= deadline {
-                        self.retransmit_count += 1;
-                        self.timer_g_value =
-                            next_retransmit_interval(self.timer_g_value, self.timer_config.t2);
-                        self.timer_g_deadline = Some(now + self.timer_g_value);
-                        return Some(TimerType::TimerG);
-                    }
+                    && now >= deadline
+                {
+                    self.retransmit_count += 1;
+                    self.timer_g_value =
+                        next_retransmit_interval(self.timer_g_value, self.timer_config.t2);
+                    self.timer_g_deadline = Some(now + self.timer_g_value);
+                    return Some(TimerType::TimerG);
+                }
             }
             ServerInviteState::Confirmed => {
                 // Check Timer I
                 if let Some(deadline) = self.timer_i_deadline
-                    && now >= deadline {
-                        self.state = ServerInviteState::Terminated;
-                        return Some(TimerType::TimerI);
-                    }
+                    && now >= deadline
+                {
+                    self.state = ServerInviteState::Terminated;
+                    return Some(TimerType::TimerI);
+                }
             }
             _ => {}
         }
@@ -382,10 +385,11 @@ impl ServerNonInviteTransaction {
     pub fn check_timers(&mut self) -> Option<TimerType> {
         if self.state == ServerNonInviteState::Completed
             && let Some(deadline) = self.timer_j_deadline
-                && Instant::now() >= deadline {
-                    self.state = ServerNonInviteState::Terminated;
-                    return Some(TimerType::TimerJ);
-                }
+            && Instant::now() >= deadline
+        {
+            self.state = ServerNonInviteState::Terminated;
+            return Some(TimerType::TimerJ);
+        }
         None
     }
 

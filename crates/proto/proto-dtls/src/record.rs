@@ -116,7 +116,7 @@ impl RecordHeader {
     }
 
     /// Serializes the header to bytes.
-    #[must_use] 
+    #[must_use]
     pub fn serialize(&self) -> [u8; RECORD_HEADER_LEN] {
         let mut header = [0u8; RECORD_HEADER_LEN];
 
@@ -138,7 +138,7 @@ impl RecordHeader {
     /// Per RFC 5288, the nonce is constructed as:
     /// - 4 bytes: implicit IV from key derivation
     /// - 8 bytes: explicit nonce = epoch (2) + `sequence_number` (6)
-    #[must_use] 
+    #[must_use]
     pub fn explicit_nonce(&self) -> [u8; 8] {
         let mut nonce = [0u8; 8];
         nonce[0..2].copy_from_slice(&self.epoch.to_be_bytes());

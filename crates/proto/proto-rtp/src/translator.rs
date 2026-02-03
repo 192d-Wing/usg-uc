@@ -214,9 +214,10 @@ impl RtpTranslator {
         // Apply SSRC translation if enabled
         if self.translate_ssrc
             && let Some(ref mapping) = self.ssrc_mapping
-                && let Some(&new_ssrc) = mapping.get(&ssrc) {
-                    forwarded_header.ssrc = new_ssrc;
-                }
+            && let Some(&new_ssrc) = mapping.get(&ssrc)
+        {
+            forwarded_header.ssrc = new_ssrc;
+        }
 
         Ok(RtpPacket::new(forwarded_header, packet.payload.clone()))
     }

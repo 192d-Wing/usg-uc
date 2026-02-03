@@ -497,10 +497,12 @@ impl Call {
             }
         }
         // If both legs are active, call is active
-        else if self.a_leg.is_active() && self.b_leg.is_active()
-            && self.state != CallState::OnHold {
-                self.state = CallState::Active;
-            }
+        else if self.a_leg.is_active()
+            && self.b_leg.is_active()
+            && self.state != CallState::OnHold
+        {
+            self.state = CallState::Active;
+        }
     }
 }
 

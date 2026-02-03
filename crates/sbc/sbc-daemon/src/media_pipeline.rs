@@ -277,9 +277,9 @@ impl MediaPipeline {
 
         // Get SSRC from session
         let sessions = self.sessions.read().await;
-        let ssrc = sessions
-            .get(call_id)
-            .map_or(0x12345678, |s| if is_a_leg { s.a_leg_ssrc } else { s.b_leg_ssrc });
+        let ssrc = sessions.get(call_id).map_or(0x12345678, |s| {
+            if is_a_leg { s.a_leg_ssrc } else { s.b_leg_ssrc }
+        });
         drop(sessions);
 
         // Create SRTP contexts

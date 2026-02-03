@@ -186,28 +186,31 @@ impl ClientInviteTransaction {
             ClientInviteState::Calling => {
                 // Check Timer B first (transaction timeout)
                 if let Some(deadline) = self.timer_b_deadline
-                    && now >= deadline {
-                        self.state = ClientInviteState::Terminated;
-                        return Some(TimerType::TimerB);
-                    }
+                    && now >= deadline
+                {
+                    self.state = ClientInviteState::Terminated;
+                    return Some(TimerType::TimerB);
+                }
 
                 // Check Timer A (retransmit)
                 if let Some(deadline) = self.timer_a_deadline
-                    && now >= deadline {
-                        self.retransmit_count += 1;
-                        self.timer_a_value =
-                            next_retransmit_interval(self.timer_a_value, self.timer_config.t2);
-                        self.timer_a_deadline = Some(now + self.timer_a_value);
-                        return Some(TimerType::TimerA);
-                    }
+                    && now >= deadline
+                {
+                    self.retransmit_count += 1;
+                    self.timer_a_value =
+                        next_retransmit_interval(self.timer_a_value, self.timer_config.t2);
+                    self.timer_a_deadline = Some(now + self.timer_a_value);
+                    return Some(TimerType::TimerA);
+                }
             }
             ClientInviteState::Completed => {
                 // Check Timer D
                 if let Some(deadline) = self.timer_d_deadline
-                    && now >= deadline {
-                        self.state = ClientInviteState::Terminated;
-                        return Some(TimerType::TimerD);
-                    }
+                    && now >= deadline
+                {
+                    self.state = ClientInviteState::Terminated;
+                    return Some(TimerType::TimerD);
+                }
             }
             _ => {}
         }
@@ -386,28 +389,31 @@ impl ClientNonInviteTransaction {
             ClientNonInviteState::Trying | ClientNonInviteState::Proceeding => {
                 // Check Timer F first
                 if let Some(deadline) = self.timer_f_deadline
-                    && now >= deadline {
-                        self.state = ClientNonInviteState::Terminated;
-                        return Some(TimerType::TimerF);
-                    }
+                    && now >= deadline
+                {
+                    self.state = ClientNonInviteState::Terminated;
+                    return Some(TimerType::TimerF);
+                }
 
                 // Check Timer E
                 // RFC 3261 Section 17.1.2.2: Timer E caps at T2 in both Trying and Proceeding states
                 if let Some(deadline) = self.timer_e_deadline
-                    && now >= deadline {
-                        self.retransmit_count += 1;
-                        self.timer_e_value =
-                            next_retransmit_interval(self.timer_e_value, self.timer_config.t2);
-                        self.timer_e_deadline = Some(now + self.timer_e_value);
-                        return Some(TimerType::TimerE);
-                    }
+                    && now >= deadline
+                {
+                    self.retransmit_count += 1;
+                    self.timer_e_value =
+                        next_retransmit_interval(self.timer_e_value, self.timer_config.t2);
+                    self.timer_e_deadline = Some(now + self.timer_e_value);
+                    return Some(TimerType::TimerE);
+                }
             }
             ClientNonInviteState::Completed => {
                 if let Some(deadline) = self.timer_k_deadline
-                    && now >= deadline {
-                        self.state = ClientNonInviteState::Terminated;
-                        return Some(TimerType::TimerK);
-                    }
+                    && now >= deadline
+                {
+                    self.state = ClientNonInviteState::Terminated;
+                    return Some(TimerType::TimerK);
+                }
             }
             _ => {}
         }

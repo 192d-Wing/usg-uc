@@ -488,17 +488,18 @@ impl ConsentKeepaliveManager {
     pub fn process_response(&mut self, response: &StunMessage) -> IceResult<()> {
         // Check if this is a response to our consent check
         if let Some(expected_tid) = self.current_transaction
-            && response.transaction_id == expected_tid {
-                if response.msg_type.class == StunClass::SuccessResponse {
-                    self.consent.consent_received();
-                    self.keepalive.traffic_received();
-                    self.current_transaction = None;
-                    return Ok(());
-                } else if response.msg_type.class == StunClass::ErrorResponse {
-                    self.consent.check_failed();
-                    self.current_transaction = None;
-                }
+            && response.transaction_id == expected_tid
+        {
+            if response.msg_type.class == StunClass::SuccessResponse {
+                self.consent.consent_received();
+                self.keepalive.traffic_received();
+                self.current_transaction = None;
+                return Ok(());
+            } else if response.msg_type.class == StunClass::ErrorResponse {
+                self.consent.check_failed();
+                self.current_transaction = None;
             }
+        }
 
         // Any valid STUN traffic counts as received traffic for keepalive
         self.keepalive.traffic_received();

@@ -645,10 +645,7 @@ impl AuthenticatedRegistrar {
                     return Ok(RegisterResponse::unauthorized(&challenge));
                 }
                 AuthResult::Failed { reason } => {
-                    return Ok(RegisterResponse::error(
-                        403,
-                        format!("Forbidden: {reason}"),
-                    ));
+                    return Ok(RegisterResponse::error(403, format!("Forbidden: {reason}")));
                 }
             }
         }

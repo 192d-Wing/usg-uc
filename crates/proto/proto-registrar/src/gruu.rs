@@ -206,15 +206,17 @@ impl GruuService {
     pub fn lookup_gruu(&self, gruu: &str) -> Option<(&str, &str)> {
         // Try public GRUU first
         if let Some(entry) = self.pub_gruu_map.get(gruu)
-            && !entry.is_expired() {
-                return Some((entry.aor(), entry.instance_id()));
-            }
+            && !entry.is_expired()
+        {
+            return Some((entry.aor(), entry.instance_id()));
+        }
 
         // Try temporary GRUU
         if let Some(entry) = self.temp_gruu_map.get(gruu)
-            && !entry.is_expired() {
-                return Some((entry.aor(), entry.instance_id()));
-            }
+            && !entry.is_expired()
+        {
+            return Some((entry.aor(), entry.instance_id()));
+        }
 
         None
     }

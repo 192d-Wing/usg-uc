@@ -215,7 +215,9 @@ impl RateLimiter {
 
     /// Checks if a source is blocked.
     pub fn is_blocked(&self, source: IpAddr) -> bool {
-        self.blocked.get(&source).is_some_and(|entry| !entry.is_expired())
+        self.blocked
+            .get(&source)
+            .is_some_and(|entry| !entry.is_expired())
     }
 
     /// Returns the remaining block time for a source.

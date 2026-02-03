@@ -3,8 +3,7 @@
 use crate::record::CallRecord;
 
 /// CDR output format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CdrFormat {
     /// JSON format.
     #[default]
@@ -14,7 +13,6 @@ pub enum CdrFormat {
     /// Custom format.
     Custom,
 }
-
 
 /// Trait for CDR formatters.
 pub trait CdrFormatter {

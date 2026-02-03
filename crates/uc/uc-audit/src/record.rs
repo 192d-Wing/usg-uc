@@ -41,7 +41,7 @@ impl AuditRecord {
     /// Creates a new audit record with hash chain.
     ///
     /// ## NIST 800-53 Rev5: AU-9 (Protection of Audit Information)
-    #[must_use] 
+    #[must_use]
     pub fn new(
         sequence: u64,
         event: AuditEvent,

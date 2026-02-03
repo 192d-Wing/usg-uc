@@ -291,7 +291,7 @@ impl MulticastAddress {
 /// Per RFC 4566, multicast addresses are:
 /// - IPv4: 224.0.0.0/4 (224.0.0.0 - 239.255.255.255)
 /// - IPv6: `ff00::/8`
-#[must_use] 
+#[must_use]
 pub fn is_multicast_address(connection: &ConnectionData) -> bool {
     // Extract the base address (before any /)
     let addr_part = connection
@@ -305,15 +305,16 @@ pub fn is_multicast_address(connection: &ConnectionData) -> bool {
             return addr.is_multicast();
         }
     } else if connection.addr_type == "IP6"
-        && let Ok(addr) = Ipv6Addr::from_str(addr_part) {
-            return addr.is_multicast();
-        }
+        && let Ok(addr) = Ipv6Addr::from_str(addr_part)
+    {
+        return addr.is_multicast();
+    }
 
     false
 }
 
 /// Checks if a media description uses multicast.
-#[must_use] 
+#[must_use]
 pub fn is_multicast_media(
     media: &MediaDescription,
     session_connection: Option<&ConnectionData>,
@@ -360,13 +361,13 @@ impl Default for MulticastNegotiator {
 
 impl MulticastNegotiator {
     /// Creates a new multicast negotiator.
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Sets the local multicast address for sending.
-    #[must_use] 
+    #[must_use]
     pub fn with_send_address(mut self, address: MulticastAddress) -> Self {
         self.local_address = Some(address);
         self.can_send = true;
@@ -374,14 +375,14 @@ impl MulticastNegotiator {
     }
 
     /// Sets whether we can receive multicast.
-    #[must_use] 
+    #[must_use]
     pub const fn with_receive(mut self, can_receive: bool) -> Self {
         self.can_receive = can_receive;
         self
     }
 
     /// Sets the preferred TTL.
-    #[must_use] 
+    #[must_use]
     pub const fn with_ttl(mut self, ttl: u8) -> Self {
         self.preferred_ttl = ttl;
         self

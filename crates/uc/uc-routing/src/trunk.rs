@@ -5,8 +5,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 /// Trunk state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrunkState {
     /// Trunk is available.
     #[default]
@@ -28,10 +27,8 @@ impl TrunkState {
     }
 }
 
-
 /// Trunk protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrunkProtocol {
     /// UDP transport.
     Udp,
@@ -41,7 +38,6 @@ pub enum TrunkProtocol {
     #[default]
     Tls,
 }
-
 
 /// Trunk statistics.
 #[derive(Debug, Clone, Default)]
@@ -245,9 +241,10 @@ impl Trunk {
         // Check if cooldown has expired
         if self.state == TrunkState::Cooldown
             && let Some(until) = self.cooldown_until
-                && Instant::now() >= until {
-                    return TrunkState::Available;
-                }
+            && Instant::now() >= until
+        {
+            return TrunkState::Available;
+        }
         self.state
     }
 
@@ -339,8 +336,7 @@ impl Trunk {
 }
 
 /// Trunk selection strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SelectionStrategy {
     /// Select by priority (lowest first).
     #[default]
@@ -354,7 +350,6 @@ pub enum SelectionStrategy {
     /// Best success rate.
     BestSuccessRate,
 }
-
 
 /// A group of trunks for failover and load balancing.
 #[derive(Debug)]

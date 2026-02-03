@@ -353,7 +353,10 @@ impl MediaDescription {
         };
 
         let protocol: TransportProtocol = parts[2].parse()?;
-        let formats: Vec<String> = parts[3..].iter().map(std::string::ToString::to_string).collect();
+        let formats: Vec<String> = parts[3..]
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
 
         Ok(Self {
             media_type,

@@ -4,8 +4,7 @@ use crate::DEFAULT_PRIORITY;
 use std::collections::HashMap;
 
 /// Number transformation operation.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub enum NumberTransform {
     /// No transformation.
     #[default]
@@ -35,7 +34,6 @@ pub enum NumberTransform {
     /// Multiple transformations.
     Chain(Vec<NumberTransform>),
 }
-
 
 impl NumberTransform {
     /// Applies the transformation to a number.
@@ -383,14 +381,15 @@ impl DialPlan {
     pub fn match_number(&self, number: &str) -> Option<DialPlanResult> {
         for id in &self.sorted_ids {
             if let Some(entry) = self.entries.get(id)
-                && entry.matches(number) {
-                    return Some(DialPlanResult {
-                        entry_id: entry.id().to_string(),
-                        original_number: number.to_string(),
-                        transformed_number: entry.transform_number(number),
-                        trunk_group: entry.trunk_group().to_string(),
-                    });
-                }
+                && entry.matches(number)
+            {
+                return Some(DialPlanResult {
+                    entry_id: entry.id().to_string(),
+                    original_number: number.to_string(),
+                    transformed_number: entry.transform_number(number),
+                    trunk_group: entry.trunk_group().to_string(),
+                });
+            }
         }
         None
     }

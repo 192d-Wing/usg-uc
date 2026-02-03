@@ -125,8 +125,7 @@ impl AppState {
 
     /// Sets the ready state.
     pub fn set_ready(&self, ready: bool) {
-        self.ready
-            .store(u64::from(ready), Ordering::Relaxed);
+        self.ready.store(u64::from(ready), Ordering::Relaxed);
     }
 
     /// Performs a health check.
@@ -155,7 +154,11 @@ pub struct ApiServer {
 
 impl ApiServer {
     /// Creates a new API server.
-    pub const fn new(config: ApiServerConfig, state: Arc<AppState>, shutdown: ShutdownSignal) -> Self {
+    pub const fn new(
+        config: ApiServerConfig,
+        state: Arc<AppState>,
+        shutdown: ShutdownSignal,
+    ) -> Self {
         Self {
             config,
             state,
@@ -304,18 +307,19 @@ impl ApiServer {
 
     /// Creates a TLS acceptor with CNSA 2.0 compliant configuration.
     fn create_tls_acceptor(tls_config: &TlsConfig) -> Result<TlsAcceptor, ApiServerError> {
-        use rustls::pki_types::pem::PemObject;
         use rustls::pki_types::PrivateKeyDer;
+        use rustls::pki_types::pem::PemObject;
 
         // Load certificate chain
-        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&tls_config.cert_path)
-            .map_err(|e| ApiServerError::TlsError {
-                reason: format!("Failed to open certificate file: {e}"),
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| ApiServerError::TlsError {
-                reason: format!("Failed to parse certificates: {e}"),
-            })?;
+        let certs: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_file_iter(&tls_config.cert_path)
+                .map_err(|e| ApiServerError::TlsError {
+                    reason: format!("Failed to open certificate file: {e}"),
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| ApiServerError::TlsError {
+                    reason: format!("Failed to parse certificates: {e}"),
+                })?;
 
         if certs.is_empty() {
             return Err(ApiServerError::TlsError {
@@ -324,10 +328,11 @@ impl ApiServer {
         }
 
         // Load private key
-        let key = PrivateKeyDer::from_pem_file(&tls_config.key_path)
-            .map_err(|e| ApiServerError::TlsError {
+        let key = PrivateKeyDer::from_pem_file(&tls_config.key_path).map_err(|e| {
+            ApiServerError::TlsError {
                 reason: format!("Failed to load private key: {e}"),
-            })?;
+            }
+        })?;
 
         // Create TLS config with CNSA 2.0 compliant settings
         let config = rustls::ServerConfig::builder()

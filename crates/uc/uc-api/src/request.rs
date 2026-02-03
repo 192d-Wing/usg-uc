@@ -117,8 +117,7 @@ impl PaginationParams {
 }
 
 /// Sort order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortOrder {
     /// Ascending order.
     #[default]
@@ -126,7 +125,6 @@ pub enum SortOrder {
     /// Descending order.
     Descending,
 }
-
 
 impl SortOrder {
     /// Returns as SQL string.

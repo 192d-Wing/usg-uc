@@ -280,15 +280,17 @@ impl AclRule {
 
         // Check dest IP if provided
         if let Some(dest) = dest_ip
-            && !self.match_criteria.matches_dest_ip(dest) {
-                return false;
-            }
+            && !self.match_criteria.matches_dest_ip(dest)
+        {
+            return false;
+        }
 
         // Check method if provided
         if let Some(m) = method
-            && !self.match_criteria.matches_method(m) {
-                return false;
-            }
+            && !self.match_criteria.matches_method(m)
+        {
+            return false;
+        }
 
         true
     }

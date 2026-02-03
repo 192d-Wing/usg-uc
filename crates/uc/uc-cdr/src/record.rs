@@ -4,8 +4,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 /// Call status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CallStatus {
     /// Call is in progress.
     #[default]
@@ -44,7 +43,6 @@ impl CallStatus {
     }
 }
 
-
 impl std::fmt::Display for CallStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
@@ -52,8 +50,7 @@ impl std::fmt::Display for CallStatus {
 }
 
 /// Disconnect cause.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DisconnectCause {
     /// Normal clearing.
     NormalClearing,
@@ -126,7 +123,6 @@ impl DisconnectCause {
     }
 }
 
-
 impl std::fmt::Display for DisconnectCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
@@ -134,8 +130,7 @@ impl std::fmt::Display for DisconnectCause {
 }
 
 /// Direction of the call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CallDirection {
     /// Inbound call.
     #[default]
@@ -153,7 +148,6 @@ impl CallDirection {
         }
     }
 }
-
 
 impl std::fmt::Display for CallDirection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -44,13 +44,13 @@ pub struct SrtpKeyExporter {
 
 impl SrtpKeyExporter {
     /// Creates a new SRTP key exporter for the given profile.
-    #[must_use] 
+    #[must_use]
     pub const fn new(profile: SrtpProfile) -> Self {
         Self { profile }
     }
 
     /// Returns the negotiated profile.
-    #[must_use] 
+    #[must_use]
     pub const fn profile(&self) -> SrtpProfile {
         self.profile
     }
@@ -62,7 +62,7 @@ impl SrtpKeyExporter {
     /// - `server_write_master_key`
     /// - `client_write_master_salt`
     /// - `server_write_master_salt`
-    #[must_use] 
+    #[must_use]
     pub const fn keying_material_length(&self) -> usize {
         2 * self.profile.key_len() + 2 * self.profile.salt_len()
     }
@@ -254,7 +254,7 @@ pub struct UseSrtpExtension {
 
 impl UseSrtpExtension {
     /// Creates a new `use_srtp` extension with CNSA 2.0 profiles.
-    #[must_use] 
+    #[must_use]
     pub fn cnsa_compliant() -> Self {
         Self {
             profiles: vec![SrtpProfile::AeadAes256Gcm],
@@ -263,7 +263,7 @@ impl UseSrtpExtension {
     }
 
     /// Creates a new extension with the given profiles.
-    #[must_use] 
+    #[must_use]
     pub const fn new(profiles: Vec<SrtpProfile>) -> Self {
         Self {
             profiles,
@@ -272,7 +272,7 @@ impl UseSrtpExtension {
     }
 
     /// Encodes the extension for the `ClientHello`.
-    #[must_use] 
+    #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut data = Vec::new();
 

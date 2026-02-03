@@ -191,15 +191,18 @@ impl Allocation {
                 });
             }
             // Refresh existing binding
-            self.channel_bindings.get_mut(&channel).map(ChannelBinding::refresh);
+            self.channel_bindings
+                .get_mut(&channel)
+                .map(ChannelBinding::refresh);
         } else {
             // Check if peer already has a different channel
             if let Some(&existing_channel) = self.peer_to_channel.get(&peer_addr)
-                && existing_channel != channel {
-                    return Err(TurnError::ChannelBindFailed {
-                        reason: "peer already bound to different channel".to_string(),
-                    });
-                }
+                && existing_channel != channel
+            {
+                return Err(TurnError::ChannelBindFailed {
+                    reason: "peer already bound to different channel".to_string(),
+                });
+            }
 
             // Create new binding
             self.channel_bindings

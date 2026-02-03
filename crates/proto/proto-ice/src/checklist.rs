@@ -409,9 +409,10 @@ impl CheckList {
         if let Some(indices) = self.by_foundation.get(foundation) {
             for &i in indices {
                 if let Some(pair) = self.pairs.get_mut(i)
-                    && pair.state() == PairState::Frozen {
-                        pair.set_state(PairState::Waiting);
-                    }
+                    && pair.state() == PairState::Frozen
+                {
+                    pair.set_state(PairState::Waiting);
+                }
             }
         }
     }

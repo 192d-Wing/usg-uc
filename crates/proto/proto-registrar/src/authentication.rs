@@ -470,9 +470,10 @@ impl Authenticator {
 
         // Check username binding if specified
         if let (Some(bound_user), Some(provided_user)) = (&state.username, username)
-            && bound_user != provided_user {
-                return NonceValidation::UsernameMismatch;
-            }
+            && bound_user != provided_user
+        {
+            return NonceValidation::UsernameMismatch;
+        }
 
         // Validate nonce count if qop is used
         if let Some(nc_value) = nc {
@@ -489,9 +490,10 @@ impl Authenticator {
 
         // Bind to user on first use
         if state.username.is_none()
-            && let Some(user) = username {
-                state.bind_to_user(user);
-            }
+            && let Some(user) = username
+        {
+            state.bind_to_user(user);
+        }
 
         NonceValidation::Valid
     }
@@ -650,7 +652,8 @@ fn compute_digest_response(
 
     // Compute HA2 = H(method:uri) or H(method:uri:H(entity-body)) for auth-int
     let ha2 = if qop == Some(AuthQop::AuthInt) {
-        let body_hash = entity_body.map_or_else(|| hash_bytes(b"", algorithm), |b| hash_bytes(b, algorithm));
+        let body_hash =
+            entity_body.map_or_else(|| hash_bytes(b"", algorithm), |b| hash_bytes(b, algorithm));
         let a2 = format!("{method}:{uri}:{body_hash}");
         hash_string(&a2, algorithm)
     } else {

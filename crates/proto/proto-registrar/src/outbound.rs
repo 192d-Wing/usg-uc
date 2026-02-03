@@ -358,8 +358,7 @@ impl Flow {
             return false;
         }
 
-        self.last_probe
-            .is_some_and(|t| t.elapsed() >= timeout)
+        self.last_probe.is_some_and(|t| t.elapsed() >= timeout)
     }
 
     /// Returns true if the flow has failed.
@@ -650,16 +649,15 @@ impl OutboundFlowManager {
             .map(|f| {
                 if f.state == FlowState::Probing {
                     // Waiting for probe response
-                    f.last_probe
-                        .map_or(Duration::ZERO, |t| {
-                            let elapsed = t.elapsed();
-                            if elapsed >= self.keepalive_timeout {
-                                Duration::ZERO
-                            } else {
-                                // Safe because we checked elapsed < timeout above
-                                self.keepalive_timeout.saturating_sub(elapsed)
-                            }
-                        })
+                    f.last_probe.map_or(Duration::ZERO, |t| {
+                        let elapsed = t.elapsed();
+                        if elapsed >= self.keepalive_timeout {
+                            Duration::ZERO
+                        } else {
+                            // Safe because we checked elapsed < timeout above
+                            self.keepalive_timeout.saturating_sub(elapsed)
+                        }
+                    })
                 } else {
                     f.time_until_keepalive()
                 }

@@ -228,10 +228,11 @@ impl TurnClient {
         {
             let alloc = self.allocation.lock().await;
             if let Some(ref a) = *alloc
-                && a.is_valid() {
-                    debug!(relayed_addr = %a.relayed_addr, "Using existing allocation");
-                    return Ok(a.relayed_addr);
-                }
+                && a.is_valid()
+            {
+                debug!(relayed_addr = %a.relayed_addr, "Using existing allocation");
+                return Ok(a.relayed_addr);
+            }
         }
 
         // Create Allocate request
@@ -496,11 +497,12 @@ impl TurnClient {
                     // Check for 401 Unauthorized
                     if response.msg_type.class == StunClass::ErrorResponse
                         && let Some(code) = self.extract_error_code(&response)
-                            && code == 401 {
-                                // Update credentials from response
-                                self.update_credentials_from_response(&response).await;
-                                return Err(TurnError::AuthenticationFailed);
-                            }
+                        && code == 401
+                    {
+                        // Update credentials from response
+                        self.update_credentials_from_response(&response).await;
+                        return Err(TurnError::AuthenticationFailed);
+                    }
                     return Ok(response);
                 }
                 Ok(Err(e)) => return Err(e),

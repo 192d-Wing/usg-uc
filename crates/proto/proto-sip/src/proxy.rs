@@ -243,12 +243,13 @@ impl RequestForwarder {
     pub fn validate_request(&self, request: &SipRequest) -> ProxyValidation {
         // §16.3 Step 1: Check Max-Forwards
         if let Some(max_forwards) = self.get_max_forwards(request)
-            && max_forwards.is_zero() {
-                return ProxyValidation::invalid(
-                    "Max-Forwards is zero - loop detected",
-                    483, // Too Many Hops
-                );
-            }
+            && max_forwards.is_zero()
+        {
+            return ProxyValidation::invalid(
+                "Max-Forwards is zero - loop detected",
+                483, // Too Many Hops
+            );
+        }
 
         // §16.3 Step 4: Loop detection via Via headers
         if let Some(loop_error) = self.detect_loop(request) {

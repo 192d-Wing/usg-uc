@@ -4,8 +4,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 /// Overall health status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HealthStatus {
     /// System is healthy and operational.
     Healthy,
@@ -50,7 +49,6 @@ impl HealthStatus {
         }
     }
 }
-
 
 impl std::fmt::Display for HealthStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

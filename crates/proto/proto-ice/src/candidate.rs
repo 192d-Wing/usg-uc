@@ -379,10 +379,9 @@ impl Candidate {
                         parts[i + 1].parse().map_err(|_| IceError::ParseError {
                             reason: "invalid raddr".to_string(),
                         })?;
-                    let rport: u16 =
-                        parts[i + 3].parse().map_err(|_| IceError::ParseError {
-                            reason: "invalid rport".to_string(),
-                        })?;
+                    let rport: u16 = parts[i + 3].parse().map_err(|_| IceError::ParseError {
+                        reason: "invalid rport".to_string(),
+                    })?;
                     candidate.related_address = Some(SocketAddr::new(rip, rport));
                     i += 4;
                 } else {
