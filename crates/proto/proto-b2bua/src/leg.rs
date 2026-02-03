@@ -408,12 +408,10 @@ impl CallLeg {
     /// # Errors
     /// Returns an error if the operation fails.
     pub fn terminate(&mut self) -> B2buaResult<()> {
-        if self.state == LegState::Terminated {
-            Ok(()) // Already terminated
-        } else {
+        if self.state != LegState::Terminated {
             self.state = LegState::Terminated;
-            Ok(())
         }
+        Ok(())
     }
 
     /// Fails the leg with a reason.

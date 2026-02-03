@@ -114,6 +114,7 @@ impl ConnectivityCheck {
     }
 
     /// Sets whether to nominate this pair (controlling agent only).
+    #[must_use]
     pub fn with_nomination(mut self, nominate: bool) -> Self {
         self.nominate = nominate;
         self
@@ -276,12 +277,14 @@ impl ConnectivityChecker {
     }
 
     /// Sets the check timeout.
+    #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
     /// Sets the maximum retransmissions.
+    #[must_use]
     pub fn with_max_retransmissions(mut self, max: u32) -> Self {
         self.max_retransmissions = max;
         self
@@ -506,7 +509,7 @@ impl IceStunServer {
         }
 
         // Check for role conflict per RFC 8445 §7.3.1.1
-        let role_conflict = self.check_role_conflict(request)?;
+        let role_conflict = self.check_role_conflict(request);
         if let Some(new_role) = role_conflict {
             // Return 487 error
             let error_response = StunMessage::binding_error(request, 487, "Role Conflict");
@@ -558,7 +561,7 @@ impl IceStunServer {
     }
 
     /// Checks for role conflict per RFC 8445 §7.3.1.1.
-    fn check_role_conflict(&self, request: &StunMessage) -> IceResult<Option<IceRole>> {
+    fn check_role_conflict(&self, request: &StunMessage) -> Option<IceRole> {
         let remote_controlling = request.attributes.iter().find_map(|a| {
             if let StunAttribute::IceControlling(tb) = a {
                 Some(*tb)
@@ -578,28 +581,14 @@ impl IceStunServer {
         match (self.role, remote_controlling, remote_controlled) {
             // We're controlling, they claim controlling
             (IceRole::Controlling, Some(remote_tb), None) => {
-                if self.tie_breaker >= remote_tb {
-                    // We win, they should switch to controlled
-                    // Return error 487 so they switch
-                    Ok(Some(IceRole::Controlled))
-                } else {
-                    // They win, we should switch to controlled
-                    // But we don't return error, we switch ourselves
-                    Ok(None)
-                }
+                (self.tie_breaker >= remote_tb).then_some(IceRole::Controlled)
             }
             // We're controlled, they claim controlled
             (IceRole::Controlled, None, Some(remote_tb)) => {
-                if self.tie_breaker >= remote_tb {
-                    // We win, we should switch to controlling
-                    Ok(None)
-                } else {
-                    // They win, they should switch to controlling
-                    Ok(Some(IceRole::Controlling))
-                }
+                (self.tie_breaker < remote_tb).then_some(IceRole::Controlling)
             }
             // No conflict
-            _ => Ok(None),
+            _ => None,
         }
     }
 }

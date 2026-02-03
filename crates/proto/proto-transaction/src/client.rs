@@ -221,13 +221,10 @@ impl ClientInviteTransaction {
     /// Returns time until next timer fires.
     pub fn next_timer_deadline(&self) -> Option<Instant> {
         match self.state {
-            ClientInviteState::Calling => {
-                let deadlines: Vec<Instant> = [self.timer_a_deadline, self.timer_b_deadline]
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                deadlines.into_iter().min()
-            }
+            ClientInviteState::Calling => [self.timer_a_deadline, self.timer_b_deadline]
+                .into_iter()
+                .flatten()
+                .min(),
             ClientInviteState::Completed => self.timer_d_deadline,
             _ => None,
         }
@@ -415,7 +412,7 @@ impl ClientNonInviteTransaction {
                     return Some(TimerType::TimerK);
                 }
             }
-            _ => {}
+            ClientNonInviteState::Terminated => {}
         }
 
         None

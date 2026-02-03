@@ -354,8 +354,7 @@ impl TurnClient {
         }
 
         // Extract lifetime from response
-        let new_lifetime = self
-            .extract_lifetime(&response)
+        let new_lifetime = Self::extract_lifetime(&response)
             .unwrap_or(crate::DEFAULT_LIFETIME);
 
         // Update allocation

@@ -298,7 +298,7 @@ impl CheckList {
         let pair = self
             .pairs
             .get_mut(index)
-            .ok_or(IceError::InvalidCandidate {
+            .ok_or_else(|| IceError::InvalidCandidate {
                 reason: "pair index out of bounds".to_string(),
             })?;
 
@@ -319,7 +319,7 @@ impl CheckList {
         let pair = self
             .pairs
             .get_mut(index)
-            .ok_or(IceError::InvalidCandidate {
+            .ok_or_else(|| IceError::InvalidCandidate {
                 reason: "pair index out of bounds".to_string(),
             })?;
 
@@ -373,7 +373,7 @@ impl CheckList {
     /// Sorts pairs by priority (highest first).
     fn sort_by_priority(&mut self) {
         // We need to rebuild indices after sorting
-        self.pairs.sort_by(|a, b| b.priority().cmp(&a.priority()));
+        self.pairs.sort_by_key(|b| std::cmp::Reverse(b.priority()));
 
         // Rebuild component and foundation indices
         self.by_component.clear();

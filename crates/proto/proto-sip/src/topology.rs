@@ -529,7 +529,7 @@ impl TopologyHider {
     // =========================================================================
 
     /// Applies all topology hiding transformations to outbound request headers.
-    pub fn hide_outbound_request(&mut self, headers: &mut Headers, proxy_via: ViaHeader) {
+    pub fn hide_outbound_request(&mut self, headers: &mut Headers, proxy_via: &ViaHeader) {
         if self.config.mode == TopologyHidingMode::None {
             // Just add proxy Via at the beginning
             let existing_vias = headers.via_all_parsed();
@@ -541,7 +541,7 @@ impl TopologyHider {
             return;
         }
 
-        self.rewrite_vias_for_outbound(headers, &proxy_via);
+        self.rewrite_vias_for_outbound(headers, proxy_via);
         self.rewrite_contacts(headers);
         self.rewrite_call_id(headers);
         // Note: Record-Route is typically added by the proxy, not rewritten here

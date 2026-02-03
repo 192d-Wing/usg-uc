@@ -155,10 +155,9 @@ impl ConsentTracker {
     pub fn should_check(&self) -> bool {
         match self.state {
             ConsentState::Expired => false,
-            ConsentState::Fresh | ConsentState::Pending => match self.last_check_sent {
-                None => true,
-                Some(t) => t.elapsed() >= self.consent_interval,
-            },
+            ConsentState::Fresh | ConsentState::Pending => self
+                .last_check_sent
+                .is_none_or(|t| t.elapsed() >= self.consent_interval),
         }
     }
 
@@ -275,16 +274,14 @@ impl KeepaliveTracker {
         let now = Instant::now();
 
         // Check when we last sent traffic
-        let send_stale = match self.last_traffic_sent {
-            None => true,
-            Some(t) => now.duration_since(t) >= self.traffic_timeout,
-        };
+        let send_stale = self
+            .last_traffic_sent
+            .is_none_or(|t| now.duration_since(t) >= self.traffic_timeout);
 
         // Check when we last received traffic (also counts as activity)
-        let recv_stale = match self.last_traffic_received {
-            None => true,
-            Some(t) => now.duration_since(t) >= self.traffic_timeout,
-        };
+        let recv_stale = self
+            .last_traffic_received
+            .is_none_or(|t| now.duration_since(t) >= self.traffic_timeout);
 
         // Only need keepalive if both send and receive are stale
         // (if we've sent or received anything recently, NAT binding is fresh)
@@ -295,21 +292,15 @@ impl KeepaliveTracker {
     pub fn time_until_keepalive(&self) -> Duration {
         let now = Instant::now();
 
-        let since_send = match self.last_traffic_sent {
-            None => self.keepalive_interval,
-            Some(t) => {
-                let elapsed = now.duration_since(t);
-                self.keepalive_interval.saturating_sub(elapsed)
-            }
-        };
+        let since_send = self.last_traffic_sent.map_or(self.keepalive_interval, |t| {
+            let elapsed = now.duration_since(t);
+            self.keepalive_interval.saturating_sub(elapsed)
+        });
 
-        let since_recv = match self.last_traffic_received {
-            None => self.keepalive_interval,
-            Some(t) => {
-                let elapsed = now.duration_since(t);
-                self.keepalive_interval.saturating_sub(elapsed)
-            }
-        };
+        let since_recv = self.last_traffic_received.map_or(self.keepalive_interval, |t| {
+            let elapsed = now.duration_since(t);
+            self.keepalive_interval.saturating_sub(elapsed)
+        });
 
         since_send.min(since_recv)
     }
@@ -527,7 +518,7 @@ impl std::fmt::Debug for ConsentKeepaliveManager {
             .field("remote_addr", &self.remote_addr)
             .field("consent_state", &self.consent.state())
             .field("has_pending_check", &self.current_transaction.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

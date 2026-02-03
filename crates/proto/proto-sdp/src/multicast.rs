@@ -582,7 +582,7 @@ impl MulticastScope {
             0x02 => Self::LinkLocal,
             0x05 => Self::SiteLocal,
             0x08 => Self::OrganizationLocal,
-            0x0e | _ => Self::Global, // Unknown scope treated as global
+            _ => Self::Global, // 0x0e and unknown scopes treated as global
         })
     }
 

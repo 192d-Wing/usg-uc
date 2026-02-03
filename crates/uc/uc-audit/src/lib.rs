@@ -82,10 +82,7 @@ impl AuditLogger {
         // Compute hash chain
         let last_hash = {
             let guard = self.last_hash.lock();
-            match guard {
-                Ok(hash) => *hash,
-                Err(_) => [0u8; 48],
-            }
+            guard.map_or([0u8; 48], |hash| *hash)
         };
 
         let record = AuditRecord::new(sequence, event, timestamp, last_hash);

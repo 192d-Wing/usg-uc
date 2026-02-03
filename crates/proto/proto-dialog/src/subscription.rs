@@ -24,6 +24,7 @@
 //! This module provides validation against known IANA registrations.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 /// Default subscription expiration (3600 seconds per RFC 6665).
@@ -154,10 +155,9 @@ impl EventPackage {
 
     /// Formats as Event header value.
     pub fn to_header_value(&self) -> String {
-        match &self.id {
-            Some(id) => format!("{};id={}", self.event_type, id),
-            None => self.event_type.clone(),
-        }
+        self.id
+            .as_ref()
+            .map_or_else(|| self.event_type.clone(), |id| format!("{};id={}", self.event_type, id))
     }
 
     /// Parses from Event header value.
@@ -246,15 +246,15 @@ impl SubscriptionStateHeader {
         let mut value = self.state.to_string();
 
         if let Some(ref reason) = self.reason {
-            value.push_str(&format!(";reason={reason}"));
+            let _ = write!(value, ";reason={reason}");
         }
 
         if let Some(expires) = self.expires {
-            value.push_str(&format!(";expires={expires}"));
+            let _ = write!(value, ";expires={expires}");
         }
 
         if let Some(retry_after) = self.retry_after {
-            value.push_str(&format!(";retry-after={retry_after}"));
+            let _ = write!(value, ";retry-after={retry_after}");
         }
 
         value
@@ -417,7 +417,7 @@ impl Subscription {
         if elapsed >= expires {
             Duration::ZERO
         } else {
-            expires.checked_sub(elapsed).unwrap()
+            expires.checked_sub(elapsed).unwrap_or(Duration::ZERO)
         }
     }
 
@@ -558,7 +558,10 @@ impl Notifier {
         if elapsed >= expires {
             0
         } else {
-            expires.checked_sub(elapsed).unwrap().as_secs() as u32
+            expires
+                .checked_sub(elapsed)
+                .unwrap_or(Duration::ZERO)
+                .as_secs() as u32
         }
     }
 

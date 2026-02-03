@@ -193,13 +193,14 @@ impl RecordingTrigger {
 
     /// Creates a NOT trigger.
     #[must_use]
-    pub fn not(trigger: Self) -> Self {
+    pub fn negate(trigger: Self) -> Self {
         Self::Not(Box::new(trigger))
     }
 }
 
 /// Recording media options.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct RecordingMediaOptions {
     /// Record audio streams.
     pub record_audio: bool,

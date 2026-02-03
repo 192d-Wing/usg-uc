@@ -532,7 +532,7 @@ impl HeaderManipulator {
         // Apply global policies first
         for policy in &self.global_policies {
             if policy.applies_to(context) {
-                applied_count += self.apply_policy(headers, policy, context)?;
+                applied_count += self.apply_policy(headers, policy, context);
             }
         }
 
@@ -542,7 +542,7 @@ impl HeaderManipulator {
         {
             for policy in trunk_policies {
                 if policy.applies_to(context) {
-                    applied_count += self.apply_policy(headers, policy, context)?;
+                    applied_count += self.apply_policy(headers, policy, context);
                 }
             }
         }
@@ -556,7 +556,7 @@ impl HeaderManipulator {
         headers: &mut Headers,
         policy: &ManipulationPolicy,
         context: &ManipulationContext,
-    ) -> SipResult<usize> {
+    ) -> usize {
         let mut applied_count = 0;
 
         for rule in policy.rules() {
@@ -570,7 +570,7 @@ impl HeaderManipulator {
             }
         }
 
-        Ok(applied_count)
+        applied_count
     }
 
     /// Evaluates a condition against headers and context.
@@ -604,8 +604,8 @@ impl HeaderManipulator {
                     if pattern.starts_with('^') && pattern.ends_with('$') {
                         // Exact match
                         h.value == pattern[1..pattern.len() - 1]
-                    } else if pattern.starts_with('^') {
-                        h.value.starts_with(&pattern[1..])
+                    } else if let Some(stripped) = pattern.strip_prefix('^') {
+                        h.value.starts_with(stripped)
                     } else if pattern.ends_with('$') {
                         h.value.ends_with(&pattern[..pattern.len() - 1])
                     } else {

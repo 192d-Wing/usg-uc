@@ -287,6 +287,7 @@ impl Transport for TlsTransport {
                         address: self.peer_addr,
                         reason: e.to_string(),
                     })?;
+                drop(stream);
             }
 
             Ok(())
@@ -311,6 +312,7 @@ impl Transport for TlsTransport {
                         .map_err(|e| TransportError::ReceiveFailed {
                             reason: e.to_string(),
                         })?;
+                drop(stream);
 
                 if n == 0 {
                     return Err(TransportError::ConnectionClosed);
@@ -352,6 +354,7 @@ impl Transport for TlsTransport {
             {
                 let mut stream = self.stream.lock().await;
                 let _ = stream.shutdown().await;
+                drop(stream);
             }
 
             debug!(peer = %self.peer_addr, "TLS transport closed");
@@ -466,7 +469,7 @@ impl TlsListener {
             })?;
 
         socket
-            .listen(config.backlog as i32)
+            .listen(i32::try_from(config.backlog).unwrap_or(128))
             .map_err(|e| TransportError::BindFailed {
                 address: config.bind_address,
                 reason: format!("failed to listen: {e}"),

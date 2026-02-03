@@ -438,16 +438,16 @@ impl Registrar {
     /// Processes a REGISTER request.
     pub fn process_register(
         &mut self,
-        request: RegisterRequest,
+        request: &RegisterRequest,
     ) -> RegistrarResult<RegisterResponse> {
         // Check if this is a fetch (no contacts)
         if request.contacts.is_empty() {
-            return self.fetch_bindings(&request.aor);
+            return Ok(self.fetch_bindings(&request.aor));
         }
 
         // Check for wildcard removal (Contact: *)
         if request.contacts.len() == 1 && request.contacts[0].uri == "*" {
-            return self.remove_all_bindings(&request);
+            return Ok(self.remove_all_bindings(request));
         }
 
         // Process each contact
@@ -466,33 +466,33 @@ impl Registrar {
                 let _ = self.location.remove_binding(&request.aor, &contact.uri);
             } else {
                 // Add or update binding
-                self.add_or_update_binding(&request, contact, expires)?;
+                self.add_or_update_binding(request, contact, expires)?;
             }
         }
 
         // Return current bindings
-        self.fetch_bindings(&request.aor)
+        Ok(self.fetch_bindings(&request.aor))
     }
 
     /// Fetches current bindings for an AOR.
-    fn fetch_bindings(&self, aor: &str) -> RegistrarResult<RegisterResponse> {
+    fn fetch_bindings(&self, aor: &str) -> RegisterResponse {
         let bindings: Vec<Binding> = self.location.lookup(aor).into_iter().cloned().collect();
 
-        Ok(RegisterResponse::ok(bindings))
+        RegisterResponse::ok(bindings)
     }
 
     /// Removes all bindings for an AOR.
     fn remove_all_bindings(
         &mut self,
         request: &RegisterRequest,
-    ) -> RegistrarResult<RegisterResponse> {
+    ) -> RegisterResponse {
         // Wildcard removal requires expires=0
         if request.expires != Some(0) {
-            return Ok(RegisterResponse::error(400, "Bad Request"));
+            return RegisterResponse::error(400, "Bad Request");
         }
 
         let _ = self.location.remove_all_bindings(&request.aor);
-        Ok(RegisterResponse::ok(Vec::new()))
+        RegisterResponse::ok(Vec::new())
     }
 
     /// Adds or updates a binding.
@@ -620,7 +620,7 @@ impl AuthenticatedRegistrar {
     /// returns a 401 Unauthorized response with a challenge.
     pub fn process_register(
         &mut self,
-        request: RegisterRequest,
+        request: &RegisterRequest,
     ) -> RegistrarResult<RegisterResponse> {
         let config = self.registrar.config();
 
@@ -742,7 +742,7 @@ mod tests {
         let request =
             test_register_request("sip:alice@example.com", "sip:alice@192.168.1.100:5060");
 
-        let response = registrar.process_register(request).unwrap();
+        let response = registrar.process_register(&request).unwrap();
         assert!(response.success);
         assert_eq!(response.status_code, 200);
         assert_eq!(response.contacts.len(), 1);
@@ -767,7 +767,7 @@ mod tests {
             method: "REGISTER".to_string(),
         };
 
-        let response = registrar.process_register(request).unwrap();
+        let response = registrar.process_register(&request).unwrap();
         assert!(response.success);
         assert_eq!(response.contacts.len(), 2);
     }
@@ -779,7 +779,7 @@ mod tests {
         // First register
         let request =
             test_register_request("sip:alice@example.com", "sip:alice@192.168.1.100:5060");
-        registrar.process_register(request).unwrap();
+        registrar.process_register(&request).unwrap();
 
         // Then fetch (no contacts)
         let fetch_request = RegisterRequest {
@@ -794,7 +794,7 @@ mod tests {
             method: "REGISTER".to_string(),
         };
 
-        let response = registrar.process_register(fetch_request).unwrap();
+        let response = registrar.process_register(&fetch_request).unwrap();
         assert!(response.success);
         assert_eq!(response.contacts.len(), 1);
     }
@@ -806,7 +806,7 @@ mod tests {
         // First register
         let request =
             test_register_request("sip:alice@example.com", "sip:alice@192.168.1.100:5060");
-        registrar.process_register(request).unwrap();
+        registrar.process_register(&request).unwrap();
 
         // Then remove with expires=0
         let remove_request = RegisterRequest {
@@ -821,7 +821,7 @@ mod tests {
             method: "REGISTER".to_string(),
         };
 
-        let response = registrar.process_register(remove_request).unwrap();
+        let response = registrar.process_register(&remove_request).unwrap();
         assert!(response.success);
         assert!(response.contacts.is_empty());
     }
@@ -833,7 +833,7 @@ mod tests {
         // First register
         let request =
             test_register_request("sip:alice@example.com", "sip:alice@192.168.1.100:5060");
-        registrar.process_register(request).unwrap();
+        registrar.process_register(&request).unwrap();
 
         // Remove all with wildcard
         let remove_request = RegisterRequest {
@@ -848,7 +848,7 @@ mod tests {
             method: "REGISTER".to_string(),
         };
 
-        let response = registrar.process_register(remove_request).unwrap();
+        let response = registrar.process_register(&remove_request).unwrap();
         assert!(response.success);
         assert!(response.contacts.is_empty());
     }
@@ -870,7 +870,7 @@ mod tests {
             method: "REGISTER".to_string(),
         };
 
-        let response = registrar.process_register(request).unwrap();
+        let response = registrar.process_register(&request).unwrap();
         assert!(!response.success);
         assert_eq!(response.status_code, 423);
         assert!(response.min_expires.is_some());
@@ -892,7 +892,7 @@ mod tests {
             authorization: None,
             method: "REGISTER".to_string(),
         };
-        registrar.process_register(request1).unwrap();
+        registrar.process_register(&request1).unwrap();
 
         // Update with higher CSeq
         let request2 = RegisterRequest {
@@ -906,7 +906,7 @@ mod tests {
             authorization: None,
             method: "REGISTER".to_string(),
         };
-        let response = registrar.process_register(request2).unwrap();
+        let response = registrar.process_register(&request2).unwrap();
 
         assert!(response.success);
         assert_eq!(response.contacts.len(), 1);
@@ -962,7 +962,7 @@ mod tests {
             method: "REGISTER".to_string(),
         };
 
-        let response = registrar.process_register(request).unwrap();
+        let response = registrar.process_register(&request).unwrap();
         assert!(response.success);
 
         // Format contacts per RFC 3261 §10.3

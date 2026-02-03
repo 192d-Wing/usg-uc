@@ -350,7 +350,7 @@ mod tests {
     #[test]
     fn test_q_value() {
         let mut binding = test_binding();
-        assert_eq!(binding.q_value(), 1.0);
+        assert!((binding.q_value() - 1.0).abs() < f32::EPSILON);
 
         binding.set_q_value(0.5);
         assert!((binding.q_value() - 0.5).abs() < f32::EPSILON);

@@ -44,7 +44,7 @@ impl std::fmt::Display for RefresherRole {
 
 impl RefresherRole {
     /// Parses from string.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "uac" => Some(Self::Uac),
             "uas" => Some(Self::Uas),
@@ -139,7 +139,7 @@ impl SessionTimer {
         if elapsed >= expires {
             Duration::ZERO
         } else {
-            expires.checked_sub(elapsed).unwrap()
+            expires.checked_sub(elapsed).unwrap_or(Duration::ZERO)
         }
     }
 
@@ -240,17 +240,13 @@ pub fn negotiate_session_timer(
     }
 
     // Determine refresher per RFC 4028 Section 7.1
-    let refresher = match requested_refresher {
-        Some(role) => role,
-        None => {
-            // If not specified, UAS should refresh by default per RFC 4028
-            if we_are_uas {
-                RefresherRole::Uas
-            } else {
-                RefresherRole::Uac
-            }
-        }
+    // If not specified, UAS should refresh by default per RFC 4028
+    let default_refresher = if we_are_uas {
+        RefresherRole::Uas
+    } else {
+        RefresherRole::Uac
     };
+    let refresher = requested_refresher.unwrap_or(default_refresher);
 
     SessionTimerNegotiation::success(requested_expires, refresher)
 }
@@ -281,7 +277,7 @@ pub fn parse_session_expires(value: &str) -> DialogResult<(u32, Option<Refresher
     for part in parts.iter().skip(1) {
         let part = part.trim();
         if let Some(value) = part.strip_prefix("refresher=") {
-            refresher = RefresherRole::from_str(value);
+            refresher = RefresherRole::parse(value);
         }
     }
 
@@ -306,10 +302,7 @@ pub fn parse_min_se(value: &str) -> DialogResult<u32> {
 
 /// Creates a Session-Expires header value.
 pub fn format_session_expires(expires: u32, refresher: Option<RefresherRole>) -> String {
-    match refresher {
-        Some(role) => format!("{expires};refresher={role}"),
-        None => format!("{expires}"),
-    }
+    refresher.map_or_else(|| format!("{expires}"), |role| format!("{expires};refresher={role}"))
 }
 
 /// Creates a Min-SE header value.
@@ -381,9 +374,9 @@ mod tests {
 
     #[test]
     fn test_refresher_role() {
-        assert_eq!(RefresherRole::from_str("uac"), Some(RefresherRole::Uac));
-        assert_eq!(RefresherRole::from_str("UAS"), Some(RefresherRole::Uas));
-        assert_eq!(RefresherRole::from_str("invalid"), None);
+        assert_eq!(RefresherRole::parse("uac"), Some(RefresherRole::Uac));
+        assert_eq!(RefresherRole::parse("UAS"), Some(RefresherRole::Uas));
+        assert_eq!(RefresherRole::parse("invalid"), None);
     }
 
     #[test]

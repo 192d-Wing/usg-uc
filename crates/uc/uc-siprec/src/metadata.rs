@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::fmt::Write as _;
 use std::time::{Duration, SystemTime};
 
 /// Unique identifier for recording entities.
@@ -470,29 +471,27 @@ impl RecordingMetadata {
         xml.push_str("<recording xmlns=\"urn:ietf:params:xml:ns:recording:1\">\n");
 
         // Session info
-        xml.push_str(&format!(
-            "  <session id=\"{}\">\n",
-            self.session.recording_session_id
-        ));
-        xml.push_str(&format!(
-            "    <call-id>{}</call-id>\n",
+        let _ = writeln!(xml, "  <session id=\"{}\">", self.session.recording_session_id);
+        let _ = writeln!(
+            xml,
+            "    <call-id>{}</call-id>",
             self.session.communication_session_id
-        ));
-        xml.push_str(&format!("    <state>{}</state>\n", self.session.state));
+        );
+        let _ = writeln!(xml, "    <state>{}</state>", self.session.state);
         if let Some(ref reason) = self.session.reason {
-            xml.push_str(&format!("    <reason>{reason}</reason>\n"));
+            let _ = writeln!(xml, "    <reason>{reason}</reason>");
         }
         xml.push_str("  </session>\n");
 
         // Participants
         xml.push_str("  <participants>\n");
         for participant in &self.participants {
-            xml.push_str(&format!("    <participant id=\"{}\">\n", participant.id));
-            xml.push_str(&format!("      <aor>{}</aor>\n", participant.aor));
+            let _ = writeln!(xml, "    <participant id=\"{}\">", participant.id);
+            let _ = writeln!(xml, "      <aor>{}</aor>", participant.aor);
             if let Some(ref name) = participant.display_name {
-                xml.push_str(&format!("      <name>{name}</name>\n"));
+                let _ = writeln!(xml, "      <name>{name}</name>");
             }
-            xml.push_str(&format!("      <role>{}</role>\n", participant.role));
+            let _ = writeln!(xml, "      <role>{}</role>", participant.role);
             xml.push_str("    </participant>\n");
         }
         xml.push_str("  </participants>\n");
@@ -500,25 +499,17 @@ impl RecordingMetadata {
         // Streams
         xml.push_str("  <streams>\n");
         for stream in &self.streams {
-            xml.push_str(&format!("    <stream id=\"{}\">\n", stream.id));
-            xml.push_str(&format!(
-                "      <media-type>{}</media-type>\n",
-                stream.media_type
-            ));
+            let _ = writeln!(xml, "    <stream id=\"{}\">", stream.id);
+            let _ = writeln!(xml, "      <media-type>{}</media-type>", stream.media_type);
             if let Some(ref codec) = stream.codec {
-                xml.push_str(&format!("      <codec>{codec}</codec>\n"));
+                let _ = writeln!(xml, "      <codec>{codec}</codec>");
             }
-            xml.push_str(&format!(
-                "      <direction>{}</direction>\n",
-                stream.direction
-            ));
+            let _ = writeln!(xml, "      <direction>{}</direction>", stream.direction);
             if let Some(ssrc) = stream.ssrc {
-                xml.push_str(&format!("      <ssrc>{ssrc}</ssrc>\n"));
+                let _ = writeln!(xml, "      <ssrc>{ssrc}</ssrc>");
             }
             if let Some(ref participant_id) = stream.participant_id {
-                xml.push_str(&format!(
-                    "      <participant-id>{participant_id}</participant-id>\n"
-                ));
+                let _ = writeln!(xml, "      <participant-id>{participant_id}</participant-id>");
             }
             xml.push_str("    </stream>\n");
         }

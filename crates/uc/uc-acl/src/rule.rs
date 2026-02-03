@@ -247,6 +247,7 @@ impl AclRule {
     }
 
     /// Sets the priority.
+    #[must_use]
     pub fn with_priority(mut self, priority: RulePriority) -> Self {
         self.priority = priority;
         self

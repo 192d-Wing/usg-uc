@@ -261,13 +261,10 @@ impl Dialog {
     /// # Errors
     /// Returns an error if the operation fails.
     pub fn terminate(&mut self) -> DialogResult<()> {
-        match self.state {
-            DialogState::Terminated => Ok(()), // Already terminated
-            _ => {
-                self.state = DialogState::Terminated;
-                Ok(())
-            }
+        if self.state != DialogState::Terminated {
+            self.state = DialogState::Terminated;
         }
+        Ok(())
     }
 
     /// Gets the next local CSeq and increments.

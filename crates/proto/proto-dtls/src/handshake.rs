@@ -204,7 +204,7 @@ pub struct Handshake {
     /// Local private key (for signing).
     local_private_key: Vec<u8>,
     /// Handshake hash (for Finished message).
-    handshake_hash: Vec<u8>,
+    hash: Vec<u8>,
     /// Cookie from `HelloVerifyRequest`.
     cookie: Vec<u8>,
     /// Peer certificate chain (received during handshake).
@@ -268,7 +268,7 @@ impl Handshake {
             message_seq: 0,
             local_cert_chain: cert_chain,
             local_private_key: private_key,
-            handshake_hash: Vec::new(),
+            hash: Vec::new(),
             cookie: Vec::new(),
             peer_cert_chain: Vec::new(),
             peer_public_key: None,
@@ -703,7 +703,10 @@ impl Handshake {
 
         let mut msg = Vec::new();
         msg.extend_from_slice(&DTLS_1_2_VERSION.to_be_bytes());
-        msg.push(cookie.len() as u8);
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            msg.push(cookie.len().min(255) as u8);
+        }
         msg.extend_from_slice(&cookie);
 
         Ok(msg)
@@ -977,10 +980,10 @@ impl Handshake {
             })?;
 
         // Compute hash of all handshake messages (excluding this Finished)
-        let handshake_hash = uc_crypto::hash::sha384(&self.handshake_hash);
+        let hash = uc_crypto::hash::sha384(&self.hash);
 
         // Verify the Finished message
-        FinishedVerifier::verify(data, &master_secret, &handshake_hash, is_client_finished)?;
+        FinishedVerifier::verify(data, &master_secret, &hash, is_client_finished)?;
 
         debug!(
             role = if is_client_finished {
@@ -1154,9 +1157,9 @@ impl Handshake {
         };
 
         // Hash of all handshake messages
-        let handshake_hash = uc_crypto::hash::sha384(&self.handshake_hash);
+        let hash = uc_crypto::hash::sha384(&self.hash);
 
-        let verify_data = prf_sha384(&master_secret, label, &handshake_hash, 12);
+        let verify_data = prf_sha384(&master_secret, label, &hash, 12);
 
         Ok(verify_data)
     }
@@ -1185,7 +1188,7 @@ impl Handshake {
         fragment.extend_from_slice(payload);
 
         // Add to handshake hash
-        self.handshake_hash.extend_from_slice(&fragment);
+        self.hash.extend_from_slice(&fragment);
 
         // Encrypt and frame
         let record = self
@@ -1240,7 +1243,7 @@ impl Handshake {
 
                 // Add to handshake hash (except Finished which we verify)
                 if header.msg_type != HandshakeType::Finished {
-                    self.handshake_hash.extend_from_slice(&fragment);
+                    self.hash.extend_from_slice(&fragment);
                 }
 
                 return Ok((header.msg_type, payload));

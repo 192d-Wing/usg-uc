@@ -150,6 +150,8 @@ missing_docs = "warn"
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
+# unwrap/expect/panic are acceptable in test code, but we want them denied in production code
+# Individual test modules should use #[cfg_attr(test, allow(clippy::unwrap_used))]
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"

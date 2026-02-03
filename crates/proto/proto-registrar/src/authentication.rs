@@ -565,19 +565,19 @@ impl Authenticator {
         };
 
         // Verify the digest response
-        let expected = compute_digest_response(
-            &creds.username,
-            &creds.realm,
-            &password,
+        let expected = compute_digest_response(&DigestParams {
+            username: &creds.username,
+            realm: &creds.realm,
+            password: &password,
             method,
-            &creds.uri,
-            &creds.nonce,
-            creds.algorithm,
-            creds.qop,
-            creds.nc,
-            creds.cnonce.as_deref(),
+            uri: &creds.uri,
+            nonce: &creds.nonce,
+            algorithm: creds.algorithm,
+            qop: creds.qop,
+            nc: creds.nc,
+            cnonce: creds.cnonce.as_deref(),
             entity_body,
-        );
+        });
 
         if expected.to_lowercase() == creds.response.to_lowercase() {
             AuthResult::Success {
@@ -631,44 +631,50 @@ fn generate_opaque() -> String {
     generate_random_nonce()[..16].to_string()
 }
 
-/// Computes the digest response.
-///
-/// Uses SHA-256 by default for CNSA 2.0 compliance.
-fn compute_digest_response(
-    username: &str,
-    realm: &str,
-    password: &str,
-    method: &str,
-    uri: &str,
-    nonce: &str,
+/// Parameters for digest response computation.
+struct DigestParams<'a> {
+    username: &'a str,
+    realm: &'a str,
+    password: &'a str,
+    method: &'a str,
+    uri: &'a str,
+    nonce: &'a str,
     algorithm: AuthAlgorithm,
     qop: Option<AuthQop>,
     nc: Option<u32>,
-    cnonce: Option<&str>,
-    entity_body: Option<&[u8]>,
-) -> String {
+    cnonce: Option<&'a str>,
+    entity_body: Option<&'a [u8]>,
+}
+
+/// Computes the digest response.
+///
+/// Uses SHA-256 by default for CNSA 2.0 compliance.
+fn compute_digest_response(params: &DigestParams<'_>) -> String {
+    let algorithm = params.algorithm;
+    let qop = params.qop;
+    let nc = params.nc;
     // Compute HA1 = H(username:realm:password)
-    let a1 = format!("{username}:{realm}:{password}");
+    let a1 = format!("{}:{}:{}", params.username, params.realm, params.password);
     let ha1 = hash_string(&a1, algorithm);
 
     // Compute HA2 = H(method:uri) or H(method:uri:H(entity-body)) for auth-int
     let ha2 = if qop == Some(AuthQop::AuthInt) {
         let body_hash =
-            entity_body.map_or_else(|| hash_bytes(b"", algorithm), |b| hash_bytes(b, algorithm));
-        let a2 = format!("{method}:{uri}:{body_hash}");
+            params.entity_body.map_or_else(|| hash_bytes(b"", algorithm), |b| hash_bytes(b, algorithm));
+        let a2 = format!("{}:{}:{}", params.method, params.uri, body_hash);
         hash_string(&a2, algorithm)
     } else {
-        let a2 = format!("{method}:{uri}");
+        let a2 = format!("{}:{}", params.method, params.uri);
         hash_string(&a2, algorithm)
     };
 
     // Compute response
-    if let (Some(qop_val), Some(nc_val), Some(cnonce_val)) = (qop, nc, cnonce) {
+    if let (Some(qop_val), Some(nc_val), Some(cnonce_val)) = (qop, nc, params.cnonce) {
         // With qop: response = H(HA1:nonce:nc:cnonce:qop:HA2)
         let data = format!(
             "{}:{}:{:08x}:{}:{}:{}",
             ha1,
-            nonce,
+            params.nonce,
             nc_val,
             cnonce_val,
             qop_val.as_str(),
@@ -677,7 +683,7 @@ fn compute_digest_response(
         hash_string(&data, algorithm)
     } else {
         // Without qop: response = H(HA1:nonce:HA2)
-        let data = format!("{ha1}:{nonce}:{ha2}");
+        let data = format!("{}:{}:{}", ha1, params.nonce, ha2);
         hash_string(&data, algorithm)
     }
 }

@@ -143,9 +143,8 @@ impl TurnAttribute {
         value: &[u8],
         transaction_id: &[u8; 12],
     ) -> TurnResult<Option<Self>> {
-        let turn_type = match TurnAttributeType::from_u16(attr_type) {
-            Some(t) => t,
-            None => return Ok(None), // Not a TURN attribute
+        let Some(turn_type) = TurnAttributeType::from_u16(attr_type) else {
+            return Ok(None); // Not a TURN attribute
         };
 
         let attr = match turn_type {

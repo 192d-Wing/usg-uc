@@ -2,6 +2,7 @@
 
 use crate::error::{IceError, IceResult};
 use crate::type_preference;
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 
 /// ICE candidate type.
@@ -89,6 +90,7 @@ impl std::fmt::Display for TransportProtocol {
 
 /// ICE candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_field_names)]
 pub struct Candidate {
     /// Foundation (unique per base + server + type combination).
     foundation: String,
@@ -295,11 +297,11 @@ impl Candidate {
         );
 
         if let Some(raddr) = self.related_address {
-            sdp.push_str(&format!(" raddr {} rport {}", raddr.ip(), raddr.port()));
+            let _ = write!(sdp, " raddr {} rport {}", raddr.ip(), raddr.port());
         }
 
         for (name, value) in &self.extensions {
-            sdp.push_str(&format!(" {name} {value}"));
+            let _ = write!(sdp, " {name} {value}");
         }
 
         sdp

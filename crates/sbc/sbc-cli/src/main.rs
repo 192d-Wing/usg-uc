@@ -61,11 +61,7 @@ fn main() {
             println!("sbc-cli {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Command::Help => {
-            Args::print_help();
-            Ok(())
-        }
-        Command::None => {
+        Command::Help | Command::None => {
             Args::print_help();
             Ok(())
         }

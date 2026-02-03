@@ -52,7 +52,7 @@ impl IdentityHeader {
         let info = passport
             .certificate_url()
             .map(|url| IdentityInfo::Url(url.to_string()))
-            .ok_or(StirShakenError::MissingField {
+            .ok_or_else(|| StirShakenError::MissingField {
                 field: "x5u".to_string(),
             })?;
 
@@ -132,7 +132,7 @@ impl IdentityHeader {
             }
         }
 
-        let info = info.ok_or(StirShakenError::MissingField {
+        let info = info.ok_or_else(|| StirShakenError::MissingField {
             field: "info".to_string(),
         })?;
 

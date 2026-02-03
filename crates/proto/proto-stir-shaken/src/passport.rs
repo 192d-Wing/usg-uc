@@ -45,7 +45,7 @@ impl Attestation {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    pub fn from_str(s: &str) -> StirShakenResult<Self> {
+    pub fn parse(s: &str) -> StirShakenResult<Self> {
         match s.to_uppercase().as_str() {
             "A" => Ok(Self::Full),
             "B" => Ok(Self::Partial),
@@ -119,6 +119,7 @@ impl PASSporTHeader {
     }
 
     /// Sets the certificate URL.
+    #[must_use]
     pub fn with_x5u(mut self, url: impl Into<String>) -> Self {
         self.x5u = Some(url.into());
         self
@@ -241,12 +242,14 @@ impl PASSporTClaims {
     }
 
     /// Sets the origination ID.
+    #[must_use]
     pub fn with_origid(mut self, origid: OrigId) -> Self {
         self.origid = origid;
         self
     }
 
     /// Sets the issued-at time.
+    #[must_use]
     pub fn with_iat(mut self, iat: u64) -> Self {
         self.iat = iat;
         self
@@ -316,6 +319,7 @@ impl PASSporT {
     }
 
     /// Creates a PASSporT with default header.
+    #[must_use]
     pub fn with_claims(claims: PASSporTClaims) -> Self {
         Self::new(PASSporTHeader::new(), claims)
     }
@@ -383,17 +387,15 @@ impl PASSporT {
     /// Encodes header for signing (base64url without padding).
     pub fn encode_header(&self) -> String {
         // Simplified JSON encoding for header
-        let json = if let Some(ref ppt) = self.header.ppt {
-            format!(
-                r#"{{"alg":"{}","typ":"{}","ppt":"{}"}}"#,
-                self.header.alg, self.header.typ, ppt
-            )
-        } else {
-            format!(
-                r#"{{"alg":"{}","typ":"{}"}}"#,
-                self.header.alg, self.header.typ
-            )
-        };
+        let json = self.header.ppt.as_ref().map_or_else(
+            || format!(r#"{{"alg":"{}","typ":"{}"}}"#, self.header.alg, self.header.typ),
+            |ppt| {
+                format!(
+                    r#"{{"alg":"{}","typ":"{}","ppt":"{}"}}"#,
+                    self.header.alg, self.header.typ, ppt
+                )
+            },
+        );
 
         base64url_encode(json.as_bytes())
     }
@@ -433,7 +435,7 @@ impl PASSporT {
         let signature = self
             .signature
             .as_ref()
-            .ok_or(StirShakenError::MissingField {
+            .ok_or_else(|| StirShakenError::MissingField {
                 field: "signature".to_string(),
             })?;
 

@@ -168,7 +168,7 @@ impl GruuService {
 
             // Update entry
             entry.refresh(expires);
-            entry.temp_gruu = new_temp_gruu.clone();
+            entry.temp_gruu.clone_from(&new_temp_gruu);
 
             // Add new temp-gruu mapping
             let updated_entry = entry.clone();
@@ -533,17 +533,15 @@ pub fn extract_gruu_info(uri: &str) -> Option<(String, bool)> {
     }
 
     // Check for public GRUU (;gr=value)
-    if let Some(gr_value) = parse_gr_parameter(uri) {
+    parse_gr_parameter(uri).map(|gr_value| {
         if gr_value.is_empty() {
             // Temporary GRUU: ;gr (no value)
-            Some((String::new(), true))
+            (String::new(), true)
         } else {
             // Public GRUU: ;gr=value
-            Some((gr_value, false))
+            (gr_value, false)
         }
-    } else {
-        None
-    }
+    })
 }
 
 #[cfg(test)]

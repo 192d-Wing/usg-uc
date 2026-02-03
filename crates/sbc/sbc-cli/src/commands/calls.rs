@@ -10,15 +10,14 @@ pub fn run(args: &Args, cmd: CallsCommand) -> CommandResult {
     match cmd {
         CallsCommand::List => {
             list_calls(args);
-            Ok(())
         }
-        CallsCommand::Show { call_id } => show_call(args, &call_id),
-        CallsCommand::Terminate { call_id } => terminate_call(args, &call_id),
+        CallsCommand::Show { call_id } => show_call(args, &call_id)?,
+        CallsCommand::Terminate { call_id } => terminate_call(args, &call_id)?,
         CallsCommand::Stats => {
             show_stats(args);
-            Ok(())
         }
     }
+    Ok(())
 }
 
 /// Lists active calls.
@@ -181,8 +180,8 @@ mod tests {
             ..Default::default()
         };
 
-        let result = list_calls(&args);
-        assert!(result.is_ok());
+        list_calls(&args);
+        // No assertions needed - just verify it runs without panic
     }
 
     #[test]
@@ -225,7 +224,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = show_stats(&args);
-        assert!(result.is_ok());
+        show_stats(&args);
+        // No assertions needed - just verify it runs without panic
     }
 }

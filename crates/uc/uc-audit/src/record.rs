@@ -109,7 +109,11 @@ mod hex_array {
     where
         S: Serializer,
     {
-        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let hex = bytes.iter().fold(String::new(), |mut acc, b| {
+            use std::fmt::Write;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
         serializer.serialize_str(&hex)
     }
 

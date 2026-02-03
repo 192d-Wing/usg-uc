@@ -247,12 +247,14 @@ impl VerifierConfig {
     }
 
     /// Sets the maximum age.
+    #[must_use]
     pub fn with_max_age(mut self, seconds: u64) -> Self {
         self.max_age_seconds = seconds;
         self
     }
 
     /// Sets whether to verify certificates.
+    #[must_use]
     pub fn with_certificate_verification(mut self, verify: bool) -> Self {
         self.verify_certificate = verify;
         self
@@ -273,6 +275,7 @@ impl Verifier {
     }
 
     /// Creates a verifier with default configuration.
+    #[must_use]
     pub fn with_defaults() -> Self {
         Self::new(VerifierConfig::default())
     }
@@ -292,11 +295,11 @@ impl Verifier {
     pub fn verify_identity(&self, header: &IdentityHeader) -> StirShakenResult<VerificationResult> {
         // Parse the token
         let token = header.token();
-        let parts: Vec<&str> = token.split('.').collect();
+        let parts_count = token.split('.').count();
 
-        if parts.len() != 3 {
+        if parts_count != 3 {
             return Ok(VerificationResult::failed(FailureReason::InvalidFormat(
-                format!("Expected 3 parts, got {}", parts.len()),
+                format!("Expected 3 parts, got {parts_count}"),
             )));
         }
 

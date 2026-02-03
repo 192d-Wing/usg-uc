@@ -11,14 +11,13 @@ pub fn run(args: &Args, cmd: ConfigCommand) -> CommandResult {
     match cmd {
         ConfigCommand::Show => {
             show_config(args);
-            Ok(())
         }
-        ConfigCommand::Validate { path } => validate_config(args, path),
+        ConfigCommand::Validate { path } => validate_config(args, path)?,
         ConfigCommand::Reload => {
             reload_config(args);
-            Ok(())
         }
     }
+    Ok(())
 }
 
 /// Shows current configuration.
@@ -155,8 +154,8 @@ mod tests {
             ..Default::default()
         };
 
-        let result = show_config(&args);
-        assert!(result.is_ok());
+        show_config(&args);
+        // No assertions needed - just verify it runs without panic
     }
 
     #[test]
@@ -177,7 +176,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = reload_config(&args);
-        assert!(result.is_ok());
+        reload_config(&args);
+        // No assertions needed - just verify it runs without panic
     }
 }

@@ -50,14 +50,96 @@ pub enum TopologyHiding {
 /// Media processing capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MediaCapabilities {
+    flags: u8,
+}
+
+impl MediaCapabilities {
+    const TRANSCODING: u8 = 0b0001;
+    const RECORDING: u8 = 0b0010;
+    const DTMF_DETECTION: u8 = 0b0100;
+    const RTP_INSPECTION: u8 = 0b1000;
+
+    /// Creates a new `MediaCapabilities` with no capabilities enabled.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self { flags: 0 }
+    }
+
+    /// Creates a new `MediaCapabilities` with all capabilities enabled.
+    #[must_use]
+    pub const fn all() -> Self {
+        Self {
+            flags: Self::TRANSCODING | Self::RECORDING | Self::DTMF_DETECTION | Self::RTP_INSPECTION,
+        }
+    }
+
+    /// Sets transcoding capability.
+    #[must_use]
+    pub const fn with_transcoding(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.flags |= Self::TRANSCODING;
+        } else {
+            self.flags &= !Self::TRANSCODING;
+        }
+        self
+    }
+
+    /// Sets recording capability.
+    #[must_use]
+    pub const fn with_recording(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.flags |= Self::RECORDING;
+        } else {
+            self.flags &= !Self::RECORDING;
+        }
+        self
+    }
+
+    /// Sets DTMF detection capability.
+    #[must_use]
+    pub const fn with_dtmf_detection(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.flags |= Self::DTMF_DETECTION;
+        } else {
+            self.flags &= !Self::DTMF_DETECTION;
+        }
+        self
+    }
+
+    /// Sets RTP inspection capability.
+    #[must_use]
+    pub const fn with_rtp_inspection(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.flags |= Self::RTP_INSPECTION;
+        } else {
+            self.flags &= !Self::RTP_INSPECTION;
+        }
+        self
+    }
+
     /// Whether transcoding is supported.
-    pub transcoding: bool,
+    #[must_use]
+    pub const fn transcoding(&self) -> bool {
+        self.flags & Self::TRANSCODING != 0
+    }
+
     /// Whether media recording is supported.
-    pub recording: bool,
+    #[must_use]
+    pub const fn recording(&self) -> bool {
+        self.flags & Self::RECORDING != 0
+    }
+
     /// Whether DTMF detection is supported.
-    pub dtmf_detection: bool,
+    #[must_use]
+    pub const fn dtmf_detection(&self) -> bool {
+        self.flags & Self::DTMF_DETECTION != 0
+    }
+
     /// Whether RTP inspection is supported.
-    pub rtp_inspection: bool,
+    #[must_use]
+    pub const fn rtp_inspection(&self) -> bool {
+        self.flags & Self::RTP_INSPECTION != 0
+    }
 }
 
 /// Mode-specific behavioral characteristics.
@@ -87,35 +169,28 @@ impl ModeCharacteristics {
                 sdp_modification: SdpModification::Passthrough,
                 media_handling: MediaHandling::Direct,
                 topology_hiding: TopologyHiding::SignalingOnly,
-                capabilities: MediaCapabilities::default(),
+                capabilities: MediaCapabilities::none(),
             },
             B2buaMode::MediaRelay => Self {
                 sdp_modification: SdpModification::RewriteConnection,
                 media_handling: MediaHandling::Relay,
                 topology_hiding: TopologyHiding::Full,
-                capabilities: MediaCapabilities::default(),
+                capabilities: MediaCapabilities::none(),
             },
             B2buaMode::MediaAware => Self {
                 sdp_modification: SdpModification::RewriteConnection,
                 media_handling: MediaHandling::Inspect,
                 topology_hiding: TopologyHiding::Full,
-                capabilities: MediaCapabilities {
-                    transcoding: false,
-                    recording: true,
-                    dtmf_detection: true,
-                    rtp_inspection: true,
-                },
+                capabilities: MediaCapabilities::none()
+                    .with_recording(true)
+                    .with_dtmf_detection(true)
+                    .with_rtp_inspection(true),
             },
             B2buaMode::MediaTermination => Self {
                 sdp_modification: SdpModification::FullModification,
                 media_handling: MediaHandling::Terminate,
                 topology_hiding: TopologyHiding::Full,
-                capabilities: MediaCapabilities {
-                    transcoding: true,
-                    recording: true,
-                    dtmf_detection: true,
-                    rtp_inspection: true,
-                },
+                capabilities: MediaCapabilities::all(),
             },
         }
     }
@@ -140,7 +215,7 @@ impl ModeCharacteristics {
 
     /// Returns true if the mode can transcode.
     pub fn can_transcode(&self) -> bool {
-        self.capabilities.transcoding
+        self.capabilities.transcoding()
     }
 }
 
@@ -273,14 +348,96 @@ impl SdpRewriteContext {
 /// Header hiding flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HeaderHiding {
-    /// Replace Via headers.
-    pub via: bool,
-    /// Replace Record-Route headers.
-    pub record_route: bool,
-    /// Replace Contact header.
-    pub contact: bool,
-    /// Strip internal headers (e.g., P-Asserted-Identity).
-    pub internal_headers: bool,
+    flags: u8,
+}
+
+impl HeaderHiding {
+    const VIA: u8 = 0b0001;
+    const RECORD_ROUTE: u8 = 0b0010;
+    const CONTACT: u8 = 0b0100;
+    const INTERNAL_HEADERS: u8 = 0b1000;
+
+    /// Creates a new `HeaderHiding` with no headers hidden.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self { flags: 0 }
+    }
+
+    /// Creates a new `HeaderHiding` with all headers hidden.
+    #[must_use]
+    pub const fn all() -> Self {
+        Self {
+            flags: Self::VIA | Self::RECORD_ROUTE | Self::CONTACT | Self::INTERNAL_HEADERS,
+        }
+    }
+
+    /// Sets Via header hiding.
+    #[must_use]
+    pub const fn with_via(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.flags |= Self::VIA;
+        } else {
+            self.flags &= !Self::VIA;
+        }
+        self
+    }
+
+    /// Sets Record-Route header hiding.
+    #[must_use]
+    pub const fn with_record_route(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.flags |= Self::RECORD_ROUTE;
+        } else {
+            self.flags &= !Self::RECORD_ROUTE;
+        }
+        self
+    }
+
+    /// Sets Contact header hiding.
+    #[must_use]
+    pub const fn with_contact(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.flags |= Self::CONTACT;
+        } else {
+            self.flags &= !Self::CONTACT;
+        }
+        self
+    }
+
+    /// Sets internal headers hiding.
+    #[must_use]
+    pub const fn with_internal_headers(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.flags |= Self::INTERNAL_HEADERS;
+        } else {
+            self.flags &= !Self::INTERNAL_HEADERS;
+        }
+        self
+    }
+
+    /// Whether Via headers should be replaced.
+    #[must_use]
+    pub const fn via(&self) -> bool {
+        self.flags & Self::VIA != 0
+    }
+
+    /// Whether Record-Route headers should be replaced.
+    #[must_use]
+    pub const fn record_route(&self) -> bool {
+        self.flags & Self::RECORD_ROUTE != 0
+    }
+
+    /// Whether Contact header should be replaced.
+    #[must_use]
+    pub const fn contact(&self) -> bool {
+        self.flags & Self::CONTACT != 0
+    }
+
+    /// Whether internal headers should be stripped.
+    #[must_use]
+    pub const fn internal_headers(&self) -> bool {
+        self.flags & Self::INTERNAL_HEADERS != 0
+    }
 }
 
 /// Identity hiding flags.
@@ -306,16 +463,11 @@ impl TopologyHidingConfig {
     pub fn for_level(level: TopologyHiding) -> Self {
         match level {
             TopologyHiding::None => Self {
-                headers: HeaderHiding::default(),
+                headers: HeaderHiding::none(),
                 identity: IdentityHiding::default(),
             },
             TopologyHiding::SignalingOnly | TopologyHiding::Full => Self {
-                headers: HeaderHiding {
-                    via: true,
-                    record_route: true,
-                    contact: true,
-                    internal_headers: true,
-                },
+                headers: HeaderHiding::all(),
                 identity: IdentityHiding {
                     call_id: true,
                     display_names: false,
@@ -332,10 +484,10 @@ impl TopologyHidingConfig {
 
     /// Returns true if any topology hiding is enabled.
     pub fn is_enabled(&self) -> bool {
-        self.headers.via
-            || self.headers.record_route
-            || self.headers.contact
-            || self.headers.internal_headers
+        self.headers.via()
+            || self.headers.record_route()
+            || self.headers.contact()
+            || self.headers.internal_headers()
             || self.identity.call_id
             || self.identity.display_names
     }
@@ -463,8 +615,8 @@ mod tests {
         assert_eq!(chars.sdp_modification, SdpModification::Passthrough);
         assert_eq!(chars.media_handling, MediaHandling::Direct);
         assert_eq!(chars.topology_hiding, TopologyHiding::SignalingOnly);
-        assert!(!chars.transcoding_supported);
-        assert!(!chars.recording_supported);
+        assert!(!chars.capabilities.transcoding());
+        assert!(!chars.capabilities.recording());
         assert!(!chars.anchors_media());
         assert!(!chars.can_transcode());
     }
@@ -476,7 +628,7 @@ mod tests {
         assert_eq!(chars.sdp_modification, SdpModification::RewriteConnection);
         assert_eq!(chars.media_handling, MediaHandling::Relay);
         assert_eq!(chars.topology_hiding, TopologyHiding::Full);
-        assert!(!chars.transcoding_supported);
+        assert!(!chars.capabilities.transcoding());
         assert!(chars.anchors_media());
         assert!(chars.requires_sdp_rewrite());
     }
@@ -486,10 +638,10 @@ mod tests {
         let chars = ModeCharacteristics::for_mode(B2buaMode::MediaAware);
 
         assert_eq!(chars.media_handling, MediaHandling::Inspect);
-        assert!(chars.recording_supported);
-        assert!(chars.dtmf_detection_supported);
-        assert!(chars.rtp_inspection_supported);
-        assert!(!chars.transcoding_supported);
+        assert!(chars.capabilities.recording());
+        assert!(chars.capabilities.dtmf_detection());
+        assert!(chars.capabilities.rtp_inspection());
+        assert!(!chars.capabilities.transcoding());
         assert!(chars.can_inspect_media());
     }
 
@@ -499,8 +651,8 @@ mod tests {
 
         assert_eq!(chars.sdp_modification, SdpModification::FullModification);
         assert_eq!(chars.media_handling, MediaHandling::Terminate);
-        assert!(chars.transcoding_supported);
-        assert!(chars.recording_supported);
+        assert!(chars.capabilities.transcoding());
+        assert!(chars.capabilities.recording());
         assert!(chars.can_transcode());
         assert!(chars.can_inspect_media());
     }
@@ -570,19 +722,19 @@ mod tests {
     fn test_topology_hiding_config_none() {
         let config = TopologyHidingConfig::for_level(TopologyHiding::None);
         assert!(!config.is_enabled());
-        assert!(!config.hide_via);
-        assert!(!config.hide_contact);
+        assert!(!config.headers.via());
+        assert!(!config.headers.contact());
     }
 
     #[test]
     fn test_topology_hiding_config_full() {
         let config = TopologyHidingConfig::for_level(TopologyHiding::Full);
         assert!(config.is_enabled());
-        assert!(config.hide_via);
-        assert!(config.hide_record_route);
-        assert!(config.hide_contact);
-        assert!(config.strip_internal_headers);
-        assert!(config.replace_call_id);
+        assert!(config.headers.via());
+        assert!(config.headers.record_route());
+        assert!(config.headers.contact());
+        assert!(config.headers.internal_headers());
+        assert!(config.identity.call_id);
     }
 
     #[test]
@@ -594,7 +746,7 @@ mod tests {
         // Media relay should have full hiding
         let config = TopologyHidingConfig::for_mode(B2buaMode::MediaRelay);
         assert!(config.is_enabled());
-        assert!(config.hide_via);
+        assert!(config.headers.via());
     }
 
     #[test]

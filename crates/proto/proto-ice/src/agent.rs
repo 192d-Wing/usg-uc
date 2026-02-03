@@ -308,13 +308,13 @@ impl IceAgent {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    pub fn add_remote_candidate(&mut self, candidate: Candidate) -> IceResult<()> {
+    pub fn add_remote_candidate(&mut self, candidate: &Candidate) -> IceResult<()> {
         // Add to remote candidates
         self.remote_candidates.push(candidate.clone());
 
         // Form pairs with existing local candidates
         for local in &self.local_candidates {
-            if self.can_pair(local, &candidate) {
+            if Self::can_pair(local, candidate) {
                 let pair = crate::checklist::CandidatePair::new(
                     local.clone(),
                     candidate.clone(),
@@ -548,7 +548,7 @@ impl IceAgent {
         let pair = self
             .checklist
             .get_mut(pair_index)
-            .ok_or(IceError::InvalidCandidate {
+            .ok_or_else(|| IceError::InvalidCandidate {
                 reason: "invalid pair index".to_string(),
             })?;
 
@@ -574,7 +574,7 @@ impl IceAgent {
         let pair = self
             .checklist
             .get(pair_index)
-            .ok_or(IceError::InvalidCandidate {
+            .ok_or_else(|| IceError::InvalidCandidate {
                 reason: "invalid pair index".to_string(),
             })?;
         let component = pair.local().component();
@@ -621,7 +621,7 @@ impl IceAgent {
         let pair = self
             .checklist
             .get_mut(pair_index)
-            .ok_or(IceError::InvalidCandidate {
+            .ok_or_else(|| IceError::InvalidCandidate {
                 reason: "invalid pair index".to_string(),
             })?;
 
@@ -766,7 +766,7 @@ impl IceAgent {
     }
 
     /// Checks if two candidates can be paired.
-    fn can_pair(&self, local: &Candidate, remote: &Candidate) -> bool {
+    fn can_pair(local: &Candidate, remote: &Candidate) -> bool {
         // Same component
         if local.component() != remote.component() {
             return false;

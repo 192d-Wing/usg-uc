@@ -7,6 +7,9 @@ use std::future::Future;
 use std::pin::Pin;
 use uc_types::address::{SbcSocketAddr, TransportType};
 
+/// Type alias for the accept future return type.
+pub type AcceptFuture<'a, C> = Pin<Box<dyn Future<Output = TransportResult<(C, SbcSocketAddr)>> + Send + 'a>>;
+
 /// Listener for accepting incoming transport connections.
 ///
 /// This trait abstracts over different transport listeners (TCP, TLS, WebSocket).
@@ -21,9 +24,7 @@ pub trait TransportListener: Send + Sync {
     /// ## Errors
     ///
     /// Returns an error if the accept operation fails.
-    fn accept(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<(Self::Connection, SbcSocketAddr)>> + Send + '_>>;
+    fn accept(&self) -> AcceptFuture<'_, Self::Connection>;
 
     /// Returns the local address this listener is bound to.
     fn local_addr(&self) -> &SbcSocketAddr;

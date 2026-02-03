@@ -95,7 +95,7 @@ mod tests {
 
     #[test]
     fn test_expires_constants() {
-        assert!(MIN_EXPIRES < DEFAULT_EXPIRES);
-        assert!(DEFAULT_EXPIRES < MAX_EXPIRES);
+        const { assert!(MIN_EXPIRES < DEFAULT_EXPIRES); }
+        const { assert!(DEFAULT_EXPIRES < MAX_EXPIRES); }
     }
 }

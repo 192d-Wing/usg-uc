@@ -218,7 +218,7 @@ impl IceManager {
 
         context
             .agent
-            .add_remote_candidate(candidate)
+            .add_remote_candidate(&candidate)
             .map_err(|e| IceManagerError::CandidateError(e.to_string()))?;
 
         Ok(())

@@ -148,18 +148,21 @@ impl ReferRequest {
     }
 
     /// Sets the Referred-By header.
+    #[must_use]
     pub fn with_referred_by(mut self, referred_by: impl Into<String>) -> Self {
         self.referred_by = Some(referred_by.into());
         self
     }
 
     /// Sets the subscription expiration.
+    #[must_use]
     pub fn with_expires(mut self, expires: Duration) -> Self {
         self.expires = expires;
         self
     }
 
     /// Sets the norefersub option (no implicit subscription).
+    #[must_use]
     pub fn with_no_refer_sub(mut self, no_refer_sub: bool) -> Self {
         self.no_refer_sub = no_refer_sub;
         self
@@ -272,12 +275,14 @@ impl ReferHandler {
     }
 
     /// Sets the Referred-By value.
+    #[must_use]
     pub fn with_referred_by(mut self, referred_by: impl Into<String>) -> Self {
         self.referred_by = Some(referred_by.into());
         self
     }
 
     /// Sets the subscription expiration.
+    #[must_use]
     pub fn with_expires(mut self, expires: Duration) -> Self {
         self.expires = expires;
         self
@@ -412,11 +417,7 @@ pub fn parse_refer_to(value: &str) -> DialogResult<String> {
 
 /// Generates a Refer-To header value.
 pub fn format_refer_to(uri: &str, replaces: Option<&str>) -> String {
-    if let Some(replaces) = replaces {
-        format!("<{uri}>?Replaces={replaces}")
-    } else {
-        format!("<{uri}>")
-    }
+    replaces.map_or_else(|| format!("<{uri}>"), |replaces| format!("<{uri}>?Replaces={replaces}"))
 }
 
 #[cfg(test)]

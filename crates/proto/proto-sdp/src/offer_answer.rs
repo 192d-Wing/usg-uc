@@ -356,21 +356,14 @@ pub const fn compute_answer_direction(offer: Direction, local: Direction) -> Dir
         // Both want bidirectional
         (Direction::Sendrecv, Direction::Sendrecv) => Direction::Sendrecv,
 
-        // Offer is sendrecv, local has preference
-        (Direction::Sendrecv, Direction::Sendonly) => Direction::Recvonly,
-        (Direction::Sendrecv, Direction::Recvonly) => Direction::Sendonly,
-        (Direction::Sendrecv, Direction::Inactive) => Direction::Inactive,
+        // Offer is sendrecv, we can receive only
+        (Direction::Sendrecv, Direction::Sendonly) | (Direction::Sendonly, Direction::Sendrecv | Direction::Recvonly) => Direction::Recvonly,
 
-        // Offer is sendonly, we can only receive
-        (Direction::Sendonly, Direction::Sendrecv | Direction::Recvonly) => Direction::Recvonly,
-        (Direction::Sendonly, Direction::Sendonly | Direction::Inactive) => Direction::Inactive, // Can't both send
+        // Offer is sendrecv, we can send only
+        (Direction::Sendrecv, Direction::Recvonly) | (Direction::Recvonly, Direction::Sendrecv | Direction::Sendonly) => Direction::Sendonly,
 
-        // Offer is recvonly, we can only send
-        (Direction::Recvonly, Direction::Sendrecv | Direction::Sendonly) => Direction::Sendonly,
-        (Direction::Recvonly, Direction::Recvonly | Direction::Inactive) => Direction::Inactive, // Can't both receive
-
-        // Offer is inactive
-        (Direction::Inactive, _) => Direction::Inactive,
+        // Both inactive or incompatible directions
+        (Direction::Sendrecv, Direction::Inactive) | (Direction::Sendonly, Direction::Sendonly | Direction::Inactive) | (Direction::Recvonly, Direction::Recvonly | Direction::Inactive) | (Direction::Inactive, _) => Direction::Inactive,
     }
 }
 
@@ -622,6 +615,9 @@ pub fn enable_media_stream(
 /// 2. Media types match at each index
 /// 3. Formats are a subset of offered formats
 /// 4. Direction is valid for the offer direction
+///
+/// # Errors
+/// Returns an error if validation fails due to invalid SDP structure.
 pub fn validate_answer(
     offer: &SessionDescription,
     answer: &SessionDescription,

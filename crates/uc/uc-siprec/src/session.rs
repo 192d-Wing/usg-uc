@@ -279,6 +279,9 @@ impl RecordingSession {
     }
 
     /// Adds a participant to the recording.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     pub fn add_participant(
         &mut self,
         id: impl Into<String>,
@@ -331,6 +334,9 @@ impl RecordingSession {
     }
 
     /// Sets up media forking for a stream.
+    ///
+    /// # Errors
+    /// Returns an error if the forker initialization or rule addition fails.
     pub fn setup_forking(
         &mut self,
         stream_id: impl Into<String>,
@@ -623,7 +629,7 @@ impl SessionRecordingClient {
         match self.config.mode {
             crate::config::RecordingMode::AllCalls => true,
             crate::config::RecordingMode::Selective => {
-                self.evaluate_triggers(&self.config.triggers, context)
+                Self::evaluate_triggers(&self.config.triggers, context)
             }
             crate::config::RecordingMode::OnDemand => context.explicit_record_request,
             crate::config::RecordingMode::Disabled => false,
@@ -631,14 +637,14 @@ impl SessionRecordingClient {
     }
 
     /// Evaluates recording triggers against context.
-    fn evaluate_triggers(&self, triggers: &[RecordingTrigger], context: &RecordingContext) -> bool {
+    fn evaluate_triggers(triggers: &[RecordingTrigger], context: &RecordingContext) -> bool {
         if triggers.is_empty() {
             // No triggers = record all
             return true;
         }
 
         for trigger in triggers {
-            if self.evaluate_trigger(trigger, context) {
+            if Self::evaluate_trigger(trigger, context) {
                 return true;
             }
         }
@@ -646,7 +652,7 @@ impl SessionRecordingClient {
     }
 
     /// Evaluates a single trigger.
-    fn evaluate_trigger(&self, trigger: &RecordingTrigger, context: &RecordingContext) -> bool {
+    fn evaluate_trigger(trigger: &RecordingTrigger, context: &RecordingContext) -> bool {
         match trigger {
             RecordingTrigger::Trunk(trunk) => context.trunk_id.as_ref().is_some_and(|t| t == trunk),
 
@@ -678,18 +684,21 @@ impl SessionRecordingClient {
             RecordingTrigger::OutboundOnly => !context.is_inbound,
 
             RecordingTrigger::Any(triggers) => {
-                triggers.iter().any(|t| self.evaluate_trigger(t, context))
+                triggers.iter().any(|t| Self::evaluate_trigger(t, context))
             }
 
             RecordingTrigger::All(triggers) => {
-                triggers.iter().all(|t| self.evaluate_trigger(t, context))
+                triggers.iter().all(|t| Self::evaluate_trigger(t, context))
             }
 
-            RecordingTrigger::Not(inner) => !self.evaluate_trigger(inner, context),
+            RecordingTrigger::Not(inner) => !Self::evaluate_trigger(inner, context),
         }
     }
 
     /// Creates a recording session for a call.
+    ///
+    /// # Errors
+    /// Returns an error if a session with the same call ID already exists or if no recording servers are available.
     pub fn create_session(
         &mut self,
         call_id: impl Into<String>,
@@ -783,12 +792,12 @@ impl RecordingContext {
     pub fn new(
         call_id: impl Into<String>,
         caller: impl Into<String>,
-        callee: impl Into<String>,
+        called_party: impl Into<String>,
     ) -> Self {
         Self {
             call_id: call_id.into(),
             caller: caller.into(),
-            callee: callee.into(),
+            callee: called_party.into(),
             ..Default::default()
         }
     }
