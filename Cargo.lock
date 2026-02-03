@@ -1246,15 +1246,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustls-pemfile"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
-dependencies = [
- "rustls-pki-types",
-]
-
-[[package]]
 name = "rustls-pki-types"
 version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1328,7 +1319,7 @@ dependencies = [
  "proto-transaction",
  "proto-turn",
  "rustls",
- "rustls-pemfile",
+ "rustls-pki-types",
  "sbc-config",
  "serde",
  "serde_json",
@@ -1938,7 +1929,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "rustls",
- "rustls-pemfile",
+ "rustls-pki-types",
  "socket2",
  "thiserror",
  "tokio",

@@ -105,7 +105,7 @@ http-body-util = "0.1"
 hyper = { version = "1.6", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tokio-rustls = "0.26"
-rustls-pemfile = "2.2"
+rustls-pki-types = { version = "1.14", features = ["std"] }
 
 # Internal crates - Foundation (uc-* = reusable UC infrastructure)
 uc-types = { path = "crates/uc/uc-types" }

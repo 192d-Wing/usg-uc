@@ -13,7 +13,7 @@ categories.workspace = true
 default = ["udp", "tcp", "tls"]
 udp = []
 tcp = []
-tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pki-types"]
 websocket = ["dep:tokio-tungstenite"]
 
 [dependencies]
@@ -28,7 +28,7 @@ socket2.workspace = true
 # TLS support
 rustls = { workspace = true, optional = true }
 tokio-rustls = { version = "0.26", optional = true }
-rustls-pemfile = { version = "2.2", optional = true }
+rustls-pki-types = { workspace = true, optional = true }
 
 # WebSocket support
 tokio-tungstenite = { version = "0.28", optional = true }

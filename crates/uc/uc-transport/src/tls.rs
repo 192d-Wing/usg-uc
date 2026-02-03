@@ -26,7 +26,6 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, ServerConfig};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::future::Future;
-use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::pin::Pin;
@@ -102,12 +101,12 @@ pub fn create_client_config(root_certs: rustls::RootCertStore) -> TransportResul
 ///
 /// Returns an error if the file cannot be read or parsed.
 pub fn load_certs(path: &Path) -> TransportResult<Vec<CertificateDer<'static>>> {
-    let file = std::fs::File::open(path).map_err(|e| TransportError::TlsCertificateError {
-        reason: format!("failed to open cert file: {e}"),
-    })?;
+    use rustls::pki_types::pem::PemObject;
 
-    let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_file_iter(path)
+        .map_err(|e| TransportError::TlsCertificateError {
+            reason: format!("failed to open cert file: {e}"),
+        })?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| TransportError::TlsCertificateError {
             reason: format!("failed to parse certs: {e}"),
@@ -128,36 +127,11 @@ pub fn load_certs(path: &Path) -> TransportResult<Vec<CertificateDer<'static>>> 
 ///
 /// Returns an error if the file cannot be read or parsed.
 pub fn load_private_key(path: &Path) -> TransportResult<PrivateKeyDer<'static>> {
-    let file = std::fs::File::open(path).map_err(|e| TransportError::TlsCertificateError {
-        reason: format!("failed to open key file: {e}"),
-    })?;
+    use rustls::pki_types::pem::PemObject;
 
-    let mut reader = BufReader::new(file);
-
-    loop {
-        match rustls_pemfile::read_one(&mut reader) {
-            Ok(Some(rustls_pemfile::Item::Pkcs1Key(key))) => {
-                return Ok(PrivateKeyDer::Pkcs1(key));
-            }
-            Ok(Some(rustls_pemfile::Item::Pkcs8Key(key))) => {
-                return Ok(PrivateKeyDer::Pkcs8(key));
-            }
-            Ok(Some(rustls_pemfile::Item::Sec1Key(key))) => {
-                return Ok(PrivateKeyDer::Sec1(key));
-            }
-            Ok(Some(_)) => continue,
-            Ok(None) => {
-                return Err(TransportError::TlsCertificateError {
-                    reason: "no private key found in file".to_string(),
-                });
-            }
-            Err(e) => {
-                return Err(TransportError::TlsCertificateError {
-                    reason: format!("failed to parse key: {e}"),
-                });
-            }
-        }
-    }
+    PrivateKeyDer::from_pem_file(path).map_err(|e| TransportError::TlsCertificateError {
+        reason: format!("failed to load private key: {e}"),
+    })
 }
 
 /// TLS transport for secure SIP messaging.

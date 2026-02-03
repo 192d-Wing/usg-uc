@@ -37,8 +37,6 @@ use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use hyper_util::service::TowerToHyperService;
 use rustls::pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
-use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -306,15 +304,18 @@ impl ApiServer {
 
     /// Creates a TLS acceptor with CNSA 2.0 compliant configuration.
     fn create_tls_acceptor(tls_config: &TlsConfig) -> Result<TlsAcceptor, ApiServerError> {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::PrivateKeyDer;
+
         // Load certificate chain
-        let cert_file =
-            File::open(&tls_config.cert_path).map_err(|e| ApiServerError::TlsError {
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&tls_config.cert_path)
+            .map_err(|e| ApiServerError::TlsError {
                 reason: format!("Failed to open certificate file: {e}"),
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ApiServerError::TlsError {
+                reason: format!("Failed to parse certificates: {e}"),
             })?;
-        let mut cert_reader = BufReader::new(cert_file);
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
-            .filter_map(std::result::Result::ok)
-            .collect();
 
         if certs.is_empty() {
             return Err(ApiServerError::TlsError {
@@ -323,16 +324,9 @@ impl ApiServer {
         }
 
         // Load private key
-        let key_file = File::open(&tls_config.key_path).map_err(|e| ApiServerError::TlsError {
-            reason: format!("Failed to open key file: {e}"),
-        })?;
-        let mut key_reader = BufReader::new(key_file);
-        let key = rustls_pemfile::private_key(&mut key_reader)
+        let key = PrivateKeyDer::from_pem_file(&tls_config.key_path)
             .map_err(|e| ApiServerError::TlsError {
-                reason: format!("Failed to parse private key: {e}"),
-            })?
-            .ok_or_else(|| ApiServerError::TlsError {
-                reason: "No private key found in key file".to_string(),
+                reason: format!("Failed to load private key: {e}"),
             })?;
 
         // Create TLS config with CNSA 2.0 compliant settings
