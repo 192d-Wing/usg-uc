@@ -1,0 +1,112 @@
+# GitLab CI/CD Pipeline for USG Unified Communications
+# Includes testing, linting, and code coverage with Codecov
+
+stages:
+  - check
+  - test
+  - coverage
+
+variables:
+  CARGO_HOME: ${CI_PROJECT_DIR}/.cargo
+  RUSTFLAGS: "-D warnings"
+
+# Cache cargo dependencies between jobs
+.cargo-cache: &cargo-cache
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .cargo/bin/
+      - .cargo/registry/index/
+      - .cargo/registry/cache/
+      - .cargo/git/db/
+      - target/
+
+# Base image for Rust jobs
+.rust-base:
+  image: rust:latest
+  <<: *cargo-cache
+  before_script:
+    - rustc --version
+    - cargo --version
+
+# Format check
+fmt:
+  extends: .rust-base
+  stage: check
+  script:
+    - rustup component add rustfmt
+    - cargo fmt --all --check
+
+# Clippy linting
+clippy:
+  extends: .rust-base
+  stage: check
+  script:
+    - rustup component add clippy
+    - cargo clippy --all-targets --all-features -- -D warnings
+
+# Build check
+build:
+  extends: .rust-base
+  stage: check
+  script:
+    - cargo build --all-targets
+
+# Run tests
+test:
+  extends: .rust-base
+  stage: test
+  script:
+    - cargo test --all-targets
+  needs:
+    - build
+
+# Security audit
+audit:
+  extends: .rust-base
+  stage: check
+  script:
+    - cargo install cargo-audit --locked || true
+    - cargo audit
+  allow_failure: true
+
+# Generate documentation
+docs:
+  extends: .rust-base
+  stage: check
+  script:
+    - cargo doc --no-deps
+  artifacts:
+    paths:
+      - target/doc/
+    expire_in: 1 week
+
+# Code coverage with llvm-cov and Codecov upload
+coverage:
+  extends: .rust-base
+  stage: coverage
+  needs:
+    - test
+  script:
+    # Install llvm-cov
+    - rustup component add llvm-tools-preview
+    - cargo install cargo-llvm-cov --locked || true
+    # Generate coverage report in lcov format for Codecov
+    - cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+    # Upload to Codecov
+    - |
+      curl -Os https://cli.codecov.io/latest/linux/codecov
+      chmod +x codecov
+      ./codecov --verbose upload-process --fail-on-error -t ${CODECOV_TOKEN} -n "gitlab-ci-${CI_COMMIT_SHA}" -F unit -f lcov.info
+  coverage: '/Total coverage: \d+\.\d+%/'
+  artifacts:
+    paths:
+      - lcov.info
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: lcov.info
+    expire_in: 1 week
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
