@@ -44,23 +44,26 @@ pub struct SrtpKeyExporter {
 
 impl SrtpKeyExporter {
     /// Creates a new SRTP key exporter for the given profile.
-    pub fn new(profile: SrtpProfile) -> Self {
+    #[must_use] 
+    pub const fn new(profile: SrtpProfile) -> Self {
         Self { profile }
     }
 
     /// Returns the negotiated profile.
-    pub fn profile(&self) -> SrtpProfile {
+    #[must_use] 
+    pub const fn profile(&self) -> SrtpProfile {
         self.profile
     }
 
     /// Calculates the total keying material length needed.
     ///
     /// Per RFC 5764, the layout is:
-    /// - client_write_master_key
-    /// - server_write_master_key
-    /// - client_write_master_salt
-    /// - server_write_master_salt
-    pub fn keying_material_length(&self) -> usize {
+    /// - `client_write_master_key`
+    /// - `server_write_master_key`
+    /// - `client_write_master_salt`
+    /// - `server_write_master_salt`
+    #[must_use] 
+    pub const fn keying_material_length(&self) -> usize {
         2 * self.profile.key_len() + 2 * self.profile.salt_len()
     }
 
@@ -232,9 +235,9 @@ fn prf_sha384(secret: &[u8], seed: &[u8], output_len: usize) -> DtlsResult<Vec<u
     Ok(output)
 }
 
-/// SRTP protection profile extension for use_srtp.
+/// SRTP protection profile extension for `use_srtp`.
 ///
-/// Encodes/decodes the use_srtp extension per RFC 5764.
+/// Encodes/decodes the `use_srtp` extension per RFC 5764.
 #[derive(Debug, Clone)]
 pub struct UseSrtpExtension {
     /// Offered/selected profiles.
@@ -244,7 +247,8 @@ pub struct UseSrtpExtension {
 }
 
 impl UseSrtpExtension {
-    /// Creates a new use_srtp extension with CNSA 2.0 profiles.
+    /// Creates a new `use_srtp` extension with CNSA 2.0 profiles.
+    #[must_use] 
     pub fn cnsa_compliant() -> Self {
         Self {
             profiles: vec![SrtpProfile::AeadAes256Gcm],
@@ -253,14 +257,16 @@ impl UseSrtpExtension {
     }
 
     /// Creates a new extension with the given profiles.
-    pub fn new(profiles: Vec<SrtpProfile>) -> Self {
+    #[must_use] 
+    pub const fn new(profiles: Vec<SrtpProfile>) -> Self {
         Self {
             profiles,
             mki: Vec::new(),
         }
     }
 
-    /// Encodes the extension for the ClientHello.
+    /// Encodes the extension for the `ClientHello`.
+    #[must_use] 
     pub fn encode(&self) -> Vec<u8> {
         let mut data = Vec::new();
 

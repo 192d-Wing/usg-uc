@@ -354,7 +354,7 @@ mod tests {
         let header = RtpHeader::new(0, 100, 1600, 0xABCDEF01);
         let payload = vec![0u8; 160]; // 20ms G.711
 
-        let packet = RtpPacket::new(header, payload.clone());
+        let packet = RtpPacket::new(header, payload);
         let bytes = packet.to_bytes();
         let parsed = RtpPacket::parse(&bytes).unwrap();
 

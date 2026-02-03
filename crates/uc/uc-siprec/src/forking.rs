@@ -88,30 +88,30 @@ impl StreamFork {
 
     /// Sets the forking mode.
     #[must_use]
-    pub fn with_mode(mut self, mode: ForkingMode) -> Self {
+    pub const fn with_mode(mut self, mode: ForkingMode) -> Self {
         self.mode = mode;
         self
     }
 
     /// Sets the fork SSRC.
     #[must_use]
-    pub fn with_fork_ssrc(mut self, ssrc: u32) -> Self {
+    pub const fn with_fork_ssrc(mut self, ssrc: u32) -> Self {
         self.fork_ssrc = Some(ssrc);
         self
     }
 
     /// Activates the fork.
-    pub fn activate(&mut self) {
+    pub const fn activate(&mut self) {
         self.active = true;
     }
 
     /// Deactivates the fork.
-    pub fn deactivate(&mut self) {
+    pub const fn deactivate(&mut self) {
         self.active = false;
     }
 
     /// Records a forked packet.
-    pub fn record_forked_packet(&mut self, bytes: usize) {
+    pub const fn record_forked_packet(&mut self, bytes: usize) {
         self.packets_forked += 1;
         self.bytes_forked += bytes as u64;
     }
@@ -186,7 +186,7 @@ impl MediaForker {
 
     /// Sets the default forking mode.
     #[must_use]
-    pub fn with_default_mode(mut self, mode: ForkingMode) -> Self {
+    pub const fn with_default_mode(mut self, mode: ForkingMode) -> Self {
         self.default_mode = mode;
         self
     }
@@ -199,7 +199,7 @@ impl MediaForker {
 
     /// Returns the current state.
     #[must_use]
-    pub fn state(&self) -> ForkerState {
+    pub const fn state(&self) -> ForkerState {
         self.state
     }
 
@@ -211,13 +211,13 @@ impl MediaForker {
 
     /// Returns the total packets forked.
     #[must_use]
-    pub fn total_packets_forked(&self) -> u64 {
+    pub const fn total_packets_forked(&self) -> u64 {
         self.total_packets_forked
     }
 
     /// Returns the total bytes forked.
     #[must_use]
-    pub fn total_bytes_forked(&self) -> u64 {
+    pub const fn total_bytes_forked(&self) -> u64 {
         self.total_bytes_forked
     }
 

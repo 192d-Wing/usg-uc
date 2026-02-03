@@ -111,14 +111,14 @@ impl DtlsConfig {
 
     /// Sets the handshake timeout.
     #[must_use]
-    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+    pub const fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = timeout;
         self
     }
 
     /// Sets the MTU.
     #[must_use]
-    pub fn with_mtu(mut self, mtu: u16) -> Self {
+    pub const fn with_mtu(mut self, mtu: u16) -> Self {
         self.mtu = mtu;
         self
     }

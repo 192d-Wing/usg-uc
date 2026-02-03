@@ -239,7 +239,7 @@ mod tests {
     #[test]
     fn test_dialog_id_components() {
         let call_id = CallId::new("call@host");
-        let dialog_id = DialogId::new(call_id.clone(), "local-tag", "remote-tag");
+        let dialog_id = DialogId::new(call_id, "local-tag", "remote-tag");
 
         assert_eq!(dialog_id.call_id().as_str(), "call@host");
         assert_eq!(dialog_id.local_tag(), "local-tag");

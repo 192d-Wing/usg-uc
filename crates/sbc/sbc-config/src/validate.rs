@@ -164,7 +164,7 @@ fn validate_rate_limit(config: &crate::schema::RateLimitConfig) -> ConfigResult<
 }
 
 /// Validates CNSA 2.0 SRTP profile compliance.
-fn validate_cnsa_srtp(config: &crate::schema::SrtpConfig) -> ConfigResult<()> {
+const fn validate_cnsa_srtp(config: &crate::schema::SrtpConfig) -> ConfigResult<()> {
     // Only AEAD_AES_256_GCM is permitted
     match config.profile {
         CnsaSrtpProfile::AeadAes256Gcm => Ok(()),
@@ -172,14 +172,14 @@ fn validate_cnsa_srtp(config: &crate::schema::SrtpConfig) -> ConfigResult<()> {
 }
 
 /// Validates CNSA 2.0 hash algorithm compliance.
-fn validate_cnsa_hash(hash: CnsaHash) -> ConfigResult<()> {
+const fn validate_cnsa_hash(hash: CnsaHash) -> ConfigResult<()> {
     match hash {
         CnsaHash::Sha384 | CnsaHash::Sha512 => Ok(()),
     }
 }
 
 /// Validates CNSA 2.0 elliptic curve compliance.
-fn validate_cnsa_curve(curve: CnsaCurve) -> ConfigResult<()> {
+const fn validate_cnsa_curve(curve: CnsaCurve) -> ConfigResult<()> {
     match curve {
         CnsaCurve::P384 | CnsaCurve::P521 => Ok(()),
     }

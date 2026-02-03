@@ -170,7 +170,7 @@ pub struct RecordLayer {
 impl RecordLayer {
     /// Creates a new record layer in plaintext mode.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             write_key: None,
             read_key: None,

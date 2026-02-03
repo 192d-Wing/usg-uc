@@ -3,7 +3,7 @@
 //! ## CNSA 2.0 Compliance
 //!
 //! This module provides only CNSA 2.0 compliant cipher suites:
-//! - **TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384** (0xC02C)
+//! - **`TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`** (0xC02C)
 //!
 //! All other cipher suites (AES-128, SHA-256, P-256) are explicitly forbidden.
 //!
@@ -11,7 +11,7 @@
 //!
 //! - **SC-13**: Cryptographic Protection
 
-/// CNSA 2.0 compliant cipher suite: TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384.
+/// CNSA 2.0 compliant cipher suite: `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`.
 ///
 /// This is the only cipher suite allowed for CNSA 2.0 compliance in this implementation.
 pub const TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384: u16 = 0xC02C;
@@ -22,7 +22,7 @@ pub const TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384: u16 = 0xC02C;
 pub struct CipherSuiteId(pub u16);
 
 impl CipherSuiteId {
-    /// TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+    /// `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`
     pub const AES_256_GCM_SHA384: Self = Self(TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384);
 
     /// Returns the raw cipher suite ID value.
@@ -55,7 +55,7 @@ impl std::fmt::Display for CipherSuiteId {
 
 /// Returns the list of CNSA 2.0 compliant cipher suites.
 ///
-/// Currently only returns TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384.
+/// Currently only returns `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`.
 #[must_use]
 pub fn cnsa_cipher_suites() -> Vec<CipherSuiteId> {
     vec![CipherSuiteId::AES_256_GCM_SHA384]
@@ -65,15 +65,15 @@ pub fn cnsa_cipher_suites() -> Vec<CipherSuiteId> {
 ///
 /// ## Returns
 ///
-/// `true` only for TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384.
+/// `true` only for `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`.
 #[must_use]
-pub fn is_cnsa_compliant(cipher_suite: CipherSuiteId) -> bool {
+pub const fn is_cnsa_compliant(cipher_suite: CipherSuiteId) -> bool {
     cipher_suite.0 == TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
 }
 
 /// Checks if a cipher suite is acceptable (same as CNSA compliant).
 #[must_use]
-pub fn is_acceptable(cipher_suite: CipherSuiteId) -> bool {
+pub const fn is_acceptable(cipher_suite: CipherSuiteId) -> bool {
     is_cnsa_compliant(cipher_suite)
 }
 
@@ -97,17 +97,17 @@ pub fn filter_acceptable(cipher_suites: &[CipherSuiteId]) -> Vec<CipherSuiteId> 
 ///
 /// These are explicitly listed to document what is NOT allowed.
 pub mod forbidden {
-    /// TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 - Uses AES-128 (forbidden).
+    /// `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` - Uses AES-128 (forbidden).
     pub const AES_128_GCM_SHA256: u16 = 0xC02B;
-    /// TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 - Uses RSA (not recommended for CNSA 2.0).
+    /// `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384` - Uses RSA (not recommended for CNSA 2.0).
     pub const RSA_AES_256_GCM: u16 = 0xC030;
-    /// TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384 - Uses CBC (not AEAD).
+    /// `TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384` - Uses CBC (not AEAD).
     pub const AES_256_CBC_SHA384: u16 = 0xC024;
 }
 
 /// Returns a reason why a cipher suite is forbidden.
 #[must_use]
-pub fn forbidden_reason(cipher_suite_id: u16) -> Option<&'static str> {
+pub const fn forbidden_reason(cipher_suite_id: u16) -> Option<&'static str> {
     match cipher_suite_id {
         forbidden::AES_128_GCM_SHA256 => Some("AES-128 forbidden by CNSA 2.0 - requires AES-256"),
         forbidden::RSA_AES_256_GCM => {

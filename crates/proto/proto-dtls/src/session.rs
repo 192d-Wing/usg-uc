@@ -10,7 +10,7 @@
 //! generation for testing purposes. Full integration requires:
 //! 1. Proper certificate handling for P-384 ECDSA
 //! 2. webrtc-dtls cipher suite support (currently lacks AES-256-GCM)
-//! 3. KeyingMaterialExporter trait integration
+//! 3. `KeyingMaterialExporter` trait integration
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
@@ -158,13 +158,13 @@ impl DtlsSession {
 
     /// Returns whether the session is established.
     #[must_use]
-    pub fn is_established(&self) -> bool {
+    pub const fn is_established(&self) -> bool {
         self.established
     }
 
     /// Returns the DTLS role.
     #[must_use]
-    pub fn role(&self) -> DtlsRole {
+    pub const fn role(&self) -> DtlsRole {
         self.role
     }
 

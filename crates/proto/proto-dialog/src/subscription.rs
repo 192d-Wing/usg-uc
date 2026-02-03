@@ -1146,7 +1146,7 @@ mod tests {
             EventPackageValidation::UnregisteredAllowed { warning } => {
                 assert!(warning.contains("not IANA-registered"));
             }
-            _ => panic!("Expected UnregisteredAllowed, got {:?}", result),
+            _ => panic!("Expected UnregisteredAllowed, got {result:?}"),
         }
     }
 
@@ -1159,7 +1159,7 @@ mod tests {
             EventPackageValidation::Invalid { reason } => {
                 assert!(reason.contains("not IANA-registered"));
             }
-            _ => panic!("Expected Invalid, got {:?}", result),
+            _ => panic!("Expected Invalid, got {result:?}"),
         }
     }
 

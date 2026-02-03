@@ -55,7 +55,7 @@ impl UdpTransport {
     ///
     /// If binding to an IPv6 address, the socket will be configured as
     /// dual-stack (accepting both IPv6 and IPv4-mapped addresses) unless
-    /// IPV6_V6ONLY is explicitly set.
+    /// `IPV6_V6ONLY` is explicitly set.
     ///
     /// ## Errors
     ///
@@ -296,7 +296,7 @@ mod tests {
         let transport1 = UdpTransport::bind(addr1).await.unwrap();
         let transport2 = UdpTransport::bind(addr2).await.unwrap();
 
-        let dest = transport2.local_addr().clone();
+        let dest = *transport2.local_addr();
         let test_data = b"Hello, SIP!";
 
         // Send from transport1 to transport2

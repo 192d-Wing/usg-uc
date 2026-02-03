@@ -339,13 +339,13 @@ impl RepeatTimes {
 
     /// Creates daily repeat times.
     #[must_use]
-    pub fn daily(duration: TimeValue, offsets: Vec<TimeValue>) -> Self {
+    pub const fn daily(duration: TimeValue, offsets: Vec<TimeValue>) -> Self {
         Self::new(TimeValue::from_days(1), duration, offsets)
     }
 
     /// Creates weekly repeat times.
     #[must_use]
-    pub fn weekly(duration: TimeValue, offsets: Vec<TimeValue>) -> Self {
+    pub const fn weekly(duration: TimeValue, offsets: Vec<TimeValue>) -> Self {
         Self::new(TimeValue::from_days(7), duration, offsets)
     }
 
@@ -384,13 +384,13 @@ impl RepeatTimes {
 
     /// Returns the repeat interval in seconds.
     #[must_use]
-    pub fn interval_seconds(&self) -> u64 {
+    pub const fn interval_seconds(&self) -> u64 {
         self.interval.as_seconds()
     }
 
     /// Returns the active duration in seconds.
     #[must_use]
-    pub fn duration_seconds(&self) -> u64 {
+    pub const fn duration_seconds(&self) -> u64 {
         self.duration.as_seconds()
     }
 

@@ -32,7 +32,7 @@ pub struct AuditRecord {
     ///
     /// ## NIST 800-53 Rev5: AU-9 (Protection of Audit Information)
     ///
-    /// SHA-384 hash of: previous_hash || sequence || timestamp || event_json
+    /// SHA-384 hash of: `previous_hash` || sequence || timestamp || `event_json`
     #[serde(with = "hex_array")]
     pub hash_chain: [u8; 48],
 }
@@ -41,6 +41,7 @@ impl AuditRecord {
     /// Creates a new audit record with hash chain.
     ///
     /// ## NIST 800-53 Rev5: AU-9 (Protection of Audit Information)
+    #[must_use] 
     pub fn new(
         sequence: u64,
         event: AuditEvent,

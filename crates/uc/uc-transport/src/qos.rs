@@ -1,4 +1,4 @@
-//! QoS (Quality of Service) DSCP marking for network traffic.
+//! `QoS` (Quality of Service) DSCP marking for network traffic.
 //!
 //! This module provides DSCP (Differentiated Services Code Point) marking
 //! capabilities for SIP signaling and RTP media traffic.
@@ -6,9 +6,9 @@
 //! ## RFC Compliance
 //!
 //! - **RFC 2474**: Definition of the Differentiated Services Field (DSCP)
-//! - **RFC 4594**: Configuration Guidelines for DiffServ Service Classes
+//! - **RFC 4594**: Configuration Guidelines for `DiffServ` Service Classes
 //!
-//! ## Common DSCP Values for VoIP
+//! ## Common DSCP Values for `VoIP`
 //!
 //! | Traffic Type    | DSCP Class | DSCP Value | TOS Byte |
 //! |-----------------|------------|------------|----------|
@@ -102,7 +102,7 @@ impl DscpValue {
 
     /// Returns the numeric DSCP value (0-63).
     #[must_use]
-    pub fn value(&self) -> u8 {
+    pub const fn value(&self) -> u8 {
         match *self {
             Self::BestEffort => 0,
             Self::Cs1 => 8,
@@ -133,43 +133,43 @@ impl DscpValue {
     ///
     /// The TOS byte has DSCP in the upper 6 bits and ECN in the lower 2 bits.
     #[must_use]
-    pub fn to_tos(&self) -> u8 {
+    pub const fn to_tos(&self) -> u8 {
         self.value() << 2
     }
 
     /// Returns the DSCP value for voice RTP traffic (EF).
     #[must_use]
-    pub fn voice_rtp() -> Self {
+    pub const fn voice_rtp() -> Self {
         Self::Ef
     }
 
     /// Returns the DSCP value for video RTP traffic (AF41).
     #[must_use]
-    pub fn video_rtp() -> Self {
+    pub const fn video_rtp() -> Self {
         Self::Af41
     }
 
     /// Returns the DSCP value for voice signaling (CS3).
     #[must_use]
-    pub fn voice_signaling() -> Self {
+    pub const fn voice_signaling() -> Self {
         Self::Cs3
     }
 
     /// Returns the DSCP value for video signaling (AF31).
     #[must_use]
-    pub fn video_signaling() -> Self {
+    pub const fn video_signaling() -> Self {
         Self::Af31
     }
 
     /// Returns the DSCP value for network management/OAM (CS2).
     #[must_use]
-    pub fn oam() -> Self {
+    pub const fn oam() -> Self {
         Self::Cs2
     }
 
     /// Returns the name of this DSCP class.
     #[must_use]
-    pub fn name(&self) -> &'static str {
+    pub const fn name(&self) -> &'static str {
         match *self {
             Self::BestEffort => "BE",
             Self::Cs1 => "CS1",
@@ -260,7 +260,7 @@ pub enum TrafficType {
 impl TrafficType {
     /// Returns the recommended DSCP value for this traffic type.
     #[must_use]
-    pub fn recommended_dscp(&self) -> DscpValue {
+    pub const fn recommended_dscp(&self) -> DscpValue {
         match self {
             Self::VoiceMedia => DscpValue::Ef,
             Self::VideoMedia => DscpValue::Af41,
@@ -285,14 +285,14 @@ impl fmt::Display for TrafficType {
     }
 }
 
-/// QoS configuration for a socket or transport.
+/// `QoS` configuration for a socket or transport.
 #[derive(Debug, Clone)]
 pub struct QosConfig {
     /// DSCP value to apply.
     pub dscp: DscpValue,
     /// Traffic type (for informational purposes).
     pub traffic_type: TrafficType,
-    /// Whether to apply QoS marking.
+    /// Whether to apply `QoS` marking.
     pub enabled: bool,
 }
 
@@ -307,9 +307,9 @@ impl Default for QosConfig {
 }
 
 impl QosConfig {
-    /// Creates a QoS config for voice signaling (CS3).
+    /// Creates a `QoS` config for voice signaling (CS3).
     #[must_use]
-    pub fn voice_signaling() -> Self {
+    pub const fn voice_signaling() -> Self {
         Self {
             dscp: DscpValue::voice_signaling(),
             traffic_type: TrafficType::VoiceSignaling,
@@ -317,9 +317,9 @@ impl QosConfig {
         }
     }
 
-    /// Creates a QoS config for voice media (EF).
+    /// Creates a `QoS` config for voice media (EF).
     #[must_use]
-    pub fn voice_media() -> Self {
+    pub const fn voice_media() -> Self {
         Self {
             dscp: DscpValue::voice_rtp(),
             traffic_type: TrafficType::VoiceMedia,
@@ -327,9 +327,9 @@ impl QosConfig {
         }
     }
 
-    /// Creates a QoS config for video signaling (AF31).
+    /// Creates a `QoS` config for video signaling (AF31).
     #[must_use]
-    pub fn video_signaling() -> Self {
+    pub const fn video_signaling() -> Self {
         Self {
             dscp: DscpValue::video_signaling(),
             traffic_type: TrafficType::VideoSignaling,
@@ -337,9 +337,9 @@ impl QosConfig {
         }
     }
 
-    /// Creates a QoS config for video media (AF41).
+    /// Creates a `QoS` config for video media (AF41).
     #[must_use]
-    pub fn video_media() -> Self {
+    pub const fn video_media() -> Self {
         Self {
             dscp: DscpValue::video_rtp(),
             traffic_type: TrafficType::VideoMedia,
@@ -347,9 +347,9 @@ impl QosConfig {
         }
     }
 
-    /// Creates a QoS config for management traffic (CS2).
+    /// Creates a `QoS` config for management traffic (CS2).
     #[must_use]
-    pub fn management() -> Self {
+    pub const fn management() -> Self {
         Self {
             dscp: DscpValue::oam(),
             traffic_type: TrafficType::Management,
@@ -357,9 +357,9 @@ impl QosConfig {
         }
     }
 
-    /// Creates a custom QoS config.
+    /// Creates a custom `QoS` config.
     #[must_use]
-    pub fn custom(dscp: DscpValue, traffic_type: TrafficType) -> Self {
+    pub const fn custom(dscp: DscpValue, traffic_type: TrafficType) -> Self {
         Self {
             dscp,
             traffic_type,
@@ -367,7 +367,7 @@ impl QosConfig {
         }
     }
 
-    /// Disables QoS marking.
+    /// Disables `QoS` marking.
     #[must_use]
     pub fn disabled() -> Self {
         Self::default()
@@ -416,11 +416,11 @@ pub fn apply_dscp(socket: &Socket, dscp: DscpValue, is_ipv6: bool) -> io::Result
     Ok(())
 }
 
-/// Applies QoS configuration to a socket.
+/// Applies `QoS` configuration to a socket.
 ///
 /// # Errors
 ///
-/// Returns an error if QoS marking cannot be applied.
+/// Returns an error if `QoS` marking cannot be applied.
 pub fn apply_qos_config(socket: &Socket, config: &QosConfig, is_ipv6: bool) -> io::Result<()> {
     if !config.enabled {
         return Ok(());
@@ -437,19 +437,19 @@ pub fn apply_qos_config(socket: &Socket, config: &QosConfig, is_ipv6: bool) -> i
     Ok(())
 }
 
-/// Per-trunk QoS policy.
+/// Per-trunk `QoS` policy.
 #[derive(Debug, Clone)]
 pub struct TrunkQosPolicy {
     /// Trunk identifier.
     pub trunk_id: String,
-    /// QoS config for signaling traffic.
+    /// `QoS` config for signaling traffic.
     pub signaling: QosConfig,
-    /// QoS config for media traffic.
+    /// `QoS` config for media traffic.
     pub media: QosConfig,
 }
 
 impl TrunkQosPolicy {
-    /// Creates a new trunk QoS policy with default voice settings.
+    /// Creates a new trunk `QoS` policy with default voice settings.
     #[must_use]
     pub fn voice_default(trunk_id: impl Into<String>) -> Self {
         Self {
@@ -459,7 +459,7 @@ impl TrunkQosPolicy {
         }
     }
 
-    /// Creates a new trunk QoS policy with video settings.
+    /// Creates a new trunk `QoS` policy with video settings.
     #[must_use]
     pub fn video_default(trunk_id: impl Into<String>) -> Self {
         Self {
@@ -469,7 +469,7 @@ impl TrunkQosPolicy {
         }
     }
 
-    /// Creates a trunk policy with QoS disabled.
+    /// Creates a trunk policy with `QoS` disabled.
     #[must_use]
     pub fn disabled(trunk_id: impl Into<String>) -> Self {
         Self {
@@ -480,19 +480,19 @@ impl TrunkQosPolicy {
     }
 }
 
-/// QoS policy manager for managing per-trunk QoS settings.
+/// `QoS` policy manager for managing per-trunk `QoS` settings.
 #[derive(Debug, Clone, Default)]
 pub struct QosPolicyManager {
-    /// Default QoS for signaling.
+    /// Default `QoS` for signaling.
     default_signaling: QosConfig,
-    /// Default QoS for media.
+    /// Default `QoS` for media.
     default_media: QosConfig,
     /// Per-trunk overrides.
     trunk_policies: std::collections::HashMap<String, TrunkQosPolicy>,
 }
 
 impl QosPolicyManager {
-    /// Creates a new QoS policy manager with default voice settings.
+    /// Creates a new `QoS` policy manager with default voice settings.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -502,7 +502,7 @@ impl QosPolicyManager {
         }
     }
 
-    /// Creates a policy manager with QoS disabled by default.
+    /// Creates a policy manager with `QoS` disabled by default.
     #[must_use]
     pub fn disabled() -> Self {
         Self {
@@ -512,17 +512,17 @@ impl QosPolicyManager {
         }
     }
 
-    /// Sets the default signaling QoS.
-    pub fn set_default_signaling(&mut self, config: QosConfig) {
+    /// Sets the default signaling `QoS`.
+    pub const fn set_default_signaling(&mut self, config: QosConfig) {
         self.default_signaling = config;
     }
 
-    /// Sets the default media QoS.
-    pub fn set_default_media(&mut self, config: QosConfig) {
+    /// Sets the default media `QoS`.
+    pub const fn set_default_media(&mut self, config: QosConfig) {
         self.default_media = config;
     }
 
-    /// Adds a trunk-specific QoS policy.
+    /// Adds a trunk-specific `QoS` policy.
     pub fn add_trunk_policy(&mut self, policy: TrunkQosPolicy) {
         self.trunk_policies.insert(policy.trunk_id.clone(), policy);
     }
@@ -532,7 +532,7 @@ impl QosPolicyManager {
         self.trunk_policies.remove(trunk_id);
     }
 
-    /// Gets the signaling QoS config for a trunk.
+    /// Gets the signaling `QoS` config for a trunk.
     #[must_use]
     pub fn signaling_config(&self, trunk_id: Option<&str>) -> &QosConfig {
         trunk_id
@@ -540,7 +540,7 @@ impl QosPolicyManager {
             .map_or(&self.default_signaling, |p| &p.signaling)
     }
 
-    /// Gets the media QoS config for a trunk.
+    /// Gets the media `QoS` config for a trunk.
     #[must_use]
     pub fn media_config(&self, trunk_id: Option<&str>) -> &QosConfig {
         trunk_id

@@ -100,6 +100,6 @@ mod tests {
     #[test]
     fn test_all_trunks_failed_display() {
         let error = RoutingError::AllTrunksFailed { trunks_tried: 3 };
-        assert!(error.to_string().contains("3"));
+        assert!(error.to_string().contains('3'));
     }
 }

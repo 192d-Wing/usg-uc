@@ -1,7 +1,7 @@
 //! SDP parsing and manipulation for media negotiation.
 //!
 //! This crate provides Session Description Protocol (SDP) parsing and
-//! generation for negotiating media parameters in VoIP sessions.
+//! generation for negotiating media parameters in `VoIP` sessions.
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!

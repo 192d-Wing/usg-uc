@@ -110,7 +110,7 @@ pub enum SessionRecordingEvent {
         session_id: String,
         /// Participant ID.
         participant_id: String,
-        /// Participant AoR.
+        /// Participant `AoR`.
         aor: String,
     },
     /// Stream added to recording.
@@ -164,7 +164,7 @@ pub struct RecordingSession {
     local_tag: Option<String>,
     /// Remote tag from SRS.
     remote_tag: Option<String>,
-    /// CSeq for recording session.
+    /// `CSeq` for recording session.
     cseq: u32,
     /// Session creation time.
     created_at: SystemTime,
@@ -200,7 +200,7 @@ impl RecordingSession {
 
     /// Returns the session ID.
     #[must_use]
-    pub fn id(&self) -> &RecordingId {
+    pub const fn id(&self) -> &RecordingId {
         &self.id
     }
 
@@ -212,29 +212,29 @@ impl RecordingSession {
 
     /// Returns the current state.
     #[must_use]
-    pub fn state(&self) -> RecordingSessionState {
+    pub const fn state(&self) -> RecordingSessionState {
         self.state
     }
 
     /// Returns the metadata.
     #[must_use]
-    pub fn metadata(&self) -> &RecordingMetadata {
+    pub const fn metadata(&self) -> &RecordingMetadata {
         &self.metadata
     }
 
     /// Returns mutable metadata.
-    pub fn metadata_mut(&mut self) -> &mut RecordingMetadata {
+    pub const fn metadata_mut(&mut self) -> &mut RecordingMetadata {
         &mut self.metadata
     }
 
     /// Returns the media forker.
     #[must_use]
-    pub fn forker(&self) -> &MediaForker {
+    pub const fn forker(&self) -> &MediaForker {
         &self.forker
     }
 
     /// Returns mutable media forker.
-    pub fn forker_mut(&mut self) -> &mut MediaForker {
+    pub const fn forker_mut(&mut self) -> &mut MediaForker {
         &mut self.forker
     }
 
@@ -246,7 +246,7 @@ impl RecordingSession {
 
     /// Gets the SRS endpoint.
     #[must_use]
-    pub fn srs_endpoint(&self) -> Option<&SrsEndpoint> {
+    pub const fn srs_endpoint(&self) -> Option<&SrsEndpoint> {
         self.srs_endpoint.as_ref()
     }
 
@@ -271,8 +271,8 @@ impl RecordingSession {
         self.remote_tag = Some(tag.into());
     }
 
-    /// Gets next CSeq and increments.
-    pub fn next_cseq(&mut self) -> u32 {
+    /// Gets next `CSeq` and increments.
+    pub const fn next_cseq(&mut self) -> u32 {
         let seq = self.cseq;
         self.cseq += 1;
         seq
@@ -554,7 +554,7 @@ impl SessionRecordingClient {
 
     /// Returns the configuration.
     #[must_use]
-    pub fn config(&self) -> &RecordingConfig {
+    pub const fn config(&self) -> &RecordingConfig {
         &self.config
     }
 
@@ -778,14 +778,14 @@ impl RecordingContext {
 
     /// Sets as inbound call.
     #[must_use]
-    pub fn inbound(mut self) -> Self {
+    pub const fn inbound(mut self) -> Self {
         self.is_inbound = true;
         self
     }
 
     /// Sets as outbound call.
     #[must_use]
-    pub fn outbound(mut self) -> Self {
+    pub const fn outbound(mut self) -> Self {
         self.is_inbound = false;
         self
     }
@@ -799,7 +799,7 @@ impl RecordingContext {
 
     /// Sets explicit recording request.
     #[must_use]
-    pub fn with_explicit_request(mut self) -> Self {
+    pub const fn with_explicit_request(mut self) -> Self {
         self.explicit_record_request = true;
         self
     }

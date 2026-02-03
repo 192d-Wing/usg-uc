@@ -59,14 +59,14 @@ impl SrsEndpoint {
 
     /// Sets as backup server.
     #[must_use]
-    pub fn as_backup(mut self) -> Self {
+    pub const fn as_backup(mut self) -> Self {
         self.is_primary = false;
         self
     }
 
     /// Sets the weight for load balancing.
     #[must_use]
-    pub fn with_weight(mut self, weight: u32) -> Self {
+    pub const fn with_weight(mut self, weight: u32) -> Self {
         self.weight = weight;
         self
     }
@@ -169,25 +169,25 @@ impl RecordingTrigger {
 
     /// Creates an inbound-only trigger.
     #[must_use]
-    pub fn inbound_only() -> Self {
+    pub const fn inbound_only() -> Self {
         Self::InboundOnly
     }
 
     /// Creates an outbound-only trigger.
     #[must_use]
-    pub fn outbound_only() -> Self {
+    pub const fn outbound_only() -> Self {
         Self::OutboundOnly
     }
 
     /// Creates an ANY trigger combining multiple triggers.
     #[must_use]
-    pub fn any(triggers: Vec<Self>) -> Self {
+    pub const fn any(triggers: Vec<Self>) -> Self {
         Self::Any(triggers)
     }
 
     /// Creates an ALL trigger requiring all conditions.
     #[must_use]
-    pub fn all(triggers: Vec<Self>) -> Self {
+    pub const fn all(triggers: Vec<Self>) -> Self {
         Self::All(triggers)
     }
 

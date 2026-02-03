@@ -1,13 +1,13 @@
 //! DTLS implementation for secure media transport.
 //!
 //! This crate provides DTLS (Datagram Transport Layer Security) functionality
-//! for securing RTP media streams in VoIP and WebRTC applications.
+//! for securing RTP media streams in `VoIP` and WebRTC applications.
 //!
 //! ## CNSA 2.0 Compliance
 //!
 //! DTLS is configured with CNSA 2.0 compliant settings:
 //! - **DTLS 1.2/1.3** with approved cipher suites
-//! - **Cipher Suite**: TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+//! - **Cipher Suite**: `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`
 //! - **Key Exchange**: P-384 ECDHE
 //! - **Certificates**: P-384 ECDSA
 //!
@@ -66,13 +66,13 @@ pub enum DtlsRole {
 impl DtlsRole {
     /// Returns true if this is the client role.
     #[must_use]
-    pub fn is_client(&self) -> bool {
+    pub const fn is_client(&self) -> bool {
         matches!(self, Self::Client)
     }
 
     /// Returns true if this is the server role.
     #[must_use]
-    pub fn is_server(&self) -> bool {
+    pub const fn is_server(&self) -> bool {
         matches!(self, Self::Server)
     }
 }
@@ -97,13 +97,13 @@ pub enum DtlsState {
 impl DtlsState {
     /// Returns true if handshake is complete.
     #[must_use]
-    pub fn is_connected(&self) -> bool {
+    pub const fn is_connected(&self) -> bool {
         matches!(self, Self::Connected)
     }
 
     /// Returns true if connection is closed or failed.
     #[must_use]
-    pub fn is_closed(&self) -> bool {
+    pub const fn is_closed(&self) -> bool {
         matches!(self, Self::Closed | Self::Failed)
     }
 }
@@ -116,7 +116,7 @@ impl DtlsState {
 /// are not available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SrtpProfile {
-    /// AEAD_AES_256_GCM (RFC 7714)
+    /// `AEAD_AES_256_GCM` (RFC 7714)
     ///
     /// CNSA 2.0 compliant profile.
     AeadAes256Gcm,
@@ -125,7 +125,7 @@ pub enum SrtpProfile {
 impl SrtpProfile {
     /// Returns the IANA profile ID.
     #[must_use]
-    pub fn profile_id(&self) -> u16 {
+    pub const fn profile_id(&self) -> u16 {
         match self {
             // AEAD_AES_256_GCM defined in RFC 7714
             Self::AeadAes256Gcm => 0x0008,
@@ -134,7 +134,7 @@ impl SrtpProfile {
 
     /// Returns the key length in bytes.
     #[must_use]
-    pub fn key_len(&self) -> usize {
+    pub const fn key_len(&self) -> usize {
         match self {
             Self::AeadAes256Gcm => 32, // 256 bits
         }
@@ -142,7 +142,7 @@ impl SrtpProfile {
 
     /// Returns the salt length in bytes.
     #[must_use]
-    pub fn salt_len(&self) -> usize {
+    pub const fn salt_len(&self) -> usize {
         match self {
             Self::AeadAes256Gcm => 12,
         }
@@ -150,7 +150,7 @@ impl SrtpProfile {
 
     /// Returns the authentication tag length in bytes.
     #[must_use]
-    pub fn auth_tag_len(&self) -> usize {
+    pub const fn auth_tag_len(&self) -> usize {
         match self {
             Self::AeadAes256Gcm => 16,
         }

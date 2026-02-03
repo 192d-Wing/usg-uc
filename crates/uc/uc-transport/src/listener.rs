@@ -44,9 +44,9 @@ pub struct ListenerConfig {
     pub transport_type: TransportType,
     /// Maximum pending connections (backlog).
     pub backlog: u32,
-    /// Enable SO_REUSEADDR.
+    /// Enable `SO_REUSEADDR`.
     pub reuse_address: bool,
-    /// Enable SO_REUSEPORT.
+    /// Enable `SO_REUSEPORT`.
     pub reuse_port: bool,
 }
 
@@ -75,21 +75,21 @@ impl ListenerConfig {
 
     /// Sets the backlog (maximum pending connections).
     #[must_use]
-    pub fn with_backlog(mut self, backlog: u32) -> Self {
+    pub const fn with_backlog(mut self, backlog: u32) -> Self {
         self.backlog = backlog;
         self
     }
 
-    /// Enables or disables SO_REUSEADDR.
+    /// Enables or disables `SO_REUSEADDR`.
     #[must_use]
-    pub fn with_reuse_address(mut self, reuse: bool) -> Self {
+    pub const fn with_reuse_address(mut self, reuse: bool) -> Self {
         self.reuse_address = reuse;
         self
     }
 
-    /// Enables or disables SO_REUSEPORT.
+    /// Enables or disables `SO_REUSEPORT`.
     #[must_use]
-    pub fn with_reuse_port(mut self, reuse: bool) -> Self {
+    pub const fn with_reuse_port(mut self, reuse: bool) -> Self {
         self.reuse_port = reuse;
         self
     }

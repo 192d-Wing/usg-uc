@@ -104,7 +104,7 @@ impl fmt::Display for ParticipantRole {
 pub struct Participant {
     /// Unique participant ID.
     pub id: String,
-    /// SIP AoR (Address of Record).
+    /// SIP `AoR` (Address of Record).
     pub aor: String,
     /// Display name.
     pub display_name: Option<String>,
@@ -145,14 +145,14 @@ impl Participant {
 
     /// Sets the role.
     #[must_use]
-    pub fn with_role(mut self, role: ParticipantRole) -> Self {
+    pub const fn with_role(mut self, role: ParticipantRole) -> Self {
         self.role = role;
         self
     }
 
     /// Sets the join time.
     #[must_use]
-    pub fn with_join_time(mut self, time: SystemTime) -> Self {
+    pub const fn with_join_time(mut self, time: SystemTime) -> Self {
         self.join_time = Some(time);
         self
     }
@@ -168,7 +168,7 @@ impl Participant {
     }
 
     /// Records that participant left.
-    pub fn left(&mut self, time: SystemTime) {
+    pub const fn left(&mut self, time: SystemTime) {
         self.leave_time = Some(time);
     }
 
@@ -246,21 +246,21 @@ impl MediaStream {
 
     /// Sets the payload type.
     #[must_use]
-    pub fn with_payload_type(mut self, pt: u8) -> Self {
+    pub const fn with_payload_type(mut self, pt: u8) -> Self {
         self.payload_type = Some(pt);
         self
     }
 
     /// Sets the SSRC.
     #[must_use]
-    pub fn with_ssrc(mut self, ssrc: u32) -> Self {
+    pub const fn with_ssrc(mut self, ssrc: u32) -> Self {
         self.ssrc = Some(ssrc);
         self
     }
 
     /// Sets the direction.
     #[must_use]
-    pub fn with_direction(mut self, direction: StreamDirection) -> Self {
+    pub const fn with_direction(mut self, direction: StreamDirection) -> Self {
         self.direction = direction;
         self
     }
@@ -273,12 +273,12 @@ impl MediaStream {
     }
 
     /// Marks stream as started.
-    pub fn started(&mut self, time: SystemTime) {
+    pub const fn started(&mut self, time: SystemTime) {
         self.start_time = Some(time);
     }
 
     /// Marks stream as ended.
-    pub fn ended(&mut self, time: SystemTime) {
+    pub const fn ended(&mut self, time: SystemTime) {
         self.end_time = Some(time);
     }
 
@@ -344,7 +344,7 @@ impl SessionMetadata {
     }
 
     /// Marks session as active.
-    pub fn activate(&mut self) {
+    pub const fn activate(&mut self) {
         self.state = SessionState::Active;
     }
 

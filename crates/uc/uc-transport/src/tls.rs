@@ -4,7 +4,7 @@
 //!
 //! TLS is configured with CNSA 2.0 compliant settings only:
 //! - **TLS 1.3** required (no TLS 1.2 or earlier)
-//! - **Cipher Suite**: TLS_AES_256_GCM_SHA384 only
+//! - **Cipher Suite**: `TLS_AES_256_GCM_SHA384` only
 //! - **Key Exchange**: P-384 ECDHE
 //! - **Certificates**: P-384 ECDSA
 //!
@@ -44,7 +44,7 @@ use uc_types::address::{SbcSocketAddr, TransportType};
 /// ## CNSA 2.0 Requirements
 ///
 /// - TLS 1.3 only
-/// - TLS_AES_256_GCM_SHA384 cipher suite
+/// - `TLS_AES_256_GCM_SHA384` cipher suite
 /// - P-384 certificates
 ///
 /// ## Errors
@@ -76,7 +76,7 @@ pub fn create_server_config(
 /// ## CNSA 2.0 Requirements
 ///
 /// - TLS 1.3 only
-/// - TLS_AES_256_GCM_SHA384 cipher suite
+/// - `TLS_AES_256_GCM_SHA384` cipher suite
 /// - P-384 key exchange
 ///
 /// ## Errors
@@ -166,7 +166,7 @@ pub fn load_private_key(path: &Path) -> TransportResult<PrivateKeyDer<'static>> 
 ///
 /// This transport is configured with CNSA 2.0 compliant TLS settings:
 /// - TLS 1.3 only
-/// - TLS_AES_256_GCM_SHA384 cipher suite
+/// - `TLS_AES_256_GCM_SHA384` cipher suite
 /// - P-384 ECDHE key exchange
 ///
 /// ## NIST 800-53 Rev5: SC-8 (Transmission Confidentiality and Integrity)
@@ -532,7 +532,7 @@ impl TlsListener {
 
     /// Returns the local address.
     #[must_use]
-    pub fn local_addr(&self) -> &SbcSocketAddr {
+    pub const fn local_addr(&self) -> &SbcSocketAddr {
         &self.local_addr
     }
 

@@ -75,7 +75,7 @@ impl CipherSuite {
 
     /// Returns the total keying material length (key + salt) in bytes.
     #[must_use]
-    pub fn keying_material_length(&self) -> usize {
+    pub const fn keying_material_length(&self) -> usize {
         self.master_key_length() + self.master_salt_length()
     }
 

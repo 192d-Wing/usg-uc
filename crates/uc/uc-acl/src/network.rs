@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn test_zero_prefix() {
-        let net = IpNetwork::v4(Ipv4Addr::new(0, 0, 0, 0), 0).unwrap();
+        let net = IpNetwork::v4(Ipv4Addr::UNSPECIFIED, 0).unwrap();
         // 0.0.0.0/0 matches everything
         assert!(net.contains(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
         assert!(net.contains(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));

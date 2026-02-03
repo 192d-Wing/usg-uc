@@ -11,7 +11,7 @@ pub struct OutputFormatter {
 
 impl OutputFormatter {
     /// Creates a new formatter.
-    pub fn new(format: OutputFormat) -> Self {
+    pub const fn new(format: OutputFormat) -> Self {
         Self { format }
     }
 

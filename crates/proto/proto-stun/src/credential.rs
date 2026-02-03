@@ -613,7 +613,7 @@ mod tests {
 
         // Should be stale (valid signature but expired)
         let result = validator.validate_nonce(&old_nonce);
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 
     #[test]

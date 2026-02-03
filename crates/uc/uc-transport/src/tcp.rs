@@ -7,7 +7,7 @@
 //! ## NIST 800-53 Rev5: SC-8 (Transmission Confidentiality and Integrity)
 //!
 //! Note: TCP provides integrity (via checksums) but no confidentiality.
-//! For secure signaling, use TLS (sbc-transport::tls).
+//! For secure signaling, use TLS (`sbc-transport::tls`).
 
 use crate::error::{TransportError, TransportResult};
 use crate::listener::ListenerConfig;
@@ -372,7 +372,7 @@ impl TcpListener {
 
     /// Returns the local address.
     #[must_use]
-    pub fn local_addr(&self) -> &SbcSocketAddr {
+    pub const fn local_addr(&self) -> &SbcSocketAddr {
         &self.local_addr
     }
 
@@ -417,7 +417,7 @@ mod tests {
     async fn test_tcp_connect_accept() {
         let addr = SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 0);
         let listener = TcpListener::bind(addr).await.unwrap();
-        let listen_addr = listener.local_addr().clone();
+        let listen_addr = *listener.local_addr();
 
         // Spawn a task to accept
         let accept_handle = tokio::spawn(async move { listener.accept().await });
@@ -436,14 +436,14 @@ mod tests {
     async fn test_tcp_send_recv() {
         let addr = SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 0);
         let listener = TcpListener::bind(addr).await.unwrap();
-        let listen_addr = listener.local_addr().clone();
+        let listen_addr = *listener.local_addr();
 
         let accept_handle = tokio::spawn(async move {
             let (server, _) = listener.accept().await.unwrap();
             server
         });
 
-        let client = TcpTransport::connect(listen_addr.clone()).await.unwrap();
+        let client = TcpTransport::connect(listen_addr).await.unwrap();
         let server = accept_handle.await.unwrap();
 
         // Send from client
@@ -460,7 +460,7 @@ mod tests {
     async fn test_tcp_close() {
         let addr = SbcSocketAddr::new_v6(Ipv6Addr::LOCALHOST, 0);
         let listener = TcpListener::bind(addr).await.unwrap();
-        let listen_addr = listener.local_addr().clone();
+        let listen_addr = *listener.local_addr();
 
         let accept_handle = tokio::spawn(async move { listener.accept().await });
 

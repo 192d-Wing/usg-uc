@@ -785,9 +785,7 @@ mod tests {
             let decision = cac.evaluate("trunk-1", Some("PCMU"), CallPriority::Normal);
             assert!(
                 decision.is_admitted(),
-                "call {} should be admitted: {:?}",
-                i,
-                decision
+                "call {i} should be admitted: {decision:?}"
             );
             if let AdmissionDecision::Admitted {
                 estimated_bandwidth_kbps,

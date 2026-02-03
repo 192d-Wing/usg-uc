@@ -92,7 +92,7 @@ pub enum AuditEvent {
 impl AuditEvent {
     /// Returns the event type category.
     #[must_use]
-    pub fn event_type(&self) -> AuditEventType {
+    pub const fn event_type(&self) -> AuditEventType {
         match self {
             Self::CallAttempt(_) | Self::CallEstablished(_) | Self::CallTerminated(_) => {
                 AuditEventType::Call
@@ -262,7 +262,7 @@ pub struct CryptoKeyOperation {
     pub algorithm: String,
 }
 
-/// DoS attack type.
+/// `DoS` attack type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DosType {
     /// Global rate limit exceeded.

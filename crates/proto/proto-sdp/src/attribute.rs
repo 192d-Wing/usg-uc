@@ -85,7 +85,7 @@ impl AttributeName {
 
     /// Returns true if this attribute takes a value.
     #[must_use]
-    pub fn has_value(&self) -> bool {
+    pub const fn has_value(&self) -> bool {
         !matches!(
             self,
             Self::Sendrecv
@@ -156,7 +156,7 @@ impl Attribute {
 
     /// Creates a flag attribute (no value).
     #[must_use]
-    pub fn flag(name: AttributeName) -> Self {
+    pub const fn flag(name: AttributeName) -> Self {
         Self { name, value: None }
     }
 
@@ -173,7 +173,7 @@ impl Attribute {
 
     /// Returns true if this is a direction attribute.
     #[must_use]
-    pub fn is_direction(&self) -> bool {
+    pub const fn is_direction(&self) -> bool {
         matches!(
             self.name,
             AttributeName::Sendrecv
@@ -234,7 +234,7 @@ pub enum Direction {
 impl Direction {
     /// Returns the attribute name for this direction.
     #[must_use]
-    pub fn as_attribute_name(&self) -> AttributeName {
+    pub const fn as_attribute_name(&self) -> AttributeName {
         match self {
             Self::Sendrecv => AttributeName::Sendrecv,
             Self::Sendonly => AttributeName::Sendonly,
@@ -245,7 +245,7 @@ impl Direction {
 
     /// Creates an attribute for this direction.
     #[must_use]
-    pub fn to_attribute(&self) -> Attribute {
+    pub const fn to_attribute(&self) -> Attribute {
         Attribute::flag(self.as_attribute_name())
     }
 }
