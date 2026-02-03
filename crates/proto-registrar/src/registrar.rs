@@ -114,6 +114,10 @@ pub struct RegisterRequest {
     pub cseq: u32,
     /// Expires header value (if present).
     pub expires: Option<u32>,
+    /// Path headers from the request (RFC 3327).
+    pub path: Vec<String>,
+    /// Source address of the request (for outbound connection tracking).
+    pub source_address: Option<String>,
 }
 
 /// Contact information from a REGISTER request.
@@ -157,6 +161,12 @@ impl ContactInfo {
 }
 
 /// Registration response.
+///
+/// Per RFC 3261 Section 10.3, a 200 OK response to REGISTER MUST contain:
+/// - All current bindings for the AOR in Contact headers
+/// - Each Contact with its expiry time
+/// - Service-Route headers if applicable (RFC 3608)
+/// - Path headers if stored during registration (RFC 3327)
 #[derive(Debug)]
 pub struct RegisterResponse {
     /// Whether registration succeeded.
@@ -169,6 +179,10 @@ pub struct RegisterResponse {
     pub contacts: Vec<Binding>,
     /// Minimum expires (for 423 response).
     pub min_expires: Option<u32>,
+    /// Path headers to include (RFC 3327).
+    pub path: Vec<String>,
+    /// Service-Route headers (RFC 3608).
+    pub service_route: Vec<String>,
 }
 
 impl RegisterResponse {
@@ -180,6 +194,21 @@ impl RegisterResponse {
             reason: "OK".to_string(),
             contacts,
             min_expires: None,
+            path: Vec::new(),
+            service_route: Vec::new(),
+        }
+    }
+
+    /// Creates a success response with Path headers.
+    pub fn ok_with_path(contacts: Vec<Binding>, path: Vec<String>) -> Self {
+        Self {
+            success: true,
+            status_code: 200,
+            reason: "OK".to_string(),
+            contacts,
+            min_expires: None,
+            path,
+            service_route: Vec::new(),
         }
     }
 
@@ -191,6 +220,8 @@ impl RegisterResponse {
             reason: "Interval Too Brief".to_string(),
             contacts: Vec::new(),
             min_expires: Some(min_expires),
+            path: Vec::new(),
+            service_route: Vec::new(),
         }
     }
 
@@ -202,7 +233,64 @@ impl RegisterResponse {
             reason: reason.into(),
             contacts: Vec::new(),
             min_expires: None,
+            path: Vec::new(),
+            service_route: Vec::new(),
         }
+    }
+
+    /// Adds Service-Route headers.
+    pub fn with_service_route(mut self, routes: Vec<String>) -> Self {
+        self.service_route = routes;
+        self
+    }
+
+    /// Formats Contact headers for the response per RFC 3261 Section 10.3.
+    ///
+    /// Each contact is formatted with its remaining expiry time.
+    /// Format: `<uri>;expires=<seconds>`
+    pub fn format_contacts(&self) -> Vec<String> {
+        self.contacts
+            .iter()
+            .map(|binding| {
+                let remaining = binding.remaining_seconds();
+                let mut contact = format!("<{}>", binding.contact_uri());
+
+                // Add expires parameter
+                contact.push_str(&format!(";expires={}", remaining));
+
+                // Add q-value if not default (1.0)
+                let q = binding.q_value();
+                if (q - 1.0).abs() > f32::EPSILON {
+                    contact.push_str(&format!(";q={:.1}", q));
+                }
+
+                // Add instance-id if present (RFC 5626)
+                if let Some(instance) = binding.instance_id() {
+                    contact.push_str(&format!(";+sip.instance=\"{}\"", instance));
+                }
+
+                // Add reg-id if present (RFC 5626)
+                if let Some(reg_id) = binding.reg_id() {
+                    contact.push_str(&format!(";reg-id={}", reg_id));
+                }
+
+                contact
+            })
+            .collect()
+    }
+
+    /// Formats the Date header value (RFC 3261 recommends including Date).
+    pub fn format_date(&self) -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // RFC 1123 date format (simplified)
+        // In production, use a proper date formatting library
+        format!("SIP-Date: {}", now)
     }
 }
 
@@ -388,6 +476,8 @@ mod tests {
             call_id: "call-123@client".to_string(),
             cseq: 1,
             expires: Some(3600),
+            path: Vec::new(),
+            source_address: None,
         }
     }
 
@@ -444,6 +534,8 @@ mod tests {
             call_id: "call-123@client".to_string(),
             cseq: 1,
             expires: Some(3600),
+            path: Vec::new(),
+            source_address: None,
         };
 
         let response = registrar.process_register(request).unwrap();
@@ -469,6 +561,8 @@ mod tests {
             call_id: "call-456@client".to_string(),
             cseq: 1,
             expires: None,
+            path: Vec::new(),
+            source_address: None,
         };
 
         let response = registrar.process_register(fetch_request).unwrap();
@@ -494,6 +588,8 @@ mod tests {
             call_id: "call-123@client".to_string(),
             cseq: 2,
             expires: None,
+            path: Vec::new(),
+            source_address: None,
         };
 
         let response = registrar.process_register(remove_request).unwrap();
@@ -519,6 +615,8 @@ mod tests {
             call_id: "call-123@client".to_string(),
             cseq: 2,
             expires: Some(0),
+            path: Vec::new(),
+            source_address: None,
         };
 
         let response = registrar.process_register(remove_request).unwrap();
@@ -537,6 +635,8 @@ mod tests {
             call_id: "call-123@client".to_string(),
             cseq: 1,
             expires: None,
+            path: Vec::new(),
+            source_address: None,
         };
 
         let response = registrar.process_register(request).unwrap();
@@ -556,6 +656,8 @@ mod tests {
             call_id: "call-123@client".to_string(),
             cseq: 1,
             expires: Some(3600),
+            path: Vec::new(),
+            source_address: None,
         };
         registrar.process_register(request1).unwrap();
 
@@ -567,13 +669,16 @@ mod tests {
             call_id: "call-123@client".to_string(),
             cseq: 2,
             expires: Some(7200),
+            path: Vec::new(),
+            source_address: None,
         };
         let response = registrar.process_register(request2).unwrap();
 
         assert!(response.success);
         assert_eq!(response.contacts.len(), 1);
         // Q-value should be updated
-        assert!((response.contacts[0].q_value() - 0.5).abs() < f32::EPSILON);
+        let q = response.contacts[0].q_value();
+        assert!((q - 0.5).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -599,5 +704,62 @@ mod tests {
         let error_response = RegisterResponse::error(500, "Server Error");
         assert!(!error_response.success);
         assert_eq!(error_response.status_code, 500);
+    }
+
+    #[test]
+    fn test_format_contacts_rfc3261() {
+        let mut registrar = Registrar::with_defaults();
+
+        // Register with instance-id and reg-id (RFC 5626)
+        let mut contact = ContactInfo::new("sip:alice@192.168.1.100:5060");
+        contact.instance_id = Some("<urn:uuid:abc123>".to_string());
+        contact.reg_id = Some(1);
+        contact.q_value = Some(0.8);
+
+        let request = RegisterRequest {
+            aor: "sip:alice@example.com".to_string(),
+            contacts: vec![contact],
+            call_id: "call-123@client".to_string(),
+            cseq: 1,
+            expires: Some(3600),
+            path: Vec::new(),
+            source_address: None,
+        };
+
+        let response = registrar.process_register(request).unwrap();
+        assert!(response.success);
+
+        // Format contacts per RFC 3261 §10.3
+        let formatted = response.format_contacts();
+        assert_eq!(formatted.len(), 1);
+
+        let contact_str = &formatted[0];
+        assert!(contact_str.contains("<sip:alice@192.168.1.100:5060>"));
+        assert!(contact_str.contains(";expires="));
+        assert!(contact_str.contains(";q=0.8"));
+        assert!(contact_str.contains(";+sip.instance=\"<urn:uuid:abc123>\""));
+        assert!(contact_str.contains(";reg-id=1"));
+    }
+
+    #[test]
+    fn test_response_with_path() {
+        let bindings = Vec::new();
+        let path = vec![
+            "<sip:proxy1.example.com;lr>".to_string(),
+            "<sip:proxy2.example.com;lr>".to_string(),
+        ];
+
+        let response = RegisterResponse::ok_with_path(bindings, path.clone());
+        assert!(response.success);
+        assert_eq!(response.path.len(), 2);
+        assert_eq!(response.path, path);
+    }
+
+    #[test]
+    fn test_response_with_service_route() {
+        let response = RegisterResponse::ok(Vec::new())
+            .with_service_route(vec!["<sip:edge.example.com;lr>".to_string()]);
+
+        assert_eq!(response.service_route.len(), 1);
     }
 }

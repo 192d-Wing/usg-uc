@@ -6,6 +6,7 @@
 //! ## RFC Compliance
 //!
 //! - **RFC 3261**: SIP Transaction Layer (Sections 17.1, 17.2)
+//! - **RFC 3262**: Reliable Provisional Responses (100rel, PRACK)
 //!
 //! ## Transaction Types
 //!
@@ -59,11 +60,16 @@
 
 pub mod client;
 pub mod error;
+pub mod prack;
 pub mod server;
 pub mod timer;
 
 pub use client::{ClientInviteTransaction, ClientNonInviteTransaction};
 pub use error::{TransactionError, TransactionResult};
+pub use prack::{
+    requires_100rel, supports_100rel, ClientReliableProvisionalTracker, RAck,
+    ReliableProvisionalState, ReliableProvisionalTracker, EXTENSION_100REL,
+};
 pub use server::{ServerInviteTransaction, ServerNonInviteTransaction};
 pub use timer::TimerConfig;
 

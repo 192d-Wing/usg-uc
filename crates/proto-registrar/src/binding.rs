@@ -250,6 +250,11 @@ impl Binding {
         }
     }
 
+    /// Returns remaining seconds until expiry (for RFC 3261 §10.3 response).
+    pub fn remaining_seconds(&self) -> u32 {
+        self.time_until_expiry().as_secs() as u32
+    }
+
     /// Returns time since last update.
     pub fn time_since_update(&self) -> Duration {
         self.updated_at.elapsed()
