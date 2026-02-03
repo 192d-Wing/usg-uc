@@ -110,6 +110,52 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - `create_stale_nonce_response()` for 438 generation
   - Configurable nonce lifetime (default 10 minutes per RFC 5389)
 
+#### Phase 19: SIP Authentication & Security
+
+**proto-registrar (RFC 3261 §22)**
+
+- SIP Digest authentication (`authentication.rs`):
+  - `Authenticator` struct with nonce generation/validation
+  - `NonceState` with expiration tracking and nonce count validation
+  - `AuthChallenge` for 401/407 response generation
+  - `AuthCredentials` with full digest auth parameter parsing
+  - `AuthResult` enum: Success, ChallengeRequired, StaleNonce, Failed
+  - `AuthAlgorithm` enum: MD5, SHA256, SHA512_256
+  - `AuthQop` enum: Auth, AuthInt (integrity protection)
+  - `AuthenticatedRegistrar` combining Registrar + Authenticator
+  - Password lookup callback pattern for credential retrieval
+  - Nonce count (nc) tracking for replay attack prevention
+  - Stale nonce detection and renewal with opaque parameter
+
+**proto-sip (RFC 3323/RFC 5765)**
+
+- Topology hiding (`topology.rs`):
+  - `TopologyHider` for SIP message anonymization
+  - `TopologyHidingConfig` with external host and mode settings
+  - `TopologyHidingMode` enum: None, Basic, Aggressive
+  - Via header stripping for internal network addresses
+  - `anonymize_via()` with received/rport parameter hiding
+  - Contact header anonymization with external URI substitution
+  - Record-Route rewriting with anonymized record routes
+  - Call-ID obfuscation with bidirectional mapping
+  - `obfuscate_call_id()` / `restore_call_id()` for symmetric operation
+  - Internal network detection via configurable prefixes (RFC 1918)
+  - `hide_outbound_request()` and `hide_inbound_response()` convenience methods
+
+**proto-sdp (RFC 4568)**
+
+- SRTP-SDES key exchange (`srtp.rs`):
+  - `CryptoAttribute` parsing per RFC 4568 format
+  - `CipherSuite` enum: AES_CM_128_HMAC_SHA1_80/32, F8_128_HMAC_SHA1_80, AEAD_AES_128/256_GCM
+  - `KeyParams` with base64 keying material, lifetime, MKI support
+  - `master_key()` and `master_salt()` extraction per cipher suite
+  - `SessionParams` for KDR, UNENCRYPTED_SRTP/SRTCP, FEC options
+  - `FecOrder` enum: FecSrtp, SrtpFec
+  - `SrtpNegotiator` for cipher suite selection with preferences
+  - `extract_crypto_attributes()` for SDP parsing
+  - `supports_sdes()` and `uses_dtls_srtp()` protocol detection helpers
+  - `generate_keying_material()` for SRTP key generation
+
 #### P3 Low Priority RFC Compliance Gaps
 
 **proto-sdp (RFC 3264 §6.2)**

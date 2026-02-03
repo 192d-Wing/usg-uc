@@ -39,6 +39,7 @@ pub mod media;
 pub mod multicast;
 pub mod offer_answer;
 pub mod session;
+pub mod srtp;
 
 pub use attribute::{Attribute, AttributeName, Direction};
 pub use error::{SdpError, SdpResult};
@@ -55,6 +56,12 @@ pub use session::{Origin, RepeatTimes, SessionDescription, TimeValue, Timing};
 pub use multicast::{
     is_multicast_address, is_multicast_media, MulticastAddress, MulticastNegotiator,
     MulticastScope, MulticastValidation,
+};
+
+// RFC 4568 SRTP-SDES Key Exchange
+pub use srtp::{
+    extract_crypto_attributes, supports_sdes, uses_dtls_srtp, CipherSuite, CryptoAttribute,
+    FecOrder, KeyParams, SessionParams, SrtpNegotiator,
 };
 
 /// SDP protocol version (always 0 per RFC 4566).

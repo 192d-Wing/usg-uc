@@ -13,6 +13,7 @@ categories.workspace = true
 uc-types.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+base64 = "0.22.1"
 
 [lints]
 workspace = true

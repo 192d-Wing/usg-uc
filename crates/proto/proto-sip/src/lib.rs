@@ -50,6 +50,7 @@ pub mod proxy;
 pub mod redirect;
 pub mod response;
 pub mod routing;
+pub mod topology;
 pub mod transport;
 pub mod uri;
 
@@ -72,6 +73,7 @@ pub use routing::{
     compute_request_target, create_record_route, process_record_route_for_uac,
     process_record_route_for_uas, RouteEntry, RouteSet,
 };
+pub use topology::{TopologyHider, TopologyHidingConfig, TopologyHidingMode};
 pub use transport::Transport;
 pub use uri::{SipUri, UriScheme};
 

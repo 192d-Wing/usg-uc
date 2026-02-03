@@ -2,6 +2,7 @@
 //!
 //! Handles REGISTER requests and manages the location service.
 
+use crate::authentication::{AuthChallenge, AuthCredentials, AuthResult, Authenticator};
 use crate::binding::Binding;
 use crate::error::RegistrarResult;
 use crate::location::LocationService;
@@ -118,6 +119,56 @@ pub struct RegisterRequest {
     pub path: Vec<String>,
     /// Source address of the request (for outbound connection tracking).
     pub source_address: Option<String>,
+    /// Authorization header value (for digest authentication).
+    pub authorization: Option<String>,
+    /// Request method (typically REGISTER).
+    pub method: String,
+}
+
+impl RegisterRequest {
+    /// Creates a new register request with the given AOR.
+    pub fn new(aor: impl Into<String>) -> Self {
+        Self {
+            aor: aor.into(),
+            contacts: Vec::new(),
+            call_id: String::new(),
+            cseq: 1,
+            expires: None,
+            path: Vec::new(),
+            source_address: None,
+            authorization: None,
+            method: "REGISTER".to_string(),
+        }
+    }
+
+    /// Sets the contacts.
+    pub fn with_contacts(mut self, contacts: Vec<ContactInfo>) -> Self {
+        self.contacts = contacts;
+        self
+    }
+
+    /// Sets the Call-ID.
+    pub fn with_call_id(mut self, call_id: impl Into<String>) -> Self {
+        self.call_id = call_id.into();
+        self
+    }
+
+    /// Sets the CSeq.
+    pub fn with_cseq(mut self, cseq: u32) -> Self {
+        self.cseq = cseq;
+        self
+    }
+
+    /// Sets the Authorization header.
+    pub fn with_authorization(mut self, auth: impl Into<String>) -> Self {
+        self.authorization = Some(auth.into());
+        self
+    }
+
+    /// Parses authorization credentials if present.
+    pub fn credentials(&self) -> Option<AuthCredentials> {
+        self.authorization.as_ref().and_then(|a| AuthCredentials::parse(a))
+    }
 }
 
 /// Contact information from a REGISTER request.
@@ -183,6 +234,10 @@ pub struct RegisterResponse {
     pub path: Vec<String>,
     /// Service-Route headers (RFC 3608).
     pub service_route: Vec<String>,
+    /// WWW-Authenticate header (for 401 response).
+    pub www_authenticate: Option<String>,
+    /// Authentication-Info header (for successful auth).
+    pub authentication_info: Option<String>,
 }
 
 impl RegisterResponse {
@@ -196,6 +251,8 @@ impl RegisterResponse {
             min_expires: None,
             path: Vec::new(),
             service_route: Vec::new(),
+            www_authenticate: None,
+            authentication_info: None,
         }
     }
 
@@ -209,6 +266,8 @@ impl RegisterResponse {
             min_expires: None,
             path,
             service_route: Vec::new(),
+            www_authenticate: None,
+            authentication_info: None,
         }
     }
 
@@ -222,6 +281,8 @@ impl RegisterResponse {
             min_expires: Some(min_expires),
             path: Vec::new(),
             service_route: Vec::new(),
+            www_authenticate: None,
+            authentication_info: None,
         }
     }
 
@@ -235,7 +296,30 @@ impl RegisterResponse {
             min_expires: None,
             path: Vec::new(),
             service_route: Vec::new(),
+            www_authenticate: None,
+            authentication_info: None,
         }
+    }
+
+    /// Creates a 401 Unauthorized response with authentication challenge.
+    pub fn unauthorized(challenge: &AuthChallenge) -> Self {
+        Self {
+            success: false,
+            status_code: 401,
+            reason: "Unauthorized".to_string(),
+            contacts: Vec::new(),
+            min_expires: None,
+            path: Vec::new(),
+            service_route: Vec::new(),
+            www_authenticate: Some(challenge.to_header_value()),
+            authentication_info: None,
+        }
+    }
+
+    /// Sets authentication info for successful auth response.
+    pub fn with_authentication_info(mut self, info: impl Into<String>) -> Self {
+        self.authentication_info = Some(info.into());
+        self
     }
 
     /// Adds Service-Route headers.
@@ -465,6 +549,129 @@ impl Default for Registrar {
     }
 }
 
+/// Registrar with integrated authentication support.
+///
+/// Combines the basic registrar with an authenticator for RFC 3261 §22
+/// digest authentication.
+pub struct AuthenticatedRegistrar {
+    /// Inner registrar.
+    registrar: Registrar,
+    /// Authenticator for digest auth.
+    authenticator: Authenticator,
+}
+
+impl std::fmt::Debug for AuthenticatedRegistrar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthenticatedRegistrar")
+            .field("registrar", &self.registrar)
+            .field("authenticator", &self.authenticator)
+            .finish()
+    }
+}
+
+impl AuthenticatedRegistrar {
+    /// Creates a new authenticated registrar.
+    pub fn new(config: RegistrarConfig) -> Self {
+        Self {
+            registrar: Registrar::new(config),
+            authenticator: Authenticator::new(),
+        }
+    }
+
+    /// Sets the password lookup function.
+    pub fn with_password_lookup<F>(mut self, lookup: F) -> Self
+    where
+        F: Fn(&str, &str) -> Option<String> + Send + Sync + 'static,
+    {
+        self.authenticator = self.authenticator.with_password_lookup(lookup);
+        self
+    }
+
+    /// Returns the configuration.
+    pub fn config(&self) -> &RegistrarConfig {
+        self.registrar.config()
+    }
+
+    /// Returns the location service.
+    pub fn location(&self) -> &LocationService {
+        self.registrar.location()
+    }
+
+    /// Processes a REGISTER request with authentication.
+    ///
+    /// If authentication is required and credentials are missing or invalid,
+    /// returns a 401 Unauthorized response with a challenge.
+    pub fn process_register(&mut self, request: RegisterRequest) -> RegistrarResult<RegisterResponse> {
+        let config = self.registrar.config();
+
+        // Check if authentication is required
+        if config.require_auth {
+            let credentials = request.credentials();
+            let auth_result = self.authenticator.authenticate(
+                credentials.as_ref(),
+                &config.realm,
+                &request.method,
+                None, // No entity body for REGISTER
+            );
+
+            match auth_result {
+                AuthResult::Success { .. } => {
+                    // Authentication successful, proceed with registration
+                }
+                AuthResult::ChallengeRequired { challenge } => {
+                    return Ok(RegisterResponse::unauthorized(&challenge));
+                }
+                AuthResult::StaleNonce { challenge } => {
+                    return Ok(RegisterResponse::unauthorized(&challenge));
+                }
+                AuthResult::Failed { reason } => {
+                    return Ok(RegisterResponse::error(403, format!("Forbidden: {}", reason)));
+                }
+            }
+        }
+
+        // Process the registration
+        self.registrar.process_register(request)
+    }
+
+    /// Removes expired bindings and nonces.
+    pub fn cleanup_expired(&mut self) -> usize {
+        let bindings_removed = self.registrar.cleanup_expired();
+        let nonces_removed = self.authenticator.cleanup_expired();
+        bindings_removed + nonces_removed
+    }
+
+    /// Returns the total number of bindings.
+    pub fn total_bindings(&self) -> usize {
+        self.registrar.total_bindings()
+    }
+
+    /// Returns the number of registered AORs.
+    pub fn aor_count(&self) -> usize {
+        self.registrar.aor_count()
+    }
+
+    /// Returns the inner registrar.
+    pub fn registrar(&self) -> &Registrar {
+        &self.registrar
+    }
+
+    /// Returns a mutable reference to the inner registrar.
+    pub fn registrar_mut(&mut self) -> &mut Registrar {
+        &mut self.registrar
+    }
+
+    /// Returns the authenticator.
+    pub fn authenticator(&self) -> &Authenticator {
+        &self.authenticator
+    }
+
+    /// Returns a mutable reference to the authenticator.
+    pub fn authenticator_mut(&mut self) -> &mut Authenticator {
+        &mut self.authenticator
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,6 +685,8 @@ mod tests {
             expires: Some(3600),
             path: Vec::new(),
             source_address: None,
+            authorization: None,
+            method: "REGISTER".to_string(),
         }
     }
 
@@ -536,6 +745,8 @@ mod tests {
             expires: Some(3600),
             path: Vec::new(),
             source_address: None,
+            authorization: None,
+            method: "REGISTER".to_string(),
         };
 
         let response = registrar.process_register(request).unwrap();
@@ -563,6 +774,8 @@ mod tests {
             expires: None,
             path: Vec::new(),
             source_address: None,
+            authorization: None,
+            method: "REGISTER".to_string(),
         };
 
         let response = registrar.process_register(fetch_request).unwrap();
@@ -590,6 +803,8 @@ mod tests {
             expires: None,
             path: Vec::new(),
             source_address: None,
+            authorization: None,
+            method: "REGISTER".to_string(),
         };
 
         let response = registrar.process_register(remove_request).unwrap();
@@ -617,6 +832,8 @@ mod tests {
             expires: Some(0),
             path: Vec::new(),
             source_address: None,
+            authorization: None,
+            method: "REGISTER".to_string(),
         };
 
         let response = registrar.process_register(remove_request).unwrap();
@@ -637,6 +854,8 @@ mod tests {
             expires: None,
             path: Vec::new(),
             source_address: None,
+            authorization: None,
+            method: "REGISTER".to_string(),
         };
 
         let response = registrar.process_register(request).unwrap();
@@ -658,6 +877,8 @@ mod tests {
             expires: Some(3600),
             path: Vec::new(),
             source_address: None,
+            authorization: None,
+            method: "REGISTER".to_string(),
         };
         registrar.process_register(request1).unwrap();
 
@@ -671,6 +892,8 @@ mod tests {
             expires: Some(7200),
             path: Vec::new(),
             source_address: None,
+            authorization: None,
+            method: "REGISTER".to_string(),
         };
         let response = registrar.process_register(request2).unwrap();
 
@@ -724,6 +947,8 @@ mod tests {
             expires: Some(3600),
             path: Vec::new(),
             source_address: None,
+            authorization: None,
+            method: "REGISTER".to_string(),
         };
 
         let response = registrar.process_register(request).unwrap();

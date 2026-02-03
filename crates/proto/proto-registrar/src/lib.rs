@@ -49,6 +49,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![cfg_attr(test, allow(clippy::panic))]
 
+pub mod authentication;
 pub mod binding;
 pub mod error;
 pub mod gruu;
@@ -69,6 +70,12 @@ pub use outbound::{
     DEFAULT_KEEPALIVE_TIMEOUT,
 };
 pub use registrar::{Registrar, RegistrarConfig, RegistrarMode};
+
+// RFC 3261 §22 Digest Authentication
+pub use authentication::{
+    AuthAlgorithm, AuthChallenge, AuthCredentials, AuthQop, AuthResult, Authenticator,
+    NonceState, NonceValidation, DEFAULT_NONCE_LIFETIME_SECS, MAX_NONCE_COUNT,
+};
 
 /// Default registration expiration in seconds (RFC 3261 recommends 3600).
 pub const DEFAULT_EXPIRES: u32 = 3600;
