@@ -32,9 +32,21 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 - `client-audio`: Audio pipeline skeleton (CPAL integration planned)
   - `AudioError` and `AudioResult` types
 
-- `client-sip-ua`: SIP User Agent skeleton
+- `client-sip-ua`: SIP User Agent implementation
   - `SipUaError` with smart card error types (SmartCardNotPresent, CertificateError)
   - `SipUaResult` type
+  - `RegistrationAgent` for SIP REGISTER transactions
+    - State management: Unregistered → Registering → Registered
+    - Handles 200 OK, 401/407 rejection (mTLS only), 403, 423 responses
+    - Registration refresh before expiry
+    - `RegistrationEvent` for state changes and request sending
+  - `CallAgent` for INVITE/BYE/CANCEL/ACK transactions
+    - Outbound call flow: make_call → Dialing → Ringing → Connected
+    - Hangup: CANCEL for pending calls, BYE for connected
+    - SDP offer/answer event emission
+    - Response handling for 1xx, 2xx, 3xx, 4xx-6xx status codes
+    - Proper ACK generation for all final responses
+    - `CallEvent` for state changes, SDP handling, request sending
 
 - `client-core`: Application core skeleton
   - `AppError` and `AppResult` types
@@ -60,6 +72,7 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 - `rfd` 0.17: Native file dialogs
 - `winrt-notification` 0.5: Windows toast notifications
 - `windows` 0.62: Windows CryptoAPI for smart card access
+- `uuid` 1.16: UUID generation for call IDs
 
 #### CDR Export Endpoints
 

@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1659 tests passing, Phases 1-23 complete, Hickory-resolver DNS integration complete, Phase 24 (SIP Soft Client) in progress
+**Current Status**: 1669 tests passing, Phases 1-23 complete, Hickory-resolver DNS integration complete, Phase 24.2 (SIP User Agent) complete
 
 ---
 
@@ -558,15 +558,23 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ `Contact` and `CallHistoryEntry` for persistence
 - ✅ Crate skeletons for client-audio, client-sip-ua, client-core, client-gui
 
-**Phase 24.2: SIP User Agent** (Next)
+**Phase 24.2: SIP User Agent** ✅
 
-- 🚧 `RegistrationAgent` using `proto-transaction::ClientNonInviteTransaction`
-- 🚧 `CallAgent` using `proto-transaction::ClientInviteTransaction`
-- 🚧 Windows CryptoAPI integration for smart card certificates
-- 🚧 Mutual TLS client authentication
-- 🚧 SDP offer/answer via `proto-sdp`
+- ✅ `RegistrationAgent` using `proto-transaction::ClientNonInviteTransaction`
+  - State management: Unregistered → Registering → Registered
+  - Handles 200 OK, 401/407 rejection, 403, 423 responses
+  - Registration refresh before expiry
+- ✅ `CallAgent` using `proto-transaction::ClientInviteTransaction`
+  - Outbound call flow: make_call → Dialing → Ringing → Connected
+  - Hangup handling: CANCEL for pending, BYE for connected
+  - SDP offer/answer event emission
+  - Response handling for all status codes
+- ✅ Mutual TLS client authentication (mTLS only, no digest auth)
+- 🚧 Windows CryptoAPI integration for smart card certificates (Phase 24.4)
 
-**Phase 24.3: Secure Media**
+**Tests**: 10 new tests (client-sip-ua crate)
+
+**Phase 24.3: Secure Media** (Next)
 
 - 🚧 ICE candidate gathering via `proto-ice`
 - 🚧 DTLS handshake via `proto-dtls`
