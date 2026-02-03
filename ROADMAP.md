@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1669 tests passing, Phases 1-23 complete, Hickory-resolver DNS integration complete, Phase 24.2 (SIP User Agent) complete
+**Current Status**: 1669+ tests passing, Phases 1-23 complete, Hickory-resolver DNS integration complete, Phase 24.3 (Secure Media) complete
 
 ---
 
@@ -574,14 +574,26 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **Tests**: 10 new tests (client-sip-ua crate)
 
-**Phase 24.3: Secure Media** (Next)
+**Phase 24.3: Secure Media** ✅
 
-- 🚧 ICE candidate gathering via `proto-ice`
-- 🚧 DTLS handshake via `proto-dtls`
-- 🚧 SRTP context creation via `proto-srtp`
-- 🚧 RTP/SRTP pipeline with jitter buffer
+- ✅ `IceHandler` for ICE candidate gathering via `proto-ice`
+  - Host, server-reflexive (STUN), and relay (TURN) candidates
+  - SDP candidate formatting and parsing
+  - ICE role handling (controlling/controlled)
+- ✅ `DtlsHandler` for DTLS handshake via `proto-dtls`
+  - SRTP key derivation via DTLS-SRTP
+  - Certificate fingerprint handling for SDP
+  - Support for client and server roles
+- ✅ `MediaSession` coordinated secure media pipeline
+  - Orchestrates ICE + DTLS + SRTP setup
+  - RtpPacket encryption/decryption
+  - UDP socket management for media
+  - State machine for session lifecycle
+- ✅ All components use CNSA 2.0 compliant cryptography (AES-256-GCM, P-384, SHA-384)
 
-**Phase 24.4: Application Core**
+**Tests**: 20 total tests (client-sip-ua crate)
+
+**Phase 24.4: Application Core** (Next)
 
 - 🚧 Call manager with event broadcasting
 - 🚧 Settings persistence (TOML)

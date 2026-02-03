@@ -47,6 +47,24 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
     - Response handling for 1xx, 2xx, 3xx, 4xx-6xx status codes
     - Proper ACK generation for all final responses
     - `CallEvent` for state changes, SDP handling, request sending
+  - `IceHandler` for ICE candidate gathering
+    - Host, server-reflexive (STUN), and relay (TURN) candidates
+    - SDP candidate formatting using `Candidate::to_sdp()`
+    - SDP candidate parsing using `Candidate::from_sdp()`
+    - ICE role handling (controlling/controlled)
+    - `IceEvent` for state changes, candidates, connectivity
+  - `DtlsHandler` for DTLS handshake
+    - SRTP key derivation via DTLS-SRTP
+    - Certificate fingerprint handling for SDP
+    - Support for client and server roles
+    - `DtlsEvent` for state changes, handshake completion
+  - `MediaSession` coordinated secure media pipeline
+    - Orchestrates ICE + DTLS + SRTP setup
+    - `MediaSessionState`: New, Gathering, Connecting, Securing, Active, Closing, Closed, Failed
+    - RtpPacket encryption via `SrtpProtect`
+    - RtpPacket decryption via `SrtpUnprotect`
+    - UDP socket management for media
+    - `MediaSessionEvent` for state changes, candidates, credentials, ready notification
 
 - `client-core`: Application core skeleton
   - `AppError` and `AppResult` types
