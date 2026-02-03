@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1700+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.4 (Application Core) complete
+**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.5 (GUI Implementation) complete
 
 ---
 
@@ -616,12 +616,23 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **Tests**: 19 total tests (client-core crate)
 
-**Phase 24.5: GUI Implementation** (Next)
+**Phase 24.5: GUI Implementation** ✅
 
-- 🚧 egui-based main window
-- 🚧 Dialer, call view, contacts, settings views
-- 🚧 System tray integration
-- 🚧 Windows toast notifications
+- ✅ egui-based main window with dark theme
+- ✅ Dialer view with number pad and URI input
+- ✅ Active call view with mute/hold/hangup controls and duration timer
+- ✅ Contacts list view with search and favorites
+- ✅ Settings view with Account, Audio, General, and About tabs
+- ✅ System tray integration with show/exit menu items
+- ✅ Event-driven architecture connecting GUI to client-core
+
+**Phase 24.6: Polish & Security Hardening** (Next)
+
+- 🚧 Windows toast notifications for incoming calls
+- 🚧 Certificate selection from Windows Certificate Store
+- 🚧 CNSA 2.0 compliance audit
+- 🚧 Memory zeroization for credentials (zeroize crate)
+- 🚧 MSI installer via WiX
 
 ---
 

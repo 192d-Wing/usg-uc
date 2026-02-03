@@ -163,8 +163,43 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
     - Graceful shutdown with state persistence
   - `AppError` and `AppResult` types
 
-- `client-gui`: Windows GUI skeleton (egui)
-  - Main application entry point
+- `client-gui`: Windows GUI implementation (Phase 24.5 Complete)
+  - Main window with dark theme and navigation bar (Dialer, Call, Contacts, Settings)
+  - `app.rs`: Main GUI application coordinator
+    - `SipClientApp` implementing `eframe::App`
+    - `ActiveView` enum for navigation state
+    - Event-driven architecture connecting to client-core
+    - Registration status indicator in navigation bar
+    - Error dialog for user notifications
+  - `views/dialer.rs`: Phone dialer view
+    - Number pad with digits 0-9, *, #
+    - URI input field with backspace and clear
+    - Auto-formatting for sips: URIs
+    - `DialerAction::Call(String)` for call initiation
+  - `views/call.rs`: Active call view
+    - Duration timer with mm:ss display
+    - Remote party info display
+    - Mute/Hold/Hangup button controls
+    - `CallAction` enum: Hangup, Mute, Hold
+    - Visual call state feedback
+  - `views/contacts.rs`: Contacts list view
+    - Search filtering by name or SIP URI
+    - Favorites section with star indicators
+    - Avatar initials display
+    - Context menu with call/edit/delete options
+    - `ContactsAction` enum: Call, Edit, Delete
+  - `views/settings.rs`: Settings view
+    - Tabbed interface: Account, Audio, General, About
+    - Account configuration with smart card info
+    - Audio device selection (input/output)
+    - General settings (startup behavior, audio preferences)
+    - About tab with version info
+    - `SettingsAction` enum: Save, Register, Unregister
+  - `tray.rs`: System tray integration
+    - `SystemTray` with tray-icon crate
+    - Menu items: Show window, Exit
+    - `TrayAction` enum for event handling
+    - Icon generation for tray display
 
 **Security**
 
