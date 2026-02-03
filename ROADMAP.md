@@ -52,7 +52,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1000+ tests passing, Phase 18.6 complete + proto-* crate extraction with RFC compliance + P0/P1/P2 compliance gaps addressed
+**Current Status**: 1000+ tests passing, Phase 18.7 complete + proto-* crate extraction with RFC compliance + ALL RFC compliance gaps addressed (P0/P1/P2/P3)
 
 ---
 
@@ -304,6 +304,39 @@ This document outlines the development roadmap for the USG Session Border Contro
 - [x] Parsing and generation roundtrip
 - [x] Validation (interval, duration, offsets)
 
+### ✅ Phase 18.7: P3 Low Priority RFC Compliance
+
+**Goal**: Address low priority RFC compliance gaps (edge cases)
+
+**P3 Low - Multicast Streams** (RFC 3264 §6.2) ✅
+
+- [x] MulticastAddress struct with IPv4/IPv6 scope detection
+- [x] MulticastNegotiator for offer/answer multicast validation
+- [x] MulticastScope enum (NodeLocal to Global)
+- [x] is_multicast_address() and is_multicast_media() helpers
+- [x] TTL validation and administrative scope checking
+
+**P3 Low - Translators/Mixers** (RFC 3550 §7) ✅
+
+- [x] RtpTranslator for SSRC-preserving packet forwarding
+- [x] RtpMixer for multi-source mixing with CSRC list
+- [x] SsrcCollisionDetector for loop prevention
+- [x] TranslatorRtcpBuilder for combined RTCP reports
+- [x] MAX_CSRC_COUNT constant (15) per RFC 3550
+- [x] validate_csrc_list() for CSRC validation
+
+**P3 Low - Proxy Forwarding** (RFC 3261 §16.6) ✅
+
+- [x] ProxyContext for proxy configuration
+- [x] RequestForwarder with full §16.6 compliance
+- [x] Max-Forwards validation and decrement
+- [x] Via header insertion at correct position
+- [x] Record-Route header insertion
+- [x] Loop detection via Via inspection
+- [x] ResponseProcessor for upstream forwarding
+- [x] ForkingMode enum (None, Parallel, Sequential)
+- [x] Best response selection (6xx > 2xx > 3xx priority)
+
 ### ⏳ Phase 19: SIP Authentication & Security
 **Goal**: Production-grade SIP security
 
@@ -422,9 +455,9 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 | RFC | Title | Status |
 |-----|-------|--------|
-| RFC 3261 | SIP Core | ✅ Enhanced (~95% compliant, redirect handling) |
-| RFC 3264 | Offer/Answer | ✅ Enhanced (media modification rules) |
-| RFC 3550 | RTP | ✅ Enhanced (RTCP timing rules) |
+| RFC 3261 | SIP Core | ✅ Enhanced (~98% compliant, redirect + proxy forwarding) |
+| RFC 3264 | Offer/Answer | ✅ Enhanced (media modification, multicast streams) |
+| RFC 3550 | RTP | ✅ Enhanced (RTCP timing, translators/mixers) |
 | RFC 3711 | SRTP | ✅ Implemented (CNSA 2.0) |
 | RFC 4566 | SDP | ✅ Enhanced (repeat times r= line) |
 | RFC 5389 | STUN | ✅ Enhanced (long-term credential) |

@@ -110,6 +110,50 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - `create_stale_nonce_response()` for 438 generation
   - Configurable nonce lifetime (default 10 minutes per RFC 5389)
 
+#### P3 Low Priority RFC Compliance Gaps
+
+**proto-sdp (RFC 3264 §6.2)**
+
+- Multicast stream negotiation (`multicast.rs`):
+  - `MulticastAddress` struct with IPv4/IPv6 scope detection
+  - `MulticastNegotiator` for offer/answer multicast validation
+  - `MulticastScope` enum: NodeLocal, LinkLocal, RealmLocal, AdminLocal, SiteLocal, Organization, Global
+  - `MulticastValidation` struct with TTL and scope validation results
+  - `is_multicast_address()` for detecting multicast addresses
+  - `is_multicast_media()` for checking if media description uses multicast
+  - TTL validation for IPv4 multicast
+  - Administrative scope checking for IPv6 multicast
+
+**proto-rtp (RFC 3550 §7)**
+
+- RTP translators and mixers (`translator.rs`):
+  - `RtpTranslator` for SSRC-preserving packet forwarding
+  - `RtpMixer` for multi-source mixing with CSRC list management
+  - `SourceState` for tracking per-source RTP state (sequence, timestamp, packets)
+  - `SsrcCollisionDetector` for loop prevention
+  - `TranslatorRtcpBuilder` for combined RTCP reports from multiple sources
+  - `CsrcValidation` struct for CSRC list validation results
+  - `validate_csrc_list()` function for RFC compliance checking
+  - `MAX_CSRC_COUNT` constant (15) per RFC 3550
+
+**proto-sip (RFC 3261 §16.6)**
+
+- SIP proxy request forwarding (`proxy.rs`):
+  - `ProxyContext` for proxy configuration (URI, transport, host, port)
+  - `ProxyValidation` struct for request validation results
+  - `ForwardingTarget` with priority, q-value, and transport override
+  - `ForkingMode` enum: None, Parallel, Sequential
+  - `RequestForwarder` implementing full RFC 3261 §16.6 compliance:
+    - Max-Forwards validation and decrement (§16.3, §16.6 step 3)
+    - Via header insertion at correct position (§16.6 step 8)
+    - Record-Route header insertion (§16.6 step 5)
+    - Loop detection via Via headers (§16.3 step 4)
+    - Request forking with priority/q-value ordering
+  - `ResponseProcessor` for upstream forwarding:
+    - Topmost Via removal (§16.7)
+    - Best response selection for forked requests (6xx > 2xx > 3xx priority)
+  - Helper functions: `create_trying_response()`, `create_too_many_hops_response()`, `create_loop_detected_response()`
+
 #### P2 Medium Priority RFC Compliance Gaps
 
 **proto-registrar (RFC 5627 §5.1)**
