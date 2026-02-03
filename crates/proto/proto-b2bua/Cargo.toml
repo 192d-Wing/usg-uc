@@ -1,13 +1,13 @@
 [package]
 name = "proto-b2bua"
 description = "RFC 7092 SIP Back-to-Back User Agent implementation"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.85"
-license = "Apache-2.0"
-repository = "https://github.com/usg/usg-uc-sbc"
-keywords = ["sip", "b2bua", "voip", "rfc7092"]
-categories = ["network-programming"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 thiserror = "2.0"

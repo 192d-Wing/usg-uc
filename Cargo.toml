@@ -54,10 +54,9 @@ resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
-# Note: Will migrate to edition 2024 and rust-version 1.92 when available
 # Per CONTRIBUTING.md requirements
-edition = "2021"
-rust-version = "1.85"
+edition = "2024"
+rust-version = "1.92"
 license = "Apache-2.0"
 repository = "https://github.com/usg/usg-uc-sbc"
 keywords = ["sip", "sbc", "voip", "session-border-controller", "cnsa"]
