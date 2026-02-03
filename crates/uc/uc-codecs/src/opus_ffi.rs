@@ -72,14 +72,22 @@ impl FfiOpusEncoder {
             }
         })?;
 
-        // Configure encoder settings
+        Self::configure_encoder(&mut encoder, &config)?;
+
+        Ok(Self {
+            encoder: Mutex::new(encoder),
+            config,
+        })
+    }
+
+    /// Configures the encoder with the specified settings.
+    fn configure_encoder(encoder: &mut OpusEncoder, config: &OpusConfig) -> CodecResult<()> {
         encoder
             .set_bitrate(Bitrate::BitsPerSecond(config.bitrate as i32))
             .map_err(|e| CodecError::InvalidConfig {
                 reason: format!("failed to set bitrate: {e}"),
             })?;
 
-        // Set signal type
         let signal = match config.signal {
             crate::opus::OpusSignal::Auto => Signal::Auto,
             crate::opus::OpusSignal::Voice => Signal::Voice,
@@ -91,38 +99,31 @@ impl FfiOpusEncoder {
                 reason: format!("failed to set signal type: {e}"),
             })?;
 
-        // Set complexity
         encoder
             .set_complexity(config.complexity as i32)
             .map_err(|e| CodecError::InvalidConfig {
                 reason: format!("failed to set complexity: {e}"),
             })?;
 
-        // Set FEC
         encoder
             .set_inband_fec(config.fec)
             .map_err(|e| CodecError::InvalidConfig {
                 reason: format!("failed to set FEC: {e}"),
             })?;
 
-        // Set DTX
         encoder
             .set_dtx(config.dtx)
             .map_err(|e| CodecError::InvalidConfig {
                 reason: format!("failed to set DTX: {e}"),
             })?;
 
-        // Set packet loss percentage for FEC optimization
         encoder
             .set_packet_loss_perc(config.packet_loss_perc as i32)
             .map_err(|e| CodecError::InvalidConfig {
                 reason: format!("failed to set packet loss percentage: {e}"),
             })?;
 
-        Ok(Self {
-            encoder: Mutex::new(encoder),
-            config,
-        })
+        Ok(())
     }
 
     /// Encodes PCM samples to Opus.

@@ -184,6 +184,28 @@ impl SendIndication {
     /// # Errors
     /// Returns an error if the operation fails.
     pub fn parse(msg: &StunMessage, raw_data: &[u8]) -> TurnResult<Self> {
+        Self::validate_message_type(msg)?;
+
+        let (peer_address, data, dont_fragment) =
+            Self::parse_indication_attributes(raw_data, &msg.transaction_id)?;
+
+        let peer_address = peer_address.ok_or_else(|| TurnError::InvalidRequest {
+            reason: "missing XOR-PEER-ADDRESS".to_string(),
+        })?;
+
+        let data = data.ok_or_else(|| TurnError::InvalidRequest {
+            reason: "missing DATA attribute".to_string(),
+        })?;
+
+        Ok(Self {
+            peer_address,
+            data,
+            dont_fragment,
+        })
+    }
+
+    /// Validates that the message is a Send indication.
+    fn validate_message_type(msg: &StunMessage) -> TurnResult<()> {
         if msg.msg_type.method != StunMethod::Send {
             return Err(TurnError::InvalidRequest {
                 reason: "not a Send indication".to_string(),
@@ -196,7 +218,14 @@ impl SendIndication {
             });
         }
 
-        // Parse TURN attributes from raw data
+        Ok(())
+    }
+
+    /// Parses TURN attributes from raw indication data.
+    fn parse_indication_attributes(
+        raw_data: &[u8],
+        transaction_id: &[u8; 12],
+    ) -> TurnResult<(Option<SocketAddr>, Option<Bytes>, bool)> {
         let mut peer_address: Option<SocketAddr> = None;
         let mut data: Option<Bytes> = None;
         let mut dont_fragment = false;
@@ -217,9 +246,7 @@ impl SendIndication {
 
             let attr_value = &attrs_data[offset..offset + attr_len];
 
-            if let Some(turn_attr) =
-                TurnAttribute::parse(attr_type, attr_value, &msg.transaction_id)?
-            {
+            if let Some(turn_attr) = TurnAttribute::parse(attr_type, attr_value, transaction_id)? {
                 match turn_attr {
                     TurnAttribute::XorPeerAddress(addr) => peer_address = Some(addr),
                     TurnAttribute::Data(d) => data = Some(d),
@@ -232,19 +259,7 @@ impl SendIndication {
             offset += (attr_len + 3) & !3;
         }
 
-        let peer_address = peer_address.ok_or_else(|| TurnError::InvalidRequest {
-            reason: "missing XOR-PEER-ADDRESS".to_string(),
-        })?;
-
-        let data = data.ok_or_else(|| TurnError::InvalidRequest {
-            reason: "missing DATA attribute".to_string(),
-        })?;
-
-        Ok(Self {
-            peer_address,
-            data,
-            dont_fragment,
-        })
+        Ok((peer_address, data, dont_fragment))
     }
 }
 

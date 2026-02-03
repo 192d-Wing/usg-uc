@@ -263,62 +263,98 @@ impl PolicyEngine {
             return PolicyDecision::allow();
         }
 
-        // Collect additional actions if configured
         let mut additional_actions = Vec::new();
 
         // First, evaluate global rules
-        if self.config.collect_all_matches {
-            for (rule, action) in self.global_rules.evaluate_all(context) {
-                if action.is_terminal() {
-                    self.stats.rules_matched += 1;
-                    let mut decision =
-                        PolicyDecision::new(action.clone(), Some(rule.id().to_string()));
-                    for a in additional_actions {
-                        decision = decision.with_additional_action(a);
-                    }
-                    self.update_stats(&decision);
-                    return decision;
-                }
-                additional_actions.push(action.clone());
-            }
-        } else if let Some(action) = self.evaluate_first_match(&self.global_rules, context) {
-            self.stats.rules_matched += 1;
-            let decision = PolicyDecision::new(action.0.clone(), Some(action.1.to_string()));
-            self.update_stats(&decision);
+        if let Some(decision) =
+            self.try_evaluate_rule_set(&self.global_rules.clone(), context, &mut additional_actions)
+        {
             return decision;
         }
 
         // Then evaluate named rule sets (in arbitrary order)
-        for rule_set in self.rule_sets.values() {
-            if self.config.collect_all_matches {
-                for (rule, action) in rule_set.evaluate_all(context) {
-                    if action.is_terminal() {
-                        self.stats.rules_matched += 1;
-                        let mut decision =
-                            PolicyDecision::new(action.clone(), Some(rule.id().to_string()));
-                        for a in additional_actions {
-                            decision = decision.with_additional_action(a);
-                        }
-                        self.update_stats(&decision);
-                        return decision;
-                    }
-                    additional_actions.push(action.clone());
-                }
-            } else if let Some(action) = self.evaluate_first_match(rule_set, context) {
-                self.stats.rules_matched += 1;
-                let decision = PolicyDecision::new(action.0.clone(), Some(action.1.to_string()));
-                self.update_stats(&decision);
+        let rule_sets: Vec<_> = self.rule_sets.values().cloned().collect();
+        for rule_set in &rule_sets {
+            if let Some(decision) =
+                self.try_evaluate_rule_set(rule_set, context, &mut additional_actions)
+            {
                 return decision;
             }
         }
 
         // No matching rule, use default action
         self.stats.default_actions += 1;
-        let mut decision = PolicyDecision::new(self.config.default_action.clone(), None);
+        let decision = Self::build_decision_with_actions(
+            self.config.default_action.clone(),
+            None,
+            additional_actions,
+        );
+        self.update_stats(&decision);
+        decision
+    }
+
+    /// Tries to evaluate a rule set, returning a decision if a terminal match is found.
+    fn try_evaluate_rule_set(
+        &mut self,
+        rule_set: &RuleSet,
+        context: &RequestContext,
+        additional_actions: &mut Vec<PolicyAction>,
+    ) -> Option<PolicyDecision> {
+        if self.config.collect_all_matches {
+            self.evaluate_collecting_matches(rule_set, context, additional_actions)
+        } else {
+            self.evaluate_first_match_only(rule_set, context)
+        }
+    }
+
+    /// Evaluates collecting all matches until a terminal action is found.
+    fn evaluate_collecting_matches(
+        &mut self,
+        rule_set: &RuleSet,
+        context: &RequestContext,
+        additional_actions: &mut Vec<PolicyAction>,
+    ) -> Option<PolicyDecision> {
+        for (rule, action) in rule_set.evaluate_all(context) {
+            if action.is_terminal() {
+                self.stats.rules_matched += 1;
+                let decision = Self::build_decision_with_actions(
+                    action.clone(),
+                    Some(rule.id().to_string()),
+                    std::mem::take(additional_actions),
+                );
+                self.update_stats(&decision);
+                return Some(decision);
+            }
+            additional_actions.push(action.clone());
+        }
+        None
+    }
+
+    /// Evaluates and returns the first matching rule's decision.
+    fn evaluate_first_match_only(
+        &mut self,
+        rule_set: &RuleSet,
+        context: &RequestContext,
+    ) -> Option<PolicyDecision> {
+        if let Some((action, rule_id)) = self.evaluate_first_match(rule_set, context) {
+            self.stats.rules_matched += 1;
+            let decision = PolicyDecision::new(action.clone(), Some(rule_id.to_string()));
+            self.update_stats(&decision);
+            return Some(decision);
+        }
+        None
+    }
+
+    /// Builds a decision with additional actions attached.
+    fn build_decision_with_actions(
+        action: PolicyAction,
+        rule_id: Option<String>,
+        additional_actions: Vec<PolicyAction>,
+    ) -> PolicyDecision {
+        let mut decision = PolicyDecision::new(action, rule_id);
         for a in additional_actions {
             decision = decision.with_additional_action(a);
         }
-        self.update_stats(&decision);
         decision
     }
 

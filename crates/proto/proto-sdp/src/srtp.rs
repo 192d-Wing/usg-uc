@@ -547,48 +547,55 @@ impl CryptoAttribute {
 
         // Parse optional lifetime
         if parts.len() > 1 && !parts[1].is_empty() {
-            let lifetime_str = parts[1];
-            let lifetime = if let Some(exp_str) = lifetime_str.strip_prefix("2^") {
-                let exp: u32 = exp_str.parse().map_err(|_| SdpError::InvalidAttribute {
-                    name: "crypto".to_string(),
-                    reason: format!("invalid lifetime exponent: {exp_str}"),
-                })?;
-                2u64.pow(exp)
-            } else {
-                lifetime_str
-                    .parse()
-                    .map_err(|_| SdpError::InvalidAttribute {
-                        name: "crypto".to_string(),
-                        reason: format!("invalid lifetime: {lifetime_str}"),
-                    })?
-            };
-            key_params.lifetime = Some(lifetime);
+            key_params.lifetime = Some(Self::parse_lifetime(parts[1])?);
         }
 
         // Parse optional MKI
         if parts.len() > 2 && !parts[2].is_empty() {
-            let mki_parts: Vec<&str> = parts[2].split(':').collect();
-            if mki_parts.len() == 2 {
-                let mki_value: u32 =
-                    mki_parts[0]
-                        .parse()
-                        .map_err(|_| SdpError::InvalidAttribute {
-                            name: "crypto".to_string(),
-                            reason: format!("invalid MKI value: {}", mki_parts[0]),
-                        })?;
-                let mki_length: u8 =
-                    mki_parts[1]
-                        .parse()
-                        .map_err(|_| SdpError::InvalidAttribute {
-                            name: "crypto".to_string(),
-                            reason: format!("invalid MKI length: {}", mki_parts[1]),
-                        })?;
-                key_params.mki_value = Some(mki_value);
-                key_params.mki_length = Some(mki_length);
-            }
+            Self::parse_mki(parts[2], &mut key_params)?;
         }
 
         Ok(key_params)
+    }
+
+    /// Parses the lifetime portion of key parameters.
+    fn parse_lifetime(lifetime_str: &str) -> SdpResult<u64> {
+        if let Some(exp_str) = lifetime_str.strip_prefix("2^") {
+            let exp: u32 = exp_str.parse().map_err(|_| SdpError::InvalidAttribute {
+                name: "crypto".to_string(),
+                reason: format!("invalid lifetime exponent: {exp_str}"),
+            })?;
+            Ok(2u64.pow(exp))
+        } else {
+            lifetime_str
+                .parse()
+                .map_err(|_| SdpError::InvalidAttribute {
+                    name: "crypto".to_string(),
+                    reason: format!("invalid lifetime: {lifetime_str}"),
+                })
+        }
+    }
+
+    /// Parses the MKI (Master Key Identifier) portion of key parameters.
+    fn parse_mki(mki_str: &str, key_params: &mut KeyParams) -> SdpResult<()> {
+        let mki_parts: Vec<&str> = mki_str.split(':').collect();
+        if mki_parts.len() == 2 {
+            let mki_value: u32 = mki_parts[0]
+                .parse()
+                .map_err(|_| SdpError::InvalidAttribute {
+                    name: "crypto".to_string(),
+                    reason: format!("invalid MKI value: {}", mki_parts[0]),
+                })?;
+            let mki_length: u8 = mki_parts[1]
+                .parse()
+                .map_err(|_| SdpError::InvalidAttribute {
+                    name: "crypto".to_string(),
+                    reason: format!("invalid MKI length: {}", mki_parts[1]),
+                })?;
+            key_params.mki_value = Some(mki_value);
+            key_params.mki_length = Some(mki_length);
+        }
+        Ok(())
     }
 
     /// Validates this crypto attribute.

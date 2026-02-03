@@ -306,9 +306,6 @@ impl RecordLayer {
     /// ## Errors
     ///
     /// Returns an error if decryption fails or replay is detected.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     pub fn decrypt_record(&mut self, record: &[u8]) -> DtlsResult<(ContentType, Vec<u8>)> {
         let header = RecordHeader::parse(record)?;
 
@@ -321,61 +318,18 @@ impl RecordLayer {
         let payload = &record[RECORD_HEADER_LEN..RECORD_HEADER_LEN + header.length as usize];
 
         let fragment = if let Some(ref key) = self.read_key {
-            // Check epoch
-            if header.epoch != self.read_epoch {
-                return Err(DtlsError::RecordError {
-                    reason: format!(
-                        "epoch mismatch: expected {}, got {}",
-                        self.read_epoch, header.epoch
-                    ),
-                });
-            }
+            // Validate epoch and replay before decryption
+            validate_record_epoch(header.epoch, self.read_epoch)?;
+            validate_replay(&self.replay_window, header.sequence_number)?;
 
-            // Check replay
-            if !self.replay_window.check(header.sequence_number) {
-                return Err(DtlsError::ReplayDetected);
-            }
+            // Decrypt the payload
+            let plaintext = decrypt_aes_gcm_payload(key, self.read_iv, &header, payload)?;
 
-            // Extract explicit nonce (8 bytes)
-            if payload.len() < 8 + TAG_LEN {
-                return Err(DtlsError::RecordError {
-                    reason: "ciphertext too short".to_string(),
-                });
-            }
-
-            let explicit_nonce = &payload[0..8];
-            let ciphertext = &payload[8..];
-
-            // Build nonce
-            let mut nonce = [0u8; NONCE_LEN];
-            nonce[0..4].copy_from_slice(&self.read_iv);
-            nonce[4..12].copy_from_slice(explicit_nonce);
-
-            // Build AAD
-            let plaintext_len = ciphertext.len() - TAG_LEN;
-            let mut aad = [0u8; 13];
-            aad[0] = header.content_type as u8;
-            aad[1..3].copy_from_slice(&header.version.to_be_bytes());
-            aad[3..5].copy_from_slice(&header.epoch.to_be_bytes());
-            let seq_bytes = header.sequence_number.to_be_bytes();
-            aad[5..11].copy_from_slice(&seq_bytes[2..8]);
-            // plaintext_len is bounded by ciphertext length which fits in u16
-            #[allow(clippy::cast_possible_truncation)]
-            aad[11..13].copy_from_slice(&(plaintext_len as u16).to_be_bytes());
-
-            // Decrypt
-            let plaintext =
-                key.open(&nonce, &aad, ciphertext)
-                    .map_err(|_| DtlsError::DecryptionFailed {
-                        reason: "AES-256-GCM authentication failed".to_string(),
-                    })?;
-
-            // Update replay window
+            // Update replay window after successful decryption
             self.replay_window.update(header.sequence_number);
 
             plaintext
         } else {
-            // Plaintext mode
             payload.to_vec()
         };
 
@@ -393,6 +347,71 @@ impl Default for RecordLayer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Builds the 12-byte nonce for decryption.
+fn build_decryption_nonce(read_iv: [u8; 4], explicit_nonce: &[u8]) -> [u8; NONCE_LEN] {
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce[0..4].copy_from_slice(&read_iv);
+    nonce[4..12].copy_from_slice(explicit_nonce);
+    nonce
+}
+
+/// Builds the 13-byte AAD for AEAD decryption.
+#[allow(clippy::cast_possible_truncation)]
+fn build_aad(header: &RecordHeader, plaintext_len: usize) -> [u8; 13] {
+    let mut aad = [0u8; 13];
+    aad[0] = header.content_type as u8;
+    aad[1..3].copy_from_slice(&header.version.to_be_bytes());
+    aad[3..5].copy_from_slice(&header.epoch.to_be_bytes());
+    let seq_bytes = header.sequence_number.to_be_bytes();
+    aad[5..11].copy_from_slice(&seq_bytes[2..8]);
+    // plaintext_len is bounded by ciphertext length which fits in u16
+    aad[11..13].copy_from_slice(&(plaintext_len as u16).to_be_bytes());
+    aad
+}
+
+/// Validates that the record epoch matches the expected epoch.
+fn validate_record_epoch(record_epoch: u16, expected_epoch: u16) -> DtlsResult<()> {
+    if record_epoch != expected_epoch {
+        return Err(DtlsError::RecordError {
+            reason: format!("epoch mismatch: expected {expected_epoch}, got {record_epoch}"),
+        });
+    }
+    Ok(())
+}
+
+/// Validates that the sequence number is not a replay.
+const fn validate_replay(replay_window: &ReplayWindow, sequence_number: u64) -> DtlsResult<()> {
+    if !replay_window.check(sequence_number) {
+        return Err(DtlsError::ReplayDetected);
+    }
+    Ok(())
+}
+
+/// Decrypts an AES-256-GCM encrypted payload.
+fn decrypt_aes_gcm_payload(
+    key: &Aes256GcmKey,
+    read_iv: [u8; 4],
+    header: &RecordHeader,
+    payload: &[u8],
+) -> DtlsResult<Vec<u8>> {
+    if payload.len() < 8 + TAG_LEN {
+        return Err(DtlsError::RecordError {
+            reason: "ciphertext too short".to_string(),
+        });
+    }
+
+    let explicit_nonce = &payload[0..8];
+    let ciphertext = &payload[8..];
+
+    let nonce = build_decryption_nonce(read_iv, explicit_nonce);
+    let aad = build_aad(header, ciphertext.len() - TAG_LEN);
+
+    key.open(&nonce, &aad, ciphertext)
+        .map_err(|_| DtlsError::DecryptionFailed {
+            reason: "AES-256-GCM authentication failed".to_string(),
+        })
 }
 
 /// Anti-replay window using a bitmap.

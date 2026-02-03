@@ -146,82 +146,14 @@ impl CertificateValidator {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     pub fn extract_public_key(&self, cert_der: &[u8]) -> DtlsResult<Vec<u8>> {
-        // X.509 certificate structure (simplified):
-        // SEQUENCE {
-        //   SEQUENCE {          -- TBSCertificate
-        //     ...
-        //     SEQUENCE {        -- SubjectPublicKeyInfo
-        //       SEQUENCE {      -- AlgorithmIdentifier
-        //         OID, ...
-        //       }
-        //       BIT STRING      -- Public key
-        //     }
-        //     ...
-        //   }
-        //   SEQUENCE { ... }    -- SignatureAlgorithm
-        //   BIT STRING           -- Signature
-        // }
+        let _ = self; // Silence unused_self warning - method may use self in future
 
-        // Find the SubjectPublicKeyInfo by looking for the EC public key OID
-        // OID 1.2.840.10045.2.1 (ecPublicKey) followed by curve OID
-        let ec_pubkey_oid: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
-        let p384_oid: &[u8] = &[0x2B, 0x81, 0x04, 0x00, 0x22]; // secp384r1
+        // Locate EC public key OID and verify P-384 curve
+        let search_start = find_and_verify_ec_curve(cert_der)?;
 
-        // Search for the EC public key OID
-        let ec_pos = find_subsequence(cert_der, ec_pubkey_oid).ok_or_else(|| {
-            DtlsError::CertificateError {
-                reason: "not an EC certificate".to_string(),
-            }
-        })?;
-
-        // Verify it's P-384
-        let after_ec = ec_pos + ec_pubkey_oid.len() + 2; // Skip OID tag and length
-        if after_ec + p384_oid.len() > cert_der.len() {
-            return Err(DtlsError::CertificateError {
-                reason: "certificate truncated".to_string(),
-            });
-        }
-
-        if !cert_der[after_ec..].starts_with(p384_oid) {
-            return Err(DtlsError::CertificateError {
-                reason: "not a P-384 certificate (CNSA 2.0 required)".to_string(),
-            });
-        }
-
-        // Find the BIT STRING containing the public key
-        // It follows the AlgorithmIdentifier SEQUENCE
-        let search_start = after_ec + p384_oid.len();
-        let mut pos = search_start;
-
-        // Look for BIT STRING tag (0x03)
-        while pos < cert_der.len() {
-            if cert_der[pos] == 0x03 {
-                // BIT STRING found
-                let (len, len_bytes) = parse_der_length(&cert_der[pos + 1..])?;
-                let content_start = pos + 1 + len_bytes + 1; // +1 for unused bits byte
-
-                if content_start + len - 1 > cert_der.len() {
-                    return Err(DtlsError::CertificateError {
-                        reason: "public key truncated".to_string(),
-                    });
-                }
-
-                // P-384 uncompressed public key is 97 bytes (0x04 || x || y)
-                let pubkey = &cert_der[content_start..content_start + len - 1];
-                if pubkey.len() == 97 && pubkey[0] == 0x04 {
-                    return Ok(pubkey.to_vec());
-                }
-            }
-            pos += 1;
-        }
-
-        Err(DtlsError::CertificateError {
-            reason: "public key not found".to_string(),
-        })
+        // Extract the P-384 public key from the BIT STRING
+        extract_p384_pubkey_from_bitstring(cert_der, search_start)
     }
 
     /// Verifies that a certificate is properly self-signed.
@@ -263,67 +195,15 @@ impl CertificateValidator {
     /// Extracts TBS certificate and signature from a DER-encoded certificate.
     fn extract_tbs_and_signature<'a>(&self, cert_der: &'a [u8]) -> DtlsResult<(&'a [u8], Vec<u8>)> {
         let _ = self; // Silence unused_self warning - method may use self in future
-        // X.509 structure:
-        // SEQUENCE {
-        //   SEQUENCE { ... }  -- TBSCertificate
-        //   SEQUENCE { ... }  -- SignatureAlgorithm
-        //   BIT STRING        -- Signature
-        // }
 
-        if cert_der.len() < 4 || cert_der[0] != 0x30 {
-            return Err(DtlsError::CertificateError {
-                reason: "invalid certificate structure".to_string(),
-            });
-        }
+        // Parse the outer certificate SEQUENCE
+        let content_start = parse_outer_cert_sequence(cert_der)?;
 
-        // Parse outer SEQUENCE
-        let (outer_len, outer_len_bytes) = parse_der_length(&cert_der[1..])?;
-        let content_start = 1 + outer_len_bytes;
+        // Extract TBSCertificate
+        let (tbs, tbs_end) = extract_tbs_certificate(cert_der, content_start)?;
 
-        if content_start + outer_len > cert_der.len() {
-            return Err(DtlsError::CertificateError {
-                reason: "certificate truncated".to_string(),
-            });
-        }
-
-        // First inner SEQUENCE is TBSCertificate
-        let tbs_start = content_start;
-        if cert_der[tbs_start] != 0x30 {
-            return Err(DtlsError::CertificateError {
-                reason: "TBSCertificate not found".to_string(),
-            });
-        }
-
-        let (tbs_len, tbs_len_bytes) = parse_der_length(&cert_der[tbs_start + 1..])?;
-        let tbs_end = tbs_start + 1 + tbs_len_bytes + tbs_len;
-        let tbs = &cert_der[tbs_start..tbs_end];
-
-        // Skip SignatureAlgorithm SEQUENCE
-        let sig_alg_start = tbs_end;
-        if cert_der[sig_alg_start] != 0x30 {
-            return Err(DtlsError::CertificateError {
-                reason: "SignatureAlgorithm not found".to_string(),
-            });
-        }
-        let (sig_alg_len, sig_alg_len_bytes) = parse_der_length(&cert_der[sig_alg_start + 1..])?;
-        let sig_start = sig_alg_start + 1 + sig_alg_len_bytes + sig_alg_len;
-
-        // BIT STRING containing signature
-        if cert_der[sig_start] != 0x03 {
-            return Err(DtlsError::CertificateError {
-                reason: "signature not found".to_string(),
-            });
-        }
-        let (sig_len, sig_len_bytes) = parse_der_length(&cert_der[sig_start + 1..])?;
-        let sig_content_start = sig_start + 1 + sig_len_bytes + 1; // +1 for unused bits byte
-
-        if sig_content_start + sig_len - 1 > cert_der.len() {
-            return Err(DtlsError::CertificateError {
-                reason: "signature truncated".to_string(),
-            });
-        }
-
-        let signature = cert_der[sig_content_start..sig_content_start + sig_len - 1].to_vec();
+        // Extract signature (skipping SignatureAlgorithm)
+        let signature = extract_cert_signature(cert_der, tbs_end)?;
 
         Ok((tbs, signature))
     }
@@ -560,6 +440,128 @@ fn parse_der_length(data: &[u8]) -> DtlsResult<(usize, usize)> {
             Ok((len, 1 + num_bytes))
         }
     }
+}
+
+/// OID for ecPublicKey (1.2.840.10045.2.1).
+const EC_PUBKEY_OID: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
+
+/// OID for secp384r1 (P-384).
+const P384_OID: &[u8] = &[0x2B, 0x81, 0x04, 0x00, 0x22];
+
+/// Finds EC public key OID and verifies P-384 curve.
+///
+/// Returns the position to start searching for the public key BIT STRING.
+fn find_and_verify_ec_curve(cert_der: &[u8]) -> DtlsResult<usize> {
+    let ec_pos =
+        find_subsequence(cert_der, EC_PUBKEY_OID).ok_or_else(|| DtlsError::CertificateError {
+            reason: "not an EC certificate".to_string(),
+        })?;
+
+    let after_ec = ec_pos + EC_PUBKEY_OID.len() + 2; // Skip OID tag and length
+    if after_ec + P384_OID.len() > cert_der.len() {
+        return Err(DtlsError::CertificateError {
+            reason: "certificate truncated".to_string(),
+        });
+    }
+
+    if !cert_der[after_ec..].starts_with(P384_OID) {
+        return Err(DtlsError::CertificateError {
+            reason: "not a P-384 certificate (CNSA 2.0 required)".to_string(),
+        });
+    }
+
+    Ok(after_ec + P384_OID.len())
+}
+
+/// Extracts P-384 public key from the BIT STRING in a certificate.
+fn extract_p384_pubkey_from_bitstring(cert_der: &[u8], search_start: usize) -> DtlsResult<Vec<u8>> {
+    let mut pos = search_start;
+
+    while pos < cert_der.len() {
+        if cert_der[pos] == 0x03 {
+            let (len, len_bytes) = parse_der_length(&cert_der[pos + 1..])?;
+            let content_start = pos + 1 + len_bytes + 1; // +1 for unused bits byte
+
+            if content_start + len - 1 > cert_der.len() {
+                return Err(DtlsError::CertificateError {
+                    reason: "public key truncated".to_string(),
+                });
+            }
+
+            let pubkey = &cert_der[content_start..content_start + len - 1];
+            if pubkey.len() == 97 && pubkey[0] == 0x04 {
+                return Ok(pubkey.to_vec());
+            }
+        }
+        pos += 1;
+    }
+
+    Err(DtlsError::CertificateError {
+        reason: "public key not found".to_string(),
+    })
+}
+
+/// Parses the outer certificate SEQUENCE and validates structure.
+fn parse_outer_cert_sequence(cert_der: &[u8]) -> DtlsResult<usize> {
+    if cert_der.len() < 4 || cert_der[0] != 0x30 {
+        return Err(DtlsError::CertificateError {
+            reason: "invalid certificate structure".to_string(),
+        });
+    }
+
+    let (outer_len, outer_len_bytes) = parse_der_length(&cert_der[1..])?;
+    let content_start = 1 + outer_len_bytes;
+
+    if content_start + outer_len > cert_der.len() {
+        return Err(DtlsError::CertificateError {
+            reason: "certificate truncated".to_string(),
+        });
+    }
+
+    Ok(content_start)
+}
+
+/// Extracts the `TBSCertificate` from a certificate.
+fn extract_tbs_certificate(cert_der: &[u8], tbs_start: usize) -> DtlsResult<(&[u8], usize)> {
+    if cert_der[tbs_start] != 0x30 {
+        return Err(DtlsError::CertificateError {
+            reason: "TBSCertificate not found".to_string(),
+        });
+    }
+
+    let (tbs_len, tbs_len_bytes) = parse_der_length(&cert_der[tbs_start + 1..])?;
+    let tbs_end = tbs_start + 1 + tbs_len_bytes + tbs_len;
+
+    Ok((&cert_der[tbs_start..tbs_end], tbs_end))
+}
+
+/// Extracts the signature from a certificate after the TBS.
+fn extract_cert_signature(cert_der: &[u8], tbs_end: usize) -> DtlsResult<Vec<u8>> {
+    // Skip SignatureAlgorithm SEQUENCE
+    if cert_der[tbs_end] != 0x30 {
+        return Err(DtlsError::CertificateError {
+            reason: "SignatureAlgorithm not found".to_string(),
+        });
+    }
+    let (sig_alg_len, sig_alg_len_bytes) = parse_der_length(&cert_der[tbs_end + 1..])?;
+    let sig_start = tbs_end + 1 + sig_alg_len_bytes + sig_alg_len;
+
+    // BIT STRING containing signature
+    if cert_der[sig_start] != 0x03 {
+        return Err(DtlsError::CertificateError {
+            reason: "signature not found".to_string(),
+        });
+    }
+    let (sig_len, sig_len_bytes) = parse_der_length(&cert_der[sig_start + 1..])?;
+    let sig_content_start = sig_start + 1 + sig_len_bytes + 1; // +1 for unused bits byte
+
+    if sig_content_start + sig_len - 1 > cert_der.len() {
+        return Err(DtlsError::CertificateError {
+            reason: "signature truncated".to_string(),
+        });
+    }
+
+    Ok(cert_der[sig_content_start..sig_content_start + sig_len - 1].to_vec())
 }
 
 #[cfg(test)]

@@ -224,54 +224,54 @@ impl StunClient {
 
             // Verify it's from the expected server
             if from != self.server {
-                debug!(
-                    expected = %self.server,
-                    got = %from,
-                    "Ignoring response from unexpected source"
-                );
+                debug!(expected = %self.server, got = %from, "Ignoring response from unexpected source");
                 continue;
             }
 
-            // Parse the response
             let response = StunMessage::parse(&buf[..n])?;
 
             // Verify transaction ID matches
             if response.transaction_id != *expected_tid {
-                debug!(
-                    expected = ?expected_tid,
-                    got = ?response.transaction_id,
-                    "Ignoring response with mismatched transaction ID"
-                );
+                debug!(expected = ?expected_tid, got = ?response.transaction_id, "Ignoring response with mismatched transaction ID");
                 continue;
             }
 
-            // Check for error response
-            if response.msg_type.class == crate::StunClass::ErrorResponse {
-                let error_code = response.attributes.iter().find_map(|a| {
-                    if let crate::StunAttribute::ErrorCode { code, reason } = a {
-                        Some((*code, reason.clone()))
-                    } else {
-                        None
-                    }
-                });
+            return Self::extract_mapped_address(&response);
+        }
+    }
 
-                if let Some((code, reason)) = error_code {
-                    return Err(StunError::ServerError { code, reason });
-                }
-                return Err(StunError::ServerError {
-                    code: 500,
-                    reason: "unknown error".to_string(),
-                });
+    /// Extracts the mapped address from a STUN response, handling error responses.
+    fn extract_mapped_address(response: &StunMessage) -> StunResult<SocketAddr> {
+        // Check for error response
+        if response.msg_type.class == crate::StunClass::ErrorResponse {
+            return Err(Self::extract_error_code(response));
+        }
+
+        // Extract XOR-MAPPED-ADDRESS
+        response
+            .xor_mapped_address()
+            .ok_or_else(|| StunError::InvalidMessage {
+                reason: "response missing XOR-MAPPED-ADDRESS".to_string(),
+            })
+    }
+
+    /// Extracts error code from an error response.
+    fn extract_error_code(response: &StunMessage) -> StunError {
+        let error_code = response.attributes.iter().find_map(|a| {
+            if let crate::StunAttribute::ErrorCode { code, reason } = a {
+                Some((*code, reason.clone()))
+            } else {
+                None
             }
+        });
 
-            // Extract XOR-MAPPED-ADDRESS
-            let addr = response
-                .xor_mapped_address()
-                .ok_or_else(|| StunError::InvalidMessage {
-                    reason: "response missing XOR-MAPPED-ADDRESS".to_string(),
-                })?;
-
-            return Ok(addr);
+        if let Some((code, reason)) = error_code {
+            StunError::ServerError { code, reason }
+        } else {
+            StunError::ServerError {
+                code: 500,
+                reason: "unknown error".to_string(),
+            }
         }
     }
 }

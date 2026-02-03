@@ -363,26 +363,20 @@ impl fmt::Display for SipResponse {
     }
 }
 
-/// Parses headers and body from message rest.
-///
-/// # Loop Bounds (Power of 10 Rule 2)
-///
-/// - `header_section.lines()` is bounded by input string length
-/// - Maximum iterations: `header_section.len()` (one per character worst case)
-fn parse_headers_and_body(rest: &str) -> SipResult<(Headers, Option<Bytes>)> {
-    let mut headers = Headers::new();
-
-    // Split headers from body (double CRLF)
-    let (header_section, body_section) = if let Some(pos) = rest.find("\r\n\r\n") {
+/// Splits message into header and body sections.
+fn split_header_body(rest: &str) -> (&str, Option<&str>) {
+    if let Some(pos) = rest.find("\r\n\r\n") {
         (&rest[..pos], Some(&rest[pos + 4..]))
     } else if let Some(pos) = rest.find("\n\n") {
         (&rest[..pos], Some(&rest[pos + 2..]))
     } else {
         (rest, None)
-    };
+    }
+}
 
-    // Parse headers
-    // Power of 10 Rule 2: Loop bounded by header_section.lines() count
+/// Parses headers from a header section, handling folded headers.
+fn parse_header_section(header_section: &str) -> SipResult<Headers> {
+    let mut headers = Headers::new();
     let mut current_header: Option<String> = None;
 
     for line in header_section.lines() {
@@ -409,6 +403,19 @@ fn parse_headers_and_body(rest: &str) -> SipResult<(Headers, Option<Bytes>)> {
     if let Some(h) = current_header {
         headers.add(Header::parse(&h)?);
     }
+
+    Ok(headers)
+}
+
+/// Parses headers and body from message rest.
+///
+/// # Loop Bounds (Power of 10 Rule 2)
+///
+/// - `header_section.lines()` is bounded by input string length
+/// - Maximum iterations: `header_section.len()` (one per character worst case)
+fn parse_headers_and_body(rest: &str) -> SipResult<(Headers, Option<Bytes>)> {
+    let (header_section, body_section) = split_header_body(rest);
+    let headers = parse_header_section(header_section)?;
 
     // Parse body
     let body = body_section
