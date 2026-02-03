@@ -20,11 +20,11 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![cfg_attr(test, allow(clippy::panic))]
 
-// Modules will be added as implementation progresses
-// pub mod registration;
-// pub mod call_agent;
-// pub mod ice_handler;
-// pub mod dtls_handler;
+pub mod call_agent;
+pub mod registration;
+
+pub use call_agent::{CallAgent, CallEvent};
+pub use registration::{RegistrationAgent, RegistrationEvent};
 
 use thiserror::Error;
 

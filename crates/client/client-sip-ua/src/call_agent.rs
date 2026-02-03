@@ -1,0 +1,1165 @@
+//! SIP Call Agent.
+//!
+//! Handles call control including INVITE, BYE, CANCEL transactions.
+//! Uses mutual TLS with smart card certificates for authentication.
+
+use crate::{SipUaError, SipUaResult};
+use chrono::Utc;
+use client_types::{CallDirection, CallFailureReason, CallInfo, CallState};
+use proto_dialog::Dialog;
+use proto_sip::builder::{generate_branch, generate_call_id, generate_tag, RequestBuilder};
+use proto_sip::header::HeaderName;
+use proto_sip::header_params::{NameAddr, ViaHeader};
+use proto_sip::message::{SipRequest, SipResponse};
+use proto_sip::uri::SipUri;
+use proto_transaction::client::{ClientInviteTransaction, ClientNonInviteTransaction};
+use proto_transaction::{TransactionKey, TransportType};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::time::Instant;
+use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
+
+/// User agent string for SIP messages.
+const USER_AGENT: &str = "USG-SIP-Client/0.1.0 (CNSA 2.0)";
+
+/// Call agent handles outbound and inbound calls.
+pub struct CallAgent {
+    /// Active calls by call ID.
+    calls: HashMap<String, CallSession>,
+    /// Event sender for call state changes.
+    event_tx: mpsc::Sender<CallEvent>,
+    /// Local address for Via/Contact headers.
+    local_addr: SocketAddr,
+    /// Our SIP URI (address of record).
+    aor: String,
+    /// Display name for From header.
+    display_name: String,
+}
+
+/// State for a single call session.
+struct CallSession {
+    /// Unique call ID for application tracking.
+    id: String,
+    /// SIP Call-ID header value.
+    sip_call_id: String,
+    /// Current call state.
+    state: CallState,
+    /// SIP dialog (once established).
+    #[allow(dead_code)]
+    dialog: Option<Dialog>,
+    /// Active INVITE transaction (if any).
+    invite_transaction: Option<ClientInviteTransaction>,
+    /// Active non-INVITE transaction (if any, e.g., BYE, CANCEL).
+    #[allow(dead_code)]
+    non_invite_transaction: Option<ClientNonInviteTransaction>,
+    /// From tag.
+    from_tag: String,
+    /// To tag (from remote).
+    to_tag: Option<String>,
+    /// CSeq number.
+    cseq: u32,
+    /// Remote party URI.
+    remote_uri: String,
+    /// Remote party display name.
+    remote_display_name: Option<String>,
+    /// Whether this is an outbound call.
+    is_outbound: bool,
+    /// Local SDP offer (if sent).
+    #[allow(dead_code)]
+    local_sdp: Option<String>,
+    /// Remote SDP answer/offer (if received).
+    remote_sdp: Option<String>,
+    /// Call start time (when call was initiated).
+    start_time: chrono::DateTime<Utc>,
+    /// Call connect time (when Connected).
+    connected_at: Option<Instant>,
+    /// Last branch parameter.
+    last_branch: Option<String>,
+    /// Failure reason if the call failed.
+    failure_reason: Option<CallFailureReason>,
+}
+
+/// Events emitted by the call agent.
+#[derive(Debug, Clone)]
+pub enum CallEvent {
+    /// Call state changed.
+    StateChanged {
+        /// Call ID.
+        call_id: String,
+        /// New state.
+        state: CallState,
+        /// Call info (if available).
+        info: Option<CallInfo>,
+    },
+    /// Need to send a SIP request.
+    SendRequest {
+        /// The SIP request to send.
+        request: SipRequest,
+        /// Destination address.
+        destination: SocketAddr,
+    },
+    /// Need to send a SIP response.
+    #[allow(dead_code)]
+    SendResponse {
+        /// The SIP response to send.
+        response: SipResponse,
+        /// Destination address.
+        destination: SocketAddr,
+    },
+    /// SDP offer received, need to provide answer.
+    #[allow(dead_code)]
+    SdpOfferReceived {
+        /// Call ID.
+        call_id: String,
+        /// SDP offer content.
+        sdp: String,
+    },
+    /// SDP answer received, can start media.
+    SdpAnswerReceived {
+        /// Call ID.
+        call_id: String,
+        /// SDP answer content.
+        sdp: String,
+    },
+}
+
+impl CallAgent {
+    /// Creates a new call agent.
+    pub fn new(
+        local_addr: SocketAddr,
+        aor: String,
+        display_name: String,
+        event_tx: mpsc::Sender<CallEvent>,
+    ) -> Self {
+        Self {
+            calls: HashMap::new(),
+            event_tx,
+            local_addr,
+            aor,
+            display_name,
+        }
+    }
+
+    /// Makes an outbound call.
+    ///
+    /// Returns the call ID for tracking.
+    pub async fn make_call(
+        &mut self,
+        remote_uri: &str,
+        sdp_offer: &str,
+    ) -> SipUaResult<String> {
+        let call_id = Uuid::new_v4().to_string();
+        let sip_call_id = generate_call_id(&self.local_addr.ip().to_string());
+
+        info!(call_id = %call_id, remote_uri = %remote_uri, "Initiating outbound call");
+
+        // Parse destination address from URI
+        let destination = Self::parse_destination(remote_uri)?;
+
+        // Create call session
+        let from_tag = generate_tag();
+        let branch = generate_branch();
+
+        let mut session = CallSession {
+            id: call_id.clone(),
+            sip_call_id: sip_call_id.clone(),
+            state: CallState::Idle,
+            dialog: None,
+            invite_transaction: None,
+            non_invite_transaction: None,
+            from_tag: from_tag.clone(),
+            to_tag: None,
+            cseq: 1,
+            remote_uri: remote_uri.to_string(),
+            remote_display_name: None,
+            is_outbound: true,
+            local_sdp: Some(sdp_offer.to_string()),
+            remote_sdp: None,
+            start_time: Utc::now(),
+            connected_at: None,
+            last_branch: Some(branch.clone()),
+            failure_reason: None,
+        };
+
+        // Build request before storing session
+        let request = Self::build_invite_request_static(
+            remote_uri,
+            &self.aor,
+            &self.display_name,
+            self.local_addr,
+            &sip_call_id,
+            1,
+            &from_tag,
+            &branch,
+            sdp_offer,
+        )?;
+
+        // Create INVITE transaction
+        let tx_key = TransactionKey::client(&branch, "INVITE");
+        let transaction = ClientInviteTransaction::new(tx_key, TransportType::Reliable);
+        session.invite_transaction = Some(transaction);
+        session.state = CallState::Dialing;
+
+        self.calls.insert(call_id.clone(), session);
+
+        // Send state change notification
+        self.event_tx
+            .send(CallEvent::StateChanged {
+                call_id: call_id.clone(),
+                state: CallState::Dialing,
+                info: None,
+            })
+            .await
+            .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+        // Send request
+        self.event_tx
+            .send(CallEvent::SendRequest {
+                request,
+                destination,
+            })
+            .await
+            .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+        Ok(call_id)
+    }
+
+    /// Hangs up an active call.
+    pub async fn hangup(&mut self, call_id: &str) -> SipUaResult<()> {
+        let state = self
+            .calls
+            .get(call_id)
+            .ok_or_else(|| SipUaError::InvalidState("Call not found".to_string()))?
+            .state;
+
+        info!(call_id = %call_id, state = ?state, "Hanging up call");
+
+        match state {
+            CallState::Dialing | CallState::Ringing | CallState::EarlyMedia => {
+                // Send CANCEL for pending INVITE
+                self.send_cancel(call_id).await
+            }
+            CallState::Connected | CallState::OnHold => {
+                // Send BYE
+                self.send_bye(call_id).await
+            }
+            CallState::Terminated | CallState::Idle => {
+                // Already ended
+                Ok(())
+            }
+            _ => Err(SipUaError::InvalidState(format!(
+                "Cannot hangup in state {state:?}"
+            ))),
+        }
+    }
+
+    /// Handles a received SIP response.
+    pub async fn handle_response(
+        &mut self,
+        response: &SipResponse,
+        call_id: &str,
+    ) -> SipUaResult<()> {
+        let status_code = response.status.code();
+        let current_state = self
+            .calls
+            .get(call_id)
+            .ok_or_else(|| SipUaError::InvalidState("Call not found".to_string()))?
+            .state;
+
+        debug!(
+            call_id = %call_id,
+            status_code = status_code,
+            state = ?current_state,
+            "Received call response"
+        );
+
+        // Update transaction state
+        if let Some(session) = self.calls.get_mut(call_id) {
+            if let Some(ref mut tx) = session.invite_transaction {
+                let _ = tx.receive_response(status_code);
+            }
+        }
+
+        match status_code {
+            100 => {
+                // Trying - no state change needed
+                debug!(call_id = %call_id, "Call is trying");
+            }
+            180 | 183 => {
+                self.handle_provisional_response(call_id, status_code, response)
+                    .await?;
+            }
+            200 => {
+                self.handle_success_response(call_id, response).await?;
+            }
+            code if (300..400).contains(&code) => {
+                self.handle_redirect_response(call_id, code).await?;
+            }
+            401 | 407 => {
+                self.handle_auth_challenge(call_id, status_code, response)
+                    .await?;
+            }
+            480 => {
+                self.handle_unavailable_response(call_id, response).await?;
+            }
+            486 | 600 => {
+                self.handle_busy_response(call_id, status_code, response)
+                    .await?;
+            }
+            487 => {
+                self.handle_cancelled_response(call_id, response).await?;
+            }
+            code if (400..700).contains(&code) => {
+                self.handle_failure_response(call_id, code, response).await?;
+            }
+            _ => {
+                debug!(
+                    call_id = %call_id,
+                    status_code = status_code,
+                    "Received unexpected response"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_provisional_response(
+        &mut self,
+        call_id: &str,
+        status_code: u16,
+        response: &SipResponse,
+    ) -> SipUaResult<()> {
+        let session = self
+            .calls
+            .get_mut(call_id)
+            .ok_or_else(|| SipUaError::InvalidState("Call not found".to_string()))?;
+
+        if session.state == CallState::Dialing {
+            let new_state = if status_code == 183 {
+                CallState::EarlyMedia
+            } else {
+                CallState::Ringing
+            };
+            session.state = new_state;
+
+            self.event_tx
+                .send(CallEvent::StateChanged {
+                    call_id: call_id.to_string(),
+                    state: new_state,
+                    info: None,
+                })
+                .await
+                .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+        }
+
+        // Extract early SDP if present (183)
+        if status_code == 183 {
+            if let Some(body) = &response.body {
+                let sdp = String::from_utf8_lossy(body).to_string();
+                if let Some(session) = self.calls.get_mut(call_id) {
+                    session.remote_sdp = Some(sdp.clone());
+                }
+                let _ = self
+                    .event_tx
+                    .send(CallEvent::SdpAnswerReceived {
+                        call_id: call_id.to_string(),
+                        sdp,
+                    })
+                    .await;
+            }
+        }
+
+        // Extract To tag if present
+        if let Some(session) = self.calls.get_mut(call_id) {
+            if session.to_tag.is_none() {
+                session.to_tag = Self::extract_to_tag(response);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_success_response(
+        &mut self,
+        call_id: &str,
+        response: &SipResponse,
+    ) -> SipUaResult<()> {
+        // Extract data needed for ACK
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag) = {
+            let session = self
+                .calls
+                .get_mut(call_id)
+                .ok_or_else(|| SipUaError::InvalidState("Call not found".to_string()))?;
+
+            session.state = CallState::Connected;
+            session.connected_at = Some(Instant::now());
+            session.invite_transaction = None;
+
+            if session.to_tag.is_none() {
+                session.to_tag = Self::extract_to_tag(response);
+            }
+
+            if let Some(body) = &response.body {
+                let sdp = String::from_utf8_lossy(body).to_string();
+                session.remote_sdp = Some(sdp.clone());
+                let _ = self
+                    .event_tx
+                    .send(CallEvent::SdpAnswerReceived {
+                        call_id: call_id.to_string(),
+                        sdp,
+                    })
+                    .await;
+            }
+
+            info!(call_id = %call_id, "Call connected");
+
+            (
+                session.remote_uri.clone(),
+                session.sip_call_id.clone(),
+                session.cseq,
+                session.from_tag.clone(),
+                session.to_tag.clone(),
+            )
+        };
+
+        // Send ACK
+        let destination = Self::parse_destination(&remote_uri)?;
+        let ack_request = Self::build_ack_request_static(
+            &remote_uri,
+            &self.aor,
+            &self.display_name,
+            self.local_addr,
+            &sip_call_id,
+            cseq,
+            &from_tag,
+            to_tag.as_deref(),
+        )?;
+
+        self.event_tx
+            .send(CallEvent::SendRequest {
+                request: ack_request,
+                destination,
+            })
+            .await
+            .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+        self.event_tx
+            .send(CallEvent::StateChanged {
+                call_id: call_id.to_string(),
+                state: CallState::Connected,
+                info: None,
+            })
+            .await
+            .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn handle_redirect_response(
+        &mut self,
+        call_id: &str,
+        code: u16,
+    ) -> SipUaResult<()> {
+        warn!(
+            call_id = %call_id,
+            status_code = code,
+            "Call redirected, not supported"
+        );
+
+        if let Some(session) = self.calls.get_mut(call_id) {
+            session.state = CallState::Terminated;
+            session.failure_reason = Some(CallFailureReason::Rejected {
+                status_code: code,
+                reason: "Redirect not supported".to_string(),
+            });
+            session.invite_transaction = None;
+        }
+
+        self.event_tx
+            .send(CallEvent::StateChanged {
+                call_id: call_id.to_string(),
+                state: CallState::Terminated,
+                info: None,
+            })
+            .await
+            .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn handle_auth_challenge(
+        &mut self,
+        call_id: &str,
+        status_code: u16,
+        response: &SipResponse,
+    ) -> SipUaResult<()> {
+        error!(
+            call_id = %call_id,
+            status_code = status_code,
+            "Server requested digest auth, mTLS-only supported"
+        );
+
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag) =
+            self.extract_session_data_for_ack(call_id)?;
+
+        if let Some(session) = self.calls.get_mut(call_id) {
+            session.state = CallState::Terminated;
+            session.failure_reason = Some(CallFailureReason::AuthenticationFailed);
+            session.invite_transaction = None;
+        }
+
+        self.event_tx
+            .send(CallEvent::StateChanged {
+                call_id: call_id.to_string(),
+                state: CallState::Terminated,
+                info: None,
+            })
+            .await
+            .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+        self.send_ack_for_failure(call_id, &remote_uri, &sip_call_id, cseq, &from_tag, to_tag.as_deref(), response)
+            .await
+    }
+
+    async fn handle_unavailable_response(
+        &mut self,
+        call_id: &str,
+        response: &SipResponse,
+    ) -> SipUaResult<()> {
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag) =
+            self.extract_session_data_for_ack(call_id)?;
+
+        if let Some(session) = self.calls.get_mut(call_id) {
+            session.state = CallState::Terminated;
+            session.failure_reason = Some(CallFailureReason::Rejected {
+                status_code: 480,
+                reason: "Temporarily unavailable".to_string(),
+            });
+            session.invite_transaction = None;
+        }
+
+        self.event_tx
+            .send(CallEvent::StateChanged {
+                call_id: call_id.to_string(),
+                state: CallState::Terminated,
+                info: None,
+            })
+            .await
+            .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+        self.send_ack_for_failure(call_id, &remote_uri, &sip_call_id, cseq, &from_tag, to_tag.as_deref(), response)
+            .await
+    }
+
+    async fn handle_busy_response(
+        &mut self,
+        call_id: &str,
+        status_code: u16,
+        response: &SipResponse,
+    ) -> SipUaResult<()> {
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag) =
+            self.extract_session_data_for_ack(call_id)?;
+
+        if let Some(session) = self.calls.get_mut(call_id) {
+            session.state = CallState::Terminated;
+            session.failure_reason = Some(CallFailureReason::Rejected {
+                status_code,
+                reason: "Busy".to_string(),
+            });
+            session.invite_transaction = None;
+        }
+
+        self.event_tx
+            .send(CallEvent::StateChanged {
+                call_id: call_id.to_string(),
+                state: CallState::Terminated,
+                info: None,
+            })
+            .await
+            .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+        self.send_ack_for_failure(call_id, &remote_uri, &sip_call_id, cseq, &from_tag, to_tag.as_deref(), response)
+            .await
+    }
+
+    async fn handle_cancelled_response(
+        &mut self,
+        call_id: &str,
+        response: &SipResponse,
+    ) -> SipUaResult<()> {
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag) =
+            self.extract_session_data_for_ack(call_id)?;
+
+        if let Some(session) = self.calls.get_mut(call_id) {
+            session.state = CallState::Terminated;
+            session.failure_reason = Some(CallFailureReason::Cancelled);
+            session.invite_transaction = None;
+        }
+
+        self.event_tx
+            .send(CallEvent::StateChanged {
+                call_id: call_id.to_string(),
+                state: CallState::Terminated,
+                info: None,
+            })
+            .await
+            .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+        self.send_ack_for_failure(call_id, &remote_uri, &sip_call_id, cseq, &from_tag, to_tag.as_deref(), response)
+            .await
+    }
+
+    async fn handle_failure_response(
+        &mut self,
+        call_id: &str,
+        code: u16,
+        response: &SipResponse,
+    ) -> SipUaResult<()> {
+        error!(
+            call_id = %call_id,
+            status_code = code,
+            "Call failed"
+        );
+
+        let reason = response
+            .reason
+            .clone()
+            .unwrap_or_else(|| "Unknown error".to_string());
+
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag) =
+            self.extract_session_data_for_ack(call_id)?;
+
+        if let Some(session) = self.calls.get_mut(call_id) {
+            session.state = CallState::Terminated;
+            session.failure_reason = Some(CallFailureReason::Rejected {
+                status_code: code,
+                reason,
+            });
+            session.invite_transaction = None;
+        }
+
+        self.event_tx
+            .send(CallEvent::StateChanged {
+                call_id: call_id.to_string(),
+                state: CallState::Terminated,
+                info: None,
+            })
+            .await
+            .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+        self.send_ack_for_failure(call_id, &remote_uri, &sip_call_id, cseq, &from_tag, to_tag.as_deref(), response)
+            .await
+    }
+
+    fn extract_session_data_for_ack(
+        &self,
+        call_id: &str,
+    ) -> SipUaResult<(String, String, u32, String, Option<String>)> {
+        let session = self
+            .calls
+            .get(call_id)
+            .ok_or_else(|| SipUaError::InvalidState("Call not found".to_string()))?;
+
+        Ok((
+            session.remote_uri.clone(),
+            session.sip_call_id.clone(),
+            session.cseq,
+            session.from_tag.clone(),
+            session.to_tag.clone(),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_ack_for_failure(
+        &self,
+        _call_id: &str,
+        remote_uri: &str,
+        sip_call_id: &str,
+        cseq: u32,
+        from_tag: &str,
+        to_tag: Option<&str>,
+        _response: &SipResponse,
+    ) -> SipUaResult<()> {
+        let destination = Self::parse_destination(remote_uri)?;
+        let ack_request = Self::build_ack_request_static(
+            remote_uri,
+            &self.aor,
+            &self.display_name,
+            self.local_addr,
+            sip_call_id,
+            cseq,
+            from_tag,
+            to_tag,
+        )?;
+
+        self.event_tx
+            .send(CallEvent::SendRequest {
+                request: ack_request,
+                destination,
+            })
+            .await
+            .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Gets call information.
+    pub fn get_call_info(&self, call_id: &str) -> Option<CallInfo> {
+        self.calls.get(call_id).map(|session| {
+            let connect_time = session.connected_at.map(|_| Utc::now());
+            CallInfo {
+                id: session.id.clone(),
+                state: session.state,
+                direction: if session.is_outbound {
+                    CallDirection::Outbound
+                } else {
+                    CallDirection::Inbound
+                },
+                remote_uri: session.remote_uri.clone(),
+                remote_display_name: session.remote_display_name.clone(),
+                start_time: session.start_time,
+                connect_time,
+                is_muted: false,
+                is_on_hold: session.state == CallState::OnHold,
+                failure_reason: session.failure_reason.clone(),
+            }
+        })
+    }
+
+    /// Gets call state.
+    pub fn get_state(&self, call_id: &str) -> Option<CallState> {
+        self.calls.get(call_id).map(|s| s.state)
+    }
+
+    /// Sends a CANCEL request for a pending INVITE.
+    async fn send_cancel(&mut self, call_id: &str) -> SipUaResult<()> {
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag, branch) = {
+            let session = self
+                .calls
+                .get(call_id)
+                .ok_or_else(|| SipUaError::InvalidState("Call not found".to_string()))?;
+
+            (
+                session.remote_uri.clone(),
+                session.sip_call_id.clone(),
+                session.cseq,
+                session.from_tag.clone(),
+                session.to_tag.clone(),
+                session.last_branch.clone().unwrap_or_else(generate_branch),
+            )
+        };
+
+        let destination = Self::parse_destination(&remote_uri)?;
+
+        // Build CANCEL request
+        let request = Self::build_cancel_request_static(
+            &remote_uri,
+            &self.aor,
+            &self.display_name,
+            self.local_addr,
+            &sip_call_id,
+            cseq,
+            &from_tag,
+            to_tag.as_deref(),
+            &branch,
+        )?;
+
+        // Create non-INVITE transaction
+        let new_branch = generate_branch();
+        let tx_key = TransactionKey::client(&new_branch, "CANCEL");
+        let transaction = ClientNonInviteTransaction::new(tx_key, TransportType::Reliable);
+
+        if let Some(session) = self.calls.get_mut(call_id) {
+            session.non_invite_transaction = Some(transaction);
+        }
+
+        // Send request
+        self.event_tx
+            .send(CallEvent::SendRequest {
+                request,
+                destination,
+            })
+            .await
+            .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Sends a BYE request to end a connected call.
+    async fn send_bye(&mut self, call_id: &str) -> SipUaResult<()> {
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag) = {
+            let session = self
+                .calls
+                .get_mut(call_id)
+                .ok_or_else(|| SipUaError::InvalidState("Call not found".to_string()))?;
+
+            session.cseq += 1;
+            session.state = CallState::Terminating;
+
+            (
+                session.remote_uri.clone(),
+                session.sip_call_id.clone(),
+                session.cseq,
+                session.from_tag.clone(),
+                session.to_tag.clone(),
+            )
+        };
+
+        let destination = Self::parse_destination(&remote_uri)?;
+
+        // Build BYE request
+        let request = Self::build_bye_request_static(
+            &remote_uri,
+            &self.aor,
+            &self.display_name,
+            self.local_addr,
+            &sip_call_id,
+            cseq,
+            &from_tag,
+            to_tag.as_deref(),
+        )?;
+
+        // Create non-INVITE transaction
+        let branch = generate_branch();
+        let tx_key = TransactionKey::client(&branch, "BYE");
+        let transaction = ClientNonInviteTransaction::new(tx_key, TransportType::Reliable);
+
+        if let Some(session) = self.calls.get_mut(call_id) {
+            session.non_invite_transaction = Some(transaction);
+        }
+
+        // Send request
+        self.event_tx
+            .send(CallEvent::SendRequest {
+                request,
+                destination,
+            })
+            .await
+            .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+        self.event_tx
+            .send(CallEvent::StateChanged {
+                call_id: call_id.to_string(),
+                state: CallState::Terminating,
+                info: None,
+            })
+            .await
+            .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Builds an INVITE request (static version to avoid borrow issues).
+    #[allow(clippy::too_many_arguments)]
+    fn build_invite_request_static(
+        remote_uri_str: &str,
+        aor: &str,
+        display_name: &str,
+        local_addr: SocketAddr,
+        sip_call_id: &str,
+        cseq: u32,
+        from_tag: &str,
+        branch: &str,
+        sdp_offer: &str,
+    ) -> SipUaResult<SipRequest> {
+        let remote_uri: SipUri = remote_uri_str
+            .parse()
+            .map_err(|e| SipUaError::ConfigError(format!("Invalid remote URI: {e}")))?;
+
+        let aor_uri: SipUri = aor
+            .parse()
+            .map_err(|e| SipUaError::ConfigError(format!("Invalid AOR: {e}")))?;
+
+        let via = ViaHeader::new("TLS", &local_addr.ip().to_string())
+            .with_port(local_addr.port())
+            .with_branch(branch.to_string());
+
+        let from = NameAddr::new(aor_uri.clone())
+            .with_display_name(display_name)
+            .with_tag(from_tag.to_string());
+
+        let to = NameAddr::new(remote_uri.clone());
+
+        let mut contact_uri = SipUri::new(local_addr.ip().to_string())
+            .with_port(local_addr.port())
+            .with_param("transport", Some("tls".to_string()));
+        if let Some(user) = &aor_uri.user {
+            contact_uri = contact_uri.with_user(user.clone());
+        }
+        let contact = NameAddr::new(contact_uri);
+
+        let request = RequestBuilder::invite(remote_uri)
+            .via(&via)
+            .from(&from)
+            .to(&to)
+            .call_id(sip_call_id)
+            .cseq(cseq)
+            .max_forwards(70)
+            .contact(&contact)
+            .user_agent(USER_AGENT)
+            .content_type("application/sdp")
+            .body(bytes::Bytes::from(sdp_offer.as_bytes().to_vec()))
+            .build()
+            .map_err(|e| SipUaError::TransactionError(e.to_string()))?;
+
+        Ok(request)
+    }
+
+    /// Builds a CANCEL request (static version).
+    #[allow(clippy::too_many_arguments)]
+    fn build_cancel_request_static(
+        remote_uri_str: &str,
+        aor: &str,
+        display_name: &str,
+        local_addr: SocketAddr,
+        sip_call_id: &str,
+        cseq: u32,
+        from_tag: &str,
+        to_tag: Option<&str>,
+        branch: &str,
+    ) -> SipUaResult<SipRequest> {
+        let remote_uri: SipUri = remote_uri_str
+            .parse()
+            .map_err(|e| SipUaError::ConfigError(format!("Invalid remote URI: {e}")))?;
+
+        let aor_uri: SipUri = aor
+            .parse()
+            .map_err(|e| SipUaError::ConfigError(format!("Invalid AOR: {e}")))?;
+
+        let via = ViaHeader::new("TLS", &local_addr.ip().to_string())
+            .with_port(local_addr.port())
+            .with_branch(branch.to_string());
+
+        let from = NameAddr::new(aor_uri)
+            .with_display_name(display_name)
+            .with_tag(from_tag.to_string());
+
+        let mut to = NameAddr::new(remote_uri.clone());
+        if let Some(tag) = to_tag {
+            to = to.with_tag(tag.to_string());
+        }
+
+        let request = RequestBuilder::cancel(remote_uri)
+            .via(&via)
+            .from(&from)
+            .to(&to)
+            .call_id(sip_call_id)
+            .cseq(cseq)
+            .max_forwards(70)
+            .build()
+            .map_err(|e| SipUaError::TransactionError(e.to_string()))?;
+
+        Ok(request)
+    }
+
+    /// Builds a BYE request (static version).
+    #[allow(clippy::too_many_arguments)]
+    fn build_bye_request_static(
+        remote_uri_str: &str,
+        aor: &str,
+        display_name: &str,
+        local_addr: SocketAddr,
+        sip_call_id: &str,
+        cseq: u32,
+        from_tag: &str,
+        to_tag: Option<&str>,
+    ) -> SipUaResult<SipRequest> {
+        let remote_uri: SipUri = remote_uri_str
+            .parse()
+            .map_err(|e| SipUaError::ConfigError(format!("Invalid remote URI: {e}")))?;
+
+        let aor_uri: SipUri = aor
+            .parse()
+            .map_err(|e| SipUaError::ConfigError(format!("Invalid AOR: {e}")))?;
+
+        let branch = generate_branch();
+
+        let via = ViaHeader::new("TLS", &local_addr.ip().to_string())
+            .with_port(local_addr.port())
+            .with_branch(branch);
+
+        let from = NameAddr::new(aor_uri)
+            .with_display_name(display_name)
+            .with_tag(from_tag.to_string());
+
+        let mut to = NameAddr::new(remote_uri.clone());
+        if let Some(tag) = to_tag {
+            to = to.with_tag(tag.to_string());
+        }
+
+        let request = RequestBuilder::bye(remote_uri)
+            .via(&via)
+            .from(&from)
+            .to(&to)
+            .call_id(sip_call_id)
+            .cseq(cseq)
+            .max_forwards(70)
+            .build()
+            .map_err(|e| SipUaError::TransactionError(e.to_string()))?;
+
+        Ok(request)
+    }
+
+    /// Builds an ACK request (static version).
+    #[allow(clippy::too_many_arguments)]
+    fn build_ack_request_static(
+        remote_uri_str: &str,
+        aor: &str,
+        display_name: &str,
+        local_addr: SocketAddr,
+        sip_call_id: &str,
+        cseq: u32,
+        from_tag: &str,
+        to_tag: Option<&str>,
+    ) -> SipUaResult<SipRequest> {
+        let remote_uri: SipUri = remote_uri_str
+            .parse()
+            .map_err(|e| SipUaError::ConfigError(format!("Invalid remote URI: {e}")))?;
+
+        let aor_uri: SipUri = aor
+            .parse()
+            .map_err(|e| SipUaError::ConfigError(format!("Invalid AOR: {e}")))?;
+
+        let branch = generate_branch();
+
+        let via = ViaHeader::new("TLS", &local_addr.ip().to_string())
+            .with_port(local_addr.port())
+            .with_branch(branch);
+
+        let from = NameAddr::new(aor_uri)
+            .with_display_name(display_name)
+            .with_tag(from_tag.to_string());
+
+        let mut to = NameAddr::new(remote_uri.clone());
+        if let Some(tag) = to_tag {
+            to = to.with_tag(tag.to_string());
+        }
+
+        let request = RequestBuilder::ack(remote_uri)
+            .via(&via)
+            .from(&from)
+            .to(&to)
+            .call_id(sip_call_id)
+            .cseq(cseq)
+            .max_forwards(70)
+            .build()
+            .map_err(|e| SipUaError::TransactionError(e.to_string()))?;
+
+        Ok(request)
+    }
+
+    /// Parses a SIP URI to get destination address.
+    fn parse_destination(uri: &str) -> SipUaResult<SocketAddr> {
+        let sip_uri: SipUri = uri
+            .parse()
+            .map_err(|e| SipUaError::ConfigError(format!("Invalid URI: {e}")))?;
+
+        let host = &sip_uri.host;
+        let port = sip_uri.port.unwrap_or(5061);
+
+        let ip: std::net::IpAddr = host
+            .parse()
+            .map_err(|_| SipUaError::ConfigError(format!("Cannot resolve hostname: {host}")))?;
+
+        Ok(SocketAddr::new(ip, port))
+    }
+
+    /// Extracts To tag from response.
+    fn extract_to_tag(response: &SipResponse) -> Option<String> {
+        response.headers.get(&HeaderName::To).and_then(|h| {
+            let value = &h.value;
+            value.find("tag=").map(|pos| {
+                let start = pos + 4;
+                let end = value[start..]
+                    .find(|c: char| c == ';' || c == '>' || c.is_whitespace())
+                    .map_or(value.len(), |i| start + i);
+                value[start..end].to_string()
+            })
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_call_agent_new() {
+        let (tx, _rx) = mpsc::channel(10);
+        let local_addr: SocketAddr = "192.168.1.100:5060".parse().unwrap();
+        let agent = CallAgent::new(
+            local_addr,
+            "sips:alice@example.com".to_string(),
+            "Alice".to_string(),
+            tx,
+        );
+
+        assert!(agent.calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_parse_destination() {
+        let addr = CallAgent::parse_destination("sips:bob@192.168.1.1:5061").unwrap();
+        assert_eq!(addr.ip().to_string(), "192.168.1.1");
+        assert_eq!(addr.port(), 5061);
+    }
+
+    #[tokio::test]
+    async fn test_parse_destination_default_port() {
+        let addr = CallAgent::parse_destination("sips:bob@192.168.1.1").unwrap();
+        assert_eq!(addr.ip().to_string(), "192.168.1.1");
+        assert_eq!(addr.port(), 5061);
+    }
+
+    #[tokio::test]
+    async fn test_make_call() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let local_addr: SocketAddr = "192.168.1.100:5060".parse().unwrap();
+        let mut agent = CallAgent::new(
+            local_addr,
+            "sips:alice@192.168.1.100".to_string(),
+            "Alice".to_string(),
+            tx,
+        );
+
+        let sdp = "v=0\r\no=- 0 0 IN IP4 192.168.1.100\r\n";
+        let call_id = agent
+            .make_call("sips:bob@192.168.1.1:5061", sdp)
+            .await
+            .unwrap();
+
+        // Should receive state change
+        let event = rx.recv().await.unwrap();
+        assert!(matches!(
+            event,
+            CallEvent::StateChanged {
+                state: CallState::Dialing,
+                ..
+            }
+        ));
+
+        // Should receive send request
+        let event = rx.recv().await.unwrap();
+        assert!(matches!(event, CallEvent::SendRequest { .. }));
+
+        // State should be Dialing
+        assert_eq!(agent.get_state(&call_id), Some(CallState::Dialing));
+    }
+
+    #[tokio::test]
+    async fn test_get_call_info_unknown() {
+        let (tx, _rx) = mpsc::channel(10);
+        let local_addr: SocketAddr = "192.168.1.100:5060".parse().unwrap();
+        let agent = CallAgent::new(
+            local_addr,
+            "sips:alice@example.com".to_string(),
+            "Alice".to_string(),
+            tx,
+        );
+
+        assert!(agent.get_call_info("unknown").is_none());
+    }
+}
