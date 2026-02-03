@@ -270,22 +270,24 @@ impl Transport for TlsTransport {
 
             trace!(size = data.len(), "sending TLS data");
 
-            let mut stream = self.stream.lock().await;
-            stream
-                .write_all(data)
-                .await
-                .map_err(|e| TransportError::SendFailed {
-                    address: self.peer_addr,
-                    reason: e.to_string(),
-                })?;
+            {
+                let mut stream = self.stream.lock().await;
+                stream
+                    .write_all(data)
+                    .await
+                    .map_err(|e| TransportError::SendFailed {
+                        address: self.peer_addr,
+                        reason: e.to_string(),
+                    })?;
 
-            stream
-                .flush()
-                .await
-                .map_err(|e| TransportError::SendFailed {
-                    address: self.peer_addr,
-                    reason: e.to_string(),
-                })?;
+                stream
+                    .flush()
+                    .await
+                    .map_err(|e| TransportError::SendFailed {
+                        address: self.peer_addr,
+                        reason: e.to_string(),
+                    })?;
+            }
 
             Ok(())
         })
@@ -297,27 +299,29 @@ impl Transport for TlsTransport {
                 return Err(TransportError::AlreadyClosed);
             }
 
-            let mut read_buffer = self.read_buffer.lock().await;
-            let mut stream = self.stream.lock().await;
+            let data = {
+                let mut read_buffer = self.read_buffer.lock().await;
+                let mut stream = self.stream.lock().await;
 
-            let mut temp_buffer = [0u8; 4096];
-            let n =
-                stream
-                    .read(&mut temp_buffer)
-                    .await
-                    .map_err(|e| TransportError::ReceiveFailed {
-                        reason: e.to_string(),
-                    })?;
+                let mut temp_buffer = [0u8; 4096];
+                let n =
+                    stream
+                        .read(&mut temp_buffer)
+                        .await
+                        .map_err(|e| TransportError::ReceiveFailed {
+                            reason: e.to_string(),
+                        })?;
 
-            if n == 0 {
-                return Err(TransportError::ConnectionClosed);
-            }
+                if n == 0 {
+                    return Err(TransportError::ConnectionClosed);
+                }
 
-            read_buffer.extend_from_slice(&temp_buffer[..n]);
+                read_buffer.extend_from_slice(&temp_buffer[..n]);
 
-            trace!(size = n, "received TLS data");
+                trace!(size = n, "received TLS data");
 
-            let data = read_buffer.split().freeze();
+                read_buffer.split().freeze()
+            };
 
             Ok(ReceivedMessage {
                 data,
@@ -345,8 +349,10 @@ impl Transport for TlsTransport {
                 return Err(TransportError::AlreadyClosed);
             }
 
-            let mut stream = self.stream.lock().await;
-            let _ = stream.shutdown().await;
+            {
+                let mut stream = self.stream.lock().await;
+                let _ = stream.shutdown().await;
+            }
 
             debug!(peer = %self.peer_addr, "TLS transport closed");
             Ok(())
@@ -367,8 +373,10 @@ impl StreamTransport for TlsTransport {
 impl std::fmt::Debug for TlsTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TlsTransport")
+            .field("stream", &"<mutex>")
             .field("local_addr", &self.local_addr)
             .field("peer_addr", &self.peer_addr)
+            .field("read_buffer", &"<mutex>")
             .field("closed", &self.is_closed())
             .finish()
     }
@@ -552,6 +560,8 @@ impl TlsListener {
 impl std::fmt::Debug for TlsListener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TlsListener")
+            .field("listener", &self.listener)
+            .field("acceptor", &"<TlsAcceptor>")
             .field("local_addr", &self.local_addr)
             .field("closed", &self.closed.load(Ordering::Relaxed))
             .finish()

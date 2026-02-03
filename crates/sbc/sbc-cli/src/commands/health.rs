@@ -1,12 +1,11 @@
 //! Health command implementation.
 
-use super::CommandResult;
 use crate::args::Args;
 use crate::output::OutputFormatter;
 use uc_health::{HealthChecker, HealthCheckerConfig, HealthStatus};
 
 /// Runs the health command.
-pub fn run(args: &Args) -> CommandResult {
+pub fn run(args: &Args) {
     let formatter = OutputFormatter::new(args.format);
 
     println!("Health Check");
@@ -74,8 +73,6 @@ pub fn run(args: &Args) -> CommandResult {
         "  Readiness: {}",
         formatter.format_status("ready", checker.is_ready())
     );
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -90,7 +87,6 @@ mod tests {
             ..Default::default()
         };
 
-        let result = run(&args);
-        assert!(result.is_ok());
+        run(&args);
     }
 }

@@ -367,6 +367,7 @@ impl std::fmt::Debug for Authenticator {
             .field("nonce_lifetime", &self.nonce_lifetime)
             .field("default_algorithm", &self.default_algorithm)
             .field("supported_qop", &self.supported_qop)
+            .field("password_lookup", &self.password_lookup.as_ref().map(|_| "<function>"))
             .finish()
     }
 }

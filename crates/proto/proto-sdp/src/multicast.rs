@@ -395,6 +395,10 @@ impl MulticastNegotiator {
     /// 1. The answerer MUST NOT change the multicast address
     /// 2. The answerer MUST NOT change the TTL (for IPv4)
     /// 3. Direction indicates sender/receiver role in multicast group
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the offer violates multicast validation rules.
     pub fn validate_offer(
         &self,
         media: &MediaDescription,
@@ -480,6 +484,10 @@ impl MulticastNegotiator {
     /// 1. MUST use the same multicast address
     /// 2. MUST use the same TTL
     /// 3. Sets direction based on local capabilities
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the offer is invalid or answer generation fails.
     pub fn generate_answer(
         &self,
         offer_media: &MediaDescription,

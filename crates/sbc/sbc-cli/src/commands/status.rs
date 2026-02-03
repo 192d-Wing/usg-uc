@@ -1,12 +1,11 @@
 //! Status command implementation.
 
-use super::CommandResult;
 use crate::args::Args;
 use crate::output::OutputFormatter;
 use std::collections::HashMap;
 
 /// Runs the status command.
-pub fn run(args: &Args) -> CommandResult {
+pub fn run(args: &Args) {
     let formatter = OutputFormatter::new(args.format);
 
     // In production, would query the SBC API
@@ -44,8 +43,6 @@ pub fn run(args: &Args) -> CommandResult {
     resources.insert("RTP Streams".to_string(), "84".to_string());
 
     println!("{}", formatter.format_map(&resources));
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -60,7 +57,6 @@ mod tests {
             ..Default::default()
         };
 
-        let result = run(&args);
-        assert!(result.is_ok());
+        run(&args);
     }
 }

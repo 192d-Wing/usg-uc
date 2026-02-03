@@ -107,6 +107,10 @@ impl DtlsConnection {
     /// Creates a new DTLS connection with an existing UDP socket.
     ///
     /// Use this when you already have a bound socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DTLS connection creation fails.
     #[instrument(skip(config, socket), fields(local = %local_addr, remote = %remote_addr))]
     pub fn with_socket(
         config: DtlsConfig,
@@ -189,27 +193,30 @@ impl DtlsConnection {
             return Ok(socket);
         }
 
-        let mut socket_guard = self.socket.lock().await;
+        let socket = {
+            let mut socket_guard = self.socket.lock().await;
 
-        // Bind to local address
-        let local_std_addr: SocketAddr = self.local_addr.into();
-        let socket = UdpSocket::bind(local_std_addr)
-            .await
-            .map_err(|e| DtlsError::Io {
-                reason: format!("failed to bind UDP socket: {e}"),
-            })?;
+            // Bind to local address
+            let local_std_addr: SocketAddr = self.local_addr.into();
+            let socket = UdpSocket::bind(local_std_addr)
+                .await
+                .map_err(|e| DtlsError::Io {
+                    reason: format!("failed to bind UDP socket: {e}"),
+                })?;
 
-        // Connect to remote address
-        let remote_std_addr: SocketAddr = self.remote_addr.into();
-        socket
-            .connect(remote_std_addr)
-            .await
-            .map_err(|e| DtlsError::Io {
-                reason: format!("failed to connect UDP socket: {e}"),
-            })?;
+            // Connect to remote address
+            let remote_std_addr: SocketAddr = self.remote_addr.into();
+            socket
+                .connect(remote_std_addr)
+                .await
+                .map_err(|e| DtlsError::Io {
+                    reason: format!("failed to connect UDP socket: {e}"),
+                })?;
 
-        let socket = Arc::new(socket);
-        *socket_guard = Some(Arc::clone(&socket));
+            let socket = Arc::new(socket);
+            *socket_guard = Some(Arc::clone(&socket));
+            socket
+        };
 
         debug!(
             local = %self.local_addr,

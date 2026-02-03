@@ -108,24 +108,28 @@ impl MediaSessionConfig {
     }
 
     /// Sets the media mode.
+    #[must_use]
     pub fn with_mode(mut self, mode: MediaMode) -> Self {
         self.mode = mode;
         self
     }
 
     /// Adds a local codec.
+    #[must_use]
     pub fn with_codec(mut self, codec: CodecCapability) -> Self {
         self.local_codecs.push(codec);
         self
     }
 
     /// Sets local codecs.
+    #[must_use]
     pub fn with_codecs(mut self, codecs: Vec<CodecCapability>) -> Self {
         self.local_codecs = codecs;
         self
     }
 
     /// Enables/disables SRTP.
+    #[must_use]
     pub fn with_srtp(mut self, enabled: bool) -> Self {
         self.srtp_enabled = enabled;
         self

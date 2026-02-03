@@ -128,22 +128,24 @@ impl Transport for TcpTransport {
 
             trace!(size = data.len(), "sending TCP data");
 
-            let mut stream = self.stream.lock().await;
-            stream
-                .write_all(data)
-                .await
-                .map_err(|e| TransportError::SendFailed {
-                    address: self.peer_addr,
-                    reason: e.to_string(),
-                })?;
+            {
+                let mut stream = self.stream.lock().await;
+                stream
+                    .write_all(data)
+                    .await
+                    .map_err(|e| TransportError::SendFailed {
+                        address: self.peer_addr,
+                        reason: e.to_string(),
+                    })?;
 
-            stream
-                .flush()
-                .await
-                .map_err(|e| TransportError::SendFailed {
-                    address: self.peer_addr,
-                    reason: e.to_string(),
-                })?;
+                stream
+                    .flush()
+                    .await
+                    .map_err(|e| TransportError::SendFailed {
+                        address: self.peer_addr,
+                        reason: e.to_string(),
+                    })?;
+            }
 
             Ok(())
         })
@@ -155,30 +157,32 @@ impl Transport for TcpTransport {
                 return Err(TransportError::AlreadyClosed);
             }
 
-            let mut read_buffer = self.read_buffer.lock().await;
-            let mut stream = self.stream.lock().await;
+            let data = {
+                let mut read_buffer = self.read_buffer.lock().await;
+                let mut stream = self.stream.lock().await;
 
-            // Read available data
-            let mut temp_buffer = [0u8; 4096];
-            let n =
-                stream
-                    .read(&mut temp_buffer)
-                    .await
-                    .map_err(|e| TransportError::ReceiveFailed {
-                        reason: e.to_string(),
-                    })?;
+                // Read available data
+                let mut temp_buffer = [0u8; 4096];
+                let n =
+                    stream
+                        .read(&mut temp_buffer)
+                        .await
+                        .map_err(|e| TransportError::ReceiveFailed {
+                            reason: e.to_string(),
+                        })?;
 
-            if n == 0 {
-                return Err(TransportError::ConnectionClosed);
-            }
+                if n == 0 {
+                    return Err(TransportError::ConnectionClosed);
+                }
 
-            read_buffer.extend_from_slice(&temp_buffer[..n]);
+                read_buffer.extend_from_slice(&temp_buffer[..n]);
 
-            trace!(size = n, "received TCP data");
+                trace!(size = n, "received TCP data");
 
-            // For SIP, we'd parse the Content-Length and wait for full message.
-            // For now, return whatever we received (simplified).
-            let data = read_buffer.split().freeze();
+                // For SIP, we'd parse the Content-Length and wait for full message.
+                // For now, return whatever we received (simplified).
+                read_buffer.split().freeze()
+            };
 
             Ok(ReceivedMessage {
                 data,
@@ -206,8 +210,10 @@ impl Transport for TcpTransport {
                 return Err(TransportError::AlreadyClosed);
             }
 
-            let mut stream = self.stream.lock().await;
-            let _ = stream.shutdown().await;
+            {
+                let mut stream = self.stream.lock().await;
+                let _ = stream.shutdown().await;
+            }
 
             debug!(peer = %self.peer_addr, "TCP transport closed");
             Ok(())
@@ -228,8 +234,10 @@ impl StreamTransport for TcpTransport {
 impl std::fmt::Debug for TcpTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TcpTransport")
+            .field("stream", &"<mutex>")
             .field("local_addr", &self.local_addr)
             .field("peer_addr", &self.peer_addr)
+            .field("read_buffer", &"<mutex>")
             .field("closed", &self.is_closed())
             .finish()
     }
@@ -406,6 +414,7 @@ impl TcpListener {
 impl std::fmt::Debug for TcpListener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TcpListener")
+            .field("listener", &self.listener)
             .field("local_addr", &self.local_addr)
             .field("closed", &self.closed.load(Ordering::Relaxed))
             .finish()

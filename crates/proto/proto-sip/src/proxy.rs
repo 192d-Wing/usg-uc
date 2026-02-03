@@ -328,6 +328,10 @@ impl RequestForwarder {
     /// 4. Optionally add Record-Route (§16.6 step 5)
     /// 5. Add Via header (§16.6 step 8)
     /// 6. Forward the request
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request forwarding fails.
     pub fn forward_request(
         &self,
         request: &SipRequest,
@@ -448,6 +452,10 @@ impl RequestForwarder {
     /// Forks a request to multiple targets.
     ///
     /// Returns forwarded requests for each target, ordered by priority and q-value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request forking fails.
     pub fn fork_request(
         &self,
         request: &SipRequest,

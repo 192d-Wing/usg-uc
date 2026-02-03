@@ -359,6 +359,10 @@ impl FinishedVerifier {
     /// ## Returns
     ///
     /// The 12-byte `verify_data`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if verify data computation fails.
     pub fn compute_verify_data(
         master_secret: &[u8; 48],
         handshake_hash: &[u8],

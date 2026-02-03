@@ -1,11 +1,10 @@
 //! Metrics command implementation.
 
-use super::CommandResult;
 use crate::args::Args;
 use uc_metrics::SbcMetrics;
 
 /// Runs the metrics command.
-pub fn run(_args: &Args) -> CommandResult {
+pub fn run(_args: &Args) {
     println!("SBC Metrics (Prometheus Format)");
     println!("===============================\n");
 
@@ -63,8 +62,6 @@ pub fn run(_args: &Args) -> CommandResult {
             metric.help
         );
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -79,7 +76,6 @@ mod tests {
             ..Default::default()
         };
 
-        let result = run(&args);
-        assert!(result.is_ok());
+        run(&args);
     }
 }

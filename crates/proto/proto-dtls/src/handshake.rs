@@ -221,6 +221,10 @@ pub struct Handshake {
 
 impl Handshake {
     /// Creates a new handshake context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if handshake context creation fails.
     pub fn new(
         is_client: bool,
         cert_chain: Vec<Vec<u8>>,

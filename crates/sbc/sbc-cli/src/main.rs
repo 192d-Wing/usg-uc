@@ -43,11 +43,20 @@ fn main() {
     }
 
     let result = match &args.command {
-        Command::Status => commands::status::run(&args),
+        Command::Status => {
+            commands::status::run(&args);
+            Ok(())
+        }
         Command::Config(cmd) => commands::config::run(&args, cmd.clone()),
         Command::Calls(cmd) => commands::calls::run(&args, cmd.clone()),
-        Command::Health => commands::health::run(&args),
-        Command::Metrics => commands::metrics::run(&args),
+        Command::Health => {
+            commands::health::run(&args);
+            Ok(())
+        }
+        Command::Metrics => {
+            commands::metrics::run(&args);
+            Ok(())
+        }
         Command::Version => {
             println!("sbc-cli {}", env!("CARGO_PKG_VERSION"));
             Ok(())

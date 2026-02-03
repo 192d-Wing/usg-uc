@@ -257,7 +257,9 @@ impl Transport for UdpTransport {
 impl std::fmt::Debug for UdpTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UdpTransport")
+            .field("socket", &self.socket)
             .field("local_addr", &self.local_addr)
+            .field("recv_buffer", &"<mutex>")
             .field("closed", &self.is_closed())
             .finish()
     }

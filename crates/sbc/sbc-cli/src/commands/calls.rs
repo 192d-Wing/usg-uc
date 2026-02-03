@@ -8,15 +8,21 @@ use std::collections::HashMap;
 /// Runs the calls command.
 pub fn run(args: &Args, cmd: CallsCommand) -> CommandResult {
     match cmd {
-        CallsCommand::List => list_calls(args),
+        CallsCommand::List => {
+            list_calls(args);
+            Ok(())
+        }
         CallsCommand::Show { call_id } => show_call(args, &call_id),
         CallsCommand::Terminate { call_id } => terminate_call(args, &call_id),
-        CallsCommand::Stats => show_stats(args),
+        CallsCommand::Stats => {
+            show_stats(args);
+            Ok(())
+        }
     }
 }
 
 /// Lists active calls.
-fn list_calls(_args: &Args) -> CommandResult {
+fn list_calls(_args: &Args) {
     println!("Active Calls");
     println!("============\n");
 
@@ -44,7 +50,7 @@ fn list_calls(_args: &Args) -> CommandResult {
 
     if calls.is_empty() {
         println!("No active calls");
-        return Ok(());
+        return;
     }
 
     println!(
@@ -59,8 +65,6 @@ fn list_calls(_args: &Args) -> CommandResult {
 
     println!();
     println!("Total: 3 active calls");
-
-    Ok(())
 }
 
 /// Shows call details.
@@ -128,7 +132,7 @@ fn terminate_call(args: &Args, call_id: &str) -> CommandResult {
 }
 
 /// Shows call statistics.
-fn show_stats(args: &Args) -> CommandResult {
+fn show_stats(args: &Args) {
     let formatter = OutputFormatter::new(args.format);
 
     println!("Call Statistics");
@@ -163,8 +167,6 @@ fn show_stats(args: &Args) -> CommandResult {
     codecs.insert("G.711 μ-law".to_string(), "678 (11.9%)".to_string());
     codecs.insert("G.711 A-law".to_string(), "310 (5.5%)".to_string());
     println!("{}", formatter.format_map(&codecs));
-
-    Ok(())
 }
 
 #[cfg(test)]

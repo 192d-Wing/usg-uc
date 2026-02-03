@@ -236,7 +236,7 @@ impl TurnClient {
         }
 
         // Create Allocate request
-        let mut request = self.create_allocate_request()?;
+        let mut request = Self::create_allocate_request()?;
 
         // First attempt (may get 401)
         match self.send_request(&request).await {
@@ -251,7 +251,7 @@ impl TurnClient {
         }
 
         // Retry with updated credentials (nonce/realm from 401)
-        request = self.create_allocate_request()?;
+        request = Self::create_allocate_request()?;
         let response = self.send_request(&request).await?;
         self.handle_allocate_response(&response).await
     }
@@ -276,7 +276,7 @@ impl TurnClient {
             }
         }
 
-        let request = self.create_permission_request(peer_addr)?;
+        let request = Self::create_permission_request(peer_addr)?;
         let response = self.send_request(&request).await?;
 
         // Check for success
@@ -314,7 +314,7 @@ impl TurnClient {
             return Err(TurnError::InvalidChannel { channel });
         }
 
-        let request = self.create_channel_bind_request(channel, peer_addr)?;
+        let request = Self::create_channel_bind_request(channel, peer_addr)?;
         let response = self.send_request(&request).await?;
 
         // Check for success
@@ -343,7 +343,7 @@ impl TurnClient {
             }
         }
 
-        let request = self.create_refresh_request(lifetime)?;
+        let request = Self::create_refresh_request(lifetime)?;
         let response = self.send_request(&request).await?;
 
         // Check for success
@@ -392,7 +392,7 @@ impl TurnClient {
     }
 
     /// Creates an Allocate request.
-    fn create_allocate_request(&self) -> TurnResult<StunMessage> {
+    fn create_allocate_request() -> TurnResult<StunMessage> {
         let mut transaction_id = [0u8; 12];
         uc_crypto::random::fill_random(&mut transaction_id).map_err(|_| {
             TurnError::AllocationFailed {
@@ -413,7 +413,7 @@ impl TurnClient {
     }
 
     /// Creates a CreatePermission request.
-    fn create_permission_request(&self, _peer_addr: SocketAddr) -> TurnResult<StunMessage> {
+    fn create_permission_request(_peer_addr: SocketAddr) -> TurnResult<StunMessage> {
         let mut transaction_id = [0u8; 12];
         uc_crypto::random::fill_random(&mut transaction_id).map_err(|_| {
             TurnError::AllocationFailed {
@@ -432,7 +432,6 @@ impl TurnClient {
 
     /// Creates a ChannelBind request.
     fn create_channel_bind_request(
-        &self,
         _channel: u16,
         _peer_addr: SocketAddr,
     ) -> TurnResult<StunMessage> {
@@ -452,7 +451,7 @@ impl TurnClient {
     }
 
     /// Creates a Refresh request.
-    fn create_refresh_request(&self, _lifetime: Option<u32>) -> TurnResult<StunMessage> {
+    fn create_refresh_request(_lifetime: Option<u32>) -> TurnResult<StunMessage> {
         let mut transaction_id = [0u8; 12];
         uc_crypto::random::fill_random(&mut transaction_id).map_err(|_| {
             TurnError::AllocationFailed {
@@ -496,7 +495,7 @@ impl TurnClient {
                 Ok(Ok(response)) => {
                     // Check for 401 Unauthorized
                     if response.msg_type.class == StunClass::ErrorResponse
-                        && let Some(code) = self.extract_error_code(&response)
+                        && let Some(code) = Self::extract_error_code(&response)
                         && code == 401
                     {
                         // Update credentials from response
@@ -555,9 +554,8 @@ impl TurnClient {
     /// Handles an Allocate response.
     async fn handle_allocate_response(&self, response: &StunMessage) -> TurnResult<SocketAddr> {
         if response.msg_type.class == StunClass::ErrorResponse {
-            let code = self.extract_error_code(response).unwrap_or(500);
-            let reason = self
-                .extract_error_reason(response)
+            let code = Self::extract_error_code(response).unwrap_or(500);
+            let reason = Self::extract_error_reason(response)
                 .unwrap_or_else(|| "unknown".to_string());
             return Err(TurnError::AllocationFailed {
                 reason: format!("server error {code}: {reason}"),
@@ -566,14 +564,13 @@ impl TurnClient {
 
         // Extract XOR-RELAYED-ADDRESS
         let relayed_addr =
-            self.extract_relayed_address(response)
+            Self::extract_relayed_address(response)
                 .ok_or_else(|| TurnError::AllocationFailed {
                     reason: "response missing XOR-RELAYED-ADDRESS".to_string(),
                 })?;
 
         // Extract lifetime
-        let lifetime = self
-            .extract_lifetime(response)
+        let lifetime = Self::extract_lifetime(response)
             .unwrap_or(crate::DEFAULT_LIFETIME);
 
         // Store allocation
@@ -608,7 +605,7 @@ impl TurnClient {
     }
 
     /// Extracts error code from response.
-    fn extract_error_code(&self, response: &StunMessage) -> Option<u16> {
+    fn extract_error_code(response: &StunMessage) -> Option<u16> {
         for attr in &response.attributes {
             if let StunAttribute::ErrorCode { code, .. } = attr {
                 return Some(*code);
@@ -618,7 +615,7 @@ impl TurnClient {
     }
 
     /// Extracts error reason from response.
-    fn extract_error_reason(&self, response: &StunMessage) -> Option<String> {
+    fn extract_error_reason(response: &StunMessage) -> Option<String> {
         for attr in &response.attributes {
             if let StunAttribute::ErrorCode { reason, .. } = attr {
                 return Some(reason.clone());
@@ -628,14 +625,14 @@ impl TurnClient {
     }
 
     /// Extracts XOR-RELAYED-ADDRESS from response.
-    fn extract_relayed_address(&self, response: &StunMessage) -> Option<SocketAddr> {
+    fn extract_relayed_address(response: &StunMessage) -> Option<SocketAddr> {
         // For now, check XOR-MAPPED-ADDRESS as a fallback
         // A full implementation would parse TURN-specific attributes
         response.xor_mapped_address()
     }
 
     /// Extracts LIFETIME from response.
-    fn extract_lifetime(&self, _response: &StunMessage) -> Option<u32> {
+    fn extract_lifetime(_response: &StunMessage) -> Option<u32> {
         // A full implementation would parse the LIFETIME attribute
         // For now, return None to use default
         None
@@ -645,9 +642,12 @@ impl TurnClient {
 impl std::fmt::Debug for TurnClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TurnClient")
+            .field("socket", &self.socket)
             .field("server", &self.server)
+            .field("credentials", &"<credentials>")
             .field("timeout", &self.timeout)
             .field("max_retries", &self.max_retries)
+            .field("allocation", &"<mutex>")
             .finish()
     }
 }

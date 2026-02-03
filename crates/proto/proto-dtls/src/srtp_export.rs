@@ -129,6 +129,10 @@ impl SrtpKeyExporter {
     ///
     /// This is useful for testing or when keys are derived through
     /// other means.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if keying material creation fails.
     pub fn create_keying_material(
         &self,
         client_write_key: Vec<u8>,
@@ -185,6 +189,10 @@ impl SrtpKeyExporter {
     /// In a full implementation, this would be called by the DTLS
     /// handshake layer with the actual secrets. For now, this provides
     /// the interface for integration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if keying material derivation fails.
     pub fn derive_keying_material(
         &self,
         master_secret: &[u8],

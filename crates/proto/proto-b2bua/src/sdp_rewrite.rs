@@ -96,7 +96,7 @@ impl SdpRewriter {
         match self.characteristics.sdp_modification {
             SdpModification::Passthrough => SdpRewriteResult::passthrough(sdp.to_string()),
             SdpModification::RewriteConnection | SdpModification::FullModification => {
-                let rewritten = self.rewrite_connection_and_port(sdp, local_address);
+                let rewritten = Self::rewrite_connection_and_port(sdp, local_address);
                 SdpRewriteResult::modified(sdp.to_string(), rewritten)
             }
         }
@@ -123,7 +123,7 @@ impl SdpRewriter {
         match self.characteristics.sdp_modification {
             SdpModification::Passthrough => SdpRewriteResult::passthrough(sdp.to_string()),
             SdpModification::RewriteConnection | SdpModification::FullModification => {
-                let rewritten = self.rewrite_connection_and_port(sdp, local_address);
+                let rewritten = Self::rewrite_connection_and_port(sdp, local_address);
                 SdpRewriteResult::modified(sdp.to_string(), rewritten)
             }
         }
@@ -141,7 +141,7 @@ impl SdpRewriter {
     /// Per RFC 3264, hold is signaled by setting direction to sendonly
     /// or using 0.0.0.0 as connection address.
     pub fn rewrite_for_hold(&self, sdp: &str, local_address: &MediaAddress) -> SdpRewriteResult {
-        let mut rewritten = self.rewrite_connection_and_port(sdp, local_address);
+        let mut rewritten = Self::rewrite_connection_and_port(sdp, local_address);
 
         // Add or modify direction attribute
         // Find a=sendrecv or a=recvonly and change to a=sendonly
@@ -183,7 +183,7 @@ impl SdpRewriter {
 
     /// Rewrites SDP for resume (sendrecv).
     pub fn rewrite_for_resume(&self, sdp: &str, local_address: &MediaAddress) -> SdpRewriteResult {
-        let mut rewritten = self.rewrite_connection_and_port(sdp, local_address);
+        let mut rewritten = Self::rewrite_connection_and_port(sdp, local_address);
 
         // Change direction back to sendrecv
         rewritten = rewritten.replace("a=sendonly", "a=sendrecv");
@@ -194,7 +194,7 @@ impl SdpRewriter {
     }
 
     /// Internal: Rewrite connection (c=) and media port (m=) lines.
-    fn rewrite_connection_and_port(&self, sdp: &str, local_address: &MediaAddress) -> String {
+    fn rewrite_connection_and_port(sdp: &str, local_address: &MediaAddress) -> String {
         let mut result = String::with_capacity(sdp.len() + 100);
         let addr_type = if local_address.address.contains(':') {
             "IP6"

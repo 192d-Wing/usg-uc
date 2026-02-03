@@ -638,6 +638,10 @@ pub trait DigestHasher {
 /// * `algorithm` - The digest algorithm being used
 /// * `nonce` - Server nonce (required for session algorithms)
 /// * `cnonce` - Client nonce (required for session algorithms)
+///
+/// # Errors
+///
+/// Returns an error if HA1 computation fails.
 pub fn compute_ha1(
     hasher: &impl DigestHasher,
     username: &str,
@@ -678,6 +682,10 @@ pub fn compute_ha1(
 /// * `uri` - The digest URI
 /// * `qop` - Quality of protection option
 /// * `entity_body` - The message body (required for auth-int)
+///
+/// # Errors
+///
+/// Returns an error if HA2 computation fails.
 pub fn compute_ha2(
     hasher: &impl DigestHasher,
     method: &str,
@@ -710,6 +718,10 @@ pub fn compute_ha2(
 /// * `cnonce` - Client nonce (required if qop is set)
 /// * `qop` - Quality of protection option
 /// * `ha2` - Pre-computed HA2 value
+///
+/// # Errors
+///
+/// Returns an error if response computation fails.
 pub fn compute_response(
     hasher: &impl DigestHasher,
     ha1: &str,
@@ -755,6 +767,10 @@ pub fn compute_response(
 /// * `nc` - Nonce count
 /// * `cnonce` - Client nonce
 /// * `entity_body` - Message body (for auth-int)
+///
+/// # Errors
+///
+/// Returns an error if digest response computation fails.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_digest_response(
     hasher: &impl DigestHasher,
@@ -794,6 +810,10 @@ pub fn compute_digest_response(
 /// * `password` - The user's known password
 /// * `method` - The SIP method of the request
 /// * `entity_body` - The message body (for auth-int verification)
+///
+/// # Errors
+///
+/// Returns an error if credential verification fails.
 pub fn verify_credentials(
     hasher: &impl DigestHasher,
     credentials: &DigestCredentials,
@@ -846,6 +866,10 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 /// * `cnonce` - Client nonce (required if qop is used)
 /// * `nc` - Nonce count (required if qop is used)
 /// * `entity_body` - Message body (for auth-int)
+///
+/// # Errors
+///
+/// Returns an error if credential creation fails.
 #[allow(clippy::too_many_arguments)]
 pub fn create_credentials(
     hasher: &impl DigestHasher,

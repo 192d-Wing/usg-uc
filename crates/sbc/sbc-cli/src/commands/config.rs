@@ -9,14 +9,20 @@ use std::collections::HashMap;
 /// Runs the config command.
 pub fn run(args: &Args, cmd: ConfigCommand) -> CommandResult {
     match cmd {
-        ConfigCommand::Show => show_config(args),
+        ConfigCommand::Show => {
+            show_config(args);
+            Ok(())
+        }
         ConfigCommand::Validate { path } => validate_config(args, path),
-        ConfigCommand::Reload => reload_config(args),
+        ConfigCommand::Reload => {
+            reload_config(args);
+            Ok(())
+        }
     }
 }
 
 /// Shows current configuration.
-fn show_config(args: &Args) -> CommandResult {
+fn show_config(args: &Args) {
     let formatter = OutputFormatter::new(args.format);
 
     // In production, would fetch from API
@@ -81,8 +87,6 @@ fn show_config(args: &Args) -> CommandResult {
         config.security.require_mtls.to_string(),
     );
     println!("{}", formatter.format_map(&security));
-
-    Ok(())
 }
 
 /// Validates a configuration file.
@@ -125,7 +129,7 @@ fn validate_config(args: &Args, path: Option<String>) -> CommandResult {
 }
 
 /// Reloads configuration.
-fn reload_config(args: &Args) -> CommandResult {
+fn reload_config(args: &Args) {
     let formatter = OutputFormatter::new(args.format);
 
     // In production, would send reload signal to daemon via API
@@ -137,8 +141,6 @@ fn reload_config(args: &Args) -> CommandResult {
         "{}",
         formatter.format_status("Configuration reloaded", true)
     );
-
-    Ok(())
 }
 
 #[cfg(test)]

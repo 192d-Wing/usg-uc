@@ -102,6 +102,10 @@ impl MediaModificationValidator {
     /// 2. Media descriptions MUST remain in the same order
     /// 3. To disable a stream, port MUST be set to 0
     /// 4. Media type and transport MUST NOT change
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the modification violates RFC 3264 rules.
     pub fn validate(
         &self,
         original: &SessionDescription,
@@ -245,6 +249,10 @@ pub enum MediaModificationType {
 /// 2. Match media types at each index
 /// 3. Select formats from those offered
 /// 4. Set appropriate direction based on offer
+///
+/// # Errors
+///
+/// Returns an error if answer generation fails or offer is invalid.
 pub fn generate_answer(
     offer: &SessionDescription,
     local_capabilities: &LocalCapabilities,
@@ -468,6 +476,10 @@ impl LocalMediaCapability {
 /// To put a stream on hold, the direction is changed to:
 /// - sendonly: if we want to keep sending but stop receiving
 /// - inactive: if we want to stop both
+///
+/// # Errors
+///
+/// Returns an error if the media index is invalid.
 pub fn hold_media_stream(
     sdp: &mut SessionDescription,
     media_index: usize,
@@ -501,6 +513,10 @@ pub fn hold_media_stream(
 /// ## RFC 3264 §8.4.3 Resuming from Hold
 ///
 /// To resume from hold, change direction back to sendrecv or recvonly.
+///
+/// # Errors
+///
+/// Returns an error if the media index is invalid.
 pub fn resume_media_stream(
     sdp: &mut SessionDescription,
     media_index: usize,
@@ -567,6 +583,10 @@ pub fn disable_media_stream(sdp: &mut SessionDescription, media_index: usize) ->
 /// ## RFC 3264 §8.4 Re-enabling a Stream
 ///
 /// A disabled stream (port=0) can be re-enabled by setting a new port.
+///
+/// # Errors
+///
+/// Returns an error if the media index is invalid.
 pub fn enable_media_stream(
     sdp: &mut SessionDescription,
     media_index: usize,
