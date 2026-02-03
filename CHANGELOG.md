@@ -224,6 +224,35 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
     - All types implement Debug with [REDACTED]
     - 7 tests for sensitive types
 
+**Phase 24.7: Deployment & Packaging**
+
+- `crates/client/installer/` directory for Windows packaging
+  - `usg-sip-client.wxs` - WiX v4.x MSI installer configuration
+    - Program Files installation with proper permissions
+    - Start Menu and Desktop shortcuts
+    - Registry entries for uninstall
+    - SIP/SIPS URI handler registration for click-to-call
+    - Upgrade support via UpgradeCode
+  - `build-installer.ps1` - PowerShell build script
+    - Debug and Release build modes
+    - CNSA 2.0 compliant code signing (SHA-384)
+    - MSI creation via WiX Toolset
+    - Portable ZIP package creation
+  - `resources/license.rtf` - License agreement for installer
+  - `resources/default-settings.toml` - Default configuration
+  - `README.md` - Installer documentation
+
+- `crates/client/client-gui/` Windows integration
+  - `app.manifest` - Windows application manifest
+    - UAC settings (asInvoker - no elevation required)
+    - DPI awareness (Per-Monitor V2)
+    - Visual styles (Common Controls 6)
+    - Windows version compatibility (Windows 7+)
+  - `build.rs` - Build script for Windows resources
+    - Version info resource generation
+    - Manifest embedding
+    - Icon embedding support
+
 **CNSA 2.0 Compliance Documentation**
 
 - `CNSA_COMPLIANCE.md` in crates/client/

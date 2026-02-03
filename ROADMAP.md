@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.6 (Polish & Security Hardening) complete
+**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.7 (Deployment & Packaging) complete
 
 ---
 
@@ -636,12 +636,19 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **Tests**: 69 total tests (client crates)
 
-**Phase 24.7: Deployment & Packaging** (Next)
+**Phase 24.7: Deployment & Packaging** ✅
 
-- 🚧 MSI installer via WiX
-- 🚧 Windows code signing
-- 🚧 Auto-update mechanism
-- 🚧 User documentation
+- ✅ WiX v4.x installer configuration (usg-sip-client.wxs)
+- ✅ MSI installer with registry entries and URI handlers
+- ✅ PowerShell build script (build-installer.ps1)
+- ✅ CNSA 2.0 compliant code signing (SHA-384)
+- ✅ Application manifest (DPI awareness, UAC, visual styles)
+- ✅ Build.rs for Windows resource embedding
+- ✅ Portable ZIP package option
+- ✅ Default settings configuration (default-settings.toml)
+- ✅ License agreement (license.rtf)
+
+**Tests**: 69 total tests (client crates)
 
 ---
 

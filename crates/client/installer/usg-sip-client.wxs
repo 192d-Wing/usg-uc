@@ -1,0 +1,210 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  USG SIP Soft Client - WiX Installer Configuration
+
+  Build with: wix build -o dist/USG-SIP-Client.msi usg-sip-client.wxs
+
+  Requirements:
+  - WiX Toolset v4.x (https://wixtoolset.org/)
+  - Rust release build: cargo build --release -p client-gui
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <!-- Product Definition -->
+  <Package
+    Name="USG SIP Soft Client"
+    Version="0.1.0"
+    Manufacturer="USG Communications"
+    UpgradeCode="A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
+    Language="1033"
+    Codepage="1252"
+    Scope="perMachine">
+
+    <!-- Package metadata -->
+    <SummaryInformation
+      Keywords="SIP, VoIP, CNSA, Government, Soft Client"
+      Description="CNSA 2.0 compliant SIP soft client for enterprise/government use. Smart card authentication only."
+      Manufacturer="USG Communications" />
+
+    <!-- Media definition -->
+    <Media Id="1" Cabinet="usg_sip_client.cab" EmbedCab="yes" />
+
+    <!-- Upgrade handling for future versions -->
+    <MajorUpgrade
+      DowngradeErrorMessage="A newer version of [ProductName] is already installed."
+      Schedule="afterInstallInitialize" />
+
+    <!-- Feature hierarchy -->
+    <Feature Id="MainApplication" Title="USG SIP Client" Level="1">
+      <ComponentGroupRef Id="ApplicationComponents" />
+      <ComponentGroupRef Id="RegistryComponents" />
+      <ComponentGroupRef Id="ShortcutComponents" />
+    </Feature>
+
+    <!-- Custom UI sequence -->
+    <UI>
+      <UIRef Id="WixUI_InstallDir" />
+      <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    </UI>
+
+    <!-- License agreement -->
+    <WixVariable Id="WixUILicenseRtf" Value="resources/license.rtf" />
+
+    <!-- Banner and dialog images -->
+    <WixVariable Id="WixUIBannerBmp" Value="resources/banner.bmp" />
+    <WixVariable Id="WixUIDialogBmp" Value="resources/dialog.bmp" />
+
+  </Package>
+
+  <!-- Directory Structure -->
+  <Fragment>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="USG SIP Client">
+        <Directory Id="ConfigDir" Name="config" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="USG SIP Client" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder" />
+  </Fragment>
+
+  <!-- Application Components -->
+  <Fragment>
+    <ComponentGroup Id="ApplicationComponents" Directory="INSTALLFOLDER">
+
+      <!-- Main executable -->
+      <Component Id="MainExecutable" Guid="B2C3D4E5-F6A7-8901-BCDE-F23456789012">
+        <File
+          Id="SipSoftClientExe"
+          Source="$(var.BuildOutput)\sip-softclient.exe"
+          KeyPath="yes">
+          <!-- File association for SIP URIs -->
+          <Shortcut
+            Id="StartMenuShortcut"
+            Directory="ApplicationProgramsFolder"
+            Name="USG SIP Client"
+            Description="CNSA 2.0 compliant SIP soft client"
+            WorkingDirectory="INSTALLFOLDER"
+            Icon="AppIcon.ico"
+            Advertise="yes" />
+        </File>
+      </Component>
+
+      <!-- Application icon -->
+      <Component Id="AppIconComponent" Guid="C3D4E5F6-A7B8-9012-CDEF-345678901234">
+        <File
+          Id="AppIcon"
+          Source="resources/app-icon.ico"
+          Name="usg-sip-client.ico" />
+      </Component>
+
+      <!-- Default configuration -->
+      <Component Id="DefaultConfig" Guid="D4E5F6A7-B8C9-0123-DEFA-456789012345" Directory="ConfigDir">
+        <File
+          Id="DefaultSettingsToml"
+          Source="resources/default-settings.toml"
+          Name="settings.toml" />
+      </Component>
+
+    </ComponentGroup>
+  </Fragment>
+
+  <!-- Registry Components -->
+  <Fragment>
+    <ComponentGroup Id="RegistryComponents" Directory="INSTALLFOLDER">
+
+      <!-- Application registration -->
+      <Component Id="AppRegistration" Guid="E5F6A7B8-C9D0-1234-EFAB-567890123456">
+        <RegistryKey Root="HKLM" Key="SOFTWARE\USG Communications\SIP Client">
+          <RegistryValue Type="string" Name="InstallPath" Value="[INSTALLFOLDER]" />
+          <RegistryValue Type="string" Name="Version" Value="0.1.0" />
+        </RegistryKey>
+      </Component>
+
+      <!-- Autostart registration (optional) -->
+      <Component Id="AutostartRegistration" Guid="F6A7B8C9-D0E1-2345-FABC-678901234567">
+        <Condition>AUTOSTART="1"</Condition>
+        <RegistryValue
+          Root="HKCU"
+          Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+          Name="USG SIP Client"
+          Type="string"
+          Value="[INSTALLFOLDER]sip-softclient.exe --minimized"
+          KeyPath="yes" />
+      </Component>
+
+      <!-- SIP URI handler registration -->
+      <Component Id="SipUriHandler" Guid="A7B8C9D0-E1F2-3456-ABCD-789012345678">
+        <RegistryKey Root="HKCR" Key="sip">
+          <RegistryValue Type="string" Value="URL:SIP Protocol" />
+          <RegistryValue Type="string" Name="URL Protocol" Value="" />
+        </RegistryKey>
+        <RegistryKey Root="HKCR" Key="sip\DefaultIcon">
+          <RegistryValue Type="string" Value="[INSTALLFOLDER]sip-softclient.exe,0" />
+        </RegistryKey>
+        <RegistryKey Root="HKCR" Key="sip\shell\open\command">
+          <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]sip-softclient.exe&quot; &quot;%1&quot;" />
+        </RegistryKey>
+
+        <!-- SIPS handler -->
+        <RegistryKey Root="HKCR" Key="sips">
+          <RegistryValue Type="string" Value="URL:Secure SIP Protocol" />
+          <RegistryValue Type="string" Name="URL Protocol" Value="" />
+        </RegistryKey>
+        <RegistryKey Root="HKCR" Key="sips\DefaultIcon">
+          <RegistryValue Type="string" Value="[INSTALLFOLDER]sip-softclient.exe,0" />
+        </RegistryKey>
+        <RegistryKey Root="HKCR" Key="sips\shell\open\command">
+          <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]sip-softclient.exe&quot; &quot;%1&quot;" />
+        </RegistryKey>
+      </Component>
+
+    </ComponentGroup>
+  </Fragment>
+
+  <!-- Shortcut Components -->
+  <Fragment>
+    <ComponentGroup Id="ShortcutComponents">
+
+      <!-- Desktop shortcut (optional) -->
+      <Component Id="DesktopShortcut" Guid="B8C9D0E1-F2A3-4567-BCDE-890123456789" Directory="DesktopFolder">
+        <Condition>DESKTOP_SHORTCUT="1"</Condition>
+        <Shortcut
+          Id="DesktopShortcutLink"
+          Name="USG SIP Client"
+          Description="CNSA 2.0 compliant SIP soft client"
+          Target="[INSTALLFOLDER]sip-softclient.exe"
+          WorkingDirectory="INSTALLFOLDER"
+          Icon="AppIcon.ico" />
+        <RegistryValue Root="HKCU" Key="SOFTWARE\USG Communications\SIP Client"
+                       Name="DesktopShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+
+      <!-- Start menu folder -->
+      <Component Id="StartMenuFolder" Guid="C9D0E1F2-A3B4-5678-CDEF-901234567890" Directory="ApplicationProgramsFolder">
+        <RemoveFolder Id="RemoveStartMenuFolder" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="SOFTWARE\USG Communications\SIP Client"
+                       Name="StartMenu" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+
+    </ComponentGroup>
+  </Fragment>
+
+  <!-- Icon definition -->
+  <Fragment>
+    <Icon Id="AppIcon.ico" SourceFile="resources/app-icon.ico" />
+  </Fragment>
+
+  <!-- Installation properties -->
+  <Fragment>
+    <Property Id="AUTOSTART" Value="0" />
+    <Property Id="DESKTOP_SHORTCUT" Value="1" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/example/usg-uc" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/example/usg-uc" />
+  </Fragment>
+
+</Wix>
