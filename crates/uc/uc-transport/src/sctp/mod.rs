@@ -23,12 +23,12 @@
 pub mod chunk;
 pub mod congestion;
 pub mod packet;
+pub mod path;
 pub mod state;
 pub mod stream;
 pub mod timer;
 
 // These modules will be added in subsequent phases:
-// pub mod path;
 // pub mod association;
 // pub mod listener;
 // pub mod cookie;
@@ -44,6 +44,7 @@ pub use packet::{HEADER_SIZE, MAX_PACKET_SIZE, SctpPacket};
 pub use state::{AssociationState, StateAction, StateEvent, StateMachine};
 pub use stream::{Stream, StreamError, StreamManager};
 pub use timer::{RtoCalculator, Timer, TimerManager, TimerType};
+pub use path::{Path, PathId, PathManager, PathState};
 
 use crate::error::{TransportError, TransportResult};
 use crate::{MAX_STREAM_MESSAGE_SIZE, ReceivedMessage, StreamTransport, Transport};
