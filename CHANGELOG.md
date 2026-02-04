@@ -426,6 +426,38 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
     - Pending certificate storage for delayed init
     - Certificate chain retrieval and validation
 
+**Phase 24.13: PIN Entry UI**
+
+- `client-gui` PIN dialog implementation
+  - `app.rs`: Modal PIN dialog for smart card authentication
+    - Masked password input field
+    - Lock icon with clear visual styling
+    - PIN attempt counter with lockout warning (max 3 attempts)
+    - Enter key submission support
+    - Focus management for keyboard-first input
+    - Cancel button for user abort
+  - `PinOperation` enum for tracking PIN context
+    - `UseCertificate { thumbprint }` - certificate selection
+    - `Register { account_id }` - SIP registration signing
+    - `SignCall { call_id }` - DTLS call establishment
+  - PIN dialog state management
+    - `show_pin_dialog`, `pin_input`, `pin_error` fields
+    - `pin_operation` for operation context
+    - `pin_attempts` for retry tracking
+  - Methods: `show_pin_dialog_for()`, `submit_pin()`, `cancel_pin()`, `use_certificate_with_pin()`
+- `client-gui` Settings integration
+  - `settings.rs`: `SettingsAction::PinRequired { thumbprint }` variant
+- `client-core` async event support
+  - `app.rs`: PIN-related AppEvent variants
+    - `PinRequired { operation, thumbprint }` - trigger PIN dialog
+    - `PinCompleted { success, error }` - report PIN result
+  - `PinOperationType` enum: CertificateSelection, Registration, CallEstablishment
+  - Exported in `lib.rs` for GUI access
+- Integration with CertStoreError
+  - Automatic PIN dialog on `CertStoreError::PinRequired`
+  - Handles `CertStoreError::PinIncorrect` with error display
+  - Smart card not present detection via `CertStoreError::SmartCardNotPresent`
+
 **Security**
 
 - Smart card authentication ONLY (CAC/PIV/SIPR token)

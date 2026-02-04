@@ -29,6 +29,30 @@ pub enum ActiveView {
     Settings,
 }
 
+/// Operation that requires PIN entry.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Register and SignCall will be used in future phases
+pub enum PinOperation {
+    /// Using a certificate for authentication.
+    UseCertificate {
+        /// Certificate thumbprint.
+        thumbprint: String,
+    },
+    /// Signing during registration.
+    Register {
+        /// Account ID.
+        account_id: String,
+    },
+    /// Signing during call establishment (DTLS).
+    SignCall {
+        /// Call ID.
+        call_id: String,
+    },
+}
+
+/// Maximum PIN retry attempts before lockout warning.
+const MAX_PIN_ATTEMPTS: u8 = 3;
+
 /// Main GUI application state.
 pub struct SipClientApp {
     /// Active view.
@@ -67,6 +91,16 @@ pub struct SipClientApp {
     pending_cert_thumbprint: Option<String>,
     /// Notification manager for toast notifications.
     notifications: NotificationManager,
+    /// Show PIN entry dialog.
+    show_pin_dialog: bool,
+    /// PIN input field (masked).
+    pin_input: String,
+    /// PIN dialog error message.
+    pin_error: Option<String>,
+    /// Operation that requires PIN.
+    pin_operation: Option<PinOperation>,
+    /// Number of PIN retry attempts.
+    pin_attempts: u8,
 }
 
 impl SipClientApp {
@@ -130,6 +164,11 @@ impl SipClientApp {
             notifications: NotificationManager::new("USG SIP Client"),
             pending_cert_chain: None,
             pending_cert_thumbprint: None,
+            show_pin_dialog: false,
+            pin_input: String::new(),
+            pin_error: None,
+            pin_operation: None,
+            pin_attempts: 0,
         }
     }
 
@@ -252,6 +291,26 @@ impl SipClientApp {
                 AppEvent::ContactsChanged => {
                     self.status_message = "Contacts updated".to_string();
                 }
+                AppEvent::PinRequired {
+                    operation,
+                    thumbprint,
+                } => {
+                    info!(operation = ?operation, thumbprint = ?thumbprint, "PIN required from core");
+                    // Map core operation type to GUI operation type
+                    if let Some(tp) = thumbprint {
+                        self.show_pin_dialog_for(PinOperation::UseCertificate { thumbprint: tp });
+                    }
+                }
+                AppEvent::PinCompleted { success, error } => {
+                    if success {
+                        info!("PIN operation completed successfully");
+                        self.show_pin_dialog = false;
+                        self.status_message = "Authentication successful".to_string();
+                    } else if let Some(err_msg) = error {
+                        warn!(error = %err_msg, "PIN operation failed");
+                        self.pin_error = Some(err_msg);
+                    }
+                }
             }
         }
     }
@@ -370,6 +429,243 @@ impl SipClientApp {
                 });
         }
     }
+
+    /// Renders the PIN entry dialog for smart card authentication.
+    fn render_pin_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_pin_dialog {
+            return;
+        }
+
+        let mut submit_pin = false;
+        let mut cancel_pin = false;
+
+        egui::Window::new("Smart Card PIN")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(320.0);
+
+                // Icon and title
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("\u{1F512}").size(24.0)); // Lock emoji
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("Enter Smart Card PIN")
+                                .strong()
+                                .size(16.0),
+                        );
+                        ui.label(
+                            egui::RichText::new("Your PIN is required to access the private key")
+                                .small()
+                                .color(egui::Color32::GRAY),
+                        );
+                    });
+                });
+
+                ui.add_space(16.0);
+
+                // Show which operation requires PIN
+                if let Some(ref operation) = self.pin_operation {
+                    let op_text = match operation {
+                        PinOperation::UseCertificate { thumbprint } => {
+                            format!("Certificate: ...{}", &thumbprint[thumbprint.len().saturating_sub(8)..])
+                        }
+                        PinOperation::Register { account_id } => {
+                            format!("Registration: {}", account_id)
+                        }
+                        PinOperation::SignCall { call_id } => {
+                            format!("Call: {}", call_id)
+                        }
+                    };
+                    ui.label(
+                        egui::RichText::new(op_text)
+                            .small()
+                            .color(egui::Color32::LIGHT_BLUE),
+                    );
+                    ui.add_space(8.0);
+                }
+
+                // PIN input field (masked)
+                ui.label("PIN:");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.pin_input)
+                        .password(true)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Enter PIN"),
+                );
+
+                // Focus the input field when dialog opens
+                if response.gained_focus() || self.pin_input.is_empty() {
+                    response.request_focus();
+                }
+
+                // Submit on Enter key
+                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit_pin = true;
+                }
+
+                // Error message
+                if let Some(ref error) = self.pin_error {
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(error).color(egui::Color32::RED));
+                }
+
+                // Attempt counter warning
+                if self.pin_attempts > 0 {
+                    ui.add_space(4.0);
+                    let remaining = MAX_PIN_ATTEMPTS.saturating_sub(self.pin_attempts);
+                    let warning_color = if remaining <= 1 {
+                        egui::Color32::RED
+                    } else {
+                        egui::Color32::YELLOW
+                    };
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Attempts remaining: {}",
+                            remaining
+                        ))
+                        .small()
+                        .color(warning_color),
+                    );
+                }
+
+                ui.add_space(16.0);
+
+                // Buttons
+                ui.horizontal(|ui| {
+                    // Cancel button
+                    if ui.button("Cancel").clicked() {
+                        cancel_pin = true;
+                    }
+
+                    ui.add_space(ui.available_width() - 60.0);
+
+                    // OK button
+                    let ok_enabled = !self.pin_input.is_empty();
+                    if ui
+                        .add_enabled(ok_enabled, egui::Button::new("OK"))
+                        .clicked()
+                    {
+                        submit_pin = true;
+                    }
+                });
+            });
+
+        // Handle actions after dialog rendering
+        if submit_pin {
+            self.submit_pin();
+        } else if cancel_pin {
+            self.cancel_pin();
+        }
+    }
+
+    /// Shows the PIN dialog for an operation.
+    fn show_pin_dialog_for(&mut self, operation: PinOperation) {
+        info!(operation = ?operation, "Showing PIN dialog");
+        self.pin_operation = Some(operation);
+        self.pin_input.clear();
+        self.pin_error = None;
+        self.pin_attempts = 0;
+        self.show_pin_dialog = true;
+    }
+
+    /// Handles PIN submission.
+    fn submit_pin(&mut self) {
+        let pin = self.pin_input.clone();
+        self.pin_input.clear(); // Clear immediately for security
+
+        if pin.is_empty() {
+            self.pin_error = Some("PIN cannot be empty".to_string());
+            return;
+        }
+
+        info!("PIN submitted for operation");
+        self.pin_attempts += 1;
+
+        // Process the PIN based on operation
+        if let Some(operation) = self.pin_operation.take() {
+            match operation {
+                PinOperation::UseCertificate { thumbprint } => {
+                    self.use_certificate_with_pin(&thumbprint, &pin);
+                }
+                PinOperation::Register { account_id } => {
+                    // TODO: Pass PIN to registration agent
+                    self.status_message = format!("PIN entered for registration: {}", account_id);
+                    self.show_pin_dialog = false;
+                }
+                PinOperation::SignCall { call_id } => {
+                    // TODO: Pass PIN to call signing
+                    self.status_message = format!("PIN entered for call: {}", call_id);
+                    self.show_pin_dialog = false;
+                }
+            }
+        }
+    }
+
+    /// Handles PIN cancellation.
+    fn cancel_pin(&mut self) {
+        info!("PIN entry cancelled");
+        self.pin_input.clear();
+        self.pin_error = None;
+        self.pin_operation = None;
+        self.pin_attempts = 0;
+        self.show_pin_dialog = false;
+        self.status_message = "PIN entry cancelled".to_string();
+    }
+
+    /// Uses certificate with PIN for signing operations.
+    fn use_certificate_with_pin(&mut self, thumbprint: &str, _pin: &str) {
+        use client_core::CertificateStore;
+
+        // On Windows, the CryptoAPI handles PIN entry via system dialog
+        // This function is for future use when we implement custom PIN handling
+        // For now, we proceed with the certificate operation
+
+        let cert_store = CertificateStore::open_personal();
+
+        match cert_store.get_certificate_chain(thumbprint) {
+            Ok(cert_chain) => {
+                info!(
+                    thumbprint = %thumbprint,
+                    chain_length = cert_chain.len(),
+                    "Retrieved certificate chain after PIN entry"
+                );
+
+                if let Some(ref mut app) = self.client_app {
+                    app.set_client_certificate(cert_chain.clone(), thumbprint.to_string());
+                    self.status_message = "Certificate configured for authentication".to_string();
+                    info!("Certificate configured in ClientApp");
+                } else {
+                    self.pending_cert_chain = Some(cert_chain);
+                    self.pending_cert_thumbprint = Some(thumbprint.to_string());
+                    self.status_message = "Certificate will be used when connecting".to_string();
+                }
+
+                self.show_pin_dialog = false;
+            }
+            Err(e) => {
+                let error_str = e.to_string();
+
+                // Check for PIN-related errors
+                if error_str.contains("PIN") {
+                    self.pin_error = Some("Incorrect PIN".to_string());
+                    self.pin_operation = Some(PinOperation::UseCertificate {
+                        thumbprint: thumbprint.to_string(),
+                    });
+
+                    if self.pin_attempts >= MAX_PIN_ATTEMPTS {
+                        self.pin_error = Some("Too many incorrect attempts. Card may be locked.".to_string());
+                        warn!("PIN attempt limit reached");
+                    }
+                } else {
+                    self.status_message = format!("Failed to get certificate: {}", e);
+                    self.show_pin_dialog = false;
+                    warn!(error = %e, "Failed to get certificate chain");
+                }
+            }
+        }
+    }
 }
 
 impl eframe::App for SipClientApp {
@@ -414,8 +710,9 @@ impl eframe::App for SipClientApp {
             }
         });
 
-        // Error dialog
+        // Dialogs (rendered last for z-order)
         self.render_error_dialog(ctx);
+        self.render_pin_dialog(ctx);
 
         // Request repaint for animations
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -526,11 +823,15 @@ impl SipClientApp {
                 info!(thumbprint = %thumbprint, "Using certificate for authentication");
                 self.use_certificate(&thumbprint);
             }
+            crate::views::SettingsAction::PinRequired { thumbprint } => {
+                info!(thumbprint = %thumbprint, "PIN required for certificate operation");
+                self.show_pin_dialog_for(PinOperation::UseCertificate { thumbprint });
+            }
         }
     }
 
     fn use_certificate(&mut self, thumbprint: &str) {
-        use client_core::CertificateStore;
+        use client_core::{CertStoreError, CertificateStore};
 
         let cert_store = CertificateStore::open_personal();
 
@@ -543,6 +844,20 @@ impl SipClientApp {
                 self.status_message =
                     "Certificate does not have an associated private key".to_string();
                 warn!(thumbprint = %thumbprint, "No private key for certificate");
+                return;
+            }
+            Err(CertStoreError::PinRequired) => {
+                // Smart card needs PIN - show dialog
+                info!(thumbprint = %thumbprint, "PIN required for certificate");
+                self.show_pin_dialog_for(PinOperation::UseCertificate {
+                    thumbprint: thumbprint.to_string(),
+                });
+                return;
+            }
+            Err(CertStoreError::SmartCardNotPresent) => {
+                self.status_message = "Please insert your smart card".to_string();
+                self.registration_state = RegistrationState::SmartCardNotPresent;
+                warn!("Smart card not present");
                 return;
             }
             Err(e) => {
@@ -573,6 +888,19 @@ impl SipClientApp {
                     self.status_message =
                         "Certificate will be used when connecting".to_string();
                 }
+            }
+            Err(CertStoreError::PinRequired) => {
+                // Smart card needs PIN - show dialog
+                info!(thumbprint = %thumbprint, "PIN required for certificate chain");
+                self.show_pin_dialog_for(PinOperation::UseCertificate {
+                    thumbprint: thumbprint.to_string(),
+                });
+            }
+            Err(CertStoreError::PinIncorrect) => {
+                self.pin_error = Some("Incorrect PIN".to_string());
+                self.show_pin_dialog_for(PinOperation::UseCertificate {
+                    thumbprint: thumbprint.to_string(),
+                });
             }
             Err(e) => {
                 self.status_message = format!("Failed to get certificate: {e}");

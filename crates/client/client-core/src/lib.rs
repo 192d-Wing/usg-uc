@@ -24,7 +24,7 @@ pub mod cert_store;
 pub mod contact_manager;
 pub mod settings;
 
-pub use app::{AppEvent, AppState, ClientApp};
+pub use app::{AppEvent, AppState, ClientApp, PinOperationType};
 pub use audio_session::{
     AudioSession, AudioSessionConfig, AudioSessionConfigBuilder, AudioSessionEvent,
 };

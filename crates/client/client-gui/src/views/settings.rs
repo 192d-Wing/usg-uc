@@ -5,6 +5,7 @@ use eframe::egui;
 
 /// Actions from the settings view.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // PinRequired will be used when CertStoreError::PinRequired is returned
 pub enum SettingsAction {
     /// Save settings.
     Save,
@@ -18,6 +19,11 @@ pub enum SettingsAction {
     SelectCertificate(String),
     /// Use the selected certificate for authentication.
     UseCertificate(String),
+    /// PIN is required for certificate operation.
+    PinRequired {
+        /// Certificate thumbprint that needs PIN.
+        thumbprint: String,
+    },
 }
 
 /// Settings view state.

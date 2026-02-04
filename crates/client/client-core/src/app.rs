@@ -61,6 +61,31 @@ pub enum AppEvent {
     SettingsChanged,
     /// Contacts changed.
     ContactsChanged,
+    /// PIN required for smart card operation.
+    PinRequired {
+        /// Operation that requires PIN.
+        operation: PinOperationType,
+        /// Certificate thumbprint (if applicable).
+        thumbprint: Option<String>,
+    },
+    /// PIN entry completed.
+    PinCompleted {
+        /// Whether the PIN was successful.
+        success: bool,
+        /// Error message if failed.
+        error: Option<String>,
+    },
+}
+
+/// Type of operation requiring a PIN.
+#[derive(Debug, Clone)]
+pub enum PinOperationType {
+    /// Certificate selection for authentication.
+    CertificateSelection,
+    /// SIP registration.
+    Registration,
+    /// Call establishment (DTLS signing).
+    CallEstablishment,
 }
 
 /// Application state.

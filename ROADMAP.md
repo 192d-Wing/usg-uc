@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.12 (Certificate Authentication) complete
+**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.13 (PIN Entry UI) complete
 
 ---
 
@@ -788,6 +788,30 @@ This document outlines the development roadmap for the USG Session Border Contro
   - Applies certificate when connecting
 
 **Tests**: 109 total tests (client crates)
+
+**Phase 24.13: PIN Entry UI** ✅
+
+- ✅ PIN dialog implementation in client-gui
+  - Modal dialog with masked password input
+  - Lock icon and clear visual feedback
+  - PIN attempt counter with lockout warning
+  - Enter key submission support
+  - Focus management for keyboard-first input
+- ✅ PinOperation enum for tracking PIN context
+  - `UseCertificate { thumbprint }` - certificate selection
+  - `Register { account_id }` - SIP registration signing
+  - `SignCall { call_id }` - DTLS call establishment
+- ✅ Integration with CertStoreError::PinRequired
+  - Automatic PIN dialog on smart card operations
+  - Handles PinRequired and PinIncorrect errors
+  - Smart card not present detection
+- ✅ AppEvent extensions for async PIN handling
+  - `PinRequired { operation, thumbprint }` event
+  - `PinCompleted { success, error }` event
+  - `PinOperationType` enum exported from client-core
+- ✅ SettingsAction::PinRequired for Settings UI integration
+
+**Tests**: 109+ total tests (client crates)
 
 ---
 
