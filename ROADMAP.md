@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.14 (SIP Transport Layer) complete
+**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.15 (Call Signaling Integration) complete
 
 ---
 
@@ -851,6 +851,28 @@ This document outlines the development roadmap for the USG Session Border Contro
   - Event serialization tests
 
 **Tests**: 45+ unit tests in client-core
+
+**Phase 24.15: Call Signaling Integration** ✅
+
+- ✅ CallManager call event polling
+  - `poll_call_events()` method to retrieve pending events
+  - `call_event_rx` receiver now stored and used
+- ✅ Call request routing through SipTransport
+  - INVITE, BYE, CANCEL, ACK sent via TLS transport
+  - `handle_call_agent_event()` in ClientApp
+- ✅ Call response routing from transport
+  - CSeq-based routing to appropriate agent
+  - REGISTER responses to RegistrationAgent
+  - INVITE/BYE/CANCEL responses to CallManager
+- ✅ Incoming request handling
+  - `handle_sip_request()` in CallManager
+  - Routes INVITE, BYE, CANCEL to appropriate handlers
+  - `handle_incoming_invite()`, `handle_incoming_bye()`, `handle_incoming_cancel()`
+- ✅ SIP Call-ID correlation
+  - `find_call_by_sip_id()` in CallAgent
+  - Maps SIP Call-ID header to application call ID
+
+**Tests**: 45 unit tests in client-core
 
 ---
 

@@ -17,6 +17,8 @@ use client_types::{
     CallDirection, CallEndReason, CallHistoryEntry, CallInfo, CallState, SipAccount,
 };
 use proto_ice::IceConfig;
+use proto_sip::header::HeaderName;
+use proto_sip::message::{SipRequest, SipResponse};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -27,6 +29,8 @@ use tracing::{debug, error, info, warn};
 pub struct CallManager {
     /// SIP call agent.
     call_agent: CallAgent,
+    /// Call agent event receiver.
+    call_event_rx: mpsc::Receiver<CallEvent>,
     /// Active media sessions by call ID.
     media_sessions: HashMap<String, MediaSession>,
     /// Active audio sessions by call ID.
@@ -123,7 +127,7 @@ impl CallManager {
         app_event_tx: mpsc::Sender<CallManagerEvent>,
     ) -> Self {
         // Create internal channel for call agent events
-        let (call_event_tx, _call_event_rx) = mpsc::channel(64);
+        let (call_event_tx, call_event_rx) = mpsc::channel(64);
 
         // Create internal channel for audio session events
         let (audio_event_tx, _audio_event_rx) = mpsc::channel(64);
@@ -137,6 +141,7 @@ impl CallManager {
 
         Self {
             call_agent,
+            call_event_rx,
             media_sessions: HashMap::new(),
             audio_sessions: HashMap::new(),
             local_media_addr,
@@ -330,14 +335,151 @@ impl CallManager {
                 self.handle_sdp_answer(&call_id, &sdp).await?;
             }
             CallEvent::SendRequest { .. } => {
-                // Transport layer handles this
+                // Transport layer handles this via poll_call_events()
             }
             CallEvent::SendResponse { .. } => {
-                // Transport layer handles this
+                // Transport layer handles this via poll_call_events()
             }
             CallEvent::SdpOfferReceived { call_id, sdp } => {
                 self.handle_sdp_offer(&call_id, &sdp).await?;
             }
+        }
+
+        Ok(())
+    }
+
+    /// Polls for pending call events.
+    ///
+    /// Returns events that need to be processed. `SendRequest` and `SendResponse`
+    /// events should be forwarded to the SIP transport layer.
+    pub fn poll_call_events(&mut self) -> Vec<CallEvent> {
+        std::iter::from_fn(|| self.call_event_rx.try_recv().ok()).collect()
+    }
+
+    /// Routes an incoming SIP response to the appropriate call.
+    ///
+    /// This should be called when the transport layer receives a SIP response
+    /// for a call (INVITE 1xx/2xx/3xx-6xx, BYE 200, CANCEL 200, etc.).
+    pub async fn handle_sip_response(&mut self, response: &SipResponse) -> AppResult<()> {
+        // Extract Call-ID from response to find the matching call
+        let sip_call_id = match response.headers.get_value(&HeaderName::CallId) {
+            Some(id) => id.to_string(),
+            None => {
+                warn!("Received response without Call-ID header");
+                return Ok(());
+            }
+        };
+
+        // Find the call session with this SIP Call-ID
+        if let Some(call_id) = self.find_call_by_sip_id(&sip_call_id) {
+            debug!(
+                call_id = %call_id,
+                sip_call_id = %sip_call_id,
+                status = response.status.code(),
+                "Routing response to call agent"
+            );
+            self.call_agent
+                .handle_response(response, &call_id)
+                .await
+                .map_err(|e| AppError::Sip(e.to_string()))?;
+        } else {
+            debug!(sip_call_id = %sip_call_id, "No matching call found for response");
+        }
+
+        Ok(())
+    }
+
+    /// Routes an incoming SIP request (e.g., INVITE) to the call manager.
+    ///
+    /// This handles incoming calls and in-dialog requests.
+    pub async fn handle_sip_request(&mut self, request: &SipRequest) -> AppResult<()> {
+        let method = request.method.as_str();
+        debug!(method = %method, "Received incoming SIP request");
+
+        match method {
+            "INVITE" => {
+                // Incoming call
+                self.handle_incoming_invite(request).await?;
+            }
+            "BYE" => {
+                // Remote party hanging up
+                self.handle_incoming_bye(request).await?;
+            }
+            "CANCEL" => {
+                // Remote party cancelling
+                self.handle_incoming_cancel(request).await?;
+            }
+            "ACK" => {
+                // Acknowledgement (normally handled by transaction layer)
+                debug!("Received ACK");
+            }
+            _ => {
+                debug!(method = %method, "Ignoring unsupported request method");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Finds a call by its SIP Call-ID.
+    fn find_call_by_sip_id(&self, sip_call_id: &str) -> Option<String> {
+        self.call_agent.find_call_by_sip_id(sip_call_id)
+    }
+
+    /// Handles an incoming INVITE request.
+    async fn handle_incoming_invite(&mut self, request: &SipRequest) -> AppResult<()> {
+        // For now, log and potentially reject (we don't fully support incoming calls yet)
+        info!("Received incoming INVITE - feature not fully implemented");
+
+        // Extract caller info from From header
+        let remote_uri = request
+            .headers
+            .get_value(&HeaderName::From)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Notify the application about the incoming call attempt
+        let _ = self
+            .app_event_tx
+            .send(CallManagerEvent::IncomingCall {
+                call_id: "incoming".to_string(),
+                remote_uri,
+                remote_display_name: None,
+            })
+            .await;
+
+        Ok(())
+    }
+
+    /// Handles an incoming BYE request.
+    async fn handle_incoming_bye(&mut self, request: &SipRequest) -> AppResult<()> {
+        let sip_call_id = match request.headers.get_value(&HeaderName::CallId) {
+            Some(id) => id.to_string(),
+            None => return Ok(()),
+        };
+
+        if let Some(call_id) = self.find_call_by_sip_id(&sip_call_id) {
+            info!(call_id = %call_id, "Remote party sent BYE");
+            // Mark the call as terminated - the remote party hung up
+            self.handle_state_changed(&call_id, CallState::Terminated, None)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Handles an incoming CANCEL request.
+    async fn handle_incoming_cancel(&mut self, request: &SipRequest) -> AppResult<()> {
+        let sip_call_id = match request.headers.get_value(&HeaderName::CallId) {
+            Some(id) => id.to_string(),
+            None => return Ok(()),
+        };
+
+        if let Some(call_id) = self.find_call_by_sip_id(&sip_call_id) {
+            info!(call_id = %call_id, "Remote party sent CANCEL");
+            // Mark the call as terminated - the remote party cancelled
+            self.handle_state_changed(&call_id, CallState::Terminated, None)
+                .await?;
         }
 
         Ok(())

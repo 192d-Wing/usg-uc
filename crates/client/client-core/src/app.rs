@@ -512,15 +512,28 @@ impl ClientApp {
                     "Received SIP response"
                 );
 
-                // Route response to registration agent if it's a REGISTER response
-                // The Via header and Call-ID can be used to correlate with the request
-                if let Some(ref account_id) = self.current_account_id {
-                    if let Err(e) = self
-                        .registration_agent
-                        .handle_response(&response, account_id)
-                        .await
-                    {
-                        warn!(error = %e, "Failed to handle registration response");
+                // Route response to appropriate agent based on CSeq method
+                // For REGISTER responses, route to registration agent
+                // For INVITE/BYE/CANCEL responses, route to call manager
+                let cseq_value = response.headers.get_value(&proto_sip::header::HeaderName::CSeq);
+                let is_register_response = cseq_value
+                    .map(|v| v.to_uppercase().contains("REGISTER"))
+                    .unwrap_or(false);
+
+                if is_register_response {
+                    if let Some(ref account_id) = self.current_account_id {
+                        if let Err(e) = self
+                            .registration_agent
+                            .handle_response(&response, account_id)
+                            .await
+                        {
+                            warn!(error = %e, "Failed to handle registration response");
+                        }
+                    }
+                } else {
+                    // Route to call manager for call-related responses
+                    if let Err(e) = self.call_manager.handle_sip_response(&response).await {
+                        warn!(error = %e, "Failed to handle call response");
                     }
                 }
             }
@@ -531,8 +544,10 @@ impl ClientApp {
                     "Received incoming SIP request"
                 );
 
-                // TODO: Handle incoming calls (INVITE), etc.
-                // For now, just log it
+                // Route to call manager for handling (INVITE, BYE, CANCEL, etc.)
+                if let Err(e) = self.call_manager.handle_sip_request(&request).await {
+                    warn!(error = %e, "Failed to handle incoming SIP request");
+                }
             }
             TransportEvent::Connected { peer } => {
                 info!(peer = %peer, "Connected to SIP peer");
@@ -582,6 +597,93 @@ impl ClientApp {
         };
         for event in transport_events {
             self.handle_transport_event(event).await?;
+        }
+
+        // Poll call events and send requests via transport
+        let call_events = self.call_manager.poll_call_events();
+        for event in call_events {
+            self.handle_call_agent_event(event).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Handles a call agent event.
+    async fn handle_call_agent_event(
+        &mut self,
+        event: client_sip_ua::CallEvent,
+    ) -> AppResult<()> {
+        use client_sip_ua::CallEvent;
+
+        match event {
+            CallEvent::SendRequest {
+                request,
+                destination,
+            } => {
+                // Send call signaling (INVITE, BYE, CANCEL, ACK) via transport
+                if let Some(ref transport) = self.sip_transport {
+                    if let Err(e) = transport.send_request(&request, destination).await {
+                        error!(error = %e, "Failed to send call request");
+                        let _ = self
+                            .app_event_tx
+                            .send(AppEvent::Error {
+                                message: format!("Failed to send call request: {e}"),
+                            })
+                            .await;
+                    }
+                } else {
+                    warn!("SIP transport not initialized");
+                }
+            }
+            CallEvent::SendResponse {
+                response,
+                destination,
+            } => {
+                // Send response (for incoming calls)
+                // Note: Response sending requires adding send_response to SipTransport
+                // For now, log that we received a response to send
+                debug!(
+                    destination = %destination,
+                    status = response.status.code(),
+                    "Would send SIP response (incoming call responses not yet implemented)"
+                );
+            }
+            CallEvent::StateChanged {
+                call_id,
+                state,
+                info,
+            } => {
+                // Route to call manager for state tracking
+                if let Err(e) = self
+                    .call_manager
+                    .handle_call_event(CallEvent::StateChanged {
+                        call_id,
+                        state,
+                        info,
+                    })
+                    .await
+                {
+                    warn!(error = %e, "Failed to handle call state change");
+                }
+            }
+            CallEvent::SdpOfferReceived { call_id, sdp } => {
+                if let Err(e) = self
+                    .call_manager
+                    .handle_call_event(CallEvent::SdpOfferReceived { call_id, sdp })
+                    .await
+                {
+                    warn!(error = %e, "Failed to handle SDP offer");
+                }
+            }
+            CallEvent::SdpAnswerReceived { call_id, sdp } => {
+                if let Err(e) = self
+                    .call_manager
+                    .handle_call_event(CallEvent::SdpAnswerReceived { call_id, sdp })
+                    .await
+                {
+                    warn!(error = %e, "Failed to handle SDP answer");
+                }
+            }
         }
 
         Ok(())

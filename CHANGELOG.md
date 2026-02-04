@@ -492,6 +492,26 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - Transport creation and shutdown
   - Event serialization
 
+**Phase 24.15: Call Signaling Integration**
+
+- `client-core/call_manager.rs` - Call signaling wiring
+  - `call_event_rx` field to receive CallAgent events
+  - `poll_call_events()` to collect pending call events
+  - `handle_sip_response()` for routing responses to CallAgent
+  - `handle_sip_request()` for routing incoming requests
+  - `handle_incoming_invite()`, `handle_incoming_bye()`, `handle_incoming_cancel()`
+  - `find_call_by_sip_id()` for SIP Call-ID to app call ID mapping
+- `client-core/app.rs` - Call event routing
+  - `handle_call_agent_event()` for processing CallAgent events
+  - Routes `SendRequest` events to SipTransport
+  - CSeq-based response routing (REGISTER vs INVITE/BYE/CANCEL)
+  - Incoming request routing to CallManager
+- `client-sip-ua/call_agent.rs` - SIP Call-ID lookup
+  - `find_call_by_sip_id()` method for call correlation
+- Full call signaling path:
+  - Outbound: CallAgent → CallEvent::SendRequest → SipTransport
+  - Inbound: SipTransport → TransportEvent → CallManager → CallAgent
+
 **Security**
 
 - Smart card authentication ONLY (CAC/PIV/SIPR token)

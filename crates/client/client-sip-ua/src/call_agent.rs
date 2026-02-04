@@ -767,6 +767,16 @@ impl CallAgent {
         self.calls.get(call_id).map(|s| s.state)
     }
 
+    /// Finds a call by its SIP Call-ID header value.
+    ///
+    /// Returns the application call ID if found.
+    pub fn find_call_by_sip_id(&self, sip_call_id: &str) -> Option<String> {
+        self.calls
+            .iter()
+            .find(|(_, session)| session.sip_call_id == sip_call_id)
+            .map(|(_, session)| session.id.clone())
+    }
+
     /// Sends a CANCEL request for a pending INVITE.
     async fn send_cancel(&mut self, call_id: &str) -> SipUaResult<()> {
         let (remote_uri, sip_call_id, cseq, from_tag, to_tag, branch) = {
