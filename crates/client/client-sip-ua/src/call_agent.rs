@@ -6,8 +6,8 @@
 use crate::{SipUaError, SipUaResult};
 use chrono::Utc;
 use client_types::{CallDirection, CallFailureReason, CallInfo, CallState};
-use proto_dialog::refer::{ReferRequest, ReferStatus};
 use proto_dialog::Dialog;
+use proto_dialog::refer::{ReferRequest, ReferStatus};
 use proto_sip::builder::{RequestBuilder, generate_branch, generate_call_id, generate_tag};
 use proto_sip::header::HeaderName;
 use proto_sip::header_params::{NameAddr, ViaHeader};
@@ -325,11 +325,7 @@ impl CallAgent {
     /// # Returns
     /// Ok(()) if the REFER was sent successfully. The actual transfer result
     /// will be reported via NOTIFY messages (handled asynchronously).
-    pub async fn transfer_call(
-        &mut self,
-        call_id: &str,
-        transfer_target: &str,
-    ) -> SipUaResult<()> {
+    pub async fn transfer_call(&mut self, call_id: &str, transfer_target: &str) -> SipUaResult<()> {
         let session = self
             .calls
             .get(call_id)
@@ -392,8 +388,7 @@ impl CallAgent {
         let transaction = ClientNonInviteTransaction::new(tx_key, TransportType::Reliable);
 
         // Create ReferRequest to track the implicit subscription (RFC 3515)
-        let refer_request = ReferRequest::new(transfer_target)
-            .with_referred_by(self.aor.clone());
+        let refer_request = ReferRequest::new(transfer_target).with_referred_by(self.aor.clone());
 
         if let Some(session) = self.calls.get_mut(call_id) {
             session.non_invite_transaction = Some(transaction);
@@ -580,10 +575,7 @@ impl CallAgent {
     ///
     /// This processes the sipfrag body to determine transfer progress and emits
     /// appropriate events. Returns the 200 OK response to send back.
-    pub async fn handle_notify(
-        &mut self,
-        request: &SipRequest,
-    ) -> SipUaResult<SipResponse> {
+    pub async fn handle_notify(&mut self, request: &SipRequest) -> SipUaResult<SipResponse> {
         // Extract Call-ID to find the right session
         let sip_call_id = request
             .headers
@@ -600,10 +592,7 @@ impl CallAgent {
             .to_string();
 
         // Verify this is a REFER notification (Event: refer)
-        let event_header = request
-            .headers
-            .get_value(&HeaderName::Event)
-            .unwrap_or("");
+        let event_header = request.headers.get_value(&HeaderName::Event).unwrap_or("");
 
         if !event_header.starts_with("refer") {
             warn!(

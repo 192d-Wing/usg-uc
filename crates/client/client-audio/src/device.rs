@@ -295,9 +295,9 @@ impl DeviceManager {
     pub fn get_output_device_by_name(&self, name: &str) -> AudioResult<cpal::Device> {
         let host = cpal::default_host();
 
-        let devices = host.output_devices().map_err(|e| {
-            AudioError::StreamError(format!("Failed to enumerate devices: {e}"))
-        })?;
+        let devices = host
+            .output_devices()
+            .map_err(|e| AudioError::StreamError(format!("Failed to enumerate devices: {e}")))?;
 
         for device in devices {
             if let Some(device_name) = get_device_name(&device) {

@@ -220,11 +220,11 @@ mod section3_packet_format {
         // Test all flag combinations
         let test_cases = [
             (false, false, false, false, 0b0000),
-            (true, false, false, false, 0b1000),  // I bit
-            (false, true, false, false, 0b0100),  // U bit
-            (false, false, true, false, 0b0010),  // B bit
-            (false, false, false, true, 0b0001),  // E bit
-            (true, true, true, true, 0b1111),     // All bits
+            (true, false, false, false, 0b1000), // I bit
+            (false, true, false, false, 0b0100), // U bit
+            (false, false, true, false, 0b0010), // B bit
+            (false, false, false, true, 0b0001), // E bit
+            (true, true, true, true, 0b1111),    // All bits
         ];
 
         for (immediate, unordered, beginning, ending, expected_flags) in test_cases {
@@ -283,7 +283,8 @@ mod section3_packet_format {
     #[test]
     fn test_init_ack_chunk_format() {
         let init = InitChunk::new(0x11111111, 32768, 5, 5, 500);
-        let init_ack = InitAckChunk::from_init(&init, 0x22222222, 65535, 1000, Bytes::from("cookie"));
+        let init_ack =
+            InitAckChunk::from_init(&init, 0x22222222, 65535, 1000, Bytes::from("cookie"));
 
         let decoded = roundtrip_chunk(Chunk::InitAck(init_ack));
 
@@ -708,7 +709,7 @@ mod section4_state_diagram {
     #[test]
     fn test_abort_from_any_state() {
         let states_to_test = [
-            vec![StateEvent::Associate], // COOKIE-WAIT
+            vec![StateEvent::Associate],                             // COOKIE-WAIT
             vec![StateEvent::Associate, StateEvent::ReceiveInitAck], // COOKIE-ECHOED
             vec![
                 StateEvent::Associate,
@@ -843,23 +844,31 @@ mod section5_association_init {
         // Step 2: Server receives INIT, sends INIT-ACK
         let init_ack_chunks = server.process_packet(&init_packet).await.unwrap();
         assert!(!init_ack_chunks.is_empty());
-        assert!(init_ack_chunks.iter().any(|c| matches!(c, Chunk::InitAck(_))));
+        assert!(
+            init_ack_chunks
+                .iter()
+                .any(|c| matches!(c, Chunk::InitAck(_)))
+        );
 
         // Step 3: Client receives INIT-ACK, sends COOKIE-ECHO
         let init_ack_packet = build_packet(&server, &client, init_ack_chunks).await;
         let cookie_echo_chunks = client.process_packet(&init_ack_packet).await.unwrap();
         assert_eq!(client.state().await, AssociationState::CookieEchoed);
-        assert!(cookie_echo_chunks
-            .iter()
-            .any(|c| matches!(c, Chunk::CookieEcho(_))));
+        assert!(
+            cookie_echo_chunks
+                .iter()
+                .any(|c| matches!(c, Chunk::CookieEcho(_)))
+        );
 
         // Step 4: Server receives COOKIE-ECHO, sends COOKIE-ACK
         let cookie_echo_packet = build_packet(&client, &server, cookie_echo_chunks).await;
         let cookie_ack_chunks = server.process_packet(&cookie_echo_packet).await.unwrap();
         assert_eq!(server.state().await, AssociationState::Established);
-        assert!(cookie_ack_chunks
-            .iter()
-            .any(|c| matches!(c, Chunk::CookieAck(_))));
+        assert!(
+            cookie_ack_chunks
+                .iter()
+                .any(|c| matches!(c, Chunk::CookieAck(_)))
+        );
 
         // Step 5: Client receives COOKIE-ACK
         let cookie_ack_packet = build_packet(&server, &client, cookie_ack_chunks).await;
@@ -964,8 +973,7 @@ mod section6_data_transfer {
         }
 
         let cookie_echo = client.process_packet(&init_ack_pkt).await.unwrap();
-        let mut cookie_echo_pkt =
-            SctpPacket::new(5060, 5061, client.peer_verification_tag().await);
+        let mut cookie_echo_pkt = SctpPacket::new(5060, 5061, client.peer_verification_tag().await);
         for c in cookie_echo {
             cookie_echo_pkt.add_chunk(c);
         }
@@ -1015,7 +1023,10 @@ mod section6_data_transfer {
         let (client, server) = create_established_pair().await;
 
         // Client sends data
-        let _tsn = client.send(0, Bytes::from("test data"), true).await.unwrap();
+        let _tsn = client
+            .send(0, Bytes::from("test data"), true)
+            .await
+            .unwrap();
         let data_chunks = client.get_pending_data().await;
         assert_eq!(data_chunks.len(), 1);
 
@@ -1039,7 +1050,7 @@ mod section6_data_transfer {
     #[test]
     fn test_gap_ack_block_encoding() {
         let mut sack = SackChunk::new(100, 65535);
-        sack.add_gap_block(5, 10);  // TSNs 105-110 received
+        sack.add_gap_block(5, 10); // TSNs 105-110 received
         sack.add_gap_block(15, 20); // TSNs 115-120 received
 
         let decoded = roundtrip_chunk(Chunk::Sack(sack));
@@ -1077,7 +1088,10 @@ mod section6_data_transfer {
         let (client, _server) = create_established_pair().await;
 
         // Send unordered message
-        let _tsn = client.send(0, Bytes::from("unordered"), false).await.unwrap();
+        let _tsn = client
+            .send(0, Bytes::from("unordered"), false)
+            .await
+            .unwrap();
 
         let data_chunks = client.get_pending_data().await;
         assert_eq!(data_chunks.len(), 1);
@@ -1501,7 +1515,7 @@ mod additional_compliance {
     fn test_ssn_sequential() {
         let data1 = DataChunk::new(1, 0, 0, 0, Bytes::from("first"));
         let data2 = DataChunk::new(2, 0, 1, 0, Bytes::from("second")); // SSN = 1
-        let data3 = DataChunk::new(3, 0, 2, 0, Bytes::from("third"));  // SSN = 2
+        let data3 = DataChunk::new(3, 0, 2, 0, Bytes::from("third")); // SSN = 2
 
         // Verify SSNs are sequential
         assert_eq!(data1.ssn, 0);
@@ -1526,8 +1540,7 @@ mod additional_compliance {
         }
         let cookie_echo = client.process_packet(&init_ack_pkt).await.unwrap();
 
-        let mut cookie_echo_pkt =
-            SctpPacket::new(5060, 5061, client.peer_verification_tag().await);
+        let mut cookie_echo_pkt = SctpPacket::new(5060, 5061, client.peer_verification_tag().await);
         for c in cookie_echo {
             cookie_echo_pkt.add_chunk(c);
         }
@@ -1548,9 +1561,7 @@ mod additional_compliance {
         let response = server.process_packet(&hb_pkt).await.unwrap();
 
         // Should get HEARTBEAT-ACK back
-        assert!(response
-            .iter()
-            .any(|c| matches!(c, Chunk::HeartbeatAck(_))));
+        assert!(response.iter().any(|c| matches!(c, Chunk::HeartbeatAck(_))));
     }
 
     /// RFC 9260: PPID (Payload Protocol Identifier) handling.
@@ -1578,7 +1589,10 @@ mod additional_compliance {
             let decoded = roundtrip_chunk(Chunk::Data(data));
 
             if let Chunk::Data(d) = decoded {
-                assert_eq!(d.stream_id, stream_id, "Stream ID {stream_id} not preserved");
+                assert_eq!(
+                    d.stream_id, stream_id,
+                    "Stream ID {stream_id} not preserved"
+                );
             }
         }
     }

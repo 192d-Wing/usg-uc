@@ -74,8 +74,8 @@ pub use device::{
 };
 pub use file_source::FileAudioSource;
 pub use jitter_buffer::{BufferedPacket, JitterBuffer, JitterBufferResult, JitterBufferStats};
-pub use ringtone::RingtonePlayer;
 pub use pipeline::{AudioPipeline, PipelineConfig, PipelineState, PipelineStats};
+pub use ringtone::RingtonePlayer;
 pub use rtp_handler::{RtpReceiver, RtpStats, RtpTransmitter, generate_ssrc};
 pub use stream::{CaptureStream, PlaybackStream, Sample};
 

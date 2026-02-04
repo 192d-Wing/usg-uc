@@ -2220,8 +2220,9 @@ impl ReConfigParam {
             }
             Self::RESPONSE if length >= 12 => {
                 let resp_seq_num = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-                let result =
-                    ReConfigResult::from_u32(u32::from_be_bytes([data[8], data[9], data[10], data[11]]));
+                let result = ReConfigResult::from_u32(u32::from_be_bytes([
+                    data[8], data[9], data[10], data[11],
+                ]));
                 let (sender_next_tsn, receiver_next_tsn) = if length >= 20 {
                     (
                         Some(u32::from_be_bytes([data[12], data[13], data[14], data[15]])),
@@ -2299,7 +2300,12 @@ impl ReConfigChunk {
 
     /// Creates an outgoing SSN reset request.
     #[must_use]
-    pub fn outgoing_ssn_reset(req_seq_num: u32, resp_seq_num: u32, last_tsn: u32, stream_ids: Vec<u16>) -> Self {
+    pub fn outgoing_ssn_reset(
+        req_seq_num: u32,
+        resp_seq_num: u32,
+        last_tsn: u32,
+        stream_ids: Vec<u16>,
+    ) -> Self {
         let mut chunk = Self::new();
         chunk.add_param(ReConfigParam::OutgoingSsnReset {
             req_seq_num,
@@ -2473,7 +2479,13 @@ impl AsconfParam {
         ipv6: Option<std::net::Ipv6Addr>,
     ) {
         // Calculate length: 4 (header) + 4 (correlation_id) + address param
-        let addr_len = if ipv4.is_some() { 8 } else if ipv6.is_some() { 20 } else { 0 };
+        let addr_len = if ipv4.is_some() {
+            8
+        } else if ipv6.is_some() {
+            20
+        } else {
+            0
+        };
         let length = 4 + 4 + addr_len;
 
         buf.put_u16(param_type);
@@ -2913,8 +2925,7 @@ impl AsconfAckChunk {
 
     /// Adds a success response for the given correlation ID.
     pub fn add_success(&mut self, correlation_id: u32) {
-        self.params
-            .push(AsconfAckParam::Success { correlation_id });
+        self.params.push(AsconfAckParam::Success { correlation_id });
     }
 
     /// Adds an error response for the given correlation ID.
@@ -3522,21 +3533,24 @@ mod tests {
 
     #[test]
     fn test_asconf_chunk_creation() {
-        let mut asconf = AsconfChunk::new(12345)
-            .with_sender_ipv4(std::net::Ipv4Addr::new(192, 168, 1, 1));
+        let mut asconf =
+            AsconfChunk::new(12345).with_sender_ipv4(std::net::Ipv4Addr::new(192, 168, 1, 1));
 
         asconf.add_ip(1, Some(std::net::Ipv4Addr::new(10, 0, 0, 1)), None);
         asconf.delete_ip(2, Some(std::net::Ipv4Addr::new(10, 0, 0, 2)), None);
 
         assert_eq!(asconf.serial_number, 12345);
-        assert_eq!(asconf.sender_ipv4, Some(std::net::Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(
+            asconf.sender_ipv4,
+            Some(std::net::Ipv4Addr::new(192, 168, 1, 1))
+        );
         assert_eq!(asconf.params.len(), 2);
     }
 
     #[test]
     fn test_asconf_chunk_roundtrip() {
-        let mut asconf = AsconfChunk::new(999)
-            .with_sender_ipv4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+        let mut asconf =
+            AsconfChunk::new(999).with_sender_ipv4(std::net::Ipv4Addr::new(127, 0, 0, 1));
         asconf.add_ip(1, Some(std::net::Ipv4Addr::new(192, 168, 0, 1)), None);
 
         let mut buf = BytesMut::new();

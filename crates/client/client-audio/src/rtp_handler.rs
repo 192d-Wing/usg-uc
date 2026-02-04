@@ -208,8 +208,7 @@ impl RtpTransmitter {
             new_ts
         } else {
             // Continuation - use the current timestamp without incrementing
-            self.dtmf_timestamp.load(Ordering::Relaxed)
-                - event.duration as u32
+            self.dtmf_timestamp.load(Ordering::Relaxed) - event.duration as u32
         };
 
         // Build RTP header with DTMF payload type

@@ -999,7 +999,10 @@ impl SettingsView {
                     .show_ui(ui, |ui| {
                         // Default option (uses output device)
                         if ui
-                            .selectable_label(self.ring_device == "Default", "Default (Output Device)")
+                            .selectable_label(
+                                self.ring_device == "Default",
+                                "Default (Output Device)",
+                            )
                             .clicked()
                         {
                             self.ring_device = "Default".to_string();
@@ -1118,9 +1121,21 @@ impl SettingsView {
         self.auto_answer_delay = settings.general.auto_answer_delay_secs;
 
         // Audio settings
-        self.input_device = settings.audio.input_device.clone().unwrap_or_else(|| "Default".to_string());
-        self.output_device = settings.audio.output_device.clone().unwrap_or_else(|| "Default".to_string());
-        self.ring_device = settings.audio.ring_device.clone().unwrap_or_else(|| "Default".to_string());
+        self.input_device = settings
+            .audio
+            .input_device
+            .clone()
+            .unwrap_or_else(|| "Default".to_string());
+        self.output_device = settings
+            .audio
+            .output_device
+            .clone()
+            .unwrap_or_else(|| "Default".to_string());
+        self.ring_device = settings
+            .audio
+            .ring_device
+            .clone()
+            .unwrap_or_else(|| "Default".to_string());
         self.ring_volume = settings.audio.ring_volume;
         self.echo_cancellation = settings.audio.echo_cancellation;
         self.noise_suppression = settings.audio.noise_suppression;
@@ -1132,7 +1147,9 @@ impl SettingsView {
 
         // Network/Security settings
         self.server_cert_verification = settings.network.server_cert_verification.clone();
-        if let ServerCertVerificationMode::Custom { ca_file_path } = &settings.network.server_cert_verification {
+        if let ServerCertVerificationMode::Custom { ca_file_path } =
+            &settings.network.server_cert_verification
+        {
             self.custom_ca_path = ca_file_path.clone();
         }
 
@@ -1160,13 +1177,29 @@ impl SettingsView {
         };
 
         let audio = AudioConfig {
-            input_device: if self.input_device == "Default" { None } else { Some(self.input_device.clone()) },
-            output_device: if self.output_device == "Default" { None } else { Some(self.output_device.clone()) },
-            ring_device: if self.ring_device == "Default" { None } else { Some(self.ring_device.clone()) },
+            input_device: if self.input_device == "Default" {
+                None
+            } else {
+                Some(self.input_device.clone())
+            },
+            output_device: if self.output_device == "Default" {
+                None
+            } else {
+                Some(self.output_device.clone())
+            },
+            ring_device: if self.ring_device == "Default" {
+                None
+            } else {
+                Some(self.ring_device.clone())
+            },
             ring_volume: self.ring_volume,
             echo_cancellation: self.echo_cancellation,
             noise_suppression: self.noise_suppression,
-            ringtone_file_path: if self.ringtone_path.is_empty() { None } else { Some(self.ringtone_path.clone()) },
+            ringtone_file_path: if self.ringtone_path.is_empty() {
+                None
+            } else {
+                Some(self.ringtone_path.clone())
+            },
             ..Default::default()
         };
 

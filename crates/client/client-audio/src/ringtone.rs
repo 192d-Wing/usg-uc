@@ -11,8 +11,8 @@ use cpal::{SampleFormat, Stream, StreamConfig};
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error, info};
 
 /// Default sample rate for ringtone playback.
@@ -129,9 +129,9 @@ impl RingtonePlayer {
         let is_playing = self.is_playing.clone();
         let stream = build_ringtone_stream(&device, &config, consumer, is_playing.clone())?;
 
-        stream
-            .play()
-            .map_err(|e| AudioError::StreamError(format!("Failed to start ringtone stream: {e}")))?;
+        stream.play().map_err(|e| {
+            AudioError::StreamError(format!("Failed to start ringtone stream: {e}"))
+        })?;
 
         self.stream = Some(stream);
         self.producer = Some(producer);

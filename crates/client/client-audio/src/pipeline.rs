@@ -505,7 +505,8 @@ impl AudioPipeline {
 
         // Send continuation packets every 20ms
         let packet_interval_ms = 20u32;
-        let num_continuation_packets = duration_ms.saturating_sub(packet_interval_ms) / packet_interval_ms;
+        let num_continuation_packets =
+            duration_ms.saturating_sub(packet_interval_ms) / packet_interval_ms;
 
         for i in 1..=num_continuation_packets {
             let elapsed_duration = DtmfEvent::duration_from_ms(i * packet_interval_ms);
@@ -513,7 +514,10 @@ impl AudioPipeline {
             transmitter.send_dtmf(&event, false).await?;
 
             // Wait between packets (in real usage, this would be handled by the audio processing loop)
-            tokio::time::sleep(tokio::time::Duration::from_millis(packet_interval_ms as u64)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(
+                packet_interval_ms as u64,
+            ))
+            .await;
         }
 
         // Send end packets (3x for reliability per RFC 4733)
@@ -576,9 +580,7 @@ impl AudioPipeline {
     /// * `device_name` - Name of the new input device, or None for default
     pub fn switch_input_device(&mut self, device_name: Option<String>) -> AudioResult<()> {
         if self.state != PipelineState::Running {
-            return Err(AudioError::ConfigError(
-                "Pipeline not running".to_string(),
-            ));
+            return Err(AudioError::ConfigError("Pipeline not running".to_string()));
         }
 
         info!("Switching input device to: {:?}", device_name);
@@ -608,9 +610,7 @@ impl AudioPipeline {
     /// * `device_name` - Name of the new output device, or None for default
     pub fn switch_output_device(&mut self, device_name: Option<String>) -> AudioResult<()> {
         if self.state != PipelineState::Running {
-            return Err(AudioError::ConfigError(
-                "Pipeline not running".to_string(),
-            ));
+            return Err(AudioError::ConfigError("Pipeline not running".to_string()));
         }
 
         info!("Switching output device to: {:?}", device_name);

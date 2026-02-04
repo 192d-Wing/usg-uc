@@ -424,7 +424,11 @@ impl ContactsView {
     }
 
     /// Renders a single contact row.
-    fn render_contact_row(&mut self, ui: &mut egui::Ui, contact: &Contact) -> Option<ContactsAction> {
+    fn render_contact_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        contact: &Contact,
+    ) -> Option<ContactsAction> {
         let mut action = None;
 
         let is_selected = self.selected_contact.as_ref() == Some(&contact.id);
@@ -480,7 +484,11 @@ impl ContactsView {
                     }
 
                     // Favorite toggle button
-                    let fav_text = if contact.favorite { "\u{2B50}" } else { "\u{2606}" };
+                    let fav_text = if contact.favorite {
+                        "\u{2B50}"
+                    } else {
+                        "\u{2606}"
+                    };
                     let fav_button = egui::Button::new(egui::RichText::new(fav_text).size(14.0))
                         .min_size(egui::vec2(28.0, 28.0));
                     if ui

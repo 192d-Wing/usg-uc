@@ -328,7 +328,8 @@ impl Stream {
 
             // Remove buffered messages with SSN that was skipped
             // Keep only messages with SSN > new_ssn (i.e., ssn >= new_ssn+1)
-            self.reorder_buffer.retain(|&ssn, _| Self::ssn_gt(ssn, new_ssn));
+            self.reorder_buffer
+                .retain(|&ssn, _| Self::ssn_gt(ssn, new_ssn));
 
             // Also clear any ongoing fragment assemblies for skipped SSNs
             self.fragment_buffer

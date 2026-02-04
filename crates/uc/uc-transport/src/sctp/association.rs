@@ -1165,7 +1165,6 @@ impl AssociationInner {
     /// above the cumulative TSN ack. The start/end values are offsets
     /// from the cumulative TSN ack (1-based, per RFC 9260 §3.3.4).
     fn build_gap_ack_blocks(&self) -> Vec<GapAckBlock> {
-
         if self.received_tsns.is_empty() {
             return Vec::new();
         }
@@ -1301,10 +1300,7 @@ impl AssociationInner {
                     tracing::warn!("Peer reported missing mandatory parameter");
                 }
                 ErrorCause::StaleCookieError { measure } => {
-                    tracing::warn!(
-                        staleness_usec = measure,
-                        "Peer reported stale cookie"
-                    );
+                    tracing::warn!(staleness_usec = measure, "Peer reported stale cookie");
                 }
                 ErrorCause::OutOfResource => {
                     tracing::warn!("Peer reported out of resource");
@@ -1327,10 +1323,7 @@ impl AssociationInner {
                     tracing::debug!("Peer reported unrecognized parameters");
                 }
                 ErrorCause::NoUserData { tsn } => {
-                    tracing::warn!(
-                        tsn = tsn,
-                        "Peer reported DATA chunk with no user data"
-                    );
+                    tracing::warn!(tsn = tsn, "Peer reported DATA chunk with no user data");
                 }
                 ErrorCause::CookieReceivedWhileShuttingDown => {
                     tracing::warn!("Peer reported cookie received while shutting down");
@@ -1345,10 +1338,7 @@ impl AssociationInner {
                     tracing::warn!("Peer reported protocol violation");
                 }
                 ErrorCause::Unknown { cause_code, .. } => {
-                    tracing::warn!(
-                        cause_code = cause_code,
-                        "Peer reported unknown error cause"
-                    );
+                    tracing::warn!(cause_code = cause_code, "Peer reported unknown error cause");
                 }
             }
         }
@@ -1528,7 +1518,9 @@ impl AssociationInner {
                             AsconfAckParam::ErrorCause {
                                 correlation_id: *correlation_id,
                                 error_code: ERROR_INVALID_MANDATORY_PARAMETER,
-                                error_info: Bytes::from_static(b"cannot delete primary without alternates"),
+                                error_info: Bytes::from_static(
+                                    b"cannot delete primary without alternates",
+                                ),
                             }
                         } else {
                             // Pick a new primary from the peer addresses
@@ -2049,7 +2041,10 @@ impl std::fmt::Display for VerificationTagError {
             Self::InitNonZero => write!(f, "INIT chunk must have verification tag 0"),
             Self::Mismatch => write!(f, "Verification tag does not match local tag"),
             Self::AbortTBitMismatch => {
-                write!(f, "ABORT with T-bit set has incorrect peer verification tag")
+                write!(
+                    f,
+                    "ABORT with T-bit set has incorrect peer verification tag"
+                )
             }
             Self::ShutdownCompleteTBitMismatch => write!(
                 f,
@@ -2829,7 +2824,12 @@ mod tests {
 
         assert_eq!(ack.serial_number, 1);
         assert_eq!(ack.params.len(), 1);
-        assert!(matches!(ack.params[0], AsconfAckParam::Success { correlation_id: 100 }));
+        assert!(matches!(
+            ack.params[0],
+            AsconfAckParam::Success {
+                correlation_id: 100
+            }
+        ));
 
         // Verify the address was added
         let new_addr: SocketAddr = "192.168.1.100:5061".parse().unwrap();
@@ -2860,7 +2860,12 @@ mod tests {
 
         assert_eq!(ack.serial_number, 1);
         assert_eq!(ack.params.len(), 1);
-        assert!(matches!(ack.params[0], AsconfAckParam::Success { correlation_id: 200 }));
+        assert!(matches!(
+            ack.params[0],
+            AsconfAckParam::Success {
+                correlation_id: 200
+            }
+        ));
 
         // Verify the address was removed
         assert!(!inner.peer_addresses.contains(&addr));
@@ -2885,7 +2890,13 @@ mod tests {
         let ack = inner.process_asconf(&asconf);
 
         assert_eq!(ack.params.len(), 1);
-        assert!(matches!(ack.params[0], AsconfAckParam::ErrorCause { correlation_id: 300, .. }));
+        assert!(matches!(
+            ack.params[0],
+            AsconfAckParam::ErrorCause {
+                correlation_id: 300,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2911,7 +2922,12 @@ mod tests {
         let ack = inner.process_asconf(&asconf);
 
         assert_eq!(ack.params.len(), 1);
-        assert!(matches!(ack.params[0], AsconfAckParam::Success { correlation_id: 400 }));
+        assert!(matches!(
+            ack.params[0],
+            AsconfAckParam::Success {
+                correlation_id: 400
+            }
+        ));
 
         // Verify the primary was changed
         assert_eq!(inner.peer_addr, new_primary);
@@ -2973,7 +2989,10 @@ mod tests {
         assert_eq!(chunk.serial_number, initial_serial);
         assert_eq!(inner.asconf_serial_number, initial_serial.wrapping_add(1));
         assert_eq!(chunk.params.len(), 1);
-        assert!(matches!(chunk.params[0], AsconfParam::AddIp { ipv4: Some(_), .. }));
+        assert!(matches!(
+            chunk.params[0],
+            AsconfParam::AddIp { ipv4: Some(_), .. }
+        ));
     }
 
     #[test]
@@ -2992,10 +3011,7 @@ mod tests {
         // Process a FORWARD-TSN that advances the cumulative TSN
         let ftsn = ForwardTsnChunk::with_streams(
             1005,
-            vec![
-                ForwardTsnStream::new(0, 5),
-                ForwardTsnStream::new(1, 10),
-            ],
+            vec![ForwardTsnStream::new(0, 5), ForwardTsnStream::new(1, 10)],
         );
 
         inner.process_forward_tsn(&ftsn);
@@ -3044,7 +3060,12 @@ mod tests {
         let response = response.unwrap();
         assert_eq!(response.params.len(), 1);
 
-        if let ReConfigParam::Response { resp_seq_num, result, .. } = &response.params[0] {
+        if let ReConfigParam::Response {
+            resp_seq_num,
+            result,
+            ..
+        } = &response.params[0]
+        {
             assert_eq!(*resp_seq_num, 100);
             assert!(result.is_success());
         } else {
@@ -3118,8 +3139,12 @@ mod tests {
 
         // Simulate established state
         inner.state_machine.process_event(StateEvent::Associate);
-        inner.state_machine.process_event(StateEvent::ReceiveInitAck);
-        inner.state_machine.process_event(StateEvent::ReceiveCookieAck);
+        inner
+            .state_machine
+            .process_event(StateEvent::ReceiveInitAck);
+        inner
+            .state_machine
+            .process_event(StateEvent::ReceiveCookieAck);
         inner.peer_cumulative_tsn = 1000;
 
         // Create a DATA chunk with TSN 1001
@@ -3148,8 +3173,12 @@ mod tests {
 
         // Simulate established state
         inner.state_machine.process_event(StateEvent::Associate);
-        inner.state_machine.process_event(StateEvent::ReceiveInitAck);
-        inner.state_machine.process_event(StateEvent::ReceiveCookieAck);
+        inner
+            .state_machine
+            .process_event(StateEvent::ReceiveInitAck);
+        inner
+            .state_machine
+            .process_event(StateEvent::ReceiveCookieAck);
         inner.peer_cumulative_tsn = 1000;
 
         // Send a TSN that's at or below the cumulative (always a duplicate)
@@ -3171,8 +3200,12 @@ mod tests {
 
         // Simulate established state
         inner.state_machine.process_event(StateEvent::Associate);
-        inner.state_machine.process_event(StateEvent::ReceiveInitAck);
-        inner.state_machine.process_event(StateEvent::ReceiveCookieAck);
+        inner
+            .state_machine
+            .process_event(StateEvent::ReceiveInitAck);
+        inner
+            .state_machine
+            .process_event(StateEvent::ReceiveCookieAck);
         inner.peer_cumulative_tsn = 1000;
 
         // Receive out-of-order TSNs (simulating gap)
@@ -3204,8 +3237,12 @@ mod tests {
 
         // Simulate established state
         inner.state_machine.process_event(StateEvent::Associate);
-        inner.state_machine.process_event(StateEvent::ReceiveInitAck);
-        inner.state_machine.process_event(StateEvent::ReceiveCookieAck);
+        inner
+            .state_machine
+            .process_event(StateEvent::ReceiveInitAck);
+        inner
+            .state_machine
+            .process_event(StateEvent::ReceiveCookieAck);
         inner.peer_cumulative_tsn = 1000;
 
         // Create multiple gaps: receive 1002-1003, 1005-1007
@@ -3234,8 +3271,12 @@ mod tests {
 
         // Simulate established state
         inner.state_machine.process_event(StateEvent::Associate);
-        inner.state_machine.process_event(StateEvent::ReceiveInitAck);
-        inner.state_machine.process_event(StateEvent::ReceiveCookieAck);
+        inner
+            .state_machine
+            .process_event(StateEvent::ReceiveInitAck);
+        inner
+            .state_machine
+            .process_event(StateEvent::ReceiveCookieAck);
         inner.peer_cumulative_tsn = 1000;
 
         // Receive out of order: 1002, 1003
@@ -3269,8 +3310,12 @@ mod tests {
 
         // Simulate established state
         inner.state_machine.process_event(StateEvent::Associate);
-        inner.state_machine.process_event(StateEvent::ReceiveInitAck);
-        inner.state_machine.process_event(StateEvent::ReceiveCookieAck);
+        inner
+            .state_machine
+            .process_event(StateEvent::ReceiveInitAck);
+        inner
+            .state_machine
+            .process_event(StateEvent::ReceiveCookieAck);
         inner.peer_cumulative_tsn = 1000;
 
         // Create and receive a chunk, then receive it again
@@ -3413,8 +3458,12 @@ mod tests {
 
         // Simulate established state
         inner.state_machine.process_event(StateEvent::Associate);
-        inner.state_machine.process_event(StateEvent::ReceiveInitAck);
-        inner.state_machine.process_event(StateEvent::ReceiveCookieAck);
+        inner
+            .state_machine
+            .process_event(StateEvent::ReceiveInitAck);
+        inner
+            .state_machine
+            .process_event(StateEvent::ReceiveCookieAck);
         inner.peer_cumulative_tsn = 1000;
 
         // Initially, no immediate SACK needed
@@ -3448,8 +3497,12 @@ mod tests {
 
         // Simulate established state
         inner.state_machine.process_event(StateEvent::Associate);
-        inner.state_machine.process_event(StateEvent::ReceiveInitAck);
-        inner.state_machine.process_event(StateEvent::ReceiveCookieAck);
+        inner
+            .state_machine
+            .process_event(StateEvent::ReceiveInitAck);
+        inner
+            .state_machine
+            .process_event(StateEvent::ReceiveCookieAck);
         inner.peer_cumulative_tsn = 1000;
 
         // Set immediate flag directly

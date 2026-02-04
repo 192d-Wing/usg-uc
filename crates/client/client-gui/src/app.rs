@@ -206,9 +206,7 @@ impl SipClientApp {
             Ok(manager) => manager,
             Err(e) => {
                 error!("Failed to load contacts: {}, starting fresh", e);
-                ContactManager::new().unwrap_or_else(|_| {
-                    panic!("Failed to create contact manager")
-                })
+                ContactManager::new().unwrap_or_else(|_| panic!("Failed to create contact manager"))
             }
         };
 
@@ -479,8 +477,7 @@ impl SipClientApp {
                             self.status_message = format!("Transfer to {target_uri} failed");
                         }
                     } else {
-                        self.status_message =
-                            format!("Transfer to {target_uri}: {status_text}...");
+                        self.status_message = format!("Transfer to {target_uri}: {status_text}...");
                     }
 
                     info!(
@@ -712,7 +709,11 @@ impl SipClientApp {
                 ui.set_min_width(350.0);
 
                 ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("\u{26A0}").size(40.0).color(egui::Color32::YELLOW));
+                    ui.label(
+                        egui::RichText::new("\u{26A0}")
+                            .size(40.0)
+                            .color(egui::Color32::YELLOW),
+                    );
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new("Unsaved Settings").strong().size(18.0));
                 });
@@ -1074,8 +1075,9 @@ impl SipClientApp {
                         });
 
                         if self.pin_attempts >= MAX_PIN_ATTEMPTS {
-                            self.pin_error =
-                                Some("Too many incorrect attempts. Card may be locked.".to_string());
+                            self.pin_error = Some(
+                                "Too many incorrect attempts. Card may be locked.".to_string(),
+                            );
                             warn!("PIN attempt limit reached");
                         }
                     }
@@ -1754,7 +1756,8 @@ impl SipClientApp {
     /// Discards unsaved settings changes and reloads from disk.
     fn discard_settings(&mut self) {
         // Reload settings from the manager (which has the last saved state)
-        self.settings_view.load_from_settings(self.settings_manager.settings());
+        self.settings_view
+            .load_from_settings(self.settings_manager.settings());
         self.status_message = "Changes discarded".to_string();
         info!("Settings changes discarded");
     }
@@ -1858,7 +1861,8 @@ impl SipClientApp {
         let should_answer = if let Some((ref call_id, started_at)) = self.auto_answer_timer {
             if let Some(ref app) = self.client_app {
                 let settings = app.settings().settings();
-                let delay = std::time::Duration::from_secs(settings.general.auto_answer_delay_secs as u64);
+                let delay =
+                    std::time::Duration::from_secs(settings.general.auto_answer_delay_secs as u64);
 
                 if started_at.elapsed() >= delay {
                     info!(call_id = %call_id, "Auto-answer timer elapsed, answering call");

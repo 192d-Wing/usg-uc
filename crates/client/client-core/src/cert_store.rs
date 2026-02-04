@@ -872,14 +872,14 @@ impl CertificateStore {
         algorithm: SignatureAlgorithm,
         pin: Option<&SmartCardPin>,
     ) -> CertStoreResult<Vec<u8>> {
-        use windows::core::PCWSTR;
         use windows::Win32::Security::Cryptography::{
             BCRYPT_PAD_PKCS1, CERT_CONTEXT, CERT_NCRYPT_KEY_SPEC, CERT_OPEN_STORE_FLAGS,
             CERT_QUERY_ENCODING_TYPE, CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_CURRENT_USER,
             CRYPT_ACQUIRE_SILENT_FLAG, CertCloseStore, CertEnumCertificatesInStore, CertOpenStore,
-            CryptAcquireCertificatePrivateKey, NCryptFreeObject, NCryptSignHash, NCRYPT_KEY_HANDLE,
-            NCRYPT_SILENT_FLAG, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+            CryptAcquireCertificatePrivateKey, NCRYPT_KEY_HANDLE, NCRYPT_SILENT_FLAG,
+            NCryptFreeObject, NCryptSignHash, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
         };
+        use windows::core::PCWSTR;
 
         let store_name_wide: Vec<u16> = self
             .store_name
@@ -973,8 +973,10 @@ impl CertificateStore {
 
                 // NCryptSetProperty for PIN
                 use windows::Win32::Security::Cryptography::NCryptSetProperty;
-                let ncrypt_pin_property: Vec<u16> =
-                    "SmartCardPin".encode_utf16().chain(std::iter::once(0)).collect();
+                let ncrypt_pin_property: Vec<u16> = "SmartCardPin"
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
 
                 let pin_result = NCryptSetProperty(
                     key_handle,
@@ -1107,11 +1109,7 @@ impl CertificateStore {
     /// Ok(true) if the PIN is correct and key is accessible,
     /// Err(PinIncorrect) if the PIN is wrong,
     /// Err(SmartCardNotPresent) if the card is not inserted.
-    pub fn verify_pin(
-        &self,
-        thumbprint: &str,
-        pin: &SmartCardPin,
-    ) -> CertStoreResult<bool> {
+    pub fn verify_pin(&self, thumbprint: &str, pin: &SmartCardPin) -> CertStoreResult<bool> {
         info!(thumbprint = %thumbprint, "Verifying smart card PIN");
 
         #[cfg(windows)]
@@ -1127,19 +1125,15 @@ impl CertificateStore {
 
     /// Verifies PIN on Windows using CryptoNG.
     #[cfg(windows)]
-    fn verify_pin_windows(
-        &self,
-        thumbprint: &str,
-        pin: &SmartCardPin,
-    ) -> CertStoreResult<bool> {
-        use windows::core::PCWSTR;
+    fn verify_pin_windows(&self, thumbprint: &str, pin: &SmartCardPin) -> CertStoreResult<bool> {
         use windows::Win32::Security::Cryptography::{
             CERT_CONTEXT, CERT_NCRYPT_KEY_SPEC, CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE,
             CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_CURRENT_USER, CRYPT_ACQUIRE_SILENT_FLAG,
             CertCloseStore, CertEnumCertificatesInStore, CertOpenStore,
-            CryptAcquireCertificatePrivateKey, NCryptFreeObject, NCryptSetProperty,
-            NCRYPT_KEY_HANDLE, NCRYPT_SILENT_FLAG, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+            CryptAcquireCertificatePrivateKey, NCRYPT_KEY_HANDLE, NCRYPT_SILENT_FLAG,
+            NCryptFreeObject, NCryptSetProperty, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
         };
+        use windows::core::PCWSTR;
 
         let store_name_wide: Vec<u16> = self
             .store_name
@@ -1203,8 +1197,10 @@ impl CertificateStore {
                 .chain(std::iter::once(0))
                 .collect();
 
-            let ncrypt_pin_property: Vec<u16> =
-                "SmartCardPin".encode_utf16().chain(std::iter::once(0)).collect();
+            let ncrypt_pin_property: Vec<u16> = "SmartCardPin"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
 
             let pin_result = NCryptSetProperty(
                 key_handle,
@@ -1232,11 +1228,7 @@ impl CertificateStore {
 
     /// Stub PIN verification for non-Windows platforms.
     #[cfg(not(windows))]
-    fn verify_pin_stub(
-        &self,
-        thumbprint: &str,
-        pin: &SmartCardPin,
-    ) -> CertStoreResult<bool> {
+    fn verify_pin_stub(&self, thumbprint: &str, pin: &SmartCardPin) -> CertStoreResult<bool> {
         // Verify certificate exists
         let _ = self.find_by_thumbprint(thumbprint)?;
 
@@ -1459,20 +1451,29 @@ mod tests {
         #[cfg(not(windows))]
         {
             let store = CertificateStore::open_personal();
-            let thumbprint =
-                "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2";
+            let thumbprint = "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2";
             let data = b"test data to sign";
             let pin = SmartCardPin::new("1234");
 
             // Sign with ECDSA P-384
             let signature = store
-                .sign_data(thumbprint, data, SignatureAlgorithm::EcdsaSha384, Some(&pin))
+                .sign_data(
+                    thumbprint,
+                    data,
+                    SignatureAlgorithm::EcdsaSha384,
+                    Some(&pin),
+                )
                 .unwrap();
             assert_eq!(signature.len(), 96); // P-384 signature size
 
             // Sign with ECDSA P-256
             let signature = store
-                .sign_data(thumbprint, data, SignatureAlgorithm::EcdsaSha256, Some(&pin))
+                .sign_data(
+                    thumbprint,
+                    data,
+                    SignatureAlgorithm::EcdsaSha256,
+                    Some(&pin),
+                )
                 .unwrap();
             assert_eq!(signature.len(), 64); // P-256 signature size
 
@@ -1489,8 +1490,7 @@ mod tests {
         #[cfg(not(windows))]
         {
             let store = CertificateStore::open_personal();
-            let thumbprint =
-                "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2";
+            let thumbprint = "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2";
             let data = b"test data to sign";
 
             // Sign without PIN (should still work in stub mode)
@@ -1508,7 +1508,10 @@ mod tests {
         let pin = SmartCardPin::new("1234");
 
         let result = store.sign_data("INVALID", data, SignatureAlgorithm::EcdsaSha384, Some(&pin));
-        assert!(matches!(result, Err(CertStoreError::CertificateNotFound(_))));
+        assert!(matches!(
+            result,
+            Err(CertStoreError::CertificateNotFound(_))
+        ));
     }
 
     #[test]
@@ -1516,8 +1519,7 @@ mod tests {
         #[cfg(not(windows))]
         {
             let store = CertificateStore::open_personal();
-            let thumbprint =
-                "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2";
+            let thumbprint = "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2";
 
             // Valid PIN (4+ digits)
             let valid_pin = SmartCardPin::new("1234");
@@ -1538,7 +1540,10 @@ mod tests {
         let pin = SmartCardPin::new("1234");
 
         let result = store.verify_pin("INVALID", &pin);
-        assert!(matches!(result, Err(CertStoreError::CertificateNotFound(_))));
+        assert!(matches!(
+            result,
+            Err(CertStoreError::CertificateNotFound(_))
+        ));
     }
 
     #[test]

@@ -273,9 +273,10 @@ impl ConnectedSctpAssociation {
     fn decode_packet(&self, buf: &[u8]) -> Result<SctpPacket, TransportError> {
         if self.use_udp_encapsulation {
             use super::udp_encap::decapsulate;
-            let encap = decapsulate(Bytes::copy_from_slice(buf)).map_err(|e| TransportError::Io {
-                reason: format!("UDP decapsulation failed: {e}"),
-            })?;
+            let encap =
+                decapsulate(Bytes::copy_from_slice(buf)).map_err(|e| TransportError::Io {
+                    reason: format!("UDP decapsulation failed: {e}"),
+                })?;
             Ok(encap.sctp_packet)
         } else {
             SctpPacket::decode(&Bytes::copy_from_slice(buf)).map_err(|e| TransportError::Io {
@@ -1052,7 +1053,10 @@ mod tests {
         assert_eq!(config.outbound_streams, 10);
         assert_eq!(config.max_inbound_streams, 10);
         assert!(!config.use_udp_encapsulation);
-        assert_eq!(config.udp_encap_config.local_port, super::super::udp_encap::SCTP_UDP_PORT);
+        assert_eq!(
+            config.udp_encap_config.local_port,
+            super::super::udp_encap::SCTP_UDP_PORT
+        );
     }
 
     #[test]
@@ -1060,17 +1064,25 @@ mod tests {
         use super::super::chunk::{Chunk, DataChunk};
 
         let mut packet = SctpPacket::new(5060, 5061, 0x12345678);
-        packet.add_chunk(Chunk::Data(DataChunk::new(1, 0, 0, 0, Bytes::from_static(b"test"))));
+        packet.add_chunk(Chunk::Data(DataChunk::new(
+            1,
+            0,
+            0,
+            0,
+            Bytes::from_static(b"test"),
+        )));
 
         let config = UdpEncapConfig::default();
         let local_addr: SocketAddr = "192.168.1.1:9899".parse().unwrap();
         let peer_addr: SocketAddr = "192.168.1.2:9899".parse().unwrap();
 
         // Without encapsulation
-        let bytes_raw = encode_packet_with_encap(&packet, false, &config, Some(&local_addr), &peer_addr);
+        let bytes_raw =
+            encode_packet_with_encap(&packet, false, &config, Some(&local_addr), &peer_addr);
 
         // With encapsulation (should be larger due to UDP header)
-        let bytes_encap = encode_packet_with_encap(&packet, true, &config, Some(&local_addr), &peer_addr);
+        let bytes_encap =
+            encode_packet_with_encap(&packet, true, &config, Some(&local_addr), &peer_addr);
 
         // Encapsulated packet should be 8 bytes larger (UDP header)
         assert_eq!(bytes_encap.len(), bytes_raw.len() + 8);
@@ -1081,7 +1093,13 @@ mod tests {
         use super::super::chunk::{Chunk, DataChunk};
 
         let mut packet = SctpPacket::new(5060, 5061, 0x12345678);
-        packet.add_chunk(Chunk::Data(DataChunk::new(1, 0, 0, 0, Bytes::from_static(b"hello"))));
+        packet.add_chunk(Chunk::Data(DataChunk::new(
+            1,
+            0,
+            0,
+            0,
+            Bytes::from_static(b"hello"),
+        )));
 
         let config = UdpEncapConfig::default();
         let peer_addr: SocketAddr = "192.168.1.2:9899".parse().unwrap();
@@ -1101,13 +1119,20 @@ mod tests {
         use super::super::udp_encap::decapsulate;
 
         let mut packet = SctpPacket::new(5060, 5061, 0x12345678);
-        packet.add_chunk(Chunk::Data(DataChunk::new(1, 0, 0, 0, Bytes::from_static(b"hello"))));
+        packet.add_chunk(Chunk::Data(DataChunk::new(
+            1,
+            0,
+            0,
+            0,
+            Bytes::from_static(b"hello"),
+        )));
 
         let config = UdpEncapConfig::default();
         let local_addr: SocketAddr = "192.168.1.1:9899".parse().unwrap();
         let peer_addr: SocketAddr = "192.168.1.2:9899".parse().unwrap();
 
-        let encoded = encode_packet_with_encap(&packet, true, &config, Some(&local_addr), &peer_addr);
+        let encoded =
+            encode_packet_with_encap(&packet, true, &config, Some(&local_addr), &peer_addr);
 
         // Decode with decapsulation
         let encap = decapsulate(encoded).unwrap();
