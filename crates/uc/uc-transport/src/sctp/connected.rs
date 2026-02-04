@@ -3,20 +3,20 @@
 //! This module provides `ConnectedSctpAssociation`, which wraps an
 //! `AssociationHandle` with a UDP socket for actual network communication.
 
+use super::StreamId;
 use super::association::{AssociationConfig, AssociationHandle};
 use super::chunk::{AbortChunk, Chunk, ShutdownChunk};
-use super::packet::{SctpPacket, MAX_PACKET_SIZE};
+use super::packet::{MAX_PACKET_SIZE, SctpPacket};
 use super::state::{AssociationState, StateAction};
 use super::udp_encap::UdpEncapConfig;
-use super::StreamId;
 use crate::error::{TransportError, TransportResult};
-use crate::{ReceivedMessage, StreamTransport, Transport, MAX_STREAM_MESSAGE_SIZE};
+use crate::{MAX_STREAM_MESSAGE_SIZE, ReceivedMessage, StreamTransport, Transport};
 use bytes::Bytes;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace, warn};
@@ -96,20 +96,22 @@ impl ConnectedSctpAssociation {
     ) -> TransportResult<Self> {
         // Bind UDP socket
         let local_socket: SocketAddr = local_addr.clone().into();
-        let socket = UdpSocket::bind(local_socket).await.map_err(|e| {
-            TransportError::BindFailed {
-                reason: e.to_string(),
-                address: local_addr.clone(),
-            }
-        })?;
+        let socket =
+            UdpSocket::bind(local_socket)
+                .await
+                .map_err(|e| TransportError::BindFailed {
+                    reason: e.to_string(),
+                    address: local_addr.clone(),
+                })?;
 
         // Get actual local address (in case port 0 was used)
-        let actual_local: SocketAddr = socket.local_addr().map_err(|e| {
-            TransportError::BindFailed {
-                reason: e.to_string(),
-                address: local_addr.clone(),
-            }
-        })?;
+        let actual_local: SocketAddr =
+            socket
+                .local_addr()
+                .map_err(|e| TransportError::BindFailed {
+                    reason: e.to_string(),
+                    address: local_addr.clone(),
+                })?;
 
         let actual_local_sbc = SbcSocketAddr::from(actual_local);
 
@@ -241,13 +243,13 @@ impl ConnectedSctpAssociation {
             }
         })?;
 
-        let response_chunks = self
-            .handle
-            .process_packet(&packet)
-            .await
-            .map_err(|e| TransportError::Io {
-                reason: format!("Failed to process INIT-ACK: {e}"),
-            })?;
+        let response_chunks =
+            self.handle
+                .process_packet(&packet)
+                .await
+                .map_err(|e| TransportError::Io {
+                    reason: format!("Failed to process INIT-ACK: {e}"),
+                })?;
 
         // Should have COOKIE-ECHO to send
         if response_chunks.is_empty() {
@@ -378,12 +380,13 @@ impl ConnectedSctpAssociation {
 
             let bytes = packet.encode();
             let peer_socket: SocketAddr = self.peer_addr.clone().into();
-            self.socket.send_to(&bytes, peer_socket).await.map_err(|e| {
-                TransportError::SendFailed {
+            self.socket
+                .send_to(&bytes, peer_socket)
+                .await
+                .map_err(|e| TransportError::SendFailed {
                     address: self.peer_addr.clone(),
                     reason: e.to_string(),
-                }
-            })?;
+                })?;
         }
 
         debug!(
@@ -513,7 +516,11 @@ impl Transport for ConnectedSctpAssociation {
             loop {
                 // Try to get a message from the handle
                 if let Some((stream_id, data)) = self.handle.recv().await {
-                    trace!(stream = stream_id, len = data.len(), "Received SCTP message");
+                    trace!(
+                        stream = stream_id,
+                        len = data.len(),
+                        "Received SCTP message"
+                    );
                     return Ok(ReceivedMessage {
                         data,
                         source: self.peer_addr.clone(),

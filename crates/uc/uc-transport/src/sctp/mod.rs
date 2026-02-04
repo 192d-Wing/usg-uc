@@ -34,8 +34,6 @@ pub mod timer;
 pub mod udp_encap;
 
 pub use association::{AssociationConfig, AssociationHandle, AssociationInner};
-pub use connected::{ConnectedSctpAssociation, ConnectedSctpConfig};
-pub use listener::{SctpListener, SctpListenerConfig};
 pub use chunk::{
     AbortChunk, Chunk, ChunkType, CookieAckChunk, CookieEchoChunk, DataChunk, ErrorCause,
     ErrorChunk, GapAckBlock, HeartbeatAckChunk, HeartbeatChunk, InitAckChunk, InitChunk, InitParam,
@@ -43,7 +41,9 @@ pub use chunk::{
     UnknownChunkAction,
 };
 pub use congestion::CongestionController;
+pub use connected::{ConnectedSctpAssociation, ConnectedSctpConfig};
 pub use cookie::{CookieData, CookieError, CookieGenerator, DEFAULT_COOKIE_LIFETIME};
+pub use listener::{SctpListener, SctpListenerConfig};
 pub use packet::{HEADER_SIZE, MAX_PACKET_SIZE, SctpPacket};
 pub use path::{Path, PathId, PathManager, PathState};
 pub use state::{AssociationState, StateAction, StateEvent, StateMachine};

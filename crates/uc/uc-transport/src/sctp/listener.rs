@@ -21,17 +21,17 @@ use super::association::{AssociationConfig, AssociationHandle};
 use super::chunk::{Chunk, CookieAckChunk, InitAckChunk, InitChunk};
 use super::cookie::{CookieData, CookieGenerator};
 use super::packet::SctpPacket;
-use super::udp_encap::{EncapsulatedPacket, UdpEncapConfig, SCTP_UDP_PORT};
+use super::udp_encap::{EncapsulatedPacket, SCTP_UDP_PORT, UdpEncapConfig};
 use crate::error::{TransportError, TransportResult};
 use crate::listener::{AcceptFuture, TransportListener};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, trace, warn};
 use uc_types::address::{SbcSocketAddr, TransportType};
 
@@ -170,12 +170,12 @@ impl SctpListenerInner {
         peer_addr: SocketAddr,
     ) -> Result<AssociationHandle, TransportError> {
         // Validate the cookie
-        let cookie_data = self
-            .cookie_generator
-            .validate(cookie)
-            .map_err(|e| TransportError::ReceiveFailed {
-                reason: format!("Invalid cookie: {e}"),
-            })?;
+        let cookie_data =
+            self.cookie_generator
+                .validate(cookie)
+                .map_err(|e| TransportError::ReceiveFailed {
+                    reason: format!("Invalid cookie: {e}"),
+                })?;
 
         // Verify the peer address matches
         if cookie_data.peer_addr != peer_addr {
@@ -201,9 +201,8 @@ impl SctpListenerInner {
     /// Cleans up stale pending associations.
     fn cleanup_stale_pending(&mut self) {
         let now = Instant::now();
-        self.pending.retain(|_, pending| {
-            now.duration_since(pending.created_at) < PENDING_TIMEOUT
-        });
+        self.pending
+            .retain(|_, pending| now.duration_since(pending.created_at) < PENDING_TIMEOUT);
     }
 }
 
@@ -630,7 +629,9 @@ impl TransportListener for SctpListener {
         TransportType::Sctp
     }
 
-    fn close(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = TransportResult<()>> + Send + '_>> {
+    fn close(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TransportResult<()>> + Send + '_>> {
         Box::pin(async move {
             self.closed.store(true, Ordering::Relaxed);
 

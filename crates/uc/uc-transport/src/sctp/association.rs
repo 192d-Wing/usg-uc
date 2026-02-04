@@ -654,9 +654,26 @@ impl AssociationHandle {
         Ok(response_chunks)
     }
 
+    /// Initiates the association (moves state machine to CookieWait).
+    ///
+    /// This should be called before `create_init_packet()` on the client side
+    /// to properly initialize the state machine for the 4-way handshake.
+    pub async fn initiate(&self) -> Vec<StateAction> {
+        let mut inner = self.inner.write().await;
+        inner.state_machine.process_event(StateEvent::Associate)
+    }
+
     /// Creates an INIT packet to start the handshake.
+    ///
+    /// Note: Call `initiate()` first to move the state machine to CookieWait.
     pub async fn create_init_packet(&self) -> SctpPacket {
-        let inner = self.inner.read().await;
+        let mut inner = self.inner.write().await;
+
+        // If we're in Closed state, automatically initiate
+        if inner.state() == AssociationState::Closed {
+            inner.state_machine.process_event(StateEvent::Associate);
+        }
+
         let init = inner.create_init_chunk();
         let local_port = inner.local_addr.port();
         let peer_port = inner.peer_addr.port();
@@ -695,6 +712,18 @@ impl AssociationHandle {
         }
 
         chunks
+    }
+
+    /// Confirms the primary path as reachable.
+    ///
+    /// In normal operation, paths are confirmed via HEARTBEAT-ACK responses
+    /// or receiving data. This method allows external code (including tests)
+    /// to simulate path confirmation without actual network I/O.
+    pub async fn confirm_primary_path(&self) {
+        let mut inner = self.inner.write().await;
+        if let Some(path) = inner.paths.primary_path_mut() {
+            path.confirm();
+        }
     }
 }
 
