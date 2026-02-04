@@ -865,6 +865,24 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - `refresh_audio_devices()` called when entering call view
   - Device switch action handlers with status messages
 
+#### Phase 24.27: Codec Negotiation from SDP
+
+- `client-core/src/call_manager.rs` - SDP codec negotiation
+  - `parse_codec_from_sdp()` - Extract negotiated codec from SDP answer
+    - Parses m=audio line for first payload type
+    - Maps static payload types (0=PCMU, 8=PCMA, 9=G722)
+    - Looks up dynamic payload types via rtpmap attributes (e.g., Opus)
+  - `negotiated_codecs: HashMap<String, CodecPreference>` - Per-call codec storage
+  - `handle_sdp_answer()` - Stores negotiated codec from remote SDP
+  - `start_audio_session()` - Uses negotiated codec (falls back to preferred)
+  - Cleanup: negotiated codec removed on call termination or hangup
+- Unit tests for SDP codec parsing
+  - `test_parse_codec_from_sdp_pcmu` - Static payload type 0
+  - `test_parse_codec_from_sdp_pcma` - Static payload type 8
+  - `test_parse_codec_from_sdp_g722` - Static payload type 9
+  - `test_parse_codec_from_sdp_opus` - Dynamic payload type with rtpmap
+  - `test_parse_codec_from_sdp_no_audio` - Missing m=audio line
+
 **Security**
 
 - Smart card authentication ONLY (CAC/PIV/SIPR token)

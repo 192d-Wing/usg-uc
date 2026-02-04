@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.26 complete, Phase 25 critical items complete
+**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.27 complete, Phase 25 critical items complete
 
 ---
 
@@ -1224,6 +1224,25 @@ This document outlines the development roadmap for the USG Session Border Contro
   - Speaker dropdown with available devices
   - Device lists refreshed when entering call view
   - Status messages for device changes
+
+**Phase 24.27: Codec Negotiation from SDP** ✅
+
+- ✅ SDP codec parsing in CallManager
+  - `parse_codec_from_sdp()` extracts negotiated codec from SDP answer
+  - Parses m=audio line for first payload type
+  - Maps static payload types (0=PCMU, 8=PCMA, 9=G722)
+  - Looks up dynamic payload types via rtpmap attributes
+- ✅ Negotiated codec storage
+  - `negotiated_codecs: HashMap<String, CodecPreference>` per call
+  - Stored when SDP answer received in `handle_sdp_answer()`
+  - Cleaned up on call termination or hangup
+- ✅ Audio session codec integration
+  - `start_audio_session()` uses negotiated codec when available
+  - Falls back to `preferred_codec` if no negotiation occurred
+  - Logging indicates which codec is being used
+- ✅ Unit tests for SDP codec parsing
+  - Tests for PCMU, PCMA, G722, Opus detection
+  - Tests for missing m=audio line handling
 
 ---
 

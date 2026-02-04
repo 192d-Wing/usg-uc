@@ -85,6 +85,8 @@ pub struct CallManager {
     is_muted: bool,
     /// Music on Hold file path (optional).
     moh_file_path: Option<String>,
+    /// Negotiated codec per call (from SDP answer).
+    negotiated_codecs: HashMap<String, CodecPreference>,
 }
 
 /// Events emitted by the call manager.
@@ -194,6 +196,7 @@ impl CallManager {
             max_concurrent_calls: 2, // Support call waiting with 2 calls
             is_muted: false,
             moh_file_path: None,
+            negotiated_codecs: HashMap::new(),
         }
     }
 
@@ -364,6 +367,9 @@ impl CallManager {
         if let Some(mut session) = self.media_sessions.remove(call_id) {
             let _ = session.close().await;
         }
+
+        // Clean up negotiated codec
+        self.negotiated_codecs.remove(call_id);
 
         // Record in call history
         if let Some(info) = call_info {
@@ -1195,11 +1201,20 @@ impl CallManager {
         // Create audio session
         let mut audio_session = AudioSession::new(self.audio_event_tx.clone());
 
+        // Use the negotiated codec from SDP answer if available, otherwise fall back to preferred
+        let codec = self
+            .negotiated_codecs
+            .get(call_id)
+            .copied()
+            .unwrap_or(self.preferred_codec);
+
+        info!(call_id = %call_id, codec = ?codec, "Using codec for audio session");
+
         // Configure audio
         let config = AudioSessionConfig {
             local_port: 0,
             remote_addr,
-            codec: self.preferred_codec,
+            codec,
             jitter_buffer_ms: 60,
             // SRTP keys will be obtained from media session in production
             srtp_key: None,
@@ -1299,6 +1314,9 @@ impl CallManager {
                     let _ = session.close().await;
                 }
 
+                // Clean up negotiated codec
+                self.negotiated_codecs.remove(call_id);
+
                 // Record in call history
                 let end_reason = call_info
                     .failure_reason
@@ -1335,6 +1353,14 @@ impl CallManager {
 
     async fn handle_sdp_answer(&mut self, call_id: &str, sdp: &str) -> AppResult<()> {
         debug!(call_id = %call_id, "Received SDP answer");
+
+        // Parse the negotiated codec from the SDP answer
+        if let Some(codec) = parse_codec_from_sdp(sdp) {
+            info!(call_id = %call_id, codec = ?codec, "Negotiated codec from SDP answer");
+            self.negotiated_codecs.insert(call_id.to_string(), codec);
+        } else {
+            debug!(call_id = %call_id, "No codec found in SDP answer, will use preferred codec");
+        }
 
         // Parse SDP and configure media session
         if let Some(session) = self.media_sessions.get_mut(call_id) {
@@ -1577,6 +1603,79 @@ fn parse_ice_credentials_from_sdp(sdp: &str) -> Option<proto_ice::IceCredentials
     }
 }
 
+/// Parses the negotiated codec from an SDP answer.
+///
+/// Looks at the first payload type in the m=audio line, then finds the
+/// corresponding rtpmap to determine the codec name.
+///
+/// # Arguments
+/// * `sdp` - The SDP answer string
+///
+/// # Returns
+/// The negotiated codec preference, or None if not found
+fn parse_codec_from_sdp(sdp: &str) -> Option<CodecPreference> {
+    let mut first_payload_type: Option<u8> = None;
+    let mut rtpmaps: Vec<(u8, String)> = Vec::new();
+
+    for line in sdp.lines() {
+        // Find the m=audio line and get the first payload type
+        if line.starts_with("m=audio") {
+            // Format: m=audio <port> <proto> <fmt> <fmt> ...
+            // e.g., "m=audio 49170 RTP/AVP 0 8 96"
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 {
+                // First format is at index 3
+                if let Ok(pt) = parts[3].parse::<u8>() {
+                    first_payload_type = Some(pt);
+                }
+            }
+        }
+
+        // Collect all rtpmap attributes
+        // Format: a=rtpmap:<payload type> <encoding name>/<clock rate>[/<parameters>]
+        // e.g., "a=rtpmap:0 PCMU/8000"
+        if let Some(rtpmap) = line.strip_prefix("a=rtpmap:") {
+            let parts: Vec<&str> = rtpmap.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let Ok(pt) = parts[0].parse::<u8>() {
+                    // Get the encoding name (before the /)
+                    let codec_name = parts[1].split('/').next().unwrap_or("");
+                    rtpmaps.push((pt, codec_name.to_string()));
+                }
+            }
+        }
+    }
+
+    // Find the codec name for the first payload type
+    let pt = first_payload_type?;
+
+    // Check well-known static payload types first
+    match pt {
+        0 => return Some(CodecPreference::G711Ulaw),
+        8 => return Some(CodecPreference::G711Alaw),
+        9 => return Some(CodecPreference::G722),
+        _ => {}
+    }
+
+    // Look up in rtpmap for dynamic payload types
+    for (rtpmap_pt, codec_name) in rtpmaps {
+        if rtpmap_pt == pt {
+            let name_lower = codec_name.to_lowercase();
+            if name_lower == "pcmu" {
+                return Some(CodecPreference::G711Ulaw);
+            } else if name_lower == "pcma" {
+                return Some(CodecPreference::G711Alaw);
+            } else if name_lower == "g722" {
+                return Some(CodecPreference::G722);
+            } else if name_lower == "opus" {
+                return Some(CodecPreference::Opus);
+            }
+        }
+    }
+
+    None
+}
+
 /// Generates a unique session ID for SDP.
 fn session_id() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1729,5 +1828,80 @@ mod tests {
         // Initially no incoming calls
         assert!(!manager.has_incoming_call());
         assert!(manager.incoming_calls().is_empty());
+    }
+
+    #[test]
+    fn test_parse_codec_from_sdp_pcmu() {
+        let sdp = "v=0\r\n\
+                   o=- 0 0 IN IP4 192.168.1.1\r\n\
+                   s=-\r\n\
+                   c=IN IP4 192.168.1.1\r\n\
+                   t=0 0\r\n\
+                   m=audio 49170 RTP/AVP 0 8 96\r\n\
+                   a=rtpmap:0 PCMU/8000\r\n\
+                   a=rtpmap:8 PCMA/8000\r\n\
+                   a=rtpmap:96 opus/48000/2\r\n";
+
+        let codec = parse_codec_from_sdp(sdp).unwrap();
+        assert!(matches!(codec, CodecPreference::G711Ulaw));
+    }
+
+    #[test]
+    fn test_parse_codec_from_sdp_pcma() {
+        let sdp = "v=0\r\n\
+                   o=- 0 0 IN IP4 192.168.1.1\r\n\
+                   s=-\r\n\
+                   c=IN IP4 192.168.1.1\r\n\
+                   t=0 0\r\n\
+                   m=audio 49170 RTP/AVP 8 0 96\r\n\
+                   a=rtpmap:0 PCMU/8000\r\n\
+                   a=rtpmap:8 PCMA/8000\r\n\
+                   a=rtpmap:96 opus/48000/2\r\n";
+
+        let codec = parse_codec_from_sdp(sdp).unwrap();
+        assert!(matches!(codec, CodecPreference::G711Alaw));
+    }
+
+    #[test]
+    fn test_parse_codec_from_sdp_opus() {
+        let sdp = "v=0\r\n\
+                   o=- 0 0 IN IP4 192.168.1.1\r\n\
+                   s=-\r\n\
+                   c=IN IP4 192.168.1.1\r\n\
+                   t=0 0\r\n\
+                   m=audio 49170 RTP/AVP 111 0 8\r\n\
+                   a=rtpmap:111 opus/48000/2\r\n\
+                   a=rtpmap:0 PCMU/8000\r\n\
+                   a=rtpmap:8 PCMA/8000\r\n";
+
+        let codec = parse_codec_from_sdp(sdp).unwrap();
+        assert!(matches!(codec, CodecPreference::Opus));
+    }
+
+    #[test]
+    fn test_parse_codec_from_sdp_g722() {
+        let sdp = "v=0\r\n\
+                   o=- 0 0 IN IP4 192.168.1.1\r\n\
+                   s=-\r\n\
+                   c=IN IP4 192.168.1.1\r\n\
+                   t=0 0\r\n\
+                   m=audio 49170 RTP/AVP 9 0 8\r\n\
+                   a=rtpmap:9 G722/8000\r\n\
+                   a=rtpmap:0 PCMU/8000\r\n\
+                   a=rtpmap:8 PCMA/8000\r\n";
+
+        let codec = parse_codec_from_sdp(sdp).unwrap();
+        assert!(matches!(codec, CodecPreference::G722));
+    }
+
+    #[test]
+    fn test_parse_codec_from_sdp_no_audio() {
+        let sdp = "v=0\r\n\
+                   o=- 0 0 IN IP4 192.168.1.1\r\n\
+                   s=-\r\n\
+                   c=IN IP4 192.168.1.1\r\n\
+                   t=0 0\r\n";
+
+        assert!(parse_codec_from_sdp(sdp).is_none());
     }
 }
