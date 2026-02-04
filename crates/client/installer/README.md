@@ -65,7 +65,7 @@ installer/
 
 The MSI installer includes:
 
-- **Main Application**: `sip-softclient.exe` installed to Program Files
+- **Main Application**: `sip-softclient-windows.exe` installed to Program Files
 - **Start Menu Shortcuts**: Desktop and Start Menu shortcuts
 - **Registry Entries**:
   - Uninstall information
@@ -83,7 +83,7 @@ For CNSA 2.0 compliance, code signing should use:
 Example signing command:
 
 ```powershell
-signtool sign /sha1 <thumbprint> /fd SHA384 /tr http://timestamp.digicert.com /td SHA384 /v sip-softclient.exe
+signtool sign /sha1 <thumbprint> /fd SHA384 /tr http://timestamp.digicert.com /td SHA384 /v sip-softclient-windows.exe
 ```
 
 ## Customization
@@ -125,7 +125,7 @@ Install Windows SDK from <https://developer.microsoft.com/en-us/windows/download
 Ensure you've built the Rust application first:
 
 ```powershell
-cargo build --release -p client-gui
+cargo build --release -p client-gui-windows
 ```
 
 ## Security Notes

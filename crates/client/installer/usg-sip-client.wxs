@@ -6,7 +6,7 @@
 
   Requirements:
   - WiX Toolset v4.x (https://wixtoolset.org/)
-  - Rust release build: cargo build --release -p client-gui
+  - Rust release build: cargo build --release -p client-gui-windows
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
 
@@ -79,7 +79,7 @@
       <Component Id="MainExecutable" Guid="B2C3D4E5-F6A7-8901-BCDE-F23456789012">
         <File
           Id="SipSoftClientExe"
-          Source="$(var.BuildOutput)\sip-softclient.exe"
+          Source="$(var.BuildOutput)\sip-softclient-windows.exe"
           KeyPath="yes">
           <!-- File association for SIP URIs -->
           <Shortcut
@@ -132,7 +132,7 @@
           Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
           Name="USG SIP Client"
           Type="string"
-          Value="[INSTALLFOLDER]sip-softclient.exe --minimized"
+          Value="[INSTALLFOLDER]sip-softclient-windows.exe --minimized"
           KeyPath="yes" />
       </Component>
 
@@ -143,10 +143,10 @@
           <RegistryValue Type="string" Name="URL Protocol" Value="" />
         </RegistryKey>
         <RegistryKey Root="HKCR" Key="sip\DefaultIcon">
-          <RegistryValue Type="string" Value="[INSTALLFOLDER]sip-softclient.exe,0" />
+          <RegistryValue Type="string" Value="[INSTALLFOLDER]sip-softclient-windows.exe,0" />
         </RegistryKey>
         <RegistryKey Root="HKCR" Key="sip\shell\open\command">
-          <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]sip-softclient.exe&quot; &quot;%1&quot;" />
+          <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]sip-softclient-windows.exe&quot; &quot;%1&quot;" />
         </RegistryKey>
 
         <!-- SIPS handler -->
@@ -155,10 +155,10 @@
           <RegistryValue Type="string" Name="URL Protocol" Value="" />
         </RegistryKey>
         <RegistryKey Root="HKCR" Key="sips\DefaultIcon">
-          <RegistryValue Type="string" Value="[INSTALLFOLDER]sip-softclient.exe,0" />
+          <RegistryValue Type="string" Value="[INSTALLFOLDER]sip-softclient-windows.exe,0" />
         </RegistryKey>
         <RegistryKey Root="HKCR" Key="sips\shell\open\command">
-          <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]sip-softclient.exe&quot; &quot;%1&quot;" />
+          <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]sip-softclient-windows.exe&quot; &quot;%1&quot;" />
         </RegistryKey>
       </Component>
 
@@ -176,7 +176,7 @@
           Id="DesktopShortcutLink"
           Name="USG SIP Client"
           Description="CNSA 2.0 compliant SIP soft client"
-          Target="[INSTALLFOLDER]sip-softclient.exe"
+          Target="[INSTALLFOLDER]sip-softclient-windows.exe"
           WorkingDirectory="INSTALLFOLDER"
           Icon="AppIcon.ico" />
         <RegistryValue Root="HKCU" Key="SOFTWARE\USG Communications\SIP Client"

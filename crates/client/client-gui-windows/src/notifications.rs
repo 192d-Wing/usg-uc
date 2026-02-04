@@ -3,6 +3,7 @@
 //! Uses winrt-notification for native Windows toast support.
 
 use tracing::{error, info};
+use winrt_notification::{Duration, Sound, Toast};
 
 /// Notification types for the SIP client.
 #[derive(Debug, Clone)]
@@ -74,18 +75,6 @@ impl NotificationManager {
         if !self.enabled {
             return;
         }
-
-        #[cfg(target_os = "windows")]
-        self.show_windows_notification(notification);
-
-        #[cfg(not(target_os = "windows"))]
-        self.show_fallback_notification(notification);
-    }
-
-    /// Shows a Windows toast notification.
-    #[cfg(target_os = "windows")]
-    fn show_windows_notification(&self, notification: NotificationType) {
-        use winrt_notification::{Duration, Sound, Toast};
 
         let result = match notification {
             NotificationType::IncomingCall {
@@ -178,54 +167,6 @@ impl NotificationManager {
             error!("Failed to show notification: {}", e);
         } else {
             info!("Notification shown");
-        }
-    }
-
-    /// Fallback notification logging for non-Windows platforms.
-    #[cfg(not(target_os = "windows"))]
-    fn show_fallback_notification(&self, notification: NotificationType) {
-        match notification {
-            NotificationType::IncomingCall {
-                caller_name,
-                caller_uri,
-            } => {
-                info!(
-                    "Incoming call from {}",
-                    caller_name.as_deref().unwrap_or(&caller_uri)
-                );
-            }
-            NotificationType::MissedCall {
-                caller_name,
-                caller_uri,
-            } => {
-                info!(
-                    "Missed call from {}",
-                    caller_name.as_deref().unwrap_or(&caller_uri)
-                );
-            }
-            NotificationType::RegistrationChanged {
-                registered,
-                account_id,
-            } => {
-                if registered {
-                    info!("Registered: {}", account_id);
-                } else {
-                    info!("Registration failed: {}", account_id);
-                }
-            }
-            NotificationType::CallEnded {
-                remote_name,
-                duration_secs,
-            } => {
-                info!(
-                    "Call ended with {} ({}s)",
-                    remote_name.as_deref().unwrap_or("unknown"),
-                    duration_secs.unwrap_or(0)
-                );
-            }
-            NotificationType::Error { title, message } => {
-                error!("{}: {}", title, message);
-            }
         }
     }
 

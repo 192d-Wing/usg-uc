@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-25 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.30-24.32 complete, Phase 25 100% RFC 9260 compliance achieved
+**Current Status**: 1750+ tests passing, Phases 1-25 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.30-24.36 complete, Phase 25 100% RFC 9260 compliance achieved
 
 ---
 
@@ -668,7 +668,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - 🚧 `client-audio`: CPAL audio I/O, jitter buffer, RTP/SRTP pipeline
 - 🚧 `client-sip-ua`: SIP User Agent (registration, call control, ICE/DTLS)
 - 🚧 `client-core`: Application logic, settings persistence, event coordination
-- 🚧 `client-gui`: Windows GUI (egui), system tray, notifications
+- 🚧 `client-gui-windows`: Windows GUI (egui), system tray, notifications
 
 **Key Features**
 
@@ -1403,6 +1403,104 @@ This document outlines the development roadmap for the USG Session Border Contro
   - Support for both PEM and DER formats
   - Manual PEM parsing with base64 decoding
   - Added `load_certs_from_pem_file` utility function
+
+**Phase 24.35: Platform-Specific UI Architecture** ✅
+
+- ✅ Rename `client-gui` to `client-gui-windows`
+  - Binary: `sip-softclient-windows`
+  - Add `#![cfg(target_os = "windows")]` attribute
+  - Make `winrt-notification` unconditional dependency
+  - Remove cross-platform fallback notification code
+- ✅ Update workspace references
+  - Cargo.toml workspace member path
+  - Workspace dependency declaration
+- ✅ Platform-specific UI crate structure (planned)
+  - `client-gui-windows`: Windows desktop (native-windows-gui, winrt-notification)
+  - `client-gui-macos`: macOS desktop (planned)
+  - `client-gui-linux`: Linux desktop (planned)
+  - `client-gui-android`: Android mobile (planned)
+  - `client-gui-ios`: iOS mobile (planned)
+- ✅ Shared cross-platform crates
+  - `client-types`: Data types and models (no platform deps)
+  - `client-core`: App logic, transport, contacts (Windows CryptoAPI optional)
+  - `client-sip-ua`: SIP protocol (no platform deps)
+  - `client-audio`: Audio pipeline (cpal for platform abstraction)
+
+**Phase 24.36: Windows UI Optimization** ✅
+
+- ✅ Centralized styling module (`style.rs`)
+  - Color palette constants (primary, danger, warning, success, muted)
+  - Call state colors, registration status colors
+  - Certificate quality colors for CNSA 2.0 compliance indicators
+  - Base sizes and font sizes for consistent UI
+- ✅ DPI-aware responsive scaling
+  - `UiScale` struct with `from_ctx()` for automatic DPI detection
+  - Scaled sizes: buttons, spacing, fonts, input fields
+  - Helper methods: `dialpad_button()`, `button_height()`, `spacing_*()`, `font_*()`
+- ✅ Global keyboard shortcuts
+  - Navigation: Alt+D (Dialer), Alt+K (Contacts), Alt+S (Settings)
+  - Call controls: Alt+H/Escape (Hangup), Alt+M (Mute), Alt+O (Hold)
+  - Incoming calls: Alt+A (Accept), Alt+R (Reject)
+  - Settings: Ctrl+S (Save), F5 (Refresh certificates)
+  - Dialer: Alt+C (Call), Enter (Call)
+- ✅ Styled text helpers
+  - `heading()`, `subheading()`, `body()`, `secondary()`, `small()`, `display()`
+  - `button_text()`, `dialpad_text()` for consistent button labels
+- ✅ Button helpers
+  - `primary_button()`, `danger_button()`, `warning_button()`, `secondary_button()`
+- ✅ Theme management
+  - `apply_dark_theme()` for consistent visuals
+  - `dialog_window()` helper for modal dialogs
+- ✅ Fixed hardcoded domain in dialer
+  - Added `set_default_domain()` method
+  - Domain now comes from account settings
+
+**Phase 24.37: Native Windows GUI Migration** ✅
+
+- ✅ Migration from egui/eframe to native-windows-gui (NWG)
+  - Replaced egui with native Win32 controls via native-windows-gui 1.0
+  - Removed egui/eframe and tray-icon dependencies from Cargo.toml
+  - True Windows native appearance with system theming
+- ✅ Main application window (`app.rs`)
+  - `nwg::Window` with proper sizing (420x640)
+  - `nwg::TabsContainer` for navigation between views
+  - `nwg::StatusBar` for status messages
+  - `nwg::AnimationTimer` (100ms) for event polling
+  - RefCell-based state management for interior mutability
+- ✅ Dialer view with native controls
+  - `nwg::TextInput` for number/SIP URI input
+  - 12 `nwg::Button` controls for dialpad (0-9, *, #)
+  - Call, Clear, Backspace action buttons
+  - SIP URI formatting (sip:/sips: prefix handling)
+- ✅ Call view with native controls
+  - `nwg::Label` for caller info, status, duration
+  - Mute, Hold, Transfer, Hangup buttons
+  - `nwg::ComboBox` for audio device selection (input/output)
+  - Duration formatting (MM:SS or HH:MM:SS)
+- ✅ Contacts view with native list control
+  - `nwg::ListBox` for contact display
+  - `nwg::TextInput` for search filtering
+  - Add, Call, Edit, Delete, Favorite action buttons
+  - Alphabetical sorting by name
+  - Favorite indicator (*) prefix in list
+- ✅ Settings view with native form controls
+  - Account settings (display name, SIP URI, registrar)
+  - Certificate `nwg::ListBox` with selection
+  - Register/Unregister/Save/Discard buttons
+  - Settings persistence (load/collect methods)
+- ✅ System tray integration using NWG
+  - `nwg::TrayNotification` for tray icon
+  - `nwg::Menu` with popup context menu
+  - Show, Hide, Exit menu items
+  - Tray click shows window
+  - Removed `tray-icon` crate dependency
+- ✅ Windows toast notifications
+  - Kept `winrt-notification` for native toasts (independent of GUI)
+  - Incoming call, missed call, registration status notifications
+- ✅ Event-driven architecture
+  - Direct method calls instead of Action enums
+  - NWG event handlers bound via `nwg::bind_event_handler`
+  - Timer-based polling for SIP events
 
 ---
 

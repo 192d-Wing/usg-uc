@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ### Added
 
+#### Phase 24.37: Native Windows GUI Migration (Completed)
+
+**Migration from egui/eframe to native-windows-gui**
+
+- Replaced egui/eframe with native-windows-gui (NWG) 1.0 for true Windows native appearance
+- Removed `tray-icon` dependency in favor of NWG's built-in `TrayNotification`
+- Kept `winrt-notification` for Windows toast notifications (works independently of GUI)
+
+**Main Application Window** (`client-gui-windows/src/app.rs`)
+
+- `nwg::Window` as main application container (420x640)
+- `nwg::TabsContainer` for view navigation (Dialer, Call, Contacts, Settings)
+- `nwg::StatusBar` for status messages
+- `nwg::AnimationTimer` (100ms) for SIP event polling
+- RefCell-based interior mutability for NWG's event-driven model
+- Rc-based app sharing across event handlers
+
+**View Implementations**
+
+- `DialerView`: TextInput, 12 dialpad buttons, Call/Clear/Backspace actions
+- `CallView`: Labels for caller/status/duration, Mute/Hold/Transfer/Hangup buttons, audio device ComboBoxes
+- `ContactsView`: ListBox with search filtering, CRUD action buttons, favorite indicators
+- `SettingsView`: Account form fields, certificate ListBox, Register/Unregister buttons
+
+**System Tray** (`client-gui-windows/src/tray.rs`)
+
+- `nwg::TrayNotification` for system tray icon
+- `nwg::Menu` with popup context menu (Show, Hide, Exit)
+- Event handlers for tray icon click and menu selection
+- Tray icon click shows main window
+
+**Styling** (`client-gui-windows/src/style.rs`)
+
+- Simplified to color constants (RGB tuples) and size definitions
+- Removed egui-specific styling helpers
+- Windows system theming handles most visual styling
+
 #### Phase 15: Production Hardening (Completed)
 
 **New Crate**: `uc-telemetry`
@@ -1184,6 +1221,55 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 **Dependencies Added (client-core)**
 
 - `base64` 0.22: PEM certificate decoding
+
+#### Phase 24.35: Platform-Specific UI Architecture
+
+- Renamed `client-gui` to `client-gui-windows`
+  - Crate is now explicitly Windows-only via `#![cfg(target_os = "windows")]`
+  - Binary renamed from `sip-softclient` to `sip-softclient-windows`
+  - Removed `[target.'cfg(windows)'.dependencies]` - `winrt-notification` now unconditional
+  - Removed cross-platform fallback code from `notifications.rs`
+- Platform-specific UI architecture established
+  - `client-gui-windows`: Windows desktop (egui/eframe with winrt-notification)
+  - `client-gui-macos`: macOS desktop (planned)
+  - `client-gui-linux`: Linux desktop (planned)
+  - `client-gui-android`: Android mobile (planned)
+  - `client-gui-ios`: iOS mobile (planned)
+- Shared crates remain cross-platform
+  - `client-types`: Data types and models
+  - `client-core`: Application logic, SIP transport, contact management
+  - `client-sip-ua`: SIP user agent protocol
+  - `client-audio`: Audio pipeline (requires platform audio backend)
+
+#### Phase 24.36: Windows UI Optimization
+
+- `client-gui-windows/src/style.rs` - New centralized styling module
+  - Color constants: `COLOR_PRIMARY`, `COLOR_DANGER`, `COLOR_WARNING`, etc.
+  - Call state colors: `COLOR_CALL_CONNECTED`, `COLOR_CALL_HOLD`, etc.
+  - Registration status colors: `COLOR_REG_REGISTERED`, `COLOR_REG_FAILED`, etc.
+  - Certificate quality colors for CNSA 2.0 compliance indicators
+  - Base size constants for buttons, spacing, fonts
+  - `UiScale` struct for DPI-aware responsive scaling
+  - Styled text helpers: `heading()`, `body()`, `secondary()`, `display()`, etc.
+  - Button helpers: `primary_button()`, `danger_button()`, `warning_button()`
+  - `apply_dark_theme()` for consistent theme application
+  - Keyboard shortcut constants in `style::keys` module
+- `client-gui-windows/src/views/dialer.rs` - Updated with new style system
+  - Uses `UiScale` for DPI-aware button and spacing sizes
+  - Uses `style::dialpad_text()` and `style::primary_button()` helpers
+  - Added `set_default_domain()` to fix hardcoded domain issue
+  - Keyboard shortcut hint displayed
+  - Alt+C shortcut support for calling
+- `client-gui-windows/src/app.rs` - Keyboard shortcuts and styling
+  - Added `handle_keyboard_shortcuts()` method for global shortcuts
+  - Navigation: Alt+D (Dialer), Alt+K (Contacts), Alt+S (Settings)
+  - Call controls: Alt+H/Escape (Hangup), Alt+M (Mute), Alt+O (Hold)
+  - Incoming calls: Alt+A (Accept), Alt+R (Reject)
+  - Settings: Ctrl+S (Save), F5 (Refresh certificates)
+  - Navigation bar updated to use style module colors
+  - Status bar updated with style module colors
+  - Uses `style::apply_dark_theme()` for initialization
+  - Hover text hints for keyboard shortcuts on buttons
 
 **Security**
 

@@ -1,5 +1,5 @@
 [package]
-name = "client-gui"
+name = "client-gui-windows"
 description = "Windows GUI for USG SIP Soft Client"
 version.workspace = true
 edition.workspace = true
@@ -8,7 +8,14 @@ license.workspace = true
 repository.workspace = true
 build = "build.rs"
 
-[dependencies]
+# This crate is Windows-only. Other platforms have separate UI crates:
+# - client-gui-macos (planned)
+# - client-gui-linux (planned)
+# - client-gui-android (planned)
+# - client-gui-ios (planned)
+
+# All dependencies are Windows-only to avoid pulling in GTK/Linux dependencies
+[target.'cfg(windows)'.dependencies]
 client-types = { path = "../client-types" }
 client-core = { path = "../client-core" }
 client-audio = { path = "../client-audio" }
@@ -16,20 +23,16 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-# GUI
-egui.workspace = true
-eframe.workspace = true
+# Native Windows GUI
+native-windows-gui = "1.0"
+native-windows-derive = "1.0"
 
 # Windows integration
-tray-icon.workspace = true
-image.workspace = true
 rfd.workspace = true
-
-[target.'cfg(windows)'.dependencies]
 winrt-notification.workspace = true
 
 [[bin]]
-name = "sip-softclient"
+name = "sip-softclient-windows"
 path = "src/main.rs"
 
 [lints]

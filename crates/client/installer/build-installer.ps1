@@ -59,7 +59,7 @@ $BuildOutput = Join-Path $ProjectRoot "target\$BuildProfile"
 Write-Host "Building Rust application ($BuildProfile)..." -ForegroundColor Yellow
 Push-Location $ProjectRoot
 try {
-    $BuildCmd = "cargo build -p client-gui $BuildFlags"
+    $BuildCmd = "cargo build -p client-gui-windows $BuildFlags"
     Write-Host "  Running: $BuildCmd"
     Invoke-Expression $BuildCmd
     if ($LASTEXITCODE -ne 0) {
@@ -70,7 +70,7 @@ try {
 }
 
 # Verify executable exists
-$ExePath = Join-Path $BuildOutput "sip-softclient.exe"
+$ExePath = Join-Path $BuildOutput "sip-softclient-windows.exe"
 if (!(Test-Path $ExePath)) {
     throw "Executable not found: $ExePath"
 }
@@ -153,7 +153,7 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "Creating portable ZIP..." -ForegroundColor Yellow
 
 $ZipContents = @(
-    @{ Source = $ExePath; Dest = "sip-softclient.exe" }
+    @{ Source = $ExePath; Dest = "sip-softclient-windows.exe" }
 )
 
 # Add resources if they exist
