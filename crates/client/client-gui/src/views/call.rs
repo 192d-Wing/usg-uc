@@ -12,6 +12,16 @@ pub enum CallAction {
     Mute,
     /// Toggle hold.
     Hold,
+    /// Accept incoming call.
+    Accept {
+        /// Call ID to accept.
+        call_id: String,
+    },
+    /// Reject incoming call.
+    Reject {
+        /// Call ID to reject.
+        call_id: String,
+    },
 }
 
 /// Call view state.

@@ -120,6 +120,8 @@ pub enum CallEndReason {
         /// SIP status code.
         status_code: u16,
     },
+    /// Local user rejected an incoming call.
+    LocalReject,
     /// Call timed out.
     Timeout,
     /// Network error.
@@ -138,6 +140,7 @@ impl std::fmt::Display for CallEndReason {
             Self::LocalHangup => write!(f, "Ended by you"),
             Self::RemoteHangup => write!(f, "Ended by remote"),
             Self::Rejected { status_code } => write!(f, "Rejected ({status_code})"),
+            Self::LocalReject => write!(f, "Rejected by you"),
             Self::Timeout => write!(f, "Timed out"),
             Self::NetworkError => write!(f, "Network error"),
             Self::Failed => write!(f, "Failed"),

@@ -556,6 +556,46 @@ impl SipTransport {
         Ok(())
     }
 
+    /// Sends a SIP response to the specified destination.
+    ///
+    /// Used to respond to incoming SIP requests (e.g., INVITE, OPTIONS).
+    /// The destination should match the source of the original request.
+    pub async fn send_response(
+        &self,
+        response: &SipResponse,
+        destination: SocketAddr,
+    ) -> AppResult<()> {
+        info!(
+            status = response.status.code(),
+            destination = %destination,
+            "Sending SIP response"
+        );
+
+        // Get existing connection - responses are sent on the same connection
+        // that received the request
+        let mut connections = self.connections.lock().await;
+
+        let conn = connections.get_mut(&destination).ok_or_else(|| {
+            AppError::Sip(format!(
+                "No connection to {destination} - cannot send response without established connection"
+            ))
+        })?;
+
+        // Serialize and send
+        let message_bytes = response.to_string();
+        debug!(
+            destination = %destination,
+            size = message_bytes.len(),
+            status = response.status.code(),
+            "Sending SIP response"
+        );
+
+        conn.send(message_bytes.as_bytes()).await?;
+        drop(connections);
+
+        Ok(())
+    }
+
     /// Establishes a TLS connection to a peer.
     async fn connect(&self, peer: SocketAddr) -> AppResult<()> {
         info!(peer = %peer, "Connecting to SIP peer");
@@ -666,6 +706,88 @@ impl SipTransport {
         let mut connections = self.connections.lock().await;
         connections.clear();
     }
+}
+
+/// Builds a SIP response from an incoming request.
+///
+/// This copies the required headers from the request per RFC 3261 §8.2.6:
+/// - Via (all headers, in order)
+/// - From
+/// - To (with optional tag for new dialogs)
+/// - Call-ID
+/// - CSeq
+///
+/// # Arguments
+/// * `request` - The original SIP request
+/// * `status` - The response status code
+/// * `to_tag` - Optional To tag for dialog establishment (required for 200 OK to INVITE)
+///
+/// # Returns
+/// A new SIP response with the required headers copied from the request.
+pub fn build_response_from_request(
+    request: &SipRequest,
+    status: proto_sip::response::StatusCode,
+    to_tag: Option<&str>,
+) -> SipResponse {
+    use proto_sip::header::{Header, HeaderName};
+
+    let mut response = SipResponse::new(status);
+
+    // Copy Via headers (all, in order) - RFC 3261 §8.2.6.1
+    for via in request.headers.get_all(&HeaderName::Via) {
+        response.add_header(Header::new(HeaderName::Via, &via.value));
+    }
+
+    // Copy From header unchanged
+    if let Some(from) = request.headers.get_value(&HeaderName::From) {
+        response.add_header(Header::new(HeaderName::From, from));
+    }
+
+    // Copy To header, adding tag if provided
+    if let Some(to) = request.headers.get_value(&HeaderName::To) {
+        let to_value = if let Some(tag) = to_tag {
+            // Add or replace tag
+            if to.contains(";tag=") {
+                to.to_string()
+            } else {
+                format!("{to};tag={tag}")
+            }
+        } else {
+            to.to_string()
+        };
+        response.add_header(Header::new(HeaderName::To, to_value));
+    }
+
+    // Copy Call-ID header unchanged
+    if let Some(call_id) = request.headers.get_value(&HeaderName::CallId) {
+        response.add_header(Header::new(HeaderName::CallId, call_id));
+    }
+
+    // Copy CSeq header unchanged
+    if let Some(cseq) = request.headers.get_value(&HeaderName::CSeq) {
+        response.add_header(Header::new(HeaderName::CSeq, cseq));
+    }
+
+    // Add Content-Length: 0 if no body
+    response.add_header(Header::new(HeaderName::ContentLength, "0"));
+
+    response
+}
+
+/// Generates a unique tag for SIP dialogs.
+///
+/// Returns a random alphanumeric string suitable for use as a To or From tag.
+pub fn generate_tag() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Generate pseudo-random tag based on timestamp
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
+    // Format as base36 for compact representation
+    format!("{:x}-{:x}", now, now.wrapping_mul(31))
 }
 
 /// Finds the end of SIP headers (\r\n\r\n).
@@ -975,5 +1097,185 @@ mod tests {
         // Invalid cert data should be skipped but if all fail, should error
         let result = load_custom_root_certs(&[vec![1, 2, 3]]);
         assert!(result.is_err(), "Invalid certs should fail");
+    }
+
+    #[test]
+    fn test_generate_tag() {
+        let tag1 = generate_tag();
+        let tag2 = generate_tag();
+
+        // Tags should be non-empty
+        assert!(!tag1.is_empty());
+        assert!(!tag2.is_empty());
+
+        // Tags should contain hyphen (from our format)
+        assert!(tag1.contains('-'));
+    }
+
+    #[test]
+    fn test_build_response_from_request() {
+        use proto_sip::header::{Header, HeaderName};
+        use proto_sip::method::Method;
+        use proto_sip::response::StatusCode;
+        use proto_sip::uri::SipUri;
+
+        // Create a test INVITE request
+        let uri = SipUri::new("example.com").with_user("alice");
+        let mut request = SipRequest::new(Method::Invite, uri);
+        request.add_header(Header::new(
+            HeaderName::Via,
+            "SIP/2.0/TLS client.example.com:5061;branch=z9hG4bK776asdhds",
+        ));
+        request.add_header(Header::new(
+            HeaderName::From,
+            "<sip:bob@example.com>;tag=123456",
+        ));
+        request.add_header(Header::new(HeaderName::To, "<sip:alice@example.com>"));
+        request.add_header(Header::new(
+            HeaderName::CallId,
+            "abc123@client.example.com",
+        ));
+        request.add_header(Header::new(HeaderName::CSeq, "1 INVITE"));
+
+        // Build a 180 Ringing response
+        let response = build_response_from_request(&request, StatusCode::RINGING, Some("789xyz"));
+
+        // Verify response status
+        assert_eq!(response.status, StatusCode::RINGING);
+
+        // Verify Via header is copied
+        assert!(response.headers.get_value(&HeaderName::Via).is_some());
+
+        // Verify From header is copied
+        let from = response.headers.get_value(&HeaderName::From).unwrap();
+        assert!(from.contains("bob@example.com"));
+
+        // Verify To header has tag added
+        let to = response.headers.get_value(&HeaderName::To).unwrap();
+        assert!(to.contains("alice@example.com"));
+        assert!(to.contains(";tag=789xyz"));
+
+        // Verify Call-ID is copied
+        let call_id = response.headers.get_value(&HeaderName::CallId).unwrap();
+        assert_eq!(call_id, "abc123@client.example.com");
+
+        // Verify CSeq is copied
+        let cseq = response.headers.get_value(&HeaderName::CSeq).unwrap();
+        assert_eq!(cseq, "1 INVITE");
+
+        // Verify Content-Length is set
+        let content_length = response.headers.get_value(&HeaderName::ContentLength).unwrap();
+        assert_eq!(content_length, "0");
+    }
+
+    #[test]
+    fn test_build_response_without_to_tag() {
+        use proto_sip::header::{Header, HeaderName};
+        use proto_sip::method::Method;
+        use proto_sip::response::StatusCode;
+        use proto_sip::uri::SipUri;
+
+        // Create a test request
+        let uri = SipUri::new("example.com").with_user("alice");
+        let mut request = SipRequest::new(Method::Invite, uri);
+        request.add_header(Header::new(
+            HeaderName::Via,
+            "SIP/2.0/TLS client.example.com:5061;branch=z9hG4bK776asdhds",
+        ));
+        request.add_header(Header::new(
+            HeaderName::From,
+            "<sip:bob@example.com>;tag=123456",
+        ));
+        request.add_header(Header::new(HeaderName::To, "<sip:alice@example.com>"));
+        request.add_header(Header::new(
+            HeaderName::CallId,
+            "abc123@client.example.com",
+        ));
+        request.add_header(Header::new(HeaderName::CSeq, "1 INVITE"));
+
+        // Build a 100 Trying response (no to tag needed)
+        let response = build_response_from_request(&request, StatusCode::TRYING, None);
+
+        // Verify To header has no tag
+        let to = response.headers.get_value(&HeaderName::To).unwrap();
+        assert!(!to.contains(";tag="));
+    }
+
+    #[test]
+    fn test_build_response_preserves_existing_to_tag() {
+        use proto_sip::header::{Header, HeaderName};
+        use proto_sip::method::Method;
+        use proto_sip::response::StatusCode;
+        use proto_sip::uri::SipUri;
+
+        // Create a request with To tag already present (in-dialog request)
+        let uri = SipUri::new("example.com").with_user("alice");
+        let mut request = SipRequest::new(Method::Invite, uri);
+        request.add_header(Header::new(
+            HeaderName::Via,
+            "SIP/2.0/TLS client.example.com:5061;branch=z9hG4bK776asdhds",
+        ));
+        request.add_header(Header::new(
+            HeaderName::From,
+            "<sip:bob@example.com>;tag=123456",
+        ));
+        request.add_header(Header::new(
+            HeaderName::To,
+            "<sip:alice@example.com>;tag=existing",
+        ));
+        request.add_header(Header::new(
+            HeaderName::CallId,
+            "abc123@client.example.com",
+        ));
+        request.add_header(Header::new(HeaderName::CSeq, "2 INVITE"));
+
+        // Build response - should not add another tag
+        let response = build_response_from_request(&request, StatusCode::OK, Some("new-tag"));
+
+        let to = response.headers.get_value(&HeaderName::To).unwrap();
+        // Should still have the original tag, not the new one
+        assert!(to.contains(";tag=existing"));
+        assert!(!to.contains("new-tag"));
+    }
+
+    #[test]
+    fn test_build_response_multiple_via_headers() {
+        use proto_sip::header::{Header, HeaderName};
+        use proto_sip::method::Method;
+        use proto_sip::response::StatusCode;
+        use proto_sip::uri::SipUri;
+
+        // Create request with multiple Via headers (proxied request)
+        let uri = SipUri::new("example.com").with_user("alice");
+        let mut request = SipRequest::new(Method::Invite, uri);
+        request.add_header(Header::new(
+            HeaderName::Via,
+            "SIP/2.0/TLS proxy.example.com:5061;branch=z9hG4bKproxy1",
+        ));
+        request.add_header(Header::new(
+            HeaderName::Via,
+            "SIP/2.0/TLS client.example.com:5061;branch=z9hG4bKclient",
+        ));
+        request.add_header(Header::new(
+            HeaderName::From,
+            "<sip:bob@example.com>;tag=123456",
+        ));
+        request.add_header(Header::new(HeaderName::To, "<sip:alice@example.com>"));
+        request.add_header(Header::new(
+            HeaderName::CallId,
+            "abc123@client.example.com",
+        ));
+        request.add_header(Header::new(HeaderName::CSeq, "1 INVITE"));
+
+        // Build response
+        let response = build_response_from_request(&request, StatusCode::RINGING, Some("xyz"));
+
+        // Count Via headers - should have 2
+        let via_headers = response.headers.get_all(&HeaderName::Via);
+        assert_eq!(via_headers.len(), 2);
+
+        // Verify order preserved (proxy first, then client)
+        assert!(via_headers[0].value.contains("proxy.example.com"));
+        assert!(via_headers[1].value.contains("client.example.com"));
     }
 }

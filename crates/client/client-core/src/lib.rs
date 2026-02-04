@@ -26,7 +26,10 @@ pub mod settings;
 pub mod sip_transport;
 
 pub use app::{AppEvent, AppState, ClientApp, PinOperationType};
-pub use sip_transport::{CertVerificationMode, SipTransport, TransportConfig, TransportEvent};
+pub use sip_transport::{
+    CertVerificationMode, SipTransport, TransportConfig, TransportEvent,
+    build_response_from_request, generate_tag,
+};
 pub use audio_session::{
     AudioSession, AudioSessionConfig, AudioSessionConfigBuilder, AudioSessionEvent,
 };

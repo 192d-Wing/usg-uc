@@ -378,6 +378,24 @@ impl ClientApp {
         Ok(())
     }
 
+    /// Accepts an incoming call.
+    ///
+    /// Sends a 200 OK response with SDP answer.
+    pub async fn accept_incoming_call(&mut self, call_id: &str) -> AppResult<()> {
+        info!(call_id = %call_id, "Accepting incoming call");
+        self.call_manager.accept_incoming_call(call_id).await?;
+        self.state = AppState::InCall;
+        Ok(())
+    }
+
+    /// Rejects an incoming call.
+    ///
+    /// Sends a 486 Busy Here or 603 Decline response.
+    pub async fn reject_incoming_call(&mut self, call_id: &str) -> AppResult<()> {
+        info!(call_id = %call_id, "Rejecting incoming call");
+        self.call_manager.reject_incoming_call(call_id, false).await
+    }
+
     /// Toggles mute state.
     pub fn toggle_mute(&mut self) -> bool {
         self.call_manager.toggle_mute()
@@ -569,6 +587,21 @@ impl ClientApp {
                 error!(call_id = ?call_id, message = %message, "Call error");
 
                 let _ = self.app_event_tx.send(AppEvent::Error { message }).await;
+            }
+            CallManagerEvent::SendResponse {
+                response,
+                destination,
+            } => {
+                // Forward response to transport layer
+                debug!(status = response.status.code(), destination = %destination, "Sending SIP response");
+
+                if let Some(transport) = &self.sip_transport {
+                    if let Err(e) = transport.send_response(&response, destination).await {
+                        error!(error = %e, "Failed to send SIP response");
+                    }
+                } else {
+                    warn!("No SIP transport configured, cannot send response");
+                }
             }
         }
 

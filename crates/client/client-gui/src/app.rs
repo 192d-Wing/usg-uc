@@ -53,6 +53,17 @@ pub enum PinOperation {
 /// Maximum PIN retry attempts before lockout warning.
 const MAX_PIN_ATTEMPTS: u8 = 3;
 
+/// Information about a pending incoming call.
+#[derive(Debug, Clone)]
+pub struct IncomingCallAlert {
+    /// Internal call ID.
+    pub call_id: String,
+    /// Remote party SIP URI.
+    pub remote_uri: String,
+    /// Remote party display name (if available).
+    pub remote_display_name: Option<String>,
+}
+
 /// Main GUI application state.
 pub struct SipClientApp {
     /// Active view.
@@ -77,6 +88,10 @@ pub struct SipClientApp {
     registration_state: RegistrationState,
     /// Current call info.
     active_call: Option<CallInfo>,
+    /// Incoming call alert (ringing).
+    incoming_call: Option<IncomingCallAlert>,
+    /// Show incoming call dialog.
+    show_incoming_call_dialog: bool,
     /// Status message.
     status_message: String,
     /// Error message (if any).
@@ -157,6 +172,8 @@ impl SipClientApp {
             tray_action_rx,
             registration_state: RegistrationState::Unregistered,
             active_call: None,
+            incoming_call: None,
+            show_incoming_call_dialog: false,
             status_message: "Ready".to_string(),
             error_message: None,
             show_error_dialog: false,
@@ -249,6 +266,14 @@ impl SipClientApp {
                         remote_display_name.as_deref().unwrap_or(&remote_uri)
                     );
 
+                    // Store incoming call info and show dialog
+                    self.incoming_call = Some(IncomingCallAlert {
+                        call_id,
+                        remote_uri: remote_uri.clone(),
+                        remote_display_name: remote_display_name.clone(),
+                    });
+                    self.show_incoming_call_dialog = true;
+
                     // Show toast notification for incoming call
                     self.notifications
                         .notify_incoming_call(remote_display_name.clone(), remote_uri.clone());
@@ -264,6 +289,10 @@ impl SipClientApp {
                         .and_then(|c| c.remote_display_name.clone());
 
                     self.active_call = None;
+                    // Clear incoming call dialog too
+                    self.incoming_call = None;
+                    self.show_incoming_call_dialog = false;
+
                     if let Some(duration) = duration_secs {
                         self.status_message = format!("Call ended ({duration}s)");
                     } else {
@@ -428,6 +457,88 @@ impl SipClientApp {
                     }
                 });
         }
+    }
+
+    /// Renders the incoming call dialog.
+    fn render_incoming_call_dialog(&mut self, ctx: &egui::Context) -> Option<crate::views::CallAction> {
+        if !self.show_incoming_call_dialog {
+            return None;
+        }
+
+        let mut action = None;
+
+        if let Some(ref incoming) = self.incoming_call.clone() {
+            egui::Window::new("Incoming Call")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_min_width(350.0);
+
+                    // Phone ringing icon
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("\u{1F4DE}").size(48.0)); // Phone icon
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("Incoming Call")
+                                .strong()
+                                .size(20.0),
+                        );
+                    });
+
+                    ui.add_space(16.0);
+
+                    // Caller info
+                    ui.vertical_centered(|ui| {
+                        if let Some(ref name) = incoming.remote_display_name {
+                            ui.label(egui::RichText::new(name).size(18.0).strong());
+                        }
+                        ui.label(
+                            egui::RichText::new(&incoming.remote_uri)
+                                .color(egui::Color32::GRAY),
+                        );
+                    });
+
+                    ui.add_space(24.0);
+
+                    // Accept/Reject buttons
+                    ui.horizontal(|ui| {
+                        let button_size = egui::vec2(120.0, 50.0);
+
+                        // Reject button (red)
+                        let reject_button = egui::Button::new(
+                            egui::RichText::new("\u{1F534} Reject")
+                                .size(16.0)
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(200, 50, 50));
+
+                        if ui.add_sized(button_size, reject_button).clicked() {
+                            action = Some(crate::views::CallAction::Reject {
+                                call_id: incoming.call_id.clone(),
+                            });
+                        }
+
+                        ui.add_space(20.0);
+
+                        // Accept button (green)
+                        let accept_button = egui::Button::new(
+                            egui::RichText::new("\u{1F7E2} Accept")
+                                .size(16.0)
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(50, 180, 50));
+
+                        if ui.add_sized(button_size, accept_button).clicked() {
+                            action = Some(crate::views::CallAction::Accept {
+                                call_id: incoming.call_id.clone(),
+                            });
+                        }
+                    });
+                });
+        }
+
+        action
     }
 
     /// Renders the PIN entry dialog for smart card authentication.
@@ -714,6 +825,11 @@ impl eframe::App for SipClientApp {
         self.render_error_dialog(ctx);
         self.render_pin_dialog(ctx);
 
+        // Incoming call dialog
+        if let Some(action) = self.render_incoming_call_dialog(ctx) {
+            self.handle_call_action(action);
+        }
+
         // Request repaint for animations
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
@@ -763,6 +879,38 @@ impl SipClientApp {
             crate::views::CallAction::Hold => {
                 // TODO: Implement hold
                 self.status_message = "Hold not yet implemented".to_string();
+            }
+            crate::views::CallAction::Accept { call_id } => {
+                info!(call_id = %call_id, "Accepting incoming call");
+                self.show_incoming_call_dialog = false;
+
+                if let Some(ref mut app) = self.client_app {
+                    let runtime = self.runtime.clone();
+                    match runtime.block_on(app.accept_incoming_call(&call_id)) {
+                        Ok(()) => {
+                            self.status_message = "Call accepted".to_string();
+                            self.active_view = ActiveView::Call;
+                        }
+                        Err(e) => {
+                            self.error_message = Some(format!("Failed to accept call: {e}"));
+                            self.show_error_dialog = true;
+                        }
+                    }
+                }
+                self.incoming_call = None;
+            }
+            crate::views::CallAction::Reject { call_id } => {
+                info!(call_id = %call_id, "Rejecting incoming call");
+                self.show_incoming_call_dialog = false;
+
+                if let Some(ref mut app) = self.client_app {
+                    let runtime = self.runtime.clone();
+                    if let Err(e) = runtime.block_on(app.reject_incoming_call(&call_id)) {
+                        warn!(error = %e, "Failed to reject call");
+                    }
+                }
+                self.incoming_call = None;
+                self.status_message = "Call rejected".to_string();
             }
         }
     }

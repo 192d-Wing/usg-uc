@@ -552,6 +552,49 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - System root cert loading
   - Custom root cert validation
 
+**Phase 24.17: Response Sending for Incoming Calls**
+
+- `client-core/sip_transport.rs` - Response sending capability
+  - `send_response()` - Send SIP responses over existing TLS connections
+  - `build_response_from_request()` - RFC 3261 §8.2.6 compliant response building
+    - Copy Via headers (all, in order)
+    - Copy From header unchanged
+    - Copy To header with optional tag
+    - Copy Call-ID and CSeq headers
+    - Add Content-Length: 0 if no body
+  - `generate_tag()` - Unique dialog tag generation
+- `client-core/call_manager.rs` - Incoming call handling
+  - `IncomingCallInfo` struct for tracking pending incoming calls
+  - `handle_incoming_invite_from()` - Process incoming INVITE with source address
+    - Automatic 100 Trying response (per RFC 3261 §8.2.6)
+    - Automatic 180 Ringing response with To-tag
+    - 486 Busy Here when already in a call
+  - `accept_incoming_call()` - Accept with 200 OK and SDP answer
+  - `reject_incoming_call()` - Reject with 486 Busy or 603 Decline
+  - `has_incoming_call()` and `incoming_calls()` accessors
+  - Helper functions: `parse_from_header()`, `extract_username_from_sip_uri()`
+- `client-core/app.rs` - Transport integration
+  - Handle `CallManagerEvent::SendResponse` to forward responses to transport
+- `client-types/call.rs` - New end reason
+  - `CallEndReason::LocalReject` for rejected incoming calls
+- Unit tests: 11 new tests (66 total in client-core)
+
+**Phase 24.18: Incoming Call UI**
+
+- `client-gui/src/views/call.rs` - New call actions
+  - `CallAction::Accept { call_id }` - Accept incoming call
+  - `CallAction::Reject { call_id }` - Reject incoming call
+- `client-gui/src/app.rs` - Incoming call dialog
+  - `IncomingCallAlert` struct for tracking pending calls
+  - `render_incoming_call_dialog()` - Modal dialog with caller info
+  - Green Accept button and Red Reject button
+  - Dialog shows on `AppEvent::IncomingCall`
+  - Dialog clears on `AppEvent::CallEnded`
+  - Handle Accept/Reject in `handle_call_action()`
+- `client-core/app.rs` - ClientApp methods
+  - `accept_incoming_call()` - Accept and transition to InCall
+  - `reject_incoming_call()` - Reject with 486 Busy Here
+
 **Dependencies Added**
 
 - `rustls-native-certs` 0.8: Platform-specific CA certificate loading

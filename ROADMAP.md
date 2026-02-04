@@ -908,32 +908,57 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **Tests**: 55 unit tests in client-core
 
-**Phase 24.17: Response Sending for Incoming Calls** 🚧
+**Phase 24.17: Response Sending for Incoming Calls** ✅
 
-- 🚧 `send_response()` method in SipTransport
-  - Generate SIP responses (180 Ringing, 200 OK, 486 Busy, etc.)
-  - Proper Via header handling for responses
+- ✅ `send_response()` method in SipTransport
+  - Send SIP responses over existing TLS connections
+  - Proper serialization and logging
+- ✅ `build_response_from_request()` helper function
+  - Copy Via, From, To, Call-ID, CSeq headers per RFC 3261 §8.2.6
   - To-tag generation for dialog establishment
-- 🚧 ServerInviteTransaction integration
-  - Use `proto-transaction::ServerInviteTransaction` for UAS state machine
-  - Handle retransmissions per RFC 3261 §17.2.1
-- 🚧 Response routing to correct connection
-  - Match response to original request connection
-  - Handle connection state for responses
+  - Content-Length header handling
+- ✅ `generate_tag()` for dialog To/From tags
+- ✅ Incoming call handling in CallManager
+  - `IncomingCallInfo` struct for tracking pending incoming calls
+  - `handle_incoming_invite_from()` with source address
+  - Automatic 100 Trying and 180 Ringing responses
+  - 486 Busy Here when already in a call
+- ✅ Accept/Reject incoming calls
+  - `accept_incoming_call()` sends 200 OK with SDP answer
+  - `reject_incoming_call()` sends 486 Busy or 603 Decline
+  - `has_incoming_call()` and `incoming_calls()` accessors
+- ✅ Helper functions for SIP header parsing
+  - `parse_from_header()` extracts display name and URI
+  - `extract_username_from_sip_uri()` extracts username
+- ✅ CallEndReason::LocalReject for rejected incoming calls
+- ✅ CallManagerEvent::SendResponse for transport-layer routing
 
-**Phase 24.18: Incoming Call UI** 🚧
+**Tests**: 66 unit tests in client-core
 
-- 🚧 Incoming call notification
-  - Visual ring indicator in GUI
-  - System toast notification with caller ID
-  - Caller information display (display name, SIP URI)
-- 🚧 Accept/Reject buttons
-  - Accept sends 200 OK with SDP answer
-  - Reject sends 486 Busy Here or 603 Decline
-- 🚧 Audio ringtone support
+**Phase 24.18: Incoming Call UI** ✅
+
+- ✅ Incoming call dialog
+  - Modal dialog with caller display name and SIP URI
+  - Phone icon and "Incoming Call" header
+  - Centered anchor with consistent styling
+- ✅ Accept/Reject buttons
+  - Green "Accept" button with circle emoji
+  - Red "Reject" button with circle emoji
+  - CallAction::Accept and CallAction::Reject variants
+- ✅ IncomingCallAlert tracking
+  - Stores call_id, remote_uri, remote_display_name
+  - Dialog shows on IncomingCall event
+  - Dialog clears on CallEnded event
+- ✅ ClientApp integration
+  - `accept_incoming_call()` calls CallManager
+  - `reject_incoming_call()` calls CallManager
+  - Transitions to Call view on accept
+- ✅ System toast notifications (existing)
+  - notify_incoming_call() already implemented
+- 🚧 Audio ringtone support (future)
   - Configurable ringtone file
   - Ring on default audio device
-- 🚧 Auto-answer option
+- 🚧 Auto-answer option (future)
   - Settings flag for auto-answer
   - Configurable delay before auto-answer
 

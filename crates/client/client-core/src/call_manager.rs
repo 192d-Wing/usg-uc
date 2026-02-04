@@ -19,11 +19,31 @@ use client_types::{
 use proto_ice::IceConfig;
 use proto_sip::header::HeaderName;
 use proto_sip::message::{SipRequest, SipResponse};
+use proto_sip::response::StatusCode;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
+
+/// Information about an incoming call that hasn't been answered yet.
+#[derive(Debug, Clone)]
+pub struct IncomingCallInfo {
+    /// Internal call ID.
+    pub call_id: String,
+    /// SIP Call-ID header value.
+    pub sip_call_id: String,
+    /// Remote party SIP URI.
+    pub remote_uri: String,
+    /// Remote party display name.
+    pub remote_display_name: Option<String>,
+    /// Source address of the INVITE.
+    pub source_addr: SocketAddr,
+    /// The original INVITE request (for building responses).
+    pub invite_request: SipRequest,
+    /// Our local tag for the dialog.
+    pub local_tag: String,
+}
 
 /// Call manager coordinates calls between SIP UA and media sessions.
 pub struct CallManager {
@@ -35,6 +55,8 @@ pub struct CallManager {
     media_sessions: HashMap<String, MediaSession>,
     /// Active audio sessions by call ID.
     audio_sessions: HashMap<String, AudioSession>,
+    /// Incoming calls awaiting answer/reject.
+    incoming_calls: HashMap<String, IncomingCallInfo>,
     /// Local address for media.
     local_media_addr: SocketAddr,
     /// ICE configuration.
@@ -112,6 +134,13 @@ pub enum CallManagerEvent {
         /// Error message.
         message: String,
     },
+    /// Response needs to be sent (for incoming calls).
+    SendResponse {
+        /// The SIP response to send.
+        response: SipResponse,
+        /// Destination address.
+        destination: SocketAddr,
+    },
 }
 
 impl CallManager {
@@ -144,6 +173,7 @@ impl CallManager {
             call_event_rx,
             media_sessions: HashMap::new(),
             audio_sessions: HashMap::new(),
+            incoming_calls: HashMap::new(),
             local_media_addr,
             ice_config: IceConfig::default(),
             dtls_cert_chain: Vec::new(),
@@ -427,28 +457,277 @@ impl CallManager {
     }
 
     /// Handles an incoming INVITE request.
+    ///
+    /// This method requires the source address of the INVITE to be known
+    /// for sending responses. Use `handle_incoming_invite_from` instead.
     async fn handle_incoming_invite(&mut self, request: &SipRequest) -> AppResult<()> {
-        // For now, log and potentially reject (we don't fully support incoming calls yet)
-        info!("Received incoming INVITE - feature not fully implemented");
+        // Default to localhost if source not known (shouldn't happen in real usage)
+        let default_addr: SocketAddr = "127.0.0.1:5060".parse().unwrap_or_else(|_| {
+            // Fallback that won't panic
+            SocketAddr::from(([127, 0, 0, 1], 5060))
+        });
+        self.handle_incoming_invite_from(request, default_addr)
+            .await
+    }
+
+    /// Handles an incoming INVITE request from a known source.
+    ///
+    /// This is the preferred method as it includes the source address
+    /// needed for sending responses.
+    pub async fn handle_incoming_invite_from(
+        &mut self,
+        request: &SipRequest,
+        source: SocketAddr,
+    ) -> AppResult<()> {
+        use crate::sip_transport::{build_response_from_request, generate_tag};
+
+        info!(source = %source, "Received incoming INVITE");
+
+        // Check if we already have an active call
+        if self.active_call_id.is_some() {
+            info!("Already have an active call, rejecting incoming with 486 Busy Here");
+            // Send 486 Busy Here
+            let response = build_response_from_request(request, StatusCode::BUSY_HERE, None);
+            let _ = self
+                .app_event_tx
+                .send(CallManagerEvent::SendResponse {
+                    response,
+                    destination: source,
+                })
+                .await;
+            return Ok(());
+        }
 
         // Extract caller info from From header
-        let remote_uri = request
+        let from_value = request
             .headers
             .get_value(&HeaderName::From)
             .map(|s| s.to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
-        // Notify the application about the incoming call attempt
+        // Parse display name and URI from From header
+        let (remote_display_name, remote_uri) = parse_from_header(&from_value);
+
+        // Extract SIP Call-ID
+        let sip_call_id = request
+            .headers
+            .get_value(&HeaderName::CallId)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("unknown-{}", generate_tag()));
+
+        // Generate a unique internal call ID
+        let call_id = format!("incoming-{}", generate_tag());
+
+        // Generate our local tag for the dialog
+        let local_tag = generate_tag();
+
+        // Store the incoming call info
+        let incoming_info = IncomingCallInfo {
+            call_id: call_id.clone(),
+            sip_call_id: sip_call_id.clone(),
+            remote_uri: remote_uri.clone(),
+            remote_display_name: remote_display_name.clone(),
+            source_addr: source,
+            invite_request: request.clone(),
+            local_tag: local_tag.clone(),
+        };
+        self.incoming_calls.insert(call_id.clone(), incoming_info);
+
+        // Send 100 Trying immediately (per RFC 3261 §8.2.6)
+        let trying_response = build_response_from_request(request, StatusCode::TRYING, None);
+        let _ = self
+            .app_event_tx
+            .send(CallManagerEvent::SendResponse {
+                response: trying_response,
+                destination: source,
+            })
+            .await;
+
+        // Send 180 Ringing
+        let ringing_response =
+            build_response_from_request(request, StatusCode::RINGING, Some(&local_tag));
+        let _ = self
+            .app_event_tx
+            .send(CallManagerEvent::SendResponse {
+                response: ringing_response,
+                destination: source,
+            })
+            .await;
+
+        // Notify the application about the incoming call
         let _ = self
             .app_event_tx
             .send(CallManagerEvent::IncomingCall {
-                call_id: "incoming".to_string(),
+                call_id,
                 remote_uri,
-                remote_display_name: None,
+                remote_display_name,
             })
             .await;
 
         Ok(())
+    }
+
+    /// Accepts an incoming call.
+    ///
+    /// Sends a 200 OK response with SDP answer and transitions to Connected state.
+    pub async fn accept_incoming_call(&mut self, call_id: &str) -> AppResult<()> {
+        use crate::sip_transport::build_response_from_request;
+
+        let incoming = self
+            .incoming_calls
+            .remove(call_id)
+            .ok_or_else(|| AppError::Sip(format!("No incoming call with ID: {call_id}")))?;
+
+        info!(call_id = %call_id, remote = %incoming.remote_uri, "Accepting incoming call");
+
+        // Verify we have an account configured
+        let account = self
+            .account
+            .as_ref()
+            .ok_or_else(|| AppError::Sip("No account configured".to_string()))?
+            .clone();
+
+        // Create media session for this call
+        let (media_tx, _media_rx) = mpsc::channel(32);
+        let media_session = MediaSession::new(
+            self.local_media_addr,
+            false, // incoming = controlled
+            self.ice_config.clone(),
+            self.dtls_cert_chain.clone(),
+            self.dtls_private_key.clone(),
+            media_tx,
+        );
+
+        // Generate SDP answer
+        let sdp_answer = self.generate_sdp_offer(&media_session, &account)?;
+
+        // Build 200 OK with SDP body
+        let mut ok_response = build_response_from_request(
+            &incoming.invite_request,
+            StatusCode::OK,
+            Some(&incoming.local_tag),
+        );
+
+        // Add Contact header - extract user from SIP URI
+        let username = extract_username_from_sip_uri(&account.sip_uri)
+            .unwrap_or_else(|| account.id.clone());
+        ok_response.add_header(proto_sip::header::Header::new(
+            proto_sip::header::HeaderName::Contact,
+            format!("<sip:{username}@{}>", self.local_media_addr.ip()),
+        ));
+
+        // Add Content-Type and body
+        ok_response.add_header(proto_sip::header::Header::new(
+            proto_sip::header::HeaderName::ContentType,
+            "application/sdp",
+        ));
+
+        // Update Content-Length
+        ok_response.add_header(proto_sip::header::Header::new(
+            proto_sip::header::HeaderName::ContentLength,
+            sdp_answer.len().to_string(),
+        ));
+
+        ok_response = ok_response.with_body(sdp_answer);
+
+        // Send 200 OK
+        let _ = self
+            .app_event_tx
+            .send(CallManagerEvent::SendResponse {
+                response: ok_response,
+                destination: incoming.source_addr,
+            })
+            .await;
+
+        // Store media session and set as active call
+        self.media_sessions
+            .insert(call_id.to_string(), media_session);
+        self.active_call_id = Some(call_id.to_string());
+
+        // Notify application of state change
+        let info = CallInfo {
+            id: call_id.to_string(),
+            state: CallState::Connected,
+            direction: CallDirection::Inbound,
+            remote_uri: incoming.remote_uri,
+            remote_display_name: incoming.remote_display_name,
+            start_time: Utc::now(),
+            connect_time: Some(Utc::now()),
+            is_muted: false,
+            is_on_hold: false,
+            failure_reason: None,
+        };
+
+        let _ = self
+            .app_event_tx
+            .send(CallManagerEvent::CallStateChanged {
+                call_id: call_id.to_string(),
+                state: CallState::Connected,
+                info,
+            })
+            .await;
+
+        Ok(())
+    }
+
+    /// Rejects an incoming call.
+    ///
+    /// Sends a 486 Busy Here (or 603 Decline) response.
+    pub async fn reject_incoming_call(&mut self, call_id: &str, decline: bool) -> AppResult<()> {
+        use crate::sip_transport::build_response_from_request;
+
+        let incoming = self
+            .incoming_calls
+            .remove(call_id)
+            .ok_or_else(|| AppError::Sip(format!("No incoming call with ID: {call_id}")))?;
+
+        let status = if decline {
+            StatusCode::DECLINE
+        } else {
+            StatusCode::BUSY_HERE
+        };
+
+        info!(
+            call_id = %call_id,
+            remote = %incoming.remote_uri,
+            status = status.code(),
+            "Rejecting incoming call"
+        );
+
+        // Build rejection response
+        let response =
+            build_response_from_request(&incoming.invite_request, status, Some(&incoming.local_tag));
+
+        // Send the rejection
+        let _ = self
+            .app_event_tx
+            .send(CallManagerEvent::SendResponse {
+                response,
+                destination: incoming.source_addr,
+            })
+            .await;
+
+        // Notify application
+        let _ = self
+            .app_event_tx
+            .send(CallManagerEvent::CallEnded {
+                call_id: call_id.to_string(),
+                reason: CallEndReason::LocalReject,
+                duration_secs: None,
+            })
+            .await;
+
+        Ok(())
+    }
+
+    /// Returns information about pending incoming calls.
+    pub fn incoming_calls(&self) -> Vec<&IncomingCallInfo> {
+        self.incoming_calls.values().collect()
+    }
+
+    /// Checks if there's a pending incoming call.
+    pub fn has_incoming_call(&self) -> bool {
+        !self.incoming_calls.is_empty()
     }
 
     /// Handles an incoming BYE request.
@@ -840,6 +1119,78 @@ impl CallManager {
     }
 }
 
+/// Extracts the username from a SIP URI.
+///
+/// Handles formats like:
+/// - `sip:user@host`
+/// - `sips:user@host`
+/// - `<sip:user@host>`
+///
+/// Returns None if the URI doesn't contain a username.
+fn extract_username_from_sip_uri(uri: &str) -> Option<String> {
+    // Strip angle brackets if present
+    let uri = uri.trim().trim_start_matches('<').trim_end_matches('>');
+
+    // Strip sip: or sips: prefix
+    let uri = uri
+        .strip_prefix("sip:")
+        .or_else(|| uri.strip_prefix("sips:"))
+        .unwrap_or(uri);
+
+    // Find the @ symbol - username is before it
+    if let Some(at_pos) = uri.find('@') {
+        let username = &uri[..at_pos];
+        if !username.is_empty() {
+            return Some(username.to_string());
+        }
+    }
+
+    None
+}
+
+/// Parses a From header value to extract display name and URI.
+///
+/// From header format: `"Display Name" <sip:user@host>` or `<sip:user@host>`
+///
+/// Returns (display_name, uri) where display_name is None if not present.
+fn parse_from_header(from_value: &str) -> (Option<String>, String) {
+    let trimmed = from_value.trim();
+
+    // Check for display name in quotes
+    if let Some(quote_end) = trimmed.strip_prefix('"').and_then(|s| s.find('"')) {
+        let display_name = trimmed[1..quote_end + 1].to_string();
+        let rest = &trimmed[quote_end + 2..];
+
+        // Extract URI from angle brackets
+        if let (Some(start), Some(end)) = (rest.find('<'), rest.find('>')) {
+            let uri = rest[start + 1..end].to_string();
+            return (Some(display_name), uri);
+        }
+    }
+
+    // Check for URI in angle brackets without display name
+    if let (Some(start), Some(end)) = (trimmed.find('<'), trimmed.find('>')) {
+        // Check if there's a display name before the <
+        let before = trimmed[..start].trim();
+        let display_name = if before.is_empty() {
+            None
+        } else {
+            Some(before.to_string())
+        };
+        let uri = trimmed[start + 1..end].to_string();
+        return (display_name, uri);
+    }
+
+    // No angle brackets, use the whole thing as URI (minus tag)
+    let uri = trimmed
+        .split(';')
+        .next()
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string();
+    (None, uri)
+}
+
 /// Parses ICE credentials from SDP.
 fn parse_ice_credentials_from_sdp(sdp: &str) -> Option<proto_ice::IceCredentials> {
     let mut ufrag = None;
@@ -943,5 +1294,73 @@ mod tests {
     fn test_parse_ice_credentials_missing() {
         let sdp = "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\n";
         assert!(parse_ice_credentials_from_sdp(sdp).is_none());
+    }
+
+    #[test]
+    fn test_extract_username_from_sip_uri() {
+        // Standard SIP URI
+        assert_eq!(
+            extract_username_from_sip_uri("sip:alice@example.com"),
+            Some("alice".to_string())
+        );
+
+        // SIPS URI
+        assert_eq!(
+            extract_username_from_sip_uri("sips:bob@secure.example.com"),
+            Some("bob".to_string())
+        );
+
+        // With angle brackets
+        assert_eq!(
+            extract_username_from_sip_uri("<sip:carol@example.com>"),
+            Some("carol".to_string())
+        );
+
+        // No username (host only)
+        assert_eq!(extract_username_from_sip_uri("sip:example.com"), None);
+
+        // Empty string
+        assert_eq!(extract_username_from_sip_uri(""), None);
+    }
+
+    #[test]
+    fn test_parse_from_header_with_display_name() {
+        let (display, uri) = parse_from_header("\"Alice Smith\" <sip:alice@example.com>;tag=123");
+        assert_eq!(display, Some("Alice Smith".to_string()));
+        assert_eq!(uri, "sip:alice@example.com");
+    }
+
+    #[test]
+    fn test_parse_from_header_no_display_name() {
+        let (display, uri) = parse_from_header("<sip:bob@example.com>;tag=456");
+        assert_eq!(display, None);
+        assert_eq!(uri, "sip:bob@example.com");
+    }
+
+    #[test]
+    fn test_parse_from_header_plain_uri() {
+        let (display, uri) = parse_from_header("sip:charlie@example.com;tag=789");
+        assert_eq!(display, None);
+        assert_eq!(uri, "sip:charlie@example.com");
+    }
+
+    #[test]
+    fn test_parse_from_header_unquoted_display_name() {
+        let (display, uri) = parse_from_header("Dave <sip:dave@example.com>");
+        assert_eq!(display, Some("Dave".to_string()));
+        assert_eq!(uri, "sip:dave@example.com");
+    }
+
+    #[tokio::test]
+    async fn test_incoming_call_tracking() {
+        let (tx, _rx) = mpsc::channel(10);
+        let sip_addr: SocketAddr = "192.168.1.100:5060".parse().unwrap();
+        let media_addr: SocketAddr = "192.168.1.100:16384".parse().unwrap();
+
+        let manager = CallManager::new(sip_addr, media_addr, tx);
+
+        // Initially no incoming calls
+        assert!(!manager.has_incoming_call());
+        assert!(manager.incoming_calls().is_empty());
     }
 }
