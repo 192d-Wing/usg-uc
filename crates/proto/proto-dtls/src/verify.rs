@@ -654,4 +654,295 @@ mod tests {
         assert_eq!(find_subsequence(haystack, b"xyz"), None);
         assert_eq!(find_subsequence(haystack, b"hello"), Some(0));
     }
+
+    // Additional tests for improved coverage
+
+    #[test]
+    fn test_certificate_validator_default() {
+        let validator = CertificateValidator::default();
+        // Default validator should not allow self-signed
+        assert!(!validator.allow_self_signed);
+        assert!(validator.expected_fingerprint.is_none());
+    }
+
+    #[test]
+    fn test_certificate_validator_allow_self_signed() {
+        let validator = CertificateValidator::new().allow_self_signed();
+        assert!(validator.allow_self_signed);
+    }
+
+    #[test]
+    fn test_certificate_validator_with_fingerprint() {
+        let fingerprint = [0xABu8; 48];
+        let validator = CertificateValidator::new().with_fingerprint(fingerprint);
+        assert_eq!(validator.expected_fingerprint, Some(fingerprint));
+    }
+
+    #[test]
+    fn test_certificate_validator_builder_chaining() {
+        let fingerprint = [0xCDu8; 48];
+        let validator = CertificateValidator::new()
+            .allow_self_signed()
+            .with_fingerprint(fingerprint);
+        assert!(validator.allow_self_signed);
+        assert_eq!(validator.expected_fingerprint, Some(fingerprint));
+    }
+
+    #[test]
+    fn test_certificate_validation_result_eq() {
+        assert_eq!(CertificateValidationResult::Valid, CertificateValidationResult::Valid);
+        assert_eq!(CertificateValidationResult::SelfSigned, CertificateValidationResult::SelfSigned);
+        assert_eq!(
+            CertificateValidationResult::Invalid("test".to_string()),
+            CertificateValidationResult::Invalid("test".to_string())
+        );
+        assert_ne!(CertificateValidationResult::Valid, CertificateValidationResult::SelfSigned);
+    }
+
+    #[test]
+    fn test_certificate_validation_result_clone() {
+        let result = CertificateValidationResult::Invalid("test error".to_string());
+        let cloned = result.clone();
+        assert_eq!(result, cloned);
+    }
+
+    #[test]
+    fn test_certificate_validation_result_debug() {
+        let result = CertificateValidationResult::Valid;
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("Valid"));
+
+        let invalid = CertificateValidationResult::Invalid("reason".to_string());
+        let debug_str = format!("{:?}", invalid);
+        assert!(debug_str.contains("Invalid"));
+        assert!(debug_str.contains("reason"));
+    }
+
+    #[test]
+    fn test_finished_verify_wrong_length() {
+        let master_secret = [0xABu8; 48];
+        let handshake_hash = uc_crypto::hash::sha384(b"test");
+
+        // Too short
+        let short_data = [0u8; 10];
+        let result = FinishedVerifier::verify(&short_data, &master_secret, &handshake_hash, true);
+        assert!(matches!(result, Err(DtlsError::HandshakeFailed { .. })));
+
+        // Too long
+        let long_data = [0u8; 14];
+        let result = FinishedVerifier::verify(&long_data, &master_secret, &handshake_hash, true);
+        assert!(matches!(result, Err(DtlsError::HandshakeFailed { .. })));
+    }
+
+    #[test]
+    fn test_finished_verify_empty_data() {
+        let master_secret = [0xABu8; 48];
+        let handshake_hash = uc_crypto::hash::sha384(b"test");
+
+        let result = FinishedVerifier::verify(&[], &master_secret, &handshake_hash, true);
+        assert!(matches!(result, Err(DtlsError::HandshakeFailed { reason }) if reason.contains("wrong length")));
+    }
+
+    #[test]
+    fn test_parse_der_length_empty() {
+        let result = parse_der_length(&[]);
+        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("empty")));
+    }
+
+    #[test]
+    fn test_parse_der_length_indefinite() {
+        let data = [0x80]; // Indefinite length marker
+        let result = parse_der_length(&data);
+        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("indefinite")));
+    }
+
+    #[test]
+    fn test_parse_der_length_too_many_bytes() {
+        let data = [0x85, 0x01, 0x02, 0x03, 0x04, 0x05]; // 5 length bytes (too many)
+        let result = parse_der_length(&data);
+        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("invalid length")));
+    }
+
+    #[test]
+    fn test_parse_der_length_truncated() {
+        let data = [0x82, 0x01]; // Claims 2 bytes but only 1 present
+        let result = parse_der_length(&data);
+        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("invalid length")));
+    }
+
+    #[test]
+    fn test_parse_der_length_single_byte_long() {
+        let data = [0x81, 0xFF]; // 255 in long form with 1 byte
+        let (len, bytes) = parse_der_length(&data).unwrap();
+        assert_eq!(len, 255);
+        assert_eq!(bytes, 2);
+    }
+
+    #[test]
+    fn test_parse_der_length_zero() {
+        let data = [0x00]; // Length 0
+        let (len, bytes) = parse_der_length(&data).unwrap();
+        assert_eq!(len, 0);
+        assert_eq!(bytes, 1);
+    }
+
+    #[test]
+    fn test_constant_time_eq_empty() {
+        assert!(constant_time_eq(&[], &[]));
+    }
+
+    #[test]
+    fn test_constant_time_eq_single_byte() {
+        assert!(constant_time_eq(&[0x42], &[0x42]));
+        assert!(!constant_time_eq(&[0x42], &[0x43]));
+    }
+
+    #[test]
+    fn test_constant_time_eq_all_bits_differ() {
+        assert!(!constant_time_eq(&[0x00], &[0xFF]));
+        assert!(!constant_time_eq(&[0x55], &[0xAA])); // Alternating bits
+    }
+
+    #[test]
+    #[should_panic(expected = "window size must be non-zero")]
+    fn test_find_subsequence_empty_needle_panics() {
+        // The windows() function panics on empty needle
+        let haystack = b"hello";
+        let _ = find_subsequence(haystack, b"");
+    }
+
+    #[test]
+    fn test_find_subsequence_empty_haystack() {
+        assert_eq!(find_subsequence(b"", b"x"), None);
+    }
+
+    #[test]
+    fn test_find_subsequence_needle_equals_haystack() {
+        assert_eq!(find_subsequence(b"test", b"test"), Some(0));
+    }
+
+    #[test]
+    fn test_find_subsequence_needle_longer_than_haystack() {
+        assert_eq!(find_subsequence(b"hi", b"hello"), None);
+    }
+
+    #[test]
+    fn test_prf_sha384_produces_correct_length() {
+        let secret = [0x42u8; 48];
+        let label = b"test label";
+        let seed = b"test seed";
+
+        // Test various lengths
+        let result = prf_sha384(&secret, label, seed, 12);
+        assert_eq!(result.len(), 12);
+
+        let result = prf_sha384(&secret, label, seed, 48);
+        assert_eq!(result.len(), 48);
+
+        let result = prf_sha384(&secret, label, seed, 100);
+        assert_eq!(result.len(), 100);
+    }
+
+    #[test]
+    fn test_prf_sha384_deterministic() {
+        let secret = [0x42u8; 48];
+        let label = b"test label";
+        let seed = b"test seed";
+
+        let result1 = prf_sha384(&secret, label, seed, 32);
+        let result2 = prf_sha384(&secret, label, seed, 32);
+
+        assert_eq!(result1, result2);
+    }
+
+    #[test]
+    fn test_prf_sha384_different_secrets() {
+        let secret1 = [0x42u8; 48];
+        let secret2 = [0x43u8; 48];
+        let label = b"test label";
+        let seed = b"test seed";
+
+        let result1 = prf_sha384(&secret1, label, seed, 32);
+        let result2 = prf_sha384(&secret2, label, seed, 32);
+
+        assert_ne!(result1, result2);
+    }
+
+    #[test]
+    fn test_prf_sha384_different_labels() {
+        let secret = [0x42u8; 48];
+        let seed = b"test seed";
+
+        let result1 = prf_sha384(&secret, b"label1", seed, 32);
+        let result2 = prf_sha384(&secret, b"label2", seed, 32);
+
+        assert_ne!(result1, result2);
+    }
+
+    #[test]
+    fn test_certificate_validator_single_cert_self_signed_not_allowed() {
+        let validator = CertificateValidator::new();
+        // Use a minimal invalid cert (not self-signed check will fail first due to structure)
+        let fake_cert = vec![0x30, 0x10, 0x00]; // Invalid DER structure
+        let result = validator.validate(&[fake_cert]);
+        assert!(matches!(result, CertificateValidationResult::Invalid(_)));
+    }
+
+    #[test]
+    fn test_certificate_validator_fingerprint_mismatch() {
+        let fingerprint = [0xABu8; 48];
+        let validator = CertificateValidator::new().with_fingerprint(fingerprint);
+
+        // Any certificate that doesn't hash to the expected fingerprint
+        let fake_cert = vec![0x30, 0x10, 0x01, 0x02, 0x03];
+        let result = validator.validate(&[fake_cert]);
+        assert!(matches!(result, CertificateValidationResult::Invalid(reason) if reason.contains("fingerprint mismatch")));
+    }
+
+    #[test]
+    fn test_find_and_verify_ec_curve_not_ec() {
+        // Certificate without EC OID
+        let cert_der = vec![0x30, 0x10, 0x00, 0x00, 0x00];
+        let result = find_and_verify_ec_curve(&cert_der);
+        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("not an EC certificate")));
+    }
+
+    #[test]
+    fn test_parse_outer_cert_sequence_invalid() {
+        // Not a SEQUENCE (wrong tag)
+        let cert_der = vec![0x02, 0x01, 0x00]; // INTEGER instead of SEQUENCE
+        let result = parse_outer_cert_sequence(&cert_der);
+        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("invalid certificate structure")));
+    }
+
+    #[test]
+    fn test_parse_outer_cert_sequence_too_short() {
+        let cert_der = vec![0x30, 0x00]; // Too short
+        let result = parse_outer_cert_sequence(&cert_der);
+        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("invalid certificate structure")));
+    }
+
+    #[test]
+    fn test_parse_outer_cert_sequence_truncated() {
+        // SEQUENCE claims length 100 but only has 3 bytes
+        let cert_der = vec![0x30, 0x64, 0x00, 0x00, 0x00];
+        let result = parse_outer_cert_sequence(&cert_der);
+        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("truncated")));
+    }
+
+    #[test]
+    fn test_extract_tbs_certificate_not_sequence() {
+        // Valid outer sequence but TBS is not a sequence
+        let cert_der = vec![0x30, 0x03, 0x02, 0x01, 0x00]; // Inner is INTEGER
+        let result = extract_tbs_certificate(&cert_der, 2);
+        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("TBSCertificate not found")));
+    }
+
+    #[test]
+    fn test_extract_cert_signature_no_sig_alg() {
+        // No SignatureAlgorithm SEQUENCE after TBS
+        let cert_der = vec![0x30, 0x05, 0x30, 0x01, 0x00, 0x02, 0x01]; // TBS followed by INTEGER
+        let result = extract_cert_signature(&cert_der, 4);
+        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("SignatureAlgorithm not found")));
+    }
 }

@@ -297,4 +297,236 @@ mod tests {
         let decoded = base64_decode(encoded).unwrap();
         assert_eq!(decoded, b"Hello World");
     }
+
+    #[test]
+    fn test_new_client_config() {
+        let config = DtlsConfig::new(DtlsRole::Client);
+        assert_eq!(config.role, DtlsRole::Client);
+        // Should inherit defaults
+        assert_eq!(config.srtp_profiles, vec![SrtpProfile::AeadAes256Gcm]);
+        assert_eq!(config.handshake_timeout, Duration::from_secs(30));
+        assert_eq!(config.mtu, 1200);
+    }
+
+    #[test]
+    fn test_new_server_config() {
+        let config = DtlsConfig::new(DtlsRole::Server);
+        assert_eq!(config.role, DtlsRole::Server);
+    }
+
+    #[test]
+    fn test_with_identity() {
+        let cert_chain = vec![vec![1, 2, 3], vec![4, 5, 6]];
+        let private_key = vec![7, 8, 9];
+
+        let config = DtlsConfig::default().with_identity(cert_chain.clone(), private_key.clone());
+
+        assert_eq!(config.certificate_chain, cert_chain);
+        assert_eq!(config.private_key, private_key);
+    }
+
+    #[test]
+    fn test_with_handshake_timeout() {
+        let timeout = Duration::from_secs(60);
+        let config = DtlsConfig::default().with_handshake_timeout(timeout);
+        assert_eq!(config.handshake_timeout, timeout);
+    }
+
+    #[test]
+    fn test_with_mtu() {
+        let config = DtlsConfig::default().with_mtu(1500);
+        assert_eq!(config.mtu, 1500);
+    }
+
+    #[test]
+    fn test_validate_empty_private_key() {
+        let config = DtlsConfig {
+            certificate_chain: vec![vec![1, 2, 3]],
+            private_key: Vec::new(), // Empty
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(matches!(result, Err(DtlsError::InvalidConfig { reason }) if reason.contains("private key is empty")));
+    }
+
+    #[test]
+    fn test_validate_empty_srtp_profiles() {
+        let config = DtlsConfig {
+            certificate_chain: vec![vec![1, 2, 3]],
+            private_key: vec![4, 5, 6],
+            srtp_profiles: Vec::new(), // Empty
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(matches!(result, Err(DtlsError::InvalidConfig { reason }) if reason.contains("no SRTP profiles")));
+    }
+
+    #[test]
+    fn test_validate_mtu_boundary() {
+        // Test MTU at boundary (576 should be valid)
+        let config = DtlsConfig::default()
+            .with_identity(vec![vec![1, 2, 3]], vec![4, 5, 6])
+            .with_mtu(576);
+        assert!(config.validate().is_ok());
+
+        // Test MTU just below boundary (575 should fail)
+        let config = DtlsConfig::default()
+            .with_identity(vec![vec![1, 2, 3]], vec![4, 5, 6])
+            .with_mtu(575);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_parse_pem_certificates_single() {
+        let pem = b"-----BEGIN CERTIFICATE-----
+SGVsbG8=
+-----END CERTIFICATE-----";
+
+        let certs = parse_pem_certificates(pem).unwrap();
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0], b"Hello");
+    }
+
+    #[test]
+    fn test_parse_pem_certificates_multiple() {
+        let pem = b"-----BEGIN CERTIFICATE-----
+SGVsbG8=
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+V29ybGQ=
+-----END CERTIFICATE-----";
+
+        let certs = parse_pem_certificates(pem).unwrap();
+        assert_eq!(certs.len(), 2);
+        assert_eq!(certs[0], b"Hello");
+        assert_eq!(certs[1], b"World");
+    }
+
+    #[test]
+    fn test_parse_pem_certificates_empty() {
+        let pem = b"no certificates here";
+        let certs = parse_pem_certificates(pem).unwrap();
+        assert!(certs.is_empty());
+    }
+
+    #[test]
+    fn test_parse_pem_certificates_invalid_utf8() {
+        let pem = &[0xFF, 0xFE]; // Invalid UTF-8
+        let result = parse_pem_certificates(pem);
+        assert!(matches!(result, Err(DtlsError::CertificateError { .. })));
+    }
+
+    #[test]
+    fn test_parse_pem_private_key() {
+        let pem = b"-----BEGIN PRIVATE KEY-----
+SGVsbG8=
+-----END PRIVATE KEY-----";
+
+        let key = parse_pem_private_key(pem).unwrap();
+        assert_eq!(key, b"Hello");
+    }
+
+    #[test]
+    fn test_parse_pem_private_key_ec() {
+        let pem = b"-----BEGIN EC PRIVATE KEY-----
+V29ybGQ=
+-----END EC PRIVATE KEY-----";
+
+        let key = parse_pem_private_key(pem).unwrap();
+        assert_eq!(key, b"World");
+    }
+
+    #[test]
+    fn test_parse_pem_private_key_rsa() {
+        let pem = b"-----BEGIN RSA PRIVATE KEY-----
+VGVzdA==
+-----END RSA PRIVATE KEY-----";
+
+        let key = parse_pem_private_key(pem).unwrap();
+        assert_eq!(key, b"Test");
+    }
+
+    #[test]
+    fn test_parse_pem_private_key_not_found() {
+        let pem = b"no key here";
+        let result = parse_pem_private_key(pem);
+        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("no private key found")));
+    }
+
+    #[test]
+    fn test_parse_pem_private_key_invalid_utf8() {
+        let pem = &[0xFF, 0xFE]; // Invalid UTF-8
+        let result = parse_pem_private_key(pem);
+        assert!(matches!(result, Err(DtlsError::CertificateError { .. })));
+    }
+
+    #[test]
+    fn test_base64_decode_empty() {
+        let decoded = base64_decode("").unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn test_base64_decode_with_whitespace() {
+        let encoded = "SGVs\nbG8g\nV29y\nbGQ=";
+        let decoded = base64_decode(encoded).unwrap();
+        assert_eq!(decoded, b"Hello World");
+    }
+
+    #[test]
+    fn test_base64_decode_invalid_char() {
+        let encoded = "SGVs!G8="; // ! is invalid
+        let result = base64_decode(encoded);
+        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("invalid base64 character")));
+    }
+
+    #[test]
+    fn test_base64_decode_no_padding() {
+        // "Hello" encoded without padding
+        let encoded = "SGVsbG8";
+        let decoded = base64_decode(encoded).unwrap();
+        assert_eq!(decoded, b"Hello");
+    }
+
+    #[test]
+    fn test_builder_chaining() {
+        let config = DtlsConfig::new(DtlsRole::Client)
+            .with_identity(vec![vec![1, 2, 3]], vec![4, 5, 6])
+            .with_handshake_timeout(Duration::from_secs(45))
+            .with_mtu(1400);
+
+        assert_eq!(config.role, DtlsRole::Client);
+        assert_eq!(config.certificate_chain, vec![vec![1, 2, 3]]);
+        assert_eq!(config.private_key, vec![4, 5, 6]);
+        assert_eq!(config.handshake_timeout, Duration::from_secs(45));
+        assert_eq!(config.mtu, 1400);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_clone() {
+        let config = DtlsConfig::default().with_identity(vec![vec![1, 2, 3]], vec![4, 5, 6]);
+
+        let cloned = config.clone();
+        assert_eq!(cloned.certificate_chain, config.certificate_chain);
+        assert_eq!(cloned.private_key, config.private_key);
+        assert_eq!(cloned.role, config.role);
+    }
+
+    #[test]
+    fn test_config_debug() {
+        let config = DtlsConfig::default();
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("DtlsConfig"));
+        assert!(debug_str.contains("role"));
+    }
+
+    #[test]
+    fn test_with_pem_files_nonexistent() {
+        let config = DtlsConfig::default();
+        let result = config.with_pem_files("/nonexistent/cert.pem", "/nonexistent/key.pem");
+        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("failed to read cert file")));
+    }
 }

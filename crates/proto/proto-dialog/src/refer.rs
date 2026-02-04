@@ -555,4 +555,308 @@ mod tests {
         assert_eq!(handler.next_notify_cseq(), 2);
         assert_eq!(handler.next_notify_cseq(), 3);
     }
+
+    // Additional tests for improved coverage
+
+    #[test]
+    fn test_subscription_state_display() {
+        assert_eq!(format!("{}", ReferSubscriptionState::Pending), "pending");
+        assert_eq!(format!("{}", ReferSubscriptionState::Active), "active");
+        assert_eq!(format!("{}", ReferSubscriptionState::Terminated), "terminated");
+    }
+
+    #[test]
+    fn test_subscription_state_parse_case_insensitive() {
+        assert_eq!(
+            "PENDING".parse::<ReferSubscriptionState>().unwrap(),
+            ReferSubscriptionState::Pending
+        );
+        assert_eq!(
+            "Active".parse::<ReferSubscriptionState>().unwrap(),
+            ReferSubscriptionState::Active
+        );
+        assert_eq!(
+            "TERMINATED".parse::<ReferSubscriptionState>().unwrap(),
+            ReferSubscriptionState::Terminated
+        );
+    }
+
+    #[test]
+    fn test_subscription_state_parse_invalid() {
+        let result = "invalid".parse::<ReferSubscriptionState>();
+        assert!(matches!(result, Err(DialogError::InvalidParameter { name, reason })
+            if name == "subscription-state" && reason.contains("unknown state")));
+    }
+
+    #[test]
+    fn test_refer_status_status_code() {
+        assert_eq!(ReferStatus::Trying.status_code(), 100);
+        assert_eq!(ReferStatus::Ringing.status_code(), 180);
+        assert_eq!(ReferStatus::Success.status_code(), 200);
+        assert_eq!(ReferStatus::Failed.status_code(), 503);
+    }
+
+    #[test]
+    fn test_refer_status_display() {
+        assert_eq!(format!("{}", ReferStatus::Trying), "Trying");
+        assert_eq!(format!("{}", ReferStatus::Ringing), "Ringing");
+        assert_eq!(format!("{}", ReferStatus::Success), "Success");
+        assert_eq!(format!("{}", ReferStatus::Failed), "Failed");
+    }
+
+    #[test]
+    fn test_refer_status_from_code_ranges() {
+        // Test 180-183 range for ringing
+        assert_eq!(ReferStatus::from_status_code(181), ReferStatus::Ringing);
+        assert_eq!(ReferStatus::from_status_code(183), ReferStatus::Ringing);
+
+        // Test 200-299 range for success
+        assert_eq!(ReferStatus::from_status_code(202), ReferStatus::Success);
+        assert_eq!(ReferStatus::from_status_code(299), ReferStatus::Success);
+
+        // Test other codes as failed
+        assert_eq!(ReferStatus::from_status_code(400), ReferStatus::Failed);
+        assert_eq!(ReferStatus::from_status_code(500), ReferStatus::Failed);
+        assert_eq!(ReferStatus::from_status_code(603), ReferStatus::Failed);
+    }
+
+    #[test]
+    fn test_refer_request_with_expires() {
+        let request = ReferRequest::new("sip:bob@example.com")
+            .with_expires(Duration::from_secs(300));
+        assert_eq!(request.expires(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_refer_request_with_no_refer_sub() {
+        let request = ReferRequest::new("sip:bob@example.com")
+            .with_no_refer_sub(true);
+        assert!(request.no_refer_sub());
+
+        let request2 = ReferRequest::new("sip:bob@example.com")
+            .with_no_refer_sub(false);
+        assert!(!request2.no_refer_sub());
+    }
+
+    #[test]
+    fn test_refer_request_default_values() {
+        let request = ReferRequest::new("sip:bob@example.com");
+        assert_eq!(request.refer_to(), "sip:bob@example.com");
+        assert!(request.referred_by().is_none());
+        assert_eq!(request.subscription_state(), ReferSubscriptionState::Pending);
+        assert!(request.current_status().is_none());
+        assert_eq!(request.expires(), Duration::from_secs(180));
+        assert!(!request.no_refer_sub());
+    }
+
+    #[test]
+    fn test_refer_request_sent_at() {
+        let before = Instant::now();
+        let request = ReferRequest::new("sip:bob@example.com");
+        let after = Instant::now();
+
+        assert!(request.sent_at() >= before);
+        assert!(request.sent_at() <= after);
+    }
+
+    #[test]
+    fn test_refer_request_set_subscription_state() {
+        let mut request = ReferRequest::new("sip:bob@example.com");
+        assert_eq!(request.subscription_state(), ReferSubscriptionState::Pending);
+
+        request.set_subscription_state(ReferSubscriptionState::Active);
+        assert_eq!(request.subscription_state(), ReferSubscriptionState::Active);
+
+        request.set_subscription_state(ReferSubscriptionState::Terminated);
+        assert_eq!(request.subscription_state(), ReferSubscriptionState::Terminated);
+    }
+
+    #[test]
+    fn test_refer_request_headers() {
+        let request = ReferRequest::new("sip:bob@example.com")
+            .with_referred_by("sip:alice@example.com");
+
+        assert_eq!(request.refer_to_header(), "sip:bob@example.com");
+        assert_eq!(request.referred_by_header(), Some("sip:alice@example.com".to_string()));
+    }
+
+    #[test]
+    fn test_refer_request_headers_no_referred_by() {
+        let request = ReferRequest::new("sip:bob@example.com");
+        assert_eq!(request.refer_to_header(), "sip:bob@example.com");
+        assert!(request.referred_by_header().is_none());
+    }
+
+    #[test]
+    fn test_refer_request_update_status_from_active() {
+        let mut request = ReferRequest::new("sip:bob@example.com");
+        request.set_subscription_state(ReferSubscriptionState::Active);
+
+        // Update status when already active should stay active (for non-final)
+        request.update_status(ReferStatus::Ringing);
+        assert_eq!(request.subscription_state(), ReferSubscriptionState::Active);
+        assert_eq!(request.current_status(), Some(ReferStatus::Ringing));
+    }
+
+    #[test]
+    fn test_refer_request_update_status_to_failed() {
+        let mut request = ReferRequest::new("sip:bob@example.com");
+
+        request.update_status(ReferStatus::Failed);
+        assert_eq!(request.subscription_state(), ReferSubscriptionState::Terminated);
+        assert!(request.is_complete());
+    }
+
+    #[test]
+    fn test_refer_request_is_complete_without_status() {
+        let request = ReferRequest::new("sip:bob@example.com");
+        assert!(!request.is_complete());
+    }
+
+    #[test]
+    fn test_refer_request_clone() {
+        let request = ReferRequest::new("sip:bob@example.com")
+            .with_referred_by("sip:alice@example.com")
+            .with_expires(Duration::from_secs(60));
+
+        let cloned = request.clone();
+        assert_eq!(cloned.refer_to(), request.refer_to());
+        assert_eq!(cloned.referred_by(), request.referred_by());
+        assert_eq!(cloned.expires(), request.expires());
+    }
+
+    #[test]
+    fn test_refer_handler_with_referred_by() {
+        let handler = ReferHandler::new("sip:bob@example.com")
+            .with_referred_by("sip:alice@example.com");
+        assert_eq!(handler.referred_by(), Some("sip:alice@example.com"));
+    }
+
+    #[test]
+    fn test_refer_handler_with_expires() {
+        let handler = ReferHandler::new("sip:bob@example.com")
+            .with_expires(Duration::from_secs(60));
+        // Can't directly check expires, but we can verify it was set
+        // by checking subscription_state_header when active
+        let mut handler = handler;
+        handler.accept().unwrap();
+        let header = handler.subscription_state_header();
+        assert!(header.starts_with("active;expires="));
+    }
+
+    #[test]
+    fn test_refer_handler_reject() {
+        let mut handler = ReferHandler::new("sip:bob@example.com");
+        handler.reject().unwrap();
+
+        assert_eq!(handler.subscription_state(), ReferSubscriptionState::Terminated);
+        assert_eq!(handler.current_status(), ReferStatus::Failed);
+        assert!(handler.is_complete());
+    }
+
+    #[test]
+    fn test_refer_handler_accept_invalid_state() {
+        let mut handler = ReferHandler::new("sip:bob@example.com");
+        handler.accept().unwrap();
+
+        // Trying to accept again should fail
+        let result = handler.accept();
+        assert!(matches!(result, Err(DialogError::InvalidStateTransition { .. })));
+    }
+
+    #[test]
+    fn test_refer_handler_subscription_state_header_pending() {
+        let handler = ReferHandler::new("sip:bob@example.com");
+        assert_eq!(handler.subscription_state_header(), "pending");
+    }
+
+    #[test]
+    fn test_refer_handler_subscription_state_header_terminated_success() {
+        let mut handler = ReferHandler::new("sip:bob@example.com");
+        handler.accept().unwrap();
+        handler.update_status(ReferStatus::Success);
+
+        assert_eq!(handler.subscription_state_header(), "terminated;reason=noresource");
+    }
+
+    #[test]
+    fn test_refer_handler_subscription_state_header_terminated_failed() {
+        let mut handler = ReferHandler::new("sip:bob@example.com");
+        handler.reject().unwrap();
+
+        assert_eq!(handler.subscription_state_header(), "terminated;reason=rejected");
+    }
+
+    #[test]
+    fn test_refer_handler_notify_body_trying() {
+        let handler = ReferHandler::new("sip:bob@example.com");
+        assert_eq!(handler.notify_body(), "SIP/2.0 100 Trying");
+    }
+
+    #[test]
+    fn test_refer_handler_notify_body_failed() {
+        let mut handler = ReferHandler::new("sip:bob@example.com");
+        handler.update_status(ReferStatus::Failed);
+        assert_eq!(handler.notify_body(), "SIP/2.0 503 Failed");
+    }
+
+    #[test]
+    fn test_refer_handler_clone() {
+        let handler = ReferHandler::new("sip:bob@example.com")
+            .with_referred_by("sip:alice@example.com");
+
+        let cloned = handler.clone();
+        assert_eq!(cloned.refer_to(), handler.refer_to());
+        assert_eq!(cloned.referred_by(), handler.referred_by());
+    }
+
+    #[test]
+    fn test_refer_handler_debug() {
+        let handler = ReferHandler::new("sip:bob@example.com");
+        let debug_str = format!("{:?}", handler);
+        assert!(debug_str.contains("ReferHandler"));
+        assert!(debug_str.contains("sip:bob@example.com"));
+    }
+
+    #[test]
+    fn test_refer_request_debug() {
+        let request = ReferRequest::new("sip:bob@example.com");
+        let debug_str = format!("{:?}", request);
+        assert!(debug_str.contains("ReferRequest"));
+        assert!(debug_str.contains("sip:bob@example.com"));
+    }
+
+    #[test]
+    fn test_parse_refer_to_with_whitespace() {
+        assert_eq!(
+            parse_refer_to("  <sip:bob@example.com>  ").unwrap(),
+            "sip:bob@example.com"
+        );
+    }
+
+    #[test]
+    fn test_subscription_state_copy() {
+        let state = ReferSubscriptionState::Active;
+        let copied = state;
+        assert_eq!(state, copied);
+    }
+
+    #[test]
+    fn test_refer_status_copy() {
+        let status = ReferStatus::Ringing;
+        let copied = status;
+        assert_eq!(status, copied);
+    }
+
+    #[test]
+    fn test_subscription_state_eq() {
+        assert_eq!(ReferSubscriptionState::Pending, ReferSubscriptionState::Pending);
+        assert_ne!(ReferSubscriptionState::Pending, ReferSubscriptionState::Active);
+    }
+
+    #[test]
+    fn test_refer_status_eq() {
+        assert_eq!(ReferStatus::Trying, ReferStatus::Trying);
+        assert_ne!(ReferStatus::Trying, ReferStatus::Ringing);
+    }
 }

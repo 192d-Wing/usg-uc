@@ -292,4 +292,213 @@ mod tests {
         // RFC 5764 Section 4.2
         assert_eq!(SRTP_EXPORTER_LABEL, "EXTRACTOR-dtls_srtp");
     }
+
+    fn create_test_config() -> DtlsConfig {
+        DtlsConfig {
+            certificate_chain: vec![vec![0u8; 100]],
+            private_key: vec![0u8; 48],
+            role: DtlsRole::Client,
+            srtp_profiles: vec![SrtpProfile::AeadAes256Gcm],
+            handshake_timeout: std::time::Duration::from_secs(30),
+            mtu: 1200,
+            extended_master_secret: true,
+            replay_protection: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_new_client() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = create_test_config();
+
+        let session = DtlsSession::new(&config, Arc::new(socket), true).await;
+        assert!(session.is_ok());
+
+        let session = session.unwrap();
+        assert!(session.is_established());
+        assert_eq!(session.role(), DtlsRole::Client);
+    }
+
+    #[tokio::test]
+    async fn test_session_new_server() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut config = create_test_config();
+        config.role = DtlsRole::Server;
+
+        let session = DtlsSession::new(&config, Arc::new(socket), false).await;
+        assert!(session.is_ok());
+
+        let session = session.unwrap();
+        assert!(session.is_established());
+        assert_eq!(session.role(), DtlsRole::Server);
+    }
+
+    #[tokio::test]
+    async fn test_session_invalid_config() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = DtlsConfig {
+            certificate_chain: vec![], // Invalid: empty
+            private_key: vec![0u8; 48],
+            role: DtlsRole::Client,
+            srtp_profiles: vec![SrtpProfile::AeadAes256Gcm],
+            handshake_timeout: std::time::Duration::from_secs(30),
+            mtu: 1200,
+            extended_master_secret: true,
+            replay_protection: true,
+        };
+
+        let result = DtlsSession::new(&config, Arc::new(socket), true).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_export_srtp_keying_material() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = create_test_config();
+
+        let session = DtlsSession::new(&config, Arc::new(socket), true)
+            .await
+            .unwrap();
+
+        let keying_material = session.export_srtp_keying_material().await;
+        assert!(keying_material.is_ok());
+
+        let km = keying_material.unwrap();
+        assert_eq!(km.profile, SrtpProfile::AeadAes256Gcm);
+        assert_eq!(km.client_write_key.len(), SrtpProfile::AeadAes256Gcm.key_len());
+        assert_eq!(km.server_write_key.len(), SrtpProfile::AeadAes256Gcm.key_len());
+        assert_eq!(km.client_write_salt.len(), SrtpProfile::AeadAes256Gcm.salt_len());
+        assert_eq!(km.server_write_salt.len(), SrtpProfile::AeadAes256Gcm.salt_len());
+    }
+
+    #[tokio::test]
+    async fn test_export_srtp_keying_material_not_connected() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = create_test_config();
+
+        let mut session = DtlsSession::new(&config, Arc::new(socket), true)
+            .await
+            .unwrap();
+
+        // Close the session
+        session.close().await.unwrap();
+
+        // Now try to export keying material
+        let result = session.export_srtp_keying_material().await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(DtlsError::NotConnected)));
+    }
+
+    #[tokio::test]
+    async fn test_session_close() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = create_test_config();
+
+        let mut session = DtlsSession::new(&config, Arc::new(socket), true)
+            .await
+            .unwrap();
+
+        assert!(session.is_established());
+
+        let result = session.close().await;
+        assert!(result.is_ok());
+        assert!(!session.is_established());
+    }
+
+    #[tokio::test]
+    async fn test_session_close_twice() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = create_test_config();
+
+        let mut session = DtlsSession::new(&config, Arc::new(socket), true)
+            .await
+            .unwrap();
+
+        // First close should succeed
+        let result = session.close().await;
+        assert!(result.is_ok());
+
+        // Second close should fail
+        let result = session.close().await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(DtlsError::AlreadyClosed)));
+    }
+
+    #[tokio::test]
+    async fn test_send_not_connected() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = create_test_config();
+
+        let mut session = DtlsSession::new(&config, Arc::new(socket), true)
+            .await
+            .unwrap();
+
+        session.close().await.unwrap();
+
+        let result = session.send(b"test data").await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(DtlsError::NotConnected)));
+    }
+
+    #[tokio::test]
+    async fn test_recv_not_connected() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = create_test_config();
+
+        let mut session = DtlsSession::new(&config, Arc::new(socket), true)
+            .await
+            .unwrap();
+
+        session.close().await.unwrap();
+
+        let result = session.recv().await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(DtlsError::NotConnected)));
+    }
+
+    #[tokio::test]
+    async fn test_session_debug() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = create_test_config();
+
+        let session = DtlsSession::new(&config, Arc::new(socket), true)
+            .await
+            .unwrap();
+
+        let debug_str = format!("{:?}", session);
+        assert!(debug_str.contains("DtlsSession"));
+        assert!(debug_str.contains("Client"));
+        assert!(debug_str.contains("established"));
+    }
+
+    #[test]
+    fn test_generate_keying_material() {
+        let config = create_test_config();
+        let km = DtlsSession::generate_keying_material(&config);
+        assert!(km.is_ok());
+
+        let km = km.unwrap();
+        // Keys should be non-zero (random)
+        assert!(km.client_write_key.iter().any(|&b| b != 0));
+        assert!(km.server_write_key.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn test_generate_keying_material_uses_first_profile() {
+        let mut config = create_test_config();
+        config.srtp_profiles = vec![SrtpProfile::AeadAes256Gcm];
+
+        let km = DtlsSession::generate_keying_material(&config).unwrap();
+        assert_eq!(km.profile, SrtpProfile::AeadAes256Gcm);
+    }
+
+    #[test]
+    fn test_generate_keying_material_empty_profiles_uses_default() {
+        let mut config = create_test_config();
+        config.srtp_profiles = vec![];
+
+        let km = DtlsSession::generate_keying_material(&config).unwrap();
+        // Should default to AeadAes256Gcm
+        assert_eq!(km.profile, SrtpProfile::AeadAes256Gcm);
+    }
 }
