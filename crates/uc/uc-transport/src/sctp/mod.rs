@@ -24,6 +24,7 @@ pub mod association;
 pub mod chunk;
 pub mod congestion;
 pub mod cookie;
+pub mod listener;
 pub mod packet;
 pub mod path;
 pub mod state;
@@ -31,10 +32,8 @@ pub mod stream;
 pub mod timer;
 pub mod udp_encap;
 
-// This module will be added when needed:
-// pub mod listener;
-
 pub use association::{AssociationConfig, AssociationHandle, AssociationInner};
+pub use listener::{SctpListener, SctpListenerConfig};
 pub use chunk::{
     AbortChunk, Chunk, ChunkType, CookieAckChunk, CookieEchoChunk, DataChunk, ErrorCause,
     ErrorChunk, GapAckBlock, HeartbeatAckChunk, HeartbeatChunk, InitAckChunk, InitChunk, InitParam,
@@ -419,60 +418,6 @@ impl std::fmt::Debug for SctpAssociation {
             .field("peer_addr", &self.peer_addr)
             .field("state", &self.state())
             .field("connected", &self.connected.load(Ordering::Relaxed))
-            .field("outbound_streams", &self.config.outbound_streams)
-            .finish_non_exhaustive()
-    }
-}
-
-// =============================================================================
-// SCTP Listener
-// =============================================================================
-
-/// SCTP listener for accepting incoming associations.
-pub struct SctpListener {
-    /// Local address.
-    local_addr: SbcSocketAddr,
-    /// Configuration.
-    config: SctpConfig,
-}
-
-impl SctpListener {
-    /// Creates a new SCTP listener.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if binding fails.
-    pub async fn bind(addr: &SbcSocketAddr, config: SctpConfig) -> TransportResult<Self> {
-        info!(addr = %addr, "SCTP listener binding");
-
-        Ok(Self {
-            local_addr: addr.clone(),
-            config,
-        })
-    }
-
-    /// Accepts the next SCTP association.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if accept fails.
-    pub async fn accept(&self) -> TransportResult<SctpAssociation> {
-        // TODO: Actually listen on UDP socket for INIT chunks
-        // For now, just wait indefinitely
-        std::future::pending().await
-    }
-
-    /// Returns the local address.
-    #[must_use]
-    pub fn local_addr(&self) -> &SbcSocketAddr {
-        &self.local_addr
-    }
-}
-
-impl std::fmt::Debug for SctpListener {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SctpListener")
-            .field("local_addr", &self.local_addr)
             .field("outbound_streams", &self.config.outbound_streams)
             .finish_non_exhaustive()
     }
