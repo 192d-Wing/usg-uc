@@ -9,6 +9,11 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+radius = ["dep:radius-proto"]
+diameter = ["dep:diameter"]
+
 [dependencies]
 # Async runtime
 tokio.workspace = true
@@ -25,6 +30,12 @@ thiserror.workspace = true
 
 # Bytes handling
 bytes.workspace = true
+
+# RADIUS protocol (RFC 2865, RFC 2866) - using usg-radius project
+radius-proto = { git = "https://gitlab.com/192d-wing/usg-radius.git", optional = true }
+
+# Diameter protocol (RFC 6733)
+diameter = { version = "0.7", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

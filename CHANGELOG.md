@@ -744,10 +744,23 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 - New crate for authentication/authorization/accounting:
   - `AaaProvider` trait with authenticate/authorize/accounting methods
-  - `RadiusClient` for RADIUS server communication
+  - `RadiusClient` for RADIUS server communication (using `radius-proto` from usg-radius)
+    - Async UDP transport with configurable timeout and retries
+    - Server failover support (primary/secondary)
+    - Message-Authenticator HMAC-MD5 for request integrity
+    - Full accounting support (Start, Stop, Interim)
+    - RFC 2865 (Authentication) and RFC 2866 (Accounting) compliant
+  - `DiameterClient` for 3GPP Cx/Dx interface (IMS authentication)
+    - RFC 6733 Diameter base protocol support
+    - Capabilities Exchange (CER/CEA) for session establishment
+    - User-Authorization-Request (UAR) for IMS registration
+    - Multimedia-Auth-Request (MAR) for authentication vectors
+    - Server-Assignment-Request (SAR) for user data
+    - TCP transport with async I/O
   - `AuthRequest` and `AuthResponse` types
   - `AccountingRecord` for CDR-style accounting
   - `AccountingType` enum: Start, Stop, Interim
+  - Feature flags: `radius` (uses radius-proto), `diameter` (uses diameter crate)
 
 **uc-snmp - SNMP Trap Generation**
 

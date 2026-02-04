@@ -448,7 +448,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ `uc-discovery`: Service discovery (static, DNS SRV/A, Kubernetes)
 - ✅ `uc-storage`: Storage backends (in-memory, Redis, PostgreSQL)
 - ✅ `uc-state-sync`: State replication engine with CRDTs
-- ✅ `uc-aaa`: AAA integration (RADIUS client)
+- ✅ `uc-aaa`: AAA integration (RADIUS and Diameter clients)
 - ✅ `uc-snmp`: SNMP trap generation
 - ✅ `uc-syslog`: RFC 5424 syslog forwarding
 
@@ -486,7 +486,13 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **External Integrations**
 
-- ✅ `RadiusClient` for RADIUS authentication and accounting
+- ✅ `RadiusClient` for RADIUS authentication and accounting (using `radius-proto` from usg-radius)
+- ✅ `DiameterClient` for Diameter authentication (3GPP Cx/Dx interface for IMS)
+  - RFC 6733 Diameter base protocol
+  - 3GPP TS 29.228/229 Cx/Dx interface for HSS communication
+  - Capabilities Exchange (CER/CEA), Watchdog (DWR/DWA)
+  - User-Authorization (UAR/UAA), Multimedia-Auth (MAR/MAA), Server-Assignment (SAR/SAA)
+  - Feature-gated with `diameter` feature flag
 - ✅ `SnmpTrapSender` with 14 trap types
 - ✅ `SyslogForwarder` with RFC 5424 and BSD format support
 
@@ -530,6 +536,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ SctpConfig with full SCTP parameters
 - ✅ SctpAssociation implementing Transport trait
 - ✅ TransportType::Sctp added to uc-types
+- ⚠️ **Note**: Full SCTP implementation pending mature async Rust SCTP library (no suitable library exists; `webrtc-sctp` is WebRTC-only, `usrsctp-rs` requires FFI)
 
 **Tests**: 25 new tests (T.38 crate)
 

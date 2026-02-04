@@ -14,6 +14,8 @@ pub struct AaaConfig {
     pub provider: AaaProviderType,
     /// RADIUS configuration.
     pub radius: Option<RadiusConfig>,
+    /// Diameter configuration.
+    pub diameter: Option<DiameterConfig>,
     /// Local authentication database (for testing/fallback).
     pub local: Option<LocalConfig>,
     /// Failover configuration.
@@ -26,6 +28,7 @@ impl Default for AaaConfig {
             enabled: false,
             provider: AaaProviderType::Local,
             radius: None,
+            diameter: None,
             local: Some(LocalConfig::default()),
             failover: FailoverConfig::default(),
         }
@@ -40,6 +43,20 @@ impl AaaConfig {
             enabled: true,
             provider: AaaProviderType::Radius,
             radius: Some(RadiusConfig::new(server, secret)),
+            diameter: None,
+            local: None,
+            failover: FailoverConfig::default(),
+        }
+    }
+
+    /// Creates a Diameter configuration.
+    #[must_use]
+    pub fn diameter(server: SocketAddr, origin_host: impl Into<String>, origin_realm: impl Into<String>) -> Self {
+        Self {
+            enabled: true,
+            provider: AaaProviderType::Diameter,
+            radius: None,
+            diameter: Some(DiameterConfig::new(server, origin_host, origin_realm)),
             local: None,
             failover: FailoverConfig::default(),
         }
@@ -52,6 +69,7 @@ impl AaaConfig {
             enabled: true,
             provider: AaaProviderType::Local,
             radius: None,
+            diameter: None,
             local: Some(LocalConfig::default()),
             failover: FailoverConfig::default(),
         }
@@ -143,6 +161,104 @@ impl RadiusConfig {
     #[must_use]
     pub fn with_backup(mut self, server: SocketAddr) -> Self {
         self.backup_servers.push(server);
+        self
+    }
+}
+
+/// Diameter configuration (RFC 6733, 3GPP Cx/Dx).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiameterConfig {
+    /// Diameter server address (HSS).
+    pub server: SocketAddr,
+    /// Backup Diameter servers.
+    #[serde(default)]
+    pub backup_servers: Vec<SocketAddr>,
+    /// Origin-Host (this SBC's identity).
+    pub origin_host: String,
+    /// Origin-Realm (this SBC's realm).
+    pub origin_realm: String,
+    /// Destination-Host (HSS identity, optional).
+    pub destination_host: Option<String>,
+    /// Destination-Realm (HSS realm).
+    pub destination_realm: String,
+    /// Use TLS for transport.
+    pub use_tls: bool,
+    /// Verify TLS certificates.
+    pub verify_cert: bool,
+    /// Request timeout in milliseconds.
+    pub timeout_ms: u64,
+    /// Watchdog interval in seconds (DWR).
+    pub watchdog_interval_secs: u64,
+    /// Vendor ID for vendor-specific AVPs.
+    pub vendor_id: u32,
+    /// Application ID for Cx interface.
+    pub application_id: u32,
+}
+
+impl Default for DiameterConfig {
+    fn default() -> Self {
+        Self {
+            server: "127.0.0.1:3868".parse().unwrap_or_else(|_| {
+                SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 3868)
+            }),
+            backup_servers: Vec::new(),
+            origin_host: "sbc.example.com".to_string(),
+            origin_realm: "example.com".to_string(),
+            destination_host: None,
+            destination_realm: "example.com".to_string(),
+            use_tls: false,
+            verify_cert: true,
+            timeout_ms: 5000,
+            watchdog_interval_secs: 30,
+            vendor_id: 10415, // 3GPP vendor ID
+            application_id: 16777216, // 3GPP Cx interface
+        }
+    }
+}
+
+impl DiameterConfig {
+    /// Creates a new Diameter configuration.
+    #[must_use]
+    pub fn new(
+        server: SocketAddr,
+        origin_host: impl Into<String>,
+        origin_realm: impl Into<String>,
+    ) -> Self {
+        let realm = origin_realm.into();
+        Self {
+            server,
+            origin_host: origin_host.into(),
+            origin_realm: realm.clone(),
+            destination_realm: realm,
+            ..Default::default()
+        }
+    }
+
+    /// Returns the timeout as a Duration.
+    #[must_use]
+    pub const fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms)
+    }
+
+    /// Adds a backup server.
+    #[must_use]
+    pub fn with_backup(mut self, server: SocketAddr) -> Self {
+        self.backup_servers.push(server);
+        self
+    }
+
+    /// Sets TLS enabled.
+    #[must_use]
+    pub const fn with_tls(mut self, use_tls: bool) -> Self {
+        self.use_tls = use_tls;
+        self
+    }
+
+    /// Sets the destination realm.
+    #[must_use]
+    pub fn with_destination_realm(mut self, realm: impl Into<String>) -> Self {
+        self.destination_realm = realm.into();
         self
     }
 }

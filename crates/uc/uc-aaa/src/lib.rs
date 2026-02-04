@@ -11,8 +11,8 @@
 //! This crate provides AAA (Authentication, Authorization, Accounting) integration
 //! for the USG Session Border Controller, supporting:
 //!
-//! - **RADIUS**: Remote Authentication Dial-In User Service
-//! - **Diameter**: Next-generation AAA protocol (planned)
+//! - **RADIUS**: Remote Authentication Dial-In User Service (RFC 2865, RFC 2866)
+//! - **Diameter**: 3GPP Cx/Dx for IMS (RFC 6733, TS 29.228/229)
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
@@ -32,11 +32,13 @@
 //! ```
 
 pub mod config;
+pub mod diameter;
 pub mod error;
 pub mod provider;
 pub mod radius;
 
-pub use config::{AaaConfig, RadiusConfig};
+pub use config::{AaaConfig, DiameterConfig, RadiusConfig};
+pub use diameter::DiameterClient;
 pub use error::{AaaError, AaaResult};
 pub use provider::{AaaProvider, AccountingRecord, AuthRequest, AuthResponse};
 pub use radius::RadiusClient;
