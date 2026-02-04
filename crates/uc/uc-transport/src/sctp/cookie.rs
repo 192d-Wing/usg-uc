@@ -220,7 +220,7 @@ impl CookieGenerator {
 
         // Generate a cryptographically secure random key
         let mut key = [0u8; 48];
-        rand::thread_rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut key);
 
         Self {
             secret_key: key,

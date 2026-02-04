@@ -454,7 +454,7 @@ impl std::fmt::Debug for SctpAssociation {
 /// Uses the `rand` crate with OS-provided entropy.
 fn rand_verification_tag() -> u32 {
     use rand::RngCore;
-    rand::thread_rng().next_u32()
+    rand::rng().next_u32()
 }
 
 /// Generates a cryptographically secure random initial TSN.
@@ -462,7 +462,7 @@ fn rand_verification_tag() -> u32 {
 /// Uses the `rand` crate with OS-provided entropy.
 fn rand_initial_tsn() -> u32 {
     use rand::RngCore;
-    rand::thread_rng().next_u32()
+    rand::rng().next_u32()
 }
 
 // =============================================================================

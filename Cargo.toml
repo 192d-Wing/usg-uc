@@ -74,7 +74,7 @@ members = [
     "crates/client/client-audio",
     "crates/client/client-sip-ua",
     "crates/client/client-core",
-    "crates/client/client-gui",
+    "crates/client/client-gui-windows",
     "crates/client/client-integration-tests",
 ]
 resolver = "2"
@@ -91,10 +91,10 @@ categories = ["network-programming", "multimedia"]
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.43", features = ["full"] }
+tokio = { version = "1.49", features = ["full"] }
 
 # Cryptography (CNSA 2.0 compliant)
-aws-lc-rs = { version = "1.12", default-features = false }
+aws-lc-rs = { version = "1.15", default-features = false }
 rustls = { version = "0.23", default-features = false, features = [
     "aws-lc-rs",
     "tls12",
@@ -127,9 +127,9 @@ socket2 = { version = "0.6", features = ["all"] }
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
-http = "1.2"
+http = "1.4"
 http-body-util = "0.1"
-hyper = { version = "1.6", features = ["server", "http1", "http2"] }
+hyper = { version = "1.8", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tokio-rustls = "0.26"
 rustls-pki-types = { version = "1.14", features = ["std"] }
@@ -185,7 +185,7 @@ client-types = { path = "crates/client/client-types" }
 client-audio = { path = "crates/client/client-audio" }
 client-sip-ua = { path = "crates/client/client-sip-ua" }
 client-core = { path = "crates/client/client-core" }
-client-gui = { path = "crates/client/client-gui" }
+client-gui-windows = { path = "crates/client/client-gui-windows" }
 
 # Audio (for soft client)
 cpal = "0.17"
@@ -197,7 +197,7 @@ eframe = { version = "0.33", features = ["wgpu"] }
 
 # Windows integration (for soft client)
 directories = "6"
-tray-icon = "0.21"
+tray-icon = "0.21.3"
 image = "0.25"
 rfd = "0.17"
 winrt-notification = "0.5"
@@ -205,8 +205,8 @@ windows = { version = "0.62", features = [
     "Win32_Security_Cryptography",
     "Win32_Foundation",
 ] }
-uuid = { version = "1.16", features = ["v4"] }
-tempfile = "3.20"
+uuid = { version = "1.20", features = ["v4"] }
+tempfile = "3.24"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

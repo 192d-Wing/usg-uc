@@ -674,7 +674,7 @@ impl SctpListener {
 /// values like verification tags and initial TSNs.
 fn generate_random_u32() -> u32 {
     use rand::RngCore;
-    rand::thread_rng().next_u32()
+    rand::rng().next_u32()
 }
 
 // =============================================================================

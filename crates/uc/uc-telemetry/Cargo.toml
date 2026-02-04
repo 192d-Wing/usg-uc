@@ -35,7 +35,7 @@ opentelemetry = { version = "0.31", features = ["trace", "metrics"] }
 opentelemetry_sdk = { version = "0.31", features = ["trace", "metrics", "rt-tokio"] }
 
 # Tracing integration (optional)
-tracing-opentelemetry = { version = "0.31", optional = true }
+tracing-opentelemetry = { version = "0.32", optional = true }
 
 # OTLP exporter (optional)
 opentelemetry-otlp = { version = "0.31", features = ["trace", "metrics", "grpc-tonic"], optional = true }

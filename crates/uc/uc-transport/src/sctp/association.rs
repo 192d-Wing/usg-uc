@@ -2402,9 +2402,16 @@ impl AssociationHandle {
 
                     if action.should_report() {
                         // Report unrecognized chunk type in ERROR chunk
-                        let error = ErrorChunk::new(vec![ErrorCause::UnrecognizedChunkType {
-                            chunk: unknown.clone(),
-                        }]);
+                        // Serialize the unknown chunk to bytes for the error cause
+                        let mut chunk_bytes = bytes::BytesMut::new();
+                        chunk_bytes.extend_from_slice(&[unknown.chunk_type, unknown.flags]);
+                        let len = (4 + unknown.data.len()) as u16;
+                        chunk_bytes.extend_from_slice(&len.to_be_bytes());
+                        chunk_bytes.extend_from_slice(&unknown.data);
+                        let mut error = ErrorChunk::new();
+                        error.add_cause(ErrorCause::UnrecognizedChunkType {
+                            chunk: chunk_bytes.freeze(),
+                        });
                         response_chunks.push(Chunk::Error(error));
                     }
 
@@ -2748,7 +2755,7 @@ impl AssociationHandle {
 /// values like verification tags and initial TSNs.
 fn generate_random_u32() -> u32 {
     use rand::RngCore;
-    rand::thread_rng().next_u32()
+    rand::rng().next_u32()
 }
 
 /// TSN comparison with wrap-around (serial number arithmetic).
