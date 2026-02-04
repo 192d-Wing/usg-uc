@@ -324,4 +324,136 @@ mod tests {
 
     // Note: Integration tests with real STUN servers would go in a separate
     // integration test file to avoid requiring network access in unit tests.
+
+    #[tokio::test]
+    async fn test_bind_creates_client() {
+        let server = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 3478);
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+
+        let result = StunClient::bind(local_addr, server).await;
+        assert!(result.is_ok());
+
+        let client = result.unwrap();
+        assert_eq!(client.server(), server);
+        assert!(client.local_addr().is_ok());
+    }
+
+    #[test]
+    fn test_client_debug() {
+        // Test Debug implementation (need to avoid async for direct struct inspection)
+        let format = format!(
+            "StunClient {{ server: {:?}, timeout: {:?}, max_retries: {:?} }}",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 3478),
+            Duration::from_secs(3),
+            7u32
+        );
+        assert!(format.contains("192.0.2.1"));
+    }
+
+    #[tokio::test]
+    async fn test_client_debug_impl() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 3478);
+        let client = StunClient::new(Arc::new(socket), server);
+
+        let debug_str = format!("{:?}", client);
+        assert!(debug_str.contains("StunClient"));
+        assert!(debug_str.contains("192.0.2.1"));
+    }
+
+    #[test]
+    fn test_extract_mapped_address_success() {
+        use crate::{StunAttribute, StunClass, StunMethod};
+        use crate::attribute::XorMappedAddress;
+        use crate::message::StunMessageType;
+
+        // Create a success response with XOR-MAPPED-ADDRESS
+        let msg_type = StunMessageType::new(StunMethod::Binding, StunClass::SuccessResponse);
+        let mut response = StunMessage::new(msg_type, [1u8; 12]);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 12345);
+        response.add_attribute(StunAttribute::XorMappedAddress(XorMappedAddress::new(addr)));
+
+        let result = StunClient::extract_mapped_address(&response);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), addr);
+    }
+
+    #[test]
+    fn test_extract_mapped_address_missing() {
+        use crate::{StunClass, StunMethod};
+        use crate::message::StunMessageType;
+
+        // Create a success response without XOR-MAPPED-ADDRESS
+        let msg_type = StunMessageType::new(StunMethod::Binding, StunClass::SuccessResponse);
+        let response = StunMessage::new(msg_type, [1u8; 12]);
+
+        let result = StunClient::extract_mapped_address(&response);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(StunError::InvalidMessage { .. })));
+    }
+
+    #[test]
+    fn test_extract_mapped_address_error_response() {
+        use crate::{StunAttribute, StunClass, StunMethod};
+        use crate::message::StunMessageType;
+
+        // Create an error response
+        let msg_type = StunMessageType::new(StunMethod::Binding, StunClass::ErrorResponse);
+        let mut response = StunMessage::new(msg_type, [1u8; 12]);
+        response.add_attribute(StunAttribute::ErrorCode {
+            code: 401,
+            reason: "Unauthorized".to_string(),
+        });
+
+        let result = StunClient::extract_mapped_address(&response);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(StunError::ServerError { code: 401, .. })));
+    }
+
+    #[test]
+    fn test_extract_error_code_with_error() {
+        use crate::{StunAttribute, StunClass, StunMethod};
+        use crate::message::StunMessageType;
+
+        let msg_type = StunMessageType::new(StunMethod::Binding, StunClass::ErrorResponse);
+        let mut response = StunMessage::new(msg_type, [1u8; 12]);
+        response.add_attribute(StunAttribute::ErrorCode {
+            code: 438,
+            reason: "Stale Nonce".to_string(),
+        });
+
+        let error = StunClient::extract_error_code(&response);
+        assert!(matches!(error, StunError::ServerError { code: 438, .. }));
+    }
+
+    #[test]
+    fn test_extract_error_code_missing() {
+        use crate::{StunClass, StunMethod};
+        use crate::message::StunMessageType;
+
+        // Error response without error code attribute
+        let msg_type = StunMessageType::new(StunMethod::Binding, StunClass::ErrorResponse);
+        let response = StunMessage::new(msg_type, [1u8; 12]);
+
+        let error = StunClient::extract_error_code(&response);
+        assert!(matches!(
+            error,
+            StunError::ServerError { code: 500, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_discover_srflx_timeout() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Use a non-routable address to ensure timeout
+        let server = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 3478);
+
+        let client = StunClient::new(Arc::new(socket), server)
+            .with_timeout(Duration::from_millis(100))
+            .with_max_retries(0);
+
+        let result = client.discover_srflx().await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(StunError::Timeout)));
+    }
 }

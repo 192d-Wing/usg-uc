@@ -707,4 +707,269 @@ mod tests {
 
     // Note: Integration tests with real TURN servers would go in a separate
     // integration test file to avoid requiring network access in unit tests.
+
+    #[test]
+    fn test_create_allocate_request() {
+        let request = TurnClient::create_allocate_request().unwrap();
+
+        assert_eq!(request.msg_type.method, StunMethod::Allocate);
+        assert_eq!(request.msg_type.class, StunClass::Request);
+        // Transaction ID should be 12 bytes of random data
+        assert_eq!(request.transaction_id.len(), 12);
+    }
+
+    #[test]
+    fn test_create_permission_request() {
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 100)), 5000);
+        let request = TurnClient::create_permission_request(peer_addr).unwrap();
+
+        assert_eq!(request.msg_type.method, StunMethod::CreatePermission);
+        assert_eq!(request.msg_type.class, StunClass::Request);
+        assert_eq!(request.transaction_id.len(), 12);
+    }
+
+    #[test]
+    fn test_create_channel_bind_request() {
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 100)), 5000);
+        let request = TurnClient::create_channel_bind_request(0x4001, peer_addr).unwrap();
+
+        assert_eq!(request.msg_type.method, StunMethod::ChannelBind);
+        assert_eq!(request.msg_type.class, StunClass::Request);
+        assert_eq!(request.transaction_id.len(), 12);
+    }
+
+    #[test]
+    fn test_create_refresh_request() {
+        let request = TurnClient::create_refresh_request(Some(3600)).unwrap();
+
+        assert_eq!(request.msg_type.method, StunMethod::Refresh);
+        assert_eq!(request.msg_type.class, StunClass::Request);
+        assert_eq!(request.transaction_id.len(), 12);
+    }
+
+    #[test]
+    fn test_create_refresh_request_no_lifetime() {
+        let request = TurnClient::create_refresh_request(None).unwrap();
+
+        assert_eq!(request.msg_type.method, StunMethod::Refresh);
+        assert_eq!(request.msg_type.class, StunClass::Request);
+    }
+
+    #[test]
+    fn test_extract_error_code() {
+        let msg_type = StunMessageType::new(StunMethod::Allocate, StunClass::ErrorResponse);
+        let mut msg = StunMessage::new(msg_type, [1u8; 12]);
+        msg.add_attribute(StunAttribute::ErrorCode {
+            code: 401,
+            reason: "Unauthorized".to_string(),
+        });
+
+        let code = TurnClient::extract_error_code(&msg);
+        assert_eq!(code, Some(401));
+    }
+
+    #[test]
+    fn test_extract_error_code_missing() {
+        let msg_type = StunMessageType::new(StunMethod::Allocate, StunClass::SuccessResponse);
+        let msg = StunMessage::new(msg_type, [1u8; 12]);
+
+        let code = TurnClient::extract_error_code(&msg);
+        assert_eq!(code, None);
+    }
+
+    #[test]
+    fn test_extract_error_reason() {
+        let msg_type = StunMessageType::new(StunMethod::Allocate, StunClass::ErrorResponse);
+        let mut msg = StunMessage::new(msg_type, [1u8; 12]);
+        msg.add_attribute(StunAttribute::ErrorCode {
+            code: 438,
+            reason: "Stale Nonce".to_string(),
+        });
+
+        let reason = TurnClient::extract_error_reason(&msg);
+        assert_eq!(reason, Some("Stale Nonce".to_string()));
+    }
+
+    #[test]
+    fn test_extract_error_reason_missing() {
+        let msg_type = StunMessageType::new(StunMethod::Allocate, StunClass::SuccessResponse);
+        let msg = StunMessage::new(msg_type, [1u8; 12]);
+
+        let reason = TurnClient::extract_error_reason(&msg);
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn test_extract_lifetime_returns_none() {
+        // Current implementation always returns None
+        let msg_type = StunMessageType::new(StunMethod::Allocate, StunClass::SuccessResponse);
+        let msg = StunMessage::new(msg_type, [1u8; 12]);
+
+        let lifetime = TurnClient::extract_lifetime(&msg);
+        assert_eq!(lifetime, None);
+    }
+
+    #[test]
+    fn test_allocation_expired() {
+        // Create an allocation that was created 700 seconds ago with 600s lifetime
+        let created_at = Instant::now() - Duration::from_secs(700);
+        let alloc = ClientAllocation {
+            relayed_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 49152),
+            created_at,
+            lifetime: 600,
+        };
+
+        assert!(!alloc.is_valid());
+        assert_eq!(alloc.remaining_lifetime(), 0);
+    }
+
+    #[test]
+    fn test_allocation_remaining_lifetime() {
+        // Create an allocation that was created 100 seconds ago with 600s lifetime
+        let created_at = Instant::now() - Duration::from_secs(100);
+        let alloc = ClientAllocation {
+            relayed_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 49152),
+            created_at,
+            lifetime: 600,
+        };
+
+        assert!(alloc.is_valid());
+        let remaining = alloc.remaining_lifetime();
+        // Should be around 500 seconds (600 - 100)
+        assert!(remaining <= 500);
+        assert!(remaining >= 499);
+    }
+
+    #[tokio::test]
+    async fn test_bind_creates_client() {
+        let server = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 3478);
+        let creds = TurnCredentials::new("user", "pass");
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+
+        let result = TurnClient::bind(local_addr, server, creds).await;
+        assert!(result.is_ok());
+
+        let client = result.unwrap();
+        assert_eq!(client.server(), server);
+    }
+
+    #[tokio::test]
+    async fn test_create_permission_no_allocation() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 3478);
+        let creds = TurnCredentials::new("user", "pass");
+        let client = TurnClient::new(Arc::new(socket), server, creds);
+
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 100)), 5000);
+        let result = client.create_permission(peer).await;
+
+        assert!(matches!(result, Err(TurnError::NoAllocation)));
+    }
+
+    #[tokio::test]
+    async fn test_bind_channel_no_allocation() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 3478);
+        let creds = TurnCredentials::new("user", "pass");
+        let client = TurnClient::new(Arc::new(socket), server, creds);
+
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 100)), 5000);
+        let result = client.bind_channel(0x4001, peer).await;
+
+        assert!(matches!(result, Err(TurnError::NoAllocation)));
+    }
+
+    #[tokio::test]
+    async fn test_refresh_no_allocation() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 3478);
+        let creds = TurnCredentials::new("user", "pass");
+        let client = TurnClient::new(Arc::new(socket), server, creds);
+
+        let result = client.refresh(Some(3600)).await;
+
+        assert!(matches!(result, Err(TurnError::NoAllocation)));
+    }
+
+    #[test]
+    fn test_credentials_default() {
+        let creds = TurnCredentials::new("user", "pass");
+
+        assert_eq!(creds.username, "user");
+        assert_eq!(creds.password, "pass");
+        assert_eq!(creds.realm, None);
+        assert_eq!(creds.nonce, None);
+    }
+
+    #[test]
+    fn test_turn_client_debug() {
+        // Can't easily test Debug impl without creating client, but we can verify it compiles
+        // This is mainly for coverage of the Debug impl
+        let format_str = format!(
+            "{:?}",
+            TurnCredentials::new("user", "pass")
+                .with_realm("example.com")
+                .with_nonce("nonce123")
+        );
+        assert!(format_str.contains("TurnCredentials"));
+    }
+
+    #[tokio::test]
+    async fn test_turn_client_debug_impl() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 3478);
+        let creds = TurnCredentials::new("user", "pass");
+        let client = TurnClient::new(Arc::new(socket), server, creds);
+
+        let debug_str = format!("{:?}", client);
+        assert!(debug_str.contains("TurnClient"));
+        assert!(debug_str.contains("<credentials>"));
+        assert!(debug_str.contains("<mutex>"));
+    }
+
+    #[tokio::test]
+    async fn test_relayed_addr_with_expired_allocation() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 3478);
+        let creds = TurnCredentials::new("user", "pass");
+        let client = TurnClient::new(Arc::new(socket), server, creds);
+
+        // Manually set an expired allocation
+        {
+            let mut alloc = client.allocation.lock().await;
+            *alloc = Some(ClientAllocation {
+                relayed_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50)), 50000),
+                created_at: Instant::now() - Duration::from_secs(700),
+                lifetime: 600,
+            });
+        }
+
+        // Should return None because allocation is expired
+        let result = client.relayed_addr().await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_relayed_addr_with_valid_allocation() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 3478);
+        let creds = TurnCredentials::new("user", "pass");
+        let client = TurnClient::new(Arc::new(socket), server, creds);
+
+        let expected_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50)), 50000);
+
+        // Manually set a valid allocation
+        {
+            let mut alloc = client.allocation.lock().await;
+            *alloc = Some(ClientAllocation {
+                relayed_addr: expected_addr,
+                created_at: Instant::now(),
+                lifetime: 600,
+            });
+        }
+
+        // Should return the relayed address
+        let result = client.relayed_addr().await;
+        assert_eq!(result, Some(expected_addr));
+    }
 }

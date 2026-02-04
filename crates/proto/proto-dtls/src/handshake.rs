@@ -1368,6 +1368,74 @@ mod tests {
     }
 
     #[test]
+    fn test_handshake_header_all_types() {
+        // Test all handshake message types
+        for (msg_type, expected_byte) in [
+            (HandshakeType::ClientHello, 1),
+            (HandshakeType::ServerHello, 2),
+            (HandshakeType::HelloVerifyRequest, 3),
+            (HandshakeType::Certificate, 11),
+            (HandshakeType::ServerKeyExchange, 12),
+            (HandshakeType::CertificateRequest, 13),
+            (HandshakeType::ServerHelloDone, 14),
+            (HandshakeType::CertificateVerify, 15),
+            (HandshakeType::ClientKeyExchange, 16),
+            (HandshakeType::Finished, 20),
+        ] {
+            let header = HandshakeHeader {
+                msg_type,
+                length: 256,
+                message_seq: 5,
+                fragment_offset: 128,
+                fragment_length: 128,
+            };
+
+            let serialized = header.serialize();
+            assert_eq!(serialized[0], expected_byte);
+
+            let parsed = HandshakeHeader::parse(&serialized).unwrap();
+            assert_eq!(parsed.msg_type, msg_type);
+            assert_eq!(parsed.length, 256);
+            assert_eq!(parsed.message_seq, 5);
+            assert_eq!(parsed.fragment_offset, 128);
+            assert_eq!(parsed.fragment_length, 128);
+        }
+    }
+
+    #[test]
+    fn test_handshake_header_parse_too_short() {
+        let short_data = [0u8; 5];
+        assert!(HandshakeHeader::parse(&short_data).is_err());
+    }
+
+    #[test]
+    fn test_handshake_header_parse_unknown_type() {
+        let mut data = [0u8; HandshakeHeader::SIZE];
+        data[0] = 99; // Invalid type
+        assert!(HandshakeHeader::parse(&data).is_err());
+    }
+
+    #[test]
+    fn test_handshake_header_large_values() {
+        // Test with maximum values to ensure no overflow
+        let header = HandshakeHeader {
+            msg_type: HandshakeType::Finished,
+            length: 0xFFFFFF, // Max 24-bit value
+            message_seq: 0xFFFF,
+            fragment_offset: 0xFFFFFF,
+            fragment_length: 0xFFFFFF,
+        };
+
+        let serialized = header.serialize();
+        let parsed = HandshakeHeader::parse(&serialized).unwrap();
+
+        assert_eq!(parsed.length, 0xFFFFFF);
+        assert_eq!(parsed.message_seq, 0xFFFF);
+        assert_eq!(parsed.fragment_offset, 0xFFFFFF);
+        assert_eq!(parsed.fragment_length, 0xFFFFFF);
+    }
+
+    #[test]
     fn test_handshake_type_conversion() {
         assert_eq!(
             HandshakeType::try_from(1).unwrap(),
@@ -1378,10 +1446,40 @@ mod tests {
             HandshakeType::ServerHello
         );
         assert_eq!(
+            HandshakeType::try_from(3).unwrap(),
+            HandshakeType::HelloVerifyRequest
+        );
+        assert_eq!(
+            HandshakeType::try_from(11).unwrap(),
+            HandshakeType::Certificate
+        );
+        assert_eq!(
+            HandshakeType::try_from(12).unwrap(),
+            HandshakeType::ServerKeyExchange
+        );
+        assert_eq!(
+            HandshakeType::try_from(13).unwrap(),
+            HandshakeType::CertificateRequest
+        );
+        assert_eq!(
+            HandshakeType::try_from(14).unwrap(),
+            HandshakeType::ServerHelloDone
+        );
+        assert_eq!(
+            HandshakeType::try_from(15).unwrap(),
+            HandshakeType::CertificateVerify
+        );
+        assert_eq!(
+            HandshakeType::try_from(16).unwrap(),
+            HandshakeType::ClientKeyExchange
+        );
+        assert_eq!(
             HandshakeType::try_from(20).unwrap(),
             HandshakeType::Finished
         );
+        assert!(HandshakeType::try_from(0).is_err());
         assert!(HandshakeType::try_from(99).is_err());
+        assert!(HandshakeType::try_from(255).is_err());
     }
 
     #[test]
@@ -1403,4 +1501,365 @@ mod tests {
         assert_eq!(result1, result2);
         assert_eq!(result1.len(), 32);
     }
+
+    #[test]
+    fn test_prf_sha384_different_lengths() {
+        let secret = b"master secret";
+        let label = b"key expansion";
+        let seed = b"random seed data for testing";
+
+        // Test different output lengths
+        let result_48 = prf_sha384(secret, label, seed, 48);
+        let result_64 = prf_sha384(secret, label, seed, 64);
+        let result_128 = prf_sha384(secret, label, seed, 128);
+
+        assert_eq!(result_48.len(), 48);
+        assert_eq!(result_64.len(), 64);
+        assert_eq!(result_128.len(), 128);
+
+        // First 48 bytes should match
+        assert_eq!(&result_64[..48], &result_48[..]);
+    }
+
+    #[test]
+    fn test_prf_sha384_different_inputs_produce_different_outputs() {
+        let secret = b"secret";
+        let label = b"label";
+        let seed1 = b"seed1";
+        let seed2 = b"seed2";
+
+        let result1 = prf_sha384(secret, label, seed1, 32);
+        let result2 = prf_sha384(secret, label, seed2, 32);
+
+        assert_ne!(result1, result2);
+    }
+
+    #[test]
+    fn test_handshake_state_enum() {
+        // Test all handshake states
+        let states = [
+            HandshakeState::Start,
+            HandshakeState::WaitClientHello,
+            HandshakeState::WaitHelloVerifyRequest,
+            HandshakeState::WaitServerHello,
+            HandshakeState::WaitCertificate,
+            HandshakeState::WaitServerKeyExchange,
+            HandshakeState::WaitServerHelloDone,
+            HandshakeState::WaitClientKeyExchange,
+            HandshakeState::WaitCertificateVerify,
+            HandshakeState::WaitChangeCipherSpec,
+            HandshakeState::WaitFinished,
+            HandshakeState::Complete,
+            HandshakeState::Failed,
+        ];
+
+        // Test Debug and Clone
+        for state in states {
+            let _ = format!("{:?}", state);
+            let cloned = state;
+            assert_eq!(state, cloned);
+        }
+    }
+
+    #[test]
+    fn test_handshake_header_size_constant() {
+        assert_eq!(HandshakeHeader::SIZE, 12);
+    }
+
+    #[test]
+    fn test_handshake_new_client() {
+        // Test creating a client handshake context
+        let cert = vec![vec![0u8; 100]]; // Dummy certificate
+        let key = vec![0u8; 48]; // Dummy private key
+
+        let handshake = Handshake::new(true, cert, key);
+        assert!(handshake.is_ok());
+
+        let hs = handshake.unwrap();
+        assert_eq!(hs.state, HandshakeState::Start);
+        // Client random should be non-zero
+        assert!(hs.client_random.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn test_handshake_new_server() {
+        // Test creating a server handshake context
+        let cert = vec![vec![0u8; 100]]; // Dummy certificate
+        let key = vec![0u8; 48]; // Dummy private key
+
+        let handshake = Handshake::new(false, cert, key);
+        assert!(handshake.is_ok());
+
+        let hs = handshake.unwrap();
+        // Server starts in WaitClientHello state
+        assert_eq!(hs.state, HandshakeState::WaitClientHello);
+        // Server random should be non-zero
+        assert!(hs.server_random.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn test_handshake_build_client_hello() {
+        let cert = vec![vec![0u8; 100]];
+        let key = vec![0u8; 48];
+        let hs = Handshake::new(true, cert, key).unwrap();
+
+        let client_hello = hs.build_client_hello();
+
+        // Verify structure:
+        // 2 bytes version + 32 bytes random + 1 byte session ID len +
+        // 1 byte cookie len + 2 bytes cipher suites len + 2 bytes cipher suite +
+        // 1 byte compression len + 1 byte compression + 2 bytes extensions len
+        assert!(client_hello.len() >= 42);
+
+        // Check version (DTLS 1.2 = 0xFEFD)
+        assert_eq!(client_hello[0], 0xFE);
+        assert_eq!(client_hello[1], 0xFD);
+
+        // Session ID length should be 0
+        assert_eq!(client_hello[34], 0);
+
+        // Cookie length should be 0 initially
+        assert_eq!(client_hello[35], 0);
+
+        // Cipher suites length should be 2
+        assert_eq!(client_hello[36], 0);
+        assert_eq!(client_hello[37], 2);
+
+        // Cipher suite should be TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        assert_eq!(client_hello[38], 0xC0);
+        assert_eq!(client_hello[39], 0x2C);
+    }
+
+    #[test]
+    fn test_process_hello_verify_request_valid() {
+        let cert = vec![vec![0u8; 100]];
+        let key = vec![0u8; 48];
+        let mut hs = Handshake::new(true, cert, key).unwrap();
+
+        // Build a valid HelloVerifyRequest
+        // Format: version (2) + cookie_len (1) + cookie (variable)
+        let mut hvr = Vec::new();
+        hvr.extend_from_slice(&DTLS_1_2_VERSION.to_be_bytes()); // Version
+        hvr.push(16); // Cookie length
+        hvr.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]); // Cookie
+
+        let result = hs.process_hello_verify_request(&hvr);
+        assert!(result.is_ok());
+        assert_eq!(hs.cookie.len(), 16);
+    }
+
+    #[test]
+    fn test_process_hello_verify_request_too_short() {
+        let cert = vec![vec![0u8; 100]];
+        let key = vec![0u8; 48];
+        let mut hs = Handshake::new(true, cert, key).unwrap();
+
+        // Too short - less than 3 bytes
+        let result = hs.process_hello_verify_request(&[0xFE, 0xFD]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_process_hello_verify_request_truncated_cookie() {
+        let cert = vec![vec![0u8; 100]];
+        let key = vec![0u8; 48];
+        let mut hs = Handshake::new(true, cert, key).unwrap();
+
+        // Cookie length says 16, but only 5 bytes provided
+        let mut hvr = Vec::new();
+        hvr.extend_from_slice(&DTLS_1_2_VERSION.to_be_bytes());
+        hvr.push(16); // Says 16 bytes
+        hvr.extend_from_slice(&[1, 2, 3, 4, 5]); // Only 5 bytes
+
+        let result = hs.process_hello_verify_request(&hvr);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_process_server_hello_valid() {
+        let cert = vec![vec![0u8; 100]];
+        let key = vec![0u8; 48];
+        let mut hs = Handshake::new(true, cert, key).unwrap();
+
+        // Build a valid ServerHello
+        let mut server_hello = Vec::new();
+        server_hello.extend_from_slice(&DTLS_1_2_VERSION.to_be_bytes()); // Version (2 bytes)
+        server_hello.extend_from_slice(&[0u8; 32]); // Server random (32 bytes)
+        server_hello.push(0); // Session ID length (0)
+        server_hello.extend_from_slice(&TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384.to_be_bytes()); // Cipher suite
+        server_hello.push(0); // Compression method
+
+        let result = hs.process_server_hello(&server_hello);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_process_server_hello_too_short() {
+        let cert = vec![vec![0u8; 100]];
+        let key = vec![0u8; 48];
+        let mut hs = Handshake::new(true, cert, key).unwrap();
+
+        let result = hs.process_server_hello(&[0u8; 30]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_process_server_hello_unsupported_cipher() {
+        let cert = vec![vec![0u8; 100]];
+        let key = vec![0u8; 48];
+        let mut hs = Handshake::new(true, cert, key).unwrap();
+
+        let mut server_hello = Vec::new();
+        server_hello.extend_from_slice(&DTLS_1_2_VERSION.to_be_bytes());
+        server_hello.extend_from_slice(&[0u8; 32]); // Server random
+        server_hello.push(0); // Session ID length
+        server_hello.extend_from_slice(&0x002Fu16.to_be_bytes()); // TLS_RSA_WITH_AES_128_CBC_SHA - not CNSA 2.0
+
+        let result = hs.process_server_hello(&server_hello);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_process_client_hello_valid() {
+        let cert = vec![vec![0u8; 100]];
+        let key = vec![0u8; 48];
+        let mut hs = Handshake::new(false, cert, key).unwrap();
+
+        // Build a minimal valid ClientHello
+        let mut client_hello = Vec::new();
+        client_hello.extend_from_slice(&DTLS_1_2_VERSION.to_be_bytes()); // Version (2 bytes)
+        let client_random = [0x42u8; 32];
+        client_hello.extend_from_slice(&client_random); // Client random (32 bytes)
+
+        let result = hs.process_client_hello(&client_hello);
+        assert!(result.is_ok());
+        assert_eq!(hs.client_random, client_random);
+    }
+
+    #[test]
+    fn test_process_client_hello_too_short() {
+        let cert = vec![vec![0u8; 100]];
+        let key = vec![0u8; 48];
+        let mut hs = Handshake::new(false, cert, key).unwrap();
+
+        let result = hs.process_client_hello(&[0u8; 20]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_server_hello() {
+        let cert = vec![vec![0u8; 100]];
+        let key = vec![0u8; 48];
+        let hs = Handshake::new(false, cert, key).unwrap();
+
+        let server_hello = hs.build_server_hello();
+
+        // Verify structure
+        assert!(server_hello.len() >= 38);
+
+        // Check version
+        assert_eq!(server_hello[0], 0xFE);
+        assert_eq!(server_hello[1], 0xFD);
+
+        // Check cipher suite is our CNSA 2.0 suite
+        // Position depends on session ID length
+        let session_id_len = server_hello[34] as usize;
+        let cipher_offset = 35 + session_id_len;
+        assert_eq!(server_hello[cipher_offset], 0xC0);
+        assert_eq!(server_hello[cipher_offset + 1], 0x2C);
+    }
+
+    #[test]
+    fn test_build_certificate() {
+        let cert_data = vec![0x30, 0x82, 0x01, 0x00]; // Minimal ASN.1 structure
+        let cert = vec![cert_data.clone()];
+        let key = vec![0u8; 48];
+        let hs = Handshake::new(false, cert.clone(), key).unwrap();
+
+        let certificate_msg = hs.build_certificate();
+
+        // Message should contain: total length (3 bytes) + cert length (3 bytes) + cert data
+        assert!(certificate_msg.len() >= 6 + cert_data.len());
+
+        // Extract the certificate data from the message
+        let total_len =
+            u32::from_be_bytes([0, certificate_msg[0], certificate_msg[1], certificate_msg[2]])
+                as usize;
+        assert_eq!(total_len, certificate_msg.len() - 3);
+    }
+
+    #[test]
+    fn test_verify_client_hello_cookie_valid() {
+        let cert = vec![vec![0u8; 100]];
+        let key = vec![0u8; 48];
+        let mut hs = Handshake::new(false, cert, key).unwrap();
+
+        // Set the expected cookie
+        hs.cookie = vec![1, 2, 3, 4, 5, 6, 7, 8];
+
+        // Build ClientHello with matching cookie
+        let mut client_hello = Vec::new();
+        client_hello.extend_from_slice(&DTLS_1_2_VERSION.to_be_bytes()); // Version
+        client_hello.extend_from_slice(&[0u8; 32]); // Client random
+        client_hello.push(0); // Session ID length
+        client_hello.push(8); // Cookie length
+        client_hello.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]); // Cookie
+
+        let result = hs.verify_client_hello_cookie(&client_hello);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_client_hello_cookie_mismatch() {
+        let cert = vec![vec![0u8; 100]];
+        let key = vec![0u8; 48];
+        let mut hs = Handshake::new(false, cert, key).unwrap();
+
+        // Set the expected cookie
+        hs.cookie = vec![1, 2, 3, 4, 5, 6, 7, 8];
+
+        // Build ClientHello with wrong cookie
+        let mut client_hello = Vec::new();
+        client_hello.extend_from_slice(&DTLS_1_2_VERSION.to_be_bytes());
+        client_hello.extend_from_slice(&[0u8; 32]);
+        client_hello.push(0); // Session ID length
+        client_hello.push(8); // Cookie length
+        client_hello.extend_from_slice(&[9, 9, 9, 9, 9, 9, 9, 9]); // Wrong cookie
+
+        let result = hs.verify_client_hello_cookie(&client_hello);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_client_hello_cookie_too_short() {
+        let cert = vec![vec![0u8; 100]];
+        let key = vec![0u8; 48];
+        let hs = Handshake::new(false, cert, key).unwrap();
+
+        let result = hs.verify_client_hello_cookie(&[0u8; 30]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_hello_verify_request() {
+        let cert = vec![vec![0u8; 100]];
+        let key = vec![0u8; 48];
+        let mut hs = Handshake::new(false, cert, key).unwrap();
+
+        let hvr = hs.build_hello_verify_request();
+        assert!(hvr.is_ok());
+
+        let hvr = hvr.unwrap();
+        // Check version
+        assert_eq!(hvr[0], 0xFE);
+        assert_eq!(hvr[1], 0xFD);
+        // Check cookie length
+        assert_eq!(hvr[2], 32);
+        // Check total length
+        assert_eq!(hvr.len(), 3 + 32);
+
+        // Cookie should now be set in handshake
+        assert_eq!(hs.cookie.len(), 32);
+    }
+
 }
