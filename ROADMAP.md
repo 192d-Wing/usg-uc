@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.16 (Production Certificate Validation & mTLS) complete
+**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.16 complete, Phases 24.17-24.22 in progress
 
 ---
 
@@ -528,17 +528,23 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ T38Session management with state machine
 - ✅ Goertzel algorithm for tone detection
 
-**SIP over SCTP** (RFC 4168)
+**SIP over SCTP** (RFC 4168, RFC 9260)
 
-- ✅ SCTP transport in `uc-transport/sctp.rs` (stub implementation)
+- ✅ Pure Rust SCTP implementation in `uc-transport/sctp/`:
+  - `chunk.rs`: All RFC 9260 chunk types (DATA, INIT, SACK, etc.)
+  - `packet.rs`: Packet encoding with CRC32c checksum
+  - `state.rs`: Full RFC 9260 Section 4 state machine
+  - `mod.rs`: Public API (SctpAssociation, SctpListener, SctpConfig)
 - ✅ Multi-homing support (add_peer_address, set_primary_path)
 - ✅ Multi-stream support (StreamId, send_on_stream)
 - ✅ SctpConfig with full SCTP parameters
-- ✅ SctpAssociation implementing Transport trait
+- ✅ SctpAssociation implementing Transport + StreamTransport traits
 - ✅ TransportType::Sctp added to uc-types
-- ⚠️ **Note**: Full SCTP implementation pending mature async Rust SCTP library (no suitable library exists; `webrtc-sctp` is WebRTC-only, `usrsctp-rs` requires FFI)
+- ✅ 4-way handshake state machine (INIT → INIT-ACK → COOKIE-ECHO → COOKIE-ACK)
+- ✅ Graceful shutdown and abort handling
+- 🚧 Remaining: Stream management, reliability (TSN/SACK), congestion control, UDP encapsulation (RFC 6951)
 
-**Tests**: 25 new tests (T.38 crate)
+**Tests**: 25 new tests (T.38 crate), 26 new tests (SCTP)
 
 ### 🚧 Phase 24: SIP Soft Client (In Progress)
 
@@ -901,6 +907,96 @@ This document outlines the development roadmap for the USG Session Border Contro
   - Connection pooling compatible with config changes
 
 **Tests**: 55 unit tests in client-core
+
+**Phase 24.17: Response Sending for Incoming Calls** 🚧
+
+- 🚧 `send_response()` method in SipTransport
+  - Generate SIP responses (180 Ringing, 200 OK, 486 Busy, etc.)
+  - Proper Via header handling for responses
+  - To-tag generation for dialog establishment
+- 🚧 ServerInviteTransaction integration
+  - Use `proto-transaction::ServerInviteTransaction` for UAS state machine
+  - Handle retransmissions per RFC 3261 §17.2.1
+- 🚧 Response routing to correct connection
+  - Match response to original request connection
+  - Handle connection state for responses
+
+**Phase 24.18: Incoming Call UI** 🚧
+
+- 🚧 Incoming call notification
+  - Visual ring indicator in GUI
+  - System toast notification with caller ID
+  - Caller information display (display name, SIP URI)
+- 🚧 Accept/Reject buttons
+  - Accept sends 200 OK with SDP answer
+  - Reject sends 486 Busy Here or 603 Decline
+- 🚧 Audio ringtone support
+  - Configurable ringtone file
+  - Ring on default audio device
+- 🚧 Auto-answer option
+  - Settings flag for auto-answer
+  - Configurable delay before auto-answer
+
+**Phase 24.19: Full End-to-End Call Testing** 🚧
+
+- 🚧 Integration test infrastructure
+  - Mock SIP server for test scenarios
+  - Test certificate generation
+  - Audio mock for testing without hardware
+- 🚧 Test scenarios
+  - Outbound call establishment and teardown
+  - Incoming call accept and reject
+  - Call failure handling (4xx, 5xx responses)
+  - Registration and re-registration
+  - mTLS authentication
+- 🚧 Performance testing
+  - Call setup latency measurement
+  - Audio pipeline throughput
+
+**Phase 24.20: Audio Pipeline Activation** 🚧
+
+- 🚧 Wire audio to call state
+  - Start audio capture/playback on CallState::Connected
+  - Stop audio on call termination
+  - Handle audio device changes during call
+- 🚧 Codec negotiation integration
+  - Apply negotiated codec from SDP answer
+  - Handle codec parameter changes
+- 🚧 DTMF support
+  - RFC 4733 RTP telephone events
+  - DTMF generation from dialpad
+  - DTMF detection and events
+
+**Phase 24.21: GUI Certificate Verification Mode** 🚧
+
+- 🚧 Settings UI for verification mode
+  - Dropdown for Insecure/System/Custom modes
+  - Custom CA file browser
+  - Warning dialog for Insecure mode
+- 🚧 CA certificate management
+  - Load custom CA from file
+  - Display loaded CA information
+  - Multiple CA support
+- 🚧 Connection status indicators
+  - TLS version display
+  - Certificate chain visualization
+  - Verification status in status bar
+
+**Phase 24.22: Hold/Resume** 🚧
+
+- 🚧 Send re-INVITE with hold SDP
+  - Set media direction to `sendonly` or `inactive`
+  - Handle 200 OK response
+- 🚧 Resume with re-INVITE
+  - Restore media direction to `sendrecv`
+  - Resume audio pipeline
+- 🚧 Hold/Resume UI
+  - Hold button in active call view
+  - Visual indicator for held calls
+  - Multiple held calls support
+- 🚧 Music on hold (optional)
+  - Play local audio file while on hold
+  - Configurable hold music
 
 ---
 

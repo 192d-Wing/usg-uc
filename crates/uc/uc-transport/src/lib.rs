@@ -51,6 +51,28 @@ pub mod cert_reload;
 pub mod websocket;
 
 #[cfg(feature = "sctp")]
+#[allow(
+    clippy::doc_markdown,
+    clippy::missing_errors_doc,
+    clippy::must_use_candidate,
+    clippy::missing_const_for_fn,
+    clippy::unused_async,
+    clippy::cast_possible_truncation,
+    clippy::unreadable_literal,
+    clippy::struct_excessive_bools,
+    clippy::clone_on_copy,
+    clippy::match_same_arms,
+    clippy::module_name_repetitions,
+    clippy::similar_names,
+    clippy::too_many_lines,
+    clippy::derive_partial_eq_without_eq,
+    clippy::unnecessary_wraps,
+    clippy::bool_to_int_with_if,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::unused_self,
+    clippy::uninlined_format_args,
+    clippy::derivable_impls
+)]
 pub mod sctp;
 
 pub use error::{TransportError, TransportResult};

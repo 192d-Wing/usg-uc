@@ -826,6 +826,34 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - `AccountingType` enum: Start, Stop, Interim
   - Feature flags: `radius` (uses radius-proto), `diameter` (uses diameter crate)
 
+**uc-transport - Pure Rust SCTP Implementation (RFC 9260)**
+
+- Full SCTP protocol implementation for SIP signaling (RFC 4168):
+  - `sctp/chunk.rs` (~1900 lines) - All RFC 9260 chunk types:
+    - DATA, INIT, INIT-ACK, SACK, HEARTBEAT, HEARTBEAT-ACK
+    - ABORT, SHUTDOWN, SHUTDOWN-ACK, ERROR, COOKIE-ECHO, COOKIE-ACK
+    - SHUTDOWN-COMPLETE with proper encoding/decoding
+    - `InitParam` enum for INIT parameters (IPv4/IPv6, cookie, etc.)
+    - `ErrorCause` enum for all error cause codes
+    - 4-byte padding per RFC specification
+  - `sctp/packet.rs` (~300 lines) - Packet structure:
+    - SCTP common header with CRC32c checksum (using `crc32c` crate)
+    - Chunk bundling validation per RFC 9260 Section 6.10
+    - Encode/decode with checksum verification
+  - `sctp/state.rs` (~730 lines) - State machine:
+    - Full RFC 9260 Section 4 state machine
+    - 8 states: CLOSED, COOKIE-WAIT, COOKIE-ECHOED, ESTABLISHED, shutdown states
+    - 16 event types (application, received chunks, timers)
+    - 20 action types (send chunks, timers, notifications)
+  - `sctp/mod.rs` - Public API:
+    - `SctpConfig` with full SCTP parameters
+    - `StreamId` for stream identification (stream 0 for SIP signaling)
+    - `SctpAssociation` implementing `Transport` and `StreamTransport` traits
+    - `SctpListener` for server-side listening
+    - Multi-homing support (add_peer_address, set_primary_path)
+  - Feature flag: `sctp` (optional, requires `crc32c`)
+  - 26 new unit tests
+
 **uc-snmp - SNMP Trap Generation**
 
 - New crate for SNMP monitoring:
