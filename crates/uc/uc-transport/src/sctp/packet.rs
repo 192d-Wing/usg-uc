@@ -107,10 +107,17 @@ impl SctpPacket {
         buf
     }
 
-    /// Decodes a packet from bytes.
+    /// Decodes a packet from a `Bytes` buffer.
     ///
     /// Verifies the CRC32c checksum before parsing chunks.
-    pub fn decode(data: &[u8]) -> TransportResult<Self> {
+    pub fn decode(data: &Bytes) -> TransportResult<Self> {
+        Self::decode_slice(data)
+    }
+
+    /// Decodes a packet from a byte slice.
+    ///
+    /// Verifies the CRC32c checksum before parsing chunks.
+    pub fn decode_slice(data: &[u8]) -> TransportResult<Self> {
         if data.len() < HEADER_SIZE {
             return Err(TransportError::ReceiveFailed {
                 reason: format!(
@@ -183,6 +190,15 @@ impl SctpPacket {
         }
         None
     }
+
+    /// Estimates the encoded size of all chunks.
+    ///
+    /// This is an approximation used for buffer allocation.
+    #[must_use]
+    pub fn estimated_chunks_size(&self) -> usize {
+        // Rough estimate: 16 bytes header per chunk plus average payload
+        self.chunks.len() * 64
+    }
 }
 
 // =============================================================================
@@ -199,7 +215,7 @@ mod tests {
         let packet = SctpPacket::new(5060, 5061, 0x12345678);
 
         let encoded = packet.encode();
-        let decoded = SctpPacket::decode(&encoded).unwrap();
+        let decoded = SctpPacket::decode_slice(&encoded).unwrap();
 
         assert_eq!(decoded.source_port, 5060);
         assert_eq!(decoded.dest_port, 5061);
@@ -219,7 +235,7 @@ mod tests {
         )));
 
         let encoded = packet.encode();
-        let decoded = SctpPacket::decode(&encoded).unwrap();
+        let decoded = SctpPacket::decode_slice(&encoded).unwrap();
 
         assert_eq!(decoded.source_port, 5060);
         assert_eq!(decoded.dest_port, 5061);
@@ -251,7 +267,7 @@ mod tests {
         packet.add_chunk(Chunk::Sack(SackChunk::new(100, 65535)));
 
         let encoded = packet.encode();
-        let decoded = SctpPacket::decode(&encoded).unwrap();
+        let decoded = SctpPacket::decode_slice(&encoded).unwrap();
 
         assert_eq!(decoded.chunks.len(), 3);
     }
@@ -264,7 +280,7 @@ mod tests {
         // Corrupt the checksum
         encoded[8] ^= 0xFF;
 
-        let result = SctpPacket::decode(&encoded);
+        let result = SctpPacket::decode_slice(&encoded);
         assert!(result.is_err());
         assert!(
             result
@@ -277,7 +293,7 @@ mod tests {
     #[test]
     fn test_packet_too_short() {
         let short_data = vec![0u8; 8];
-        let result = SctpPacket::decode(&short_data);
+        let result = SctpPacket::decode_slice(&short_data);
         assert!(result.is_err());
     }
 

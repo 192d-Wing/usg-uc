@@ -27,6 +27,7 @@ pub mod path;
 pub mod state;
 pub mod stream;
 pub mod timer;
+pub mod udp_encap;
 
 // These modules will be added in subsequent phases:
 // pub mod association;
@@ -45,6 +46,10 @@ pub use state::{AssociationState, StateAction, StateEvent, StateMachine};
 pub use stream::{Stream, StreamError, StreamManager};
 pub use timer::{RtoCalculator, Timer, TimerManager, TimerType};
 pub use path::{Path, PathId, PathManager, PathState};
+pub use udp_encap::{
+    decapsulate, encapsulate, EncapsulatedPacket, UdpEncapConfig, UdpEncapError, UdpHeader,
+    SCTP_UDP_PORT, UDP_HEADER_SIZE,
+};
 
 use crate::error::{TransportError, TransportResult};
 use crate::{MAX_STREAM_MESSAGE_SIZE, ReceivedMessage, StreamTransport, Transport};
