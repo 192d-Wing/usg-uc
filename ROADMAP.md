@@ -495,7 +495,16 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ `sbc-config` feature flags: cluster, aaa, snmp, syslog
 - ✅ Cluster API routes in `uc-api` (status, members, failover, drain, sync)
 
-**Tests**: 125 new tests across all Phase 22 crates
+**Integration Tests** (`sbc-integration-tests`)
+
+- ✅ Storage backend tests (basic ops, TTL, keys pattern, increment, health)
+- ✅ Discovery tests (static discovery, health check, peer metadata)
+- ✅ Membership tests (create, add/remove node, get node, view version)
+- ✅ Registrar tests (AsyncLocationService CRUD, cache reload, health)
+- ✅ End-to-end tests (cluster formation, registration flow, shared storage)
+- ✅ Feature flags: `cluster`, `redis`, `postgres`
+
+**Tests**: 125 new tests across Phase 22 crates + 23 integration tests
 
 ### ✅ Phase 23: Specialized Protocols
 

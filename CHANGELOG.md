@@ -93,6 +93,17 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - Storage feature flag (`storage`) for optional dependency
   - 6 tests for StorableBinding + AsyncLocationService
 
+**Cluster Integration Tests** (`sbc-integration-tests`)
+
+- Comprehensive integration test suite for clustering infrastructure
+  - Storage tests: basic operations, TTL, keys pattern, increment, health check
+  - Discovery tests: static discovery, empty peers, health check, peer metadata
+  - Membership tests: creation, add/remove node, get node, view version
+  - Registrar tests: AsyncLocationService CRUD, cache reload, health check
+  - End-to-end tests: cluster formation, registration flow, shared storage
+  - 23 integration tests total
+  - Feature flags: `cluster`, `redis`, `postgres`
+
 **Dependencies Added**
 
 - `arc-swap` 1.7: Lock-free atomic pointer swapping
