@@ -275,13 +275,21 @@ impl SipClientApp {
                     let was_registered = self.registration_state == RegistrationState::Registered;
                     let is_registered = state == RegistrationState::Registered;
 
+                    // Clear registration in progress when we get a final state
+                    if state == RegistrationState::Registered
+                        || state == RegistrationState::Unregistered
+                        || state == RegistrationState::Failed
+                    {
+                        self.settings_view.set_registration_in_progress(false);
+                    }
+
                     // Show notification on registration state change
                     if was_registered != is_registered {
                         self.notifications
                             .notify_registration(is_registered, account_id.clone());
                     }
 
-                    self.registration_state = state;
+                    self.registration_state = state.clone();
                     self.status_message = format!("Registration: {}", state);
                 }
                 AppEvent::CallStateChanged {
@@ -1389,16 +1397,13 @@ impl SipClientApp {
                 info!("Discarding settings changes");
                 self.discard_settings();
             }
-            crate::views::SettingsAction::Register(account_id) => {
-                info!(account_id = %account_id, "Registering account");
-                // TODO: Register account
+            crate::views::SettingsAction::Register(_account_id) => {
+                info!("Registering account");
+                self.register_account();
             }
             crate::views::SettingsAction::Unregister => {
                 info!("Unregistering");
-                if let Some(ref mut app) = self.client_app {
-                    let runtime = self.runtime.clone();
-                    let _ = runtime.block_on(app.unregister());
-                }
+                self.unregister_account();
             }
             crate::views::SettingsAction::RefreshCertificates => {
                 info!("Refreshing certificates");
@@ -1574,6 +1579,62 @@ impl SipClientApp {
         self.status_message =
             "WARNING: Insecure mode enabled - certificates not validated".to_string();
         warn!("User enabled insecure certificate verification mode");
+    }
+
+    /// Registers the account with the SIP server.
+    fn register_account(&mut self) {
+        // Build account from settings view
+        let account = match self.settings_view.build_account() {
+            Some(account) => account,
+            None => {
+                self.error_message = Some("Please enter SIP URI and Registrar".to_string());
+                self.show_error_dialog = true;
+                return;
+            }
+        };
+
+        // Show registration in progress
+        self.settings_view.set_registration_in_progress(true);
+        self.status_message = "Registering...".to_string();
+
+        // Attempt registration
+        if let Some(ref mut app) = self.client_app {
+            let runtime = self.runtime.clone();
+            match runtime.block_on(app.register_account(&account)) {
+                Ok(()) => {
+                    info!(account_id = %account.id, "Registration initiated");
+                    self.status_message = "Registration in progress...".to_string();
+                    // Note: Registration state will be updated via AppEvent::RegistrationStateChanged
+                }
+                Err(e) => {
+                    error!(error = %e, "Registration failed");
+                    self.settings_view.set_registration_in_progress(false);
+                    self.error_message = Some(format!("Registration failed: {e}"));
+                    self.show_error_dialog = true;
+                }
+            }
+        } else {
+            self.settings_view.set_registration_in_progress(false);
+            self.error_message = Some("Client not initialized".to_string());
+            self.show_error_dialog = true;
+        }
+    }
+
+    /// Unregisters from the SIP server.
+    fn unregister_account(&mut self) {
+        if let Some(ref mut app) = self.client_app {
+            let runtime = self.runtime.clone();
+            match runtime.block_on(app.unregister()) {
+                Ok(()) => {
+                    info!("Unregistration initiated");
+                    self.status_message = "Unregistering...".to_string();
+                }
+                Err(e) => {
+                    warn!(error = %e, "Unregistration failed");
+                    self.status_message = format!("Unregister failed: {e}");
+                }
+            }
+        }
     }
 
     /// Saves current settings to disk.

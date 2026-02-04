@@ -1108,6 +1108,28 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
     - Shows confirmation dialog with Save/Discard/Cancel
     - Also handles tray exit with dirty settings
 
+#### Phase 24.32: Account Registration UI
+
+- `client-gui/src/views/settings.rs` - Registration UI improvements
+  - `registration_in_progress` field - Track registration state
+  - `set_registration_in_progress()` - Toggle spinner visibility
+  - `build_account()` - Create SipAccount from view fields
+    - Validates required fields (SIP URI, Registrar)
+    - Returns None if validation fails
+  - Register button disabled when fields empty
+  - Spinner shown during registration
+- `client-gui/src/app.rs` - Registration handlers
+  - `register_account()` - Initiate SIP registration
+    - Builds SipAccount from view state
+    - Calls ClientApp::register_account()
+    - Shows error dialog on failure
+  - `unregister_account()` - Initiate SIP unregistration
+    - Calls ClientApp::unregister()
+    - Error handling with status messages
+  - `AppEvent::RegistrationStateChanged` handler updated
+    - Clears registration spinner on final state
+    - Handles Registered, Unregistered, and Failed states
+
 **Security**
 
 - Smart card authentication ONLY (CAC/PIV/SIPR token)

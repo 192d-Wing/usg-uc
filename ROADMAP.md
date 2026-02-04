@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-25 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.30-24.31 complete, Phase 25 100% RFC 9260 compliance achieved
+**Current Status**: 1750+ tests passing, Phases 1-25 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.30-24.32 complete, Phase 25 100% RFC 9260 compliance achieved
 
 ---
 
@@ -1350,15 +1350,18 @@ This document outlines the development roadmap for the USG Session Border Contro
   - collect_settings(): Collect view state for saving
   - Proper field mapping for General, Audio, Network, UI settings
 
-**Phase 24.32: Account Registration UI** 🚧
+**Phase 24.32: Account Registration UI** ✅
 
-- 🚧 `SettingsAction::Register` handler
-  - Wire Register button to ClientApp::register()
-  - Show registration progress spinner
-  - Display registration success/failure status
-- 🚧 `SettingsAction::Unregister` handler
+- ✅ `SettingsAction::Register` handler
+  - Wire Register button to ClientApp::register_account()
+  - Show registration progress spinner during registration
+  - Display registration success/failure status via AppEvent
+  - Validate required fields before registration
+  - build_account() creates SipAccount from view state
+- ✅ `SettingsAction::Unregister` handler
   - Wire Unregister button to ClientApp::unregister()
   - Update UI state on completion
+  - Error handling with status messages
 
 **Phase 24.33: Contact Management UI** 🚧
 

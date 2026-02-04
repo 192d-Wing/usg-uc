@@ -1,7 +1,10 @@
 //! Settings view.
 
 use client_core::{GeneralSettings, NetworkSettings, Settings, UiSettings};
-use client_types::{AudioConfig, CertificateInfo, ServerCertVerificationMode};
+use client_types::{
+    AudioConfig, CertificateConfig, CertificateInfo, ServerCertVerificationMode, SipAccount,
+    TransportPreference,
+};
 use eframe::egui;
 
 /// Actions from the settings view.
@@ -93,6 +96,8 @@ pub struct SettingsView {
     ring_device: String,
     /// Ring volume (0.0 - 1.0).
     ring_volume: f32,
+    /// Registration in progress.
+    registration_in_progress: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -141,6 +146,7 @@ impl SettingsView {
             ringtone_path: String::new(),
             ring_device: "Default".to_string(),
             ring_volume: 1.0,
+            registration_in_progress: false,
         }
     }
 
@@ -197,6 +203,34 @@ impl SettingsView {
     pub fn cancel_insecure_mode(&mut self) {
         self.pending_verification_mode = None;
         self.show_insecure_warning = false;
+    }
+
+    /// Sets whether registration is in progress.
+    pub fn set_registration_in_progress(&mut self, in_progress: bool) {
+        self.registration_in_progress = in_progress;
+    }
+
+    /// Builds a SipAccount from the current view state.
+    ///
+    /// Returns None if required fields (sip_uri, registrar_uri) are empty.
+    pub fn build_account(&self) -> Option<SipAccount> {
+        if self.sip_uri.is_empty() || self.registrar_uri.is_empty() {
+            return None;
+        }
+
+        Some(SipAccount {
+            id: "default".to_string(),
+            display_name: self.display_name.clone(),
+            sip_uri: self.sip_uri.clone(),
+            registrar_uri: self.registrar_uri.clone(),
+            outbound_proxy: None,
+            transport: TransportPreference::TlsOnly,
+            register_expiry: 3600,
+            stun_server: None,
+            turn_config: None,
+            enabled: true,
+            certificate_config: CertificateConfig::default(),
+        })
     }
 
     /// Renders the settings view.
@@ -337,11 +371,23 @@ impl SettingsView {
 
         // Registration buttons
         ui.horizontal(|ui| {
-            if ui.button("Register").clicked() {
-                action = Some(SettingsAction::Register("default".to_string()));
-            }
-            if ui.button("Unregister").clicked() {
-                action = Some(SettingsAction::Unregister);
+            if self.registration_in_progress {
+                ui.spinner();
+                ui.label("Registering...");
+            } else {
+                // Validate required fields
+                let can_register = !self.sip_uri.is_empty() && !self.registrar_uri.is_empty();
+
+                if ui
+                    .add_enabled(can_register, egui::Button::new("Register"))
+                    .on_disabled_hover_text("Enter SIP URI and Registrar to register")
+                    .clicked()
+                {
+                    action = Some(SettingsAction::Register("default".to_string()));
+                }
+                if ui.button("Unregister").clicked() {
+                    action = Some(SettingsAction::Unregister);
+                }
             }
         });
 
