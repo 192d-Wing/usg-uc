@@ -6,9 +6,22 @@
 //! On non-Windows platforms, this module provides stub implementations
 //! for development and testing purposes.
 
-use client_types::{CertificateConfig, CertificateInfo, CertificateSelectionMode};
+use client_types::{CertificateConfig, CertificateInfo, CertificateSelectionMode, SmartCardPin};
 use thiserror::Error;
 use tracing::{debug, info, warn};
+
+/// Signature algorithm for signing operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureAlgorithm {
+    /// ECDSA with SHA-384 (CNSA 2.0 compliant).
+    EcdsaSha384,
+    /// ECDSA with SHA-256.
+    EcdsaSha256,
+    /// RSA with SHA-384 (CNSA 2.0 compliant).
+    RsaSha384,
+    /// RSA with SHA-256.
+    RsaSha256,
+}
 
 /// Errors that can occur when accessing the certificate store.
 #[derive(Debug, Error)]
@@ -816,6 +829,425 @@ impl CertificateStore {
             Err(CertStoreError::CertificateNotFound(thumbprint.to_string()))
         }
     }
+
+    /// Signs data using a certificate's private key with PIN authentication.
+    ///
+    /// This method acquires the private key from the smart card using the provided PIN,
+    /// then signs the data using the specified algorithm.
+    ///
+    /// # Arguments
+    /// * `thumbprint` - Certificate thumbprint to use for signing
+    /// * `data` - Data to sign (typically a hash)
+    /// * `algorithm` - Signature algorithm to use
+    /// * `pin` - Smart card PIN for key access
+    ///
+    /// # Returns
+    /// The digital signature bytes, or an error if signing fails.
+    pub fn sign_data(
+        &self,
+        thumbprint: &str,
+        data: &[u8],
+        algorithm: SignatureAlgorithm,
+        pin: Option<&SmartCardPin>,
+    ) -> CertStoreResult<Vec<u8>> {
+        info!(thumbprint = %thumbprint, algorithm = ?algorithm, "Signing data with certificate");
+
+        #[cfg(windows)]
+        {
+            self.sign_data_windows(thumbprint, data, algorithm, pin)
+        }
+
+        #[cfg(not(windows))]
+        {
+            self.sign_data_stub(thumbprint, data, algorithm, pin)
+        }
+    }
+
+    /// Signs data using Windows CryptoNG (NCrypt) APIs.
+    #[cfg(windows)]
+    fn sign_data_windows(
+        &self,
+        thumbprint: &str,
+        data: &[u8],
+        algorithm: SignatureAlgorithm,
+        pin: Option<&SmartCardPin>,
+    ) -> CertStoreResult<Vec<u8>> {
+        use windows::core::PCWSTR;
+        use windows::Win32::Security::Cryptography::{
+            BCRYPT_PAD_PKCS1, CERT_CONTEXT, CERT_NCRYPT_KEY_SPEC, CERT_OPEN_STORE_FLAGS,
+            CERT_QUERY_ENCODING_TYPE, CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_CURRENT_USER,
+            CRYPT_ACQUIRE_SILENT_FLAG, CertCloseStore, CertEnumCertificatesInStore, CertOpenStore,
+            CryptAcquireCertificatePrivateKey, NCryptFreeObject, NCryptSignHash, NCRYPT_KEY_HANDLE,
+            NCRYPT_SILENT_FLAG, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+        };
+
+        let store_name_wide: Vec<u16> = self
+            .store_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        unsafe {
+            // Open certificate store
+            let store = CertOpenStore(
+                CERT_STORE_PROV_SYSTEM_W,
+                CERT_QUERY_ENCODING_TYPE(X509_ASN_ENCODING.0 | PKCS_7_ASN_ENCODING.0),
+                None,
+                CERT_OPEN_STORE_FLAGS(CERT_SYSTEM_STORE_CURRENT_USER),
+                Some(store_name_wide.as_ptr().cast()),
+            )
+            .map_err(|e| CertStoreError::StoreNotAvailable(e.to_string()))?;
+
+            // Find certificate by thumbprint
+            let mut cert_context: *const CERT_CONTEXT = std::ptr::null();
+            let mut found_cert: Option<*const CERT_CONTEXT> = None;
+
+            loop {
+                cert_context = CertEnumCertificatesInStore(store, Some(cert_context));
+                if cert_context.is_null() {
+                    break;
+                }
+
+                let cert_thumbprint = self.get_certificate_thumbprint(cert_context);
+                if cert_thumbprint.eq_ignore_ascii_case(thumbprint) {
+                    found_cert = Some(cert_context);
+                    break;
+                }
+            }
+
+            let cert_ctx = found_cert.ok_or_else(|| {
+                let _ = CertCloseStore(store, 0);
+                CertStoreError::CertificateNotFound(thumbprint.to_string())
+            })?;
+
+            // Acquire private key handle
+            let mut key_handle = NCRYPT_KEY_HANDLE::default();
+            let mut key_spec = 0u32;
+            let mut caller_free_key = false;
+
+            // Set flags - try silent first, which may trigger PIN dialog
+            let acquire_flags = if pin.is_some() {
+                // If we have a PIN, we'll set it after acquiring
+                CRYPT_ACQUIRE_SILENT_FLAG
+            } else {
+                // No PIN provided - allow Windows to show PIN dialog
+                0u32
+            };
+
+            let result = CryptAcquireCertificatePrivateKey(
+                cert_ctx,
+                acquire_flags | CERT_NCRYPT_KEY_SPEC,
+                None,
+                &mut key_handle.0 as *mut _ as *mut _,
+                Some(&mut key_spec),
+                Some(&mut caller_free_key),
+            );
+
+            if result.is_err() {
+                let _ = CertCloseStore(store, 0);
+                let err = std::io::Error::last_os_error();
+                // Check for PIN-related errors
+                let error_code = err.raw_os_error().unwrap_or(0) as u32;
+                // NTE_USER_CANCELLED (0x80090036) or SCARD_W_CANCELLED_BY_USER (0x8010006E)
+                if error_code == 0x80090036 || error_code == 0x8010006E {
+                    return Err(CertStoreError::PinRequired);
+                }
+                // SCARD_W_WRONG_CHV (0x8010006B) - wrong PIN
+                if error_code == 0x8010006B {
+                    return Err(CertStoreError::PinIncorrect);
+                }
+                return Err(CertStoreError::WindowsError(format!(
+                    "Failed to acquire private key: {}",
+                    err
+                )));
+            }
+
+            // If PIN was provided, set it on the key (for NCrypt keys)
+            if let Some(pin_value) = pin {
+                // Convert PIN to wide string
+                let pin_wide: Vec<u16> = pin_value
+                    .as_str()
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+
+                // NCryptSetProperty for PIN
+                use windows::Win32::Security::Cryptography::NCryptSetProperty;
+                let ncrypt_pin_property: Vec<u16> =
+                    "SmartCardPin".encode_utf16().chain(std::iter::once(0)).collect();
+
+                let pin_result = NCryptSetProperty(
+                    key_handle,
+                    PCWSTR::from_raw(ncrypt_pin_property.as_ptr()),
+                    Some(std::slice::from_raw_parts(
+                        pin_wide.as_ptr() as *const u8,
+                        pin_wide.len() * 2,
+                    )),
+                    NCRYPT_SILENT_FLAG,
+                );
+
+                if pin_result.is_err() {
+                    if caller_free_key {
+                        let _ = NCryptFreeObject(key_handle);
+                    }
+                    let _ = CertCloseStore(store, 0);
+                    return Err(CertStoreError::PinIncorrect);
+                }
+            }
+
+            // Determine padding and algorithm info based on algorithm
+            let (padding_info, padding_flags) = match algorithm {
+                SignatureAlgorithm::EcdsaSha384 | SignatureAlgorithm::EcdsaSha256 => {
+                    // ECDSA doesn't use padding
+                    (std::ptr::null(), 0u32)
+                }
+                SignatureAlgorithm::RsaSha384 | SignatureAlgorithm::RsaSha256 => {
+                    // RSA uses PKCS#1 padding
+                    (std::ptr::null(), BCRYPT_PAD_PKCS1.0)
+                }
+            };
+
+            // Get signature size
+            let mut signature_size = 0u32;
+            let size_result = NCryptSignHash(
+                key_handle,
+                Some(padding_info as *const _),
+                data,
+                None,
+                &mut signature_size,
+                padding_flags,
+            );
+
+            if size_result.is_err() {
+                if caller_free_key {
+                    let _ = NCryptFreeObject(key_handle);
+                }
+                let _ = CertCloseStore(store, 0);
+                return Err(CertStoreError::WindowsError(
+                    "Failed to get signature size".to_string(),
+                ));
+            }
+
+            // Allocate signature buffer and sign
+            let mut signature = vec![0u8; signature_size as usize];
+            let sign_result = NCryptSignHash(
+                key_handle,
+                Some(padding_info as *const _),
+                data,
+                Some(&mut signature),
+                &mut signature_size,
+                padding_flags,
+            );
+
+            // Clean up
+            if caller_free_key {
+                let _ = NCryptFreeObject(key_handle);
+            }
+            let _ = CertCloseStore(store, 0);
+
+            if sign_result.is_err() {
+                let err = std::io::Error::last_os_error();
+                let error_code = err.raw_os_error().unwrap_or(0) as u32;
+                // Check for PIN-related errors
+                if error_code == 0x8010006B {
+                    return Err(CertStoreError::PinIncorrect);
+                }
+                return Err(CertStoreError::WindowsError(format!(
+                    "Failed to sign data: {}",
+                    err
+                )));
+            }
+
+            signature.truncate(signature_size as usize);
+            info!(signature_len = signature.len(), "Data signed successfully");
+            Ok(signature)
+        }
+    }
+
+    /// Stub signing implementation for non-Windows platforms.
+    #[cfg(not(windows))]
+    fn sign_data_stub(
+        &self,
+        thumbprint: &str,
+        data: &[u8],
+        algorithm: SignatureAlgorithm,
+        _pin: Option<&SmartCardPin>,
+    ) -> CertStoreResult<Vec<u8>> {
+        // Verify certificate exists
+        let _ = self.find_by_thumbprint(thumbprint)?;
+
+        warn!("Using stub signing - not for production use");
+
+        // Return a fake signature based on algorithm
+        let sig_size = match algorithm {
+            SignatureAlgorithm::EcdsaSha384 => 96, // P-384 signature
+            SignatureAlgorithm::EcdsaSha256 => 64, // P-256 signature
+            SignatureAlgorithm::RsaSha384 | SignatureAlgorithm::RsaSha256 => 256, // RSA 2048
+        };
+
+        // Create deterministic fake signature from data hash
+        let mut signature = vec![0u8; sig_size];
+        for (i, byte) in data.iter().cycle().take(sig_size).enumerate() {
+            signature[i] = byte.wrapping_add(i as u8);
+        }
+
+        Ok(signature)
+    }
+
+    /// Verifies that a certificate's private key is accessible with the given PIN.
+    ///
+    /// This attempts to acquire the private key without actually signing anything,
+    /// which validates that the PIN is correct and the smart card is present.
+    ///
+    /// # Arguments
+    /// * `thumbprint` - Certificate thumbprint
+    /// * `pin` - Smart card PIN to verify
+    ///
+    /// # Returns
+    /// Ok(true) if the PIN is correct and key is accessible,
+    /// Err(PinIncorrect) if the PIN is wrong,
+    /// Err(SmartCardNotPresent) if the card is not inserted.
+    pub fn verify_pin(
+        &self,
+        thumbprint: &str,
+        pin: &SmartCardPin,
+    ) -> CertStoreResult<bool> {
+        info!(thumbprint = %thumbprint, "Verifying smart card PIN");
+
+        #[cfg(windows)]
+        {
+            self.verify_pin_windows(thumbprint, pin)
+        }
+
+        #[cfg(not(windows))]
+        {
+            self.verify_pin_stub(thumbprint, pin)
+        }
+    }
+
+    /// Verifies PIN on Windows using CryptoNG.
+    #[cfg(windows)]
+    fn verify_pin_windows(
+        &self,
+        thumbprint: &str,
+        pin: &SmartCardPin,
+    ) -> CertStoreResult<bool> {
+        use windows::core::PCWSTR;
+        use windows::Win32::Security::Cryptography::{
+            CERT_CONTEXT, CERT_NCRYPT_KEY_SPEC, CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE,
+            CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_CURRENT_USER, CRYPT_ACQUIRE_SILENT_FLAG,
+            CertCloseStore, CertEnumCertificatesInStore, CertOpenStore,
+            CryptAcquireCertificatePrivateKey, NCryptFreeObject, NCryptSetProperty,
+            NCRYPT_KEY_HANDLE, NCRYPT_SILENT_FLAG, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+        };
+
+        let store_name_wide: Vec<u16> = self
+            .store_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        unsafe {
+            let store = CertOpenStore(
+                CERT_STORE_PROV_SYSTEM_W,
+                CERT_QUERY_ENCODING_TYPE(X509_ASN_ENCODING.0 | PKCS_7_ASN_ENCODING.0),
+                None,
+                CERT_OPEN_STORE_FLAGS(CERT_SYSTEM_STORE_CURRENT_USER),
+                Some(store_name_wide.as_ptr().cast()),
+            )
+            .map_err(|e| CertStoreError::StoreNotAvailable(e.to_string()))?;
+
+            let mut cert_context: *const CERT_CONTEXT = std::ptr::null();
+            let mut found_cert: Option<*const CERT_CONTEXT> = None;
+
+            loop {
+                cert_context = CertEnumCertificatesInStore(store, Some(cert_context));
+                if cert_context.is_null() {
+                    break;
+                }
+
+                let cert_thumbprint = self.get_certificate_thumbprint(cert_context);
+                if cert_thumbprint.eq_ignore_ascii_case(thumbprint) {
+                    found_cert = Some(cert_context);
+                    break;
+                }
+            }
+
+            let cert_ctx = found_cert.ok_or_else(|| {
+                let _ = CertCloseStore(store, 0);
+                CertStoreError::CertificateNotFound(thumbprint.to_string())
+            })?;
+
+            let mut key_handle = NCRYPT_KEY_HANDLE::default();
+            let mut key_spec = 0u32;
+            let mut caller_free_key = false;
+
+            let result = CryptAcquireCertificatePrivateKey(
+                cert_ctx,
+                CRYPT_ACQUIRE_SILENT_FLAG | CERT_NCRYPT_KEY_SPEC,
+                None,
+                &mut key_handle.0 as *mut _ as *mut _,
+                Some(&mut key_spec),
+                Some(&mut caller_free_key),
+            );
+
+            if result.is_err() {
+                let _ = CertCloseStore(store, 0);
+                return Err(CertStoreError::SmartCardNotPresent);
+            }
+
+            // Set PIN
+            let pin_wide: Vec<u16> = pin
+                .as_str()
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+
+            let ncrypt_pin_property: Vec<u16> =
+                "SmartCardPin".encode_utf16().chain(std::iter::once(0)).collect();
+
+            let pin_result = NCryptSetProperty(
+                key_handle,
+                PCWSTR::from_raw(ncrypt_pin_property.as_ptr()),
+                Some(std::slice::from_raw_parts(
+                    pin_wide.as_ptr() as *const u8,
+                    pin_wide.len() * 2,
+                )),
+                NCRYPT_SILENT_FLAG,
+            );
+
+            if caller_free_key {
+                let _ = NCryptFreeObject(key_handle);
+            }
+            let _ = CertCloseStore(store, 0);
+
+            if pin_result.is_err() {
+                Err(CertStoreError::PinIncorrect)
+            } else {
+                info!("PIN verified successfully");
+                Ok(true)
+            }
+        }
+    }
+
+    /// Stub PIN verification for non-Windows platforms.
+    #[cfg(not(windows))]
+    fn verify_pin_stub(
+        &self,
+        thumbprint: &str,
+        pin: &SmartCardPin,
+    ) -> CertStoreResult<bool> {
+        // Verify certificate exists
+        let _ = self.find_by_thumbprint(thumbprint)?;
+
+        // Accept any PIN that's at least 4 digits for testing
+        if pin.len() >= 4 {
+            info!("Stub PIN verified (test mode)");
+            Ok(true)
+        } else {
+            Err(CertStoreError::PinIncorrect)
+        }
+    }
 }
 
 /// Creates a stub DER-encoded certificate for testing on non-Windows platforms.
@@ -1020,5 +1452,101 @@ mod tests {
 
         // Should not error, even if no certificates are present
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_sign_data_stub() {
+        #[cfg(not(windows))]
+        {
+            let store = CertificateStore::open_personal();
+            let thumbprint =
+                "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2";
+            let data = b"test data to sign";
+            let pin = SmartCardPin::new("1234");
+
+            // Sign with ECDSA P-384
+            let signature = store
+                .sign_data(thumbprint, data, SignatureAlgorithm::EcdsaSha384, Some(&pin))
+                .unwrap();
+            assert_eq!(signature.len(), 96); // P-384 signature size
+
+            // Sign with ECDSA P-256
+            let signature = store
+                .sign_data(thumbprint, data, SignatureAlgorithm::EcdsaSha256, Some(&pin))
+                .unwrap();
+            assert_eq!(signature.len(), 64); // P-256 signature size
+
+            // Sign with RSA
+            let signature = store
+                .sign_data(thumbprint, data, SignatureAlgorithm::RsaSha384, Some(&pin))
+                .unwrap();
+            assert_eq!(signature.len(), 256); // RSA 2048 signature size
+        }
+    }
+
+    #[test]
+    fn test_sign_data_without_pin() {
+        #[cfg(not(windows))]
+        {
+            let store = CertificateStore::open_personal();
+            let thumbprint =
+                "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2";
+            let data = b"test data to sign";
+
+            // Sign without PIN (should still work in stub mode)
+            let signature = store
+                .sign_data(thumbprint, data, SignatureAlgorithm::EcdsaSha384, None)
+                .unwrap();
+            assert_eq!(signature.len(), 96);
+        }
+    }
+
+    #[test]
+    fn test_sign_data_invalid_thumbprint() {
+        let store = CertificateStore::open_personal();
+        let data = b"test data";
+        let pin = SmartCardPin::new("1234");
+
+        let result = store.sign_data("INVALID", data, SignatureAlgorithm::EcdsaSha384, Some(&pin));
+        assert!(matches!(result, Err(CertStoreError::CertificateNotFound(_))));
+    }
+
+    #[test]
+    fn test_verify_pin_stub() {
+        #[cfg(not(windows))]
+        {
+            let store = CertificateStore::open_personal();
+            let thumbprint =
+                "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2";
+
+            // Valid PIN (4+ digits)
+            let valid_pin = SmartCardPin::new("1234");
+            let result = store.verify_pin(thumbprint, &valid_pin);
+            assert!(result.is_ok());
+            assert!(result.unwrap());
+
+            // Invalid PIN (too short)
+            let short_pin = SmartCardPin::new("123");
+            let result = store.verify_pin(thumbprint, &short_pin);
+            assert!(matches!(result, Err(CertStoreError::PinIncorrect)));
+        }
+    }
+
+    #[test]
+    fn test_verify_pin_invalid_thumbprint() {
+        let store = CertificateStore::open_personal();
+        let pin = SmartCardPin::new("1234");
+
+        let result = store.verify_pin("INVALID", &pin);
+        assert!(matches!(result, Err(CertStoreError::CertificateNotFound(_))));
+    }
+
+    #[test]
+    fn test_signature_algorithm_variants() {
+        // Ensure all variants can be created
+        let _ = SignatureAlgorithm::EcdsaSha384;
+        let _ = SignatureAlgorithm::EcdsaSha256;
+        let _ = SignatureAlgorithm::RsaSha384;
+        let _ = SignatureAlgorithm::RsaSha256;
     }
 }

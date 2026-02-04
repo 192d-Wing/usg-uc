@@ -906,54 +906,95 @@ impl SipClientApp {
     }
 
     /// Uses certificate with PIN for signing operations.
-    fn use_certificate_with_pin(&mut self, thumbprint: &str, _pin: &str) {
-        use client_core::CertificateStore;
-
-        // On Windows, the CryptoAPI handles PIN entry via system dialog
-        // This function is for future use when we implement custom PIN handling
-        // For now, we proceed with the certificate operation
+    ///
+    /// This method verifies the PIN against the smart card before configuring
+    /// the certificate for use. The PIN is used to acquire the private key
+    /// which validates access to the smart card.
+    fn use_certificate_with_pin(&mut self, thumbprint: &str, pin: &str) {
+        use client_core::{CertStoreError, CertificateStore};
+        use client_types::SmartCardPin;
 
         let cert_store = CertificateStore::open_personal();
+        let smart_card_pin = SmartCardPin::new(pin);
 
-        match cert_store.get_certificate_chain(thumbprint) {
-            Ok(cert_chain) => {
-                info!(
-                    thumbprint = %thumbprint,
-                    chain_length = cert_chain.len(),
-                    "Retrieved certificate chain after PIN entry"
-                );
+        // First verify the PIN is correct by attempting to access the private key
+        match cert_store.verify_pin(thumbprint, &smart_card_pin) {
+            Ok(true) => {
+                info!(thumbprint = %thumbprint, "PIN verified successfully");
 
-                if let Some(ref mut app) = self.client_app {
-                    app.set_client_certificate(cert_chain.clone(), thumbprint);
-                    self.status_message = "Certificate configured for authentication".to_string();
-                    info!("Certificate configured in ClientApp");
-                } else {
-                    self.pending_cert_chain = Some(cert_chain);
-                    self.pending_cert_thumbprint = Some(thumbprint.to_string());
-                    self.status_message = "Certificate will be used when connecting".to_string();
+                // PIN is correct, now get the certificate chain
+                match cert_store.get_certificate_chain(thumbprint) {
+                    Ok(cert_chain) => {
+                        info!(
+                            thumbprint = %thumbprint,
+                            chain_length = cert_chain.len(),
+                            "Retrieved certificate chain after PIN verification"
+                        );
+
+                        if let Some(ref mut app) = self.client_app {
+                            app.set_client_certificate(cert_chain.clone(), thumbprint);
+                            self.status_message =
+                                "Certificate configured for authentication".to_string();
+                            info!("Certificate configured in ClientApp");
+                        } else {
+                            self.pending_cert_chain = Some(cert_chain);
+                            self.pending_cert_thumbprint = Some(thumbprint.to_string());
+                            self.status_message =
+                                "Certificate will be used when connecting".to_string();
+                        }
+
+                        self.show_pin_dialog = false;
+                        self.pin_error = None;
+                    }
+                    Err(e) => {
+                        self.status_message = format!("Failed to get certificate: {}", e);
+                        self.show_pin_dialog = false;
+                        warn!(error = %e, "Failed to get certificate chain after PIN verification");
+                    }
                 }
-
-                self.show_pin_dialog = false;
+            }
+            Ok(false) => {
+                // This shouldn't happen with our implementation, but handle it
+                self.pin_error = Some("PIN verification failed".to_string());
+                self.pin_operation = Some(PinOperation::UseCertificate {
+                    thumbprint: thumbprint.to_string(),
+                });
             }
             Err(e) => {
-                let error_str = e.to_string();
+                // Handle specific error types
+                match e {
+                    CertStoreError::PinIncorrect => {
+                        self.pin_error = Some("Incorrect PIN".to_string());
+                        self.pin_operation = Some(PinOperation::UseCertificate {
+                            thumbprint: thumbprint.to_string(),
+                        });
 
-                // Check for PIN-related errors
-                if error_str.contains("PIN") {
-                    self.pin_error = Some("Incorrect PIN".to_string());
-                    self.pin_operation = Some(PinOperation::UseCertificate {
-                        thumbprint: thumbprint.to_string(),
-                    });
-
-                    if self.pin_attempts >= MAX_PIN_ATTEMPTS {
-                        self.pin_error =
-                            Some("Too many incorrect attempts. Card may be locked.".to_string());
-                        warn!("PIN attempt limit reached");
+                        if self.pin_attempts >= MAX_PIN_ATTEMPTS {
+                            self.pin_error =
+                                Some("Too many incorrect attempts. Card may be locked.".to_string());
+                            warn!("PIN attempt limit reached");
+                        }
                     }
-                } else {
-                    self.status_message = format!("Failed to get certificate: {}", e);
-                    self.show_pin_dialog = false;
-                    warn!(error = %e, "Failed to get certificate chain");
+                    CertStoreError::SmartCardNotPresent => {
+                        self.pin_error = Some("Smart card not present".to_string());
+                        self.status_message = "Please insert your smart card".to_string();
+                        // Keep dialog open to retry after card insertion
+                        self.pin_operation = Some(PinOperation::UseCertificate {
+                            thumbprint: thumbprint.to_string(),
+                        });
+                    }
+                    CertStoreError::PinRequired => {
+                        // This means we need to try again with PIN
+                        self.pin_error = Some("PIN is required".to_string());
+                        self.pin_operation = Some(PinOperation::UseCertificate {
+                            thumbprint: thumbprint.to_string(),
+                        });
+                    }
+                    _ => {
+                        self.status_message = format!("Certificate error: {}", e);
+                        self.show_pin_dialog = false;
+                        warn!(error = %e, "Failed to verify PIN");
+                    }
                 }
             }
         }

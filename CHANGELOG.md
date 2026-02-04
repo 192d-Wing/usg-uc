@@ -943,6 +943,31 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - Real-time status messages ("Trying...", "Ringing...", etc.)
   - Final result message on transfer completion
 
+#### Phase 24.30: PIN Handling & Smart Card Signing
+
+- `client-core/src/cert_store.rs` - Smart card signing support
+  - `SignatureAlgorithm` enum - EcdsaSha384, EcdsaSha256, RsaSha384, RsaSha256
+  - `sign_data()` - Sign data with certificate private key
+    - Uses CryptAcquireCertificatePrivateKey to acquire NCrypt key handle
+    - Signs via NCryptSignHash (Windows CryptoNG)
+    - Supports ECDSA (no padding) and RSA (PKCS#1 padding)
+    - Maps Windows error codes: NTE_USER_CANCELLED, SCARD_W_WRONG_CHV, etc.
+  - `verify_pin()` - Verify smart card PIN without signing
+    - Acquires key handle with CRYPT_ACQUIRE_SILENT_FLAG
+    - Sets PIN via NCryptSetProperty with "SmartCardPin" property
+    - Returns PinIncorrect, SmartCardNotPresent, or success
+  - Non-Windows stub implementations
+    - Deterministic fake signatures based on algorithm type
+    - PIN validation accepts 4+ digit PINs for testing
+- `client-core/src/lib.rs` - Public exports
+  - `SignatureAlgorithm` exported for external use
+- `client-gui/src/app.rs` - PIN dialog integration
+  - `use_certificate_with_pin()` verifies PIN before configuring certificate
+  - Handles CertStoreError::PinIncorrect with retry UI
+  - Handles CertStoreError::SmartCardNotPresent with insertion prompt
+  - PIN attempt tracking with lockout warning at 3 attempts
+- 6 new tests for signing and PIN verification
+
 **Security**
 
 - Smart card authentication ONLY (CAC/PIV/SIPR token)

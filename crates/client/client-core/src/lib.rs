@@ -30,7 +30,7 @@ pub use audio_session::{
     AudioSession, AudioSessionConfig, AudioSessionConfigBuilder, AudioSessionEvent,
 };
 pub use call_manager::{CallManager, CallManagerEvent, IncomingCallInfo};
-pub use cert_store::{CertStoreError, CertStoreResult, CertificateStore};
+pub use cert_store::{CertStoreError, CertStoreResult, CertificateStore, SignatureAlgorithm};
 pub use contact_manager::{ContactManager, ContactStore, create_contact};
 pub use settings::{GeneralSettings, NetworkSettings, Settings, SettingsManager, UiSettings};
 pub use sip_transport::{

@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.29 complete, Phase 25 critical items complete
+**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.30 complete, Phase 25 critical items complete
 
 ---
 
@@ -1294,6 +1294,31 @@ This document outlines the development roadmap for the USG Session Border Contro
   - Final result message on transfer completion
 - ✅ ReferStatus re-export from client-sip-ua
   - Public access to `proto_dialog::refer::ReferStatus`
+
+**Phase 24.30: PIN Handling & Smart Card Signing** ✅
+
+- ✅ `SignatureAlgorithm` enum for signing operations
+  - EcdsaSha384 (CNSA 2.0 compliant)
+  - EcdsaSha256, RsaSha384, RsaSha256 variants
+- ✅ `sign_data()` method in CertificateStore
+  - Acquires private key via CryptAcquireCertificatePrivateKey
+  - Signs data using NCryptSignHash (Windows CryptoNG)
+  - Supports ECDSA and RSA algorithms with PKCS#1 padding
+  - Handles PIN-protected smart card keys
+  - Maps Windows error codes to CertStoreError variants
+- ✅ `verify_pin()` method for PIN validation
+  - Verifies PIN correctness without signing
+  - Detects SmartCardNotPresent, PinIncorrect, PinRequired errors
+  - Uses NCryptSetProperty to set smart card PIN
+- ✅ GUI PIN dialog integration
+  - `use_certificate_with_pin()` verifies PIN before configuring certificate
+  - Handles specific CertStoreError cases with appropriate UI messages
+  - PIN attempt tracking with lockout warning
+- ✅ Non-Windows stub implementations for testing
+  - Deterministic fake signatures based on algorithm
+  - PIN validation accepts 4+ digit PINs
+
+**Tests**: 14 cert_store tests (client-core crate)
 
 ---
 
