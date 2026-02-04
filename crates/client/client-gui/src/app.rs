@@ -61,6 +61,10 @@ pub struct SipClientApp {
     show_error_dialog: bool,
     /// Whether a tray exit was requested.
     exit_requested: bool,
+    /// Pending certificate chain (waiting for ClientApp init).
+    pending_cert_chain: Option<Vec<Vec<u8>>>,
+    /// Pending certificate thumbprint.
+    pending_cert_thumbprint: Option<String>,
     /// Notification manager for toast notifications.
     notifications: NotificationManager,
 }
@@ -124,6 +128,8 @@ impl SipClientApp {
             show_error_dialog: false,
             exit_requested: false,
             notifications: NotificationManager::new("USG SIP Client"),
+            pending_cert_chain: None,
+            pending_cert_thumbprint: None,
         }
     }
 
@@ -515,6 +521,62 @@ impl SipClientApp {
                 info!(thumbprint = %thumbprint, "Selecting certificate");
                 self.settings_view.set_selected_certificate(Some(thumbprint));
                 self.status_message = "Certificate selected".to_string();
+            }
+            crate::views::SettingsAction::UseCertificate(thumbprint) => {
+                info!(thumbprint = %thumbprint, "Using certificate for authentication");
+                self.use_certificate(&thumbprint);
+            }
+        }
+    }
+
+    fn use_certificate(&mut self, thumbprint: &str) {
+        use client_core::CertificateStore;
+
+        let cert_store = CertificateStore::open_personal();
+
+        // First verify the certificate has a private key
+        match cert_store.has_private_key(thumbprint) {
+            Ok(true) => {
+                info!(thumbprint = %thumbprint, "Certificate has private key");
+            }
+            Ok(false) => {
+                self.status_message =
+                    "Certificate does not have an associated private key".to_string();
+                warn!(thumbprint = %thumbprint, "No private key for certificate");
+                return;
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to check private key: {e}");
+                warn!(error = %e, "Failed to check private key");
+                return;
+            }
+        }
+
+        // Get the certificate chain
+        match cert_store.get_certificate_chain(thumbprint) {
+            Ok(cert_chain) => {
+                info!(
+                    thumbprint = %thumbprint,
+                    chain_length = cert_chain.len(),
+                    "Retrieved certificate chain"
+                );
+
+                // Store the certificate chain for use with mTLS
+                if let Some(ref mut app) = self.client_app {
+                    app.set_client_certificate(cert_chain.clone(), thumbprint.to_string());
+                    self.status_message = "Certificate configured for authentication".to_string();
+                    info!("Certificate configured in ClientApp");
+                } else {
+                    // Store for later when ClientApp is initialized
+                    self.pending_cert_chain = Some(cert_chain);
+                    self.pending_cert_thumbprint = Some(thumbprint.to_string());
+                    self.status_message =
+                        "Certificate will be used when connecting".to_string();
+                }
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to get certificate: {e}");
+                warn!(error = %e, "Failed to get certificate chain");
             }
         }
     }

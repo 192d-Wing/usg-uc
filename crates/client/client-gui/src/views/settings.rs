@@ -16,6 +16,8 @@ pub enum SettingsAction {
     RefreshCertificates,
     /// Select a certificate by thumbprint.
     SelectCertificate(String),
+    /// Use the selected certificate for authentication.
+    UseCertificate(String),
 }
 
 /// Settings view state.
@@ -464,6 +466,21 @@ impl SettingsView {
         }
 
         ui.add_space(20.0);
+
+        // Use certificate button
+        if let Some(thumbprint) = &self.selected_certificate.clone() {
+            ui.horizontal(|ui| {
+                if ui
+                    .button("\u{1F512} Use Selected Certificate")
+                    .on_hover_text("Configure the application to use this certificate for authentication")
+                    .clicked()
+                {
+                    action = Some(SettingsAction::UseCertificate(thumbprint.clone()));
+                }
+            });
+
+            ui.add_space(10.0);
+        }
 
         // CNSA 2.0 compliance info
         ui.label(egui::RichText::new("CNSA 2.0 Compliance").strong());

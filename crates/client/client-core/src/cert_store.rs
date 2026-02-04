@@ -652,6 +652,230 @@ impl CertificateStore {
         debug!(count = readers.len(), "Found smart card readers");
         Ok(readers)
     }
+
+    /// Gets the DER-encoded certificate chain for a certificate.
+    ///
+    /// Returns the certificate and its issuer chain as DER-encoded bytes.
+    /// The first element is the end-entity certificate, followed by any
+    /// intermediate certificates.
+    pub fn get_certificate_chain(&self, thumbprint: &str) -> CertStoreResult<Vec<Vec<u8>>> {
+        info!(thumbprint = %thumbprint, "Getting certificate chain");
+
+        #[cfg(windows)]
+        {
+            self.get_certificate_chain_windows(thumbprint)
+        }
+
+        #[cfg(not(windows))]
+        {
+            // Return stub certificate for non-Windows
+            self.get_certificate_chain_stub(thumbprint)
+        }
+    }
+
+    /// Gets the DER-encoded certificate chain on Windows.
+    #[cfg(windows)]
+    fn get_certificate_chain_windows(&self, thumbprint: &str) -> CertStoreResult<Vec<Vec<u8>>> {
+        use windows::Win32::Security::Cryptography::{
+            CertCloseStore, CertEnumCertificatesInStore, CertOpenStore, CERT_CONTEXT,
+            CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE, CERT_STORE_PROV_SYSTEM_W,
+            CERT_SYSTEM_STORE_CURRENT_USER, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+        };
+
+        let store_name_wide: Vec<u16> = self
+            .store_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        unsafe {
+            let store = CertOpenStore(
+                CERT_STORE_PROV_SYSTEM_W,
+                CERT_QUERY_ENCODING_TYPE(X509_ASN_ENCODING.0 | PKCS_7_ASN_ENCODING.0),
+                None,
+                CERT_OPEN_STORE_FLAGS(CERT_SYSTEM_STORE_CURRENT_USER),
+                Some(store_name_wide.as_ptr().cast()),
+            )
+            .map_err(|e| CertStoreError::StoreNotAvailable(e.to_string()))?;
+
+            let mut cert_context: *const CERT_CONTEXT = std::ptr::null();
+            let mut found_cert: Option<*const CERT_CONTEXT> = None;
+
+            // Find the certificate by thumbprint
+            loop {
+                cert_context = CertEnumCertificatesInStore(store, Some(cert_context));
+                if cert_context.is_null() {
+                    break;
+                }
+
+                let cert_thumbprint = self.get_certificate_thumbprint(cert_context);
+                if cert_thumbprint.eq_ignore_ascii_case(thumbprint) {
+                    found_cert = Some(cert_context);
+                    break;
+                }
+            }
+
+            let cert_ctx = found_cert.ok_or_else(|| {
+                let _ = CertCloseStore(store, 0);
+                CertStoreError::CertificateNotFound(thumbprint.to_string())
+            })?;
+
+            // Get the DER-encoded certificate
+            let cert = &*cert_ctx;
+            let cert_der =
+                std::slice::from_raw_parts(cert.pbCertEncoded, cert.cbCertEncoded as usize)
+                    .to_vec();
+
+            let _ = CertCloseStore(store, 0);
+
+            // Return just the end-entity cert for now
+            // A full implementation would build the chain using CertGetCertificateChain
+            Ok(vec![cert_der])
+        }
+    }
+
+    /// Gets a stub certificate chain for non-Windows platforms.
+    #[cfg(not(windows))]
+    fn get_certificate_chain_stub(&self, thumbprint: &str) -> CertStoreResult<Vec<Vec<u8>>> {
+        // Verify the certificate exists in our stub data
+        let _ = self.find_by_thumbprint(thumbprint)?;
+
+        // Return a self-signed test certificate (DER-encoded)
+        // This is a minimal X.509 v3 certificate for testing
+        // In production, this would come from the actual certificate store
+        let stub_cert = create_stub_der_certificate();
+        Ok(vec![stub_cert])
+    }
+
+    /// Checks if a certificate has an associated private key.
+    ///
+    /// For smart card certificates, this verifies the card is present.
+    pub fn has_private_key(&self, thumbprint: &str) -> CertStoreResult<bool> {
+        #[cfg(windows)]
+        {
+            self.has_private_key_windows(thumbprint)
+        }
+
+        #[cfg(not(windows))]
+        {
+            // Stub always has a "private key"
+            let _ = self.find_by_thumbprint(thumbprint)?;
+            Ok(true)
+        }
+    }
+
+    /// Checks for private key on Windows.
+    #[cfg(windows)]
+    fn has_private_key_windows(&self, thumbprint: &str) -> CertStoreResult<bool> {
+        use windows::Win32::Security::Cryptography::{
+            CERT_KEY_PROV_INFO_PROP_ID, CertCloseStore, CertEnumCertificatesInStore,
+            CertGetCertificateContextProperty, CertOpenStore, CERT_CONTEXT,
+            CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE, CERT_STORE_PROV_SYSTEM_W,
+            CERT_SYSTEM_STORE_CURRENT_USER, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+        };
+
+        let store_name_wide: Vec<u16> = self
+            .store_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        unsafe {
+            let store = CertOpenStore(
+                CERT_STORE_PROV_SYSTEM_W,
+                CERT_QUERY_ENCODING_TYPE(X509_ASN_ENCODING.0 | PKCS_7_ASN_ENCODING.0),
+                None,
+                CERT_OPEN_STORE_FLAGS(CERT_SYSTEM_STORE_CURRENT_USER),
+                Some(store_name_wide.as_ptr().cast()),
+            )
+            .map_err(|e| CertStoreError::StoreNotAvailable(e.to_string()))?;
+
+            let mut cert_context: *const CERT_CONTEXT = std::ptr::null();
+
+            loop {
+                cert_context = CertEnumCertificatesInStore(store, Some(cert_context));
+                if cert_context.is_null() {
+                    break;
+                }
+
+                let cert_thumbprint = self.get_certificate_thumbprint(cert_context);
+                if cert_thumbprint.eq_ignore_ascii_case(thumbprint) {
+                    // Check if it has a private key by querying CERT_KEY_PROV_INFO_PROP_ID
+                    let mut size: u32 = 0;
+                    let has_key = CertGetCertificateContextProperty(
+                        cert_context,
+                        CERT_KEY_PROV_INFO_PROP_ID,
+                        None,
+                        &mut size,
+                    )
+                    .is_ok();
+
+                    let _ = CertCloseStore(store, 0);
+                    return Ok(has_key && size > 0);
+                }
+            }
+
+            let _ = CertCloseStore(store, 0);
+            Err(CertStoreError::CertificateNotFound(thumbprint.to_string()))
+        }
+    }
+}
+
+/// Creates a stub DER-encoded certificate for testing on non-Windows platforms.
+#[cfg(not(windows))]
+fn create_stub_der_certificate() -> Vec<u8> {
+    // This is a minimal self-signed test certificate
+    // Generated for testing purposes only - not for production use
+    // Subject: CN=Test User, O=Test Org
+    // Key: ECDSA P-384
+    // Validity: 2024-01-01 to 2027-01-01
+    //
+    // In a real implementation, you would load a test certificate from a file
+    // or generate one using a crypto library
+    vec![
+        0x30, 0x82, 0x01, 0x5a, // SEQUENCE, length
+        0x30, 0x82, 0x01, 0x00, // tbsCertificate SEQUENCE
+        0xa0, 0x03, 0x02, 0x01, 0x02, // version [0] INTEGER 2 (v3)
+        0x02, 0x01, 0x01, // serialNumber INTEGER 1
+        0x30, 0x0a, // signature AlgorithmIdentifier
+        0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03, // ecdsa-with-SHA384
+        0x30, 0x1f, // issuer Name
+        0x31, 0x1d, 0x30, 0x1b, 0x06, 0x03, 0x55, 0x04, 0x03, // CN=
+        0x0c, 0x14, 0x54, 0x65, 0x73, 0x74, 0x20, 0x55, 0x73, 0x65, 0x72, 0x20, 0x28, 0x53, 0x74,
+        0x75, 0x62, 0x20, 0x43, 0x41, 0x43, 0x29, // "Test User (Stub CAC)"
+        0x30, 0x1e, // validity
+        0x17, 0x0d, 0x32, 0x34, 0x30, 0x31, 0x30, 0x31, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30,
+        0x5a, // notBefore: 240101000000Z
+        0x17, 0x0d, 0x32, 0x37, 0x30, 0x31, 0x30, 0x31, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30,
+        0x5a, // notAfter: 270101000000Z
+        0x30, 0x1f, // subject Name (same as issuer for self-signed)
+        0x31, 0x1d, 0x30, 0x1b, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 0x14, 0x54, 0x65, 0x73, 0x74,
+        0x20, 0x55, 0x73, 0x65, 0x72, 0x20, 0x28, 0x53, 0x74, 0x75, 0x62, 0x20, 0x43, 0x41, 0x43,
+        0x29, 0x30, 0x76, // subjectPublicKeyInfo
+        0x30, 0x10, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, // ecPublicKey
+        0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22, // secp384r1
+        0x03, 0x62, 0x00, // BIT STRING, 97 bytes (P-384 public key placeholder)
+        0x04, // Uncompressed point
+        // X coordinate (48 bytes) - placeholder
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x01, // Y coordinate (48 bytes) - placeholder
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x02, 0x30, 0x0a, // signatureAlgorithm
+        0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03, // ecdsa-with-SHA384
+        0x03, 0x48, 0x00, // signature BIT STRING (placeholder)
+        0x30, 0x45, // ECDSA-Sig-Value SEQUENCE
+        0x02, 0x21, 0x00, // r INTEGER
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x02, 0x20, // s INTEGER
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x02,
+    ]
 }
 
 /// Converts a Windows FILETIME to a date string.

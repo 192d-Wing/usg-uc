@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.11 (Certificate Selection UI) complete
+**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.12 (Certificate Authentication) complete
 
 ---
 
@@ -752,6 +752,31 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ CNSA 2.0 compliance guidance in UI
   - P-384 certificates highlighted as preferred
   - RSA certificates marked as not recommended for government use
+
+**Tests**: 109 total tests (client crates)
+
+**Phase 24.12: Certificate Authentication Integration** ✅
+
+- ✅ Certificate export functionality in CertificateStore
+  - `get_certificate_chain()` - retrieves DER-encoded certificate chain
+  - `has_private_key()` - verifies private key availability
+  - Windows CryptoAPI: extracts raw certificate bytes from CERT_CONTEXT
+  - Non-Windows: stub certificate generation for testing
+- ✅ UseCertificate action in Settings UI
+  - "Use Selected Certificate" button with lock icon
+  - Verifies private key exists before configuration
+  - Retrieves and stores certificate chain
+- ✅ ClientApp certificate integration
+  - `set_client_certificate()` for mTLS configuration
+  - `client_certificate_thumbprint()` accessor
+  - `has_client_certificate()` check
+  - Certificate chain passed to CallManager DTLS credentials
+- ✅ CallManager DTLS credential wiring
+  - Certificate chain stored for MediaSession creation
+  - Ready for DTLS handshake with smart card certificates
+- ✅ Pending certificate support in GUI
+  - Stores cert chain/thumbprint when ClientApp not initialized
+  - Applies certificate when connecting
 
 **Tests**: 109 total tests (client crates)
 

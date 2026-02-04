@@ -102,6 +102,10 @@ pub struct ClientApp {
     call_event_rx: mpsc::Receiver<CallManagerEvent>,
     /// Current account ID.
     current_account_id: Option<String>,
+    /// Client certificate chain (DER-encoded) for mTLS authentication.
+    client_cert_chain: Option<Vec<Vec<u8>>>,
+    /// Client certificate thumbprint.
+    client_cert_thumbprint: Option<String>,
 }
 
 impl ClientApp {
@@ -147,6 +151,8 @@ impl ClientApp {
             reg_event_rx,
             call_event_rx,
             current_account_id: None,
+            client_cert_chain: None,
+            client_cert_thumbprint: None,
         })
     }
 
@@ -169,6 +175,38 @@ impl ClientApp {
         }
 
         Ok(())
+    }
+
+    /// Sets the client certificate for mTLS authentication.
+    ///
+    /// The certificate chain should be DER-encoded, with the end-entity
+    /// certificate first, followed by any intermediate certificates.
+    pub fn set_client_certificate(&mut self, cert_chain: Vec<Vec<u8>>, thumbprint: String) {
+        info!(
+            thumbprint = %thumbprint,
+            chain_length = cert_chain.len(),
+            "Setting client certificate for authentication"
+        );
+
+        self.client_cert_chain = Some(cert_chain.clone());
+        self.client_cert_thumbprint = Some(thumbprint.clone());
+
+        // Configure the call manager with the DTLS credentials
+        // For smart card certificates, the private key stays on the card
+        // and signing operations are performed by the Windows CryptoAPI
+        self.call_manager.set_dtls_credentials(cert_chain, Vec::new());
+
+        info!("Client certificate configured");
+    }
+
+    /// Returns the configured client certificate thumbprint.
+    pub fn client_certificate_thumbprint(&self) -> Option<&str> {
+        self.client_cert_thumbprint.as_deref()
+    }
+
+    /// Returns whether a client certificate is configured.
+    pub fn has_client_certificate(&self) -> bool {
+        self.client_cert_chain.is_some()
     }
 
     /// Registers a SIP account.

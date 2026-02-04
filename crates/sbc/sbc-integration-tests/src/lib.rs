@@ -24,3 +24,6 @@ mod metrics_tests;
 
 #[cfg(test)]
 mod policy_tests;
+
+#[cfg(all(test, feature = "cluster"))]
+mod cluster_tests;

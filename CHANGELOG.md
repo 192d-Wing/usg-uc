@@ -393,6 +393,28 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - Real-time certificate loading from CertificateStore
   - Error handling with status message display
 
+**Phase 24.12: Certificate Authentication Integration**
+
+- `client-core` certificate export functionality
+  - `cert_store.rs`: Certificate chain export methods
+    - `get_certificate_chain()` retrieves DER-encoded certificates
+    - `has_private_key()` verifies private key availability
+    - Windows: extracts raw bytes from CERT_CONTEXT
+    - Non-Windows: stub certificate for testing
+  - `app.rs`: Certificate authentication support
+    - `set_client_certificate()` for mTLS configuration
+    - `client_certificate_thumbprint()` accessor
+    - `has_client_certificate()` check
+    - Certificate chain passed to CallManager
+- `client-gui` certificate usage
+  - `settings.rs`: UseCertificate action
+    - "Use Selected Certificate" button
+    - Private key verification before use
+    - Status message feedback
+  - `app.rs`: Certificate configuration flow
+    - Pending certificate storage for delayed init
+    - Certificate chain retrieval and validation
+
 **Security**
 
 - Smart card authentication ONLY (CAC/PIV/SIPR token)
