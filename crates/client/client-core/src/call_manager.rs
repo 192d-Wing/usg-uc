@@ -6,18 +6,21 @@
 //! - Media session coordination
 //! - Call history integration
 
+use crate::audio_session::{AudioSession, AudioSessionConfig, AudioSessionEvent};
 use crate::contact_manager::ContactManager;
 use crate::{AppError, AppResult};
+use chrono::Utc;
+use client_audio::PipelineStats;
 use client_sip_ua::{CallAgent, CallEvent, MediaSession, MediaSessionEvent, MediaSessionState};
+use client_types::audio::CodecPreference;
 use client_types::{
     CallDirection, CallEndReason, CallHistoryEntry, CallInfo, CallState, SipAccount,
 };
-use chrono::Utc;
 use proto_ice::IceConfig;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
 /// Call manager coordinates calls between SIP UA and media sessions.
@@ -26,6 +29,8 @@ pub struct CallManager {
     call_agent: CallAgent,
     /// Active media sessions by call ID.
     media_sessions: HashMap<String, MediaSession>,
+    /// Active audio sessions by call ID.
+    audio_sessions: HashMap<String, AudioSession>,
     /// Local address for media.
     local_media_addr: SocketAddr,
     /// ICE configuration.
@@ -36,10 +41,14 @@ pub struct CallManager {
     dtls_private_key: Vec<u8>,
     /// Event sender for application events.
     app_event_tx: mpsc::Sender<CallManagerEvent>,
+    /// Audio event sender.
+    audio_event_tx: mpsc::Sender<AudioSessionEvent>,
     /// Contact manager for call history (optional).
     contact_manager: Option<Arc<RwLock<ContactManager>>>,
     /// Current SIP account.
     account: Option<SipAccount>,
+    /// Preferred codec for calls.
+    preferred_codec: CodecPreference,
     /// Active call ID (single call mode for now).
     active_call_id: Option<String>,
     /// Whether muted.
@@ -116,6 +125,9 @@ impl CallManager {
         // Create internal channel for call agent events
         let (call_event_tx, _call_event_rx) = mpsc::channel(64);
 
+        // Create internal channel for audio session events
+        let (audio_event_tx, _audio_event_rx) = mpsc::channel(64);
+
         let call_agent = CallAgent::new(
             local_sip_addr,
             String::new(), // Will be set when account is configured
@@ -126,13 +138,16 @@ impl CallManager {
         Self {
             call_agent,
             media_sessions: HashMap::new(),
+            audio_sessions: HashMap::new(),
             local_media_addr,
             ice_config: IceConfig::default(),
             dtls_cert_chain: Vec::new(),
             dtls_private_key: Vec::new(),
             app_event_tx,
+            audio_event_tx,
             contact_manager: None,
             account: None,
+            preferred_codec: CodecPreference::G711Ulaw,
             active_call_id: None,
             is_muted: false,
         }
@@ -154,6 +169,17 @@ impl CallManager {
         self.dtls_cert_chain = cert_chain;
         self.dtls_private_key = private_key;
         info!("DTLS credentials configured");
+    }
+
+    /// Sets the preferred codec for calls.
+    pub fn set_preferred_codec(&mut self, codec: CodecPreference) {
+        self.preferred_codec = codec;
+        info!(codec = ?codec, "Preferred codec set");
+    }
+
+    /// Returns the preferred codec.
+    pub fn preferred_codec(&self) -> CodecPreference {
+        self.preferred_codec
     }
 
     /// Sets the contact manager for call history.
@@ -379,6 +405,14 @@ impl CallManager {
     /// Toggles mute state.
     pub fn toggle_mute(&mut self) -> bool {
         self.is_muted = !self.is_muted;
+
+        // Update audio session mute state
+        if let Some(call_id) = &self.active_call_id {
+            if let Some(session) = self.audio_sessions.get(call_id) {
+                session.set_muted(self.is_muted);
+            }
+        }
+
         info!(muted = self.is_muted, "Mute toggled");
         self.is_muted
     }
@@ -420,6 +454,67 @@ impl CallManager {
         self.media_sessions.get_mut(call_id)
     }
 
+    /// Returns the audio session for a call.
+    pub fn get_audio_session(&self, call_id: &str) -> Option<&AudioSession> {
+        self.audio_sessions.get(call_id)
+    }
+
+    /// Returns audio pipeline statistics for the active call.
+    pub async fn audio_stats(&self) -> Option<PipelineStats> {
+        if let Some(call_id) = &self.active_call_id {
+            if let Some(session) = self.audio_sessions.get(call_id) {
+                return Some(session.stats().await);
+            }
+        }
+        None
+    }
+
+    /// Starts the audio session for a connected call.
+    async fn start_audio_session(
+        &mut self,
+        call_id: &str,
+        remote_addr: SocketAddr,
+    ) -> AppResult<()> {
+        info!(call_id = %call_id, remote = %remote_addr, "Starting audio session");
+
+        // Create audio session
+        let mut audio_session = AudioSession::new(self.audio_event_tx.clone());
+
+        // Configure audio
+        let config = AudioSessionConfig {
+            local_port: 0,
+            remote_addr,
+            codec: self.preferred_codec,
+            jitter_buffer_ms: 60,
+            // SRTP keys will be obtained from media session in production
+            srtp_key: None,
+            srtp_salt: None,
+        };
+
+        // Start the audio session
+        match audio_session.start(config).await {
+            Ok(port) => {
+                info!(call_id = %call_id, port = port, "Audio session started");
+                self.audio_sessions
+                    .insert(call_id.to_string(), audio_session);
+                Ok(())
+            }
+            Err(e) => {
+                error!(call_id = %call_id, error = %e, "Failed to start audio session");
+                Err(e)
+            }
+        }
+    }
+
+    /// Stops the audio session for a call.
+    async fn stop_audio_session(&mut self, call_id: &str) -> AppResult<()> {
+        if let Some(mut session) = self.audio_sessions.remove(call_id) {
+            info!(call_id = %call_id, "Stopping audio session");
+            session.stop().await?;
+        }
+        Ok(())
+    }
+
     // --- Private methods ---
 
     async fn handle_state_changed(
@@ -455,8 +550,26 @@ impl CallManager {
                         warn!(call_id = %call_id, error = %e, "Failed to establish media");
                     }
                 }
+
+                // Start audio session when call connects
+                // Get remote address from media session if available
+                let remote_addr = self.media_sessions.get(call_id).and_then(|_session| {
+                    // Use the local media address as fallback
+                    Some(self.local_media_addr)
+                });
+
+                if let Some(addr) = remote_addr {
+                    if let Err(e) = self.start_audio_session(call_id, addr).await {
+                        warn!(call_id = %call_id, error = %e, "Failed to start audio");
+                    }
+                }
             }
             CallState::Terminated => {
+                // Stop audio session first
+                if let Err(e) = self.stop_audio_session(call_id).await {
+                    warn!(call_id = %call_id, error = %e, "Failed to stop audio session");
+                }
+
                 // Clean up media session
                 if let Some(mut session) = self.media_sessions.remove(call_id) {
                     let _ = session.close().await;
@@ -530,7 +643,11 @@ impl CallManager {
         Ok(())
     }
 
-    fn generate_sdp_offer(&self, session: &MediaSession, account: &SipAccount) -> AppResult<String> {
+    fn generate_sdp_offer(
+        &self,
+        session: &MediaSession,
+        account: &SipAccount,
+    ) -> AppResult<String> {
         let creds = session.local_ice_credentials();
         let fingerprint = session.local_dtls_fingerprint();
         let ssrc = session.local_ssrc();

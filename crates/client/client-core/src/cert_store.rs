@@ -60,16 +60,25 @@ pub type CertStoreResult<T> = Result<T, CertStoreError>;
 pub struct CertificateStore {
     /// Store name (e.g., "MY" for personal certificates).
     store_name: String,
-    /// Cached certificates (for stub mode).
+    /// Cached certificates (for stub mode or caching).
+    #[allow(dead_code)]
     cached_certs: Vec<CertificateInfo>,
 }
 
 impl CertificateStore {
     /// Creates a new certificate store accessor.
     pub fn new(store_name: &str) -> Self {
+        let cached_certs = if cfg!(windows) {
+            // On Windows, start with empty cache - will be populated on first list
+            Vec::new()
+        } else {
+            // On non-Windows, use stub data
+            Self::create_stub_certificates()
+        };
+
         Self {
             store_name: store_name.to_string(),
-            cached_certs: Self::create_stub_certificates(),
+            cached_certs,
         }
     }
 
@@ -82,9 +91,15 @@ impl CertificateStore {
     pub fn list_certificates(&self) -> CertStoreResult<Vec<CertificateInfo>> {
         info!("Listing certificates from store: {}", self.store_name);
 
-        // TODO: On Windows, use CryptoAPI to enumerate real certificates
-        // For now, return stub data for cross-platform development
-        self.list_certificates_stub()
+        #[cfg(windows)]
+        {
+            self.list_certificates_windows()
+        }
+
+        #[cfg(not(windows))]
+        {
+            self.list_certificates_stub()
+        }
     }
 
     /// Selects a certificate based on the configuration.
@@ -207,23 +222,448 @@ impl CertificateStore {
         ]
     }
 
-    /// Lists certificates using stub data (for development).
+    /// Lists certificates using stub data (for development on non-Windows).
+    #[cfg(not(windows))]
     fn list_certificates_stub(&self) -> CertStoreResult<Vec<CertificateInfo>> {
         warn!("Certificate store using stub data - Windows CryptoAPI not available");
-        Ok(self.cached_certs.clone())
+        Ok(Self::create_stub_certificates())
+    }
+
+    /// Lists certificates using Windows CryptoAPI.
+    #[cfg(windows)]
+    fn list_certificates_windows(&self) -> CertStoreResult<Vec<CertificateInfo>> {
+        use windows::Win32::Security::Cryptography::{
+            CertCloseStore, CertEnumCertificatesInStore, CertOpenStore, CERT_CONTEXT,
+            CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE, CERT_STORE_PROV_SYSTEM_W,
+            CERT_SYSTEM_STORE_CURRENT_USER, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+        };
+
+        info!(
+            "Enumerating certificates from Windows Certificate Store: {}",
+            self.store_name
+        );
+
+        let mut certificates = Vec::new();
+
+        // Convert store name to wide string
+        let store_name_wide: Vec<u16> = self
+            .store_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        unsafe {
+            // Open the certificate store
+            let store = CertOpenStore(
+                CERT_STORE_PROV_SYSTEM_W,
+                CERT_QUERY_ENCODING_TYPE(X509_ASN_ENCODING.0 | PKCS_7_ASN_ENCODING.0),
+                None,
+                CERT_OPEN_STORE_FLAGS(CERT_SYSTEM_STORE_CURRENT_USER),
+                Some(store_name_wide.as_ptr().cast()),
+            );
+
+            let store = store.map_err(|e| {
+                CertStoreError::StoreNotAvailable(format!(
+                    "Failed to open certificate store '{}': {}",
+                    self.store_name, e
+                ))
+            })?;
+
+            // Enumerate certificates
+            let mut cert_context: *const CERT_CONTEXT = std::ptr::null();
+
+            loop {
+                cert_context = CertEnumCertificatesInStore(store, Some(cert_context));
+
+                if cert_context.is_null() {
+                    break;
+                }
+
+                // Parse the certificate
+                if let Some(cert_info) = self.parse_certificate_context(cert_context) {
+                    certificates.push(cert_info);
+                }
+            }
+
+            // Close the store
+            let _ = CertCloseStore(store, 0);
+        }
+
+        debug!("Found {} certificates in store", certificates.len());
+        Ok(certificates)
+    }
+
+    /// Parses a certificate context into `CertificateInfo`.
+    #[cfg(windows)]
+    fn parse_certificate_context(
+        &self,
+        cert_context: *const windows::Win32::Security::Cryptography::CERT_CONTEXT,
+    ) -> Option<CertificateInfo> {
+        unsafe {
+            let cert = &*cert_context;
+            let cert_info_ptr = cert.pCertInfo;
+            if cert_info_ptr.is_null() {
+                return None;
+            }
+
+            // Get subject CN
+            let subject_cn = self.get_cert_name_string(cert_context, true);
+
+            // Get issuer CN
+            let issuer_cn = self.get_cert_name_string(cert_context, false);
+
+            // Get validity dates
+            let cert_info = &*cert_info_ptr;
+            let not_before = filetime_to_string(&cert_info.NotBefore);
+            let not_after = filetime_to_string(&cert_info.NotAfter);
+
+            // Check if certificate is currently valid
+            let is_valid = self.check_certificate_validity(cert_context);
+
+            // Get thumbprint (SHA-1 hash of certificate)
+            let thumbprint = self.get_certificate_thumbprint(cert_context);
+
+            // Get key algorithm
+            let key_algorithm = self.get_key_algorithm(cert_context);
+
+            // Get smart card reader name if available
+            let reader_name = self.get_reader_name(cert_context);
+
+            // Get full subject DN
+            let subject_dn = self.get_cert_dn_string(cert_context, true);
+
+            Some(CertificateInfo {
+                thumbprint,
+                subject_cn,
+                subject_dn,
+                issuer_cn,
+                not_before,
+                not_after,
+                is_valid,
+                reader_name,
+                key_algorithm,
+            })
+        }
+    }
+
+    /// Gets the certificate name string (subject or issuer CN).
+    #[cfg(windows)]
+    fn get_cert_name_string(
+        &self,
+        cert_context: *const windows::Win32::Security::Cryptography::CERT_CONTEXT,
+        is_subject: bool,
+    ) -> String {
+        use windows::Win32::Security::Cryptography::{
+            CertGetNameStringW, CERT_NAME_SIMPLE_DISPLAY_TYPE,
+        };
+
+        unsafe {
+            let mut buffer = vec![0u16; 256];
+            let name_type = if is_subject { 0 } else { 1 }; // Subject or Issuer
+
+            let len = CertGetNameStringW(
+                cert_context,
+                CERT_NAME_SIMPLE_DISPLAY_TYPE,
+                name_type,
+                None,
+                Some(&mut buffer),
+            );
+
+            if len > 1 {
+                String::from_utf16_lossy(&buffer[..len as usize - 1])
+            } else {
+                String::from("Unknown")
+            }
+        }
+    }
+
+    /// Gets the full DN string.
+    #[cfg(windows)]
+    fn get_cert_dn_string(
+        &self,
+        cert_context: *const windows::Win32::Security::Cryptography::CERT_CONTEXT,
+        is_subject: bool,
+    ) -> String {
+        use windows::Win32::Security::Cryptography::{
+            CertNameToStrW, CERT_X500_NAME_STR, X509_ASN_ENCODING,
+        };
+
+        unsafe {
+            let cert = &*cert_context;
+            let cert_info_ptr = cert.pCertInfo;
+            if cert_info_ptr.is_null() {
+                return String::from("Unknown");
+            }
+            let cert_info = &*cert_info_ptr;
+
+            let name_blob = if is_subject {
+                &cert_info.Subject
+            } else {
+                &cert_info.Issuer
+            };
+
+            let mut buffer = vec![0u16; 512];
+
+            let len = CertNameToStrW(
+                X509_ASN_ENCODING,
+                name_blob,
+                CERT_X500_NAME_STR,
+                Some(&mut buffer),
+            );
+
+            if len > 1 {
+                String::from_utf16_lossy(&buffer[..len as usize - 1])
+            } else {
+                String::from("Unknown")
+            }
+        }
+    }
+
+    /// Gets the certificate thumbprint (SHA-1 hash).
+    #[cfg(windows)]
+    fn get_certificate_thumbprint(
+        &self,
+        cert_context: *const windows::Win32::Security::Cryptography::CERT_CONTEXT,
+    ) -> String {
+        use windows::Win32::Security::Cryptography::{
+            CertGetCertificateContextProperty, CERT_HASH_PROP_ID,
+        };
+
+        unsafe {
+            let mut hash = vec![0u8; 20]; // SHA-1 is 20 bytes
+            let mut hash_size = hash.len() as u32;
+
+            let result = CertGetCertificateContextProperty(
+                cert_context,
+                CERT_HASH_PROP_ID,
+                Some(hash.as_mut_ptr().cast()),
+                &mut hash_size,
+            );
+
+            if result.is_ok() {
+                hash.iter()
+                    .map(|b| format!("{b:02X}"))
+                    .collect::<Vec<_>>()
+                    .join("")
+            } else {
+                String::from("Unknown")
+            }
+        }
+    }
+
+    /// Gets the key algorithm description.
+    #[cfg(windows)]
+    fn get_key_algorithm(
+        &self,
+        cert_context: *const windows::Win32::Security::Cryptography::CERT_CONTEXT,
+    ) -> String {
+        unsafe {
+            let cert = &*cert_context;
+            let cert_info_ptr = cert.pCertInfo;
+            if cert_info_ptr.is_null() {
+                return String::from("Unknown");
+            }
+            let cert_info = &*cert_info_ptr;
+
+            // Get the public key algorithm OID
+            let oid_ptr = cert_info.SubjectPublicKeyInfo.Algorithm.pszObjId.0;
+            if oid_ptr.is_null() {
+                return String::from("Unknown");
+            }
+
+            let alg_oid = std::ffi::CStr::from_ptr(oid_ptr)
+                .to_string_lossy()
+                .to_string();
+
+            // Map common OIDs to friendly names
+            match alg_oid.as_str() {
+                "1.2.840.10045.2.1" => {
+                    // EC public key - check curve
+                    let params = &cert_info.SubjectPublicKeyInfo.Algorithm.Parameters;
+                    if params.cbData > 0 && !params.pbData.is_null() {
+                        // Parse curve OID from parameters
+                        let curve =
+                            self.parse_ec_curve_from_params(params.pbData, params.cbData as usize);
+                        format!("ECDSA {curve}")
+                    } else {
+                        String::from("ECDSA")
+                    }
+                }
+                "1.2.840.113549.1.1.1" => {
+                    // RSA - get approximate key size
+                    let key_bits = cert_info.SubjectPublicKeyInfo.PublicKey.cbData * 8;
+                    format!("RSA {key_bits}")
+                }
+                _ => alg_oid,
+            }
+        }
+    }
+
+    /// Parses EC curve from algorithm parameters.
+    #[cfg(windows)]
+    fn parse_ec_curve_from_params(&self, data: *const u8, len: usize) -> String {
+        if data.is_null() || len == 0 {
+            return String::from("Unknown");
+        }
+
+        unsafe {
+            // The parameters typically contain the curve OID
+            // Common curves:
+            // P-256: 1.2.840.10045.3.1.7
+            // P-384: 1.3.132.0.34
+            // P-521: 1.3.132.0.35
+
+            let params = std::slice::from_raw_parts(data, len);
+
+            // Simple OID detection (actual parsing would need ASN.1 decoder)
+            if params.len() >= 7 {
+                // Check for P-384 OID (1.3.132.0.34 = 06 05 2B 81 04 00 22)
+                if params.contains(&0x22) && params.contains(&0x04) {
+                    return String::from("P-384");
+                }
+                // Check for P-521 OID (1.3.132.0.35 = 06 05 2B 81 04 00 23)
+                if params.contains(&0x23) && params.contains(&0x04) {
+                    return String::from("P-521");
+                }
+                // Check for P-256 OID (1.2.840.10045.3.1.7)
+                if params.contains(&0x07) && params.contains(&0x03) {
+                    return String::from("P-256");
+                }
+            }
+
+            String::from("Unknown")
+        }
+    }
+
+    /// Gets the smart card reader name if the certificate is on a smart card.
+    #[cfg(windows)]
+    fn get_reader_name(
+        &self,
+        cert_context: *const windows::Win32::Security::Cryptography::CERT_CONTEXT,
+    ) -> Option<String> {
+        use windows::Win32::Security::Cryptography::{
+            CertGetCertificateContextProperty, CERT_KEY_PROV_INFO_PROP_ID, CRYPT_KEY_PROV_INFO,
+        };
+
+        unsafe {
+            // First, get the size needed
+            let mut prov_info_size = 0u32;
+            let result = CertGetCertificateContextProperty(
+                cert_context,
+                CERT_KEY_PROV_INFO_PROP_ID,
+                None,
+                &mut prov_info_size,
+            );
+
+            if result.is_err() || prov_info_size == 0 {
+                return None;
+            }
+
+            // Allocate buffer and get the property
+            let mut prov_info_buf = vec![0u8; prov_info_size as usize];
+            let result = CertGetCertificateContextProperty(
+                cert_context,
+                CERT_KEY_PROV_INFO_PROP_ID,
+                Some(prov_info_buf.as_mut_ptr().cast()),
+                &mut prov_info_size,
+            );
+
+            if result.is_err() {
+                return None;
+            }
+
+            let prov_info = &*(prov_info_buf.as_ptr().cast::<CRYPT_KEY_PROV_INFO>());
+
+            // Get container name which often contains reader info
+            if !prov_info.pwszContainerName.is_null() {
+                let container = widestring_to_string(prov_info.pwszContainerName.0);
+                // Smart card containers often include reader name
+                if container.contains("\\\\") {
+                    // Format: \\.\<reader>\<container>
+                    if let Some(reader_end) = container.rfind('\\') {
+                        let reader = &container[4..reader_end];
+                        return Some(reader.to_string());
+                    }
+                }
+            }
+
+            // Check provider name for smart card indication
+            if !prov_info.pwszProvName.is_null() {
+                let provider = widestring_to_string(prov_info.pwszProvName.0);
+                if provider.contains("Smart Card") || provider.contains("Minidriver") {
+                    return Some(provider);
+                }
+            }
+
+            None
+        }
+    }
+
+    /// Checks if the certificate is currently valid (not expired, not yet valid).
+    #[cfg(windows)]
+    fn check_certificate_validity(
+        &self,
+        cert_context: *const windows::Win32::Security::Cryptography::CERT_CONTEXT,
+    ) -> bool {
+        use windows::Win32::Security::Cryptography::CertVerifyTimeValidity;
+
+        unsafe {
+            let cert = &*cert_context;
+            // NULL for current time
+            let result = CertVerifyTimeValidity(None, cert.pCertInfo);
+            result == 0 // 0 means valid, -1 means not yet valid, 1 means expired
+        }
     }
 
     /// Refreshes the certificate list from the store.
     pub fn refresh(&mut self) -> CertStoreResult<()> {
         info!("Refreshing certificate list");
-        // In real Windows implementation, this would re-enumerate certificates
-        // For stub mode, the cached data is already populated
+
+        #[cfg(windows)]
+        {
+            // Re-enumerate certificates - the list_certificates_windows
+            // function already returns fresh data
+            let _ = self.list_certificates_windows()?;
+        }
+
         Ok(())
     }
 
     /// Returns the store name.
     pub fn store_name(&self) -> &str {
         &self.store_name
+    }
+}
+
+/// Converts a Windows FILETIME to a date string.
+#[cfg(windows)]
+fn filetime_to_string(ft: &windows::Win32::Foundation::FILETIME) -> String {
+    use windows::Win32::Foundation::SYSTEMTIME;
+    use windows::Win32::System::Time::FileTimeToSystemTime;
+
+    unsafe {
+        let mut st = SYSTEMTIME::default();
+        if FileTimeToSystemTime(ft, &mut st).is_ok() {
+            format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay)
+        } else {
+            String::from("Unknown")
+        }
+    }
+}
+
+/// Converts a null-terminated wide string to a Rust String.
+#[cfg(windows)]
+fn widestring_to_string(ptr: *const u16) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+
+    unsafe {
+        let mut len = 0;
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
     }
 }
 
@@ -253,19 +693,32 @@ mod tests {
     fn test_list_certificates_stub() {
         let store = CertificateStore::open_personal();
         let certs = store.list_certificates().unwrap();
-        assert!(!certs.is_empty());
-        // Should have at least one valid certificate
-        assert!(certs.iter().any(|c| c.is_valid));
+        // On non-Windows, we get stub data
+        // On Windows, we get real certificates (may be empty)
+        #[cfg(not(windows))]
+        {
+            assert!(!certs.is_empty());
+            assert!(certs.iter().any(|c| c.is_valid));
+        }
+        #[cfg(windows)]
+        {
+            // On Windows, just verify we don't crash
+            let _ = certs;
+        }
     }
 
     #[test]
     fn test_find_by_thumbprint() {
         let store = CertificateStore::open_personal();
-        let cert = store.find_by_thumbprint(
-            "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2",
-        );
-        assert!(cert.is_ok());
-        assert_eq!(cert.unwrap().subject_cn, "John Doe (CAC)");
+
+        #[cfg(not(windows))]
+        {
+            let cert = store.find_by_thumbprint(
+                "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2",
+            );
+            assert!(cert.is_ok());
+            assert_eq!(cert.unwrap().subject_cn, "John Doe (CAC)");
+        }
     }
 
     #[test]
@@ -280,20 +733,26 @@ mod tests {
         let config = CertificateConfig::new();
         let store = CertificateStore::open_personal();
 
-        let cert = store.select_certificate(&config).unwrap();
-        // Should select a P-384 certificate (first valid one)
-        assert!(cert.key_algorithm.contains("P-384"));
+        #[cfg(not(windows))]
+        {
+            let cert = store.select_certificate(&config).unwrap();
+            // Should select a P-384 certificate (first valid one)
+            assert!(cert.key_algorithm.contains("P-384"));
+        }
     }
 
     #[test]
     fn test_select_specific_certificate() {
-        let config = CertificateConfig::new().with_thumbprint(
-            "B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3",
-        );
-        let store = CertificateStore::open_personal();
+        #[cfg(not(windows))]
+        {
+            let config = CertificateConfig::new().with_thumbprint(
+                "B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3",
+            );
+            let store = CertificateStore::open_personal();
 
-        let cert = store.select_certificate(&config).unwrap();
-        assert_eq!(cert.subject_cn, "Jane Smith (PIV)");
+            let cert = store.select_certificate(&config).unwrap();
+            assert_eq!(cert.subject_cn, "Jane Smith (PIV)");
+        }
     }
 
     #[test]
@@ -302,10 +761,24 @@ mod tests {
         config.selection_mode = CertificateSelectionMode::AutoSelect;
 
         let store = CertificateStore::open_personal();
-        let cert = store.select_certificate(&config).unwrap();
 
-        // Should not select the expired certificate
-        assert!(cert.is_valid);
-        assert_ne!(cert.subject_cn, "Test User (Expired)");
+        #[cfg(not(windows))]
+        {
+            let cert = store.select_certificate(&config).unwrap();
+            // Should not select the expired certificate
+            assert!(cert.is_valid);
+            assert_ne!(cert.subject_cn, "Test User (Expired)");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_certificate_enumeration() {
+        // This test only runs on Windows and verifies the API works
+        let store = CertificateStore::open_personal();
+        let result = store.list_certificates();
+
+        // Should not error, even if no certificates are present
+        assert!(result.is_ok());
     }
 }

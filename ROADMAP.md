@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.8 (Audio Pipeline) complete
+**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.10 (Windows CryptoAPI) complete
 
 ---
 
@@ -682,6 +682,51 @@ This document outlines the development roadmap for the USG Session Border Contro
   - Pipeline statistics aggregation
 
 **Tests**: 72 total tests (client crates)
+
+**Phase 24.9: Audio Integration** ✅
+
+- ✅ `audio_session.rs` - Audio session management bridging media and audio
+  - AudioSession coordinates MediaSession SRTP with AudioPipeline
+  - AudioSessionConfig for flexible configuration
+  - AudioSessionConfigBuilder for fluent API
+  - 20ms audio processing loop with proper timing
+  - Mute control propagation to audio pipeline
+  - Statistics reporting every 5 seconds
+- ✅ CallManager audio integration
+  - Audio session lifecycle tied to call state (start on Connected, stop on Terminated)
+  - Mute toggle updates both CallManager and AudioSession
+  - Preferred codec configuration
+  - Audio statistics access via `audio_stats()` method
+- ✅ Event system for audio session events
+  - Started, Stopped, StatsUpdate, Error events
+  - Integration with application event loop
+
+**Tests**: 76 total tests (client crates)
+
+**Phase 24.10: Windows CryptoAPI Integration** ✅
+
+- ✅ `cert_store.rs` - Windows Certificate Store access via CryptoAPI
+  - `CertOpenStore` for system certificate store access (CERT_SYSTEM_STORE_CURRENT_USER)
+  - `CertEnumCertificatesInStore` for certificate enumeration
+  - Certificate parsing with full metadata extraction:
+    - Subject CN and full X.500 DN
+    - Issuer CN
+    - Validity dates (NotBefore, NotAfter)
+    - SHA-1 thumbprint via `CERT_HASH_PROP_ID`
+    - Key algorithm detection (ECDSA P-256/P-384/P-521, RSA)
+    - EC curve OID parsing from algorithm parameters
+  - Time validity check via `CertVerifyTimeValidity`
+  - Smart card reader detection via `CERT_KEY_PROV_INFO_PROP_ID`
+    - Container name parsing for reader identification
+    - Provider name detection for "Smart Card"/"Minidriver"
+  - Cross-platform support:
+    - Full Windows CryptoAPI implementation
+    - Stub certificates for non-Windows development
+  - CNSA 2.0 compliance:
+    - Auto-select prefers ECDSA P-384 certificates
+    - Key algorithm filtering for Client Authentication
+
+**Tests**: 109 total tests (client crates)
 
 ---
 

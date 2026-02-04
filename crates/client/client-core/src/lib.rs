@@ -18,15 +18,19 @@
 #![cfg_attr(test, allow(clippy::panic))]
 
 pub mod app;
+pub mod audio_session;
 pub mod call_manager;
 pub mod cert_store;
 pub mod contact_manager;
 pub mod settings;
 
 pub use app::{AppEvent, AppState, ClientApp};
+pub use audio_session::{
+    AudioSession, AudioSessionConfig, AudioSessionConfigBuilder, AudioSessionEvent,
+};
 pub use call_manager::{CallManager, CallManagerEvent};
 pub use cert_store::{CertStoreError, CertStoreResult, CertificateStore};
-pub use contact_manager::{create_contact, ContactManager, ContactStore};
+pub use contact_manager::{ContactManager, ContactStore, create_contact};
 pub use settings::{GeneralSettings, NetworkSettings, Settings, SettingsManager, UiSettings};
 
 use thiserror::Error;

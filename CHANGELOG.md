@@ -330,6 +330,45 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
     - SRTP context setup with `SrtpKeyMaterial`
     - Mute control and pipeline statistics aggregation
 
+**Phase 24.9: Audio Integration**
+
+- `client-core` audio session management
+  - `audio_session.rs`: Bridge between MediaSession and AudioPipeline
+    - `AudioSession` coordinates SRTP keys with audio pipeline
+    - `AudioSessionConfig` for flexible configuration
+    - `AudioSessionConfigBuilder` for fluent API
+    - 20ms audio processing loop via `tokio::time::interval`
+    - Proper tick behavior (`MissedTickBehavior::Skip`)
+    - Statistics reporting every 5 seconds
+    - `AudioSessionEvent`: Started, Stopped, StatsUpdate, Error
+  - `CallManager` audio integration
+    - Audio session starts on `CallState::Connected`
+    - Audio session stops on `CallState::Terminated`
+    - `toggle_mute()` propagates to audio session
+    - `audio_stats()` for real-time pipeline statistics
+    - `set_preferred_codec()` for codec selection
+  - 4 new tests for AudioSession
+
+**Phase 24.10: Windows CryptoAPI Integration**
+
+- `client-core` certificate store implementation
+  - `cert_store.rs`: Full Windows CryptoAPI integration
+    - `CertificateStore` for managing certificates from Windows Certificate Store
+    - `CertificateInfo` with subject, issuer, validity dates, thumbprint, key algorithm
+    - `CertOpenStore` for MY (Personal) certificate store access
+    - `CertEnumCertificatesInStore` for certificate enumeration
+    - `CertGetNameStringW` / `CertNameToStrW` for name extraction
+    - `CertGetCertificateContextProperty` for smart card detection
+    - `CertVerifyTimeValidity` for validity checking
+    - EC curve OID parsing (P-256, P-384, P-521 detection)
+    - Smart card reader detection via `CERT_KEY_PROV_INFO_PROP_ID`
+    - CNSA 2.0 preference: prioritizes P-384 certificates
+  - Cross-platform support
+    - Full Windows implementation with `#[cfg(windows)]`
+    - Stub certificate data for non-Windows platforms (development/testing)
+    - `list_smart_card_readers()` returns detected readers on Windows
+  - 7 tests for certificate store functionality
+
 **Security**
 
 - Smart card authentication ONLY (CAC/PIV/SIPR token)
