@@ -251,6 +251,129 @@ impl CallAgent {
         }
     }
 
+    /// Puts a call on hold by sending a re-INVITE with hold SDP.
+    ///
+    /// The hold SDP uses `a=sendonly` direction to indicate we're putting the call on hold.
+    /// This stops sending media but continues receiving.
+    pub async fn hold_call(&mut self, call_id: &str, hold_sdp: &str) -> SipUaResult<()> {
+        let session = self
+            .calls
+            .get(call_id)
+            .ok_or_else(|| SipUaError::InvalidState("Call not found".to_string()))?;
+
+        if session.state != CallState::Connected {
+            return Err(SipUaError::InvalidState(format!(
+                "Cannot hold call in state {:?}",
+                session.state
+            )));
+        }
+
+        info!(call_id = %call_id, "Putting call on hold");
+
+        self.send_reinvite(call_id, hold_sdp, true).await
+    }
+
+    /// Resumes a held call by sending a re-INVITE with normal SDP.
+    ///
+    /// The resume SDP uses `a=sendrecv` direction to restore bidirectional media.
+    pub async fn resume_call(&mut self, call_id: &str, resume_sdp: &str) -> SipUaResult<()> {
+        let session = self
+            .calls
+            .get(call_id)
+            .ok_or_else(|| SipUaError::InvalidState("Call not found".to_string()))?;
+
+        if session.state != CallState::OnHold {
+            return Err(SipUaError::InvalidState(format!(
+                "Cannot resume call in state {:?}",
+                session.state
+            )));
+        }
+
+        info!(call_id = %call_id, "Resuming held call");
+
+        self.send_reinvite(call_id, resume_sdp, false).await
+    }
+
+    /// Sends a re-INVITE with new SDP.
+    ///
+    /// Used for hold/resume and other mid-call SDP renegotiation.
+    async fn send_reinvite(&mut self, call_id: &str, sdp: &str, is_hold: bool) -> SipUaResult<()> {
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag) = {
+            let session = self
+                .calls
+                .get_mut(call_id)
+                .ok_or_else(|| SipUaError::InvalidState("Call not found".to_string()))?;
+
+            session.cseq += 1;
+            session.local_sdp = Some(sdp.to_string());
+
+            (
+                session.remote_uri.clone(),
+                session.sip_call_id.clone(),
+                session.cseq,
+                session.from_tag.clone(),
+                session.to_tag.clone(),
+            )
+        };
+
+        let destination = Self::parse_destination(&remote_uri)?;
+        let branch = generate_branch();
+
+        // Build re-INVITE request
+        let request = Self::build_reinvite_request_static(
+            &remote_uri,
+            &self.aor,
+            &self.display_name,
+            self.local_addr,
+            &sip_call_id,
+            cseq,
+            &from_tag,
+            to_tag.as_deref(),
+            &branch,
+            sdp,
+        )?;
+
+        // Create INVITE transaction for re-INVITE
+        let tx_key = TransactionKey::client(&branch, "INVITE");
+        let transaction = ClientInviteTransaction::new(tx_key, TransportType::Reliable);
+
+        if let Some(session) = self.calls.get_mut(call_id) {
+            session.invite_transaction = Some(transaction);
+            session.last_branch = Some(branch);
+        }
+
+        // Send request
+        self.event_tx
+            .send(CallEvent::SendRequest {
+                request,
+                destination,
+            })
+            .await
+            .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+        // Transition state based on hold/resume
+        let new_state = if is_hold {
+            CallState::OnHold
+        } else {
+            CallState::Connected
+        };
+
+        if let Some(session) = self.calls.get_mut(call_id) {
+            session.state = new_state;
+        }
+
+        self.event_tx
+            .send(CallEvent::StateChanged {
+                call_id: call_id.to_string(),
+                state: new_state,
+                info: None,
+            })
+            .await
+            .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+        Ok(())
+    }
+
     /// Handles a received SIP response.
     pub async fn handle_response(
         &mut self,
@@ -1088,6 +1211,67 @@ impl CallAgent {
             .call_id(sip_call_id)
             .cseq(cseq)
             .max_forwards(70)
+            .build()
+            .map_err(|e| SipUaError::TransactionError(e.to_string()))?;
+
+        Ok(request)
+    }
+
+    /// Builds a re-INVITE request for mid-call SDP renegotiation (hold/resume).
+    #[allow(clippy::too_many_arguments)]
+    fn build_reinvite_request_static(
+        remote_uri_str: &str,
+        aor: &str,
+        display_name: &str,
+        local_addr: SocketAddr,
+        sip_call_id: &str,
+        cseq: u32,
+        from_tag: &str,
+        to_tag: Option<&str>,
+        branch: &str,
+        sdp: &str,
+    ) -> SipUaResult<SipRequest> {
+        let remote_uri: SipUri = remote_uri_str
+            .parse()
+            .map_err(|e| SipUaError::ConfigError(format!("Invalid remote URI: {e}")))?;
+
+        let aor_uri: SipUri = aor
+            .parse()
+            .map_err(|e| SipUaError::ConfigError(format!("Invalid AOR: {e}")))?;
+
+        let via = ViaHeader::new("TLS", &local_addr.ip().to_string())
+            .with_port(local_addr.port())
+            .with_branch(branch.to_string());
+
+        let from = NameAddr::new(aor_uri.clone())
+            .with_display_name(display_name)
+            .with_tag(from_tag.to_string());
+
+        let mut to = NameAddr::new(remote_uri.clone());
+        if let Some(tag) = to_tag {
+            to = to.with_tag(tag.to_string());
+        }
+
+        // Contact header for in-dialog request
+        let mut contact_uri = SipUri::new(local_addr.ip().to_string())
+            .with_port(local_addr.port())
+            .with_param("transport", Some("tls".to_string()));
+        if let Some(user) = &aor_uri.user {
+            contact_uri = contact_uri.with_user(user.clone());
+        }
+        let contact = NameAddr::new(contact_uri);
+
+        let request = RequestBuilder::invite(remote_uri)
+            .via(&via)
+            .from(&from)
+            .to(&to)
+            .call_id(sip_call_id)
+            .cseq(cseq)
+            .max_forwards(70)
+            .contact(&contact)
+            .user_agent(USER_AGENT)
+            .content_type("application/sdp")
+            .body(bytes::Bytes::from(sdp.as_bytes().to_vec()))
             .build()
             .map_err(|e| SipUaError::TransactionError(e.to_string()))?;
 

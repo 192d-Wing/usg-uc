@@ -882,8 +882,22 @@ impl SipClientApp {
                 }
             }
             crate::views::CallAction::Hold => {
-                // TODO: Implement hold
-                self.status_message = "Hold not yet implemented".to_string();
+                if let Some(ref mut app) = self.client_app {
+                    let runtime = self.runtime.clone();
+                    match runtime.block_on(app.toggle_hold()) {
+                        Ok(is_on_hold) => {
+                            self.status_message = if is_on_hold {
+                                "Call on hold".to_string()
+                            } else {
+                                "Call resumed".to_string()
+                            };
+                        }
+                        Err(e) => {
+                            self.error_message = Some(format!("Failed to toggle hold: {e}"));
+                            self.show_error_dialog = true;
+                        }
+                    }
+                }
             }
             crate::views::CallAction::Accept { call_id } => {
                 info!(call_id = %call_id, "Accepting incoming call");

@@ -843,6 +843,96 @@ impl CallManager {
         self.is_muted
     }
 
+    /// Puts the active call on hold.
+    ///
+    /// Sends a re-INVITE with `a=sendonly` direction to put media on hold.
+    pub async fn hold_call(&mut self) -> AppResult<()> {
+        let call_id = self
+            .active_call_id
+            .as_ref()
+            .ok_or_else(|| AppError::Sip("No active call".to_string()))?
+            .clone();
+
+        info!(call_id = %call_id, "Putting call on hold");
+
+        // Generate hold SDP with sendonly direction
+        let hold_sdp = self.generate_hold_sdp(&call_id)?;
+
+        // Send re-INVITE via call agent
+        self.call_agent
+            .hold_call(&call_id, &hold_sdp)
+            .await
+            .map_err(|e| AppError::Sip(e.to_string()))?;
+
+        // Pause audio session
+        if let Some(audio_session) = self.audio_sessions.get(&call_id) {
+            audio_session.set_muted(true);
+        }
+
+        Ok(())
+    }
+
+    /// Resumes a held call.
+    ///
+    /// Sends a re-INVITE with `a=sendrecv` direction to restore bidirectional media.
+    pub async fn resume_call(&mut self) -> AppResult<()> {
+        let call_id = self
+            .active_call_id
+            .as_ref()
+            .ok_or_else(|| AppError::Sip("No active call".to_string()))?
+            .clone();
+
+        info!(call_id = %call_id, "Resuming call");
+
+        // Generate resume SDP with sendrecv direction
+        let resume_sdp = self.generate_resume_sdp(&call_id)?;
+
+        // Send re-INVITE via call agent
+        self.call_agent
+            .resume_call(&call_id, &resume_sdp)
+            .await
+            .map_err(|e| AppError::Sip(e.to_string()))?;
+
+        // Resume audio session
+        if let Some(audio_session) = self.audio_sessions.get(&call_id) {
+            audio_session.set_muted(self.is_muted);
+        }
+
+        Ok(())
+    }
+
+    /// Toggles hold state for the active call.
+    ///
+    /// If the call is connected, puts it on hold.
+    /// If the call is on hold, resumes it.
+    pub async fn toggle_hold(&mut self) -> AppResult<bool> {
+        let call_id = self
+            .active_call_id
+            .as_ref()
+            .ok_or_else(|| AppError::Sip("No active call".to_string()))?
+            .clone();
+
+        let state = self
+            .call_agent
+            .get_state(&call_id)
+            .ok_or_else(|| AppError::Sip("Call not found".to_string()))?;
+
+        match state {
+            CallState::Connected => {
+                self.hold_call().await?;
+                Ok(true) // Now on hold
+            }
+            CallState::OnHold => {
+                self.resume_call().await?;
+                Ok(false) // No longer on hold
+            }
+            _ => Err(AppError::Sip(format!(
+                "Cannot toggle hold in state {:?}",
+                state
+            ))),
+        }
+    }
+
     /// Returns the active call ID.
     pub fn active_call_id(&self) -> Option<&str> {
         self.active_call_id.as_deref()
@@ -1108,6 +1198,66 @@ impl CallManager {
             ufrag = creds.ufrag,
             pwd = creds.pwd,
             fingerprint = fingerprint,
+            ssrc = ssrc,
+            cname = account.id,
+        );
+
+        Ok(sdp)
+    }
+
+    /// Generates SDP for putting a call on hold (sendonly direction).
+    fn generate_hold_sdp(&self, call_id: &str) -> AppResult<String> {
+        self.generate_sdp_with_direction(call_id, "sendonly")
+    }
+
+    /// Generates SDP for resuming a call (sendrecv direction).
+    fn generate_resume_sdp(&self, call_id: &str) -> AppResult<String> {
+        self.generate_sdp_with_direction(call_id, "sendrecv")
+    }
+
+    /// Generates SDP with the specified media direction.
+    fn generate_sdp_with_direction(&self, call_id: &str, direction: &str) -> AppResult<String> {
+        let session = self
+            .media_sessions
+            .get(call_id)
+            .ok_or_else(|| AppError::Sip("No media session for call".to_string()))?;
+
+        let account = self
+            .account
+            .as_ref()
+            .ok_or_else(|| AppError::Sip("No account configured".to_string()))?;
+
+        let creds = session.local_ice_credentials();
+        let fingerprint = session.local_dtls_fingerprint();
+        let ssrc = session.local_ssrc();
+
+        // Generate SDP with specified direction
+        let sdp = format!(
+            "v=0\r\n\
+             o=- {session_id} {session_version} IN IP4 {ip}\r\n\
+             s=USG SIP Client\r\n\
+             c=IN IP4 {ip}\r\n\
+             t=0 0\r\n\
+             m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8\r\n\
+             a=rtpmap:111 opus/48000/2\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=rtpmap:8 PCMA/8000\r\n\
+             a=ice-ufrag:{ufrag}\r\n\
+             a=ice-pwd:{pwd}\r\n\
+             a=fingerprint:sha-384 {fingerprint}\r\n\
+             a=setup:actpass\r\n\
+             a=mid:audio\r\n\
+             a={direction}\r\n\
+             a=rtcp-mux\r\n\
+             a=ssrc:{ssrc} cname:{cname}\r\n",
+            session_id = session_id(),
+            session_version = 2, // Increment version for re-INVITE
+            ip = self.local_media_addr.ip(),
+            port = self.local_media_addr.port(),
+            ufrag = creds.ufrag,
+            pwd = creds.pwd,
+            fingerprint = fingerprint,
+            direction = direction,
             ssrc = ssrc,
             cname = account.id,
         );

@@ -1016,21 +1016,28 @@ This document outlines the development roadmap for the USG Session Border Contro
   - Certificate chain visualization
   - TLS version in status bar
 
-**Phase 24.22: Hold/Resume** 🚧
+**Phase 24.22: Hold/Resume** ✅
 
-- 🚧 Send re-INVITE with hold SDP
-  - Set media direction to `sendonly` or `inactive`
-  - Handle 200 OK response
-- 🚧 Resume with re-INVITE
-  - Restore media direction to `sendrecv`
-  - Resume audio pipeline
-- 🚧 Hold/Resume UI
-  - Hold button in active call view
-  - Visual indicator for held calls
-  - Multiple held calls support
-- 🚧 Music on hold (optional)
-  - Play local audio file while on hold
-  - Configurable hold music
+- ✅ Send re-INVITE with hold SDP
+  - CallAgent `hold_call()` method with `a=sendonly` direction
+  - CallAgent `build_reinvite_request_static()` for re-INVITE construction
+  - ClientInviteTransaction for tracking re-INVITE response
+- ✅ Resume with re-INVITE
+  - CallAgent `resume_call()` method with `a=sendrecv` direction
+  - Shared `send_reinvite()` helper for both operations
+- ✅ Hold/Resume in CallManager
+  - `hold_call()` generates hold SDP and pauses audio
+  - `resume_call()` generates resume SDP and restores audio
+  - `toggle_hold()` switches between Connected and OnHold states
+  - `generate_sdp_with_direction()` helper for SDP generation
+- ✅ Hold/Resume UI integration
+  - `toggle_hold()` method in ClientApp
+  - Hold action handler in GUI app.rs
+  - Status messages for hold/resume feedback
+- 🚧 Future enhancements
+  - Visual indicator for held calls in call view
+  - Multiple held calls support (call waiting)
+  - Music on hold (local audio file playback)
 
 ---
 

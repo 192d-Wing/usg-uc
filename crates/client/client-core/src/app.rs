@@ -406,6 +406,13 @@ impl ClientApp {
         self.call_manager.is_muted()
     }
 
+    /// Toggles hold state for the active call.
+    ///
+    /// Returns `true` if call is now on hold, `false` if resumed.
+    pub async fn toggle_hold(&mut self) -> AppResult<bool> {
+        self.call_manager.toggle_hold().await
+    }
+
     /// Returns the current application state.
     pub fn state(&self) -> AppState {
         self.state

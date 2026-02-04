@@ -657,6 +657,26 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - `ConfirmInsecureMode` - User confirmation for insecure mode
 - Total: 94 tests passing (28 client-types, 66 client-core)
 
+#### Phase 24.22: Hold/Resume
+
+- `client-sip-ua/src/call_agent.rs` - SIP re-INVITE for hold/resume
+  - `hold_call()` - Put call on hold via re-INVITE with `a=sendonly` SDP
+  - `resume_call()` - Resume held call via re-INVITE with `a=sendrecv` SDP
+  - `send_reinvite()` - Shared helper for building and sending re-INVITE
+  - `build_reinvite_request_static()` - Constructs re-INVITE SIP request
+  - ClientInviteTransaction for tracking re-INVITE responses
+- `client-core/src/call_manager.rs` - High-level hold/resume API
+  - `hold_call()` - Generates hold SDP, sends re-INVITE, pauses audio
+  - `resume_call()` - Generates resume SDP, sends re-INVITE, restores audio
+  - `toggle_hold()` - Switches between Connected and OnHold states
+  - `generate_hold_sdp()` / `generate_resume_sdp()` - SDP direction helpers
+  - `generate_sdp_with_direction()` - Common SDP generation with configurable direction
+- `client-core/src/app.rs` - Expose hold toggle to GUI
+  - `toggle_hold()` - Returns true if now on hold, false if resumed
+- `client-gui/src/app.rs` - Handle Hold action from UI
+  - CallAction::Hold handler calls toggle_hold() and displays status
+- Total: 88 tests passing (22 client-sip-ua, 66 client-core)
+
 **Dependencies Added**
 
 - `rustls-native-certs` 0.8: Platform-specific CA certificate loading
