@@ -289,10 +289,28 @@ impl Runtime {
         });
 
         // Spawn gRPC server task (if enabled)
-        #[cfg(feature = "grpc")]
+        #[cfg(all(feature = "grpc", not(feature = "cluster")))]
         let grpc_handle = if grpc_config.enabled {
             let grpc_server =
                 GrpcServer::new(grpc_config, Arc::clone(&app_state), signal.clone());
+            Some(tokio::spawn(async move {
+                if let Err(e) = grpc_server.run().await {
+                    error!("gRPC server error: {e}");
+                }
+            }))
+        } else {
+            debug!("gRPC server disabled by configuration");
+            None
+        };
+
+        #[cfg(all(feature = "grpc", feature = "cluster"))]
+        let grpc_handle = if grpc_config.enabled {
+            let grpc_server = GrpcServer::new(
+                grpc_config,
+                Arc::clone(&app_state),
+                signal.clone(),
+                self.cluster.clone(),
+            );
             Some(tokio::spawn(async move {
                 if let Err(e) = grpc_server.run().await {
                     error!("gRPC server error: {e}");

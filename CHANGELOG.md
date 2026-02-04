@@ -41,12 +41,16 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 - `HealthServiceImpl`: Standard gRPC health Check and Watch RPCs
 - `CallServiceImpl`: ListCalls, GetCall, TerminateCall, GetCallStats, WatchCalls RPCs
 - `RegistrationServiceImpl`: ListRegistrations, GetRegistration, DeleteRegistration, GetRegistrationStats RPCs
+- `ClusterServiceImpl`: GetClusterStatus, ListNodes, GetNodeStatus, DrainNode, WatchCluster RPCs (cluster feature)
+- ClusterService maps internal NodeRole/NodeState to protobuf enums
+- ClusterService aggregates health from storage, discovery, and location services
 - `GrpcConfig` schema in sbc-config for server configuration
-- Feature-gated behind `grpc` feature flag
+- Feature-gated behind `grpc` feature flag (ClusterService also requires `cluster` feature)
 - Integrated into Runtime with graceful shutdown support
+- Runtime passes ClusterManager to GrpcServer when cluster feature enabled
 - Default port 9090 (alongside REST API on 8080)
 - TLS/mTLS support via `ServerTlsConfig` with certificate and CA configuration
-- 57 tests passing for daemon crate
+- 61 tests passing for daemon crate (with cluster feature)
 
 **Configuration Schema** (`sbc-config/schema.rs`)
 

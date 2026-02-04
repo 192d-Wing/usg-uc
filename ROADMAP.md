@@ -1552,11 +1552,21 @@ This document outlines the development roadmap for the USG Session Border Contro
   - `request_timeout_secs`: Request timeout
   - `enable_reflection`: gRPC reflection service
 
+**ClusterService gRPC** (`sbc-daemon`, cluster feature) ✅
+
+- ✅ `ClusterServiceImpl`: GetClusterStatus, ListNodes, GetNodeStatus, DrainNode, WatchCluster RPCs
+- ✅ InitiateFailover and UndoFailover RPCs (stubs pending FailoverCoordinator integration)
+- ✅ NodeRole and NodeState mapping to protobuf enums
+- ✅ ClusterHealth aggregation from storage, discovery, and location services
+- ✅ Feature-gated behind `cluster` feature flag
+- ✅ Runtime integration passes ClusterManager to GrpcServer when cluster enabled
+- ✅ 61 tests passing with cluster feature
+
 **Pending**
 
-- 🚧 ClusterService implementation (cluster feature)
 - 🚧 gRPC reflection service
 - 🚧 Integration tests for gRPC services
+- 🚧 Full FailoverCoordinator integration for InitiateFailover/UndoFailover
 
 ---
 

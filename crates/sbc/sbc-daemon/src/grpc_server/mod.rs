@@ -20,11 +20,15 @@
 //! - **IA-3**: Device Identification (mTLS support)
 
 mod call_service;
+#[cfg(feature = "cluster")]
+mod cluster_service;
 mod config_service;
 mod health_service;
 mod registration_service;
 mod system_service;
 
+#[cfg(feature = "cluster")]
+use crate::cluster::ClusterManager;
 use crate::api_server::AppState;
 use crate::shutdown::ShutdownSignal;
 use sbc_config::schema::GrpcConfig;
@@ -33,6 +37,8 @@ use sbc_grpc_api::sbc::call_service_server::CallServiceServer;
 use sbc_grpc_api::sbc::config_service_server::ConfigServiceServer;
 use sbc_grpc_api::sbc::registration_service_server::RegistrationServiceServer;
 use sbc_grpc_api::sbc::system_service_server::SystemServiceServer;
+#[cfg(feature = "cluster")]
+use sbc_grpc_api::sbc::cluster_service_server::ClusterServiceServer;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tonic::transport::Server;
@@ -40,6 +46,8 @@ use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tracing::{info, warn};
 
 pub use call_service::CallServiceImpl;
+#[cfg(feature = "cluster")]
+pub use cluster_service::ClusterServiceImpl;
 pub use config_service::ConfigServiceImpl;
 pub use health_service::HealthServiceImpl;
 pub use registration_service::RegistrationServiceImpl;
@@ -53,6 +61,9 @@ pub struct GrpcServer {
     state: Arc<AppState>,
     /// Shutdown signal.
     shutdown: ShutdownSignal,
+    /// Cluster manager (when cluster feature is enabled).
+    #[cfg(feature = "cluster")]
+    cluster: Option<Arc<ClusterManager>>,
 }
 
 /// Error type for gRPC server operations.
@@ -97,11 +108,28 @@ impl std::error::Error for GrpcServerError {}
 
 impl GrpcServer {
     /// Creates a new gRPC server.
+    #[cfg(not(feature = "cluster"))]
     pub const fn new(config: GrpcConfig, state: Arc<AppState>, shutdown: ShutdownSignal) -> Self {
         Self {
             config,
             state,
             shutdown,
+        }
+    }
+
+    /// Creates a new gRPC server with optional cluster support.
+    #[cfg(feature = "cluster")]
+    pub const fn new(
+        config: GrpcConfig,
+        state: Arc<AppState>,
+        shutdown: ShutdownSignal,
+        cluster: Option<Arc<ClusterManager>>,
+    ) -> Self {
+        Self {
+            config,
+            state,
+            shutdown,
+            cluster,
         }
     }
 
@@ -141,12 +169,34 @@ impl GrpcServer {
             Server::builder()
         };
 
+        // Build router with core services
+        #[cfg(not(feature = "cluster"))]
         let router = server
             .add_service(ConfigServiceServer::new(config_svc))
             .add_service(SystemServiceServer::new(system_svc))
             .add_service(HealthServer::new(health_svc))
             .add_service(CallServiceServer::new(call_svc))
             .add_service(RegistrationServiceServer::new(registration_svc));
+
+        // Build router with core services and optional cluster service
+        #[cfg(feature = "cluster")]
+        let router = {
+            let base = server
+                .add_service(ConfigServiceServer::new(config_svc))
+                .add_service(SystemServiceServer::new(system_svc))
+                .add_service(HealthServer::new(health_svc))
+                .add_service(CallServiceServer::new(call_svc))
+                .add_service(RegistrationServiceServer::new(registration_svc));
+
+            // Add ClusterService if cluster manager is available
+            if let Some(cluster) = &self.cluster {
+                let cluster_svc = ClusterServiceImpl::new(Arc::clone(&self.state), Arc::clone(cluster));
+                info!("ClusterService enabled");
+                base.add_service(ClusterServiceServer::new(cluster_svc))
+            } else {
+                base
+            }
+        };
 
         // Run with graceful shutdown
         let shutdown = self.shutdown.clone();
