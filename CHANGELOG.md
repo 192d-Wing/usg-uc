@@ -1031,12 +1031,18 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
     - T3-rtx expiration triggers retransmissions
     - Heartbeat timer sends HEARTBEAT chunks with RTT timestamps
     - Fast retransmit chunks sent on each timer tick
+    - UDP encapsulation for NAT traversal (RFC 6951):
+      - `use_udp_encapsulation` and `udp_encap_config` in ConnectedSctpConfig
+      - Builder methods: `with_udp_encapsulation()`, `with_udp_encap_ports()`
+      - `encode_packet()` and `decode_packet()` with automatic encapsulation
+      - `is_udp_encapsulated()` accessor
+      - 8-byte overhead per packet for UDP header
   - `sctp/timer.rs` - Timer enhancements:
     - Heartbeat timer support with RTT calculation
   - Cryptographically secure random via `rand` crate
   - `SctpAssociation` stub deprecated in favor of `ConnectedSctpAssociation`
   - Feature flag: `sctp` (optional, requires `crc32c`, `rand`)
-  - 26+ unit tests
+  - 35+ unit tests
 
 **uc-snmp - SNMP Trap Generation**
 

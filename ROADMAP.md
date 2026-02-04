@@ -550,9 +550,14 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ Message fragmentation/reassembly based on path MTU
 - ✅ Cryptographically secure random (rand crate)
 - ✅ SctpAssociation stub deprecated in favor of ConnectedSctpAssociation
-- 🚧 Remaining: ECNE/CWR for ECN support, comprehensive RFC compliance tests, UDP encapsulation (RFC 6951)
+- ✅ UDP encapsulation for NAT traversal (RFC 6951)
+  - `use_udp_encapsulation` and `udp_encap_config` in ConnectedSctpConfig
+  - Builder methods: `with_udp_encapsulation()`, `with_udp_encap_ports()`
+  - Automatic encapsulation/decapsulation in I/O paths
+  - 8-byte overhead per packet for UDP header
+- 🚧 Remaining: ECNE/CWR for ECN support (optional), comprehensive RFC compliance tests
 
-**Tests**: 25 new tests (T.38 crate), 26+ tests (SCTP)
+**Tests**: 25 new tests (T.38 crate), 35+ tests (SCTP)
 
 ### 🚧 Phase 24: SIP Soft Client (In Progress)
 
