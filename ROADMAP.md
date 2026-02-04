@@ -962,21 +962,25 @@ This document outlines the development roadmap for the USG Session Border Contro
   - Settings flag for auto-answer
   - Configurable delay before auto-answer
 
-**Phase 24.19: Full End-to-End Call Testing** 🚧
+**Phase 24.19: Full End-to-End Call Testing** ✅
 
-- 🚧 Integration test infrastructure
-  - Mock SIP server for test scenarios
-  - Test certificate generation
-  - Audio mock for testing without hardware
-- 🚧 Test scenarios
+- ✅ Integration test infrastructure
+  - Mock SIP server with INVITE helpers (create_invite_request, basic_sdp_offer)
+  - Provisional response generators (100 Trying, 180 Ringing)
+  - Final response generators (486 Busy, 603 Decline, 200 OK)
+  - BYE request/response generators for call termination
+  - Unique test ID generation for SIP branches and tags
+- ✅ Test scenarios
+  - Incoming call accept and reject (6 tests)
+  - Incoming INVITE handling with provisional responses
+  - Error handling for nonexistent calls
+  - Incoming call list tracking
+  - Mock server format validation (7 tests)
+- 🚧 Future test scenarios
   - Outbound call establishment and teardown
-  - Incoming call accept and reject
   - Call failure handling (4xx, 5xx responses)
-  - Registration and re-registration
-  - mTLS authentication
-- 🚧 Performance testing
-  - Call setup latency measurement
-  - Audio pipeline throughput
+  - mTLS authentication end-to-end
+  - Performance testing (call setup latency, audio throughput)
 
 **Phase 24.20: Audio Pipeline Activation** 🚧
 

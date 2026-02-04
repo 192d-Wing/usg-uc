@@ -595,6 +595,32 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - `accept_incoming_call()` - Accept and transition to InCall
   - `reject_incoming_call()` - Reject with 486 Busy Here
 
+**Phase 24.19: Full End-to-End Call Testing**
+
+- `client-integration-tests/src/test_utils.rs` - Enhanced mock server
+  - `create_invite_request()` - Generate INVITE requests for testing
+  - `basic_sdp_offer()` - Generate test SDP offers with ICE/DTLS
+  - `invite_100_trying()` - Generate 100 Trying responses
+  - `invite_486_busy()` - Generate 486 Busy Here responses
+  - `invite_603_decline()` - Generate 603 Decline responses
+  - `create_bye_request()` - Generate BYE requests for call termination
+  - `bye_200_ok()` - Generate 200 OK for BYE
+  - `send_incoming_invite()` - Helper to simulate incoming calls
+  - `generate_test_id()` - Unique ID generation for test branches/tags
+- `client-integration-tests/src/call_flow_tests.rs` - Incoming call tests
+  - `incoming_call_tests` module with 6 new tests:
+    - `test_handle_incoming_invite` - INVITE handling with provisional responses
+    - `test_accept_incoming_call` - Call acceptance with 200 OK
+    - `test_reject_incoming_call` - Call rejection with 486 Busy
+    - `test_accept_nonexistent_call_fails` - Error handling
+    - `test_reject_nonexistent_call_fails` - Error handling
+    - `test_incoming_calls_list` - Incoming call tracking
+  - `mock_server_invite_tests` module with 7 tests:
+    - Tests for INVITE, SDP, 100/486/603 responses, BYE
+  - Helper function `parse_invite()` for parsing SIP messages
+- `client-core/src/lib.rs` - Export `IncomingCallInfo` for tests
+- Total: 54 integration tests passing
+
 **Dependencies Added**
 
 - `rustls-native-certs` 0.8: Platform-specific CA certificate loading

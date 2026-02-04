@@ -2,10 +2,26 @@
 
 use client_types::{CertificateInfo, SipAccount};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc};
 use tracing::info;
+
+/// Counter for generating unique test IDs.
+#[allow(dead_code)]
+static TEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Generates a unique ID for test purposes.
+#[allow(dead_code)]
+fn generate_test_id() -> String {
+    let id = TEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{:016x}{:016x}", timestamp, id)
+}
 
 /// Initialize tracing for tests (call once per test module).
 pub fn init_test_tracing() {
@@ -253,6 +269,182 @@ impl MockSipServer {
              a=sendrecv\r\n\
              a=rtcp-mux\r\n"
         )
+    }
+
+    /// Creates an INVITE request for simulating incoming calls.
+    pub fn create_invite_request(
+        caller_uri: &str,
+        caller_display: &str,
+        callee_uri: &str,
+        target_addr: SocketAddr,
+        call_id: &str,
+        sdp_offer: &str,
+    ) -> String {
+        let branch = format!("z9hG4bK-{}", generate_test_id());
+        let from_tag = format!("from-{}", generate_test_id());
+
+        format!(
+            "INVITE {callee_uri} SIP/2.0\r\n\
+             Via: SIP/2.0/TLS {target_addr};branch={branch}\r\n\
+             Max-Forwards: 70\r\n\
+             From: \"{caller_display}\" <{caller_uri}>;tag={from_tag}\r\n\
+             To: <{callee_uri}>\r\n\
+             Call-ID: {call_id}\r\n\
+             CSeq: 1 INVITE\r\n\
+             Contact: <{caller_uri}>\r\n\
+             Content-Type: application/sdp\r\n\
+             Content-Length: {}\r\n\
+             \r\n\
+             {sdp_offer}",
+            sdp_offer.len()
+        )
+    }
+
+    /// Creates a basic SDP offer for incoming call simulation.
+    pub fn basic_sdp_offer(media_port: u16, ice_ufrag: &str, ice_pwd: &str) -> String {
+        format!(
+            "v=0\r\n\
+             o=- 9876543210 1 IN IP4 192.168.1.100\r\n\
+             s=USG SIP Client\r\n\
+             c=IN IP4 192.168.1.100\r\n\
+             t=0 0\r\n\
+             m=audio {media_port} UDP/TLS/RTP/SAVPF 111 0 8\r\n\
+             a=rtpmap:111 opus/48000/2\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=rtpmap:8 PCMA/8000\r\n\
+             a=ice-ufrag:{ice_ufrag}\r\n\
+             a=ice-pwd:{ice_pwd}\r\n\
+             a=fingerprint:sha-384 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55\r\n\
+             a=setup:actpass\r\n\
+             a=mid:audio\r\n\
+             a=sendrecv\r\n\
+             a=rtcp-mux\r\n"
+        )
+    }
+
+    /// Creates a 100 Trying response for INVITE.
+    pub fn invite_100_trying(request: &str) -> String {
+        let via = extract_header(request, "Via:");
+        let from = extract_header(request, "From:");
+        let to = extract_header(request, "To:");
+        let call_id = extract_header(request, "Call-ID:");
+        let cseq = extract_header(request, "CSeq:");
+
+        format!(
+            "SIP/2.0 100 Trying\r\n\
+             Via: {via}\r\n\
+             From: {from}\r\n\
+             To: {to}\r\n\
+             Call-ID: {call_id}\r\n\
+             CSeq: {cseq}\r\n\
+             Content-Length: 0\r\n\
+             \r\n"
+        )
+    }
+
+    /// Creates a 486 Busy Here response for INVITE.
+    pub fn invite_486_busy(request: &str) -> String {
+        let via = extract_header(request, "Via:");
+        let from = extract_header(request, "From:");
+        let to = extract_header(request, "To:");
+        let call_id = extract_header(request, "Call-ID:");
+        let cseq = extract_header(request, "CSeq:");
+
+        format!(
+            "SIP/2.0 486 Busy Here\r\n\
+             Via: {via}\r\n\
+             From: {from}\r\n\
+             To: {to};tag=reject-tag-123\r\n\
+             Call-ID: {call_id}\r\n\
+             CSeq: {cseq}\r\n\
+             Content-Length: 0\r\n\
+             \r\n"
+        )
+    }
+
+    /// Creates a 603 Decline response for INVITE.
+    pub fn invite_603_decline(request: &str) -> String {
+        let via = extract_header(request, "Via:");
+        let from = extract_header(request, "From:");
+        let to = extract_header(request, "To:");
+        let call_id = extract_header(request, "Call-ID:");
+        let cseq = extract_header(request, "CSeq:");
+
+        format!(
+            "SIP/2.0 603 Decline\r\n\
+             Via: {via}\r\n\
+             From: {from}\r\n\
+             To: {to};tag=decline-tag-456\r\n\
+             Call-ID: {call_id}\r\n\
+             CSeq: {cseq}\r\n\
+             Content-Length: 0\r\n\
+             \r\n"
+        )
+    }
+
+    /// Creates a BYE request for call termination.
+    pub fn create_bye_request(
+        caller_uri: &str,
+        callee_uri: &str,
+        call_id: &str,
+        from_tag: &str,
+        to_tag: &str,
+        target_addr: SocketAddr,
+    ) -> String {
+        let branch = format!("z9hG4bK-{}", generate_test_id());
+
+        format!(
+            "BYE {callee_uri} SIP/2.0\r\n\
+             Via: SIP/2.0/TLS {target_addr};branch={branch}\r\n\
+             Max-Forwards: 70\r\n\
+             From: <{caller_uri}>;tag={from_tag}\r\n\
+             To: <{callee_uri}>;tag={to_tag}\r\n\
+             Call-ID: {call_id}\r\n\
+             CSeq: 2 BYE\r\n\
+             Content-Length: 0\r\n\
+             \r\n"
+        )
+    }
+
+    /// Creates a 200 OK response for BYE.
+    pub fn bye_200_ok(request: &str) -> String {
+        let via = extract_header(request, "Via:");
+        let from = extract_header(request, "From:");
+        let to = extract_header(request, "To:");
+        let call_id = extract_header(request, "Call-ID:");
+        let cseq = extract_header(request, "CSeq:");
+
+        format!(
+            "SIP/2.0 200 OK\r\n\
+             Via: {via}\r\n\
+             From: {from}\r\n\
+             To: {to}\r\n\
+             Call-ID: {call_id}\r\n\
+             CSeq: {cseq}\r\n\
+             Content-Length: 0\r\n\
+             \r\n"
+        )
+    }
+
+    /// Sends an INVITE to simulate an incoming call.
+    pub async fn send_incoming_invite(
+        &self,
+        dest: SocketAddr,
+        caller_uri: &str,
+        caller_display: &str,
+        callee_uri: &str,
+        call_id: &str,
+    ) {
+        let sdp = Self::basic_sdp_offer(5004, "caller-ufrag", "caller-password-here");
+        let invite = Self::create_invite_request(
+            caller_uri,
+            caller_display,
+            callee_uri,
+            self.addr,
+            call_id,
+            &sdp,
+        );
+        self.send(&invite, dest).await;
     }
 
     /// Stops the mock server.
