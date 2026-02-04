@@ -1,0 +1,39 @@
+[package]
+name = "client-integration-tests"
+description = "Integration tests for the Windows SIP Soft Client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Enable tests that require two client instances
+two_client = []
+
+[dependencies]
+# Client crates to test
+client-types.workspace = true
+client-core.workspace = true
+client-sip-ua.workspace = true
+client-audio.workspace = true
+
+# Protocol crates for mock server
+proto-sip.workspace = true
+proto-sdp.workspace = true
+proto-ice.workspace = true
+
+# Test utilities
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+tempfile.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lib]
+name = "client_integration_tests"
+path = "src/lib.rs"

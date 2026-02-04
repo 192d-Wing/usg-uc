@@ -75,6 +75,7 @@ members = [
     "crates/client/client-sip-ua",
     "crates/client/client-core",
     "crates/client/client-gui",
+    "crates/client/client-integration-tests",
 ]
 resolver = "2"
 
