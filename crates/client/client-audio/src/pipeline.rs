@@ -6,6 +6,7 @@
 
 use crate::codec::CodecPipeline;
 use crate::device::DeviceManager;
+use crate::file_source::FileAudioSource;
 use crate::jitter_buffer::JitterBufferResult;
 use crate::rtp_handler::{RtpReceiver, RtpStats, RtpTransmitter, generate_ssrc};
 use crate::stream::{CaptureStream, PlaybackStream};
@@ -49,6 +50,8 @@ pub struct PipelineConfig {
     pub srtp_master_salt: Option<Vec<u8>>,
     /// Whether transmit is muted.
     pub muted: bool,
+    /// Music on Hold file path (optional).
+    pub moh_file_path: Option<String>,
 }
 
 impl Default for PipelineConfig {
@@ -61,6 +64,7 @@ impl Default for PipelineConfig {
             srtp_master_key: None,
             srtp_master_salt: None,
             muted: false,
+            moh_file_path: None,
         }
     }
 }
@@ -106,6 +110,10 @@ pub struct AudioPipeline {
     running: Arc<AtomicBool>,
     /// Statistics.
     stats: Arc<std::sync::Mutex<PipelineStats>>,
+    /// Music on Hold audio source.
+    moh_source: Option<FileAudioSource>,
+    /// Whether MOH is currently active (call on hold).
+    moh_active: AtomicBool,
 }
 
 impl AudioPipeline {
@@ -124,6 +132,8 @@ impl AudioPipeline {
             muted: AtomicBool::new(false),
             running: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(std::sync::Mutex::new(PipelineStats::default())),
+            moh_source: None,
+            moh_active: AtomicBool::new(false),
         }
     }
 
@@ -219,6 +229,23 @@ impl AudioPipeline {
         // Start playback stream
         let playback = PlaybackStream::new(&self.device_manager)?;
 
+        // Load MOH if configured
+        let moh_source = if let Some(ref moh_path) = config.moh_file_path {
+            let mut source = FileAudioSource::new(clock_rate);
+            match source.load(moh_path) {
+                Ok(()) => {
+                    info!("MOH loaded: {:.2}s", source.duration_secs());
+                    Some(source)
+                }
+                Err(e) => {
+                    warn!("Failed to load MOH file: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Store components
         self.codec = Some(codec);
         self.transmitter = Some(transmitter);
@@ -226,6 +253,8 @@ impl AudioPipeline {
         self.socket = Some(socket);
         self.capture = Some(capture);
         self.playback = Some(playback);
+        self.moh_source = moh_source;
+        self.moh_active.store(false, Ordering::Relaxed);
         self.config = config;
         self.muted.store(self.config.muted, Ordering::Relaxed);
         self.running.store(true, Ordering::Relaxed);
@@ -395,6 +424,59 @@ impl AudioPipeline {
     /// Returns whether transmission is muted.
     pub fn is_muted(&self) -> bool {
         self.muted.load(Ordering::Relaxed)
+    }
+
+    /// Sets the Music on Hold active state.
+    ///
+    /// When MOH is active, `process_moh_frame` will send MOH audio instead of
+    /// using the microphone capture.
+    pub fn set_moh_active(&self, active: bool) {
+        self.moh_active.store(active, Ordering::Relaxed);
+        debug!("MOH active: {}", active);
+    }
+
+    /// Returns whether Music on Hold is currently active.
+    pub fn is_moh_active(&self) -> bool {
+        self.moh_active.load(Ordering::Relaxed)
+    }
+
+    /// Returns whether MOH audio has been loaded.
+    pub fn has_moh(&self) -> bool {
+        self.moh_source.as_ref().is_some_and(|s| s.is_loaded())
+    }
+
+    /// Processes one frame of MOH audio (read file -> encode -> send).
+    ///
+    /// This should be called instead of `process_capture_frame` when the call
+    /// is on hold and we want to send MOH to the remote party.
+    pub async fn process_moh_frame(&mut self) -> AudioResult<()> {
+        let moh_source = match self.moh_source.as_mut() {
+            Some(source) if source.is_loaded() => source,
+            _ => return Ok(()), // No MOH configured, do nothing
+        };
+
+        let codec = self
+            .codec
+            .as_mut()
+            .ok_or_else(|| AudioError::ConfigError("Pipeline not started".to_string()))?;
+
+        let transmitter = self
+            .transmitter
+            .as_mut()
+            .ok_or_else(|| AudioError::ConfigError("Transmitter not available".to_string()))?;
+
+        // Read samples from MOH file
+        let samples_needed = codec.samples_per_frame();
+        let mut pcm = vec![0i16; samples_needed];
+        moh_source.read(&mut pcm);
+
+        // Encode
+        let encoded = codec.encode(&pcm)?;
+
+        // Send
+        transmitter.send(encoded).await?;
+
+        Ok(())
     }
 
     /// Returns the current pipeline state.

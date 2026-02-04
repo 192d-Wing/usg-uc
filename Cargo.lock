@@ -1127,6 +1127,7 @@ dependencies = [
  "bytes",
  "client-types",
  "cpal",
+ "hound",
  "proto-rtp",
  "proto-srtp",
  "ringbuf",
@@ -2918,6 +2919,12 @@ dependencies = [
  "libc",
  "windows-link 0.2.1",
 ]
+
+[[package]]
+name = "hound"
+version = "3.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
 
 [[package]]
 name = "http"
@@ -7532,6 +7539,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "futures-util",
+ "rand 0.8.5",
  "rustls",
  "rustls-pki-types",
  "socket2 0.6.2",

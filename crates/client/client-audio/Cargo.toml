@@ -21,6 +21,9 @@ bytes.workspace = true
 cpal.workspace = true
 ringbuf.workspace = true
 
+# WAV file loading for Music on Hold
+hound = "3.5"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 

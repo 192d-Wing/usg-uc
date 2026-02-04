@@ -75,10 +75,16 @@ pub struct CallManager {
     account: Option<SipAccount>,
     /// Preferred codec for calls.
     preferred_codec: CodecPreference,
-    /// Active call ID (single call mode for now).
-    active_call_id: Option<String>,
+    /// Currently focused call ID (the one with active audio).
+    focused_call_id: Option<String>,
+    /// All active call IDs (including held calls).
+    active_calls: Vec<String>,
+    /// Maximum concurrent calls allowed (call waiting limit).
+    max_concurrent_calls: usize,
     /// Whether muted.
     is_muted: bool,
+    /// Music on Hold file path (optional).
+    moh_file_path: Option<String>,
 }
 
 /// Events emitted by the call manager.
@@ -183,8 +189,11 @@ impl CallManager {
             contact_manager: None,
             account: None,
             preferred_codec: CodecPreference::G711Ulaw,
-            active_call_id: None,
+            focused_call_id: None,
+            active_calls: Vec::new(),
+            max_concurrent_calls: 2, // Support call waiting with 2 calls
             is_muted: false,
+            moh_file_path: None,
         }
     }
 
@@ -212,6 +221,24 @@ impl CallManager {
         info!(codec = ?codec, "Preferred codec set");
     }
 
+    /// Sets the Music on Hold file path.
+    ///
+    /// The file should be a WAV file that will be played to the remote party
+    /// when a call is placed on hold.
+    pub fn set_moh_file_path(&mut self, path: Option<String>) {
+        self.moh_file_path = path.clone();
+        if let Some(ref p) = path {
+            info!(path = %p, "MOH file path set");
+        } else {
+            info!("MOH file path cleared");
+        }
+    }
+
+    /// Returns the currently configured MOH file path.
+    pub fn moh_file_path(&self) -> Option<&str> {
+        self.moh_file_path.as_deref()
+    }
+
     /// Returns the preferred codec.
     pub fn preferred_codec(&self) -> CodecPreference {
         self.preferred_codec
@@ -230,11 +257,21 @@ impl CallManager {
     /// # Returns
     /// Call ID on success.
     pub async fn make_call(&mut self, remote_uri: &str) -> AppResult<String> {
-        // Check if there's already an active call
-        if let Some(call_id) = &self.active_call_id {
+        // Check concurrent call limit
+        if self.active_calls.len() >= self.max_concurrent_calls {
             return Err(AppError::Sip(format!(
-                "Already have an active call: {call_id}"
+                "Maximum concurrent calls ({}) reached",
+                self.max_concurrent_calls
             )));
+        }
+
+        // If there's a focused call that's connected, put it on hold first (call waiting)
+        if let Some(ref focused_id) = self.focused_call_id.clone() {
+            let state = self.call_agent.get_state(&focused_id);
+            if state == Some(CallState::Connected) {
+                info!(call_id = %focused_id, "Auto-holding current call for new outbound call");
+                self.hold_call_by_id(&focused_id).await?;
+            }
         }
 
         // Verify we have an account configured
@@ -268,9 +305,10 @@ impl CallManager {
             .await
             .map_err(|e| AppError::Sip(e.to_string()))?;
 
-        // Store media session
+        // Store media session and track the call
         self.media_sessions.insert(call_id.clone(), media_session);
-        self.active_call_id = Some(call_id.clone());
+        self.active_calls.push(call_id.clone());
+        self.focused_call_id = Some(call_id.clone());
 
         // Notify application
         let info = CallInfo {
@@ -298,10 +336,10 @@ impl CallManager {
         Ok(call_id)
     }
 
-    /// Hangs up the current call.
+    /// Hangs up the currently focused call.
     pub async fn hangup(&mut self) -> AppResult<()> {
         let call_id = self
-            .active_call_id
+            .focused_call_id
             .as_ref()
             .ok_or_else(|| AppError::Sip("No active call".to_string()))?
             .clone();
@@ -333,9 +371,13 @@ impl CallManager {
                 .await;
         }
 
-        // Clear active call
-        if self.active_call_id.as_ref() == Some(&call_id.to_string()) {
-            self.active_call_id = None;
+        // Remove from active calls list
+        self.active_calls.retain(|id| id != call_id);
+
+        // Clear focused call if it was the one we hung up
+        if self.focused_call_id.as_ref() == Some(&call_id.to_string()) {
+            // If there are other calls, focus the first one
+            self.focused_call_id = self.active_calls.first().cloned();
         }
 
         // Notify application
@@ -483,9 +525,13 @@ impl CallManager {
 
         info!(source = %source, "Received incoming INVITE");
 
-        // Check if we already have an active call
-        if self.active_call_id.is_some() {
-            info!("Already have an active call, rejecting incoming with 486 Busy Here");
+        // Check if we've reached the concurrent call limit
+        if self.active_calls.len() >= self.max_concurrent_calls {
+            info!(
+                current = self.active_calls.len(),
+                max = self.max_concurrent_calls,
+                "At max concurrent calls, rejecting incoming with 486 Busy Here"
+            );
             // Send 486 Busy Here
             let response = build_response_from_request(request, StatusCode::BUSY_HERE, None);
             let _ = self
@@ -496,6 +542,14 @@ impl CallManager {
                 })
                 .await;
             return Ok(());
+        }
+
+        // If we have an active call, this is a call waiting scenario
+        if !self.active_calls.is_empty() {
+            info!(
+                existing_calls = self.active_calls.len(),
+                "Incoming call during active call (call waiting)"
+            );
         }
 
         // Extract caller info from From header
@@ -609,8 +663,8 @@ impl CallManager {
         );
 
         // Add Contact header - extract user from SIP URI
-        let username = extract_username_from_sip_uri(&account.sip_uri)
-            .unwrap_or_else(|| account.id.clone());
+        let username =
+            extract_username_from_sip_uri(&account.sip_uri).unwrap_or_else(|| account.id.clone());
         ok_response.add_header(proto_sip::header::Header::new(
             proto_sip::header::HeaderName::Contact,
             format!("<sip:{username}@{}>", self.local_media_addr.ip()),
@@ -639,10 +693,20 @@ impl CallManager {
             })
             .await;
 
-        // Store media session and set as active call
+        // If there's an existing focused call, put it on hold first
+        if let Some(ref focused_id) = self.focused_call_id.clone() {
+            let state = self.call_agent.get_state(&focused_id);
+            if state == Some(CallState::Connected) {
+                info!(call_id = %focused_id, "Auto-holding current call for incoming call");
+                self.hold_call_by_id(&focused_id).await?;
+            }
+        }
+
+        // Store media session and track the call
         self.media_sessions
             .insert(call_id.to_string(), media_session);
-        self.active_call_id = Some(call_id.to_string());
+        self.active_calls.push(call_id.to_string());
+        self.focused_call_id = Some(call_id.to_string());
 
         // Notify application of state change
         let info = CallInfo {
@@ -695,8 +759,11 @@ impl CallManager {
         );
 
         // Build rejection response
-        let response =
-            build_response_from_request(&incoming.invite_request, status, Some(&incoming.local_tag));
+        let response = build_response_from_request(
+            &incoming.invite_request,
+            status,
+            Some(&incoming.local_tag),
+        );
 
         // Send the rejection
         let _ = self
@@ -827,8 +894,8 @@ impl CallManager {
     pub fn toggle_mute(&mut self) -> bool {
         self.is_muted = !self.is_muted;
 
-        // Update audio session mute state
-        if let Some(call_id) = &self.active_call_id {
+        // Update audio session mute state for focused call
+        if let Some(call_id) = &self.focused_call_id {
             if let Some(session) = self.audio_sessions.get(call_id) {
                 session.set_muted(self.is_muted);
             }
@@ -843,71 +910,86 @@ impl CallManager {
         self.is_muted
     }
 
-    /// Puts the active call on hold.
+    /// Puts the focused call on hold.
     ///
     /// Sends a re-INVITE with `a=sendonly` direction to put media on hold.
     pub async fn hold_call(&mut self) -> AppResult<()> {
         let call_id = self
-            .active_call_id
+            .focused_call_id
             .as_ref()
             .ok_or_else(|| AppError::Sip("No active call".to_string()))?
             .clone();
 
+        self.hold_call_by_id(&call_id).await
+    }
+
+    /// Puts a specific call on hold by ID.
+    pub async fn hold_call_by_id(&mut self, call_id: &str) -> AppResult<()> {
         info!(call_id = %call_id, "Putting call on hold");
 
         // Generate hold SDP with sendonly direction
-        let hold_sdp = self.generate_hold_sdp(&call_id)?;
+        let hold_sdp = self.generate_hold_sdp(call_id)?;
 
         // Send re-INVITE via call agent
         self.call_agent
-            .hold_call(&call_id, &hold_sdp)
+            .hold_call(call_id, &hold_sdp)
             .await
             .map_err(|e| AppError::Sip(e.to_string()))?;
 
-        // Pause audio session
-        if let Some(audio_session) = self.audio_sessions.get(&call_id) {
-            audio_session.set_muted(true);
+        // Activate MOH for this call's audio session
+        if let Some(audio_session) = self.audio_sessions.get(call_id) {
+            // Enable MOH (will send MOH audio instead of microphone)
+            audio_session.set_moh_active(true).await;
+            debug!(call_id = %call_id, "MOH activated for held call");
         }
 
         Ok(())
     }
 
-    /// Resumes a held call.
+    /// Resumes the focused held call.
     ///
     /// Sends a re-INVITE with `a=sendrecv` direction to restore bidirectional media.
     pub async fn resume_call(&mut self) -> AppResult<()> {
         let call_id = self
-            .active_call_id
+            .focused_call_id
             .as_ref()
             .ok_or_else(|| AppError::Sip("No active call".to_string()))?
             .clone();
 
+        self.resume_call_by_id(&call_id).await
+    }
+
+    /// Resumes a specific held call by ID.
+    pub async fn resume_call_by_id(&mut self, call_id: &str) -> AppResult<()> {
         info!(call_id = %call_id, "Resuming call");
 
         // Generate resume SDP with sendrecv direction
-        let resume_sdp = self.generate_resume_sdp(&call_id)?;
+        let resume_sdp = self.generate_resume_sdp(call_id)?;
 
         // Send re-INVITE via call agent
         self.call_agent
-            .resume_call(&call_id, &resume_sdp)
+            .resume_call(call_id, &resume_sdp)
             .await
             .map_err(|e| AppError::Sip(e.to_string()))?;
 
-        // Resume audio session
-        if let Some(audio_session) = self.audio_sessions.get(&call_id) {
+        // Resume audio session and deactivate MOH
+        if let Some(audio_session) = self.audio_sessions.get(call_id) {
+            // Deactivate MOH (return to normal microphone capture)
+            audio_session.set_moh_active(false).await;
             audio_session.set_muted(self.is_muted);
+            debug!(call_id = %call_id, "MOH deactivated for resumed call");
         }
 
         Ok(())
     }
 
-    /// Toggles hold state for the active call.
+    /// Toggles hold state for the focused call.
     ///
     /// If the call is connected, puts it on hold.
     /// If the call is on hold, resumes it.
     pub async fn toggle_hold(&mut self) -> AppResult<bool> {
         let call_id = self
-            .active_call_id
+            .focused_call_id
             .as_ref()
             .ok_or_else(|| AppError::Sip("No active call".to_string()))?
             .clone();
@@ -933,16 +1015,29 @@ impl CallManager {
         }
     }
 
-    /// Returns the active call ID.
+    /// Returns the focused call ID.
     pub fn active_call_id(&self) -> Option<&str> {
-        self.active_call_id.as_deref()
+        self.focused_call_id.as_deref()
     }
 
-    /// Returns info for the active call.
+    /// Returns info for the focused call.
     pub fn active_call_info(&self) -> Option<CallInfo> {
-        self.active_call_id
+        self.focused_call_id
             .as_ref()
             .and_then(|id| self.call_agent.get_call_info(id))
+    }
+
+    /// Returns all active call IDs (including held calls).
+    pub fn all_call_ids(&self) -> &[String] {
+        &self.active_calls
+    }
+
+    /// Returns info for all active calls.
+    pub fn all_call_info(&self) -> Vec<CallInfo> {
+        self.active_calls
+            .iter()
+            .filter_map(|id| self.call_agent.get_call_info(id))
+            .collect()
     }
 
     /// Returns the state of a specific call.
@@ -970,14 +1065,45 @@ impl CallManager {
         self.audio_sessions.get(call_id)
     }
 
-    /// Returns audio pipeline statistics for the active call.
+    /// Returns audio pipeline statistics for the focused call.
     pub async fn audio_stats(&self) -> Option<PipelineStats> {
-        if let Some(call_id) = &self.active_call_id {
+        if let Some(call_id) = &self.focused_call_id {
             if let Some(session) = self.audio_sessions.get(call_id) {
                 return Some(session.stats().await);
             }
         }
         None
+    }
+
+    /// Switches focus to a different call.
+    ///
+    /// If there's a currently focused call that's connected, it will be put on hold.
+    /// The target call will be resumed if it's on hold.
+    pub async fn switch_to_call(&mut self, call_id: &str) -> AppResult<()> {
+        // Verify target call exists
+        if !self.active_calls.contains(&call_id.to_string()) {
+            return Err(AppError::Sip(format!("Call not found: {}", call_id)));
+        }
+
+        // Put current focused call on hold if it's connected
+        if let Some(ref current) = self.focused_call_id.clone() {
+            if current != call_id {
+                let state = self.call_agent.get_state(&current);
+                if state == Some(CallState::Connected) {
+                    self.hold_call_by_id(&current).await?;
+                }
+            }
+        }
+
+        // Resume target call if it's on hold
+        let state = self.call_agent.get_state(call_id);
+        if state == Some(CallState::OnHold) {
+            self.resume_call_by_id(call_id).await?;
+        }
+
+        self.focused_call_id = Some(call_id.to_string());
+        info!(call_id = %call_id, "Switched focus to call");
+        Ok(())
     }
 
     /// Starts the audio session for a connected call.
@@ -1000,6 +1126,7 @@ impl CallManager {
             // SRTP keys will be obtained from media session in production
             srtp_key: None,
             srtp_salt: None,
+            moh_file_path: self.moh_file_path.clone(),
         };
 
         // Start the audio session
@@ -1103,9 +1230,13 @@ impl CallManager {
 
                 self.record_call_history(&call_info, end_reason).await;
 
-                // Clear active call
-                if self.active_call_id.as_ref() == Some(&call_id.to_string()) {
-                    self.active_call_id = None;
+                // Remove from active calls list
+                self.active_calls.retain(|id| id != call_id);
+
+                // Clear focused call if it was this one
+                if self.focused_call_id.as_ref() == Some(&call_id.to_string()) {
+                    // Focus another call if available
+                    self.focused_call_id = self.active_calls.first().cloned();
                 }
             }
             _ => {}

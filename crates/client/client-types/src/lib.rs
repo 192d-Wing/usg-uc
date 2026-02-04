@@ -27,7 +27,8 @@ pub use account::{
 };
 pub use audio::{AudioConfig, AudioDevice, CodecPreference};
 pub use call::{
-    CallDirection, CallEndReason, CallFailureReason, CallHistoryEntry, CallInfo, CallState,
+    CallDirection, CallEndReason, CallFailureReason, CallFocus, CallHistoryEntry, CallInfo,
+    CallState,
 };
 pub use contact::{Contact, PhoneNumber, PhoneNumberType};
 pub use error::{ClientError, ClientResult};

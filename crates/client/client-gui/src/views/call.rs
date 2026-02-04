@@ -22,6 +22,11 @@ pub enum CallAction {
         /// Call ID to reject.
         call_id: String,
     },
+    /// Switch focus to a different call (multi-call mode).
+    SwitchTo {
+        /// Call ID to switch to.
+        call_id: String,
+    },
 }
 
 /// Call view state.
@@ -87,9 +92,44 @@ impl CallView {
 
                 ui.add_space(10.0);
 
-                // Duration timer
+                // Duration timer - styled orange when on hold
                 let duration = info.duration_string();
-                ui.label(egui::RichText::new(duration).size(32.0).strong());
+                let duration_style = if info.is_on_hold {
+                    egui::RichText::new(duration)
+                        .size(32.0)
+                        .strong()
+                        .color(egui::Color32::ORANGE)
+                } else {
+                    egui::RichText::new(duration).size(32.0).strong()
+                };
+                ui.label(duration_style);
+
+                // Hold banner - prominent visual indicator when call is on hold
+                if info.is_on_hold {
+                    ui.add_space(16.0);
+
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgba_unmultiplied(255, 165, 0, 200))
+                        .corner_radius(8.0)
+                        .inner_margin(20.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                // Pause icon
+                                ui.label(
+                                    egui::RichText::new("\u{23F8}")
+                                        .size(20.0)
+                                        .color(egui::Color32::WHITE),
+                                );
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new("CALL ON HOLD")
+                                        .color(egui::Color32::WHITE)
+                                        .strong()
+                                        .size(16.0),
+                                );
+                            });
+                        });
+                }
 
                 // Update local state from call info
                 self.is_muted = info.is_muted;

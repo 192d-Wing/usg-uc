@@ -26,10 +26,6 @@ pub mod settings;
 pub mod sip_transport;
 
 pub use app::{AppEvent, AppState, ClientApp, PinOperationType};
-pub use sip_transport::{
-    CertVerificationMode, SipTransport, TransportConfig, TransportEvent,
-    build_response_from_request, generate_tag,
-};
 pub use audio_session::{
     AudioSession, AudioSessionConfig, AudioSessionConfigBuilder, AudioSessionEvent,
 };
@@ -37,6 +33,10 @@ pub use call_manager::{CallManager, CallManagerEvent, IncomingCallInfo};
 pub use cert_store::{CertStoreError, CertStoreResult, CertificateStore};
 pub use contact_manager::{ContactManager, ContactStore, create_contact};
 pub use settings::{GeneralSettings, NetworkSettings, Settings, SettingsManager, UiSettings};
+pub use sip_transport::{
+    CertVerificationMode, SipTransport, TransportConfig, TransportEvent,
+    build_response_from_request, generate_tag,
+};
 
 use thiserror::Error;
 

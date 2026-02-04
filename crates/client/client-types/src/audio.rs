@@ -27,6 +27,12 @@ pub struct AudioConfig {
     pub jitter_buffer_min_ms: u32,
     /// Jitter buffer maximum depth in milliseconds.
     pub jitter_buffer_max_ms: u32,
+    /// Music on Hold file path (optional WAV file).
+    ///
+    /// When a call is placed on hold, this audio file will be played
+    /// to the remote party instead of silence.
+    #[serde(default)]
+    pub moh_file_path: Option<String>,
 }
 
 impl Default for AudioConfig {
@@ -43,6 +49,7 @@ impl Default for AudioConfig {
             preferred_codec: CodecPreference::Opus,
             jitter_buffer_min_ms: 20,
             jitter_buffer_max_ms: 200,
+            moh_file_path: None,
         }
     }
 }

@@ -42,6 +42,7 @@
 //! - [`device`]: Audio device enumeration and selection
 //! - [`stream`]: CPAL-based audio capture and playback
 //! - [`codec`]: Audio codec integration (G.711, G.722, Opus)
+//! - [`file_source`]: WAV file loading for Music on Hold
 //! - [`jitter_buffer`]: Adaptive jitter buffer for RTP reordering
 //! - [`rtp_handler`]: RTP/SRTP packet handling
 //! - [`pipeline`]: Main audio pipeline coordinator
@@ -59,6 +60,7 @@
 
 pub mod codec;
 pub mod device;
+pub mod file_source;
 pub mod jitter_buffer;
 pub mod pipeline;
 pub mod rtp_handler;
@@ -68,6 +70,7 @@ pub use codec::{CodecPipeline, negotiate_codec};
 pub use device::{
     DEFAULT_SAMPLE_RATE, DeviceManager, SAMPLE_RATE_8KHZ, SAMPLE_RATE_16KHZ, SAMPLE_RATE_48KHZ,
 };
+pub use file_source::FileAudioSource;
 pub use jitter_buffer::{BufferedPacket, JitterBuffer, JitterBufferResult, JitterBufferStats};
 pub use pipeline::{AudioPipeline, PipelineConfig, PipelineState, PipelineStats};
 pub use rtp_handler::{RtpReceiver, RtpStats, RtpTransmitter, generate_ssrc};

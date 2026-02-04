@@ -68,6 +68,31 @@ impl CallState {
     }
 }
 
+/// Call focus state for multi-call scenarios.
+///
+/// In multi-call mode (call waiting), one call is "focused" (has active
+/// media and UI focus), while others are held in the background.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CallFocus {
+    /// This is the currently active/focused call with live media.
+    #[default]
+    Active,
+    /// This call is held in the background (on hold).
+    Held,
+    /// This call is ringing (incoming, not yet answered).
+    Ringing,
+}
+
+impl std::fmt::Display for CallFocus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Active => write!(f, "Active"),
+            Self::Held => write!(f, "Held"),
+            Self::Ringing => write!(f, "Ringing"),
+        }
+    }
+}
+
 /// Reason for call failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallFailureReason {

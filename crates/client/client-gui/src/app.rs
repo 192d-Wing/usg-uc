@@ -86,8 +86,10 @@ pub struct SipClientApp {
     tray_action_rx: Option<StdReceiver<TrayAction>>,
     /// Current registration state.
     registration_state: RegistrationState,
-    /// Current call info.
+    /// Current focused call info.
     active_call: Option<CallInfo>,
+    /// All active calls (for multi-call support).
+    all_calls: Vec<CallInfo>,
     /// Incoming call alert (ringing).
     incoming_call: Option<IncomingCallAlert>,
     /// Show incoming call dialog.
@@ -172,6 +174,7 @@ impl SipClientApp {
             tray_action_rx,
             registration_state: RegistrationState::Unregistered,
             active_call: None,
+            all_calls: Vec::new(),
             incoming_call: None,
             show_incoming_call_dialog: false,
             status_message: "Ready".to_string(),
@@ -238,6 +241,11 @@ impl SipClientApp {
                     info!(call_id = %call_id, state = ?state, "Call state changed");
                     self.active_call = Some(info);
 
+                    // Update all_calls from the core
+                    if let Some(ref app) = self.client_app {
+                        self.all_calls = app.all_call_info();
+                    }
+
                     // Switch to call view when call starts
                     if state.is_active() && self.active_view != ActiveView::Call {
                         self.active_view = ActiveView::Call;
@@ -245,9 +253,17 @@ impl SipClientApp {
 
                     // Switch back to dialer when call ends
                     if state == CallState::Terminated {
-                        self.active_call = None;
-                        if self.active_view == ActiveView::Call {
-                            self.active_view = ActiveView::Dialer;
+                        // Update all_calls - the terminated call should be removed
+                        if let Some(ref app) = self.client_app {
+                            self.all_calls = app.all_call_info();
+                        }
+
+                        // If no more active calls, clear active_call and go back to dialer
+                        if self.all_calls.is_empty() {
+                            self.active_call = None;
+                            if self.active_view == ActiveView::Call {
+                                self.active_view = ActiveView::Dialer;
+                            }
                         }
                     }
                 }
@@ -288,8 +304,12 @@ impl SipClientApp {
                         .as_ref()
                         .and_then(|c| c.remote_display_name.clone());
 
-                    self.active_call = None;
-                    // Clear incoming call dialog too
+                    // Update all_calls from core
+                    if let Some(ref app) = self.client_app {
+                        self.all_calls = app.all_call_info();
+                    }
+
+                    // Clear incoming call dialog
                     self.incoming_call = None;
                     self.show_incoming_call_dialog = false;
 
@@ -298,8 +318,16 @@ impl SipClientApp {
                     } else {
                         self.status_message = "Call ended".to_string();
                     }
-                    if self.active_view == ActiveView::Call {
-                        self.active_view = ActiveView::Dialer;
+
+                    // If no more active calls, clear active_call and go back to dialer
+                    if self.all_calls.is_empty() {
+                        self.active_call = None;
+                        if self.active_view == ActiveView::Call {
+                            self.active_view = ActiveView::Dialer;
+                        }
+                    } else {
+                        // Set active_call to the first remaining call
+                        self.active_call = self.all_calls.first().cloned();
                     }
 
                     // Show notification for call ended
@@ -435,6 +463,95 @@ impl SipClientApp {
         });
     }
 
+    /// Renders call tabs when multiple calls are active.
+    ///
+    /// Returns a `SwitchTo` action if user clicks on a non-focused call tab.
+    fn render_call_tabs(&mut self, ui: &mut egui::Ui) -> Option<crate::views::CallAction> {
+        // Only show tabs if there are multiple calls
+        if self.all_calls.len() <= 1 {
+            return None;
+        }
+
+        let mut action = None;
+        let focused_id = self.active_call.as_ref().map(|c| c.id.as_str());
+
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("Active Calls:")
+                    .small()
+                    .color(egui::Color32::GRAY),
+            );
+            ui.add_space(8.0);
+
+            for call in &self.all_calls {
+                let is_focused = focused_id == Some(call.id.as_str());
+
+                // Determine tab color based on call state
+                let (bg_color, text_color) = if is_focused {
+                    (egui::Color32::from_rgb(50, 100, 50), egui::Color32::WHITE)
+                } else if call.is_on_hold {
+                    (egui::Color32::from_rgb(180, 120, 50), egui::Color32::WHITE)
+                } else {
+                    (
+                        egui::Color32::from_rgb(60, 60, 65),
+                        egui::Color32::LIGHT_GRAY,
+                    )
+                };
+
+                // Display name for the tab
+                let display_name = call
+                    .remote_display_name
+                    .as_deref()
+                    .unwrap_or(&call.remote_uri);
+
+                // Truncate if too long
+                let tab_label = if display_name.len() > 15 {
+                    format!("{}...", &display_name[..12])
+                } else {
+                    display_name.to_string()
+                };
+
+                // Add hold indicator
+                let tab_text = if call.is_on_hold {
+                    format!("\u{23F8} {}", tab_label)
+                } else {
+                    tab_label
+                };
+
+                let button =
+                    egui::Button::new(egui::RichText::new(&tab_text).small().color(text_color))
+                        .fill(bg_color)
+                        .corner_radius(4.0);
+
+                let response = ui.add(button);
+
+                // Show tooltip with full info
+                let tooltip = format!(
+                    "{}\n{}\nState: {}",
+                    call.remote_display_name.as_deref().unwrap_or("Unknown"),
+                    call.remote_uri,
+                    call.state
+                );
+                response.clone().on_hover_text(tooltip);
+
+                // Handle click - switch to this call if not already focused
+                if response.clicked() && !is_focused {
+                    action = Some(crate::views::CallAction::SwitchTo {
+                        call_id: call.id.clone(),
+                    });
+                }
+
+                ui.add_space(4.0);
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.separator();
+
+        action
+    }
+
     /// Renders the error dialog.
     fn render_error_dialog(&mut self, ctx: &egui::Context) {
         if self.show_error_dialog {
@@ -460,7 +577,10 @@ impl SipClientApp {
     }
 
     /// Renders the incoming call dialog.
-    fn render_incoming_call_dialog(&mut self, ctx: &egui::Context) -> Option<crate::views::CallAction> {
+    fn render_incoming_call_dialog(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<crate::views::CallAction> {
         if !self.show_incoming_call_dialog {
             return None;
         }
@@ -479,11 +599,7 @@ impl SipClientApp {
                     ui.vertical_centered(|ui| {
                         ui.label(egui::RichText::new("\u{1F4DE}").size(48.0)); // Phone icon
                         ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new("Incoming Call")
-                                .strong()
-                                .size(20.0),
-                        );
+                        ui.label(egui::RichText::new("Incoming Call").strong().size(20.0));
                     });
 
                     ui.add_space(16.0);
@@ -494,8 +610,7 @@ impl SipClientApp {
                             ui.label(egui::RichText::new(name).size(18.0).strong());
                         }
                         ui.label(
-                            egui::RichText::new(&incoming.remote_uri)
-                                .color(egui::Color32::GRAY),
+                            egui::RichText::new(&incoming.remote_uri).color(egui::Color32::GRAY),
                         );
                     });
 
@@ -580,7 +695,10 @@ impl SipClientApp {
                 if let Some(ref operation) = self.pin_operation {
                     let op_text = match operation {
                         PinOperation::UseCertificate { thumbprint } => {
-                            format!("Certificate: ...{}", &thumbprint[thumbprint.len().saturating_sub(8)..])
+                            format!(
+                                "Certificate: ...{}",
+                                &thumbprint[thumbprint.len().saturating_sub(8)..]
+                            )
                         }
                         PinOperation::Register { account_id } => {
                             format!("Registration: {}", account_id)
@@ -632,12 +750,9 @@ impl SipClientApp {
                         egui::Color32::YELLOW
                     };
                     ui.label(
-                        egui::RichText::new(format!(
-                            "Attempts remaining: {}",
-                            remaining
-                        ))
-                        .small()
-                        .color(warning_color),
+                        egui::RichText::new(format!("Attempts remaining: {}", remaining))
+                            .small()
+                            .color(warning_color),
                     );
                 }
 
@@ -766,7 +881,8 @@ impl SipClientApp {
                     });
 
                     if self.pin_attempts >= MAX_PIN_ATTEMPTS {
-                        self.pin_error = Some("Too many incorrect attempts. Card may be locked.".to_string());
+                        self.pin_error =
+                            Some("Too many incorrect attempts. Card may be locked.".to_string());
                         warn!("PIN attempt limit reached");
                     }
                 } else {
@@ -805,6 +921,11 @@ impl eframe::App for SipClientApp {
                 }
             }
             ActiveView::Call => {
+                // Render call tabs if multiple calls
+                if let Some(action) = self.render_call_tabs(ui) {
+                    self.handle_call_action(action);
+                }
+                // Render the call view for the focused call
                 if let Some(action) = self.call_view.render(ui, self.active_call.as_ref()) {
                     self.handle_call_action(action);
                 }
@@ -931,6 +1052,21 @@ impl SipClientApp {
                 self.incoming_call = None;
                 self.status_message = "Call rejected".to_string();
             }
+            crate::views::CallAction::SwitchTo { call_id } => {
+                info!(call_id = %call_id, "Switching to call");
+                if let Some(ref mut app) = self.client_app {
+                    let runtime = self.runtime.clone();
+                    match runtime.block_on(app.switch_to_call(&call_id)) {
+                        Ok(()) => {
+                            self.status_message = "Switched to call".to_string();
+                        }
+                        Err(e) => {
+                            self.error_message = Some(format!("Failed to switch call: {e}"));
+                            self.show_error_dialog = true;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -983,7 +1119,8 @@ impl SipClientApp {
             }
             crate::views::SettingsAction::SelectCertificate(thumbprint) => {
                 info!(thumbprint = %thumbprint, "Selecting certificate");
-                self.settings_view.set_selected_certificate(Some(thumbprint));
+                self.settings_view
+                    .set_selected_certificate(Some(thumbprint));
                 self.status_message = "Certificate selected".to_string();
             }
             crate::views::SettingsAction::UseCertificate(thumbprint) => {
@@ -1064,8 +1201,7 @@ impl SipClientApp {
                     // Store for later when ClientApp is initialized
                     self.pending_cert_chain = Some(cert_chain);
                     self.pending_cert_thumbprint = Some(thumbprint.to_string());
-                    self.status_message =
-                        "Certificate will be used when connecting".to_string();
+                    self.status_message = "Certificate will be used when connecting".to_string();
                 }
             }
             Err(CertStoreError::PinRequired) => {
@@ -1123,7 +1259,8 @@ impl SipClientApp {
         use client_types::ServerCertVerificationMode;
 
         // Update the settings view
-        self.settings_view.set_server_cert_verification(mode.clone());
+        self.settings_view
+            .set_server_cert_verification(mode.clone());
 
         // Update the custom CA path if in Custom mode
         if let ServerCertVerificationMode::Custom { ref ca_file_path } = mode {
@@ -1139,15 +1276,15 @@ impl SipClientApp {
     fn browse_for_ca_file(&mut self) {
         // For now, user must type the path manually
         // TODO: Add rfd (native file dialog) dependency for file browsing
-        self.status_message =
-            "Enter the CA file path manually in the text field".to_string();
+        self.status_message = "Enter the CA file path manually in the text field".to_string();
         info!("User requested file browser - must enter path manually for now");
     }
 
     fn apply_insecure_mode(&mut self) {
         // The warning was already shown and confirmed by the user
         self.set_verification_mode(client_types::ServerCertVerificationMode::Insecure);
-        self.status_message = "WARNING: Insecure mode enabled - certificates not validated".to_string();
+        self.status_message =
+            "WARNING: Insecure mode enabled - certificates not validated".to_string();
         warn!("User enabled insecure certificate verification mode");
     }
 }

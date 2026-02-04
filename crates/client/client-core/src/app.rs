@@ -413,6 +413,19 @@ impl ClientApp {
         self.call_manager.toggle_hold().await
     }
 
+    /// Switches focus to a different call.
+    ///
+    /// The current focused call will be put on hold if it's connected,
+    /// and the target call will be resumed if it's on hold.
+    pub async fn switch_to_call(&mut self, call_id: &str) -> AppResult<()> {
+        self.call_manager.switch_to_call(call_id).await
+    }
+
+    /// Returns info for all active calls (including held).
+    pub fn all_call_info(&self) -> Vec<CallInfo> {
+        self.call_manager.all_call_info()
+    }
+
     /// Returns the current application state.
     pub fn state(&self) -> AppState {
         self.state
@@ -495,7 +508,10 @@ impl ClientApp {
                     }
                 }
             }
-            RegistrationEvent::SendRequest { request, destination } => {
+            RegistrationEvent::SendRequest {
+                request,
+                destination,
+            } => {
                 // Send via SIP transport
                 if let Some(ref transport) = self.sip_transport {
                     if let Err(e) = transport.send_request(&request, destination).await {
@@ -628,7 +644,9 @@ impl ClientApp {
                 // Route response to appropriate agent based on CSeq method
                 // For REGISTER responses, route to registration agent
                 // For INVITE/BYE/CANCEL responses, route to call manager
-                let cseq_value = response.headers.get_value(&proto_sip::header::HeaderName::CSeq);
+                let cseq_value = response
+                    .headers
+                    .get_value(&proto_sip::header::HeaderName::CSeq);
                 let is_register_response = cseq_value
                     .map(|v| v.to_uppercase().contains("REGISTER"))
                     .unwrap_or(false);
@@ -722,10 +740,7 @@ impl ClientApp {
     }
 
     /// Handles a call agent event.
-    async fn handle_call_agent_event(
-        &mut self,
-        event: client_sip_ua::CallEvent,
-    ) -> AppResult<()> {
+    async fn handle_call_agent_event(&mut self, event: client_sip_ua::CallEvent) -> AppResult<()> {
         use client_sip_ua::CallEvent;
 
         match event {

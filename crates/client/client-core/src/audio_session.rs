@@ -30,6 +30,8 @@ pub struct AudioSessionConfig {
     pub srtp_key: Option<Vec<u8>>,
     /// SRTP master salt.
     pub srtp_salt: Option<Vec<u8>>,
+    /// Music on Hold file path (optional).
+    pub moh_file_path: Option<String>,
 }
 
 impl Default for AudioSessionConfig {
@@ -43,6 +45,7 @@ impl Default for AudioSessionConfig {
             jitter_buffer_ms: 60,
             srtp_key: None,
             srtp_salt: None,
+            moh_file_path: None,
         }
     }
 }
@@ -127,6 +130,7 @@ impl AudioSession {
             // The audio pipeline will use its own RTP handling
             srtp_key: None,
             srtp_salt: None,
+            moh_file_path: None,
         };
 
         self.start(config).await
@@ -153,6 +157,7 @@ impl AudioSession {
             srtp_master_key: config.srtp_key,
             srtp_master_salt: config.srtp_salt,
             muted: self.muted.load(Ordering::Relaxed),
+            moh_file_path: config.moh_file_path,
         };
 
         // Start pipeline
@@ -218,6 +223,28 @@ impl AudioSession {
     /// Returns whether the session is muted.
     pub fn is_muted(&self) -> bool {
         self.muted.load(Ordering::Relaxed)
+    }
+
+    /// Sets the Music on Hold active state.
+    ///
+    /// When MOH is active, the audio pipeline will send MOH audio instead
+    /// of capturing from the microphone.
+    pub async fn set_moh_active(&self, active: bool) {
+        let pipeline = self.pipeline.lock().await;
+        pipeline.set_moh_active(active);
+        debug!(active = active, "Audio session MOH state changed");
+    }
+
+    /// Returns whether Music on Hold is currently active.
+    pub async fn is_moh_active(&self) -> bool {
+        let pipeline = self.pipeline.lock().await;
+        pipeline.is_moh_active()
+    }
+
+    /// Returns whether MOH audio has been loaded.
+    pub async fn has_moh(&self) -> bool {
+        let pipeline = self.pipeline.lock().await;
+        pipeline.has_moh()
     }
 
     /// Returns whether the session is running.
@@ -314,7 +341,14 @@ async fn audio_processing_loop(
         }
 
         // Process capture frame (capture → encode → send)
-        if let Err(e) = pipeline_guard.process_capture_frame().await {
+        // Use MOH if active and available, otherwise use microphone capture
+        let capture_result = if pipeline_guard.is_moh_active() && pipeline_guard.has_moh() {
+            pipeline_guard.process_moh_frame().await
+        } else {
+            pipeline_guard.process_capture_frame().await
+        };
+
+        if let Err(e) = capture_result {
             // Don't spam logs for normal errors like no samples available
             if !matches!(e, client_audio::AudioError::StreamError(_)) {
                 warn!(error = %e, "Error processing capture frame");
