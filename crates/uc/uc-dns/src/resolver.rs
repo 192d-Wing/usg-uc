@@ -145,13 +145,16 @@ impl SipResolver {
     /// Creates a new SIP resolver.
     #[must_use]
     pub fn new(config: SipResolverConfig, cache: Arc<DnsCache>) -> Self {
+        #[cfg(feature = "resolver")]
+        let dns_resolver = HickoryDnsResolver::new(Arc::clone(&cache)).ok();
+
         Self {
             config,
-            cache: cache.clone(),
+            cache,
             naptr_resolver: NaptrResolver::new(),
             srv_resolver: SrvResolver::new(),
             #[cfg(feature = "resolver")]
-            dns_resolver: HickoryDnsResolver::new(cache).ok(),
+            dns_resolver,
         }
     }
 

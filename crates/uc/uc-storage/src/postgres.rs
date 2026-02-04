@@ -187,9 +187,8 @@ impl StorageBackend for PostgresBackend {
         Box::pin(async move {
             trace!(key = %key, ttl = ?ttl, "PostgreSQL SET");
 
-            let expires_at = ttl.map(|d| {
-                chrono::Utc::now() + chrono::Duration::seconds(d.as_secs() as i64)
-            });
+            let expires_at =
+                ttl.map(|d| chrono::Utc::now() + chrono::Duration::seconds(d.as_secs() as i64));
 
             sqlx::query(
                 r"
@@ -332,9 +331,8 @@ impl StorageBackend for PostgresBackend {
         Box::pin(async move {
             trace!(key = %key, ttl = ?ttl, "PostgreSQL SET NX");
 
-            let expires_at = ttl.map(|d| {
-                chrono::Utc::now() + chrono::Duration::seconds(d.as_secs() as i64)
-            });
+            let expires_at =
+                ttl.map(|d| chrono::Utc::now() + chrono::Duration::seconds(d.as_secs() as i64));
 
             // Use INSERT ... ON CONFLICT DO NOTHING for atomic set-if-not-exists
             let result = sqlx::query(
@@ -379,8 +377,7 @@ impl StorageBackend for PostgresBackend {
             .await?;
 
             // Build a map for quick lookup
-            let map: std::collections::HashMap<String, Vec<u8>> =
-                rows.into_iter().collect();
+            let map: std::collections::HashMap<String, Vec<u8>> = rows.into_iter().collect();
 
             // Return values in the same order as input keys
             Ok(keys
@@ -406,16 +403,17 @@ impl StorageBackend for PostgresBackend {
 
             trace!(count = pairs.len(), ttl = ?ttl, "PostgreSQL MSET");
 
-            let expires_at = ttl.map(|d| {
-                chrono::Utc::now() + chrono::Duration::seconds(d.as_secs() as i64)
-            });
+            let expires_at =
+                ttl.map(|d| chrono::Utc::now() + chrono::Duration::seconds(d.as_secs() as i64));
 
             // Use a transaction for atomicity
-            let mut tx = self.pool.begin().await.map_err(|e| {
-                StorageError::TransactionError {
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| StorageError::TransactionError {
                     reason: format!("Failed to begin transaction: {e}"),
-                }
-            })?;
+                })?;
 
             for (key, value) in &pairs {
                 sqlx::query(
@@ -435,9 +433,11 @@ impl StorageBackend for PostgresBackend {
                 .await?;
             }
 
-            tx.commit().await.map_err(|e| StorageError::TransactionError {
-                reason: format!("Failed to commit transaction: {e}"),
-            })?;
+            tx.commit()
+                .await
+                .map_err(|e| StorageError::TransactionError {
+                    reason: format!("Failed to commit transaction: {e}"),
+                })?;
 
             Ok(())
         })
@@ -486,7 +486,7 @@ impl StorageBackend for PostgresBackend {
             .await?;
 
             match row {
-                None => Ok(None), // Key doesn't exist
+                None => Ok(None),                    // Key doesn't exist
                 Some((None,)) => Ok(Some(i64::MAX)), // No TTL (never expires)
                 Some((Some(expires_at),)) => {
                     let now = chrono::Utc::now();
@@ -510,8 +510,7 @@ impl StorageBackend for PostgresBackend {
         Box::pin(async move {
             trace!(key = %key, ttl = ?ttl, "PostgreSQL EXPIRE");
 
-            let expires_at =
-                chrono::Utc::now() + chrono::Duration::seconds(ttl.as_secs() as i64);
+            let expires_at = chrono::Utc::now() + chrono::Duration::seconds(ttl.as_secs() as i64);
 
             let result = sqlx::query(
                 r"
@@ -797,7 +796,10 @@ mod tests {
         backend.set(&key, b"value", None).await.unwrap();
 
         // Add TTL
-        let expired = backend.expire(&key, Duration::from_secs(100)).await.unwrap();
+        let expired = backend
+            .expire(&key, Duration::from_secs(100))
+            .await
+            .unwrap();
         assert!(expired);
 
         // Check TTL is set

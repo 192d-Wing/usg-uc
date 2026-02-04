@@ -11,16 +11,31 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+default = []
+cluster = ["uc-cluster", "uc-discovery", "uc-storage", "proto-registrar/storage"]
+redis = ["cluster", "uc-storage/redis"]
+postgres = ["cluster", "uc-storage/postgres"]
+
 [dependencies]
 # SBC crates to test
 uc-types.workspace = true
-sbc-config = { path = "../sbc-config" }
+sbc-config = { path = "../sbc-config", features = ["cluster"] }
 uc-health.workspace = true
 uc-metrics.workspace = true
 uc-policy.workspace = true
 uc-routing.workspace = true
 uc-cdr.workspace = true
 uc-api.workspace = true
+
+# Cluster crates (optional)
+uc-cluster = { path = "../../uc/uc-cluster", optional = true }
+uc-discovery = { path = "../../uc/uc-discovery", optional = true }
+uc-storage = { path = "../../uc/uc-storage", optional = true }
+proto-registrar = { path = "../../proto/proto-registrar", optional = true }
+
+# Test utilities
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [lib]
 name = "sbc_integration_tests"

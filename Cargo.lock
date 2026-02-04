@@ -5733,11 +5733,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uc-api",
+ "uc-cluster",
  "uc-codecs",
+ "uc-discovery",
  "uc-dos-protection",
  "uc-health",
  "uc-media-engine",
  "uc-metrics",
+ "uc-state-sync",
+ "uc-storage",
  "uc-telemetry",
  "uc-transport",
  "uc-types",
@@ -5747,13 +5751,18 @@ dependencies = [
 name = "sbc-integration-tests"
 version = "0.1.0"
 dependencies = [
+ "proto-registrar",
  "sbc-config",
+ "tokio",
  "uc-api",
  "uc-cdr",
+ "uc-cluster",
+ "uc-discovery",
  "uc-health",
  "uc-metrics",
  "uc-policy",
  "uc-routing",
+ "uc-storage",
  "uc-types",
 ]
 

@@ -49,9 +49,12 @@ impl RedisBackend {
 
         // Test the connection
         {
-            let mut conn = pool.get().await.map_err(|e| StorageError::ConnectionFailed {
-                reason: format!("Failed to get connection from pool: {e}"),
-            })?;
+            let mut conn = pool
+                .get()
+                .await
+                .map_err(|e| StorageError::ConnectionFailed {
+                    reason: format!("Failed to get connection from pool: {e}"),
+                })?;
 
             redis::cmd("PING")
                 .query_async::<String>(&mut *conn)
@@ -67,9 +70,7 @@ impl RedisBackend {
     }
 
     /// Gets a connection from the pool.
-    async fn get_conn(
-        &self,
-    ) -> StorageResult<bb8::PooledConnection<'_, RedisConnectionManager>> {
+    async fn get_conn(&self) -> StorageResult<bb8::PooledConnection<'_, RedisConnectionManager>> {
         self.pool.get().await.map_err(|e| {
             warn!(error = %e, "Failed to get Redis connection");
             StorageError::PoolExhausted
@@ -179,18 +180,13 @@ impl StorageBackend for RedisBackend {
     fn health_check(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
         Box::pin(async move {
             match self.get_conn().await {
-                Ok(mut conn) => {
-                    match redis::cmd("PING")
-                        .query_async::<String>(&mut *conn)
-                        .await
-                    {
-                        Ok(response) => response == "PONG",
-                        Err(e) => {
-                            warn!(error = %e, "Redis health check failed");
-                            false
-                        }
+                Ok(mut conn) => match redis::cmd("PING").query_async::<String>(&mut *conn).await {
+                    Ok(response) => response == "PONG",
+                    Err(e) => {
+                        warn!(error = %e, "Redis health check failed");
+                        false
                     }
-                }
+                },
                 Err(e) => {
                     warn!(error = %e, "Redis health check failed - no connection");
                     false
@@ -264,7 +260,10 @@ impl StorageBackend for RedisBackend {
             let mut conn = self.get_conn().await?;
 
             let results: Vec<Option<Vec<u8>>> = conn.mget(&keys).await?;
-            Ok(results.into_iter().map(|opt| opt.map(Bytes::from)).collect())
+            Ok(results
+                .into_iter()
+                .map(|opt| opt.map(Bytes::from))
+                .collect())
         })
     }
 
@@ -600,7 +599,10 @@ mod tests {
         backend.set(&key, b"value", None).await.unwrap();
 
         // Add TTL
-        let expired = backend.expire(&key, Duration::from_secs(100)).await.unwrap();
+        let expired = backend
+            .expire(&key, Duration::from_secs(100))
+            .await
+            .unwrap();
         assert!(expired);
 
         // Check TTL is set

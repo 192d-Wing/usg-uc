@@ -34,8 +34,8 @@ use crate::tls::{create_server_config, load_certs, load_private_key};
 use arc_swap::ArcSwap;
 use rustls::ServerConfig;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
@@ -227,10 +227,7 @@ impl ReloadableTlsAcceptor {
         let certs = load_certs(cert_path)?;
         let key = load_private_key(key_path)?;
 
-        debug!(
-            cert_count = certs.len(),
-            "Loaded certificate chain"
-        );
+        debug!(cert_count = certs.len(), "Loaded certificate chain");
 
         create_server_config(certs, key)
     }
@@ -280,45 +277,33 @@ mod tests {
 
         // Generate P-384 private key
         let key_result = Command::new("openssl")
-            .args([
-                "ecparam",
-                "-name",
-                "secp384r1",
-                "-genkey",
-                "-noout",
-                "-out",
-            ])
+            .args(["ecparam", "-name", "secp384r1", "-genkey", "-noout", "-out"])
             .arg(&key_path)
             .output();
 
-        if key_result.is_err() || !key_result.as_ref().map(|o| o.status.success()).unwrap_or(false)
+        if key_result.is_err()
+            || !key_result
+                .as_ref()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
         {
             return None;
         }
 
         // Generate self-signed certificate
         let cert_result = Command::new("openssl")
-            .args([
-                "req",
-                "-new",
-                "-x509",
-                "-key",
-            ])
+            .args(["req", "-new", "-x509", "-key"])
             .arg(&key_path)
-            .args([
-                "-out",
-            ])
+            .args(["-out"])
             .arg(&cert_path)
-            .args([
-                "-days",
-                "1",
-                "-subj",
-                "/CN=test",
-            ])
+            .args(["-days", "1", "-subj", "/CN=test"])
             .output();
 
         if cert_result.is_err()
-            || !cert_result.as_ref().map(|o| o.status.success()).unwrap_or(false)
+            || !cert_result
+                .as_ref()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
         {
             return None;
         }
