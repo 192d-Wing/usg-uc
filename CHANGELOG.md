@@ -1039,10 +1039,15 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
       - 8-byte overhead per packet for UDP header
   - `sctp/timer.rs` - Timer enhancements:
     - Heartbeat timer support with RTT calculation
+  - `sctp/chunk.rs` - ECN support (RFC 9260 §3.3.11-12):
+    - `EcneChunk` for Explicit Congestion Notification Echo
+    - `CwrChunk` for Congestion Window Reduced
+    - Both contain lowest_tsn field in 8-byte format
+    - Full encode/decode support in Chunk enum
   - Cryptographically secure random via `rand` crate
   - `SctpAssociation` stub deprecated in favor of `ConnectedSctpAssociation`
   - Feature flag: `sctp` (optional, requires `crc32c`, `rand`)
-  - 35+ unit tests
+  - 43+ unit tests
 
 **uc-snmp - SNMP Trap Generation**
 

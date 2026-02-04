@@ -555,9 +555,13 @@ This document outlines the development roadmap for the USG Session Border Contro
   - Builder methods: `with_udp_encapsulation()`, `with_udp_encap_ports()`
   - Automatic encapsulation/decapsulation in I/O paths
   - 8-byte overhead per packet for UDP header
-- 🚧 Remaining: ECNE/CWR for ECN support (optional), comprehensive RFC compliance tests
+- ✅ ECNE/CWR chunks for ECN support (RFC 9260 §3.3.11-12)
+  - `EcneChunk`: echoes CE marks from IP header
+  - `CwrChunk`: acknowledges congestion window reduction
+  - Full encode/decode support in Chunk enum
+- 🚧 Remaining: comprehensive RFC compliance tests
 
-**Tests**: 25 new tests (T.38 crate), 35+ tests (SCTP)
+**Tests**: 25 new tests (T.38 crate), 43+ tests (SCTP)
 
 ### 🚧 Phase 24: SIP Soft Client (In Progress)
 
