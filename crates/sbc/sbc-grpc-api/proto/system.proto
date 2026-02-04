@@ -1,0 +1,228 @@
+// SBC System Management Service
+//
+// NIST 800-53 Rev5 Controls:
+// - AU-6: Audit Record Review
+// - SC-12: Cryptographic Key Management
+// - SC-13: Cryptographic Protection
+
+syntax = "proto3";
+
+package sbc.api.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// SystemService provides system-level management operations.
+service SystemService {
+    // GetVersion returns version and build information.
+    rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+
+    // GetStats returns system-wide statistics.
+    rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
+
+    // GetMetrics returns Prometheus-format metrics.
+    rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
+
+    // ReloadTls triggers TLS certificate hot-reload.
+    rpc ReloadTls(ReloadTlsRequest) returns (ReloadTlsResponse);
+
+    // GetTlsStatus returns TLS certificate status.
+    rpc GetTlsStatus(GetTlsStatusRequest) returns (GetTlsStatusResponse);
+
+    // Shutdown initiates graceful shutdown.
+    rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+}
+
+// Request for version information.
+message GetVersionRequest {}
+
+// Response containing version information.
+message GetVersionResponse {
+    // Semantic version string (e.g., "1.2.3").
+    string version = 1;
+
+    // Application name.
+    string name = 2;
+
+    // Build timestamp.
+    string build_time = 3;
+
+    // Rust compiler version.
+    string rust_version = 4;
+
+    // Git commit hash.
+    string git_commit = 5;
+
+    // Git branch.
+    string git_branch = 6;
+
+    // Whether this is a release build.
+    bool release_build = 7;
+
+    // Target architecture.
+    string target = 8;
+
+    // Enabled features.
+    repeated string features = 9;
+}
+
+// Request for system statistics.
+message GetStatsRequest {}
+
+// Response containing system statistics.
+message GetStatsResponse {
+    // Total calls processed since startup.
+    int64 calls_total = 1;
+
+    // Currently active calls.
+    int64 calls_active = 2;
+
+    // Total registrations since startup.
+    int64 registrations_total = 3;
+
+    // Currently active registrations.
+    int64 registrations_active = 4;
+
+    // SIP messages received.
+    int64 messages_received = 5;
+
+    // SIP messages sent.
+    int64 messages_sent = 6;
+
+    // Messages rejected due to rate limiting.
+    int64 rate_limited = 7;
+
+    // Server uptime in seconds.
+    int64 uptime_secs = 8;
+
+    // Server start time.
+    google.protobuf.Timestamp start_time = 9;
+
+    // Current memory usage in bytes.
+    int64 memory_usage_bytes = 10;
+
+    // Peak memory usage in bytes.
+    int64 peak_memory_bytes = 11;
+
+    // Number of active connections.
+    int64 active_connections = 12;
+
+    // Number of active transactions.
+    int64 active_transactions = 13;
+
+    // Number of active dialogs.
+    int64 active_dialogs = 14;
+}
+
+// Request for Prometheus metrics.
+message GetMetricsRequest {
+    // Optional prefix filter for metric names.
+    string prefix = 1;
+
+    // Include histogram buckets in output.
+    bool include_histograms = 2;
+}
+
+// Response containing Prometheus metrics.
+message GetMetricsResponse {
+    // Prometheus text format metrics.
+    string metrics = 1;
+
+    // Content type header value.
+    string content_type = 2;
+}
+
+// Request to reload TLS certificates.
+message ReloadTlsRequest {
+    // Optional: Specific TLS context to reload (empty = all).
+    string context = 1;
+}
+
+// Response from TLS reload.
+message ReloadTlsResponse {
+    // Whether the reload was successful.
+    bool success = 1;
+
+    // Human-readable status message.
+    string message = 2;
+
+    // Updated TLS status after reload.
+    TlsStatus status = 3;
+}
+
+// Request for TLS status.
+message GetTlsStatusRequest {}
+
+// Response containing TLS status.
+message GetTlsStatusResponse {
+    // Whether TLS is enabled.
+    bool enabled = 1;
+
+    // TLS status details.
+    TlsStatus status = 2;
+}
+
+// TLS certificate status.
+message TlsStatus {
+    // Number of successful certificate reloads.
+    int64 reload_count = 1;
+
+    // Timestamp of last certificate reload.
+    google.protobuf.Timestamp last_reload = 2;
+
+    // Path to the certificate file.
+    string cert_path = 3;
+
+    // Path to the private key file.
+    string key_path = 4;
+
+    // Certificate expiration time.
+    google.protobuf.Timestamp cert_expiry = 5;
+
+    // Certificate subject DN.
+    string cert_subject = 6;
+
+    // Certificate issuer DN.
+    string cert_issuer = 7;
+
+    // Certificate serial number.
+    string cert_serial = 8;
+
+    // Days until certificate expires.
+    int32 days_until_expiry = 9;
+
+    // Whether the certificate is CNSA 2.0 compliant.
+    bool cnsa_compliant = 10;
+
+    // TLS version in use.
+    string tls_version = 11;
+
+    // Cipher suite in use.
+    string cipher_suite = 12;
+}
+
+// Request to initiate shutdown.
+message ShutdownRequest {
+    // Graceful shutdown timeout in seconds.
+    int32 timeout_secs = 1;
+
+    // Reason for shutdown (logged).
+    string reason = 2;
+
+    // If true, only drain connections without terminating.
+    bool drain_only = 3;
+}
+
+// Response from shutdown request.
+message ShutdownResponse {
+    // Whether shutdown was initiated.
+    bool accepted = 1;
+
+    // Human-readable status message.
+    string message = 2;
+
+    // Estimated time to complete shutdown in seconds.
+    int32 estimated_completion_secs = 3;
+
+    // Number of active connections being drained.
+    int64 connections_draining = 4;
+}

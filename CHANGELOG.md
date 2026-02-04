@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ### Added
 
+#### Enterprise Management Features (In Progress)
+
+**Multi-Format Configuration Support** (`sbc-config`)
+
+- Added `serde_yaml_ng` dependency for YAML configuration parsing
+- New `ConfigFormat` enum with `Toml` and `Yaml` variants
+- `ConfigFormat::from_extension()` for automatic format detection from file extension
+- `load_from_file_with_format()` for explicit format loading
+- `load_from_str_with_format()` for parsing configuration strings
+- Auto-detection: `.yaml`/`.yml` files parse as YAML, all others as TOML
+- Backward compatible: existing TOML workflows unchanged
+- 20 tests passing for configuration crate
+
+**gRPC Management API** (`sbc-grpc-api` new crate)
+
+- New Protocol Buffer definitions for enterprise management
+- Services: ConfigService, CallService, RegistrationService, SystemService, HealthService, ClusterService
+- Proto files: config.proto, call.proto, registration.proto, system.proto, health.proto, cluster.proto
+- Built with tonic 0.14 and prost 0.14
+- Standard gRPC health checking protocol (grpc.health.v1)
+- Cluster service feature-gated behind `cluster` feature flag
+- 4 tests passing for gRPC API crate
+
+**gRPC Server Implementation** (`sbc-daemon`)
+
+- New `grpc_server` module with service implementations
+- `GrpcServer` struct for managing gRPC server lifecycle
+- `ConfigServiceImpl`: GetConfig, UpdateConfig, ValidateConfig, ReloadConfig RPCs
+- `SystemServiceImpl`: GetVersion, GetStats, GetMetrics, ReloadTls, GetTlsStatus, Shutdown RPCs
+- `HealthServiceImpl`: Standard gRPC health Check and Watch RPCs
+- `GrpcConfig` schema in sbc-config for server configuration
+- Feature-gated behind `grpc` feature flag
+- Integrated into Runtime with graceful shutdown support
+- Default port 9090 (alongside REST API on 8080)
+- mTLS support via GrpcConfig options
+- 57 tests passing for daemon crate
+
+**Configuration Schema** (`sbc-config/schema.rs`)
+
+- `GrpcConfig` struct with comprehensive options:
+  - `enabled`: Enable/disable gRPC server
+  - `listen_addr`: Bind address (default: 0.0.0.0:9090)
+  - `tls_cert_path`, `tls_key_path`, `tls_ca_path`: TLS configuration
+  - `require_mtls`: Mutual TLS requirement
+  - `max_connections`: Connection limit
+  - `request_timeout_secs`: Request timeout
+  - `enable_reflection`: gRPC reflection service
+
 #### Phase 24.38: Button Event Handlers & Custom Dialogs (Completed)
 
 **Button Event Handlers** (`client-gui-windows/src/views/*.rs`)

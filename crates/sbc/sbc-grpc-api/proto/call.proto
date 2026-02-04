@@ -1,0 +1,256 @@
+// SBC Call Management Service
+//
+// NIST 800-53 Rev5 Controls:
+// - AU-2: Event Logging
+// - AU-12: Audit Record Generation
+
+syntax = "proto3";
+
+package sbc.api.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// CallService provides call management and monitoring operations.
+service CallService {
+    // ListCalls returns all active calls with optional filtering.
+    rpc ListCalls(ListCallsRequest) returns (ListCallsResponse);
+
+    // GetCall returns details for a specific call.
+    rpc GetCall(GetCallRequest) returns (GetCallResponse);
+
+    // TerminateCall forcefully terminates an active call.
+    rpc TerminateCall(TerminateCallRequest) returns (TerminateCallResponse);
+
+    // GetCallStats returns aggregated call statistics.
+    rpc GetCallStats(GetCallStatsRequest) returns (GetCallStatsResponse);
+
+    // WatchCalls streams call state changes in real-time.
+    rpc WatchCalls(WatchCallsRequest) returns (stream CallEvent);
+}
+
+// Call state enumeration.
+enum CallState {
+    CALL_STATE_UNSPECIFIED = 0;
+    CALL_STATE_INITIAL = 1;
+    CALL_STATE_EARLY = 2;
+    CALL_STATE_CONFIRMED = 3;
+    CALL_STATE_TERMINATED = 4;
+}
+
+// Information about a single call.
+message CallInfo {
+    // Unique call identifier (Call-ID header).
+    string call_id = 1;
+
+    // Current call state.
+    CallState state = 2;
+
+    // From URI (caller).
+    string from_uri = 3;
+
+    // To URI (callee).
+    string to_uri = 4;
+
+    // From tag.
+    string from_tag = 5;
+
+    // To tag (if dialog established).
+    string to_tag = 6;
+
+    // Call start time.
+    google.protobuf.Timestamp start_time = 7;
+
+    // Call duration in seconds (0 if not yet answered).
+    int64 duration_secs = 8;
+
+    // Media handling mode: "relay", "passthrough", "transcode".
+    string media_mode = 9;
+
+    // SIP transport: "udp", "tcp", "tls", "ws", "wss".
+    string transport = 10;
+
+    // A-leg (caller side) information.
+    CallLegInfo a_leg = 11;
+
+    // B-leg (callee side) information.
+    CallLegInfo b_leg = 12;
+
+    // STIR/SHAKEN attestation level (if applicable).
+    string attestation = 13;
+
+    // Call direction: "inbound" or "outbound".
+    string direction = 14;
+}
+
+// Information about one leg of a B2BUA call.
+message CallLegInfo {
+    // Local SIP address.
+    string local_addr = 1;
+
+    // Remote SIP address.
+    string remote_addr = 2;
+
+    // Local RTP address:port.
+    string rtp_local = 3;
+
+    // Remote RTP address:port.
+    string rtp_remote = 4;
+
+    // Negotiated audio codec.
+    string codec = 5;
+
+    // Whether SRTP is enabled.
+    bool srtp_enabled = 6;
+
+    // DTLS state if applicable.
+    string dtls_state = 7;
+
+    // ICE state if applicable.
+    string ice_state = 8;
+
+    // Packets sent on this leg.
+    uint64 packets_sent = 9;
+
+    // Packets received on this leg.
+    uint64 packets_received = 10;
+
+    // Bytes sent on this leg.
+    uint64 bytes_sent = 11;
+
+    // Bytes received on this leg.
+    uint64 bytes_received = 12;
+}
+
+// Request to list calls.
+message ListCallsRequest {
+    // Maximum number of calls to return.
+    int32 limit = 1;
+
+    // Offset for pagination.
+    int32 offset = 2;
+
+    // Filter by call state.
+    CallState state_filter = 3;
+
+    // Filter by caller URI (substring match).
+    string from_filter = 4;
+
+    // Filter by callee URI (substring match).
+    string to_filter = 5;
+
+    // Filter by direction.
+    string direction_filter = 6;
+}
+
+// Response containing list of calls.
+message ListCallsResponse {
+    // List of calls matching the filter.
+    repeated CallInfo calls = 1;
+
+    // Total number of calls (ignoring pagination).
+    int64 total = 2;
+
+    // Number of currently active calls.
+    int64 active = 3;
+}
+
+// Request to get a specific call.
+message GetCallRequest {
+    // Call ID to retrieve.
+    string call_id = 1;
+}
+
+// Response containing call details.
+message GetCallResponse {
+    // Call information.
+    CallInfo call = 1;
+}
+
+// Request to terminate a call.
+message TerminateCallRequest {
+    // Call ID to terminate.
+    string call_id = 1;
+
+    // Reason for termination (included in BYE/CANCEL).
+    string reason = 2;
+
+    // SIP response code (default 200 for normal, 603 for reject).
+    int32 cause_code = 3;
+}
+
+// Response from call termination.
+message TerminateCallResponse {
+    // Whether termination was successful.
+    bool success = 1;
+
+    // Human-readable status message.
+    string message = 2;
+}
+
+// Request for call statistics.
+message GetCallStatsRequest {
+    // Time range in seconds (0 = all time, -1 = since last query).
+    int64 time_range_secs = 1;
+}
+
+// Response containing call statistics.
+message GetCallStatsResponse {
+    // Total calls processed since startup.
+    int64 calls_total = 1;
+
+    // Currently active calls.
+    int64 calls_active = 2;
+
+    // Calls completed successfully.
+    int64 calls_completed = 3;
+
+    // Calls that failed (4xx/5xx/6xx).
+    int64 calls_failed = 4;
+
+    // Average call duration in seconds.
+    double average_duration_secs = 5;
+
+    // Peak concurrent calls.
+    int64 peak_concurrent = 6;
+
+    // Calls per second (current rate).
+    double calls_per_second = 7;
+
+    // Statistics time window start.
+    google.protobuf.Timestamp window_start = 8;
+
+    // Statistics time window end.
+    google.protobuf.Timestamp window_end = 9;
+}
+
+// Request to watch call events.
+message WatchCallsRequest {
+    // Filter events by call state changes.
+    repeated CallState state_filter = 1;
+
+    // Include detailed leg information in events.
+    bool include_leg_info = 2;
+}
+
+// Call state change event.
+message CallEvent {
+    // Event type.
+    enum EventType {
+        EVENT_TYPE_UNSPECIFIED = 0;
+        EVENT_TYPE_CREATED = 1;
+        EVENT_TYPE_STATE_CHANGED = 2;
+        EVENT_TYPE_TERMINATED = 3;
+    }
+
+    // Type of event.
+    EventType event_type = 1;
+
+    // Call information at time of event.
+    CallInfo call = 2;
+
+    // Previous state (for state change events).
+    CallState previous_state = 3;
+
+    // Event timestamp.
+    google.protobuf.Timestamp timestamp = 4;
+}

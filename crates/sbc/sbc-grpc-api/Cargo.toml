@@ -1,0 +1,28 @@
+[package]
+name = "sbc-grpc-api"
+description = "gRPC API protocol definitions for SBC management"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+# Enable cluster management service
+cluster = []
+
+[dependencies]
+# gRPC/protobuf
+prost = "0.14"
+prost-types = "0.14"
+tonic = { version = "0.14", features = ["gzip", "tls-aws-lc"] }
+tonic-prost = "0.14"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[lints]
+workspace = true

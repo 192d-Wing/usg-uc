@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-25 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.30-24.38 complete, Phase 25 100% RFC 9260 compliance achieved
+**Current Status**: 1750+ tests passing, Phases 1-25 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.30-24.38 complete, Phase 25 100% RFC 9260 compliance achieved, Enterprise Features in progress
 
 ---
 
@@ -1501,6 +1501,64 @@ This document outlines the development roadmap for the USG Session Border Contro
   - Direct method calls instead of Action enums
   - NWG event handlers bound via `nwg::bind_event_handler`
   - Timer-based polling for SIP events
+
+### 🚧 Enterprise Management Features (In Progress)
+
+**Goal**: Enterprise-level management capabilities for the SBC
+
+**Multi-Format Configuration Support** (`sbc-config`) ✅
+
+- ✅ `serde_yaml_ng` dependency for YAML parsing
+- ✅ `ConfigFormat` enum: `Toml`, `Yaml`
+- ✅ `ConfigFormat::from_extension()` auto-detects format from file extension
+- ✅ `load_from_file_with_format()` for explicit format loading
+- ✅ `load_from_str_with_format()` for parsing strings with specified format
+- ✅ Backward compatible: existing TOML workflows unchanged
+- ✅ 20 tests passing
+
+**gRPC Management API** (`sbc-grpc-api` new crate) ✅
+
+- ✅ Protocol Buffer definitions for enterprise management
+- ✅ `config.proto`: ConfigService (GetConfig, UpdateConfig, ValidateConfig, ReloadConfig)
+- ✅ `call.proto`: CallService (ListCalls, GetCall, TerminateCall, GetCallStats)
+- ✅ `registration.proto`: RegistrationService (ListRegistrations, GetRegistration)
+- ✅ `system.proto`: SystemService (GetVersion, GetStats, GetMetrics, ReloadTls, GetTlsStatus, Shutdown)
+- ✅ `health.proto`: Standard gRPC health protocol (Check, Watch)
+- ✅ `cluster.proto`: ClusterService (GetClusterStatus, ListNodes, GetNodeStatus, InitiateFailover) - feature-gated
+- ✅ Built with tonic 0.14 and prost 0.14
+- ✅ 4 tests passing
+
+**gRPC Server Implementation** (`sbc-daemon`) ✅
+
+- ✅ `grpc_server` module with service implementations
+- ✅ `GrpcServer` struct for lifecycle management
+- ✅ `ConfigServiceImpl`, `SystemServiceImpl`, `HealthServiceImpl`
+- ✅ Feature-gated behind `grpc` feature flag
+- ✅ Integrated into Runtime with graceful shutdown
+- ✅ Default port 9090 (alongside REST API on 8080)
+- ✅ 57 tests passing
+
+**Configuration Schema** (`sbc-config/schema.rs`) ✅
+
+- ✅ `GrpcConfig` struct:
+  - `enabled`: Enable/disable gRPC server
+  - `listen_addr`: Bind address (default: 0.0.0.0:9090)
+  - `tls_cert_path`, `tls_key_path`, `tls_ca_path`: TLS configuration
+  - `require_mtls`: Mutual TLS requirement
+  - `max_connections`: Connection limit
+  - `request_timeout_secs`: Request timeout
+  - `enable_reflection`: gRPC reflection service
+
+**Pending**
+
+- 🚧 CallService implementation
+- 🚧 RegistrationService implementation
+- 🚧 ClusterService implementation (cluster feature)
+- 🚧 TLS/mTLS for gRPC server
+- 🚧 gRPC reflection service
+- 🚧 Integration tests for gRPC services
+
+---
 
 **Phase 24.38: Button Event Handlers & Custom Dialogs** ✅
 

@@ -91,6 +91,14 @@ pub struct SbcConfig {
     #[cfg(feature = "telemetry")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<TelemetryConfig>,
+
+    /// gRPC API server configuration.
+    ///
+    /// When enabled, provides enterprise-level management via gRPC.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8 (Transmission Confidentiality)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grpc: Option<GrpcConfig>,
 }
 
 /// General SBC settings.
@@ -444,6 +452,66 @@ impl Default for MonitoringConfig {
             metrics_bind: None,
             per_call_metrics: false,
             scrape_interval_secs: 15,
+        }
+    }
+}
+
+/// gRPC API server configuration.
+///
+/// Configures the gRPC management API for enterprise control plane operations.
+///
+/// ## NIST 800-53 Rev5 Controls
+///
+/// - **SC-8**: Transmission Confidentiality (TLS support)
+/// - **SC-13**: Cryptographic Protection (CNSA 2.0 compliant TLS)
+/// - **IA-3**: Device Identification (mTLS support)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GrpcConfig {
+    /// Enable the gRPC API server.
+    pub enabled: bool,
+
+    /// Listen address for the gRPC server.
+    pub listen_addr: SocketAddr,
+
+    /// Path to TLS certificate (PEM format, P-384 ECDSA).
+    pub tls_cert_path: Option<PathBuf>,
+
+    /// Path to TLS private key (PEM format, P-384 ECDSA).
+    pub tls_key_path: Option<PathBuf>,
+
+    /// Path to CA certificate for client verification (mTLS).
+    pub tls_ca_path: Option<PathBuf>,
+
+    /// Require mutual TLS (client certificate authentication).
+    pub require_mtls: bool,
+
+    /// Maximum concurrent gRPC connections.
+    pub max_connections: u32,
+
+    /// Request timeout in seconds.
+    pub request_timeout_secs: u64,
+
+    /// Enable gRPC reflection for debugging tools like grpcurl.
+    pub enable_reflection: bool,
+}
+
+impl Default for GrpcConfig {
+    fn default() -> Self {
+        // Use unwrap for hardcoded valid address in Default impl
+        #[allow(clippy::unwrap_used)]
+        let listen_addr = "0.0.0.0:9090".parse().unwrap();
+
+        Self {
+            enabled: false,
+            listen_addr,
+            tls_cert_path: None,
+            tls_key_path: None,
+            tls_ca_path: None,
+            require_mtls: false,
+            max_connections: 1000,
+            request_timeout_secs: 30,
+            enable_reflection: true,
         }
     }
 }

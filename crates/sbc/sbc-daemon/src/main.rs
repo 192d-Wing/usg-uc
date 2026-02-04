@@ -40,6 +40,8 @@ mod api_server;
 mod args;
 #[cfg(feature = "cluster")]
 mod cluster;
+#[cfg(feature = "grpc")]
+mod grpc_server;
 mod ice_agent;
 mod media_pipeline;
 mod runtime;
