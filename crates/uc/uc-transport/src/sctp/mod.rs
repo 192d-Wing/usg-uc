@@ -22,6 +22,7 @@
 
 pub mod chunk;
 pub mod congestion;
+pub mod cookie;
 pub mod packet;
 pub mod path;
 pub mod state;
@@ -32,7 +33,6 @@ pub mod udp_encap;
 // These modules will be added in subsequent phases:
 // pub mod association;
 // pub mod listener;
-// pub mod cookie;
 
 pub use chunk::{
     AbortChunk, Chunk, ChunkType, CookieAckChunk, CookieEchoChunk, DataChunk, ErrorCause,
@@ -50,6 +50,7 @@ pub use udp_encap::{
     decapsulate, encapsulate, EncapsulatedPacket, UdpEncapConfig, UdpEncapError, UdpHeader,
     SCTP_UDP_PORT, UDP_HEADER_SIZE,
 };
+pub use cookie::{CookieData, CookieError, CookieGenerator, DEFAULT_COOKIE_LIFETIME};
 
 use crate::error::{TransportError, TransportResult};
 use crate::{MAX_STREAM_MESSAGE_SIZE, ReceivedMessage, StreamTransport, Transport};
