@@ -232,8 +232,20 @@ mod tests {
         let mut packet = SctpPacket::new(5060, 5061, 0x11223344);
 
         // Add multiple DATA chunks
-        packet.add_chunk(Chunk::Data(DataChunk::new(1, 0, 1, 0, Bytes::from("First"))));
-        packet.add_chunk(Chunk::Data(DataChunk::new(2, 0, 2, 0, Bytes::from("Second"))));
+        packet.add_chunk(Chunk::Data(DataChunk::new(
+            1,
+            0,
+            1,
+            0,
+            Bytes::from("First"),
+        )));
+        packet.add_chunk(Chunk::Data(DataChunk::new(
+            2,
+            0,
+            2,
+            0,
+            Bytes::from("Second"),
+        )));
 
         // Add a SACK chunk
         packet.add_chunk(Chunk::Sack(SackChunk::new(100, 65535)));
@@ -254,7 +266,12 @@ mod tests {
 
         let result = SctpPacket::decode(&encoded);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Checksum mismatch"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Checksum mismatch")
+        );
     }
 
     #[test]

@@ -21,29 +21,32 @@
 //! - **SC-23**: Association state tracking
 
 pub mod chunk;
+pub mod congestion;
 pub mod packet;
 pub mod state;
+pub mod stream;
+pub mod timer;
 
 // These modules will be added in subsequent phases:
-// pub mod stream;
-// pub mod congestion;
 // pub mod path;
-// pub mod timer;
 // pub mod association;
 // pub mod listener;
 // pub mod cookie;
 
 pub use chunk::{
     AbortChunk, Chunk, ChunkType, CookieAckChunk, CookieEchoChunk, DataChunk, ErrorCause,
-    ErrorChunk, GapAckBlock, HeartbeatAckChunk, HeartbeatChunk, InitAckChunk, InitChunk,
-    InitParam, SackChunk, ShutdownAckChunk, ShutdownChunk, ShutdownCompleteChunk, UnknownChunk,
+    ErrorChunk, GapAckBlock, HeartbeatAckChunk, HeartbeatChunk, InitAckChunk, InitChunk, InitParam,
+    SackChunk, ShutdownAckChunk, ShutdownChunk, ShutdownCompleteChunk, UnknownChunk,
     UnknownChunkAction,
 };
-pub use packet::{SctpPacket, HEADER_SIZE, MAX_PACKET_SIZE};
+pub use congestion::CongestionController;
+pub use packet::{HEADER_SIZE, MAX_PACKET_SIZE, SctpPacket};
 pub use state::{AssociationState, StateAction, StateEvent, StateMachine};
+pub use stream::{Stream, StreamError, StreamManager};
+pub use timer::{RtoCalculator, Timer, TimerManager, TimerType};
 
 use crate::error::{TransportError, TransportResult};
-use crate::{ReceivedMessage, StreamTransport, Transport, MAX_STREAM_MESSAGE_SIZE};
+use crate::{MAX_STREAM_MESSAGE_SIZE, ReceivedMessage, StreamTransport, Transport};
 use bytes::Bytes;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -195,8 +198,7 @@ impl SctpAssociation {
 
         // TODO: Actually send INIT and process responses
         // For now, simulate successful connection
-        self.state_machine
-            .process_event(StateEvent::ReceiveInitAck);
+        self.state_machine.process_event(StateEvent::ReceiveInitAck);
         self.state_machine
             .process_event(StateEvent::ReceiveCookieAck);
 

@@ -101,10 +101,7 @@ impl ChunkType {
     /// - INIT, INIT ACK, and SHUTDOWN COMPLETE MUST NOT be bundled.
     #[must_use]
     pub const fn must_not_bundle(&self) -> bool {
-        matches!(
-            self,
-            Self::Init | Self::InitAck | Self::ShutdownComplete
-        )
+        matches!(self, Self::Init | Self::InitAck | Self::ShutdownComplete)
     }
 
     /// Returns the action to take for unknown chunk types based on high bits.
@@ -279,30 +276,36 @@ impl Chunk {
         match ChunkType::from_u8(chunk_type) {
             Some(ChunkType::Data) => Ok(Self::Data(DataChunk::decode_body(flags, &chunk_data)?)),
             Some(ChunkType::Init) => Ok(Self::Init(InitChunk::decode_body(flags, &chunk_data)?)),
-            Some(ChunkType::InitAck) => {
-                Ok(Self::InitAck(InitAckChunk::decode_body(flags, &chunk_data)?))
-            }
+            Some(ChunkType::InitAck) => Ok(Self::InitAck(InitAckChunk::decode_body(
+                flags,
+                &chunk_data,
+            )?)),
             Some(ChunkType::Sack) => Ok(Self::Sack(SackChunk::decode_body(flags, &chunk_data)?)),
-            Some(ChunkType::Heartbeat) => {
-                Ok(Self::Heartbeat(HeartbeatChunk::decode_body(flags, &chunk_data)?))
-            }
-            Some(ChunkType::HeartbeatAck) => {
-                Ok(Self::HeartbeatAck(HeartbeatAckChunk::decode_body(flags, &chunk_data)?))
-            }
+            Some(ChunkType::Heartbeat) => Ok(Self::Heartbeat(HeartbeatChunk::decode_body(
+                flags,
+                &chunk_data,
+            )?)),
+            Some(ChunkType::HeartbeatAck) => Ok(Self::HeartbeatAck(
+                HeartbeatAckChunk::decode_body(flags, &chunk_data)?,
+            )),
             Some(ChunkType::Abort) => Ok(Self::Abort(AbortChunk::decode_body(flags, &chunk_data)?)),
-            Some(ChunkType::Shutdown) => {
-                Ok(Self::Shutdown(ShutdownChunk::decode_body(flags, &chunk_data)?))
-            }
-            Some(ChunkType::ShutdownAck) => {
-                Ok(Self::ShutdownAck(ShutdownAckChunk::decode_body(flags, &chunk_data)?))
-            }
+            Some(ChunkType::Shutdown) => Ok(Self::Shutdown(ShutdownChunk::decode_body(
+                flags,
+                &chunk_data,
+            )?)),
+            Some(ChunkType::ShutdownAck) => Ok(Self::ShutdownAck(ShutdownAckChunk::decode_body(
+                flags,
+                &chunk_data,
+            )?)),
             Some(ChunkType::Error) => Ok(Self::Error(ErrorChunk::decode_body(flags, &chunk_data)?)),
-            Some(ChunkType::CookieEcho) => {
-                Ok(Self::CookieEcho(CookieEchoChunk::decode_body(flags, &chunk_data)?))
-            }
-            Some(ChunkType::CookieAck) => {
-                Ok(Self::CookieAck(CookieAckChunk::decode_body(flags, &chunk_data)?))
-            }
+            Some(ChunkType::CookieEcho) => Ok(Self::CookieEcho(CookieEchoChunk::decode_body(
+                flags,
+                &chunk_data,
+            )?)),
+            Some(ChunkType::CookieAck) => Ok(Self::CookieAck(CookieAckChunk::decode_body(
+                flags,
+                &chunk_data,
+            )?)),
             Some(ChunkType::ShutdownComplete) => Ok(Self::ShutdownComplete(
                 ShutdownCompleteChunk::decode_body(flags, &chunk_data)?,
             )),
@@ -563,18 +566,10 @@ impl InitChunk {
         }
 
         let length = u16::from_be_bytes([chunk_data[2], chunk_data[3]]) as usize;
-        let initiate_tag = u32::from_be_bytes([
-            chunk_data[4],
-            chunk_data[5],
-            chunk_data[6],
-            chunk_data[7],
-        ]);
-        let a_rwnd = u32::from_be_bytes([
-            chunk_data[8],
-            chunk_data[9],
-            chunk_data[10],
-            chunk_data[11],
-        ]);
+        let initiate_tag =
+            u32::from_be_bytes([chunk_data[4], chunk_data[5], chunk_data[6], chunk_data[7]]);
+        let a_rwnd =
+            u32::from_be_bytes([chunk_data[8], chunk_data[9], chunk_data[10], chunk_data[11]]);
         let num_outbound_streams = u16::from_be_bytes([chunk_data[12], chunk_data[13]]);
         let num_inbound_streams = u16::from_be_bytes([chunk_data[14], chunk_data[15]]);
         let initial_tsn = u32::from_be_bytes([
@@ -868,18 +863,10 @@ impl InitAckChunk {
         }
 
         let length = u16::from_be_bytes([chunk_data[2], chunk_data[3]]) as usize;
-        let initiate_tag = u32::from_be_bytes([
-            chunk_data[4],
-            chunk_data[5],
-            chunk_data[6],
-            chunk_data[7],
-        ]);
-        let a_rwnd = u32::from_be_bytes([
-            chunk_data[8],
-            chunk_data[9],
-            chunk_data[10],
-            chunk_data[11],
-        ]);
+        let initiate_tag =
+            u32::from_be_bytes([chunk_data[4], chunk_data[5], chunk_data[6], chunk_data[7]]);
+        let a_rwnd =
+            u32::from_be_bytes([chunk_data[8], chunk_data[9], chunk_data[10], chunk_data[11]]);
         let num_outbound_streams = u16::from_be_bytes([chunk_data[12], chunk_data[13]]);
         let num_inbound_streams = u16::from_be_bytes([chunk_data[14], chunk_data[15]]);
         let initial_tsn = u32::from_be_bytes([
@@ -965,9 +952,7 @@ impl SackChunk {
     }
 
     fn encode(&self, buf: &mut BytesMut) {
-        let length = Self::HEADER_SIZE
-            + self.gap_ack_blocks.len() * 4
-            + self.dup_tsns.len() * 4;
+        let length = Self::HEADER_SIZE + self.gap_ack_blocks.len() * 4 + self.dup_tsns.len() * 4;
 
         buf.put_u8(ChunkType::Sack as u8);
         buf.put_u8(0); // flags
@@ -999,18 +984,10 @@ impl SackChunk {
             });
         }
 
-        let cumulative_tsn_ack = u32::from_be_bytes([
-            chunk_data[4],
-            chunk_data[5],
-            chunk_data[6],
-            chunk_data[7],
-        ]);
-        let a_rwnd = u32::from_be_bytes([
-            chunk_data[8],
-            chunk_data[9],
-            chunk_data[10],
-            chunk_data[11],
-        ]);
+        let cumulative_tsn_ack =
+            u32::from_be_bytes([chunk_data[4], chunk_data[5], chunk_data[6], chunk_data[7]]);
+        let a_rwnd =
+            u32::from_be_bytes([chunk_data[8], chunk_data[9], chunk_data[10], chunk_data[11]]);
         let num_gap_blocks = u16::from_be_bytes([chunk_data[12], chunk_data[13]]) as usize;
         let num_dup_tsns = u16::from_be_bytes([chunk_data[14], chunk_data[15]]) as usize;
 
@@ -1262,12 +1239,8 @@ impl ShutdownChunk {
             });
         }
 
-        let cumulative_tsn_ack = u32::from_be_bytes([
-            chunk_data[4],
-            chunk_data[5],
-            chunk_data[6],
-            chunk_data[7],
-        ]);
+        let cumulative_tsn_ack =
+            u32::from_be_bytes([chunk_data[4], chunk_data[5], chunk_data[6], chunk_data[7]]);
 
         Ok(Self { cumulative_tsn_ack })
     }
@@ -1653,7 +1626,9 @@ impl CookieEchoChunk {
 
     fn decode_body(_flags: u8, chunk_data: &Bytes) -> TransportResult<Self> {
         let length = u16::from_be_bytes([chunk_data[2], chunk_data[3]]) as usize;
-        let cookie_len = length.saturating_sub(CHUNK_HEADER_SIZE).min(chunk_data.len() - CHUNK_HEADER_SIZE);
+        let cookie_len = length
+            .saturating_sub(CHUNK_HEADER_SIZE)
+            .min(chunk_data.len() - CHUNK_HEADER_SIZE);
         let cookie = chunk_data.slice(CHUNK_HEADER_SIZE..CHUNK_HEADER_SIZE + cookie_len);
         Ok(Self { cookie })
     }
@@ -1796,13 +1771,25 @@ mod tests {
     #[test]
     fn test_unknown_action() {
         // 00xxxxxx - stop and report
-        assert_eq!(ChunkType::unknown_action(0x00), UnknownChunkAction::StopAndReport);
+        assert_eq!(
+            ChunkType::unknown_action(0x00),
+            UnknownChunkAction::StopAndReport
+        );
         // 01xxxxxx - stop silently
-        assert_eq!(ChunkType::unknown_action(0x40), UnknownChunkAction::StopSilently);
+        assert_eq!(
+            ChunkType::unknown_action(0x40),
+            UnknownChunkAction::StopSilently
+        );
         // 10xxxxxx - skip and report
-        assert_eq!(ChunkType::unknown_action(0x80), UnknownChunkAction::SkipAndReport);
+        assert_eq!(
+            ChunkType::unknown_action(0x80),
+            UnknownChunkAction::SkipAndReport
+        );
         // 11xxxxxx - skip silently
-        assert_eq!(ChunkType::unknown_action(0xC0), UnknownChunkAction::SkipSilently);
+        assert_eq!(
+            ChunkType::unknown_action(0xC0),
+            UnknownChunkAction::SkipSilently
+        );
     }
 
     #[test]

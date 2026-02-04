@@ -89,9 +89,7 @@ impl AssociationState {
     pub const fn is_connected(&self) -> bool {
         matches!(
             self,
-            Self::Established
-                | Self::ShutdownPending
-                | Self::ShutdownReceived
+            Self::Established | Self::ShutdownPending | Self::ShutdownReceived
         )
     }
 
@@ -587,7 +585,10 @@ mod tests {
     fn test_state_display() {
         assert_eq!(AssociationState::Closed.to_string(), "CLOSED");
         assert_eq!(AssociationState::Established.to_string(), "ESTABLISHED");
-        assert_eq!(AssociationState::ShutdownPending.to_string(), "SHUTDOWN-PENDING");
+        assert_eq!(
+            AssociationState::ShutdownPending.to_string(),
+            "SHUTDOWN-PENDING"
+        );
     }
 
     #[test]
