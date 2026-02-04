@@ -1130,6 +1130,35 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
     - Clears registration spinner on final state
     - Handles Registered, Unregistered, and Failed states
 
+#### Phase 24.33: Contact Management UI
+
+- `client-gui/src/views/contacts.rs` - Contact CRUD dialogs
+  - `ContactsAction` enum expanded with Add, ToggleFavorite, SaveContact, ConfirmDelete
+  - `ContactDialogMode` enum for Add vs Edit modes
+  - `open_add_dialog()` - Initialize empty dialog for new contact
+  - `open_edit_dialog()` - Pre-populate fields from existing contact
+  - `open_delete_dialog()` - Set up deletion confirmation
+  - `render_contact_dialog()` - Modal with name, SIP URI, organization, notes, favorite
+    - Validation: Name required, SIP URI must start with sip: or sips:
+    - Cancel/Save buttons with visual feedback
+  - `render_delete_dialog()` - Confirmation with contact name display
+    - Warning message about irreversible action
+    - Cancel/Delete buttons (Delete in red)
+  - Favorite toggle button on contact row
+  - Context menu with Call, Edit, Add/Remove Favorites, Delete options
+  - `set_contacts()` - Load contacts from iterator with sorting
+- `client-gui/src/app.rs` - Contact management integration
+  - Added `ContactManager` field for persistence
+  - Initialize ContactManager on startup, load contacts into view
+  - `handle_contacts_action()` handlers for all actions:
+    - `Add` - Opens add dialog
+    - `Edit` - Loads contact into edit dialog
+    - `Delete` - Opens delete confirmation
+    - `ToggleFavorite` - Toggles and persists favorite status
+    - `SaveContact` - Saves to ContactManager, refreshes view
+    - `ConfirmDelete` - Removes from ContactManager, refreshes view
+  - Auto-save contacts on all modifications
+
 **Security**
 
 - Smart card authentication ONLY (CAC/PIV/SIPR token)

@@ -6,7 +6,7 @@ use crate::notifications::NotificationManager;
 use crate::tray::TrayAction;
 use crate::views::{CallView, ContactsView, DialerView, SettingsView};
 use client_audio::RingtonePlayer;
-use client_core::{AppEvent, ClientApp, SettingsManager};
+use client_core::{AppEvent, ClientApp, ContactManager, SettingsManager};
 use client_types::{CallInfo, CallState, RegistrationState};
 use eframe::egui;
 use std::net::SocketAddr;
@@ -134,6 +134,8 @@ pub struct SipClientApp {
     current_output_device: Option<String>,
     /// Settings manager for persisting configuration.
     settings_manager: SettingsManager,
+    /// Contact manager for storing contacts.
+    contact_manager: ContactManager,
     /// Show unsaved settings confirmation dialog.
     show_unsaved_settings_dialog: bool,
     /// Close requested while unsaved settings dialog is shown.
@@ -199,11 +201,26 @@ impl SipClientApp {
         let mut settings_view = SettingsView::new();
         settings_view.load_from_settings(settings_manager.settings());
 
+        // Initialize contact manager
+        let contact_manager = match ContactManager::new() {
+            Ok(manager) => manager,
+            Err(e) => {
+                error!("Failed to load contacts: {}, starting fresh", e);
+                ContactManager::new().unwrap_or_else(|_| {
+                    panic!("Failed to create contact manager")
+                })
+            }
+        };
+
+        // Load contacts into the view
+        let mut contacts_view = ContactsView::new();
+        contacts_view.set_contacts(contact_manager.contacts().cloned());
+
         Self {
             active_view: ActiveView::Dialer,
             dialer_view: DialerView::new(),
             call_view: CallView::new(),
-            contacts_view: ContactsView::new(),
+            contacts_view,
             settings_view,
             client_app,
             runtime,
@@ -233,6 +250,7 @@ impl SipClientApp {
             current_input_device: None,
             current_output_device: None,
             settings_manager,
+            contact_manager,
             show_unsaved_settings_dialog: false,
             pending_close: false,
         }
@@ -1151,6 +1169,7 @@ impl eframe::App for SipClientApp {
                 if let Some(action) = self.contacts_view.render(ui) {
                     self.handle_contacts_action(action);
                 }
+                // Render contact dialogs (outside scroll area)
             }
             ActiveView::Settings => {
                 if let Some(action) = self.settings_view.render(ui) {
@@ -1162,6 +1181,14 @@ impl eframe::App for SipClientApp {
         // Dialogs (rendered last for z-order)
         self.render_error_dialog(ctx);
         self.render_pin_dialog(ctx);
+
+        // Contact dialogs
+        if let Some(action) = self.contacts_view.render_contact_dialog(ctx) {
+            self.handle_contacts_action(action);
+        }
+        if let Some(action) = self.contacts_view.render_delete_dialog(ctx) {
+            self.handle_contacts_action(action);
+        }
 
         // Incoming call dialog
         if let Some(action) = self.render_incoming_call_dialog(ctx) {
@@ -1378,11 +1405,62 @@ impl SipClientApp {
                     }
                 }
             }
-            crate::views::ContactsAction::Edit(_contact_id) => {
-                // TODO: Open contact editor
+            crate::views::ContactsAction::Add => {
+                info!("Opening add contact dialog");
+                self.contacts_view.open_add_dialog();
             }
-            crate::views::ContactsAction::Delete(_contact_id) => {
-                // TODO: Delete contact
+            crate::views::ContactsAction::Edit(contact_id) => {
+                info!(contact_id = %contact_id, "Opening edit contact dialog");
+                if let Some(contact) = self.contact_manager.get_contact(&contact_id) {
+                    self.contacts_view.open_edit_dialog(contact);
+                }
+            }
+            crate::views::ContactsAction::Delete(contact_id) => {
+                info!(contact_id = %contact_id, "Opening delete contact dialog");
+                if let Some(contact) = self.contact_manager.get_contact(&contact_id) {
+                    self.contacts_view
+                        .open_delete_dialog(&contact_id, &contact.name);
+                }
+            }
+            crate::views::ContactsAction::ToggleFavorite(contact_id) => {
+                info!(contact_id = %contact_id, "Toggling favorite");
+                if let Some(contact) = self.contact_manager.get_contact(&contact_id) {
+                    let mut updated = contact.clone();
+                    updated.favorite = !updated.favorite;
+                    self.contact_manager.set_contact(updated);
+                    // Refresh the view
+                    self.contacts_view
+                        .set_contacts(self.contact_manager.contacts().cloned());
+                    // Save contacts
+                    if let Err(e) = self.contact_manager.save() {
+                        warn!(error = %e, "Failed to save contacts");
+                    }
+                }
+            }
+            crate::views::ContactsAction::SaveContact(contact) => {
+                info!(contact_id = %contact.id, name = %contact.name, "Saving contact");
+                self.contact_manager.set_contact(contact);
+                // Refresh the view
+                self.contacts_view
+                    .set_contacts(self.contact_manager.contacts().cloned());
+                // Save contacts
+                if let Err(e) = self.contact_manager.save() {
+                    warn!(error = %e, "Failed to save contacts");
+                }
+                self.status_message = "Contact saved".to_string();
+            }
+            crate::views::ContactsAction::ConfirmDelete(contact_id) => {
+                info!(contact_id = %contact_id, "Deleting contact");
+                if self.contact_manager.remove_contact(&contact_id).is_some() {
+                    // Refresh the view
+                    self.contacts_view
+                        .set_contacts(self.contact_manager.contacts().cloned());
+                    // Save contacts
+                    if let Err(e) = self.contact_manager.save() {
+                        warn!(error = %e, "Failed to save contacts");
+                    }
+                    self.status_message = "Contact deleted".to_string();
+                }
             }
         }
     }
