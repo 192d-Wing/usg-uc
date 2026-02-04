@@ -677,9 +677,48 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - CallAction::Hold handler calls toggle_hold() and displays status
 - Total: 88 tests passing (22 client-sip-ua, 66 client-core)
 
-**Dependencies Added**
+#### Phase 24.23: Future Enhancements (Hold UI, Multi-Call, MOH)
 
-- `rustls-native-certs` 0.8: Platform-specific CA certificate loading
+- `client-gui/src/views/call.rs` - Visual hold indicator
+  - Prominent orange hold banner with pause icon (⏸) and "CALL ON HOLD" text
+  - Orange duration text styling when on hold
+  - `CallAction::SwitchTo { call_id }` for multi-call switching
+- `client-types/src/call.rs` - Multi-call state tracking
+  - `CallFocus` enum: Active, Held, Ringing
+  - Exported from lib.rs for use across crates
+- `client-core/src/call_manager.rs` - Multiple held calls support
+  - Replace `active_call_id` with `focused_call_id` + `active_calls: Vec<String>`
+  - `max_concurrent_calls` configuration (default: 2 for call waiting)
+  - `switch_to_call()` - Hold current, resume target call
+  - `all_call_ids()` / `all_call_info()` - Accessors for all active calls
+  - Auto-hold current call when making/accepting second call
+  - `hold_call_by_id()` / `resume_call_by_id()` - Direct call manipulation
+  - MOH activation on hold, deactivation on resume
+- `client-gui/src/app.rs` - Multi-call UI
+  - `all_calls: Vec<CallInfo>` tracking for GUI state
+  - `render_call_tabs()` - Tabs showing all active calls
+  - Tab colors: green=focused, orange=held
+  - Click to switch between calls
+  - `SwitchTo` handler calling `switch_to_call()`
+- `client-audio/src/file_source.rs` - NEW file for MOH audio
+  - `FileAudioSource` for WAV file loading
+  - Automatic mono conversion from stereo
+  - Linear resampling to target sample rate
+  - Continuous looping playback for MOH
+  - 8 tests for file source operations
+- `client-audio/src/pipeline.rs` - MOH integration
+  - `moh_source: Option<FileAudioSource>` field
+  - `moh_active: AtomicBool` for hold state
+  - `set_moh_active()` / `is_moh_active()` / `has_moh()` accessors
+  - `process_moh_frame()` - Send MOH audio instead of microphone
+  - MOH loaded during pipeline start if configured
+- `client-core/src/audio_session.rs` - MOH control
+  - `moh_file_path` in AudioSessionConfig
+  - `set_moh_active()` / `is_moh_active()` / `has_moh()` async methods
+  - Audio processing loop uses MOH when active instead of capture
+- `client-types/src/audio.rs` - MOH configuration
+  - `moh_file_path: Option<String>` in AudioConfig (serde-serializable)
+  - User-configurable MOH file path
 
 **Security**
 
@@ -690,6 +729,7 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 **Dependencies Added**
 
+- `hound` 3.5: WAV file reading for Music on Hold
 - `cpal` 0.17: Cross-platform audio I/O
 - `ringbuf` 0.4: Lock-free ring buffers for audio threads
 - `egui` 0.33: Immediate mode GUI

@@ -1042,10 +1042,29 @@ This document outlines the development roadmap for the USG Session Border Contro
   - `toggle_hold()` method in ClientApp
   - Hold action handler in GUI app.rs
   - Status messages for hold/resume feedback
-- 🚧 Future enhancements
-  - Visual indicator for held calls in call view
-  - Multiple held calls support (call waiting)
-  - Music on hold (local audio file playback)
+
+**Phase 24.23: Future Enhancements** ✅
+
+- ✅ Visual indicator for held calls
+  - Prominent orange hold banner in call view
+  - Orange duration text styling when on hold
+  - Pause icon (⏸) in the banner
+- ✅ Multiple held calls support (call waiting)
+  - `CallFocus` enum (Active, Held, Ringing) in client-types
+  - `focused_call_id` + `active_calls: Vec<String>` in CallManager
+  - `max_concurrent_calls` configuration (default: 2)
+  - Auto-hold current call when making/accepting second call
+  - `SwitchTo` action in CallAction enum
+  - Call tabs UI showing all active calls with state indicators
+  - Tab colors: green=focused, orange=held
+  - `switch_to_call()` in ClientApp and CallManager
+- ✅ Music on Hold (MOH)
+  - `hound` dependency for WAV file reading
+  - `FileAudioSource` for loading WAV with mono conversion and resampling
+  - Continuous looping playback
+  - `moh_file_path` in AudioConfig, PipelineConfig, AudioSessionConfig
+  - `set_moh_active()`, `is_moh_active()`, `has_moh()`, `process_moh_frame()` in pipeline
+  - MOH activates automatically on hold, deactivates on resume
 
 ---
 
