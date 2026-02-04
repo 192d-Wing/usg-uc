@@ -1440,7 +1440,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 | RFC 8445 | ICE | ✅ Enhanced (aggressive nomination, consent, keepalives) |
 | RFC 8224 | STIR | ✅ Implemented (ES384) |
 | RFC 8225 | PASSporT | ✅ Implemented (ES384) |
-| RFC 9260 | SCTP | 🚧 Partial (~92% compliant, critical + medium items complete) |
+| RFC 9260 | SCTP | ✅ Complete (100% compliant - all chunks, state machine, timers, congestion control) |
 | RFC 4168 | SIP over SCTP | 🚧 Partial (transport layer complete) |
 | RFC 6951 | UDP Encapsulation for SCTP | ✅ Implemented |
 | RFC 3758 | PR-SCTP | ✅ Implemented (FORWARD-TSN chunk) |
