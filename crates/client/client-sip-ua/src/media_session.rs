@@ -438,6 +438,43 @@ impl MediaSession {
         self.unprotect_rtp(&buf).await
     }
 
+    /// Returns the remote media address if established.
+    ///
+    /// This returns `Some(addr)` after ICE connectivity is established.
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        self.remote_addr
+    }
+
+    /// Returns the local media address.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Returns true if the media session is active and ready for RTP.
+    pub fn is_ready(&self) -> bool {
+        self.state == MediaSessionState::Active
+            && self.remote_addr.is_some()
+            && self.outbound_srtp.is_some()
+            && self.inbound_srtp.is_some()
+    }
+
+    /// Returns the SRTP contexts for direct audio handling.
+    ///
+    /// Returns `(outbound, inbound)` SRTP context references if available.
+    /// Use this when you need to handle SRTP encryption separately from
+    /// the MediaSession's built-in send_rtp/recv_rtp methods.
+    pub fn srtp_contexts(
+        &self,
+    ) -> Option<(
+        Arc<RwLock<SrtpContext>>,
+        Arc<RwLock<SrtpContext>>,
+    )> {
+        match (&self.outbound_srtp, &self.inbound_srtp) {
+            (Some(out), Some(inp)) => Some((out.clone(), inp.clone())),
+            _ => None,
+        }
+    }
+
     /// Closes the media session.
     pub async fn close(&mut self) -> SipUaResult<()> {
         info!("Closing media session");
@@ -500,6 +537,54 @@ mod tests {
 
         // Verify initial state
         assert_eq!(session.state(), MediaSessionState::New);
+    }
+
+    #[tokio::test]
+    async fn test_media_session_accessors() {
+        let (tx, _rx) = mpsc::channel(10);
+        let local_addr: SocketAddr = "127.0.0.1:5004".parse().unwrap();
+
+        let session = MediaSession::new(
+            local_addr,
+            true,
+            IceConfig::default(),
+            vec![],
+            vec![],
+            tx,
+        );
+
+        // Test local_addr accessor
+        assert_eq!(session.local_addr(), local_addr);
+
+        // Test remote_addr is None before establishment
+        assert!(session.remote_addr().is_none());
+
+        // Test is_ready is false before establishment
+        assert!(!session.is_ready());
+
+        // Test srtp_contexts is None before DTLS
+        assert!(session.srtp_contexts().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_media_session_state_transitions() {
+        let (tx, _rx) = mpsc::channel(10);
+        let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+
+        let session = MediaSession::new(
+            local_addr,
+            false, // inbound
+            IceConfig::default(),
+            vec![],
+            vec![],
+            tx,
+        );
+
+        // Initial state
+        assert_eq!(session.state(), MediaSessionState::New);
+
+        // is_ready should be false in New state
+        assert!(!session.is_ready());
     }
 
     #[test]

@@ -982,19 +982,21 @@ This document outlines the development roadmap for the USG Session Border Contro
   - mTLS authentication end-to-end
   - Performance testing (call setup latency, audio throughput)
 
-**Phase 24.20: Audio Pipeline Activation** 🚧
+**Phase 24.20: Audio Pipeline Activation** ✅
 
-- 🚧 Wire audio to call state
-  - Start audio capture/playback on CallState::Connected
-  - Stop audio on call termination
-  - Handle audio device changes during call
-- 🚧 Codec negotiation integration
-  - Apply negotiated codec from SDP answer
-  - Handle codec parameter changes
-- 🚧 DTMF support
-  - RFC 4733 RTP telephone events
-  - DTMF generation from dialpad
-  - DTMF detection and events
+- ✅ MediaSession accessors for audio integration
+  - `remote_addr()` - Get remote media address after ICE
+  - `local_addr()` - Get local media address
+  - `is_ready()` - Check if session ready for RTP
+  - `srtp_contexts()` - Get SRTP contexts for direct audio handling
+- ✅ Wire audio to call state
+  - Start audio on CallState::Connected using real remote address
+  - Stop audio on CallState::Terminated
+  - Fallback to local address if media not ready (with warning)
+- 🚧 Future enhancements
+  - Codec negotiation integration from SDP answer
+  - DTMF support (RFC 4733 RTP telephone events)
+  - Audio device change handling during call
 
 **Phase 24.21: GUI Certificate Verification Mode** 🚧
 

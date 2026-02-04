@@ -965,7 +965,7 @@ impl CallManager {
 
         match state {
             CallState::Connected => {
-                // Start media session
+                // Start media session establishment (ICE + DTLS)
                 if let Some(session) = self.media_sessions.get_mut(call_id) {
                     if let Err(e) = session.establish(None).await {
                         warn!(call_id = %call_id, error = %e, "Failed to establish media");
@@ -973,13 +973,21 @@ impl CallManager {
                 }
 
                 // Start audio session when call connects
-                // Get remote address from media session if available
-                let remote_addr = self.media_sessions.get(call_id).and_then(|_session| {
-                    // Use the local media address as fallback
-                    Some(self.local_media_addr)
+                // Get remote address from media session after ICE completes
+                let remote_addr = self.media_sessions.get(call_id).and_then(|session| {
+                    if session.is_ready() {
+                        session.remote_addr()
+                    } else {
+                        warn!(
+                            call_id = %call_id,
+                            "Media session not ready, using local address as fallback"
+                        );
+                        Some(self.local_media_addr)
+                    }
                 });
 
                 if let Some(addr) = remote_addr {
+                    info!(call_id = %call_id, remote_addr = %addr, "Starting audio session");
                     if let Err(e) = self.start_audio_session(call_id, addr).await {
                         warn!(call_id = %call_id, error = %e, "Failed to start audio");
                     }

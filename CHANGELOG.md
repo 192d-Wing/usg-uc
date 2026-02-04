@@ -621,6 +621,20 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 - `client-core/src/lib.rs` - Export `IncomingCallInfo` for tests
 - Total: 54 integration tests passing
 
+**Phase 24.20: Audio Pipeline Activation**
+
+- `client-sip-ua/src/media_session.rs` - New accessors for audio integration
+  - `remote_addr()` - Get remote media address after ICE establishment
+  - `local_addr()` - Get local media address
+  - `is_ready()` - Check if session is Active with SRTP ready
+  - `srtp_contexts()` - Get outbound/inbound SRTP context references
+- `client-core/src/call_manager.rs` - Improved audio lifecycle
+  - Use real remote address from MediaSession when starting audio
+  - Check `session.is_ready()` before extracting remote address
+  - Log warning if media not ready (fallback to local address)
+  - Audio starts on `CallState::Connected`, stops on `CallState::Terminated`
+- New unit tests for MediaSession accessors (22 tests in client-sip-ua)
+
 **Dependencies Added**
 
 - `rustls-native-certs` 0.8: Platform-specific CA certificate loading
