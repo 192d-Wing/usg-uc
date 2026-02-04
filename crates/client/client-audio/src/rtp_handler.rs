@@ -9,8 +9,8 @@ use bytes::Bytes;
 use proto_rtp::{RtpHeader, RtpPacket};
 use proto_srtp::{SrtpContext, SrtpProtect, SrtpUnprotect};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tracing::{debug, trace};
@@ -102,7 +102,9 @@ impl RtpTransmitter {
     /// Sends an RTP packet with the given audio payload.
     pub async fn send(&mut self, payload: &[u8]) -> AudioResult<()> {
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let ts = self.timestamp.fetch_add(self.timestamp_increment, Ordering::Relaxed);
+        let ts = self
+            .timestamp
+            .fetch_add(self.timestamp_increment, Ordering::Relaxed);
 
         // Build RTP header
         let header = RtpHeader::new(self.payload_type, seq, ts, self.ssrc);
@@ -119,9 +121,10 @@ impl RtpTransmitter {
                 Ok(protected) => protected.to_vec(),
                 Err(e) => {
                     drop(srtp_guard);
-                    let mut stats = self.stats.lock().map_err(|_| {
-                        AudioError::RtpError("Failed to lock stats".to_string())
-                    })?;
+                    let mut stats = self
+                        .stats
+                        .lock()
+                        .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
                     stats.srtp_errors += 1;
                     return Err(AudioError::SrtpError(format!("SRTP protect failed: {e}")));
                 }
@@ -133,23 +136,20 @@ impl RtpTransmitter {
         // Send packet
         match self.socket.send_to(&send_bytes, self.remote_addr).await {
             Ok(sent) => {
-                trace!(
-                    "Sent RTP packet: seq={}, ts={}, size={}",
-                    seq,
-                    ts,
-                    sent
-                );
-                let mut stats = self.stats.lock().map_err(|_| {
-                    AudioError::RtpError("Failed to lock stats".to_string())
-                })?;
+                trace!("Sent RTP packet: seq={}, ts={}, size={}", seq, ts, sent);
+                let mut stats = self
+                    .stats
+                    .lock()
+                    .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
                 stats.packets_sent += 1;
                 stats.bytes_sent += sent as u64;
                 Ok(())
             }
             Err(e) => {
-                let mut stats = self.stats.lock().map_err(|_| {
-                    AudioError::RtpError("Failed to lock stats".to_string())
-                })?;
+                let mut stats = self
+                    .stats
+                    .lock()
+                    .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
                 stats.packets_dropped += 1;
                 Err(AudioError::RtpError(format!("Send failed: {e}")))
             }
@@ -235,7 +235,8 @@ impl RtpReceiver {
                 }
 
                 // Process the packet
-                self.process_packet(&self.recv_buffer[..len].to_vec()).await?;
+                self.process_packet(&self.recv_buffer[..len].to_vec())
+                    .await?;
                 Ok(true)
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -256,9 +257,10 @@ impl RtpReceiver {
                 Ok(pkt) => pkt,
                 Err(e) => {
                     drop(srtp_guard);
-                    let mut stats = self.stats.lock().map_err(|_| {
-                        AudioError::RtpError("Failed to lock stats".to_string())
-                    })?;
+                    let mut stats = self
+                        .stats
+                        .lock()
+                        .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
                     stats.srtp_errors += 1;
                     return Err(AudioError::SrtpError(format!("SRTP unprotect failed: {e}")));
                 }
@@ -271,9 +273,7 @@ impl RtpReceiver {
 
         trace!(
             "Received RTP packet: seq={}, ts={}, pt={}",
-            packet.header.sequence_number,
-            packet.header.timestamp,
-            packet.header.payload_type
+            packet.header.sequence_number, packet.header.timestamp, packet.header.payload_type
         );
 
         // Add to jitter buffer
@@ -286,9 +286,10 @@ impl RtpReceiver {
 
         self.jitter_buffer.push(buffered);
 
-        let mut stats = self.stats.lock().map_err(|_| {
-            AudioError::RtpError("Failed to lock stats".to_string())
-        })?;
+        let mut stats = self
+            .stats
+            .lock()
+            .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
         stats.packets_received += 1;
         stats.bytes_received += data.len() as u64;
 

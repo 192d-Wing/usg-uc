@@ -7,14 +7,14 @@
 use crate::codec::CodecPipeline;
 use crate::device::DeviceManager;
 use crate::jitter_buffer::JitterBufferResult;
-use crate::rtp_handler::{generate_ssrc, RtpReceiver, RtpStats, RtpTransmitter};
+use crate::rtp_handler::{RtpReceiver, RtpStats, RtpTransmitter, generate_ssrc};
 use crate::stream::{CaptureStream, PlaybackStream};
 use crate::{AudioError, AudioResult};
 use client_types::audio::CodecPreference;
 use proto_srtp::{SrtpContext, SrtpDirection, SrtpKeyMaterial, SrtpProfile};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tracing::{debug, info, trace, warn};
@@ -190,17 +190,24 @@ impl AudioPipeline {
         // Set up SRTP if keys are provided
         if let (Some(key), Some(salt)) = (&config.srtp_master_key, &config.srtp_master_salt) {
             // Create key material
-            let key_material = SrtpKeyMaterial::new(SrtpProfile::AeadAes256Gcm, key.clone(), salt.clone())
-                .map_err(|e| AudioError::SrtpError(format!("Failed to create SRTP key material: {e}")))?;
+            let key_material =
+                SrtpKeyMaterial::new(SrtpProfile::AeadAes256Gcm, key.clone(), salt.clone())
+                    .map_err(|e| {
+                        AudioError::SrtpError(format!("Failed to create SRTP key material: {e}"))
+                    })?;
 
             // Create outbound context for transmitter
             let tx_context = SrtpContext::new(&key_material, SrtpDirection::Outbound, ssrc)
-                .map_err(|e| AudioError::SrtpError(format!("Failed to create TX SRTP context: {e}")))?;
+                .map_err(|e| {
+                    AudioError::SrtpError(format!("Failed to create TX SRTP context: {e}"))
+                })?;
             transmitter.set_srtp(Arc::new(Mutex::new(tx_context)));
 
             // Create inbound context for receiver (SSRC will be learned from first packet)
-            let rx_context = SrtpContext::new(&key_material, SrtpDirection::Inbound, 0)
-                .map_err(|e| AudioError::SrtpError(format!("Failed to create RX SRTP context: {e}")))?;
+            let rx_context =
+                SrtpContext::new(&key_material, SrtpDirection::Inbound, 0).map_err(|e| {
+                    AudioError::SrtpError(format!("Failed to create RX SRTP context: {e}"))
+                })?;
             receiver.set_srtp(Arc::new(Mutex::new(rx_context)));
 
             debug!("SRTP enabled for audio pipeline");
@@ -265,17 +272,20 @@ impl AudioPipeline {
     ///
     /// This should be called at regular intervals (e.g., every 20ms for G.711).
     pub async fn process_capture_frame(&mut self) -> AudioResult<()> {
-        let codec = self.codec.as_mut().ok_or_else(|| {
-            AudioError::ConfigError("Pipeline not started".to_string())
-        })?;
+        let codec = self
+            .codec
+            .as_mut()
+            .ok_or_else(|| AudioError::ConfigError("Pipeline not started".to_string()))?;
 
-        let capture = self.capture.as_mut().ok_or_else(|| {
-            AudioError::ConfigError("Capture stream not available".to_string())
-        })?;
+        let capture = self
+            .capture
+            .as_mut()
+            .ok_or_else(|| AudioError::ConfigError("Capture stream not available".to_string()))?;
 
-        let transmitter = self.transmitter.as_mut().ok_or_else(|| {
-            AudioError::ConfigError("Transmitter not available".to_string())
-        })?;
+        let transmitter = self
+            .transmitter
+            .as_mut()
+            .ok_or_else(|| AudioError::ConfigError("Transmitter not available".to_string()))?;
 
         // Read captured samples
         let samples_needed = codec.samples_per_frame();
@@ -286,8 +296,7 @@ impl AudioPipeline {
             // Not enough samples - pad with silence
             trace!(
                 "Capture underrun: got {} samples, needed {}",
-                samples_read,
-                samples_needed
+                samples_read, samples_needed
             );
             if let Ok(mut stats) = self.stats.lock() {
                 stats.capture_underruns += 1;
@@ -311,17 +320,20 @@ impl AudioPipeline {
 
     /// Processes received packets and outputs to playback.
     pub fn process_playback_frame(&mut self) -> AudioResult<()> {
-        let codec = self.codec.as_mut().ok_or_else(|| {
-            AudioError::ConfigError("Pipeline not started".to_string())
-        })?;
+        let codec = self
+            .codec
+            .as_mut()
+            .ok_or_else(|| AudioError::ConfigError("Pipeline not started".to_string()))?;
 
-        let receiver = self.receiver.as_mut().ok_or_else(|| {
-            AudioError::ConfigError("Receiver not available".to_string())
-        })?;
+        let receiver = self
+            .receiver
+            .as_mut()
+            .ok_or_else(|| AudioError::ConfigError("Receiver not available".to_string()))?;
 
-        let playback = self.playback.as_mut().ok_or_else(|| {
-            AudioError::ConfigError("Playback stream not available".to_string())
-        })?;
+        let playback = self
+            .playback
+            .as_mut()
+            .ok_or_else(|| AudioError::ConfigError("Playback stream not available".to_string()))?;
 
         // Get packet from jitter buffer
         match receiver.get_packet() {
@@ -354,15 +366,16 @@ impl AudioPipeline {
 
     /// Receives any pending RTP packets.
     pub async fn receive_packets(&mut self) -> AudioResult<()> {
-        let receiver = self.receiver.as_mut().ok_or_else(|| {
-            AudioError::ConfigError("Receiver not available".to_string())
-        })?;
+        let receiver = self
+            .receiver
+            .as_mut()
+            .ok_or_else(|| AudioError::ConfigError("Receiver not available".to_string()))?;
 
         // Receive all available packets
         loop {
             match receiver.receive().await {
-                Ok(true) => continue,  // Got a packet, try for more
-                Ok(false) => break,    // No more packets
+                Ok(true) => continue, // Got a packet, try for more
+                Ok(false) => break,   // No more packets
                 Err(e) => {
                     warn!("RTP receive error: {}", e);
                     break;
@@ -414,7 +427,10 @@ impl AudioPipeline {
 
     /// Returns the local RTP port.
     pub fn local_port(&self) -> Option<u16> {
-        self.socket.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port())
+        self.socket
+            .as_ref()
+            .and_then(|s| s.local_addr().ok())
+            .map(|a| a.port())
     }
 
     /// Returns the SSRC being used for transmission.

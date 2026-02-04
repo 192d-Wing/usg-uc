@@ -64,11 +64,13 @@ pub mod pipeline;
 pub mod rtp_handler;
 pub mod stream;
 
-pub use codec::{negotiate_codec, CodecPipeline};
-pub use device::{DeviceManager, DEFAULT_SAMPLE_RATE, SAMPLE_RATE_16KHZ, SAMPLE_RATE_48KHZ, SAMPLE_RATE_8KHZ};
+pub use codec::{CodecPipeline, negotiate_codec};
+pub use device::{
+    DEFAULT_SAMPLE_RATE, DeviceManager, SAMPLE_RATE_8KHZ, SAMPLE_RATE_16KHZ, SAMPLE_RATE_48KHZ,
+};
 pub use jitter_buffer::{BufferedPacket, JitterBuffer, JitterBufferResult, JitterBufferStats};
 pub use pipeline::{AudioPipeline, PipelineConfig, PipelineState, PipelineStats};
-pub use rtp_handler::{generate_ssrc, RtpReceiver, RtpStats, RtpTransmitter};
+pub use rtp_handler::{RtpReceiver, RtpStats, RtpTransmitter, generate_ssrc};
 pub use stream::{CaptureStream, PlaybackStream, Sample};
 
 use thiserror::Error;

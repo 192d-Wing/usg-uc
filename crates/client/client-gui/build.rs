@@ -85,12 +85,7 @@ END
     // Try to compile the resource file if windres is available
     // This requires the Windows SDK or MinGW to be installed
     let windres_result = std::process::Command::new("windres")
-        .args([
-            rc_path.to_str().expect("Invalid path"),
-            "-O",
-            "coff",
-            "-o",
-        ])
+        .args([rc_path.to_str().expect("Invalid path"), "-O", "coff", "-o"])
         .arg(Path::new(&out_dir).join("app.res"))
         .status();
 

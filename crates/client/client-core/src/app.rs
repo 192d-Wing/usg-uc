@@ -14,7 +14,7 @@ use client_sip_ua::{RegistrationAgent, RegistrationEvent};
 use client_types::{CallInfo, CallState, RegistrationState, SipAccount};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
 /// Application events broadcast to the GUI.
@@ -408,10 +408,7 @@ impl ClientApp {
             CallManagerEvent::Error { call_id, message } => {
                 error!(call_id = ?call_id, message = %message, "Call error");
 
-                let _ = self
-                    .app_event_tx
-                    .send(AppEvent::Error { message })
-                    .await;
+                let _ = self.app_event_tx.send(AppEvent::Error { message }).await;
             }
         }
 

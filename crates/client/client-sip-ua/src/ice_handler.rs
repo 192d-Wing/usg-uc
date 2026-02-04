@@ -225,7 +225,8 @@ impl IceHandler {
             let local_candidates = self.agent.local_candidates();
             let remote_candidates = self.agent.remote_candidates();
 
-            if let (Some(local), Some(remote)) = (local_candidates.first(), remote_candidates.first())
+            if let (Some(local), Some(remote)) =
+                (local_candidates.first(), remote_candidates.first())
             {
                 return Some((local.address(), remote.address()));
             }
@@ -328,8 +329,7 @@ mod tests {
 
     #[test]
     fn test_parse_srflx_candidate() {
-        let sdp =
-            "candidate:2 1 UDP 1694498815 203.0.113.5 54321 typ srflx raddr 192.168.1.100 rport 10000";
+        let sdp = "candidate:2 1 UDP 1694498815 203.0.113.5 54321 typ srflx raddr 192.168.1.100 rport 10000";
         let candidate = IceHandler::parse_sdp_candidate(sdp).unwrap();
 
         assert_eq!(candidate.candidate_type(), CandidateType::ServerReflexive);

@@ -7,10 +7,10 @@ use crate::device::DeviceManager;
 use crate::{AudioError, AudioResult};
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
-use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::HeapRb;
-use std::sync::atomic::{AtomicBool, Ordering};
+use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error, info};
 
 /// Helper to get device name (cpal 0.17 deprecated name()).
@@ -65,13 +65,17 @@ impl CaptureStream {
             .map_err(|e| AudioError::StreamError(format!("Failed to get config: {e}")))?;
 
         let stream = match supported_config.sample_format() {
-            SampleFormat::I16 => build_input_stream_i16(&device, &config, producer, is_running_clone)?,
-            SampleFormat::F32 => build_input_stream_f32(&device, &config, producer, is_running_clone)?,
+            SampleFormat::I16 => {
+                build_input_stream_i16(&device, &config, producer, is_running_clone)?
+            }
+            SampleFormat::F32 => {
+                build_input_stream_f32(&device, &config, producer, is_running_clone)?
+            }
             format => {
                 return Err(AudioError::StreamError(format!(
                     "Unsupported sample format: {:?}",
                     format
-                )))
+                )));
             }
         };
 
@@ -247,7 +251,7 @@ impl PlaybackStream {
                 return Err(AudioError::StreamError(format!(
                     "Unsupported sample format: {:?}",
                     format
-                )))
+                )));
             }
         };
 

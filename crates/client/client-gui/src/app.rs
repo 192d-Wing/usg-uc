@@ -9,8 +9,8 @@ use client_core::{AppEvent, ClientApp};
 use client_types::{CallInfo, CallState, RegistrationState};
 use eframe::egui;
 use std::net::SocketAddr;
-use std::sync::mpsc::Receiver as StdReceiver;
 use std::sync::Arc;
+use std::sync::mpsc::Receiver as StdReceiver;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tracing::{error, info};
@@ -92,12 +92,12 @@ impl SipClientApp {
         let (event_tx, event_rx) = mpsc::channel(64);
 
         // Initialize client app
-        let local_sip_addr: SocketAddr = "0.0.0.0:5060".parse().unwrap_or_else(|_| {
-            "0.0.0.0:0".parse().unwrap()
-        });
-        let local_media_addr: SocketAddr = "0.0.0.0:16384".parse().unwrap_or_else(|_| {
-            "0.0.0.0:0".parse().unwrap()
-        });
+        let local_sip_addr: SocketAddr = "0.0.0.0:5060"
+            .parse()
+            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+        let local_media_addr: SocketAddr = "0.0.0.0:16384"
+            .parse()
+            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
 
         let client_app = match ClientApp::new(local_sip_addr, local_media_addr, event_tx) {
             Ok(app) => Some(app),
@@ -229,7 +229,8 @@ impl SipClientApp {
                     }
 
                     // Show notification for call ended
-                    self.notifications.notify_call_ended(remote_name, duration_secs);
+                    self.notifications
+                        .notify_call_ended(remote_name, duration_secs);
                 }
                 AppEvent::Error { message } => {
                     error!(message = %message, "Application error");
@@ -384,27 +385,25 @@ impl eframe::App for SipClientApp {
         });
 
         // Central panel with active view
-        egui::CentralPanel::default().show(ctx, |ui| {
-            match self.active_view {
-                ActiveView::Dialer => {
-                    if let Some(action) = self.dialer_view.render(ui) {
-                        self.handle_dialer_action(action);
-                    }
+        egui::CentralPanel::default().show(ctx, |ui| match self.active_view {
+            ActiveView::Dialer => {
+                if let Some(action) = self.dialer_view.render(ui) {
+                    self.handle_dialer_action(action);
                 }
-                ActiveView::Call => {
-                    if let Some(action) = self.call_view.render(ui, self.active_call.as_ref()) {
-                        self.handle_call_action(action);
-                    }
+            }
+            ActiveView::Call => {
+                if let Some(action) = self.call_view.render(ui, self.active_call.as_ref()) {
+                    self.handle_call_action(action);
                 }
-                ActiveView::Contacts => {
-                    if let Some(action) = self.contacts_view.render(ui) {
-                        self.handle_contacts_action(action);
-                    }
+            }
+            ActiveView::Contacts => {
+                if let Some(action) = self.contacts_view.render(ui) {
+                    self.handle_contacts_action(action);
                 }
-                ActiveView::Settings => {
-                    if let Some(action) = self.settings_view.render(ui) {
-                        self.handle_settings_action(action);
-                    }
+            }
+            ActiveView::Settings => {
+                if let Some(action) = self.settings_view.render(ui) {
+                    self.handle_settings_action(action);
                 }
             }
         });

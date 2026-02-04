@@ -5,7 +5,7 @@
 
 use crate::{SipUaError, SipUaResult};
 use client_types::{RegistrationState, SipAccount};
-use proto_sip::builder::{generate_branch, generate_call_id, generate_tag, RequestBuilder};
+use proto_sip::builder::{RequestBuilder, generate_branch, generate_call_id, generate_tag};
 use proto_sip::header::HeaderName;
 use proto_sip::header_params::{NameAddr, ViaHeader};
 use proto_sip::message::{SipRequest, SipResponse};
@@ -220,7 +220,8 @@ impl RegistrationAgent {
                 // Success - extract expiry from response
                 let expires = Self::extract_expires(response);
                 registration.state = RegistrationState::Registered;
-                registration.expires_at = Some(Instant::now() + Duration::from_secs(expires as u64));
+                registration.expires_at =
+                    Some(Instant::now() + Duration::from_secs(expires as u64));
                 registration.transaction = None;
 
                 info!(
@@ -568,7 +569,10 @@ mod tests {
         assert!(matches!(event, RegistrationEvent::SendRequest { .. }));
 
         // State should be Registering
-        assert_eq!(agent.get_state("test"), Some(RegistrationState::Registering));
+        assert_eq!(
+            agent.get_state("test"),
+            Some(RegistrationState::Registering)
+        );
     }
 
     #[tokio::test]

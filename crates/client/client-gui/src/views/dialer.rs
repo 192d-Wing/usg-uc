@@ -70,7 +70,10 @@ impl DialerView {
                     ui.add_space((ui.available_width() - 3.0 * button_size.x - 16.0) / 2.0);
                     for &digit in row {
                         if ui
-                            .add_sized(button_size, egui::Button::new(egui::RichText::new(digit).size(24.0)))
+                            .add_sized(
+                                button_size,
+                                egui::Button::new(egui::RichText::new(digit).size(24.0)),
+                            )
                             .clicked()
                         {
                             self.input.push_str(digit);
@@ -137,7 +140,10 @@ impl DialerView {
 
         // Looks like a phone number - wrap in sips: URI
         // In production, you'd need the domain from account settings
-        if input.chars().all(|c| c.is_ascii_digit() || c == '+' || c == '-' || c == '*' || c == '#') {
+        if input
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '+' || c == '-' || c == '*' || c == '#')
+        {
             return format!("sips:{input}@example.com");
         }
 

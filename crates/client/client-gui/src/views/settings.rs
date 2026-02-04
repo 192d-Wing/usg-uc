@@ -70,7 +70,11 @@ impl SettingsView {
             minimize_to_tray: true,
             dark_mode: true,
             available_inputs: vec!["Default".to_string(), "Microphone (USB)".to_string()],
-            available_outputs: vec!["Default".to_string(), "Speakers".to_string(), "Headphones".to_string()],
+            available_outputs: vec![
+                "Default".to_string(),
+                "Speakers".to_string(),
+                "Headphones".to_string(),
+            ],
             is_dirty: false,
         }
     }
@@ -96,10 +100,7 @@ impl SettingsView {
                 ];
 
                 for (tab, label) in tabs {
-                    if ui
-                        .selectable_label(self.active_tab == tab, label)
-                        .clicked()
-                    {
+                    if ui.selectable_label(self.active_tab == tab, label).clicked() {
                         self.active_tab = tab;
                     }
                 }
@@ -108,22 +109,20 @@ impl SettingsView {
             ui.separator();
 
             // Tab content
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                match self.active_tab {
-                    SettingsTab::Account => {
-                        if let Some(a) = self.render_account_settings(ui) {
-                            action = Some(a);
-                        }
+            egui::ScrollArea::vertical().show(ui, |ui| match self.active_tab {
+                SettingsTab::Account => {
+                    if let Some(a) = self.render_account_settings(ui) {
+                        action = Some(a);
                     }
-                    SettingsTab::Audio => {
-                        self.render_audio_settings(ui);
-                    }
-                    SettingsTab::General => {
-                        self.render_general_settings(ui);
-                    }
-                    SettingsTab::About => {
-                        self.render_about(ui);
-                    }
+                }
+                SettingsTab::Audio => {
+                    self.render_audio_settings(ui);
+                }
+                SettingsTab::General => {
+                    self.render_general_settings(ui);
+                }
+                SettingsTab::About => {
+                    self.render_about(ui);
                 }
             });
 
@@ -161,10 +160,7 @@ impl SettingsView {
             .show(ui, |ui| {
                 // Display name
                 ui.label("Display Name:");
-                if ui
-                    .text_edit_singleline(&mut self.display_name)
-                    .changed()
-                {
+                if ui.text_edit_singleline(&mut self.display_name).changed() {
                     self.is_dirty = true;
                 }
                 ui.end_row();
@@ -204,10 +200,7 @@ impl SettingsView {
 
         ui.horizontal(|ui| {
             ui.label("\u{1F4B3} Smart Card:");
-            ui.label(
-                egui::RichText::new("CAC/PIV Required")
-                    .color(egui::Color32::YELLOW),
-            );
+            ui.label(egui::RichText::new("CAC/PIV Required").color(egui::Color32::YELLOW));
         });
 
         ui.label(
@@ -312,7 +305,10 @@ impl SettingsView {
             self.is_dirty = true;
         }
         if ui
-            .checkbox(&mut self.minimize_to_tray, "Minimize to tray instead of taskbar")
+            .checkbox(
+                &mut self.minimize_to_tray,
+                "Minimize to tray instead of taskbar",
+            )
             .changed()
         {
             self.is_dirty = true;

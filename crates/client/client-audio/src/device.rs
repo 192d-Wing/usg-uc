@@ -50,9 +50,9 @@ impl DeviceManager {
     /// Lists all available input (capture) devices.
     pub fn list_input_devices(&self) -> AudioResult<Vec<AudioDevice>> {
         let host = cpal::default_host();
-        let devices = host
-            .input_devices()
-            .map_err(|e| AudioError::StreamError(format!("Failed to enumerate input devices: {e}")))?;
+        let devices = host.input_devices().map_err(|e| {
+            AudioError::StreamError(format!("Failed to enumerate input devices: {e}"))
+        })?;
 
         let default_name = host
             .default_input_device()
@@ -83,9 +83,9 @@ impl DeviceManager {
     /// Lists all available output (playback) devices.
     pub fn list_output_devices(&self) -> AudioResult<Vec<AudioDevice>> {
         let host = cpal::default_host();
-        let devices = host
-            .output_devices()
-            .map_err(|e| AudioError::StreamError(format!("Failed to enumerate output devices: {e}")))?;
+        let devices = host.output_devices().map_err(|e| {
+            AudioError::StreamError(format!("Failed to enumerate output devices: {e}"))
+        })?;
 
         let default_name = host
             .default_output_device()
@@ -166,9 +166,9 @@ impl DeviceManager {
 
         if let Some(ref name) = self.input_device_name {
             // Find device by name
-            let devices = host
-                .input_devices()
-                .map_err(|e| AudioError::StreamError(format!("Failed to enumerate devices: {e}")))?;
+            let devices = host.input_devices().map_err(|e| {
+                AudioError::StreamError(format!("Failed to enumerate devices: {e}"))
+            })?;
 
             for device in devices {
                 if let Some(device_name) = get_device_name(&device) {
@@ -183,8 +183,7 @@ impl DeviceManager {
         }
 
         // Fall back to default device
-        host.default_input_device()
-            .ok_or(AudioError::NoInputDevice)
+        host.default_input_device().ok_or(AudioError::NoInputDevice)
     }
 
     /// Gets the currently selected output device.
@@ -193,9 +192,9 @@ impl DeviceManager {
 
         if let Some(ref name) = self.output_device_name {
             // Find device by name
-            let devices = host
-                .output_devices()
-                .map_err(|e| AudioError::StreamError(format!("Failed to enumerate devices: {e}")))?;
+            let devices = host.output_devices().map_err(|e| {
+                AudioError::StreamError(format!("Failed to enumerate devices: {e}"))
+            })?;
 
             for device in devices {
                 if let Some(device_name) = get_device_name(&device) {
@@ -217,9 +216,9 @@ impl DeviceManager {
     /// Gets the supported stream configuration for an input device.
     pub fn get_input_config(&self, device: &cpal::Device) -> AudioResult<cpal::StreamConfig> {
         // Try to get a config that supports our preferred sample rate
-        let supported_configs = device
-            .supported_input_configs()
-            .map_err(|e| AudioError::StreamError(format!("Failed to get supported configs: {e}")))?;
+        let supported_configs = device.supported_input_configs().map_err(|e| {
+            AudioError::StreamError(format!("Failed to get supported configs: {e}"))
+        })?;
 
         // Look for a config that supports mono and our preferred sample rate
         for config_range in supported_configs {
@@ -251,9 +250,9 @@ impl DeviceManager {
     /// Gets the supported stream configuration for an output device.
     pub fn get_output_config(&self, device: &cpal::Device) -> AudioResult<cpal::StreamConfig> {
         // Try to get a config that supports our preferred sample rate
-        let supported_configs = device
-            .supported_output_configs()
-            .map_err(|e| AudioError::StreamError(format!("Failed to get supported configs: {e}")))?;
+        let supported_configs = device.supported_output_configs().map_err(|e| {
+            AudioError::StreamError(format!("Failed to get supported configs: {e}"))
+        })?;
 
         // Look for a config that supports mono and our preferred sample rate
         for config_range in supported_configs {

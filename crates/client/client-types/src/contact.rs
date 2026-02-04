@@ -117,13 +117,15 @@ impl PhoneNumber {
 
     /// Returns the display type string.
     pub fn type_label(&self) -> &str {
-        self.label.as_deref().unwrap_or_else(|| match self.number_type {
-            PhoneNumberType::Work => "Work",
-            PhoneNumberType::Mobile => "Mobile",
-            PhoneNumberType::Home => "Home",
-            PhoneNumberType::Fax => "Fax",
-            PhoneNumberType::Other => "Other",
-        })
+        self.label
+            .as_deref()
+            .unwrap_or_else(|| match self.number_type {
+                PhoneNumberType::Work => "Work",
+                PhoneNumberType::Mobile => "Mobile",
+                PhoneNumberType::Home => "Home",
+                PhoneNumberType::Fax => "Fax",
+                PhoneNumberType::Other => "Other",
+            })
     }
 }
 

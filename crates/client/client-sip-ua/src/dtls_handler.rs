@@ -185,13 +185,8 @@ impl DtlsHandler {
 
         // Create connection
         let connection = if let Some(socket) = &self.socket {
-            DtlsConnection::with_socket(
-                self.config.clone(),
-                local_sbc,
-                remote_sbc,
-                socket.clone(),
-            )
-            .map_err(|e| SipUaError::DtlsError(e.to_string()))?
+            DtlsConnection::with_socket(self.config.clone(), local_sbc, remote_sbc, socket.clone())
+                .map_err(|e| SipUaError::DtlsError(e.to_string()))?
         } else {
             DtlsConnection::new(self.config.clone(), local_sbc, remote_sbc)
                 .map_err(|e| SipUaError::DtlsError(e.to_string()))?

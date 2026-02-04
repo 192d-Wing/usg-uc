@@ -169,7 +169,11 @@ impl ContactsView {
     }
 
     /// Renders a single contact row.
-    fn render_contact_row(&mut self, ui: &mut egui::Ui, contact: &ContactEntry) -> Option<ContactsAction> {
+    fn render_contact_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        contact: &ContactEntry,
+    ) -> Option<ContactsAction> {
         let mut action = None;
 
         let is_selected = self.selected_contact.as_ref() == Some(&contact.id);

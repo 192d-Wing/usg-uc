@@ -191,8 +191,7 @@ impl JitterBuffer {
                 // Packet is older than what we've already played
                 trace!(
                     "Dropping late packet: seq={}, expected>={}",
-                    packet.sequence,
-                    next_seq
+                    packet.sequence, next_seq
                 );
                 self.stats.packets_dropped += 1;
                 self.late_count += 1;
@@ -243,8 +242,7 @@ impl JitterBuffer {
             if buffered_ms < self.target_depth_ms {
                 trace!(
                     "Buffer not primed: {}ms < {}ms target",
-                    buffered_ms,
-                    self.target_depth_ms
+                    buffered_ms, self.target_depth_ms
                 );
                 return JitterBufferResult::NotReady;
             }
@@ -322,8 +320,8 @@ impl JitterBuffer {
         if let (Some(last_arrival), Some(last_ts)) = (self.last_arrival, self.last_timestamp) {
             // Calculate interarrival jitter per RFC 3550
             let arrival_diff = now.duration_since(last_arrival).as_secs_f32();
-            let timestamp_diff = timestamp_diff(packet.timestamp, last_ts) as f32
-                / self.clock_rate as f32;
+            let timestamp_diff =
+                timestamp_diff(packet.timestamp, last_ts) as f32 / self.clock_rate as f32;
 
             let d = (arrival_diff - timestamp_diff).abs();
             self.jitter_accumulator += (d - self.jitter_accumulator) / 16.0;
@@ -497,7 +495,11 @@ mod tests {
 
         // Reorder is detected when a packet arrives that isn't the expected next sequence
         // Since we pushed 0 then 2 (skipping 1), the jitter buffer should count this
-        assert!(jb.stats().packets_reordered > 0, "Expected reordered count > 0, got {}", jb.stats().packets_reordered);
+        assert!(
+            jb.stats().packets_reordered > 0,
+            "Expected reordered count > 0, got {}",
+            jb.stats().packets_reordered
+        );
     }
 
     #[test]
@@ -536,7 +538,9 @@ mod tests {
 
         // Next should detect loss
         match jb.pop() {
-            JitterBufferResult::Lost { expected_sequence, .. } => {
+            JitterBufferResult::Lost {
+                expected_sequence, ..
+            } => {
                 assert_eq!(expected_sequence, 1);
             }
             _ => panic!("Expected loss detection"),

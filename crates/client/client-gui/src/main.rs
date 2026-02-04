@@ -77,8 +77,8 @@ fn load_icon() -> eframe::egui::IconData {
             let x = i % size;
             let y = i / size;
             // Simple phone icon pattern
-            let is_icon = (x >= 8 && x < 24 && y >= 4 && y < 28)
-                || (x >= 4 && x < 28 && y >= 10 && y < 22);
+            let is_icon =
+                (x >= 8 && x < 24 && y >= 4 && y < 28) || (x >= 4 && x < 28 && y >= 10 && y < 22);
             if is_icon {
                 [0, 150, 0, 255] // Green
             } else {

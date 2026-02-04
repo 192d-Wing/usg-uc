@@ -52,9 +52,7 @@ impl fmt::Debug for SmartCardPin {
 
 impl Default for SmartCardPin {
     fn default() -> Self {
-        Self {
-            pin: String::new(),
-        }
+        Self { pin: String::new() }
     }
 }
 

@@ -314,11 +314,7 @@ impl SettingsManager {
 
     /// Saves settings if modified.
     pub fn save_if_dirty(&mut self) -> AppResult<()> {
-        if self.dirty {
-            self.save()
-        } else {
-            Ok(())
-        }
+        if self.dirty { self.save() } else { Ok(()) }
     }
 
     /// Returns whether settings have unsaved changes.

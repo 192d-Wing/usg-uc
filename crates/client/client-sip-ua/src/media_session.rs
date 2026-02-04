@@ -9,11 +9,13 @@ use crate::{SipUaError, SipUaResult};
 use proto_dtls::SrtpKeyingMaterial;
 use proto_ice::{IceConfig, IceCredentials};
 use proto_rtp::packet::RtpPacket;
-use proto_srtp::{SrtpContext, SrtpDirection, SrtpKeyMaterial, SrtpProfile, SrtpProtect, SrtpUnprotect};
+use proto_srtp::{
+    SrtpContext, SrtpDirection, SrtpKeyMaterial, SrtpProfile, SrtpProtect, SrtpUnprotect,
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info};
 
 /// Media session state.
@@ -274,9 +276,10 @@ impl MediaSession {
         // For now, use the selected pair if available
 
         // Get selected ICE pair
-        let (local_addr, remote_addr) = self.ice_handler.selected_pair().ok_or_else(|| {
-            SipUaError::IceError("No ICE candidates available".to_string())
-        })?;
+        let (local_addr, remote_addr) = self
+            .ice_handler
+            .selected_pair()
+            .ok_or_else(|| SipUaError::IceError("No ICE candidates available".to_string()))?;
 
         self.remote_addr = Some(remote_addr);
         info!(
@@ -326,10 +329,11 @@ impl MediaSession {
             SipUaError::DtlsError(format!("Failed to create outbound key material: {e}"))
         })?;
 
-        let outbound_ctx = SrtpContext::new(&outbound_material, SrtpDirection::Outbound, self.local_ssrc)
-            .map_err(|e| {
-                SipUaError::DtlsError(format!("Failed to create outbound SRTP context: {e}"))
-            })?;
+        let outbound_ctx =
+            SrtpContext::new(&outbound_material, SrtpDirection::Outbound, self.local_ssrc)
+                .map_err(|e| {
+                    SipUaError::DtlsError(format!("Failed to create outbound SRTP context: {e}"))
+                })?;
 
         self.outbound_srtp = Some(Arc::new(RwLock::new(outbound_ctx)));
 

@@ -34,7 +34,9 @@ impl CodecPipeline {
     /// Creates a new codec pipeline with the specified codec.
     pub fn new(preference: CodecPreference) -> AudioResult<Self> {
         let codec: Box<dyn AudioCodec> = match preference {
-            CodecPreference::Opus => Box::new(OpusCodec::new(OpusConfig::default(), DEFAULT_OPUS_PT)),
+            CodecPreference::Opus => {
+                Box::new(OpusCodec::new(OpusConfig::default(), DEFAULT_OPUS_PT))
+            }
             CodecPreference::G722 => Box::new(G722Codec::new()),
             CodecPreference::G711Ulaw => Box::new(G711Ulaw::new()),
             CodecPreference::G711Alaw => Box::new(G711Alaw::new()),
@@ -66,7 +68,7 @@ impl CodecPipeline {
                 return Err(AudioError::CodecError(format!(
                     "Unknown payload type: {}",
                     payload_type
-                )))
+                )));
             }
         };
 

@@ -70,9 +70,8 @@ impl ContactManager {
 
     /// Gets the platform-specific contacts file path.
     fn contacts_file_path() -> AppResult<PathBuf> {
-        let proj_dirs = ProjectDirs::from("com", "usg", "sip-client").ok_or_else(|| {
-            AppError::Contact("Could not determine config directory".to_string())
-        })?;
+        let proj_dirs = ProjectDirs::from("com", "usg", "sip-client")
+            .ok_or_else(|| AppError::Contact("Could not determine config directory".to_string()))?;
 
         let data_dir = proj_dirs.data_dir();
 
@@ -117,11 +116,7 @@ impl ContactManager {
 
     /// Saves contacts if modified.
     pub fn save_if_dirty(&mut self) -> AppResult<()> {
-        if self.dirty {
-            self.save()
-        } else {
-            Ok(())
-        }
+        if self.dirty { self.save() } else { Ok(()) }
     }
 
     /// Returns whether contacts have unsaved changes.

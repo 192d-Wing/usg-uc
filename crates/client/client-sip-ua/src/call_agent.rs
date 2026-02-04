@@ -7,7 +7,7 @@ use crate::{SipUaError, SipUaResult};
 use chrono::Utc;
 use client_types::{CallDirection, CallFailureReason, CallInfo, CallState};
 use proto_dialog::Dialog;
-use proto_sip::builder::{generate_branch, generate_call_id, generate_tag, RequestBuilder};
+use proto_sip::builder::{RequestBuilder, generate_branch, generate_call_id, generate_tag};
 use proto_sip::header::HeaderName;
 use proto_sip::header_params::{NameAddr, ViaHeader};
 use proto_sip::message::{SipRequest, SipResponse};
@@ -145,11 +145,7 @@ impl CallAgent {
     /// Makes an outbound call.
     ///
     /// Returns the call ID for tracking.
-    pub async fn make_call(
-        &mut self,
-        remote_uri: &str,
-        sdp_offer: &str,
-    ) -> SipUaResult<String> {
+    pub async fn make_call(&mut self, remote_uri: &str, sdp_offer: &str) -> SipUaResult<String> {
         let call_id = Uuid::new_v4().to_string();
         let sip_call_id = generate_call_id(&self.local_addr.ip().to_string());
 
@@ -312,7 +308,8 @@ impl CallAgent {
                 self.handle_cancelled_response(call_id, response).await?;
             }
             code if (400..700).contains(&code) => {
-                self.handle_failure_response(call_id, code, response).await?;
+                self.handle_failure_response(call_id, code, response)
+                    .await?;
             }
             _ => {
                 debug!(
@@ -458,11 +455,7 @@ impl CallAgent {
         Ok(())
     }
 
-    async fn handle_redirect_response(
-        &mut self,
-        call_id: &str,
-        code: u16,
-    ) -> SipUaResult<()> {
+    async fn handle_redirect_response(&mut self, call_id: &str, code: u16) -> SipUaResult<()> {
         warn!(
             call_id = %call_id,
             status_code = code,
@@ -520,8 +513,16 @@ impl CallAgent {
             .await
             .map_err(|e| SipUaError::TransportError(e.to_string()))?;
 
-        self.send_ack_for_failure(call_id, &remote_uri, &sip_call_id, cseq, &from_tag, to_tag.as_deref(), response)
-            .await
+        self.send_ack_for_failure(
+            call_id,
+            &remote_uri,
+            &sip_call_id,
+            cseq,
+            &from_tag,
+            to_tag.as_deref(),
+            response,
+        )
+        .await
     }
 
     async fn handle_unavailable_response(
@@ -550,8 +551,16 @@ impl CallAgent {
             .await
             .map_err(|e| SipUaError::TransportError(e.to_string()))?;
 
-        self.send_ack_for_failure(call_id, &remote_uri, &sip_call_id, cseq, &from_tag, to_tag.as_deref(), response)
-            .await
+        self.send_ack_for_failure(
+            call_id,
+            &remote_uri,
+            &sip_call_id,
+            cseq,
+            &from_tag,
+            to_tag.as_deref(),
+            response,
+        )
+        .await
     }
 
     async fn handle_busy_response(
@@ -581,8 +590,16 @@ impl CallAgent {
             .await
             .map_err(|e| SipUaError::TransportError(e.to_string()))?;
 
-        self.send_ack_for_failure(call_id, &remote_uri, &sip_call_id, cseq, &from_tag, to_tag.as_deref(), response)
-            .await
+        self.send_ack_for_failure(
+            call_id,
+            &remote_uri,
+            &sip_call_id,
+            cseq,
+            &from_tag,
+            to_tag.as_deref(),
+            response,
+        )
+        .await
     }
 
     async fn handle_cancelled_response(
@@ -608,8 +625,16 @@ impl CallAgent {
             .await
             .map_err(|e| SipUaError::TransportError(e.to_string()))?;
 
-        self.send_ack_for_failure(call_id, &remote_uri, &sip_call_id, cseq, &from_tag, to_tag.as_deref(), response)
-            .await
+        self.send_ack_for_failure(
+            call_id,
+            &remote_uri,
+            &sip_call_id,
+            cseq,
+            &from_tag,
+            to_tag.as_deref(),
+            response,
+        )
+        .await
     }
 
     async fn handle_failure_response(
@@ -650,8 +675,16 @@ impl CallAgent {
             .await
             .map_err(|e| SipUaError::TransportError(e.to_string()))?;
 
-        self.send_ack_for_failure(call_id, &remote_uri, &sip_call_id, cseq, &from_tag, to_tag.as_deref(), response)
-            .await
+        self.send_ack_for_failure(
+            call_id,
+            &remote_uri,
+            &sip_call_id,
+            cseq,
+            &from_tag,
+            to_tag.as_deref(),
+            response,
+        )
+        .await
     }
 
     fn extract_session_data_for_ack(

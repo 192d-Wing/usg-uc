@@ -3,11 +3,11 @@
 //! Provides a tray icon with a context menu for common operations.
 
 use std::sync::mpsc::{self, Receiver, Sender};
-use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-    Icon, TrayIcon, TrayIconBuilder,
-};
 use tracing::{error, info};
+use tray_icon::{
+    Icon, TrayIcon, TrayIconBuilder,
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+};
 
 /// Actions that can be triggered from the system tray.
 #[derive(Debug, Clone)]
@@ -128,14 +128,14 @@ fn create_tray_icon() -> Result<Icon, TrayError> {
             let idx = ((y * size + x) * 4) as usize;
 
             // Simple phone icon pattern (green on transparent)
-            let is_phone_body = (x >= 8 && x < 24 && y >= 4 && y < 28)
-                || (x >= 4 && x < 28 && y >= 10 && y < 22);
+            let is_phone_body =
+                (x >= 8 && x < 24 && y >= 4 && y < 28) || (x >= 4 && x < 28 && y >= 10 && y < 22);
 
             if is_phone_body {
                 // Green color
-                rgba[idx] = 0;     // R
+                rgba[idx] = 0; // R
                 rgba[idx + 1] = 150; // G
-                rgba[idx + 2] = 0;   // B
+                rgba[idx + 2] = 0; // B
                 rgba[idx + 3] = 255; // A
             } else {
                 // Transparent

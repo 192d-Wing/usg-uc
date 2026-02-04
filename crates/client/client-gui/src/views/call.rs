@@ -32,7 +32,11 @@ impl CallView {
     }
 
     /// Renders the call view.
-    pub fn render(&mut self, ui: &mut egui::Ui, call_info: Option<&CallInfo>) -> Option<CallAction> {
+    pub fn render(
+        &mut self,
+        ui: &mut egui::Ui,
+        call_info: Option<&CallInfo>,
+    ) -> Option<CallAction> {
         let mut action = None;
 
         ui.vertical_centered(|ui| {
@@ -99,7 +103,11 @@ impl CallView {
                     } else {
                         egui::Color32::from_rgb(60, 60, 65)
                     };
-                    let mute_text = if self.is_muted { "\u{1F507}" } else { "\u{1F508}" };
+                    let mute_text = if self.is_muted {
+                        "\u{1F507}"
+                    } else {
+                        "\u{1F508}"
+                    };
 
                     if ui
                         .add_sized(

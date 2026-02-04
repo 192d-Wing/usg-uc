@@ -93,7 +93,10 @@ pub enum CallFailureReason {
 impl std::fmt::Display for CallFailureReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Rejected { status_code, reason } => {
+            Self::Rejected {
+                status_code,
+                reason,
+            } => {
                 write!(f, "Rejected: {status_code} {reason}")
             }
             Self::Timeout => write!(f, "Timeout"),
