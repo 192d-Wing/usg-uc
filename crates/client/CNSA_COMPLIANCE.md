@@ -48,7 +48,7 @@ This document describes the CNSA 2.0 compliance status for the USG SIP Soft Clie
 - Settings do not store any passwords or shared secrets
 - All session keys use memory zeroization on drop
 
-### client-gui
+### client-gui-windows
 
 **Status: ✅ Compliant**
 
