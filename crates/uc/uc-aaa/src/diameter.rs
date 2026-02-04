@@ -37,8 +37,8 @@ mod implementation {
     use diameter::{ApplicationId, CommandCode, DiameterMessage};
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::RwLock;
     use tracing::{debug, info, trace, warn};
 
@@ -176,15 +176,28 @@ mod implementation {
                 Arc::clone(&self.dictionary),
             );
 
-            cer.add_avp(AVP_ORIGIN_HOST, None, M, Identity::new(&self.config.origin_host).into());
-            cer.add_avp(AVP_ORIGIN_REALM, None, M, Identity::new(&self.config.origin_realm).into());
+            cer.add_avp(
+                AVP_ORIGIN_HOST,
+                None,
+                M,
+                Identity::new(&self.config.origin_host).into(),
+            );
+            cer.add_avp(
+                AVP_ORIGIN_REALM,
+                None,
+                M,
+                Identity::new(&self.config.origin_realm).into(),
+            );
             cer.add_avp(266, None, M, Unsigned32::new(self.config.vendor_id).into()); // Vendor-Id
             cer.add_avp(269, None, M, UTF8String::new("USG-SBC").into()); // Product-Name
             cer.add_avp(260, None, M, Unsigned32::new(APP_CX).into()); // Supported-Vendor-Id/Auth-Application-Id
 
-            let resp = client.send_message(cer).await.map_err(|e| AaaError::DiameterError {
-                reason: format!("Failed to send CER: {e}"),
-            })?;
+            let resp = client
+                .send_message(cer)
+                .await
+                .map_err(|e| AaaError::DiameterError {
+                    reason: format!("Failed to send CER: {e}"),
+                })?;
 
             let cea = resp.await.map_err(|e| AaaError::DiameterError {
                 reason: format!("Failed to receive CEA: {e}"),
@@ -205,7 +218,11 @@ mod implementation {
         }
 
         /// Sends User-Authorization-Request (UAR).
-        pub async fn send_uar(&self, public_identity: &str, visited_network: &str) -> AaaResult<AuthResponse> {
+        pub async fn send_uar(
+            &self,
+            public_identity: &str,
+            visited_network: &str,
+        ) -> AaaResult<AuthResponse> {
             let transport = self.transport.read().await;
             let _client = transport.as_ref().ok_or_else(|| AaaError::DiameterError {
                 reason: "Not connected to Diameter server".to_string(),
@@ -327,12 +344,14 @@ mod implementation {
                 };
 
                 // Send MAR for authentication
-                let response = self.send_mar(
-                    &public_identity,
-                    &request.username,
-                    &self.config.origin_host,
-                    "SIP Digest",
-                ).await?;
+                let response = self
+                    .send_mar(
+                        &public_identity,
+                        &request.username,
+                        &self.config.origin_host,
+                        "SIP Digest",
+                    )
+                    .await?;
 
                 self.record_success();
                 Ok(response)
@@ -359,12 +378,14 @@ mod implementation {
                     AccountingRecordType::Start => {
                         // SAR with REGISTRATION assignment type
                         let public_identity = format!("sip:{}", record.username);
-                        self.send_sar(&public_identity, &self.config.origin_host, 1).await?;
+                        self.send_sar(&public_identity, &self.config.origin_host, 1)
+                            .await?;
                     }
                     AccountingRecordType::Stop => {
                         // SAR with USER_DEREGISTRATION assignment type
                         let public_identity = format!("sip:{}", record.username);
-                        self.send_sar(&public_identity, &self.config.origin_host, 4).await?;
+                        self.send_sar(&public_identity, &self.config.origin_host, 4)
+                            .await?;
                     }
                     AccountingRecordType::Interim => {
                         // Interim updates are typically handled by Rf interface
@@ -401,7 +422,10 @@ mod implementation {
                 .field("origin_host", &self.config.origin_host)
                 .field("origin_realm", &self.config.origin_realm)
                 .field("connected", &self.connected.load(Ordering::Relaxed))
-                .field("session_counter", &self.session_counter.load(Ordering::Relaxed))
+                .field(
+                    "session_counter",
+                    &self.session_counter.load(Ordering::Relaxed),
+                )
                 .finish()
         }
     }
@@ -452,7 +476,11 @@ mod stub {
         }
 
         /// Sends UAR (stub).
-        pub async fn send_uar(&self, _public_identity: &str, _visited_network: &str) -> AaaResult<AuthResponse> {
+        pub async fn send_uar(
+            &self,
+            _public_identity: &str,
+            _visited_network: &str,
+        ) -> AaaResult<AuthResponse> {
             debug!("Diameter UAR (stub)");
             Ok(AuthResponse::accept())
         }
@@ -544,7 +572,8 @@ mod tests {
             "127.0.0.1:3868".parse().unwrap(),
             "sbc.test.com",
             "test.com",
-        )).unwrap()
+        ))
+        .unwrap()
     }
 
     #[test]

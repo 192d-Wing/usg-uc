@@ -331,7 +331,10 @@ mod membership_tests {
             create_test_endpoints(),
         );
 
-        membership.add_node(node).await.expect("add_node should succeed");
+        membership
+            .add_node(node)
+            .await
+            .expect("add_node should succeed");
 
         let members = membership.all_members().await;
         assert_eq!(members.len(), 1);

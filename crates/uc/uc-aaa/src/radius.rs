@@ -89,7 +89,9 @@ mod implementation {
                     .backup_servers
                     .get(index - 1)
                     .map(|s| SocketAddr::new(s.ip(), self.config.auth_port))
-                    .unwrap_or_else(|| SocketAddr::new(self.config.server.ip(), self.config.auth_port))
+                    .unwrap_or_else(|| {
+                        SocketAddr::new(self.config.server.ip(), self.config.auth_port)
+                    })
             }
         }
 
@@ -103,7 +105,9 @@ mod implementation {
                     .backup_servers
                     .get(index - 1)
                     .map(|s| SocketAddr::new(s.ip(), self.config.acct_port))
-                    .unwrap_or_else(|| SocketAddr::new(self.config.server.ip(), self.config.acct_port))
+                    .unwrap_or_else(|| {
+                        SocketAddr::new(self.config.server.ip(), self.config.acct_port)
+                    })
             }
         }
 
@@ -141,11 +145,7 @@ mod implementation {
         }
 
         /// Sends a RADIUS packet and receives a response.
-        async fn send_receive(
-            &self,
-            packet: &Packet,
-            server: SocketAddr,
-        ) -> AaaResult<Packet> {
+        async fn send_receive(&self, packet: &Packet, server: SocketAddr) -> AaaResult<Packet> {
             // Bind to an ephemeral port
             let socket = UdpSocket::bind("0.0.0.0:0")
                 .await
@@ -153,10 +153,13 @@ mod implementation {
                     reason: format!("Failed to bind UDP socket: {e}"),
                 })?;
 
-            socket.connect(server).await.map_err(|e| AaaError::ConnectionFailed {
-                address: server,
-                reason: e.to_string(),
-            })?;
+            socket
+                .connect(server)
+                .await
+                .map_err(|e| AaaError::ConnectionFailed {
+                    address: server,
+                    reason: e.to_string(),
+                })?;
 
             // Encode packet
             let data = packet.encode().map_err(|e| AaaError::RadiusError {
@@ -219,7 +222,8 @@ mod implementation {
                         if attempts >= self.config.max_retries {
                             self.record_failure();
                             return Err(AaaError::Timeout {
-                                duration_ms: self.config.timeout_ms * u64::from(self.config.max_retries),
+                                duration_ms: self.config.timeout_ms
+                                    * u64::from(self.config.max_retries),
                             });
                         }
                         debug!(
@@ -241,28 +245,36 @@ mod implementation {
 
             // Add User-Name
             packet.add_attribute(
-                Attribute::string(AttributeType::UserName as u8, &request.username)
-                    .map_err(|e| AaaError::RadiusError {
+                Attribute::string(AttributeType::UserName as u8, &request.username).map_err(
+                    |e| AaaError::RadiusError {
                         reason: format!("Failed to create User-Name attribute: {e}"),
-                    })?,
+                    },
+                )?,
             );
 
             // Add encrypted User-Password
-            let encrypted_password =
-                encrypt_user_password(&request.password, self.config.secret.as_bytes(), &request_auth);
+            let encrypted_password = encrypt_user_password(
+                &request.password,
+                self.config.secret.as_bytes(),
+                &request_auth,
+            );
             packet.add_attribute(
-                Attribute::new(AttributeType::UserPassword as u8, encrypted_password)
-                    .map_err(|e| AaaError::RadiusError {
+                Attribute::new(AttributeType::UserPassword as u8, encrypted_password).map_err(
+                    |e| AaaError::RadiusError {
                         reason: format!("Failed to create User-Password attribute: {e}"),
-                    })?,
+                    },
+                )?,
             );
 
             // Add NAS-Identifier
             packet.add_attribute(
-                Attribute::string(AttributeType::NasIdentifier as u8, &self.config.nas_identifier)
-                    .map_err(|e| AaaError::RadiusError {
-                        reason: format!("Failed to create NAS-Identifier attribute: {e}"),
-                    })?,
+                Attribute::string(
+                    AttributeType::NasIdentifier as u8,
+                    &self.config.nas_identifier,
+                )
+                .map_err(|e| AaaError::RadiusError {
+                    reason: format!("Failed to create NAS-Identifier attribute: {e}"),
+                })?,
             );
 
             // Add source IP if available
@@ -272,7 +284,9 @@ mod implementation {
                         packet.add_attribute(
                             Attribute::ipv4(AttributeType::NasIpAddress as u8, v4.octets())
                                 .map_err(|e| AaaError::RadiusError {
-                                    reason: format!("Failed to create NAS-IP-Address attribute: {e}"),
+                                    reason: format!(
+                                        "Failed to create NAS-IP-Address attribute: {e}"
+                                    ),
                                 })?,
                         );
                     }
@@ -286,20 +300,22 @@ mod implementation {
             // Add Called-Station-Id if available
             if let Some(ref called) = request.called_station_id {
                 packet.add_attribute(
-                    Attribute::string(AttributeType::CalledStationId as u8, called)
-                        .map_err(|e| AaaError::RadiusError {
+                    Attribute::string(AttributeType::CalledStationId as u8, called).map_err(
+                        |e| AaaError::RadiusError {
                             reason: format!("Failed to create Called-Station-Id attribute: {e}"),
-                        })?,
+                        },
+                    )?,
                 );
             }
 
             // Add Calling-Station-Id if available
             if let Some(ref calling) = request.calling_station_id {
                 packet.add_attribute(
-                    Attribute::string(AttributeType::CallingStationId as u8, calling)
-                        .map_err(|e| AaaError::RadiusError {
+                    Attribute::string(AttributeType::CallingStationId as u8, calling).map_err(
+                        |e| AaaError::RadiusError {
                             reason: format!("Failed to create Calling-Station-Id attribute: {e}"),
-                        })?,
+                        },
+                    )?,
                 );
             }
 
@@ -307,10 +323,13 @@ mod implementation {
             // First add a placeholder with zeros
             let msg_auth_placeholder = [0u8; 16];
             packet.add_attribute(
-                Attribute::new(AttributeType::MessageAuthenticator as u8, msg_auth_placeholder.to_vec())
-                    .map_err(|e| AaaError::RadiusError {
-                        reason: format!("Failed to create Message-Authenticator attribute: {e}"),
-                    })?,
+                Attribute::new(
+                    AttributeType::MessageAuthenticator as u8,
+                    msg_auth_placeholder.to_vec(),
+                )
+                .map_err(|e| AaaError::RadiusError {
+                    reason: format!("Failed to create Message-Authenticator attribute: {e}"),
+                })?,
             );
 
             // Encode packet to bytes for HMAC calculation
@@ -319,10 +338,15 @@ mod implementation {
             })?;
 
             // Calculate Message-Authenticator over the encoded packet
-            let msg_auth = calculate_message_authenticator(&packet_bytes, self.config.secret.as_bytes());
+            let msg_auth =
+                calculate_message_authenticator(&packet_bytes, self.config.secret.as_bytes());
 
             // Update the Message-Authenticator attribute
-            if let Some(attr) = packet.attributes.iter_mut().find(|a| a.attr_type == AttributeType::MessageAuthenticator as u8) {
+            if let Some(attr) = packet
+                .attributes
+                .iter_mut()
+                .find(|a| a.attr_type == AttributeType::MessageAuthenticator as u8)
+            {
                 attr.value = msg_auth.to_vec();
             }
 
@@ -351,36 +375,42 @@ mod implementation {
 
             // Add Acct-Session-Id
             packet.add_attribute(
-                Attribute::string(AttributeType::AcctSessionId as u8, &record.session_id)
-                    .map_err(|e| AaaError::RadiusError {
+                Attribute::string(AttributeType::AcctSessionId as u8, &record.session_id).map_err(
+                    |e| AaaError::RadiusError {
                         reason: format!("Failed to create Acct-Session-Id attribute: {e}"),
-                    })?,
+                    },
+                )?,
             );
 
             // Add User-Name
             packet.add_attribute(
-                Attribute::string(AttributeType::UserName as u8, &record.username)
-                    .map_err(|e| AaaError::RadiusError {
+                Attribute::string(AttributeType::UserName as u8, &record.username).map_err(
+                    |e| AaaError::RadiusError {
                         reason: format!("Failed to create User-Name attribute: {e}"),
-                    })?,
+                    },
+                )?,
             );
 
             // Add NAS-Identifier
             packet.add_attribute(
-                Attribute::string(AttributeType::NasIdentifier as u8, &self.config.nas_identifier)
-                    .map_err(|e| AaaError::RadiusError {
-                        reason: format!("Failed to create NAS-Identifier attribute: {e}"),
-                    })?,
+                Attribute::string(
+                    AttributeType::NasIdentifier as u8,
+                    &self.config.nas_identifier,
+                )
+                .map_err(|e| AaaError::RadiusError {
+                    reason: format!("Failed to create NAS-Identifier attribute: {e}"),
+                })?,
             );
 
             // Add source IP if available
             if let Some(ip) = record.source_ip {
                 if let std::net::IpAddr::V4(v4) = ip {
                     packet.add_attribute(
-                        Attribute::ipv4(AttributeType::NasIpAddress as u8, v4.octets())
-                            .map_err(|e| AaaError::RadiusError {
+                        Attribute::ipv4(AttributeType::NasIpAddress as u8, v4.octets()).map_err(
+                            |e| AaaError::RadiusError {
                                 reason: format!("Failed to create NAS-IP-Address attribute: {e}"),
-                            })?,
+                            },
+                        )?,
                     );
                 }
             }
@@ -388,10 +418,11 @@ mod implementation {
             // Add session time for stop records
             if let Some(duration) = record.duration_secs {
                 packet.add_attribute(
-                    Attribute::integer(AttributeType::AcctSessionTime as u8, duration)
-                        .map_err(|e| AaaError::RadiusError {
+                    Attribute::integer(AttributeType::AcctSessionTime as u8, duration).map_err(
+                        |e| AaaError::RadiusError {
                             reason: format!("Failed to create Acct-Session-Time attribute: {e}"),
-                        })?,
+                        },
+                    )?,
                 );
             }
 
@@ -400,10 +431,11 @@ mod implementation {
                 // Use lower 32 bits for Acct-Output-Octets
                 let octets = (bytes & 0xFFFF_FFFF) as u32;
                 packet.add_attribute(
-                    Attribute::integer(AttributeType::AcctOutputOctets as u8, octets)
-                        .map_err(|e| AaaError::RadiusError {
+                    Attribute::integer(AttributeType::AcctOutputOctets as u8, octets).map_err(
+                        |e| AaaError::RadiusError {
                             reason: format!("Failed to create Acct-Output-Octets attribute: {e}"),
-                        })?,
+                        },
+                    )?,
                 );
 
                 // Add gigawords if needed
@@ -412,7 +444,9 @@ mod implementation {
                     packet.add_attribute(
                         Attribute::integer(AttributeType::AcctOutputGigawords as u8, gigawords)
                             .map_err(|e| AaaError::RadiusError {
-                                reason: format!("Failed to create Acct-Output-Gigawords attribute: {e}"),
+                                reason: format!(
+                                    "Failed to create Acct-Output-Gigawords attribute: {e}"
+                                ),
                             })?,
                     );
                 }
@@ -421,10 +455,11 @@ mod implementation {
             if let Some(bytes) = record.bytes_received {
                 let octets = (bytes & 0xFFFF_FFFF) as u32;
                 packet.add_attribute(
-                    Attribute::integer(AttributeType::AcctInputOctets as u8, octets)
-                        .map_err(|e| AaaError::RadiusError {
+                    Attribute::integer(AttributeType::AcctInputOctets as u8, octets).map_err(
+                        |e| AaaError::RadiusError {
                             reason: format!("Failed to create Acct-Input-Octets attribute: {e}"),
-                        })?,
+                        },
+                    )?,
                 );
 
                 let gigawords = (bytes >> 32) as u32;
@@ -432,7 +467,9 @@ mod implementation {
                     packet.add_attribute(
                         Attribute::integer(AttributeType::AcctInputGigawords as u8, gigawords)
                             .map_err(|e| AaaError::RadiusError {
-                                reason: format!("Failed to create Acct-Input-Gigawords attribute: {e}"),
+                                reason: format!(
+                                    "Failed to create Acct-Input-Gigawords attribute: {e}"
+                                ),
                             })?,
                     );
                 }
@@ -472,9 +509,14 @@ mod implementation {
         }
 
         /// Parses an Access-Accept response into an AuthResponse.
-        fn parse_auth_response(&self, response: &Packet, request_auth: &[u8; 16]) -> AaaResult<AuthResponse> {
+        fn parse_auth_response(
+            &self,
+            response: &Packet,
+            request_auth: &[u8; 16],
+        ) -> AaaResult<AuthResponse> {
             // Verify response authenticator
-            if !verify_response_authenticator(response, request_auth, self.config.secret.as_bytes()) {
+            if !verify_response_authenticator(response, request_auth, self.config.secret.as_bytes())
+            {
                 return Err(AaaError::InvalidResponse {
                     reason: "Response authenticator verification failed".to_string(),
                 });
@@ -491,7 +533,8 @@ mod implementation {
                     let mut auth_response = AuthResponse::accept();
 
                     // Extract Session-Timeout if present
-                    if let Some(attr) = response.find_attribute(AttributeType::SessionTimeout as u8) {
+                    if let Some(attr) = response.find_attribute(AttributeType::SessionTimeout as u8)
+                    {
                         if let Ok(timeout_val) = attr.as_integer() {
                             auth_response = auth_response.with_timeout(timeout_val);
                         }
@@ -500,10 +543,12 @@ mod implementation {
                     // Extract other attributes
                     for attr in &response.attributes {
                         if let Ok(value) = attr.as_string() {
-                            auth_response.attributes.push(crate::provider::AuthAttribute {
-                                name: format!("attr-{}", attr.attr_type),
-                                value,
-                            });
+                            auth_response
+                                .attributes
+                                .push(crate::provider::AuthAttribute {
+                                    name: format!("attr-{}", attr.attr_type),
+                                    value,
+                                });
                         }
                     }
 
@@ -520,7 +565,9 @@ mod implementation {
                 Code::AccessChallenge => {
                     // For now, treat challenge as rejection
                     // Full EAP support would handle this differently
-                    Ok(AuthResponse::reject("Authentication challenge not supported"))
+                    Ok(AuthResponse::reject(
+                        "Authentication challenge not supported",
+                    ))
                 }
                 _ => Err(AaaError::InvalidResponse {
                     reason: format!("Unexpected response code: {:?}", response.code),
@@ -636,18 +683,16 @@ mod implementation {
                 let server = self.current_auth_server();
 
                 match UdpSocket::bind("0.0.0.0:0").await {
-                    Ok(socket) => {
-                        match socket.connect(server).await {
-                            Ok(()) => {
-                                trace!("RADIUS health check passed (socket test)");
-                                true
-                            }
-                            Err(e) => {
-                                warn!(server = %server, error = %e, "RADIUS health check failed");
-                                false
-                            }
+                    Ok(socket) => match socket.connect(server).await {
+                        Ok(()) => {
+                            trace!("RADIUS health check passed (socket test)");
+                            true
                         }
-                    }
+                        Err(e) => {
+                            warn!(server = %server, error = %e, "RADIUS health check failed");
+                            false
+                        }
+                    },
                     Err(e) => {
                         warn!(error = %e, "RADIUS health check failed (socket bind)");
                         false

@@ -51,7 +51,11 @@ impl AaaConfig {
 
     /// Creates a Diameter configuration.
     #[must_use]
-    pub fn diameter(server: SocketAddr, origin_host: impl Into<String>, origin_realm: impl Into<String>) -> Self {
+    pub fn diameter(
+        server: SocketAddr,
+        origin_host: impl Into<String>,
+        origin_realm: impl Into<String>,
+    ) -> Self {
         Self {
             enabled: true,
             provider: AaaProviderType::Diameter,
@@ -211,7 +215,7 @@ impl Default for DiameterConfig {
             verify_cert: true,
             timeout_ms: 5000,
             watchdog_interval_secs: 30,
-            vendor_id: 10415, // 3GPP vendor ID
+            vendor_id: 10415,         // 3GPP vendor ID
             application_id: 16777216, // 3GPP Cx interface
         }
     }
