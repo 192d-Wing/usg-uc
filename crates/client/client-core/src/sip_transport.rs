@@ -489,7 +489,10 @@ impl SipTransport {
                 let key = PrivateKeyDer::try_from(private_key.clone())
                     .map_err(|e| AppError::Sip(format!("Invalid private key format: {e}")))?;
 
-                info!(cert_count = certs.len(), "Configuring mTLS with private key");
+                info!(
+                    cert_count = certs.len(),
+                    "Configuring mTLS with private key"
+                );
 
                 // Use custom resolver for client certificates
                 let resolver = ClientCertResolver::with_cert(certs, key);
@@ -538,9 +541,9 @@ impl SipTransport {
             connections = self.connections.lock().await;
         }
 
-        let conn = connections.get_mut(&destination).ok_or_else(|| {
-            AppError::Sip(format!("No connection to {destination}"))
-        })?;
+        let conn = connections
+            .get_mut(&destination)
+            .ok_or_else(|| AppError::Sip(format!("No connection to {destination}")))?;
 
         // Serialize and send
         let message_bytes = request.to_string();
@@ -947,7 +950,10 @@ mod tests {
     async fn test_transport_creation() {
         let (tx, _rx) = mpsc::channel(32);
         let transport = SipTransport::new(tx);
-        assert!(transport.is_ok(), "SipTransport should be created successfully");
+        assert!(
+            transport.is_ok(),
+            "SipTransport should be created successfully"
+        );
     }
 
     #[tokio::test]
@@ -1038,8 +1044,7 @@ mod tests {
     #[tokio::test]
     async fn test_transport_with_insecure_mode() {
         let (tx, _rx) = mpsc::channel(32);
-        let config =
-            TransportConfig::new().with_verification_mode(CertVerificationMode::Insecure);
+        let config = TransportConfig::new().with_verification_mode(CertVerificationMode::Insecure);
 
         let transport = SipTransport::with_config(tx, config);
         assert!(
@@ -1131,10 +1136,7 @@ mod tests {
             "<sip:bob@example.com>;tag=123456",
         ));
         request.add_header(Header::new(HeaderName::To, "<sip:alice@example.com>"));
-        request.add_header(Header::new(
-            HeaderName::CallId,
-            "abc123@client.example.com",
-        ));
+        request.add_header(Header::new(HeaderName::CallId, "abc123@client.example.com"));
         request.add_header(Header::new(HeaderName::CSeq, "1 INVITE"));
 
         // Build a 180 Ringing response
@@ -1164,7 +1166,10 @@ mod tests {
         assert_eq!(cseq, "1 INVITE");
 
         // Verify Content-Length is set
-        let content_length = response.headers.get_value(&HeaderName::ContentLength).unwrap();
+        let content_length = response
+            .headers
+            .get_value(&HeaderName::ContentLength)
+            .unwrap();
         assert_eq!(content_length, "0");
     }
 
@@ -1187,10 +1192,7 @@ mod tests {
             "<sip:bob@example.com>;tag=123456",
         ));
         request.add_header(Header::new(HeaderName::To, "<sip:alice@example.com>"));
-        request.add_header(Header::new(
-            HeaderName::CallId,
-            "abc123@client.example.com",
-        ));
+        request.add_header(Header::new(HeaderName::CallId, "abc123@client.example.com"));
         request.add_header(Header::new(HeaderName::CSeq, "1 INVITE"));
 
         // Build a 100 Trying response (no to tag needed)
@@ -1223,10 +1225,7 @@ mod tests {
             HeaderName::To,
             "<sip:alice@example.com>;tag=existing",
         ));
-        request.add_header(Header::new(
-            HeaderName::CallId,
-            "abc123@client.example.com",
-        ));
+        request.add_header(Header::new(HeaderName::CallId, "abc123@client.example.com"));
         request.add_header(Header::new(HeaderName::CSeq, "2 INVITE"));
 
         // Build response - should not add another tag
@@ -1261,10 +1260,7 @@ mod tests {
             "<sip:bob@example.com>;tag=123456",
         ));
         request.add_header(Header::new(HeaderName::To, "<sip:alice@example.com>"));
-        request.add_header(Header::new(
-            HeaderName::CallId,
-            "abc123@client.example.com",
-        ));
+        request.add_header(Header::new(HeaderName::CallId, "abc123@client.example.com"));
         request.add_header(Header::new(HeaderName::CSeq, "1 INVITE"));
 
         // Build response

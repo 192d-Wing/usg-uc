@@ -2,8 +2,8 @@
 
 use client_types::{CertificateInfo, SipAccount};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc};
 use tracing::info;
@@ -509,10 +509,7 @@ mod tests {
                        Call-ID: 12345@192.168.1.100\r\n\
                        CSeq: 1 REGISTER\r\n";
 
-        assert_eq!(
-            extract_header(request, "Call-ID:"),
-            "12345@192.168.1.100"
-        );
+        assert_eq!(extract_header(request, "Call-ID:"), "12345@192.168.1.100");
         assert_eq!(extract_header(request, "CSeq:"), "1 REGISTER");
     }
 
@@ -525,8 +522,7 @@ mod tests {
                        Call-ID: 12345@192.168.1.100\r\n\
                        CSeq: 1 REGISTER\r\n";
 
-        let response =
-            MockSipServer::register_200_ok(request, "<sips:alice@192.168.1.100:5061>");
+        let response = MockSipServer::register_200_ok(request, "<sips:alice@192.168.1.100:5061>");
 
         assert!(response.starts_with("SIP/2.0 200 OK"));
         assert!(response.contains("Call-ID: 12345@192.168.1.100"));

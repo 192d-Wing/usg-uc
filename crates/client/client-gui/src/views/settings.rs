@@ -363,7 +363,10 @@ impl SettingsView {
         // Refresh button
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(!self.certificates_loading, egui::Button::new("\u{1F504} Refresh"))
+                .add_enabled(
+                    !self.certificates_loading,
+                    egui::Button::new("\u{1F504} Refresh"),
+                )
                 .clicked()
             {
                 action = Some(SettingsAction::RefreshCertificates);
@@ -380,7 +383,10 @@ impl SettingsView {
         // Auto-select toggle
         ui.horizontal(|ui| {
             if ui
-                .checkbox(&mut self.auto_select_certificate, "Auto-select best certificate")
+                .checkbox(
+                    &mut self.auto_select_certificate,
+                    "Auto-select best certificate",
+                )
                 .changed()
             {
                 self.is_dirty = true;
@@ -397,8 +403,10 @@ impl SettingsView {
         // Certificate list
         if self.available_certificates.is_empty() && !self.certificates_loading {
             ui.label(
-                egui::RichText::new("No valid client certificates found. Insert your CAC/PIV card.")
-                    .color(egui::Color32::LIGHT_RED),
+                egui::RichText::new(
+                    "No valid client certificates found. Insert your CAC/PIV card.",
+                )
+                .color(egui::Color32::LIGHT_RED),
             );
         } else {
             egui::Frame::dark_canvas(ui.style()).show(ui, |ui| {
@@ -406,8 +414,8 @@ impl SettingsView {
                     .max_height(200.0)
                     .show(ui, |ui| {
                         for cert in &self.available_certificates {
-                            let is_selected = self.selected_certificate.as_ref()
-                                == Some(&cert.thumbprint);
+                            let is_selected =
+                                self.selected_certificate.as_ref() == Some(&cert.thumbprint);
 
                             let mut frame = egui::Frame::new()
                                 .inner_margin(8.0)
@@ -421,10 +429,7 @@ impl SettingsView {
                             frame.show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     // Selection radio
-                                    let response = ui.selectable_label(
-                                        is_selected,
-                                        "",
-                                    );
+                                    let response = ui.selectable_label(is_selected, "");
 
                                     if response.clicked() && !self.auto_select_certificate {
                                         action = Some(SettingsAction::SelectCertificate(
@@ -436,8 +441,7 @@ impl SettingsView {
                                         // Subject CN with key algorithm badge
                                         ui.horizontal(|ui| {
                                             ui.label(
-                                                egui::RichText::new(&cert.subject_cn)
-                                                    .strong(),
+                                                egui::RichText::new(&cert.subject_cn).strong(),
                                             );
 
                                             // Key algorithm badge
@@ -461,18 +465,12 @@ impl SettingsView {
 
                                             // Smart card indicator
                                             if cert.reader_name.is_some() {
-                                                ui.label(
-                                                    egui::RichText::new("\u{1F4B3}")
-                                                        .small(),
-                                                );
+                                                ui.label(egui::RichText::new("\u{1F4B3}").small());
                                             }
 
                                             // Validity indicator
                                             if cert.is_valid {
-                                                ui.label(
-                                                    egui::RichText::new("\u{2705}")
-                                                        .small(),
-                                                );
+                                                ui.label(egui::RichText::new("\u{2705}").small());
                                             } else {
                                                 ui.label(
                                                     egui::RichText::new("\u{274C} Expired")
@@ -505,12 +503,9 @@ impl SettingsView {
                                         // Reader name if from smart card
                                         if let Some(reader) = &cert.reader_name {
                                             ui.label(
-                                                egui::RichText::new(format!(
-                                                    "Reader: {}",
-                                                    reader
-                                                ))
-                                                .small()
-                                                .color(egui::Color32::LIGHT_BLUE),
+                                                egui::RichText::new(format!("Reader: {}", reader))
+                                                    .small()
+                                                    .color(egui::Color32::LIGHT_BLUE),
                                             );
                                         }
                                     });
@@ -530,7 +525,9 @@ impl SettingsView {
             ui.horizontal(|ui| {
                 if ui
                     .button("\u{1F512} Use Selected Certificate")
-                    .on_hover_text("Configure the application to use this certificate for authentication")
+                    .on_hover_text(
+                        "Configure the application to use this certificate for authentication",
+                    )
                     .clicked()
                 {
                     action = Some(SettingsAction::UseCertificate(thumbprint.clone()));
@@ -752,10 +749,7 @@ impl SettingsView {
 
                         ui.horizontal(|ui| {
                             if ui
-                                .button(
-                                    egui::RichText::new("Cancel")
-                                        .color(egui::Color32::WHITE),
-                                )
+                                .button(egui::RichText::new("Cancel").color(egui::Color32::WHITE))
                                 .clicked()
                             {
                                 self.cancel_insecure_mode();

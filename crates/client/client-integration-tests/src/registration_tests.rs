@@ -7,7 +7,7 @@
 //! - ClientApp integration
 
 use crate::test_utils::{
-    allocate_test_addr, init_test_tracing, test_account_with_registrar, MockSipServer,
+    MockSipServer, allocate_test_addr, init_test_tracing, test_account_with_registrar,
 };
 use client_sip_ua::{RegistrationAgent, RegistrationEvent};
 use client_types::RegistrationState;
@@ -39,7 +39,11 @@ async fn test_registration_agent_sends_register() {
 
     // Should receive SendRequest event
     let event = rx.recv().await.unwrap();
-    if let RegistrationEvent::SendRequest { request, destination } = event {
+    if let RegistrationEvent::SendRequest {
+        request,
+        destination,
+    } = event
+    {
         // Verify request is a REGISTER
         assert_eq!(request.method.to_string(), "REGISTER");
 
@@ -83,11 +87,12 @@ async fn test_registration_cseq_increment() {
 
     // Drain events
     let _ = rx.recv().await; // StateChanged
-    let first_request = if let RegistrationEvent::SendRequest { request, .. } = rx.recv().await.unwrap() {
-        request.to_string()
-    } else {
-        panic!("Expected SendRequest");
-    };
+    let first_request =
+        if let RegistrationEvent::SendRequest { request, .. } = rx.recv().await.unwrap() {
+            request.to_string()
+        } else {
+            panic!("Expected SendRequest");
+        };
 
     // Extract CSeq from first request
     let first_cseq = extract_cseq(&first_request);
@@ -98,11 +103,12 @@ async fn test_registration_cseq_increment() {
     // Drain state change
     let _ = rx.recv().await;
 
-    let second_request = if let RegistrationEvent::SendRequest { request, .. } = rx.recv().await.unwrap() {
-        request.to_string()
-    } else {
-        panic!("Expected SendRequest");
-    };
+    let second_request =
+        if let RegistrationEvent::SendRequest { request, .. } = rx.recv().await.unwrap() {
+            request.to_string()
+        } else {
+            panic!("Expected SendRequest");
+        };
 
     let second_cseq = extract_cseq(&second_request);
 
@@ -130,22 +136,24 @@ async fn test_registration_reuses_call_id() {
     // First registration
     agent.register(&account).await.unwrap();
     let _ = rx.recv().await;
-    let first_request = if let RegistrationEvent::SendRequest { request, .. } = rx.recv().await.unwrap() {
-        request.to_string()
-    } else {
-        panic!("Expected SendRequest");
-    };
+    let first_request =
+        if let RegistrationEvent::SendRequest { request, .. } = rx.recv().await.unwrap() {
+            request.to_string()
+        } else {
+            panic!("Expected SendRequest");
+        };
 
     let first_call_id = extract_call_id(&first_request);
 
     // Second registration
     agent.register(&account).await.unwrap();
     let _ = rx.recv().await;
-    let second_request = if let RegistrationEvent::SendRequest { request, .. } = rx.recv().await.unwrap() {
-        request.to_string()
-    } else {
-        panic!("Expected SendRequest");
-    };
+    let second_request =
+        if let RegistrationEvent::SendRequest { request, .. } = rx.recv().await.unwrap() {
+            request.to_string()
+        } else {
+            panic!("Expected SendRequest");
+        };
 
     let second_call_id = extract_call_id(&second_request);
 
@@ -171,22 +179,24 @@ async fn test_registration_reuses_from_tag() {
     // First registration
     agent.register(&account).await.unwrap();
     let _ = rx.recv().await;
-    let first_request = if let RegistrationEvent::SendRequest { request, .. } = rx.recv().await.unwrap() {
-        request.to_string()
-    } else {
-        panic!("Expected SendRequest");
-    };
+    let first_request =
+        if let RegistrationEvent::SendRequest { request, .. } = rx.recv().await.unwrap() {
+            request.to_string()
+        } else {
+            panic!("Expected SendRequest");
+        };
 
     let first_from_tag = extract_from_tag(&first_request);
 
     // Second registration
     agent.register(&account).await.unwrap();
     let _ = rx.recv().await;
-    let second_request = if let RegistrationEvent::SendRequest { request, .. } = rx.recv().await.unwrap() {
-        request.to_string()
-    } else {
-        panic!("Expected SendRequest");
-    };
+    let second_request =
+        if let RegistrationEvent::SendRequest { request, .. } = rx.recv().await.unwrap() {
+            request.to_string()
+        } else {
+            panic!("Expected SendRequest");
+        };
 
     let second_from_tag = extract_from_tag(&second_request);
 

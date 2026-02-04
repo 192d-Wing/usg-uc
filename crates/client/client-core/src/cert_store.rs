@@ -233,9 +233,9 @@ impl CertificateStore {
     #[cfg(windows)]
     fn list_certificates_windows(&self) -> CertStoreResult<Vec<CertificateInfo>> {
         use windows::Win32::Security::Cryptography::{
-            CertCloseStore, CertEnumCertificatesInStore, CertOpenStore, CERT_CONTEXT,
-            CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE, CERT_STORE_PROV_SYSTEM_W,
-            CERT_SYSTEM_STORE_CURRENT_USER, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+            CERT_CONTEXT, CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE,
+            CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_CURRENT_USER, CertCloseStore,
+            CertEnumCertificatesInStore, CertOpenStore, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
         };
 
         info!(
@@ -354,7 +354,7 @@ impl CertificateStore {
         is_subject: bool,
     ) -> String {
         use windows::Win32::Security::Cryptography::{
-            CertGetNameStringW, CERT_NAME_SIMPLE_DISPLAY_TYPE,
+            CERT_NAME_SIMPLE_DISPLAY_TYPE, CertGetNameStringW,
         };
 
         unsafe {
@@ -385,7 +385,7 @@ impl CertificateStore {
         is_subject: bool,
     ) -> String {
         use windows::Win32::Security::Cryptography::{
-            CertNameToStrW, CERT_X500_NAME_STR, X509_ASN_ENCODING,
+            CERT_X500_NAME_STR, CertNameToStrW, X509_ASN_ENCODING,
         };
 
         unsafe {
@@ -426,7 +426,7 @@ impl CertificateStore {
         cert_context: *const windows::Win32::Security::Cryptography::CERT_CONTEXT,
     ) -> String {
         use windows::Win32::Security::Cryptography::{
-            CertGetCertificateContextProperty, CERT_HASH_PROP_ID,
+            CERT_HASH_PROP_ID, CertGetCertificateContextProperty,
         };
 
         unsafe {
@@ -542,7 +542,7 @@ impl CertificateStore {
         cert_context: *const windows::Win32::Security::Cryptography::CERT_CONTEXT,
     ) -> Option<String> {
         use windows::Win32::Security::Cryptography::{
-            CertGetCertificateContextProperty, CERT_KEY_PROV_INFO_PROP_ID, CRYPT_KEY_PROV_INFO,
+            CERT_KEY_PROV_INFO_PROP_ID, CRYPT_KEY_PROV_INFO, CertGetCertificateContextProperty,
         };
 
         unsafe {
@@ -640,10 +640,7 @@ impl CertificateStore {
     pub fn list_smart_card_readers(&self) -> CertStoreResult<Vec<String>> {
         let certs = self.list_certificates()?;
 
-        let mut readers: Vec<String> = certs
-            .iter()
-            .filter_map(|c| c.reader_name.clone())
-            .collect();
+        let mut readers: Vec<String> = certs.iter().filter_map(|c| c.reader_name.clone()).collect();
 
         // Remove duplicates while preserving order
         readers.sort();
@@ -677,9 +674,9 @@ impl CertificateStore {
     #[cfg(windows)]
     fn get_certificate_chain_windows(&self, thumbprint: &str) -> CertStoreResult<Vec<Vec<u8>>> {
         use windows::Win32::Security::Cryptography::{
-            CertCloseStore, CertEnumCertificatesInStore, CertOpenStore, CERT_CONTEXT,
-            CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE, CERT_STORE_PROV_SYSTEM_W,
-            CERT_SYSTEM_STORE_CURRENT_USER, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+            CERT_CONTEXT, CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE,
+            CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_CURRENT_USER, CertCloseStore,
+            CertEnumCertificatesInStore, CertOpenStore, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
         };
 
         let store_name_wide: Vec<u16> = self
@@ -768,10 +765,10 @@ impl CertificateStore {
     #[cfg(windows)]
     fn has_private_key_windows(&self, thumbprint: &str) -> CertStoreResult<bool> {
         use windows::Win32::Security::Cryptography::{
-            CERT_KEY_PROV_INFO_PROP_ID, CertCloseStore, CertEnumCertificatesInStore,
-            CertGetCertificateContextProperty, CertOpenStore, CERT_CONTEXT,
-            CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE, CERT_STORE_PROV_SYSTEM_W,
-            CERT_SYSTEM_STORE_CURRENT_USER, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+            CERT_CONTEXT, CERT_KEY_PROV_INFO_PROP_ID, CERT_OPEN_STORE_FLAGS,
+            CERT_QUERY_ENCODING_TYPE, CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_CURRENT_USER,
+            CertCloseStore, CertEnumCertificatesInStore, CertGetCertificateContextProperty,
+            CertOpenStore, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
         };
 
         let store_name_wide: Vec<u16> = self

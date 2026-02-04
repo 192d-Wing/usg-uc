@@ -10,7 +10,7 @@
 //! Run with: `cargo test --features two_client`
 
 use crate::test_utils::{
-    allocate_test_addr, init_test_tracing, test_account_with_registrar, MockSipServer,
+    MockSipServer, allocate_test_addr, init_test_tracing, test_account_with_registrar,
 };
 use client_core::{AppEvent, CertificateStore, ClientApp};
 use tokio::sync::mpsc;
@@ -259,7 +259,11 @@ async fn test_two_clients_address_isolation() {
     let media_addr2 = allocate_test_addr().await;
 
     // Verify addresses are unique
-    assert_ne!(sip_addr1.port(), sip_addr2.port(), "SIP ports should differ");
+    assert_ne!(
+        sip_addr1.port(),
+        sip_addr2.port(),
+        "SIP ports should differ"
+    );
     assert_ne!(
         media_addr1.port(),
         media_addr2.port(),

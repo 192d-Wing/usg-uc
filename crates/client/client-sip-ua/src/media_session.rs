@@ -463,12 +463,7 @@ impl MediaSession {
     /// Returns `(outbound, inbound)` SRTP context references if available.
     /// Use this when you need to handle SRTP encryption separately from
     /// the MediaSession's built-in send_rtp/recv_rtp methods.
-    pub fn srtp_contexts(
-        &self,
-    ) -> Option<(
-        Arc<RwLock<SrtpContext>>,
-        Arc<RwLock<SrtpContext>>,
-    )> {
+    pub fn srtp_contexts(&self) -> Option<(Arc<RwLock<SrtpContext>>, Arc<RwLock<SrtpContext>>)> {
         match (&self.outbound_srtp, &self.inbound_srtp) {
             (Some(out), Some(inp)) => Some((out.clone(), inp.clone())),
             _ => None,
@@ -544,14 +539,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let local_addr: SocketAddr = "127.0.0.1:5004".parse().unwrap();
 
-        let session = MediaSession::new(
-            local_addr,
-            true,
-            IceConfig::default(),
-            vec![],
-            vec![],
-            tx,
-        );
+        let session = MediaSession::new(local_addr, true, IceConfig::default(), vec![], vec![], tx);
 
         // Test local_addr accessor
         assert_eq!(session.local_addr(), local_addr);

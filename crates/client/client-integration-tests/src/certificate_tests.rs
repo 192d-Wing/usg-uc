@@ -151,7 +151,10 @@ async fn test_certificate_has_private_key() {
     #[cfg(not(windows))]
     {
         let has_key = store.has_private_key(&cert_info.thumbprint).unwrap();
-        assert!(has_key, "Stub certificates should report having a private key");
+        assert!(
+            has_key,
+            "Stub certificates should report having a private key"
+        );
     }
 }
 
@@ -216,26 +219,18 @@ async fn test_client_app_certificate_change() {
     #[cfg(not(windows))]
     {
         // Configure first certificate
-        let cert1_thumbprint =
-            "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2";
+        let cert1_thumbprint = "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2";
         let chain1 = store.get_certificate_chain(cert1_thumbprint).unwrap();
 
         app.set_client_certificate(chain1, cert1_thumbprint);
-        assert_eq!(
-            app.client_certificate_thumbprint(),
-            Some(cert1_thumbprint)
-        );
+        assert_eq!(app.client_certificate_thumbprint(), Some(cert1_thumbprint));
 
         // Change to second certificate
-        let cert2_thumbprint =
-            "B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3";
+        let cert2_thumbprint = "B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3";
         let chain2 = store.get_certificate_chain(cert2_thumbprint).unwrap();
 
         app.set_client_certificate(chain2, cert2_thumbprint);
-        assert_eq!(
-            app.client_certificate_thumbprint(),
-            Some(cert2_thumbprint)
-        );
+        assert_eq!(app.client_certificate_thumbprint(), Some(cert2_thumbprint));
     }
 }
 
@@ -327,10 +322,7 @@ async fn test_full_certificate_selection_flow() {
                 Some(selected.thumbprint.as_str())
             );
 
-            println!(
-                "Full certificate flow completed: {}",
-                selected.subject_cn
-            );
+            println!("Full certificate flow completed: {}", selected.subject_cn);
         }
     }
 }

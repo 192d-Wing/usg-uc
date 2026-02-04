@@ -326,17 +326,17 @@ mod sdp_tests {
         // We test the expected structure conceptually
 
         let expected_elements = [
-            "v=0",           // Version
-            "o=",            // Origin
-            "s=",            // Session name
-            "c=",            // Connection info
-            "t=0 0",         // Timing
-            "m=audio",       // Media description
-            "a=rtpmap:",     // Codec mappings
-            "a=ice-ufrag:",  // ICE credentials
-            "a=ice-pwd:",    // ICE credentials
+            "v=0",            // Version
+            "o=",             // Origin
+            "s=",             // Session name
+            "c=",             // Connection info
+            "t=0 0",          // Timing
+            "m=audio",        // Media description
+            "a=rtpmap:",      // Codec mappings
+            "a=ice-ufrag:",   // ICE credentials
+            "a=ice-pwd:",     // ICE credentials
             "a=fingerprint:", // DTLS fingerprint
-            "a=setup:",      // DTLS setup role
+            "a=setup:",       // DTLS setup role
         ];
 
         // These would be verified against actual SDP output in full integration
@@ -422,14 +422,17 @@ mod incoming_call_tests {
         let invite = parse_invite(&invite_str);
 
         // Handle the incoming INVITE
-        let result = manager.handle_incoming_invite_from(&invite, source_addr).await;
-        assert!(result.is_ok(), "Should handle incoming INVITE: {:?}", result);
+        let result = manager
+            .handle_incoming_invite_from(&invite, source_addr)
+            .await;
+        assert!(
+            result.is_ok(),
+            "Should handle incoming INVITE: {:?}",
+            result
+        );
 
         // Should have the incoming call tracked
-        assert!(
-            manager.has_incoming_call(),
-            "Should track incoming call"
-        );
+        assert!(manager.has_incoming_call(), "Should track incoming call");
 
         // Should emit SendResponse events for 100 Trying and 180 Ringing
         let mut saw_trying = false;
@@ -484,7 +487,10 @@ mod incoming_call_tests {
         );
 
         let invite = parse_invite(&invite_str);
-        manager.handle_incoming_invite_from(&invite, source_addr).await.unwrap();
+        manager
+            .handle_incoming_invite_from(&invite, source_addr)
+            .await
+            .unwrap();
 
         // Get the internal call ID from incoming calls
         let incoming = manager.incoming_calls();
@@ -523,7 +529,10 @@ mod incoming_call_tests {
         }
 
         assert!(saw_200_ok, "Should send 200 OK when accepting call");
-        assert!(saw_connected_event, "Should emit Connected state change event");
+        assert!(
+            saw_connected_event,
+            "Should emit Connected state change event"
+        );
 
         // Verify internal state tracking
         assert!(
@@ -563,7 +572,10 @@ mod incoming_call_tests {
         );
 
         let invite = parse_invite(&invite_str);
-        manager.handle_incoming_invite_from(&invite, source_addr).await.unwrap();
+        manager
+            .handle_incoming_invite_from(&invite, source_addr)
+            .await
+            .unwrap();
 
         // Get the internal call ID
         let incoming = manager.incoming_calls();
@@ -629,7 +641,9 @@ mod incoming_call_tests {
 
         let mut manager = CallManager::new(sip_addr, media_addr, tx);
 
-        let result = manager.reject_incoming_call("nonexistent-call-id", false).await;
+        let result = manager
+            .reject_incoming_call("nonexistent-call-id", false)
+            .await;
         assert!(result.is_err(), "Should fail for nonexistent call");
     }
 
@@ -667,7 +681,9 @@ mod incoming_call_tests {
         );
 
         let invite = parse_invite(&invite_str);
-        let _ = manager.handle_incoming_invite_from(&invite, source_addr).await;
+        let _ = manager
+            .handle_incoming_invite_from(&invite, source_addr)
+            .await;
 
         // Should have one incoming call
         let incoming = manager.incoming_calls();

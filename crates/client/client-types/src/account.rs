@@ -408,10 +408,12 @@ mod tests {
     fn test_server_cert_verification_mode_is_insecure() {
         assert!(ServerCertVerificationMode::Insecure.is_insecure());
         assert!(!ServerCertVerificationMode::System.is_insecure());
-        assert!(!ServerCertVerificationMode::Custom {
-            ca_file_path: "/path".to_string()
-        }
-        .is_insecure());
+        assert!(
+            !ServerCertVerificationMode::Custom {
+                ca_file_path: "/path".to_string()
+            }
+            .is_insecure()
+        );
     }
 
     #[test]
@@ -429,7 +431,10 @@ mod tests {
 
     #[test]
     fn test_server_cert_verification_mode_labels() {
-        assert_eq!(ServerCertVerificationMode::System.label(), "System CA Store");
+        assert_eq!(
+            ServerCertVerificationMode::System.label(),
+            "System CA Store"
+        );
         assert_eq!(
             ServerCertVerificationMode::Insecure.label(),
             "Insecure (Dev Only)"
