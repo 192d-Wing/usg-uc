@@ -43,6 +43,7 @@
 //! - [`stream`]: CPAL-based audio capture and playback
 //! - [`codec`]: Audio codec integration (G.711, G.722, Opus)
 //! - [`file_source`]: WAV file loading for Music on Hold
+//! - [`ringtone`]: Ringtone playback for incoming calls
 //! - [`jitter_buffer`]: Adaptive jitter buffer for RTP reordering
 //! - [`rtp_handler`]: RTP/SRTP packet handling
 //! - [`pipeline`]: Main audio pipeline coordinator
@@ -63,6 +64,7 @@ pub mod device;
 pub mod file_source;
 pub mod jitter_buffer;
 pub mod pipeline;
+pub mod ringtone;
 pub mod rtp_handler;
 pub mod stream;
 
@@ -72,6 +74,7 @@ pub use device::{
 };
 pub use file_source::FileAudioSource;
 pub use jitter_buffer::{BufferedPacket, JitterBuffer, JitterBufferResult, JitterBufferStats};
+pub use ringtone::RingtonePlayer;
 pub use pipeline::{AudioPipeline, PipelineConfig, PipelineState, PipelineStats};
 pub use rtp_handler::{RtpReceiver, RtpStats, RtpTransmitter, generate_ssrc};
 pub use stream::{CaptureStream, PlaybackStream, Sample};

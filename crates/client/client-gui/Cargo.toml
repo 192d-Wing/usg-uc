@@ -11,6 +11,7 @@ build = "build.rs"
 [dependencies]
 client-types = { path = "../client-types" }
 client-core = { path = "../client-core" }
+client-audio = { path = "../client-audio" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

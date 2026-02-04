@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.16 complete, Phases 24.17-24.22 in progress
+**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.16 complete, Phase 24.24 complete
 
 ---
 
@@ -1074,6 +1074,28 @@ This document outlines the development roadmap for the USG Session Border Contro
   - `moh_file_path` in AudioConfig, PipelineConfig, AudioSessionConfig
   - `set_moh_active()`, `is_moh_active()`, `has_moh()`, `process_moh_frame()` in pipeline
   - MOH activates automatically on hold, deactivates on resume
+
+**Phase 24.24: Audio Ringtone & Auto-Answer** ✅
+
+- ✅ Ringtone playback for incoming calls
+  - `RingtonePlayer` struct in client-audio/ringtone.rs
+  - WAV file loading via `FileAudioSource` with resampling
+  - Default dual-tone (440Hz + 480Hz) when no custom ringtone configured
+  - Ring buffer-based audio streaming to output device
+  - Configurable ring device (separate from speaker)
+  - `ringtone_file_path` in AudioConfig
+  - Ringtone starts on IncomingCall event, stops on accept/reject/end
+- ✅ Auto-answer option
+  - `auto_answer_enabled` and `auto_answer_delay_secs` in GeneralSettings
+  - Timer-based auto-answer with configurable delay (0-30 seconds)
+  - Ringtone plays during delay period
+  - Auto-answer processed in GUI update loop
+- ✅ Settings UI for ringtone and auto-answer
+  - Auto-answer checkbox with delay slider
+  - Ring device dropdown
+  - Ringtone file browser (WAV format)
+  - Ring volume slider
+  - Supported format info display
 
 ---
 

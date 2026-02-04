@@ -33,6 +33,12 @@ pub struct AudioConfig {
     /// to the remote party instead of silence.
     #[serde(default)]
     pub moh_file_path: Option<String>,
+    /// Ringtone file path (optional WAV file).
+    ///
+    /// When an incoming call arrives, this audio file will be played
+    /// on the ring device. If not set, a default system beep is used.
+    #[serde(default)]
+    pub ringtone_file_path: Option<String>,
 }
 
 impl Default for AudioConfig {
@@ -50,6 +56,7 @@ impl Default for AudioConfig {
             jitter_buffer_min_ms: 20,
             jitter_buffer_max_ms: 200,
             moh_file_path: None,
+            ringtone_file_path: None,
         }
     }
 }

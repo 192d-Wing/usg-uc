@@ -720,6 +720,39 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - `moh_file_path: Option<String>` in AudioConfig (serde-serializable)
   - User-configurable MOH file path
 
+#### Phase 24.24: Audio Ringtone & Auto-Answer
+
+- `client-audio/src/ringtone.rs` - NEW file for ringtone playback
+  - `RingtonePlayer` struct for incoming call audio
+  - WAV file loading via `FileAudioSource` with resampling
+  - Default dual-tone generator (440Hz + 480Hz, standard phone ring)
+  - Ring buffer-based audio streaming to output device
+  - Configurable ring device (separate from speaker output)
+  - `start()` / `stop()` / `process_frame()` for playback control
+  - Volume control and device selection
+  - 4 tests for ringtone operations
+- `client-audio/src/device.rs` - Ring device support
+  - `get_output_device_by_name()` for ring device selection
+- `client-types/src/audio.rs` - Ringtone configuration
+  - `ringtone_file_path: Option<String>` in AudioConfig
+- `client-core/src/settings.rs` - Auto-answer settings
+  - `auto_answer_enabled: bool` in GeneralSettings
+  - `auto_answer_delay_secs: u32` with default of 3 seconds
+- `client-gui/src/app.rs` - Ringtone and auto-answer integration
+  - `RingtonePlayer` field in SipClientApp
+  - `auto_answer_timer: Option<(String, Instant)>` for delayed answer
+  - `start_ringtone()` / `stop_ringtone()` / `check_auto_answer()` methods
+  - `process_auto_answer()` called in update loop
+  - Ringtone starts on IncomingCall event
+  - Ringtone stops on Accept/Reject/CallEnded
+- `client-gui/src/views/settings.rs` - Ringtone and auto-answer UI
+  - "Incoming Calls" section in General settings tab
+  - Auto-answer checkbox with delay slider (0-30 seconds)
+  - Ring device dropdown
+  - Ringtone file browser with WAV filter
+  - Ring volume slider (0.0 - 1.0)
+  - Supported format info display
+
 **Security**
 
 - Smart card authentication ONLY (CAC/PIV/SIPR token)

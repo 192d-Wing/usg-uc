@@ -80,6 +80,16 @@ pub struct SettingsView {
     show_insecure_warning: bool,
     /// Pending verification mode change (awaiting insecure confirmation).
     pending_verification_mode: Option<ServerCertVerificationMode>,
+    /// Auto-answer enabled.
+    auto_answer_enabled: bool,
+    /// Auto-answer delay in seconds.
+    auto_answer_delay: u32,
+    /// Ringtone file path (empty = use default tone).
+    ringtone_path: String,
+    /// Ring device name.
+    ring_device: String,
+    /// Ring volume (0.0 - 1.0).
+    ring_volume: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -123,6 +133,11 @@ impl SettingsView {
             custom_ca_path: String::new(),
             show_insecure_warning: false,
             pending_verification_mode: None,
+            auto_answer_enabled: false,
+            auto_answer_delay: 3,
+            ringtone_path: String::new(),
+            ring_device: "Default".to_string(),
+            ring_volume: 1.0,
         }
     }
 
@@ -874,6 +889,142 @@ impl SettingsView {
         if ui.checkbox(&mut self.dark_mode, "Dark mode").changed() {
             self.is_dirty = true;
         }
+
+        ui.add_space(20.0);
+        ui.separator();
+        ui.add_space(10.0);
+
+        // Incoming Calls section
+        ui.label(egui::RichText::new("Incoming Calls").strong());
+        ui.add_space(10.0);
+
+        // Auto-answer settings
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(&mut self.auto_answer_enabled, "Auto-answer incoming calls")
+                .changed()
+            {
+                self.is_dirty = true;
+            }
+        });
+
+        if self.auto_answer_enabled {
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                ui.label("Delay before answering:");
+                if ui
+                    .add(egui::Slider::new(&mut self.auto_answer_delay, 0..=30).suffix(" sec"))
+                    .changed()
+                {
+                    self.is_dirty = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                ui.label(
+                    egui::RichText::new(if self.auto_answer_delay == 0 {
+                        "Calls will be answered immediately"
+                    } else {
+                        "Ringtone will play during delay"
+                    })
+                    .small()
+                    .color(egui::Color32::GRAY),
+                );
+            });
+        }
+
+        ui.add_space(20.0);
+        ui.separator();
+        ui.add_space(10.0);
+
+        // Ringtone section
+        ui.label(egui::RichText::new("Ringtone").strong());
+        ui.add_space(10.0);
+
+        egui::Grid::new("ringtone_settings_grid")
+            .num_columns(2)
+            .spacing([20.0, 8.0])
+            .show(ui, |ui| {
+                // Ring device
+                ui.label("Ring Device:");
+                egui::ComboBox::from_id_salt("ring_device")
+                    .selected_text(&self.ring_device)
+                    .show_ui(ui, |ui| {
+                        // Default option (uses output device)
+                        if ui
+                            .selectable_label(self.ring_device == "Default", "Default (Output Device)")
+                            .clicked()
+                        {
+                            self.ring_device = "Default".to_string();
+                            self.is_dirty = true;
+                        }
+                        // Show available output devices
+                        for device in &self.available_outputs {
+                            if device != "Default" {
+                                if ui
+                                    .selectable_label(self.ring_device == *device, device)
+                                    .clicked()
+                                {
+                                    self.ring_device = device.clone();
+                                    self.is_dirty = true;
+                                }
+                            }
+                        }
+                    });
+                ui.end_row();
+
+                // Ringtone file path
+                ui.label("Ringtone File:");
+                ui.horizontal(|ui| {
+                    let hint = if self.ringtone_path.is_empty() {
+                        "Default tone (built-in)"
+                    } else {
+                        ""
+                    };
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.ringtone_path)
+                                .hint_text(hint)
+                                .desired_width(200.0),
+                        )
+                        .changed()
+                    {
+                        self.is_dirty = true;
+                    }
+                    if ui.button("Browse...").clicked() {
+                        // Open file dialog for WAV files
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("WAV Files", &["wav"])
+                            .pick_file()
+                        {
+                            self.ringtone_path = path.to_string_lossy().to_string();
+                            self.is_dirty = true;
+                        }
+                    }
+                    if !self.ringtone_path.is_empty() && ui.button("Clear").clicked() {
+                        self.ringtone_path.clear();
+                        self.is_dirty = true;
+                    }
+                });
+                ui.end_row();
+
+                // Ring volume
+                ui.label("Ring Volume:");
+                if ui
+                    .add(egui::Slider::new(&mut self.ring_volume, 0.0..=1.0).show_value(true))
+                    .changed()
+                {
+                    self.is_dirty = true;
+                }
+                ui.end_row();
+            });
+
+        ui.add_space(10.0);
+        ui.label(
+            egui::RichText::new("Supported formats: WAV (8kHz/16kHz/48kHz, 16-bit mono/stereo)")
+                .small()
+                .color(egui::Color32::GRAY),
+        );
     }
 
     fn render_about(&mut self, ui: &mut egui::Ui) {

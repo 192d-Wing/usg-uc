@@ -70,6 +70,18 @@ pub struct GeneralSettings {
     /// Default account ID to use.
     #[serde(default)]
     pub default_account: Option<String>,
+
+    /// Enable auto-answer for incoming calls.
+    #[serde(default)]
+    pub auto_answer_enabled: bool,
+
+    /// Delay in seconds before auto-answering (0 = immediate).
+    #[serde(default = "default_auto_answer_delay")]
+    pub auto_answer_delay_secs: u32,
+}
+
+fn default_auto_answer_delay() -> u32 {
+    3
 }
 
 impl Default for GeneralSettings {
@@ -81,6 +93,8 @@ impl Default for GeneralSettings {
             check_updates: true,
             debug_logging: false,
             default_account: None,
+            auto_answer_enabled: false,
+            auto_answer_delay_secs: default_auto_answer_delay(),
         }
     }
 }

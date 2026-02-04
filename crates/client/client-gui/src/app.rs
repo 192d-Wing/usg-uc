@@ -5,15 +5,17 @@
 use crate::notifications::NotificationManager;
 use crate::tray::TrayAction;
 use crate::views::{CallView, ContactsView, DialerView, SettingsView};
+use client_audio::RingtonePlayer;
 use client_core::{AppEvent, ClientApp};
 use client_types::{CallInfo, CallState, RegistrationState};
 use eframe::egui;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver as StdReceiver;
+use std::time::Instant;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Active view in the application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -118,6 +120,10 @@ pub struct SipClientApp {
     pin_operation: Option<PinOperation>,
     /// Number of PIN retry attempts.
     pin_attempts: u8,
+    /// Ringtone player for incoming calls.
+    ringtone_player: RingtonePlayer,
+    /// Auto-answer timer (when auto-answer is enabled).
+    auto_answer_timer: Option<(String, Instant)>,
 }
 
 impl SipClientApp {
@@ -189,6 +195,8 @@ impl SipClientApp {
             pin_error: None,
             pin_operation: None,
             pin_attempts: 0,
+            ringtone_player: RingtonePlayer::new(),
+            auto_answer_timer: None,
         }
     }
 
@@ -284,11 +292,17 @@ impl SipClientApp {
 
                     // Store incoming call info and show dialog
                     self.incoming_call = Some(IncomingCallAlert {
-                        call_id,
+                        call_id: call_id.clone(),
                         remote_uri: remote_uri.clone(),
                         remote_display_name: remote_display_name.clone(),
                     });
                     self.show_incoming_call_dialog = true;
+
+                    // Start ringtone playback
+                    self.start_ringtone();
+
+                    // Check for auto-answer
+                    self.check_auto_answer(&call_id);
 
                     // Show toast notification for incoming call
                     self.notifications
@@ -308,6 +322,10 @@ impl SipClientApp {
                     if let Some(ref app) = self.client_app {
                         self.all_calls = app.all_call_info();
                     }
+
+                    // Stop ringtone and clear auto-answer timer
+                    self.stop_ringtone();
+                    self.auto_answer_timer = None;
 
                     // Clear incoming call dialog
                     self.incoming_call = None;
@@ -903,6 +921,12 @@ impl eframe::App for SipClientApp {
         // Process events from core
         self.process_events();
 
+        // Process ringtone audio frames (for buffer refill)
+        self.ringtone_player.process_frame();
+
+        // Process auto-answer timer
+        self.process_auto_answer();
+
         // Top panel with navigation
         egui::TopBottomPanel::top("nav_bar").show(ctx, |ui| {
             self.render_nav_bar(ui);
@@ -1023,6 +1047,8 @@ impl SipClientApp {
             crate::views::CallAction::Accept { call_id } => {
                 info!(call_id = %call_id, "Accepting incoming call");
                 self.show_incoming_call_dialog = false;
+                self.stop_ringtone();
+                self.auto_answer_timer = None;
 
                 if let Some(ref mut app) = self.client_app {
                     let runtime = self.runtime.clone();
@@ -1042,6 +1068,8 @@ impl SipClientApp {
             crate::views::CallAction::Reject { call_id } => {
                 info!(call_id = %call_id, "Rejecting incoming call");
                 self.show_incoming_call_dialog = false;
+                self.stop_ringtone();
+                self.auto_answer_timer = None;
 
                 if let Some(ref mut app) = self.client_app {
                     let runtime = self.runtime.clone();
@@ -1286,5 +1314,104 @@ impl SipClientApp {
         self.status_message =
             "WARNING: Insecure mode enabled - certificates not validated".to_string();
         warn!("User enabled insecure certificate verification mode");
+    }
+
+    /// Starts ringtone playback for an incoming call.
+    fn start_ringtone(&mut self) {
+        // Configure ringtone from settings
+        if let Some(ref app) = self.client_app {
+            let settings = app.settings().settings();
+
+            // Set ring device if configured
+            self.ringtone_player
+                .set_ring_device(settings.audio.ring_device.clone());
+
+            // Set volume
+            self.ringtone_player.set_volume(settings.audio.ring_volume);
+
+            // Load custom ringtone if configured
+            if let Some(ref path) = settings.audio.ringtone_file_path {
+                if let Err(e) = self.ringtone_player.load(path) {
+                    warn!(error = %e, path = %path, "Failed to load ringtone file, using default tone");
+                    self.ringtone_player.use_default();
+                }
+            } else {
+                self.ringtone_player.use_default();
+            }
+        }
+
+        // Start playing
+        if let Err(e) = self.ringtone_player.start() {
+            warn!(error = %e, "Failed to start ringtone playback");
+        } else {
+            debug!("Ringtone playback started");
+        }
+    }
+
+    /// Stops ringtone playback.
+    fn stop_ringtone(&mut self) {
+        if self.ringtone_player.is_playing() {
+            self.ringtone_player.stop();
+            debug!("Ringtone playback stopped");
+        }
+    }
+
+    /// Checks if auto-answer is enabled and starts the timer if so.
+    fn check_auto_answer(&mut self, call_id: &str) {
+        if let Some(ref app) = self.client_app {
+            let settings = app.settings().settings();
+
+            if settings.general.auto_answer_enabled {
+                let delay = settings.general.auto_answer_delay_secs;
+                info!(
+                    call_id = %call_id,
+                    delay_secs = delay,
+                    "Auto-answer enabled, starting timer"
+                );
+                self.auto_answer_timer = Some((call_id.to_string(), Instant::now()));
+            }
+        }
+    }
+
+    /// Processes the auto-answer timer and answers the call if the delay has elapsed.
+    fn process_auto_answer(&mut self) {
+        let should_answer = if let Some((ref call_id, started_at)) = self.auto_answer_timer {
+            if let Some(ref app) = self.client_app {
+                let settings = app.settings().settings();
+                let delay = std::time::Duration::from_secs(settings.general.auto_answer_delay_secs as u64);
+
+                if started_at.elapsed() >= delay {
+                    info!(call_id = %call_id, "Auto-answer timer elapsed, answering call");
+                    Some(call_id.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(call_id) = should_answer {
+            self.auto_answer_timer = None;
+            self.show_incoming_call_dialog = false;
+            self.stop_ringtone();
+
+            if let Some(ref mut app) = self.client_app {
+                let runtime = self.runtime.clone();
+                match runtime.block_on(app.accept_incoming_call(&call_id)) {
+                    Ok(()) => {
+                        self.status_message = "Call auto-answered".to_string();
+                        self.active_view = ActiveView::Call;
+                    }
+                    Err(e) => {
+                        self.error_message = Some(format!("Failed to auto-answer call: {e}"));
+                        self.show_error_dialog = true;
+                    }
+                }
+            }
+            self.incoming_call = None;
+        }
     }
 }

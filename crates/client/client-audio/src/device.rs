@@ -290,6 +290,28 @@ impl DeviceManager {
     pub fn output_device_name(&self) -> Option<&str> {
         self.output_device_name.as_deref()
     }
+
+    /// Gets an output device by name, falling back to default if not found.
+    pub fn get_output_device_by_name(&self, name: &str) -> AudioResult<cpal::Device> {
+        let host = cpal::default_host();
+
+        let devices = host.output_devices().map_err(|e| {
+            AudioError::StreamError(format!("Failed to enumerate devices: {e}"))
+        })?;
+
+        for device in devices {
+            if let Some(device_name) = get_device_name(&device) {
+                if device_name == name {
+                    debug!("Using output device: {}", name);
+                    return Ok(device);
+                }
+            }
+        }
+
+        warn!("Output device '{}' not found, using default", name);
+        host.default_output_device()
+            .ok_or(AudioError::NoOutputDevice)
+    }
 }
 
 impl Default for DeviceManager {

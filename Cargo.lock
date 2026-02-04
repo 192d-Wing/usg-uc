@@ -1168,6 +1168,7 @@ dependencies = [
 name = "client-gui"
 version = "0.1.0"
 dependencies = [
+ "client-audio",
  "client-core",
  "client-types",
  "eframe",
