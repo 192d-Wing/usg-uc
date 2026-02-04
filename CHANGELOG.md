@@ -80,7 +80,7 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 **Tests**: 169 tests passing (76 RFC 9260 compliance + 9 integration + 84 unit)
 
-#### Phase 25: SCTP RFC 9260 Full Compliance - Medium Priority (In Progress)
+#### Phase 25: SCTP RFC 9260 Full Compliance - Medium Priority (Completed)
 
 **ASCONF Chunks** (`uc-transport/sctp/chunk.rs`, `association.rs`)
 
@@ -141,7 +141,7 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - ASCONF serial number tracking for dynamic updates
   - RE-CONFIG sequence number management
 
-#### Phase 25: SCTP RFC 9260 Full Compliance - Lower Priority (In Progress)
+#### Phase 25: SCTP RFC 9260 Full Compliance - Lower Priority (Completed)
 
 **PAD Chunk Support** (`uc-transport/sctp/chunk.rs`)
 
@@ -159,7 +159,39 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - `hmac_algorithm()` and `hmac_length()` helpers
   - Encode/decode roundtrip verified
 
-**Tests**: 17 new tests for PAD and AUTH chunks
+**SACK Bundling Optimization** (`uc-transport/sctp/association.rs`)
+
+- RFC 9260 §6.2 compliant delayed/bundled SACK
+  - `on_data_received()` tracks DATA chunks since last SACK
+  - `should_send_sack()` checks timer, every-other-DATA rule, and I-bit
+  - `try_bundle_sack()` for bundling SACK with outgoing DATA
+  - T4-sack timer (200ms) for delayed SACK generation
+  - Immediate SACK on second DATA chunk per RFC requirement
+
+**Heartbeat Bundling** (`uc-transport/sctp/association.rs`)
+
+- RFC 9260 §8.3 compliant heartbeat optimization
+  - `should_send_heartbeat()` checks idle paths and timer
+  - `restart_heartbeat_timer()` tracks last data sent time
+  - Heartbeat bundling with DATA chunks reduces overhead
+
+**Path MTU Discovery** (`uc-transport/sctp/association.rs`)
+
+- RFC 9260 §8.4 compliant PMTU probing
+  - `path_mtu()` returns current discovered MTU
+  - `start_pmtu_probe()` sends PAD chunks to probe larger MTU
+  - `on_pmtu_probe_success()` updates MTU on successful probe
+  - `on_pmtu_probe_failure()` handles ICMP Packet Too Big
+  - Configurable PMTU min (576 IPv4 / 1280 IPv6) and max bounds
+
+**T2-Shutdown Timer** (`uc-transport/sctp/timer.rs`)
+
+- RFC 9260 §9.2 compliant shutdown retransmission timer
+  - Already implemented as T2-shutdown in TimerManager
+  - Handles SHUTDOWN-ACK retransmission timing
+  - Proper state machine integration
+
+**Tests**: 240 unit tests + 76 RFC compliance tests + 9 integration tests
 
 #### Phase 22: High Availability - Storage Backends (Completed)
 

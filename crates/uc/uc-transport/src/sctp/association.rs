@@ -229,6 +229,30 @@ pub struct AssociationInner {
     // Immediate SACK tracking (RFC 9260 §6.8)
     /// Whether immediate SACK is required (set when I-bit received).
     sack_immediately: bool,
+
+    // SACK bundling state (RFC 9260 §6.2)
+    /// Whether a SACK is pending (waiting for timer or bundling opportunity).
+    sack_pending: bool,
+    /// Number of DATA chunks received since last SACK (for every-other rule).
+    data_chunks_since_sack: u32,
+
+    // Heartbeat state (RFC 9260 §8.3)
+    /// Whether automatic heartbeat sending is enabled.
+    #[allow(dead_code)] // RFC 9260 §8.3 infrastructure - will be used when fully integrated
+    heartbeat_enabled: bool,
+    /// Time of last data chunk sent (for idle detection).
+    #[allow(dead_code)] // RFC 9260 §8.3 infrastructure - will be used when fully integrated
+    last_data_sent: Option<std::time::Instant>,
+
+    // PMTU Discovery state (RFC 9260 §8.4)
+    /// Current Path MTU.
+    pmtu: u32,
+    /// Minimum Path MTU (576 for IPv4, 1280 for IPv6).
+    pmtu_min: u32,
+    /// Maximum Path MTU to probe.
+    pmtu_max: u32,
+    /// Whether PMTU probing is in progress.
+    pmtu_probe_pending: bool,
 }
 
 impl AssociationInner {
@@ -267,7 +291,6 @@ impl AssociationInner {
             cookie_generator: CookieGenerator::new(),
             send_queue: VecDeque::new(),
             retransmit_queue: BTreeMap::new(),
-            config,
             local_addr,
             peer_addr,
             local_addresses: HashSet::new(),
@@ -279,6 +302,15 @@ impl AssociationInner {
             received_tsns: HashSet::new(),
             duplicate_tsns: Vec::new(),
             sack_immediately: false,
+            sack_pending: false,
+            data_chunks_since_sack: 0,
+            heartbeat_enabled: true,
+            last_data_sent: None,
+            pmtu: config.path_mtu.into(),
+            pmtu_min: 576, // IPv4 minimum
+            pmtu_max: 1500,
+            pmtu_probe_pending: false,
+            config,
         }
     }
 
@@ -617,6 +649,9 @@ impl AssociationInner {
 
         // Process through stream manager
         self.streams.receive_data(data).map_err(|e| e.to_string())?;
+
+        // Track for SACK bundling (RFC 9260 §6.2)
+        self.on_data_received();
 
         Ok(())
     }
@@ -970,6 +1005,158 @@ impl AssociationInner {
     /// The caller should send a SACK immediately instead of using delayed SACK.
     fn should_sack_immediately(&self) -> bool {
         self.sack_immediately
+    }
+
+    // =========================================================================
+    // SACK Bundling (RFC 9260 §6.2)
+    // =========================================================================
+
+    /// Called when a DATA chunk is received to track SACK timing.
+    ///
+    /// Per RFC 9260 §6.2:
+    /// - A SACK SHOULD be sent for every second DATA chunk received.
+    /// - If delayed, the SACK MUST be sent within 200ms of the first unacknowledged DATA.
+    fn on_data_received(&mut self) {
+        self.data_chunks_since_sack += 1;
+        self.sack_pending = true;
+
+        // RFC 9260 §6.2: Send SACK for every second DATA chunk received.
+        // Note: The I-bit (immediate) flag is handled separately in process_data().
+        // Gap ack block reporting is checked in should_send_sack().
+        if self.data_chunks_since_sack >= 2 {
+            self.sack_immediately = true;
+        }
+
+        // Start delayed SACK timer if not already running
+        if !self.timers.is_t4_sack_expired() {
+            self.timers.start_t4_sack();
+        }
+    }
+
+    /// Returns true if a SACK should be sent now (RFC 9260 §6.2).
+    ///
+    /// A SACK should be sent if:
+    /// - Immediate SACK is required (I-bit was set)
+    /// - Two or more DATA chunks have been received since last SACK
+    /// - The delayed SACK timer (T4-sack, 200ms) has expired
+    /// - Gap ack blocks need to be reported
+    fn should_send_sack(&self) -> bool {
+        if !self.sack_pending {
+            return false;
+        }
+
+        // Immediate SACK requested via I-bit
+        if self.sack_immediately {
+            return true;
+        }
+
+        // Every-other-DATA rule: SACK after every 2nd DATA chunk
+        if self.data_chunks_since_sack >= 2 {
+            return true;
+        }
+
+        // Delayed SACK timer expired
+        if self.timers.is_t4_sack_expired() {
+            return true;
+        }
+
+        // Gap blocks present (out-of-order data received)
+        if !self.received_tsns.is_empty() {
+            return true;
+        }
+
+        false
+    }
+
+    /// Creates a SACK and resets the bundling state.
+    ///
+    /// This should be called when `should_send_sack()` returns true.
+    fn create_sack_and_reset(&mut self) -> SackChunk {
+        let sack = self.create_sack();
+
+        // Reset SACK bundling state
+        self.sack_pending = false;
+        self.data_chunks_since_sack = 0;
+        self.timers.stop_t4_sack();
+
+        sack
+    }
+
+    /// Tries to bundle a SACK with outgoing DATA (RFC 9260 §6.2).
+    ///
+    /// Returns Some(SackChunk) if a SACK should be bundled with the DATA,
+    /// or None if no SACK is needed.
+    ///
+    /// This implements the RFC recommendation to bundle SACKs with DATA
+    /// whenever possible to reduce packet overhead.
+    fn try_bundle_sack(&mut self) -> Option<SackChunk> {
+        if self.sack_pending {
+            Some(self.create_sack_and_reset())
+        } else {
+            None
+        }
+    }
+
+    // =========================================================================
+    // Automatic Heartbeat (RFC 9260 §8.3)
+    // =========================================================================
+
+    /// Checks if a HEARTBEAT should be sent to an idle path.
+    ///
+    /// Per RFC 9260 §8.3, HEARTBEAT chunks should be sent periodically
+    /// to verify peer reachability when no DATA is being sent.
+    #[allow(dead_code)] // RFC 9260 §8.3 infrastructure - will be used when fully integrated
+    fn should_send_heartbeat(&self) -> bool {
+        if !self.heartbeat_enabled || !self.is_established() {
+            return false;
+        }
+
+        // Check if heartbeat timer has expired
+        let expired = self.timers.expired_timers();
+        expired.contains(&super::timer::TimerType::Heartbeat)
+    }
+
+    // =========================================================================
+    // Path MTU Discovery (RFC 9260 §8.4)
+    // =========================================================================
+
+    /// Returns the current Path MTU.
+    fn path_mtu(&self) -> u32 {
+        self.pmtu
+    }
+
+    /// Starts PMTU probing by sending a PAD chunk.
+    ///
+    /// Per RFC 9260 §8.4, PMTU can be discovered by sending packets
+    /// of increasing size and observing ICMP Packet Too Big messages.
+    fn start_pmtu_probe(&mut self, probe_size: u32) -> Option<super::chunk::PadChunk> {
+        if self.pmtu_probe_pending || probe_size <= self.pmtu {
+            return None;
+        }
+
+        let padding_size = probe_size.saturating_sub(super::packet::HEADER_SIZE as u32 + 4);
+        if padding_size == 0 {
+            return None;
+        }
+
+        self.pmtu_probe_pending = true;
+        Some(super::chunk::PadChunk::new(padding_size as usize))
+    }
+
+    /// Called when PMTU probe succeeds (no ICMP error received).
+    fn on_pmtu_probe_success(&mut self, probe_size: u32) {
+        if probe_size > self.pmtu {
+            self.pmtu = probe_size.min(self.pmtu_max);
+            tracing::info!(new_pmtu = self.pmtu, "PMTU increased");
+        }
+        self.pmtu_probe_pending = false;
+    }
+
+    /// Called when PMTU probe fails (ICMP Packet Too Big received).
+    fn on_pmtu_probe_failure(&mut self, new_mtu: u32) {
+        self.pmtu = new_mtu.max(self.pmtu_min);
+        self.pmtu_probe_pending = false;
+        tracing::info!(new_pmtu = self.pmtu, "PMTU decreased");
     }
 
     /// Builds gap ack blocks from the received TSNs set.
@@ -2115,9 +2302,11 @@ impl AssociationHandle {
                 }
                 Chunk::Data(data) => {
                     inner.process_data(data.clone())?;
-                    // Generate SACK
-                    let sack = inner.create_sack();
-                    response_chunks.push(Chunk::Sack(sack));
+                    // RFC 9260 §6.2: Use delayed/bundled SACK unless immediate is required
+                    if inner.should_send_sack() {
+                        let sack = inner.create_sack_and_reset();
+                        response_chunks.push(Chunk::Sack(sack));
+                    }
                 }
                 Chunk::Sack(sack) => {
                     inner.process_sack(sack);
@@ -2184,9 +2373,13 @@ impl AssociationHandle {
                 Chunk::ForwardTsn(ftsn) => {
                     // RFC 3758: Process FORWARD-TSN (Partial Reliability)
                     inner.process_forward_tsn(ftsn);
-                    // Generate SACK in response to acknowledge the FORWARD-TSN
-                    let sack = inner.create_sack();
-                    response_chunks.push(Chunk::Sack(sack));
+                    // Mark SACK as needed (FORWARD-TSN advances cumulative TSN)
+                    inner.sack_pending = true;
+                    inner.sack_immediately = true; // FORWARD-TSN should be acknowledged quickly
+                    if inner.should_send_sack() {
+                        let sack = inner.create_sack_and_reset();
+                        response_chunks.push(Chunk::Sack(sack));
+                    }
                 }
                 Chunk::ReConfig(reconfig) => {
                     // RFC 6525: Process RE-CONFIG (Stream Reconfiguration)
@@ -2457,6 +2650,63 @@ impl AssociationHandle {
     /// The flag is cleared after `create_sack()` is called.
     pub async fn should_sack_immediately(&self) -> bool {
         self.inner.read().await.should_sack_immediately()
+    }
+
+    // =========================================================================
+    // SACK Bundling (RFC 9260 §6.2)
+    // =========================================================================
+
+    /// Returns true if a SACK should be sent now.
+    ///
+    /// Per RFC 9260 §6.2, a SACK should be sent if:
+    /// - Immediate SACK is required (I-bit was set)
+    /// - Two or more DATA chunks have been received since last SACK
+    /// - The delayed SACK timer (200ms) has expired
+    /// - Gap ack blocks need to be reported
+    pub async fn should_send_sack(&self) -> bool {
+        self.inner.read().await.should_send_sack()
+    }
+
+    /// Creates a SACK and resets the bundling state.
+    ///
+    /// Call this when `should_send_sack()` returns true.
+    pub async fn create_sack(&self) -> SackChunk {
+        self.inner.write().await.create_sack_and_reset()
+    }
+
+    /// Tries to bundle a SACK with outgoing DATA.
+    ///
+    /// Returns Some(SackChunk) if a SACK should be bundled,
+    /// or None if no SACK is pending.
+    pub async fn try_bundle_sack(&self) -> Option<SackChunk> {
+        self.inner.write().await.try_bundle_sack()
+    }
+
+    // =========================================================================
+    // Path MTU Discovery (RFC 9260 §8.4)
+    // =========================================================================
+
+    /// Returns the current Path MTU.
+    pub async fn path_mtu(&self) -> u32 {
+        self.inner.read().await.path_mtu()
+    }
+
+    /// Starts PMTU probing by creating a PAD chunk.
+    ///
+    /// Returns Some(PadChunk) if probing should be started,
+    /// or None if already probing or size <= current PMTU.
+    pub async fn start_pmtu_probe(&self, probe_size: u32) -> Option<super::chunk::PadChunk> {
+        self.inner.write().await.start_pmtu_probe(probe_size)
+    }
+
+    /// Called when PMTU probe succeeds (no ICMP error received).
+    pub async fn on_pmtu_probe_success(&self, probe_size: u32) {
+        self.inner.write().await.on_pmtu_probe_success(probe_size);
+    }
+
+    /// Called when PMTU probe fails (ICMP Packet Too Big received).
+    pub async fn on_pmtu_probe_failure(&self, new_mtu: u32) {
+        self.inner.write().await.on_pmtu_probe_failure(new_mtu);
     }
 }
 

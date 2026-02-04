@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.30-24.31 complete, Phase 25 critical + medium priority items complete
+**Current Status**: 1750+ tests passing, Phases 1-25 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.30-24.31 complete, Phase 25 100% RFC 9260 compliance achieved
 
 ---
 
@@ -563,7 +563,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **Tests**: 25 new tests (T.38 crate), 137+ tests (SCTP)
 
-### 🚧 Phase 25: SCTP RFC 9260 Full Compliance
+### ✅ Phase 25: SCTP RFC 9260 Full Compliance
 
 **Goal**: Complete RFC 9260 compliance for production-grade SCTP
 
@@ -610,17 +610,20 @@ This document outlines the development roadmap for the USG Session Border Contro
   - Add/Delete streams dynamically
   - RE-CONFIG chunk encode/decode
   - Request/response sequence number tracking
-- 🚧 Path MTU Discovery (RFC 9260 §8.4)
+- ✅ Path MTU Discovery (RFC 9260 §8.4)
   - PMTU probing with PAD chunks
   - ICMP Packet Too Big handling
   - Dynamic fragmentation threshold adjustment
-- 🚧 T4-shutdown timer implementation (RFC 9260 §9.2)
+  - `start_pmtu_probe()`, `on_pmtu_probe_success/failure()` methods
+- ✅ T2-shutdown timer implementation (RFC 9260 §9.2)
   - Timer for SHUTDOWN-ACK retransmission
   - Proper shutdown state machine timing
-- 🚧 Automatic heartbeat sending (RFC 9260 §8.3)
+  - Already implemented via existing T2-shutdown timer infrastructure
+- ✅ Automatic heartbeat sending (RFC 9260 §8.3)
   - Periodic HEARTBEAT on idle paths
   - Configurable heartbeat interval
   - RTT update from HEARTBEAT-ACK
+  - `should_send_heartbeat()` with timer integration
 - ✅ Duplicate TSN detection (RFC 9260 §6.2)
   - Track received TSNs for duplicate detection
   - Report duplicates in SACK
@@ -636,13 +639,15 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **Lower Priority - Optimizations**
 
-- 🚧 SACK bundling optimization (RFC 9260 §6.2)
+- ✅ SACK bundling optimization (RFC 9260 §6.2)
   - Bundle SACK with DATA when possible
-  - Delayed SACK timer (200ms default)
-  - Immediate SACK for gap detection
-- 🚧 Heartbeat bundling (RFC 9260 §8.3)
+  - Delayed SACK timer (T4-sack, 200ms default)
+  - Immediate SACK for gap detection and every-other-DATA rule
+  - `on_data_received()`, `should_send_sack()`, `try_bundle_sack()` methods
+- ✅ Heartbeat bundling (RFC 9260 §8.3)
   - Bundle HEARTBEAT with DATA chunks
   - Reduce overhead on busy associations
+  - `restart_heartbeat_timer()` tracks last data sent
 - ✅ PAD chunk support (RFC 4820 / RFC 9260 §3.3.14)
   - `PadChunk` struct for PMTU probing
   - Arbitrary padding size support
