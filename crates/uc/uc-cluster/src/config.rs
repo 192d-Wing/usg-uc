@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 /// Cluster configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClusterConfig {
     /// Enable clustering.
@@ -162,7 +162,7 @@ impl ClusterConfigBuilder {
 }
 
 /// Heartbeat configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HeartbeatConfig {
     /// Heartbeat interval in milliseconds.
@@ -204,7 +204,7 @@ impl HeartbeatConfig {
 }
 
 /// Failover configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FailoverConfig {
     /// Time before declaring a node dead (milliseconds).
@@ -267,7 +267,7 @@ pub enum FailoverStrategy {
 }
 
 /// Replication configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReplicationConfig {
     /// Replication mode.

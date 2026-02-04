@@ -106,6 +106,16 @@ pub struct AppState {
     pub ready: AtomicU64,
     /// TLS acceptor for certificate hot-reload (if TLS is enabled).
     pub tls_acceptor: Option<Arc<ReloadableTlsAcceptor>>,
+    /// Cluster health check function (when cluster feature is enabled).
+    #[cfg(feature = "cluster")]
+    pub cluster_health_fn: Option<
+        Arc<
+            dyn Fn() -> std::pin::Pin<
+                    Box<dyn std::future::Future<Output = crate::cluster::ClusterHealth> + Send>,
+                > + Send
+                + Sync,
+        >,
+    >,
 }
 
 impl AppState {
@@ -118,6 +128,8 @@ impl AppState {
             start_time: Instant::now(),
             ready: AtomicU64::new(1), // Start as ready
             tls_acceptor: None,
+            #[cfg(feature = "cluster")]
+            cluster_health_fn: None,
         }
     }
 
@@ -134,7 +146,19 @@ impl AppState {
             start_time: Instant::now(),
             ready: AtomicU64::new(1),
             tls_acceptor: Some(tls_acceptor),
+            #[cfg(feature = "cluster")]
+            cluster_health_fn: None,
         }
+    }
+
+    /// Sets the cluster health check function.
+    #[cfg(feature = "cluster")]
+    pub fn set_cluster_health_fn<F, Fut>(&mut self, f: F)
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = crate::cluster::ClusterHealth> + Send + 'static,
+    {
+        self.cluster_health_fn = Some(Arc::new(move || Box::pin(f())));
     }
 
     /// Reloads TLS certificates if TLS is enabled.
@@ -176,12 +200,63 @@ impl AppState {
     }
 
     /// Performs a health check.
+    #[allow(unused_mut)]
     pub fn check_health(&self) -> SystemHealth {
-        let components = vec![
+        let mut components = vec![
             ComponentStatus::healthy("sbc_core"),
             ComponentStatus::healthy("sip_transport"),
             ComponentStatus::healthy("media_engine"),
         ];
+
+        // Note: Cluster health is checked asynchronously via check_health_async
+        // This synchronous version returns static component status
+        #[cfg(feature = "cluster")]
+        if self.cluster_health_fn.is_some() {
+            components.push(ComponentStatus::healthy("cluster"));
+        }
+
+        SystemHealth::from_components(components)
+            .with_uptime(self.uptime_secs())
+            .with_version(&self.version)
+    }
+
+    /// Performs an async health check that includes cluster health.
+    #[cfg(feature = "cluster")]
+    pub async fn check_health_async(&self) -> SystemHealth {
+        let mut components = vec![
+            ComponentStatus::healthy("sbc_core"),
+            ComponentStatus::healthy("sip_transport"),
+            ComponentStatus::healthy("media_engine"),
+        ];
+
+        // Check cluster health if configured
+        if let Some(ref health_fn) = self.cluster_health_fn {
+            let cluster_health = health_fn().await;
+            let cluster_status = if cluster_health.healthy {
+                ComponentStatus::healthy("cluster")
+            } else {
+                ComponentStatus::unhealthy("cluster", "Cluster health check failed")
+            };
+            components.push(cluster_status);
+
+            // Add individual cluster components
+            if cluster_health.storage_healthy {
+                components.push(ComponentStatus::healthy("cluster_storage"));
+            } else {
+                components.push(ComponentStatus::unhealthy(
+                    "cluster_storage",
+                    "Storage backend unhealthy",
+                ));
+            }
+            if cluster_health.discovery_healthy {
+                components.push(ComponentStatus::healthy("cluster_discovery"));
+            } else {
+                components.push(ComponentStatus::unhealthy(
+                    "cluster_discovery",
+                    "Discovery service unhealthy",
+                ));
+            }
+        }
 
         SystemHealth::from_components(components)
             .with_uptime(self.uptime_secs())

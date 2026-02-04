@@ -58,7 +58,9 @@ pub mod dns;
 #[cfg(feature = "kubernetes")]
 pub mod kubernetes;
 
-pub use config::{DiscoveryConfig, DiscoveryMethod, GossipConfig};
+pub use config::{
+    DiscoveryConfig, DiscoveryMethod, DnsConfig, GossipConfig, KubernetesConfig, KubernetesPort,
+};
 pub use error::{DiscoveryError, DiscoveryResult};
 pub use gossip::{GossipProtocol, MemberStatus};
 pub use static_list::StaticDiscovery;

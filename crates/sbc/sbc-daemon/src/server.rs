@@ -10,6 +10,8 @@
 //! - Automatic blocking of abusive sources
 //! - Configurable thresholds from `sbc-config`
 
+#[cfg(feature = "cluster")]
+use crate::cluster::ClusterManager;
 use crate::shutdown::ShutdownSignal;
 use crate::sip_stack::{ProcessResult, SipStack, SipStackConfig};
 use proto_registrar::RegistrarMode;
@@ -44,6 +46,9 @@ pub struct Server {
     sip_stack: Arc<SipStack>,
     /// Rate limiter for `DoS` protection.
     rate_limiter: Arc<Mutex<RateLimiter>>,
+    /// Cluster manager (when cluster feature is enabled).
+    #[cfg(feature = "cluster")]
+    cluster: Option<Arc<ClusterManager>>,
 }
 
 impl Server {
@@ -99,7 +104,92 @@ impl Server {
             udp_transports: RwLock::new(Vec::new()),
             sip_stack,
             rate_limiter,
+            #[cfg(feature = "cluster")]
+            cluster: None,
         }
+    }
+
+    /// Creates a new server with cluster support.
+    #[cfg(feature = "cluster")]
+    pub fn new_with_cluster(
+        config: SbcConfig,
+        shutdown: ShutdownSignal,
+        cluster: Option<Arc<ClusterManager>>,
+    ) -> Self {
+        // Use standard SBC metrics
+        let metrics = SbcMetrics::standard();
+
+        let mut health = HealthChecker::new(HealthCheckerConfig::default())
+            .with_version(env!("CARGO_PKG_VERSION"));
+
+        // Register health checks
+        health.register(Box::new(uc_health::check::AlwaysHealthyCheck::new(
+            "sbc_core",
+        )));
+        health.register(Box::new(uc_health::check::MemoryCheck::new()));
+
+        // Create SIP stack configuration
+        // If we have a cluster manager with AsyncLocationService, use it
+        let sip_stack = if let Some(ref cluster_mgr) = cluster {
+            let sip_config = SipStackConfig {
+                instance_name: config.general.instance_name.clone(),
+                domain: config.general.instance_name.clone(),
+                registrar_mode: RegistrarMode::B2bua,
+                b2bua_enabled: true,
+            };
+            // Create SIP stack with cluster-backed location service
+            Arc::new(SipStack::new_with_location_service(
+                sip_config,
+                Arc::clone(cluster_mgr.location_service()),
+            ))
+        } else {
+            let sip_config = SipStackConfig {
+                instance_name: config.general.instance_name.clone(),
+                domain: config.general.instance_name.clone(),
+                registrar_mode: RegistrarMode::B2bua,
+                b2bua_enabled: true,
+            };
+            Arc::new(SipStack::new(sip_config))
+        };
+
+        // Create rate limiter from config
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let burst_size = (f64::from(config.rate_limit.per_ip_rps)
+            * f64::from(config.rate_limit.burst_multiplier)) as u32;
+        let rate_limit_config =
+            RateLimiterConfig::new(config.rate_limit.per_ip_rps, burst_size).with_per_ip(true);
+
+        let rate_limiter = Arc::new(Mutex::new(RateLimiter::new(rate_limit_config)));
+
+        info!(
+            enabled = config.rate_limit.enabled,
+            per_ip_rps = config.rate_limit.per_ip_rps,
+            burst_multiplier = config.rate_limit.burst_multiplier,
+            cluster_enabled = cluster.is_some(),
+            "Rate limiting configured"
+        );
+
+        Self {
+            config,
+            shutdown,
+            health,
+            metrics,
+            stats: Arc::new(ServerStats::default()),
+            udp_transports: RwLock::new(Vec::new()),
+            sip_stack,
+            rate_limiter,
+            cluster,
+        }
+    }
+
+    /// Returns the cluster manager if available.
+    #[cfg(feature = "cluster")]
+    pub fn cluster(&self) -> Option<&Arc<ClusterManager>> {
+        self.cluster.as_ref()
     }
 
     /// Returns the server configuration.

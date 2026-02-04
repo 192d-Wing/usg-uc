@@ -62,7 +62,10 @@ pub mod redis;
 pub mod postgres;
 
 pub use backend::StorageBackend;
-pub use config::{StorageBackendType, StorageConfig};
+pub use config::{
+    PostgresConfig, PostgresSslMode, RedisConfig, RedisTlsConfig, RetryConfig, StorageBackendType,
+    StorageConfig,
+};
 pub use error::{StorageError, StorageResult};
 pub use memory::InMemoryBackend;
 

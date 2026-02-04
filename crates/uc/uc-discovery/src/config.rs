@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 /// Discovery configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DiscoveryConfig {
     /// Discovery method to use.
@@ -140,7 +140,7 @@ impl std::fmt::Display for DiscoveryMethod {
 }
 
 /// DNS discovery configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DnsConfig {
     /// DNS domain name to query.
@@ -177,7 +177,7 @@ impl DnsConfig {
 }
 
 /// Kubernetes discovery configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KubernetesConfig {
     /// Namespace to search in (empty means current namespace).
@@ -209,7 +209,7 @@ impl Default for KubernetesConfig {
 }
 
 /// Kubernetes port specification.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum KubernetesPort {
     /// Named port.
@@ -225,7 +225,7 @@ impl Default for KubernetesPort {
 }
 
 /// Gossip protocol configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GossipConfig {
     /// Enable gossip protocol.

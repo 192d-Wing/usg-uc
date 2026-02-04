@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// Storage configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StorageConfig {
     /// Storage backend type.
@@ -93,7 +93,7 @@ impl std::fmt::Display for StorageBackendType {
 }
 
 /// Redis configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RedisConfig {
     /// Redis connection URL.
@@ -150,7 +150,7 @@ impl RedisConfig {
 }
 
 /// Redis TLS configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RedisTlsConfig {
     /// Path to CA certificate.
     pub ca_cert_path: Option<String>,
@@ -174,7 +174,7 @@ impl Default for RedisTlsConfig {
 }
 
 /// PostgreSQL configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PostgresConfig {
     /// Connection URL or DSN.
@@ -263,7 +263,7 @@ impl std::fmt::Display for PostgresSslMode {
 }
 
 /// Retry configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetryConfig {
     /// Maximum number of retry attempts.

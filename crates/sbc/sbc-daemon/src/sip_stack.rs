@@ -16,6 +16,8 @@
 use bytes::Bytes;
 use proto_b2bua::{Call, CallId};
 use proto_dialog::{Dialog, DialogId};
+#[cfg(feature = "cluster")]
+use proto_registrar::AsyncLocationService;
 use proto_registrar::{LocationService, Registrar, RegistrarConfig, RegistrarMode};
 use proto_sip::{Header, HeaderName, Method, SipMessage, StatusCode};
 use proto_transaction::{
@@ -38,8 +40,11 @@ pub struct SipStack {
     calls: RwLock<CallStore>,
     /// Registrar for REGISTER handling.
     registrar: RwLock<Registrar>,
-    /// Location service for routing.
+    /// Location service for routing (in-memory).
     location_service: Arc<RwLock<LocationService>>,
+    /// Async location service for routing (storage-backed, when cluster enabled).
+    #[cfg(feature = "cluster")]
+    async_location_service: Option<Arc<AsyncLocationService>>,
     /// Stack configuration.
     config: SipStackConfig,
 }
@@ -163,8 +168,44 @@ impl SipStack {
             calls: RwLock::new(CallStore::default()),
             registrar: RwLock::new(registrar),
             location_service,
+            #[cfg(feature = "cluster")]
+            async_location_service: None,
             config,
         }
+    }
+
+    /// Creates a new SIP stack with a storage-backed async location service.
+    #[cfg(feature = "cluster")]
+    pub fn new_with_location_service(
+        config: SipStackConfig,
+        async_location_service: Arc<AsyncLocationService>,
+    ) -> Self {
+        // Keep a local in-memory location service as fallback
+        let location_service = Arc::new(RwLock::new(LocationService::new()));
+
+        let registrar_config = RegistrarConfig {
+            mode: config.registrar_mode,
+            ..RegistrarConfig::default()
+        };
+        let registrar = Registrar::new(registrar_config);
+
+        info!("SIP stack initialized with storage-backed location service");
+
+        Self {
+            transactions: RwLock::new(TransactionStore::default()),
+            dialogs: RwLock::new(DialogStore::default()),
+            calls: RwLock::new(CallStore::default()),
+            registrar: RwLock::new(registrar),
+            location_service,
+            async_location_service: Some(async_location_service),
+            config,
+        }
+    }
+
+    /// Returns whether the stack has a storage-backed location service.
+    #[cfg(feature = "cluster")]
+    pub fn has_async_location_service(&self) -> bool {
+        self.async_location_service.is_some()
     }
 
     /// Processes an incoming SIP message.

@@ -11,6 +11,8 @@
 
 use crate::api_server::{ApiServer, ApiServerConfig, AppState};
 use crate::args::Args;
+#[cfg(feature = "cluster")]
+use crate::cluster::ClusterManager;
 use crate::server::{Server, ServerError};
 use crate::shutdown::{ShutdownCoordinator, ShutdownSignal};
 #[cfg(test)]
@@ -38,6 +40,9 @@ pub struct Runtime {
     reload_check_interval: Duration,
     /// Telemetry provider for distributed tracing.
     telemetry: Option<TelemetryProvider>,
+    /// Cluster manager (when cluster feature is enabled).
+    #[cfg(feature = "cluster")]
+    cluster: Option<Arc<ClusterManager>>,
 }
 
 impl Runtime {
@@ -61,6 +66,25 @@ impl Runtime {
 
         let shutdown = ShutdownCoordinator::new(signal);
 
+        // Initialize cluster manager if cluster feature is enabled and configured
+        #[cfg(feature = "cluster")]
+        let cluster = if config.cluster.is_some() {
+            match ClusterManager::new(&config).await {
+                Ok(mgr) => {
+                    info!("Cluster manager initialized successfully");
+                    Some(Arc::new(mgr))
+                }
+                Err(e) => {
+                    // Log warning but continue - cluster is optional
+                    warn!(error = %e, "Cluster initialization failed, running in standalone mode");
+                    None
+                }
+            }
+        } else {
+            debug!("Cluster configuration not present, running in standalone mode");
+            None
+        };
+
         Ok(Self {
             args,
             config: Arc::new(RwLock::new(config)),
@@ -68,6 +92,8 @@ impl Runtime {
             server: None,
             reload_check_interval: Duration::from_millis(500),
             telemetry,
+            #[cfg(feature = "cluster")]
+            cluster,
         })
     }
 
@@ -212,9 +238,26 @@ impl Runtime {
 
     /// Runs the SBC daemon.
     pub async fn run(&mut self) -> Result<(), RuntimeError> {
+        // Start cluster services if configured
+        #[cfg(feature = "cluster")]
+        if let Some(ref cluster) = self.cluster {
+            cluster
+                .start()
+                .await
+                .map_err(|e| RuntimeError::InitFailed {
+                    component: "cluster".to_string(),
+                    reason: e.to_string(),
+                })?;
+        }
+
         // Create and start SIP server
         let signal = self.shutdown.signal().clone();
         let config = self.config.read().await.clone();
+
+        // Pass cluster manager to server if available
+        #[cfg(feature = "cluster")]
+        let mut server = Server::new_with_cluster(config, signal.clone(), self.cluster.clone());
+        #[cfg(not(feature = "cluster"))]
         let mut server = Server::new(config, signal.clone());
 
         server
@@ -285,6 +328,13 @@ impl Runtime {
             .map_err(|e| RuntimeError::ServerFailed {
                 reason: e.to_string(),
             })?;
+
+        // Stop cluster services
+        #[cfg(feature = "cluster")]
+        if let Some(ref cluster) = self.cluster {
+            cluster.stop().await;
+            info!("Cluster services stopped");
+        }
 
         // Shutdown telemetry provider (flush pending spans/metrics)
         if let Some(ref telemetry) = self.telemetry {

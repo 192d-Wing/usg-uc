@@ -38,6 +38,8 @@
 
 mod api_server;
 mod args;
+#[cfg(feature = "cluster")]
+mod cluster;
 mod ice_agent;
 mod media_pipeline;
 mod runtime;
