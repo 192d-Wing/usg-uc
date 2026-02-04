@@ -668,14 +668,13 @@ impl SctpListener {
 // Helper Functions
 // =============================================================================
 
-/// Generates a pseudo-random u32.
+/// Generates a cryptographically secure random u32.
+///
+/// Uses the `rand` crate with OS-provided entropy for security-critical
+/// values like verification tags and initial TSNs.
 fn generate_random_u32() -> u32 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-
-    (now ^ (now >> 32)) as u32
+    use rand::RngCore;
+    rand::thread_rng().next_u32()
 }
 
 // =============================================================================

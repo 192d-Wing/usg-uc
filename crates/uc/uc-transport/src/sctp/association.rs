@@ -21,7 +21,7 @@ use super::stream::StreamManager;
 use super::timer::TimerManager;
 use super::udp_encap::UdpEncapConfig;
 use bytes::Bytes;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -94,19 +94,23 @@ impl Default for AssociationConfig {
 // =============================================================================
 
 /// Entry in the retransmission queue.
-#[derive(Debug)]
-#[allow(dead_code)] // Fields will be used by retransmission logic
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields used for RTT calculation and path selection in future
 struct RetransmitEntry {
     /// The data chunk to retransmit.
     chunk: DataChunk,
-    /// When the chunk was first sent.
+    /// When the chunk was first sent (for RTT calculation).
     first_sent: Instant,
     /// When the chunk was last sent.
     last_sent: Instant,
     /// Number of retransmissions.
     retransmit_count: u32,
-    /// Path the chunk was sent on.
+    /// Path the chunk was sent on (for multi-homing).
     path_id: PathId,
+    /// Whether this chunk has been marked for fast retransmit.
+    marked_for_fast_retransmit: bool,
+    /// Number of times this chunk was reported missing in SACKs.
+    miss_indications: u32,
 }
 
 // =============================================================================
@@ -319,15 +323,30 @@ impl AssociationInner {
             self.config.ordered_delivery,
         );
 
-        Ok(self
+        let actions = self
             .state_machine
-            .process_event(StateEvent::ReceiveCookieEcho))
+            .process_event(StateEvent::ReceiveCookieEcho);
+
+        // Start heartbeat timer when association becomes established (server side)
+        if self.is_established() {
+            self.timers.start_heartbeat();
+        }
+
+        Ok(actions)
     }
 
     /// Processes a received COOKIE-ACK chunk.
     fn process_cookie_ack(&mut self) -> Vec<StateAction> {
-        self.state_machine
-            .process_event(StateEvent::ReceiveCookieAck)
+        let actions = self
+            .state_machine
+            .process_event(StateEvent::ReceiveCookieAck);
+
+        // Start heartbeat timer when association becomes established
+        if self.is_established() {
+            self.timers.start_heartbeat();
+        }
+
+        actions
     }
 
     /// Processes a received DATA chunk.
@@ -357,18 +376,97 @@ impl AssociationInner {
         // Update peer's receiver window
         self.peer_rwnd = sack.a_rwnd;
 
-        // Process acknowledged TSNs
+        // Process acknowledged TSNs (cumulative acknowledgment)
         let bytes_acked = self.acknowledge_tsns(sack.cumulative_tsn_ack);
+
+        // Process gap ack blocks for selective acknowledgment (RFC 9260 Section 6.2.1)
+        let gap_bytes_acked = self.process_gap_ack_blocks(sack);
+
+        // Update miss indications for TSNs not acknowledged
+        // This implements fast retransmit (RFC 9260 Section 7.2.4)
+        self.update_miss_indications(sack);
 
         // Update congestion control
         if let Some(path) = self.paths.get_active_path_mut() {
             let is_new_ack = sack.cumulative_tsn_ack != self.last_acked_tsn;
-            path.on_sack_received(bytes_acked, is_new_ack, None);
+            path.on_sack_received(bytes_acked + gap_bytes_acked, is_new_ack, None);
         }
 
         self.last_acked_tsn = sack.cumulative_tsn_ack;
 
-        // TODO: Process gap ack blocks for selective acknowledgment
+        // Stop T3-rtx if no outstanding data remains (RFC 9260 Section 6.3.2)
+        if !self.has_outstanding_data() {
+            self.timers.stop_t3_rtx();
+        }
+    }
+
+    /// Processes gap ack blocks from a SACK chunk.
+    ///
+    /// Gap ack blocks indicate TSNs that have been received out of order.
+    /// The start and end values are offsets from the cumulative TSN ack.
+    /// Returns the total bytes acknowledged via gap blocks.
+    fn process_gap_ack_blocks(&mut self, sack: &SackChunk) -> u32 {
+        let mut bytes_acked = 0u32;
+        let cum_tsn = sack.cumulative_tsn_ack;
+
+        for gap in &sack.gap_ack_blocks {
+            // Gap block TSNs are offsets from cumulative TSN ack
+            // Start and end are 1-based offsets (RFC 9260 Section 3.3.4)
+            let start_tsn = cum_tsn.wrapping_add(u32::from(gap.start));
+            let end_tsn = cum_tsn.wrapping_add(u32::from(gap.end));
+
+            // Mark TSNs in range [start_tsn, end_tsn] as acknowledged
+            let mut tsn = start_tsn;
+            while tsn_le(tsn, end_tsn) {
+                if let Some(entry) = self.retransmit_queue.remove(&tsn) {
+                    bytes_acked = bytes_acked.saturating_add(entry.chunk.data.len() as u32);
+                }
+                tsn = tsn.wrapping_add(1);
+            }
+        }
+
+        bytes_acked
+    }
+
+    /// Updates miss indications for TSNs not acknowledged.
+    ///
+    /// Per RFC 9260 Section 7.2.4, when a SACK arrives that advances the
+    /// cumulative TSN ack point or reports gap blocks, increment the miss
+    /// indication counter for each TSN that is NOT acknowledged.
+    /// When a TSN reaches 3 miss indications, mark it for fast retransmit.
+    fn update_miss_indications(&mut self, sack: &SackChunk) {
+        let cum_tsn = sack.cumulative_tsn_ack;
+
+        // Build a set of TSNs that are acknowledged (either cumulatively or via gaps)
+        let mut acked_tsns = HashSet::new();
+
+        // All TSNs <= cumulative are acked (already removed from queue, but track for logic)
+        // Gap blocks acknowledge specific TSNs above cumulative
+        for gap in &sack.gap_ack_blocks {
+            let start_tsn = cum_tsn.wrapping_add(u32::from(gap.start));
+            let end_tsn = cum_tsn.wrapping_add(u32::from(gap.end));
+            let mut tsn = start_tsn;
+            while tsn_le(tsn, end_tsn) {
+                acked_tsns.insert(tsn);
+                tsn = tsn.wrapping_add(1);
+            }
+        }
+
+        // Update miss indications for TSNs still in retransmit queue
+        // that are NOT in the gap blocks
+        for entry in self.retransmit_queue.values_mut() {
+            let tsn = entry.chunk.tsn;
+            // Only count miss indications for TSNs above the cumulative ack
+            // that are not acknowledged via gap blocks
+            if tsn_lt(cum_tsn, tsn) && !acked_tsns.contains(&tsn) {
+                entry.miss_indications = entry.miss_indications.saturating_add(1);
+
+                // RFC 9260 Section 7.2.4: Fast Retransmit on 3 missing reports
+                if entry.miss_indications >= 3 && !entry.marked_for_fast_retransmit {
+                    entry.marked_for_fast_retransmit = true;
+                }
+            }
+        }
     }
 
     /// Acknowledges TSNs up to the given cumulative TSN.
@@ -393,9 +491,38 @@ impl AssociationInner {
     }
 
     /// Queues data for sending.
+    ///
+    /// If the data exceeds the path MTU, it will be fragmented into multiple
+    /// DATA chunks per RFC 9260 Section 6.9.
     fn queue_data(&mut self, stream_id: u16, data: Bytes, ordered: bool) -> Result<u32, String> {
         if !self.is_established() {
             return Err("Association not established".to_string());
+        }
+
+        // RFC 9260 Section 6.1: Flow control enforcement
+        // Check if we have available receiver window space
+        let data_len = data.len() as u32;
+        let current_flight = self.flight_size();
+
+        // Calculate available window (peer_rwnd - outstanding data)
+        let available_window = self.peer_rwnd.saturating_sub(current_flight);
+        if data_len > available_window {
+            return Err(format!(
+                "Peer receive window exhausted: need {} bytes, only {} available (peer_rwnd={}, flight={})",
+                data_len, available_window, self.peer_rwnd, current_flight
+            ));
+        }
+
+        // Also check congestion window
+        if let Some(path) = self.paths.get_active_path() {
+            let cwnd = path.congestion().cwnd();
+            let cwnd_available = cwnd.saturating_sub(current_flight);
+            if data_len > cwnd_available {
+                return Err(format!(
+                    "Congestion window exhausted: need {} bytes, only {} available (cwnd={}, flight={})",
+                    data_len, cwnd_available, cwnd, current_flight
+                ));
+            }
         }
 
         // Allocate SSN if ordered
@@ -405,20 +532,148 @@ impl AssociationInner {
             0
         };
 
-        // Create DATA chunk
-        let tsn = self.next_tsn;
-        self.next_tsn = self.next_tsn.wrapping_add(1);
+        // Calculate max DATA chunk payload size
+        // MTU - IP header (20/40) - UDP header (8) - SCTP common header (12) - DATA chunk header (16)
+        // For simplicity, use a conservative estimate
+        let data_chunk_header_size = 16;
+        let sctp_header_size = 12;
+        let udp_header_size = 8;
+        let ip_header_size = 40; // Assume IPv6 worst case
+        let max_payload = self.config.path_mtu as usize
+            - ip_header_size
+            - udp_header_size
+            - sctp_header_size
+            - data_chunk_header_size;
 
-        let mut chunk = DataChunk::new(tsn, stream_id, ssn, 0, data);
-        if !ordered {
-            chunk = chunk.with_unordered(true);
+        // Check if fragmentation is needed
+        if data.len() <= max_payload {
+            // Single unfragmented message
+            let tsn = self.next_tsn;
+            self.next_tsn = self.next_tsn.wrapping_add(1);
+
+            let mut chunk = DataChunk::new(tsn, stream_id, ssn, 0, data);
+            if !ordered {
+                chunk = chunk.with_unordered(true);
+            }
+            // Mark as both beginning and end (single fragment)
+            chunk = chunk.with_fragment(true, true);
+
+            self.send_queue.push_back(chunk);
+            return Ok(tsn);
         }
-        // Mark as both beginning and end (single fragment)
-        chunk = chunk.with_fragment(true, true);
 
-        self.send_queue.push_back(chunk);
+        // Fragmentation required (RFC 9260 Section 6.9)
+        let first_tsn = self.next_tsn;
+        let mut offset = 0;
+        let total_len = data.len();
+        let mut is_first = true;
 
-        Ok(tsn)
+        while offset < total_len {
+            let end = (offset + max_payload).min(total_len);
+            let is_last = end == total_len;
+
+            let fragment = data.slice(offset..end);
+            let tsn = self.next_tsn;
+            self.next_tsn = self.next_tsn.wrapping_add(1);
+
+            let mut chunk = DataChunk::new(tsn, stream_id, ssn, 0, fragment);
+            if !ordered {
+                chunk = chunk.with_unordered(true);
+            }
+            // Set B and E flags appropriately
+            chunk = chunk.with_fragment(is_first, is_last);
+
+            self.send_queue.push_back(chunk);
+
+            is_first = false;
+            offset = end;
+        }
+
+        Ok(first_tsn)
+    }
+
+    /// Adds a sent chunk to the retransmission queue.
+    fn add_to_retransmit_queue(&mut self, chunk: DataChunk) {
+        let now = Instant::now();
+        // Use primary path or create a fallback path ID
+        let path_id = self
+            .paths
+            .primary_path_id()
+            .unwrap_or_else(|| PathId::new(self.local_addr, self.peer_addr));
+
+        let entry = RetransmitEntry {
+            chunk,
+            first_sent: now,
+            last_sent: now,
+            retransmit_count: 0,
+            path_id,
+            marked_for_fast_retransmit: false,
+            miss_indications: 0,
+        };
+
+        self.retransmit_queue.insert(entry.chunk.tsn, entry);
+
+        // Start T3-rtx timer if not already running
+        if !self.timers.is_t3_running() {
+            self.timers.start_t3_rtx();
+        }
+    }
+
+    /// Gets chunks that need retransmission due to T3-rtx timeout.
+    fn get_retransmit_chunks(&mut self) -> Vec<DataChunk> {
+        let mut chunks = Vec::new();
+        let now = Instant::now();
+        let max_retransmissions = self.config.max_retransmissions;
+
+        // Get chunks that need retransmission
+        for entry in self.retransmit_queue.values_mut() {
+            // Skip if we've exceeded max retransmissions
+            if entry.retransmit_count >= max_retransmissions {
+                continue;
+            }
+
+            // Include chunk for retransmission
+            entry.retransmit_count += 1;
+            entry.last_sent = now;
+            chunks.push(entry.chunk.clone());
+        }
+
+        // Restart T3-rtx timer if we have outstanding data
+        if !self.retransmit_queue.is_empty() {
+            self.timers.start_t3_rtx();
+        }
+
+        chunks
+    }
+
+    /// Gets chunks marked for fast retransmit (3 miss indications).
+    fn get_fast_retransmit_chunks(&mut self) -> Vec<DataChunk> {
+        let mut chunks = Vec::new();
+        let now = Instant::now();
+
+        for entry in self.retransmit_queue.values_mut() {
+            if entry.miss_indications >= 3 && !entry.marked_for_fast_retransmit {
+                entry.marked_for_fast_retransmit = true;
+                entry.retransmit_count += 1;
+                entry.last_sent = now;
+                chunks.push(entry.chunk.clone());
+            }
+        }
+
+        chunks
+    }
+
+    /// Checks if there's outstanding data awaiting acknowledgment.
+    fn has_outstanding_data(&self) -> bool {
+        !self.retransmit_queue.is_empty()
+    }
+
+    /// Gets the flight size (bytes of outstanding data).
+    fn flight_size(&self) -> u32 {
+        self.retransmit_queue
+            .values()
+            .map(|e| e.chunk.data.len() as u32)
+            .sum()
     }
 
     /// Takes the next message from any stream.
@@ -725,6 +980,109 @@ impl AssociationHandle {
             path.confirm();
         }
     }
+
+    /// Adds sent chunks to the retransmission queue.
+    ///
+    /// Call this after successfully sending DATA chunks to track them
+    /// for potential retransmission.
+    pub async fn track_sent_chunks(&self, chunks: &[DataChunk]) {
+        let mut inner = self.inner.write().await;
+        for chunk in chunks {
+            inner.add_to_retransmit_queue(chunk.clone());
+        }
+    }
+
+    /// Checks for chunks that need retransmission due to T3-rtx timeout.
+    ///
+    /// Returns chunks that should be retransmitted. The caller is responsible
+    /// for actually sending these chunks over the network.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn check_retransmissions(&self) -> Vec<DataChunk> {
+        let mut inner = self.inner.write().await;
+
+        // Check if T3-rtx has expired
+        if inner.timers.is_t3_expired() {
+            // Record the expiration and apply backoff
+            let count = inner
+                .timers
+                .record_expiration(super::timer::TimerType::T3Rtx);
+
+            // Check if we've exceeded max retransmissions
+            if count > inner.config.max_retransmissions {
+                // Association failure - should abort
+                tracing::warn!(
+                    count = count,
+                    max = inner.config.max_retransmissions,
+                    "T3-rtx exceeded max retransmissions"
+                );
+                return Vec::new();
+            }
+
+            // Update congestion control on timeout
+            if let Some(path) = inner.paths.get_active_path_mut() {
+                path.congestion_mut().on_timeout();
+            }
+
+            return inner.get_retransmit_chunks();
+        }
+
+        Vec::new()
+    }
+
+    /// Gets chunks marked for fast retransmit.
+    ///
+    /// Fast retransmit is triggered when a chunk receives 3 or more
+    /// miss indications (gap ack blocks that skip it).
+    pub async fn get_fast_retransmit_chunks(&self) -> Vec<DataChunk> {
+        self.inner.write().await.get_fast_retransmit_chunks()
+    }
+
+    /// Returns true if there's outstanding data awaiting acknowledgment.
+    pub async fn has_outstanding_data(&self) -> bool {
+        self.inner.read().await.has_outstanding_data()
+    }
+
+    /// Returns the current flight size (bytes of outstanding data).
+    pub async fn flight_size(&self) -> u32 {
+        self.inner.read().await.flight_size()
+    }
+
+    /// Checks all timers and returns expired timer types.
+    pub async fn check_timers(&self) -> Vec<super::timer::TimerType> {
+        self.inner.read().await.timers.expired_timers()
+    }
+
+    /// Restarts the heartbeat timer after sending a heartbeat.
+    ///
+    /// Call this after successfully sending a HEARTBEAT chunk.
+    pub async fn restart_heartbeat_timer(&self) {
+        let mut inner = self.inner.write().await;
+        // Record expiration and restart
+        inner
+            .timers
+            .record_expiration(super::timer::TimerType::Heartbeat);
+        inner.timers.start_heartbeat();
+    }
+
+    /// Starts the T3-rtx timer if there is outstanding data.
+    ///
+    /// This should be called after sending DATA chunks.
+    pub async fn ensure_t3_running(&self) {
+        let mut inner = self.inner.write().await;
+        if inner.has_outstanding_data() && !inner.timers.is_t3_running() {
+            inner.timers.start_t3_rtx();
+        }
+    }
+
+    /// Stops the T3-rtx timer.
+    ///
+    /// Called when all outstanding data has been acknowledged.
+    pub async fn stop_t3_if_no_data(&self) {
+        let mut inner = self.inner.write().await;
+        if !inner.has_outstanding_data() {
+            inner.timers.stop_t3_rtx();
+        }
+    }
 }
 
 // =============================================================================
@@ -732,13 +1090,13 @@ impl AssociationHandle {
 // =============================================================================
 
 /// Generates a pseudo-random u32.
+/// Generates a cryptographically secure random u32.
+///
+/// Uses the `rand` crate with OS-provided entropy for security-critical
+/// values like verification tags and initial TSNs.
 fn generate_random_u32() -> u32 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-
-    (now ^ (now >> 32)) as u32
+    use rand::RngCore;
+    rand::thread_rng().next_u32()
 }
 
 /// TSN comparison with wrap-around (serial number arithmetic).

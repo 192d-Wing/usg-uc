@@ -136,12 +136,28 @@ impl StreamId {
 }
 
 // =============================================================================
-// SCTP Association
+// SCTP Association (Deprecated Stub)
 // =============================================================================
 
 /// SCTP association for SIP transport.
 ///
-/// Represents an SCTP association with multi-homing and multi-stream support.
+/// # Deprecated
+///
+/// This is a stub implementation without real network I/O.
+/// Use [`ConnectedSctpAssociation`] instead for production use.
+///
+/// ```rust,ignore
+/// use uc_transport::sctp::{ConnectedSctpAssociation, ConnectedSctpConfig};
+///
+/// let config = ConnectedSctpConfig::default();
+/// let mut assoc = ConnectedSctpAssociation::new(local_addr, peer_addr, config).await?;
+/// assoc.connect().await?;
+/// ```
+#[deprecated(
+    since = "0.2.0",
+    note = "Use ConnectedSctpAssociation for real network I/O"
+)]
+#[allow(deprecated)]
 pub struct SctpAssociation {
     /// Local address.
     local_addr: SbcSocketAddr,
@@ -165,6 +181,7 @@ pub struct SctpAssociation {
     local_tsn: u32,
 }
 
+#[allow(deprecated)]
 impl SctpAssociation {
     /// Creates a new SCTP association (client mode).
     #[must_use]
@@ -355,6 +372,7 @@ impl SctpAssociation {
     }
 }
 
+#[allow(deprecated)]
 impl Transport for SctpAssociation {
     fn send<'a>(
         &'a self,
@@ -403,6 +421,7 @@ impl Transport for SctpAssociation {
     }
 }
 
+#[allow(deprecated)]
 impl StreamTransport for SctpAssociation {
     fn peer_addr(&self) -> &SbcSocketAddr {
         &self.peer_addr
@@ -413,6 +432,7 @@ impl StreamTransport for SctpAssociation {
     }
 }
 
+#[allow(deprecated)]
 impl std::fmt::Debug for SctpAssociation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SctpAssociation")
@@ -429,24 +449,20 @@ impl std::fmt::Debug for SctpAssociation {
 // Helper Functions
 // =============================================================================
 
-/// Generates a random verification tag.
+/// Generates a cryptographically secure random verification tag.
+///
+/// Uses the `rand` crate with OS-provided entropy.
 fn rand_verification_tag() -> u32 {
-    // Use a simple hash of the current time as a pseudo-random source
-    // In production, this should use a cryptographically secure RNG
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u32)
-        .unwrap_or(0x12345678);
-    now ^ 0xDEADBEEF
+    use rand::RngCore;
+    rand::thread_rng().next_u32()
 }
 
-/// Generates a random initial TSN.
+/// Generates a cryptographically secure random initial TSN.
+///
+/// Uses the `rand` crate with OS-provided entropy.
 fn rand_initial_tsn() -> u32 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u32)
-        .unwrap_or(0x87654321);
-    now ^ 0xCAFEBABE
+    use rand::RngCore;
+    rand::thread_rng().next_u32()
 }
 
 // =============================================================================
@@ -454,6 +470,7 @@ fn rand_initial_tsn() -> u32 {
 // =============================================================================
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

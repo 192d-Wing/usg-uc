@@ -382,6 +382,16 @@ impl TimerManager {
         self.t3_rtx.stop();
     }
 
+    /// Returns true if T3-rtx timer is running.
+    pub fn is_t3_running(&self) -> bool {
+        self.t3_rtx.is_running()
+    }
+
+    /// Returns true if T3-rtx timer has expired.
+    pub fn is_t3_expired(&self) -> bool {
+        self.t3_rtx.is_expired()
+    }
+
     /// Starts the heartbeat timer.
     pub fn start_heartbeat(&mut self) {
         self.heartbeat.start_with_duration(self.heartbeat_interval);

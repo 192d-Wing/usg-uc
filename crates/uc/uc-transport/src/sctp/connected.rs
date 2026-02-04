@@ -574,6 +574,9 @@ impl std::fmt::Debug for ConnectedSctpAssociation {
 // Background I/O Task
 // =============================================================================
 
+/// Timer check interval (100ms).
+const TIMER_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Background I/O loop for handling socket operations.
 async fn io_loop(
     socket: Arc<UdpSocket>,
@@ -584,6 +587,10 @@ async fn io_loop(
 ) {
     let mut buf = vec![0u8; MAX_PACKET_SIZE];
 
+    // Create timer interval for periodic checks
+    let mut timer_interval = tokio::time::interval(TIMER_CHECK_INTERVAL);
+    timer_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             biased;
@@ -592,6 +599,40 @@ async fn io_loop(
             _ = &mut shutdown_rx => {
                 debug!("SCTP I/O loop shutting down");
                 break;
+            }
+
+            // Periodic timer check for retransmissions and heartbeats
+            _ = timer_interval.tick() => {
+                // Check for T3-rtx expiration and handle retransmissions
+                let retransmit_chunks = handle.check_retransmissions().await;
+                if !retransmit_chunks.is_empty() {
+                    trace!(count = retransmit_chunks.len(), "Retransmitting DATA chunks");
+                    if let Err(e) = send_data_chunks(&socket, &handle, peer_addr, &retransmit_chunks).await {
+                        warn!(error = %e, "Failed to send retransmit chunks");
+                    }
+                }
+
+                // Check for fast retransmit chunks
+                let fast_rtx_chunks = handle.get_fast_retransmit_chunks().await;
+                if !fast_rtx_chunks.is_empty() {
+                    trace!(count = fast_rtx_chunks.len(), "Fast retransmitting DATA chunks");
+                    if let Err(e) = send_data_chunks(&socket, &handle, peer_addr, &fast_rtx_chunks).await {
+                        warn!(error = %e, "Failed to send fast retransmit chunks");
+                    }
+                }
+
+                // Check for heartbeat timer expiration
+                let expired_timers = handle.check_timers().await;
+                for timer_type in expired_timers {
+                    if timer_type == super::timer::TimerType::Heartbeat {
+                        trace!("Sending HEARTBEAT");
+                        if let Err(e) = send_heartbeat(&socket, &handle, peer_addr).await {
+                            warn!(error = %e, "Failed to send heartbeat");
+                        }
+                        // Restart heartbeat timer
+                        handle.restart_heartbeat_timer().await;
+                    }
+                }
             }
 
             // Receive packets from the network
@@ -655,6 +696,62 @@ async fn io_loop(
             }
         }
     }
+}
+
+/// Sends DATA chunks in a packet.
+async fn send_data_chunks(
+    socket: &UdpSocket,
+    handle: &AssociationHandle,
+    peer_addr: SocketAddr,
+    chunks: &[super::chunk::DataChunk],
+) -> Result<(), std::io::Error> {
+    if chunks.is_empty() {
+        return Ok(());
+    }
+
+    let vtag = handle.peer_verification_tag().await;
+    let local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+    let mut packet = SctpPacket::new(local_port, peer_addr.port(), vtag);
+
+    for chunk in chunks {
+        packet.add_chunk(Chunk::Data(chunk.clone()));
+    }
+
+    let bytes = packet.encode();
+    socket.send_to(&bytes, peer_addr).await?;
+
+    // Track sent chunks for retransmission
+    handle.track_sent_chunks(chunks).await;
+
+    Ok(())
+}
+
+/// Sends a HEARTBEAT chunk.
+async fn send_heartbeat(
+    socket: &UdpSocket,
+    handle: &AssociationHandle,
+    peer_addr: SocketAddr,
+) -> Result<(), std::io::Error> {
+    use super::chunk::HeartbeatChunk;
+
+    let vtag = handle.peer_verification_tag().await;
+    let local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+    let mut packet = SctpPacket::new(local_port, peer_addr.port(), vtag);
+
+    // Create heartbeat with timestamp for RTT calculation
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hb_info = Bytes::from(now.to_be_bytes().to_vec());
+    let heartbeat = HeartbeatChunk::new(hb_info);
+
+    packet.add_chunk(Chunk::Heartbeat(heartbeat));
+
+    let bytes = packet.encode();
+    socket.send_to(&bytes, peer_addr).await?;
+
+    Ok(())
 }
 
 // =============================================================================

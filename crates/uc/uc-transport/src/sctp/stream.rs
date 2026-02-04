@@ -34,6 +34,68 @@ pub struct Stream {
     reorder_buffer: BTreeMap<u16, DataChunk>,
     /// Messages ready for delivery (in order).
     delivery_queue: VecDeque<Bytes>,
+    /// Fragment buffer for ongoing reassembly.
+    /// Key is SSN (for ordered) or TSN (for unordered), value is accumulated fragments.
+    fragment_buffer: FragmentBuffer,
+}
+
+/// Buffer for accumulating message fragments.
+#[derive(Debug, Default)]
+struct FragmentBuffer {
+    /// Fragments being assembled, keyed by SSN for ordered or arbitrary key for unordered.
+    /// Value is (accumulated_data, is_unordered, expected_next_tsn).
+    ongoing: HashMap<u16, FragmentState>,
+}
+
+#[derive(Debug)]
+struct FragmentState {
+    /// Accumulated data from fragments so far.
+    data: Vec<u8>,
+    /// TSN of the last fragment received.
+    last_tsn: u32,
+    /// Whether this is an unordered message.
+    #[allow(dead_code)]
+    is_unordered: bool,
+}
+
+impl FragmentBuffer {
+    /// Starts a new fragment assembly or returns existing one.
+    fn start_or_get(&mut self, ssn: u16, first_chunk: &DataChunk) -> &mut FragmentState {
+        self.ongoing.entry(ssn).or_insert_with(|| FragmentState {
+            data: Vec::new(),
+            last_tsn: first_chunk.tsn,
+            is_unordered: first_chunk.unordered,
+        })
+    }
+
+    /// Adds data to an ongoing assembly.
+    fn add_fragment(&mut self, ssn: u16, chunk: &DataChunk) -> Option<Bytes> {
+        let state = self.ongoing.get_mut(&ssn)?;
+
+        // Verify TSN ordering (should be sequential)
+        // Note: In a full implementation, we'd track and validate TSN order
+        state.data.extend_from_slice(&chunk.data);
+        state.last_tsn = chunk.tsn;
+
+        // If this is the ending fragment, complete the assembly
+        if chunk.ending {
+            let complete_data = std::mem::take(&mut state.data);
+            self.ongoing.remove(&ssn);
+            return Some(Bytes::from(complete_data));
+        }
+
+        None
+    }
+
+    /// Checks if there's an ongoing assembly for the given SSN.
+    fn has_ongoing(&self, ssn: u16) -> bool {
+        self.ongoing.contains_key(&ssn)
+    }
+
+    /// Clears all ongoing assemblies.
+    fn clear(&mut self) {
+        self.ongoing.clear();
+    }
 }
 
 impl Stream {
@@ -46,6 +108,7 @@ impl Stream {
             default_ordered,
             reorder_buffer: BTreeMap::new(),
             delivery_queue: VecDeque::new(),
+            fragment_buffer: FragmentBuffer::default(),
         }
     }
 
@@ -77,15 +140,54 @@ impl Stream {
     /// all preceding chunks arrive. For unordered delivery, chunks
     /// are immediately available.
     ///
+    /// Handles fragmentation: if B (beginning) flag is set, starts a new assembly.
+    /// If E (ending) flag is set, completes the assembly and delivers the message.
+    /// Single-fragment messages have both B and E flags set.
+    ///
     /// Returns true if one or more messages became available for delivery.
+    #[allow(clippy::missing_panics_doc)] // Unwrap is safe after start_or_get
     pub fn receive_data(&mut self, chunk: DataChunk) -> bool {
+        // Handle fragmentation (RFC 9260 Section 6.9)
+        // B=1, E=1: Single unfragmented message
+        // B=1, E=0: First fragment
+        // B=0, E=0: Middle fragment
+        // B=0, E=1: Last fragment
+
+        let ssn = chunk.ssn;
+        let is_beginning = chunk.beginning;
+        let is_ending = chunk.ending;
+
+        // Handle unordered messages
         if chunk.unordered {
-            // Unordered delivery - immediately available
-            self.delivery_queue.push_back(chunk.data);
-            return true;
+            return self.receive_unordered_data(chunk);
         }
 
-        // Ordered delivery - check if this is the expected SSN
+        // For ordered delivery, we need to handle fragments within SSN context
+        // Complete message (single fragment)
+        if is_beginning && is_ending {
+            return self.receive_ordered_complete(chunk);
+        }
+
+        // Fragment handling
+        if is_beginning {
+            // Start of fragmented message - safe to unwrap as start_or_get just inserted it
+            self.fragment_buffer.start_or_get(ssn, &chunk);
+            if let Some(state) = self.fragment_buffer.ongoing.get_mut(&ssn) {
+                state.data.extend_from_slice(&chunk.data);
+            }
+        } else if self.fragment_buffer.has_ongoing(ssn) {
+            // Continuation or end of fragmented message
+            if let Some(complete_data) = self.fragment_buffer.add_fragment(ssn, &chunk) {
+                // Message complete - deliver it
+                return self.deliver_ordered_message(ssn, complete_data);
+            }
+        }
+        // Middle or end fragment without a beginning, or waiting for more fragments
+        false
+    }
+
+    /// Receives a complete ordered message (single fragment).
+    fn receive_ordered_complete(&mut self, chunk: DataChunk) -> bool {
         let ssn = chunk.ssn;
 
         if ssn == self.expected_ssn_in {
@@ -104,6 +206,65 @@ impl Stream {
             // Old/duplicate chunk - ignore
             false
         }
+    }
+
+    /// Delivers a complete ordered message after fragment assembly.
+    fn deliver_ordered_message(&mut self, ssn: u16, data: Bytes) -> bool {
+        if ssn == self.expected_ssn_in {
+            self.delivery_queue.push_back(data);
+            self.expected_ssn_in = self.expected_ssn_in.wrapping_add(1);
+            self.flush_reorder_buffer();
+            true
+        } else if Self::ssn_gt(ssn, self.expected_ssn_in) {
+            // Create a synthetic chunk for reordering
+            let chunk = DataChunk {
+                tsn: 0,
+                stream_id: self.stream_id,
+                ssn,
+                ppid: 0,
+                data,
+                immediate: false,
+                unordered: false,
+                beginning: true,
+                ending: true,
+            };
+            self.reorder_buffer.insert(ssn, chunk);
+            false
+        } else {
+            // Old SSN - ignore
+            false
+        }
+    }
+
+    /// Receives unordered data (fragments or complete).
+    fn receive_unordered_data(&mut self, chunk: DataChunk) -> bool {
+        // For unordered, use TSN as the key (cast to u16 for simplicity)
+        // Note: This is a simplification; a full implementation would track by TSN
+        let key = (chunk.tsn & 0xFFFF) as u16;
+
+        if chunk.beginning && chunk.ending {
+            // Complete unordered message
+            self.delivery_queue.push_back(chunk.data);
+            return true;
+        }
+
+        if chunk.beginning {
+            // Start of unordered fragmented message
+            self.fragment_buffer.start_or_get(key, &chunk);
+            if let Some(state) = self.fragment_buffer.ongoing.get_mut(&key) {
+                state.data.extend_from_slice(&chunk.data);
+            }
+        } else if let Some(complete_data) = self
+            .fragment_buffer
+            .has_ongoing(key)
+            .then(|| self.fragment_buffer.add_fragment(key, &chunk))
+            .flatten()
+        {
+            self.delivery_queue.push_back(complete_data);
+            return true;
+        }
+        // Fragment without beginning, or waiting for more fragments
+        false
     }
 
     /// Flushes any consecutive chunks from the reorder buffer.
@@ -149,6 +310,7 @@ impl Stream {
         self.expected_ssn_in = 0;
         self.reorder_buffer.clear();
         self.delivery_queue.clear();
+        self.fragment_buffer.clear();
     }
 }
 

@@ -15,7 +15,7 @@ udp = []
 tcp = []
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pki-types", "dep:arc-swap"]
 websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
-sctp = ["dep:crc32c"]  # SCTP transport (RFC 9260)
+sctp = ["dep:crc32c", "dep:rand"]  # SCTP transport (RFC 9260)
 
 [dependencies]
 uc-types.workspace = true
@@ -38,6 +38,7 @@ futures-util = { version = "0.3", optional = true }
 
 # SCTP support
 crc32c = { version = "0.6", optional = true }
+rand = { version = "0.8", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
