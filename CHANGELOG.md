@@ -63,6 +63,16 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - `request_timeout_secs`: Request timeout
   - `enable_reflection`: gRPC reflection service
 
+**gRPC Reflection Service** (`sbc-grpc-api`, `sbc-daemon`)
+
+- Added `tonic-reflection` v0.14 dependency to workspace
+- Build script generates file descriptor set (`sbc_descriptor.bin`) for reflection
+- `FILE_DESCRIPTOR_SET` constant exported from sbc-grpc-api (feature-gated behind `reflection`)
+- New `grpc-reflection` feature flag in sbc-daemon enables reflection support
+- Reflection service enabled at runtime via `enable_reflection` config option
+- Allows service discovery via `grpcurl -plaintext localhost:9090 list`
+- Compatible with all feature combinations (grpc, cluster, grpc-reflection)
+
 #### Phase 24.38: Button Event Handlers & Custom Dialogs (Completed)
 
 **Button Event Handlers** (`client-gui-windows/src/views/*.rs`)

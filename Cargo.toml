@@ -187,6 +187,7 @@ prost = "0.13"
 prost-types = "0.13"
 tonic = { version = "0.14", features = ["gzip", "tls-aws-lc"] }
 tonic-prost-build = "0.14"
+tonic-reflection = "0.14"
 
 # Internal crates - SIP Soft Client
 client-types = { path = "crates/client/client-types" }

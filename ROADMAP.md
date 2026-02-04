@@ -1562,9 +1562,18 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ Runtime integration passes ClusterManager to GrpcServer when cluster enabled
 - ✅ 61 tests passing with cluster feature
 
+**gRPC Reflection Service** (`sbc-grpc-api`, `sbc-daemon`) ✅
+
+- ✅ `tonic-reflection` dependency added to workspace
+- ✅ File descriptor set generation in build.rs
+- ✅ `FILE_DESCRIPTOR_SET` constant exported (feature-gated behind `reflection`)
+- ✅ `grpc-reflection` feature flag in sbc-daemon
+- ✅ Runtime configuration via `enable_reflection` in GrpcConfig
+- ✅ Service discovery via `grpcurl` and other gRPC reflection clients
+- ✅ Works with all feature combinations (cluster, reflection)
+
 **Pending**
 
-- 🚧 gRPC reflection service
 - 🚧 Integration tests for gRPC services
 - 🚧 Full FailoverCoordinator integration for InitiateFailover/UndoFailover
 

@@ -82,6 +82,25 @@
 /// - `RegistrationService` - SIP registration management
 /// - `SystemService` - System-level operations (version, stats, TLS)
 /// - `ClusterService` - Cluster management (requires `cluster` feature)
+/// File descriptor set for gRPC reflection service.
+///
+/// This constant contains the serialized protobuf file descriptors for all
+/// SBC services. It is used by the gRPC reflection service to allow clients
+/// to discover available services and methods at runtime.
+///
+/// # Usage
+///
+/// ```ignore
+/// use sbc_grpc_api::FILE_DESCRIPTOR_SET;
+/// use tonic_reflection::server::Builder;
+///
+/// let reflection_service = Builder::configure()
+///     .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
+///     .build_v1()?;
+/// ```
+#[cfg(feature = "reflection")]
+pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("sbc_descriptor");
+
 #[allow(missing_docs)]
 pub mod sbc {
     tonic::include_proto!("sbc.api.v1");

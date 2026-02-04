@@ -11,6 +11,7 @@
 //! - `SystemService` - System operations
 //! - `ClusterService` - Cluster management (requires `cluster` feature)
 //! - `Health` - Standard gRPC health checking
+//! - `ServerReflection` - gRPC reflection service (requires `grpc-reflection` feature)
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
@@ -143,6 +144,7 @@ impl GrpcServer {
             address = %addr,
             tls = self.config.tls_cert_path.is_some(),
             mtls = self.config.require_mtls,
+            reflection = self.config.enable_reflection,
             "Starting gRPC server"
         );
 
@@ -169,8 +171,8 @@ impl GrpcServer {
             Server::builder()
         };
 
-        // Build router with core services
-        #[cfg(not(feature = "cluster"))]
+        // Build router with core services (no cluster, no reflection)
+        #[cfg(all(not(feature = "cluster"), not(feature = "grpc-reflection")))]
         let router = server
             .add_service(ConfigServiceServer::new(config_svc))
             .add_service(SystemServiceServer::new(system_svc))
@@ -178,8 +180,33 @@ impl GrpcServer {
             .add_service(CallServiceServer::new(call_svc))
             .add_service(RegistrationServiceServer::new(registration_svc));
 
-        // Build router with core services and optional cluster service
-        #[cfg(feature = "cluster")]
+        // Build router with reflection but no cluster
+        #[cfg(all(not(feature = "cluster"), feature = "grpc-reflection"))]
+        let router = {
+            let base = server
+                .add_service(ConfigServiceServer::new(config_svc))
+                .add_service(SystemServiceServer::new(system_svc))
+                .add_service(HealthServer::new(health_svc))
+                .add_service(CallServiceServer::new(call_svc))
+                .add_service(RegistrationServiceServer::new(registration_svc));
+
+            // Add reflection service if enabled in config
+            if self.config.enable_reflection {
+                let reflection_svc = tonic_reflection::server::Builder::configure()
+                    .register_encoded_file_descriptor_set(sbc_grpc_api::FILE_DESCRIPTOR_SET)
+                    .build_v1()
+                    .map_err(|e| GrpcServerError::ServerError {
+                        reason: format!("Failed to build reflection service: {e}"),
+                    })?;
+                info!("gRPC reflection service enabled");
+                base.add_service(reflection_svc)
+            } else {
+                base
+            }
+        };
+
+        // Build router with cluster but no reflection
+        #[cfg(all(feature = "cluster", not(feature = "grpc-reflection")))]
         let router = {
             let base = server
                 .add_service(ConfigServiceServer::new(config_svc))
@@ -195,6 +222,40 @@ impl GrpcServer {
                 base.add_service(ClusterServiceServer::new(cluster_svc))
             } else {
                 base
+            }
+        };
+
+        // Build router with both cluster and reflection
+        #[cfg(all(feature = "cluster", feature = "grpc-reflection"))]
+        let router = {
+            let base = server
+                .add_service(ConfigServiceServer::new(config_svc))
+                .add_service(SystemServiceServer::new(system_svc))
+                .add_service(HealthServer::new(health_svc))
+                .add_service(CallServiceServer::new(call_svc))
+                .add_service(RegistrationServiceServer::new(registration_svc));
+
+            // Add ClusterService if cluster manager is available
+            let with_cluster = if let Some(cluster) = &self.cluster {
+                let cluster_svc = ClusterServiceImpl::new(Arc::clone(&self.state), Arc::clone(cluster));
+                info!("ClusterService enabled");
+                base.add_service(ClusterServiceServer::new(cluster_svc))
+            } else {
+                base
+            };
+
+            // Add reflection service if enabled in config
+            if self.config.enable_reflection {
+                let reflection_svc = tonic_reflection::server::Builder::configure()
+                    .register_encoded_file_descriptor_set(sbc_grpc_api::FILE_DESCRIPTOR_SET)
+                    .build_v1()
+                    .map_err(|e| GrpcServerError::ServerError {
+                        reason: format!("Failed to build reflection service: {e}"),
+                    })?;
+                info!("gRPC reflection service enabled");
+                with_cluster.add_service(reflection_svc)
+            } else {
+                with_cluster
             }
         };
 
