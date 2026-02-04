@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ### Added
 
+#### Phase 24.38: Button Event Handlers & Custom Dialogs (Completed)
+
+**Button Event Handlers** (`client-gui-windows/src/views/*.rs`)
+
+- Dialer view: Dialpad digits (0-9, *, #), Call, Clear, Backspace buttons
+- Call view: Mute, Hold, Transfer, Hangup, Keypad buttons, audio device selection
+- Contacts view: Add, Call, Edit, Favorite, Delete buttons, search text filtering
+- Settings view: Register, Unregister, Refresh Certs, Use Cert, Save, Discard buttons
+
+**Custom Dialogs Module** (`client-gui-windows/src/dialogs/`)
+
+- `TransferDialog`: Modal dialog for call transfer with SIP URI input
+- `ContactDialog`: Add/edit contact dialog with name, SIP URI, favorite checkbox
+- `PinDialog`: Masked PIN entry dialog for smart card authentication
+- `DtmfDialog`: Non-modal DTMF dialpad for sending tones during active calls
+
+**App Handler Methods** (`client-gui-windows/src/app.rs`)
+
+- Dialer handlers: `on_dialer_digit()`, `on_dialer_call()`, `on_dialer_clear()`, `on_dialer_backspace()`
+- Call handlers: `on_call_mute()`, `on_call_hold()`, `on_call_transfer()`, `on_call_hangup()`, `on_call_keypad()`
+- Contact handlers: `on_contact_add()`, `on_contact_call()`, `on_contact_edit()`, `on_contact_favorite()`, `on_contact_delete()`, `on_contact_search()`
+- Settings handlers: `on_settings_register()`, `on_settings_unregister()`, `on_settings_refresh_certs()`, `on_settings_use_cert()`, `on_settings_save()`, `on_settings_discard()`
+- DTMF support: `show_dtmf_dialog()`, `send_dtmf()` for RFC 4733 telephone events
+- Transfer support: `show_transfer_dialog()`, `transfer_call()` for RFC 3515 REFER
+
 #### Phase 24.37: Native Windows GUI Migration (Completed)
 
 **Migration from egui/eframe to native-windows-gui**

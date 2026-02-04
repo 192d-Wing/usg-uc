@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-25 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.30-24.36 complete, Phase 25 100% RFC 9260 compliance achieved
+**Current Status**: 1750+ tests passing, Phases 1-25 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.30-24.38 complete, Phase 25 100% RFC 9260 compliance achieved
 
 ---
 
@@ -1501,6 +1501,22 @@ This document outlines the development roadmap for the USG Session Border Contro
   - Direct method calls instead of Action enums
   - NWG event handlers bound via `nwg::bind_event_handler`
   - Timer-based polling for SIP events
+
+**Phase 24.38: Button Event Handlers & Custom Dialogs** ✅
+
+- ✅ Button event handlers for all views
+  - Dialer: dialpad digits (0-9, *, #), Call, Clear, Backspace
+  - Call: Mute, Hold, Transfer, Hangup, Keypad, audio device selection
+  - Contacts: Add, Call, Edit, Favorite, Delete, search text filtering
+  - Settings: Register, Unregister, Refresh Certs, Use Cert, Save, Discard
+- ✅ Custom dialogs module (`dialogs/`)
+  - `TransferDialog`: Modal SIP URI input for call transfers
+  - `ContactDialog`: Add/edit contact with name, SIP URI, favorite checkbox
+  - `PinDialog`: Masked PIN entry for smart card authentication
+  - `DtmfDialog`: Non-modal dialpad for DTMF tones during calls
+- ✅ App handler methods wired to dialogs and core functionality
+  - DTMF support via `send_dtmf()` for RFC 4733 telephone events
+  - Transfer support via `transfer_call()` for RFC 3515 REFER
 
 ---
 
