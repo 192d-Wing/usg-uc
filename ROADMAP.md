@@ -542,9 +542,17 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ TransportType::Sctp added to uc-types
 - ✅ 4-way handshake state machine (INIT → INIT-ACK → COOKIE-ECHO → COOKIE-ACK)
 - ✅ Graceful shutdown and abort handling
-- 🚧 Remaining: Stream management, reliability (TSN/SACK), congestion control, UDP encapsulation (RFC 6951)
+- ✅ DATA retransmission with T3-rtx timer integration
+- ✅ Selective acknowledgment via gap ack block processing
+- ✅ Fast retransmit for chunks with 3+ miss indications
+- ✅ Flow control enforcement (peer rwnd and cwnd checks)
+- ✅ Heartbeat sending with RTT timestamps
+- ✅ Message fragmentation/reassembly based on path MTU
+- ✅ Cryptographically secure random (rand crate)
+- ✅ SctpAssociation stub deprecated in favor of ConnectedSctpAssociation
+- 🚧 Remaining: ECNE/CWR for ECN support, comprehensive RFC compliance tests, UDP encapsulation (RFC 6951)
 
-**Tests**: 25 new tests (T.38 crate), 26 new tests (SCTP)
+**Tests**: 25 new tests (T.38 crate), 26+ tests (SCTP)
 
 ### 🚧 Phase 24: SIP Soft Client (In Progress)
 

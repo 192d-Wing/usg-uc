@@ -976,8 +976,27 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
     - `SctpAssociation` implementing `Transport` and `StreamTransport` traits
     - `SctpListener` for server-side listening
     - Multi-homing support (add_peer_address, set_primary_path)
-  - Feature flag: `sctp` (optional, requires `crc32c`)
-  - 26 new unit tests
+  - `sctp/association.rs` - Data transfer and reliability:
+    - `RetransmitEntry` for tracking sent chunks with timestamps
+    - `add_to_retransmit_queue()` method for DATA queuing
+    - `process_gap_ack_blocks()` for selective acknowledgment
+    - `update_miss_indications()` for fast retransmit detection (3+ misses)
+    - T3-rtx timer integration for retransmission triggering
+    - Flow control enforcement (peer rwnd and cwnd checks)
+    - `FragmentBuffer` for multi-fragment message reassembly
+    - B/E flag handling for fragmented DATA chunks
+    - Path MTU-based fragmentation on send
+  - `sctp/connected.rs` - Real socket I/O:
+    - 100ms timer check interval in background loop
+    - T3-rtx expiration triggers retransmissions
+    - Heartbeat timer sends HEARTBEAT chunks with RTT timestamps
+    - Fast retransmit chunks sent on each timer tick
+  - `sctp/timer.rs` - Timer enhancements:
+    - Heartbeat timer support with RTT calculation
+  - Cryptographically secure random via `rand` crate
+  - `SctpAssociation` stub deprecated in favor of `ConnectedSctpAssociation`
+  - Feature flag: `sctp` (optional, requires `crc32c`, `rand`)
+  - 26+ unit tests
 
 **uc-snmp - SNMP Trap Generation**
 
