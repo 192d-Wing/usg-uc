@@ -112,7 +112,91 @@ impl ContactsView {
 
     /// Binds events to the contacts view controls.
     pub fn bind_events(&self, app: &Rc<SipClientApp>) {
-        let _ = app; // Events handled through the main app's event loop
+        let app_weak = Rc::downgrade(app);
+
+        // Bind add button
+        let app_add = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.add_button.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnButtonClick {
+                    if let Some(app) = app_add.upgrade() {
+                        app.on_contact_add();
+                    }
+                }
+            },
+        );
+
+        // Bind call button
+        let app_call = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.call_button.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnButtonClick {
+                    if let Some(app) = app_call.upgrade() {
+                        app.on_contact_call();
+                    }
+                }
+            },
+        );
+
+        // Bind edit button
+        let app_edit = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.edit_button.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnButtonClick {
+                    if let Some(app) = app_edit.upgrade() {
+                        app.on_contact_edit();
+                    }
+                }
+            },
+        );
+
+        // Bind favorite button
+        let app_fav = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.favorite_button.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnButtonClick {
+                    if let Some(app) = app_fav.upgrade() {
+                        app.on_contact_favorite();
+                    }
+                }
+            },
+        );
+
+        // Bind delete button
+        let app_del = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.delete_button.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnButtonClick {
+                    if let Some(app) = app_del.upgrade() {
+                        app.on_contact_delete();
+                    }
+                }
+            },
+        );
+
+        // Bind search input text change
+        let app_search = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.search_input.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnTextInput {
+                    if let Some(app) = app_search.upgrade() {
+                        app.on_contact_search();
+                    }
+                }
+            },
+        );
     }
 
     /// Updates the contacts list from an iterator.
@@ -193,5 +277,10 @@ impl ContactsView {
     /// Gets all stored contacts.
     pub fn contacts(&self) -> std::cell::Ref<Vec<Contact>> {
         self.contacts.borrow()
+    }
+
+    /// Refreshes the list display (called when search text changes).
+    pub fn refresh_filter(&self) {
+        self.update_list_display();
     }
 }

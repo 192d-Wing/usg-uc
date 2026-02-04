@@ -247,7 +247,91 @@ impl SettingsView {
 
     /// Binds events to the settings view controls.
     pub fn bind_events(&self, app: &Rc<SipClientApp>) {
-        let _ = app; // Events handled through the main app's event loop
+        let app_weak = Rc::downgrade(app);
+
+        // Bind register button
+        let app_register = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.register_button.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnButtonClick {
+                    if let Some(app) = app_register.upgrade() {
+                        app.on_settings_register();
+                    }
+                }
+            },
+        );
+
+        // Bind unregister button
+        let app_unregister = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.unregister_button.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnButtonClick {
+                    if let Some(app) = app_unregister.upgrade() {
+                        app.on_settings_unregister();
+                    }
+                }
+            },
+        );
+
+        // Bind refresh certificates button
+        let app_refresh = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.refresh_certs_button.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnButtonClick {
+                    if let Some(app) = app_refresh.upgrade() {
+                        app.on_settings_refresh_certs();
+                    }
+                }
+            },
+        );
+
+        // Bind use certificate button
+        let app_use_cert = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.use_cert_button.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnButtonClick {
+                    if let Some(app) = app_use_cert.upgrade() {
+                        app.on_settings_use_cert();
+                    }
+                }
+            },
+        );
+
+        // Bind save button
+        let app_save = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.save_button.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnButtonClick {
+                    if let Some(app) = app_save.upgrade() {
+                        app.on_settings_save();
+                    }
+                }
+            },
+        );
+
+        // Bind discard button
+        let app_discard = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.discard_button.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnButtonClick {
+                    if let Some(app) = app_discard.upgrade() {
+                        app.on_settings_discard();
+                    }
+                }
+            },
+        );
     }
 
     /// Updates the available certificates.

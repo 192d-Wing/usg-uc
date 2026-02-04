@@ -99,15 +99,67 @@ impl DialerView {
 
     /// Binds events to the dialer controls.
     pub fn bind_events(&self, app: &Rc<SipClientApp>) {
-        // Note: In NWG, we typically use derive macros for event binding.
-        // For this manual approach, we'll handle events through the app's timer polling.
-        // The app will call our action methods directly based on button states.
+        let app_weak = Rc::downgrade(app);
 
-        // For a proper implementation, we would use the nwg_ui! macro or NativeUi derive.
-        // However, to keep things simple and avoid macros, we'll use a different approach:
-        // The main app will poll for button clicks using the timer.
+        // Bind digit button events (0-9, *, #)
+        let digit_labels = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#"];
+        for (i, button) in self.buttons.iter().enumerate() {
+            let app_digit = app_weak.clone();
+            let digit = digit_labels[i].to_string();
+            nwg::bind_event_handler(
+                &button.handle,
+                app.window(),
+                move |evt, _evt_data, _handle| {
+                    if evt == nwg::Event::OnButtonClick {
+                        if let Some(app) = app_digit.upgrade() {
+                            app.on_dialer_digit(&digit);
+                        }
+                    }
+                },
+            );
+        }
 
-        let _ = app; // Silence unused warning - events handled through polling
+        // Bind call button
+        let app_call = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.call_button.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnButtonClick {
+                    if let Some(app) = app_call.upgrade() {
+                        app.on_dialer_call();
+                    }
+                }
+            },
+        );
+
+        // Bind clear button
+        let app_clear = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.clear_button.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnButtonClick {
+                    if let Some(app) = app_clear.upgrade() {
+                        app.on_dialer_clear();
+                    }
+                }
+            },
+        );
+
+        // Bind backspace button
+        let app_backspace = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.backspace_button.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnButtonClick {
+                    if let Some(app) = app_backspace.upgrade() {
+                        app.on_dialer_backspace();
+                    }
+                }
+            },
+        );
     }
 
     /// Processes a digit button click.

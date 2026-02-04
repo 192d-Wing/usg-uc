@@ -3,6 +3,7 @@
 //! This module provides the main window and coordinates between views
 //! using native-windows-gui for true Windows native appearance.
 
+use crate::dialogs::{ContactDialog, ContactDialogResult, DtmfAction, DtmfDialog, PinDialog, PinDialogResult, TransferDialog, TransferDialogResult};
 use crate::notifications::NotificationManager;
 use crate::tray::{SystemTray, TrayAction};
 use crate::views::{CallView, ContactsView, DialerView, SettingsView};
@@ -11,7 +12,7 @@ use client_core::{
     load_certs_from_pem_file, AppEvent, CertVerificationMode, ClientApp, ContactManager,
     SettingsManager,
 };
-use client_types::{CallInfo, CallState, RegistrationState};
+use client_types::{CallInfo, CallState, DtmfDigit, RegistrationState};
 use native_windows_gui as nwg;
 use std::cell::RefCell;
 use std::net::SocketAddr;
@@ -810,26 +811,28 @@ impl SipClientApp {
     /// Shows the PIN entry dialog.
     fn show_pin_dialog_for(&self, operation: PinOperation) {
         info!(operation = ?operation, "Showing PIN dialog");
-        *self.pin_operation.borrow_mut() = Some(operation);
-        *self.pin_input.borrow_mut() = String::new();
-        *self.pin_error.borrow_mut() = None;
-        *self.pin_attempts.borrow_mut() = 0;
 
-        // Use input dialog for PIN
-        let pin = nwg::simple_message(
-            "Smart Card PIN",
-            "Enter your smart card PIN:",
-            nwg::MessageButtons::OkCancel,
-            nwg::MessageIcons::Info,
-        );
+        let message = match &operation {
+            PinOperation::UseCertificate { thumbprint } => {
+                format!("Enter PIN for certificate:\n{}", &thumbprint[..8.min(thumbprint.len())])
+            }
+            PinOperation::Register { account_id } => {
+                format!("Enter PIN to register account:\n{}", account_id)
+            }
+            PinOperation::SignCall { call_id } => {
+                format!("Enter PIN to authenticate call:\n{}", call_id)
+            }
+        };
 
-        match pin {
-            nwg::MessageChoice::Ok => {
-                // In production, we'd use a proper password input dialog
-                // For now, use a simple prompt
+        let error = self.pin_error.borrow().clone();
+
+        match PinDialog::show(&self.window, &message, error.as_deref()) {
+            PinDialogResult::Entered(pin) => {
+                *self.pin_input.borrow_mut() = pin;
+                *self.pin_operation.borrow_mut() = Some(operation);
                 self.submit_pin();
             }
-            _ => {
+            PinDialogResult::Cancelled => {
                 self.cancel_pin();
             }
         }
@@ -939,6 +942,243 @@ impl SipClientApp {
                 }
             },
         }
+    }
+
+    // =========================================================================
+    // Dialer Event Handlers
+    // =========================================================================
+
+    /// Called when a digit button is clicked on the dialer.
+    pub fn on_dialer_digit(&self, digit: &str) {
+        self.dialer_view.borrow().on_digit_click(digit);
+    }
+
+    /// Called when the call button is clicked on the dialer.
+    pub fn on_dialer_call(&self) {
+        if let Some(uri) = self.dialer_view.borrow().on_call() {
+            self.make_call(&uri);
+        }
+    }
+
+    /// Called when the clear button is clicked on the dialer.
+    pub fn on_dialer_clear(&self) {
+        self.dialer_view.borrow().on_clear();
+    }
+
+    /// Called when the backspace button is clicked on the dialer.
+    pub fn on_dialer_backspace(&self) {
+        self.dialer_view.borrow().on_backspace();
+    }
+
+    // =========================================================================
+    // Call View Event Handlers
+    // =========================================================================
+
+    /// Called when the mute button is clicked.
+    pub fn on_call_mute(&self) {
+        self.toggle_mute();
+    }
+
+    /// Called when the hold button is clicked.
+    pub fn on_call_hold(&self) {
+        self.toggle_hold();
+    }
+
+    /// Called when the transfer button is clicked.
+    pub fn on_call_transfer(&self) {
+        self.show_transfer_dialog();
+    }
+
+    /// Called when the hangup button is clicked.
+    pub fn on_call_hangup(&self) {
+        self.hangup_call();
+    }
+
+    /// Called when the keypad button is clicked.
+    pub fn on_call_keypad(&self) {
+        self.show_dtmf_dialog();
+    }
+
+    /// Called when the input device selection changes.
+    pub fn on_input_device_changed(&self) {
+        if let Some(device) = self.call_view.borrow().selected_input_device() {
+            info!(device = %device, "Input device changed");
+            if let Some(ref mut app) = *self.client_app.borrow_mut() {
+                if let Err(e) = app.switch_input_device(&device) {
+                    warn!(error = %e, "Failed to switch input device");
+                }
+            }
+        }
+    }
+
+    /// Called when the output device selection changes.
+    pub fn on_output_device_changed(&self) {
+        if let Some(device) = self.call_view.borrow().selected_output_device() {
+            info!(device = %device, "Output device changed");
+            if let Some(ref mut app) = *self.client_app.borrow_mut() {
+                if let Err(e) = app.switch_output_device(&device) {
+                    warn!(error = %e, "Failed to switch output device");
+                }
+            }
+        }
+    }
+
+    /// Shows the transfer dialog.
+    fn show_transfer_dialog(&self) {
+        match TransferDialog::show(&self.window) {
+            TransferDialogResult::Transfer(target_uri) => {
+                info!(target_uri = %target_uri, "Initiating call transfer");
+                self.transfer_call(&target_uri);
+            }
+            TransferDialogResult::Cancelled => {
+                debug!("Transfer cancelled by user");
+            }
+        }
+    }
+
+    /// Transfers the current call to the specified URI.
+    fn transfer_call(&self, target_uri: &str) {
+        if let Some(ref mut app) = *self.client_app.borrow_mut() {
+            match self.runtime.block_on(app.transfer_call(target_uri)) {
+                Ok(()) => {
+                    *self.status_message.borrow_mut() = format!("Transferring to {}...", target_uri);
+                }
+                Err(e) => {
+                    self.show_error_dialog(&format!("Transfer failed: {}", e));
+                }
+            }
+        }
+    }
+
+    /// Shows the DTMF dialpad dialog.
+    fn show_dtmf_dialog(&self) {
+        // Check if there's an active call
+        if self.active_call.borrow().is_none() {
+            *self.status_message.borrow_mut() = "No active call for DTMF".to_string();
+            return;
+        }
+
+        let (_dialog, action_rx) = DtmfDialog::show(&self.window);
+
+        // Process DTMF actions from the dialog
+        // Since NWG is single-threaded, we process actions in a loop
+        // The dialog runs non-modally so we need to check for actions
+        loop {
+            match action_rx.try_recv() {
+                Ok(DtmfAction::SendDigit(digit_char)) => {
+                    if let Some(digit) = DtmfDigit::from_char(digit_char) {
+                        self.send_dtmf(digit);
+                    }
+                }
+                Ok(DtmfAction::Close) => {
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Process window events to keep the dialog responsive
+                    if !nwg::dispatch_thread_events_with_callback(|| {}) {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Sends a DTMF digit during an active call.
+    fn send_dtmf(&self, digit: DtmfDigit) {
+        info!(digit = %digit, "Sending DTMF");
+        if let Some(ref mut app) = *self.client_app.borrow_mut() {
+            match self.runtime.block_on(app.send_dtmf(digit)) {
+                Ok(()) => {
+                    *self.status_message.borrow_mut() = format!("Sent DTMF: {}", digit);
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to send DTMF");
+                    *self.status_message.borrow_mut() = format!("DTMF failed: {}", e);
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // Contacts View Event Handlers
+    // =========================================================================
+
+    /// Called when the add contact button is clicked.
+    pub fn on_contact_add(&self) {
+        match ContactDialog::show_add(&self.window) {
+            ContactDialogResult::Saved(contact) => {
+                info!(contact_id = %contact.id, name = %contact.name, "Adding new contact");
+                self.save_contact(contact);
+            }
+            ContactDialogResult::Cancelled => {
+                debug!("Add contact cancelled by user");
+            }
+        }
+    }
+
+    /// Called when the call contact button is clicked.
+    pub fn on_contact_call(&self) {
+        if let Some(contact) = self.contacts_view.borrow().selected_contact() {
+            info!(contact = %contact.name, uri = %contact.sip_uri, "Calling contact");
+            self.make_call(&contact.sip_uri);
+            // Switch to dialer tab
+            self.tab_control.set_selected_tab(0);
+        } else {
+            *self.status_message.borrow_mut() = "No contact selected".to_string();
+        }
+    }
+
+    /// Called when the edit contact button is clicked.
+    pub fn on_contact_edit(&self) {
+        if let Some(contact) = self.contacts_view.borrow().selected_contact() {
+            match ContactDialog::show_edit(&self.window, &contact) {
+                ContactDialogResult::Saved(updated_contact) => {
+                    info!(contact_id = %updated_contact.id, name = %updated_contact.name, "Updating contact");
+                    self.save_contact(updated_contact);
+                }
+                ContactDialogResult::Cancelled => {
+                    debug!("Edit contact cancelled by user");
+                }
+            }
+        } else {
+            *self.status_message.borrow_mut() = "No contact selected".to_string();
+        }
+    }
+
+    /// Called when the favorite contact button is clicked.
+    pub fn on_contact_favorite(&self) {
+        if let Some(contact) = self.contacts_view.borrow().selected_contact() {
+            self.toggle_favorite(&contact.id);
+        } else {
+            *self.status_message.borrow_mut() = "No contact selected".to_string();
+        }
+    }
+
+    /// Called when the delete contact button is clicked.
+    pub fn on_contact_delete(&self) {
+        if let Some(contact) = self.contacts_view.borrow().selected_contact() {
+            // Confirm deletion
+            let params = nwg::MessageParams {
+                title: "Delete Contact",
+                content: &format!("Are you sure you want to delete '{}'?", contact.name),
+                buttons: nwg::MessageButtons::YesNo,
+                icons: nwg::MessageIcons::Warning,
+            };
+
+            if nwg::modal_message(&self.window, &params) == nwg::MessageChoice::Yes {
+                self.delete_contact(&contact.id);
+            }
+        } else {
+            *self.status_message.borrow_mut() = "No contact selected".to_string();
+        }
+    }
+
+    /// Called when the search text changes.
+    pub fn on_contact_search(&self) {
+        self.contacts_view.borrow().refresh_filter();
     }
 
     // =========================================================================
@@ -1451,5 +1691,53 @@ impl SipClientApp {
                 warn!(error = %e, "Failed to save contacts");
             }
         }
+    }
+
+    // =========================================================================
+    // Settings View Event Handlers
+    // =========================================================================
+
+    /// Called when the register button is clicked.
+    pub fn on_settings_register(&self) {
+        self.register_account();
+    }
+
+    /// Called when the unregister button is clicked.
+    pub fn on_settings_unregister(&self) {
+        self.unregister_account();
+    }
+
+    /// Called when the refresh certificates button is clicked.
+    pub fn on_settings_refresh_certs(&self) {
+        self.refresh_certificates();
+    }
+
+    /// Called when the use certificate button is clicked.
+    pub fn on_settings_use_cert(&self) {
+        if let Some(thumbprint) = self.settings_view.borrow().get_selected_certificate() {
+            info!(thumbprint = %thumbprint, "Using selected certificate");
+            self.show_pin_dialog_for(PinOperation::UseCertificate { thumbprint });
+        } else {
+            *self.status_message.borrow_mut() = "No certificate selected".to_string();
+        }
+    }
+
+    /// Called when the save button is clicked.
+    pub fn on_settings_save(&self) {
+        self.save_settings();
+    }
+
+    /// Called when the discard button is clicked.
+    pub fn on_settings_discard(&self) {
+        self.discard_settings();
+    }
+
+    // =========================================================================
+    // Accessors
+    // =========================================================================
+
+    /// Returns a reference to the main window.
+    pub fn window(&self) -> &nwg::Window {
+        &self.window
     }
 }

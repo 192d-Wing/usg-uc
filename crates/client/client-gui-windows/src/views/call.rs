@@ -24,6 +24,8 @@ pub struct CallView {
     hangup_button: nwg::Button,
     /// Transfer button.
     transfer_button: nwg::Button,
+    /// Keypad button (for DTMF).
+    keypad_button: nwg::Button,
     /// Input device combo box.
     input_device_combo: nwg::ComboBox<String>,
     /// Output device combo box.
@@ -75,10 +77,10 @@ impl CallView {
             .h_align(nwg::HTextAlign::Center)
             .build(&mut duration_label)?;
 
-        // Control buttons row
+        // Control buttons - first row
         let button_width = 90;
-        let button_height = 45;
-        let button_y = 180;
+        let button_height = 35;
+        let button_y = 165;
         let spacing = 10;
         let start_x = 25;
 
@@ -114,8 +116,19 @@ impl CallView {
             .size((button_width, button_height))
             .build(&mut hangup_button)?;
 
+        // Control buttons - second row
+        let button_y2 = button_y + button_height as i32 + 8;
+
+        let mut keypad_button = Default::default();
+        nwg::Button::builder()
+            .parent(parent)
+            .text("Keypad")
+            .position((start_x, button_y2))
+            .size((button_width, button_height))
+            .build(&mut keypad_button)?;
+
         // Audio device selection
-        let device_y = 260;
+        let device_y = 255;
 
         let mut input_label = Default::default();
         nwg::Label::builder()
@@ -157,6 +170,7 @@ impl CallView {
             hold_button,
             hangup_button,
             transfer_button,
+            keypad_button,
             input_device_combo,
             output_device_combo,
             _input_label: input_label,
@@ -170,7 +184,105 @@ impl CallView {
 
     /// Binds events to the call view controls.
     pub fn bind_events(&self, app: &Rc<SipClientApp>) {
-        let _ = app; // Events handled through the main app's event loop
+        let app_weak = Rc::downgrade(app);
+
+        // Bind mute button
+        let app_mute = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.mute_button.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnButtonClick {
+                    if let Some(app) = app_mute.upgrade() {
+                        app.on_call_mute();
+                    }
+                }
+            },
+        );
+
+        // Bind hold button
+        let app_hold = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.hold_button.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnButtonClick {
+                    if let Some(app) = app_hold.upgrade() {
+                        app.on_call_hold();
+                    }
+                }
+            },
+        );
+
+        // Bind transfer button
+        let app_transfer = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.transfer_button.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnButtonClick {
+                    if let Some(app) = app_transfer.upgrade() {
+                        app.on_call_transfer();
+                    }
+                }
+            },
+        );
+
+        // Bind hangup button
+        let app_hangup = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.hangup_button.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnButtonClick {
+                    if let Some(app) = app_hangup.upgrade() {
+                        app.on_call_hangup();
+                    }
+                }
+            },
+        );
+
+        // Bind input device combo selection change
+        let app_input = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.input_device_combo.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnComboxBoxSelection {
+                    if let Some(app) = app_input.upgrade() {
+                        app.on_input_device_changed();
+                    }
+                }
+            },
+        );
+
+        // Bind output device combo selection change
+        let app_output = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.output_device_combo.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnComboxBoxSelection {
+                    if let Some(app) = app_output.upgrade() {
+                        app.on_output_device_changed();
+                    }
+                }
+            },
+        );
+
+        // Bind keypad button
+        let app_keypad = app_weak.clone();
+        nwg::bind_event_handler(
+            &self.keypad_button.handle,
+            app.window(),
+            move |evt, _evt_data, _handle| {
+                if evt == nwg::Event::OnButtonClick {
+                    if let Some(app) = app_keypad.upgrade() {
+                        app.on_call_keypad();
+                    }
+                }
+            },
+        );
     }
 
     /// Updates the view with call information.
@@ -242,6 +354,11 @@ impl CallView {
     /// Returns a reference to the transfer button.
     pub fn transfer_button(&self) -> &nwg::Button {
         &self.transfer_button
+    }
+
+    /// Returns a reference to the keypad button.
+    pub fn keypad_button(&self) -> &nwg::Button {
+        &self.keypad_button
     }
 
     /// Returns a reference to the input device combo.
