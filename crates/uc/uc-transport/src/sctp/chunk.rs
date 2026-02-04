@@ -164,6 +164,38 @@ pub enum UnknownChunkAction {
     SkipSilently,
 }
 
+impl UnknownChunkAction {
+    /// Determines the action for an unknown chunk type per RFC 9260 §3.2.
+    ///
+    /// The highest 2 bits of the chunk type determine the action:
+    /// - 00: Stop processing this packet and discard it, report in ERROR.
+    /// - 01: Stop processing this packet and discard it, do not report.
+    /// - 10: Skip this chunk and continue processing, do not report.
+    /// - 11: Skip this chunk and continue processing, report in ERROR.
+    #[must_use]
+    pub fn from_chunk_type(chunk_type: u8) -> Self {
+        match (chunk_type >> 6) & 0x3 {
+            0 => Self::StopAndReport,
+            1 => Self::StopSilently,
+            2 => Self::SkipSilently,
+            3 => Self::SkipAndReport,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Returns true if this action requires reporting in an ERROR chunk.
+    #[must_use]
+    pub fn should_report(&self) -> bool {
+        matches!(self, Self::StopAndReport | Self::SkipAndReport)
+    }
+
+    /// Returns true if this action should stop processing further chunks.
+    #[must_use]
+    pub fn should_stop(&self) -> bool {
+        matches!(self, Self::StopAndReport | Self::StopSilently)
+    }
+}
+
 // =============================================================================
 // Chunk Enum
 // =============================================================================

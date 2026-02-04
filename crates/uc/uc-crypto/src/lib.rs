@@ -50,7 +50,7 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
-// TODO: Fix these warnings in a dedicated cleanup pass
+// Clippy style preferences for cryptographic implementation code
 #![allow(clippy::missing_const_for_fn)]
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::redundant_closure)]

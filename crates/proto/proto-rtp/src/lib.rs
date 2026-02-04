@@ -27,11 +27,11 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
-// TODO: Fix these warnings in a dedicated cleanup pass
+// Clippy style preferences for protocol implementation code
 #![allow(clippy::missing_const_for_fn)]
-#![allow(clippy::cast_possible_truncation)]
-#![allow(clippy::cast_sign_loss)]
-#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_possible_truncation)] // Protocol fields have known sizes
+#![allow(clippy::cast_sign_loss)] // Timestamp/sequence calculations
+#![allow(clippy::cast_precision_loss)] // Jitter calculations use f64
 #![allow(clippy::cast_lossless)]
 #![allow(clippy::branches_sharing_code)]
 

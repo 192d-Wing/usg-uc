@@ -253,6 +253,12 @@ pub struct AssociationInner {
     pmtu_max: u32,
     /// Whether PMTU probing is in progress.
     pmtu_probe_pending: bool,
+
+    // Peer capability tracking (RFC 9260)
+    /// Whether peer supports ECN (RFC 9260 §5.1).
+    peer_ecn_capable: bool,
+    /// Whether peer supports PR-SCTP / Forward TSN (RFC 3758).
+    peer_prsctp_capable: bool,
 }
 
 impl AssociationInner {
@@ -310,6 +316,8 @@ impl AssociationInner {
             pmtu_min: 576, // IPv4 minimum
             pmtu_max: 1500,
             pmtu_probe_pending: false,
+            peer_ecn_capable: false,
+            peer_prsctp_capable: false,
             config,
         }
     }
@@ -490,11 +498,11 @@ impl AssociationInner {
             }
             InitParam::EcnCapable => {
                 tracing::debug!("Peer supports ECN");
-                // TODO: Store ECN capability and use it for congestion control
+                self.peer_ecn_capable = true;
             }
             InitParam::ForwardTsnSupported => {
                 tracing::debug!("Peer supports Forward TSN (PR-SCTP)");
-                // TODO: Store PR-SCTP capability
+                self.peer_prsctp_capable = true;
             }
             InitParam::SupportedAddressTypes(types) => {
                 tracing::debug!(types = ?types, "Peer supported address types");
@@ -503,8 +511,9 @@ impl AssociationInner {
                 // Handled separately
             }
             InitParam::HostnameAddress(hostname) => {
-                tracing::debug!(hostname = %hostname, "Peer hostname address");
-                // TODO: DNS resolution if needed
+                // Note: DNS resolution for hostname addresses is not yet implemented.
+                // Per RFC 9260, hostname addresses are optional and rarely used in practice.
+                tracing::debug!(hostname = %hostname, "Peer hostname address (DNS resolution not implemented)");
             }
             InitParam::Unknown { param_type, .. } => {
                 // RFC 9260 §3.2.1: Handle unknown parameters based on high bits
@@ -2382,9 +2391,32 @@ impl AssociationHandle {
                         response_chunks.push(Chunk::ReConfig(response));
                     }
                 }
-                _ => {
+                Chunk::Unknown(unknown) => {
                     // Handle unknown chunks per RFC 9260 §3.2 high-bit rules
-                    // TODO: Implement unknown chunk handling with proper error reporting
+                    let action = super::chunk::UnknownChunkAction::from_chunk_type(unknown.chunk_type);
+                    tracing::debug!(
+                        chunk_type = unknown.chunk_type,
+                        action = ?action,
+                        "Received unknown chunk"
+                    );
+
+                    if action.should_report() {
+                        // Report unrecognized chunk type in ERROR chunk
+                        let error = ErrorChunk::new(vec![ErrorCause::UnrecognizedChunkType {
+                            chunk: unknown.clone(),
+                        }]);
+                        response_chunks.push(Chunk::Error(error));
+                    }
+
+                    if action.should_stop() {
+                        // Stop processing further chunks in this packet
+                        break;
+                    }
+                    // Otherwise skip and continue processing
+                }
+                _ => {
+                    // All known chunk types should be handled above
+                    tracing::warn!("Unhandled chunk type in process_packet");
                 }
             }
         }

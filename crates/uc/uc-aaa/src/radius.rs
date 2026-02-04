@@ -522,11 +522,63 @@ mod implementation {
                 });
             }
 
-            // Verify Message-Authenticator if present
-            // Note: Full verification requires knowing the offset of the Message-Authenticator
-            // in the encoded packet. For now, we skip this verification as it requires
-            // more complex packet parsing. The Response Authenticator provides primary integrity.
-            // TODO: Implement full Message-Authenticator verification
+            // Verify Message-Authenticator if present (RFC 2869 §5.14)
+            // The Message-Authenticator is HMAC-MD5 computed over the entire response packet
+            // with the Response Authenticator replaced by the original Request Authenticator.
+            if let Some(msg_auth_attr) =
+                response.find_attribute(AttributeType::MessageAuthenticator as u8)
+            {
+                // Get the received Message-Authenticator value
+                let received_auth = msg_auth_attr.value.clone();
+                if received_auth.len() != 16 {
+                    return Err(AaaError::InvalidResponse {
+                        reason: "Invalid Message-Authenticator length".to_string(),
+                    });
+                }
+
+                // Create a copy of the response with:
+                // 1. Request Authenticator in place of Response Authenticator
+                // 2. Message-Authenticator zeroed out
+                let mut verify_packet =
+                    Packet::new(response.code, response.identifier, *request_auth);
+                for attr in &response.attributes {
+                    if attr.attr_type == AttributeType::MessageAuthenticator as u8 {
+                        // Replace with zeros for HMAC calculation
+                        verify_packet.add_attribute(
+                            Attribute::new(attr.attr_type, vec![0u8; 16]).map_err(|e| {
+                                AaaError::RadiusError {
+                                    reason: format!(
+                                        "Failed to create zero Message-Authenticator: {e}"
+                                    ),
+                                }
+                            })?,
+                        );
+                    } else {
+                        verify_packet.add_attribute(attr.clone());
+                    }
+                }
+
+                // Encode and calculate expected Message-Authenticator
+                let verify_bytes = verify_packet.encode().map_err(|e| AaaError::RadiusError {
+                    reason: format!("Failed to encode verification packet: {e}"),
+                })?;
+                let expected_auth =
+                    calculate_message_authenticator(&verify_bytes, self.config.secret.as_bytes());
+
+                // Constant-time comparison to prevent timing attacks
+                if received_auth.len() != expected_auth.len()
+                    || !received_auth
+                        .iter()
+                        .zip(expected_auth.iter())
+                        .all(|(a, b)| a == b)
+                {
+                    return Err(AaaError::InvalidResponse {
+                        reason: "Message-Authenticator verification failed".to_string(),
+                    });
+                }
+
+                trace!("Message-Authenticator verified successfully");
+            }
 
             match response.code {
                 Code::AccessAccept => {

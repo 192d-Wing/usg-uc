@@ -43,7 +43,7 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
-// TODO: Fix these warnings in a dedicated cleanup pass
+// Clippy style preferences for protocol implementation code
 #![allow(clippy::unreadable_literal)]
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::missing_const_for_fn)]
@@ -55,9 +55,7 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::match_same_arms)]
 #![allow(clippy::use_self)]
-// Allow unwrap/panic in tests
-#![cfg_attr(test, allow(clippy::unwrap_used))]
-#![cfg_attr(test, allow(clippy::panic))]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic))]
 
 pub mod dialog;
 pub mod error;

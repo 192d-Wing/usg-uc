@@ -34,21 +34,19 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
-// TODO: Fix these warnings in a dedicated cleanup pass
-#![allow(clippy::unreadable_literal)]
-#![allow(clippy::doc_markdown)]
-#![allow(clippy::missing_const_for_fn)]
-#![allow(clippy::cast_possible_truncation)]
-#![allow(clippy::cast_lossless)]
+// Clippy style preferences for protocol implementation code
+#![allow(clippy::unreadable_literal)] // Hex constants for protocol magic values
+#![allow(clippy::doc_markdown)] // Protocol acronyms don't need backticks
+#![allow(clippy::missing_const_for_fn)] // Many functions could be const but aren't for flexibility
+#![allow(clippy::cast_possible_truncation)] // Protocol fields have known sizes
+#![allow(clippy::cast_lossless)] // Explicit casts for clarity
 #![allow(clippy::must_use_candidate)]
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::match_same_arms)]
 #![allow(clippy::use_self)]
-// Allow unwrap/panic in tests
-#![cfg_attr(test, allow(clippy::unwrap_used))]
-#![cfg_attr(test, allow(clippy::panic))]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic))]
 
 pub mod attribute;
 pub mod client;
