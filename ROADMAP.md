@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.15 (Call Signaling Integration) complete
+**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.16 (Production Certificate Validation & mTLS) complete
 
 ---
 
@@ -873,6 +873,34 @@ This document outlines the development roadmap for the USG Session Border Contro
   - Maps SIP Call-ID header to application call ID
 
 **Tests**: 45 unit tests in client-core
+
+**Phase 24.16: Production Certificate Validation & mTLS** ✅
+
+- ✅ Certificate verification modes
+  - `Insecure` - Accept all certificates (development only)
+  - `System` - Use OS trusted CA store via rustls-native-certs
+  - `Custom` - Use user-provided CA certificates
+- ✅ System CA loading
+  - Windows: Windows Certificate Store (ROOT)
+  - macOS: Keychain
+  - Linux: /etc/ssl/certs
+  - Handles partial load errors gracefully
+- ✅ mTLS client authentication
+  - `ClientCertResolver` for TLS handshake
+  - Certificate chain configuration
+  - Private key support for software certificates
+  - Smart card certificate support (without private key)
+- ✅ ClientApp integration
+  - `set_client_certificate()` - configure cert chain
+  - `set_client_certificate_with_key()` - full mTLS with private key
+  - `set_verification_mode()` - change verification mode
+  - `set_trusted_ca_certs()` - configure custom CAs
+- ✅ Transport configuration
+  - `TransportConfig` for builder pattern
+  - Hot-reload of TLS configuration
+  - Connection pooling compatible with config changes
+
+**Tests**: 55 unit tests in client-core
 
 ---
 

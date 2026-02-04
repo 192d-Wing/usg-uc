@@ -9,7 +9,7 @@
 use crate::call_manager::{CallManager, CallManagerEvent};
 use crate::contact_manager::ContactManager;
 use crate::settings::SettingsManager;
-use crate::sip_transport::{SipTransport, TransportEvent};
+use crate::sip_transport::{CertVerificationMode, SipTransport, TransportEvent};
 use crate::{AppError, AppResult};
 use client_sip_ua::{RegistrationAgent, RegistrationEvent};
 use client_types::{CallInfo, CallState, RegistrationState, SipAccount};
@@ -217,6 +217,10 @@ impl ClientApp {
     ///
     /// The certificate chain should be DER-encoded, with the end-entity
     /// certificate first, followed by any intermediate certificates.
+    ///
+    /// This configures:
+    /// - SIP transport for mTLS with the registrar
+    /// - Call manager for DTLS-SRTP with media endpoints
     pub fn set_client_certificate(&mut self, cert_chain: Vec<Vec<u8>>, thumbprint: &str) {
         info!(
             thumbprint = %thumbprint,
@@ -230,9 +234,78 @@ impl ClientApp {
         // Configure the call manager with the DTLS credentials
         // For smart card certificates, the private key stays on the card
         // and signing operations are performed by the Windows CryptoAPI
-        self.call_manager.set_dtls_credentials(cert_chain, Vec::new());
+        self.call_manager
+            .set_dtls_credentials(cert_chain.clone(), Vec::new());
 
-        info!("Client certificate configured");
+        // Note: For smart card mTLS, we pass the cert chain without private key.
+        // The Windows TLS stack handles smart card signing natively.
+        // For software keys, pass the private key via set_client_certificate_with_key().
+        info!("Client certificate configured for DTLS");
+    }
+
+    /// Sets the client certificate with private key for mTLS authentication.
+    ///
+    /// Use this for software-based certificates where the private key is available.
+    /// For smart card certificates, use `set_client_certificate()` instead.
+    pub async fn set_client_certificate_with_key(
+        &mut self,
+        cert_chain: Vec<Vec<u8>>,
+        private_key: Vec<u8>,
+        thumbprint: &str,
+    ) -> AppResult<()> {
+        info!(
+            thumbprint = %thumbprint,
+            chain_length = cert_chain.len(),
+            "Setting client certificate with private key for mTLS"
+        );
+
+        self.client_cert_chain = Some(cert_chain.clone());
+        self.client_cert_thumbprint = Some(thumbprint.to_string());
+
+        // Configure the SIP transport for mTLS
+        if let Some(ref transport) = self.sip_transport {
+            transport
+                .set_client_certificate(cert_chain.clone(), Some(private_key.clone()))
+                .await?;
+            info!("SIP transport configured for mTLS");
+        }
+
+        // Configure the call manager with the DTLS credentials
+        self.call_manager
+            .set_dtls_credentials(cert_chain, private_key);
+
+        info!("Client certificate configured for mTLS and DTLS");
+        Ok(())
+    }
+
+    /// Sets the certificate verification mode for the SIP transport.
+    ///
+    /// # Arguments
+    /// * `mode` - The verification mode to use:
+    ///   - `Insecure` - Accept all certificates (development only)
+    ///   - `System` - Use platform's trusted CA store
+    ///   - `Custom` - Use custom CA certificates
+    pub async fn set_verification_mode(&mut self, mode: CertVerificationMode) -> AppResult<()> {
+        info!(mode = ?mode, "Setting certificate verification mode");
+
+        if let Some(ref transport) = self.sip_transport {
+            transport.set_verification_mode(mode).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Sets custom trusted CA certificates for server verification.
+    ///
+    /// Use this for environments with private CAs (e.g., government networks).
+    pub async fn set_trusted_ca_certs(&mut self, trusted_certs: Vec<Vec<u8>>) -> AppResult<()> {
+        info!(
+            cert_count = trusted_certs.len(),
+            "Setting custom trusted CA certificates"
+        );
+
+        let mode = CertVerificationMode::Custom { trusted_certs };
+        self.set_verification_mode(mode).await
     }
 
     /// Returns the configured client certificate thumbprint.

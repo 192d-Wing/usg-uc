@@ -512,6 +512,50 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - Outbound: CallAgent → CallEvent::SendRequest → SipTransport
   - Inbound: SipTransport → TransportEvent → CallManager → CallAgent
 
+**Phase 24.16: Production Certificate Validation & mTLS**
+
+- `client-core/sip_transport.rs` - Certificate verification and mTLS
+  - `CertVerificationMode` enum with three modes:
+    - `Insecure` - Accept all certificates (development only, with warnings)
+    - `System` - Use OS trusted CA store (default for production)
+    - `Custom` - Use user-provided CA certificates
+  - `load_system_root_certs()` - Platform-specific CA loading
+    - Windows: Windows Certificate Store (ROOT store)
+    - macOS: Keychain
+    - Linux: /etc/ssl/certs via rustls-native-certs
+    - Graceful handling of partial load errors
+  - `load_custom_root_certs()` - Custom CA certificate loading
+    - Validates at least one cert is successfully added
+  - `ClientCertResolver` for mTLS client authentication
+    - Implements `ResolvesClientCert` trait
+    - Provides certificate chain during TLS handshake
+  - `TransportConfig` for builder-pattern configuration
+    - `with_verification_mode()` - set verification mode
+    - `with_client_certificate()` - configure client cert and optional private key
+  - `SipTransport` updates:
+    - `with_config()` - create transport with custom config
+    - `set_verification_mode()` - change mode at runtime
+    - `set_client_certificate()` - configure mTLS credentials
+    - Hot-reload: closes existing connections on config change
+- `client-core/app.rs` - ClientApp integration
+  - `set_client_certificate()` - configure cert chain for DTLS
+  - `set_client_certificate_with_key()` - full mTLS with private key
+  - `set_verification_mode()` - change transport verification
+  - `set_trusted_ca_certs()` - configure custom CAs
+- `client-core/lib.rs` - Export new types
+  - `CertVerificationMode`, `TransportConfig` exported for external use
+- Unit tests: 10 new tests
+  - Verification mode default and debug
+  - Config builder pattern
+  - Transport with insecure/system modes
+  - Runtime verification mode change
+  - System root cert loading
+  - Custom root cert validation
+
+**Dependencies Added**
+
+- `rustls-native-certs` 0.8: Platform-specific CA certificate loading
+
 **Security**
 
 - Smart card authentication ONLY (CAC/PIV/SIPR token)

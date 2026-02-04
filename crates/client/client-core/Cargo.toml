@@ -27,6 +27,7 @@ bytes.workspace = true
 rustls.workspace = true
 tokio-rustls = "0.26"
 rustls-pki-types.workspace = true
+rustls-native-certs.workspace = true
 
 # Platform utilities
 directories.workspace = true
