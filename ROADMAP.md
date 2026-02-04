@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.7 (Deployment & Packaging) complete
+**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.8 (Audio Pipeline) complete
 
 ---
 
@@ -649,7 +649,39 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ Default settings configuration (default-settings.toml)
 - ✅ License agreement (license.rtf)
 
-**Tests**: 69 total tests (client crates)
+**Phase 24.8: Audio Pipeline** ✅
+
+- ✅ `client-audio` crate with full audio pipeline implementation
+- ✅ `device.rs` - Audio device enumeration and management (CPAL 0.17)
+  - Cross-platform input/output device listing
+  - Device selection by name with fallback to default
+  - Stream configuration for 8/16/48 kHz sample rates
+- ✅ `jitter_buffer.rs` - Adaptive jitter buffer for RTP reordering
+  - BTreeMap-based packet ordering by sequence number
+  - Adaptive depth adjustment (40-200ms)
+  - Packet loss detection and PLC signaling
+  - Jitter calculation and statistics
+- ✅ `stream.rs` - CPAL audio capture/playback streams
+  - Ring buffer-based producer/consumer (ringbuf 0.4)
+  - Support for i16 and f32 sample formats
+  - Automatic mono mixdown from stereo
+  - Non-blocking read/write operations
+- ✅ `codec.rs` - Codec encode/decode pipeline
+  - Unified CodecPipeline wrapper for G.711, G.722, Opus
+  - Codec negotiation from local preferences and remote capabilities
+  - Payload type mapping and SDP capability generation
+- ✅ `rtp_handler.rs` - RTP packet send/receive
+  - RtpTransmitter with sequence number and timestamp management
+  - RtpReceiver with jitter buffer integration
+  - SRTP encryption/decryption via proto-srtp
+  - RTP statistics tracking
+- ✅ `pipeline.rs` - Main audio pipeline coordinator
+  - Orchestrates capture → encode → RTP → decode → playback
+  - SRTP context management (separate TX/RX contexts)
+  - Mute control and pipeline state management
+  - Pipeline statistics aggregation
+
+**Tests**: 72 total tests (client crates)
 
 ---
 

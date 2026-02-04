@@ -288,6 +288,48 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - Smart card authentication requirements
   - Key management practices
 
+**Phase 24.8: Audio Pipeline**
+
+- `client-audio` crate fully implemented
+  - `device.rs`: Audio device enumeration and management (CPAL 0.17)
+    - Cross-platform input/output device listing via `DeviceManager`
+    - Device selection by name with fallback to default
+    - Stream configuration for 8/16/48 kHz sample rates
+    - Deprecated CPAL API workarounds
+  - `jitter_buffer.rs`: Adaptive jitter buffer for RTP reordering
+    - BTreeMap-based packet ordering by sequence number
+    - `BufferedPacket` with sequence, timestamp, payload type, and data
+    - Adaptive depth adjustment (40-200ms min/max)
+    - Packet loss detection with `JitterBufferResult::Lost`
+    - Jitter calculation per RFC 3550
+    - `JitterBufferStats` for monitoring
+  - `stream.rs`: CPAL audio capture/playback streams
+    - `CaptureStream` for microphone input
+    - `PlaybackStream` for speaker output
+    - Ring buffer-based producer/consumer (ringbuf 0.4)
+    - Support for i16 and f32 sample formats
+    - Automatic mono mixdown from stereo
+    - Non-blocking read/write operations
+  - `codec.rs`: Codec encode/decode pipeline
+    - `CodecPipeline` wrapper for G.711, G.722, Opus
+    - Codec negotiation via `negotiate_codec()`
+    - Payload type mapping and SDP capability generation
+    - PLC (packet loss concealment) via silence generation
+  - `rtp_handler.rs`: RTP packet send/receive
+    - `RtpTransmitter` with sequence number and timestamp management
+    - `RtpReceiver` with jitter buffer integration
+    - SRTP encryption via `SrtpProtect` wrapper
+    - SRTP decryption via `SrtpUnprotect` wrapper
+    - Separate TX/RX contexts (different SSRCs and directions)
+    - `RtpStats` for packet and byte counting
+  - `pipeline.rs`: Main audio pipeline coordinator
+    - `AudioPipeline` orchestrating full audio path
+    - Capture → Encode → RTP TX / RTP RX → Decode → Playback
+    - `PipelineConfig` for codec, port, SRTP keys, mute settings
+    - `PipelineState`: Stopped, Starting, Running, Stopping
+    - SRTP context setup with `SrtpKeyMaterial`
+    - Mute control and pipeline statistics aggregation
+
 **Security**
 
 - Smart card authentication ONLY (CAC/PIV/SIPR token)
