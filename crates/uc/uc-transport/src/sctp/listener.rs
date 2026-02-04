@@ -294,13 +294,12 @@ impl SctpListener {
 
         // Start background task
         let task_handle = {
-            let inner = inner.clone();
-            let accept_tx = accept_tx.clone();
-            let closed = closed.clone();
-            let socket = socket.clone();
+            let inner_clone = inner.clone();
+            let accept_tx_clone = accept_tx.clone();
+            let closed_clone = closed.clone();
 
             tokio::spawn(async move {
-                Self::listener_loop(inner, socket, accept_tx, closed).await;
+                Self::listener_loop(inner_clone, socket, accept_tx_clone, closed_clone).await;
             })
         };
 
@@ -467,6 +466,7 @@ impl SctpListener {
                     init_tag: init.initiate_tag,
                 },
             );
+            drop(inner);
 
             (init_ack, local_tag)
         };
@@ -482,12 +482,14 @@ impl SctpListener {
         // Send response
         let response_bytes = {
             let inner = inner.read().await;
-            if inner.config.use_udp_encap {
+            let bytes = if inner.config.use_udp_encap {
                 let encap = EncapsulatedPacket::from_config(response, &inner.config.udp_encap);
                 encap.encode(Some(&local_addr), Some(&peer_addr))
             } else {
                 response.encode().freeze()
-            }
+            };
+            drop(inner);
+            bytes
         };
 
         if let Err(e) = socket.send_to(&response_bytes, peer_addr).await {
@@ -528,6 +530,7 @@ impl SctpListener {
                     return;
                 }
             };
+            drop(inner);
 
             let peer_tag = handle.peer_verification_tag().await;
             (handle, peer_tag)
@@ -551,12 +554,14 @@ impl SctpListener {
         // Send response
         let response_bytes = {
             let inner = inner.read().await;
-            if inner.config.use_udp_encap {
+            let bytes = if inner.config.use_udp_encap {
                 let encap = EncapsulatedPacket::from_config(response, &inner.config.udp_encap);
                 encap.encode(Some(&local_addr), Some(&peer_addr))
             } else {
                 response.encode().freeze()
-            }
+            };
+            drop(inner);
+            bytes
         };
 
         if let Err(e) = socket.send_to(&response_bytes, peer_addr).await {
@@ -632,6 +637,7 @@ impl TransportListener for SctpListener {
             let mut inner = self.inner.write().await;
             inner.closed = true;
             inner.pending.clear();
+            drop(inner);
 
             info!("SCTP listener closed");
             Ok(())

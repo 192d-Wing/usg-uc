@@ -23,6 +23,7 @@
 pub mod association;
 pub mod chunk;
 pub mod congestion;
+pub mod connected;
 pub mod cookie;
 pub mod listener;
 pub mod packet;
@@ -33,6 +34,7 @@ pub mod timer;
 pub mod udp_encap;
 
 pub use association::{AssociationConfig, AssociationHandle, AssociationInner};
+pub use connected::{ConnectedSctpAssociation, ConnectedSctpConfig};
 pub use listener::{SctpListener, SctpListenerConfig};
 pub use chunk::{
     AbortChunk, Chunk, ChunkType, CookieAckChunk, CookieEchoChunk, DataChunk, ErrorCause,
