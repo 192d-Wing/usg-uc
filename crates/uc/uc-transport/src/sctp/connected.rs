@@ -45,6 +45,10 @@ pub struct ConnectedSctpAssociation {
     /// Background I/O task handle.
     #[allow(dead_code)]
     io_task: Option<tokio::task::JoinHandle<()>>,
+    /// Whether UDP encapsulation is enabled (RFC 6951).
+    use_udp_encapsulation: bool,
+    /// UDP encapsulation configuration.
+    udp_encap_config: UdpEncapConfig,
 }
 
 /// Configuration for connected SCTP association.
@@ -64,6 +68,15 @@ pub struct ConnectedSctpConfig {
     pub ordered_delivery: bool,
     /// Advertised receiver window credit.
     pub a_rwnd: u32,
+    /// Enable UDP encapsulation per RFC 6951.
+    ///
+    /// When enabled, SCTP packets are wrapped in a UDP header for NAT traversal.
+    /// The encapsulation adds 8 bytes of overhead per packet.
+    pub use_udp_encapsulation: bool,
+    /// UDP encapsulation configuration (ports).
+    ///
+    /// Only used when `use_udp_encapsulation` is true.
+    pub udp_encap_config: UdpEncapConfig,
 }
 
 impl Default for ConnectedSctpConfig {
@@ -76,7 +89,29 @@ impl Default for ConnectedSctpConfig {
             path_mtu: 1280,
             ordered_delivery: true,
             a_rwnd: 65535,
+            use_udp_encapsulation: false,
+            udp_encap_config: UdpEncapConfig::default(),
         }
+    }
+}
+
+impl ConnectedSctpConfig {
+    /// Creates a configuration with UDP encapsulation enabled.
+    ///
+    /// This is useful for deployments behind NAT devices that don't
+    /// understand native SCTP.
+    #[must_use]
+    pub fn with_udp_encapsulation(mut self) -> Self {
+        self.use_udp_encapsulation = true;
+        self
+    }
+
+    /// Sets the UDP encapsulation ports.
+    #[must_use]
+    pub fn with_udp_encap_ports(mut self, local_port: u16, remote_port: u16) -> Self {
+        self.use_udp_encapsulation = true;
+        self.udp_encap_config = UdpEncapConfig::new(local_port, remote_port);
+        self
     }
 }
 
@@ -115,6 +150,10 @@ impl ConnectedSctpAssociation {
 
         let actual_local_sbc = SbcSocketAddr::from(actual_local);
 
+        // Store encapsulation settings
+        let use_udp_encapsulation = config.use_udp_encapsulation;
+        let udp_encap_config = config.udp_encap_config.clone();
+
         // Create association config
         let assoc_config = AssociationConfig {
             outbound_streams: config.outbound_streams,
@@ -128,7 +167,7 @@ impl ConnectedSctpAssociation {
             ),
             path_mtu: config.path_mtu.into(),
             ordered_delivery: config.ordered_delivery,
-            udp_encap: UdpEncapConfig::default(),
+            udp_encap: udp_encap_config.clone(),
         };
 
         // Create association handle
@@ -148,14 +187,25 @@ impl ConnectedSctpAssociation {
             let socket = socket.clone();
             let handle = handle.clone();
             let peer_addr = peer_socket;
+            let encap_config = udp_encap_config.clone();
             tokio::spawn(async move {
-                io_loop(socket, handle, peer_addr, recv_tx, shutdown_rx).await;
+                io_loop(
+                    socket,
+                    handle,
+                    peer_addr,
+                    recv_tx,
+                    shutdown_rx,
+                    use_udp_encapsulation,
+                    encap_config,
+                )
+                .await;
             })
         };
 
         info!(
             local = %actual_local_sbc,
             peer = %peer_addr,
+            udp_encap = use_udp_encapsulation,
             "Connected SCTP association created"
         );
 
@@ -168,6 +218,8 @@ impl ConnectedSctpAssociation {
             shutdown_tx: Some(shutdown_tx),
             connected: AtomicBool::new(false),
             io_task: Some(io_task),
+            use_udp_encapsulation,
+            udp_encap_config,
         })
     }
 
@@ -181,6 +233,8 @@ impl ConnectedSctpAssociation {
         handle: AssociationHandle,
         socket: Arc<UdpSocket>,
         recv_rx: mpsc::Receiver<(u16, Bytes)>,
+        use_udp_encapsulation: bool,
+        udp_encap_config: UdpEncapConfig,
     ) -> Self {
         Self {
             local_addr,
@@ -191,6 +245,42 @@ impl ConnectedSctpAssociation {
             shutdown_tx: None,
             connected: AtomicBool::new(true),
             io_task: None,
+            use_udp_encapsulation,
+            udp_encap_config,
+        }
+    }
+
+    /// Returns whether UDP encapsulation is enabled.
+    #[must_use]
+    pub fn is_udp_encapsulated(&self) -> bool {
+        self.use_udp_encapsulation
+    }
+
+    /// Encodes an SCTP packet, optionally with UDP encapsulation.
+    fn encode_packet(&self, packet: &SctpPacket) -> Bytes {
+        if self.use_udp_encapsulation {
+            use super::udp_encap::EncapsulatedPacket;
+            let encap = EncapsulatedPacket::from_config(packet.clone(), &self.udp_encap_config);
+            let local_addr: SocketAddr = self.local_addr.clone().into();
+            let peer_addr: SocketAddr = self.peer_addr.clone().into();
+            encap.encode(Some(&local_addr), Some(&peer_addr))
+        } else {
+            packet.encode().freeze()
+        }
+    }
+
+    /// Decodes a received buffer, handling optional UDP encapsulation.
+    fn decode_packet(&self, buf: &[u8]) -> Result<SctpPacket, TransportError> {
+        if self.use_udp_encapsulation {
+            use super::udp_encap::decapsulate;
+            let encap = decapsulate(Bytes::copy_from_slice(buf)).map_err(|e| TransportError::Io {
+                reason: format!("UDP decapsulation failed: {e}"),
+            })?;
+            Ok(encap.sctp_packet)
+        } else {
+            SctpPacket::decode(&Bytes::copy_from_slice(buf)).map_err(|e| TransportError::Io {
+                reason: format!("Failed to decode SCTP packet: {e}"),
+            })
         }
     }
 
@@ -205,12 +295,13 @@ impl ConnectedSctpAssociation {
         info!(
             local = %self.local_addr,
             peer = %self.peer_addr,
+            udp_encap = self.use_udp_encapsulation,
             "SCTP association initiating 4-way handshake"
         );
 
         // Create and send INIT packet
         let init_packet = self.handle.create_init_packet().await;
-        let init_bytes = init_packet.encode();
+        let init_bytes = self.encode_packet(&init_packet);
 
         let peer_socket: SocketAddr = self.peer_addr.clone().into();
         self.socket
@@ -236,12 +327,8 @@ impl ConnectedSctpAssociation {
 
         debug!(from = %from, len = len, "Received response");
 
-        // Decode and process INIT-ACK
-        let packet = SctpPacket::decode(&Bytes::copy_from_slice(&buf[..len])).map_err(|e| {
-            TransportError::Io {
-                reason: format!("Failed to decode SCTP packet: {e}"),
-            }
-        })?;
+        // Decode and process INIT-ACK (with optional decapsulation)
+        let packet = self.decode_packet(&buf[..len])?;
 
         let response_chunks =
             self.handle
@@ -269,7 +356,7 @@ impl ConnectedSctpAssociation {
             cookie_echo_packet.add_chunk(chunk);
         }
 
-        let cookie_echo_bytes = cookie_echo_packet.encode();
+        let cookie_echo_bytes = self.encode_packet(&cookie_echo_packet);
         self.socket
             .send_to(&cookie_echo_bytes, peer_socket)
             .await
@@ -288,11 +375,8 @@ impl ConnectedSctpAssociation {
                 reason: e.to_string(),
             })?;
 
-        let packet = SctpPacket::decode(&Bytes::copy_from_slice(&buf[..len])).map_err(|e| {
-            TransportError::Io {
-                reason: format!("Failed to decode COOKIE-ACK packet: {e}"),
-            }
-        })?;
+        // Decode with optional decapsulation
+        let packet = self.decode_packet(&buf[..len])?;
 
         self.handle
             .process_packet(&packet)
@@ -578,18 +662,24 @@ impl std::fmt::Debug for ConnectedSctpAssociation {
 const TIMER_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Background I/O loop for handling socket operations.
+#[allow(clippy::too_many_arguments)]
 async fn io_loop(
     socket: Arc<UdpSocket>,
     handle: AssociationHandle,
     peer_addr: SocketAddr,
     recv_tx: mpsc::Sender<(u16, Bytes)>,
     mut shutdown_rx: oneshot::Receiver<()>,
+    use_udp_encapsulation: bool,
+    udp_encap_config: UdpEncapConfig,
 ) {
     let mut buf = vec![0u8; MAX_PACKET_SIZE];
 
     // Create timer interval for periodic checks
     let mut timer_interval = tokio::time::interval(TIMER_CHECK_INTERVAL);
     timer_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Get local address for encapsulation
+    let local_addr = socket.local_addr().ok();
 
     loop {
         tokio::select! {
@@ -607,7 +697,10 @@ async fn io_loop(
                 let retransmit_chunks = handle.check_retransmissions().await;
                 if !retransmit_chunks.is_empty() {
                     trace!(count = retransmit_chunks.len(), "Retransmitting DATA chunks");
-                    if let Err(e) = send_data_chunks(&socket, &handle, peer_addr, &retransmit_chunks).await {
+                    if let Err(e) = send_data_chunks(
+                        &socket, &handle, peer_addr, &retransmit_chunks,
+                        use_udp_encapsulation, &udp_encap_config, local_addr.as_ref(),
+                    ).await {
                         warn!(error = %e, "Failed to send retransmit chunks");
                     }
                 }
@@ -616,7 +709,10 @@ async fn io_loop(
                 let fast_rtx_chunks = handle.get_fast_retransmit_chunks().await;
                 if !fast_rtx_chunks.is_empty() {
                     trace!(count = fast_rtx_chunks.len(), "Fast retransmitting DATA chunks");
-                    if let Err(e) = send_data_chunks(&socket, &handle, peer_addr, &fast_rtx_chunks).await {
+                    if let Err(e) = send_data_chunks(
+                        &socket, &handle, peer_addr, &fast_rtx_chunks,
+                        use_udp_encapsulation, &udp_encap_config, local_addr.as_ref(),
+                    ).await {
                         warn!(error = %e, "Failed to send fast retransmit chunks");
                     }
                 }
@@ -626,7 +722,10 @@ async fn io_loop(
                 for timer_type in expired_timers {
                     if timer_type == super::timer::TimerType::Heartbeat {
                         trace!("Sending HEARTBEAT");
-                        if let Err(e) = send_heartbeat(&socket, &handle, peer_addr).await {
+                        if let Err(e) = send_heartbeat(
+                            &socket, &handle, peer_addr,
+                            use_udp_encapsulation, &udp_encap_config, local_addr.as_ref(),
+                        ).await {
                             warn!(error = %e, "Failed to send heartbeat");
                         }
                         // Restart heartbeat timer
@@ -646,8 +745,18 @@ async fn io_loop(
 
                         trace!(len = len, from = %from, "Received SCTP packet");
 
-                        // Decode packet
-                        match SctpPacket::decode(&Bytes::copy_from_slice(&buf[..len])) {
+                        // Decode packet (with optional decapsulation)
+                        let decode_result = if use_udp_encapsulation {
+                            use super::udp_encap::decapsulate;
+                            decapsulate(Bytes::copy_from_slice(&buf[..len]))
+                                .map(|encap| encap.sctp_packet)
+                                .map_err(|e| e.to_string())
+                        } else {
+                            SctpPacket::decode(&Bytes::copy_from_slice(&buf[..len]))
+                                .map_err(|e| e.to_string())
+                        };
+
+                        match decode_result {
                             Ok(packet) => {
                                 // Process through handle
                                 match handle.process_packet(&packet).await {
@@ -665,7 +774,13 @@ async fn io_loop(
                                                 response_packet.add_chunk(chunk);
                                             }
 
-                                            let response_bytes = response_packet.encode();
+                                            let response_bytes = encode_packet_with_encap(
+                                                &response_packet,
+                                                use_udp_encapsulation,
+                                                &udp_encap_config,
+                                                local_addr.as_ref(),
+                                                &peer_addr,
+                                            );
                                             if let Err(e) = socket.send_to(&response_bytes, peer_addr).await {
                                                 warn!(error = %e, "Failed to send response packet");
                                             }
@@ -698,12 +813,33 @@ async fn io_loop(
     }
 }
 
+/// Encodes an SCTP packet with optional UDP encapsulation.
+fn encode_packet_with_encap(
+    packet: &SctpPacket,
+    use_udp_encapsulation: bool,
+    udp_encap_config: &UdpEncapConfig,
+    local_addr: Option<&SocketAddr>,
+    peer_addr: &SocketAddr,
+) -> Bytes {
+    if use_udp_encapsulation {
+        use super::udp_encap::EncapsulatedPacket;
+        let encap = EncapsulatedPacket::from_config(packet.clone(), udp_encap_config);
+        encap.encode(local_addr, Some(peer_addr))
+    } else {
+        packet.encode().freeze()
+    }
+}
+
 /// Sends DATA chunks in a packet.
+#[allow(clippy::too_many_arguments)]
 async fn send_data_chunks(
     socket: &UdpSocket,
     handle: &AssociationHandle,
     peer_addr: SocketAddr,
     chunks: &[super::chunk::DataChunk],
+    use_udp_encapsulation: bool,
+    udp_encap_config: &UdpEncapConfig,
+    local_addr: Option<&SocketAddr>,
 ) -> Result<(), std::io::Error> {
     if chunks.is_empty() {
         return Ok(());
@@ -717,7 +853,13 @@ async fn send_data_chunks(
         packet.add_chunk(Chunk::Data(chunk.clone()));
     }
 
-    let bytes = packet.encode();
+    let bytes = encode_packet_with_encap(
+        &packet,
+        use_udp_encapsulation,
+        udp_encap_config,
+        local_addr,
+        &peer_addr,
+    );
     socket.send_to(&bytes, peer_addr).await?;
 
     // Track sent chunks for retransmission
@@ -731,6 +873,9 @@ async fn send_heartbeat(
     socket: &UdpSocket,
     handle: &AssociationHandle,
     peer_addr: SocketAddr,
+    use_udp_encapsulation: bool,
+    udp_encap_config: &UdpEncapConfig,
+    local_addr: Option<&SocketAddr>,
 ) -> Result<(), std::io::Error> {
     use super::chunk::HeartbeatChunk;
 
@@ -748,7 +893,13 @@ async fn send_heartbeat(
 
     packet.add_chunk(Chunk::Heartbeat(heartbeat));
 
-    let bytes = packet.encode();
+    let bytes = encode_packet_with_encap(
+        &packet,
+        use_udp_encapsulation,
+        udp_encap_config,
+        local_addr,
+        &peer_addr,
+    );
     socket.send_to(&bytes, peer_addr).await?;
 
     Ok(())
@@ -777,6 +928,36 @@ mod tests {
         assert_eq!(assoc.primary_path(), &peer);
         assert!(!assoc.is_connected());
         assert_ne!(assoc.local_verification_tag().await, 0);
+        assert!(!assoc.is_udp_encapsulated());
+    }
+
+    #[tokio::test]
+    async fn test_connected_association_with_udp_encapsulation() {
+        let config = ConnectedSctpConfig::default().with_udp_encapsulation();
+        let local = SbcSocketAddr::from("127.0.0.1:0".parse::<SocketAddr>().unwrap());
+        let peer = SbcSocketAddr::from("127.0.0.1:5061".parse::<SocketAddr>().unwrap());
+
+        let assoc = ConnectedSctpAssociation::new(local, peer.clone(), config)
+            .await
+            .unwrap();
+
+        assert!(assoc.is_udp_encapsulated());
+        assert_eq!(assoc.primary_path(), &peer);
+    }
+
+    #[tokio::test]
+    async fn test_connected_association_with_custom_encap_ports() {
+        let config = ConnectedSctpConfig::default().with_udp_encap_ports(12345, 54321);
+        let local = SbcSocketAddr::from("127.0.0.1:0".parse::<SocketAddr>().unwrap());
+        let peer = SbcSocketAddr::from("127.0.0.1:5061".parse::<SocketAddr>().unwrap());
+
+        let assoc = ConnectedSctpAssociation::new(local, peer, config)
+            .await
+            .unwrap();
+
+        assert!(assoc.is_udp_encapsulated());
+        assert_eq!(assoc.udp_encap_config.local_port, 12345);
+        assert_eq!(assoc.udp_encap_config.remote_port, 54321);
     }
 
     #[tokio::test]
@@ -813,5 +994,77 @@ mod tests {
         assoc.abort().await;
 
         assert!(!assoc.is_connected());
+    }
+
+    #[test]
+    fn test_config_defaults() {
+        let config = ConnectedSctpConfig::default();
+        assert_eq!(config.outbound_streams, 10);
+        assert_eq!(config.max_inbound_streams, 10);
+        assert!(!config.use_udp_encapsulation);
+        assert_eq!(config.udp_encap_config.local_port, super::super::udp_encap::SCTP_UDP_PORT);
+    }
+
+    #[test]
+    fn test_encode_packet_with_encap() {
+        use super::super::chunk::{Chunk, DataChunk};
+
+        let mut packet = SctpPacket::new(5060, 5061, 0x12345678);
+        packet.add_chunk(Chunk::Data(DataChunk::new(1, 0, 0, 0, Bytes::from_static(b"test"))));
+
+        let config = UdpEncapConfig::default();
+        let local_addr: SocketAddr = "192.168.1.1:9899".parse().unwrap();
+        let peer_addr: SocketAddr = "192.168.1.2:9899".parse().unwrap();
+
+        // Without encapsulation
+        let bytes_raw = encode_packet_with_encap(&packet, false, &config, Some(&local_addr), &peer_addr);
+
+        // With encapsulation (should be larger due to UDP header)
+        let bytes_encap = encode_packet_with_encap(&packet, true, &config, Some(&local_addr), &peer_addr);
+
+        // Encapsulated packet should be 8 bytes larger (UDP header)
+        assert_eq!(bytes_encap.len(), bytes_raw.len() + 8);
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip_without_encap() {
+        use super::super::chunk::{Chunk, DataChunk};
+
+        let mut packet = SctpPacket::new(5060, 5061, 0x12345678);
+        packet.add_chunk(Chunk::Data(DataChunk::new(1, 0, 0, 0, Bytes::from_static(b"hello"))));
+
+        let config = UdpEncapConfig::default();
+        let peer_addr: SocketAddr = "192.168.1.2:9899".parse().unwrap();
+
+        let encoded = encode_packet_with_encap(&packet, false, &config, None, &peer_addr);
+
+        // Decode without encapsulation
+        let decoded = SctpPacket::decode(&encoded).unwrap();
+        assert_eq!(decoded.source_port, 5060);
+        assert_eq!(decoded.dest_port, 5061);
+        assert_eq!(decoded.verification_tag, 0x12345678);
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip_with_encap() {
+        use super::super::chunk::{Chunk, DataChunk};
+        use super::super::udp_encap::decapsulate;
+
+        let mut packet = SctpPacket::new(5060, 5061, 0x12345678);
+        packet.add_chunk(Chunk::Data(DataChunk::new(1, 0, 0, 0, Bytes::from_static(b"hello"))));
+
+        let config = UdpEncapConfig::default();
+        let local_addr: SocketAddr = "192.168.1.1:9899".parse().unwrap();
+        let peer_addr: SocketAddr = "192.168.1.2:9899".parse().unwrap();
+
+        let encoded = encode_packet_with_encap(&packet, true, &config, Some(&local_addr), &peer_addr);
+
+        // Decode with decapsulation
+        let encap = decapsulate(encoded).unwrap();
+        assert_eq!(encap.udp_header.source_port, config.local_port);
+        assert_eq!(encap.udp_header.dest_port, config.remote_port);
+        assert_eq!(encap.sctp_packet.source_port, 5060);
+        assert_eq!(encap.sctp_packet.dest_port, 5061);
+        assert_eq!(encap.sctp_packet.verification_tag, 0x12345678);
     }
 }
