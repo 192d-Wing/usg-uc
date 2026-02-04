@@ -173,12 +173,88 @@ pub enum CertificateSelectionMode {
     AutoSelect,
 }
 
+/// Server certificate verification mode for TLS connections.
+///
+/// This controls how the client verifies server certificates during the TLS handshake.
+/// For production use, `System` or `Custom` mode should always be used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ServerCertVerificationMode {
+    /// Accept all certificates without validation (DEVELOPMENT ONLY).
+    ///
+    /// **WARNING**: This mode bypasses all server certificate validation and should
+    /// ONLY be used for local development with self-signed certificates. Never use
+    /// this mode in production or with sensitive data.
+    Insecure,
+
+    /// Use the operating system's trusted CA store (default).
+    ///
+    /// On Windows: Windows Certificate Store (ROOT store).
+    /// On macOS: Keychain.
+    /// On Linux: /etc/ssl/certs or distribution-specific locations.
+    ///
+    /// This is the recommended mode for most deployments.
+    #[default]
+    System,
+
+    /// Use custom trusted CA certificates from a file.
+    ///
+    /// For environments with private CAs (e.g., government networks, enterprise PKI).
+    /// The CA file should be in PEM format containing one or more CA certificates.
+    Custom {
+        /// Path to the CA certificate file (PEM format).
+        ca_file_path: String,
+    },
+}
+
 impl std::fmt::Display for CertificateSelectionMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::PromptUser => write!(f, "Prompt for Selection"),
             Self::SpecificCertificate => write!(f, "Use Specific Certificate"),
             Self::AutoSelect => write!(f, "Auto-Select"),
+        }
+    }
+}
+
+impl std::fmt::Display for ServerCertVerificationMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Insecure => write!(f, "Insecure (Development Only)"),
+            Self::System => write!(f, "System CA Store"),
+            Self::Custom { .. } => write!(f, "Custom CA File"),
+        }
+    }
+}
+
+impl ServerCertVerificationMode {
+    /// Returns all available modes for UI selection.
+    pub fn all_modes() -> &'static [(&'static str, &'static str)] {
+        &[
+            ("System", "Use the operating system's trusted CA store"),
+            ("Custom", "Use a custom CA certificate file"),
+            ("Insecure", "Accept all certificates (DEVELOPMENT ONLY)"),
+        ]
+    }
+
+    /// Returns the display label for this mode.
+    pub fn label(&self) -> &str {
+        match self {
+            Self::System => "System CA Store",
+            Self::Custom { .. } => "Custom CA File",
+            Self::Insecure => "Insecure (Dev Only)",
+        }
+    }
+
+    /// Returns whether this is the insecure mode.
+    pub fn is_insecure(&self) -> bool {
+        matches!(self, Self::Insecure)
+    }
+
+    /// Returns the custom CA file path if in Custom mode.
+    pub fn custom_ca_path(&self) -> Option<&str> {
+        match self {
+            Self::Custom { ca_file_path } => Some(ca_file_path),
+            _ => None,
         }
     }
 }
@@ -301,5 +377,78 @@ mod tests {
             "Insert Smart Card"
         );
         assert_eq!(RegistrationState::WaitingForPin.to_string(), "Enter PIN...");
+    }
+
+    #[test]
+    fn test_server_cert_verification_mode_default() {
+        let mode = ServerCertVerificationMode::default();
+        assert_eq!(mode, ServerCertVerificationMode::System);
+    }
+
+    #[test]
+    fn test_server_cert_verification_mode_display() {
+        assert_eq!(
+            ServerCertVerificationMode::Insecure.to_string(),
+            "Insecure (Development Only)"
+        );
+        assert_eq!(
+            ServerCertVerificationMode::System.to_string(),
+            "System CA Store"
+        );
+        assert_eq!(
+            ServerCertVerificationMode::Custom {
+                ca_file_path: "/path/to/ca.pem".to_string()
+            }
+            .to_string(),
+            "Custom CA File"
+        );
+    }
+
+    #[test]
+    fn test_server_cert_verification_mode_is_insecure() {
+        assert!(ServerCertVerificationMode::Insecure.is_insecure());
+        assert!(!ServerCertVerificationMode::System.is_insecure());
+        assert!(!ServerCertVerificationMode::Custom {
+            ca_file_path: "/path".to_string()
+        }
+        .is_insecure());
+    }
+
+    #[test]
+    fn test_server_cert_verification_mode_custom_ca_path() {
+        assert_eq!(ServerCertVerificationMode::System.custom_ca_path(), None);
+        assert_eq!(ServerCertVerificationMode::Insecure.custom_ca_path(), None);
+        assert_eq!(
+            ServerCertVerificationMode::Custom {
+                ca_file_path: "/etc/pki/ca.pem".to_string()
+            }
+            .custom_ca_path(),
+            Some("/etc/pki/ca.pem")
+        );
+    }
+
+    #[test]
+    fn test_server_cert_verification_mode_labels() {
+        assert_eq!(ServerCertVerificationMode::System.label(), "System CA Store");
+        assert_eq!(
+            ServerCertVerificationMode::Insecure.label(),
+            "Insecure (Dev Only)"
+        );
+        assert_eq!(
+            ServerCertVerificationMode::Custom {
+                ca_file_path: "/path".to_string()
+            }
+            .label(),
+            "Custom CA File"
+        );
+    }
+
+    #[test]
+    fn test_server_cert_verification_mode_all_modes() {
+        let modes = ServerCertVerificationMode::all_modes();
+        assert_eq!(modes.len(), 3);
+        assert!(modes.iter().any(|(name, _)| *name == "System"));
+        assert!(modes.iter().any(|(name, _)| *name == "Custom"));
+        assert!(modes.iter().any(|(name, _)| *name == "Insecure"));
     }
 }

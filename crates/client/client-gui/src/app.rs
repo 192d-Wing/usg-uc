@@ -830,6 +830,11 @@ impl eframe::App for SipClientApp {
             self.handle_call_action(action);
         }
 
+        // Insecure mode warning dialog
+        if let Some(action) = self.settings_view.render_insecure_warning_dialog(ctx) {
+            self.handle_settings_action(action);
+        }
+
         // Request repaint for animations
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
@@ -975,6 +980,18 @@ impl SipClientApp {
                 info!(thumbprint = %thumbprint, "PIN required for certificate operation");
                 self.show_pin_dialog_for(PinOperation::UseCertificate { thumbprint });
             }
+            crate::views::SettingsAction::SetVerificationMode(mode) => {
+                info!(mode = ?mode, "Setting server certificate verification mode");
+                self.set_verification_mode(mode);
+            }
+            crate::views::SettingsAction::BrowseForCaFile => {
+                info!("Browsing for CA file");
+                self.browse_for_ca_file();
+            }
+            crate::views::SettingsAction::ConfirmInsecureMode => {
+                info!("User confirmed insecure mode");
+                self.apply_insecure_mode();
+            }
         }
     }
 
@@ -1086,5 +1103,37 @@ impl SipClientApp {
                 self.settings_view.set_smart_card_readers(Vec::new());
             }
         }
+    }
+
+    fn set_verification_mode(&mut self, mode: client_types::ServerCertVerificationMode) {
+        use client_types::ServerCertVerificationMode;
+
+        // Update the settings view
+        self.settings_view.set_server_cert_verification(mode.clone());
+
+        // Update the custom CA path if in Custom mode
+        if let ServerCertVerificationMode::Custom { ref ca_file_path } = mode {
+            self.settings_view.set_custom_ca_path(ca_file_path.clone());
+        }
+
+        // TODO: Apply to SipTransport when connected
+        // For now, just update the UI state
+        self.status_message = format!("Verification mode set to: {}", mode.label());
+        info!(mode = ?mode, "Server certificate verification mode updated");
+    }
+
+    fn browse_for_ca_file(&mut self) {
+        // For now, user must type the path manually
+        // TODO: Add rfd (native file dialog) dependency for file browsing
+        self.status_message =
+            "Enter the CA file path manually in the text field".to_string();
+        info!("User requested file browser - must enter path manually for now");
+    }
+
+    fn apply_insecure_mode(&mut self) {
+        // The warning was already shown and confirmed by the user
+        self.set_verification_mode(client_types::ServerCertVerificationMode::Insecure);
+        self.status_message = "WARNING: Insecure mode enabled - certificates not validated".to_string();
+        warn!("User enabled insecure certificate verification mode");
     }
 }

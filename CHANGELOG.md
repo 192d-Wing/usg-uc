@@ -635,6 +635,28 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - Audio starts on `CallState::Connected`, stops on `CallState::Terminated`
 - New unit tests for MediaSession accessors (22 tests in client-sip-ua)
 
+**Phase 24.21: GUI Certificate Verification Mode**
+
+- `client-types/src/account.rs` - New `ServerCertVerificationMode` type
+  - `System` (default) - Use OS trusted CA store
+  - `Custom { ca_file_path }` - Use custom CA certificate file (PEM)
+  - `Insecure` - Accept all certificates (DEVELOPMENT ONLY)
+  - Serializable with serde for settings persistence
+  - Helper methods: `label()`, `is_insecure()`, `custom_ca_path()`, `all_modes()`
+- `client-core/src/settings.rs` - Added `server_cert_verification` to `NetworkSettings`
+  - Persisted in settings.toml
+  - Defaults to System (OS CA store)
+- `client-gui/src/views/settings.rs` - Security tab UI enhancements
+  - Verification mode dropdown (System/Custom/Insecure)
+  - Custom CA file path input with Browse button
+  - Insecure mode confirmation dialog with security warning
+  - Visual warning banner when insecure mode is active
+- `client-gui/src/app.rs` - New actions and handlers
+  - `SetVerificationMode` - Apply verification mode change
+  - `BrowseForCaFile` - Trigger file browser
+  - `ConfirmInsecureMode` - User confirmation for insecure mode
+- Total: 94 tests passing (28 client-types, 66 client-core)
+
 **Dependencies Added**
 
 - `rustls-native-certs` 0.8: Platform-specific CA certificate loading

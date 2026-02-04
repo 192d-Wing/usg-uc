@@ -4,7 +4,7 @@
 //! Uses platform-specific directories (`%APPDATA%` on Windows).
 
 use crate::{AppError, AppResult};
-use client_types::{AudioConfig, SipAccount};
+use client_types::{AudioConfig, ServerCertVerificationMode, SipAccount};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -115,6 +115,15 @@ pub struct NetworkSettings {
     /// ICE nomination mode (aggressive vs regular).
     #[serde(default)]
     pub aggressive_nomination: bool,
+
+    /// Server certificate verification mode.
+    ///
+    /// Controls how the client verifies TLS server certificates:
+    /// - `System` (default): Uses the OS trusted CA store
+    /// - `Custom`: Uses a custom CA certificate file
+    /// - `Insecure`: Disables verification (development only)
+    #[serde(default)]
+    pub server_cert_verification: ServerCertVerificationMode,
 }
 
 fn default_rtp_port_start() -> u16 {
@@ -139,6 +148,7 @@ impl Default for NetworkSettings {
             rtp_port_end: default_rtp_port_end(),
             enable_ice: true,
             aggressive_nomination: false,
+            server_cert_verification: ServerCertVerificationMode::default(),
         }
     }
 }

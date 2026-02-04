@@ -22,8 +22,8 @@ pub mod error;
 pub mod sensitive;
 
 pub use account::{
-    CertificateConfig, CertificateInfo, CertificateSelectionMode, RegistrationState, SipAccount,
-    TransportPreference, TurnConfig,
+    CertificateConfig, CertificateInfo, CertificateSelectionMode, RegistrationState,
+    ServerCertVerificationMode, SipAccount, TransportPreference, TurnConfig,
 };
 pub use audio::{AudioConfig, AudioDevice, CodecPreference};
 pub use call::{

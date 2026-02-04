@@ -998,20 +998,23 @@ This document outlines the development roadmap for the USG Session Border Contro
   - DTMF support (RFC 4733 RTP telephone events)
   - Audio device change handling during call
 
-**Phase 24.21: GUI Certificate Verification Mode** 🚧
+**Phase 24.21: GUI Certificate Verification Mode** ✅
 
-- 🚧 Settings UI for verification mode
+- ✅ `ServerCertVerificationMode` type in client-types
+  - System (default), Custom, Insecure modes
+  - Serializable with serde for settings persistence
+  - Helper methods: `label()`, `is_insecure()`, `custom_ca_path()`
+- ✅ Settings UI for verification mode
   - Dropdown for Insecure/System/Custom modes
-  - Custom CA file browser
-  - Warning dialog for Insecure mode
-- 🚧 CA certificate management
-  - Load custom CA from file
-  - Display loaded CA information
-  - Multiple CA support
-- 🚧 Connection status indicators
-  - TLS version display
+  - Custom CA file path input field
+  - Warning dialog for Insecure mode with confirmation
+  - Visual warning banner when insecure mode active
+- ✅ Settings persistence via `NetworkSettings`
+  - `server_cert_verification` field in settings.toml
+- 🚧 Future enhancements
+  - Display loaded CA certificate information
   - Certificate chain visualization
-  - Verification status in status bar
+  - TLS version in status bar
 
 **Phase 24.22: Hold/Resume** 🚧
 

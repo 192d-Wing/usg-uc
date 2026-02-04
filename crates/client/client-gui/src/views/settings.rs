@@ -1,6 +1,6 @@
 //! Settings view.
 
-use client_types::CertificateInfo;
+use client_types::{CertificateInfo, ServerCertVerificationMode};
 use eframe::egui;
 
 /// Actions from the settings view.
@@ -24,6 +24,12 @@ pub enum SettingsAction {
         /// Certificate thumbprint that needs PIN.
         thumbprint: String,
     },
+    /// Change server certificate verification mode.
+    SetVerificationMode(ServerCertVerificationMode),
+    /// Browse for custom CA file.
+    BrowseForCaFile,
+    /// Confirm insecure mode (user acknowledged the warning).
+    ConfirmInsecureMode,
 }
 
 /// Settings view state.
@@ -66,6 +72,14 @@ pub struct SettingsView {
     smart_card_readers: Vec<String>,
     /// Certificate loading state.
     certificates_loading: bool,
+    /// Server certificate verification mode.
+    server_cert_verification: ServerCertVerificationMode,
+    /// Custom CA file path (when using Custom verification mode).
+    custom_ca_path: String,
+    /// Whether to show the insecure mode warning dialog.
+    show_insecure_warning: bool,
+    /// Pending verification mode change (awaiting insecure confirmation).
+    pending_verification_mode: Option<ServerCertVerificationMode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -105,6 +119,10 @@ impl SettingsView {
             auto_select_certificate: true,
             smart_card_readers: Vec::new(),
             certificates_loading: false,
+            server_cert_verification: ServerCertVerificationMode::default(),
+            custom_ca_path: String::new(),
+            show_insecure_warning: false,
+            pending_verification_mode: None,
         }
     }
 
@@ -127,6 +145,40 @@ impl SettingsView {
     /// Sets the certificate loading state.
     pub fn set_certificates_loading(&mut self, loading: bool) {
         self.certificates_loading = loading;
+    }
+
+    /// Sets the server certificate verification mode.
+    pub fn set_server_cert_verification(&mut self, mode: ServerCertVerificationMode) {
+        if let ServerCertVerificationMode::Custom { ca_file_path } = &mode {
+            self.custom_ca_path = ca_file_path.clone();
+        }
+        self.server_cert_verification = mode;
+    }
+
+    /// Sets the custom CA file path.
+    pub fn set_custom_ca_path(&mut self, path: String) {
+        self.custom_ca_path = path;
+    }
+
+    /// Shows or hides the insecure mode warning dialog.
+    #[allow(dead_code)] // Will be used when applying verification mode from settings persistence
+    pub fn set_show_insecure_warning(&mut self, show: bool) {
+        self.show_insecure_warning = show;
+    }
+
+    /// Confirms the pending insecure mode change.
+    pub fn confirm_insecure_mode(&mut self) {
+        if let Some(mode) = self.pending_verification_mode.take() {
+            self.server_cert_verification = mode;
+            self.is_dirty = true;
+        }
+        self.show_insecure_warning = false;
+    }
+
+    /// Cancels the pending insecure mode change.
+    pub fn cancel_insecure_mode(&mut self) {
+        self.pending_verification_mode = None;
+        self.show_insecure_warning = false;
     }
 
     /// Renders the settings view.
@@ -500,6 +552,233 @@ impl SettingsView {
             .small()
             .color(egui::Color32::GRAY),
         );
+
+        ui.add_space(20.0);
+        ui.separator();
+        ui.add_space(10.0);
+
+        // Server Certificate Verification section
+        ui.label(egui::RichText::new("Server Certificate Verification").strong());
+        ui.add_space(10.0);
+
+        ui.label(
+            egui::RichText::new(
+                "Controls how the client verifies TLS server certificates. \
+                For production use, 'System CA Store' or 'Custom CA File' should always be used.",
+            )
+            .small()
+            .color(egui::Color32::GRAY),
+        );
+
+        ui.add_space(10.0);
+
+        // Verification mode dropdown
+        egui::Grid::new("cert_verification_grid")
+            .num_columns(2)
+            .spacing([20.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Verification Mode:");
+
+                let current_label = self.server_cert_verification.label();
+                egui::ComboBox::from_id_salt("cert_verification_mode")
+                    .selected_text(current_label)
+                    .show_ui(ui, |ui| {
+                        // System mode
+                        if ui
+                            .selectable_label(
+                                matches!(
+                                    self.server_cert_verification,
+                                    ServerCertVerificationMode::System
+                                ),
+                                "System CA Store",
+                            )
+                            .on_hover_text("Use the operating system's trusted CA store")
+                            .clicked()
+                        {
+                            action = Some(SettingsAction::SetVerificationMode(
+                                ServerCertVerificationMode::System,
+                            ));
+                        }
+
+                        // Custom mode
+                        if ui
+                            .selectable_label(
+                                matches!(
+                                    self.server_cert_verification,
+                                    ServerCertVerificationMode::Custom { .. }
+                                ),
+                                "Custom CA File",
+                            )
+                            .on_hover_text("Use a custom CA certificate file (PEM format)")
+                            .clicked()
+                        {
+                            // If already in custom mode, keep current path
+                            let path = self
+                                .server_cert_verification
+                                .custom_ca_path()
+                                .map(String::from)
+                                .unwrap_or_else(|| self.custom_ca_path.clone());
+                            action = Some(SettingsAction::SetVerificationMode(
+                                ServerCertVerificationMode::Custom { ca_file_path: path },
+                            ));
+                        }
+
+                        ui.separator();
+
+                        // Insecure mode (with warning)
+                        if ui
+                            .selectable_label(
+                                matches!(
+                                    self.server_cert_verification,
+                                    ServerCertVerificationMode::Insecure
+                                ),
+                                egui::RichText::new("Insecure (Dev Only)")
+                                    .color(egui::Color32::LIGHT_RED),
+                            )
+                            .on_hover_text(
+                                "DEVELOPMENT ONLY: Accepts all certificates without validation",
+                            )
+                            .clicked()
+                        {
+                            // Show warning dialog before enabling
+                            self.pending_verification_mode =
+                                Some(ServerCertVerificationMode::Insecure);
+                            self.show_insecure_warning = true;
+                        }
+                    });
+                ui.end_row();
+
+                // Show custom CA file path field when in Custom mode
+                if matches!(
+                    self.server_cert_verification,
+                    ServerCertVerificationMode::Custom { .. }
+                ) {
+                    ui.label("CA File:");
+                    ui.horizontal(|ui| {
+                        let path_response = ui.add(
+                            egui::TextEdit::singleline(&mut self.custom_ca_path)
+                                .hint_text("/path/to/ca-bundle.pem")
+                                .desired_width(200.0),
+                        );
+                        if path_response.changed() {
+                            self.is_dirty = true;
+                        }
+
+                        if ui.button("Browse...").clicked() {
+                            action = Some(SettingsAction::BrowseForCaFile);
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+
+        // Warning for insecure mode
+        if self.server_cert_verification.is_insecure() {
+            ui.add_space(10.0);
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(80, 40, 40))
+                .inner_margin(10.0)
+                .corner_radius(4.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("\u{26A0}").size(20.0)); // Warning sign
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new("INSECURE MODE ACTIVE")
+                                    .strong()
+                                    .color(egui::Color32::LIGHT_RED),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    "Server certificates are NOT being validated. \
+                                    This should ONLY be used for local development \
+                                    with self-signed certificates.",
+                                )
+                                .small()
+                                .color(egui::Color32::LIGHT_YELLOW),
+                            );
+                        });
+                    });
+                });
+        }
+
+        action
+    }
+
+    /// Renders the insecure mode warning dialog.
+    ///
+    /// Returns Some(action) if the user confirms or cancels.
+    pub fn render_insecure_warning_dialog(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<SettingsAction> {
+        let mut action = None;
+
+        if self.show_insecure_warning {
+            egui::Window::new("Security Warning")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new("\u{26A0}")
+                                .size(48.0)
+                                .color(egui::Color32::YELLOW),
+                        );
+                        ui.add_space(10.0);
+
+                        ui.heading("Enable Insecure Mode?");
+                        ui.add_space(10.0);
+
+                        ui.label(
+                            "You are about to disable server certificate validation.\n\n\
+                            This means the client will accept ANY certificate from servers,\n\
+                            including invalid, expired, or malicious certificates.\n\n\
+                            This should ONLY be used for local development with\n\
+                            self-signed certificates.",
+                        );
+
+                        ui.add_space(20.0);
+
+                        ui.label(
+                            egui::RichText::new("NEVER use this mode in production!")
+                                .strong()
+                                .color(egui::Color32::LIGHT_RED),
+                        );
+
+                        ui.add_space(20.0);
+
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(
+                                    egui::RichText::new("Cancel")
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .clicked()
+                            {
+                                self.cancel_insecure_mode();
+                            }
+
+                            ui.add_space(20.0);
+
+                            if ui
+                                .button(
+                                    egui::RichText::new("I Understand, Enable Anyway")
+                                        .color(egui::Color32::LIGHT_RED),
+                                )
+                                .clicked()
+                            {
+                                self.confirm_insecure_mode();
+                                action = Some(SettingsAction::ConfirmInsecureMode);
+                            }
+                        });
+
+                        ui.add_space(10.0);
+                    });
+                });
+        }
 
         action
     }
