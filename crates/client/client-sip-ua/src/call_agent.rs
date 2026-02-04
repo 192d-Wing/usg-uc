@@ -6,6 +6,7 @@
 use crate::{SipUaError, SipUaResult};
 use chrono::Utc;
 use client_types::{CallDirection, CallFailureReason, CallInfo, CallState};
+use proto_dialog::refer::{ReferRequest, ReferStatus};
 use proto_dialog::Dialog;
 use proto_sip::builder::{RequestBuilder, generate_branch, generate_call_id, generate_tag};
 use proto_sip::header::HeaderName;
@@ -79,6 +80,10 @@ struct CallSession {
     last_branch: Option<String>,
     /// Failure reason if the call failed.
     failure_reason: Option<CallFailureReason>,
+    /// Active REFER request for call transfer (RFC 3515).
+    refer_request: Option<ReferRequest>,
+    /// Transfer target URI when transfer is in progress.
+    transfer_target: Option<String>,
 }
 
 /// Events emitted by the call agent.
@@ -122,6 +127,17 @@ pub enum CallEvent {
         call_id: String,
         /// SDP answer content.
         sdp: String,
+    },
+    /// Transfer progress update (RFC 3515 REFER NOTIFY).
+    TransferProgress {
+        /// Call ID being transferred.
+        call_id: String,
+        /// Transfer target URI.
+        target_uri: String,
+        /// Transfer status (Trying, Ringing, Success, Failed).
+        status: ReferStatus,
+        /// Whether this is the final status.
+        is_final: bool,
     },
 }
 
@@ -177,6 +193,8 @@ impl CallAgent {
             connected_at: None,
             last_branch: Some(branch.clone()),
             failure_reason: None,
+            refer_request: None,
+            transfer_target: None,
         };
 
         // Build request before storing session
@@ -373,9 +391,15 @@ impl CallAgent {
         let tx_key = TransactionKey::client(&branch, "REFER");
         let transaction = ClientNonInviteTransaction::new(tx_key, TransportType::Reliable);
 
+        // Create ReferRequest to track the implicit subscription (RFC 3515)
+        let refer_request = ReferRequest::new(transfer_target)
+            .with_referred_by(self.aor.clone());
+
         if let Some(session) = self.calls.get_mut(call_id) {
             session.non_invite_transaction = Some(transaction);
             session.state = CallState::Transferring;
+            session.refer_request = Some(refer_request);
+            session.transfer_target = Some(transfer_target.to_string());
         }
 
         // Send request
@@ -550,6 +574,193 @@ impl CallAgent {
         }
 
         Ok(())
+    }
+
+    /// Handles an incoming NOTIFY request for REFER subscriptions (RFC 3515).
+    ///
+    /// This processes the sipfrag body to determine transfer progress and emits
+    /// appropriate events. Returns the 200 OK response to send back.
+    pub async fn handle_notify(
+        &mut self,
+        request: &SipRequest,
+    ) -> SipUaResult<SipResponse> {
+        // Extract Call-ID to find the right session
+        let sip_call_id = request
+            .headers
+            .get_value(&HeaderName::CallId)
+            .ok_or_else(|| SipUaError::InvalidState("Missing Call-ID header".to_string()))?
+            .to_string();
+
+        // Find the call session by SIP Call-ID
+        let call_id = self
+            .find_call_by_sip_id(&sip_call_id)
+            .ok_or_else(|| {
+                SipUaError::InvalidState(format!("No call found for Call-ID: {sip_call_id}"))
+            })?
+            .to_string();
+
+        // Verify this is a REFER notification (Event: refer)
+        let event_header = request
+            .headers
+            .get_value(&HeaderName::Event)
+            .unwrap_or("");
+
+        if !event_header.starts_with("refer") {
+            warn!(
+                call_id = %call_id,
+                event = %event_header,
+                "Received NOTIFY for non-refer event, ignoring"
+            );
+            return self.build_200_ok_for_notify(request);
+        }
+
+        // Parse Subscription-State header
+        let sub_state_header = request.headers.get_value(&HeaderName::SubscriptionState);
+
+        let is_final = sub_state_header.is_some_and(|s| s.starts_with("terminated"));
+
+        // Parse sipfrag body to get transfer status
+        let status = if let Some(body) = &request.body {
+            let body_str = String::from_utf8_lossy(body);
+            Self::parse_sipfrag(&body_str)
+        } else {
+            // No body means we can't determine status
+            warn!(call_id = %call_id, "NOTIFY without sipfrag body");
+            None
+        };
+
+        // Get transfer target and update refer request state
+        let transfer_target = {
+            let session = self
+                .calls
+                .get_mut(&call_id)
+                .ok_or_else(|| SipUaError::InvalidState("Call not found".to_string()))?;
+
+            // Update ReferRequest with status if available
+            if let (Some(refer_req), Some(st)) = (&mut session.refer_request, status) {
+                refer_req.update_status(st);
+            }
+
+            session.transfer_target.clone().unwrap_or_default()
+        };
+
+        // Emit transfer progress event
+        if let Some(status) = status {
+            info!(
+                call_id = %call_id,
+                status = ?status,
+                is_final = is_final,
+                target = %transfer_target,
+                "Transfer progress update"
+            );
+
+            self.event_tx
+                .send(CallEvent::TransferProgress {
+                    call_id: call_id.clone(),
+                    target_uri: transfer_target,
+                    status,
+                    is_final,
+                })
+                .await
+                .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+            // If transfer succeeded, we can end the original call
+            if status == ReferStatus::Success {
+                info!(call_id = %call_id, "Transfer completed successfully, terminating original call");
+                if let Some(session) = self.calls.get_mut(&call_id) {
+                    session.state = CallState::Terminated;
+                    session.refer_request = None;
+                    session.transfer_target = None;
+                }
+
+                self.event_tx
+                    .send(CallEvent::StateChanged {
+                        call_id: call_id.clone(),
+                        state: CallState::Terminated,
+                        info: None,
+                    })
+                    .await
+                    .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+            } else if status == ReferStatus::Failed {
+                info!(call_id = %call_id, "Transfer failed, reverting to connected state");
+                if let Some(session) = self.calls.get_mut(&call_id) {
+                    session.state = CallState::Connected;
+                    session.refer_request = None;
+                    session.transfer_target = None;
+                }
+
+                self.event_tx
+                    .send(CallEvent::StateChanged {
+                        call_id: call_id.clone(),
+                        state: CallState::Connected,
+                        info: None,
+                    })
+                    .await
+                    .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+            }
+        }
+
+        // Build 200 OK response
+        self.build_200_ok_for_notify(request)
+    }
+
+    /// Parses a sipfrag body to extract the SIP status code.
+    ///
+    /// Sipfrag format: "SIP/2.0 <status-code> <reason-phrase>"
+    fn parse_sipfrag(body: &str) -> Option<ReferStatus> {
+        let body = body.trim();
+
+        // Must start with SIP version
+        if !body.starts_with("SIP/2.0 ") {
+            debug!("Invalid sipfrag: doesn't start with SIP/2.0");
+            return None;
+        }
+
+        // Extract status code (characters after "SIP/2.0 ")
+        let remainder = &body[8..];
+        let status_str = remainder.split_whitespace().next()?;
+        let status_code: u16 = status_str.parse().ok()?;
+
+        Some(ReferStatus::from_status_code(status_code))
+    }
+
+    /// Builds a 200 OK response for a NOTIFY request.
+    fn build_200_ok_for_notify(&self, request: &SipRequest) -> SipUaResult<SipResponse> {
+        use proto_sip::header::Header;
+        use proto_sip::response::StatusCode;
+
+        let mut response = SipResponse::new(StatusCode::OK);
+
+        // Copy Via headers (all, in order) - RFC 3261 §8.2.6.1
+        for via in request.headers.get_all(&HeaderName::Via) {
+            response.add_header(Header::new(HeaderName::Via, &via.value));
+        }
+
+        // Copy From header unchanged
+        if let Some(from) = request.headers.get_value(&HeaderName::From) {
+            response.add_header(Header::new(HeaderName::From, from));
+        }
+
+        // Copy To header unchanged
+        if let Some(to) = request.headers.get_value(&HeaderName::To) {
+            response.add_header(Header::new(HeaderName::To, to));
+        }
+
+        // Copy Call-ID header unchanged
+        if let Some(call_id) = request.headers.get_value(&HeaderName::CallId) {
+            response.add_header(Header::new(HeaderName::CallId, call_id));
+        }
+
+        // Copy CSeq header unchanged
+        if let Some(cseq) = request.headers.get_value(&HeaderName::CSeq) {
+            response.add_header(Header::new(HeaderName::CSeq, cseq));
+        }
+
+        // Add User-Agent and Content-Length
+        response.add_header(Header::new(HeaderName::UserAgent, USER_AGENT));
+        response.add_header(Header::new(HeaderName::ContentLength, "0"));
+
+        Ok(response)
     }
 
     async fn handle_provisional_response(

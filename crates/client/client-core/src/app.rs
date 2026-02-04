@@ -76,6 +76,19 @@ pub enum AppEvent {
         /// Error message if failed.
         error: Option<String>,
     },
+    /// Transfer progress update (RFC 3515 REFER NOTIFY).
+    TransferProgress {
+        /// Call ID being transferred.
+        call_id: String,
+        /// Transfer target URI.
+        target_uri: String,
+        /// SIP status code (100=Trying, 180=Ringing, 200=Success, etc.).
+        status_code: u16,
+        /// Whether the transfer succeeded.
+        is_success: bool,
+        /// Whether this is the final status.
+        is_final: bool,
+    },
 }
 
 /// Type of operation requiring a PIN.
@@ -679,6 +692,34 @@ impl ClientApp {
                     warn!("No SIP transport configured, cannot send response");
                 }
             }
+            CallManagerEvent::TransferProgress {
+                call_id,
+                target_uri,
+                status_code,
+                is_success,
+                is_final,
+            } => {
+                info!(
+                    call_id = %call_id,
+                    target = %target_uri,
+                    status_code = status_code,
+                    is_success = is_success,
+                    is_final = is_final,
+                    "Transfer progress event"
+                );
+
+                // Forward to GUI
+                let _ = self
+                    .app_event_tx
+                    .send(AppEvent::TransferProgress {
+                        call_id,
+                        target_uri,
+                        status_code,
+                        is_success,
+                        is_final,
+                    })
+                    .await;
+            }
         }
 
         Ok(())
@@ -863,6 +904,26 @@ impl ClientApp {
                     .await
                 {
                     warn!(error = %e, "Failed to handle SDP answer");
+                }
+            }
+            CallEvent::TransferProgress {
+                call_id,
+                target_uri,
+                status,
+                is_final,
+            } => {
+                // Route to call manager for transfer tracking
+                if let Err(e) = self
+                    .call_manager
+                    .handle_call_event(CallEvent::TransferProgress {
+                        call_id,
+                        target_uri,
+                        status,
+                        is_final,
+                    })
+                    .await
+                {
+                    warn!(error = %e, "Failed to handle transfer progress");
                 }
             }
         }

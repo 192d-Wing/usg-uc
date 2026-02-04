@@ -11,7 +11,9 @@ use crate::contact_manager::ContactManager;
 use crate::{AppError, AppResult};
 use chrono::Utc;
 use client_audio::PipelineStats;
-use client_sip_ua::{CallAgent, CallEvent, MediaSession, MediaSessionEvent, MediaSessionState};
+use client_sip_ua::{
+    CallAgent, CallEvent, MediaSession, MediaSessionEvent, MediaSessionState, ReferStatus,
+};
 use client_types::audio::CodecPreference;
 use client_types::{
     CallDirection, CallEndReason, CallHistoryEntry, CallInfo, CallState, DtmfDigit, SipAccount,
@@ -148,6 +150,19 @@ pub enum CallManagerEvent {
         response: SipResponse,
         /// Destination address.
         destination: SocketAddr,
+    },
+    /// Transfer progress update (RFC 3515 REFER NOTIFY).
+    TransferProgress {
+        /// Call ID being transferred.
+        call_id: String,
+        /// Transfer target URI.
+        target_uri: String,
+        /// SIP status code (100=Trying, 180=Ringing, 200=Success, etc.).
+        status_code: u16,
+        /// Whether the transfer succeeded.
+        is_success: bool,
+        /// Whether this is the final status.
+        is_final: bool,
     },
 }
 
@@ -420,6 +435,15 @@ impl CallManager {
             }
             CallEvent::SdpOfferReceived { call_id, sdp } => {
                 self.handle_sdp_offer(&call_id, &sdp).await?;
+            }
+            CallEvent::TransferProgress {
+                call_id,
+                target_uri,
+                status,
+                is_final,
+            } => {
+                self.handle_transfer_progress(&call_id, &target_uri, status, is_final)
+                    .await?;
             }
         }
 
@@ -1440,6 +1464,37 @@ impl CallManager {
         // For incoming calls, we'd create a media session here
         // and generate an answer
         let _ = (call_id, sdp);
+
+        Ok(())
+    }
+
+    /// Handles transfer progress updates from REFER NOTIFYs (RFC 3515).
+    async fn handle_transfer_progress(
+        &mut self,
+        call_id: &str,
+        target_uri: &str,
+        status: ReferStatus,
+        is_final: bool,
+    ) -> AppResult<()> {
+        info!(
+            call_id = %call_id,
+            target = %target_uri,
+            status = ?status,
+            is_final = is_final,
+            "Transfer progress update"
+        );
+
+        // Forward to application event handler
+        let _ = self
+            .app_event_tx
+            .send(CallManagerEvent::TransferProgress {
+                call_id: call_id.to_string(),
+                target_uri: target_uri.to_string(),
+                status_code: status.status_code(),
+                is_success: status == ReferStatus::Success,
+                is_final,
+            })
+            .await;
 
         Ok(())
     }

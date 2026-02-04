@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.28 complete, Phase 25 critical items complete
+**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.29 complete, Phase 25 critical items complete
 
 ---
 
@@ -1267,6 +1267,33 @@ This document outlines the development roadmap for the USG Session Border Contro
   - Transfer and Cancel buttons
   - Enter key support for quick transfer
   - Status messages for transfer progress/failure
+
+**Phase 24.29: NOTIFY Handling for REFER (RFC 3515)** ✅
+
+- ✅ NOTIFY request handling in CallAgent
+  - `handle_notify()` processes incoming NOTIFY for REFER subscriptions
+  - Event header validation (Event: refer)
+  - Subscription-State header parsing for final status detection
+  - Automatic 200 OK response generation
+- ✅ Sipfrag body parsing
+  - `parse_sipfrag()` extracts SIP status code from NOTIFY body
+  - Format: "SIP/2.0 <status-code> <reason-phrase>"
+  - Maps to ReferStatus (Trying, Ringing, Success, Failed)
+- ✅ ReferRequest tracking in CallSession
+  - Tracks implicit subscription state per RFC 3515
+  - Updates status from NOTIFY messages
+  - Subscription expiration tracking
+- ✅ Transfer progress events
+  - `CallEvent::TransferProgress` variant in call_agent
+  - `CallManagerEvent::TransferProgress` for manager layer
+  - `AppEvent::TransferProgress` for GUI layer
+  - Status code, success flag, and final indicator
+- ✅ GUI transfer progress display
+  - Real-time status messages during transfer
+  - Shows "Trying", "Ringing", "Success", or "Failed"
+  - Final result message on transfer completion
+- ✅ ReferStatus re-export from client-sip-ua
+  - Public access to `proto_dialog::refer::ReferStatus`
 
 ---
 

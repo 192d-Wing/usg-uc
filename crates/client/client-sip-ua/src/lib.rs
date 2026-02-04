@@ -32,6 +32,9 @@ pub use ice_handler::{IceEvent, IceHandler};
 pub use media_session::{MediaSession, MediaSessionEvent, MediaSessionState};
 pub use registration::{RegistrationAgent, RegistrationEvent};
 
+// Re-export ReferStatus for transfer progress handling (RFC 3515)
+pub use proto_dialog::refer::ReferStatus;
+
 use thiserror::Error;
 
 /// SIP UA error types.

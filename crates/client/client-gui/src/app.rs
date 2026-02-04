@@ -399,6 +399,40 @@ impl SipClientApp {
                         self.pin_error = Some(err_msg);
                     }
                 }
+                AppEvent::TransferProgress {
+                    call_id: _,
+                    target_uri,
+                    status_code,
+                    is_success,
+                    is_final,
+                } => {
+                    // Update status message with transfer progress
+                    let status_text = match status_code {
+                        100 => "Trying",
+                        180..=183 => "Ringing",
+                        200..=299 => "Success",
+                        _ => "Failed",
+                    };
+
+                    if is_final {
+                        if is_success {
+                            self.status_message =
+                                format!("Transfer to {target_uri} completed successfully");
+                        } else {
+                            self.status_message = format!("Transfer to {target_uri} failed");
+                        }
+                    } else {
+                        self.status_message =
+                            format!("Transfer to {target_uri}: {status_text}...");
+                    }
+
+                    info!(
+                        target = %target_uri,
+                        status_code = status_code,
+                        is_final = is_final,
+                        "Transfer progress"
+                    );
+                }
             }
         }
     }

@@ -914,6 +914,35 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - Routes `CallAction::Transfer` to `ClientApp::transfer_call()`
   - Status messages for success/failure
 
+#### Phase 24.29: NOTIFY Handling for REFER (RFC 3515)
+
+- `client-sip-ua/src/call_agent.rs` - NOTIFY processing
+  - `handle_notify()` - Process incoming NOTIFY for REFER subscriptions
+    - Event header validation (Event: refer)
+    - Subscription-State header parsing for final status detection
+    - Automatic 200 OK response generation via `build_200_ok_for_notify()`
+  - `parse_sipfrag()` - Extract SIP status code from NOTIFY body
+    - Format: "SIP/2.0 {status-code} {reason-phrase}"
+    - Maps to `ReferStatus` (Trying, Ringing, Success, Failed)
+  - `ReferRequest` tracking in `CallSession`
+    - Tracks implicit subscription state
+    - Updates status from NOTIFY messages
+  - `CallEvent::TransferProgress` - New event variant
+    - call_id, target_uri, status, is_final fields
+- `client-sip-ua/src/lib.rs` - Re-exports
+  - `ReferStatus` re-exported for public access
+- `client-core/src/call_manager.rs` - Transfer progress handling
+  - `CallManagerEvent::TransferProgress` - New event variant
+  - `handle_transfer_progress()` - Forward status to app layer
+- `client-core/src/app.rs` - Application event handling
+  - `AppEvent::TransferProgress` - New event variant
+  - Routes `CallEvent::TransferProgress` to CallManager
+  - Routes `CallManagerEvent::TransferProgress` to GUI
+- `client-gui/src/app.rs` - GUI progress display
+  - `AppEvent::TransferProgress` handler
+  - Real-time status messages ("Trying...", "Ringing...", etc.)
+  - Final result message on transfer completion
+
 **Security**
 
 - Smart card authentication ONLY (CAC/PIV/SIPR token)
