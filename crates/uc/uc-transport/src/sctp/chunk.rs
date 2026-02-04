@@ -197,6 +197,10 @@ pub enum Chunk {
     CookieAck(CookieAckChunk),
     /// Shutdown Complete chunk.
     ShutdownComplete(ShutdownCompleteChunk),
+    /// Explicit Congestion Notification Echo chunk.
+    Ecne(EcneChunk),
+    /// Congestion Window Reduced chunk.
+    Cwr(CwrChunk),
     /// Unknown chunk (preserved for forwarding/error reporting).
     Unknown(UnknownChunk),
 }
@@ -219,6 +223,8 @@ impl Chunk {
             Self::CookieEcho(_) => ChunkType::CookieEcho,
             Self::CookieAck(_) => ChunkType::CookieAck,
             Self::ShutdownComplete(_) => ChunkType::ShutdownComplete,
+            Self::Ecne(_) => ChunkType::Ecne,
+            Self::Cwr(_) => ChunkType::Cwr,
             Self::Unknown(u) => ChunkType::from_u8(u.chunk_type).unwrap_or(ChunkType::Data),
         }
     }
@@ -239,6 +245,8 @@ impl Chunk {
             Self::CookieEcho(c) => c.encode(buf),
             Self::CookieAck(c) => c.encode(buf),
             Self::ShutdownComplete(c) => c.encode(buf),
+            Self::Ecne(c) => c.encode(buf),
+            Self::Cwr(c) => c.encode(buf),
             Self::Unknown(c) => c.encode(buf),
         }
     }
@@ -309,6 +317,8 @@ impl Chunk {
             Some(ChunkType::ShutdownComplete) => Ok(Self::ShutdownComplete(
                 ShutdownCompleteChunk::decode_body(flags, &chunk_data)?,
             )),
+            Some(ChunkType::Ecne) => Ok(Self::Ecne(EcneChunk::decode_body(flags, &chunk_data)?)),
+            Some(ChunkType::Cwr) => Ok(Self::Cwr(CwrChunk::decode_body(flags, &chunk_data)?)),
             _ => Ok(Self::Unknown(UnknownChunk {
                 chunk_type,
                 flags,
@@ -1692,6 +1702,112 @@ impl Default for ShutdownCompleteChunk {
 }
 
 // =============================================================================
+// ECNE Chunk (RFC 9260 Section 3.3.11)
+// =============================================================================
+
+/// Explicit Congestion Notification Echo (ECNE) chunk.
+///
+/// Used to echo back CE (Congestion Experienced) marks received in
+/// the IP header of DATA chunks, as part of ECN support.
+///
+/// ```text
+///  0                   1                   2                   3
+///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |   Type = 12   |   Flags = 0   |         Length = 8            |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                      Lowest TSN Number                        |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EcneChunk {
+    /// Lowest TSN Number: The lowest TSN number that was received with
+    /// the CE bit set in the IP header.
+    pub lowest_tsn: u32,
+}
+
+impl EcneChunk {
+    /// Creates a new ECNE chunk.
+    #[must_use]
+    pub const fn new(lowest_tsn: u32) -> Self {
+        Self { lowest_tsn }
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(ChunkType::Ecne as u8);
+        buf.put_u8(0);
+        buf.put_u16(8);
+        buf.put_u32(self.lowest_tsn);
+    }
+
+    fn decode_body(_flags: u8, chunk_data: &Bytes) -> TransportResult<Self> {
+        if chunk_data.len() < 8 {
+            return Err(TransportError::ReceiveFailed {
+                reason: "ECNE chunk too short".to_string(),
+            });
+        }
+
+        let lowest_tsn =
+            u32::from_be_bytes([chunk_data[4], chunk_data[5], chunk_data[6], chunk_data[7]]);
+
+        Ok(Self { lowest_tsn })
+    }
+}
+
+// =============================================================================
+// CWR Chunk (RFC 9260 Section 3.3.12)
+// =============================================================================
+
+/// Congestion Window Reduced (CWR) chunk.
+///
+/// Used to acknowledge that the sender has reduced its congestion window
+/// in response to an ECNE chunk.
+///
+/// ```text
+///  0                   1                   2                   3
+///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |   Type = 13   |   Flags = 0   |         Length = 8            |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                      Lowest TSN Number                        |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CwrChunk {
+    /// Lowest TSN Number: The lowest TSN number that the sender of
+    /// the CWR chunk received with the CE bit set.
+    pub lowest_tsn: u32,
+}
+
+impl CwrChunk {
+    /// Creates a new CWR chunk.
+    #[must_use]
+    pub const fn new(lowest_tsn: u32) -> Self {
+        Self { lowest_tsn }
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(ChunkType::Cwr as u8);
+        buf.put_u8(0);
+        buf.put_u16(8);
+        buf.put_u32(self.lowest_tsn);
+    }
+
+    fn decode_body(_flags: u8, chunk_data: &Bytes) -> TransportResult<Self> {
+        if chunk_data.len() < 8 {
+            return Err(TransportError::ReceiveFailed {
+                reason: "CWR chunk too short".to_string(),
+            });
+        }
+
+        let lowest_tsn =
+            u32::from_be_bytes([chunk_data[4], chunk_data[5], chunk_data[6], chunk_data[7]]);
+
+        Ok(Self { lowest_tsn })
+    }
+}
+
+// =============================================================================
 // Unknown Chunk
 // =============================================================================
 
@@ -1920,5 +2036,98 @@ mod tests {
         assert_eq!(padded_length(3), 4);
         assert_eq!(padded_length(4), 4);
         assert_eq!(padded_length(5), 8);
+    }
+
+    #[test]
+    fn test_ecne_chunk_creation() {
+        let ecne = EcneChunk::new(12345);
+        assert_eq!(ecne.lowest_tsn, 12345);
+    }
+
+    #[test]
+    fn test_ecne_chunk_roundtrip() {
+        let ecne = EcneChunk::new(0xDEADBEEF);
+
+        let mut buf = BytesMut::new();
+        ecne.encode(&mut buf);
+
+        // Verify chunk header
+        assert_eq!(buf[0], ChunkType::Ecne as u8); // Type = 12
+        assert_eq!(buf[1], 0); // Flags = 0
+        assert_eq!(u16::from_be_bytes([buf[2], buf[3]]), 8); // Length = 8
+
+        let mut bytes = buf.freeze();
+        let decoded = Chunk::decode(&mut bytes).unwrap();
+
+        if let Chunk::Ecne(e) = decoded {
+            assert_eq!(e.lowest_tsn, 0xDEADBEEF);
+        } else {
+            panic!("Expected ECNE chunk, got {:?}", decoded);
+        }
+    }
+
+    #[test]
+    fn test_cwr_chunk_creation() {
+        let cwr = CwrChunk::new(54321);
+        assert_eq!(cwr.lowest_tsn, 54321);
+    }
+
+    #[test]
+    fn test_cwr_chunk_roundtrip() {
+        let cwr = CwrChunk::new(0xCAFEBABE);
+
+        let mut buf = BytesMut::new();
+        cwr.encode(&mut buf);
+
+        // Verify chunk header
+        assert_eq!(buf[0], ChunkType::Cwr as u8); // Type = 13
+        assert_eq!(buf[1], 0); // Flags = 0
+        assert_eq!(u16::from_be_bytes([buf[2], buf[3]]), 8); // Length = 8
+
+        let mut bytes = buf.freeze();
+        let decoded = Chunk::decode(&mut bytes).unwrap();
+
+        if let Chunk::Cwr(c) = decoded {
+            assert_eq!(c.lowest_tsn, 0xCAFEBABE);
+        } else {
+            panic!("Expected CWR chunk, got {:?}", decoded);
+        }
+    }
+
+    #[test]
+    fn test_ecne_cwr_chunk_types() {
+        let ecne = Chunk::Ecne(EcneChunk::new(100));
+        let cwr = Chunk::Cwr(CwrChunk::new(200));
+
+        assert_eq!(ecne.chunk_type(), ChunkType::Ecne);
+        assert_eq!(cwr.chunk_type(), ChunkType::Cwr);
+    }
+
+    #[test]
+    fn test_ecne_too_short() {
+        // Create a buffer that's too short for ECNE
+        let mut buf = BytesMut::new();
+        buf.put_u8(ChunkType::Ecne as u8);
+        buf.put_u8(0);
+        buf.put_u16(4); // Length only 4 (just header, no TSN)
+
+        let mut bytes = buf.freeze();
+        let result = Chunk::decode(&mut bytes);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cwr_too_short() {
+        // Create a buffer that's too short for CWR
+        let mut buf = BytesMut::new();
+        buf.put_u8(ChunkType::Cwr as u8);
+        buf.put_u8(0);
+        buf.put_u16(4); // Length only 4 (just header, no TSN)
+
+        let mut bytes = buf.freeze();
+        let result = Chunk::decode(&mut bytes);
+
+        assert!(result.is_err());
     }
 }
