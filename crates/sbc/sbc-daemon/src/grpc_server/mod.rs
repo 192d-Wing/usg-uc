@@ -19,23 +19,30 @@
 //! - **SC-13**: Cryptographic Protection (CNSA 2.0 compliant TLS)
 //! - **IA-3**: Device Identification (mTLS support)
 
+mod call_service;
 mod config_service;
 mod health_service;
+mod registration_service;
 mod system_service;
 
 use crate::api_server::AppState;
 use crate::shutdown::ShutdownSignal;
 use sbc_config::schema::GrpcConfig;
 use sbc_grpc_api::health::health_server::HealthServer;
+use sbc_grpc_api::sbc::call_service_server::CallServiceServer;
 use sbc_grpc_api::sbc::config_service_server::ConfigServiceServer;
+use sbc_grpc_api::sbc::registration_service_server::RegistrationServiceServer;
 use sbc_grpc_api::sbc::system_service_server::SystemServiceServer;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tonic::transport::Server;
-use tracing::info;
+use tonic::transport::{Certificate, Identity, ServerTlsConfig};
+use tracing::{info, warn};
 
+pub use call_service::CallServiceImpl;
 pub use config_service::ConfigServiceImpl;
 pub use health_service::HealthServiceImpl;
+pub use registration_service::RegistrationServiceImpl;
 pub use system_service::SystemServiceImpl;
 
 /// gRPC API server.
@@ -115,16 +122,35 @@ impl GrpcServer {
         let config_svc = ConfigServiceImpl::new(Arc::clone(&self.state));
         let system_svc = SystemServiceImpl::new(Arc::clone(&self.state));
         let health_svc = HealthServiceImpl::new(Arc::clone(&self.state));
+        let call_svc = CallServiceImpl::new(Arc::clone(&self.state));
+        let registration_svc = RegistrationServiceImpl::new(Arc::clone(&self.state));
 
-        // Build the server
-        let server = Server::builder()
+        // Configure TLS if enabled
+        let tls_config = self.configure_tls()?;
+
+        // Build the server with or without TLS
+        let mut server = if let Some(tls) = tls_config {
+            info!("gRPC server TLS enabled");
+            Server::builder()
+                .tls_config(tls)
+                .map_err(|e| GrpcServerError::TlsError {
+                    reason: e.to_string(),
+                })?
+        } else {
+            warn!("gRPC server running WITHOUT TLS - not recommended for production");
+            Server::builder()
+        };
+
+        let router = server
             .add_service(ConfigServiceServer::new(config_svc))
             .add_service(SystemServiceServer::new(system_svc))
-            .add_service(HealthServer::new(health_svc));
+            .add_service(HealthServer::new(health_svc))
+            .add_service(CallServiceServer::new(call_svc))
+            .add_service(RegistrationServiceServer::new(registration_svc));
 
         // Run with graceful shutdown
         let shutdown = self.shutdown.clone();
-        server
+        router
             .serve_with_shutdown(addr, async move {
                 shutdown.wait_for_shutdown().await;
                 info!("gRPC server shutting down");
@@ -135,5 +161,53 @@ impl GrpcServer {
             })?;
 
         Ok(())
+    }
+
+    /// Configures TLS for the gRPC server.
+    ///
+    /// Returns `None` if TLS is not configured, or a `ServerTlsConfig` if it is.
+    fn configure_tls(&self) -> Result<Option<ServerTlsConfig>, GrpcServerError> {
+        let (cert_path, key_path) = match (&self.config.tls_cert_path, &self.config.tls_key_path) {
+            (Some(cert), Some(key)) => (cert, key),
+            (None, None) => return Ok(None),
+            _ => {
+                return Err(GrpcServerError::TlsError {
+                    reason: "Both tls_cert_path and tls_key_path must be specified".to_string(),
+                });
+            }
+        };
+
+        // Load server certificate and key
+        let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| GrpcServerError::TlsError {
+            reason: format!("Failed to read certificate file: {e}"),
+        })?;
+
+        let key_pem = std::fs::read_to_string(key_path).map_err(|e| GrpcServerError::TlsError {
+            reason: format!("Failed to read key file: {e}"),
+        })?;
+
+        let identity = Identity::from_pem(&cert_pem, &key_pem);
+
+        let mut tls_config = ServerTlsConfig::new().identity(identity);
+
+        // Configure mTLS if CA certificate is provided
+        if let Some(ca_path) = &self.config.tls_ca_path {
+            let ca_pem = std::fs::read_to_string(ca_path).map_err(|e| GrpcServerError::TlsError {
+                reason: format!("Failed to read CA certificate file: {e}"),
+            })?;
+
+            let ca_cert = Certificate::from_pem(&ca_pem);
+            tls_config = tls_config.client_ca_root(ca_cert);
+
+            if self.config.require_mtls {
+                info!("gRPC server mTLS required - clients must present valid certificates");
+            }
+        } else if self.config.require_mtls {
+            return Err(GrpcServerError::TlsError {
+                reason: "require_mtls is true but tls_ca_path is not set".to_string(),
+            });
+        }
+
+        Ok(Some(tls_config))
     }
 }

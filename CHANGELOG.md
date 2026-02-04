@@ -39,11 +39,13 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 - `ConfigServiceImpl`: GetConfig, UpdateConfig, ValidateConfig, ReloadConfig RPCs
 - `SystemServiceImpl`: GetVersion, GetStats, GetMetrics, ReloadTls, GetTlsStatus, Shutdown RPCs
 - `HealthServiceImpl`: Standard gRPC health Check and Watch RPCs
+- `CallServiceImpl`: ListCalls, GetCall, TerminateCall, GetCallStats, WatchCalls RPCs
+- `RegistrationServiceImpl`: ListRegistrations, GetRegistration, DeleteRegistration, GetRegistrationStats RPCs
 - `GrpcConfig` schema in sbc-config for server configuration
 - Feature-gated behind `grpc` feature flag
 - Integrated into Runtime with graceful shutdown support
 - Default port 9090 (alongside REST API on 8080)
-- mTLS support via GrpcConfig options
+- TLS/mTLS support via `ServerTlsConfig` with certificate and CA configuration
 - 57 tests passing for daemon crate
 
 **Configuration Schema** (`sbc-config/schema.rs`)

@@ -1533,6 +1533,9 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ `grpc_server` module with service implementations
 - ✅ `GrpcServer` struct for lifecycle management
 - ✅ `ConfigServiceImpl`, `SystemServiceImpl`, `HealthServiceImpl`
+- ✅ `CallServiceImpl`: ListCalls, GetCall, TerminateCall, GetCallStats, WatchCalls
+- ✅ `RegistrationServiceImpl`: ListRegistrations, GetRegistration, DeleteRegistration, GetRegistrationStats
+- ✅ TLS/mTLS support via `ServerTlsConfig`
 - ✅ Feature-gated behind `grpc` feature flag
 - ✅ Integrated into Runtime with graceful shutdown
 - ✅ Default port 9090 (alongside REST API on 8080)
@@ -1551,10 +1554,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **Pending**
 
-- 🚧 CallService implementation
-- 🚧 RegistrationService implementation
 - 🚧 ClusterService implementation (cluster feature)
-- 🚧 TLS/mTLS for gRPC server
 - 🚧 gRPC reflection service
 - 🚧 Integration tests for gRPC services
 
