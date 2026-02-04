@@ -31,17 +31,17 @@ serde.workspace = true
 thiserror.workspace = true
 
 # OpenTelemetry core
-opentelemetry = { version = "0.28", features = ["trace", "metrics"] }
-opentelemetry_sdk = { version = "0.28", features = ["trace", "metrics", "rt-tokio"] }
+opentelemetry = { version = "0.31", features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.31", features = ["trace", "metrics", "rt-tokio"] }
 
 # Tracing integration (optional)
-tracing-opentelemetry = { version = "0.29", optional = true }
+tracing-opentelemetry = { version = "0.31", optional = true }
 
 # OTLP exporter (optional)
-opentelemetry-otlp = { version = "0.28", features = ["trace", "metrics", "grpc-tonic"], optional = true }
+opentelemetry-otlp = { version = "0.31", features = ["trace", "metrics", "grpc-tonic"], optional = true }
 
 # Prometheus metrics (optional)
-opentelemetry-prometheus = { version = "0.28", optional = true }
+opentelemetry-prometheus = { version = "0.31", optional = true }
 
 # HTTP server for prometheus endpoint
 axum.workspace = true

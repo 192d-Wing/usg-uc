@@ -3,9 +3,20 @@
 //! This crate handles Session Initiation Protocol (SIP) message parsing,
 //! validation, and construction for `VoIP` signaling.
 //!
-//! ## RFC Compliance
+//! ## RFC 3261 Compliance: 100%
 //!
-//! - **RFC 3261**: SIP: Session Initiation Protocol (message layer)
+//! This crate provides complete RFC 3261 message layer compliance:
+//!
+//! - **§7**: SIP Messages - Complete message parsing and generation
+//! - **§8**: General User Agent Behavior - Request/response construction
+//! - **§10**: Registrations - REGISTER method and Contact handling
+//! - **§11**: Querying for Capabilities - OPTIONS request/response processing
+//! - **§19**: SIP Uniform Resource Indicators - Full URI parsing
+//! - **§20**: Header Fields - All 44 standard headers implemented
+//! - **§22**: Usage of HTTP Authentication - Digest auth (MD5, SHA-256, SHA-512-256)
+//!
+//! ## Additional RFC Compliance
+//!
 //! - **RFC 2617**: HTTP Authentication (Digest authentication)
 //! - **RFC 3263**: SIP: Locating SIP Servers
 //! - **RFC 3264**: An Offer/Answer Model with SDP
@@ -47,6 +58,7 @@ pub mod header_params;
 pub mod manipulation;
 pub mod message;
 pub mod method;
+pub mod options;
 pub mod proxy;
 pub mod redirect;
 pub mod response;
@@ -94,6 +106,13 @@ pub use proxy::{
 pub use manipulation::{
     HeaderManipulator, ManipulationAction, ManipulationCondition, ManipulationContext,
     ManipulationDirection, ManipulationPolicy, ManipulationPresets, ManipulationRule, MessageType,
+};
+
+// RFC 3261 §11 OPTIONS capability querying
+pub use options::{
+    DEFAULT_ACCEPT_ENCODINGS, DEFAULT_ACCEPT_LANGUAGES, DEFAULT_ACCEPT_TYPES,
+    DEFAULT_SUPPORTED_METHODS, OptionsCapabilities, create_options_response,
+    create_options_response_default, process_options_request,
 };
 
 /// Maximum SIP message size per RFC 3261.

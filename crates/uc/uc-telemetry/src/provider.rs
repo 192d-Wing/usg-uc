@@ -105,8 +105,8 @@ impl TelemetryProvider {
         // Add OTLP exporter if configured
         #[cfg(feature = "otlp")]
         let builder = if let Some(ref otlp) = config.otlp {
-            use opentelemetry_otlp::SpanExporter;
-            use opentelemetry_sdk::trace::BatchSpanProcessor;
+            use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+            use opentelemetry_sdk::trace::{BatchConfigBuilder, BatchSpanProcessor};
 
             let exporter = SpanExporter::builder()
                 .with_tonic()
@@ -117,10 +117,14 @@ impl TelemetryProvider {
                     reason: format!("Failed to create OTLP span exporter: {e}"),
                 })?;
 
-            let processor = BatchSpanProcessor::builder(exporter)
+            let batch_config = BatchConfigBuilder::default()
                 .with_max_export_batch_size(config.traces.batch.max_export_batch_size as usize)
                 .with_max_queue_size(config.traces.batch.max_queue_size as usize)
                 .with_scheduled_delay(config.traces.batch.scheduled_delay())
+                .build();
+
+            let processor = BatchSpanProcessor::builder(exporter)
+                .with_batch_config(batch_config)
                 .build();
 
             builder.with_span_processor(processor)
@@ -150,7 +154,7 @@ impl TelemetryProvider {
         // Add OTLP exporter if configured
         #[cfg(feature = "otlp")]
         let builder = if let Some(ref otlp) = config.otlp {
-            use opentelemetry_otlp::MetricExporter;
+            use opentelemetry_otlp::{MetricExporter, WithExportConfig};
             use opentelemetry_sdk::metrics::PeriodicReader;
 
             let exporter = MetricExporter::builder()
