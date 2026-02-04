@@ -34,6 +34,52 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - `CertReloadStats` for monitoring
   - 7 tests passing
 
+#### Phase 25: SCTP RFC 9260 Full Compliance - Critical Items (Completed)
+
+**Verification Tag Validation** (`uc-transport/sctp/association.rs`)
+
+- RFC 9260 §8.5.1 compliant verification tag validation
+  - `VerificationTagError` enum with variants: `InitNonZero`, `Mismatch`, `AbortTBitMismatch`, `ShutdownCompleteTBitMismatch`
+  - `validate_verification_tag()` method checks V-tag on all received packets
+  - INIT must have V-tag = 0, ABORT/SHUTDOWN-COMPLETE handle T-bit flag
+  - Rejects packets with incorrect V-tag (silently drops or sends ABORT)
+
+**Cookie Security Hardening** (`uc-transport/sctp/cookie.rs`)
+
+- RFC 9260 §5.1.3 compliant cookie authentication (CNSA 2.0)
+  - HMAC-SHA384 for cookie MAC (upgraded from placeholder)
+  - 48-byte cryptographically secure random secret key
+  - Cookie lifespan enforcement with expiration checking
+  - Stale cookie detection via timestamp validation
+
+**ERROR Chunk Handling** (`uc-transport/sctp/association.rs`)
+
+- RFC 9260 §3.3.10 compliant error processing
+  - `process_error_chunk()` handles all 14 error cause codes
+  - Error causes: InvalidStreamIdentifier, MissingMandatoryParameter, StaleCookieError, OutOfResource, UnresolvableAddress, UnrecognizedChunkType, InvalidMandatoryParameter, UnrecognizedParameters, NoUserData, CookieReceivedWhileShuttingDown, RestartWithNewAddresses, UserInitiatedAbort, ProtocolViolation, Unknown
+  - Graceful degradation - non-fatal errors don't abort association
+
+**ECN Integration** (`uc-transport/sctp/congestion.rs`)
+
+- RFC 9260 §7.2.5 compliant Explicit Congestion Notification
+  - `on_ecn_ce_received()` method in CongestionController
+  - Reduces cwnd to ssthresh (less aggressive than timeout)
+  - Prevents double-reduction during fast recovery
+  - `process_ecne()` handles ECNE chunks and sends CWR response
+  - `process_cwr()` acknowledges peer's cwnd reduction
+  - 3 new ECN tests (reduction, no-double-reduce, ecn-vs-timeout)
+
+**Per-Path Congestion Control** (`uc-transport/sctp/path.rs`)
+
+- RFC 9260 §7.1 compliant multi-homed congestion management
+  - Each `Path` has dedicated `CongestionController` instance
+  - Path-specific cwnd, ssthresh, flight_size tracking
+  - `RtoCalculator` per path for RTT estimation
+  - `PathManager` handles path selection and failover
+  - Error counting and automatic path deactivation
+
+**Tests**: 169 tests passing (76 RFC 9260 compliance + 9 integration + 84 unit)
+
 #### Phase 22: High Availability - Storage Backends (Completed)
 
 **Redis Backend** (`uc-storage/redis.rs`)

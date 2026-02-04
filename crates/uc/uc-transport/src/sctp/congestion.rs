@@ -199,6 +199,42 @@ impl CongestionController {
         self.fast_recovery_exit_tsn = Some(tsn);
     }
 
+    /// Handles ECN-CE (Congestion Experienced) notification.
+    ///
+    /// Per RFC 9260 Section 7.2.5, when a packet is received with the
+    /// CE bit set in the IP header (indicated via ECNE chunk), the sender
+    /// should reduce cwnd similar to packet loss detection:
+    /// - ssthresh = max(cwnd/2, 4*MTU)
+    /// - cwnd = ssthresh
+    ///
+    /// Unlike timeout, cwnd is set to ssthresh (not MTU), since ECN provides
+    /// earlier notification than actual packet loss.
+    ///
+    /// Returns true if cwnd was reduced, false if already in ECN response.
+    pub fn on_ecn_ce_received(&mut self) -> bool {
+        // Avoid reducing cwnd multiple times for the same congestion event
+        // Similar to fast recovery - don't double-reduce
+        if self.in_fast_recovery {
+            tracing::trace!("ECN CE received but already in fast recovery, ignoring");
+            return false;
+        }
+
+        let four_mtu = 4 * self.mtu;
+        self.ssthresh = (self.cwnd / 2).max(four_mtu);
+        self.cwnd = self.ssthresh;
+        self.partial_bytes_acked = 0;
+        // Enter a fast-recovery-like state to prevent further reductions
+        self.in_fast_recovery = true;
+
+        tracing::debug!(
+            cwnd = self.cwnd,
+            ssthresh = self.ssthresh,
+            "ECN CE received: reduced cwnd"
+        );
+
+        true
+    }
+
     /// Handles a retransmission timeout.
     ///
     /// Per RFC 9260 Section 7.2.3:
@@ -426,5 +462,60 @@ mod tests {
         assert_eq!(cc.mtu(), 1500);
         // cwnd should not decrease
         assert!(cc.cwnd() >= initial_cwnd);
+    }
+
+    #[test]
+    fn test_ecn_ce_cwnd_reduction() {
+        let mut cc = CongestionController::with_mtu(1000);
+        cc.cwnd = 10000;
+        cc.ssthresh = 20000;
+
+        assert!(!cc.is_fast_recovery());
+
+        // ECN CE should reduce cwnd similar to fast recovery
+        let reduced = cc.on_ecn_ce_received();
+        assert!(reduced);
+        assert!(cc.is_fast_recovery()); // Enters fast recovery-like state
+
+        // ssthresh = max(10000/2, 4000) = 5000
+        assert_eq!(cc.ssthresh(), 5000);
+        // cwnd = ssthresh = 5000 (not MTU like timeout)
+        assert_eq!(cc.cwnd(), 5000);
+    }
+
+    #[test]
+    fn test_ecn_ce_no_double_reduce() {
+        let mut cc = CongestionController::with_mtu(1000);
+        cc.cwnd = 10000;
+        cc.ssthresh = 20000;
+
+        // First ECN CE should reduce
+        let reduced = cc.on_ecn_ce_received();
+        assert!(reduced);
+        assert_eq!(cc.cwnd(), 5000);
+
+        // Second ECN CE should NOT reduce (already in fast recovery)
+        let reduced = cc.on_ecn_ce_received();
+        assert!(!reduced);
+        assert_eq!(cc.cwnd(), 5000); // No change
+    }
+
+    #[test]
+    fn test_ecn_vs_timeout() {
+        // ECN should be less aggressive than timeout
+        let mut cc_ecn = CongestionController::with_mtu(1000);
+        cc_ecn.cwnd = 10000;
+
+        let mut cc_timeout = CongestionController::with_mtu(1000);
+        cc_timeout.cwnd = 10000;
+
+        cc_ecn.on_ecn_ce_received();
+        cc_timeout.on_timeout();
+
+        // ECN: cwnd = ssthresh = max(5000, 4000) = 5000
+        // Timeout: cwnd = MTU = 1000
+        assert!(cc_ecn.cwnd() > cc_timeout.cwnd());
+        assert_eq!(cc_ecn.cwnd(), 5000);
+        assert_eq!(cc_timeout.cwnd(), 1000);
     }
 }

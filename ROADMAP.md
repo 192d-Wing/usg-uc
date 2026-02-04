@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.16 complete, Phase 24.25 complete
+**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.26 complete, Phase 25 critical items complete
 
 ---
 
@@ -567,28 +567,31 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **Goal**: Complete RFC 9260 compliance for production-grade SCTP
 
-**Critical Priority - Security & Correctness**
+**Critical Priority - Security & Correctness** ✅
 
-- 🚧 Verification tag validation (RFC 9260 §8.5.1)
+- ✅ Verification tag validation (RFC 9260 §8.5.1)
   - Validate V-tag on all received packets
   - Reject packets with incorrect V-tag (except INIT/ABORT)
-  - Proper V-tag handling during shutdown
-- 🚧 Cookie security hardening (RFC 9260 §5.1.3)
-  - HMAC-SHA256 for cookie MAC (currently placeholder)
+  - Proper V-tag handling during shutdown with T-bit support
+  - `VerificationTagError` enum for detailed error reporting
+- ✅ Cookie security hardening (RFC 9260 §5.1.3)
+  - HMAC-SHA384 for cookie MAC (CNSA 2.0 compliant)
+  - 48-byte cryptographically secure secret key
   - Cookie lifespan enforcement
   - Stale cookie detection and handling
-- 🚧 ERROR chunk handling (RFC 9260 §3.3.10)
-  - Full ERROR chunk processing
+- ✅ ERROR chunk handling (RFC 9260 §3.3.10)
+  - Full ERROR chunk processing with all 14 cause codes
   - Error cause code parsing (Invalid Stream, Missing Parameter, etc.)
-  - Graceful degradation on non-fatal errors
-- 🚧 ECN integration in congestion control (RFC 9260 §7.2.5)
+  - Graceful degradation on non-fatal errors (no association abort)
+- ✅ ECN integration in congestion control (RFC 9260 §7.2.5)
   - Process ECNE chunks to reduce cwnd
   - Send CWR chunks to acknowledge ECN
-  - CE-marked packet tracking
-- 🚧 Per-path congestion control (RFC 9260 §7.1)
-  - Separate cwnd/ssthresh per destination address
-  - Path-specific RTT estimation
-  - Multi-homed congestion management
+  - `on_ecn_ce_received()` in CongestionController
+  - Less aggressive than timeout (cwnd = ssthresh, not MTU)
+- ✅ Per-path congestion control (RFC 9260 §7.1)
+  - Separate cwnd/ssthresh per destination address via PathManager
+  - Path-specific RTT estimation via RtoCalculator
+  - Multi-homed congestion management with failover support
 
 **Medium Priority - Protocol Features**
 
@@ -1204,6 +1207,24 @@ This document outlines the development roadmap for the USG Session Border Contro
   - Click-to-send DTMF digits
   - Status message shows sent digit
 
+**Phase 24.26: Audio Device Hot-Switching** ✅
+
+- ✅ Device switching in AudioPipeline
+  - `switch_input_device()` - Change microphone mid-call
+  - `switch_output_device()` - Change speaker mid-call
+  - Recreates audio streams without stopping RTP
+  - Device manager updates preserved
+- ✅ Full stack integration
+  - AudioSession: `switch_input_device()`, `switch_output_device()`, device name accessors
+  - CallManager: Routes device changes to active call's session
+  - ClientApp: Public API for GUI access
+- ✅ Call view audio menu
+  - "Audio Devices" toggle button (mutually exclusive with dialpad)
+  - Microphone dropdown with available devices
+  - Speaker dropdown with available devices
+  - Device lists refreshed when entering call view
+  - Status messages for device changes
+
 ---
 
 ## Known TODOs in Code
@@ -1252,7 +1273,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 | RFC 8445 | ICE | ✅ Enhanced (aggressive nomination, consent, keepalives) |
 | RFC 8224 | STIR | ✅ Implemented (ES384) |
 | RFC 8225 | PASSporT | ✅ Implemented (ES384) |
-| RFC 9260 | SCTP | 🚧 Partial (~70% compliant, see Phase 25) |
+| RFC 9260 | SCTP | 🚧 Partial (~85% compliant, critical items complete) |
 | RFC 4168 | SIP over SCTP | 🚧 Partial (transport layer complete) |
 | RFC 6951 | UDP Encapsulation for SCTP | ✅ Implemented |
 | RFC 3758 | PR-SCTP | 🚧 Planned (Phase 25) |

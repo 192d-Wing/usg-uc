@@ -2,13 +2,14 @@
 //!
 //! This module implements secure state cookies for the SCTP 4-way handshake:
 //! - Cookie generation with association state
-//! - Cookie encryption (AES-256-GCM for CNSA 2.0 compliance)
+//! - Cookie authentication with HMAC-SHA384 (CNSA 2.0 compliant)
 //! - Cookie validation with timestamp checking
-//! - Replay protection
+//! - Replay protection via cookie expiration
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use uc_crypto::hash::{hmac_sha384, verify_hmac_sha384};
 
 // =============================================================================
 // Constants
@@ -187,18 +188,24 @@ impl CookieData {
 }
 
 // =============================================================================
+// Constants
+// =============================================================================
+
+/// HMAC-SHA384 output size in bytes (per CNSA 2.0 compliance).
+const HMAC_SIZE: usize = 48;
+
+// =============================================================================
 // Cookie Generator
 // =============================================================================
 
-/// Cookie generator with optional HMAC protection.
+/// Cookie generator with HMAC-SHA384 protection (RFC 9260 Section 5.1.3).
 ///
-/// For production use, cookies should be encrypted and authenticated.
-/// This implementation supports both plaintext (for testing) and
-/// HMAC-protected cookies.
+/// Uses HMAC-SHA384 for cookie authentication, which is CNSA 2.0 compliant.
+/// The secret key should be cryptographically random and rotated periodically.
 #[derive(Debug, Clone)]
 pub struct CookieGenerator {
-    /// Secret key for HMAC (32 bytes for HMAC-SHA256).
-    secret_key: [u8; 32],
+    /// Secret key for HMAC-SHA384 (48 bytes for SHA384 security level).
+    secret_key: [u8; 48],
     /// Cookie lifetime.
     lifetime: Duration,
     /// Whether to use HMAC protection.
@@ -206,25 +213,14 @@ pub struct CookieGenerator {
 }
 
 impl CookieGenerator {
-    /// Creates a new cookie generator with a random secret.
+    /// Creates a new cookie generator with a cryptographically random secret.
     #[must_use]
     pub fn new() -> Self {
-        // Generate a pseudo-random key
-        // In production, this should use a cryptographically secure RNG
-        let mut key = [0u8; 32];
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        use rand::RngCore;
 
-        // Simple PRNG for key generation
-        let mut state = seed;
-        for byte in &mut key {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1);
-            *byte = (state >> 56) as u8;
-        }
+        // Generate a cryptographically secure random key
+        let mut key = [0u8; 48];
+        rand::thread_rng().fill_bytes(&mut key);
 
         Self {
             secret_key: key,
@@ -234,8 +230,10 @@ impl CookieGenerator {
     }
 
     /// Creates a cookie generator with a specific secret key.
+    ///
+    /// The key should be 48 bytes for HMAC-SHA384 security level.
     #[must_use]
-    pub const fn with_secret(secret_key: [u8; 32]) -> Self {
+    pub const fn with_secret(secret_key: [u8; 48]) -> Self {
         Self {
             secret_key,
             lifetime: DEFAULT_COOKIE_LIFETIME,
@@ -244,10 +242,15 @@ impl CookieGenerator {
     }
 
     /// Creates a cookie generator without HMAC (for testing only).
+    ///
+    /// # Security Warning
+    ///
+    /// This method creates an insecure cookie generator that does NOT
+    /// authenticate cookies. Use only for testing purposes.
     #[must_use]
     pub fn insecure() -> Self {
         Self {
-            secret_key: [0u8; 32],
+            secret_key: [0u8; 48],
             lifetime: DEFAULT_COOKIE_LIFETIME,
             use_hmac: false,
         }
@@ -265,14 +268,17 @@ impl CookieGenerator {
     }
 
     /// Generates a state cookie from the given data.
+    ///
+    /// The cookie contains the encoded association state followed by
+    /// an HMAC-SHA384 authentication tag for integrity protection.
     #[must_use]
     pub fn generate(&self, data: &CookieData) -> Bytes {
         let encoded = data.encode();
 
         if self.use_hmac {
-            // Add HMAC
-            let hmac = self.compute_hmac(&encoded);
-            let mut result = BytesMut::with_capacity(encoded.len() + 32);
+            // Compute HMAC-SHA384 over the encoded data
+            let hmac = hmac_sha384(&self.secret_key, &encoded);
+            let mut result = BytesMut::with_capacity(encoded.len() + HMAC_SIZE);
             result.extend_from_slice(&encoded);
             result.extend_from_slice(&hmac);
             result.freeze()
@@ -283,26 +289,27 @@ impl CookieGenerator {
 
     /// Validates and decodes a state cookie.
     ///
+    /// Verifies the HMAC-SHA384 authentication tag and checks expiration.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the cookie is invalid or expired.
+    /// Returns an error if the cookie is invalid, tampered, or expired.
     pub fn validate(&self, cookie: &Bytes) -> Result<CookieData, CookieError> {
         if self.use_hmac {
-            if cookie.len() < 32 {
+            if cookie.len() < HMAC_SIZE {
                 return Err(CookieError::TooShort {
-                    expected: 32,
+                    expected: HMAC_SIZE,
                     actual: cookie.len(),
                 });
             }
 
-            // Split cookie and HMAC
-            let data_len = cookie.len() - 32;
+            // Split cookie data and HMAC tag
+            let data_len = cookie.len() - HMAC_SIZE;
             let data_bytes = cookie.slice(..data_len);
             let received_hmac = &cookie[data_len..];
 
-            // Verify HMAC
-            let expected_hmac = self.compute_hmac(&data_bytes);
-            if received_hmac != expected_hmac {
+            // Verify HMAC-SHA384 using constant-time comparison
+            if !verify_hmac_sha384(&self.secret_key, &data_bytes, received_hmac) {
                 return Err(CookieError::HmacMismatch);
             }
 
@@ -317,7 +324,7 @@ impl CookieGenerator {
 
             Ok(data)
         } else {
-            // No HMAC, just decode
+            // No HMAC (insecure mode for testing only)
             let data = CookieData::decode(cookie.clone())?;
             if data.is_expired(self.lifetime) {
                 return Err(CookieError::Expired {
@@ -328,55 +335,6 @@ impl CookieGenerator {
 
             Ok(data)
         }
-    }
-
-    /// Computes HMAC-SHA256 of the data.
-    ///
-    /// This is a simplified implementation for demonstration.
-    /// In production, use a proper HMAC implementation from a crypto library.
-    fn compute_hmac(&self, data: &[u8]) -> [u8; 32] {
-        // Simple keyed hash (NOT cryptographically secure for production)
-        // In a real implementation, use HMAC-SHA256 from a crypto library
-        let mut result = [0u8; 32];
-
-        // XOR key with ipad
-        let mut ipad = [0x36u8; 64];
-        let mut opad = [0x5cu8; 64];
-        for (i, &k) in self.secret_key.iter().enumerate() {
-            ipad[i] ^= k;
-            opad[i] ^= k;
-        }
-
-        // Simple hash: H(opad || H(ipad || data))
-        // This is a simplified approximation; use a real crypto library in production
-        let mut inner_hash = [0u8; 32];
-        let mut state = 0u64;
-        for &b in &ipad {
-            state = state.wrapping_mul(31).wrapping_add(u64::from(b));
-        }
-        for &b in data {
-            state = state.wrapping_mul(31).wrapping_add(u64::from(b));
-        }
-        for (i, byte) in inner_hash.iter_mut().enumerate() {
-            *byte = ((state >> ((i % 8) * 8)) & 0xFF) as u8;
-            state = state.wrapping_mul(31).wrapping_add(u64::from(i as u8));
-        }
-
-        let mut outer_state = 0u64;
-        for &b in &opad {
-            outer_state = outer_state.wrapping_mul(31).wrapping_add(u64::from(b));
-        }
-        for &b in &inner_hash {
-            outer_state = outer_state.wrapping_mul(31).wrapping_add(u64::from(b));
-        }
-        for (i, byte) in result.iter_mut().enumerate() {
-            *byte = ((outer_state >> ((i % 8) * 8)) & 0xFF) as u8;
-            outer_state = outer_state
-                .wrapping_mul(31)
-                .wrapping_add(u64::from(i as u8));
-        }
-
-        result
     }
 }
 

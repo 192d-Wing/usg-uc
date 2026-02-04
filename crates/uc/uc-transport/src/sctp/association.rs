@@ -9,9 +9,9 @@
 //! - UDP encapsulation for NAT traversal
 
 use super::chunk::{
-    Chunk, CookieAckChunk, CookieEchoChunk, DataChunk, HeartbeatAckChunk, HeartbeatChunk,
-    InitAckChunk, InitChunk, InitParam, SackChunk, ShutdownAckChunk, ShutdownChunk,
-    ShutdownCompleteChunk,
+    AbortChunk, Chunk, CookieAckChunk, CookieEchoChunk, CwrChunk, DataChunk, EcneChunk, ErrorCause,
+    ErrorChunk, HeartbeatAckChunk, HeartbeatChunk, InitAckChunk, InitChunk, InitParam, SackChunk,
+    ShutdownAckChunk, ShutdownChunk, ShutdownCompleteChunk,
 };
 use super::cookie::{CookieData, CookieGenerator};
 use super::packet::SctpPacket;
@@ -738,7 +738,165 @@ impl AssociationInner {
     fn abort(&mut self) -> Vec<StateAction> {
         self.state_machine.process_event(StateEvent::Abort)
     }
+
+    /// Processes an ERROR chunk (RFC 9260 §3.3.10).
+    ///
+    /// ERROR chunks are used to report non-fatal errors to the peer.
+    /// They do NOT cause association termination - that requires ABORT.
+    /// The error causes are logged for diagnostic purposes.
+    fn process_error_chunk(&mut self, error: &ErrorChunk) {
+        for cause in &error.causes {
+            match cause {
+                ErrorCause::InvalidStreamIdentifier { stream_id } => {
+                    tracing::warn!(
+                        stream_id = stream_id,
+                        "Peer reported invalid stream identifier"
+                    );
+                }
+                ErrorCause::MissingMandatoryParameter { .. } => {
+                    tracing::warn!("Peer reported missing mandatory parameter");
+                }
+                ErrorCause::StaleCookieError { measure } => {
+                    tracing::warn!(
+                        staleness_usec = measure,
+                        "Peer reported stale cookie"
+                    );
+                }
+                ErrorCause::OutOfResource => {
+                    tracing::warn!("Peer reported out of resource");
+                }
+                ErrorCause::UnresolvableAddress { .. } => {
+                    tracing::warn!("Peer reported unresolvable address");
+                }
+                ErrorCause::UnrecognizedChunkType { chunk } => {
+                    // The chunk bytes contain the unrecognized chunk - first byte is the type
+                    let chunk_type = chunk.first().copied().unwrap_or(0);
+                    tracing::warn!(
+                        chunk_type = chunk_type,
+                        "Peer reported unrecognized chunk type"
+                    );
+                }
+                ErrorCause::InvalidMandatoryParameter => {
+                    tracing::warn!("Peer reported invalid mandatory parameter");
+                }
+                ErrorCause::UnrecognizedParameters { .. } => {
+                    tracing::debug!("Peer reported unrecognized parameters");
+                }
+                ErrorCause::NoUserData { tsn } => {
+                    tracing::warn!(
+                        tsn = tsn,
+                        "Peer reported DATA chunk with no user data"
+                    );
+                }
+                ErrorCause::CookieReceivedWhileShuttingDown => {
+                    tracing::warn!("Peer reported cookie received while shutting down");
+                }
+                ErrorCause::RestartWithNewAddresses { .. } => {
+                    tracing::warn!("Peer reported restart with new addresses");
+                }
+                ErrorCause::UserInitiatedAbort { .. } => {
+                    tracing::info!("Peer reported user-initiated abort");
+                }
+                ErrorCause::ProtocolViolation { .. } => {
+                    tracing::warn!("Peer reported protocol violation");
+                }
+                ErrorCause::Unknown { cause_code, .. } => {
+                    tracing::warn!(
+                        cause_code = cause_code,
+                        "Peer reported unknown error cause"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Processes an ECNE chunk (RFC 9260 §7.2.5).
+    ///
+    /// ECNE (Explicit Congestion Notification Echo) indicates that the peer
+    /// received a packet with the CE bit set in the IP header. We must:
+    /// 1. Reduce our congestion window (handled by congestion controller)
+    /// 2. Send a CWR chunk to acknowledge we received the ECNE
+    fn process_ecne(&mut self, ecne: &EcneChunk, response_chunks: &mut Vec<Chunk>) {
+        let lowest_tsn = ecne.lowest_tsn;
+
+        tracing::debug!(
+            lowest_tsn = lowest_tsn,
+            "Received ECNE, reducing congestion window"
+        );
+
+        // Update congestion control on the active path
+        if let Some(path) = self.paths.get_active_path_mut() {
+            let reduced = path.congestion_mut().on_ecn_ce_received();
+            if reduced {
+                tracing::info!(
+                    lowest_tsn = lowest_tsn,
+                    cwnd = path.congestion().cwnd(),
+                    "Congestion window reduced due to ECN"
+                );
+            }
+        }
+
+        // Send CWR to acknowledge the ECNE
+        // The CWR contains the same lowest_tsn that was in the ECNE
+        response_chunks.push(Chunk::Cwr(CwrChunk::new(lowest_tsn)));
+    }
+
+    /// Processes a CWR chunk (RFC 9260 §7.2.5).
+    ///
+    /// CWR (Congestion Window Reduced) indicates that the peer has received
+    /// our ECNE and reduced its congestion window. This is purely informational
+    /// and requires no action other than logging.
+    fn process_cwr(&mut self) {
+        tracing::debug!("Received CWR, peer has reduced its congestion window");
+        // No action required - the CWR is just an acknowledgment
+        // that the peer received our ECNE and acted on it
+    }
 }
+
+// =============================================================================
+// Verification Tag Error
+// =============================================================================
+
+/// Error type for verification tag validation failures (RFC 9260 §8.5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationTagError {
+    /// INIT chunk received with non-zero verification tag.
+    InitNonZero,
+    /// Verification tag doesn't match local verification tag.
+    Mismatch,
+    /// ABORT with T-bit set has wrong peer verification tag.
+    AbortTBitMismatch,
+    /// SHUTDOWN-COMPLETE with T-bit set has wrong peer verification tag.
+    ShutdownCompleteTBitMismatch,
+}
+
+impl VerificationTagError {
+    /// Returns true if this error should trigger an ABORT response.
+    #[must_use]
+    pub const fn should_send_abort(&self) -> bool {
+        // Only send ABORT for clear protocol violations, not for
+        // packets that might be from an old/stale association
+        matches!(self, Self::InitNonZero)
+    }
+}
+
+impl std::fmt::Display for VerificationTagError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InitNonZero => write!(f, "INIT chunk must have verification tag 0"),
+            Self::Mismatch => write!(f, "Verification tag does not match local tag"),
+            Self::AbortTBitMismatch => {
+                write!(f, "ABORT with T-bit set has incorrect peer verification tag")
+            }
+            Self::ShutdownCompleteTBitMismatch => write!(
+                f,
+                "SHUTDOWN-COMPLETE with T-bit set has incorrect peer verification tag"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VerificationTagError {}
 
 // =============================================================================
 // Association Handle
@@ -806,10 +964,115 @@ impl AssociationHandle {
         self.inner.write().await.abort()
     }
 
+    /// Validates the verification tag according to RFC 9260 §8.5.1.
+    ///
+    /// Returns Ok(()) if the tag is valid, or Err with an error message if invalid.
+    /// Also returns a flag indicating if an ABORT should be sent with T-bit set.
+    fn validate_verification_tag(
+        &self,
+        packet: &SctpPacket,
+        inner: &AssociationInner,
+    ) -> Result<(), VerificationTagError> {
+        // Get the first chunk to determine validation rules
+        let first_chunk = packet.chunks.first();
+
+        match first_chunk {
+            Some(Chunk::Init(_)) => {
+                // RFC 9260 §8.5.1: INIT must have V-tag = 0
+                if packet.verification_tag != 0 {
+                    return Err(VerificationTagError::InitNonZero);
+                }
+            }
+            Some(Chunk::Abort(abort)) => {
+                // RFC 9260 §8.5.1: ABORT handling:
+                // - If T-bit is 0, V-tag must match local V-tag
+                // - If T-bit is 1 (TCB destroyed), V-tag must match peer's V-tag
+                if abort.tcb_destroyed {
+                    // T-bit set: verify against peer's tag
+                    if inner.peer_verification_tag != 0
+                        && packet.verification_tag != inner.peer_verification_tag
+                    {
+                        return Err(VerificationTagError::AbortTBitMismatch);
+                    }
+                } else {
+                    // T-bit not set: verify against our local tag
+                    if packet.verification_tag != inner.local_verification_tag {
+                        return Err(VerificationTagError::Mismatch);
+                    }
+                }
+            }
+            Some(Chunk::ShutdownComplete(sc)) => {
+                // RFC 9260 §8.5.1: SHUTDOWN-COMPLETE handling similar to ABORT
+                if sc.tcb_destroyed {
+                    // T-bit set: verify against peer's tag
+                    if inner.peer_verification_tag != 0
+                        && packet.verification_tag != inner.peer_verification_tag
+                    {
+                        return Err(VerificationTagError::ShutdownCompleteTBitMismatch);
+                    }
+                } else {
+                    // T-bit not set: verify against our local tag
+                    if packet.verification_tag != inner.local_verification_tag {
+                        return Err(VerificationTagError::Mismatch);
+                    }
+                }
+            }
+            Some(Chunk::CookieEcho(_)) => {
+                // RFC 9260 §5.1: COOKIE-ECHO can be received before we know
+                // our local tag (when we're a server). The tag in the packet
+                // should match the tag we put in the cookie.
+                // For now, allow any tag for COOKIE-ECHO since the cookie
+                // itself contains the verification data.
+            }
+            _ => {
+                // RFC 9260 §8.5.1: All other packets must have V-tag equal to
+                // the receiver's local V-tag (the one we sent in INIT/INIT-ACK)
+                //
+                // Special case: In CookieWait state, we haven't established
+                // peer's tag yet, so we check against the INIT-ACK response
+                if inner.state() != AssociationState::Closed
+                    && inner.state() != AssociationState::CookieWait
+                    && packet.verification_tag != inner.local_verification_tag
+                {
+                    return Err(VerificationTagError::Mismatch);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Processes a received packet.
     pub async fn process_packet(&self, packet: &SctpPacket) -> Result<Vec<Chunk>, String> {
         let mut inner = self.inner.write().await;
         let mut response_chunks = Vec::new();
+
+        // RFC 9260 §8.5.1: Validate verification tag
+        if let Err(vtag_error) = self.validate_verification_tag(packet, &inner) {
+            tracing::warn!(
+                vtag = packet.verification_tag,
+                local_vtag = inner.local_verification_tag,
+                peer_vtag = inner.peer_verification_tag,
+                error = %vtag_error,
+                "Invalid verification tag, discarding packet"
+            );
+
+            // For some errors, we may need to send an ABORT with T-bit set
+            if vtag_error.should_send_abort() {
+                let mut abort = AbortChunk::new();
+                abort.tcb_destroyed = true;
+                abort.add_cause(ErrorCause::ProtocolViolation {
+                    info: bytes::Bytes::from(format!("Invalid verification tag: {vtag_error}")),
+                });
+                response_chunks.push(Chunk::Abort(abort));
+            }
+
+            return if response_chunks.is_empty() {
+                Err(format!("Invalid verification tag: {vtag_error}"))
+            } else {
+                Ok(response_chunks)
+            };
+        }
 
         for chunk in &packet.chunks {
             match chunk {
@@ -899,8 +1162,23 @@ impl AssociationHandle {
                 Chunk::Abort(_) => {
                     inner.state_machine.process_event(StateEvent::ReceiveAbort);
                 }
+                Chunk::Error(error_chunk) => {
+                    // RFC 9260 §3.3.10: Process ERROR chunk
+                    // ERROR chunks report non-fatal errors and do not abort the association
+                    inner.process_error_chunk(error_chunk);
+                }
+                Chunk::Ecne(ecne) => {
+                    // RFC 9260 §7.2.5: Process ECNE (Explicit Congestion Notification Echo)
+                    inner.process_ecne(ecne, &mut response_chunks);
+                }
+                Chunk::Cwr(_cwr) => {
+                    // RFC 9260 §7.2.5: Process CWR (Congestion Window Reduced)
+                    // CWR acknowledges that we received the ECNE and reduced our cwnd
+                    inner.process_cwr();
+                }
                 _ => {
-                    // Handle other chunks as needed
+                    // Handle unknown chunks per RFC 9260 §3.2 high-bit rules
+                    // TODO: Implement unknown chunk handling with proper error reporting
                 }
             }
         }

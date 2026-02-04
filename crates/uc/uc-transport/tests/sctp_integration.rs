@@ -149,10 +149,11 @@ async fn test_association_handle_4way_handshake() {
     assert_eq!(server.state().await, AssociationState::Established);
 
     // Step 5: Client processes COOKIE-ACK
+    // The V-tag must be the client's local tag (what client expects to receive)
     let mut cookie_ack_packet = SctpPacket::new(
         server_addr.port(),
         client_addr.port(),
-        server.local_verification_tag().await,
+        client.local_verification_tag().await,
     );
     for chunk in cookie_ack_chunks {
         cookie_ack_packet.add_chunk(chunk);
@@ -202,10 +203,11 @@ async fn perform_handshake(
 
     // Step 4: Server processes COOKIE-ECHO and sends COOKIE-ACK
     let cookie_ack = server.process_packet(&cookie_echo_pkt).await.unwrap();
+    // The V-tag must be the client's local tag (what client expects to receive)
     let mut cookie_ack_pkt = SctpPacket::new(
         server_addr.port(),
         client_addr.port(),
-        server.local_verification_tag().await,
+        client.local_verification_tag().await,
     );
     for c in cookie_ack {
         cookie_ack_pkt.add_chunk(c);
@@ -402,11 +404,12 @@ async fn test_heartbeat_handling() {
     perform_handshake(&client, &server, client_addr, server_addr).await;
 
     // Create a heartbeat packet
+    // When client sends to server, V-tag must be server's local tag
     let hb = HeartbeatChunk::new(Bytes::from_static(b"test-hb-info"));
     let mut hb_packet = SctpPacket::new(
         client_addr.port(),
         server_addr.port(),
-        client.peer_verification_tag().await,
+        server.local_verification_tag().await,
     );
     hb_packet.add_chunk(Chunk::Heartbeat(hb));
 
