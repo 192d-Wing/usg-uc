@@ -201,6 +201,14 @@ pub enum Chunk {
     Ecne(EcneChunk),
     /// Congestion Window Reduced chunk.
     Cwr(CwrChunk),
+    /// Forward TSN chunk (RFC 3758).
+    ForwardTsn(ForwardTsnChunk),
+    /// Reconfiguration chunk (RFC 6525).
+    ReConfig(ReConfigChunk),
+    /// Address Configuration Change chunk (RFC 5061).
+    Asconf(AsconfChunk),
+    /// Address Configuration Acknowledgement chunk (RFC 5061).
+    AsconfAck(AsconfAckChunk),
     /// Unknown chunk (preserved for forwarding/error reporting).
     Unknown(UnknownChunk),
 }
@@ -225,6 +233,10 @@ impl Chunk {
             Self::ShutdownComplete(_) => ChunkType::ShutdownComplete,
             Self::Ecne(_) => ChunkType::Ecne,
             Self::Cwr(_) => ChunkType::Cwr,
+            Self::ForwardTsn(_) => ChunkType::ForwardTsn,
+            Self::ReConfig(_) => ChunkType::ReConfig,
+            Self::Asconf(_) => ChunkType::Asconf,
+            Self::AsconfAck(_) => ChunkType::AsconfAck,
             Self::Unknown(u) => ChunkType::from_u8(u.chunk_type).unwrap_or(ChunkType::Data),
         }
     }
@@ -247,6 +259,10 @@ impl Chunk {
             Self::ShutdownComplete(c) => c.encode(buf),
             Self::Ecne(c) => c.encode(buf),
             Self::Cwr(c) => c.encode(buf),
+            Self::ForwardTsn(c) => c.encode(buf),
+            Self::ReConfig(c) => c.encode(buf),
+            Self::Asconf(c) => c.encode(buf),
+            Self::AsconfAck(c) => c.encode(buf),
             Self::Unknown(c) => c.encode(buf),
         }
     }
@@ -319,6 +335,21 @@ impl Chunk {
             )),
             Some(ChunkType::Ecne) => Ok(Self::Ecne(EcneChunk::decode_body(flags, &chunk_data)?)),
             Some(ChunkType::Cwr) => Ok(Self::Cwr(CwrChunk::decode_body(flags, &chunk_data)?)),
+            Some(ChunkType::ForwardTsn) => Ok(Self::ForwardTsn(ForwardTsnChunk::decode_body(
+                flags,
+                &chunk_data,
+            )?)),
+            Some(ChunkType::ReConfig) => Ok(Self::ReConfig(ReConfigChunk::decode_body(
+                flags,
+                &chunk_data,
+            )?)),
+            Some(ChunkType::Asconf) => {
+                Ok(Self::Asconf(AsconfChunk::decode_body(flags, &chunk_data)?))
+            }
+            Some(ChunkType::AsconfAck) => Ok(Self::AsconfAck(AsconfAckChunk::decode_body(
+                flags,
+                &chunk_data,
+            )?)),
             _ => Ok(Self::Unknown(UnknownChunk {
                 chunk_type,
                 flags,
@@ -1808,6 +1839,1145 @@ impl CwrChunk {
 }
 
 // =============================================================================
+// FORWARD-TSN Chunk (RFC 3758 Section 3.2)
+// =============================================================================
+
+/// Stream information for FORWARD-TSN (RFC 3758).
+///
+/// Indicates the new stream sequence number for a given stream after
+/// skipping undeliverable DATA chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForwardTsnStream {
+    /// Stream ID.
+    pub stream_id: u16,
+    /// New stream sequence number.
+    pub ssn: u16,
+}
+
+impl ForwardTsnStream {
+    /// Creates a new forward TSN stream entry.
+    #[must_use]
+    pub const fn new(stream_id: u16, ssn: u16) -> Self {
+        Self { stream_id, ssn }
+    }
+}
+
+/// Forward TSN (FORWARD-TSN) chunk (RFC 3758 Section 3.2).
+///
+/// The FORWARD TSN chunk is used by the sender to inform the receiver
+/// that it may skip TSNs that have not been received. This is used for
+/// partial reliability where data may be abandoned after timeouts.
+///
+/// ```text
+///  0                   1                   2                   3
+///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |   Type = 192  |  Flags = 0x00 |         Length                |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                      New Cumulative TSN                       |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |         Stream-1              |       Stream Sequence-1       |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// \                                                               /
+/// /                                                               \
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |         Stream-N              |       Stream Sequence-N       |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForwardTsnChunk {
+    /// New Cumulative TSN: The new cumulative TSN that the receiver should
+    /// advance to. All TSNs up to and including this one can be skipped.
+    pub new_cumulative_tsn: u32,
+    /// Stream information for each stream with skipped data.
+    pub streams: Vec<ForwardTsnStream>,
+}
+
+impl ForwardTsnChunk {
+    /// Creates a new FORWARD-TSN chunk.
+    #[must_use]
+    pub fn new(new_cumulative_tsn: u32) -> Self {
+        Self {
+            new_cumulative_tsn,
+            streams: Vec::new(),
+        }
+    }
+
+    /// Creates a FORWARD-TSN chunk with stream information.
+    #[must_use]
+    pub fn with_streams(new_cumulative_tsn: u32, streams: Vec<ForwardTsnStream>) -> Self {
+        Self {
+            new_cumulative_tsn,
+            streams,
+        }
+    }
+
+    /// Adds stream information to the chunk.
+    pub fn add_stream(&mut self, stream_id: u16, ssn: u16) {
+        self.streams.push(ForwardTsnStream::new(stream_id, ssn));
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        let length = 8 + self.streams.len() * 4; // header(4) + tsn(4) + streams(4 each)
+
+        buf.put_u8(ChunkType::ForwardTsn as u8);
+        buf.put_u8(0);
+        buf.put_u16(length as u16);
+        buf.put_u32(self.new_cumulative_tsn);
+
+        for stream in &self.streams {
+            buf.put_u16(stream.stream_id);
+            buf.put_u16(stream.ssn);
+        }
+
+        // Add padding if needed
+        let padding = padding_needed(length);
+        for _ in 0..padding {
+            buf.put_u8(0);
+        }
+    }
+
+    fn decode_body(_flags: u8, chunk_data: &Bytes) -> TransportResult<Self> {
+        if chunk_data.len() < 8 {
+            return Err(TransportError::ReceiveFailed {
+                reason: "FORWARD-TSN chunk too short".to_string(),
+            });
+        }
+
+        let length = u16::from_be_bytes([chunk_data[2], chunk_data[3]]) as usize;
+        let new_cumulative_tsn =
+            u32::from_be_bytes([chunk_data[4], chunk_data[5], chunk_data[6], chunk_data[7]]);
+
+        let mut streams = Vec::new();
+        let mut offset = 8;
+
+        // Parse stream entries (4 bytes each: stream_id(2) + ssn(2))
+        while offset + 4 <= length && offset + 4 <= chunk_data.len() {
+            let stream_id = u16::from_be_bytes([chunk_data[offset], chunk_data[offset + 1]]);
+            let ssn = u16::from_be_bytes([chunk_data[offset + 2], chunk_data[offset + 3]]);
+            streams.push(ForwardTsnStream::new(stream_id, ssn));
+            offset += 4;
+        }
+
+        Ok(Self {
+            new_cumulative_tsn,
+            streams,
+        })
+    }
+}
+
+// =============================================================================
+// RE-CONFIG Chunk (RFC 6525)
+// =============================================================================
+
+/// RE-CONFIG parameter types (RFC 6525 Section 4).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReConfigParam {
+    /// Outgoing SSN Reset Request (Section 4.1).
+    OutgoingSsnReset {
+        /// Request sequence number.
+        req_seq_num: u32,
+        /// Response sequence number.
+        resp_seq_num: u32,
+        /// Last assigned TSN.
+        last_tsn: u32,
+        /// Stream IDs to reset (empty = all outgoing streams).
+        stream_ids: Vec<u16>,
+    },
+    /// Incoming SSN Reset Request (Section 4.2).
+    IncomingSsnReset {
+        /// Request sequence number.
+        req_seq_num: u32,
+        /// Stream IDs to reset.
+        stream_ids: Vec<u16>,
+    },
+    /// SSN/TSN Reset Request (Section 4.3).
+    SsnTsnReset {
+        /// Request sequence number.
+        req_seq_num: u32,
+    },
+    /// RE-CONFIG Response (Section 4.4).
+    Response {
+        /// Response sequence number (matches request seq num).
+        resp_seq_num: u32,
+        /// Result of the request.
+        result: ReConfigResult,
+        /// Sender's next TSN (for SSN/TSN reset).
+        sender_next_tsn: Option<u32>,
+        /// Receiver's next TSN (for SSN/TSN reset).
+        receiver_next_tsn: Option<u32>,
+    },
+    /// Add Outgoing Streams Request (Section 4.5).
+    AddOutgoingStreams {
+        /// Request sequence number.
+        req_seq_num: u32,
+        /// Number of new outgoing streams.
+        num_streams: u16,
+    },
+    /// Add Incoming Streams Request (Section 4.6).
+    AddIncomingStreams {
+        /// Request sequence number.
+        req_seq_num: u32,
+        /// Number of new incoming streams.
+        num_streams: u16,
+    },
+}
+
+/// RE-CONFIG response result codes (RFC 6525 Section 4.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ReConfigResult {
+    /// Success - Nothing to do.
+    SuccessNothingToDo = 0,
+    /// Success - Performed.
+    SuccessPerformed = 1,
+    /// Denied.
+    Denied = 2,
+    /// Error - Wrong SSN.
+    ErrorWrongSsn = 3,
+    /// Error - Request already in progress.
+    ErrorAlreadyInProgress = 4,
+    /// Error - Bad Sequence Number.
+    ErrorBadSeqNum = 5,
+    /// In progress.
+    InProgress = 6,
+}
+
+impl ReConfigResult {
+    /// Creates a result from a raw value.
+    fn from_u32(value: u32) -> Self {
+        match value {
+            0 => Self::SuccessNothingToDo,
+            1 => Self::SuccessPerformed,
+            2 => Self::Denied,
+            3 => Self::ErrorWrongSsn,
+            4 => Self::ErrorAlreadyInProgress,
+            5 => Self::ErrorBadSeqNum,
+            6 => Self::InProgress,
+            _ => Self::Denied, // Unknown treated as denied
+        }
+    }
+
+    /// Returns true if this is a success result.
+    #[must_use]
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::SuccessNothingToDo | Self::SuccessPerformed)
+    }
+}
+
+impl ReConfigParam {
+    // Parameter type codes (RFC 6525 Section 4)
+    const OUTGOING_SSN_RESET: u16 = 13;
+    const INCOMING_SSN_RESET: u16 = 14;
+    const SSN_TSN_RESET: u16 = 15;
+    const RESPONSE: u16 = 16;
+    const ADD_OUTGOING_STREAMS: u16 = 17;
+    const ADD_INCOMING_STREAMS: u16 = 18;
+
+    fn encode(&self, buf: &mut BytesMut) {
+        match self {
+            Self::OutgoingSsnReset {
+                req_seq_num,
+                resp_seq_num,
+                last_tsn,
+                stream_ids,
+            } => {
+                let length = 16 + stream_ids.len() * 2;
+                buf.put_u16(Self::OUTGOING_SSN_RESET);
+                buf.put_u16(length as u16);
+                buf.put_u32(*req_seq_num);
+                buf.put_u32(*resp_seq_num);
+                buf.put_u32(*last_tsn);
+                for sid in stream_ids {
+                    buf.put_u16(*sid);
+                }
+                let padding = padding_needed(length);
+                for _ in 0..padding {
+                    buf.put_u8(0);
+                }
+            }
+            Self::IncomingSsnReset {
+                req_seq_num,
+                stream_ids,
+            } => {
+                let length = 8 + stream_ids.len() * 2;
+                buf.put_u16(Self::INCOMING_SSN_RESET);
+                buf.put_u16(length as u16);
+                buf.put_u32(*req_seq_num);
+                for sid in stream_ids {
+                    buf.put_u16(*sid);
+                }
+                let padding = padding_needed(length);
+                for _ in 0..padding {
+                    buf.put_u8(0);
+                }
+            }
+            Self::SsnTsnReset { req_seq_num } => {
+                buf.put_u16(Self::SSN_TSN_RESET);
+                buf.put_u16(8);
+                buf.put_u32(*req_seq_num);
+            }
+            Self::Response {
+                resp_seq_num,
+                result,
+                sender_next_tsn,
+                receiver_next_tsn,
+            } => {
+                let has_tsns = sender_next_tsn.is_some() && receiver_next_tsn.is_some();
+                let length = if has_tsns { 20 } else { 12 };
+                buf.put_u16(Self::RESPONSE);
+                buf.put_u16(length as u16);
+                buf.put_u32(*resp_seq_num);
+                buf.put_u32(*result as u32);
+                if let (Some(sender), Some(receiver)) = (sender_next_tsn, receiver_next_tsn) {
+                    buf.put_u32(*sender);
+                    buf.put_u32(*receiver);
+                }
+            }
+            Self::AddOutgoingStreams {
+                req_seq_num,
+                num_streams,
+            } => {
+                buf.put_u16(Self::ADD_OUTGOING_STREAMS);
+                buf.put_u16(12);
+                buf.put_u32(*req_seq_num);
+                buf.put_u16(*num_streams);
+                buf.put_u16(0); // Reserved
+            }
+            Self::AddIncomingStreams {
+                req_seq_num,
+                num_streams,
+            } => {
+                buf.put_u16(Self::ADD_INCOMING_STREAMS);
+                buf.put_u16(12);
+                buf.put_u32(*req_seq_num);
+                buf.put_u16(*num_streams);
+                buf.put_u16(0); // Reserved
+            }
+        }
+    }
+
+    fn decode(data: &[u8]) -> TransportResult<(Self, usize)> {
+        if data.len() < 4 {
+            return Err(TransportError::ReceiveFailed {
+                reason: "RE-CONFIG parameter too short".to_string(),
+            });
+        }
+
+        let param_type = u16::from_be_bytes([data[0], data[1]]);
+        let length = u16::from_be_bytes([data[2], data[3]]) as usize;
+
+        if data.len() < length {
+            return Err(TransportError::ReceiveFailed {
+                reason: "RE-CONFIG parameter truncated".to_string(),
+            });
+        }
+
+        let param = match param_type {
+            Self::OUTGOING_SSN_RESET if length >= 16 => {
+                let req_seq_num = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+                let resp_seq_num = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+                let last_tsn = u32::from_be_bytes([data[12], data[13], data[14], data[15]]);
+                let mut stream_ids = Vec::new();
+                let mut offset = 16;
+                while offset + 2 <= length {
+                    stream_ids.push(u16::from_be_bytes([data[offset], data[offset + 1]]));
+                    offset += 2;
+                }
+                Self::OutgoingSsnReset {
+                    req_seq_num,
+                    resp_seq_num,
+                    last_tsn,
+                    stream_ids,
+                }
+            }
+            Self::INCOMING_SSN_RESET if length >= 8 => {
+                let req_seq_num = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+                let mut stream_ids = Vec::new();
+                let mut offset = 8;
+                while offset + 2 <= length {
+                    stream_ids.push(u16::from_be_bytes([data[offset], data[offset + 1]]));
+                    offset += 2;
+                }
+                Self::IncomingSsnReset {
+                    req_seq_num,
+                    stream_ids,
+                }
+            }
+            Self::SSN_TSN_RESET if length >= 8 => {
+                let req_seq_num = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+                Self::SsnTsnReset { req_seq_num }
+            }
+            Self::RESPONSE if length >= 12 => {
+                let resp_seq_num = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+                let result =
+                    ReConfigResult::from_u32(u32::from_be_bytes([data[8], data[9], data[10], data[11]]));
+                let (sender_next_tsn, receiver_next_tsn) = if length >= 20 {
+                    (
+                        Some(u32::from_be_bytes([data[12], data[13], data[14], data[15]])),
+                        Some(u32::from_be_bytes([data[16], data[17], data[18], data[19]])),
+                    )
+                } else {
+                    (None, None)
+                };
+                Self::Response {
+                    resp_seq_num,
+                    result,
+                    sender_next_tsn,
+                    receiver_next_tsn,
+                }
+            }
+            Self::ADD_OUTGOING_STREAMS if length >= 12 => {
+                let req_seq_num = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+                let num_streams = u16::from_be_bytes([data[8], data[9]]);
+                Self::AddOutgoingStreams {
+                    req_seq_num,
+                    num_streams,
+                }
+            }
+            Self::ADD_INCOMING_STREAMS if length >= 12 => {
+                let req_seq_num = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+                let num_streams = u16::from_be_bytes([data[8], data[9]]);
+                Self::AddIncomingStreams {
+                    req_seq_num,
+                    num_streams,
+                }
+            }
+            _ => {
+                return Err(TransportError::ReceiveFailed {
+                    reason: format!("Unknown RE-CONFIG parameter type: {param_type}"),
+                });
+            }
+        };
+
+        Ok((param, padded_length(length)))
+    }
+}
+
+/// Reconfiguration (RE-CONFIG) chunk (RFC 6525 Section 3.1).
+///
+/// Used to reset streams, add streams, or reset TSN during an association.
+///
+/// ```text
+///  0                   1                   2                   3
+///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// | Type = 130    |  Chunk Flags  |         Chunk Length          |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// \                                                               \
+/// /                  Re-configuration Parameter(s)                /
+/// \                                                               \
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReConfigChunk {
+    /// RE-CONFIG parameters.
+    pub params: Vec<ReConfigParam>,
+}
+
+impl ReConfigChunk {
+    /// Creates a new empty RE-CONFIG chunk.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { params: Vec::new() }
+    }
+
+    /// Adds a parameter to the chunk.
+    pub fn add_param(&mut self, param: ReConfigParam) {
+        self.params.push(param);
+    }
+
+    /// Creates an outgoing SSN reset request.
+    #[must_use]
+    pub fn outgoing_ssn_reset(req_seq_num: u32, resp_seq_num: u32, last_tsn: u32, stream_ids: Vec<u16>) -> Self {
+        let mut chunk = Self::new();
+        chunk.add_param(ReConfigParam::OutgoingSsnReset {
+            req_seq_num,
+            resp_seq_num,
+            last_tsn,
+            stream_ids,
+        });
+        chunk
+    }
+
+    /// Creates an incoming SSN reset request.
+    #[must_use]
+    pub fn incoming_ssn_reset(req_seq_num: u32, stream_ids: Vec<u16>) -> Self {
+        let mut chunk = Self::new();
+        chunk.add_param(ReConfigParam::IncomingSsnReset {
+            req_seq_num,
+            stream_ids,
+        });
+        chunk
+    }
+
+    /// Creates a response.
+    #[must_use]
+    pub fn response(resp_seq_num: u32, result: ReConfigResult) -> Self {
+        let mut chunk = Self::new();
+        chunk.add_param(ReConfigParam::Response {
+            resp_seq_num,
+            result,
+            sender_next_tsn: None,
+            receiver_next_tsn: None,
+        });
+        chunk
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        let start = buf.len();
+        buf.put_u8(ChunkType::ReConfig as u8);
+        buf.put_u8(0);
+        buf.put_u16(0); // Length placeholder
+
+        for param in &self.params {
+            param.encode(buf);
+        }
+
+        // Update length
+        let length = buf.len() - start;
+        let length_bytes = (length as u16).to_be_bytes();
+        buf[start + 2] = length_bytes[0];
+        buf[start + 3] = length_bytes[1];
+
+        // Add chunk padding if needed
+        let padding = padding_needed(length);
+        for _ in 0..padding {
+            buf.put_u8(0);
+        }
+    }
+
+    fn decode_body(_flags: u8, chunk_data: &Bytes) -> TransportResult<Self> {
+        if chunk_data.len() < 4 {
+            return Err(TransportError::ReceiveFailed {
+                reason: "RE-CONFIG chunk too short".to_string(),
+            });
+        }
+
+        let length = u16::from_be_bytes([chunk_data[2], chunk_data[3]]) as usize;
+        let mut params = Vec::new();
+        let mut offset = 4;
+
+        while offset < length && offset < chunk_data.len() {
+            let (param, consumed) = ReConfigParam::decode(&chunk_data[offset..])?;
+            params.push(param);
+            offset += consumed;
+        }
+
+        Ok(Self { params })
+    }
+}
+
+impl Default for ReConfigChunk {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// =============================================================================
+// ASCONF Chunk (RFC 5061 Section 4.1)
+// =============================================================================
+
+/// ASCONF parameter types (RFC 5061).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AsconfParam {
+    /// Add IP Address (RFC 5061 Section 4.2.1).
+    AddIp {
+        /// Correlation ID for matching with ASCONF-ACK.
+        correlation_id: u32,
+        /// IPv4 address to add.
+        ipv4: Option<std::net::Ipv4Addr>,
+        /// IPv6 address to add.
+        ipv6: Option<std::net::Ipv6Addr>,
+    },
+    /// Delete IP Address (RFC 5061 Section 4.2.2).
+    DeleteIp {
+        /// Correlation ID for matching with ASCONF-ACK.
+        correlation_id: u32,
+        /// IPv4 address to delete.
+        ipv4: Option<std::net::Ipv4Addr>,
+        /// IPv6 address to delete.
+        ipv6: Option<std::net::Ipv6Addr>,
+    },
+    /// Set Primary Address (RFC 5061 Section 4.2.4).
+    SetPrimaryAddress {
+        /// Correlation ID for matching with ASCONF-ACK.
+        correlation_id: u32,
+        /// IPv4 address to set as primary.
+        ipv4: Option<std::net::Ipv4Addr>,
+        /// IPv6 address to set as primary.
+        ipv6: Option<std::net::Ipv6Addr>,
+    },
+}
+
+impl AsconfParam {
+    // Parameter type codes (RFC 5061)
+    const ADD_IP: u16 = 0xC001;
+    const DELETE_IP: u16 = 0xC002;
+    const SET_PRIMARY: u16 = 0xC004;
+    // Address parameter types
+    const IPV4_ADDRESS: u16 = 5;
+    const IPV6_ADDRESS: u16 = 6;
+
+    /// Returns the correlation ID for this parameter.
+    #[must_use]
+    pub fn correlation_id(&self) -> u32 {
+        match self {
+            Self::AddIp { correlation_id, .. }
+            | Self::DeleteIp { correlation_id, .. }
+            | Self::SetPrimaryAddress { correlation_id, .. } => *correlation_id,
+        }
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        match self {
+            Self::AddIp {
+                correlation_id,
+                ipv4,
+                ipv6,
+            } => {
+                Self::encode_address_param(buf, Self::ADD_IP, *correlation_id, *ipv4, *ipv6);
+            }
+            Self::DeleteIp {
+                correlation_id,
+                ipv4,
+                ipv6,
+            } => {
+                Self::encode_address_param(buf, Self::DELETE_IP, *correlation_id, *ipv4, *ipv6);
+            }
+            Self::SetPrimaryAddress {
+                correlation_id,
+                ipv4,
+                ipv6,
+            } => {
+                Self::encode_address_param(buf, Self::SET_PRIMARY, *correlation_id, *ipv4, *ipv6);
+            }
+        }
+    }
+
+    fn encode_address_param(
+        buf: &mut BytesMut,
+        param_type: u16,
+        correlation_id: u32,
+        ipv4: Option<std::net::Ipv4Addr>,
+        ipv6: Option<std::net::Ipv6Addr>,
+    ) {
+        // Calculate length: 4 (header) + 4 (correlation_id) + address param
+        let addr_len = if ipv4.is_some() { 8 } else if ipv6.is_some() { 20 } else { 0 };
+        let length = 4 + 4 + addr_len;
+
+        buf.put_u16(param_type);
+        buf.put_u16(length as u16);
+        buf.put_u32(correlation_id);
+
+        if let Some(addr) = ipv4 {
+            buf.put_u16(Self::IPV4_ADDRESS);
+            buf.put_u16(8);
+            buf.put_slice(&addr.octets());
+        } else if let Some(addr) = ipv6 {
+            buf.put_u16(Self::IPV6_ADDRESS);
+            buf.put_u16(20);
+            buf.put_slice(&addr.octets());
+        }
+
+        // Add padding if needed
+        let padding = padding_needed(length);
+        for _ in 0..padding {
+            buf.put_u8(0);
+        }
+    }
+
+    fn decode(data: &[u8]) -> TransportResult<(Self, usize)> {
+        if data.len() < 8 {
+            return Err(TransportError::ReceiveFailed {
+                reason: "ASCONF parameter too short".to_string(),
+            });
+        }
+
+        let param_type = u16::from_be_bytes([data[0], data[1]]);
+        let length = u16::from_be_bytes([data[2], data[3]]) as usize;
+        let correlation_id = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+
+        if data.len() < length {
+            return Err(TransportError::ReceiveFailed {
+                reason: "ASCONF parameter truncated".to_string(),
+            });
+        }
+
+        // Decode address if present
+        let (ipv4, ipv6) = if length > 8 {
+            Self::decode_address(&data[8..length])?
+        } else {
+            (None, None)
+        };
+
+        let param = match param_type {
+            Self::ADD_IP => Self::AddIp {
+                correlation_id,
+                ipv4,
+                ipv6,
+            },
+            Self::DELETE_IP => Self::DeleteIp {
+                correlation_id,
+                ipv4,
+                ipv6,
+            },
+            Self::SET_PRIMARY => Self::SetPrimaryAddress {
+                correlation_id,
+                ipv4,
+                ipv6,
+            },
+            _ => {
+                return Err(TransportError::ReceiveFailed {
+                    reason: format!("Unknown ASCONF parameter type: {param_type:#x}"),
+                });
+            }
+        };
+
+        let padded_len = padded_length(length);
+        Ok((param, padded_len))
+    }
+
+    fn decode_address(
+        data: &[u8],
+    ) -> TransportResult<(Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>)> {
+        if data.len() < 4 {
+            return Ok((None, None));
+        }
+
+        let addr_type = u16::from_be_bytes([data[0], data[1]]);
+        // addr_len is available but we use fixed offsets for IPv4/IPv6
+        let _addr_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+
+        match addr_type {
+            Self::IPV4_ADDRESS if data.len() >= 8 => {
+                let octets: [u8; 4] = data[4..8].try_into().unwrap();
+                Ok((Some(std::net::Ipv4Addr::from(octets)), None))
+            }
+            Self::IPV6_ADDRESS if data.len() >= 20 => {
+                let octets: [u8; 16] = data[4..20].try_into().unwrap();
+                Ok((None, Some(std::net::Ipv6Addr::from(octets))))
+            }
+            _ => Ok((None, None)),
+        }
+    }
+}
+
+/// Address Configuration Change (ASCONF) chunk (RFC 5061).
+///
+/// Used to dynamically add or delete IP addresses from an association,
+/// or to set a new primary address.
+///
+/// ```text
+///  0                   1                   2                   3
+///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// | Type = 0xC1   |  Chunk Flags  |      Chunk Length             |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                       Serial Number                           |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                 Address Parameter                             |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                     ASCONF Parameter #1                       |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// \                                                               \
+/// /                             ....                              /
+/// \                                                               \
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                     ASCONF Parameter #N                       |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct AsconfChunk {
+    /// Serial Number: Monotonically increasing number to detect duplicates.
+    pub serial_number: u32,
+    /// Address of the sender (IPv4 or IPv6).
+    pub sender_ipv4: Option<std::net::Ipv4Addr>,
+    /// Address of the sender (IPv6).
+    pub sender_ipv6: Option<std::net::Ipv6Addr>,
+    /// ASCONF parameters (ADD-IP, DELETE-IP, SET-PRIMARY).
+    pub params: Vec<AsconfParam>,
+}
+
+impl AsconfChunk {
+    /// Creates a new ASCONF chunk.
+    #[must_use]
+    pub fn new(serial_number: u32) -> Self {
+        Self {
+            serial_number,
+            sender_ipv4: None,
+            sender_ipv6: None,
+            params: Vec::new(),
+        }
+    }
+
+    /// Sets the sender's IPv4 address.
+    #[must_use]
+    pub fn with_sender_ipv4(mut self, addr: std::net::Ipv4Addr) -> Self {
+        self.sender_ipv4 = Some(addr);
+        self
+    }
+
+    /// Sets the sender's IPv6 address.
+    #[must_use]
+    pub fn with_sender_ipv6(mut self, addr: std::net::Ipv6Addr) -> Self {
+        self.sender_ipv6 = Some(addr);
+        self
+    }
+
+    /// Adds an ADD-IP parameter.
+    pub fn add_ip(
+        &mut self,
+        correlation_id: u32,
+        ipv4: Option<std::net::Ipv4Addr>,
+        ipv6: Option<std::net::Ipv6Addr>,
+    ) {
+        self.params.push(AsconfParam::AddIp {
+            correlation_id,
+            ipv4,
+            ipv6,
+        });
+    }
+
+    /// Adds a DELETE-IP parameter.
+    pub fn delete_ip(
+        &mut self,
+        correlation_id: u32,
+        ipv4: Option<std::net::Ipv4Addr>,
+        ipv6: Option<std::net::Ipv6Addr>,
+    ) {
+        self.params.push(AsconfParam::DeleteIp {
+            correlation_id,
+            ipv4,
+            ipv6,
+        });
+    }
+
+    /// Adds a SET-PRIMARY-ADDRESS parameter.
+    pub fn set_primary(
+        &mut self,
+        correlation_id: u32,
+        ipv4: Option<std::net::Ipv4Addr>,
+        ipv6: Option<std::net::Ipv6Addr>,
+    ) {
+        self.params.push(AsconfParam::SetPrimaryAddress {
+            correlation_id,
+            ipv4,
+            ipv6,
+        });
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        let start = buf.len();
+
+        buf.put_u8(ChunkType::Asconf as u8);
+        buf.put_u8(0); // flags
+        buf.put_u16(0); // length placeholder
+        buf.put_u32(self.serial_number);
+
+        // Encode sender address
+        if let Some(addr) = self.sender_ipv4 {
+            buf.put_u16(AsconfParam::IPV4_ADDRESS);
+            buf.put_u16(8);
+            buf.put_slice(&addr.octets());
+        } else if let Some(addr) = self.sender_ipv6 {
+            buf.put_u16(AsconfParam::IPV6_ADDRESS);
+            buf.put_u16(20);
+            buf.put_slice(&addr.octets());
+        }
+
+        // Encode parameters
+        for param in &self.params {
+            param.encode(buf);
+        }
+
+        // Update length
+        let length = buf.len() - start;
+        let length_bytes = (length as u16).to_be_bytes();
+        buf[start + 2] = length_bytes[0];
+        buf[start + 3] = length_bytes[1];
+
+        // Add padding
+        let padding = padding_needed(length);
+        for _ in 0..padding {
+            buf.put_u8(0);
+        }
+    }
+
+    fn decode_body(_flags: u8, chunk_data: &Bytes) -> TransportResult<Self> {
+        if chunk_data.len() < 12 {
+            return Err(TransportError::ReceiveFailed {
+                reason: "ASCONF chunk too short".to_string(),
+            });
+        }
+
+        let serial_number =
+            u32::from_be_bytes([chunk_data[4], chunk_data[5], chunk_data[6], chunk_data[7]]);
+
+        // Decode sender address
+        let addr_type = u16::from_be_bytes([chunk_data[8], chunk_data[9]]);
+        let addr_len = u16::from_be_bytes([chunk_data[10], chunk_data[11]]) as usize;
+
+        let (sender_ipv4, sender_ipv6, params_offset) = match addr_type {
+            5 if chunk_data.len() >= 16 => {
+                // IPv4
+                let octets: [u8; 4] = chunk_data[12..16].try_into().unwrap();
+                (Some(std::net::Ipv4Addr::from(octets)), None, 16)
+            }
+            6 if chunk_data.len() >= 28 => {
+                // IPv6
+                let octets: [u8; 16] = chunk_data[12..28].try_into().unwrap();
+                (None, Some(std::net::Ipv6Addr::from(octets)), 28)
+            }
+            _ => (None, None, 8 + padded_length(addr_len)),
+        };
+
+        // Decode ASCONF parameters
+        let mut params = Vec::new();
+        let mut offset = params_offset;
+        while offset < chunk_data.len() - 4 {
+            // Need at least 4 bytes for param header
+            match AsconfParam::decode(&chunk_data[offset..]) {
+                Ok((param, consumed)) => {
+                    params.push(param);
+                    offset += consumed;
+                }
+                Err(_) => break,
+            }
+        }
+
+        Ok(Self {
+            serial_number,
+            sender_ipv4,
+            sender_ipv6,
+            params,
+        })
+    }
+}
+
+// =============================================================================
+// ASCONF-ACK Chunk (RFC 5061 Section 4.1.1)
+// =============================================================================
+
+/// ASCONF-ACK response parameter.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AsconfAckParam {
+    /// Success Indication - request was processed successfully.
+    Success {
+        /// Correlation ID from the original request.
+        correlation_id: u32,
+    },
+    /// Error Cause Indication - request failed.
+    ErrorCause {
+        /// Correlation ID from the original request.
+        correlation_id: u32,
+        /// Error cause code.
+        error_code: u16,
+        /// Additional error information.
+        error_info: Bytes,
+    },
+}
+
+impl AsconfAckParam {
+    const SUCCESS_INDICATION: u16 = 0xC003;
+    const ERROR_CAUSE_INDICATION: u16 = 0xC005;
+
+    /// Returns the correlation ID.
+    #[must_use]
+    pub fn correlation_id(&self) -> u32 {
+        match self {
+            Self::Success { correlation_id } | Self::ErrorCause { correlation_id, .. } => {
+                *correlation_id
+            }
+        }
+    }
+
+    /// Returns true if this is a success response.
+    #[must_use]
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Success { .. })
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        match self {
+            Self::Success { correlation_id } => {
+                buf.put_u16(Self::SUCCESS_INDICATION);
+                buf.put_u16(8);
+                buf.put_u32(*correlation_id);
+            }
+            Self::ErrorCause {
+                correlation_id,
+                error_code,
+                error_info,
+            } => {
+                let length = 8 + 4 + error_info.len();
+                buf.put_u16(Self::ERROR_CAUSE_INDICATION);
+                buf.put_u16(length as u16);
+                buf.put_u32(*correlation_id);
+                buf.put_u16(*error_code);
+                buf.put_u16(error_info.len() as u16);
+                buf.put_slice(error_info);
+
+                let padding = padding_needed(length);
+                for _ in 0..padding {
+                    buf.put_u8(0);
+                }
+            }
+        }
+    }
+
+    fn decode(data: &[u8]) -> TransportResult<(Self, usize)> {
+        if data.len() < 8 {
+            return Err(TransportError::ReceiveFailed {
+                reason: "ASCONF-ACK parameter too short".to_string(),
+            });
+        }
+
+        let param_type = u16::from_be_bytes([data[0], data[1]]);
+        let length = u16::from_be_bytes([data[2], data[3]]) as usize;
+        let correlation_id = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+
+        let param = match param_type {
+            Self::SUCCESS_INDICATION => Self::Success { correlation_id },
+            Self::ERROR_CAUSE_INDICATION if length >= 12 => {
+                let error_code = u16::from_be_bytes([data[8], data[9]]);
+                let error_len = u16::from_be_bytes([data[10], data[11]]) as usize;
+                let error_info = if length > 12 && data.len() >= 12 + error_len {
+                    Bytes::copy_from_slice(&data[12..12 + error_len])
+                } else {
+                    Bytes::new()
+                };
+                Self::ErrorCause {
+                    correlation_id,
+                    error_code,
+                    error_info,
+                }
+            }
+            _ => Self::Success { correlation_id }, // Treat unknown as success
+        };
+
+        let padded_len = padded_length(length);
+        Ok((param, padded_len))
+    }
+}
+
+/// Address Configuration Acknowledgement (ASCONF-ACK) chunk (RFC 5061).
+///
+/// Sent in response to an ASCONF chunk to indicate success or failure
+/// of each requested operation.
+///
+/// ```text
+///  0                   1                   2                   3
+///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// | Type = 0x80   |  Chunk Flags  |      Chunk Length             |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                       Serial Number                           |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                 ASCONF-ACK Parameter #1                       |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// \                                                               \
+/// /                             ....                              /
+/// \                                                               \
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                 ASCONF-ACK Parameter #N                       |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct AsconfAckChunk {
+    /// Serial Number: Must match the ASCONF being acknowledged.
+    pub serial_number: u32,
+    /// Response parameters for each ASCONF parameter.
+    pub params: Vec<AsconfAckParam>,
+}
+
+impl AsconfAckChunk {
+    /// Creates a new ASCONF-ACK chunk.
+    #[must_use]
+    pub fn new(serial_number: u32) -> Self {
+        Self {
+            serial_number,
+            params: Vec::new(),
+        }
+    }
+
+    /// Adds a success response for the given correlation ID.
+    pub fn add_success(&mut self, correlation_id: u32) {
+        self.params
+            .push(AsconfAckParam::Success { correlation_id });
+    }
+
+    /// Adds an error response for the given correlation ID.
+    pub fn add_error(&mut self, correlation_id: u32, error_code: u16, error_info: Bytes) {
+        self.params.push(AsconfAckParam::ErrorCause {
+            correlation_id,
+            error_code,
+            error_info,
+        });
+    }
+
+    /// Returns true if all responses are successful.
+    #[must_use]
+    pub fn all_success(&self) -> bool {
+        self.params.iter().all(AsconfAckParam::is_success)
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        let start = buf.len();
+
+        buf.put_u8(ChunkType::AsconfAck as u8);
+        buf.put_u8(0); // flags
+        buf.put_u16(0); // length placeholder
+        buf.put_u32(self.serial_number);
+
+        for param in &self.params {
+            param.encode(buf);
+        }
+
+        // Update length
+        let length = buf.len() - start;
+        let length_bytes = (length as u16).to_be_bytes();
+        buf[start + 2] = length_bytes[0];
+        buf[start + 3] = length_bytes[1];
+
+        // Add padding
+        let padding = padding_needed(length);
+        for _ in 0..padding {
+            buf.put_u8(0);
+        }
+    }
+
+    fn decode_body(_flags: u8, chunk_data: &Bytes) -> TransportResult<Self> {
+        if chunk_data.len() < 8 {
+            return Err(TransportError::ReceiveFailed {
+                reason: "ASCONF-ACK chunk too short".to_string(),
+            });
+        }
+
+        let serial_number =
+            u32::from_be_bytes([chunk_data[4], chunk_data[5], chunk_data[6], chunk_data[7]]);
+
+        // Decode response parameters
+        let mut params = Vec::new();
+        let mut offset = 8;
+        while offset < chunk_data.len() - 4 {
+            match AsconfAckParam::decode(&chunk_data[offset..]) {
+                Ok((param, consumed)) => {
+                    params.push(param);
+                    offset += consumed;
+                }
+                Err(_) => break,
+            }
+        }
+
+        Ok(Self {
+            serial_number,
+            params,
+        })
+    }
+}
+
+// =============================================================================
 // Unknown Chunk
 // =============================================================================
 
@@ -2129,5 +3299,332 @@ mod tests {
         let result = Chunk::decode(&mut bytes);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_asconf_chunk_creation() {
+        let mut asconf = AsconfChunk::new(12345)
+            .with_sender_ipv4(std::net::Ipv4Addr::new(192, 168, 1, 1));
+
+        asconf.add_ip(1, Some(std::net::Ipv4Addr::new(10, 0, 0, 1)), None);
+        asconf.delete_ip(2, Some(std::net::Ipv4Addr::new(10, 0, 0, 2)), None);
+
+        assert_eq!(asconf.serial_number, 12345);
+        assert_eq!(asconf.sender_ipv4, Some(std::net::Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(asconf.params.len(), 2);
+    }
+
+    #[test]
+    fn test_asconf_chunk_roundtrip() {
+        let mut asconf = AsconfChunk::new(999)
+            .with_sender_ipv4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+        asconf.add_ip(1, Some(std::net::Ipv4Addr::new(192, 168, 0, 1)), None);
+
+        let mut buf = BytesMut::new();
+        Chunk::Asconf(asconf.clone()).encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Chunk::decode(&mut bytes).unwrap();
+
+        if let Chunk::Asconf(a) = decoded {
+            assert_eq!(a.serial_number, 999);
+            assert_eq!(a.sender_ipv4, Some(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+            assert_eq!(a.params.len(), 1);
+        } else {
+            panic!("Expected ASCONF chunk");
+        }
+    }
+
+    #[test]
+    fn test_asconf_ack_chunk_creation() {
+        let mut ack = AsconfAckChunk::new(12345);
+        ack.add_success(1);
+        ack.add_success(2);
+        ack.add_error(3, 1, Bytes::from("test error"));
+
+        assert_eq!(ack.serial_number, 12345);
+        assert_eq!(ack.params.len(), 3);
+        assert!(!ack.all_success());
+    }
+
+    #[test]
+    fn test_asconf_ack_chunk_all_success() {
+        let mut ack = AsconfAckChunk::new(100);
+        ack.add_success(1);
+        ack.add_success(2);
+
+        assert!(ack.all_success());
+    }
+
+    #[test]
+    fn test_asconf_ack_chunk_roundtrip() {
+        let mut ack = AsconfAckChunk::new(555);
+        ack.add_success(1);
+        ack.add_success(2);
+
+        let mut buf = BytesMut::new();
+        Chunk::AsconfAck(ack.clone()).encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Chunk::decode(&mut bytes).unwrap();
+
+        if let Chunk::AsconfAck(a) = decoded {
+            assert_eq!(a.serial_number, 555);
+            assert_eq!(a.params.len(), 2);
+            assert!(a.all_success());
+        } else {
+            panic!("Expected ASCONF-ACK chunk");
+        }
+    }
+
+    #[test]
+    fn test_asconf_param_correlation_id() {
+        let param = AsconfParam::AddIp {
+            correlation_id: 42,
+            ipv4: Some(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            ipv6: None,
+        };
+        assert_eq!(param.correlation_id(), 42);
+
+        let param = AsconfParam::DeleteIp {
+            correlation_id: 99,
+            ipv4: None,
+            ipv6: Some(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
+        };
+        assert_eq!(param.correlation_id(), 99);
+    }
+
+    #[test]
+    fn test_chunk_type_asconf() {
+        assert_eq!(ChunkType::from_u8(0xC1), Some(ChunkType::Asconf));
+        assert_eq!(ChunkType::from_u8(0x80), Some(ChunkType::AsconfAck));
+        assert_eq!(ChunkType::Asconf.to_string(), "ASCONF");
+        assert_eq!(ChunkType::AsconfAck.to_string(), "ASCONF-ACK");
+    }
+
+    #[test]
+    fn test_forward_tsn_chunk_creation() {
+        let ftsn = ForwardTsnChunk::new(12345);
+        assert_eq!(ftsn.new_cumulative_tsn, 12345);
+        assert!(ftsn.streams.is_empty());
+    }
+
+    #[test]
+    fn test_forward_tsn_chunk_with_streams() {
+        let streams = vec![
+            ForwardTsnStream::new(0, 10),
+            ForwardTsnStream::new(1, 20),
+            ForwardTsnStream::new(2, 30),
+        ];
+        let ftsn = ForwardTsnChunk::with_streams(1000, streams);
+
+        assert_eq!(ftsn.new_cumulative_tsn, 1000);
+        assert_eq!(ftsn.streams.len(), 3);
+        assert_eq!(ftsn.streams[0].stream_id, 0);
+        assert_eq!(ftsn.streams[0].ssn, 10);
+        assert_eq!(ftsn.streams[1].stream_id, 1);
+        assert_eq!(ftsn.streams[1].ssn, 20);
+    }
+
+    #[test]
+    fn test_forward_tsn_chunk_add_stream() {
+        let mut ftsn = ForwardTsnChunk::new(5000);
+        ftsn.add_stream(0, 100);
+        ftsn.add_stream(3, 50);
+
+        assert_eq!(ftsn.streams.len(), 2);
+        assert_eq!(ftsn.streams[0].stream_id, 0);
+        assert_eq!(ftsn.streams[0].ssn, 100);
+        assert_eq!(ftsn.streams[1].stream_id, 3);
+        assert_eq!(ftsn.streams[1].ssn, 50);
+    }
+
+    #[test]
+    fn test_forward_tsn_chunk_roundtrip() {
+        let mut ftsn = ForwardTsnChunk::new(99999);
+        ftsn.add_stream(0, 5);
+        ftsn.add_stream(1, 10);
+        ftsn.add_stream(2, 15);
+
+        let mut buf = BytesMut::new();
+        Chunk::ForwardTsn(ftsn.clone()).encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Chunk::decode(&mut bytes).unwrap();
+
+        if let Chunk::ForwardTsn(f) = decoded {
+            assert_eq!(f.new_cumulative_tsn, 99999);
+            assert_eq!(f.streams.len(), 3);
+            assert_eq!(f.streams[0].stream_id, 0);
+            assert_eq!(f.streams[0].ssn, 5);
+            assert_eq!(f.streams[1].stream_id, 1);
+            assert_eq!(f.streams[1].ssn, 10);
+            assert_eq!(f.streams[2].stream_id, 2);
+            assert_eq!(f.streams[2].ssn, 15);
+        } else {
+            panic!("Expected FORWARD-TSN chunk");
+        }
+    }
+
+    #[test]
+    fn test_forward_tsn_chunk_roundtrip_no_streams() {
+        let ftsn = ForwardTsnChunk::new(50000);
+
+        let mut buf = BytesMut::new();
+        Chunk::ForwardTsn(ftsn.clone()).encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Chunk::decode(&mut bytes).unwrap();
+
+        if let Chunk::ForwardTsn(f) = decoded {
+            assert_eq!(f.new_cumulative_tsn, 50000);
+            assert!(f.streams.is_empty());
+        } else {
+            panic!("Expected FORWARD-TSN chunk");
+        }
+    }
+
+    #[test]
+    fn test_chunk_type_forward_tsn() {
+        assert_eq!(ChunkType::from_u8(0xC0), Some(ChunkType::ForwardTsn));
+        assert_eq!(ChunkType::ForwardTsn.to_string(), "FORWARD-TSN");
+    }
+
+    #[test]
+    fn test_reconfig_chunk_creation() {
+        let chunk = ReConfigChunk::new();
+        assert!(chunk.params.is_empty());
+    }
+
+    #[test]
+    fn test_reconfig_outgoing_ssn_reset() {
+        let chunk = ReConfigChunk::outgoing_ssn_reset(100, 99, 5000, vec![0, 1, 2]);
+
+        assert_eq!(chunk.params.len(), 1);
+        if let ReConfigParam::OutgoingSsnReset {
+            req_seq_num,
+            resp_seq_num,
+            last_tsn,
+            stream_ids,
+        } = &chunk.params[0]
+        {
+            assert_eq!(*req_seq_num, 100);
+            assert_eq!(*resp_seq_num, 99);
+            assert_eq!(*last_tsn, 5000);
+            assert_eq!(*stream_ids, vec![0, 1, 2]);
+        } else {
+            panic!("Expected OutgoingSsnReset");
+        }
+    }
+
+    #[test]
+    fn test_reconfig_incoming_ssn_reset() {
+        let chunk = ReConfigChunk::incoming_ssn_reset(200, vec![5, 10]);
+
+        assert_eq!(chunk.params.len(), 1);
+        if let ReConfigParam::IncomingSsnReset {
+            req_seq_num,
+            stream_ids,
+        } = &chunk.params[0]
+        {
+            assert_eq!(*req_seq_num, 200);
+            assert_eq!(*stream_ids, vec![5, 10]);
+        } else {
+            panic!("Expected IncomingSsnReset");
+        }
+    }
+
+    #[test]
+    fn test_reconfig_response() {
+        let chunk = ReConfigChunk::response(100, ReConfigResult::SuccessPerformed);
+
+        assert_eq!(chunk.params.len(), 1);
+        if let ReConfigParam::Response {
+            resp_seq_num,
+            result,
+            sender_next_tsn,
+            receiver_next_tsn,
+        } = &chunk.params[0]
+        {
+            assert_eq!(*resp_seq_num, 100);
+            assert_eq!(*result, ReConfigResult::SuccessPerformed);
+            assert!(sender_next_tsn.is_none());
+            assert!(receiver_next_tsn.is_none());
+        } else {
+            panic!("Expected Response");
+        }
+    }
+
+    #[test]
+    fn test_reconfig_result_is_success() {
+        assert!(ReConfigResult::SuccessNothingToDo.is_success());
+        assert!(ReConfigResult::SuccessPerformed.is_success());
+        assert!(!ReConfigResult::Denied.is_success());
+        assert!(!ReConfigResult::InProgress.is_success());
+    }
+
+    #[test]
+    fn test_reconfig_outgoing_ssn_reset_roundtrip() {
+        let chunk = ReConfigChunk::outgoing_ssn_reset(1000, 999, 50000, vec![0, 1, 2, 3]);
+
+        let mut buf = BytesMut::new();
+        Chunk::ReConfig(chunk.clone()).encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Chunk::decode(&mut bytes).unwrap();
+
+        if let Chunk::ReConfig(rc) = decoded {
+            assert_eq!(rc.params.len(), 1);
+            if let ReConfigParam::OutgoingSsnReset {
+                req_seq_num,
+                resp_seq_num,
+                last_tsn,
+                stream_ids,
+            } = &rc.params[0]
+            {
+                assert_eq!(*req_seq_num, 1000);
+                assert_eq!(*resp_seq_num, 999);
+                assert_eq!(*last_tsn, 50000);
+                assert_eq!(*stream_ids, vec![0, 1, 2, 3]);
+            } else {
+                panic!("Expected OutgoingSsnReset");
+            }
+        } else {
+            panic!("Expected ReConfig chunk");
+        }
+    }
+
+    #[test]
+    fn test_reconfig_response_roundtrip() {
+        let chunk = ReConfigChunk::response(555, ReConfigResult::Denied);
+
+        let mut buf = BytesMut::new();
+        Chunk::ReConfig(chunk.clone()).encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Chunk::decode(&mut bytes).unwrap();
+
+        if let Chunk::ReConfig(rc) = decoded {
+            assert_eq!(rc.params.len(), 1);
+            if let ReConfigParam::Response {
+                resp_seq_num,
+                result,
+                ..
+            } = &rc.params[0]
+            {
+                assert_eq!(*resp_seq_num, 555);
+                assert_eq!(*result, ReConfigResult::Denied);
+            } else {
+                panic!("Expected Response");
+            }
+        } else {
+            panic!("Expected ReConfig chunk");
+        }
+    }
+
+    #[test]
+    fn test_chunk_type_reconfig() {
+        assert_eq!(ChunkType::from_u8(130), Some(ChunkType::ReConfig));
+        assert_eq!(ChunkType::ReConfig.to_string(), "RE-CONFIG");
     }
 }

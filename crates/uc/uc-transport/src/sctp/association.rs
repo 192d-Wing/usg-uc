@@ -9,9 +9,11 @@
 //! - UDP encapsulation for NAT traversal
 
 use super::chunk::{
-    AbortChunk, Chunk, CookieAckChunk, CookieEchoChunk, CwrChunk, DataChunk, EcneChunk, ErrorCause,
-    ErrorChunk, HeartbeatAckChunk, HeartbeatChunk, InitAckChunk, InitChunk, InitParam, SackChunk,
-    ShutdownAckChunk, ShutdownChunk, ShutdownCompleteChunk,
+    AbortChunk, AsconfAckChunk, AsconfAckParam, AsconfChunk, AsconfParam, Chunk, CookieAckChunk,
+    CookieEchoChunk, CwrChunk, DataChunk, EcneChunk, ErrorCause, ErrorChunk, ForwardTsnChunk,
+    GapAckBlock, HeartbeatAckChunk, HeartbeatChunk, InitAckChunk, InitChunk, InitParam,
+    ReConfigChunk, ReConfigParam, ReConfigResult, SackChunk, ShutdownAckChunk, ShutdownChunk,
+    ShutdownCompleteChunk,
 };
 use super::cookie::{CookieData, CookieGenerator};
 use super::packet::SctpPacket;
@@ -33,6 +35,33 @@ use tokio::sync::RwLock;
 
 /// Maximum number of retransmissions before aborting.
 pub const MAX_RETRANSMISSIONS: u32 = 10;
+
+// =============================================================================
+// INIT Validation Errors (RFC 9260 §5.1.2)
+// =============================================================================
+
+/// Errors from INIT/INIT-ACK validation per RFC 9260 §5.1.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitValidationError {
+    /// Initiate Tag was 0 (MUST NOT be 0).
+    InvalidInitiateTag,
+    /// Number of Inbound Streams was 0 (MUST NOT be 0).
+    InvalidInboundStreams,
+    /// Number of Outbound Streams was 0 (MUST NOT be 0).
+    InvalidOutboundStreams,
+}
+
+impl std::fmt::Display for InitValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidInitiateTag => write!(f, "Initiate Tag must not be 0"),
+            Self::InvalidInboundStreams => write!(f, "Number of Inbound Streams must not be 0"),
+            Self::InvalidOutboundStreams => write!(f, "Number of Outbound Streams must not be 0"),
+        }
+    }
+}
+
+impl std::error::Error for InitValidationError {}
 
 /// Maximum number of INIT retransmissions.
 pub const MAX_INIT_RETRANSMISSIONS: u32 = 8;
@@ -172,6 +201,34 @@ pub struct AssociationInner {
     local_addr: SocketAddr,
     /// Primary peer address.
     peer_addr: SocketAddr,
+    /// Additional local addresses for multi-homing.
+    #[allow(dead_code)] // Used when sending ASCONF to advertise local addresses
+    local_addresses: HashSet<SocketAddr>,
+    /// Additional peer addresses for multi-homing.
+    peer_addresses: HashSet<SocketAddr>,
+
+    // ASCONF state (RFC 5061)
+    /// Serial number for outgoing ASCONF chunks.
+    asconf_serial_number: u32,
+    /// Last received ASCONF serial number from peer.
+    peer_asconf_serial_number: Option<u32>,
+
+    // RE-CONFIG state (RFC 6525)
+    /// Request sequence number for outgoing RE-CONFIG chunks.
+    #[allow(dead_code)] // Used when sending RE-CONFIG requests
+    reconfig_req_seq_num: u32,
+    /// Last received RE-CONFIG request sequence number from peer.
+    peer_reconfig_req_seq_num: Option<u32>,
+
+    // Duplicate TSN tracking (RFC 9260 §6.2)
+    /// Set of received TSNs above cumulative (for gap tracking and duplicate detection).
+    received_tsns: HashSet<u32>,
+    /// Duplicate TSNs to report in the next SACK (cleared after each SACK).
+    duplicate_tsns: Vec<u32>,
+
+    // Immediate SACK tracking (RFC 9260 §6.8)
+    /// Whether immediate SACK is required (set when I-bit received).
+    sack_immediately: bool,
 }
 
 impl AssociationInner {
@@ -213,6 +270,15 @@ impl AssociationInner {
             config,
             local_addr,
             peer_addr,
+            local_addresses: HashSet::new(),
+            peer_addresses: HashSet::new(),
+            asconf_serial_number: generate_random_u32(),
+            peer_asconf_serial_number: None,
+            reconfig_req_seq_num: generate_random_u32(),
+            peer_reconfig_req_seq_num: None,
+            received_tsns: HashSet::new(),
+            duplicate_tsns: Vec::new(),
+            sack_immediately: false,
         }
     }
 
@@ -266,19 +332,90 @@ impl AssociationInner {
         (init_ack, cookie)
     }
 
-    /// Processes a received INIT chunk.
-    fn process_init(&mut self, init: &InitChunk) -> Vec<StateAction> {
+    /// Minimum receiver window per RFC 9260 §5.1.2.
+    const MIN_RWND: u32 = 1500;
+
+    /// Processes a received INIT chunk with RFC 9260 §5.1.2 validation.
+    ///
+    /// Validates:
+    /// - Initiate Tag MUST NOT be 0
+    /// - Number of Inbound Streams MUST NOT be 0
+    /// - Number of Outbound Streams MUST NOT be 0
+    /// - A-RWND SHOULD NOT be less than 1500
+    fn process_init(&mut self, init: &InitChunk) -> Result<Vec<StateAction>, InitValidationError> {
+        // RFC 9260 §5.1.2: Initiate Tag MUST NOT be 0
+        if init.initiate_tag == 0 {
+            return Err(InitValidationError::InvalidInitiateTag);
+        }
+
+        // RFC 9260 §5.1.2: Number of Inbound Streams MUST NOT be 0
+        if init.num_inbound_streams == 0 {
+            return Err(InitValidationError::InvalidInboundStreams);
+        }
+
+        // RFC 9260 §5.1.2: Number of Outbound Streams MUST NOT be 0
+        if init.num_outbound_streams == 0 {
+            return Err(InitValidationError::InvalidOutboundStreams);
+        }
+
+        // RFC 9260 §5.1.2: A-RWND SHOULD NOT be less than 1500
+        if init.a_rwnd < Self::MIN_RWND {
+            tracing::warn!(
+                a_rwnd = init.a_rwnd,
+                min = Self::MIN_RWND,
+                "Peer advertised receiver window below minimum (continuing anyway)"
+            );
+        }
+
         // Store peer parameters
         self.peer_verification_tag = init.initiate_tag;
         self.peer_initial_tsn = init.initial_tsn;
         self.peer_cumulative_tsn = init.initial_tsn.wrapping_sub(1);
         self.peer_rwnd = init.a_rwnd;
 
-        self.state_machine.process_event(StateEvent::ReceiveInit)
+        // Process optional parameters
+        for param in &init.params {
+            self.process_init_param(param);
+        }
+
+        Ok(self.state_machine.process_event(StateEvent::ReceiveInit))
     }
 
-    /// Processes a received INIT-ACK chunk.
-    fn process_init_ack(&mut self, init_ack: &InitAckChunk) -> Vec<StateAction> {
+    /// Processes a received INIT-ACK chunk with RFC 9260 §5.1.2 validation.
+    ///
+    /// Validates:
+    /// - Initiate Tag MUST NOT be 0
+    /// - Number of Inbound Streams MUST NOT be 0
+    /// - Number of Outbound Streams MUST NOT be 0
+    /// - A-RWND SHOULD NOT be less than 1500
+    fn process_init_ack(
+        &mut self,
+        init_ack: &InitAckChunk,
+    ) -> Result<Vec<StateAction>, InitValidationError> {
+        // RFC 9260 §5.1.2: Initiate Tag MUST NOT be 0
+        if init_ack.initiate_tag == 0 {
+            return Err(InitValidationError::InvalidInitiateTag);
+        }
+
+        // RFC 9260 §5.1.2: Number of Inbound Streams MUST NOT be 0
+        if init_ack.num_inbound_streams == 0 {
+            return Err(InitValidationError::InvalidInboundStreams);
+        }
+
+        // RFC 9260 §5.1.2: Number of Outbound Streams MUST NOT be 0
+        if init_ack.num_outbound_streams == 0 {
+            return Err(InitValidationError::InvalidOutboundStreams);
+        }
+
+        // RFC 9260 §5.1.2: A-RWND SHOULD NOT be less than 1500
+        if init_ack.a_rwnd < Self::MIN_RWND {
+            tracing::warn!(
+                a_rwnd = init_ack.a_rwnd,
+                min = Self::MIN_RWND,
+                "Peer advertised receiver window below minimum (continuing anyway)"
+            );
+        }
+
         // Store peer parameters
         self.peer_verification_tag = init_ack.initiate_tag;
         self.peer_initial_tsn = init_ack.initial_tsn;
@@ -296,7 +433,77 @@ impl AssociationInner {
             .min(init_ack.num_outbound_streams);
         self.streams = StreamManager::new(outbound, inbound, self.config.ordered_delivery);
 
-        self.state_machine.process_event(StateEvent::ReceiveInitAck)
+        // Process optional parameters
+        for param in &init_ack.params {
+            self.process_init_param(param);
+        }
+
+        Ok(self.state_machine.process_event(StateEvent::ReceiveInitAck))
+    }
+
+    /// Processes an INIT/INIT-ACK parameter (RFC 9260 §5.1.2).
+    fn process_init_param(&mut self, param: &InitParam) {
+        match param {
+            InitParam::Ipv4Address(addr) => {
+                // Add peer's additional IPv4 address
+                let sock_addr = SocketAddr::new((*addr).into(), self.peer_addr.port());
+                self.peer_addresses.insert(sock_addr);
+                tracing::debug!(addr = %sock_addr, "Peer advertised additional IPv4 address");
+            }
+            InitParam::Ipv6Address(addr) => {
+                // Add peer's additional IPv6 address
+                let sock_addr = SocketAddr::new((*addr).into(), self.peer_addr.port());
+                self.peer_addresses.insert(sock_addr);
+                tracing::debug!(addr = %sock_addr, "Peer advertised additional IPv6 address");
+            }
+            InitParam::EcnCapable => {
+                tracing::debug!("Peer supports ECN");
+                // TODO: Store ECN capability and use it for congestion control
+            }
+            InitParam::ForwardTsnSupported => {
+                tracing::debug!("Peer supports Forward TSN (PR-SCTP)");
+                // TODO: Store PR-SCTP capability
+            }
+            InitParam::SupportedAddressTypes(types) => {
+                tracing::debug!(types = ?types, "Peer supported address types");
+            }
+            InitParam::Cookie(_) | InitParam::CookiePreservative(_) => {
+                // Handled separately
+            }
+            InitParam::HostnameAddress(hostname) => {
+                tracing::debug!(hostname = %hostname, "Peer hostname address");
+                // TODO: DNS resolution if needed
+            }
+            InitParam::Unknown { param_type, .. } => {
+                // RFC 9260 §3.2.1: Handle unknown parameters based on high bits
+                let action = (*param_type >> 14) & 0x3;
+                match action {
+                    0 => {
+                        // Stop processing and report unrecognized parameter
+                        tracing::warn!(param_type = param_type, "Unrecognized parameter, stopping");
+                    }
+                    1 => {
+                        // Stop processing and report unrecognized parameter
+                        tracing::warn!(
+                            param_type = param_type,
+                            "Unrecognized parameter, stopping and reporting"
+                        );
+                    }
+                    2 => {
+                        // Skip and continue
+                        tracing::debug!(param_type = param_type, "Skipping unrecognized parameter");
+                    }
+                    3 => {
+                        // Skip, continue, and report
+                        tracing::debug!(
+                            param_type = param_type,
+                            "Skipping unrecognized parameter and reporting"
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
     }
 
     /// Processes a received COOKIE-ECHO chunk.
@@ -350,15 +557,62 @@ impl AssociationInner {
     }
 
     /// Processes a received DATA chunk.
+    ///
+    /// Per RFC 9260 §6.2, implements duplicate TSN detection:
+    /// - TSNs <= cumulative TSN are duplicates
+    /// - TSNs already in received_tsns set are duplicates
+    /// - Duplicate TSNs are recorded for reporting in the next SACK
+    ///
+    /// Per RFC 9260 §6.8, handles the I-bit (immediate) flag:
+    /// - If set, sets `sack_immediately` to bypass delayed SACK
     fn process_data(&mut self, data: DataChunk) -> Result<(), String> {
         if !self.is_established() {
             return Err("Association not established".to_string());
         }
 
-        // Update peer cumulative TSN
-        // Note: This is simplified; real implementation needs gap tracking
-        if data.tsn == self.peer_cumulative_tsn.wrapping_add(1) {
-            self.peer_cumulative_tsn = data.tsn;
+        let tsn = data.tsn;
+
+        // RFC 9260 §6.8: Handle I-bit (immediate acknowledgment requested)
+        if data.immediate {
+            self.sack_immediately = true;
+            tracing::trace!(tsn = tsn, "Immediate flag set, will SACK immediately");
+        }
+
+        // RFC 9260 §6.2: Detect duplicate TSNs
+        let is_duplicate = if tsn_le(tsn, self.peer_cumulative_tsn) {
+            // TSN is at or below cumulative - definitely a duplicate
+            true
+        } else if self.received_tsns.contains(&tsn) {
+            // TSN is above cumulative but already received - duplicate
+            true
+        } else {
+            false
+        };
+
+        if is_duplicate {
+            // RFC 9260 §6.2: Report duplicate TSN in next SACK
+            // Limit to prevent unbounded growth (RFC suggests reasonable limit)
+            if self.duplicate_tsns.len() < 16 {
+                self.duplicate_tsns.push(tsn);
+            }
+            tracing::trace!(tsn = tsn, "Duplicate TSN received");
+            // Still return Ok - duplicates are not errors, just ignored
+            return Ok(());
+        }
+
+        // Track this TSN as received (for gap detection)
+        self.received_tsns.insert(tsn);
+
+        // Update peer cumulative TSN and clean up received_tsns set
+        if tsn == self.peer_cumulative_tsn.wrapping_add(1) {
+            self.peer_cumulative_tsn = tsn;
+            // Advance cumulative TSN as far as possible
+            while self
+                .received_tsns
+                .remove(&self.peer_cumulative_tsn.wrapping_add(1))
+            {
+                self.peer_cumulative_tsn = self.peer_cumulative_tsn.wrapping_add(1);
+            }
         }
 
         // Process through stream manager
@@ -681,14 +935,117 @@ impl AssociationInner {
         self.streams.take_message()
     }
 
-    /// Creates a SACK chunk for the current state.
-    fn create_sack(&self) -> SackChunk {
-        // TODO: Add gap ack blocks for out-of-order reception
-        SackChunk::new(self.peer_cumulative_tsn, self.local_rwnd)
+    /// Creates a SACK chunk for the current state (RFC 9260 §6.2).
+    ///
+    /// Includes:
+    /// - Cumulative TSN acknowledgment
+    /// - Gap ack blocks for out-of-order TSNs
+    /// - Duplicate TSN reports (clears the duplicate list after)
+    ///
+    /// Also clears the `sack_immediately` flag (RFC 9260 §6.8).
+    fn create_sack(&mut self) -> SackChunk {
+        let mut sack = SackChunk::new(self.peer_cumulative_tsn, self.local_rwnd);
+
+        // Build gap ack blocks from received_tsns set
+        // Gap blocks are offsets from the cumulative TSN
+        let gap_blocks = self.build_gap_ack_blocks();
+        for block in gap_blocks {
+            sack.add_gap_block(block.start, block.end);
+        }
+
+        // Add duplicate TSNs and clear the list
+        for dup_tsn in self.duplicate_tsns.drain(..) {
+            sack.add_dup_tsn(dup_tsn);
+        }
+
+        // RFC 9260 §6.8: Clear immediate SACK flag after sending
+        self.sack_immediately = false;
+
+        sack
     }
 
-    /// Creates a HEARTBEAT chunk.
-    #[allow(dead_code)] // Will be used by heartbeat timer logic
+    /// Returns true if immediate SACK is required (RFC 9260 §6.8).
+    ///
+    /// This is set when a DATA chunk with the I-bit (immediate) flag is received.
+    /// The caller should send a SACK immediately instead of using delayed SACK.
+    fn should_sack_immediately(&self) -> bool {
+        self.sack_immediately
+    }
+
+    /// Builds gap ack blocks from the received TSNs set.
+    ///
+    /// Gap ack blocks indicate ranges of TSNs that have been received
+    /// above the cumulative TSN ack. The start/end values are offsets
+    /// from the cumulative TSN ack (1-based, per RFC 9260 §3.3.4).
+    fn build_gap_ack_blocks(&self) -> Vec<GapAckBlock> {
+
+        if self.received_tsns.is_empty() {
+            return Vec::new();
+        }
+
+        // Sort TSNs relative to cumulative TSN
+        let cum_tsn = self.peer_cumulative_tsn;
+        let mut offsets: Vec<u32> = self
+            .received_tsns
+            .iter()
+            .filter_map(|&tsn| {
+                // Calculate offset from cumulative TSN
+                let offset = tsn.wrapping_sub(cum_tsn);
+                // Only include TSNs above cumulative (offset > 0)
+                // and within u16 range (RFC limits)
+                if offset > 0 && offset <= u32::from(u16::MAX) {
+                    Some(offset)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        offsets.sort_unstable();
+
+        // Build contiguous blocks
+        let mut blocks = Vec::new();
+        let mut iter = offsets.into_iter();
+
+        if let Some(first) = iter.next() {
+            let mut start = first;
+            let mut end = first;
+
+            for offset in iter {
+                if offset == end + 1 {
+                    // Extend current block
+                    end = offset;
+                } else {
+                    // Save current block, start new one
+                    blocks.push(GapAckBlock {
+                        start: start as u16,
+                        end: end as u16,
+                    });
+                    start = offset;
+                    end = offset;
+                }
+            }
+
+            // Don't forget the last block
+            blocks.push(GapAckBlock {
+                start: start as u16,
+                end: end as u16,
+            });
+        }
+
+        // RFC 9260 recommends limiting gap blocks (typically 4)
+        if blocks.len() > 4 {
+            blocks.truncate(4);
+        }
+
+        blocks
+    }
+
+    /// Creates a simple HEARTBEAT chunk with timestamp for RTT measurement.
+    ///
+    /// Note: For multi-path heartbeats, use `AssociationHandle::create_heartbeat_for_path`
+    /// instead, which includes path identification info.
+    #[allow(dead_code)] // Kept for potential direct use, prefer create_heartbeat_for_path
     fn create_heartbeat(&self) -> HeartbeatChunk {
         // Include timestamp in heartbeat info for RTT measurement
         let now = std::time::SystemTime::now()
@@ -850,6 +1207,625 @@ impl AssociationInner {
         tracing::debug!("Received CWR, peer has reduced its congestion window");
         // No action required - the CWR is just an acknowledgment
         // that the peer received our ECNE and acted on it
+    }
+
+    /// Processes an ASCONF chunk (RFC 5061).
+    ///
+    /// ASCONF chunks allow dynamic address configuration changes during
+    /// an established association. This includes:
+    /// - ADD-IP: Add a new IP address to the association
+    /// - DELETE-IP: Remove an IP address from the association
+    /// - SET-PRIMARY: Change the primary destination address
+    ///
+    /// Returns an ASCONF-ACK chunk with the results of each operation.
+    fn process_asconf(&mut self, asconf: &AsconfChunk) -> AsconfAckChunk {
+        let serial = asconf.serial_number;
+
+        // RFC 5061 §5.2: Check serial number to detect duplicates and ordering
+        if let Some(peer_serial) = self.peer_asconf_serial_number {
+            // Serial numbers use serial number arithmetic (like TSN)
+            let diff = serial.wrapping_sub(peer_serial) as i32;
+
+            if diff < 0 {
+                // Old ASCONF - already processed, return empty ACK
+                tracing::debug!(
+                    serial = serial,
+                    last_serial = peer_serial,
+                    "Ignoring old ASCONF (already processed)"
+                );
+                return AsconfAckChunk::new(serial);
+            } else if diff == 0 {
+                // Duplicate - peer didn't receive our ACK, resend
+                tracing::debug!(
+                    serial = serial,
+                    "Received duplicate ASCONF, will resend ACK"
+                );
+                // Fall through to reprocess
+            }
+            // diff > 0 means new ASCONF
+        }
+
+        // Update the last received serial number
+        self.peer_asconf_serial_number = Some(serial);
+
+        let mut ack = AsconfAckChunk::new(serial);
+
+        // Process each parameter in order
+        for param in &asconf.params {
+            let result = self.process_asconf_param(param);
+            ack.params.push(result);
+        }
+
+        ack
+    }
+
+    /// Processes a single ASCONF parameter and returns the result.
+    fn process_asconf_param(&mut self, param: &AsconfParam) -> AsconfAckParam {
+        // RFC 9260 error cause codes
+        const ERROR_INVALID_MANDATORY_PARAMETER: u16 = 7;
+        const ERROR_UNRESOLVABLE_ADDRESS: u16 = 5;
+
+        match param {
+            AsconfParam::AddIp {
+                correlation_id,
+                ipv4,
+                ipv6,
+            } => {
+                // RFC 5061 §4.2.1: ADD IP Address
+                let addr = if let Some(ip) = ipv4 {
+                    // Use default SCTP port (could be tracked per-address)
+                    Some(SocketAddr::from((*ip, self.peer_addr.port())))
+                } else if let Some(ip) = ipv6 {
+                    Some(SocketAddr::from((*ip, self.peer_addr.port())))
+                } else {
+                    None
+                };
+
+                if let Some(addr) = addr {
+                    if self.peer_addresses.contains(&addr) || addr == self.peer_addr {
+                        // Address already exists
+                        tracing::debug!(addr = %addr, "ADD-IP: Address already exists");
+                        AsconfAckParam::Success {
+                            correlation_id: *correlation_id,
+                        }
+                    } else {
+                        // Add the new address
+                        self.peer_addresses.insert(addr);
+
+                        // Add path for multi-homing
+                        self.paths.add_path(self.local_addr, addr);
+
+                        tracing::info!(addr = %addr, "ADD-IP: Added new peer address");
+                        AsconfAckParam::Success {
+                            correlation_id: *correlation_id,
+                        }
+                    }
+                } else {
+                    // No valid address provided
+                    tracing::warn!("ADD-IP: No valid address in parameter");
+                    AsconfAckParam::ErrorCause {
+                        correlation_id: *correlation_id,
+                        error_code: ERROR_INVALID_MANDATORY_PARAMETER,
+                        error_info: Bytes::new(),
+                    }
+                }
+            }
+
+            AsconfParam::DeleteIp {
+                correlation_id,
+                ipv4,
+                ipv6,
+            } => {
+                // RFC 5061 §4.2.2: DELETE IP Address
+                let addr = if let Some(ip) = ipv4 {
+                    Some(SocketAddr::from((*ip, self.peer_addr.port())))
+                } else if let Some(ip) = ipv6 {
+                    Some(SocketAddr::from((*ip, self.peer_addr.port())))
+                } else {
+                    None
+                };
+
+                if let Some(addr) = addr {
+                    // RFC 5061 §4.2.2: Cannot delete the last address
+                    if self.peer_addresses.is_empty() && addr == self.peer_addr {
+                        tracing::warn!(addr = %addr, "DELETE-IP: Cannot delete last remaining address");
+                        AsconfAckParam::ErrorCause {
+                            correlation_id: *correlation_id,
+                            error_code: ERROR_INVALID_MANDATORY_PARAMETER,
+                            error_info: Bytes::from_static(b"cannot delete last address"),
+                        }
+                    } else if addr == self.peer_addr {
+                        // Deleting primary - must have alternates
+                        if self.peer_addresses.is_empty() {
+                            tracing::warn!("DELETE-IP: Cannot delete primary with no alternates");
+                            AsconfAckParam::ErrorCause {
+                                correlation_id: *correlation_id,
+                                error_code: ERROR_INVALID_MANDATORY_PARAMETER,
+                                error_info: Bytes::from_static(b"cannot delete primary without alternates"),
+                            }
+                        } else {
+                            // Pick a new primary from the peer addresses
+                            if let Some(&new_primary) = self.peer_addresses.iter().next() {
+                                self.peer_addr = new_primary;
+                                self.peer_addresses.remove(&new_primary);
+                                tracing::info!(
+                                    old_addr = %addr,
+                                    new_primary = %new_primary,
+                                    "DELETE-IP: Deleted primary, new primary selected"
+                                );
+                            }
+                            AsconfAckParam::Success {
+                                correlation_id: *correlation_id,
+                            }
+                        }
+                    } else if self.peer_addresses.remove(&addr) {
+                        // Remove the path
+                        let path_id = PathId::new(self.local_addr, addr);
+                        self.paths.remove_path(path_id);
+
+                        tracing::info!(addr = %addr, "DELETE-IP: Removed peer address");
+                        AsconfAckParam::Success {
+                            correlation_id: *correlation_id,
+                        }
+                    } else {
+                        // Address not found
+                        tracing::debug!(addr = %addr, "DELETE-IP: Address not found");
+                        AsconfAckParam::ErrorCause {
+                            correlation_id: *correlation_id,
+                            error_code: ERROR_UNRESOLVABLE_ADDRESS,
+                            error_info: Bytes::new(),
+                        }
+                    }
+                } else {
+                    tracing::warn!("DELETE-IP: No valid address in parameter");
+                    AsconfAckParam::ErrorCause {
+                        correlation_id: *correlation_id,
+                        error_code: ERROR_INVALID_MANDATORY_PARAMETER,
+                        error_info: Bytes::new(),
+                    }
+                }
+            }
+
+            AsconfParam::SetPrimaryAddress {
+                correlation_id,
+                ipv4,
+                ipv6,
+            } => {
+                // RFC 5061 §4.2.3: SET PRIMARY Address
+                let addr = if let Some(ip) = ipv4 {
+                    Some(SocketAddr::from((*ip, self.peer_addr.port())))
+                } else if let Some(ip) = ipv6 {
+                    Some(SocketAddr::from((*ip, self.peer_addr.port())))
+                } else {
+                    None
+                };
+
+                if let Some(addr) = addr {
+                    if addr == self.peer_addr {
+                        // Already the primary
+                        tracing::debug!(addr = %addr, "SET-PRIMARY: Already primary");
+                        AsconfAckParam::Success {
+                            correlation_id: *correlation_id,
+                        }
+                    } else if self.peer_addresses.contains(&addr) {
+                        // Move current primary to peer_addresses
+                        let old_primary = self.peer_addr;
+                        self.peer_addresses.insert(old_primary);
+                        self.peer_addresses.remove(&addr);
+                        self.peer_addr = addr;
+
+                        // Update path manager primary
+                        let path_id = PathId::new(self.local_addr, addr);
+                        self.paths.set_primary_path(path_id);
+
+                        tracing::info!(
+                            old_primary = %old_primary,
+                            new_primary = %addr,
+                            "SET-PRIMARY: Changed primary address"
+                        );
+                        AsconfAckParam::Success {
+                            correlation_id: *correlation_id,
+                        }
+                    } else {
+                        // Address not known
+                        tracing::warn!(addr = %addr, "SET-PRIMARY: Address not known");
+                        AsconfAckParam::ErrorCause {
+                            correlation_id: *correlation_id,
+                            error_code: ERROR_UNRESOLVABLE_ADDRESS,
+                            error_info: Bytes::new(),
+                        }
+                    }
+                } else {
+                    tracing::warn!("SET-PRIMARY: No valid address in parameter");
+                    AsconfAckParam::ErrorCause {
+                        correlation_id: *correlation_id,
+                        error_code: ERROR_INVALID_MANDATORY_PARAMETER,
+                        error_info: Bytes::new(),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Processes an ASCONF-ACK chunk (RFC 5061).
+    ///
+    /// ASCONF-ACK confirms the result of our ASCONF request.
+    /// Each parameter in the ACK corresponds to a parameter we sent.
+    fn process_asconf_ack(&mut self, asconf_ack: &AsconfAckChunk) {
+        let serial = asconf_ack.serial_number;
+
+        tracing::debug!(
+            serial = serial,
+            num_params = asconf_ack.params.len(),
+            "Received ASCONF-ACK"
+        );
+
+        for (i, param) in asconf_ack.params.iter().enumerate() {
+            match param {
+                AsconfAckParam::Success { correlation_id } => {
+                    tracing::debug!(
+                        index = i,
+                        correlation_id = correlation_id,
+                        "ASCONF param succeeded"
+                    );
+                }
+                AsconfAckParam::ErrorCause {
+                    correlation_id,
+                    error_code,
+                    ..
+                } => {
+                    tracing::warn!(
+                        index = i,
+                        correlation_id = correlation_id,
+                        error_code = error_code,
+                        "ASCONF param failed"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Creates an ASCONF chunk to add a new local address.
+    #[allow(dead_code)] // Will be used by public API
+    fn create_add_ip_asconf(&mut self, addr: SocketAddr) -> AsconfChunk {
+        let serial = self.asconf_serial_number;
+        self.asconf_serial_number = self.asconf_serial_number.wrapping_add(1);
+
+        let correlation_id = generate_random_u32();
+        let param = match addr {
+            SocketAddr::V4(v4) => AsconfParam::AddIp {
+                correlation_id,
+                ipv4: Some(*v4.ip()),
+                ipv6: None,
+            },
+            SocketAddr::V6(v6) => AsconfParam::AddIp {
+                correlation_id,
+                ipv4: None,
+                ipv6: Some(*v6.ip()),
+            },
+        };
+
+        let chunk = AsconfChunk::new(serial);
+        // Set sender address based on local address type
+        let mut chunk = match self.local_addr {
+            SocketAddr::V4(v4) => chunk.with_sender_ipv4(*v4.ip()),
+            SocketAddr::V6(v6) => chunk.with_sender_ipv6(*v6.ip()),
+        };
+        chunk.params.push(param);
+        chunk
+    }
+
+    /// Creates an ASCONF chunk to delete a local address.
+    #[allow(dead_code)] // Will be used by public API
+    fn create_delete_ip_asconf(&mut self, addr: SocketAddr) -> AsconfChunk {
+        let serial = self.asconf_serial_number;
+        self.asconf_serial_number = self.asconf_serial_number.wrapping_add(1);
+
+        let correlation_id = generate_random_u32();
+        let param = match addr {
+            SocketAddr::V4(v4) => AsconfParam::DeleteIp {
+                correlation_id,
+                ipv4: Some(*v4.ip()),
+                ipv6: None,
+            },
+            SocketAddr::V6(v6) => AsconfParam::DeleteIp {
+                correlation_id,
+                ipv4: None,
+                ipv6: Some(*v6.ip()),
+            },
+        };
+
+        let chunk = AsconfChunk::new(serial);
+        // Set sender address based on local address type
+        let mut chunk = match self.local_addr {
+            SocketAddr::V4(v4) => chunk.with_sender_ipv4(*v4.ip()),
+            SocketAddr::V6(v6) => chunk.with_sender_ipv6(*v6.ip()),
+        };
+        chunk.params.push(param);
+        chunk
+    }
+
+    /// Creates an ASCONF chunk to set a new primary address.
+    #[allow(dead_code)] // Will be used by public API
+    fn create_set_primary_asconf(&mut self, addr: SocketAddr) -> AsconfChunk {
+        let serial = self.asconf_serial_number;
+        self.asconf_serial_number = self.asconf_serial_number.wrapping_add(1);
+
+        let correlation_id = generate_random_u32();
+        let param = match addr {
+            SocketAddr::V4(v4) => AsconfParam::SetPrimaryAddress {
+                correlation_id,
+                ipv4: Some(*v4.ip()),
+                ipv6: None,
+            },
+            SocketAddr::V6(v6) => AsconfParam::SetPrimaryAddress {
+                correlation_id,
+                ipv4: None,
+                ipv6: Some(*v6.ip()),
+            },
+        };
+
+        let chunk = AsconfChunk::new(serial);
+        // Set sender address based on local address type
+        let mut chunk = match self.local_addr {
+            SocketAddr::V4(v4) => chunk.with_sender_ipv4(*v4.ip()),
+            SocketAddr::V6(v6) => chunk.with_sender_ipv6(*v6.ip()),
+        };
+        chunk.params.push(param);
+        chunk
+    }
+
+    /// Processes a FORWARD-TSN chunk (RFC 3758).
+    ///
+    /// FORWARD-TSN advances the cumulative TSN to skip abandoned data.
+    /// This is used for partial reliability extensions where data may be
+    /// abandoned due to lifetime expiration or other policies.
+    fn process_forward_tsn(&mut self, ftsn: &ForwardTsnChunk) {
+        let new_cum_tsn = ftsn.new_cumulative_tsn;
+
+        // RFC 3758 §3.6: The receiver should advance its cumulative TSN
+        // point if the FORWARD-TSN chunk indicates TSNs that should be skipped.
+
+        // Only advance if the new cumulative TSN is ahead of our current
+        if tsn_lt(self.peer_cumulative_tsn, new_cum_tsn) {
+            tracing::debug!(
+                old_cum_tsn = self.peer_cumulative_tsn,
+                new_cum_tsn = new_cum_tsn,
+                skipped_streams = ftsn.streams.len(),
+                "Advancing cumulative TSN via FORWARD-TSN"
+            );
+
+            self.peer_cumulative_tsn = new_cum_tsn;
+
+            // Update stream sequence numbers for affected streams
+            // This ensures we don't wait for the skipped ordered data
+            for stream_info in &ftsn.streams {
+                self.streams
+                    .advance_peer_ssn(stream_info.stream_id, stream_info.ssn);
+            }
+        } else {
+            tracing::debug!(
+                our_cum_tsn = self.peer_cumulative_tsn,
+                fwd_tsn = new_cum_tsn,
+                "Ignoring FORWARD-TSN with old cumulative TSN"
+            );
+        }
+    }
+
+    /// Processes a RE-CONFIG chunk (RFC 6525).
+    ///
+    /// RE-CONFIG chunks allow stream reconfiguration during an association:
+    /// - Resetting SSN for specific streams
+    /// - Adding new outgoing/incoming streams
+    ///
+    /// Returns a RE-CONFIG response chunk if applicable.
+    fn process_reconfig(&mut self, reconfig: &ReConfigChunk) -> Option<ReConfigChunk> {
+        let mut response_params = Vec::new();
+
+        for param in &reconfig.params {
+            match param {
+                ReConfigParam::OutgoingSsnReset {
+                    req_seq_num,
+                    stream_ids,
+                    ..
+                } => {
+                    // RFC 6525 §5.2.2: Process outgoing SSN reset request
+                    // This resets the SSN for the specified streams on the sender side
+                    // We need to reset our expected SSN for those streams
+
+                    tracing::debug!(
+                        req_seq_num = req_seq_num,
+                        streams = ?stream_ids,
+                        "Processing outgoing SSN reset request"
+                    );
+
+                    // Check sequence number to prevent replays
+                    if let Some(peer_seq) = self.peer_reconfig_req_seq_num {
+                        let diff = req_seq_num.wrapping_sub(peer_seq) as i32;
+                        if diff <= 0 {
+                            // Old or duplicate request
+                            response_params.push(ReConfigParam::Response {
+                                resp_seq_num: *req_seq_num,
+                                result: ReConfigResult::ErrorBadSeqNum,
+                                sender_next_tsn: None,
+                                receiver_next_tsn: None,
+                            });
+                            continue;
+                        }
+                    }
+
+                    self.peer_reconfig_req_seq_num = Some(*req_seq_num);
+
+                    // Reset the expected SSN for each specified stream
+                    if stream_ids.is_empty() {
+                        // Reset all streams
+                        self.streams.reset();
+                    } else {
+                        for &stream_id in stream_ids {
+                            if let Some(stream) = self.streams.get_stream_mut(stream_id) {
+                                stream.reset();
+                            }
+                        }
+                    }
+
+                    response_params.push(ReConfigParam::Response {
+                        resp_seq_num: *req_seq_num,
+                        result: ReConfigResult::SuccessPerformed,
+                        sender_next_tsn: None,
+                        receiver_next_tsn: None,
+                    });
+                }
+
+                ReConfigParam::IncomingSsnReset {
+                    req_seq_num,
+                    stream_ids,
+                } => {
+                    // RFC 6525 §5.2.1: Process incoming SSN reset request
+                    // The peer wants us to reset our outgoing SSN for these streams
+
+                    tracing::debug!(
+                        req_seq_num = req_seq_num,
+                        streams = ?stream_ids,
+                        "Processing incoming SSN reset request"
+                    );
+
+                    // Check sequence number
+                    if let Some(peer_seq) = self.peer_reconfig_req_seq_num {
+                        let diff = req_seq_num.wrapping_sub(peer_seq) as i32;
+                        if diff <= 0 {
+                            response_params.push(ReConfigParam::Response {
+                                resp_seq_num: *req_seq_num,
+                                result: ReConfigResult::ErrorBadSeqNum,
+                                sender_next_tsn: None,
+                                receiver_next_tsn: None,
+                            });
+                            continue;
+                        }
+                    }
+
+                    self.peer_reconfig_req_seq_num = Some(*req_seq_num);
+
+                    // Reset our outgoing SSN for these streams
+                    for &stream_id in stream_ids {
+                        if let Some(stream) = self.streams.get_stream_mut(stream_id) {
+                            stream.reset();
+                        }
+                    }
+
+                    response_params.push(ReConfigParam::Response {
+                        resp_seq_num: *req_seq_num,
+                        result: ReConfigResult::SuccessPerformed,
+                        sender_next_tsn: None,
+                        receiver_next_tsn: None,
+                    });
+                }
+
+                ReConfigParam::SsnTsnReset { req_seq_num } => {
+                    // RFC 6525 §5.2.3: Process SSN/TSN reset request
+                    // This resets both SSN and TSN - a complete reset
+
+                    tracing::info!(
+                        req_seq_num = req_seq_num,
+                        "Processing SSN/TSN reset request"
+                    );
+
+                    // Check sequence number
+                    if let Some(peer_seq) = self.peer_reconfig_req_seq_num {
+                        let diff = req_seq_num.wrapping_sub(peer_seq) as i32;
+                        if diff <= 0 {
+                            response_params.push(ReConfigParam::Response {
+                                resp_seq_num: *req_seq_num,
+                                result: ReConfigResult::ErrorBadSeqNum,
+                                sender_next_tsn: None,
+                                receiver_next_tsn: None,
+                            });
+                            continue;
+                        }
+                    }
+
+                    self.peer_reconfig_req_seq_num = Some(*req_seq_num);
+
+                    // Reset all streams
+                    self.streams.reset();
+
+                    // Generate new TSNs
+                    let sender_next_tsn = self.next_tsn;
+                    let receiver_next_tsn = self.peer_cumulative_tsn.wrapping_add(1);
+
+                    response_params.push(ReConfigParam::Response {
+                        resp_seq_num: *req_seq_num,
+                        result: ReConfigResult::SuccessPerformed,
+                        sender_next_tsn: Some(sender_next_tsn),
+                        receiver_next_tsn: Some(receiver_next_tsn),
+                    });
+                }
+
+                ReConfigParam::AddOutgoingStreams {
+                    req_seq_num,
+                    num_streams,
+                } => {
+                    // RFC 6525 §5.2.5: Process add outgoing streams request
+                    tracing::debug!(
+                        req_seq_num = req_seq_num,
+                        num_streams = num_streams,
+                        "Processing add outgoing streams request"
+                    );
+
+                    // For now, just acknowledge (actual stream limit checking could be added)
+                    self.peer_reconfig_req_seq_num = Some(*req_seq_num);
+
+                    response_params.push(ReConfigParam::Response {
+                        resp_seq_num: *req_seq_num,
+                        result: ReConfigResult::SuccessPerformed,
+                        sender_next_tsn: None,
+                        receiver_next_tsn: None,
+                    });
+                }
+
+                ReConfigParam::AddIncomingStreams {
+                    req_seq_num,
+                    num_streams,
+                } => {
+                    // RFC 6525 §5.2.6: Process add incoming streams request
+                    tracing::debug!(
+                        req_seq_num = req_seq_num,
+                        num_streams = num_streams,
+                        "Processing add incoming streams request"
+                    );
+
+                    self.peer_reconfig_req_seq_num = Some(*req_seq_num);
+
+                    response_params.push(ReConfigParam::Response {
+                        resp_seq_num: *req_seq_num,
+                        result: ReConfigResult::SuccessPerformed,
+                        sender_next_tsn: None,
+                        receiver_next_tsn: None,
+                    });
+                }
+
+                ReConfigParam::Response {
+                    resp_seq_num,
+                    result,
+                    ..
+                } => {
+                    // This is a response to our request
+                    tracing::debug!(
+                        resp_seq_num = resp_seq_num,
+                        result = ?result,
+                        "Received RE-CONFIG response"
+                    );
+                    // No response needed for responses
+                }
+            }
+        }
+
+        if response_params.is_empty() {
+            None
+        } else {
+            let mut response = ReConfigChunk::new();
+            response.params = response_params;
+            Some(response)
+        }
     }
 }
 
@@ -1077,32 +2053,52 @@ impl AssociationHandle {
         for chunk in &packet.chunks {
             match chunk {
                 Chunk::Init(init) => {
-                    let actions = inner.process_init(init);
-                    for action in actions {
-                        if action == StateAction::SendInitAck {
-                            let (init_ack, _) = inner.create_init_ack_chunk(init);
-                            response_chunks.push(Chunk::InitAck(init_ack));
+                    // RFC 9260 §5.1.2: Validate INIT parameters
+                    match inner.process_init(init) {
+                        Ok(actions) => {
+                            for action in actions {
+                                if action == StateAction::SendInitAck {
+                                    let (init_ack, _) = inner.create_init_ack_chunk(init);
+                                    response_chunks.push(Chunk::InitAck(init_ack));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // RFC 9260 §5.1.2: Invalid INIT - send ABORT
+                            tracing::warn!(error = %e, "Invalid INIT received, aborting");
+                            let mut abort = AbortChunk::new();
+                            abort.add_cause(ErrorCause::InvalidMandatoryParameter);
+                            response_chunks.push(Chunk::Abort(abort));
                         }
                     }
                 }
                 Chunk::InitAck(init_ack) => {
-                    let actions = inner.process_init_ack(init_ack);
-                    for action in actions {
-                        if action == StateAction::SendCookieEcho {
-                            // Extract state cookie from INIT-ACK params
-                            let cookie = init_ack
-                                .params
-                                .iter()
-                                .find_map(|p| {
-                                    if let InitParam::Cookie(c) = p {
-                                        Some(c.clone())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or_default();
-                            let cookie_echo = CookieEchoChunk::new(cookie);
-                            response_chunks.push(Chunk::CookieEcho(cookie_echo));
+                    // RFC 9260 §5.1.2: Validate INIT-ACK parameters
+                    match inner.process_init_ack(init_ack) {
+                        Ok(actions) => {
+                            for action in actions {
+                                if action == StateAction::SendCookieEcho {
+                                    // Extract state cookie from INIT-ACK params
+                                    let cookie = init_ack
+                                        .params
+                                        .iter()
+                                        .find_map(|p| {
+                                            if let InitParam::Cookie(c) = p {
+                                                Some(c.clone())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .unwrap_or_default();
+                                    let cookie_echo = CookieEchoChunk::new(cookie);
+                                    response_chunks.push(Chunk::CookieEcho(cookie_echo));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // RFC 9260 §5.1.2: Invalid INIT-ACK - abort
+                            tracing::warn!(error = %e, "Invalid INIT-ACK received, aborting");
+                            let _ = inner.abort();
                         }
                     }
                 }
@@ -1175,6 +2171,28 @@ impl AssociationHandle {
                     // RFC 9260 §7.2.5: Process CWR (Congestion Window Reduced)
                     // CWR acknowledges that we received the ECNE and reduced our cwnd
                     inner.process_cwr();
+                }
+                Chunk::Asconf(asconf) => {
+                    // RFC 5061: Process ASCONF (Address Configuration Change)
+                    let asconf_ack = inner.process_asconf(asconf);
+                    response_chunks.push(Chunk::AsconfAck(asconf_ack));
+                }
+                Chunk::AsconfAck(asconf_ack) => {
+                    // RFC 5061: Process ASCONF-ACK (Address Configuration Acknowledgement)
+                    inner.process_asconf_ack(asconf_ack);
+                }
+                Chunk::ForwardTsn(ftsn) => {
+                    // RFC 3758: Process FORWARD-TSN (Partial Reliability)
+                    inner.process_forward_tsn(ftsn);
+                    // Generate SACK in response to acknowledge the FORWARD-TSN
+                    let sack = inner.create_sack();
+                    response_chunks.push(Chunk::Sack(sack));
+                }
+                Chunk::ReConfig(reconfig) => {
+                    // RFC 6525: Process RE-CONFIG (Stream Reconfiguration)
+                    if let Some(response) = inner.process_reconfig(reconfig) {
+                        response_chunks.push(Chunk::ReConfig(response));
+                    }
                 }
                 _ => {
                     // Handle unknown chunks per RFC 9260 §3.2 high-bit rules
@@ -1342,6 +2360,76 @@ impl AssociationHandle {
         inner.timers.start_heartbeat();
     }
 
+    /// Gets paths that need heartbeats sent (RFC 9260 §8.3).
+    ///
+    /// Returns a list of (PathId, remote address) tuples for paths where
+    /// the heartbeat interval has elapsed since the last heartbeat was sent.
+    ///
+    /// Per RFC 9260 §8.3, an endpoint should send HEARTBEAT chunks to each
+    /// of the transport addresses of a peer endpoint, per heartbeat interval.
+    pub async fn get_heartbeat_targets(&self) -> Vec<(PathId, SocketAddr)> {
+        self.inner.read().await.paths.heartbeat_targets()
+    }
+
+    /// Marks a path as having sent a heartbeat (RFC 9260 §8.3).
+    ///
+    /// Call this after successfully sending a HEARTBEAT chunk to a specific path.
+    /// This records the send time so the path won't need another heartbeat
+    /// until the heartbeat interval elapses.
+    pub async fn mark_heartbeat_sent(&self, path_id: PathId) {
+        self.inner.write().await.paths.mark_heartbeat_sent(path_id);
+    }
+
+    /// Creates a HEARTBEAT chunk with sender address for path verification.
+    ///
+    /// The heartbeat info contains a timestamp for RTT measurement and
+    /// the path ID for identifying which path this heartbeat is for when
+    /// the HEARTBEAT-ACK is received.
+    pub async fn create_heartbeat_for_path(&self, path_id: PathId) -> HeartbeatChunk {
+        let inner = self.inner.read().await;
+        // Include timestamp for RTT measurement
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        // Encode path ID info: timestamp (8 bytes) + local addr + remote addr
+        // This allows us to identify the path when HEARTBEAT-ACK returns
+        let mut info = Vec::with_capacity(40);
+        info.extend_from_slice(&now.to_be_bytes());
+
+        // Encode local address
+        match path_id.local {
+            SocketAddr::V4(addr) => {
+                info.push(4); // IPv4 marker
+                info.extend_from_slice(&addr.ip().octets());
+                info.extend_from_slice(&addr.port().to_be_bytes());
+            }
+            SocketAddr::V6(addr) => {
+                info.push(6); // IPv6 marker
+                info.extend_from_slice(&addr.ip().octets());
+                info.extend_from_slice(&addr.port().to_be_bytes());
+            }
+        }
+
+        // Encode remote address
+        match path_id.remote {
+            SocketAddr::V4(addr) => {
+                info.push(4); // IPv4 marker
+                info.extend_from_slice(&addr.ip().octets());
+                info.extend_from_slice(&addr.port().to_be_bytes());
+            }
+            SocketAddr::V6(addr) => {
+                info.push(6); // IPv6 marker
+                info.extend_from_slice(&addr.ip().octets());
+                info.extend_from_slice(&addr.port().to_be_bytes());
+            }
+        }
+
+        drop(inner);
+        HeartbeatChunk::new(Bytes::from(info))
+    }
+
     /// Starts the T3-rtx timer if there is outstanding data.
     ///
     /// This should be called after sending DATA chunks.
@@ -1360,6 +2448,15 @@ impl AssociationHandle {
         if !inner.has_outstanding_data() {
             inner.timers.stop_t3_rtx();
         }
+    }
+
+    /// Returns true if immediate SACK is required (RFC 9260 §6.8).
+    ///
+    /// This is set when a DATA chunk with the I-bit (immediate) flag is received.
+    /// The caller should send a SACK immediately instead of using delayed SACK.
+    /// The flag is cleared after `create_sack()` is called.
+    pub async fn should_sack_immediately(&self) -> bool {
+        self.inner.read().await.should_sack_immediately()
     }
 }
 
@@ -1460,5 +2557,662 @@ mod tests {
 
         assert!(tsn_le(1, 1));
         assert!(tsn_le(1, 2));
+    }
+
+    #[test]
+    fn test_asconf_add_ip() {
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        // Create an ASCONF with ADD-IP parameter
+        let mut asconf = AsconfChunk::new(1);
+        asconf.params.push(AsconfParam::AddIp {
+            correlation_id: 100,
+            ipv4: Some("192.168.1.100".parse().unwrap()),
+            ipv6: None,
+        });
+
+        let ack = inner.process_asconf(&asconf);
+
+        assert_eq!(ack.serial_number, 1);
+        assert_eq!(ack.params.len(), 1);
+        assert!(matches!(ack.params[0], AsconfAckParam::Success { correlation_id: 100 }));
+
+        // Verify the address was added
+        let new_addr: SocketAddr = "192.168.1.100:5061".parse().unwrap();
+        assert!(inner.peer_addresses.contains(&new_addr));
+    }
+
+    #[test]
+    fn test_asconf_delete_ip() {
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        // First add an address
+        let addr: SocketAddr = "192.168.1.100:5061".parse().unwrap();
+        inner.peer_addresses.insert(addr);
+
+        // Create an ASCONF with DELETE-IP parameter
+        let mut asconf = AsconfChunk::new(1);
+        asconf.params.push(AsconfParam::DeleteIp {
+            correlation_id: 200,
+            ipv4: Some("192.168.1.100".parse().unwrap()),
+            ipv6: None,
+        });
+
+        let ack = inner.process_asconf(&asconf);
+
+        assert_eq!(ack.serial_number, 1);
+        assert_eq!(ack.params.len(), 1);
+        assert!(matches!(ack.params[0], AsconfAckParam::Success { correlation_id: 200 }));
+
+        // Verify the address was removed
+        assert!(!inner.peer_addresses.contains(&addr));
+    }
+
+    #[test]
+    fn test_asconf_delete_last_address_fails() {
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        // Try to delete the only (primary) address
+        let mut asconf = AsconfChunk::new(1);
+        asconf.params.push(AsconfParam::DeleteIp {
+            correlation_id: 300,
+            ipv4: Some("127.0.0.1".parse().unwrap()),
+            ipv6: None,
+        });
+
+        let ack = inner.process_asconf(&asconf);
+
+        assert_eq!(ack.params.len(), 1);
+        assert!(matches!(ack.params[0], AsconfAckParam::ErrorCause { correlation_id: 300, .. }));
+    }
+
+    #[test]
+    fn test_asconf_set_primary() {
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        // Add an alternate address
+        let new_primary: SocketAddr = "192.168.1.100:5061".parse().unwrap();
+        inner.peer_addresses.insert(new_primary);
+
+        // Create an ASCONF with SET-PRIMARY parameter
+        let mut asconf = AsconfChunk::new(1);
+        asconf.params.push(AsconfParam::SetPrimaryAddress {
+            correlation_id: 400,
+            ipv4: Some("192.168.1.100".parse().unwrap()),
+            ipv6: None,
+        });
+
+        let ack = inner.process_asconf(&asconf);
+
+        assert_eq!(ack.params.len(), 1);
+        assert!(matches!(ack.params[0], AsconfAckParam::Success { correlation_id: 400 }));
+
+        // Verify the primary was changed
+        assert_eq!(inner.peer_addr, new_primary);
+        // Old primary should now be in peer_addresses
+        assert!(inner.peer_addresses.contains(&test_addr(5061)));
+    }
+
+    #[test]
+    fn test_asconf_serial_number_tracking() {
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        // Process first ASCONF
+        let mut asconf1 = AsconfChunk::new(100);
+        asconf1.params.push(AsconfParam::AddIp {
+            correlation_id: 1,
+            ipv4: Some("10.0.0.1".parse().unwrap()),
+            ipv6: None,
+        });
+        let ack1 = inner.process_asconf(&asconf1);
+        assert_eq!(ack1.serial_number, 100);
+
+        // Process second ASCONF with higher serial
+        let mut asconf2 = AsconfChunk::new(101);
+        asconf2.params.push(AsconfParam::AddIp {
+            correlation_id: 2,
+            ipv4: Some("10.0.0.2".parse().unwrap()),
+            ipv6: None,
+        });
+        let ack2 = inner.process_asconf(&asconf2);
+        assert_eq!(ack2.serial_number, 101);
+
+        // Old serial number should be ignored (return empty ACK)
+        let mut asconf_old = AsconfChunk::new(99);
+        asconf_old.params.push(AsconfParam::AddIp {
+            correlation_id: 3,
+            ipv4: Some("10.0.0.3".parse().unwrap()),
+            ipv6: None,
+        });
+        let ack_old = inner.process_asconf(&asconf_old);
+        assert_eq!(ack_old.serial_number, 99);
+        assert!(ack_old.params.is_empty()); // Old ASCONF, no params processed
+    }
+
+    #[test]
+    fn test_create_add_ip_asconf() {
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        let initial_serial = inner.asconf_serial_number;
+        let chunk = inner.create_add_ip_asconf("192.168.1.50:5060".parse().unwrap());
+
+        assert_eq!(chunk.serial_number, initial_serial);
+        assert_eq!(inner.asconf_serial_number, initial_serial.wrapping_add(1));
+        assert_eq!(chunk.params.len(), 1);
+        assert!(matches!(chunk.params[0], AsconfParam::AddIp { ipv4: Some(_), .. }));
+    }
+
+    #[test]
+    fn test_forward_tsn_advances_cumulative_tsn() {
+        use crate::sctp::chunk::{ForwardTsnChunk, ForwardTsnStream};
+
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        // Set initial peer cumulative TSN
+        inner.peer_cumulative_tsn = 1000;
+
+        // Process a FORWARD-TSN that advances the cumulative TSN
+        let ftsn = ForwardTsnChunk::with_streams(
+            1005,
+            vec![
+                ForwardTsnStream::new(0, 5),
+                ForwardTsnStream::new(1, 10),
+            ],
+        );
+
+        inner.process_forward_tsn(&ftsn);
+
+        // Verify cumulative TSN was advanced
+        assert_eq!(inner.peer_cumulative_tsn, 1005);
+    }
+
+    #[test]
+    fn test_forward_tsn_ignores_old_tsn() {
+        use crate::sctp::chunk::ForwardTsnChunk;
+
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        // Set initial peer cumulative TSN
+        inner.peer_cumulative_tsn = 1000;
+
+        // Process a FORWARD-TSN with an old TSN (should be ignored)
+        let ftsn = ForwardTsnChunk::new(999);
+        inner.process_forward_tsn(&ftsn);
+
+        // Verify cumulative TSN was NOT changed
+        assert_eq!(inner.peer_cumulative_tsn, 1000);
+    }
+
+    #[test]
+    fn test_reconfig_outgoing_ssn_reset() {
+        use crate::sctp::chunk::{ReConfigChunk, ReConfigParam};
+
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        // Create an outgoing SSN reset request
+        let reconfig = ReConfigChunk::outgoing_ssn_reset(100, 99, 5000, vec![0, 1]);
+
+        let response = inner.process_reconfig(&reconfig);
+
+        assert!(response.is_some());
+        let response = response.unwrap();
+        assert_eq!(response.params.len(), 1);
+
+        if let ReConfigParam::Response { resp_seq_num, result, .. } = &response.params[0] {
+            assert_eq!(*resp_seq_num, 100);
+            assert!(result.is_success());
+        } else {
+            panic!("Expected Response");
+        }
+
+        // Verify the peer req seq num was updated
+        assert_eq!(inner.peer_reconfig_req_seq_num, Some(100));
+    }
+
+    #[test]
+    fn test_reconfig_duplicate_request_rejected() {
+        use crate::sctp::chunk::{ReConfigChunk, ReConfigParam, ReConfigResult};
+
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        // Set an existing peer sequence number
+        inner.peer_reconfig_req_seq_num = Some(100);
+
+        // Try to process a request with an old sequence number
+        let reconfig = ReConfigChunk::outgoing_ssn_reset(99, 98, 5000, vec![0]);
+
+        let response = inner.process_reconfig(&reconfig);
+
+        assert!(response.is_some());
+        let response = response.unwrap();
+
+        if let ReConfigParam::Response { result, .. } = &response.params[0] {
+            assert_eq!(*result, ReConfigResult::ErrorBadSeqNum);
+        } else {
+            panic!("Expected Response");
+        }
+    }
+
+    #[test]
+    fn test_reconfig_response_no_response_needed() {
+        use crate::sctp::chunk::{ReConfigChunk, ReConfigParam, ReConfigResult};
+
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        // Create a response (which shouldn't generate another response)
+        let mut reconfig = ReConfigChunk::new();
+        reconfig.params.push(ReConfigParam::Response {
+            resp_seq_num: 100,
+            result: ReConfigResult::SuccessPerformed,
+            sender_next_tsn: None,
+            receiver_next_tsn: None,
+        });
+
+        let response = inner.process_reconfig(&reconfig);
+
+        // No response should be generated for a response
+        assert!(response.is_none());
+    }
+
+    #[test]
+    fn test_duplicate_tsn_detection() {
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        // Simulate established state
+        inner.state_machine.process_event(StateEvent::Associate);
+        inner.state_machine.process_event(StateEvent::ReceiveInitAck);
+        inner.state_machine.process_event(StateEvent::ReceiveCookieAck);
+        inner.peer_cumulative_tsn = 1000;
+
+        // Create a DATA chunk with TSN 1001
+        let chunk1 = DataChunk::new(1001, 0, 0, 0, Bytes::from("test1"));
+        assert!(inner.process_data(chunk1).is_ok());
+
+        // Verify it was received
+        assert!(inner.received_tsns.contains(&1001));
+
+        // Send the same TSN again (duplicate)
+        let chunk1_dup = DataChunk::new(1001, 0, 0, 0, Bytes::from("test1"));
+        assert!(inner.process_data(chunk1_dup).is_ok());
+
+        // Verify duplicate was detected
+        assert_eq!(inner.duplicate_tsns.len(), 1);
+        assert_eq!(inner.duplicate_tsns[0], 1001);
+    }
+
+    #[test]
+    fn test_duplicate_tsn_below_cumulative() {
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        // Simulate established state
+        inner.state_machine.process_event(StateEvent::Associate);
+        inner.state_machine.process_event(StateEvent::ReceiveInitAck);
+        inner.state_machine.process_event(StateEvent::ReceiveCookieAck);
+        inner.peer_cumulative_tsn = 1000;
+
+        // Send a TSN that's at or below the cumulative (always a duplicate)
+        let old_chunk = DataChunk::new(999, 0, 0, 0, Bytes::from("old"));
+        assert!(inner.process_data(old_chunk).is_ok());
+
+        // Verify it was detected as duplicate
+        assert_eq!(inner.duplicate_tsns.len(), 1);
+        assert_eq!(inner.duplicate_tsns[0], 999);
+    }
+
+    #[test]
+    fn test_gap_ack_blocks_generation() {
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        // Simulate established state
+        inner.state_machine.process_event(StateEvent::Associate);
+        inner.state_machine.process_event(StateEvent::ReceiveInitAck);
+        inner.state_machine.process_event(StateEvent::ReceiveCookieAck);
+        inner.peer_cumulative_tsn = 1000;
+
+        // Receive out-of-order TSNs (simulating gap)
+        // TSN 1001 is missing, receive 1002 and 1003
+        let chunk2 = DataChunk::new(1002, 0, 0, 0, Bytes::from("test2"));
+        let chunk3 = DataChunk::new(1003, 0, 0, 0, Bytes::from("test3"));
+        assert!(inner.process_data(chunk2).is_ok());
+        assert!(inner.process_data(chunk3).is_ok());
+
+        // Verify gap tracking
+        assert!(inner.received_tsns.contains(&1002));
+        assert!(inner.received_tsns.contains(&1003));
+        assert_eq!(inner.peer_cumulative_tsn, 1000); // Didn't advance
+
+        // Build gap ack blocks
+        let blocks = inner.build_gap_ack_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].start, 2); // 1000 + 2 = 1002
+        assert_eq!(blocks[0].end, 3); // 1000 + 3 = 1003
+    }
+
+    #[test]
+    fn test_gap_ack_blocks_multiple_gaps() {
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        // Simulate established state
+        inner.state_machine.process_event(StateEvent::Associate);
+        inner.state_machine.process_event(StateEvent::ReceiveInitAck);
+        inner.state_machine.process_event(StateEvent::ReceiveCookieAck);
+        inner.peer_cumulative_tsn = 1000;
+
+        // Create multiple gaps: receive 1002-1003, 1005-1007
+        for tsn in [1002, 1003, 1005, 1006, 1007] {
+            let chunk = DataChunk::new(tsn, 0, 0, 0, Bytes::from("test"));
+            assert!(inner.process_data(chunk).is_ok());
+        }
+
+        let blocks = inner.build_gap_ack_blocks();
+        assert_eq!(blocks.len(), 2);
+        // First gap: 1002-1003
+        assert_eq!(blocks[0].start, 2);
+        assert_eq!(blocks[0].end, 3);
+        // Second gap: 1005-1007
+        assert_eq!(blocks[1].start, 5);
+        assert_eq!(blocks[1].end, 7);
+    }
+
+    #[test]
+    fn test_cumulative_tsn_advances_on_gap_fill() {
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        // Simulate established state
+        inner.state_machine.process_event(StateEvent::Associate);
+        inner.state_machine.process_event(StateEvent::ReceiveInitAck);
+        inner.state_machine.process_event(StateEvent::ReceiveCookieAck);
+        inner.peer_cumulative_tsn = 1000;
+
+        // Receive out of order: 1002, 1003
+        let chunk2 = DataChunk::new(1002, 0, 0, 0, Bytes::from("test2"));
+        let chunk3 = DataChunk::new(1003, 0, 0, 0, Bytes::from("test3"));
+        assert!(inner.process_data(chunk2).is_ok());
+        assert!(inner.process_data(chunk3).is_ok());
+
+        // Cumulative should still be at 1000 (gap at 1001)
+        assert_eq!(inner.peer_cumulative_tsn, 1000);
+
+        // Now receive the missing 1001
+        let chunk1 = DataChunk::new(1001, 0, 0, 0, Bytes::from("test1"));
+        assert!(inner.process_data(chunk1).is_ok());
+
+        // Cumulative should now advance to 1003
+        assert_eq!(inner.peer_cumulative_tsn, 1003);
+
+        // received_tsns should be cleared for processed TSNs
+        assert!(!inner.received_tsns.contains(&1002));
+        assert!(!inner.received_tsns.contains(&1003));
+    }
+
+    #[test]
+    fn test_sack_includes_duplicates() {
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        // Simulate established state
+        inner.state_machine.process_event(StateEvent::Associate);
+        inner.state_machine.process_event(StateEvent::ReceiveInitAck);
+        inner.state_machine.process_event(StateEvent::ReceiveCookieAck);
+        inner.peer_cumulative_tsn = 1000;
+
+        // Create and receive a chunk, then receive it again
+        let chunk = DataChunk::new(1001, 0, 0, 0, Bytes::from("test"));
+        assert!(inner.process_data(chunk.clone()).is_ok());
+        assert!(inner.process_data(chunk).is_ok());
+
+        // Create SACK
+        let sack = inner.create_sack();
+
+        // Should report duplicate
+        assert_eq!(sack.dup_tsns.len(), 1);
+        assert_eq!(sack.dup_tsns[0], 1001);
+
+        // Duplicates should be cleared after SACK creation
+        assert!(inner.duplicate_tsns.is_empty());
+    }
+
+    #[test]
+    fn test_init_validation_zero_initiate_tag() {
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        // Create an INIT with zero initiate tag (invalid per RFC 9260 §5.1.2)
+        let invalid_init = InitChunk {
+            initiate_tag: 0, // Invalid!
+            a_rwnd: 65535,
+            num_outbound_streams: 10,
+            num_inbound_streams: 10,
+            initial_tsn: 1000,
+            params: Vec::new(),
+        };
+
+        let result = inner.process_init(&invalid_init);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), InitValidationError::InvalidInitiateTag);
+    }
+
+    #[test]
+    fn test_init_validation_zero_inbound_streams() {
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        let invalid_init = InitChunk {
+            initiate_tag: 12345,
+            a_rwnd: 65535,
+            num_outbound_streams: 10,
+            num_inbound_streams: 0, // Invalid!
+            initial_tsn: 1000,
+            params: Vec::new(),
+        };
+
+        let result = inner.process_init(&invalid_init);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            InitValidationError::InvalidInboundStreams
+        );
+    }
+
+    #[test]
+    fn test_init_validation_zero_outbound_streams() {
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        let invalid_init = InitChunk {
+            initiate_tag: 12345,
+            a_rwnd: 65535,
+            num_outbound_streams: 0, // Invalid!
+            num_inbound_streams: 10,
+            initial_tsn: 1000,
+            params: Vec::new(),
+        };
+
+        let result = inner.process_init(&invalid_init);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            InitValidationError::InvalidOutboundStreams
+        );
+    }
+
+    #[test]
+    fn test_init_validation_valid() {
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        let valid_init = InitChunk {
+            initiate_tag: 12345,
+            a_rwnd: 65535,
+            num_outbound_streams: 10,
+            num_inbound_streams: 10,
+            initial_tsn: 1000,
+            params: Vec::new(),
+        };
+
+        let result = inner.process_init(&valid_init);
+        assert!(result.is_ok());
+
+        // Verify parameters were stored
+        assert_eq!(inner.peer_verification_tag, 12345);
+        assert_eq!(inner.peer_initial_tsn, 1000);
+    }
+
+    #[test]
+    fn test_init_validation_error_display() {
+        assert_eq!(
+            InitValidationError::InvalidInitiateTag.to_string(),
+            "Initiate Tag must not be 0"
+        );
+        assert_eq!(
+            InitValidationError::InvalidInboundStreams.to_string(),
+            "Number of Inbound Streams must not be 0"
+        );
+        assert_eq!(
+            InitValidationError::InvalidOutboundStreams.to_string(),
+            "Number of Outbound Streams must not be 0"
+        );
+    }
+
+    #[test]
+    fn test_immediate_flag_handling() {
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        // Simulate established state
+        inner.state_machine.process_event(StateEvent::Associate);
+        inner.state_machine.process_event(StateEvent::ReceiveInitAck);
+        inner.state_machine.process_event(StateEvent::ReceiveCookieAck);
+        inner.peer_cumulative_tsn = 1000;
+
+        // Initially, no immediate SACK needed
+        assert!(!inner.should_sack_immediately());
+
+        // Receive a DATA chunk without immediate flag
+        let chunk1 = DataChunk::new(1001, 0, 0, 0, Bytes::from("test1"));
+        assert!(inner.process_data(chunk1).is_ok());
+        assert!(!inner.should_sack_immediately());
+
+        // Receive a DATA chunk with immediate flag set
+        let mut chunk2 = DataChunk::new(1002, 0, 0, 0, Bytes::from("test2"));
+        chunk2 = chunk2.with_immediate(true);
+        assert!(inner.process_data(chunk2).is_ok());
+
+        // Now immediate SACK should be required
+        assert!(inner.should_sack_immediately());
+
+        // Create SACK - should clear the flag
+        let _sack = inner.create_sack();
+        assert!(!inner.should_sack_immediately());
+    }
+
+    #[test]
+    fn test_immediate_flag_cleared_on_sack() {
+        let mut inner = AssociationInner::new(
+            test_addr(5060),
+            test_addr(5061),
+            AssociationConfig::default(),
+        );
+
+        // Simulate established state
+        inner.state_machine.process_event(StateEvent::Associate);
+        inner.state_machine.process_event(StateEvent::ReceiveInitAck);
+        inner.state_machine.process_event(StateEvent::ReceiveCookieAck);
+        inner.peer_cumulative_tsn = 1000;
+
+        // Set immediate flag directly
+        inner.sack_immediately = true;
+        assert!(inner.should_sack_immediately());
+
+        // Create SACK
+        let sack = inner.create_sack();
+
+        // Flag should be cleared
+        assert!(!inner.should_sack_immediately());
+
+        // SACK should still be valid
+        assert_eq!(sack.cumulative_tsn_ack, 1000);
     }
 }

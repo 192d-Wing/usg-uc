@@ -80,6 +80,67 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 **Tests**: 169 tests passing (76 RFC 9260 compliance + 9 integration + 84 unit)
 
+#### Phase 25: SCTP RFC 9260 Full Compliance - Medium Priority (In Progress)
+
+**ASCONF Chunks** (`uc-transport/sctp/chunk.rs`, `association.rs`)
+
+- RFC 5061 compliant Address Configuration Change support
+  - `AsconfChunk` with ADD-IP, DELETE-IP, SET-PRIMARY-ADDRESS parameters
+  - `AsconfAckChunk` for ASCONF response with success/error codes
+  - `AsconfParam` enum: AddIp, DeleteIp, SetPrimaryAddress
+  - `AsconfAckParam` with success/error correlation IDs
+  - Multi-homing address management infrastructure
+  - Serial number tracking for ASCONF request/response correlation
+
+**Forward TSN / Partial Reliability** (`uc-transport/sctp/chunk.rs`, `association.rs`)
+
+- RFC 3758 compliant PR-SCTP extension support
+  - `ForwardTsnChunk` with new cumulative TSN and stream info
+  - `ForwardTsnStream` struct for per-stream sequence number updates
+  - Enables timed reliability and limited retransmission policies
+  - Stream sequence number advancement for skipped chunks
+
+**Stream Reset / RE-CONFIG** (`uc-transport/sctp/chunk.rs`, `association.rs`)
+
+- RFC 6525 compliant stream reconfiguration support
+  - `ReConfigChunk` for reconfiguration requests/responses
+  - `ReConfigParam` enum: OutgoingSsnReset, IncomingSsnReset, SsnTsnReset, AddOutgoingStreams, AddIncomingStreams, Response
+  - `ReConfigResult` enum: Success, Denied, WrongSsn, AlreadyInProgress, BadSequence, InProgress
+  - Request/response sequence number tracking
+  - Dynamic stream addition and SSN reset
+
+**Full INIT Parameter Validation** (`uc-transport/sctp/association.rs`)
+
+- RFC 9260 §5.1.2 compliant INIT/INIT-ACK validation
+  - `InitValidationError` enum: InvalidInitiateTag, InvalidInboundStreams, InvalidOutboundStreams
+  - Validates Initiate Tag MUST NOT be 0
+  - Validates Number of Inbound/Outbound Streams MUST NOT be 0
+  - Warns if A-RWND below minimum 1500 bytes
+  - Applied to both `process_init()` and `process_init_ack()`
+
+**Duplicate TSN Detection** (`uc-transport/sctp/association.rs`)
+
+- RFC 9260 §6.2 compliant duplicate tracking
+  - `received_tsns: HashSet<u32>` for gap tracking
+  - `duplicate_tsns: Vec<u32>` for SACK duplicate reports
+  - Duplicate TSNs reported in next SACK
+  - Prevents replay attacks and handles network duplicates
+
+**Immediate Flag Handling** (`uc-transport/sctp/association.rs`)
+
+- RFC 9260 §6.8 compliant I-bit processing
+  - `sack_immediately: bool` flag set on I-bit receipt
+  - Triggers immediate SACK generation without delay
+  - Supports low-latency signaling applications
+
+**Multi-homing Infrastructure** (`uc-transport/sctp/association.rs`)
+
+- RFC 9260 compliant multi-address support
+  - `local_addresses: HashSet<SocketAddr>` for local addresses
+  - `peer_addresses: HashSet<SocketAddr>` for peer addresses
+  - ASCONF serial number tracking for dynamic updates
+  - RE-CONFIG sequence number management
+
 #### Phase 22: High Availability - Storage Backends (Completed)
 
 **Redis Backend** (`uc-storage/redis.rs`)

@@ -358,6 +358,102 @@ impl Path {
         self.pmtu_discovery_in_progress = false;
     }
 
+    /// Minimum PMTU per RFC 9260 §8.4 (IPv4 minimum is 576, but SCTP uses 1280 for safety).
+    pub const MIN_PMTU: u32 = 576;
+    /// Maximum PMTU (typically limited by interface MTU, 9000 for jumbo frames).
+    pub const MAX_PMTU: u32 = 9000;
+    /// Default probe increment for PMTU discovery.
+    pub const PMTU_PROBE_INCREMENT: u32 = 32;
+
+    /// Handles an ICMP "Packet Too Big" message (RFC 9260 §8.4).
+    ///
+    /// When an ICMP "Packet Too Big" message is received, the path MTU
+    /// should be reduced to the MTU indicated in the ICMP message.
+    ///
+    /// Returns true if the PMTU was actually reduced.
+    pub fn handle_icmp_too_big(&mut self, reported_mtu: u32) -> bool {
+        // RFC 9260 §8.4: Only reduce PMTU if the reported MTU is less than current
+        // and at least as large as the minimum
+        let new_pmtu = reported_mtu.max(Self::MIN_PMTU);
+
+        if new_pmtu < self.pmtu {
+            tracing::info!(
+                path = %self.id,
+                old_pmtu = self.pmtu,
+                new_pmtu = new_pmtu,
+                "PMTU reduced due to ICMP Packet Too Big"
+            );
+            self.update_pmtu(new_pmtu);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Handles a PMTU black hole detection timeout (RFC 9260 §8.4).
+    ///
+    /// If packets are being lost and PMTU discovery suspects a black hole,
+    /// the PMTU should be reduced. This is called after multiple consecutive
+    /// retransmission timeouts without receiving acknowledgments.
+    ///
+    /// Returns the new PMTU.
+    pub fn handle_pmtu_black_hole(&mut self) -> u32 {
+        // Reduce PMTU to minimum safe value
+        let new_pmtu = Self::MIN_PMTU;
+
+        if new_pmtu < self.pmtu {
+            tracing::warn!(
+                path = %self.id,
+                old_pmtu = self.pmtu,
+                new_pmtu = new_pmtu,
+                "PMTU reduced due to suspected black hole"
+            );
+            self.update_pmtu(new_pmtu);
+        }
+
+        self.pmtu
+    }
+
+    /// Attempts to probe for a larger PMTU (RFC 9260 §8.4).
+    ///
+    /// This increases the PMTU probe size to discover if a larger MTU is available.
+    /// Returns the new probe size, or None if already at maximum.
+    pub fn probe_larger_pmtu(&mut self) -> Option<u32> {
+        if self.pmtu >= Self::MAX_PMTU {
+            return None;
+        }
+
+        let probe_size = (self.pmtu + Self::PMTU_PROBE_INCREMENT).min(Self::MAX_PMTU);
+        self.start_pmtu_discovery();
+
+        tracing::debug!(
+            path = %self.id,
+            current_pmtu = self.pmtu,
+            probe_size = probe_size,
+            "Probing for larger PMTU"
+        );
+
+        Some(probe_size)
+    }
+
+    /// Confirms a successful PMTU probe.
+    ///
+    /// Called when a probe packet of a certain size is acknowledged,
+    /// confirming that the network path supports that MTU.
+    pub fn confirm_pmtu_probe(&mut self, confirmed_mtu: u32) {
+        if confirmed_mtu > self.pmtu && confirmed_mtu <= Self::MAX_PMTU {
+            tracing::info!(
+                path = %self.id,
+                old_pmtu = self.pmtu,
+                new_pmtu = confirmed_mtu,
+                "PMTU probe confirmed, increasing PMTU"
+            );
+            self.update_pmtu(confirmed_mtu);
+        } else {
+            self.cancel_pmtu_discovery();
+        }
+    }
+
     /// Returns the available congestion window.
     #[must_use]
     pub fn available_window(&self) -> u32 {
@@ -583,6 +679,30 @@ impl PathManager {
             .filter(|p| p.heartbeat_due())
             .map(Path::id)
             .collect()
+    }
+
+    /// Returns path IDs and remote addresses for paths that need heartbeats.
+    ///
+    /// Per RFC 9260 §8.3, heartbeats should be sent to each destination
+    /// transport address at the heartbeat interval.
+    pub fn heartbeat_targets(&self) -> Vec<(PathId, SocketAddr)> {
+        self.paths
+            .values()
+            .filter(|p| p.heartbeat_due())
+            .map(|p| (p.id(), p.remote_addr()))
+            .collect()
+    }
+
+    /// Marks a path as having sent a heartbeat.
+    ///
+    /// Returns true if the path was found and updated.
+    pub fn mark_heartbeat_sent(&mut self, path_id: PathId) -> bool {
+        if let Some(path) = self.paths.get_mut(&path_id) {
+            path.on_heartbeat_sent();
+            true
+        } else {
+            false
+        }
     }
 
     /// Returns all active paths.
@@ -912,10 +1032,142 @@ mod tests {
     }
 
     #[test]
+    fn test_heartbeat_targets() {
+        let mut manager = PathManager::new();
+        let local = test_addr(5060);
+        let remote1 = test_addr(5061);
+        let remote2 = test_addr(5062);
+
+        manager.add_path(local, remote1);
+        manager.add_path(local, remote2);
+
+        // Both paths should need heartbeats initially
+        let targets = manager.heartbeat_targets();
+        assert_eq!(targets.len(), 2);
+
+        // Verify the targets contain the correct remote addresses
+        let addrs: Vec<_> = targets.iter().map(|(_, addr)| *addr).collect();
+        assert!(addrs.contains(&remote1));
+        assert!(addrs.contains(&remote2));
+    }
+
+    #[test]
+    fn test_mark_heartbeat_sent() {
+        let mut manager = PathManager::new();
+        let local = test_addr(5060);
+        let remote1 = test_addr(5061);
+        let remote2 = test_addr(5062);
+
+        let id1 = manager.add_path(local, remote1);
+        let id2 = manager.add_path(local, remote2);
+
+        // Initially both need heartbeats
+        assert_eq!(manager.heartbeat_targets().len(), 2);
+
+        // Mark one as sent
+        assert!(manager.mark_heartbeat_sent(id1));
+
+        // Only one should need heartbeat now
+        let targets = manager.heartbeat_targets();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, id2);
+
+        // Marking non-existent path returns false
+        let fake_id = PathId::new(test_addr(9999), test_addr(9998));
+        assert!(!manager.mark_heartbeat_sent(fake_id));
+    }
+
+    #[test]
     fn test_path_id_display() {
         let id = PathId::new(test_addr(5060), test_addr(5061));
         let display = format!("{id}");
         assert!(display.contains("5060"));
         assert!(display.contains("5061"));
+    }
+
+    #[test]
+    fn test_pmtu_icmp_too_big() {
+        let local = test_addr(5060);
+        let remote = test_addr(5061);
+        let mut path = Path::with_mtu(local, remote, 1500);
+
+        assert_eq!(path.pmtu(), 1500);
+
+        // ICMP reports smaller MTU
+        assert!(path.handle_icmp_too_big(1280));
+        assert_eq!(path.pmtu(), 1280);
+        assert!(!path.pmtu_discovery_in_progress());
+    }
+
+    #[test]
+    fn test_pmtu_icmp_too_big_respects_minimum() {
+        let local = test_addr(5060);
+        let remote = test_addr(5061);
+        let mut path = Path::with_mtu(local, remote, 1500);
+
+        // ICMP reports MTU below minimum - should use minimum
+        assert!(path.handle_icmp_too_big(100));
+        assert_eq!(path.pmtu(), Path::MIN_PMTU);
+    }
+
+    #[test]
+    fn test_pmtu_icmp_too_big_ignores_larger() {
+        let local = test_addr(5060);
+        let remote = test_addr(5061);
+        let mut path = Path::with_mtu(local, remote, 1500);
+
+        // ICMP reports larger MTU - should be ignored
+        assert!(!path.handle_icmp_too_big(2000));
+        assert_eq!(path.pmtu(), 1500);
+    }
+
+    #[test]
+    fn test_pmtu_black_hole() {
+        let local = test_addr(5060);
+        let remote = test_addr(5061);
+        let mut path = Path::with_mtu(local, remote, 1500);
+
+        // Black hole detection reduces to minimum
+        let new_pmtu = path.handle_pmtu_black_hole();
+        assert_eq!(new_pmtu, Path::MIN_PMTU);
+        assert_eq!(path.pmtu(), Path::MIN_PMTU);
+    }
+
+    #[test]
+    fn test_pmtu_probe_larger() {
+        let local = test_addr(5060);
+        let remote = test_addr(5061);
+        let mut path = Path::with_mtu(local, remote, 1280);
+
+        // Probe for larger PMTU
+        let probe = path.probe_larger_pmtu();
+        assert!(probe.is_some());
+        assert!(probe.unwrap() > 1280);
+        assert!(path.pmtu_discovery_in_progress());
+    }
+
+    #[test]
+    fn test_pmtu_probe_at_max() {
+        let local = test_addr(5060);
+        let remote = test_addr(5061);
+        let mut path = Path::with_mtu(local, remote, Path::MAX_PMTU);
+
+        // Can't probe larger when at max
+        assert!(path.probe_larger_pmtu().is_none());
+    }
+
+    #[test]
+    fn test_pmtu_probe_confirm() {
+        let local = test_addr(5060);
+        let remote = test_addr(5061);
+        let mut path = Path::with_mtu(local, remote, 1280);
+
+        path.start_pmtu_discovery();
+        assert!(path.pmtu_discovery_in_progress());
+
+        // Confirm successful probe
+        path.confirm_pmtu_probe(1500);
+        assert_eq!(path.pmtu(), 1500);
+        assert!(!path.pmtu_discovery_in_progress());
     }
 }

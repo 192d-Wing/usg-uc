@@ -312,6 +312,37 @@ impl Stream {
         self.delivery_queue.clear();
         self.fragment_buffer.clear();
     }
+
+    /// Advances the expected incoming SSN for this stream (RFC 3758).
+    ///
+    /// This is used when processing FORWARD-TSN chunks to skip abandoned
+    /// ordered data. Any buffered data with SSN <= new_ssn is discarded.
+    pub fn advance_expected_ssn(&mut self, new_ssn: u16) {
+        // Only advance if the new SSN is ahead
+        if Self::ssn_gt(new_ssn, self.expected_ssn_in)
+            || new_ssn == self.expected_ssn_in.wrapping_add(1)
+        {
+            // Remove any reordered messages that would be skipped
+            let old_expected = self.expected_ssn_in;
+            self.expected_ssn_in = new_ssn.wrapping_add(1);
+
+            // Remove buffered messages with SSN that was skipped
+            // Keep only messages with SSN > new_ssn (i.e., ssn >= new_ssn+1)
+            self.reorder_buffer.retain(|&ssn, _| Self::ssn_gt(ssn, new_ssn));
+
+            // Also clear any ongoing fragment assemblies for skipped SSNs
+            self.fragment_buffer
+                .ongoing
+                .retain(|&ssn, _| Self::ssn_gt(ssn, new_ssn));
+
+            tracing::debug!(
+                stream_id = self.stream_id,
+                old_expected = old_expected,
+                new_expected = self.expected_ssn_in,
+                "Advanced expected SSN via FORWARD-TSN"
+            );
+        }
+    }
 }
 
 // =============================================================================
@@ -454,6 +485,16 @@ impl StreamManager {
     /// Iterates over all stream IDs.
     pub fn stream_ids(&self) -> impl Iterator<Item = u16> + '_ {
         self.streams.keys().copied()
+    }
+
+    /// Advances the expected SSN for a peer's stream (RFC 3758).
+    ///
+    /// This is used when processing FORWARD-TSN chunks to skip abandoned
+    /// ordered data from the peer.
+    pub fn advance_peer_ssn(&mut self, stream_id: u16, new_ssn: u16) {
+        // Get or create the stream (if receiving data from a new stream)
+        let stream = self.get_or_create_stream(stream_id);
+        stream.advance_expected_ssn(new_ssn);
     }
 }
 

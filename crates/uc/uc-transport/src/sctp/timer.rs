@@ -158,10 +158,12 @@ pub enum TimerType {
     T1Init,
     /// T1-cookie: COOKIE ECHO retransmission.
     T1Cookie,
-    /// T2-shutdown: SHUTDOWN retransmission.
+    /// T2-shutdown: SHUTDOWN/SHUTDOWN-ACK retransmission (RFC 9260 §9.2).
     T2Shutdown,
     /// T3-rtx: Data retransmission.
     T3Rtx,
+    /// T4-sack: Delayed SACK timer (RFC 9260 §6.2).
+    T4Sack,
     /// Heartbeat timer for path liveness.
     Heartbeat,
 }
@@ -173,6 +175,7 @@ impl std::fmt::Display for TimerType {
             Self::T1Cookie => write!(f, "T1-COOKIE"),
             Self::T2Shutdown => write!(f, "T2-SHUTDOWN"),
             Self::T3Rtx => write!(f, "T3-RTX"),
+            Self::T4Sack => write!(f, "T4-SACK"),
             Self::Heartbeat => write!(f, "HEARTBEAT"),
         }
     }
@@ -285,6 +288,8 @@ pub struct TimerManager {
     t2_shutdown: Timer,
     /// T3-rtx timer (per-path in full implementation).
     t3_rtx: Timer,
+    /// T4-sack timer for delayed acknowledgments (RFC 9260 §6.2).
+    t4_sack: Timer,
     /// Heartbeat timer.
     heartbeat: Timer,
     /// RTO calculator.
@@ -296,6 +301,8 @@ pub struct TimerManager {
 impl TimerManager {
     /// Default heartbeat interval (30 seconds).
     pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+    /// Default SACK delay (200ms per RFC 9260 §6.2).
+    pub const DEFAULT_SACK_DELAY: Duration = Duration::from_millis(200);
 
     /// Creates a new timer manager.
     pub fn new() -> Self {
@@ -307,6 +314,7 @@ impl TimerManager {
             t1_cookie: Timer::new(TimerType::T1Cookie, initial_rto),
             t2_shutdown: Timer::new(TimerType::T2Shutdown, initial_rto),
             t3_rtx: Timer::new(TimerType::T3Rtx, initial_rto),
+            t4_sack: Timer::new(TimerType::T4Sack, Self::DEFAULT_SACK_DELAY),
             heartbeat: Timer::new(TimerType::Heartbeat, Self::DEFAULT_HEARTBEAT_INTERVAL),
             rto,
             heartbeat_interval: Self::DEFAULT_HEARTBEAT_INTERVAL,
@@ -392,6 +400,40 @@ impl TimerManager {
         self.t3_rtx.is_expired()
     }
 
+    /// Starts the T4-sack timer for delayed acknowledgments (RFC 9260 §6.2).
+    ///
+    /// This timer should be started when a DATA chunk is received.
+    /// If not already running, the SACK should be sent before this expires.
+    pub fn start_t4_sack(&mut self) {
+        if !self.t4_sack.is_running() {
+            self.t4_sack.start_with_duration(Self::DEFAULT_SACK_DELAY);
+        }
+    }
+
+    /// Stops the T4-sack timer.
+    ///
+    /// Called when a SACK is sent.
+    pub fn stop_t4_sack(&mut self) {
+        self.t4_sack.stop();
+    }
+
+    /// Returns true if T4-sack timer has expired.
+    ///
+    /// If expired, a SACK must be sent immediately.
+    pub fn is_t4_sack_expired(&self) -> bool {
+        self.t4_sack.is_expired()
+    }
+
+    /// Returns true if T2-shutdown timer has expired.
+    pub fn is_t2_shutdown_expired(&self) -> bool {
+        self.t2_shutdown.is_expired()
+    }
+
+    /// Returns true if T2-shutdown timer is running.
+    pub fn is_t2_shutdown_running(&self) -> bool {
+        self.t2_shutdown.is_running()
+    }
+
     /// Starts the heartbeat timer.
     pub fn start_heartbeat(&mut self) {
         self.heartbeat.start_with_duration(self.heartbeat_interval);
@@ -418,6 +460,9 @@ impl TimerManager {
         if self.t3_rtx.is_expired() {
             expired.push(TimerType::T3Rtx);
         }
+        if self.t4_sack.is_expired() {
+            expired.push(TimerType::T4Sack);
+        }
         if self.heartbeat.is_expired() {
             expired.push(TimerType::Heartbeat);
         }
@@ -432,6 +477,7 @@ impl TimerManager {
             TimerType::T1Cookie => self.t1_cookie.record_expiration(),
             TimerType::T2Shutdown => self.t2_shutdown.record_expiration(),
             TimerType::T3Rtx => self.t3_rtx.record_expiration(),
+            TimerType::T4Sack => self.t4_sack.record_expiration(),
             TimerType::Heartbeat => self.heartbeat.record_expiration(),
         };
 
@@ -453,6 +499,7 @@ impl TimerManager {
             TimerType::T1Cookie => self.t1_cookie.expiration_count(),
             TimerType::T2Shutdown => self.t2_shutdown.expiration_count(),
             TimerType::T3Rtx => self.t3_rtx.expiration_count(),
+            TimerType::T4Sack => self.t4_sack.expiration_count(),
             TimerType::Heartbeat => self.heartbeat.expiration_count(),
         }
     }
@@ -467,6 +514,8 @@ impl TimerManager {
         self.t2_shutdown.reset_count();
         self.t3_rtx.stop();
         self.t3_rtx.reset_count();
+        self.t4_sack.stop();
+        self.t4_sack.reset_count();
         self.heartbeat.stop();
         self.heartbeat.reset_count();
         self.rto.reset();
@@ -662,5 +711,60 @@ mod tests {
 
         assert!(!manager.t1_init.is_running());
         assert_eq!(manager.expiration_count(TimerType::T1Init), 0);
+    }
+
+    #[test]
+    fn test_t4_sack_timer() {
+        let mut manager = TimerManager::new();
+
+        // T4-sack should not be running initially
+        assert!(!manager.is_t4_sack_expired());
+
+        // Start T4-sack
+        manager.start_t4_sack();
+
+        // Should not expire immediately
+        assert!(!manager.is_t4_sack_expired());
+
+        // Stop T4-sack
+        manager.stop_t4_sack();
+    }
+
+    #[test]
+    fn test_t4_sack_timer_only_starts_once() {
+        let mut manager = TimerManager::new();
+
+        // Start T4-sack
+        manager.start_t4_sack();
+        let started = manager.t4_sack.started_at;
+
+        // Try to start again - should not restart
+        manager.start_t4_sack();
+        assert_eq!(manager.t4_sack.started_at, started);
+    }
+
+    #[test]
+    fn test_t2_shutdown_timer() {
+        let mut manager = TimerManager::new();
+
+        // T2-shutdown should not be running initially
+        assert!(!manager.is_t2_shutdown_running());
+        assert!(!manager.is_t2_shutdown_expired());
+
+        // Start T2-shutdown
+        manager.start_t2_shutdown();
+        assert!(manager.is_t2_shutdown_running());
+
+        // Should not expire immediately
+        assert!(!manager.is_t2_shutdown_expired());
+
+        // Stop T2-shutdown
+        manager.stop_t2_shutdown();
+        assert!(!manager.is_t2_shutdown_running());
+    }
+
+    #[test]
+    fn test_timer_type_t4_sack_display() {
+        assert_eq!(TimerType::T4Sack.to_string(), "T4-SACK");
     }
 }

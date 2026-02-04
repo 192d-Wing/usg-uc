@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.30 complete, Phase 25 critical items complete
+**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.30 complete, Phase 25 critical + medium priority items complete
 
 ---
 
@@ -595,18 +595,21 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **Medium Priority - Protocol Features**
 
-- 🚧 ASCONF chunks for dynamic address config (RFC 5061)
+- ✅ ASCONF chunks for dynamic address config (RFC 5061)
   - ADD-IP and DELETE-IP parameter handling
   - SET-PRIMARY-ADDRESS support
   - ASCONF-ACK response generation
-- 🚧 Forward TSN / Partial Reliability (RFC 3758)
+  - Serial number tracking for request/response correlation
+- ✅ Forward TSN / Partial Reliability (RFC 3758)
   - PR-SCTP extension support
   - FORWARD-TSN chunk processing
   - Timed reliability and limited retransmissions
-- 🚧 Stream Reset / RE-CONFIG (RFC 6525)
+  - Per-stream sequence number advancement
+- ✅ Stream Reset / RE-CONFIG (RFC 6525)
   - Outgoing/Incoming SSN Reset
   - Add/Delete streams dynamically
   - RE-CONFIG chunk encode/decode
+  - Request/response sequence number tracking
 - 🚧 Path MTU Discovery (RFC 9260 §8.4)
   - PMTU probing with PAD chunks
   - ICMP Packet Too Big handling
@@ -618,15 +621,15 @@ This document outlines the development roadmap for the USG Session Border Contro
   - Periodic HEARTBEAT on idle paths
   - Configurable heartbeat interval
   - RTT update from HEARTBEAT-ACK
-- 🚧 Duplicate TSN detection (RFC 9260 §6.2)
+- ✅ Duplicate TSN detection (RFC 9260 §6.2)
   - Track received TSNs for duplicate detection
   - Report duplicates in SACK
   - Prevent replay attacks
-- 🚧 Full parameter validation (RFC 9260 §5.1.2)
+- ✅ Full parameter validation (RFC 9260 §5.1.2)
   - Validate all INIT/INIT-ACK parameters
   - Unknown parameter handling (skip/report/abort)
   - Mandatory parameter presence checks
-- 🚧 Immediate flag handling (RFC 9260 §6.8)
+- ✅ Immediate flag handling (RFC 9260 §6.8)
   - I-bit in DATA chunks for immediate delivery
   - Skip bundling for immediate data
   - User-configurable immediate mode
@@ -1368,13 +1371,13 @@ This document outlines the development roadmap for the USG Session Border Contro
 | RFC 8445 | ICE | ✅ Enhanced (aggressive nomination, consent, keepalives) |
 | RFC 8224 | STIR | ✅ Implemented (ES384) |
 | RFC 8225 | PASSporT | ✅ Implemented (ES384) |
-| RFC 9260 | SCTP | 🚧 Partial (~85% compliant, critical items complete) |
+| RFC 9260 | SCTP | 🚧 Partial (~92% compliant, critical + medium items complete) |
 | RFC 4168 | SIP over SCTP | 🚧 Partial (transport layer complete) |
 | RFC 6951 | UDP Encapsulation for SCTP | ✅ Implemented |
-| RFC 3758 | PR-SCTP | 🚧 Planned (Phase 25) |
-| RFC 5061 | SCTP Dynamic Address | 🚧 Planned (Phase 25) |
-| RFC 6525 | SCTP Stream Reset | 🚧 Planned (Phase 25) |
-| RFC 4895 | SCTP Authentication | 🚧 Planned (Phase 25) |
+| RFC 3758 | PR-SCTP | ✅ Implemented (FORWARD-TSN chunk) |
+| RFC 5061 | SCTP Dynamic Address | ✅ Implemented (ASCONF/ASCONF-ACK chunks) |
+| RFC 6525 | SCTP Stream Reset | ✅ Implemented (RE-CONFIG chunk) |
+| RFC 4895 | SCTP Authentication | 🚧 Planned (Phase 25 lower priority) |
 
 ---
 

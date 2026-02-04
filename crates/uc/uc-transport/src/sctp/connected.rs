@@ -717,19 +717,33 @@ async fn io_loop(
                     }
                 }
 
-                // Check for heartbeat timer expiration
+                // Check for heartbeat timer expiration (RFC 9260 §8.3)
                 let expired_timers = handle.check_timers().await;
                 for timer_type in expired_timers {
                     if timer_type == super::timer::TimerType::Heartbeat {
-                        trace!("Sending HEARTBEAT");
-                        if let Err(e) = send_heartbeat(
-                            &socket, &handle, peer_addr,
-                            use_udp_encapsulation, &udp_encap_config, local_addr.as_ref(),
-                        ).await {
-                            warn!(error = %e, "Failed to send heartbeat");
+                        // Get all paths that need heartbeats
+                        let heartbeat_targets = handle.get_heartbeat_targets().await;
+
+                        if heartbeat_targets.is_empty() {
+                            // No paths need heartbeats yet, just restart timer
+                            handle.restart_heartbeat_timer().await;
+                        } else {
+                            // Send heartbeat to each path that needs one
+                            for (path_id, target_addr) in heartbeat_targets {
+                                trace!(target = %target_addr, path = %path_id, "Sending HEARTBEAT");
+                                if let Err(e) = send_heartbeat_to_path(
+                                    &socket, &handle, target_addr, path_id,
+                                    use_udp_encapsulation, &udp_encap_config, local_addr.as_ref(),
+                                ).await {
+                                    warn!(error = %e, target = %target_addr, "Failed to send heartbeat");
+                                } else {
+                                    // Mark this path as having sent a heartbeat
+                                    handle.mark_heartbeat_sent(path_id).await;
+                                }
+                            }
+                            // Restart heartbeat timer
+                            handle.restart_heartbeat_timer().await;
                         }
-                        // Restart heartbeat timer
-                        handle.restart_heartbeat_timer().await;
                     }
                 }
             }
@@ -868,7 +882,8 @@ async fn send_data_chunks(
     Ok(())
 }
 
-/// Sends a HEARTBEAT chunk.
+/// Sends a HEARTBEAT chunk to the primary peer address.
+#[allow(dead_code)] // Keep for backwards compatibility, prefer send_heartbeat_to_path
 async fn send_heartbeat(
     socket: &UdpSocket,
     handle: &AssociationHandle,
@@ -901,6 +916,41 @@ async fn send_heartbeat(
         &peer_addr,
     );
     socket.send_to(&bytes, peer_addr).await?;
+
+    Ok(())
+}
+
+/// Sends a HEARTBEAT chunk to a specific path (RFC 9260 §8.3).
+///
+/// Per RFC 9260 §8.3, heartbeats should be sent to each destination
+/// transport address at the heartbeat interval. The heartbeat info
+/// contains path identification for proper HEARTBEAT-ACK routing.
+async fn send_heartbeat_to_path(
+    socket: &UdpSocket,
+    handle: &AssociationHandle,
+    target_addr: SocketAddr,
+    path_id: super::path::PathId,
+    use_udp_encapsulation: bool,
+    udp_encap_config: &UdpEncapConfig,
+    local_addr: Option<&SocketAddr>,
+) -> Result<(), std::io::Error> {
+    let vtag = handle.peer_verification_tag().await;
+    let local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+    let mut packet = SctpPacket::new(local_port, target_addr.port(), vtag);
+
+    // Create heartbeat with path info for proper routing of HEARTBEAT-ACK
+    let heartbeat = handle.create_heartbeat_for_path(path_id).await;
+
+    packet.add_chunk(Chunk::Heartbeat(heartbeat));
+
+    let bytes = encode_packet_with_encap(
+        &packet,
+        use_udp_encapsulation,
+        udp_encap_config,
+        local_addr,
+        &target_addr,
+    );
+    socket.send_to(&bytes, target_addr).await?;
 
     Ok(())
 }
