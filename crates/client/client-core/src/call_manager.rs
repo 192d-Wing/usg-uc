@@ -932,6 +932,62 @@ impl CallManager {
         session.send_dtmf(digit, duration_ms).await
     }
 
+    /// Switches the input (microphone) device for the active call.
+    ///
+    /// This allows changing the microphone mid-call without disconnecting.
+    ///
+    /// # Arguments
+    /// * `device_name` - Name of the new input device, or None for default
+    pub async fn switch_input_device(&self, device_name: Option<String>) -> AppResult<()> {
+        let call_id = self
+            .focused_call_id
+            .as_ref()
+            .ok_or_else(|| AppError::Sip("No active call".to_string()))?;
+
+        let session = self
+            .audio_sessions
+            .get(call_id)
+            .ok_or_else(|| AppError::Audio("No audio session for call".to_string()))?;
+
+        info!(device = ?device_name, "Switching input device");
+        session.switch_input_device(device_name).await
+    }
+
+    /// Switches the output (speaker) device for the active call.
+    ///
+    /// This allows changing the speaker mid-call without disconnecting.
+    ///
+    /// # Arguments
+    /// * `device_name` - Name of the new output device, or None for default
+    pub async fn switch_output_device(&self, device_name: Option<String>) -> AppResult<()> {
+        let call_id = self
+            .focused_call_id
+            .as_ref()
+            .ok_or_else(|| AppError::Sip("No active call".to_string()))?;
+
+        let session = self
+            .audio_sessions
+            .get(call_id)
+            .ok_or_else(|| AppError::Audio("No audio session for call".to_string()))?;
+
+        info!(device = ?device_name, "Switching output device");
+        session.switch_output_device(device_name).await
+    }
+
+    /// Returns the current input device name for the active call.
+    pub async fn current_input_device(&self) -> Option<String> {
+        let call_id = self.focused_call_id.as_ref()?;
+        let session = self.audio_sessions.get(call_id)?;
+        session.input_device_name().await
+    }
+
+    /// Returns the current output device name for the active call.
+    pub async fn current_output_device(&self) -> Option<String> {
+        let call_id = self.focused_call_id.as_ref()?;
+        let session = self.audio_sessions.get(call_id)?;
+        session.output_device_name().await
+    }
+
     /// Puts the focused call on hold.
     ///
     /// Sends a re-INVITE with `a=sendonly` direction to put media on hold.

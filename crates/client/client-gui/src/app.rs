@@ -124,6 +124,14 @@ pub struct SipClientApp {
     ringtone_player: RingtonePlayer,
     /// Auto-answer timer (when auto-answer is enabled).
     auto_answer_timer: Option<(String, Instant)>,
+    /// Available input (microphone) devices.
+    available_inputs: Vec<String>,
+    /// Available output (speaker) devices.
+    available_outputs: Vec<String>,
+    /// Current input device for active call.
+    current_input_device: Option<String>,
+    /// Current output device for active call.
+    current_output_device: Option<String>,
 }
 
 impl SipClientApp {
@@ -197,6 +205,10 @@ impl SipClientApp {
             pin_attempts: 0,
             ringtone_player: RingtonePlayer::new(),
             auto_answer_timer: None,
+            available_inputs: vec!["Default".to_string()],
+            available_outputs: vec!["Default".to_string()],
+            current_input_device: None,
+            current_output_device: None,
         }
     }
 
@@ -257,6 +269,7 @@ impl SipClientApp {
                     // Switch to call view when call starts
                     if state.is_active() && self.active_view != ActiveView::Call {
                         self.active_view = ActiveView::Call;
+                        self.refresh_audio_devices();
                     }
 
                     // Switch back to dialer when call ends
@@ -950,7 +963,14 @@ impl eframe::App for SipClientApp {
                     self.handle_call_action(action);
                 }
                 // Render the call view for the focused call
-                if let Some(action) = self.call_view.render(ui, self.active_call.as_ref()) {
+                if let Some(action) = self.call_view.render(
+                    ui,
+                    self.active_call.as_ref(),
+                    &self.available_inputs,
+                    &self.available_outputs,
+                    self.current_input_device.as_deref(),
+                    self.current_output_device.as_deref(),
+                ) {
                     self.handle_call_action(action);
                 }
             }
@@ -1102,6 +1122,38 @@ impl SipClientApp {
                         Err(e) => {
                             self.error_message = Some(format!("Failed to switch call: {e}"));
                             self.show_error_dialog = true;
+                        }
+                    }
+                }
+            }
+            crate::views::CallAction::SwitchInputDevice { device_name } => {
+                info!(device = ?device_name, "Switching input device");
+                if let Some(ref app) = self.client_app {
+                    let runtime = self.runtime.clone();
+                    match runtime.block_on(app.switch_input_device(device_name.clone())) {
+                        Ok(()) => {
+                            self.current_input_device = device_name;
+                            self.status_message = "Microphone changed".to_string();
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to switch input device");
+                            self.status_message = format!("Failed to switch microphone: {e}");
+                        }
+                    }
+                }
+            }
+            crate::views::CallAction::SwitchOutputDevice { device_name } => {
+                info!(device = ?device_name, "Switching output device");
+                if let Some(ref app) = self.client_app {
+                    let runtime = self.runtime.clone();
+                    match runtime.block_on(app.switch_output_device(device_name.clone())) {
+                        Ok(()) => {
+                            self.current_output_device = device_name;
+                            self.status_message = "Speaker changed".to_string();
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to switch output device");
+                            self.status_message = format!("Failed to switch speaker: {e}");
                         }
                     }
                 }
@@ -1365,6 +1417,43 @@ impl SipClientApp {
             self.ringtone_player.stop();
             debug!("Ringtone playback stopped");
         }
+    }
+
+    /// Refreshes the list of available audio devices.
+    fn refresh_audio_devices(&mut self) {
+        use client_audio::DeviceManager;
+
+        let manager = DeviceManager::new();
+
+        // Get input devices
+        match manager.list_input_devices() {
+            Ok(devices) => {
+                self.available_inputs = vec!["Default".to_string()];
+                self.available_inputs
+                    .extend(devices.into_iter().map(|d| d.name));
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to list input devices");
+            }
+        }
+
+        // Get output devices
+        match manager.list_output_devices() {
+            Ok(devices) => {
+                self.available_outputs = vec!["Default".to_string()];
+                self.available_outputs
+                    .extend(devices.into_iter().map(|d| d.name));
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to list output devices");
+            }
+        }
+
+        debug!(
+            inputs = ?self.available_inputs.len(),
+            outputs = ?self.available_outputs.len(),
+            "Refreshed audio devices"
+        );
     }
 
     /// Checks if auto-answer is enabled and starts the timer if so.

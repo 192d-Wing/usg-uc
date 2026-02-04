@@ -293,6 +293,52 @@ impl AudioSession {
         self.pipeline.clone()
     }
 
+    /// Switches the input (microphone) device during an active call.
+    ///
+    /// This allows changing the microphone without stopping the call.
+    ///
+    /// # Arguments
+    /// * `device_name` - Name of the new input device, or None for default
+    pub async fn switch_input_device(&self, device_name: Option<String>) -> AppResult<()> {
+        if !self.running.load(Ordering::Relaxed) {
+            return Err(AppError::Audio("Audio session not running".to_string()));
+        }
+
+        let mut pipeline = self.pipeline.lock().await;
+        pipeline
+            .switch_input_device(device_name)
+            .map_err(|e| AppError::Audio(e.to_string()))
+    }
+
+    /// Switches the output (speaker) device during an active call.
+    ///
+    /// This allows changing the speaker without stopping the call.
+    ///
+    /// # Arguments
+    /// * `device_name` - Name of the new output device, or None for default
+    pub async fn switch_output_device(&self, device_name: Option<String>) -> AppResult<()> {
+        if !self.running.load(Ordering::Relaxed) {
+            return Err(AppError::Audio("Audio session not running".to_string()));
+        }
+
+        let mut pipeline = self.pipeline.lock().await;
+        pipeline
+            .switch_output_device(device_name)
+            .map_err(|e| AppError::Audio(e.to_string()))
+    }
+
+    /// Returns the current input device name.
+    pub async fn input_device_name(&self) -> Option<String> {
+        let pipeline = self.pipeline.lock().await;
+        pipeline.input_device_name().map(String::from)
+    }
+
+    /// Returns the current output device name.
+    pub async fn output_device_name(&self) -> Option<String> {
+        let pipeline = self.pipeline.lock().await;
+        pipeline.output_device_name().map(String::from)
+    }
+
     /// Starts the audio processing task.
     fn start_processing_task(&mut self) {
         let pipeline = self.pipeline.clone();

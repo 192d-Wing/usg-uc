@@ -418,6 +418,36 @@ impl ClientApp {
         self.call_manager.send_dtmf(digit, DTMF_DURATION_MS).await
     }
 
+    /// Switches the input (microphone) device during an active call.
+    ///
+    /// This allows changing the microphone mid-call without disconnecting.
+    ///
+    /// # Arguments
+    /// * `device_name` - Name of the new input device, or None for default
+    pub async fn switch_input_device(&self, device_name: Option<String>) -> AppResult<()> {
+        self.call_manager.switch_input_device(device_name).await
+    }
+
+    /// Switches the output (speaker) device during an active call.
+    ///
+    /// This allows changing the speaker mid-call without disconnecting.
+    ///
+    /// # Arguments
+    /// * `device_name` - Name of the new output device, or None for default
+    pub async fn switch_output_device(&self, device_name: Option<String>) -> AppResult<()> {
+        self.call_manager.switch_output_device(device_name).await
+    }
+
+    /// Returns the current input device name for the active call.
+    pub async fn current_input_device(&self) -> Option<String> {
+        self.call_manager.current_input_device().await
+    }
+
+    /// Returns the current output device name for the active call.
+    pub async fn current_output_device(&self) -> Option<String> {
+        self.call_manager.current_output_device().await
+    }
+
     /// Toggles hold state for the active call.
     ///
     /// Returns `true` if call is now on hold, `false` if resumed.

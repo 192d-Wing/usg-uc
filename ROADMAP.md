@@ -1097,8 +1097,8 @@ This document outlines the development roadmap for the USG Session Border Contro
   - Fallback to local address if media not ready (with warning)
 - 🚧 Future enhancements
   - Codec negotiation integration from SDP answer
-  - DTMF support (RFC 4733 RTP telephone events)
-  - Audio device change handling during call
+  - ✅ DTMF support (RFC 4733 RTP telephone events) - Phase 24.25
+  - ✅ Audio device change handling during call - Phase 24.26
 
 **Phase 24.21: GUI Certificate Verification Mode** ✅
 

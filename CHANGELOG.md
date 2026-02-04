@@ -837,6 +837,34 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - Handle `CallAction::Dtmf` by calling `app.send_dtmf()`
   - Status message shows sent digit
 
+#### Phase 24.26: Audio Device Hot-Switching
+
+- `client-audio/src/pipeline.rs` - Device switching in AudioPipeline
+  - `switch_input_device()` - Recreate capture stream with new device
+  - `switch_output_device()` - Recreate playback stream with new device
+  - `input_device_name()` / `output_device_name()` accessors
+  - Seamless switching without stopping RTP transmission
+- `client-core/src/audio_session.rs` - AudioSession device switching
+  - `switch_input_device()` / `switch_output_device()` methods
+  - `input_device_name()` / `output_device_name()` accessors
+  - Routes changes to pipeline when session is running
+- `client-core/src/call_manager.rs` - CallManager device switching
+  - `switch_input_device()` / `switch_output_device()` for active call
+  - `current_input_device()` / `current_output_device()` accessors
+- `client-core/src/app.rs` - ClientApp public device API
+  - `switch_input_device()` / `switch_output_device()` public methods
+  - `current_input_device()` / `current_output_device()` accessors
+- `client-gui/src/views/call.rs` - Audio device menu in call view
+  - `CallAction::SwitchInputDevice` / `CallAction::SwitchOutputDevice` variants
+  - `show_audio_menu` toggle (mutually exclusive with dialpad)
+  - `render_audio_menu()` with microphone and speaker dropdowns
+  - Available devices listed with current selection highlighted
+- `client-gui/src/app.rs` - Audio device integration
+  - `available_inputs` / `available_outputs` device lists
+  - `current_input_device` / `current_output_device` tracking
+  - `refresh_audio_devices()` called when entering call view
+  - Device switch action handlers with status messages
+
 **Security**
 
 - Smart card authentication ONLY (CAC/PIV/SIPR token)

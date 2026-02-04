@@ -566,6 +566,80 @@ impl AudioPipeline {
     pub fn ssrc(&self) -> Option<u32> {
         self.transmitter.as_ref().map(|tx| tx.ssrc())
     }
+
+    /// Switches the input (microphone) device while the pipeline is running.
+    ///
+    /// This recreates the capture stream with the new device without stopping
+    /// the rest of the pipeline (RTP, playback, etc.).
+    ///
+    /// # Arguments
+    /// * `device_name` - Name of the new input device, or None for default
+    pub fn switch_input_device(&mut self, device_name: Option<String>) -> AudioResult<()> {
+        if self.state != PipelineState::Running {
+            return Err(AudioError::ConfigError(
+                "Pipeline not running".to_string(),
+            ));
+        }
+
+        info!("Switching input device to: {:?}", device_name);
+
+        // Update device manager
+        self.device_manager.set_input_device(device_name);
+
+        // Stop old capture stream
+        if let Some(ref capture) = self.capture {
+            capture.stop();
+        }
+
+        // Create new capture stream with updated device
+        let capture = CaptureStream::new(&self.device_manager)?;
+        self.capture = Some(capture);
+
+        info!("Input device switched successfully");
+        Ok(())
+    }
+
+    /// Switches the output (speaker) device while the pipeline is running.
+    ///
+    /// This recreates the playback stream with the new device without stopping
+    /// the rest of the pipeline (RTP, capture, etc.).
+    ///
+    /// # Arguments
+    /// * `device_name` - Name of the new output device, or None for default
+    pub fn switch_output_device(&mut self, device_name: Option<String>) -> AudioResult<()> {
+        if self.state != PipelineState::Running {
+            return Err(AudioError::ConfigError(
+                "Pipeline not running".to_string(),
+            ));
+        }
+
+        info!("Switching output device to: {:?}", device_name);
+
+        // Update device manager
+        self.device_manager.set_output_device(device_name);
+
+        // Stop old playback stream
+        if let Some(ref playback) = self.playback {
+            playback.stop();
+        }
+
+        // Create new playback stream with updated device
+        let playback = PlaybackStream::new(&self.device_manager)?;
+        self.playback = Some(playback);
+
+        info!("Output device switched successfully");
+        Ok(())
+    }
+
+    /// Returns the current input device name.
+    pub fn input_device_name(&self) -> Option<&str> {
+        self.device_manager.input_device_name()
+    }
+
+    /// Returns the current output device name.
+    pub fn output_device_name(&self) -> Option<&str> {
+        self.device_manager.output_device_name()
+    }
 }
 
 impl Default for AudioPipeline {
