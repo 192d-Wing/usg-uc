@@ -1044,6 +1044,17 @@ impl SipClientApp {
                     }
                 }
             }
+            crate::views::CallAction::Dtmf { digit } => {
+                info!(digit = ?digit, "Sending DTMF");
+                if let Some(ref app) = self.client_app {
+                    let runtime = self.runtime.clone();
+                    if let Err(e) = runtime.block_on(app.send_dtmf(digit)) {
+                        warn!(error = %e, "Failed to send DTMF");
+                    } else {
+                        self.status_message = format!("DTMF: {}", digit.to_char());
+                    }
+                }
+            }
             crate::views::CallAction::Accept { call_id } => {
                 info!(call_id = %call_id, "Accepting incoming call");
                 self.show_incoming_call_dialog = false;

@@ -1,6 +1,6 @@
 //! Active call view.
 
-use client_types::{CallInfo, CallState};
+use client_types::{CallInfo, CallState, DtmfDigit};
 use eframe::egui;
 
 /// Actions from the call view.
@@ -12,6 +12,11 @@ pub enum CallAction {
     Mute,
     /// Toggle hold.
     Hold,
+    /// Send DTMF digit.
+    Dtmf {
+        /// DTMF digit to send.
+        digit: DtmfDigit,
+    },
     /// Accept incoming call.
     Accept {
         /// Call ID to accept.
@@ -35,6 +40,8 @@ pub struct CallView {
     is_muted: bool,
     /// Whether call is on hold.
     is_on_hold: bool,
+    /// Whether to show the DTMF dialpad.
+    show_dialpad: bool,
 }
 
 impl CallView {
@@ -43,6 +50,7 @@ impl CallView {
         Self {
             is_muted: false,
             is_on_hold: false,
+            show_dialpad: false,
         }
     }
 
@@ -218,8 +226,156 @@ impl CallView {
                     ui.add_space(35.0);
                     ui.label(egui::RichText::new("End").small());
                 });
+
+                ui.add_space(20.0);
+
+                // Dialpad toggle button
+                let dialpad_label = if self.show_dialpad {
+                    "Hide Keypad"
+                } else {
+                    "Show Keypad"
+                };
+                if ui.button(dialpad_label).clicked() {
+                    self.show_dialpad = !self.show_dialpad;
+                }
+
+                // DTMF Dialpad (when visible)
+                if self.show_dialpad {
+                    ui.add_space(20.0);
+                    if let Some(dtmf_action) = self.render_dialpad(ui) {
+                        action = Some(dtmf_action);
+                    }
+                }
             }
         });
+
+        action
+    }
+
+    /// Renders the DTMF dialpad.
+    fn render_dialpad(&self, ui: &mut egui::Ui) -> Option<CallAction> {
+        let mut action = None;
+
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(40, 40, 45))
+            .corner_radius(8.0)
+            .inner_margin(16.0)
+            .show(ui, |ui| {
+                let button_size = egui::vec2(60.0, 50.0);
+                let button_style = egui::Color32::from_rgb(60, 60, 65);
+
+                // Row 1: 1, 2, 3
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_sized(button_size, egui::Button::new("1").fill(button_style))
+                        .clicked()
+                    {
+                        action = Some(CallAction::Dtmf {
+                            digit: DtmfDigit::One,
+                        });
+                    }
+                    if ui
+                        .add_sized(button_size, egui::Button::new("2\nABC").fill(button_style))
+                        .clicked()
+                    {
+                        action = Some(CallAction::Dtmf {
+                            digit: DtmfDigit::Two,
+                        });
+                    }
+                    if ui
+                        .add_sized(button_size, egui::Button::new("3\nDEF").fill(button_style))
+                        .clicked()
+                    {
+                        action = Some(CallAction::Dtmf {
+                            digit: DtmfDigit::Three,
+                        });
+                    }
+                });
+
+                // Row 2: 4, 5, 6
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_sized(button_size, egui::Button::new("4\nGHI").fill(button_style))
+                        .clicked()
+                    {
+                        action = Some(CallAction::Dtmf {
+                            digit: DtmfDigit::Four,
+                        });
+                    }
+                    if ui
+                        .add_sized(button_size, egui::Button::new("5\nJKL").fill(button_style))
+                        .clicked()
+                    {
+                        action = Some(CallAction::Dtmf {
+                            digit: DtmfDigit::Five,
+                        });
+                    }
+                    if ui
+                        .add_sized(button_size, egui::Button::new("6\nMNO").fill(button_style))
+                        .clicked()
+                    {
+                        action = Some(CallAction::Dtmf {
+                            digit: DtmfDigit::Six,
+                        });
+                    }
+                });
+
+                // Row 3: 7, 8, 9
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_sized(button_size, egui::Button::new("7\nPQRS").fill(button_style))
+                        .clicked()
+                    {
+                        action = Some(CallAction::Dtmf {
+                            digit: DtmfDigit::Seven,
+                        });
+                    }
+                    if ui
+                        .add_sized(button_size, egui::Button::new("8\nTUV").fill(button_style))
+                        .clicked()
+                    {
+                        action = Some(CallAction::Dtmf {
+                            digit: DtmfDigit::Eight,
+                        });
+                    }
+                    if ui
+                        .add_sized(button_size, egui::Button::new("9\nWXYZ").fill(button_style))
+                        .clicked()
+                    {
+                        action = Some(CallAction::Dtmf {
+                            digit: DtmfDigit::Nine,
+                        });
+                    }
+                });
+
+                // Row 4: *, 0, #
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_sized(button_size, egui::Button::new("*").fill(button_style))
+                        .clicked()
+                    {
+                        action = Some(CallAction::Dtmf {
+                            digit: DtmfDigit::Star,
+                        });
+                    }
+                    if ui
+                        .add_sized(button_size, egui::Button::new("0\n+").fill(button_style))
+                        .clicked()
+                    {
+                        action = Some(CallAction::Dtmf {
+                            digit: DtmfDigit::Zero,
+                        });
+                    }
+                    if ui
+                        .add_sized(button_size, egui::Button::new("#").fill(button_style))
+                        .clicked()
+                    {
+                        action = Some(CallAction::Dtmf {
+                            digit: DtmfDigit::Pound,
+                        });
+                    }
+                });
+            });
 
         action
     }

@@ -5,6 +5,7 @@
 
 use crate::{AppError, AppResult};
 use client_audio::{AudioPipeline, PipelineConfig, PipelineState, PipelineStats};
+use client_types::DtmfDigit;
 use client_sip_ua::{MediaSession, MediaSessionState};
 use client_types::audio::CodecPreference;
 use std::net::SocketAddr;
@@ -245,6 +246,23 @@ impl AudioSession {
     pub async fn has_moh(&self) -> bool {
         let pipeline = self.pipeline.lock().await;
         pipeline.has_moh()
+    }
+
+    /// Sends a DTMF digit via RFC 4733 telephone-event.
+    ///
+    /// # Arguments
+    /// * `digit` - The DTMF digit to send (0-9, *, #, A-D)
+    /// * `duration_ms` - Duration of the tone in milliseconds (typical: 100ms)
+    pub async fn send_dtmf(&self, digit: DtmfDigit, duration_ms: u32) -> AppResult<()> {
+        if !self.running.load(Ordering::Relaxed) {
+            return Err(AppError::Audio("Audio session not running".to_string()));
+        }
+
+        let mut pipeline = self.pipeline.lock().await;
+        pipeline
+            .send_dtmf(digit, duration_ms)
+            .await
+            .map_err(|e| AppError::Audio(e.to_string()))
     }
 
     /// Returns whether the session is running.

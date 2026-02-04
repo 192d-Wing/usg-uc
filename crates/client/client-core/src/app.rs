@@ -12,7 +12,7 @@ use crate::settings::SettingsManager;
 use crate::sip_transport::{CertVerificationMode, SipTransport, TransportEvent};
 use crate::{AppError, AppResult};
 use client_sip_ua::{RegistrationAgent, RegistrationEvent};
-use client_types::{CallInfo, CallState, RegistrationState, SipAccount};
+use client_types::{CallInfo, CallState, DtmfDigit, RegistrationState, SipAccount};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
@@ -404,6 +404,18 @@ impl ClientApp {
     /// Returns whether currently muted.
     pub fn is_muted(&self) -> bool {
         self.call_manager.is_muted()
+    }
+
+    /// Sends a DTMF digit on the active call.
+    ///
+    /// Uses RFC 4733 telephone-event for out-of-band DTMF signaling.
+    ///
+    /// # Arguments
+    /// * `digit` - The DTMF digit to send (0-9, *, #, A-D)
+    pub async fn send_dtmf(&self, digit: DtmfDigit) -> AppResult<()> {
+        // Use standard DTMF duration of 100ms
+        const DTMF_DURATION_MS: u32 = 100;
+        self.call_manager.send_dtmf(digit, DTMF_DURATION_MS).await
     }
 
     /// Toggles hold state for the active call.

@@ -18,6 +18,7 @@ pub mod account;
 pub mod audio;
 pub mod call;
 pub mod contact;
+pub mod dtmf;
 pub mod error;
 pub mod sensitive;
 
@@ -31,5 +32,6 @@ pub use call::{
     CallState,
 };
 pub use contact::{Contact, PhoneNumber, PhoneNumberType};
+pub use dtmf::{DtmfDigit, DtmfEvent};
 pub use error::{ClientError, ClientResult};
 pub use sensitive::{SensitiveString, SessionToken, SmartCardPin, SrtpKeyMaterial};

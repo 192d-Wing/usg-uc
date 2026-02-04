@@ -14,7 +14,7 @@ use client_audio::PipelineStats;
 use client_sip_ua::{CallAgent, CallEvent, MediaSession, MediaSessionEvent, MediaSessionState};
 use client_types::audio::CodecPreference;
 use client_types::{
-    CallDirection, CallEndReason, CallHistoryEntry, CallInfo, CallState, SipAccount,
+    CallDirection, CallEndReason, CallHistoryEntry, CallInfo, CallState, DtmfDigit, SipAccount,
 };
 use proto_ice::IceConfig;
 use proto_sip::header::HeaderName;
@@ -908,6 +908,28 @@ impl CallManager {
     /// Returns whether currently muted.
     pub fn is_muted(&self) -> bool {
         self.is_muted
+    }
+
+    /// Sends a DTMF digit on the focused call.
+    ///
+    /// Uses RFC 4733 telephone-event for out-of-band DTMF signaling.
+    ///
+    /// # Arguments
+    /// * `digit` - The DTMF digit to send (0-9, *, #, A-D)
+    /// * `duration_ms` - Duration of the tone in milliseconds (typical: 100ms)
+    pub async fn send_dtmf(&self, digit: DtmfDigit, duration_ms: u32) -> AppResult<()> {
+        let call_id = self
+            .focused_call_id
+            .as_ref()
+            .ok_or_else(|| AppError::Sip("No active call".to_string()))?;
+
+        let session = self
+            .audio_sessions
+            .get(call_id)
+            .ok_or_else(|| AppError::Audio("No audio session for call".to_string()))?;
+
+        info!(digit = %digit, duration_ms = duration_ms, "Sending DTMF");
+        session.send_dtmf(digit, duration_ms).await
     }
 
     /// Puts the focused call on hold.

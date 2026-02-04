@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.16 complete, Phase 24.24 complete
+**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.16 complete, Phase 24.25 complete
 
 ---
 
@@ -559,9 +559,91 @@ This document outlines the development roadmap for the USG Session Border Contro
   - `EcneChunk`: echoes CE marks from IP header
   - `CwrChunk`: acknowledges congestion window reduction
   - Full encode/decode support in Chunk enum
-- 🚧 Remaining: comprehensive RFC compliance tests
+- ✅ Comprehensive RFC 9260 compliance tests (76 tests in sctp_rfc9260_compliance.rs)
 
-**Tests**: 25 new tests (T.38 crate), 43+ tests (SCTP)
+**Tests**: 25 new tests (T.38 crate), 137+ tests (SCTP)
+
+### 🚧 Phase 25: SCTP RFC 9260 Full Compliance
+
+**Goal**: Complete RFC 9260 compliance for production-grade SCTP
+
+**Critical Priority - Security & Correctness**
+
+- 🚧 Verification tag validation (RFC 9260 §8.5.1)
+  - Validate V-tag on all received packets
+  - Reject packets with incorrect V-tag (except INIT/ABORT)
+  - Proper V-tag handling during shutdown
+- 🚧 Cookie security hardening (RFC 9260 §5.1.3)
+  - HMAC-SHA256 for cookie MAC (currently placeholder)
+  - Cookie lifespan enforcement
+  - Stale cookie detection and handling
+- 🚧 ERROR chunk handling (RFC 9260 §3.3.10)
+  - Full ERROR chunk processing
+  - Error cause code parsing (Invalid Stream, Missing Parameter, etc.)
+  - Graceful degradation on non-fatal errors
+- 🚧 ECN integration in congestion control (RFC 9260 §7.2.5)
+  - Process ECNE chunks to reduce cwnd
+  - Send CWR chunks to acknowledge ECN
+  - CE-marked packet tracking
+- 🚧 Per-path congestion control (RFC 9260 §7.1)
+  - Separate cwnd/ssthresh per destination address
+  - Path-specific RTT estimation
+  - Multi-homed congestion management
+
+**Medium Priority - Protocol Features**
+
+- 🚧 ASCONF chunks for dynamic address config (RFC 5061)
+  - ADD-IP and DELETE-IP parameter handling
+  - SET-PRIMARY-ADDRESS support
+  - ASCONF-ACK response generation
+- 🚧 Forward TSN / Partial Reliability (RFC 3758)
+  - PR-SCTP extension support
+  - FORWARD-TSN chunk processing
+  - Timed reliability and limited retransmissions
+- 🚧 Stream Reset / RE-CONFIG (RFC 6525)
+  - Outgoing/Incoming SSN Reset
+  - Add/Delete streams dynamically
+  - RE-CONFIG chunk encode/decode
+- 🚧 Path MTU Discovery (RFC 9260 §8.4)
+  - PMTU probing with PAD chunks
+  - ICMP Packet Too Big handling
+  - Dynamic fragmentation threshold adjustment
+- 🚧 T4-shutdown timer implementation (RFC 9260 §9.2)
+  - Timer for SHUTDOWN-ACK retransmission
+  - Proper shutdown state machine timing
+- 🚧 Automatic heartbeat sending (RFC 9260 §8.3)
+  - Periodic HEARTBEAT on idle paths
+  - Configurable heartbeat interval
+  - RTT update from HEARTBEAT-ACK
+- 🚧 Duplicate TSN detection (RFC 9260 §6.2)
+  - Track received TSNs for duplicate detection
+  - Report duplicates in SACK
+  - Prevent replay attacks
+- 🚧 Full parameter validation (RFC 9260 §5.1.2)
+  - Validate all INIT/INIT-ACK parameters
+  - Unknown parameter handling (skip/report/abort)
+  - Mandatory parameter presence checks
+- 🚧 Immediate flag handling (RFC 9260 §6.8)
+  - I-bit in DATA chunks for immediate delivery
+  - Skip bundling for immediate data
+  - User-configurable immediate mode
+
+**Lower Priority - Optimizations**
+
+- 🚧 SACK bundling optimization (RFC 9260 §6.2)
+  - Bundle SACK with DATA when possible
+  - Delayed SACK timer (200ms default)
+  - Immediate SACK for gap detection
+- 🚧 Heartbeat bundling (RFC 9260 §8.3)
+  - Bundle HEARTBEAT with DATA chunks
+  - Reduce overhead on busy associations
+- 🚧 PAD chunk support (RFC 9260 §3.3.14)
+  - Padding for PMTU probing
+  - Ignore received PAD chunks
+- 🚧 AUTH chunk support (RFC 4895)
+  - SCTP authentication extension
+  - HMAC-SHA1 and HMAC-SHA256
+  - Shared key management
 
 ### 🚧 Phase 24: SIP Soft Client (In Progress)
 
@@ -972,10 +1054,10 @@ This document outlines the development roadmap for the USG Session Border Contro
   - Transitions to Call view on accept
 - ✅ System toast notifications (existing)
   - notify_incoming_call() already implemented
-- 🚧 Audio ringtone support (future)
+- ✅ Audio ringtone support (Phase 24.24)
   - Configurable ringtone file
   - Ring on default audio device
-- 🚧 Auto-answer option (future)
+- ✅ Auto-answer option (Phase 24.24)
   - Settings flag for auto-answer
   - Configurable delay before auto-answer
 
@@ -1097,6 +1179,31 @@ This document outlines the development roadmap for the USG Session Border Contro
   - Ring volume slider
   - Supported format info display
 
+**Phase 24.25: DTMF Support (RFC 4733)** ✅
+
+- ✅ DTMF types in client-types
+  - `DtmfDigit` enum (0-9, *, #, A-D)
+  - `DtmfEvent` struct with digit, end flag, volume, duration
+  - RFC 4733 event codes (0-15)
+  - Encode/decode methods for 4-byte payload format
+  - Duration conversion helpers (ms ↔ timestamp units)
+- ✅ RTP transmission in client-audio
+  - `DTMF_PAYLOAD_TYPE` (101) and `DTMF_CLOCK_RATE` (8000 Hz)
+  - `send_dtmf()` method in RtpTransmitter
+  - Marker bit for start of event, end bit for final packets
+  - 3x redundant end packets for reliability
+- ✅ AudioPipeline DTMF support
+  - Full event lifecycle: initial packet, continuation every 20ms, end packets
+  - Duration tracking with incrementing timestamp
+- ✅ Call manager integration
+  - `send_dtmf()` in AudioSession, CallManager, ClientApp
+  - Default 100ms tone duration
+- ✅ Dialpad UI in call view
+  - Toggle button to show/hide dialpad
+  - Phone-style 4x3 grid (1-9, *, 0, #)
+  - Click-to-send DTMF digits
+  - Status message shows sent digit
+
 ---
 
 ## Known TODOs in Code
@@ -1145,6 +1252,13 @@ This document outlines the development roadmap for the USG Session Border Contro
 | RFC 8445 | ICE | ✅ Enhanced (aggressive nomination, consent, keepalives) |
 | RFC 8224 | STIR | ✅ Implemented (ES384) |
 | RFC 8225 | PASSporT | ✅ Implemented (ES384) |
+| RFC 9260 | SCTP | 🚧 Partial (~70% compliant, see Phase 25) |
+| RFC 4168 | SIP over SCTP | 🚧 Partial (transport layer complete) |
+| RFC 6951 | UDP Encapsulation for SCTP | ✅ Implemented |
+| RFC 3758 | PR-SCTP | 🚧 Planned (Phase 25) |
+| RFC 5061 | SCTP Dynamic Address | 🚧 Planned (Phase 25) |
+| RFC 6525 | SCTP Stream Reset | 🚧 Planned (Phase 25) |
+| RFC 4895 | SCTP Authentication | 🚧 Planned (Phase 25) |
 
 ---
 

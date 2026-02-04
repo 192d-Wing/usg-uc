@@ -12,6 +12,7 @@ use crate::rtp_handler::{RtpReceiver, RtpStats, RtpTransmitter, generate_ssrc};
 use crate::stream::{CaptureStream, PlaybackStream};
 use crate::{AudioError, AudioResult};
 use client_types::audio::CodecPreference;
+use client_types::{DtmfDigit, DtmfEvent};
 use proto_srtp::{SrtpContext, SrtpDirection, SrtpKeyMaterial, SrtpProfile};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -476,6 +477,52 @@ impl AudioPipeline {
         // Send
         transmitter.send(encoded).await?;
 
+        Ok(())
+    }
+
+    /// Sends a DTMF digit using RFC 4733 telephone-event.
+    ///
+    /// This method handles the full DTMF event lifecycle:
+    /// 1. Sends initial packet with marker bit
+    /// 2. Sends continuation packets during duration
+    /// 3. Sends final packets with end bit (3x for reliability)
+    ///
+    /// # Arguments
+    /// * `digit` - The DTMF digit to send
+    /// * `duration_ms` - Duration of the tone in milliseconds (40-500ms typical)
+    pub async fn send_dtmf(&mut self, digit: DtmfDigit, duration_ms: u32) -> AudioResult<()> {
+        let transmitter = self
+            .transmitter
+            .as_mut()
+            .ok_or_else(|| AudioError::ConfigError("Transmitter not available".to_string()))?;
+
+        let duration = DtmfEvent::duration_from_ms(duration_ms);
+        info!("Sending DTMF digit '{}' for {}ms", digit, duration_ms);
+
+        // Send initial packet with marker bit
+        let event = DtmfEvent::new(digit, 0);
+        transmitter.send_dtmf(&event, true).await?;
+
+        // Send continuation packets every 20ms
+        let packet_interval_ms = 20u32;
+        let num_continuation_packets = duration_ms.saturating_sub(packet_interval_ms) / packet_interval_ms;
+
+        for i in 1..=num_continuation_packets {
+            let elapsed_duration = DtmfEvent::duration_from_ms(i * packet_interval_ms);
+            let event = DtmfEvent::new(digit, elapsed_duration);
+            transmitter.send_dtmf(&event, false).await?;
+
+            // Wait between packets (in real usage, this would be handled by the audio processing loop)
+            tokio::time::sleep(tokio::time::Duration::from_millis(packet_interval_ms as u64)).await;
+        }
+
+        // Send end packets (3x for reliability per RFC 4733)
+        for _ in 0..3 {
+            let event = DtmfEvent::with_end(digit, duration);
+            transmitter.send_dtmf(&event, false).await?;
+        }
+
+        debug!("DTMF digit '{}' sent successfully", digit);
         Ok(())
     }
 

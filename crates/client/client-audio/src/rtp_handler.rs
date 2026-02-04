@@ -6,6 +6,7 @@
 use crate::jitter_buffer::{BufferedPacket, JitterBuffer, JitterBufferResult};
 use crate::{AudioError, AudioResult};
 use bytes::Bytes;
+use client_types::DtmfEvent;
 use proto_rtp::{RtpHeader, RtpPacket};
 use proto_srtp::{SrtpContext, SrtpProtect, SrtpUnprotect};
 use std::net::SocketAddr;
@@ -26,6 +27,12 @@ pub const MAX_RTP_PACKET_SIZE: usize = 1500;
 
 /// SRTP authentication tag size for AES-256-GCM.
 pub const SRTP_AUTH_TAG_SIZE: usize = 16;
+
+/// Default payload type for telephone-event (DTMF).
+pub const DTMF_PAYLOAD_TYPE: u8 = 101;
+
+/// DTMF event clock rate (8000 Hz per RFC 4733).
+pub const DTMF_CLOCK_RATE: u32 = 8000;
 
 /// Statistics for RTP handling.
 #[derive(Debug, Clone, Default)]
@@ -64,6 +71,10 @@ pub struct RtpTransmitter {
     srtp: Option<Arc<Mutex<SrtpContext>>>,
     /// Statistics.
     stats: Arc<std::sync::Mutex<RtpStats>>,
+    /// DTMF payload type (telephone-event).
+    dtmf_payload_type: u8,
+    /// Current DTMF timestamp (separate from audio).
+    dtmf_timestamp: AtomicU32,
 }
 
 impl RtpTransmitter {
@@ -90,7 +101,15 @@ impl RtpTransmitter {
             timestamp_increment,
             srtp: None,
             stats: Arc::new(std::sync::Mutex::new(RtpStats::default())),
+            dtmf_payload_type: DTMF_PAYLOAD_TYPE,
+            dtmf_timestamp: AtomicU32::new(rand_u32()),
         }
+    }
+
+    /// Sets the DTMF payload type (default is 101).
+    pub fn set_dtmf_payload_type(&mut self, pt: u8) {
+        self.dtmf_payload_type = pt;
+        debug!("DTMF payload type set to {}", pt);
     }
 
     /// Sets the SRTP context for encryption.
@@ -164,6 +183,92 @@ impl RtpTransmitter {
     /// Returns the SSRC.
     pub fn ssrc(&self) -> u32 {
         self.ssrc
+    }
+
+    /// Sends a DTMF event packet (RFC 4733 telephone-event).
+    ///
+    /// For proper DTMF signaling, call this method multiple times:
+    /// 1. Initial packet with marker bit (start of event)
+    /// 2. Continuation packets every 20ms during the tone
+    /// 3. Final packets (3x) with end bit set
+    ///
+    /// # Arguments
+    /// * `event` - The DTMF event to send
+    /// * `marker` - Set to true for the first packet of a new event
+    pub async fn send_dtmf(&mut self, event: &DtmfEvent, marker: bool) -> AudioResult<()> {
+        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+
+        // For DTMF, timestamp stays the same for the duration of the event
+        // (it's the timestamp of when the event started)
+        let ts = if marker {
+            // Start of a new event - get a new timestamp
+            let new_ts = self
+                .dtmf_timestamp
+                .fetch_add(event.duration as u32, Ordering::Relaxed);
+            new_ts
+        } else {
+            // Continuation - use the current timestamp without incrementing
+            self.dtmf_timestamp.load(Ordering::Relaxed)
+                - event.duration as u32
+        };
+
+        // Build RTP header with DTMF payload type
+        let mut header = RtpHeader::new(self.dtmf_payload_type, seq, ts, self.ssrc);
+        if marker {
+            header.marker = true;
+        }
+
+        // Encode DTMF event payload (4 bytes per RFC 4733)
+        let payload = event.encode();
+
+        // Build packet
+        let packet = RtpPacket::new(header, Bytes::copy_from_slice(&payload));
+        let packet_bytes = packet.to_bytes();
+
+        // Apply SRTP if configured
+        let send_bytes = if let Some(ref srtp) = self.srtp {
+            let srtp_guard = srtp.lock().await;
+            let protector = SrtpProtect::new(&srtp_guard);
+            match protector.protect_rtp(&packet) {
+                Ok(protected) => protected.to_vec(),
+                Err(e) => {
+                    drop(srtp_guard);
+                    let mut stats = self
+                        .stats
+                        .lock()
+                        .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
+                    stats.srtp_errors += 1;
+                    return Err(AudioError::SrtpError(format!("SRTP protect failed: {e}")));
+                }
+            }
+        } else {
+            packet_bytes.to_vec()
+        };
+
+        // Send packet
+        match self.socket.send_to(&send_bytes, self.remote_addr).await {
+            Ok(sent) => {
+                trace!(
+                    "Sent DTMF packet: digit={}, seq={}, ts={}, end={}, marker={}",
+                    event.digit, seq, ts, event.end, marker
+                );
+                let mut stats = self
+                    .stats
+                    .lock()
+                    .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
+                stats.packets_sent += 1;
+                stats.bytes_sent += sent as u64;
+                Ok(())
+            }
+            Err(e) => {
+                let mut stats = self
+                    .stats
+                    .lock()
+                    .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
+                stats.packets_dropped += 1;
+                Err(AudioError::RtpError(format!("DTMF send failed: {e}")))
+            }
+        }
     }
 }
 
@@ -395,5 +500,31 @@ mod tests {
 
         let rx = RtpReceiver::new(socket, 8000, 160, 60);
         assert!(!rx.is_ready());
+    }
+
+    #[test]
+    fn test_dtmf_payload_type_default() {
+        assert_eq!(DTMF_PAYLOAD_TYPE, 101);
+        assert_eq!(DTMF_CLOCK_RATE, 8000);
+    }
+
+    #[tokio::test]
+    async fn test_dtmf_send() {
+        use client_types::DtmfDigit;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = Arc::new(socket);
+        let remote: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        let mut tx = RtpTransmitter::new(socket, remote, 12345, 0, 160);
+
+        // Create a DTMF event for digit '5'
+        let event = DtmfEvent::new(DtmfDigit::Five, DtmfEvent::duration_from_ms(100));
+
+        // Send should not panic (will fail because remote isn't listening, but that's OK)
+        // We're just testing the packet construction
+        let result = tx.send_dtmf(&event, true).await;
+        // The send will succeed even if no one is listening (UDP)
+        assert!(result.is_ok());
     }
 }

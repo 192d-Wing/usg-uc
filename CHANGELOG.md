@@ -753,6 +753,44 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - Ring volume slider (0.0 - 1.0)
   - Supported format info display
 
+#### Phase 24.25: DTMF Support (RFC 4733)
+
+- `client-types/src/dtmf.rs` - NEW file for DTMF types
+  - `DtmfDigit` enum representing all DTMF digits (0-9, *, #, A-D)
+  - `DtmfEvent` struct with digit, end flag, volume, and duration
+  - RFC 4733 event codes (0=digit 0, 10=*, 11=#, 12-15=A-D)
+  - `encode()` / `decode()` for 4-byte RFC 4733 payload format
+  - `from_char()` / `to_char()` for user input conversion
+  - `duration_from_ms()` / `duration_to_ms()` for timestamp conversion
+  - 8 tests for DTMF encoding/decoding
+- `client-audio/src/rtp_handler.rs` - DTMF RTP transmission
+  - `DTMF_PAYLOAD_TYPE` constant (101)
+  - `DTMF_CLOCK_RATE` constant (8000 Hz)
+  - `send_dtmf()` method in RtpTransmitter
+  - Marker bit on first packet of event
+  - End bit on final packets (3x for reliability)
+  - 1 test for DTMF send
+- `client-audio/src/pipeline.rs` - AudioPipeline DTMF support
+  - `send_dtmf(digit, duration_ms)` method
+  - Full event lifecycle: initial packet, continuation every 20ms, end packets
+  - Duration increments with each continuation packet
+- `client-core/src/audio_session.rs` - AudioSession DTMF forwarding
+  - `send_dtmf()` delegates to pipeline
+- `client-core/src/call_manager.rs` - CallManager DTMF API
+  - `send_dtmf()` sends on focused call
+  - Error handling for no active call
+- `client-core/src/app.rs` - ClientApp public DTMF API
+  - `send_dtmf(digit)` with default 100ms duration
+- `client-gui/src/views/call.rs` - Dialpad UI
+  - `CallAction::Dtmf { digit }` variant
+  - `show_dialpad` toggle in CallView
+  - Keypad toggle button in call controls
+  - `render_dialpad()` with phone-style 4x3 grid
+  - Click-to-send DTMF digits
+- `client-gui/src/app.rs` - DTMF action handling
+  - Handle `CallAction::Dtmf` by calling `app.send_dtmf()`
+  - Status message shows sent digit
+
 **Security**
 
 - Smart card authentication ONLY (CAC/PIV/SIPR token)
