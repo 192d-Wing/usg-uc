@@ -1384,18 +1384,25 @@ This document outlines the development roadmap for the USG Session Border Contro
   - ContactsAction handlers for all CRUD operations
   - Auto-save on contact modifications
 
-**Phase 24.34: Server Certificate Verification** 🚧
+**Phase 24.34: Server Certificate Verification** ✅
 
-- 🚧 Apply verification mode to transport
-  - Route ServerCertVerificationMode to SipTransport
+- ✅ Apply verification mode to transport
+  - Convert ServerCertVerificationMode to CertVerificationMode
+  - Load CA certificates from PEM/DER files
+  - Apply to SipTransport via ClientApp::set_verification_mode
   - Rebuild TLS config when mode changes
-- 🚧 Custom CA file browser
+- ✅ Custom CA file browser
   - Use rfd crate for native file dialog
-  - Filter to .pem/.crt/.cer files
+  - Filter to .pem/.crt/.cer/.der files
   - Validate CA certificate on selection
-- 🚧 Certificate info display
-  - Show loaded CA certificate details
-  - Display current TLS connection info
+  - Display certificate count after loading
+- ✅ Certificate info display
+  - Show number of loaded CA certificates
+  - Green indicator when certificates loaded successfully
+- ✅ PEM/DER certificate loading
+  - Support for both PEM and DER formats
+  - Manual PEM parsing with base64 decoding
+  - Added `load_certs_from_pem_file` utility function
 
 ---
 

@@ -1159,6 +1159,32 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
     - `ConfirmDelete` - Removes from ContactManager, refreshes view
   - Auto-save contacts on all modifications
 
+#### Phase 24.34: Server Certificate Verification
+
+- `client-core/src/sip_transport.rs` - Certificate loading utilities
+  - `load_certs_from_pem_file()` - Load CA certificates from PEM or DER files
+  - `parse_pem_certificates()` - Parse PEM-encoded certificates with base64 decoding
+  - Support for both PEM (.pem, .crt) and DER (.der, .cer) formats
+  - Validation of loaded certificates
+- `client-gui/src/app.rs` - Verification mode integration
+  - `set_verification_mode()` rewritten to apply to SipTransport
+    - Convert `ServerCertVerificationMode` → `CertVerificationMode`
+    - Load certificates from file for Custom mode
+    - Call `ClientApp::set_verification_mode()` to apply
+    - Update UI cert count on success/failure
+  - `browse_for_ca_file()` implemented with rfd
+    - Native file dialog with certificate file filters
+    - Validate certificate file before applying
+    - Show error dialog if invalid
+- `client-gui/src/views/settings.rs` - Certificate info display
+  - Added `custom_ca_cert_count` field
+  - Display "N certificate(s) loaded" in green when Custom mode active
+  - `set_custom_ca_cert_count()` method for updating UI
+
+**Dependencies Added (client-core)**
+
+- `base64` 0.22: PEM certificate decoding
+
 **Security**
 
 - Smart card authentication ONLY (CAC/PIV/SIPR token)

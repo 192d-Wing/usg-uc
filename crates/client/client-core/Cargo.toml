@@ -29,6 +29,9 @@ tokio-rustls = "0.26"
 rustls-pki-types.workspace = true
 rustls-native-certs.workspace = true
 
+# Utilities
+base64 = "0.22"
+
 # Platform utilities
 directories.workspace = true
 

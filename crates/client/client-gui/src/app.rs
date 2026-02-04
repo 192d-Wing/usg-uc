@@ -6,7 +6,10 @@ use crate::notifications::NotificationManager;
 use crate::tray::TrayAction;
 use crate::views::{CallView, ContactsView, DialerView, SettingsView};
 use client_audio::RingtonePlayer;
-use client_core::{AppEvent, ClientApp, ContactManager, SettingsManager};
+use client_core::{
+    AppEvent, CertVerificationMode, ClientApp, ContactManager, SettingsManager,
+    load_certs_from_pem_file,
+};
 use client_types::{CallInfo, CallState, RegistrationState};
 use eframe::egui;
 use std::net::SocketAddr;
@@ -1635,22 +1638,96 @@ impl SipClientApp {
         self.settings_view
             .set_server_cert_verification(mode.clone());
 
-        // Update the custom CA path if in Custom mode
+        // Update the custom CA path and cert count if in Custom mode
         if let ServerCertVerificationMode::Custom { ref ca_file_path } = mode {
             self.settings_view.set_custom_ca_path(ca_file_path.clone());
+        } else {
+            // Clear cert count for non-custom modes
+            self.settings_view.set_custom_ca_cert_count(0);
         }
 
-        // TODO: Apply to SipTransport when connected
-        // For now, just update the UI state
-        self.status_message = format!("Verification mode set to: {}", mode.label());
-        info!(mode = ?mode, "Server certificate verification mode updated");
+        // Convert to transport's CertVerificationMode and apply
+        let transport_mode = match &mode {
+            ServerCertVerificationMode::Insecure => CertVerificationMode::Insecure,
+            ServerCertVerificationMode::System => CertVerificationMode::System,
+            ServerCertVerificationMode::Custom { ca_file_path } => {
+                // Load certificates from the file
+                let path = std::path::Path::new(ca_file_path);
+                match load_certs_from_pem_file(path) {
+                    Ok(certs) => {
+                        let cert_count = certs.len();
+                        info!(
+                            path = %ca_file_path,
+                            cert_count = cert_count,
+                            "Loaded CA certificates for verification"
+                        );
+                        // Update the UI with cert count
+                        self.settings_view.set_custom_ca_cert_count(cert_count);
+                        CertVerificationMode::Custom {
+                            trusted_certs: certs,
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, path = %ca_file_path, "Failed to load CA file");
+                        self.settings_view.set_custom_ca_cert_count(0);
+                        self.error_message = Some(format!("Failed to load CA file: {e}"));
+                        self.show_error_dialog = true;
+                        return;
+                    }
+                }
+            }
+        };
+
+        // Apply to the SIP transport if available
+        if let Some(ref mut app) = self.client_app {
+            let runtime = self.runtime.clone();
+            match runtime.block_on(app.set_verification_mode(transport_mode)) {
+                Ok(()) => {
+                    self.status_message = format!("Verification mode set to: {}", mode.label());
+                    info!(mode = ?mode, "Server certificate verification mode applied");
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to apply verification mode to transport");
+                    self.status_message =
+                        format!("Verification mode updated (transport: {})", e);
+                }
+            }
+        } else {
+            self.status_message = format!("Verification mode set to: {}", mode.label());
+            info!(mode = ?mode, "Server certificate verification mode updated (no transport)");
+        }
     }
 
     fn browse_for_ca_file(&mut self) {
-        // For now, user must type the path manually
-        // TODO: Add rfd (native file dialog) dependency for file browsing
-        self.status_message = "Enter the CA file path manually in the text field".to_string();
-        info!("User requested file browser - must enter path manually for now");
+        use rfd::FileDialog;
+
+        // Open native file dialog
+        let file = FileDialog::new()
+            .add_filter("Certificate Files", &["pem", "crt", "cer", "der"])
+            .add_filter("All Files", &["*"])
+            .set_title("Select CA Certificate File")
+            .pick_file();
+
+        if let Some(path) = file {
+            let path_str = path.to_string_lossy().to_string();
+            info!(path = %path_str, "User selected CA file");
+
+            // Try to load and validate the certificate
+            match load_certs_from_pem_file(&path) {
+                Ok(certs) => {
+                    info!(cert_count = certs.len(), "Validated CA certificate file");
+                    // Apply the mode
+                    self.set_verification_mode(client_types::ServerCertVerificationMode::Custom {
+                        ca_file_path: path_str,
+                    });
+                }
+                Err(e) => {
+                    error!(error = %e, path = %path_str, "Invalid CA certificate file");
+                    self.error_message = Some(format!("Invalid CA file: {e}"));
+                    self.show_error_dialog = true;
+                }
+            }
+        }
     }
 
     fn apply_insecure_mode(&mut self) {

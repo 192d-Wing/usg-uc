@@ -888,6 +888,101 @@ fn load_custom_root_certs(trusted_certs: &[Vec<u8>]) -> AppResult<RootCertStore>
     Ok(root_store)
 }
 
+/// Loads CA certificates from a PEM file and returns them as DER-encoded bytes.
+///
+/// This function reads a PEM-encoded certificate file (which may contain
+/// multiple certificates) and returns each certificate as DER-encoded bytes,
+/// suitable for use with `CertVerificationMode::Custom`.
+///
+/// Supports both PEM (.pem, .crt) and DER (.der, .cer) formats.
+///
+/// # Arguments
+/// * `path` - Path to the certificate file
+///
+/// # Returns
+/// A vector of DER-encoded certificates on success.
+///
+/// # Errors
+/// Returns an error if the file cannot be read or contains no valid certificates.
+pub fn load_certs_from_pem_file(path: &std::path::Path) -> AppResult<Vec<Vec<u8>>> {
+    use std::fs;
+
+    let content = fs::read(path).map_err(|e| {
+        AppError::Sip(format!("Failed to read CA file '{}': {}", path.display(), e))
+    })?;
+
+    // Check if it's a DER file (starts with ASN.1 SEQUENCE tag 0x30)
+    if content.first() == Some(&0x30) {
+        // Assume it's DER-encoded
+        info!(
+            path = %path.display(),
+            "Loaded DER-encoded CA certificate"
+        );
+        return Ok(vec![content]);
+    }
+
+    // Parse as PEM
+    let pem_str = String::from_utf8(content).map_err(|e| {
+        AppError::Sip(format!("Invalid UTF-8 in CA file '{}': {}", path.display(), e))
+    })?;
+
+    let certs = parse_pem_certificates(&pem_str)?;
+
+    if certs.is_empty() {
+        return Err(AppError::Sip(format!(
+            "No valid certificates found in '{}'",
+            path.display()
+        )));
+    }
+
+    info!(
+        path = %path.display(),
+        cert_count = certs.len(),
+        "Loaded CA certificates from PEM file"
+    );
+
+    Ok(certs)
+}
+
+/// Parses PEM-encoded certificates from a string.
+///
+/// Extracts all CERTIFICATE blocks from the PEM data.
+fn parse_pem_certificates(pem_data: &str) -> AppResult<Vec<Vec<u8>>> {
+    use base64::prelude::*;
+
+    const BEGIN_CERT: &str = "-----BEGIN CERTIFICATE-----";
+    const END_CERT: &str = "-----END CERTIFICATE-----";
+
+    let mut certs = Vec::new();
+    let mut remaining = pem_data;
+
+    while let Some(begin_idx) = remaining.find(BEGIN_CERT) {
+        remaining = &remaining[begin_idx + BEGIN_CERT.len()..];
+
+        if let Some(end_idx) = remaining.find(END_CERT) {
+            let base64_data: String = remaining[..end_idx]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+
+            match BASE64_STANDARD.decode(&base64_data) {
+                Ok(der_bytes) => {
+                    certs.push(der_bytes);
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to decode PEM certificate, skipping");
+                }
+            }
+
+            remaining = &remaining[end_idx + END_CERT.len()..];
+        } else {
+            break;
+        }
+    }
+
+    Ok(certs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

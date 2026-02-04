@@ -82,6 +82,8 @@ pub struct SettingsView {
     server_cert_verification: ServerCertVerificationMode,
     /// Custom CA file path (when using Custom verification mode).
     custom_ca_path: String,
+    /// Number of CA certificates loaded from the custom file.
+    custom_ca_cert_count: usize,
     /// Whether to show the insecure mode warning dialog.
     show_insecure_warning: bool,
     /// Pending verification mode change (awaiting insecure confirmation).
@@ -139,6 +141,7 @@ impl SettingsView {
             certificates_loading: false,
             server_cert_verification: ServerCertVerificationMode::default(),
             custom_ca_path: String::new(),
+            custom_ca_cert_count: 0,
             show_insecure_warning: false,
             pending_verification_mode: None,
             auto_answer_enabled: false,
@@ -182,6 +185,11 @@ impl SettingsView {
     /// Sets the custom CA file path.
     pub fn set_custom_ca_path(&mut self, path: String) {
         self.custom_ca_path = path;
+    }
+
+    /// Sets the number of certificates loaded from the custom CA file.
+    pub fn set_custom_ca_cert_count(&mut self, count: usize) {
+        self.custom_ca_cert_count = count;
     }
 
     /// Shows or hides the insecure mode warning dialog.
@@ -728,6 +736,20 @@ impl SettingsView {
                         }
                     });
                     ui.end_row();
+
+                    // Show loaded certificate info
+                    if self.custom_ca_cert_count > 0 {
+                        ui.label("");
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} certificate(s) loaded",
+                                self.custom_ca_cert_count
+                            ))
+                            .small()
+                            .color(egui::Color32::from_rgb(100, 200, 100)),
+                        );
+                        ui.end_row();
+                    }
                 }
             });
 
