@@ -883,6 +883,37 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - `test_parse_codec_from_sdp_opus` - Dynamic payload type with rtpmap
   - `test_parse_codec_from_sdp_no_audio` - Missing m=audio line
 
+#### Phase 24.28: Call Transfer Support (RFC 3515 REFER)
+
+- `client-sip-ua/src/call_agent.rs` - REFER method implementation
+  - `transfer_call()` - Initiates blind call transfer
+    - Validates call state (Connected or OnHold only)
+    - Returns error for invalid states (Dialing, Ringing, Terminated)
+  - `send_refer()` - Builds and sends REFER request
+    - Increments CSeq for new transaction
+    - Creates `ClientNonInviteTransaction` for REFER
+    - Sets call state to `CallState::Transferring`
+  - `build_refer_request_static()` - RFC 3515 compliant REFER construction
+    - `Refer-To` header with transfer target URI
+    - `Referred-By` header with local AOR
+    - Standard dialog headers (Call-ID, From, To, Via, CSeq)
+    - Contact header for responses
+- `client-core/src/call_manager.rs` - Transfer coordination
+  - `transfer_call()` - Transfer focused call to target URI
+  - `transfer_call_by_id()` - Transfer specific call by ID
+  - Error handling for no active call scenario
+- `client-core/src/app.rs` - Transfer API
+  - `transfer_call()` - Public API for ClientApp
+- `client-gui/src/views/call.rs` - Transfer UI
+  - `CallAction::Transfer { target_uri }` - Transfer action variant
+  - `show_transfer_dialog` / `transfer_target` state fields
+  - Transfer button in call controls (arrows icon)
+  - Modal transfer dialog with SIP URI input
+  - Enter key support for quick submission
+- `client-gui/src/app.rs` - Transfer action handler
+  - Routes `CallAction::Transfer` to `ClientApp::transfer_call()`
+  - Status messages for success/failure
+
 **Security**
 
 - Smart card authentication ONLY (CAC/PIV/SIPR token)

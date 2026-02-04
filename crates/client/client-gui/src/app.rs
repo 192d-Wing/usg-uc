@@ -1158,6 +1158,21 @@ impl SipClientApp {
                     }
                 }
             }
+            crate::views::CallAction::Transfer { target_uri } => {
+                info!(target = %target_uri, "Transferring call");
+                if let Some(ref mut app) = self.client_app {
+                    let runtime = self.runtime.clone();
+                    match runtime.block_on(app.transfer_call(&target_uri)) {
+                        Ok(()) => {
+                            self.status_message = format!("Transferring to {target_uri}...");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to transfer call");
+                            self.status_message = format!("Transfer failed: {e}");
+                        }
+                    }
+                }
+            }
         }
     }
 

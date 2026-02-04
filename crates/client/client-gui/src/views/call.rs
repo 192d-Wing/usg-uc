@@ -42,6 +42,11 @@ pub enum CallAction {
         /// Device name, or None for default.
         device_name: Option<String>,
     },
+    /// Transfer call to another party (RFC 3515 REFER).
+    Transfer {
+        /// SIP URI of the transfer target.
+        target_uri: String,
+    },
 }
 
 /// Call view state.
@@ -54,6 +59,10 @@ pub struct CallView {
     show_dialpad: bool,
     /// Whether to show the audio device menu.
     show_audio_menu: bool,
+    /// Whether to show the transfer dialog.
+    show_transfer_dialog: bool,
+    /// Transfer target URI input.
+    transfer_target: String,
 }
 
 impl CallView {
@@ -64,6 +73,8 @@ impl CallView {
             is_on_hold: false,
             show_dialpad: false,
             show_audio_menu: false,
+            show_transfer_dialog: false,
+            transfer_target: String::new(),
         }
     }
 
@@ -254,7 +265,7 @@ impl CallView {
 
                 ui.add_space(20.0);
 
-                // Dialpad and Audio toggle buttons
+                // Dialpad, Audio, and Transfer toggle buttons
                 ui.horizontal(|ui| {
                     let dialpad_label = if self.show_dialpad {
                         "Hide Keypad"
@@ -265,6 +276,7 @@ impl CallView {
                         self.show_dialpad = !self.show_dialpad;
                         if self.show_dialpad {
                             self.show_audio_menu = false;
+                            self.show_transfer_dialog = false;
                         }
                     }
 
@@ -277,6 +289,20 @@ impl CallView {
                         self.show_audio_menu = !self.show_audio_menu;
                         if self.show_audio_menu {
                             self.show_dialpad = false;
+                            self.show_transfer_dialog = false;
+                        }
+                    }
+
+                    let transfer_label = if self.show_transfer_dialog {
+                        "Hide Transfer"
+                    } else {
+                        "Transfer"
+                    };
+                    if ui.button(transfer_label).clicked() {
+                        self.show_transfer_dialog = !self.show_transfer_dialog;
+                        if self.show_transfer_dialog {
+                            self.show_dialpad = false;
+                            self.show_audio_menu = false;
                         }
                     }
                 });
@@ -302,8 +328,80 @@ impl CallView {
                         action = Some(audio_action);
                     }
                 }
+
+                // Transfer dialog (when visible)
+                if self.show_transfer_dialog {
+                    ui.add_space(20.0);
+                    if let Some(transfer_action) = self.render_transfer_dialog(ui) {
+                        action = Some(transfer_action);
+                    }
+                }
             }
         });
+
+        action
+    }
+
+    /// Renders the call transfer dialog.
+    fn render_transfer_dialog(&mut self, ui: &mut egui::Ui) -> Option<CallAction> {
+        let mut action = None;
+
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(40, 40, 45))
+            .corner_radius(8.0)
+            .inner_margin(16.0)
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Transfer Call").strong());
+                ui.add_space(10.0);
+
+                ui.label("Enter transfer target (SIP URI):");
+                ui.add_space(5.0);
+
+                // Transfer target input
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.transfer_target)
+                        .hint_text("sips:bob@example.com")
+                        .desired_width(250.0),
+                );
+
+                // Handle Enter key press
+                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if !self.transfer_target.trim().is_empty() {
+                        action = Some(CallAction::Transfer {
+                            target_uri: self.transfer_target.clone(),
+                        });
+                        self.transfer_target.clear();
+                        self.show_transfer_dialog = false;
+                    }
+                }
+
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    // Transfer button
+                    let transfer_enabled = !self.transfer_target.trim().is_empty();
+                    if ui
+                        .add_enabled(
+                            transfer_enabled,
+                            egui::Button::new("Transfer")
+                                .fill(egui::Color32::from_rgb(50, 120, 200)),
+                        )
+                        .clicked()
+                    {
+                        action = Some(CallAction::Transfer {
+                            target_uri: self.transfer_target.clone(),
+                        });
+                        self.transfer_target.clear();
+                        self.show_transfer_dialog = false;
+                    }
+
+                    // Cancel button
+                    if ui.button("Cancel").clicked() {
+                        self.transfer_target.clear();
+                        self.show_transfer_dialog = false;
+                    }
+                });
+            });
 
         action
     }

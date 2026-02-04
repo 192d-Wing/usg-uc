@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.27 complete, Phase 25 critical items complete
+**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.28 complete, Phase 25 critical items complete
 
 ---
 
@@ -1243,6 +1243,30 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ Unit tests for SDP codec parsing
   - Tests for PCMU, PCMA, G722, Opus detection
   - Tests for missing m=audio line handling
+
+**Phase 24.28: Call Transfer Support (RFC 3515 REFER)** ✅
+
+- ✅ REFER method support in CallAgent
+  - `transfer_call()` method validates call state (Connected or OnHold)
+  - `send_refer()` builds and sends REFER request with Refer-To header
+  - `build_refer_request_static()` constructs RFC 3515 compliant REFER
+  - Refer-To header contains transfer target URI
+  - Referred-By header identifies the transferring party
+  - Sets call state to `CallState::Transferring` during transfer
+- ✅ CallManager transfer API
+  - `transfer_call()` transfers currently focused call
+  - `transfer_call_by_id()` transfers specific call by ID
+  - Routes transfer requests to CallAgent
+- ✅ ClientApp transfer integration
+  - `transfer_call()` public API for GUI access
+  - Error handling with user-friendly messages
+- ✅ Transfer UI in call view
+  - `CallAction::Transfer` variant for transfer action
+  - Transfer button in call controls
+  - Modal transfer dialog with SIP URI input field
+  - Transfer and Cancel buttons
+  - Enter key support for quick transfer
+  - Status messages for transfer progress/failure
 
 ---
 

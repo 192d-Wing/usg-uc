@@ -938,6 +938,53 @@ impl CallManager {
         session.send_dtmf(digit, duration_ms).await
     }
 
+    /// Transfers the focused call to another party (blind transfer).
+    ///
+    /// Sends a REFER request per RFC 3515 to transfer the call to the
+    /// specified target URI. The remote party will initiate a new call
+    /// to the transfer target.
+    ///
+    /// # Arguments
+    /// * `transfer_target` - SIP URI of the transfer destination (e.g., "sips:bob@example.com")
+    ///
+    /// # Returns
+    /// Ok(()) if the REFER was sent successfully. The actual transfer result
+    /// will be reported asynchronously via call state changes.
+    pub async fn transfer_call(&mut self, transfer_target: &str) -> AppResult<()> {
+        let call_id = self
+            .focused_call_id
+            .as_ref()
+            .ok_or_else(|| AppError::Sip("No active call".to_string()))?
+            .clone();
+
+        self.transfer_call_by_id(&call_id, transfer_target).await
+    }
+
+    /// Transfers a specific call to another party (blind transfer).
+    ///
+    /// # Arguments
+    /// * `call_id` - The call to transfer
+    /// * `transfer_target` - SIP URI of the transfer destination
+    pub async fn transfer_call_by_id(
+        &mut self,
+        call_id: &str,
+        transfer_target: &str,
+    ) -> AppResult<()> {
+        info!(
+            call_id = %call_id,
+            transfer_target = %transfer_target,
+            "Initiating call transfer"
+        );
+
+        // Send REFER via call agent
+        self.call_agent
+            .transfer_call(call_id, transfer_target)
+            .await
+            .map_err(|e| AppError::Sip(e.to_string()))?;
+
+        Ok(())
+    }
+
     /// Switches the input (microphone) device for the active call.
     ///
     /// This allows changing the microphone mid-call without disconnecting.

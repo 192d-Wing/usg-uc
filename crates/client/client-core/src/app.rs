@@ -418,6 +418,17 @@ impl ClientApp {
         self.call_manager.send_dtmf(digit, DTMF_DURATION_MS).await
     }
 
+    /// Transfers the active call to another party (blind transfer).
+    ///
+    /// Sends a REFER request per RFC 3515 to transfer the call to the
+    /// specified target URI.
+    ///
+    /// # Arguments
+    /// * `transfer_target` - SIP URI of the transfer destination (e.g., "sips:bob@example.com")
+    pub async fn transfer_call(&mut self, transfer_target: &str) -> AppResult<()> {
+        self.call_manager.transfer_call(transfer_target).await
+    }
+
     /// Switches the input (microphone) device during an active call.
     ///
     /// This allows changing the microphone mid-call without disconnecting.

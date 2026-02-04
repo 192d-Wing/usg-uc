@@ -237,7 +237,7 @@ impl CallAgent {
                 // Send CANCEL for pending INVITE
                 self.send_cancel(call_id).await
             }
-            CallState::Connected | CallState::OnHold => {
+            CallState::Connected | CallState::OnHold | CallState::Transferring => {
                 // Send BYE
                 self.send_bye(call_id).await
             }
@@ -292,6 +292,112 @@ impl CallAgent {
         info!(call_id = %call_id, "Resuming held call");
 
         self.send_reinvite(call_id, resume_sdp, false).await
+    }
+
+    /// Transfers a call to another party (blind transfer).
+    ///
+    /// Sends a REFER request per RFC 3515 to transfer the call to the
+    /// specified target URI. The remote party will initiate a new call
+    /// to the transfer target.
+    ///
+    /// # Arguments
+    /// * `call_id` - The call to transfer
+    /// * `transfer_target` - SIP URI of the transfer destination (e.g., "sips:bob@example.com")
+    ///
+    /// # Returns
+    /// Ok(()) if the REFER was sent successfully. The actual transfer result
+    /// will be reported via NOTIFY messages (handled asynchronously).
+    pub async fn transfer_call(
+        &mut self,
+        call_id: &str,
+        transfer_target: &str,
+    ) -> SipUaResult<()> {
+        let session = self
+            .calls
+            .get(call_id)
+            .ok_or_else(|| SipUaError::InvalidState("Call not found".to_string()))?;
+
+        // Can only transfer connected or held calls
+        if session.state != CallState::Connected && session.state != CallState::OnHold {
+            return Err(SipUaError::InvalidState(format!(
+                "Cannot transfer call in state {:?}",
+                session.state
+            )));
+        }
+
+        info!(
+            call_id = %call_id,
+            transfer_target = %transfer_target,
+            "Initiating blind transfer"
+        );
+
+        self.send_refer(call_id, transfer_target).await
+    }
+
+    /// Sends a REFER request to transfer the call.
+    async fn send_refer(&mut self, call_id: &str, transfer_target: &str) -> SipUaResult<()> {
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag) = {
+            let session = self
+                .calls
+                .get_mut(call_id)
+                .ok_or_else(|| SipUaError::InvalidState("Call not found".to_string()))?;
+
+            session.cseq += 1;
+
+            (
+                session.remote_uri.clone(),
+                session.sip_call_id.clone(),
+                session.cseq,
+                session.from_tag.clone(),
+                session.to_tag.clone(),
+            )
+        };
+
+        let destination = Self::parse_destination(&remote_uri)?;
+
+        // Build REFER request
+        let request = Self::build_refer_request_static(
+            &remote_uri,
+            &self.aor,
+            &self.display_name,
+            self.local_addr,
+            &sip_call_id,
+            cseq,
+            &from_tag,
+            to_tag.as_deref(),
+            transfer_target,
+        )?;
+
+        // Create non-INVITE transaction for REFER
+        let branch = generate_branch();
+        let tx_key = TransactionKey::client(&branch, "REFER");
+        let transaction = ClientNonInviteTransaction::new(tx_key, TransportType::Reliable);
+
+        if let Some(session) = self.calls.get_mut(call_id) {
+            session.non_invite_transaction = Some(transaction);
+            session.state = CallState::Transferring;
+        }
+
+        // Send request
+        self.event_tx
+            .send(CallEvent::SendRequest {
+                request,
+                destination,
+            })
+            .await
+            .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+        // Notify state change
+        self.event_tx
+            .send(CallEvent::StateChanged {
+                call_id: call_id.to_string(),
+                state: CallState::Transferring,
+                info: None,
+            })
+            .await
+            .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+        Ok(())
     }
 
     /// Sends a re-INVITE with new SDP.
@@ -1272,6 +1378,71 @@ impl CallAgent {
             .user_agent(USER_AGENT)
             .content_type("application/sdp")
             .body(bytes::Bytes::from(sdp.as_bytes().to_vec()))
+            .build()
+            .map_err(|e| SipUaError::TransactionError(e.to_string()))?;
+
+        Ok(request)
+    }
+
+    /// Builds a REFER request for call transfer (RFC 3515).
+    #[allow(clippy::too_many_arguments)]
+    fn build_refer_request_static(
+        remote_uri_str: &str,
+        aor: &str,
+        display_name: &str,
+        local_addr: SocketAddr,
+        sip_call_id: &str,
+        cseq: u32,
+        from_tag: &str,
+        to_tag: Option<&str>,
+        transfer_target: &str,
+    ) -> SipUaResult<SipRequest> {
+        use proto_sip::method::Method;
+
+        let remote_uri: SipUri = remote_uri_str
+            .parse()
+            .map_err(|e| SipUaError::ConfigError(format!("Invalid remote URI: {e}")))?;
+
+        let aor_uri: SipUri = aor
+            .parse()
+            .map_err(|e| SipUaError::ConfigError(format!("Invalid AOR: {e}")))?;
+
+        let branch = generate_branch();
+
+        let via = ViaHeader::new("TLS", &local_addr.ip().to_string())
+            .with_port(local_addr.port())
+            .with_branch(branch);
+
+        let from = NameAddr::new(aor_uri.clone())
+            .with_display_name(display_name)
+            .with_tag(from_tag.to_string());
+
+        let mut to = NameAddr::new(remote_uri.clone());
+        if let Some(tag) = to_tag {
+            to = to.with_tag(tag.to_string());
+        }
+
+        // Contact header for in-dialog request
+        let mut contact_uri = SipUri::new(local_addr.ip().to_string())
+            .with_port(local_addr.port())
+            .with_param("transport", Some("tls".to_string()));
+        if let Some(user) = &aor_uri.user {
+            contact_uri = contact_uri.with_user(user.clone());
+        }
+        let contact = NameAddr::new(contact_uri);
+
+        // Build REFER request with Refer-To header
+        let request = RequestBuilder::new(Method::Refer, remote_uri)
+            .via(&via)
+            .from(&from)
+            .to(&to)
+            .call_id(sip_call_id)
+            .cseq(cseq)
+            .max_forwards(70)
+            .contact(&contact)
+            .user_agent(USER_AGENT)
+            .header(HeaderName::ReferTo, transfer_target)
+            .header(HeaderName::ReferredBy, aor)
             .build()
             .map_err(|e| SipUaError::TransactionError(e.to_string()))?;
 
