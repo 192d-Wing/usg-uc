@@ -1,6 +1,7 @@
 //! Settings view.
 
-use client_types::{CertificateInfo, ServerCertVerificationMode};
+use client_core::{GeneralSettings, NetworkSettings, Settings, UiSettings};
+use client_types::{AudioConfig, CertificateInfo, ServerCertVerificationMode};
 use eframe::egui;
 
 /// Actions from the settings view.
@@ -9,6 +10,8 @@ use eframe::egui;
 pub enum SettingsAction {
     /// Save settings.
     Save,
+    /// Discard unsaved changes.
+    Discard,
     /// Register the specified account.
     Register(String),
     /// Unregister.
@@ -256,11 +259,9 @@ impl SettingsView {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Save Changes").clicked() {
                             action = Some(SettingsAction::Save);
-                            self.is_dirty = false;
                         }
                         if ui.button("Discard").clicked() {
-                            self.is_dirty = false;
-                            // TODO: Reload settings
+                            action = Some(SettingsAction::Discard);
                         }
                     });
                 });
@@ -1057,6 +1058,94 @@ impl SettingsView {
                     .color(egui::Color32::GRAY),
             );
         });
+    }
+
+    /// Loads settings from a Settings struct into the view.
+    ///
+    /// This populates all view fields from persisted settings.
+    pub fn load_from_settings(&mut self, settings: &Settings) {
+        // General settings
+        self.start_minimized = settings.general.start_minimized;
+        self.minimize_to_tray = settings.general.minimize_to_tray;
+        self.dark_mode = settings.ui.dark_mode;
+        self.auto_answer_enabled = settings.general.auto_answer_enabled;
+        self.auto_answer_delay = settings.general.auto_answer_delay_secs;
+
+        // Audio settings
+        self.input_device = settings.audio.input_device.clone().unwrap_or_else(|| "Default".to_string());
+        self.output_device = settings.audio.output_device.clone().unwrap_or_else(|| "Default".to_string());
+        self.ring_device = settings.audio.ring_device.clone().unwrap_or_else(|| "Default".to_string());
+        self.ring_volume = settings.audio.ring_volume;
+        self.echo_cancellation = settings.audio.echo_cancellation;
+        self.noise_suppression = settings.audio.noise_suppression;
+        if let Some(ref path) = settings.audio.ringtone_file_path {
+            self.ringtone_path = path.clone();
+        } else {
+            self.ringtone_path.clear();
+        }
+
+        // Network/Security settings
+        self.server_cert_verification = settings.network.server_cert_verification.clone();
+        if let ServerCertVerificationMode::Custom { ca_file_path } = &settings.network.server_cert_verification {
+            self.custom_ca_path = ca_file_path.clone();
+        }
+
+        // Account settings (use first account if available)
+        if let Some(account) = settings.accounts.values().next() {
+            self.display_name = account.display_name.clone();
+            self.sip_uri = account.sip_uri.clone();
+            self.registrar_uri = account.registrar_uri.clone();
+        }
+
+        // Clear dirty flag after loading
+        self.is_dirty = false;
+    }
+
+    /// Collects current view state into Settings components.
+    ///
+    /// Returns updated GeneralSettings, AudioConfig, NetworkSettings, and UiSettings.
+    pub fn collect_settings(&self) -> (GeneralSettings, AudioConfig, NetworkSettings, UiSettings) {
+        let general = GeneralSettings {
+            start_minimized: self.start_minimized,
+            minimize_to_tray: self.minimize_to_tray,
+            auto_answer_enabled: self.auto_answer_enabled,
+            auto_answer_delay_secs: self.auto_answer_delay,
+            ..Default::default()
+        };
+
+        let audio = AudioConfig {
+            input_device: if self.input_device == "Default" { None } else { Some(self.input_device.clone()) },
+            output_device: if self.output_device == "Default" { None } else { Some(self.output_device.clone()) },
+            ring_device: if self.ring_device == "Default" { None } else { Some(self.ring_device.clone()) },
+            ring_volume: self.ring_volume,
+            echo_cancellation: self.echo_cancellation,
+            noise_suppression: self.noise_suppression,
+            ringtone_file_path: if self.ringtone_path.is_empty() { None } else { Some(self.ringtone_path.clone()) },
+            ..Default::default()
+        };
+
+        let network = NetworkSettings {
+            server_cert_verification: self.server_cert_verification.clone(),
+            ..Default::default()
+        };
+
+        let ui = UiSettings {
+            dark_mode: self.dark_mode,
+            ..Default::default()
+        };
+
+        (general, audio, network, ui)
+    }
+
+    /// Returns whether the view has unsaved changes.
+    #[allow(dead_code)] // Will be used for exit prompt
+    pub fn is_dirty(&self) -> bool {
+        self.is_dirty
+    }
+
+    /// Clears the dirty flag (after saving).
+    pub fn clear_dirty(&mut self) {
+        self.is_dirty = false;
     }
 }
 

@@ -6,7 +6,7 @@ use crate::notifications::NotificationManager;
 use crate::tray::TrayAction;
 use crate::views::{CallView, ContactsView, DialerView, SettingsView};
 use client_audio::RingtonePlayer;
-use client_core::{AppEvent, ClientApp};
+use client_core::{AppEvent, ClientApp, SettingsManager};
 use client_types::{CallInfo, CallState, RegistrationState};
 use eframe::egui;
 use std::net::SocketAddr;
@@ -132,6 +132,12 @@ pub struct SipClientApp {
     current_input_device: Option<String>,
     /// Current output device for active call.
     current_output_device: Option<String>,
+    /// Settings manager for persisting configuration.
+    settings_manager: SettingsManager,
+    /// Show unsaved settings confirmation dialog.
+    show_unsaved_settings_dialog: bool,
+    /// Close requested while unsaved settings dialog is shown.
+    pending_close: bool,
 }
 
 impl SipClientApp {
@@ -176,12 +182,29 @@ impl SipClientApp {
             }
         };
 
+        // Initialize settings manager and load persisted settings
+        let settings_manager = match SettingsManager::new() {
+            Ok(manager) => manager,
+            Err(e) => {
+                error!("Failed to load settings: {}, using defaults", e);
+                // Create a fallback with default settings
+                SettingsManager::new().unwrap_or_else(|_| {
+                    // This should not happen, but provide a safe fallback
+                    panic!("Failed to create settings manager")
+                })
+            }
+        };
+
+        // Create settings view and populate with persisted settings
+        let mut settings_view = SettingsView::new();
+        settings_view.load_from_settings(settings_manager.settings());
+
         Self {
             active_view: ActiveView::Dialer,
             dialer_view: DialerView::new(),
             call_view: CallView::new(),
             contacts_view: ContactsView::new(),
-            settings_view: SettingsView::new(),
+            settings_view,
             client_app,
             runtime,
             event_rx,
@@ -209,6 +232,9 @@ impl SipClientApp {
             available_outputs: vec!["Default".to_string()],
             current_input_device: None,
             current_output_device: None,
+            settings_manager,
+            show_unsaved_settings_dialog: false,
+            pending_close: false,
         }
     }
 
@@ -228,7 +254,12 @@ impl SipClientApp {
                     TrayAction::Exit => {
                         info!("Tray: Exit requested");
                         self.exit_requested = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        if self.settings_view.is_dirty() {
+                            // Show confirmation dialog instead of immediate close
+                            self.show_unsaved_settings_dialog = true;
+                        } else {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
                     }
                 }
             }
@@ -641,6 +672,53 @@ impl SipClientApp {
         }
     }
 
+    /// Renders the unsaved settings confirmation dialog.
+    fn render_unsaved_settings_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_unsaved_settings_dialog {
+            return;
+        }
+
+        egui::Window::new("Unsaved Changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(350.0);
+
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("\u{26A0}").size(40.0).color(egui::Color32::YELLOW));
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("Unsaved Settings").strong().size(18.0));
+                });
+
+                ui.add_space(16.0);
+
+                ui.label("You have unsaved changes to your settings.");
+                ui.label("Would you like to save them before exiting?");
+
+                ui.add_space(20.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("Save and Exit").clicked() {
+                        self.save_settings();
+                        self.show_unsaved_settings_dialog = false;
+                        self.pending_close = true;
+                    }
+
+                    if ui.button("Discard and Exit").clicked() {
+                        self.settings_view.clear_dirty();
+                        self.show_unsaved_settings_dialog = false;
+                        self.pending_close = true;
+                    }
+
+                    if ui.button("Cancel").clicked() {
+                        self.show_unsaved_settings_dialog = false;
+                        self.pending_close = false;
+                    }
+                });
+            });
+    }
+
     /// Renders the incoming call dialog.
     fn render_incoming_call_dialog(
         &mut self,
@@ -1015,6 +1093,18 @@ impl eframe::App for SipClientApp {
         // Process auto-answer timer
         self.process_auto_answer();
 
+        // Handle close request with unsaved settings check
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested && !self.pending_close {
+            if self.settings_view.is_dirty() {
+                // Show confirmation dialog
+                self.show_unsaved_settings_dialog = true;
+                // Cancel the close - we'll handle it after dialog
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+            // If not dirty, let the close proceed normally
+        }
+
         // Top panel with navigation
         egui::TopBottomPanel::top("nav_bar").show(ctx, |ui| {
             self.render_nav_bar(ui);
@@ -1075,12 +1165,26 @@ impl eframe::App for SipClientApp {
             self.handle_settings_action(action);
         }
 
+        // Unsaved settings confirmation dialog
+        self.render_unsaved_settings_dialog(ctx);
+
+        // Handle pending close after dialog confirmation
+        if self.pending_close && !self.show_unsaved_settings_dialog {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
         // Request repaint for animations
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         info!("Application shutting down");
+
+        // Save settings if dirty before exit
+        if self.settings_view.is_dirty() {
+            info!("Saving dirty settings on exit");
+            self.save_settings();
+        }
 
         // Shutdown client app
         if let Some(ref mut app) = self.client_app {
@@ -1279,8 +1383,11 @@ impl SipClientApp {
         match action {
             crate::views::SettingsAction::Save => {
                 info!("Saving settings");
-                // TODO: Save settings
-                self.status_message = "Settings saved".to_string();
+                self.save_settings();
+            }
+            crate::views::SettingsAction::Discard => {
+                info!("Discarding settings changes");
+                self.discard_settings();
             }
             crate::views::SettingsAction::Register(account_id) => {
                 info!(account_id = %account_id, "Registering account");
@@ -1467,6 +1574,50 @@ impl SipClientApp {
         self.status_message =
             "WARNING: Insecure mode enabled - certificates not validated".to_string();
         warn!("User enabled insecure certificate verification mode");
+    }
+
+    /// Saves current settings to disk.
+    fn save_settings(&mut self) {
+        // Collect settings from the view
+        let (general, audio, network, ui) = self.settings_view.collect_settings();
+
+        // Update the settings manager
+        {
+            let settings = self.settings_manager.settings_mut();
+            settings.general = general;
+            settings.audio = audio;
+            settings.network = network;
+            settings.ui = ui;
+        }
+
+        // Save to disk
+        match self.settings_manager.save() {
+            Ok(()) => {
+                info!("Settings saved successfully");
+                self.settings_view.clear_dirty();
+                self.status_message = "Settings saved".to_string();
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to save settings");
+                self.error_message = Some(format!("Failed to save settings: {e}"));
+                self.show_error_dialog = true;
+            }
+        }
+
+        // Sync with ClientApp if available
+        if let Some(ref mut app) = self.client_app {
+            let settings = self.settings_manager.settings();
+            let app_settings = app.settings_mut();
+            *app_settings.settings_mut() = settings.clone();
+        }
+    }
+
+    /// Discards unsaved settings changes and reloads from disk.
+    fn discard_settings(&mut self) {
+        // Reload settings from the manager (which has the last saved state)
+        self.settings_view.load_from_settings(self.settings_manager.settings());
+        self.status_message = "Changes discarded".to_string();
+        info!("Settings changes discarded");
     }
 
     /// Starts ringtone playback for an incoming call.

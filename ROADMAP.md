@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.30 complete, Phase 25 critical + medium priority items complete
+**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.30-24.31 complete, Phase 25 critical + medium priority items complete
 
 ---
 
@@ -1325,18 +1325,25 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **Tests**: 14 cert_store tests (client-core crate)
 
-**Phase 24.31: Settings Persistence** 🚧
+**Phase 24.31: Settings Persistence** ✅
 
-- 🚧 `SettingsAction::Save` handler in GUI
+- ✅ `SettingsAction::Save` handler in GUI
   - Persist settings changes to TOML via SettingsManager
   - Atomic save with temp file + rename
   - Status message on save success/failure
-- 🚧 `SettingsAction::Discard` handler
-  - Reload settings from disk
-  - Reset dirty flag
-- 🚧 Settings dirty tracking
+  - Sync settings with ClientApp if available
+- ✅ `SettingsAction::Discard` handler
+  - Reload settings from disk via load_from_settings()
+  - Reset dirty flag via clear_dirty()
+- ✅ Settings dirty tracking
   - Mark settings dirty on any change
   - Prompt on exit if unsaved changes
+  - Cancel close and show confirmation dialog
+  - Save/Discard/Cancel options in dialog
+- ✅ Settings view bidirectional data flow
+  - load_from_settings(): Load settings into view fields
+  - collect_settings(): Collect view state for saving
+  - Proper field mapping for General, Audio, Network, UI settings
 
 **Phase 24.32: Account Registration UI** 🚧
 

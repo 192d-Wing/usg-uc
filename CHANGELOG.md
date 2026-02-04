@@ -1049,6 +1049,33 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - PIN attempt tracking with lockout warning at 3 attempts
 - 6 new tests for signing and PIN verification
 
+#### Phase 24.31: Settings Persistence
+
+- `client-gui/src/views/settings.rs` - Settings view data flow
+  - `SettingsAction::Discard` variant - Trigger settings reload
+  - `load_from_settings()` - Load Settings struct into view fields
+    - Maps General, Audio, Network, UI settings to view state
+    - Clears dirty flag after loading
+  - `collect_settings()` - Collect view state into settings components
+    - Returns (GeneralSettings, AudioConfig, NetworkSettings, UiSettings)
+    - Maps view fields back to settings structs
+  - `is_dirty()` / `clear_dirty()` - Dirty state management
+- `client-gui/src/app.rs` - Save/Discard implementation
+  - `SettingsManager` added to SipClientApp struct
+  - Settings loaded from disk on startup via load_from_settings()
+  - `save_settings()` - Persist settings to TOML file
+    - Collects settings from view
+    - Updates SettingsManager and saves atomically
+    - Syncs with ClientApp if available
+    - Shows status message on success/failure
+  - `discard_settings()` - Reload settings from disk
+    - Reloads from SettingsManager into view
+    - Shows "Changes discarded" status
+  - Exit prompt for unsaved changes
+    - Intercepts close via ViewportCommand::CancelClose
+    - Shows confirmation dialog with Save/Discard/Cancel
+    - Also handles tray exit with dirty settings
+
 **Security**
 
 - Smart card authentication ONLY (CAC/PIV/SIPR token)
