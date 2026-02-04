@@ -509,8 +509,13 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ Registrar tests (AsyncLocationService CRUD, cache reload, health)
 - ✅ End-to-end tests (cluster formation, registration flow, shared storage)
 - ✅ Feature flags: `cluster`, `redis`, `postgres`
+- ✅ gRPC integration tests with feature flags: `grpc`, `grpc-reflection`, `grpc-cluster`
+- ✅ Proto message tests for all services (Health, Config, System, Call, Registration, Cluster)
+- ✅ Service trait tests with mock implementations
+- ✅ Message serialization tests using prost encode/decode
+- ✅ Reflection service tests verifying FILE_DESCRIPTOR_SET
 
-**Tests**: 125 new tests across Phase 22 crates + 23 integration tests
+**Tests**: 125 new tests across Phase 22 crates + 23 integration tests + 35 gRPC tests
 
 ### ✅ Phase 23: Specialized Protocols
 

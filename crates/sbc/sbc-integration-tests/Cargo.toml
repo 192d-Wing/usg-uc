@@ -16,6 +16,9 @@ default = []
 cluster = ["uc-cluster", "uc-discovery", "uc-storage", "proto-registrar/storage"]
 redis = ["cluster", "uc-storage/redis"]
 postgres = ["cluster", "uc-storage/postgres"]
+grpc = ["sbc-grpc-api", "tonic", "prost", "prost-types", "tokio-stream"]
+grpc-reflection = ["grpc", "sbc-grpc-api/reflection"]
+grpc-cluster = ["grpc", "cluster", "sbc-grpc-api/cluster"]
 
 [dependencies]
 # SBC crates to test
@@ -36,6 +39,13 @@ proto-registrar = { path = "../../proto/proto-registrar", optional = true }
 
 # Test utilities
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+# gRPC dependencies (optional)
+sbc-grpc-api = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+prost = { version = "0.14", optional = true }
+prost-types = { version = "0.14", optional = true }
+tokio-stream = { version = "0.1", optional = true }
 
 [lib]
 name = "sbc_integration_tests"

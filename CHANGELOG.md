@@ -73,6 +73,18 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 - Allows service discovery via `grpcurl -plaintext localhost:9090 list`
 - Compatible with all feature combinations (grpc, cluster, grpc-reflection)
 
+**gRPC Integration Tests** (`sbc-integration-tests`)
+
+- New `grpc_tests` module with comprehensive test coverage
+- Proto message tests: Health, Config, System, Call, Registration services
+- Cluster service tests (feature-gated behind `grpc-cluster`)
+- Reflection service tests verifying FILE_DESCRIPTOR_SET
+- Prelude export tests ensuring all types accessible
+- Service trait tests with mock Health service implementation
+- Message serialization tests using prost encode/decode
+- New feature flags: `grpc`, `grpc-reflection`, `grpc-cluster`
+- 35 gRPC-specific tests, 82 total tests with all features enabled
+
 #### Phase 24.38: Button Event Handlers & Custom Dialogs (Completed)
 
 **Button Event Handlers** (`client-gui-windows/src/views/*.rs`)

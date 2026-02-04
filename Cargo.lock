@@ -3669,9 +3669,14 @@ dependencies = [
 name = "sbc-integration-tests"
 version = "0.1.0"
 dependencies = [
+ "prost",
+ "prost-types",
  "proto-registrar",
  "sbc-config",
+ "sbc-grpc-api",
  "tokio",
+ "tokio-stream",
+ "tonic",
  "uc-api",
  "uc-cdr",
  "uc-cluster",
