@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.10 (Windows CryptoAPI) complete
+**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.11 (Certificate Selection UI) complete
 
 ---
 
@@ -725,6 +725,33 @@ This document outlines the development roadmap for the USG Session Border Contro
   - CNSA 2.0 compliance:
     - Auto-select prefers ECDSA P-384 certificates
     - Key algorithm filtering for Client Authentication
+
+**Tests**: 109 total tests (client crates)
+
+**Phase 24.11: Certificate Selection UI** ✅
+
+- ✅ New Security tab in Settings view
+  - Smart card reader detection and display
+  - Certificate list with detailed information
+  - Visual indicators for key algorithm (P-384/P-256/RSA badges)
+  - Smart card indicator (\u{1F4B3}) for certificates on smart cards
+  - Validity status indicators (valid/expired)
+- ✅ Certificate selection functionality
+  - Manual certificate selection by thumbprint
+  - Auto-select mode (prefers ECDSA P-384 for CNSA 2.0)
+  - Refresh certificates button
+- ✅ Certificate information display
+  - Subject CN and issuer CN
+  - Validity period (not before/not after)
+  - Reader name for smart card certificates
+  - Key algorithm with CNSA 2.0 compliance indication
+- ✅ Integration with CertificateStore
+  - `list_smart_card_readers()` method added
+  - Real-time certificate loading with spinner
+  - Error handling for certificate store access
+- ✅ CNSA 2.0 compliance guidance in UI
+  - P-384 certificates highlighted as preferred
+  - RSA certificates marked as not recommended for government use
 
 **Tests**: 109 total tests (client crates)
 

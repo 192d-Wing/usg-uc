@@ -633,6 +633,25 @@ impl CertificateStore {
     pub fn store_name(&self) -> &str {
         &self.store_name
     }
+
+    /// Lists unique smart card reader names from certificates.
+    ///
+    /// Returns a list of reader names where certificates are stored on smart cards.
+    pub fn list_smart_card_readers(&self) -> CertStoreResult<Vec<String>> {
+        let certs = self.list_certificates()?;
+
+        let mut readers: Vec<String> = certs
+            .iter()
+            .filter_map(|c| c.reader_name.clone())
+            .collect();
+
+        // Remove duplicates while preserving order
+        readers.sort();
+        readers.dedup();
+
+        debug!(count = readers.len(), "Found smart card readers");
+        Ok(readers)
+    }
 }
 
 /// Converts a Windows FILETIME to a date string.

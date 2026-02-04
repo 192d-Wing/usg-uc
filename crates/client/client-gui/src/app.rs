@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver as StdReceiver;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Active view in the application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -505,6 +505,47 @@ impl SipClientApp {
                     let runtime = self.runtime.clone();
                     let _ = runtime.block_on(app.unregister());
                 }
+            }
+            crate::views::SettingsAction::RefreshCertificates => {
+                info!("Refreshing certificates");
+                self.settings_view.set_certificates_loading(true);
+                self.refresh_certificates();
+            }
+            crate::views::SettingsAction::SelectCertificate(thumbprint) => {
+                info!(thumbprint = %thumbprint, "Selecting certificate");
+                self.settings_view.set_selected_certificate(Some(thumbprint));
+                self.status_message = "Certificate selected".to_string();
+            }
+        }
+    }
+
+    fn refresh_certificates(&mut self) {
+        use client_core::CertificateStore;
+
+        let cert_store = CertificateStore::open_personal();
+
+        // List certificates
+        match cert_store.list_certificates() {
+            Ok(certs) => {
+                info!(count = certs.len(), "Found certificates");
+                self.settings_view.set_certificates(certs);
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to list certificates");
+                self.settings_view.set_certificates(Vec::new());
+                self.status_message = format!("Failed to load certificates: {e}");
+            }
+        }
+
+        // List smart card readers
+        match cert_store.list_smart_card_readers() {
+            Ok(readers) => {
+                info!(count = readers.len(), "Found smart card readers");
+                self.settings_view.set_smart_card_readers(readers);
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to list smart card readers");
+                self.settings_view.set_smart_card_readers(Vec::new());
             }
         }
     }

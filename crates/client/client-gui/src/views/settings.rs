@@ -1,5 +1,6 @@
 //! Settings view.
 
+use client_types::CertificateInfo;
 use eframe::egui;
 
 /// Actions from the settings view.
@@ -11,6 +12,10 @@ pub enum SettingsAction {
     Register(String),
     /// Unregister.
     Unregister,
+    /// Refresh certificate list.
+    RefreshCertificates,
+    /// Select a certificate by thumbprint.
+    SelectCertificate(String),
 }
 
 /// Settings view state.
@@ -43,12 +48,23 @@ pub struct SettingsView {
     available_outputs: Vec<String>,
     /// Has unsaved changes.
     is_dirty: bool,
+    /// Available certificates from certificate store.
+    available_certificates: Vec<CertificateInfo>,
+    /// Selected certificate thumbprint.
+    selected_certificate: Option<String>,
+    /// Whether auto-select mode is enabled.
+    auto_select_certificate: bool,
+    /// Smart card readers detected.
+    smart_card_readers: Vec<String>,
+    /// Certificate loading state.
+    certificates_loading: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum SettingsTab {
     #[default]
     Account,
+    Security,
     Audio,
     General,
     About,
@@ -76,7 +92,33 @@ impl SettingsView {
                 "Headphones".to_string(),
             ],
             is_dirty: false,
+            available_certificates: Vec::new(),
+            selected_certificate: None,
+            auto_select_certificate: true,
+            smart_card_readers: Vec::new(),
+            certificates_loading: false,
         }
+    }
+
+    /// Updates the available certificates.
+    pub fn set_certificates(&mut self, certs: Vec<CertificateInfo>) {
+        self.available_certificates = certs;
+        self.certificates_loading = false;
+    }
+
+    /// Updates the smart card readers.
+    pub fn set_smart_card_readers(&mut self, readers: Vec<String>) {
+        self.smart_card_readers = readers;
+    }
+
+    /// Sets the selected certificate thumbprint.
+    pub fn set_selected_certificate(&mut self, thumbprint: Option<String>) {
+        self.selected_certificate = thumbprint;
+    }
+
+    /// Sets the certificate loading state.
+    pub fn set_certificates_loading(&mut self, loading: bool) {
+        self.certificates_loading = loading;
     }
 
     /// Renders the settings view.
@@ -94,6 +136,7 @@ impl SettingsView {
             ui.horizontal(|ui| {
                 let tabs = [
                     (SettingsTab::Account, "Account"),
+                    (SettingsTab::Security, "Security"),
                     (SettingsTab::Audio, "Audio"),
                     (SettingsTab::General, "General"),
                     (SettingsTab::About, "About"),
@@ -112,6 +155,11 @@ impl SettingsView {
             egui::ScrollArea::vertical().show(ui, |ui| match self.active_tab {
                 SettingsTab::Account => {
                     if let Some(a) = self.render_account_settings(ui) {
+                        action = Some(a);
+                    }
+                }
+                SettingsTab::Security => {
+                    if let Some(a) = self.render_security_settings(ui) {
                         action = Some(a);
                     }
                 }
@@ -220,6 +268,215 @@ impl SettingsView {
                 action = Some(SettingsAction::Unregister);
             }
         });
+
+        action
+    }
+
+    fn render_security_settings(&mut self, ui: &mut egui::Ui) -> Option<SettingsAction> {
+        let mut action = None;
+
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new("Smart Card Readers").strong());
+        ui.add_space(10.0);
+
+        if self.smart_card_readers.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label("\u{26A0}"); // Warning sign
+                ui.label(
+                    egui::RichText::new("No smart card readers detected")
+                        .color(egui::Color32::YELLOW),
+                );
+            });
+        } else {
+            for reader in &self.smart_card_readers {
+                ui.horizontal(|ui| {
+                    ui.label("\u{2705}"); // Check mark
+                    ui.label(reader);
+                });
+            }
+        }
+
+        ui.add_space(20.0);
+        ui.label(egui::RichText::new("Client Certificates").strong());
+        ui.add_space(10.0);
+
+        // Refresh button
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!self.certificates_loading, egui::Button::new("\u{1F504} Refresh"))
+                .clicked()
+            {
+                action = Some(SettingsAction::RefreshCertificates);
+            }
+
+            if self.certificates_loading {
+                ui.spinner();
+                ui.label("Loading certificates...");
+            }
+        });
+
+        ui.add_space(10.0);
+
+        // Auto-select toggle
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(&mut self.auto_select_certificate, "Auto-select best certificate")
+                .changed()
+            {
+                self.is_dirty = true;
+            }
+            ui.label(
+                egui::RichText::new("(Prefers ECDSA P-384 for CNSA 2.0)")
+                    .small()
+                    .color(egui::Color32::GRAY),
+            );
+        });
+
+        ui.add_space(10.0);
+
+        // Certificate list
+        if self.available_certificates.is_empty() && !self.certificates_loading {
+            ui.label(
+                egui::RichText::new("No valid client certificates found. Insert your CAC/PIV card.")
+                    .color(egui::Color32::LIGHT_RED),
+            );
+        } else {
+            egui::Frame::dark_canvas(ui.style()).show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(200.0)
+                    .show(ui, |ui| {
+                        for cert in &self.available_certificates {
+                            let is_selected = self.selected_certificate.as_ref()
+                                == Some(&cert.thumbprint);
+
+                            let mut frame = egui::Frame::new()
+                                .inner_margin(8.0)
+                                .outer_margin(2.0)
+                                .corner_radius(4.0);
+
+                            if is_selected {
+                                frame = frame.fill(egui::Color32::from_rgb(40, 60, 80));
+                            }
+
+                            frame.show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    // Selection radio
+                                    let response = ui.selectable_label(
+                                        is_selected,
+                                        "",
+                                    );
+
+                                    if response.clicked() && !self.auto_select_certificate {
+                                        action = Some(SettingsAction::SelectCertificate(
+                                            cert.thumbprint.clone(),
+                                        ));
+                                    }
+
+                                    ui.vertical(|ui| {
+                                        // Subject CN with key algorithm badge
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(&cert.subject_cn)
+                                                    .strong(),
+                                            );
+
+                                            // Key algorithm badge
+                                            let (badge_color, badge_text) =
+                                                if cert.key_algorithm.contains("P-384") {
+                                                    (egui::Color32::GREEN, "P-384")
+                                                } else if cert.key_algorithm.contains("P-256") {
+                                                    (egui::Color32::YELLOW, "P-256")
+                                                } else if cert.key_algorithm.contains("RSA") {
+                                                    (egui::Color32::LIGHT_RED, "RSA")
+                                                } else {
+                                                    (egui::Color32::GRAY, "?")
+                                                };
+
+                                            ui.label(
+                                                egui::RichText::new(badge_text)
+                                                    .small()
+                                                    .color(badge_color)
+                                                    .background_color(egui::Color32::from_gray(40)),
+                                            );
+
+                                            // Smart card indicator
+                                            if cert.reader_name.is_some() {
+                                                ui.label(
+                                                    egui::RichText::new("\u{1F4B3}")
+                                                        .small(),
+                                                );
+                                            }
+
+                                            // Validity indicator
+                                            if cert.is_valid {
+                                                ui.label(
+                                                    egui::RichText::new("\u{2705}")
+                                                        .small(),
+                                                );
+                                            } else {
+                                                ui.label(
+                                                    egui::RichText::new("\u{274C} Expired")
+                                                        .small()
+                                                        .color(egui::Color32::LIGHT_RED),
+                                                );
+                                            }
+                                        });
+
+                                        // Issuer
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "Issued by: {}",
+                                                cert.issuer_cn
+                                            ))
+                                            .small()
+                                            .color(egui::Color32::GRAY),
+                                        );
+
+                                        // Validity period
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "Valid: {} to {}",
+                                                cert.not_before, cert.not_after
+                                            ))
+                                            .small()
+                                            .color(egui::Color32::GRAY),
+                                        );
+
+                                        // Reader name if from smart card
+                                        if let Some(reader) = &cert.reader_name {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "Reader: {}",
+                                                    reader
+                                                ))
+                                                .small()
+                                                .color(egui::Color32::LIGHT_BLUE),
+                                            );
+                                        }
+                                    });
+                                });
+                            });
+
+                            ui.add_space(2.0);
+                        }
+                    });
+            });
+        }
+
+        ui.add_space(20.0);
+
+        // CNSA 2.0 compliance info
+        ui.label(egui::RichText::new("CNSA 2.0 Compliance").strong());
+        ui.add_space(5.0);
+
+        ui.label(
+            egui::RichText::new(
+                "For CNSA 2.0 compliance, P-384 ECDSA certificates are preferred. \
+                RSA certificates are supported but not recommended for government use.",
+            )
+            .small()
+            .color(egui::Color32::GRAY),
+        );
 
         action
     }

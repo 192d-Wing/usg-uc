@@ -369,6 +369,30 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
     - `list_smart_card_readers()` returns detected readers on Windows
   - 7 tests for certificate store functionality
 
+**Phase 24.11: Certificate Selection UI**
+
+- `client-gui` security settings implementation
+  - `settings.rs`: New Security tab in Settings view
+    - Smart card reader detection and display
+    - Certificate list with detailed information
+    - Key algorithm badges (P-384 green, P-256 yellow, RSA red)
+    - Smart card indicator for certificates on hardware tokens
+    - Validity status indicators (valid/expired)
+  - Certificate selection functionality
+    - Manual certificate selection by thumbprint
+    - Auto-select mode toggle (prefers ECDSA P-384)
+    - Refresh certificates button with loading spinner
+  - Certificate information display
+    - Subject CN and issuer CN
+    - Validity period (not before/not after)
+    - Reader name for smart card certificates
+- `client-core` certificate store updates
+  - `list_smart_card_readers()` method for reader enumeration
+- `app.rs` integration
+  - `RefreshCertificates` and `SelectCertificate` actions
+  - Real-time certificate loading from CertificateStore
+  - Error handling with status message display
+
 **Security**
 
 - Smart card authentication ONLY (CAC/PIV/SIPR token)
