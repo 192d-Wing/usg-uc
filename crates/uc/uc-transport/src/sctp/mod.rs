@@ -35,10 +35,10 @@ pub mod udp_encap;
 
 pub use association::{AssociationConfig, AssociationHandle, AssociationInner};
 pub use chunk::{
-    AbortChunk, Chunk, ChunkType, CookieAckChunk, CookieEchoChunk, CwrChunk, DataChunk, EcneChunk,
-    ErrorCause, ErrorChunk, GapAckBlock, HeartbeatAckChunk, HeartbeatChunk, InitAckChunk,
-    InitChunk, InitParam, SackChunk, ShutdownAckChunk, ShutdownChunk, ShutdownCompleteChunk,
-    UnknownChunk, UnknownChunkAction,
+    AbortChunk, AuthChunk, Chunk, ChunkType, CookieAckChunk, CookieEchoChunk, CwrChunk, DataChunk,
+    EcneChunk, ErrorCause, ErrorChunk, GapAckBlock, HeartbeatAckChunk, HeartbeatChunk, HmacId,
+    InitAckChunk, InitChunk, InitParam, PadChunk, SackChunk, ShutdownAckChunk, ShutdownChunk,
+    ShutdownCompleteChunk, UnknownChunk, UnknownChunkAction,
 };
 pub use congestion::CongestionController;
 pub use connected::{ConnectedSctpAssociation, ConnectedSctpConfig};

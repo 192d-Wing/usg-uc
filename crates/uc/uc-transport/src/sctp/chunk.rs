@@ -209,6 +209,10 @@ pub enum Chunk {
     Asconf(AsconfChunk),
     /// Address Configuration Acknowledgement chunk (RFC 5061).
     AsconfAck(AsconfAckChunk),
+    /// Padding chunk (RFC 4820).
+    Pad(PadChunk),
+    /// Authentication chunk (RFC 4895).
+    Auth(AuthChunk),
     /// Unknown chunk (preserved for forwarding/error reporting).
     Unknown(UnknownChunk),
 }
@@ -237,6 +241,8 @@ impl Chunk {
             Self::ReConfig(_) => ChunkType::ReConfig,
             Self::Asconf(_) => ChunkType::Asconf,
             Self::AsconfAck(_) => ChunkType::AsconfAck,
+            Self::Pad(_) => ChunkType::Pad,
+            Self::Auth(_) => ChunkType::Auth,
             Self::Unknown(u) => ChunkType::from_u8(u.chunk_type).unwrap_or(ChunkType::Data),
         }
     }
@@ -263,6 +269,8 @@ impl Chunk {
             Self::ReConfig(c) => c.encode(buf),
             Self::Asconf(c) => c.encode(buf),
             Self::AsconfAck(c) => c.encode(buf),
+            Self::Pad(c) => c.encode(buf),
+            Self::Auth(c) => c.encode(buf),
             Self::Unknown(c) => c.encode(buf),
         }
     }
@@ -350,6 +358,8 @@ impl Chunk {
                 flags,
                 &chunk_data,
             )?)),
+            Some(ChunkType::Pad) => Ok(Self::Pad(PadChunk::decode_body(flags, &chunk_data)?)),
+            Some(ChunkType::Auth) => Ok(Self::Auth(AuthChunk::decode_body(flags, &chunk_data)?)),
             _ => Ok(Self::Unknown(UnknownChunk {
                 chunk_type,
                 flags,
@@ -2978,6 +2988,215 @@ impl AsconfAckChunk {
 }
 
 // =============================================================================
+// PAD Chunk (RFC 4820 / RFC 9260 §3.3.14)
+// =============================================================================
+
+/// PAD chunk for path MTU discovery (RFC 4820).
+///
+/// The PAD chunk is used to pad a packet to a specific size for PMTU probing.
+/// Receivers MUST silently ignore the padding data.
+///
+/// ```text
+///  0                   1                   2                   3
+///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// | Type = 0x84   |   Flags = 0   |             Length            |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// \                                                               \
+/// /                          Padding Data                         /
+/// \                                                               \
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct PadChunk {
+    /// Padding data (arbitrary bytes, typically zeros).
+    pub padding: Bytes,
+}
+
+impl PadChunk {
+    /// Creates a new PAD chunk with the specified padding size.
+    #[must_use]
+    pub fn new(size: usize) -> Self {
+        Self {
+            padding: Bytes::from(vec![0u8; size]),
+        }
+    }
+
+    /// Creates a PAD chunk from raw padding data.
+    #[must_use]
+    pub fn from_bytes(padding: Bytes) -> Self {
+        Self { padding }
+    }
+
+    /// Returns the total chunk size including header.
+    #[must_use]
+    pub fn chunk_size(&self) -> usize {
+        CHUNK_HEADER_SIZE + self.padding.len()
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        let length = CHUNK_HEADER_SIZE + self.padding.len();
+
+        buf.put_u8(ChunkType::Pad as u8);
+        buf.put_u8(0); // flags
+        buf.put_u16(length as u16);
+        buf.put_slice(&self.padding);
+
+        // Add padding if needed for 4-byte alignment
+        let pad = padding_needed(length);
+        for _ in 0..pad {
+            buf.put_u8(0);
+        }
+    }
+
+    fn decode_body(_flags: u8, chunk_data: &Bytes) -> TransportResult<Self> {
+        if chunk_data.len() < CHUNK_HEADER_SIZE {
+            return Err(TransportError::ReceiveFailed {
+                reason: "PAD chunk too short".to_string(),
+            });
+        }
+
+        let length = u16::from_be_bytes([chunk_data[2], chunk_data[3]]) as usize;
+        let padding_len = length.saturating_sub(CHUNK_HEADER_SIZE);
+
+        let padding = if padding_len > 0 && chunk_data.len() >= CHUNK_HEADER_SIZE + padding_len {
+            chunk_data.slice(CHUNK_HEADER_SIZE..CHUNK_HEADER_SIZE + padding_len)
+        } else {
+            Bytes::new()
+        };
+
+        Ok(Self { padding })
+    }
+}
+
+// =============================================================================
+// AUTH Chunk (RFC 4895)
+// =============================================================================
+
+/// HMAC identifier for AUTH chunk (RFC 4895 §4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum HmacId {
+    /// Reserved value (not valid for use).
+    Reserved = 0,
+    /// HMAC-SHA-1 (RFC 2104).
+    Sha1 = 1,
+    /// HMAC-SHA-256 (RFC 4231).
+    Sha256 = 3,
+}
+
+impl HmacId {
+    /// Creates an HmacId from a raw u16 value.
+    pub fn from_u16(value: u16) -> Option<Self> {
+        match value {
+            0 => Some(Self::Reserved),
+            1 => Some(Self::Sha1),
+            3 => Some(Self::Sha256),
+            _ => None,
+        }
+    }
+
+    /// Returns the HMAC output length in bytes.
+    #[must_use]
+    pub const fn hmac_length(self) -> usize {
+        match self {
+            Self::Reserved => 0,
+            Self::Sha1 => 20,
+            Self::Sha256 => 32,
+        }
+    }
+}
+
+/// AUTH chunk for SCTP authentication (RFC 4895 §4.1).
+///
+/// The AUTH chunk provides authentication of SCTP packets using shared
+/// key and HMAC algorithms. It MUST be the first chunk if present.
+///
+/// ```text
+///  0                   1                   2                   3
+///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// | Type = 0x0F   |   Flags = 0   |             Length            |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |    Shared Key Identifier      |        HMAC Identifier        |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// \                                                               \
+/// /                             HMAC                              /
+/// \                                                               \
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthChunk {
+    /// Shared Key Identifier - identifies the shared key and HMAC algorithm.
+    pub shared_key_id: u16,
+    /// HMAC Identifier - identifies the HMAC algorithm used.
+    pub hmac_id: u16,
+    /// HMAC value computed over the SCTP packet.
+    pub hmac: Bytes,
+}
+
+impl AuthChunk {
+    /// Creates a new AUTH chunk.
+    #[must_use]
+    pub fn new(shared_key_id: u16, hmac_id: HmacId, hmac: Bytes) -> Self {
+        Self {
+            shared_key_id,
+            hmac_id: hmac_id as u16,
+            hmac,
+        }
+    }
+
+    /// Returns the HMAC identifier as an enum.
+    #[must_use]
+    pub fn hmac_algorithm(&self) -> Option<HmacId> {
+        HmacId::from_u16(self.hmac_id)
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        let length = CHUNK_HEADER_SIZE + 4 + self.hmac.len(); // header + key_id + hmac_id + hmac
+
+        buf.put_u8(ChunkType::Auth as u8);
+        buf.put_u8(0); // flags
+        buf.put_u16(length as u16);
+        buf.put_u16(self.shared_key_id);
+        buf.put_u16(self.hmac_id);
+        buf.put_slice(&self.hmac);
+
+        // Add padding if needed for 4-byte alignment
+        let pad = padding_needed(length);
+        for _ in 0..pad {
+            buf.put_u8(0);
+        }
+    }
+
+    fn decode_body(_flags: u8, chunk_data: &Bytes) -> TransportResult<Self> {
+        // Minimum: header (4) + shared_key_id (2) + hmac_id (2) = 8 bytes
+        if chunk_data.len() < 8 {
+            return Err(TransportError::ReceiveFailed {
+                reason: "AUTH chunk too short".to_string(),
+            });
+        }
+
+        let length = u16::from_be_bytes([chunk_data[2], chunk_data[3]]) as usize;
+        let shared_key_id = u16::from_be_bytes([chunk_data[4], chunk_data[5]]);
+        let hmac_id = u16::from_be_bytes([chunk_data[6], chunk_data[7]]);
+
+        let hmac_len = length.saturating_sub(8);
+        let hmac = if hmac_len > 0 && chunk_data.len() >= 8 + hmac_len {
+            chunk_data.slice(8..8 + hmac_len)
+        } else {
+            Bytes::new()
+        };
+
+        Ok(Self {
+            shared_key_id,
+            hmac_id,
+            hmac,
+        })
+    }
+}
+
+// =============================================================================
 // Unknown Chunk
 // =============================================================================
 
@@ -3626,5 +3845,150 @@ mod tests {
     fn test_chunk_type_reconfig() {
         assert_eq!(ChunkType::from_u8(130), Some(ChunkType::ReConfig));
         assert_eq!(ChunkType::ReConfig.to_string(), "RE-CONFIG");
+    }
+
+    #[test]
+    fn test_pad_chunk_creation() {
+        let pad = PadChunk::new(100);
+        assert_eq!(pad.padding.len(), 100);
+        assert!(pad.padding.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_pad_chunk_from_bytes() {
+        let data = Bytes::from(vec![1, 2, 3, 4, 5]);
+        let pad = PadChunk::from_bytes(data.clone());
+        assert_eq!(pad.padding, data);
+    }
+
+    #[test]
+    fn test_pad_chunk_size() {
+        let pad = PadChunk::new(100);
+        assert_eq!(pad.chunk_size(), CHUNK_HEADER_SIZE + 100);
+    }
+
+    #[test]
+    fn test_pad_chunk_roundtrip() {
+        let pad = PadChunk::new(50);
+
+        let mut buf = BytesMut::new();
+        Chunk::Pad(pad.clone()).encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Chunk::decode(&mut bytes).unwrap();
+
+        if let Chunk::Pad(p) = decoded {
+            assert_eq!(p.padding.len(), 50);
+        } else {
+            panic!("Expected PAD chunk");
+        }
+    }
+
+    #[test]
+    fn test_pad_chunk_roundtrip_unaligned() {
+        // Test with size that requires padding for 4-byte alignment
+        let pad = PadChunk::new(17);
+
+        let mut buf = BytesMut::new();
+        Chunk::Pad(pad.clone()).encode(&mut buf);
+
+        // Should be padded to 4-byte boundary
+        assert_eq!(buf.len() % 4, 0);
+
+        let mut bytes = buf.freeze();
+        let decoded = Chunk::decode(&mut bytes).unwrap();
+
+        if let Chunk::Pad(p) = decoded {
+            assert_eq!(p.padding.len(), 17);
+        } else {
+            panic!("Expected PAD chunk");
+        }
+    }
+
+    #[test]
+    fn test_chunk_type_pad() {
+        assert_eq!(ChunkType::from_u8(0x84), Some(ChunkType::Pad));
+        assert_eq!(ChunkType::Pad.to_string(), "PAD");
+    }
+
+    #[test]
+    fn test_auth_chunk_creation() {
+        let hmac = Bytes::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let auth = AuthChunk::new(1, HmacId::Sha256, hmac.clone());
+
+        assert_eq!(auth.shared_key_id, 1);
+        assert_eq!(auth.hmac_id, HmacId::Sha256 as u16);
+        assert_eq!(auth.hmac, hmac);
+    }
+
+    #[test]
+    fn test_auth_chunk_hmac_algorithm() {
+        let auth = AuthChunk::new(1, HmacId::Sha1, Bytes::new());
+        assert_eq!(auth.hmac_algorithm(), Some(HmacId::Sha1));
+
+        let auth = AuthChunk::new(2, HmacId::Sha256, Bytes::new());
+        assert_eq!(auth.hmac_algorithm(), Some(HmacId::Sha256));
+    }
+
+    #[test]
+    fn test_auth_chunk_roundtrip() {
+        let hmac = Bytes::from(vec![0xaa; 32]); // SHA-256 HMAC length
+        let auth = AuthChunk::new(42, HmacId::Sha256, hmac.clone());
+
+        let mut buf = BytesMut::new();
+        Chunk::Auth(auth.clone()).encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Chunk::decode(&mut bytes).unwrap();
+
+        if let Chunk::Auth(a) = decoded {
+            assert_eq!(a.shared_key_id, 42);
+            assert_eq!(a.hmac_id, HmacId::Sha256 as u16);
+            assert_eq!(a.hmac, hmac);
+        } else {
+            panic!("Expected AUTH chunk");
+        }
+    }
+
+    #[test]
+    fn test_auth_chunk_roundtrip_sha1() {
+        let hmac = Bytes::from(vec![0xbb; 20]); // SHA-1 HMAC length
+        let auth = AuthChunk::new(100, HmacId::Sha1, hmac.clone());
+
+        let mut buf = BytesMut::new();
+        Chunk::Auth(auth.clone()).encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Chunk::decode(&mut bytes).unwrap();
+
+        if let Chunk::Auth(a) = decoded {
+            assert_eq!(a.shared_key_id, 100);
+            assert_eq!(a.hmac_id, HmacId::Sha1 as u16);
+            assert_eq!(a.hmac, hmac);
+        } else {
+            panic!("Expected AUTH chunk");
+        }
+    }
+
+    #[test]
+    fn test_hmac_id_from_u16() {
+        assert_eq!(HmacId::from_u16(0), Some(HmacId::Reserved));
+        assert_eq!(HmacId::from_u16(1), Some(HmacId::Sha1));
+        assert_eq!(HmacId::from_u16(3), Some(HmacId::Sha256));
+        assert_eq!(HmacId::from_u16(2), None); // Not defined
+        assert_eq!(HmacId::from_u16(255), None);
+    }
+
+    #[test]
+    fn test_hmac_id_length() {
+        assert_eq!(HmacId::Reserved.hmac_length(), 0);
+        assert_eq!(HmacId::Sha1.hmac_length(), 20);
+        assert_eq!(HmacId::Sha256.hmac_length(), 32);
+    }
+
+    #[test]
+    fn test_chunk_type_auth() {
+        assert_eq!(ChunkType::from_u8(15), Some(ChunkType::Auth));
+        assert_eq!(ChunkType::Auth.to_string(), "AUTH");
     }
 }

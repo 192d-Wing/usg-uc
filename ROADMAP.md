@@ -643,13 +643,15 @@ This document outlines the development roadmap for the USG Session Border Contro
 - 🚧 Heartbeat bundling (RFC 9260 §8.3)
   - Bundle HEARTBEAT with DATA chunks
   - Reduce overhead on busy associations
-- 🚧 PAD chunk support (RFC 9260 §3.3.14)
-  - Padding for PMTU probing
-  - Ignore received PAD chunks
-- 🚧 AUTH chunk support (RFC 4895)
-  - SCTP authentication extension
-  - HMAC-SHA1 and HMAC-SHA256
-  - Shared key management
+- ✅ PAD chunk support (RFC 4820 / RFC 9260 §3.3.14)
+  - `PadChunk` struct for PMTU probing
+  - Arbitrary padding size support
+  - Encode/decode roundtrip verified
+- ✅ AUTH chunk support (RFC 4895)
+  - `AuthChunk` struct with shared key ID and HMAC
+  - `HmacId` enum: Reserved, Sha1, Sha256
+  - HMAC length helpers per algorithm
+  - Encode/decode roundtrip verified
 
 ### 🚧 Phase 24: SIP Soft Client (In Progress)
 
@@ -1323,6 +1325,58 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **Tests**: 14 cert_store tests (client-core crate)
 
+**Phase 24.31: Settings Persistence** 🚧
+
+- 🚧 `SettingsAction::Save` handler in GUI
+  - Persist settings changes to TOML via SettingsManager
+  - Atomic save with temp file + rename
+  - Status message on save success/failure
+- 🚧 `SettingsAction::Discard` handler
+  - Reload settings from disk
+  - Reset dirty flag
+- 🚧 Settings dirty tracking
+  - Mark settings dirty on any change
+  - Prompt on exit if unsaved changes
+
+**Phase 24.32: Account Registration UI** 🚧
+
+- 🚧 `SettingsAction::Register` handler
+  - Wire Register button to ClientApp::register()
+  - Show registration progress spinner
+  - Display registration success/failure status
+- 🚧 `SettingsAction::Unregister` handler
+  - Wire Unregister button to ClientApp::unregister()
+  - Update UI state on completion
+
+**Phase 24.33: Contact Management UI** 🚧
+
+- 🚧 Add Contact dialog
+  - Modal dialog with name, SIP URI, phone fields
+  - Validation for required fields
+  - Save to ContactManager on confirm
+- 🚧 Edit Contact dialog
+  - Pre-populate fields from existing contact
+  - Update contact on save
+- 🚧 Delete Contact confirmation
+  - Confirmation dialog before deletion
+  - Remove from ContactManager on confirm
+- 🚧 Favorites toggle
+  - Toggle favorite status on contact
+  - Persist to contact store
+
+**Phase 24.34: Server Certificate Verification** 🚧
+
+- 🚧 Apply verification mode to transport
+  - Route ServerCertVerificationMode to SipTransport
+  - Rebuild TLS config when mode changes
+- 🚧 Custom CA file browser
+  - Use rfd crate for native file dialog
+  - Filter to .pem/.crt/.cer files
+  - Validate CA certificate on selection
+- 🚧 Certificate info display
+  - Show loaded CA certificate details
+  - Display current TLS connection info
+
 ---
 
 ## Known TODOs in Code
@@ -1377,7 +1431,8 @@ This document outlines the development roadmap for the USG Session Border Contro
 | RFC 3758 | PR-SCTP | ✅ Implemented (FORWARD-TSN chunk) |
 | RFC 5061 | SCTP Dynamic Address | ✅ Implemented (ASCONF/ASCONF-ACK chunks) |
 | RFC 6525 | SCTP Stream Reset | ✅ Implemented (RE-CONFIG chunk) |
-| RFC 4895 | SCTP Authentication | 🚧 Planned (Phase 25 lower priority) |
+| RFC 4895 | SCTP Authentication | ✅ Implemented (AUTH chunk encode/decode) |
+| RFC 4820 | SCTP PAD Chunk | ✅ Implemented (PMTU probing support) |
 
 ---
 

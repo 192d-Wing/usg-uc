@@ -141,6 +141,26 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - ASCONF serial number tracking for dynamic updates
   - RE-CONFIG sequence number management
 
+#### Phase 25: SCTP RFC 9260 Full Compliance - Lower Priority (In Progress)
+
+**PAD Chunk Support** (`uc-transport/sctp/chunk.rs`)
+
+- RFC 4820 / RFC 9260 §3.3.14 compliant padding chunk
+  - `PadChunk` struct for PMTU probing
+  - `new(size)` and `from_bytes(padding)` constructors
+  - `chunk_size()` helper for total size calculation
+  - Encode/decode with proper 4-byte alignment
+
+**AUTH Chunk Support** (`uc-transport/sctp/chunk.rs`)
+
+- RFC 4895 compliant SCTP authentication chunk
+  - `AuthChunk` struct with shared key ID, HMAC ID, and HMAC value
+  - `HmacId` enum: Reserved, Sha1 (20 bytes), Sha256 (32 bytes)
+  - `hmac_algorithm()` and `hmac_length()` helpers
+  - Encode/decode roundtrip verified
+
+**Tests**: 17 new tests for PAD and AUTH chunks
+
 #### Phase 22: High Availability - Storage Backends (Completed)
 
 **Redis Backend** (`uc-storage/redis.rs`)
