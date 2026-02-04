@@ -124,8 +124,8 @@ async fn test_two_clients_call_flow_structure() {
 
         if let Some(cert) = certs.iter().find(|c| c.is_valid) {
             if let Ok(chain) = store.get_certificate_chain(&cert.thumbprint) {
-                client1.set_client_certificate(chain.clone(), cert.thumbprint.clone());
-                client2.set_client_certificate(chain, cert.thumbprint.clone());
+                client1.set_client_certificate(chain.clone(), &cert.thumbprint);
+                client2.set_client_certificate(chain, &cert.thumbprint);
             }
         }
 
@@ -217,7 +217,7 @@ async fn test_two_clients_concurrent_operations() {
                 let certs = store.list_certificates().unwrap();
                 if let Some(cert) = certs.iter().find(|c| c.is_valid) {
                     if let Ok(chain) = store.get_certificate_chain(&cert.thumbprint) {
-                        client1.set_client_certificate(chain, cert.thumbprint.clone());
+                        client1.set_client_certificate(chain, &cert.thumbprint);
                     }
                 }
             }
@@ -230,7 +230,7 @@ async fn test_two_clients_concurrent_operations() {
                 let certs = store.list_certificates().unwrap();
                 if let Some(cert) = certs.iter().find(|c| c.is_valid) {
                     if let Ok(chain) = store.get_certificate_chain(&cert.thumbprint) {
-                        client2.set_client_certificate(chain, cert.thumbprint.clone());
+                        client2.set_client_certificate(chain, &cert.thumbprint);
                     }
                 }
             }

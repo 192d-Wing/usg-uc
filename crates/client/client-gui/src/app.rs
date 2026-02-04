@@ -633,7 +633,7 @@ impl SipClientApp {
                 );
 
                 if let Some(ref mut app) = self.client_app {
-                    app.set_client_certificate(cert_chain.clone(), thumbprint.to_string());
+                    app.set_client_certificate(cert_chain.clone(), thumbprint);
                     self.status_message = "Certificate configured for authentication".to_string();
                     info!("Certificate configured in ClientApp");
                 } else {
@@ -878,7 +878,7 @@ impl SipClientApp {
 
                 // Store the certificate chain for use with mTLS
                 if let Some(ref mut app) = self.client_app {
-                    app.set_client_certificate(cert_chain.clone(), thumbprint.to_string());
+                    app.set_client_certificate(cert_chain.clone(), thumbprint);
                     self.status_message = "Certificate configured for authentication".to_string();
                     info!("Certificate configured in ClientApp");
                 } else {

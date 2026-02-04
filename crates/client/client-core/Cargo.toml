@@ -11,6 +11,7 @@ repository.workspace = true
 client-types = { path = "../client-types" }
 client-sip-ua = { path = "../client-sip-ua" }
 client-audio = { path = "../client-audio" }
+proto-sip.workspace = true
 proto-ice.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,6 +21,12 @@ thiserror.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 zeroize.workspace = true
+bytes.workspace = true
+
+# TLS support
+rustls.workspace = true
+tokio-rustls = "0.26"
+rustls-pki-types.workspace = true
 
 # Platform utilities
 directories.workspace = true

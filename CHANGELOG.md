@@ -458,6 +458,40 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   - Handles `CertStoreError::PinIncorrect` with error display
   - Smart card not present detection via `CertStoreError::SmartCardNotPresent`
 
+**Phase 24.14: SIP Transport Layer**
+
+- `client-core/sip_transport.rs` - SIP over TLS transport implementation
+  - `SipTransport` struct for managing TLS connections
+    - Connection pooling by peer SocketAddr
+    - Automatic reconnection on connection loss
+    - TLS 1.3 only (CNSA 2.0 compliance)
+    - `send_request()` for sending SIP requests
+    - `shutdown()` for graceful cleanup
+  - `TlsConnection` for individual connection management
+    - Async send/receive using tokio-rustls
+    - BytesMut buffer for message reassembly
+    - SIP message framing with Content-Length
+  - `TransportEvent` enum for event-driven architecture
+    - `ResponseReceived { response, source }` - incoming SIP response
+    - `RequestReceived { request, source }` - incoming SIP request
+    - `Connected { peer }` - TLS connection established
+    - `Disconnected { peer, reason }` - connection lost
+    - `Error { message }` - transport-level error
+  - `InsecureCertVerifier` for development
+    - Accepts all certificates during development
+    - Production requires proper CA validation
+  - Helper functions: `find_header_end()`, `extract_content_length()`
+- `client-core/app.rs` - Transport integration
+  - `sip_transport` and `transport_event_rx` fields
+  - `poll_events()` for event-driven processing
+  - `handle_transport_event()` for response routing
+  - `handle_registration_event()` wired to transport
+- Unit tests: 14 new tests for transport functionality
+  - Header parsing tests
+  - Content-Length extraction (standard and compact forms)
+  - Transport creation and shutdown
+  - Event serialization
+
 **Security**
 
 - Smart card authentication ONLY (CAC/PIV/SIPR token)

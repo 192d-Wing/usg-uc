@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.13 (PIN Entry UI) complete
+**Current Status**: 1750+ tests passing, Phases 1-23 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.14 (SIP Transport Layer) complete
 
 ---
 
@@ -812,6 +812,38 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ SettingsAction::PinRequired for Settings UI integration
 
 **Tests**: 109+ total tests (client crates)
+
+**Phase 24.14: SIP Transport Layer** ✅
+
+- ✅ SipTransport module in client-core
+  - TLS 1.3 connection management (CNSA 2.0 compliant)
+  - Async send/receive for SIP messages
+  - Connection pooling by peer address
+  - Automatic reconnection on connection loss
+- ✅ Message framing and parsing
+  - SIP header detection with `\r\n\r\n` boundary
+  - Content-Length header extraction (standard and compact form)
+  - Complete message reassembly from stream
+- ✅ TransportEvent enum for event-driven architecture
+  - `ResponseReceived` - SIP response from peer
+  - `RequestReceived` - incoming SIP request
+  - `Connected` - TLS connection established
+  - `Disconnected` - connection lost with reason
+  - `Error` - transport-level errors
+- ✅ Integration with ClientApp
+  - SendRequest events routed to transport
+  - Transport responses routed back to agents
+  - Event polling with borrow-safe implementation
+- ✅ InsecureCertVerifier for development
+  - Accepts all certificates during development
+  - Production deployment requires proper CA validation
+- ✅ Unit tests for transport functionality
+  - Header parsing tests
+  - Content-Length extraction tests
+  - Transport creation and shutdown tests
+  - Event serialization tests
+
+**Tests**: 45+ unit tests in client-core
 
 ---
 

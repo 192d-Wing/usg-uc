@@ -9,6 +9,7 @@
 use crate::call_manager::{CallManager, CallManagerEvent};
 use crate::contact_manager::ContactManager;
 use crate::settings::SettingsManager;
+use crate::sip_transport::{SipTransport, TransportEvent};
 use crate::{AppError, AppResult};
 use client_sip_ua::{RegistrationAgent, RegistrationEvent};
 use client_types::{CallInfo, CallState, RegistrationState, SipAccount};
@@ -117,14 +118,17 @@ pub struct ClientApp {
     registration_agent: RegistrationAgent,
     /// Call manager.
     call_manager: CallManager,
+    /// SIP transport layer.
+    sip_transport: Option<SipTransport>,
     /// Event sender for application events.
     app_event_tx: mpsc::Sender<AppEvent>,
     /// Registration event receiver.
-    #[allow(dead_code)]
     reg_event_rx: mpsc::Receiver<RegistrationEvent>,
     /// Call manager event receiver.
     #[allow(dead_code)]
     call_event_rx: mpsc::Receiver<CallManagerEvent>,
+    /// Transport event receiver.
+    transport_event_rx: Option<mpsc::Receiver<TransportEvent>>,
     /// Current account ID.
     current_account_id: Option<String>,
     /// Client certificate chain (DER-encoded) for mTLS authentication.
@@ -166,15 +170,22 @@ impl ClientApp {
         let mut call_manager = CallManager::new(local_sip_addr, local_media_addr, call_event_tx);
         call_manager.set_contact_manager(contact_manager.clone());
 
+        // Create SIP transport
+        let (transport_event_tx, transport_event_rx) = mpsc::channel(32);
+        let sip_transport = SipTransport::new(transport_event_tx)
+            .map_err(|e| AppError::Sip(format!("Failed to create SIP transport: {e}")))?;
+
         Ok(Self {
             state: AppState::Starting,
             settings_manager,
             contact_manager,
             registration_agent,
             call_manager,
+            sip_transport: Some(sip_transport),
             app_event_tx,
             reg_event_rx,
             call_event_rx,
+            transport_event_rx: Some(transport_event_rx),
             current_account_id: None,
             client_cert_chain: None,
             client_cert_thumbprint: None,
@@ -191,12 +202,12 @@ impl ClientApp {
         self.state = AppState::Ready;
 
         // Auto-register default account if configured
-        if let Some(account) = self.settings_manager.default_account() {
-            if account.enabled {
-                info!(account_id = %account.id, "Auto-registering default account");
-                let account = account.clone();
-                self.register_account(&account).await?;
-            }
+        if let Some(account) = self.settings_manager.default_account()
+            && account.enabled
+        {
+            info!(account_id = %account.id, "Auto-registering default account");
+            let account = account.clone();
+            self.register_account(&account).await?;
         }
 
         Ok(())
@@ -206,7 +217,7 @@ impl ClientApp {
     ///
     /// The certificate chain should be DER-encoded, with the end-entity
     /// certificate first, followed by any intermediate certificates.
-    pub fn set_client_certificate(&mut self, cert_chain: Vec<Vec<u8>>, thumbprint: String) {
+    pub fn set_client_certificate(&mut self, cert_chain: Vec<Vec<u8>>, thumbprint: &str) {
         info!(
             thumbprint = %thumbprint,
             chain_length = cert_chain.len(),
@@ -214,7 +225,7 @@ impl ClientApp {
         );
 
         self.client_cert_chain = Some(cert_chain.clone());
-        self.client_cert_thumbprint = Some(thumbprint.clone());
+        self.client_cert_thumbprint = Some(thumbprint.to_string());
 
         // Configure the call manager with the DTLS credentials
         // For smart card certificates, the private key stays on the card
@@ -386,8 +397,21 @@ impl ClientApp {
                     }
                 }
             }
-            RegistrationEvent::SendRequest { .. } => {
-                // Transport layer handles this
+            RegistrationEvent::SendRequest { request, destination } => {
+                // Send via SIP transport
+                if let Some(ref transport) = self.sip_transport {
+                    if let Err(e) = transport.send_request(&request, destination).await {
+                        error!(error = %e, "Failed to send SIP request");
+                        let _ = self
+                            .app_event_tx
+                            .send(AppEvent::Error {
+                                message: format!("Failed to send registration: {}", e),
+                            })
+                            .await;
+                    }
+                } else {
+                    warn!("SIP transport not initialized");
+                }
             }
         }
 
@@ -473,6 +497,91 @@ impl ClientApp {
 
                 let _ = self.app_event_tx.send(AppEvent::Error { message }).await;
             }
+        }
+
+        Ok(())
+    }
+
+    /// Handles a transport event.
+    pub async fn handle_transport_event(&mut self, event: TransportEvent) -> AppResult<()> {
+        match event {
+            TransportEvent::ResponseReceived { response, source } => {
+                debug!(
+                    source = %source,
+                    status = response.status.code(),
+                    "Received SIP response"
+                );
+
+                // Route response to registration agent if it's a REGISTER response
+                // The Via header and Call-ID can be used to correlate with the request
+                if let Some(ref account_id) = self.current_account_id {
+                    if let Err(e) = self
+                        .registration_agent
+                        .handle_response(&response, account_id)
+                        .await
+                    {
+                        warn!(error = %e, "Failed to handle registration response");
+                    }
+                }
+            }
+            TransportEvent::RequestReceived { request, source } => {
+                info!(
+                    source = %source,
+                    method = %request.method,
+                    "Received incoming SIP request"
+                );
+
+                // TODO: Handle incoming calls (INVITE), etc.
+                // For now, just log it
+            }
+            TransportEvent::Connected { peer } => {
+                info!(peer = %peer, "Connected to SIP peer");
+            }
+            TransportEvent::Disconnected { peer, reason } => {
+                warn!(peer = %peer, reason = %reason, "Disconnected from SIP peer");
+
+                // If we were registered, update state
+                if self.state == AppState::Registered {
+                    self.state = AppState::Ready;
+                    if let Some(ref account_id) = self.current_account_id {
+                        let _ = self
+                            .app_event_tx
+                            .send(AppEvent::RegistrationStateChanged {
+                                account_id: account_id.clone(),
+                                state: RegistrationState::Failed,
+                            })
+                            .await;
+                    }
+                }
+            }
+            TransportEvent::Error { message } => {
+                error!(message = %message, "Transport error");
+                let _ = self.app_event_tx.send(AppEvent::Error { message }).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Polls for pending events from all sources.
+    ///
+    /// Call this periodically from the main event loop.
+    pub async fn poll_events(&mut self) -> AppResult<()> {
+        // Collect registration events first, then process them
+        // (avoids borrow checker issues with async methods)
+        let reg_events: Vec<_> = std::iter::from_fn(|| self.reg_event_rx.try_recv().ok()).collect();
+        for event in reg_events {
+            self.handle_registration_event(event).await?;
+        }
+
+        // Collect transport events first, then process them
+        let transport_events: Vec<_> = if let Some(ref mut rx) = self.transport_event_rx {
+            std::iter::from_fn(|| rx.try_recv().ok()).collect()
+        } else {
+            vec![]
+        };
+        for event in transport_events {
+            self.handle_transport_event(event).await?;
         }
 
         Ok(())

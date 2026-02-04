@@ -23,8 +23,10 @@ pub mod call_manager;
 pub mod cert_store;
 pub mod contact_manager;
 pub mod settings;
+pub mod sip_transport;
 
 pub use app::{AppEvent, AppState, ClientApp, PinOperationType};
+pub use sip_transport::{SipTransport, TransportEvent};
 pub use audio_session::{
     AudioSession, AudioSessionConfig, AudioSessionConfigBuilder, AudioSessionEvent,
 };

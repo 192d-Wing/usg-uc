@@ -185,7 +185,7 @@ async fn test_client_app_certificate_configuration() {
     {
         let chain = store.get_certificate_chain(&cert_info.thumbprint).unwrap();
 
-        app.set_client_certificate(chain, cert_info.thumbprint.clone());
+        app.set_client_certificate(chain, &cert_info.thumbprint);
 
         // Verify certificate is configured
         assert!(app.has_client_certificate());
@@ -220,7 +220,7 @@ async fn test_client_app_certificate_change() {
             "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2";
         let chain1 = store.get_certificate_chain(cert1_thumbprint).unwrap();
 
-        app.set_client_certificate(chain1, cert1_thumbprint.to_string());
+        app.set_client_certificate(chain1, cert1_thumbprint);
         assert_eq!(
             app.client_certificate_thumbprint(),
             Some(cert1_thumbprint)
@@ -231,7 +231,7 @@ async fn test_client_app_certificate_change() {
             "B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3D4E5F6G7B2C3";
         let chain2 = store.get_certificate_chain(cert2_thumbprint).unwrap();
 
-        app.set_client_certificate(chain2, cert2_thumbprint.to_string());
+        app.set_client_certificate(chain2, cert2_thumbprint);
         assert_eq!(
             app.client_certificate_thumbprint(),
             Some(cert2_thumbprint)
@@ -319,7 +319,7 @@ async fn test_full_certificate_selection_flow() {
         let media_addr = allocate_test_addr().await;
 
         if let Ok(mut app) = ClientApp::new(sip_addr, media_addr, tx) {
-            app.set_client_certificate(chain, selected.thumbprint.clone());
+            app.set_client_certificate(chain, &selected.thumbprint);
 
             assert!(app.has_client_certificate());
             assert_eq!(
