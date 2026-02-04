@@ -220,7 +220,9 @@ impl CookieGenerator {
         // Simple PRNG for key generation
         let mut state = seed;
         for byte in &mut key {
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
             *byte = (state >> 56) as u8;
         }
 
@@ -369,7 +371,9 @@ impl CookieGenerator {
         }
         for (i, byte) in result.iter_mut().enumerate() {
             *byte = ((outer_state >> ((i % 8) * 8)) & 0xFF) as u8;
-            outer_state = outer_state.wrapping_mul(31).wrapping_add(u64::from(i as u8));
+            outer_state = outer_state
+                .wrapping_mul(31)
+                .wrapping_add(u64::from(i as u8));
         }
 
         result
@@ -550,8 +554,14 @@ mod tests {
         let encoded = original.encode();
         let decoded = CookieData::decode(encoded.freeze()).unwrap();
 
-        assert_eq!(decoded.local_verification_tag, original.local_verification_tag);
-        assert_eq!(decoded.peer_verification_tag, original.peer_verification_tag);
+        assert_eq!(
+            decoded.local_verification_tag,
+            original.local_verification_tag
+        );
+        assert_eq!(
+            decoded.peer_verification_tag,
+            original.peer_verification_tag
+        );
         assert_eq!(decoded.local_initial_tsn, original.local_initial_tsn);
         assert_eq!(decoded.peer_initial_tsn, original.peer_initial_tsn);
         assert_eq!(decoded.outbound_streams, original.outbound_streams);
@@ -582,11 +592,7 @@ mod tests {
 
     #[test]
     fn test_cookie_age() {
-        let data = CookieData::new(
-            0, 0, 0, 0, 10, 10,
-            test_addr_v4(),
-            test_addr_v4(),
-        );
+        let data = CookieData::new(0, 0, 0, 0, 10, 10, test_addr_v4(), test_addr_v4());
 
         let age = data.age();
         assert!(age < Duration::from_secs(1));
@@ -594,11 +600,7 @@ mod tests {
 
     #[test]
     fn test_cookie_expiration() {
-        let mut data = CookieData::new(
-            0, 0, 0, 0, 10, 10,
-            test_addr_v4(),
-            test_addr_v4(),
-        );
+        let mut data = CookieData::new(0, 0, 0, 0, 10, 10, test_addr_v4(), test_addr_v4());
 
         // Not expired with default lifetime
         assert!(!data.is_expired(DEFAULT_COOKIE_LIFETIME));
@@ -625,7 +627,10 @@ mod tests {
         let cookie = generator.generate(&data);
         let validated = generator.validate(&cookie).unwrap();
 
-        assert_eq!(validated.local_verification_tag, data.local_verification_tag);
+        assert_eq!(
+            validated.local_verification_tag,
+            data.local_verification_tag
+        );
     }
 
     #[test]
@@ -648,7 +653,10 @@ mod tests {
         assert!(cookie.len() > data.encode().len());
 
         let validated = generator.validate(&cookie).unwrap();
-        assert_eq!(validated.local_verification_tag, data.local_verification_tag);
+        assert_eq!(
+            validated.local_verification_tag,
+            data.local_verification_tag
+        );
     }
 
     #[test]

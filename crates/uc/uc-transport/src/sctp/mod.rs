@@ -20,6 +20,7 @@
 //! - **SC-13**: AES-256-GCM for cookie encryption
 //! - **SC-23**: Association state tracking
 
+pub mod association;
 pub mod chunk;
 pub mod congestion;
 pub mod cookie;
@@ -30,10 +31,10 @@ pub mod stream;
 pub mod timer;
 pub mod udp_encap;
 
-// These modules will be added in subsequent phases:
-// pub mod association;
+// This module will be added when needed:
 // pub mod listener;
 
+pub use association::{AssociationConfig, AssociationHandle, AssociationInner};
 pub use chunk::{
     AbortChunk, Chunk, ChunkType, CookieAckChunk, CookieEchoChunk, DataChunk, ErrorCause,
     ErrorChunk, GapAckBlock, HeartbeatAckChunk, HeartbeatChunk, InitAckChunk, InitChunk, InitParam,
@@ -41,16 +42,16 @@ pub use chunk::{
     UnknownChunkAction,
 };
 pub use congestion::CongestionController;
+pub use cookie::{CookieData, CookieError, CookieGenerator, DEFAULT_COOKIE_LIFETIME};
 pub use packet::{HEADER_SIZE, MAX_PACKET_SIZE, SctpPacket};
+pub use path::{Path, PathId, PathManager, PathState};
 pub use state::{AssociationState, StateAction, StateEvent, StateMachine};
 pub use stream::{Stream, StreamError, StreamManager};
 pub use timer::{RtoCalculator, Timer, TimerManager, TimerType};
-pub use path::{Path, PathId, PathManager, PathState};
 pub use udp_encap::{
-    decapsulate, encapsulate, EncapsulatedPacket, UdpEncapConfig, UdpEncapError, UdpHeader,
-    SCTP_UDP_PORT, UDP_HEADER_SIZE,
+    EncapsulatedPacket, SCTP_UDP_PORT, UDP_HEADER_SIZE, UdpEncapConfig, UdpEncapError, UdpHeader,
+    decapsulate, encapsulate,
 };
-pub use cookie::{CookieData, CookieError, CookieGenerator, DEFAULT_COOKIE_LIFETIME};
 
 use crate::error::{TransportError, TransportResult};
 use crate::{MAX_STREAM_MESSAGE_SIZE, ReceivedMessage, StreamTransport, Transport};

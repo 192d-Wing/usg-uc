@@ -219,11 +219,7 @@ impl UdpHeader {
         let checksum = !sum as u16;
 
         // If checksum is 0, use 0xFFFF (RFC 768)
-        if checksum == 0 {
-            0xFFFF
-        } else {
-            checksum
-        }
+        if checksum == 0 { 0xFFFF } else { checksum }
     }
 }
 
@@ -263,7 +259,11 @@ impl EncapsulatedPacket {
     /// Encodes the encapsulated packet into bytes.
     ///
     /// Optionally calculates the UDP checksum if addresses are provided.
-    pub fn encode(&self, source_addr: Option<&SocketAddr>, dest_addr: Option<&SocketAddr>) -> Bytes {
+    pub fn encode(
+        &self,
+        source_addr: Option<&SocketAddr>,
+        dest_addr: Option<&SocketAddr>,
+    ) -> Bytes {
         // First encode the SCTP packet
         let sctp_bytes = self.sctp_packet.encode();
 
