@@ -1602,6 +1602,67 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 ---
 
+**Phase 24.39: Tauri GUI Backend Integration** 🚧
+
+**Goal**: Connect client-gui-tauri frontend to client-core backend
+
+**High Priority - Core Functionality**
+
+- 🚧 Integrate `client-core` into AppState
+  - Replace placeholder `Option<()>` with `ClientApp` instance
+  - Initialize with settings from persistent storage
+  - Proper async runtime integration with Tauri
+- 🚧 Implement SIP registration commands
+  - Wire `register_sip` to `ClientApp::register_account()`
+  - Wire `unregister_sip` to `ClientApp::unregister()`
+  - Forward registration events to frontend
+- 🚧 Implement call handling commands
+  - Wire `make_call` to `ClientApp::make_call()`
+  - Wire `end_call` to `ClientApp::end_call()`
+  - Wire `toggle_mute` to `ClientApp::toggle_mute()`
+  - Wire `toggle_hold` to `ClientApp::toggle_hold()`
+  - Wire `transfer_call` to `ClientApp::transfer_call()`
+- 🚧 Integrate `client-audio` for real audio devices
+  - Replace hardcoded mock devices with `AudioDeviceManager`
+  - Enumerate input/output devices via CPAL
+  - Wire device selection to audio pipeline
+
+**Medium Priority - Data Persistence**
+
+- 🚧 Implement persistent settings storage
+  - Save/load SIP settings via `SettingsManager`
+  - Use platform-specific config paths via `directories` crate
+  - TOML-based configuration file
+- 🚧 Implement contact database storage
+  - Wire contacts to `ContactManager` from client-core
+  - JSON-based persistent contact store
+  - Load contacts on startup, save on modification
+- 🚧 Implement call history
+  - Track calls via `CallHistoryEntry` from client-types
+  - Display recent calls in UI
+  - Persist call history to disk
+
+**Lower Priority - Security Hardening**
+
+- 🚧 Enable Content Security Policy (CSP)
+  - Configure CSP in tauri.conf.json for production
+  - Restrict script sources to self
+  - Disable unsafe-inline and unsafe-eval
+- 🚧 Add input validation
+  - Validate SIP URI format before making calls
+  - Validate registrar hostname/port
+  - Sanitize contact names to prevent XSS
+- 🚧 Smart card integration
+  - Wire to `CertificateStore` from client-core
+  - Certificate selection UI
+  - PIN entry dialog for smart card operations
+- 🚧 Add unit and integration tests
+  - Test Tauri commands with mock client
+  - Test frontend-backend communication
+  - Test error handling paths
+
+---
+
 ## Known TODOs in Code
 
 | Location | Description | Priority | Status |
