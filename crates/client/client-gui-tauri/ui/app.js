@@ -1,4 +1,44 @@
 // USG SIP Soft Client - Frontend Application Logic
+// Security hardened version
+
+// ============================================================================
+// Security Constants and Utilities
+// ============================================================================
+
+// Input length limits
+const MAX_DIAL_LENGTH = 30;
+const MAX_CONTACT_NAME = 100;
+const MAX_URI_LENGTH = 256;
+const MAX_SEARCH_LENGTH = 100;
+
+// Rate limiting for backend calls
+const rateLimiter = {
+    lastCall: {},
+    minInterval: 100, // ms between calls to same command
+
+    canCall(command) {
+        const now = Date.now();
+        if (now - (this.lastCall[command] || 0) < this.minInterval) {
+            console.warn(`Rate limited: ${command}`);
+            return false;
+        }
+        this.lastCall[command] = now;
+        return true;
+    }
+};
+
+// Generate cryptographically random ID
+function generateSecureId() {
+    const array = new Uint8Array(16);
+    crypto.getRandomValues(array);
+    return Array.from(array, b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Sanitize alert messages to prevent confusion attacks
+function safeAlert(message) {
+    const clean = String(message).replace(/<[^>]*>/g, '').slice(0, 500);
+    alert(clean);
+}
 
 // Use Tauri 2.0 invoke API - access lazily to ensure Tauri is loaded
 function getTauriApi() {
@@ -219,7 +259,7 @@ function updateClassificationBars() {
     });
 }
 
-// Save classification config
+// Save classification config (only via Tauri backend - no localStorage for security)
 function saveClassificationConfig() {
     const config = {
         level: currentClassification,
@@ -227,13 +267,7 @@ function saveClassificationConfig() {
         dissem: classificationDissem
     };
 
-    try {
-        localStorage.setItem('classificationConfig', JSON.stringify(config));
-    } catch (e) {
-        console.warn('Could not save classification to localStorage');
-    }
-
-    // Also try to save via Tauri invoke if available
+    // Save via Tauri invoke only (no localStorage for sensitive data)
     try {
         invoke('save_classification_config', { config }).catch(() => {});
     } catch (e) {
@@ -291,7 +325,26 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Initialize certificates
     await initializeCertificates();
+
+    // Check if digest auth feature is enabled and show/hide UI accordingly
+    await initializeDigestAuth();
 });
+
+// Initialize digest auth UI based on feature flag
+async function initializeDigestAuth() {
+    try {
+        const digestAuthEnabled = await invoke('is_digest_auth_enabled');
+        const digestAuthSection = document.getElementById('digestAuthSection');
+        if (digestAuthSection) {
+            digestAuthSection.style.display = digestAuthEnabled ? 'block' : 'none';
+        }
+        if (digestAuthEnabled) {
+            console.log('Digest auth feature enabled - testing mode available');
+        }
+    } catch (error) {
+        console.log('Digest auth check skipped:', error);
+    }
+}
 
 // Event Listeners for backend events
 async function initializeEventListeners() {
@@ -323,7 +376,7 @@ async function initializeEventListeners() {
     // Error events
     await listen('error', (event) => {
         console.error('Error:', event.payload);
-        alert(`Error: ${event.payload.message}`);
+        safeAlert(event.payload.message || 'An error occurred');
     });
 
     // Transfer progress
@@ -355,7 +408,8 @@ function handleIncomingCall(payload) {
     const { call_id, remote_uri, remote_display_name } = payload;
     incomingCallId = call_id;
 
-    const caller = remote_display_name || remote_uri;
+    // Sanitize caller info for display
+    const caller = escapeHtml(remote_display_name || remote_uri || 'Unknown').slice(0, 100);
     const accept = confirm(`Incoming call from ${caller}\n\nAccept?`);
 
     if (accept) {
@@ -366,12 +420,13 @@ function handleIncomingCall(payload) {
 }
 
 async function acceptIncomingCall(callId) {
+    if (!rateLimiter.canCall('accept_call')) return;
     try {
         await invoke('accept_call', { callId });
         switchTab('call');
     } catch (error) {
         console.error('Failed to accept call:', error);
-        alert(`Failed to accept call: ${error}`);
+        safeAlert('Failed to accept call');
     }
 }
 
@@ -835,10 +890,18 @@ function initializeDialer() {
         updateDialInputSize(dialInput);
     });
 
-    // Auto-format on manual input
+    // Auto-format on manual input with length limit
     dialInput.addEventListener('input', (e) => {
         const cursorPos = e.target.selectionStart;
-        const oldValue = e.target.value;
+        let oldValue = e.target.value;
+
+        // Enforce max length on raw digits
+        const digits = oldValue.replace(/\D/g, '');
+        if (digits.length > MAX_DIAL_LENGTH) {
+            oldValue = oldValue.slice(0, -1);
+            e.target.value = oldValue;
+            return;
+        }
 
         // Detect if user typed +
         if (oldValue.includes('+')) {
@@ -846,7 +909,7 @@ function initializeDialer() {
         }
 
         // If field is cleared, reset international mode
-        if (oldValue.replace(/\D/g, '').length === 0 && !oldValue.includes('+')) {
+        if (digits.length === 0 && !oldValue.includes('+')) {
             internationalMode = false;
         }
 
@@ -959,8 +1022,10 @@ function initializeDialer() {
 }
 
 async function makeCall(target) {
+    if (!rateLimiter.canCall('make_call')) return;
+
     // Extract digits if formatted, preserve SIP URIs
-    const dialTarget = extractDigits(target);
+    const dialTarget = extractDigits(target).slice(0, MAX_URI_LENGTH);
 
     // Add sip: prefix if not present
     let sipUri = dialTarget;
@@ -975,7 +1040,7 @@ async function makeCall(target) {
         switchTab('call');
     } catch (error) {
         console.error('Failed to make call:', error);
-        alert(`Failed to make call: ${error}`);
+        safeAlert('Failed to make call');
     }
 }
 
@@ -1062,7 +1127,7 @@ function initializeContacts() {
     const addContactBtn = document.getElementById('addContactBtn');
 
     searchInput.addEventListener('input', async (e) => {
-        const query = e.target.value.trim();
+        const query = e.target.value.trim().slice(0, MAX_SEARCH_LENGTH);
         if (query) {
             await searchContacts(query);
         } else {
@@ -1077,10 +1142,23 @@ function initializeContacts() {
 
 async function loadContacts() {
     try {
-        contacts = await invoke('get_contacts');
+        const result = await invoke('get_contacts');
+        // Validate response structure
+        if (!Array.isArray(result)) {
+            console.error('Invalid contacts response: not an array');
+            contacts = [];
+        } else {
+            // Filter and validate each contact
+            contacts = result.filter(c =>
+                c && typeof c.id === 'string' &&
+                typeof c.name === 'string' &&
+                typeof c.sip_uri === 'string'
+            );
+        }
         renderContacts(contacts);
     } catch (error) {
         console.error('Failed to load contacts:', error);
+        contacts = [];
     }
 }
 
@@ -1135,7 +1213,7 @@ function renderContacts(contactsToRender) {
         });
 
         item.querySelector('.contact-btn.delete').addEventListener('click', async () => {
-            if (confirm(`Delete contact ${contact.name}?`)) {
+            if (confirm(`Delete contact ${escapeHtml(contact.name).slice(0, 50)}?`)) {
                 await deleteContact(contact.id);
             }
         });
@@ -1206,9 +1284,9 @@ async function saveContact() {
     }
 
     const contact = {
-        id: modal.dataset.editId || `${Date.now()}`,
-        name,
-        sip_uri: uri,
+        id: modal.dataset.editId || generateSecureId(),
+        name: name.slice(0, MAX_CONTACT_NAME),
+        sip_uri: uri.slice(0, MAX_URI_LENGTH),
         phone_numbers: [],
         favorite,
         avatar_path: null,
@@ -1216,6 +1294,7 @@ async function saveContact() {
         notes: null
     };
 
+    if (!rateLimiter.canCall('save_contact')) return;
     try {
         if (modal.dataset.editId) {
             await invoke('update_contact', { contact });
@@ -1227,7 +1306,7 @@ async function saveContact() {
         closeContactModal();
     } catch (error) {
         console.error('Failed to save contact:', error);
-        alert(`Failed to save contact: ${error}`);
+        safeAlert('Failed to save contact');
     }
 }
 
@@ -1238,12 +1317,13 @@ function isValidSipUri(uri) {
 }
 
 async function deleteContact(id) {
+    if (!rateLimiter.canCall('delete_contact')) return;
     try {
         await invoke('delete_contact', { id });
         await loadContacts();
     } catch (error) {
         console.error('Failed to delete contact:', error);
-        alert(`Failed to delete contact: ${error}`);
+        safeAlert('Failed to delete contact');
     }
 }
 
@@ -1280,11 +1360,18 @@ function initializeCall() {
     transferBtn.addEventListener('click', async () => {
         const target = prompt('Enter transfer target (SIP URI):');
         if (target) {
+            // Validate transfer target
+            const trimmedTarget = target.trim().slice(0, MAX_URI_LENGTH);
+            if (!isValidSipUri(trimmedTarget)) {
+                safeAlert('Please enter a valid SIP URI (e.g., user@domain.com or sip:user@domain.com)');
+                return;
+            }
+            if (!rateLimiter.canCall('transfer_call')) return;
             try {
-                await invoke('transfer_call', { target });
+                await invoke('transfer_call', { target: trimmedTarget });
             } catch (error) {
                 console.error('Failed to transfer call:', error);
-                alert(`Failed to transfer call: ${error}`);
+                safeAlert('Failed to transfer call');
             }
         }
     });
@@ -1361,16 +1448,18 @@ function initializeSettings() {
     // Open config file button
     if (openConfigBtn) {
         openConfigBtn.addEventListener('click', async () => {
+            if (!rateLimiter.canCall('open_config_file')) return;
             try {
                 await invoke('open_config_file');
             } catch (error) {
                 console.error('Failed to open config file:', error);
-                alert(`Failed to open config file: ${error}`);
+                safeAlert('Failed to open config file');
             }
         });
     }
 
     registerBtn.addEventListener('click', async () => {
+        if (!rateLimiter.canCall('register_sip')) return;
         try {
             registerBtn.disabled = true;
             registerBtn.textContent = 'Registering...';
@@ -1379,7 +1468,7 @@ function initializeSettings() {
             registrationState = 'registered';
         } catch (error) {
             console.error('Failed to register:', error);
-            alert(`Failed to register: ${error}`);
+            safeAlert('Failed to register');
         } finally {
             registerBtn.disabled = false;
             registerBtn.textContent = 'Register';
@@ -1387,13 +1476,14 @@ function initializeSettings() {
     });
 
     unregisterBtn.addEventListener('click', async () => {
+        if (!rateLimiter.canCall('unregister_sip')) return;
         try {
             await invoke('unregister_sip');
             updateStatus('offline');
             registrationState = 'unregistered';
         } catch (error) {
             console.error('Failed to unregister:', error);
-            alert(`Failed to unregister: ${error}`);
+            safeAlert('Failed to unregister');
         }
     });
 
@@ -1644,16 +1734,18 @@ function renderCertificates() {
 // Select a certificate
 async function selectCertificate(cert) {
     if (!cert.is_valid) {
-        alert('Cannot select an expired certificate. Please choose a valid certificate.');
+        safeAlert('Cannot select an expired certificate. Please choose a valid certificate.');
         return;
     }
+
+    if (!rateLimiter.canCall('select_certificate')) return;
 
     try {
         // Check if private key is available (smart card present)
         const hasKey = await invoke('check_private_key', { thumbprint: cert.thumbprint });
 
         if (!hasKey) {
-            alert('Smart card not detected. Please insert your CAC/PIV card and try again.');
+            safeAlert('Smart card not detected. Please insert your CAC/PIV card and try again.');
             return;
         }
 
@@ -1667,7 +1759,7 @@ async function selectCertificate(cert) {
         console.log('Certificate selected:', cert.subject_cn);
     } catch (error) {
         console.error('Failed to select certificate:', error);
-        alert(`Failed to select certificate: ${error}`);
+        safeAlert('Failed to select certificate');
     }
 }
 
