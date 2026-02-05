@@ -75,7 +75,7 @@ members = [
     "crates/client/client-audio",
     "crates/client/client-sip-ua",
     "crates/client/client-core",
-    "crates/client/client-gui-windows",
+    # "crates/client/client-gui-windows",  # TODO: restore when Windows GUI is added
     "crates/client/client-gui-tauri",
     "crates/client/client-integration-tests",
 ]
