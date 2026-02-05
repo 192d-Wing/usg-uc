@@ -39,6 +39,14 @@ directories.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
 
+# macOS keychain/security support
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+# PKCS#11 for cross-platform smart card support (YubiKey, etc.)
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+cryptoki = "0.7"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile.workspace = true

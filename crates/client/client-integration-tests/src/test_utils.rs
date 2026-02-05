@@ -58,11 +58,18 @@ pub fn test_certificate_info() -> CertificateInfo {
         subject_cn: "John Doe (CAC)".to_string(),
         subject_dn: "CN=John Doe, OU=Users, O=US Government, C=US".to_string(),
         issuer_cn: "DOD ID CA-59".to_string(),
+        issuer_dn: "CN=DOD ID CA-59, OU=PKI, OU=DoD, O=U.S. Government, C=US".to_string(),
         not_before: "2024-01-01".to_string(),
         not_after: "2027-01-01".to_string(),
         is_valid: true,
         reader_name: Some("SCM Microsystems Inc. SCR331 0".to_string()),
         key_algorithm: "ECDSA P-384".to_string(),
+        extended_key_usage: vec![
+            "1.3.6.1.4.1.311.20.2.2".to_string(), // Smart Card Logon
+            "1.3.6.1.5.5.7.3.2".to_string(),      // Client Auth
+        ],
+        has_smart_card_logon: true,
+        has_client_auth: true,
     }
 }
 

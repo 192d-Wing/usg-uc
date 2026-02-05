@@ -260,7 +260,7 @@ impl ServerCertVerificationMode {
 }
 
 /// Information about an available smart card certificate.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertificateInfo {
     /// Certificate thumbprint (SHA-256 hash).
     pub thumbprint: String,
@@ -270,6 +270,9 @@ pub struct CertificateInfo {
     pub subject_dn: String,
     /// Issuer common name.
     pub issuer_cn: String,
+    /// Issuer distinguished name.
+    #[serde(default)]
+    pub issuer_dn: String,
     /// Certificate not valid before.
     pub not_before: String,
     /// Certificate not valid after.
@@ -280,6 +283,15 @@ pub struct CertificateInfo {
     pub reader_name: Option<String>,
     /// Key algorithm (e.g., "ECDSA P-384").
     pub key_algorithm: String,
+    /// Extended Key Usage OIDs.
+    #[serde(default)]
+    pub extended_key_usage: Vec<String>,
+    /// Whether this certificate has Smart Card Logon EKU.
+    #[serde(default)]
+    pub has_smart_card_logon: bool,
+    /// Whether this certificate has Client Authentication EKU.
+    #[serde(default)]
+    pub has_client_auth: bool,
 }
 
 impl std::fmt::Display for CertificateInfo {
