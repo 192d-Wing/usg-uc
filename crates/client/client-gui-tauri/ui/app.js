@@ -1444,6 +1444,21 @@ function initializeSettings() {
     const openConfigBtn = document.getElementById('openConfigBtn');
     const saveContactBtn = document.getElementById('saveContactBtn');
     const cancelContactBtn = document.getElementById('cancelContactBtn');
+    const saveSipSettingsBtn = document.getElementById('saveSipSettingsBtn');
+
+    // Load SIP settings on init
+    loadSipSettings();
+
+    // Save SIP settings button
+    if (saveSipSettingsBtn) {
+        console.log('Save SIP Settings button found, adding click handler');
+        saveSipSettingsBtn.addEventListener('click', async () => {
+            console.log('Save SIP Settings button clicked');
+            await saveSipSettings();
+        });
+    } else {
+        console.error('Save SIP Settings button NOT found!');
+    }
 
     // Open config file button
     if (openConfigBtn) {
@@ -1898,4 +1913,112 @@ function requestPin(thumbprint, operation = 'authentication') {
         pinCallback = resolve;
         openPinModal(thumbprint, operation);
     });
+}
+
+// ============================================================================
+// SIP Settings Management
+// ============================================================================
+
+// Load SIP settings from backend
+async function loadSipSettings() {
+    try {
+        const settings = await invoke('get_sip_settings');
+        if (settings) {
+            const displayNameInput = document.getElementById('sipDisplayName');
+            const usernameInput = document.getElementById('sipUsername');
+            const domainInput = document.getElementById('sipDomain');
+            const registrarInput = document.getElementById('sipRegistrar');
+            const portInput = document.getElementById('sipPort');
+            const transportSelect = document.getElementById('sipTransport');
+            const autoRegisterCheckbox = document.getElementById('sipAutoRegister');
+
+            if (displayNameInput) displayNameInput.value = settings.display_name || '';
+            if (usernameInput) usernameInput.value = settings.username || '';
+            if (domainInput) domainInput.value = settings.domain || '';
+            if (registrarInput) registrarInput.value = settings.registrar || '';
+            if (portInput) portInput.value = settings.port || 5060;
+            if (transportSelect) transportSelect.value = settings.transport || 'tls';
+            if (autoRegisterCheckbox) autoRegisterCheckbox.checked = settings.auto_register !== false;
+
+            // Load digest auth credentials if available
+            const authUsernameInput = document.getElementById('authUsername');
+            const authPasswordInput = document.getElementById('authPassword');
+            if (authUsernameInput && settings.auth_username) {
+                authUsernameInput.value = settings.auth_username;
+            }
+            // Note: password is never loaded from backend for security
+
+            console.log('SIP settings loaded');
+        }
+    } catch (error) {
+        console.log('Could not load SIP settings:', error);
+    }
+}
+
+// Save SIP settings to backend
+async function saveSipSettings() {
+    console.log('saveSipSettings() called');
+    if (!rateLimiter.canCall('save_sip_settings')) {
+        console.log('Rate limited, skipping');
+        return;
+    }
+
+    const displayName = document.getElementById('sipDisplayName')?.value.trim() || '';
+    const username = document.getElementById('sipUsername')?.value.trim() || '';
+    const domain = document.getElementById('sipDomain')?.value.trim() || '';
+    const registrar = document.getElementById('sipRegistrar')?.value.trim() || '';
+    const port = parseInt(document.getElementById('sipPort')?.value, 10) || 5060;
+    const transport = document.getElementById('sipTransport')?.value || 'tls';
+    const autoRegister = document.getElementById('sipAutoRegister')?.checked !== false;
+
+    // Basic validation
+    if (!username || !domain) {
+        safeAlert('Please enter at least a username and domain');
+        return;
+    }
+
+    // Validate port range
+    if (port < 1 || port > 65535) {
+        safeAlert('Port must be between 1 and 65535');
+        return;
+    }
+
+    const settings = {
+        display_name: displayName,
+        username: username,
+        domain: domain,
+        registrar: registrar || domain, // Use domain if registrar not specified
+        port: port,
+        transport: transport,
+        auto_register: autoRegister,
+    };
+
+    // Add digest auth credentials if feature is enabled and fields are filled
+    const authUsernameEl = document.getElementById('authUsername');
+    const authPasswordEl = document.getElementById('authPassword');
+    const authUsername = authUsernameEl?.value.trim();
+    const authPassword = authPasswordEl?.value;
+
+    console.log('Auth fields:', {
+        usernameEl: !!authUsernameEl,
+        passwordEl: !!authPasswordEl,
+        username: authUsername,
+        passwordLen: authPassword?.length || 0
+    });
+
+    if (authUsername) {
+        settings.auth_username = authUsername;
+    }
+    if (authPassword) {
+        settings.auth_password = authPassword;
+    }
+
+    try {
+        await invoke('save_sip_settings', { settings });
+        safeAlert('SIP settings saved successfully');
+        console.log('SIP settings saved:', settings.username + '@' + settings.domain);
+    } catch (error) {
+        console.error('Failed to save SIP settings:', error);
+        safeAlert('Failed to save SIP settings: ' + error);
+    }
 }

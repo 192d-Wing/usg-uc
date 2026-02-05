@@ -37,6 +37,7 @@ pub use settings::{CertificateFilterSettings, GeneralSettings, NetworkSettings, 
 pub use sip_transport::{
     CertVerificationMode, SipTransport, TransportConfig, TransportEvent,
     build_response_from_request, generate_tag, load_certs_from_pem_file,
+    run_udp_receive_loop, start_udp_receive_thread,
 };
 
 use thiserror::Error;

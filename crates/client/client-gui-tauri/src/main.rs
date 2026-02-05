@@ -13,7 +13,7 @@
 use client_audio::DeviceManager;
 use client_core::{
     AppEvent, AppState as CoreAppState, CertificateStore, ClientApp, ContactManager,
-    SettingsManager,
+    SettingsManager, run_udp_receive_loop,
 };
 use client_types::{CertificateInfo, Contact, SipAccount, SmartCardPin};
 use serde::{Deserialize, Serialize};
@@ -67,6 +67,9 @@ pub struct SipSettings {
     pub registrar: String,
     /// SIP port.
     pub port: u16,
+    /// Transport protocol: "udp", "tcp", or "tls".
+    #[serde(default = "default_transport")]
+    pub transport: String,
     /// Whether auto-registration is enabled.
     pub auto_register: bool,
     /// Authentication username (for digest auth testing).
@@ -75,6 +78,10 @@ pub struct SipSettings {
     /// Authentication password (for digest auth testing).
     #[serde(default)]
     pub auth_password: Option<String>,
+}
+
+fn default_transport() -> String {
+    "tls".to_string()
 }
 
 /// Classification configuration for the frontend.
@@ -146,17 +153,53 @@ async fn initialize_client(state: State<'_, TauriAppState>) -> Result<(), String
     let mut client = ClientApp::new(local_sip_addr, local_media_addr, event_tx)
         .map_err(|e| format!("Failed to create client: {e}"))?;
 
-    // Initialize the client
+    // Get UDP socket and event sender for the receive loop BEFORE initialize
+    // This ensures the receive loop is running before any registration sends
+    if let Some((udp_socket, transport_event_tx)) = client.get_udp_socket_for_receive().await {
+        info!("Spawning UDP receive loop using Tauri async runtime");
+        tauri::async_runtime::spawn(async move {
+            run_udp_receive_loop(udp_socket, transport_event_tx).await;
+        });
+        // Give the receive loop a moment to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    } else {
+        warn!("Could not get UDP socket for receive loop");
+    }
+
+    // Initialize the client (this triggers auto-registration)
     client
         .initialize()
         .await
         .map_err(|e| format!("Failed to initialize client: {e}"))?;
+    info!("Client initialized successfully, storing in state");
 
     *client_guard = Some(client);
+    drop(client_guard);
 
     // Store the event receiver for polling
     let mut rx_guard = state.event_rx.lock().await;
     *rx_guard = Some(event_rx);
+    drop(rx_guard);
+
+    // Spawn background task to poll for SIP events
+    info!("About to spawn SIP event polling loop");
+    let client_arc = state.client.clone();
+    tauri::async_runtime::spawn(async move {
+        info!("Starting SIP event polling loop");
+        loop {
+            {
+                let mut guard = client_arc.lock().await;
+                if let Some(ref mut client) = *guard {
+                    if let Err(e) = client.poll_events().await {
+                        error!(error = %e, "Error polling SIP events");
+                    }
+                } else {
+                    warn!("Client not available in polling loop");
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    });
 
     info!("SIP client core initialized");
     Ok(())
@@ -411,12 +454,26 @@ async fn get_sip_settings(state: State<'_, TauriAppState>) -> Result<SipSettings
             #[cfg(not(feature = "digest-auth"))]
             let (auth_username, auth_password): (Option<String>, Option<String>) = (None, None);
 
+            // Get transport preference
+            let transport = match acc.transport {
+                client_types::TransportPreference::TlsOnly => "tls",
+                client_types::TransportPreference::Tcp => "tcp",
+                client_types::TransportPreference::Udp => "udp",
+            };
+
+            // Default port based on transport
+            let default_port = match transport {
+                "tls" => 5061,
+                _ => 5060,
+            };
+
             Ok(SipSettings {
                 display_name: acc.display_name.clone(),
                 username,
                 domain,
                 registrar: acc.registrar_uri.clone(),
-                port: 5061, // TLS default port
+                port: default_port,
+                transport: transport.to_string(),
                 auto_register: acc.enabled,
                 auth_username,
                 auth_password,
@@ -428,6 +485,7 @@ async fn get_sip_settings(state: State<'_, TauriAppState>) -> Result<SipSettings
             domain: String::new(),
             registrar: String::new(),
             port: 5061,
+            transport: "tls".to_string(),
             auto_register: false,
             auth_username: None,
             auth_password: None,
@@ -442,15 +500,36 @@ async fn update_sip_settings(settings: SipSettings, state: State<'_, TauriAppSta
 
     let mut manager = state.settings_manager.write().await;
 
+    // Parse transport preference
+    let transport_pref = match settings.transport.as_str() {
+        "udp" => client_types::TransportPreference::Udp,
+        "tcp" => client_types::TransportPreference::Tcp,
+        _ => client_types::TransportPreference::TlsOnly,
+    };
+
+    // Use appropriate URI scheme based on transport
+    let uri_scheme = match transport_pref {
+        client_types::TransportPreference::TlsOnly => "sips",
+        client_types::TransportPreference::Udp | client_types::TransportPreference::Tcp => "sip",
+    };
+
     // Build SIP URI from username and domain
-    let sip_uri = format!("sips:{}@{}", settings.username, settings.domain);
-    // Registrar URI - append port if not default
-    let registrar_uri = if settings.registrar.is_empty() {
-        format!("sips:{}", settings.domain)
-    } else if settings.port != 5061 {
-        format!("{}:{}", settings.registrar, settings.port)
+    let sip_uri = format!("{}:{}@{}", uri_scheme, settings.username, settings.domain);
+
+    // Registrar URI - append port if not default for the transport
+    // Strip any existing sip: or sips: prefix from the registrar
+    let registrar_host = settings.registrar
+        .strip_prefix("sips:")
+        .or_else(|| settings.registrar.strip_prefix("sip:"))
+        .unwrap_or(&settings.registrar);
+
+    let default_port = transport_pref.default_port();
+    let registrar_uri = if registrar_host.is_empty() {
+        format!("{}:{}", uri_scheme, settings.domain)
+    } else if settings.port != default_port {
+        format!("{}:{}:{}", uri_scheme, registrar_host, settings.port)
     } else {
-        settings.registrar.clone()
+        format!("{}:{}", uri_scheme, registrar_host)
     };
 
     // Create account from settings
@@ -461,18 +540,36 @@ async fn update_sip_settings(settings: SipSettings, state: State<'_, TauriAppSta
         &registrar_uri,
     );
     account.enabled = settings.auto_register;
+    account.transport = transport_pref;
 
     // Set digest auth credentials if provided (only when feature enabled)
     #[cfg(feature = "digest-auth")]
     {
         if let (Some(auth_user), Some(auth_pass)) = (&settings.auth_username, &settings.auth_password) {
             if !auth_user.is_empty() && !auth_pass.is_empty() {
+                info!(
+                    auth_user = %auth_user,
+                    password_len = auth_pass.len(),
+                    "Digest auth credentials received from GUI"
+                );
                 account.digest_credentials = Some(client_types::DigestAuthCredentials::new(
                     auth_user.clone(),
                     auth_pass.clone(),
                 ));
                 info!("Digest auth credentials configured for testing");
+            } else {
+                info!(
+                    auth_user_empty = auth_user.is_empty(),
+                    auth_pass_empty = auth_pass.is_empty(),
+                    "Digest auth credentials incomplete"
+                );
             }
+        } else {
+            info!(
+                has_auth_user = settings.auth_username.is_some(),
+                has_auth_pass = settings.auth_password.is_some(),
+                "Digest auth credentials not provided"
+            );
         }
     }
 
@@ -484,6 +581,12 @@ async fn update_sip_settings(settings: SipSettings, state: State<'_, TauriAppSta
         .map_err(|e| format!("Failed to persist settings: {e}"))?;
 
     Ok(())
+}
+
+/// Save SIP settings (alias for update_sip_settings for frontend compatibility).
+#[tauri::command]
+async fn save_sip_settings(settings: SipSettings, state: State<'_, TauriAppState>) -> Result<(), String> {
+    update_sip_settings(settings, state).await
 }
 
 /// Register with SIP server.
@@ -498,6 +601,20 @@ async fn register_sip(state: State<'_, TauriAppState>) -> Result<(), String> {
         .cloned()
         .ok_or_else(|| "No account configured".to_string())?;
     drop(settings_mgr);
+
+    // Log digest credentials status
+    #[cfg(feature = "digest-auth")]
+    {
+        if let Some(ref creds) = account.digest_credentials {
+            info!(
+                username = %creds.username,
+                password_len = creds.password.len(),
+                "Digest credentials found in account for registration"
+            );
+        } else {
+            info!("No digest credentials in account");
+        }
+    }
 
     // Check if a certificate is selected for mTLS authentication
     let selected_thumbprint = state.selected_cert_thumbprint.read().await.clone();
@@ -1056,10 +1173,13 @@ async fn poll_events(app_handle: AppHandle, event_rx: Arc<Mutex<Option<mpsc::Rec
 }
 
 fn main() {
-    // Initialize logging
+    // Initialize logging - use RUST_LOG env var if set, otherwise default to INFO
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_target(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(true)
         .init();
 
     info!("USG SIP Soft Client (Tauri) starting...");
@@ -1123,6 +1243,7 @@ fn main() {
             search_contacts,
             get_sip_settings,
             update_sip_settings,
+            save_sip_settings,
             register_sip,
             unregister_sip,
             get_registration_status,

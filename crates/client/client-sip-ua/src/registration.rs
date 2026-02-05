@@ -47,6 +47,8 @@ struct AccountRegistration {
     from_tag: String,
     /// When the registration expires.
     expires_at: Option<Instant>,
+    /// Actual expiry duration from server (for refresh calculation).
+    server_expires_secs: u32,
     /// Last branch parameter used.
     last_branch: Option<String>,
     /// Nonce count for digest auth retries.
@@ -93,6 +95,19 @@ impl RegistrationAgent {
         }
     }
 
+    /// Updates the local address used for Via/Contact headers.
+    ///
+    /// Call this after the UDP socket is bound to set the actual port.
+    pub fn set_local_addr(&mut self, addr: SocketAddr) {
+        info!(old_addr = %self.local_addr, new_addr = %addr, "Updating local address for SIP headers");
+        self.local_addr = addr;
+    }
+
+    /// Returns the current local address.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
     /// Starts registration for an account.
     ///
     /// This creates and sends a REGISTER request.
@@ -100,7 +115,8 @@ impl RegistrationAgent {
         info!(account_id = %account.id, "Starting registration");
 
         // Parse registrar address upfront
-        let registrar_addr = Self::parse_registrar_addr(&account.registrar_uri)?;
+        let registrar_addr = Self::parse_registrar_addr(&account.registrar_uri).await?;
+        info!(registrar_addr = %registrar_addr, "Parsed registrar address");
 
         // Create or update registration state
         let registration = self
@@ -114,6 +130,7 @@ impl RegistrationAgent {
                 cseq: 0,
                 from_tag: generate_tag(),
                 expires_at: None,
+                server_expires_secs: 0,
                 last_branch: None,
                 #[cfg(feature = "digest-auth")]
                 nonce_count: 0,
@@ -124,6 +141,13 @@ impl RegistrationAgent {
         // Update account config
         registration.account = account.clone();
         registration.cseq += 1;
+
+        // Reset digest auth state for fresh registration attempt
+        #[cfg(feature = "digest-auth")]
+        {
+            registration.nonce_count = 0;
+            registration.last_challenge = None;
+        }
 
         // Update state
         registration.state = RegistrationState::Registering;
@@ -138,6 +162,7 @@ impl RegistrationAgent {
         registration.transaction = Some(transaction);
 
         // Notify state change
+        info!(account_id = %account.id, "Sending StateChanged event");
         self.event_tx
             .send(RegistrationEvent::StateChanged {
                 account_id: account.id.clone(),
@@ -145,8 +170,10 @@ impl RegistrationAgent {
             })
             .await
             .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+        info!(account_id = %account.id, "StateChanged event sent");
 
         // Send request via event
+        info!(account_id = %account.id, "Sending SendRequest event");
         self.event_tx
             .send(RegistrationEvent::SendRequest {
                 request,
@@ -154,6 +181,7 @@ impl RegistrationAgent {
             })
             .await
             .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+        info!(account_id = %account.id, "SendRequest event sent, registration started");
 
         Ok(())
     }
@@ -171,7 +199,7 @@ impl RegistrationAgent {
             .registrar_uri
             .clone();
 
-        let registrar_addr = Self::parse_registrar_addr(&registrar_uri)?;
+        let registrar_addr = Self::parse_registrar_addr(&registrar_uri).await?;
 
         let registration = self
             .registrations
@@ -232,6 +260,7 @@ impl RegistrationAgent {
                 registration.state = RegistrationState::Registered;
                 registration.expires_at =
                     Some(Instant::now() + Duration::from_secs(expires as u64));
+                registration.server_expires_secs = expires;
                 registration.transaction = None;
 
                 info!(
@@ -274,7 +303,7 @@ impl RegistrationAgent {
                                     // Build and send authenticated request
                                     match Self::build_register_with_auth(registration, self.local_addr) {
                                         Ok(auth_request) => {
-                                            if let Ok(registrar_addr) = Self::parse_registrar_addr(&registration.account.registrar_uri) {
+                                            if let Ok(registrar_addr) = Self::parse_registrar_addr(&registration.account.registrar_uri).await {
                                                 let branch = registration.last_branch.clone().unwrap_or_default();
                                                 let tx_key = TransactionKey::client(&branch, "REGISTER");
                                                 let transaction = ClientNonInviteTransaction::new(tx_key, TransportType::Reliable);
@@ -365,12 +394,22 @@ impl RegistrationAgent {
     /// Checks for registrations that need refresh.
     pub async fn check_expiring(&mut self) -> SipUaResult<()> {
         let now = Instant::now();
-        let refresh_threshold = Duration::from_secs(60); // Refresh 60s before expiry
 
         for (account_id, registration) in &mut self.registrations {
             if registration.state != RegistrationState::Registered {
                 continue;
             }
+
+            // Use server's actual expiry for refresh calculation, not our configured value
+            // This prevents issues where server returns different expiry than we requested
+            let expiry_secs = if registration.server_expires_secs > 0 {
+                registration.server_expires_secs
+            } else {
+                registration.account.register_expiry
+            };
+            // Dynamic refresh threshold: refresh at 50% of expiry time, minimum 5 seconds before
+            let refresh_secs = (expiry_secs / 2).max(5);
+            let refresh_threshold = Duration::from_secs(u64::from(refresh_secs));
 
             if let Some(expires_at) = registration.expires_at {
                 let time_remaining = expires_at.saturating_duration_since(now);
@@ -379,6 +418,7 @@ impl RegistrationAgent {
                     info!(
                         account_id = %account_id,
                         expires_in_secs = time_remaining.as_secs(),
+                        refresh_threshold_secs = refresh_secs,
                         "Registration expiring, triggering refresh"
                     );
 
@@ -424,8 +464,20 @@ impl RegistrationAgent {
         let branch = generate_branch();
         registration.last_branch = Some(branch.clone());
 
+        // Determine transport protocol string
+        let transport_str = match account.transport {
+            client_types::TransportPreference::TlsOnly => "TLS",
+            client_types::TransportPreference::Tcp => "TCP",
+            client_types::TransportPreference::Udp => "UDP",
+        };
+        let transport_param = match account.transport {
+            client_types::TransportPreference::TlsOnly => "tls",
+            client_types::TransportPreference::Tcp => "tcp",
+            client_types::TransportPreference::Udp => "udp",
+        };
+
         // Build Via header
-        let via = ViaHeader::new("TLS", &local_addr.ip().to_string())
+        let via = ViaHeader::new(transport_str, &local_addr.ip().to_string())
             .with_port(local_addr.port())
             .with_branch(branch);
 
@@ -440,7 +492,7 @@ impl RegistrationAgent {
         // Build Contact header - use user from AoR if present
         let mut contact_uri = SipUri::new(local_addr.ip().to_string())
             .with_port(local_addr.port())
-            .with_param("transport", Some("tls".to_string()));
+            .with_param("transport", Some(transport_param.to_string()));
         if let Some(user) = &aor_uri.user {
             contact_uri = contact_uri.with_user(user.clone());
         }
@@ -483,7 +535,19 @@ impl RegistrationAgent {
         let branch = generate_branch();
         registration.last_branch = Some(branch.clone());
 
-        let via = ViaHeader::new("TLS", &local_addr.ip().to_string())
+        // Determine transport protocol string
+        let transport_str = match account.transport {
+            client_types::TransportPreference::TlsOnly => "TLS",
+            client_types::TransportPreference::Tcp => "TCP",
+            client_types::TransportPreference::Udp => "UDP",
+        };
+        let transport_param = match account.transport {
+            client_types::TransportPreference::TlsOnly => "tls",
+            client_types::TransportPreference::Tcp => "tcp",
+            client_types::TransportPreference::Udp => "udp",
+        };
+
+        let via = ViaHeader::new(transport_str, &local_addr.ip().to_string())
             .with_port(local_addr.port())
             .with_branch(branch);
 
@@ -496,7 +560,7 @@ impl RegistrationAgent {
         // Contact: * for removing all bindings, or specific contact with expires=0
         let mut contact_uri = SipUri::new(local_addr.ip().to_string())
             .with_port(local_addr.port())
-            .with_param("transport", Some("tls".to_string()));
+            .with_param("transport", Some(transport_param.to_string()));
         if let Some(user) = &aor_uri.user {
             contact_uri = contact_uri.with_user(user.clone());
         }
@@ -573,21 +637,32 @@ impl RegistrationAgent {
     }
 
     /// Parses registrar URI to socket address.
-    fn parse_registrar_addr(registrar_uri: &str) -> SipUaResult<SocketAddr> {
-        // Simple parsing - in production would use DNS SRV lookup
+    async fn parse_registrar_addr(registrar_uri: &str) -> SipUaResult<SocketAddr> {
+        // Parse the SIP URI
         let uri: SipUri = registrar_uri
             .parse()
             .map_err(|e| SipUaError::ConfigError(format!("Invalid registrar URI: {e}")))?;
 
         let host = &uri.host;
-        let port = uri.port.unwrap_or(5061); // TLS default port
+        // Use transport-appropriate default port: UDP/TCP = 5060, TLS = 5061
+        let port = uri.port.unwrap_or(5060);
 
-        // Parse host as IP address (DNS resolution would be needed for hostnames)
-        let ip: std::net::IpAddr = host
-            .parse()
-            .map_err(|_| SipUaError::ConfigError(format!("Cannot resolve hostname: {host}")))?;
+        // Try to parse host as IP address first
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            return Ok(SocketAddr::new(ip, port));
+        }
 
-        Ok(SocketAddr::new(ip, port))
+        // DNS resolution for hostnames
+        let lookup_host = format!("{}:{}", host, port);
+        let addrs: Vec<_> = tokio::net::lookup_host(&lookup_host)
+            .await
+            .map_err(|e| SipUaError::ConfigError(format!("DNS resolution failed for {host}: {e}")))?
+            .collect();
+
+        addrs
+            .into_iter()
+            .next()
+            .ok_or_else(|| SipUaError::ConfigError(format!("No addresses found for {host}")))
     }
 
     /// Extracts expiry from response (Contact header or Expires header).
@@ -697,15 +772,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_registrar_addr() {
-        let addr = RegistrationAgent::parse_registrar_addr("sips:192.168.1.1:5061").unwrap();
+        let addr = RegistrationAgent::parse_registrar_addr("sips:192.168.1.1:5061")
+            .await
+            .unwrap();
         assert_eq!(addr.ip().to_string(), "192.168.1.1");
         assert_eq!(addr.port(), 5061);
     }
 
     #[tokio::test]
     async fn test_parse_registrar_addr_default_port() {
-        let addr = RegistrationAgent::parse_registrar_addr("sips:192.168.1.1").unwrap();
+        let addr = RegistrationAgent::parse_registrar_addr("sips:192.168.1.1")
+            .await
+            .unwrap();
         assert_eq!(addr.ip().to_string(), "192.168.1.1");
-        assert_eq!(addr.port(), 5061); // Default TLS port
+        assert_eq!(addr.port(), 5060); // Default port
     }
 }

@@ -25,6 +25,9 @@
     <div class="app-container">
         <!-- Tab Navigation Sidebar -->
         <nav class="tab-nav">
+            <div class="nav-logo">
+                <img src="assets/DOW-Seal.png" alt="DoW Logo" class="nav-logo-img">
+            </div>
             <button class="tab-btn active" data-tab="dialer">
                 <svg class="nav-icon" viewBox="0 0 24 24" fill="currentColor">
                     <path
@@ -208,6 +211,53 @@
                 <!-- Settings Tab -->
                 <div id="settings" class="tab-content">
                     <div class="settings-section">
+                        <!-- SIP Account Configuration -->
+                        <h3><svg class="section-icon" viewBox="0 0 24 24" fill="currentColor">
+                                <path d="M6.62 10.79c1.44 2.83 3.76 5.14 6.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1-9.39 0-17-7.61-17-17 0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z" />
+                            </svg> SIP Account</h3>
+                        <div class="sip-config-section">
+                            <div class="form-group">
+                                <label>Display Name:</label>
+                                <input type="text" id="sipDisplayName" placeholder="Your Name" maxlength="100">
+                            </div>
+                            <div class="form-group">
+                                <label>Username:</label>
+                                <input type="text" id="sipUsername" placeholder="SIP username" maxlength="100">
+                            </div>
+                            <div class="form-group">
+                                <label>Domain:</label>
+                                <input type="text" id="sipDomain" placeholder="sip.example.com" maxlength="256">
+                            </div>
+                            <div class="form-group">
+                                <label>Registrar:</label>
+                                <input type="text" id="sipRegistrar" placeholder="sip.example.com (or leave empty to use domain)" maxlength="256">
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group half">
+                                    <label>Port:</label>
+                                    <input type="number" id="sipPort" value="5060" min="1" max="65535">
+                                </div>
+                                <div class="form-group half">
+                                    <label>Transport:</label>
+                                    <select id="sipTransport">
+                                        <option value="udp">UDP (Testing)</option>
+                                        <option value="tcp">TCP (Testing)</option>
+                                        <option value="tls" selected>TLS (Secure)</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="form-group checkbox">
+                                <input type="checkbox" id="sipAutoRegister" checked>
+                                <label for="sipAutoRegister">Auto-register on startup</label>
+                            </div>
+                            <button id="saveSipSettingsBtn" class="action-btn primary">
+                                <svg class="btn-icon" viewBox="0 0 24 24" fill="currentColor">
+                                    <path d="M17 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V7l-4-4zm-5 16c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zm3-10H5V5h10v4z" />
+                                </svg>
+                                Save Settings
+                            </button>
+                        </div>
+
                         <h3><svg class="section-icon" viewBox="0 0 24 24" fill="currentColor">
                                 <path
                                     d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z" />
@@ -232,7 +282,7 @@
                         </div>
 
                         <!-- Digest Auth Section (hidden by default, shown when feature enabled) -->
-                        <div id="digestAuthSection" style="display: none;">
+                        <div id="digestAuthSection">
                             <h3><svg class="section-icon" viewBox="0 0 24 24" fill="currentColor">
                                     <path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V12H5V6.3l7-3.11v8.8z" />
                                 </svg> Testing Authentication (BulkVS)</h3>

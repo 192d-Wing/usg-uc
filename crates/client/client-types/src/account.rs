@@ -128,17 +128,41 @@ impl SipAccount {
 /// Transport preference for SIP signaling.
 ///
 /// For CNSA 2.0 compliance, only TLS 1.3 is supported.
+/// UDP and TCP are available for testing with commercial providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TransportPreference {
-    /// TLS 1.3 only (CNSA 2.0 compliant, required).
+    /// TLS 1.3 only (CNSA 2.0 compliant, required for production).
     #[default]
     TlsOnly,
+    /// UDP transport (for testing with commercial providers).
+    /// WARNING: NOT CNSA 2.0 compliant - for testing only.
+    Udp,
+    /// TCP transport (for testing with commercial providers).
+    /// WARNING: NOT CNSA 2.0 compliant - for testing only.
+    Tcp,
 }
 
 impl std::fmt::Display for TransportPreference {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TlsOnly => write!(f, "TLS 1.3 (CNSA 2.0)"),
+            Self::Udp => write!(f, "UDP (Testing)"),
+            Self::Tcp => write!(f, "TCP (Testing)"),
+        }
+    }
+}
+
+impl TransportPreference {
+    /// Returns true if this transport is CNSA 2.0 compliant.
+    pub fn is_secure(&self) -> bool {
+        matches!(self, Self::TlsOnly)
+    }
+
+    /// Returns the default port for this transport.
+    pub fn default_port(&self) -> u16 {
+        match self {
+            Self::TlsOnly => 5061,
+            Self::Udp | Self::Tcp => 5060,
         }
     }
 }

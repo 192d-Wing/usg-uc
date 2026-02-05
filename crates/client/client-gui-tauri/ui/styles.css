@@ -277,8 +277,24 @@ body {
     flex-direction: column;
     width: 80px;
     background: var(--md-sys-color-surface-container-low);
-    padding-top: 56px;
+    padding-top: 0;
     gap: 4px;
+}
+
+/* Navigation Logo */
+.nav-logo {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 12px;
+    margin-bottom: 8px;
+}
+
+.nav-logo-img {
+    width: 56px;
+    height: 56px;
+    object-fit: contain;
+    border-radius: var(--md-sys-shape-corner-medium);
 }
 
 .tab-btn {
@@ -941,6 +957,38 @@ h2 .section-icon {
 .form-group.checkbox label {
     margin-bottom: 0;
     color: var(--md-sys-color-on-surface);
+}
+
+/* Form row for side-by-side fields */
+.form-row {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 20px;
+}
+
+.form-row .form-group {
+    margin-bottom: 0;
+}
+
+.form-row .form-group.half {
+    flex: 1;
+}
+
+/* SIP config section styling */
+.sip-config-section {
+    padding: 16px;
+    background: var(--md-sys-color-surface-container);
+    border-radius: var(--md-sys-shape-corner-medium);
+    margin-bottom: 20px;
+}
+
+.sip-config-section .form-group:last-of-type {
+    margin-bottom: 16px;
+}
+
+.sip-config-section .action-btn {
+    flex: none;
+    width: 100%;
 }
 
 /* ===== Warning Banner (for digest auth) ===== */

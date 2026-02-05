@@ -13,6 +13,7 @@ use crate::sip_transport::{CertVerificationMode, SipTransport, TransportEvent};
 use crate::{AppError, AppResult};
 use client_sip_ua::{RegistrationAgent, RegistrationEvent};
 use client_types::{CallInfo, CallState, DtmfDigit, RegistrationState, SipAccount};
+use proto_sip::header::HeaderName;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
@@ -221,8 +222,10 @@ impl ClientApp {
             info!(account_id = %account.id, "Auto-registering default account");
             let account = account.clone();
             self.register_account(&account).await?;
+            info!(account_id = %account.id, "Auto-registration started successfully");
         }
 
+        info!("Application initialization complete");
         Ok(())
     }
 
@@ -331,6 +334,41 @@ impl ClientApp {
         self.client_cert_chain.is_some()
     }
 
+    /// Gets the UDP socket and event sender for external UDP receive loop management.
+    ///
+    /// In Tauri context, `tokio::spawn` doesn't work correctly, so the UDP receive
+    /// loop needs to be spawned using `tauri::async_runtime::spawn`. This method
+    /// provides the necessary components for that.
+    ///
+    /// **Important**: This also updates the registration agent's local address
+    /// to use the actual bound UDP port for correct Via/Contact headers.
+    ///
+    /// Returns `None` if the transport is not initialized.
+    pub async fn get_udp_socket_for_receive(
+        &mut self,
+    ) -> Option<(std::sync::Arc<tokio::net::UdpSocket>, tokio::sync::mpsc::Sender<TransportEvent>)>
+    {
+        if let Some(ref transport) = self.sip_transport {
+            match transport.get_or_create_udp_socket().await {
+                Ok((socket, _is_new)) => {
+                    // Update the registration agent's local address with the actual bound address
+                    // This ensures Via/Contact headers have the correct port
+                    if let Ok(local_addr) = socket.local_addr() {
+                        info!(local_addr = %local_addr, "Updating registration agent with actual UDP socket address");
+                        self.registration_agent.set_local_addr(local_addr);
+                    }
+                    Some((socket, transport.event_sender()))
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to get UDP socket for receive loop");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    }
+
     /// Registers a SIP account.
     pub async fn register_account(&mut self, account: &SipAccount) -> AppResult<()> {
         info!(account_id = %account.id, "Registering account");
@@ -342,10 +380,10 @@ impl ClientApp {
         self.call_manager.configure_account(account);
 
         // Start registration
-        self.registration_agent
-            .register(account)
-            .await
-            .map_err(|e| AppError::Sip(e.to_string()))?;
+        if let Err(e) = self.registration_agent.register(account).await {
+            error!(account_id = %account.id, error = %e, "Registration failed");
+            return Err(AppError::Sip(e.to_string()));
+        }
 
         Ok(())
     }
@@ -578,9 +616,34 @@ impl ClientApp {
                 request,
                 destination,
             } => {
+                debug!(
+                    method = %request.method,
+                    destination = %destination,
+                    "Processing SendRequest event"
+                );
+
                 // Send via SIP transport
                 if let Some(ref transport) = self.sip_transport {
-                    if let Err(e) = transport.send_request(&request, destination).await {
+                    // Detect transport type from Via header (e.g., "SIP/2.0/UDP" or "SIP/2.0/TLS")
+                    let via_header = request.headers.get_value(&HeaderName::Via);
+                    let use_udp = via_header
+                        .as_ref()
+                        .map(|via| via.contains("/UDP"))
+                        .unwrap_or(false);
+
+                    debug!(
+                        via = ?via_header,
+                        use_udp = use_udp,
+                        "Detected transport type"
+                    );
+
+                    let result = if use_udp {
+                        transport.send_request_udp(&request, destination).await
+                    } else {
+                        transport.send_request(&request, destination).await
+                    };
+
+                    if let Err(e) = result {
                         error!(error = %e, "Failed to send SIP request");
                         let _ = self
                             .app_event_tx
@@ -810,6 +873,9 @@ impl ClientApp {
         // Collect registration events first, then process them
         // (avoids borrow checker issues with async methods)
         let reg_events: Vec<_> = std::iter::from_fn(|| self.reg_event_rx.try_recv().ok()).collect();
+        if !reg_events.is_empty() {
+            debug!(count = reg_events.len(), "Processing registration events");
+        }
         for event in reg_events {
             self.handle_registration_event(event).await?;
         }
@@ -830,6 +896,12 @@ impl ClientApp {
             self.handle_call_agent_event(event).await?;
         }
 
+        // Check for expiring registrations and trigger refresh
+        self.registration_agent
+            .check_expiring()
+            .await
+            .map_err(|e| AppError::Sip(e.to_string()))?;
+
         Ok(())
     }
 
@@ -844,7 +916,20 @@ impl ClientApp {
             } => {
                 // Send call signaling (INVITE, BYE, CANCEL, ACK) via transport
                 if let Some(ref transport) = self.sip_transport {
-                    if let Err(e) = transport.send_request(&request, destination).await {
+                    // Detect transport type from Via header
+                    let use_udp = request
+                        .headers
+                        .get_value(&HeaderName::Via)
+                        .map(|via| via.contains("/UDP"))
+                        .unwrap_or(false);
+
+                    let result = if use_udp {
+                        transport.send_request_udp(&request, destination).await
+                    } else {
+                        transport.send_request(&request, destination).await
+                    };
+
+                    if let Err(e) = result {
                         error!(error = %e, "Failed to send call request");
                         let _ = self
                             .app_event_tx

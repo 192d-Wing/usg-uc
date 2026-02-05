@@ -35,7 +35,7 @@ use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use tracing::{debug, error, info, warn};
@@ -164,6 +164,175 @@ impl rustls::client::ResolvesClientCert for ClientCertResolver {
 
 /// Maximum SIP message size (64KB should be plenty for SIP).
 const MAX_SIP_MESSAGE_SIZE: usize = 65536;
+
+/// Starts a UDP receive loop in a dedicated thread using blocking I/O.
+///
+/// This is a workaround for Tauri's async runtime issues with tokio::spawn.
+/// The thread will run indefinitely, receiving UDP packets and sending them
+/// through the provided channel.
+///
+/// # Arguments
+/// * `local_addr` - The local address to bind to (e.g., "0.0.0.0:12345")
+/// * `event_tx` - Async channel to send transport events to
+///
+/// # Returns
+/// A JoinHandle for the spawned thread (can be ignored if you don't need to join).
+pub fn start_udp_receive_thread(
+    local_addr: std::net::SocketAddr,
+    event_tx: mpsc::Sender<TransportEvent>,
+) -> std::thread::JoinHandle<()> {
+    info!(local_addr = %local_addr, "Starting UDP receive thread (blocking I/O)");
+
+    std::thread::spawn(move || {
+        // Create a blocking std UDP socket
+        let socket = match std::net::UdpSocket::bind(local_addr) {
+            Ok(s) => {
+                info!(local_addr = %local_addr, "UDP receive thread: socket bound");
+                s
+            }
+            Err(e) => {
+                error!(error = %e, "UDP receive thread: failed to bind socket");
+                return;
+            }
+        };
+
+        let mut buf = [0u8; MAX_SIP_MESSAGE_SIZE];
+        info!("UDP receive thread: entering receive loop");
+
+        loop {
+            match socket.recv_from(&mut buf) {
+                Ok((n, source)) => {
+                    info!(source = %source, size = n, "UDP receive thread: received packet");
+                    let data = buf[..n].to_vec();
+
+                    match SipMessage::parse(&data) {
+                        Ok(message) => {
+                            info!(source = %source, "UDP receive thread: parsed SIP message");
+                            let event = match message {
+                                SipMessage::Request(request) => {
+                                    TransportEvent::RequestReceived { request, source }
+                                }
+                                SipMessage::Response(response) => {
+                                    info!(status = %response.status, "UDP receive thread: SIP response");
+                                    TransportEvent::ResponseReceived { response, source }
+                                }
+                            };
+
+                            // Send event to async channel (blocking send from sync context)
+                            if event_tx.blocking_send(event).is_err() {
+                                error!("UDP receive thread: event channel closed, exiting");
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, source = %source, "UDP receive thread: parse error");
+                            if let Ok(raw) = std::str::from_utf8(&data) {
+                                debug!(raw_message = %raw, "UDP receive thread: raw message");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "UDP receive thread: recv error");
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+    })
+}
+
+/// Runs a UDP receive loop that dispatches received SIP messages to the event channel.
+///
+/// This function spawns a dedicated thread to receive UDP messages using blocking I/O,
+/// which works around issues with Tauri's async runtime and tokio's UDP socket.
+///
+/// NOTE: This function takes ownership of the Arc<UdpSocket> and converts it to a
+/// std::net::UdpSocket for blocking receive. The socket should not be used for
+/// send after calling this function - use a separate socket or call this before
+/// the socket is stored for sending.
+///
+/// # Arguments
+/// * `socket` - The UDP socket to receive from (will be converted to blocking)
+/// * `event_tx` - Channel to send transport events to
+pub async fn run_udp_receive_loop(
+    socket: Arc<UdpSocket>,
+    event_tx: mpsc::Sender<TransportEvent>,
+) {
+    // Log socket info for debugging
+    let local_addr = socket.local_addr().ok();
+    if let Some(ref addr) = local_addr {
+        info!(
+            local_addr = %addr,
+            socket_ptr = ?Arc::as_ptr(&socket),
+            "Setting up UDP receive with blocking I/O in dedicated thread"
+        );
+    }
+
+    // Clone the socket's underlying std socket for blocking receive
+    // We use try_clone on the std socket obtained via try_recv_from
+    // Actually, we need to work with the Arc<UdpSocket> directly
+    // Let's spawn a blocking task instead
+
+    // Use tokio's spawn_blocking for actual blocking receive
+    let socket_clone = socket.clone();
+    tokio::task::spawn_blocking(move || {
+        info!("UDP receive thread started (blocking)");
+        let mut buf = [0u8; MAX_SIP_MESSAGE_SIZE];
+
+        loop {
+            // Use the tokio socket's underlying std socket for blocking receive
+            // This is a workaround - we're doing blocking I/O on the tokio socket
+            // from a blocking thread context
+            match socket_clone.try_recv_from(&mut buf) {
+                Ok((n, source)) => {
+                    info!(source = %source, size = n, "Received UDP packet (blocking thread)");
+                    let data = buf[..n].to_vec();
+
+                    match SipMessage::parse(&data) {
+                        Ok(message) => {
+                            info!(source = %source, "Parsed SIP message via UDP");
+                            let event = match message {
+                                SipMessage::Request(request) => {
+                                    debug!(method = %request.method, "Received SIP request via UDP");
+                                    TransportEvent::RequestReceived { request, source }
+                                }
+                                SipMessage::Response(response) => {
+                                    info!(status = %response.status, "Received SIP response via UDP");
+                                    TransportEvent::ResponseReceived { response, source }
+                                }
+                            };
+                            // Use blocking send from sync context
+                            if event_tx.blocking_send(event).is_err() {
+                                error!("UDP receive thread: event channel closed");
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, source = %source, "Failed to parse UDP SIP message");
+                            if let Ok(raw) = std::str::from_utf8(&data) {
+                                debug!(raw_message = %raw, "Raw UDP message");
+                            }
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // No data available, sleep a bit and try again
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    // Periodic log
+                    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if count % 500 == 0 {
+                        info!(poll_count = count, "UDP receive (blocking) still polling");
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "UDP receive error (blocking thread)");
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+    });
+}
 
 /// Events from the transport layer.
 #[derive(Debug, Clone)]
@@ -333,11 +502,15 @@ impl TransportConfig {
 /// SIP Transport manager.
 ///
 /// Manages TLS connections to SIP peers and handles message routing.
+/// Also supports UDP transport for testing with non-TLS providers.
 pub struct SipTransport {
     /// TLS client configuration (can be rebuilt when certs change).
     tls_config: Arc<RwLock<Arc<ClientConfig>>>,
-    /// Active connections by peer address.
+    /// Active TLS connections by peer address.
     connections: Arc<Mutex<HashMap<SocketAddr, TlsConnection>>>,
+    /// UDP socket for connectionless transport.
+    /// Uses RwLock so receive task can access socket without blocking sends.
+    udp_socket: Arc<RwLock<Option<Arc<UdpSocket>>>>,
     /// Event sender.
     event_tx: mpsc::Sender<TransportEvent>,
     /// Transport configuration.
@@ -363,6 +536,7 @@ impl SipTransport {
         Ok(Self {
             tls_config: Arc::new(RwLock::new(Arc::new(tls_config))),
             connections: Arc::new(Mutex::new(HashMap::new())),
+            udp_socket: Arc::new(RwLock::new(None)),
             event_tx,
             config: Arc::new(RwLock::new(config)),
         })
@@ -598,6 +772,99 @@ impl SipTransport {
 
         Ok(())
     }
+
+    /// Gets or creates the UDP socket, returning it along with a flag indicating if it's new.
+    ///
+    /// If the socket is new, the caller should start a receive loop.
+    /// In Tauri context, use `tauri::async_runtime::spawn` for the receive loop.
+    pub async fn get_or_create_udp_socket(&self) -> AppResult<(Arc<UdpSocket>, bool)> {
+        let socket_guard = self.udp_socket.read().await;
+        if let Some(ref sock) = *socket_guard {
+            return Ok((sock.clone(), false));
+        }
+        drop(socket_guard);
+
+        // Need to create socket - get write lock
+        let mut socket_guard = self.udp_socket.write().await;
+        // Double-check in case another task created it
+        if let Some(ref sock) = *socket_guard {
+            return Ok((sock.clone(), false));
+        }
+
+        // Bind to any available port
+        let socket = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => {
+                info!("UDP socket bound to 0.0.0.0");
+                s
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to bind to 0.0.0.0, trying localhost");
+                UdpSocket::bind("127.0.0.1:0")
+                    .await
+                    .map_err(|e2| AppError::Sip(format!("Failed to bind UDP socket: {e} / {e2}")))?
+            }
+        };
+        let local_addr = socket
+            .local_addr()
+            .map_err(|e| AppError::Sip(format!("Failed to get UDP local address: {e}")))?;
+        info!(local_addr = %local_addr, "UDP socket bound");
+        let socket = Arc::new(socket);
+        *socket_guard = Some(socket.clone());
+        Ok((socket, true))
+    }
+
+    /// Returns the event sender for transport events.
+    ///
+    /// Use this to send events from an external UDP receive loop.
+    pub fn event_sender(&self) -> mpsc::Sender<TransportEvent> {
+        self.event_tx.clone()
+    }
+
+    /// Sends a SIP request via UDP (connectionless).
+    ///
+    /// For testing with non-TLS providers like BulkVS.
+    /// NOTE: The caller is responsible for starting the UDP receive loop.
+    /// In Tauri context, use `tauri::async_runtime::spawn` with `run_udp_receive_loop`.
+    pub async fn send_request_udp(
+        &self,
+        request: &SipRequest,
+        destination: SocketAddr,
+    ) -> AppResult<()> {
+        info!(
+            method = %request.method,
+            destination = %destination,
+            "Sending SIP request via UDP"
+        );
+
+        // Get or create UDP socket (caller is responsible for receive loop)
+        let (socket, is_new) = self.get_or_create_udp_socket().await?;
+
+        // Log socket info for debugging
+        if let Ok(local_addr) = socket.local_addr() {
+            info!(
+                local_addr = %local_addr,
+                is_new_socket = is_new,
+                socket_ptr = ?Arc::as_ptr(&socket),
+                "Using UDP socket for send"
+            );
+        }
+
+        // Serialize and send
+        let message_bytes = request.to_string();
+        debug!(
+            destination = %destination,
+            size = message_bytes.len(),
+            "Sending SIP message via UDP"
+        );
+
+        socket
+            .send_to(message_bytes.as_bytes(), destination)
+            .await
+            .map_err(|e| AppError::Sip(format!("Failed to send UDP to {destination}: {e}")))?;
+
+        Ok(())
+    }
+
 
     /// Establishes a TLS connection to a peer.
     async fn connect(&self, peer: SocketAddr) -> AppResult<()> {
