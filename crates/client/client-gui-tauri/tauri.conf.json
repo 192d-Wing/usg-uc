@@ -1,0 +1,32 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "USG SIP Soft Client",
+  "version": "0.1.0",
+  "identifier": "mil.example.usg-sip-client",
+  "build": {
+    "frontendDist": "./ui"
+  },
+  "app": {
+    "security": {
+      "csp": null
+    },
+    "windows": [
+      {
+        "title": "📞 USG SIP Soft Client - CNSA 2.0 🔒",
+        "width": 500,
+        "height": 720,
+        "minWidth": 400,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "decorations": true,
+        "alwaysOnTop": false,
+        "skipTaskbar": false
+      }
+    ]
+  },
+  "bundle": {
+    "active": false
+  }
+}

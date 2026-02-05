@@ -75,6 +75,7 @@ members = [
     "crates/client/client-sip-ua",
     "crates/client/client-core",
     "crates/client/client-gui-windows",
+    "crates/client/client-gui-tauri",
     "crates/client/client-integration-tests",
 ]
 resolver = "2"
@@ -204,12 +205,15 @@ winrt-notification = "0.5"
 windows = { version = "0.62", features = [
     "Win32_Security_Cryptography",
     "Win32_Foundation",
+    "Win32_System_Time",
 ] }
 uuid = { version = "1.20", features = ["v4"] }
 tempfile = "3.24"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# Use deny instead of forbid to allow platform-specific unsafe code with explicit #[allow(unsafe_code)]
+# This maintains safety while enabling Windows IPv6 QoS and other platform-specific features
+unsafe_code = "deny"
 missing_docs = "warn"
 
 [workspace.lints.clippy]

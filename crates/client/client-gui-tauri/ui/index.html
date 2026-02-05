@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>📞 USG SIP Soft Client</title>
+    <link rel="stylesheet" href="styles.css">
+    <script type="module">
+        // Tauri 2.0 API is injected automatically, make it available globally
+        window.__TAURI_INVOKE__ = window.__TAURI_INTERNALS__.invoke;
+    </script>
+</head>
+<body>
+    <div class="app-container">
+        <!-- Tab Navigation Sidebar -->
+        <nav class="tab-nav">
+            <button class="tab-btn active" data-tab="dialer">📞<br>Dial</button>
+            <button class="tab-btn" data-tab="contacts">👥<br>Contacts</button>
+            <button class="tab-btn" data-tab="call">📱<br>Call</button>
+            <button class="tab-btn" data-tab="settings">⚙️<br>Settings</button>
+        </nav>
+
+        <!-- Main Content Wrapper -->
+        <div class="main-wrapper">
+            <!-- Header -->
+            <header class="app-header">
+                <h1>📞 USG SIP Soft Client</h1>
+                <div class="status-indicator" id="status">
+                    <span class="status-dot"></span>
+                    <span class="status-text">Offline</span>
+                </div>
+            </header>
+
+            <!-- Main Content -->
+            <main class="content-area">
+            <!-- Dialer Tab -->
+            <div id="dialer" class="tab-content active">
+                <div class="dialer-section">
+                    <input type="text" id="dialInput" class="dial-input" placeholder="Enter number or SIP URI">
+
+                    <div class="dialpad">
+                        <button class="dialpad-btn" data-digit="1">1</button>
+                        <button class="dialpad-btn" data-digit="2">2 <span>ABC</span></button>
+                        <button class="dialpad-btn" data-digit="3">3 <span>DEF</span></button>
+
+                        <button class="dialpad-btn" data-digit="4">4 <span>GHI</span></button>
+                        <button class="dialpad-btn" data-digit="5">5 <span>JKL</span></button>
+                        <button class="dialpad-btn" data-digit="6">6 <span>MNO</span></button>
+
+                        <button class="dialpad-btn" data-digit="7">7 <span>PQRS</span></button>
+                        <button class="dialpad-btn" data-digit="8">8 <span>TUV</span></button>
+                        <button class="dialpad-btn" data-digit="9">9 <span>WXYZ</span></button>
+
+                        <button class="dialpad-btn" data-digit="*">*</button>
+                        <button class="dialpad-btn" data-digit="0">0 <span>+</span></button>
+                        <button class="dialpad-btn" data-digit="#">#</button>
+                    </div>
+
+                    <div class="dial-actions">
+                        <button id="backspaceBtn" class="action-btn secondary">⌫</button>
+                        <button id="callBtn" class="action-btn primary">📞 Call</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Contacts Tab -->
+            <div id="contacts" class="tab-content">
+                <div class="contacts-section">
+                    <div class="search-bar">
+                        <input type="text" id="searchInput" placeholder="🔍 Search contacts...">
+                    </div>
+
+                    <div class="contacts-list" id="contactsList">
+                        <!-- Contacts will be loaded dynamically -->
+                    </div>
+
+                    <button id="addContactBtn" class="action-btn primary">➕ Add Contact</button>
+                </div>
+            </div>
+
+            <!-- Active Call Tab -->
+            <div id="call" class="tab-content">
+                <div class="call-section">
+                    <div class="call-info">
+                        <div class="call-status">No active call</div>
+                        <div class="call-target" id="callTarget"></div>
+                        <div class="call-duration" id="callDuration">00:00</div>
+                    </div>
+
+                    <div class="call-controls">
+                        <button id="muteBtn" class="control-btn" disabled>
+                            <span class="icon">🔇</span>
+                            <span class="label">Mute</span>
+                        </button>
+                        <button id="holdBtn" class="control-btn" disabled>
+                            <span class="icon">⏸️</span>
+                            <span class="label">Hold</span>
+                        </button>
+                        <button id="keypadBtn" class="control-btn" disabled>
+                            <span class="icon">⌨️</span>
+                            <span class="label">Keypad</span>
+                        </button>
+                        <button id="transferBtn" class="control-btn" disabled>
+                            <span class="icon">↪️</span>
+                            <span class="label">Transfer</span>
+                        </button>
+                    </div>
+
+                    <button id="hangupBtn" class="action-btn danger" disabled>📵 Hang Up</button>
+                </div>
+            </div>
+
+            <!-- Settings Tab -->
+            <div id="settings" class="tab-content">
+                <div class="settings-section">
+                    <h3>📱 SIP Account Settings</h3>
+                    <div class="form-group">
+                        <label>Username:</label>
+                        <input type="text" id="username" placeholder="user@example.mil">
+                    </div>
+                    <div class="form-group">
+                        <label>Domain:</label>
+                        <input type="text" id="domain" placeholder="example.mil">
+                    </div>
+                    <div class="form-group">
+                        <label>Proxy Server:</label>
+                        <input type="text" id="proxy" placeholder="sip.example.mil">
+                    </div>
+                    <div class="form-group">
+                        <label>Port:</label>
+                        <input type="number" id="port" placeholder="5061">
+                    </div>
+
+                    <h3>🔐 Client Certificates (CAC/PIV/SIPR)</h3>
+                    <div class="cert-info">
+                        <p>Insert your smart card to authenticate</p>
+                        <div class="cert-status" id="certStatus">No certificate loaded</div>
+                    </div>
+
+                    <h3>🔊 Audio Devices</h3>
+                    <div class="form-group">
+                        <label>🎤 Microphone:</label>
+                        <select id="micDevice">
+                            <option>Default Microphone</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>🔊 Speaker:</label>
+                        <select id="speakerDevice">
+                            <option>Default Speaker</option>
+                        </select>
+                    </div>
+
+                    <div class="settings-actions">
+                        <button id="registerBtn" class="action-btn success">✅ Register</button>
+                        <button id="unregisterBtn" class="action-btn warning">⛔ Unregister</button>
+                        <button id="saveSettingsBtn" class="action-btn primary">💾 Save Settings</button>
+                    </div>
+                </div>
+            </div>
+        </main>
+        </div>
+    </div>
+
+    <!-- Contact Dialog (Modal) -->
+    <div id="contactModal" class="modal">
+        <div class="modal-content">
+            <h2 id="modalTitle">Add Contact</h2>
+            <div class="form-group">
+                <label>👤 Name:</label>
+                <input type="text" id="contactName">
+            </div>
+            <div class="form-group">
+                <label>📞 SIP URI:</label>
+                <input type="text" id="contactUri">
+            </div>
+            <div class="form-group checkbox">
+                <input type="checkbox" id="contactFavorite">
+                <label for="contactFavorite">⭐ Mark as Favorite</label>
+            </div>
+            <div class="modal-actions">
+                <button id="saveContactBtn" class="action-btn primary">💾 Save</button>
+                <button id="cancelContactBtn" class="action-btn secondary">❌ Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+[package]
+name = "client-gui-tauri"
+version = "0.1.0"
+edition = "2021"
+description = "USG SIP Soft Client - Modern Tauri-based GUI"
+
+[dependencies]
+# Tauri for desktop app framework
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Client core and types
+client-types = { path = "../client-types" }
+client-core = { path = "../client-core" }
+client-audio = { path = "../client-audio" }
+
+# Async runtime
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[build-dependencies]
+tauri-build = { version = "2" }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "sip-softclient"
+path = "src/main.rs"
