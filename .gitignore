@@ -29,3 +29,4 @@ coverage/
 /docs/build/
 
 .claude/
+pcaps/
