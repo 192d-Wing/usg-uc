@@ -38,6 +38,10 @@ pub struct Settings {
     /// UI preferences.
     #[serde(default)]
     pub ui: UiSettings,
+
+    /// Certificate filter settings.
+    #[serde(default)]
+    pub certificates: CertificateFilterSettings,
 }
 
 fn default_version() -> String {
@@ -201,6 +205,22 @@ pub struct UiSettings {
     /// Sort contacts alphabetically.
     #[serde(default = "default_true")]
     pub sort_contacts_alpha: bool,
+
+    /// Classification level (unclassified, cui, confidential, secret, top-secret, top-secret-sci).
+    #[serde(default = "default_classification")]
+    pub classification_level: String,
+
+    /// SCI caveats (e.g., SI, TK, G, HCS).
+    #[serde(default)]
+    pub classification_caveats: Vec<String>,
+
+    /// Dissemination controls (e.g., NOFORN, RELTO, ORCON).
+    #[serde(default)]
+    pub classification_dissem: Vec<String>,
+}
+
+fn default_classification() -> String {
+    "unclassified".to_string()
 }
 
 fn default_window_width() -> u32 {
@@ -222,6 +242,116 @@ impl Default for UiSettings {
             show_call_duration: true,
             confirm_hangup: false,
             sort_contacts_alpha: true,
+            classification_level: default_classification(),
+            classification_caveats: Vec::new(),
+            classification_dissem: Vec::new(),
+        }
+    }
+}
+
+/// Certificate filter settings for controlling which certificates are displayed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertificateFilterSettings {
+    /// Only show certificates from these trusted CA issuers.
+    /// If empty, all certificates are shown.
+    /// Matches against issuer CN (Common Name).
+    #[serde(default = "default_trusted_issuers")]
+    pub trusted_issuers: Vec<String>,
+
+    /// Only show certificates with Smart Card Logon EKU (1.3.6.1.4.1.311.20.2.2).
+    #[serde(default = "default_true")]
+    pub require_smart_card_logon_eku: bool,
+
+    /// Only show certificates with Client Authentication EKU (1.3.6.1.5.5.7.3.2).
+    #[serde(default = "default_true")]
+    pub require_client_auth_eku: bool,
+
+    /// Hide expired certificates.
+    #[serde(default = "default_true")]
+    pub hide_expired: bool,
+
+    /// Only show certificates from YubiKey/smart cards (not software certs).
+    #[serde(default)]
+    pub smart_card_only: bool,
+
+    /// Exclude certificates where the subject CN is numeric-only.
+    /// This filters out Card Authentication certificates (e.g., "CN=33952358")
+    /// which are not user identity certificates.
+    #[serde(default = "default_true")]
+    pub exclude_numeric_cn: bool,
+}
+
+/// Default list of trusted DOD CA issuers.
+fn default_trusted_issuers() -> Vec<String> {
+    vec![
+        // DOD Root CAs
+        "DOD ROOT CA 3".to_string(),
+        "DOD ROOT CA 4".to_string(),
+        "DOD ROOT CA 5".to_string(),
+        "DOD ROOT CA 6".to_string(),
+        // DOD Intermediate CAs (ID/CAC)
+        "DOD ID CA-59".to_string(),
+        "DOD ID CA-62".to_string(),
+        "DOD ID CA-63".to_string(),
+        "DOD ID CA-64".to_string(),
+        "DOD ID CA-65".to_string(),
+        "DOD ID CA-66".to_string(),
+        "DOD ID CA-67".to_string(),
+        "DOD ID CA-68".to_string(),
+        "DOD ID CA-69".to_string(),
+        "DOD ID CA-70".to_string(),
+        "DOD ID CA-71".to_string(),
+        "DOD ID CA-72".to_string(),
+        "DOD ID CA-73".to_string(),
+        // DOD SW (Software) CAs
+        "DOD ID SW CA-59".to_string(),
+        "DOD ID SW CA-60".to_string(),
+        "DOD ID SW CA-61".to_string(),
+        "DOD ID SW CA-62".to_string(),
+        "DOD ID SW CA-63".to_string(),
+        "DOD ID SW CA-64".to_string(),
+        "DOD ID SW CA-65".to_string(),
+        "DOD ID SW CA-66".to_string(),
+        "DOD ID SW CA-67".to_string(),
+        "DOD ID SW CA-68".to_string(),
+        "DOD ID SW CA-69".to_string(),
+        "DOD ID SW CA-70".to_string(),
+        "DOD ID SW CA-71".to_string(),
+        // DOD Email CAs
+        "DOD EMAIL CA-59".to_string(),
+        "DOD EMAIL CA-62".to_string(),
+        "DOD EMAIL CA-63".to_string(),
+        "DOD EMAIL CA-64".to_string(),
+        "DOD EMAIL CA-65".to_string(),
+        "DOD EMAIL CA-66".to_string(),
+        "DOD EMAIL CA-67".to_string(),
+        "DOD EMAIL CA-68".to_string(),
+        "DOD EMAIL CA-69".to_string(),
+        "DOD EMAIL CA-70".to_string(),
+        "DOD EMAIL CA-71".to_string(),
+        // DOD DERILITY CAs (from your YubiKey)
+        "DOD DERILITY CA-1".to_string(),
+        "DOD DERILITY CA-2".to_string(),
+        "DOD DERILITY CA-3".to_string(),
+        "DOD DERILITY CA-4".to_string(),
+        // ECA (External Certificate Authority)
+        "ECA Root CA 4".to_string(),
+        "ECA Subordinate CA 4A".to_string(),
+        // Federal PKI
+        "Federal Bridge CA G4".to_string(),
+        "Federal Common Policy CA G2".to_string(),
+    ]
+}
+
+impl Default for CertificateFilterSettings {
+    fn default() -> Self {
+        Self {
+            trusted_issuers: default_trusted_issuers(),
+            require_smart_card_logon_eku: true,
+            require_client_auth_eku: true,
+            hide_expired: true,
+            smart_card_only: false,
+            exclude_numeric_cn: true,
         }
     }
 }
@@ -235,6 +365,7 @@ impl Default for Settings {
             accounts: HashMap::new(),
             network: NetworkSettings::default(),
             ui: UiSettings::default(),
+            certificates: CertificateFilterSettings::default(),
         }
     }
 }

@@ -33,7 +33,7 @@ pub use audio_session::{
 pub use call_manager::{CallManager, CallManagerEvent, IncomingCallInfo};
 pub use cert_store::{CertStoreError, CertStoreResult, CertificateStore, SignatureAlgorithm};
 pub use contact_manager::{ContactManager, ContactStore, create_contact};
-pub use settings::{GeneralSettings, NetworkSettings, Settings, SettingsManager, UiSettings};
+pub use settings::{CertificateFilterSettings, GeneralSettings, NetworkSettings, Settings, SettingsManager, UiSettings};
 pub use sip_transport::{
     CertVerificationMode, SipTransport, TransportConfig, TransportEvent,
     build_response_from_request, generate_tag, load_certs_from_pem_file,
