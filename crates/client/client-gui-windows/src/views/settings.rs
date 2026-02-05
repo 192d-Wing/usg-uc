@@ -39,6 +39,7 @@ pub struct SettingsView {
     /// Available certificates.
     available_certificates: RefCell<Vec<CertificateInfo>>,
     /// Selected certificate index.
+    #[allow(dead_code)]
     selected_certificate: RefCell<Option<String>>,
     /// Smart card readers.
     smart_card_readers: RefCell<Vec<String>>,
@@ -83,45 +84,45 @@ pub struct SettingsView {
 impl SettingsView {
     /// Builds the settings view within the given parent tab.
     pub fn build(parent: &nwg::Tab) -> Result<Self, nwg::NwgError> {
-        // Account section label
+        // Account section label - larger, modern header
         let mut _account_label = Default::default();
         nwg::Label::builder()
             .parent(parent)
-            .text("SIP Account")
-            .position((10, 10))
-            .size((380, 20))
+            .text("📱 SIP Account Settings")
+            .position((20, 20))
+            .size((440, 30))
             .build(&mut _account_label)?;
 
-        // Display name
+        // Display name - better spacing
         let mut _name_label = Default::default();
         nwg::Label::builder()
             .parent(parent)
             .text("Display Name:")
-            .position((10, 40))
-            .size((100, 20))
+            .position((30, 60))
+            .size((120, 25))
             .build(&mut _name_label)?;
 
         let mut display_name_input = Default::default();
         nwg::TextInput::builder()
             .parent(parent)
-            .position((120, 38))
-            .size((270, 22))
+            .position((160, 58))
+            .size((300, 30))
             .build(&mut display_name_input)?;
 
-        // SIP URI
+        // SIP URI - larger inputs
         let mut _uri_label = Default::default();
         nwg::Label::builder()
             .parent(parent)
             .text("SIP URI:")
-            .position((10, 70))
-            .size((100, 20))
+            .position((30, 100))
+            .size((120, 25))
             .build(&mut _uri_label)?;
 
         let mut sip_uri_input = Default::default();
         nwg::TextInput::builder()
             .parent(parent)
-            .position((120, 68))
-            .size((270, 22))
+            .position((160, 98))
+            .size((300, 30))
             .placeholder_text(Some("sips:user@domain.com"))
             .build(&mut sip_uri_input)?;
 
@@ -130,84 +131,84 @@ impl SettingsView {
         nwg::Label::builder()
             .parent(parent)
             .text("Registrar:")
-            .position((10, 100))
-            .size((100, 20))
+            .position((30, 140))
+            .size((120, 25))
             .build(&mut _reg_label)?;
 
         let mut registrar_input = Default::default();
         nwg::TextInput::builder()
             .parent(parent)
-            .position((120, 98))
-            .size((270, 22))
+            .position((160, 138))
+            .size((300, 30))
             .placeholder_text(Some("sips:registrar.domain.com"))
             .build(&mut registrar_input)?;
 
-        // Register/Unregister buttons
+        // Register/Unregister buttons - larger, modern
         let mut register_button = Default::default();
         nwg::Button::builder()
             .parent(parent)
-            .text("Register")
-            .position((120, 130))
-            .size((100, 30))
+            .text("✅ Register")
+            .position((160, 180))
+            .size((140, 40))
             .build(&mut register_button)?;
 
         let mut unregister_button = Default::default();
         nwg::Button::builder()
             .parent(parent)
-            .text("Unregister")
-            .position((230, 130))
-            .size((100, 30))
+            .text("⛔ Unregister")
+            .position((310, 180))
+            .size((150, 40))
             .build(&mut unregister_button)?;
 
-        // Certificate section
+        // Certificate section - modern header
         let mut _cert_label = Default::default();
         nwg::Label::builder()
             .parent(parent)
-            .text("Client Certificates (CAC/PIV)")
-            .position((10, 180))
-            .size((380, 20))
+            .text("🔐 Client Certificates (CAC/PIV/SIPR)")
+            .position((20, 240))
+            .size((440, 30))
             .build(&mut _cert_label)?;
 
         let mut cert_list = Default::default();
         nwg::ListBox::builder()
             .parent(parent)
-            .position((10, 205))
-            .size((380, 150))
+            .position((20, 280))
+            .size((440, 200))
             .collection(Vec::new())
             .build(&mut cert_list)?;
 
-        // Certificate buttons
+        // Certificate buttons - larger and modern
         let mut refresh_certs_button = Default::default();
         nwg::Button::builder()
             .parent(parent)
-            .text("Refresh")
-            .position((10, 365))
-            .size((90, 30))
+            .text("🔄 Refresh")
+            .position((20, 490))
+            .size((110, 40))
             .build(&mut refresh_certs_button)?;
 
         let mut use_cert_button = Default::default();
         nwg::Button::builder()
             .parent(parent)
-            .text("Use Selected")
-            .position((110, 365))
-            .size((100, 30))
+            .text("🔑 Use Selected")
+            .position((140, 490))
+            .size((150, 40))
             .build(&mut use_cert_button)?;
 
-        // Save/Discard buttons at bottom
+        // Save/Discard buttons at bottom - prominent
         let mut save_button = Default::default();
         nwg::Button::builder()
             .parent(parent)
-            .text("Save")
-            .position((200, 420))
-            .size((90, 30))
+            .text("💾 Save Settings")
+            .position((200, 560))
+            .size((130, 45))
             .build(&mut save_button)?;
 
         let mut discard_button = Default::default();
         nwg::Button::builder()
             .parent(parent)
-            .text("Discard")
-            .position((300, 420))
-            .size((90, 30))
+            .text("❌ Discard")
+            .position((340, 560))
+            .size((120, 45))
             .build(&mut discard_button)?;
 
         Ok(Self {
@@ -253,7 +254,7 @@ impl SettingsView {
         let app_register = app_weak.clone();
         nwg::bind_event_handler(
             &self.register_button.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
                     if let Some(app) = app_register.upgrade() {
@@ -267,7 +268,7 @@ impl SettingsView {
         let app_unregister = app_weak.clone();
         nwg::bind_event_handler(
             &self.unregister_button.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
                     if let Some(app) = app_unregister.upgrade() {
@@ -281,7 +282,7 @@ impl SettingsView {
         let app_refresh = app_weak.clone();
         nwg::bind_event_handler(
             &self.refresh_certs_button.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
                     if let Some(app) = app_refresh.upgrade() {
@@ -295,7 +296,7 @@ impl SettingsView {
         let app_use_cert = app_weak.clone();
         nwg::bind_event_handler(
             &self.use_cert_button.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
                     if let Some(app) = app_use_cert.upgrade() {
@@ -309,7 +310,7 @@ impl SettingsView {
         let app_save = app_weak.clone();
         nwg::bind_event_handler(
             &self.save_button.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
                     if let Some(app) = app_save.upgrade() {
@@ -323,7 +324,7 @@ impl SettingsView {
         let app_discard = app_weak.clone();
         nwg::bind_event_handler(
             &self.discard_button.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
                     if let Some(app) = app_discard.upgrade() {
@@ -363,11 +364,13 @@ impl SettingsView {
     }
 
     /// Sets the selected certificate thumbprint.
+    #[allow(dead_code)]
     pub fn set_selected_certificate(&mut self, thumbprint: Option<String>) {
         *self.selected_certificate.borrow_mut() = thumbprint;
     }
 
     /// Sets the certificate loading state.
+    #[allow(dead_code)]
     pub fn set_certificates_loading(&mut self, loading: bool) {
         *self.certificates_loading.borrow_mut() = loading;
     }
@@ -540,36 +543,43 @@ impl SettingsView {
     }
 
     /// Returns a reference to the register button.
+    #[allow(dead_code)]
     pub fn register_button(&self) -> &nwg::Button {
         &self.register_button
     }
 
     /// Returns a reference to the unregister button.
+    #[allow(dead_code)]
     pub fn unregister_button(&self) -> &nwg::Button {
         &self.unregister_button
     }
 
     /// Returns a reference to the refresh certificates button.
+    #[allow(dead_code)]
     pub fn refresh_certs_button(&self) -> &nwg::Button {
         &self.refresh_certs_button
     }
 
     /// Returns a reference to the use certificate button.
+    #[allow(dead_code)]
     pub fn use_cert_button(&self) -> &nwg::Button {
         &self.use_cert_button
     }
 
     /// Returns a reference to the save button.
+    #[allow(dead_code)]
     pub fn save_button(&self) -> &nwg::Button {
         &self.save_button
     }
 
     /// Returns a reference to the discard button.
+    #[allow(dead_code)]
     pub fn discard_button(&self) -> &nwg::Button {
         &self.discard_button
     }
 
     /// Returns a reference to the certificate list.
+    #[allow(dead_code)]
     pub fn cert_list(&self) -> &nwg::ListBox<String> {
         &self.cert_list
     }
@@ -582,6 +592,7 @@ impl SettingsView {
     }
 
     /// Triggers certificate refresh request.
+    #[allow(dead_code)]
     pub fn refresh_certificates(&mut self) {
         *self.certificates_loading.borrow_mut() = true;
     }

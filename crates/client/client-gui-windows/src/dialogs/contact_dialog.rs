@@ -79,7 +79,12 @@ impl ContactDialog {
 
         // Show modal and run event loop
         dialog.window.set_visible(true);
-        nwg::Modal::new(&dialog.window).run_modal(&dialog.save_button, &dialog.cancel_button);
+
+        // Simple modal loop - wait for window to close
+        while dialog.window.visible() {
+            nwg::dispatch_thread_events();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
 
         // Return result
         dialog.result.borrow().clone()
@@ -89,7 +94,7 @@ impl ContactDialog {
     fn build(parent: &nwg::Window, title: &str) -> Result<Self, nwg::NwgError> {
         let mut window = Default::default();
         nwg::Window::builder()
-            .size((350, 200))
+            .size((420, 240))
             .position((
                 parent.position().0 + 50,
                 parent.position().1 + 100,
@@ -102,67 +107,67 @@ impl ContactDialog {
             )
             .build(&mut window)?;
 
-        // Name label and input
+        // Name label and input - larger, modern
         let mut name_label = Default::default();
         nwg::Label::builder()
             .parent(&window)
-            .text("Name:")
-            .position((15, 15))
-            .size((80, 20))
+            .text("👤 Name:")
+            .position((20, 20))
+            .size((90, 25))
             .build(&mut name_label)?;
 
         let mut name_input = Default::default();
         nwg::TextInput::builder()
             .parent(&window)
-            .position((100, 12))
-            .size((235, 25))
+            .position((120, 18))
+            .size((280, 32))
             .build(&mut name_input)?;
 
-        // SIP URI label and input
+        // SIP URI label and input - modern styling
         let mut uri_label = Default::default();
         nwg::Label::builder()
             .parent(&window)
-            .text("SIP URI:")
-            .position((15, 50))
-            .size((80, 20))
+            .text("📞 SIP URI:")
+            .position((20, 65))
+            .size((90, 25))
             .build(&mut uri_label)?;
 
         let mut uri_input = Default::default();
         nwg::TextInput::builder()
             .parent(&window)
-            .position((100, 47))
-            .size((235, 25))
+            .position((120, 63))
+            .size((280, 32))
             .placeholder_text(Some("sip:user@domain.com"))
             .build(&mut uri_input)?;
 
-        // Favorite checkbox
+        // Favorite checkbox - larger
         let mut favorite_checkbox = Default::default();
         nwg::CheckBox::builder()
             .parent(&window)
-            .text("Favorite")
-            .position((100, 85))
-            .size((100, 25))
+            .text("⭐ Mark as Favorite")
+            .position((120, 110))
+            .size((180, 30))
             .build(&mut favorite_checkbox)?;
 
-        // Buttons
+        // Buttons - larger and more prominent
         let mut save_button = Default::default();
         nwg::Button::builder()
             .parent(&window)
-            .text("Save")
-            .position((130, 130))
-            .size((100, 30))
+            .text("💾 Save")
+            .position((180, 160))
+            .size((110, 40))
             .build(&mut save_button)?;
 
         let mut cancel_button = Default::default();
         nwg::Button::builder()
             .parent(&window)
-            .text("Cancel")
-            .position((235, 130))
-            .size((100, 30))
+            .text("❌ Cancel")
+            .position((300, 160))
+            .size((110, 40))
             .build(&mut cancel_button)?;
 
         // Focus the name field
-        nwg::Window::set_focus(&name_input);
+        name_input.set_focus();
 
         Ok(Self {
             window,
@@ -179,27 +184,28 @@ impl ContactDialog {
     }
 
     /// Binds event handlers to the dialog controls.
+    #[allow(unsafe_code)]
     fn bind_events(&self) {
+        use std::mem;
+
+        // SAFETY: We're creating a static reference from self which lives for the duration of the dialog.
+        // This is safe because the dialog is modal and bind_events is only called once during construction.
+        let this: &'static Self = unsafe { mem::transmute(self) };
+
         // Save button click
-        let result_save = self.result.clone();
-        let contact_id = self.contact_id.clone();
-        let name_input = self.name_input.handle.clone();
-        let uri_input = self.uri_input.handle.clone();
-        let favorite_checkbox = self.favorite_checkbox.handle.clone();
-        let window_save = self.window.handle.clone();
         nwg::bind_event_handler(
             &self.save_button.handle,
-            &self.window,
+            &self.window.handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
-                    let name = nwg::TextInput::from(&name_input).text();
-                    let uri = nwg::TextInput::from(&uri_input).text();
-                    let favorite = nwg::CheckBox::from(&favorite_checkbox).check_state()
+                    let name = this.name_input.text();
+                    let uri = this.uri_input.text();
+                    let favorite = this.favorite_checkbox.check_state()
                         == nwg::CheckBoxState::Checked;
 
                     if name.is_empty() || uri.is_empty() {
                         nwg::modal_error_message(
-                            &nwg::Window::from(&window_save),
+                            &this.window,
                             "Validation Error",
                             "Name and SIP URI are required.",
                         );
@@ -207,7 +213,7 @@ impl ContactDialog {
                     }
 
                     // Generate ID for new contacts or use existing
-                    let id = contact_id
+                    let id = this.contact_id
                         .borrow()
                         .clone()
                         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -216,23 +222,26 @@ impl ContactDialog {
                         id,
                         name,
                         sip_uri: uri,
+                        phone_numbers: Vec::new(),
                         favorite,
+                        avatar_path: None,
+                        organization: None,
+                        notes: None,
                     };
 
-                    *result_save.borrow_mut() = ContactDialogResult::Saved(contact);
-                    nwg::Window::from(&window_save).close();
+                    *this.result.borrow_mut() = ContactDialogResult::Saved(contact);
+                    this.window.close();
                 }
             },
         );
 
         // Cancel button click
-        let window_cancel = self.window.handle.clone();
         nwg::bind_event_handler(
             &self.cancel_button.handle,
-            &self.window,
+            &self.window.handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
-                    nwg::Window::from(&window_cancel).close();
+                    this.window.close();
                 }
             },
         );
@@ -240,7 +249,7 @@ impl ContactDialog {
         // Window close (X button)
         nwg::bind_event_handler(
             &self.window.handle,
-            &self.window,
+            &self.window.handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnWindowClose {
                     nwg::stop_thread_dispatch();

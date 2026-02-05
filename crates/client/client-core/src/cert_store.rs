@@ -8,7 +8,7 @@
 
 use client_types::{CertificateConfig, CertificateInfo, CertificateSelectionMode, SmartCardPin};
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Signature algorithm for signing operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,6 +265,8 @@ impl CertificateStore {
             .chain(std::iter::once(0))
             .collect();
 
+        #[allow(unsafe_code)]
+        #[allow(unsafe_code)]
         unsafe {
             // Open the certificate store
             let store = CertOpenStore(
@@ -299,7 +301,7 @@ impl CertificateStore {
             }
 
             // Close the store
-            let _ = CertCloseStore(store, 0);
+            let _ = CertCloseStore(Some(store), 0);
         }
 
         debug!("Found {} certificates in store", certificates.len());
@@ -312,6 +314,7 @@ impl CertificateStore {
         &self,
         cert_context: *const windows::Win32::Security::Cryptography::CERT_CONTEXT,
     ) -> Option<CertificateInfo> {
+        #[allow(unsafe_code)]
         unsafe {
             let cert = &*cert_context;
             let cert_info_ptr = cert.pCertInfo;
@@ -370,6 +373,7 @@ impl CertificateStore {
             CERT_NAME_SIMPLE_DISPLAY_TYPE, CertGetNameStringW,
         };
 
+        #[allow(unsafe_code)]
         unsafe {
             let mut buffer = vec![0u16; 256];
             let name_type = if is_subject { 0 } else { 1 }; // Subject or Issuer
@@ -401,6 +405,7 @@ impl CertificateStore {
             CERT_X500_NAME_STR, CertNameToStrW, X509_ASN_ENCODING,
         };
 
+        #[allow(unsafe_code)]
         unsafe {
             let cert = &*cert_context;
             let cert_info_ptr = cert.pCertInfo;
@@ -442,6 +447,7 @@ impl CertificateStore {
             CERT_HASH_PROP_ID, CertGetCertificateContextProperty,
         };
 
+        #[allow(unsafe_code)]
         unsafe {
             let mut hash = vec![0u8; 20]; // SHA-1 is 20 bytes
             let mut hash_size = hash.len() as u32;
@@ -470,6 +476,7 @@ impl CertificateStore {
         &self,
         cert_context: *const windows::Win32::Security::Cryptography::CERT_CONTEXT,
     ) -> String {
+        #[allow(unsafe_code)]
         unsafe {
             let cert = &*cert_context;
             let cert_info_ptr = cert.pCertInfo;
@@ -484,7 +491,7 @@ impl CertificateStore {
                 return String::from("Unknown");
             }
 
-            let alg_oid = std::ffi::CStr::from_ptr(oid_ptr)
+            let alg_oid = std::ffi::CStr::from_ptr(oid_ptr as *const i8)
                 .to_string_lossy()
                 .to_string();
 
@@ -519,6 +526,7 @@ impl CertificateStore {
             return String::from("Unknown");
         }
 
+        #[allow(unsafe_code)]
         unsafe {
             // The parameters typically contain the curve OID
             // Common curves:
@@ -558,6 +566,7 @@ impl CertificateStore {
             CERT_KEY_PROV_INFO_PROP_ID, CRYPT_KEY_PROV_INFO, CertGetCertificateContextProperty,
         };
 
+        #[allow(unsafe_code)]
         unsafe {
             // First, get the size needed
             let mut prov_info_size = 0u32;
@@ -620,6 +629,7 @@ impl CertificateStore {
     ) -> bool {
         use windows::Win32::Security::Cryptography::CertVerifyTimeValidity;
 
+        #[allow(unsafe_code)]
         unsafe {
             let cert = &*cert_context;
             // NULL for current time
@@ -698,6 +708,7 @@ impl CertificateStore {
             .chain(std::iter::once(0))
             .collect();
 
+        #[allow(unsafe_code)]
         unsafe {
             let store = CertOpenStore(
                 CERT_STORE_PROV_SYSTEM_W,
@@ -726,7 +737,7 @@ impl CertificateStore {
             }
 
             let cert_ctx = found_cert.ok_or_else(|| {
-                let _ = CertCloseStore(store, 0);
+                let _ = CertCloseStore(Some(store), 0);
                 CertStoreError::CertificateNotFound(thumbprint.to_string())
             })?;
 
@@ -736,7 +747,7 @@ impl CertificateStore {
                 std::slice::from_raw_parts(cert.pbCertEncoded, cert.cbCertEncoded as usize)
                     .to_vec();
 
-            let _ = CertCloseStore(store, 0);
+            let _ = CertCloseStore(Some(store), 0);
 
             // Return just the end-entity cert for now
             // A full implementation would build the chain using CertGetCertificateChain
@@ -790,6 +801,7 @@ impl CertificateStore {
             .chain(std::iter::once(0))
             .collect();
 
+        #[allow(unsafe_code)]
         unsafe {
             let store = CertOpenStore(
                 CERT_STORE_PROV_SYSTEM_W,
@@ -820,12 +832,12 @@ impl CertificateStore {
                     )
                     .is_ok();
 
-                    let _ = CertCloseStore(store, 0);
+                    let _ = CertCloseStore(Some(store), 0);
                     return Ok(has_key && size > 0);
                 }
             }
 
-            let _ = CertCloseStore(store, 0);
+            let _ = CertCloseStore(Some(store), 0);
             Err(CertStoreError::CertificateNotFound(thumbprint.to_string()))
         }
     }
@@ -873,7 +885,7 @@ impl CertificateStore {
         pin: Option<&SmartCardPin>,
     ) -> CertStoreResult<Vec<u8>> {
         use windows::Win32::Security::Cryptography::{
-            BCRYPT_PAD_PKCS1, CERT_CONTEXT, CERT_NCRYPT_KEY_SPEC, CERT_OPEN_STORE_FLAGS,
+            BCRYPT_PAD_PKCS1, CERT_CONTEXT, CERT_OPEN_STORE_FLAGS,
             CERT_QUERY_ENCODING_TYPE, CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_CURRENT_USER,
             CRYPT_ACQUIRE_SILENT_FLAG, CertCloseStore, CertEnumCertificatesInStore, CertOpenStore,
             CryptAcquireCertificatePrivateKey, NCRYPT_KEY_HANDLE, NCRYPT_SILENT_FLAG,
@@ -887,6 +899,7 @@ impl CertificateStore {
             .chain(std::iter::once(0))
             .collect();
 
+        #[allow(unsafe_code)]
         unsafe {
             // Open certificate store
             let store = CertOpenStore(
@@ -916,7 +929,7 @@ impl CertificateStore {
             }
 
             let cert_ctx = found_cert.ok_or_else(|| {
-                let _ = CertCloseStore(store, 0);
+                let _ = CertCloseStore(Some(store), 0);
                 CertStoreError::CertificateNotFound(thumbprint.to_string())
             })?;
 
@@ -931,20 +944,20 @@ impl CertificateStore {
                 CRYPT_ACQUIRE_SILENT_FLAG
             } else {
                 // No PIN provided - allow Windows to show PIN dialog
-                0u32
+                windows::Win32::Security::Cryptography::CRYPT_ACQUIRE_FLAGS(0u32)
             };
 
             let result = CryptAcquireCertificatePrivateKey(
                 cert_ctx,
-                acquire_flags | CERT_NCRYPT_KEY_SPEC,
+                acquire_flags,
                 None,
-                &mut key_handle.0 as *mut _ as *mut _,
-                Some(&mut key_spec),
-                Some(&mut caller_free_key),
+                &mut key_handle.0 as *mut usize as *mut _,
+                Some(&mut key_spec as *mut u32 as *mut _),
+                Some(&mut caller_free_key as *mut bool as *mut _),
             );
 
             if result.is_err() {
-                let _ = CertCloseStore(store, 0);
+                let _ = CertCloseStore(Some(store), 0);
                 let err = std::io::Error::last_os_error();
                 // Check for PIN-related errors
                 let error_code = err.raw_os_error().unwrap_or(0) as u32;
@@ -979,20 +992,20 @@ impl CertificateStore {
                     .collect();
 
                 let pin_result = NCryptSetProperty(
-                    key_handle,
+                    key_handle.into(),
                     PCWSTR::from_raw(ncrypt_pin_property.as_ptr()),
-                    Some(std::slice::from_raw_parts(
+                    std::slice::from_raw_parts(
                         pin_wide.as_ptr() as *const u8,
                         pin_wide.len() * 2,
-                    )),
+                    ),
                     NCRYPT_SILENT_FLAG,
                 );
 
                 if pin_result.is_err() {
                     if caller_free_key {
-                        let _ = NCryptFreeObject(key_handle);
+                        let _ = NCryptFreeObject(key_handle.into());
                     }
-                    let _ = CertCloseStore(store, 0);
+                    let _ = CertCloseStore(Some(store), 0);
                     return Err(CertStoreError::PinIncorrect);
                 }
             }
@@ -1017,14 +1030,14 @@ impl CertificateStore {
                 data,
                 None,
                 &mut signature_size,
-                padding_flags,
+                windows::Win32::Security::Cryptography::NCRYPT_FLAGS(padding_flags),
             );
 
             if size_result.is_err() {
                 if caller_free_key {
-                    let _ = NCryptFreeObject(key_handle);
+                    let _ = NCryptFreeObject(key_handle.into());
                 }
-                let _ = CertCloseStore(store, 0);
+                let _ = CertCloseStore(Some(store), 0);
                 return Err(CertStoreError::WindowsError(
                     "Failed to get signature size".to_string(),
                 ));
@@ -1038,14 +1051,14 @@ impl CertificateStore {
                 data,
                 Some(&mut signature),
                 &mut signature_size,
-                padding_flags,
+                windows::Win32::Security::Cryptography::NCRYPT_FLAGS(padding_flags),
             );
 
             // Clean up
             if caller_free_key {
-                let _ = NCryptFreeObject(key_handle);
+                let _ = NCryptFreeObject(key_handle.into());
             }
-            let _ = CertCloseStore(store, 0);
+            let _ = CertCloseStore(Some(store), 0);
 
             if sign_result.is_err() {
                 let err = std::io::Error::last_os_error();
@@ -1127,7 +1140,7 @@ impl CertificateStore {
     #[cfg(windows)]
     fn verify_pin_windows(&self, thumbprint: &str, pin: &SmartCardPin) -> CertStoreResult<bool> {
         use windows::Win32::Security::Cryptography::{
-            CERT_CONTEXT, CERT_NCRYPT_KEY_SPEC, CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE,
+            CERT_CONTEXT, CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE,
             CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_CURRENT_USER, CRYPT_ACQUIRE_SILENT_FLAG,
             CertCloseStore, CertEnumCertificatesInStore, CertOpenStore,
             CryptAcquireCertificatePrivateKey, NCRYPT_KEY_HANDLE, NCRYPT_SILENT_FLAG,
@@ -1141,6 +1154,7 @@ impl CertificateStore {
             .chain(std::iter::once(0))
             .collect();
 
+        #[allow(unsafe_code)]
         unsafe {
             let store = CertOpenStore(
                 CERT_STORE_PROV_SYSTEM_W,
@@ -1168,7 +1182,7 @@ impl CertificateStore {
             }
 
             let cert_ctx = found_cert.ok_or_else(|| {
-                let _ = CertCloseStore(store, 0);
+                let _ = CertCloseStore(Some(store), 0);
                 CertStoreError::CertificateNotFound(thumbprint.to_string())
             })?;
 
@@ -1178,15 +1192,15 @@ impl CertificateStore {
 
             let result = CryptAcquireCertificatePrivateKey(
                 cert_ctx,
-                CRYPT_ACQUIRE_SILENT_FLAG | CERT_NCRYPT_KEY_SPEC,
+                CRYPT_ACQUIRE_SILENT_FLAG,
                 None,
-                &mut key_handle.0 as *mut _ as *mut _,
-                Some(&mut key_spec),
-                Some(&mut caller_free_key),
+                &mut key_handle.0 as *mut usize as *mut _,
+                Some(&mut key_spec as *mut u32 as *mut _),
+                Some(&mut caller_free_key as *mut bool as *mut _),
             );
 
             if result.is_err() {
-                let _ = CertCloseStore(store, 0);
+                let _ = CertCloseStore(Some(store), 0);
                 return Err(CertStoreError::SmartCardNotPresent);
             }
 
@@ -1203,19 +1217,19 @@ impl CertificateStore {
                 .collect();
 
             let pin_result = NCryptSetProperty(
-                key_handle,
+                key_handle.into(),
                 PCWSTR::from_raw(ncrypt_pin_property.as_ptr()),
-                Some(std::slice::from_raw_parts(
+                std::slice::from_raw_parts(
                     pin_wide.as_ptr() as *const u8,
                     pin_wide.len() * 2,
-                )),
+                ),
                 NCRYPT_SILENT_FLAG,
             );
 
             if caller_free_key {
-                let _ = NCryptFreeObject(key_handle);
+                let _ = NCryptFreeObject(key_handle.into());
             }
-            let _ = CertCloseStore(store, 0);
+            let _ = CertCloseStore(Some(store), 0);
 
             if pin_result.is_err() {
                 Err(CertStoreError::PinIncorrect)
@@ -1305,6 +1319,7 @@ fn filetime_to_string(ft: &windows::Win32::Foundation::FILETIME) -> String {
     use windows::Win32::Foundation::SYSTEMTIME;
     use windows::Win32::System::Time::FileTimeToSystemTime;
 
+    #[allow(unsafe_code)]
     unsafe {
         let mut st = SYSTEMTIME::default();
         if FileTimeToSystemTime(ft, &mut st).is_ok() {
@@ -1322,6 +1337,7 @@ fn widestring_to_string(ptr: *const u16) -> String {
         return String::new();
     }
 
+    #[allow(unsafe_code)]
     unsafe {
         let mut len = 0;
         while *ptr.add(len) != 0 {

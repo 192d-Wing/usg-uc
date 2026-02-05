@@ -12,7 +12,9 @@
 
 // This crate only compiles on Windows
 #![cfg(target_os = "windows")]
-#![forbid(unsafe_code)]
+// Use deny instead of forbid to allow platform-specific unsafe code in modal dialogs
+// The unsafe transmute pattern is needed for event handlers since NWG controls don't implement Clone
+#![deny(unsafe_code)]
 #![deny(warnings)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]

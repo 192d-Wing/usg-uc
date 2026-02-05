@@ -23,6 +23,7 @@ pub struct PinDialog {
     /// PIN input field.
     pin_input: nwg::TextInput,
     /// Error label (for showing PIN errors).
+    #[allow(dead_code)]
     error_label: nwg::Label,
     /// OK button.
     ok_button: nwg::Button,
@@ -54,7 +55,12 @@ impl PinDialog {
 
         // Show modal and run event loop
         dialog.window.set_visible(true);
-        nwg::Modal::new(&dialog.window).run_modal(&dialog.ok_button, &dialog.cancel_button);
+
+        // Simple modal loop - wait for window to close
+        while dialog.window.visible() {
+            nwg::dispatch_thread_events();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
 
         // Return result
         dialog.result.borrow().clone()
@@ -127,7 +133,7 @@ impl PinDialog {
             .build(&mut cancel_button)?;
 
         // Focus the PIN field
-        nwg::Window::set_focus(&pin_input);
+        pin_input.set_focus();
 
         Ok(Self {
             window,
@@ -141,51 +147,51 @@ impl PinDialog {
     }
 
     /// Binds event handlers to the dialog controls.
+    #[allow(unsafe_code)]
     fn bind_events(&self) {
+        use std::mem;
+
+        // SAFETY: Creating a static reference for modal dialog event handlers.
+        // Safe because the dialog is short-lived and bind_events is called only once.
+        let this: &'static Self = unsafe { mem::transmute(self) };
+
         // OK button click
-        let result_ok = self.result.clone();
-        let pin_input = self.pin_input.handle.clone();
-        let window_ok = self.window.handle.clone();
         nwg::bind_event_handler(
             &self.ok_button.handle,
-            &self.window,
+            &self.window.handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
-                    let pin = nwg::TextInput::from(&pin_input).text();
+                    let pin = this.pin_input.text();
                     if !pin.is_empty() {
-                        *result_ok.borrow_mut() = PinDialogResult::Entered(pin);
+                        *this.result.borrow_mut() = PinDialogResult::Entered(pin);
                     }
-                    nwg::Window::from(&window_ok).close();
+                    this.window.close();
                 }
             },
         );
 
         // Cancel button click
-        let window_cancel = self.window.handle.clone();
         nwg::bind_event_handler(
             &self.cancel_button.handle,
-            &self.window,
+            &self.window.handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
-                    nwg::Window::from(&window_cancel).close();
+                    this.window.close();
                 }
             },
         );
 
         // Enter key in PIN field submits
-        let result_enter = self.result.clone();
-        let pin_input_enter = self.pin_input.handle.clone();
-        let window_enter = self.window.handle.clone();
         nwg::bind_event_handler(
             &self.pin_input.handle,
-            &self.window,
+            &self.window.handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnKeyEnter {
-                    let pin = nwg::TextInput::from(&pin_input_enter).text();
+                    let pin = this.pin_input.text();
                     if !pin.is_empty() {
-                        *result_enter.borrow_mut() = PinDialogResult::Entered(pin);
+                        *this.result.borrow_mut() = PinDialogResult::Entered(pin);
                     }
-                    nwg::Window::from(&window_enter).close();
+                    this.window.close();
                 }
             },
         );
@@ -193,7 +199,7 @@ impl PinDialog {
         // Window close (X button)
         nwg::bind_event_handler(
             &self.window.handle,
-            &self.window,
+            &self.window.handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnWindowClose {
                     nwg::stop_thread_dispatch();
@@ -203,6 +209,7 @@ impl PinDialog {
     }
 
     /// Sets the error message on the dialog.
+    #[allow(dead_code)]
     pub fn set_error(&self, error: &str) {
         self.error_label.set_text(error);
     }

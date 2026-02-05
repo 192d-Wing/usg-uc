@@ -33,68 +33,68 @@ pub struct ContactsView {
 impl ContactsView {
     /// Builds the contacts view within the given parent tab.
     pub fn build(parent: &nwg::Tab) -> Result<Self, nwg::NwgError> {
-        // Search input
+        // Search input - larger and more modern
         let mut search_input = Default::default();
         nwg::TextInput::builder()
             .parent(parent)
-            .position((10, 10))
-            .size((280, 25))
-            .placeholder_text(Some("Search contacts..."))
+            .position((20, 20))
+            .size((340, 35))
+            .placeholder_text(Some("🔍 Search contacts..."))
             .build(&mut search_input)?;
 
         // Add contact button
         let mut add_button = Default::default();
         nwg::Button::builder()
             .parent(parent)
-            .text("Add")
-            .position((300, 10))
-            .size((90, 25))
+            .text("➕ Add")
+            .position((370, 20))
+            .size((90, 35))
             .build(&mut add_button)?;
 
-        // Contacts list
+        // Contacts list - larger with more spacing
         let mut contacts_list = Default::default();
         nwg::ListBox::builder()
             .parent(parent)
-            .position((10, 45))
-            .size((380, 380))
+            .position((20, 70))
+            .size((440, 480))
             .collection(Vec::new())
             .build(&mut contacts_list)?;
 
-        // Action buttons
-        let button_y = 435;
-        let button_width = 85;
+        // Action buttons - larger and better spaced
+        let button_y = 565;
+        let button_width = 100;
         let spacing = 10;
 
         let mut call_button = Default::default();
         nwg::Button::builder()
             .parent(parent)
-            .text("Call")
-            .position((10, button_y))
-            .size((button_width, 30))
+            .text("📞 Call")
+            .position((20, button_y))
+            .size((button_width, 40))
             .build(&mut call_button)?;
 
         let mut edit_button = Default::default();
         nwg::Button::builder()
             .parent(parent)
-            .text("Edit")
-            .position((10 + button_width as i32 + spacing, button_y))
-            .size((button_width, 30))
+            .text("✏️ Edit")
+            .position((20 + button_width as i32 + spacing, button_y))
+            .size((button_width, 40))
             .build(&mut edit_button)?;
 
         let mut favorite_button = Default::default();
         nwg::Button::builder()
             .parent(parent)
-            .text("Favorite")
-            .position((10 + 2 * (button_width as i32 + spacing), button_y))
-            .size((button_width, 30))
+            .text("⭐ Favorite")
+            .position((20 + 2 * (button_width as i32 + spacing), button_y))
+            .size((button_width, 40))
             .build(&mut favorite_button)?;
 
         let mut delete_button = Default::default();
         nwg::Button::builder()
             .parent(parent)
-            .text("Delete")
-            .position((10 + 3 * (button_width as i32 + spacing), button_y))
-            .size((button_width, 30))
+            .text("🗑️ Delete")
+            .position((20 + 3 * (button_width as i32 + spacing), button_y))
+            .size((button_width, 40))
             .build(&mut delete_button)?;
 
         Ok(Self {
@@ -118,7 +118,7 @@ impl ContactsView {
         let app_add = app_weak.clone();
         nwg::bind_event_handler(
             &self.add_button.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
                     if let Some(app) = app_add.upgrade() {
@@ -132,7 +132,7 @@ impl ContactsView {
         let app_call = app_weak.clone();
         nwg::bind_event_handler(
             &self.call_button.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
                     if let Some(app) = app_call.upgrade() {
@@ -146,7 +146,7 @@ impl ContactsView {
         let app_edit = app_weak.clone();
         nwg::bind_event_handler(
             &self.edit_button.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
                     if let Some(app) = app_edit.upgrade() {
@@ -160,7 +160,7 @@ impl ContactsView {
         let app_fav = app_weak.clone();
         nwg::bind_event_handler(
             &self.favorite_button.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
                     if let Some(app) = app_fav.upgrade() {
@@ -174,7 +174,7 @@ impl ContactsView {
         let app_del = app_weak.clone();
         nwg::bind_event_handler(
             &self.delete_button.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
                     if let Some(app) = app_del.upgrade() {
@@ -188,7 +188,7 @@ impl ContactsView {
         let app_search = app_weak.clone();
         nwg::bind_event_handler(
             &self.search_input.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnTextInput {
                     if let Some(app) = app_search.upgrade() {
@@ -240,42 +240,50 @@ impl ContactsView {
     }
 
     /// Returns a reference to the add button.
+    #[allow(dead_code)]
     pub fn add_button(&self) -> &nwg::Button {
         &self.add_button
     }
 
     /// Returns a reference to the call button.
+    #[allow(dead_code)]
     pub fn call_button(&self) -> &nwg::Button {
         &self.call_button
     }
 
     /// Returns a reference to the edit button.
+    #[allow(dead_code)]
     pub fn edit_button(&self) -> &nwg::Button {
         &self.edit_button
     }
 
     /// Returns a reference to the delete button.
+    #[allow(dead_code)]
     pub fn delete_button(&self) -> &nwg::Button {
         &self.delete_button
     }
 
     /// Returns a reference to the favorite button.
+    #[allow(dead_code)]
     pub fn favorite_button(&self) -> &nwg::Button {
         &self.favorite_button
     }
 
     /// Returns a reference to the search input.
+    #[allow(dead_code)]
     pub fn search_input(&self) -> &nwg::TextInput {
         &self.search_input
     }
 
     /// Returns a reference to the contacts list.
+    #[allow(dead_code)]
     pub fn contacts_list(&self) -> &nwg::ListBox<String> {
         &self.contacts_list
     }
 
     /// Gets all stored contacts.
-    pub fn contacts(&self) -> std::cell::Ref<Vec<Contact>> {
+    #[allow(dead_code)]
+    pub fn contacts(&self) -> std::cell::Ref<'_, Vec<Contact>> {
         self.contacts.borrow()
     }
 

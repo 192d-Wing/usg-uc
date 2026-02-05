@@ -11,10 +11,13 @@ use std::rc::Rc;
 /// Call view state with native Windows controls.
 pub struct CallView {
     /// Caller info label.
+    #[allow(dead_code)]
     caller_label: nwg::Label,
     /// Call status label.
+    #[allow(dead_code)]
     status_label: nwg::Label,
     /// Call duration label.
+    #[allow(dead_code)]
     duration_label: nwg::Label,
     /// Mute button.
     mute_button: nwg::Button,
@@ -39,21 +42,23 @@ pub struct CallView {
     /// Available output devices.
     output_devices: RefCell<Vec<String>>,
     /// Current mute state.
+    #[allow(dead_code)]
     is_muted: RefCell<bool>,
     /// Current hold state.
+    #[allow(dead_code)]
     is_on_hold: RefCell<bool>,
 }
 
 impl CallView {
     /// Builds the call view within the given parent tab.
     pub fn build(parent: &nwg::Tab) -> Result<Self, nwg::NwgError> {
-        // Caller info label (large, centered)
+        // Caller info label (large, centered, modern)
         let mut caller_label = Default::default();
         nwg::Label::builder()
             .parent(parent)
             .text("No active call")
-            .position((10, 30))
-            .size((380, 30))
+            .position((20, 40))
+            .size((440, 40))
             .h_align(nwg::HTextAlign::Center)
             .build(&mut caller_label)?;
 
@@ -62,8 +67,8 @@ impl CallView {
         nwg::Label::builder()
             .parent(parent)
             .text("")
-            .position((10, 70))
-            .size((380, 25))
+            .position((20, 90))
+            .size((440, 30))
             .h_align(nwg::HTextAlign::Center)
             .build(&mut status_label)?;
 
@@ -72,22 +77,22 @@ impl CallView {
         nwg::Label::builder()
             .parent(parent)
             .text("00:00")
-            .position((10, 110))
-            .size((380, 40))
+            .position((20, 130))
+            .size((440, 50))
             .h_align(nwg::HTextAlign::Center)
             .build(&mut duration_label)?;
 
-        // Control buttons - first row
-        let button_width = 90;
-        let button_height = 35;
-        let button_y = 165;
+        // Control buttons - first row (larger, more modern)
+        let button_width = 100;
+        let button_height = 50;
+        let button_y = 200;
         let spacing = 10;
-        let start_x = 25;
+        let start_x = 30;
 
         let mut mute_button = Default::default();
         nwg::Button::builder()
             .parent(parent)
-            .text("Mute")
+            .text("🔇 Mute")
             .position((start_x, button_y))
             .size((button_width, button_height))
             .build(&mut mute_button)?;
@@ -95,7 +100,7 @@ impl CallView {
         let mut hold_button = Default::default();
         nwg::Button::builder()
             .parent(parent)
-            .text("Hold")
+            .text("⏸️ Hold")
             .position((start_x + button_width as i32 + spacing, button_y))
             .size((button_width, button_height))
             .build(&mut hold_button)?;
@@ -103,7 +108,7 @@ impl CallView {
         let mut transfer_button = Default::default();
         nwg::Button::builder()
             .parent(parent)
-            .text("Transfer")
+            .text("↪️ Transfer")
             .position((start_x + 2 * (button_width as i32 + spacing), button_y))
             .size((button_width, button_height))
             .build(&mut transfer_button)?;
@@ -111,54 +116,54 @@ impl CallView {
         let mut hangup_button = Default::default();
         nwg::Button::builder()
             .parent(parent)
-            .text("Hangup")
+            .text("📵 Hangup")
             .position((start_x + 3 * (button_width as i32 + spacing), button_y))
             .size((button_width, button_height))
             .build(&mut hangup_button)?;
 
         // Control buttons - second row
-        let button_y2 = button_y + button_height as i32 + 8;
+        let button_y2 = button_y + button_height as i32 + 15;
 
         let mut keypad_button = Default::default();
         nwg::Button::builder()
             .parent(parent)
-            .text("Keypad")
+            .text("⌨️ Keypad")
             .position((start_x, button_y2))
             .size((button_width, button_height))
             .build(&mut keypad_button)?;
 
-        // Audio device selection
-        let device_y = 255;
+        // Audio device selection - better spaced
+        let device_y = 330;
 
         let mut input_label = Default::default();
         nwg::Label::builder()
             .parent(parent)
-            .text("Microphone:")
-            .position((10, device_y))
-            .size((100, 25))
+            .text("🎤 Microphone:")
+            .position((30, device_y))
+            .size((120, 30))
             .build(&mut input_label)?;
 
         let mut input_device_combo = Default::default();
         nwg::ComboBox::builder()
             .parent(parent)
-            .position((120, device_y))
-            .size((270, 25))
+            .position((160, device_y))
+            .size((300, 30))
             .collection(vec!["Default".to_string()])
             .build(&mut input_device_combo)?;
 
         let mut output_label = Default::default();
         nwg::Label::builder()
             .parent(parent)
-            .text("Speaker:")
-            .position((10, device_y + 35))
-            .size((100, 25))
+            .text("🔊 Speaker:")
+            .position((30, device_y + 45))
+            .size((120, 30))
             .build(&mut output_label)?;
 
         let mut output_device_combo = Default::default();
         nwg::ComboBox::builder()
             .parent(parent)
-            .position((120, device_y + 35))
-            .size((270, 25))
+            .position((160, device_y + 45))
+            .size((300, 30))
             .collection(vec!["Default".to_string()])
             .build(&mut output_device_combo)?;
 
@@ -190,7 +195,7 @@ impl CallView {
         let app_mute = app_weak.clone();
         nwg::bind_event_handler(
             &self.mute_button.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
                     if let Some(app) = app_mute.upgrade() {
@@ -204,7 +209,7 @@ impl CallView {
         let app_hold = app_weak.clone();
         nwg::bind_event_handler(
             &self.hold_button.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
                     if let Some(app) = app_hold.upgrade() {
@@ -218,7 +223,7 @@ impl CallView {
         let app_transfer = app_weak.clone();
         nwg::bind_event_handler(
             &self.transfer_button.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
                     if let Some(app) = app_transfer.upgrade() {
@@ -232,7 +237,7 @@ impl CallView {
         let app_hangup = app_weak.clone();
         nwg::bind_event_handler(
             &self.hangup_button.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
                     if let Some(app) = app_hangup.upgrade() {
@@ -246,7 +251,7 @@ impl CallView {
         let app_input = app_weak.clone();
         nwg::bind_event_handler(
             &self.input_device_combo.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnComboxBoxSelection {
                     if let Some(app) = app_input.upgrade() {
@@ -260,7 +265,7 @@ impl CallView {
         let app_output = app_weak.clone();
         nwg::bind_event_handler(
             &self.output_device_combo.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnComboxBoxSelection {
                     if let Some(app) = app_output.upgrade() {
@@ -274,7 +279,7 @@ impl CallView {
         let app_keypad = app_weak.clone();
         nwg::bind_event_handler(
             &self.keypad_button.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
                     if let Some(app) = app_keypad.upgrade() {
@@ -286,6 +291,7 @@ impl CallView {
     }
 
     /// Updates the view with call information.
+    #[allow(dead_code)]
     pub fn update_call_info(&mut self, call: Option<&CallInfo>) {
         match call {
             Some(info) => {
@@ -300,7 +306,7 @@ impl CallView {
                 self.status_label.set_text(&info.state.to_string());
 
                 // Update duration
-                let duration_text = format_duration(info.duration_secs);
+                let duration_text = info.duration_string();
                 self.duration_label.set_text(&duration_text);
 
                 // Update button states
@@ -337,36 +343,43 @@ impl CallView {
     }
 
     /// Returns a reference to the mute button.
+    #[allow(dead_code)]
     pub fn mute_button(&self) -> &nwg::Button {
         &self.mute_button
     }
 
     /// Returns a reference to the hold button.
+    #[allow(dead_code)]
     pub fn hold_button(&self) -> &nwg::Button {
         &self.hold_button
     }
 
     /// Returns a reference to the hangup button.
+    #[allow(dead_code)]
     pub fn hangup_button(&self) -> &nwg::Button {
         &self.hangup_button
     }
 
     /// Returns a reference to the transfer button.
+    #[allow(dead_code)]
     pub fn transfer_button(&self) -> &nwg::Button {
         &self.transfer_button
     }
 
     /// Returns a reference to the keypad button.
+    #[allow(dead_code)]
     pub fn keypad_button(&self) -> &nwg::Button {
         &self.keypad_button
     }
 
     /// Returns a reference to the input device combo.
+    #[allow(dead_code)]
     pub fn input_device_combo(&self) -> &nwg::ComboBox<String> {
         &self.input_device_combo
     }
 
     /// Returns a reference to the output device combo.
+    #[allow(dead_code)]
     pub fn output_device_combo(&self) -> &nwg::ComboBox<String> {
         &self.output_device_combo
     }
@@ -387,6 +400,7 @@ impl CallView {
 }
 
 /// Formats a duration in seconds as MM:SS or HH:MM:SS.
+#[allow(dead_code)]
 fn format_duration(seconds: u32) -> String {
     let hours = seconds / 3600;
     let minutes = (seconds % 3600) / 60;

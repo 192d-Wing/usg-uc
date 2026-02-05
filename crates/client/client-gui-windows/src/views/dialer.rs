@@ -26,22 +26,22 @@ pub struct DialerView {
 impl DialerView {
     /// Builds the dialer view within the given parent tab.
     pub fn build(parent: &nwg::Tab) -> Result<Self, nwg::NwgError> {
-        // Input field
+        // Input field - larger and more modern
         let mut input = Default::default();
         nwg::TextInput::builder()
             .parent(parent)
-            .position((10, 20))
-            .size((380, 30))
+            .position((20, 30))
+            .size((440, 40))
             .placeholder_text(Some("Enter number or SIP URI"))
             .build(&mut input)?;
 
-        // Create dialpad buttons (4 rows x 3 columns)
+        // Create dialpad buttons (4 rows x 3 columns) - larger, more touch-friendly
         let button_labels = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#"];
-        let button_width = 80i32;
-        let button_height = 60i32;
+        let button_width = 100i32;
+        let button_height = 70i32;
         let start_x = 90i32;
-        let start_y = 70i32;
-        let spacing = 10i32;
+        let start_y = 100i32;
+        let spacing = 15i32;
 
         let mut buttons = Vec::with_capacity(12);
         for (i, label) in button_labels.iter().enumerate() {
@@ -55,36 +55,36 @@ impl DialerView {
                 .parent(parent)
                 .text(label)
                 .position((x, y))
-                .size((button_width as u32, button_height as u32))
+                .size((button_width, button_height))
                 .build(&mut button)?;
             buttons.push(button);
         }
 
-        // Action buttons row
-        let action_y = start_y + 4 * (button_height + spacing);
+        // Action buttons row - larger, more modern
+        let action_y = start_y + 4 * (button_height + spacing) + 20;
 
         let mut backspace_button = Default::default();
         nwg::Button::builder()
             .parent(parent)
-            .text("<-") // Backspace symbol
+            .text("⌫") // Backspace symbol
             .position((start_x, action_y))
-            .size((80, 50))
+            .size((100, 60))
             .build(&mut backspace_button)?;
 
         let mut call_button = Default::default();
         nwg::Button::builder()
             .parent(parent)
-            .text("Call")
-            .position((start_x + 90, action_y))
-            .size((170, 50))
+            .text("📞 Call")
+            .position((start_x + 115, action_y))
+            .size((215, 60))
             .build(&mut call_button)?;
 
         let mut clear_button = Default::default();
         nwg::Button::builder()
             .parent(parent)
             .text("Clear")
-            .position((start_x + 180, action_y + 60))
-            .size((80, 30))
+            .position((start_x + 220, action_y + 70))
+            .size((110, 40))
             .build(&mut clear_button)?;
 
         Ok(Self {
@@ -108,7 +108,7 @@ impl DialerView {
             let digit = digit_labels[i].to_string();
             nwg::bind_event_handler(
                 &button.handle,
-                app.window(),
+                &app.window().handle,
                 move |evt, _evt_data, _handle| {
                     if evt == nwg::Event::OnButtonClick {
                         if let Some(app) = app_digit.upgrade() {
@@ -123,7 +123,7 @@ impl DialerView {
         let app_call = app_weak.clone();
         nwg::bind_event_handler(
             &self.call_button.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
                     if let Some(app) = app_call.upgrade() {
@@ -137,7 +137,7 @@ impl DialerView {
         let app_clear = app_weak.clone();
         nwg::bind_event_handler(
             &self.clear_button.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
                     if let Some(app) = app_clear.upgrade() {
@@ -151,7 +151,7 @@ impl DialerView {
         let app_backspace = app_weak.clone();
         nwg::bind_event_handler(
             &self.backspace_button.handle,
-            app.window(),
+            &app.window().handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
                     if let Some(app) = app_backspace.upgrade() {
@@ -195,36 +195,43 @@ impl DialerView {
     }
 
     /// Sets the default domain for phone number URIs.
+    #[allow(dead_code)]
     pub fn set_default_domain(&self, domain: Option<String>) {
         *self.default_domain.borrow_mut() = domain;
     }
 
     /// Gets the current input text.
+    #[allow(dead_code)]
     pub fn input_text(&self) -> String {
         self.input.text()
     }
 
     /// Sets the input text.
+    #[allow(dead_code)]
     pub fn set_input_text(&self, text: &str) {
         self.input.set_text(text);
     }
 
     /// Returns references to the digit buttons for event handling.
+    #[allow(dead_code)]
     pub fn digit_buttons(&self) -> &[nwg::Button] {
         &self.buttons
     }
 
     /// Returns a reference to the call button.
+    #[allow(dead_code)]
     pub fn call_button(&self) -> &nwg::Button {
         &self.call_button
     }
 
     /// Returns a reference to the clear button.
+    #[allow(dead_code)]
     pub fn clear_button(&self) -> &nwg::Button {
         &self.clear_button
     }
 
     /// Returns a reference to the backspace button.
+    #[allow(dead_code)]
     pub fn backspace_button(&self) -> &nwg::Button {
         &self.backspace_button
     }

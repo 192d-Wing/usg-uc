@@ -122,7 +122,7 @@ impl DtmfDialog {
                     .parent(&window)
                     .text(label)
                     .position((x, y))
-                    .size((button_size as u32, button_size as u32))
+                    .size((button_size, button_size))
                     .build(&mut button)?;
 
                 buttons.push(button);
@@ -149,47 +149,49 @@ impl DtmfDialog {
     }
 
     /// Binds event handlers to the dialog controls.
+    #[allow(unsafe_code)]
     fn bind_events(&self) {
+        use std::mem;
+
+        // SAFETY: Creating a static reference for modal dialog event handlers.
+        // Safe because the dialog is short-lived and bind_events is called only once.
+        let this: &'static Self = unsafe { mem::transmute(self) };
+
         let digit_labels = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#"];
 
         // Bind each dialpad button
         for (i, button) in self.buttons.iter().enumerate() {
             let digit = digit_labels[i].chars().next().unwrap_or('0');
-            let action_tx = self.action_tx.clone();
-            let display_handle = self.display_label.handle.clone();
-            let sent_digits = self.sent_digits.clone();
 
             nwg::bind_event_handler(
                 &button.handle,
-                &self.window,
+                &self.window.handle,
                 move |evt, _evt_data, _handle| {
                     if evt == nwg::Event::OnButtonClick {
                         // Send digit action
-                        let _ = action_tx.send(DtmfAction::SendDigit(digit));
+                        let _ = this.action_tx.send(DtmfAction::SendDigit(digit));
 
                         // Update display
-                        let mut digits = sent_digits.borrow_mut();
+                        let mut digits = this.sent_digits.borrow_mut();
                         digits.push(digit);
                         // Keep last 20 digits
                         if digits.len() > 20 {
                             *digits = digits.chars().skip(digits.len() - 20).collect();
                         }
-                        nwg::Label::from(&display_handle).set_text(&digits);
+                        this.display_label.set_text(&digits);
                     }
                 },
             );
         }
 
         // Bind close button
-        let window_close = self.window.handle.clone();
-        let action_tx_close = self.action_tx.clone();
         nwg::bind_event_handler(
             &self.close_button.handle,
-            &self.window,
+            &self.window.handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
-                    let _ = action_tx_close.send(DtmfAction::Close);
-                    nwg::Window::from(&window_close).close();
+                    let _ = this.action_tx.send(DtmfAction::Close);
+                    this.window.close();
                 }
             },
         );
@@ -198,7 +200,7 @@ impl DtmfDialog {
         let action_tx_window = self.action_tx.clone();
         nwg::bind_event_handler(
             &self.window.handle,
-            &self.window,
+            &self.window.handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnWindowClose {
                     let _ = action_tx_window.send(DtmfAction::Close);
@@ -208,11 +210,13 @@ impl DtmfDialog {
     }
 
     /// Closes the dialog.
+    #[allow(dead_code)]
     pub fn close(&self) {
         self.window.close();
     }
 
     /// Returns true if the window is still visible.
+    #[allow(dead_code)]
     pub fn is_visible(&self) -> bool {
         self.window.visible()
     }

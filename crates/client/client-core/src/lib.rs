@@ -6,7 +6,8 @@
 //! - Settings persistence
 //! - Event coordination between GUI and SIP/Audio layers
 
-#![forbid(unsafe_code)]
+// Use deny instead of forbid to allow platform-specific unsafe code for Windows certificate store
+#![deny(unsafe_code)]
 #![deny(warnings)]
 #![deny(missing_docs)]
 #![deny(clippy::unwrap_used)]

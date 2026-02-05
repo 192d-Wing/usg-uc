@@ -91,7 +91,7 @@ impl NotificationManager {
                 Toast::new(&self.app_name)
                     .title(title)
                     .text1(&body)
-                    .sound(Some(Sound::Call))
+                    .sound(Some(Sound::IM))
                     .duration(Duration::Long)
                     .show()
             }
@@ -171,6 +171,7 @@ impl NotificationManager {
     }
 
     /// Shows an incoming call notification.
+    #[allow(dead_code)]
     pub fn notify_incoming_call(&self, caller_name: Option<String>, caller_uri: String) {
         self.show(NotificationType::IncomingCall {
             caller_name,
@@ -188,6 +189,7 @@ impl NotificationManager {
     }
 
     /// Shows a registration state notification.
+    #[allow(dead_code)]
     pub fn notify_registration(&self, registered: bool, account_id: String) {
         self.show(NotificationType::RegistrationChanged {
             registered,
@@ -196,6 +198,7 @@ impl NotificationManager {
     }
 
     /// Shows a call ended notification.
+    #[allow(dead_code)]
     pub fn notify_call_ended(&self, remote_name: Option<String>, duration_secs: Option<u64>) {
         self.show(NotificationType::CallEnded {
             remote_name,
@@ -204,6 +207,7 @@ impl NotificationManager {
     }
 
     /// Shows an error notification.
+    #[allow(dead_code)]
     pub fn notify_error(&self, title: &str, message: &str) {
         self.show(NotificationType::Error {
             title: title.to_string(),

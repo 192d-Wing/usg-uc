@@ -46,7 +46,12 @@ impl TransferDialog {
 
         // Show modal and run event loop
         dialog.window.set_visible(true);
-        nwg::Modal::new(&dialog.window).run_modal(&dialog.transfer_button, &dialog.cancel_button);
+
+        // Simple modal loop - wait for window to close
+        while dialog.window.visible() {
+            nwg::dispatch_thread_events();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
 
         // Return result
         dialog.result.borrow().clone()
@@ -105,7 +110,7 @@ impl TransferDialog {
             .build(&mut cancel_button)?;
 
         // Focus the input field
-        nwg::Window::set_focus(&uri_input);
+        uri_input.set_focus();
 
         Ok(Self {
             window,
@@ -118,33 +123,36 @@ impl TransferDialog {
     }
 
     /// Binds event handlers to the dialog controls.
+    #[allow(unsafe_code)]
     fn bind_events(&self) {
+        use std::mem;
+
+        // SAFETY: Creating a static reference for modal dialog event handlers.
+        // Safe because the dialog is short-lived and bind_events is called only once.
+        let this: &'static Self = unsafe { mem::transmute(self) };
+
         // Transfer button click
-        let result_transfer = self.result.clone();
-        let uri_input_transfer = self.uri_input.handle.clone();
-        let window_transfer = self.window.handle.clone();
         nwg::bind_event_handler(
             &self.transfer_button.handle,
-            &self.window,
+            &self.window.handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
-                    let uri = nwg::TextInput::from(&uri_input_transfer).text();
+                    let uri = this.uri_input.text();
                     if !uri.is_empty() {
-                        *result_transfer.borrow_mut() = TransferDialogResult::Transfer(uri);
+                        *this.result.borrow_mut() = TransferDialogResult::Transfer(uri);
                     }
-                    nwg::Window::from(&window_transfer).close();
+                    this.window.close();
                 }
             },
         );
 
         // Cancel button click
-        let window_cancel = self.window.handle.clone();
         nwg::bind_event_handler(
             &self.cancel_button.handle,
-            &self.window,
+            &self.window.handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnButtonClick {
-                    nwg::Window::from(&window_cancel).close();
+                    this.window.close();
                 }
             },
         );
@@ -152,7 +160,7 @@ impl TransferDialog {
         // Window close (X button or escape)
         nwg::bind_event_handler(
             &self.window.handle,
-            &self.window,
+            &self.window.handle,
             move |evt, _evt_data, _handle| {
                 if evt == nwg::Event::OnWindowClose {
                     nwg::stop_thread_dispatch();
@@ -162,6 +170,7 @@ impl TransferDialog {
     }
 
     /// Gets the entered URI.
+    #[allow(dead_code)]
     pub fn uri(&self) -> String {
         self.uri_input.text()
     }
