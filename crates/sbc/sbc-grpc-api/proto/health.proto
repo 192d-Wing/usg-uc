@@ -1,0 +1,54 @@
+// Standard gRPC Health Checking Protocol
+//
+// This follows the standard gRPC health checking protocol as defined in:
+// https://github.com/grpc/grpc/blob/master/doc/health-checking.md
+//
+// NIST 800-53 Rev5 Controls:
+// - SC-24: Fail in Known State
+
+syntax = "proto3";
+
+package grpc.health.v1;
+
+// Health is the standard gRPC health checking service.
+// This service is used by load balancers, orchestrators, and monitoring systems
+// to determine whether the server is healthy and able to handle requests.
+service Health {
+    // Check performs a health check on the specified service.
+    // If the service name is empty, it checks the overall server health.
+    rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
+
+    // Watch performs a streaming health check.
+    // The server will send a new HealthCheckResponse whenever the status changes.
+    rpc Watch(HealthCheckRequest) returns (stream HealthCheckResponse);
+}
+
+// Request message for health check.
+message HealthCheckRequest {
+    // The service name to check. Empty string means check overall server health.
+    // Service names follow the pattern: "package.service" (e.g., "sbc.api.v1.CallService").
+    string service = 1;
+}
+
+// Response message for health check.
+message HealthCheckResponse {
+    // Serving status enumeration.
+    enum ServingStatus {
+        // Unknown status (should not be used).
+        UNKNOWN = 0;
+
+        // The service is healthy and ready to serve requests.
+        SERVING = 1;
+
+        // The service exists but is not currently able to serve requests.
+        // This might be due to graceful shutdown, temporary overload, etc.
+        NOT_SERVING = 2;
+
+        // The requested service name is not recognized.
+        // Only used in Check responses, not Watch.
+        SERVICE_UNKNOWN = 3;
+    }
+
+    // Current serving status.
+    ServingStatus status = 1;
+}

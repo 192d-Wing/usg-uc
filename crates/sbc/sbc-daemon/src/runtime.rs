@@ -13,6 +13,8 @@ use crate::api_server::{ApiServer, ApiServerConfig, AppState};
 use crate::args::Args;
 #[cfg(feature = "cluster")]
 use crate::cluster::ClusterManager;
+#[cfg(feature = "grpc")]
+use crate::grpc_server::GrpcServer;
 use crate::server::{Server, ServerError};
 use crate::shutdown::{ShutdownCoordinator, ShutdownSignal};
 #[cfg(test)]
@@ -254,6 +256,10 @@ impl Runtime {
         let signal = self.shutdown.signal().clone();
         let config = self.config.read().await.clone();
 
+        // Extract gRPC config before moving config to server
+        #[cfg(feature = "grpc")]
+        let grpc_config = config.grpc.clone().unwrap_or_default();
+
         // Pass cluster manager to server if available
         #[cfg(feature = "cluster")]
         let mut server = Server::new_with_cluster(config, signal.clone(), self.cluster.clone());
@@ -282,6 +288,39 @@ impl Runtime {
             }
         });
 
+        // Spawn gRPC server task (if enabled)
+        #[cfg(all(feature = "grpc", not(feature = "cluster")))]
+        let grpc_handle = if grpc_config.enabled {
+            let grpc_server =
+                GrpcServer::new(grpc_config, Arc::clone(&app_state), signal.clone());
+            Some(tokio::spawn(async move {
+                if let Err(e) = grpc_server.run().await {
+                    error!("gRPC server error: {e}");
+                }
+            }))
+        } else {
+            debug!("gRPC server disabled by configuration");
+            None
+        };
+
+        #[cfg(all(feature = "grpc", feature = "cluster"))]
+        let grpc_handle = if grpc_config.enabled {
+            let grpc_server = GrpcServer::new(
+                grpc_config,
+                Arc::clone(&app_state),
+                signal.clone(),
+                self.cluster.clone(),
+            );
+            Some(tokio::spawn(async move {
+                if let Err(e) = grpc_server.run().await {
+                    error!("gRPC server error: {e}");
+                }
+            }))
+        } else {
+            debug!("gRPC server disabled by configuration");
+            None
+        };
+
         // Spawn configuration reload monitor task
         let reload_signal = signal.clone();
         let config_ref = Arc::clone(&self.config);
@@ -302,6 +341,13 @@ impl Runtime {
 
         // Stop API server
         api_handle.abort();
+
+        // Stop gRPC server
+        #[cfg(feature = "grpc")]
+        if let Some(handle) = grpc_handle {
+            handle.abort();
+            info!("gRPC server stopped");
+        }
 
         // Perform graceful shutdown with connection draining
         info!("Initiating graceful shutdown with connection draining");

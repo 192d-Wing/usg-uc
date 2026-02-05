@@ -1,0 +1,144 @@
+// SBC Configuration Management Service
+//
+// NIST 800-53 Rev5 Controls:
+// - CM-2: Baseline Configuration
+// - CM-6: Configuration Settings
+
+syntax = "proto3";
+
+package sbc.api.v1;
+
+// ConfigService provides configuration management operations for the SBC.
+service ConfigService {
+    // GetConfig returns the current active configuration.
+    rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
+
+    // UpdateConfig applies a new configuration.
+    // Only hot-reloadable sections can be updated without restart.
+    rpc UpdateConfig(UpdateConfigRequest) returns (UpdateConfigResponse);
+
+    // ValidateConfig validates a configuration without applying it.
+    rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
+
+    // ReloadConfig triggers a full configuration reload from the config file.
+    rpc ReloadConfig(ReloadConfigRequest) returns (ReloadConfigResponse);
+}
+
+// Request to get current configuration.
+message GetConfigRequest {
+    // Optional section filter (e.g., "general", "media", "security").
+    // Empty means return full configuration.
+    repeated string sections = 1;
+
+    // Output format: "json", "toml", or "yaml".
+    // Defaults to "json" if not specified.
+    string format = 2;
+}
+
+// Response containing current configuration.
+message GetConfigResponse {
+    // Configuration content in the requested format.
+    string config = 1;
+
+    // Format of the returned configuration.
+    string format = 2;
+
+    // Configuration version/hash for change detection.
+    string version = 3;
+
+    // Timestamp when config was last modified (Unix epoch seconds).
+    int64 last_modified = 4;
+}
+
+// Request to update configuration.
+message UpdateConfigRequest {
+    // Configuration content to apply.
+    string config = 1;
+
+    // Format of the configuration: "json", "toml", or "yaml".
+    string format = 2;
+
+    // Sections to update. Empty means attempt full config update.
+    repeated string sections = 3;
+
+    // If true, validate only without applying changes.
+    bool dry_run = 4;
+}
+
+// Response from configuration update.
+message UpdateConfigResponse {
+    // Whether the update was successful.
+    bool success = 1;
+
+    // Human-readable status message.
+    string message = 2;
+
+    // List of sections that were changed.
+    repeated string changed_sections = 3;
+
+    // Validation errors if any.
+    repeated ValidationError errors = 4;
+
+    // New configuration version after update.
+    string new_version = 5;
+}
+
+// Request to validate configuration.
+message ValidateConfigRequest {
+    // Configuration content to validate.
+    string config = 1;
+
+    // Format of the configuration: "json", "toml", or "yaml".
+    string format = 2;
+}
+
+// Response from configuration validation.
+message ValidateConfigResponse {
+    // Whether the configuration is valid.
+    bool valid = 1;
+
+    // Validation errors if any.
+    repeated ValidationError errors = 2;
+
+    // Validation warnings (non-fatal issues).
+    repeated ValidationError warnings = 3;
+}
+
+// Configuration validation error.
+message ValidationError {
+    // Configuration section where the error occurred.
+    string section = 1;
+
+    // Field name within the section.
+    string field = 2;
+
+    // Human-readable error message.
+    string message = 3;
+
+    // Error code for programmatic handling.
+    string code = 4;
+
+    // Severity level: "error" or "warning".
+    string severity = 5;
+}
+
+// Request to reload configuration from file.
+message ReloadConfigRequest {
+    // Optional path override. If empty, uses the configured config path.
+    string path = 1;
+}
+
+// Response from configuration reload.
+message ReloadConfigResponse {
+    // Whether the reload was successful.
+    bool success = 1;
+
+    // Human-readable status message.
+    string message = 2;
+
+    // List of sections that changed during reload.
+    repeated string changed_sections = 3;
+
+    // New configuration version after reload.
+    string new_version = 4;
+}

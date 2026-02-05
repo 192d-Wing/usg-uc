@@ -27,3 +27,6 @@ mod policy_tests;
 
 #[cfg(all(test, feature = "cluster"))]
 mod cluster_tests;
+
+#[cfg(all(test, feature = "grpc"))]
+mod grpc_tests;

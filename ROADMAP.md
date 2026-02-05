@@ -60,7 +60,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `sbc-cli`: Command-line interface
 - `sbc-integration-tests`: Cross-crate integration tests
 
-**Current Status**: 1750+ tests passing, Phases 1-25 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.30-24.38 complete, Phase 25 100% RFC 9260 compliance achieved
+**Current Status**: 1750+ tests passing, Phases 1-25 complete, Phase 15 fully complete, Phase 22 storage backends complete, Phase 24.30-24.38 complete, Phase 25 100% RFC 9260 compliance achieved, Enterprise Features in progress
 
 ---
 
@@ -509,8 +509,13 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ Registrar tests (AsyncLocationService CRUD, cache reload, health)
 - ✅ End-to-end tests (cluster formation, registration flow, shared storage)
 - ✅ Feature flags: `cluster`, `redis`, `postgres`
+- ✅ gRPC integration tests with feature flags: `grpc`, `grpc-reflection`, `grpc-cluster`
+- ✅ Proto message tests for all services (Health, Config, System, Call, Registration, Cluster)
+- ✅ Service trait tests with mock implementations
+- ✅ Message serialization tests using prost encode/decode
+- ✅ Reflection service tests verifying FILE_DESCRIPTOR_SET
 
-**Tests**: 125 new tests across Phase 22 crates + 23 integration tests
+**Tests**: 125 new tests across Phase 22 crates + 23 integration tests + 35 gRPC tests
 
 ### ✅ Phase 23: Specialized Protocols
 
@@ -1501,6 +1506,83 @@ This document outlines the development roadmap for the USG Session Border Contro
   - Direct method calls instead of Action enums
   - NWG event handlers bound via `nwg::bind_event_handler`
   - Timer-based polling for SIP events
+
+### 🚧 Enterprise Management Features (In Progress)
+
+**Goal**: Enterprise-level management capabilities for the SBC
+
+**Multi-Format Configuration Support** (`sbc-config`) ✅
+
+- ✅ `serde_yaml_ng` dependency for YAML parsing
+- ✅ `ConfigFormat` enum: `Toml`, `Yaml`
+- ✅ `ConfigFormat::from_extension()` auto-detects format from file extension
+- ✅ `load_from_file_with_format()` for explicit format loading
+- ✅ `load_from_str_with_format()` for parsing strings with specified format
+- ✅ Backward compatible: existing TOML workflows unchanged
+- ✅ 20 tests passing
+
+**gRPC Management API** (`sbc-grpc-api` new crate) ✅
+
+- ✅ Protocol Buffer definitions for enterprise management
+- ✅ `config.proto`: ConfigService (GetConfig, UpdateConfig, ValidateConfig, ReloadConfig)
+- ✅ `call.proto`: CallService (ListCalls, GetCall, TerminateCall, GetCallStats)
+- ✅ `registration.proto`: RegistrationService (ListRegistrations, GetRegistration)
+- ✅ `system.proto`: SystemService (GetVersion, GetStats, GetMetrics, ReloadTls, GetTlsStatus, Shutdown)
+- ✅ `health.proto`: Standard gRPC health protocol (Check, Watch)
+- ✅ `cluster.proto`: ClusterService (GetClusterStatus, ListNodes, GetNodeStatus, InitiateFailover) - feature-gated
+- ✅ Built with tonic 0.14 and prost 0.14
+- ✅ 4 tests passing
+
+**gRPC Server Implementation** (`sbc-daemon`) ✅
+
+- ✅ `grpc_server` module with service implementations
+- ✅ `GrpcServer` struct for lifecycle management
+- ✅ `ConfigServiceImpl`, `SystemServiceImpl`, `HealthServiceImpl`
+- ✅ `CallServiceImpl`: ListCalls, GetCall, TerminateCall, GetCallStats, WatchCalls
+- ✅ `RegistrationServiceImpl`: ListRegistrations, GetRegistration, DeleteRegistration, GetRegistrationStats
+- ✅ TLS/mTLS support via `ServerTlsConfig`
+- ✅ Feature-gated behind `grpc` feature flag
+- ✅ Integrated into Runtime with graceful shutdown
+- ✅ Default port 9090 (alongside REST API on 8080)
+- ✅ 57 tests passing
+
+**Configuration Schema** (`sbc-config/schema.rs`) ✅
+
+- ✅ `GrpcConfig` struct:
+  - `enabled`: Enable/disable gRPC server
+  - `listen_addr`: Bind address (default: 0.0.0.0:9090)
+  - `tls_cert_path`, `tls_key_path`, `tls_ca_path`: TLS configuration
+  - `require_mtls`: Mutual TLS requirement
+  - `max_connections`: Connection limit
+  - `request_timeout_secs`: Request timeout
+  - `enable_reflection`: gRPC reflection service
+
+**ClusterService gRPC** (`sbc-daemon`, cluster feature) ✅
+
+- ✅ `ClusterServiceImpl`: GetClusterStatus, ListNodes, GetNodeStatus, DrainNode, WatchCluster RPCs
+- ✅ InitiateFailover and UndoFailover RPCs (stubs pending FailoverCoordinator integration)
+- ✅ NodeRole and NodeState mapping to protobuf enums
+- ✅ ClusterHealth aggregation from storage, discovery, and location services
+- ✅ Feature-gated behind `cluster` feature flag
+- ✅ Runtime integration passes ClusterManager to GrpcServer when cluster enabled
+- ✅ 61 tests passing with cluster feature
+
+**gRPC Reflection Service** (`sbc-grpc-api`, `sbc-daemon`) ✅
+
+- ✅ `tonic-reflection` dependency added to workspace
+- ✅ File descriptor set generation in build.rs
+- ✅ `FILE_DESCRIPTOR_SET` constant exported (feature-gated behind `reflection`)
+- ✅ `grpc-reflection` feature flag in sbc-daemon
+- ✅ Runtime configuration via `enable_reflection` in GrpcConfig
+- ✅ Service discovery via `grpcurl` and other gRPC reflection clients
+- ✅ Works with all feature combinations (cluster, reflection)
+
+**Pending**
+
+- 🚧 Integration tests for gRPC services
+- 🚧 Full FailoverCoordinator integration for InitiateFailover/UndoFailover
+
+---
 
 **Phase 24.38: Button Event Handlers & Custom Dialogs** ✅
 

@@ -1,0 +1,197 @@
+// SBC Registration Management Service
+//
+// NIST 800-53 Rev5 Controls:
+// - IA-2: Identification and Authentication
+// - AC-2: Account Management
+
+syntax = "proto3";
+
+package sbc.api.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// RegistrationService provides registration management and monitoring.
+service RegistrationService {
+    // ListRegistrations returns all active registrations with optional filtering.
+    rpc ListRegistrations(ListRegistrationsRequest) returns (ListRegistrationsResponse);
+
+    // GetRegistration returns details for a specific AOR.
+    rpc GetRegistration(GetRegistrationRequest) returns (GetRegistrationResponse);
+
+    // DeleteRegistration removes a registration (sends NOTIFY with expires=0).
+    rpc DeleteRegistration(DeleteRegistrationRequest) returns (DeleteRegistrationResponse);
+
+    // GetRegistrationStats returns registration statistics.
+    rpc GetRegistrationStats(GetRegistrationStatsRequest) returns (GetRegistrationStatsResponse);
+}
+
+// Information about a registration (Address of Record).
+message RegistrationInfo {
+    // Address of Record (SIP URI).
+    string aor = 1;
+
+    // List of registered contacts for this AOR.
+    repeated ContactInfo contacts = 2;
+
+    // When this AOR was first registered.
+    google.protobuf.Timestamp registered_at = 3;
+
+    // Shortest expires time among all contacts.
+    int64 min_expires_secs = 4;
+
+    // User-Agent header from registration.
+    string user_agent = 5;
+
+    // Authentication realm.
+    string realm = 6;
+
+    // Instance ID if provided.
+    string instance_id = 7;
+
+    // Display name from From header.
+    string display_name = 8;
+}
+
+// Information about a single contact binding.
+message ContactInfo {
+    // Contact URI.
+    string uri = 1;
+
+    // Time until expiration in seconds.
+    int64 expires = 2;
+
+    // Q-value priority (0.0 to 1.0).
+    float q_value = 3;
+
+    // Instance ID for this contact.
+    string instance_id = 4;
+
+    // Public GRUU if assigned.
+    string pub_gruu = 5;
+
+    // Temporary GRUU if assigned.
+    string temp_gruu = 6;
+
+    // When this contact was registered.
+    google.protobuf.Timestamp registered_at = 7;
+
+    // Source transport address.
+    string source_addr = 8;
+
+    // Transport protocol used.
+    string transport = 9;
+
+    // Whether registration used TLS.
+    bool secure = 10;
+
+    // Call-ID from REGISTER request.
+    string call_id = 11;
+
+    // CSeq from REGISTER request.
+    uint32 cseq = 12;
+}
+
+// Request to list registrations.
+message ListRegistrationsRequest {
+    // Maximum number of registrations to return.
+    int32 limit = 1;
+
+    // Offset for pagination.
+    int32 offset = 2;
+
+    // Filter by AOR (substring match).
+    string aor_filter = 3;
+
+    // Filter by realm.
+    string realm_filter = 4;
+
+    // Filter by user agent (substring match).
+    string user_agent_filter = 5;
+
+    // Only return registrations expiring within this many seconds.
+    int64 expiring_within_secs = 6;
+}
+
+// Response containing list of registrations.
+message ListRegistrationsResponse {
+    // List of registrations matching the filter.
+    repeated RegistrationInfo registrations = 1;
+
+    // Total number of registrations (ignoring pagination).
+    int64 total = 2;
+
+    // Number of active registrations.
+    int64 active = 3;
+}
+
+// Request to get a specific registration.
+message GetRegistrationRequest {
+    // AOR to retrieve.
+    string aor = 1;
+}
+
+// Response containing registration details.
+message GetRegistrationResponse {
+    // Registration information.
+    RegistrationInfo registration = 1;
+}
+
+// Request to delete a registration.
+message DeleteRegistrationRequest {
+    // AOR to delete.
+    string aor = 1;
+
+    // Optional: specific contact to delete. If empty, deletes all contacts.
+    string contact_uri = 2;
+
+    // Reason for deletion.
+    string reason = 3;
+}
+
+// Response from registration deletion.
+message DeleteRegistrationResponse {
+    // Whether deletion was successful.
+    bool success = 1;
+
+    // Human-readable status message.
+    string message = 2;
+
+    // Number of contacts removed.
+    int32 contacts_removed = 3;
+}
+
+// Request for registration statistics.
+message GetRegistrationStatsRequest {
+    // Optional realm filter.
+    string realm = 1;
+}
+
+// Response containing registration statistics.
+message GetRegistrationStatsResponse {
+    // Total registrations since startup.
+    int64 registrations_total = 1;
+
+    // Currently active registrations.
+    int64 registrations_active = 2;
+
+    // Total unique AORs registered.
+    int64 unique_aors = 3;
+
+    // Total contact bindings.
+    int64 total_contacts = 4;
+
+    // Registrations expiring in next 60 seconds.
+    int64 expiring_soon = 5;
+
+    // Average contacts per AOR.
+    double avg_contacts_per_aor = 6;
+
+    // Registration rate (per minute).
+    double registrations_per_minute = 7;
+
+    // Re-registration rate (per minute).
+    double reregistrations_per_minute = 8;
+
+    // Failed authentication attempts (per minute).
+    double auth_failures_per_minute = 9;
+}

@@ -1,0 +1,372 @@
+// SBC Cluster Management Service
+//
+// This service is only available when the cluster feature is enabled.
+//
+// NIST 800-53 Rev5 Controls:
+// - SC-24: Fail in Known State
+// - CP-10: System Recovery and Reconstitution
+
+syntax = "proto3";
+
+package sbc.api.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// ClusterService provides cluster management operations.
+// This service requires the "cluster" feature to be enabled.
+service ClusterService {
+    // GetClusterStatus returns the current cluster status.
+    rpc GetClusterStatus(GetClusterStatusRequest) returns (GetClusterStatusResponse);
+
+    // ListNodes returns all nodes in the cluster.
+    rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+
+    // GetNodeStatus returns detailed status for a specific node.
+    rpc GetNodeStatus(GetNodeStatusRequest) returns (GetNodeStatusResponse);
+
+    // InitiateFailover triggers manual failover to a target node.
+    rpc InitiateFailover(InitiateFailoverRequest) returns (InitiateFailoverResponse);
+
+    // DrainNode removes a node from service for maintenance.
+    rpc DrainNode(DrainNodeRequest) returns (DrainNodeResponse);
+
+    // UndoFailover reverts a previous failover operation.
+    rpc UndoFailover(UndoFailoverRequest) returns (UndoFailoverResponse);
+
+    // WatchCluster streams cluster state changes.
+    rpc WatchCluster(WatchClusterRequest) returns (stream ClusterEvent);
+}
+
+// Node role in the cluster.
+enum NodeRole {
+    NODE_ROLE_UNSPECIFIED = 0;
+    NODE_ROLE_PRIMARY = 1;
+    NODE_ROLE_SECONDARY = 2;
+    NODE_ROLE_STANDBY = 3;
+    NODE_ROLE_WITNESS = 4;
+}
+
+// Node state in the cluster.
+enum NodeState {
+    NODE_STATE_UNSPECIFIED = 0;
+    NODE_STATE_INITIALIZING = 1;
+    NODE_STATE_ACTIVE = 2;
+    NODE_STATE_DRAINING = 3;
+    NODE_STATE_STANDBY = 4;
+    NODE_STATE_FAILED = 5;
+    NODE_STATE_MAINTENANCE = 6;
+}
+
+// Request for cluster status.
+message GetClusterStatusRequest {}
+
+// Response containing cluster status.
+message GetClusterStatusResponse {
+    // This node's ID.
+    string node_id = 1;
+
+    // This node's role.
+    NodeRole role = 2;
+
+    // This node's state.
+    NodeState state = 3;
+
+    // Overall cluster health.
+    ClusterHealth health = 4;
+
+    // Number of members in the cluster.
+    int32 member_count = 5;
+
+    // Storage backend type.
+    string storage_backend = 6;
+
+    // Cluster ID.
+    string cluster_id = 7;
+
+    // Leader node ID (if applicable).
+    string leader_id = 8;
+
+    // Last state sync timestamp.
+    google.protobuf.Timestamp last_sync = 9;
+
+    // Replication lag in milliseconds.
+    int64 replication_lag_ms = 10;
+}
+
+// Cluster health status.
+message ClusterHealth {
+    // Overall health status.
+    bool healthy = 1;
+
+    // Storage backend health.
+    bool storage_healthy = 2;
+
+    // Discovery service health.
+    bool discovery_healthy = 3;
+
+    // Location service (registrar) health.
+    bool location_healthy = 4;
+
+    // State sync health.
+    bool sync_healthy = 5;
+
+    // Number of healthy nodes.
+    int32 healthy_nodes = 6;
+
+    // Minimum required healthy nodes.
+    int32 quorum_size = 7;
+
+    // Whether quorum is met.
+    bool quorum_met = 8;
+
+    // Health check details.
+    repeated HealthCheckDetail checks = 9;
+}
+
+// Individual health check result.
+message HealthCheckDetail {
+    // Check name.
+    string name = 1;
+
+    // Whether the check passed.
+    bool passed = 2;
+
+    // Human-readable message.
+    string message = 3;
+
+    // When the check was performed.
+    google.protobuf.Timestamp timestamp = 4;
+
+    // Duration of the check in milliseconds.
+    int64 duration_ms = 5;
+}
+
+// Information about a cluster node.
+message NodeInfo {
+    // Node identifier.
+    string node_id = 1;
+
+    // Node role.
+    NodeRole role = 2;
+
+    // Node state.
+    NodeState state = 3;
+
+    // Node address (for cluster communication).
+    string address = 4;
+
+    // SIP signaling address.
+    string sip_address = 5;
+
+    // Management API address.
+    string api_address = 6;
+
+    // Last heartbeat received.
+    google.protobuf.Timestamp last_seen = 7;
+
+    // Node uptime in seconds.
+    int64 uptime_secs = 8;
+
+    // Node metrics.
+    NodeMetrics metrics = 9;
+
+    // Node version.
+    string version = 10;
+
+    // Geographic region.
+    string region = 11;
+
+    // Availability zone.
+    string zone = 12;
+
+    // Tags/labels for this node.
+    map<string, string> labels = 13;
+}
+
+// Node performance metrics.
+message NodeMetrics {
+    // Active calls on this node.
+    int64 active_calls = 1;
+
+    // Active registrations on this node.
+    int64 active_registrations = 2;
+
+    // CPU usage percentage (0-100).
+    double cpu_usage = 3;
+
+    // Memory usage percentage (0-100).
+    double memory_usage = 4;
+
+    // Network bytes in (per second).
+    int64 network_in_bps = 5;
+
+    // Network bytes out (per second).
+    int64 network_out_bps = 6;
+
+    // Disk usage percentage (0-100).
+    double disk_usage = 7;
+
+    // Current load score (for load balancing).
+    double load_score = 8;
+
+    // Calls per second.
+    double calls_per_second = 9;
+
+    // Messages per second.
+    double messages_per_second = 10;
+}
+
+// Request to list nodes.
+message ListNodesRequest {
+    // Filter by role.
+    NodeRole role_filter = 1;
+
+    // Filter by state.
+    NodeState state_filter = 2;
+
+    // Include offline/failed nodes.
+    bool include_offline = 3;
+}
+
+// Response containing list of nodes.
+message ListNodesResponse {
+    // List of nodes.
+    repeated NodeInfo nodes = 1;
+
+    // Total node count.
+    int32 total = 2;
+}
+
+// Request for specific node status.
+message GetNodeStatusRequest {
+    // Node ID to query.
+    string node_id = 1;
+}
+
+// Response containing node status.
+message GetNodeStatusResponse {
+    // Node information.
+    NodeInfo node = 1;
+}
+
+// Request to initiate failover.
+message InitiateFailoverRequest {
+    // Target node to promote (empty = automatic selection).
+    string target_node_id = 1;
+
+    // Reason for failover.
+    string reason = 2;
+
+    // Force failover even if conditions are not optimal.
+    bool force = 3;
+}
+
+// Response from failover request.
+message InitiateFailoverResponse {
+    // Whether failover was initiated.
+    bool success = 1;
+
+    // Human-readable status message.
+    string message = 2;
+
+    // New primary node ID.
+    string new_primary_id = 3;
+
+    // Failover operation ID for tracking.
+    string operation_id = 4;
+}
+
+// Request to drain a node.
+message DrainNodeRequest {
+    // Node ID to drain.
+    string node_id = 1;
+
+    // Timeout for draining in seconds.
+    int32 timeout_secs = 2;
+
+    // Reason for draining.
+    string reason = 3;
+}
+
+// Response from drain request.
+message DrainNodeResponse {
+    // Whether drain was initiated.
+    bool success = 1;
+
+    // Human-readable status message.
+    string message = 2;
+
+    // Number of calls being drained.
+    int64 calls_draining = 3;
+
+    // Number of registrations being migrated.
+    int64 registrations_migrating = 4;
+}
+
+// Request to undo failover.
+message UndoFailoverRequest {
+    // Operation ID from InitiateFailoverResponse.
+    string operation_id = 1;
+
+    // Reason for reverting.
+    string reason = 2;
+}
+
+// Response from undo failover request.
+message UndoFailoverResponse {
+    // Whether undo was initiated.
+    bool success = 1;
+
+    // Human-readable status message.
+    string message = 2;
+}
+
+// Request to watch cluster events.
+message WatchClusterRequest {
+    // Include node join/leave events.
+    bool include_membership = 1;
+
+    // Include role change events.
+    bool include_role_changes = 2;
+
+    // Include health status changes.
+    bool include_health = 3;
+}
+
+// Cluster state change event.
+message ClusterEvent {
+    // Event type.
+    enum EventType {
+        EVENT_TYPE_UNSPECIFIED = 0;
+        EVENT_TYPE_NODE_JOINED = 1;
+        EVENT_TYPE_NODE_LEFT = 2;
+        EVENT_TYPE_NODE_FAILED = 3;
+        EVENT_TYPE_ROLE_CHANGED = 4;
+        EVENT_TYPE_FAILOVER_STARTED = 5;
+        EVENT_TYPE_FAILOVER_COMPLETED = 6;
+        EVENT_TYPE_HEALTH_CHANGED = 7;
+        EVENT_TYPE_QUORUM_LOST = 8;
+        EVENT_TYPE_QUORUM_RESTORED = 9;
+    }
+
+    // Type of event.
+    EventType event_type = 1;
+
+    // Node involved in the event (if applicable).
+    NodeInfo node = 2;
+
+    // Previous role (for role change events).
+    NodeRole previous_role = 3;
+
+    // Previous state (for state change events).
+    NodeState previous_state = 4;
+
+    // Cluster health at time of event.
+    ClusterHealth health = 5;
+
+    // Event timestamp.
+    google.protobuf.Timestamp timestamp = 6;
+
+    // Event description.
+    string message = 7;
+}

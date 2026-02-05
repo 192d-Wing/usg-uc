@@ -14,10 +14,12 @@ workspace = true
 
 [features]
 default = []
-cluster = ["uc-cluster", "uc-discovery", "uc-storage", "uc-state-sync", "proto-registrar/storage", "sbc-config/cluster"]
+grpc = ["dep:sbc-grpc-api", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:prost-types", "dep:tokio-stream"]
+grpc-reflection = ["grpc", "sbc-grpc-api?/reflection", "dep:tonic-reflection"]
+cluster = ["uc-cluster", "uc-discovery", "uc-storage", "uc-state-sync", "proto-registrar/storage", "sbc-config/cluster", "sbc-grpc-api?/cluster"]
 redis = ["uc-storage/redis"]
 postgres = ["uc-storage/postgres"]
-full = ["cluster", "redis", "postgres"]
+full = ["cluster", "redis", "postgres", "grpc", "grpc-reflection"]
 
 [dependencies]
 uc-types.workspace = true
@@ -61,6 +63,15 @@ tokio-rustls.workspace = true
 rustls-pki-types.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+
+# gRPC dependencies (optional)
+sbc-grpc-api = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+tonic-prost = { version = "0.14", optional = true }
+tonic-reflection = { workspace = true, optional = true }
+prost = { version = "0.14", optional = true }
+prost-types = { version = "0.14", optional = true }
+tokio-stream = { version = "0.1", optional = true }
 
 [[bin]]
 name = "sbc-daemon"

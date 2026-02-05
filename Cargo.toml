@@ -65,6 +65,7 @@ members = [
 
     # SBC Application
     "crates/sbc/sbc-config",
+    "crates/sbc/sbc-grpc-api",
     "crates/sbc/sbc-daemon",
     "crates/sbc/sbc-cli",
     "crates/sbc/sbc-integration-tests",
@@ -180,6 +181,14 @@ proto-stir-shaken = { path = "crates/proto/proto-stir-shaken" }
 
 # Internal crates - SBC Application
 sbc-config = { path = "crates/sbc/sbc-config" }
+sbc-grpc-api = { path = "crates/sbc/sbc-grpc-api" }
+
+# gRPC/Protobuf
+prost = "0.13"
+prost-types = "0.13"
+tonic = { version = "0.14", features = ["gzip", "tls-aws-lc"] }
+tonic-prost-build = "0.14"
+tonic-reflection = "0.14"
 
 # Internal crates - SIP Soft Client
 client-types = { path = "crates/client/client-types" }
