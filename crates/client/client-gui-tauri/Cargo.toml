@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "USG SIP Soft Client - Modern Tauri-based GUI"
 
+[features]
+default = []
+digest-auth = ["client-core/digest-auth", "client-types/digest-auth", "dep:zeroize"]
+
 [dependencies]
 # Tauri for desktop app framework
 tauri = { version = "2", features = ["tray-icon"] }
@@ -20,6 +24,9 @@ client-audio = { path = "../client-audio" }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+# Optional dependencies for digest-auth feature
+zeroize = { workspace = true, optional = true }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

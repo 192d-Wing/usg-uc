@@ -3,8 +3,38 @@
 //! Authentication is exclusively via smart card (CAC/PIV/SIPR token)
 //! using mutual TLS client certificates. Password-based digest auth
 //! is NOT supported for CNSA 2.0 compliance.
+//!
+//! Note: The `digest-auth` feature enables username/password authentication
+//! for testing with commercial VoIP providers. This is NOT CNSA 2.0 compliant.
 
 use serde::{Deserialize, Serialize};
+
+/// Digest authentication credentials for testing with commercial providers.
+///
+/// WARNING: This is NOT CNSA 2.0 compliant and should only be used for
+/// interoperability testing with commercial VoIP providers that do not
+/// support mTLS client certificates.
+#[cfg(feature = "digest-auth")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DigestAuthCredentials {
+    /// Authentication username (often the SIP username).
+    pub username: String,
+    /// Authentication password (zeroized on drop, never persisted to disk).
+    /// The password must be provided at runtime and is never serialized.
+    #[serde(skip)]
+    pub password: zeroize::Zeroizing<String>,
+}
+
+#[cfg(feature = "digest-auth")]
+impl DigestAuthCredentials {
+    /// Creates new digest auth credentials.
+    pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
+        Self {
+            username: username.into(),
+            password: zeroize::Zeroizing::new(password.into()),
+        }
+    }
+}
 
 /// SIP account configuration.
 ///
@@ -34,6 +64,9 @@ pub struct SipAccount {
     pub enabled: bool,
     /// Smart card certificate configuration.
     pub certificate_config: CertificateConfig,
+    /// Optional digest auth credentials for testing (NOT CNSA 2.0 compliant).
+    #[cfg(feature = "digest-auth")]
+    pub digest_credentials: Option<DigestAuthCredentials>,
 }
 
 impl Default for SipAccount {
@@ -50,6 +83,8 @@ impl Default for SipAccount {
             turn_config: None,
             enabled: true,
             certificate_config: CertificateConfig::default(),
+            #[cfg(feature = "digest-auth")]
+            digest_credentials: None,
         }
     }
 }

@@ -568,6 +568,32 @@ pub trait DigestHasher {
     fn hash(&self, input: &[u8]) -> String;
 }
 
+/// MD5 hasher for digest authentication (legacy compatibility).
+///
+/// WARNING: MD5 is cryptographically weak. Only use for
+/// interoperability with systems that don't support SHA-256.
+#[cfg(feature = "digest-auth")]
+pub struct Md5DigestHasher;
+
+#[cfg(feature = "digest-auth")]
+impl DigestHasher for Md5DigestHasher {
+    fn hash(&self, input: &[u8]) -> String {
+        format!("{:x}", md5::compute(input))
+    }
+}
+
+/// Generates a client nonce for digest authentication.
+#[cfg(feature = "digest-auth")]
+#[must_use]
+pub fn generate_cnonce() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{now:016x}")
+}
+
 /// Computes HA1 for digest authentication per RFC 2617 Section 3.2.2.1.
 ///
 /// For non-session algorithms: `HA1 = H(username:realm:password)`

@@ -49,6 +49,12 @@ struct AccountRegistration {
     expires_at: Option<Instant>,
     /// Last branch parameter used.
     last_branch: Option<String>,
+    /// Nonce count for digest auth retries.
+    #[cfg(feature = "digest-auth")]
+    nonce_count: u32,
+    /// Last challenge received from server.
+    #[cfg(feature = "digest-auth")]
+    last_challenge: Option<proto_sip::auth::DigestChallenge>,
 }
 
 /// Events emitted by the registration agent.
@@ -109,6 +115,10 @@ impl RegistrationAgent {
                 from_tag: generate_tag(),
                 expires_at: None,
                 last_branch: None,
+                #[cfg(feature = "digest-auth")]
+                nonce_count: 0,
+                #[cfg(feature = "digest-auth")]
+                last_challenge: None,
             });
 
         // Update account config
@@ -234,8 +244,62 @@ impl RegistrationAgent {
                     .await;
             }
             401 | 407 => {
-                // Authentication challenge - but we use mTLS, so this shouldn't happen
-                // If the server requires digest auth, we fail
+                // Authentication challenge
+                #[cfg(feature = "digest-auth")]
+                {
+                    // Try digest auth if credentials are configured
+                    if let Some(ref _creds) = registration.account.digest_credentials {
+                        // Parse WWW-Authenticate / Proxy-Authenticate header
+                        let header_name = if status_code == 401 {
+                            HeaderName::WwwAuthenticate
+                        } else {
+                            HeaderName::ProxyAuthenticate
+                        };
+
+                        if let Some(challenge_header) = response.headers.get(&header_name) {
+                            if let Ok(challenge) = challenge_header.value.parse::<proto_sip::auth::DigestChallenge>() {
+                                // Check retry limit to prevent infinite loops
+                                if registration.nonce_count < 3 {
+                                    info!(
+                                        account_id = %account_id,
+                                        realm = %challenge.realm,
+                                        nonce_count = registration.nonce_count,
+                                        "Digest auth challenge received, retrying with credentials"
+                                    );
+
+                                    registration.last_challenge = Some(challenge);
+                                    registration.nonce_count += 1;
+                                    registration.cseq += 1;
+
+                                    // Build and send authenticated request
+                                    match Self::build_register_with_auth(registration, self.local_addr) {
+                                        Ok(auth_request) => {
+                                            if let Ok(registrar_addr) = Self::parse_registrar_addr(&registration.account.registrar_uri) {
+                                                let branch = registration.last_branch.clone().unwrap_or_default();
+                                                let tx_key = TransactionKey::client(&branch, "REGISTER");
+                                                let transaction = ClientNonInviteTransaction::new(tx_key, TransportType::Reliable);
+                                                registration.transaction = Some(transaction);
+
+                                                let _ = self.event_tx.send(RegistrationEvent::SendRequest {
+                                                    request: auth_request,
+                                                    destination: registrar_addr,
+                                                }).await;
+                                                return Ok(());
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!(account_id = %account_id, error = %e, "Failed to build auth request");
+                                        }
+                                    }
+                                } else {
+                                    warn!(account_id = %account_id, "Max digest auth retries exceeded");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Fall through: no digest credentials or auth failed
                 error!(
                     account_id = %account_id,
                     status_code = status_code,
@@ -454,6 +518,60 @@ impl RegistrationAgent {
         Ok(request)
     }
 
+    /// Builds a REGISTER request with digest authentication.
+    ///
+    /// This is called when the server responds with 401/407 and we have
+    /// digest credentials configured.
+    #[cfg(feature = "digest-auth")]
+    fn build_register_with_auth(
+        registration: &mut AccountRegistration,
+        local_addr: SocketAddr,
+    ) -> SipUaResult<SipRequest> {
+        use proto_sip::auth::{create_credentials, generate_cnonce, Md5DigestHasher};
+
+        // Clone the data we need before mutating registration
+        let challenge = registration
+            .last_challenge
+            .clone()
+            .ok_or_else(|| SipUaError::InvalidState("No challenge available".to_string()))?;
+
+        let digest_creds = registration
+            .account
+            .digest_credentials
+            .clone()
+            .ok_or_else(|| SipUaError::InvalidState("No digest credentials".to_string()))?;
+
+        let digest_uri = registration.account.registrar_uri.clone();
+        let nonce_count = registration.nonce_count;
+
+        // Build base REGISTER request (this mutates registration)
+        let mut request = Self::build_register_request(registration, local_addr)?;
+
+        // Compute digest response
+        let hasher = Md5DigestHasher;
+        let cnonce = generate_cnonce();
+
+        let auth_creds = create_credentials(
+            &hasher,
+            &challenge,
+            &digest_creds.username,
+            &digest_creds.password,
+            "REGISTER",
+            &digest_uri,
+            Some(&cnonce),
+            Some(nonce_count),
+            None, // No body for REGISTER
+        )
+        .map_err(|e| SipUaError::TransactionError(e.to_string()))?;
+
+        // Add Authorization header
+        request
+            .headers
+            .set(HeaderName::Authorization, auth_creds.to_string());
+
+        Ok(request)
+    }
+
     /// Parses registrar URI to socket address.
     fn parse_registrar_addr(registrar_uri: &str) -> SipUaResult<SocketAddr> {
         // Simple parsing - in production would use DNS SRV lookup
@@ -529,6 +647,8 @@ mod tests {
             turn_config: None,
             enabled: true,
             certificate_config: CertificateConfig::default(),
+            #[cfg(feature = "digest-auth")]
+            digest_credentials: None,
         }
     }
 

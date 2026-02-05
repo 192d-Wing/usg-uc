@@ -69,6 +69,12 @@ pub struct SipSettings {
     pub port: u16,
     /// Whether auto-registration is enabled.
     pub auto_register: bool,
+    /// Authentication username (for digest auth testing).
+    #[serde(default)]
+    pub auth_username: Option<String>,
+    /// Authentication password (for digest auth testing).
+    #[serde(default)]
+    pub auth_password: Option<String>,
 }
 
 /// Classification configuration for the frontend.
@@ -108,6 +114,15 @@ pub struct CallStatus {
     pub is_muted: bool,
     /// Whether on hold.
     pub is_on_hold: bool,
+}
+
+/// Check if digest authentication feature is enabled.
+///
+/// This allows the UI to conditionally show username/password fields
+/// for testing with commercial VoIP providers like BulkVS.
+#[tauri::command]
+fn is_digest_auth_enabled() -> bool {
+    cfg!(feature = "digest-auth")
 }
 
 /// Initialize the SIP client core.
@@ -386,6 +401,16 @@ async fn get_sip_settings(state: State<'_, TauriAppState>) -> Result<SipSettings
             // Extract domain from sip_uri
             let domain = acc.domain().unwrap_or_default().to_string();
 
+            // Extract digest auth credentials if feature enabled
+            #[cfg(feature = "digest-auth")]
+            let (auth_username, auth_password) = acc
+                .digest_credentials
+                .as_ref()
+                .map(|c| (Some(c.username.clone()), None)) // Never return password
+                .unwrap_or((None, None));
+            #[cfg(not(feature = "digest-auth"))]
+            let (auth_username, auth_password): (Option<String>, Option<String>) = (None, None);
+
             Ok(SipSettings {
                 display_name: acc.display_name.clone(),
                 username,
@@ -393,6 +418,8 @@ async fn get_sip_settings(state: State<'_, TauriAppState>) -> Result<SipSettings
                 registrar: acc.registrar_uri.clone(),
                 port: 5061, // TLS default port
                 auto_register: acc.enabled,
+                auth_username,
+                auth_password,
             })
         }
         None => Ok(SipSettings {
@@ -402,6 +429,8 @@ async fn get_sip_settings(state: State<'_, TauriAppState>) -> Result<SipSettings
             registrar: String::new(),
             port: 5061,
             auto_register: false,
+            auth_username: None,
+            auth_password: None,
         }),
     }
 }
@@ -432,6 +461,20 @@ async fn update_sip_settings(settings: SipSettings, state: State<'_, TauriAppSta
         &registrar_uri,
     );
     account.enabled = settings.auto_register;
+
+    // Set digest auth credentials if provided (only when feature enabled)
+    #[cfg(feature = "digest-auth")]
+    {
+        if let (Some(auth_user), Some(auth_pass)) = (&settings.auth_username, &settings.auth_password) {
+            if !auth_user.is_empty() && !auth_pass.is_empty() {
+                account.digest_credentials = Some(client_types::DigestAuthCredentials::new(
+                    auth_user.clone(),
+                    auth_pass.clone(),
+                ));
+                info!("Digest auth credentials configured for testing");
+            }
+        }
+    }
 
     manager.set_account(account);
     manager.set_default_account(Some("default".to_string()));
@@ -1063,6 +1106,7 @@ fn main() {
         .manage(app_state)
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
+            is_digest_auth_enabled,
             initialize_client,
             make_call,
             end_call,

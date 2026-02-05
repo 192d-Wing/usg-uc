@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+digest-auth = ["client-types/digest-auth", "client-sip-ua/digest-auth"]
+
 [dependencies]
 client-types = { path = "../client-types" }
 client-sip-ua = { path = "../client-sip-ua" }

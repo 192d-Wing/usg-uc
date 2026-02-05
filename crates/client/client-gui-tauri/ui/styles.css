@@ -943,6 +943,39 @@ h2 .section-icon {
     color: var(--md-sys-color-on-surface);
 }
 
+/* ===== Warning Banner (for digest auth) ===== */
+.warning-banner {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 16px;
+    margin-bottom: 16px;
+    background: rgba(255, 180, 0, 0.15);
+    border: 1px solid var(--md-sys-color-warning);
+    border-radius: var(--md-sys-shape-corner-medium);
+    color: var(--md-sys-color-warning);
+    font: var(--md-sys-typescale-body-small);
+}
+
+.warning-banner .warning-icon {
+    flex-shrink: 0;
+    width: 24px;
+    height: 24px;
+    fill: var(--md-sys-color-warning);
+}
+
+#digestAuthSection {
+    padding: 16px;
+    margin-bottom: 20px;
+    background: var(--md-sys-color-surface-container);
+    border-radius: var(--md-sys-shape-corner-medium);
+    border-left: 3px solid var(--md-sys-color-warning);
+}
+
+#digestAuthSection h3 {
+    color: var(--md-sys-color-warning);
+}
+
 /* ===== SCI Options ===== */
 .sci-options {
     padding: 16px;
