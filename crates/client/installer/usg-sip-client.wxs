@@ -14,7 +14,7 @@
   <Package
     Name="USG SIP Soft Client"
     Version="0.1.0"
-    Manufacturer="USG Communications"
+    Manufacturer="Department of War"
     UpgradeCode="A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
     Language="1033"
     Codepage="1252"
@@ -24,7 +24,7 @@
     <SummaryInformation
       Keywords="SIP, VoIP, CNSA, Government, Soft Client"
       Description="CNSA 2.0 compliant SIP soft client for enterprise/government use. Smart card authentication only."
-      Manufacturer="USG Communications" />
+      Manufacturer="Department of War" />
 
     <!-- Media definition -->
     <Media Id="1" Cabinet="usg_sip_client.cab" EmbedCab="yes" />
