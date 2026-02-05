@@ -27,6 +27,9 @@ use socket2::Socket;
 use std::fmt;
 use std::io;
 
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
+
 /// DSCP (Differentiated Services Code Point) values.
 ///
 /// Per RFC 4594, these are recommended values for various traffic types.
@@ -390,8 +393,8 @@ impl QosConfig {
 ///
 /// # Platform Support
 ///
-/// - **Linux/macOS/BSD**: Full support
-/// - **Windows**: Requires elevated privileges or may need registry changes
+/// - **Linux/macOS/BSD**: Full support via socket2
+/// - **Windows**: Full support via platform-specific API (requires unsafe code)
 ///
 /// # Errors
 ///
@@ -399,13 +402,85 @@ impl QosConfig {
 ///
 /// # Errors
 /// Returns an error if the operation fails.
+///
+/// # Windows IPv6 Implementation
+///
+/// On Windows, IPv6 traffic class setting uses unsafe code with safety protections:
+/// - Validates socket handle before use
+/// - Uses correct parameter sizes
+/// - Properly handles error codes
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn set_ipv6_tclass_windows(socket: &Socket, tclass: u32) -> io::Result<()> {
+    use windows::Win32::Networking::WinSock::{
+        setsockopt, IPPROTO_IPV6, IPV6_TCLASS, SOCKET, SOCKET_ERROR,
+    };
+
+    let raw_socket = socket.as_raw_socket() as usize;
+
+    // Safety check: Ensure we have a valid socket handle
+    if raw_socket == 0 || raw_socket == usize::MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid socket handle",
+        ));
+    }
+
+    // SAFETY: This is safe because:
+    // 1. We verified the socket handle is valid (non-zero, not INVALID_SOCKET)
+    // 2. We're creating a valid byte slice from a u32 reference
+    // 3. The tclass value lifetime extends through the unsafe call
+    // 4. IPPROTO_IPV6 and IPV6_TCLASS are valid constants from Windows API
+    let result = unsafe {
+        let tclass_bytes = std::slice::from_raw_parts(
+            &tclass as *const u32 as *const u8,
+            std::mem::size_of::<u32>(),
+        );
+        setsockopt(
+            SOCKET(raw_socket),
+            IPPROTO_IPV6.0 as i32,
+            IPV6_TCLASS,
+            Some(tclass_bytes),
+        )
+    };
+
+    if result == SOCKET_ERROR {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+/// Applies DSCP marking to a socket.
+///
+/// # Arguments
+///
+/// * `socket` - The socket to apply DSCP marking to
+/// * `dscp` - The DSCP value to apply
+/// * `is_ipv6` - Whether this is an IPv6 socket
+///
+/// # Errors
+///
+/// Returns an error if the socket option cannot be set.
 pub fn apply_dscp(socket: &Socket, dscp: DscpValue, is_ipv6: bool) -> io::Result<()> {
     let tos = u32::from(dscp.to_tos());
 
-    if is_ipv6 {
-        socket.set_tclass_v6(tos)?;
-    } else {
-        socket.set_tos_v4(tos)?;
+    #[cfg(not(windows))]
+    {
+        if is_ipv6 {
+            socket.set_tclass_v6(tos)?;
+        } else {
+            socket.set_tos_v4(tos)?;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if is_ipv6 {
+            set_ipv6_tclass_windows(socket, tos)?;
+        } else {
+            socket.set_tos_v4(tos)?;
+        }
     }
 
     tracing::debug!(

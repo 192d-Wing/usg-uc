@@ -26,7 +26,8 @@
 //! - P-384 ECDHE key exchange
 //! - P-384 ECDSA certificates
 
-#![forbid(unsafe_code)]
+// Use deny instead of forbid to allow platform-specific unsafe code with #[allow(unsafe_code)]
+#![deny(unsafe_code)]
 #![deny(warnings)]
 #![deny(missing_docs)]
 #![deny(clippy::unwrap_used)]
