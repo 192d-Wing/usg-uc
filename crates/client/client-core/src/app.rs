@@ -12,7 +12,7 @@ use crate::settings::SettingsManager;
 use crate::sip_transport::{CertVerificationMode, SipTransport, TransportEvent};
 use crate::{AppError, AppResult};
 use client_sip_ua::{RegistrationAgent, RegistrationEvent};
-use client_types::{CallInfo, CallState, DtmfDigit, RegistrationState, SipAccount};
+use client_types::{CallInfo, CallQualityMetrics, CallState, DtmfDigit, RegistrationState, SipAccount};
 use proto_sip::header::HeaderName;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -570,6 +570,31 @@ impl ClientApp {
     /// Returns the active call info.
     pub fn active_call_info(&self) -> Option<CallInfo> {
         self.call_manager.active_call_info()
+    }
+
+    /// Returns call quality metrics for the active call.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    pub fn call_quality_metrics(&self) -> Option<CallQualityMetrics> {
+        let stats = self.call_manager.audio_stats()?;
+        let packets_lost = stats.jitter_stats.packets_lost;
+        let packets_received = stats.rx_stats.packets_received;
+        let packet_loss_rate = if packets_received > 0 {
+            packets_lost as f64 / (packets_received + packets_lost) as f64
+        } else {
+            0.0
+        };
+
+        Some(CallQualityMetrics::from_stats(
+            stats.tx_stats.packets_sent,
+            packets_received,
+            packets_lost,
+            packet_loss_rate,
+            stats.jitter_stats.average_jitter_ms,
+            stats.jitter_stats.current_depth_ms,
+            stats.capture_underruns,
+            stats.playback_underruns,
+            stats.rx_stats.srtp_errors,
+        ))
     }
 
     /// Returns the settings manager.
