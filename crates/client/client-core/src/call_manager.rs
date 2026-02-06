@@ -217,8 +217,27 @@ impl CallManager {
 
     /// Configures the call manager with a SIP account.
     pub fn configure_account(&mut self, account: &SipAccount) {
+        // Map transport preference to Via header transport string
+        let transport_str = match account.transport {
+            client_types::TransportPreference::Udp => "UDP",
+            client_types::TransportPreference::Tcp => "TCP",
+            client_types::TransportPreference::TlsOnly => "TLS",
+        };
+
+        // Configure call agent with account's AOR, display name, caller ID, and transport
+        self.call_agent.configure(
+            account.sip_uri.clone(),
+            account.display_name.clone(),
+            account.caller_id.clone(),
+            transport_str,
+        );
         self.account = Some(account.clone());
-        info!(account_id = %account.id, "Call manager configured with account");
+        info!(
+            account_id = %account.id,
+            caller_id = ?account.caller_id,
+            transport = %transport_str,
+            "Call manager configured with account"
+        );
     }
 
     /// Sets the ICE configuration.
@@ -298,7 +317,26 @@ impl CallManager {
             .as_ref()
             .ok_or_else(|| AppError::Sip("No account configured".to_string()))?;
 
-        info!(remote_uri = %remote_uri, "Making outbound call");
+        // If the URI doesn't contain a domain (@), append the account's domain
+        let full_remote_uri = if !remote_uri.contains('@') {
+            // Extract scheme and user part
+            let (scheme, user_part) = if let Some(rest) = remote_uri.strip_prefix("sips:") {
+                ("sips", rest)
+            } else if let Some(rest) = remote_uri.strip_prefix("sip:") {
+                ("sip", rest)
+            } else {
+                // No scheme, treat as user part with default sip: scheme
+                ("sip", remote_uri)
+            };
+
+            // Get domain from account
+            let domain = account.domain().unwrap_or("localhost");
+            format!("{}:{}@{}", scheme, user_part, domain)
+        } else {
+            remote_uri.to_string()
+        };
+
+        info!(remote_uri = %full_remote_uri, "Making outbound call");
 
         // Create media session channel
         let (media_tx, _media_rx) = mpsc::channel(32);
@@ -319,7 +357,7 @@ impl CallManager {
         // Make the call via SIP UA
         let call_id = self
             .call_agent
-            .make_call(remote_uri, &sdp_offer)
+            .make_call(&full_remote_uri, &sdp_offer)
             .await
             .map_err(|e| AppError::Sip(e.to_string()))?;
 
@@ -333,7 +371,7 @@ impl CallManager {
             id: call_id.clone(),
             state: CallState::Dialing,
             direction: CallDirection::Outbound,
-            remote_uri: remote_uri.to_string(),
+            remote_uri: full_remote_uri.clone(),
             remote_display_name: None,
             start_time: Utc::now(),
             connect_time: None,

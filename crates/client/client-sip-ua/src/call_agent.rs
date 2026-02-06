@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// User agent string for SIP messages.
-const USER_AGENT: &str = "USG-SIP-Client/0.1.0 (CNSA 2.0)";
+const USER_AGENT: &str = "USG-SIP-Client/0.1.0";
 
 /// Call agent handles outbound and inbound calls.
 pub struct CallAgent {
@@ -37,6 +37,8 @@ pub struct CallAgent {
     aor: String,
     /// Display name for From header.
     display_name: String,
+    /// Transport type for SIP signaling (UDP, TCP, or TLS).
+    transport_type: String,
 }
 
 /// State for a single call session.
@@ -155,20 +157,79 @@ impl CallAgent {
             local_addr,
             aor,
             display_name,
+            transport_type: "TLS".to_string(), // Default to TLS, updated by configure()
         }
+    }
+
+    /// Configures the agent with account information.
+    ///
+    /// # Arguments
+    /// * `aor` - Address of Record (SIP URI for the account)
+    /// * `display_name` - Display name for From header
+    /// * `caller_id` - Optional Caller ID to use instead of the AOR user part
+    /// * `transport` - Transport type string ("UDP", "TCP", or "TLS")
+    pub fn configure(
+        &mut self,
+        aor: String,
+        display_name: String,
+        caller_id: Option<String>,
+        transport: &str,
+    ) {
+        // If caller_id is provided, replace the user part of the AOR
+        self.aor = if let Some(cid) = caller_id {
+            // Parse the AOR and replace the user part
+            if let Some(at_pos) = aor.find('@') {
+                let scheme_end = aor.find(':').map(|p| p + 1).unwrap_or(0);
+                format!("{}{}{}", &aor[..scheme_end], cid, &aor[at_pos..])
+            } else {
+                aor
+            }
+        } else {
+            aor
+        };
+        self.display_name = display_name;
+        self.transport_type = transport.to_uppercase();
+        info!(
+            aor = %self.aor,
+            display_name = %self.display_name,
+            transport = %self.transport_type,
+            "Call agent configured"
+        );
     }
 
     /// Makes an outbound call.
     ///
     /// Returns the call ID for tracking.
     pub async fn make_call(&mut self, remote_uri: &str, sdp_offer: &str) -> SipUaResult<String> {
+        // Verify agent is configured
+        if self.aor.is_empty() {
+            return Err(SipUaError::ConfigError(
+                "Call agent not configured with account (empty AOR)".to_string(),
+            ));
+        }
+
         let call_id = Uuid::new_v4().to_string();
-        let sip_call_id = generate_call_id(&self.local_addr.ip().to_string());
 
-        info!(call_id = %call_id, remote_uri = %remote_uri, "Initiating outbound call");
+        info!(
+            call_id = %call_id,
+            remote_uri = %remote_uri,
+            aor = %self.aor,
+            display_name = %self.display_name,
+            "Initiating outbound call"
+        );
 
-        // Parse destination address from URI
-        let destination = Self::parse_destination(remote_uri)?;
+        // Parse destination address from URI (includes DNS resolution)
+        let destination = Self::parse_destination(remote_uri).await?;
+
+        // Get the local IP address that can reach the destination
+        let effective_local_addr = Self::get_local_addr_for_destination(destination, self.local_addr).await?;
+        debug!(
+            destination = %destination,
+            local_addr = %effective_local_addr,
+            "Determined local address for call"
+        );
+
+        let sip_call_id = generate_call_id(&effective_local_addr.ip().to_string());
 
         // Create call session
         let from_tag = generate_tag();
@@ -202,12 +263,13 @@ impl CallAgent {
             remote_uri,
             &self.aor,
             &self.display_name,
-            self.local_addr,
+            effective_local_addr,
             &sip_call_id,
             1,
             &from_tag,
             &branch,
             sdp_offer,
+            &self.transport_type,
         )?;
 
         // Create INVITE transaction
@@ -229,6 +291,12 @@ impl CallAgent {
             .map_err(|e| SipUaError::TransportError(e.to_string()))?;
 
         // Send request
+        info!(
+            call_id = %call_id,
+            destination = %destination,
+            method = "INVITE",
+            "Queuing SendRequest event for INVITE"
+        );
         self.event_tx
             .send(CallEvent::SendRequest {
                 request,
@@ -237,6 +305,7 @@ impl CallAgent {
             .await
             .map_err(|e| SipUaError::TransportError(e.to_string()))?;
 
+        info!(call_id = %call_id, "SendRequest event queued successfully");
         Ok(call_id)
     }
 
@@ -367,14 +436,15 @@ impl CallAgent {
             )
         };
 
-        let destination = Self::parse_destination(&remote_uri)?;
+        let destination = Self::parse_destination(&remote_uri).await?;
+        let effective_local_addr = Self::get_local_addr_for_destination(destination, self.local_addr).await?;
 
         // Build REFER request
         let request = Self::build_refer_request_static(
             &remote_uri,
             &self.aor,
             &self.display_name,
-            self.local_addr,
+            effective_local_addr,
             &sip_call_id,
             cseq,
             &from_tag,
@@ -441,7 +511,8 @@ impl CallAgent {
             )
         };
 
-        let destination = Self::parse_destination(&remote_uri)?;
+        let destination = Self::parse_destination(&remote_uri).await?;
+        let effective_local_addr = Self::get_local_addr_for_destination(destination, self.local_addr).await?;
         let branch = generate_branch();
 
         // Build re-INVITE request
@@ -449,7 +520,7 @@ impl CallAgent {
             &remote_uri,
             &self.aor,
             &self.display_name,
-            self.local_addr,
+            effective_local_addr,
             &sip_call_id,
             cseq,
             &from_tag,
@@ -852,12 +923,13 @@ impl CallAgent {
         };
 
         // Send ACK
-        let destination = Self::parse_destination(&remote_uri)?;
+        let destination = Self::parse_destination(&remote_uri).await?;
+        let effective_local_addr = Self::get_local_addr_for_destination(destination, self.local_addr).await?;
         let ack_request = Self::build_ack_request_static(
             &remote_uri,
             &self.aor,
             &self.display_name,
-            self.local_addr,
+            effective_local_addr,
             &sip_call_id,
             cseq,
             &from_tag,
@@ -1145,12 +1217,13 @@ impl CallAgent {
         to_tag: Option<&str>,
         _response: &SipResponse,
     ) -> SipUaResult<()> {
-        let destination = Self::parse_destination(remote_uri)?;
+        let destination = Self::parse_destination(remote_uri).await?;
+        let effective_local_addr = Self::get_local_addr_for_destination(destination, self.local_addr).await?;
         let ack_request = Self::build_ack_request_static(
             remote_uri,
             &self.aor,
             &self.display_name,
-            self.local_addr,
+            effective_local_addr,
             sip_call_id,
             cseq,
             from_tag,
@@ -1224,14 +1297,15 @@ impl CallAgent {
             )
         };
 
-        let destination = Self::parse_destination(&remote_uri)?;
+        let destination = Self::parse_destination(&remote_uri).await?;
+        let effective_local_addr = Self::get_local_addr_for_destination(destination, self.local_addr).await?;
 
         // Build CANCEL request
         let request = Self::build_cancel_request_static(
             &remote_uri,
             &self.aor,
             &self.display_name,
-            self.local_addr,
+            effective_local_addr,
             &sip_call_id,
             cseq,
             &from_tag,
@@ -1280,14 +1354,15 @@ impl CallAgent {
             )
         };
 
-        let destination = Self::parse_destination(&remote_uri)?;
+        let destination = Self::parse_destination(&remote_uri).await?;
+        let effective_local_addr = Self::get_local_addr_for_destination(destination, self.local_addr).await?;
 
         // Build BYE request
         let request = Self::build_bye_request_static(
             &remote_uri,
             &self.aor,
             &self.display_name,
-            self.local_addr,
+            effective_local_addr,
             &sip_call_id,
             cseq,
             &from_tag,
@@ -1336,6 +1411,7 @@ impl CallAgent {
         from_tag: &str,
         branch: &str,
         sdp_offer: &str,
+        transport_type: &str,
     ) -> SipUaResult<SipRequest> {
         let remote_uri: SipUri = remote_uri_str
             .parse()
@@ -1345,7 +1421,7 @@ impl CallAgent {
             .parse()
             .map_err(|e| SipUaError::ConfigError(format!("Invalid AOR: {e}")))?;
 
-        let via = ViaHeader::new("TLS", &local_addr.ip().to_string())
+        let via = ViaHeader::new(transport_type, &local_addr.ip().to_string())
             .with_port(local_addr.port())
             .with_branch(branch.to_string());
 
@@ -1355,9 +1431,11 @@ impl CallAgent {
 
         let to = NameAddr::new(remote_uri.clone());
 
-        let mut contact_uri = SipUri::new(local_addr.ip().to_string())
-            .with_port(local_addr.port())
-            .with_param("transport", Some("tls".to_string()));
+        // Only add transport param for non-UDP (UDP is the default)
+        let mut contact_uri = SipUri::new(local_addr.ip().to_string()).with_port(local_addr.port());
+        if transport_type != "UDP" {
+            contact_uri = contact_uri.with_param("transport", Some(transport_type.to_lowercase()));
+        }
         if let Some(user) = &aor_uri.user {
             contact_uri = contact_uri.with_user(user.clone());
         }
@@ -1649,20 +1727,110 @@ impl CallAgent {
         Ok(request)
     }
 
-    /// Parses a SIP URI to get destination address.
-    fn parse_destination(uri: &str) -> SipUaResult<SocketAddr> {
-        let sip_uri: SipUri = uri
-            .parse()
-            .map_err(|e| SipUaError::ConfigError(format!("Invalid URI: {e}")))?;
+    /// Parses a SIP URI to get destination address, performing DNS resolution if needed.
+    async fn parse_destination(uri: &str) -> SipUaResult<SocketAddr> {
+        debug!(uri = %uri, "parse_destination: parsing SIP URI");
+
+        let sip_uri: SipUri = uri.parse().map_err(|e| {
+            error!(uri = %uri, error = %e, "parse_destination: failed to parse SIP URI");
+            SipUaError::ConfigError(format!("Invalid URI: {e}"))
+        })?;
 
         let host = &sip_uri.host;
-        let port = sip_uri.port.unwrap_or(5061);
+        // Use transport-appropriate default port: UDP/TCP = 5060, TLS = 5061
+        let port = sip_uri.port.unwrap_or(5060);
 
-        let ip: std::net::IpAddr = host
-            .parse()
-            .map_err(|_| SipUaError::ConfigError(format!("Cannot resolve hostname: {host}")))?;
+        debug!(host = %host, port = port, "parse_destination: extracted host and port");
 
-        Ok(SocketAddr::new(ip, port))
+        // Try to parse host as IP address first
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            let addr = SocketAddr::new(ip, port);
+            debug!(addr = %addr, "parse_destination: host is already an IP address");
+            return Ok(addr);
+        }
+
+        // DNS resolution for hostnames
+        debug!(host = %host, "parse_destination: performing DNS resolution");
+        let lookup_host = format!("{}:{}", host, port);
+        let addrs: Vec<_> = tokio::net::lookup_host(&lookup_host)
+            .await
+            .map_err(|e| {
+                error!(host = %host, error = %e, "parse_destination: DNS resolution failed");
+                SipUaError::ConfigError(format!("DNS resolution failed for {host}: {e}"))
+            })?
+            .collect();
+
+        debug!(
+            host = %host,
+            count = addrs.len(),
+            addresses = ?addrs,
+            "parse_destination: DNS resolution returned addresses"
+        );
+
+        let result = addrs
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                error!(host = %host, "parse_destination: no addresses found");
+                SipUaError::ConfigError(format!("No addresses found for {host}"))
+            })?;
+
+        info!(
+            uri = %uri,
+            resolved = %result,
+            "parse_destination: resolved destination address"
+        );
+
+        Ok(result)
+    }
+
+    /// Gets the local address to use for reaching a destination.
+    ///
+    /// If the configured local_addr is unspecified (0.0.0.0), this function
+    /// determines the appropriate local IP by creating a UDP socket connected
+    /// to the destination. This ensures the Via/Contact headers contain a
+    /// routable IP address.
+    async fn get_local_addr_for_destination(
+        destination: SocketAddr,
+        configured_addr: SocketAddr,
+    ) -> SipUaResult<SocketAddr> {
+        // If we already have a specific IP configured, use it
+        if !configured_addr.ip().is_unspecified() {
+            debug!(
+                configured = %configured_addr,
+                "Using configured local address"
+            );
+            return Ok(configured_addr);
+        }
+
+        // Create a UDP socket and "connect" to the destination to discover our local IP
+        debug!(
+            destination = %destination,
+            "Discovering local IP for destination"
+        );
+
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| {
+            error!(error = %e, "Failed to bind socket for local IP discovery");
+            SipUaError::TransportError(format!("Failed to bind UDP socket: {e}"))
+        })?;
+
+        socket.connect(destination).map_err(|e| {
+            error!(error = %e, destination = %destination, "Failed to connect socket for local IP discovery");
+            SipUaError::TransportError(format!("Failed to connect to destination: {e}"))
+        })?;
+
+        let local_addr = socket.local_addr().map_err(|e| {
+            error!(error = %e, "Failed to get local address from socket");
+            SipUaError::TransportError(format!("Failed to get local address: {e}"))
+        })?;
+
+        info!(
+            destination = %destination,
+            local_addr = %local_addr,
+            "Discovered local IP for destination"
+        );
+
+        Ok(local_addr)
     }
 
     /// Extracts To tag from response.
@@ -1700,16 +1868,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_destination() {
-        let addr = CallAgent::parse_destination("sips:bob@192.168.1.1:5061").unwrap();
+        let addr = CallAgent::parse_destination("sips:bob@192.168.1.1:5061")
+            .await
+            .unwrap();
         assert_eq!(addr.ip().to_string(), "192.168.1.1");
         assert_eq!(addr.port(), 5061);
     }
 
     #[tokio::test]
     async fn test_parse_destination_default_port() {
-        let addr = CallAgent::parse_destination("sips:bob@192.168.1.1").unwrap();
+        let addr = CallAgent::parse_destination("sips:bob@192.168.1.1")
+            .await
+            .unwrap();
         assert_eq!(addr.ip().to_string(), "192.168.1.1");
-        assert_eq!(addr.port(), 5061);
+        // Default port for non-TLS is now 5060 (not 5061)
+        assert_eq!(addr.port(), 5060);
     }
 
     #[tokio::test]
