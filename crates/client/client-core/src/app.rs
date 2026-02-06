@@ -702,20 +702,14 @@ impl ClientApp {
                 }
 
                 // Notify GUI
-                info!(call_id = %call_id, state = ?state, "Sending AppEvent::CallStateChanged to GUI");
-                if let Err(e) = self
+                let _ = self
                     .app_event_tx
                     .send(AppEvent::CallStateChanged {
                         call_id,
                         state,
                         info,
                     })
-                    .await
-                {
-                    error!(error = %e, "Failed to send AppEvent::CallStateChanged to GUI");
-                } else {
-                    info!("AppEvent::CallStateChanged sent successfully to GUI channel");
-                }
+                    .await;
             }
             CallManagerEvent::IncomingCall {
                 call_id,
@@ -952,11 +946,7 @@ impl ClientApp {
         // Collect call manager events (state changes, responses to send, etc.)
         let call_mgr_events: Vec<_> =
             std::iter::from_fn(|| self.call_event_rx.try_recv().ok()).collect();
-        if !call_mgr_events.is_empty() {
-            info!(count = call_mgr_events.len(), "Processing call manager events");
-        }
         for event in call_mgr_events {
-            info!(event = ?event, "Handling call manager event");
             self.handle_call_event(event).await?;
         }
 

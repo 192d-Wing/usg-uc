@@ -134,22 +134,12 @@ function getTauriApi() {
             invoke: window.__TAURI_INTERNALS__.invoke,
             // For events, Tauri 2.0 uses a different approach
             listen: async (event, handler) => {
-                console.log('getTauriApi.listen called for event:', event);
-                console.log('window.__TAURI__ =', window.__TAURI__);
-                console.log('window.__TAURI__?.event =', window.__TAURI__?.event);
                 // Use the Tauri 2.0 event API if available
                 if (window.__TAURI__ && window.__TAURI__.event) {
-                    console.log('Using window.__TAURI__.event.listen for:', event);
-                    const unlisten = await window.__TAURI__.event.listen(event, (e) => {
-                        console.log('Event received:', event, e);
-                        handler(e);
-                    });
-                    console.log('Listener registered for:', event);
-                    return unlisten;
+                    return window.__TAURI__.event.listen(event, handler);
                 }
-                // Fallback: log and return noop
-                console.warn('FALLBACK: No Tauri event API available for:', event);
-                return () => {}; // Return unsubscribe function
+                // Fallback: return noop
+                return () => {};
             }
         };
     }
@@ -523,15 +513,12 @@ async function initializeEventListeners() {
 
 function handleCallStateChange(payload) {
     const { call_id, state, remote_uri, remote_display_name } = payload;
-    console.log('handleCallStateChange: state =', JSON.stringify(state), 'typeof =', typeof state);
 
     if (state === 'Ringing' || state === 'ringing') {
         // Play ringback tone while waiting for answer
-        console.log('handleCallStateChange: Ringing state detected');
         ringbackTone.start();
     } else if (state === 'Connected' || state === 'connected') {
         // Stop ringback tone when call is answered
-        console.log('handleCallStateChange: Connected state detected');
         ringbackTone.stop();
         if (!callActive) {
             startCall(remote_display_name || remote_uri);
@@ -540,7 +527,6 @@ function handleCallStateChange(payload) {
         updateHoldButton();
     } else if (state === 'Terminated' || state === 'terminated') {
         // Stop ringback tone when call ends
-        console.log('handleCallStateChange: Terminated state detected, calling endCall()');
         ringbackTone.stop();
         endCall();
     } else if (state === 'OnHold' || state === 'on_hold') {

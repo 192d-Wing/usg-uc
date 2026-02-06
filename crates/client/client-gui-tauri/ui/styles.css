@@ -666,6 +666,19 @@ body {
     box-shadow: none;
 }
 
+/* Small button variant for headers and compact areas */
+.action-btn.small {
+    flex: none;
+    padding: 8px 12px;
+    font: var(--md-sys-typescale-label-medium);
+    gap: 6px;
+}
+
+.action-btn.small .btn-icon {
+    width: 14px;
+    height: 14px;
+}
+
 /* ===== Contacts Section ===== */
 .contacts-section {
     max-width: 560px;
