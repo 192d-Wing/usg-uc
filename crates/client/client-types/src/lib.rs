@@ -28,7 +28,7 @@ pub use account::{
     CertificateConfig, CertificateInfo, CertificateSelectionMode, RegistrationState,
     ServerCertVerificationMode, SipAccount, TransportPreference, TurnConfig,
 };
-pub use audio::{AudioConfig, AudioDevice, CodecPreference};
+pub use audio::{AudioConfig, AudioDevice, CallQualityMetrics, CodecPreference};
 pub use call::{
     CallDirection, CallEndReason, CallFailureReason, CallFocus, CallHistoryEntry, CallInfo,
     CallState,

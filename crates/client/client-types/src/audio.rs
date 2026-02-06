@@ -170,6 +170,109 @@ pub struct AudioStatistics {
     pub current_codec: String,
 }
 
+/// Call quality metrics for the quality dashboard.
+///
+/// Combines RTP, jitter buffer, and audio stats into a single
+/// view suitable for real-time UI display.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallQualityMetrics {
+    /// RTP packets sent.
+    pub packets_sent: u64,
+    /// RTP packets received.
+    pub packets_received: u64,
+    /// RTP packets lost (detected by jitter buffer).
+    pub packets_lost: u64,
+    /// Packet loss rate (0.0 - 1.0).
+    pub packet_loss_rate: f64,
+    /// Average network jitter in milliseconds.
+    pub jitter_ms: f32,
+    /// Current jitter buffer depth in milliseconds.
+    pub jitter_buffer_depth_ms: u32,
+    /// Capture underruns (mic buffer empty).
+    pub capture_underruns: u64,
+    /// Playback underruns (speaker buffer empty).
+    pub playback_underruns: u64,
+    /// SRTP decryption errors.
+    pub srtp_errors: u64,
+    /// Estimated MOS score (1.0 - 5.0, higher = better).
+    ///
+    /// Calculated using simplified E-model (ITU-T G.107):
+    /// - 4.0+: Excellent (toll quality)
+    /// - 3.5-4.0: Good
+    /// - 3.0-3.5: Fair
+    /// - <3.0: Poor
+    pub mos_score: f32,
+}
+
+impl CallQualityMetrics {
+    /// Creates metrics from raw audio pipeline statistics.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_stats(
+        packets_sent: u64,
+        packets_received: u64,
+        packets_lost: u64,
+        packet_loss_rate: f64,
+        jitter_ms: f32,
+        jitter_buffer_depth_ms: u32,
+        capture_underruns: u64,
+        playback_underruns: u64,
+        srtp_errors: u64,
+    ) -> Self {
+        let mos_score = Self::estimate_mos(packet_loss_rate, jitter_ms);
+        Self {
+            packets_sent,
+            packets_received,
+            packets_lost,
+            packet_loss_rate,
+            jitter_ms,
+            jitter_buffer_depth_ms,
+            capture_underruns,
+            playback_underruns,
+            srtp_errors,
+            mos_score,
+        }
+    }
+
+    /// Estimates MOS score from packet loss rate and jitter.
+    ///
+    /// Uses simplified E-model: R = 93.2 - packet_loss_effect - jitter_effect
+    /// Then maps R to MOS via standard formula.
+    #[allow(clippy::cast_possible_truncation)]
+    fn estimate_mos(packet_loss_rate: f64, jitter_ms: f32) -> f32 {
+        // Simplified E-model R-factor calculation
+        // R = 93.2 (base) - Id (delay impairment) - Ie-eff (equipment impairment from loss)
+        let loss_pct = packet_loss_rate * 100.0;
+
+        // Equipment impairment factor for G.711 (from ITU-T G.113)
+        // Ie-eff = Ie + (95 - Ie) * Ppl / (Ppl + Bpl)
+        // For G.711: Ie=0, Bpl=25.1
+        let ie_eff = 95.0 * loss_pct / (loss_pct + 25.1);
+
+        // Delay impairment (jitter adds to effective delay)
+        // Id increases with delay; assume 100ms base + jitter
+        let effective_delay_ms = 100.0 + f64::from(jitter_ms);
+        let id = if effective_delay_ms > 177.3 {
+            0.024 * effective_delay_ms + 0.11 * (effective_delay_ms - 177.3)
+        } else {
+            0.024 * effective_delay_ms
+        };
+
+        let r = (93.2 - id - ie_eff).clamp(0.0, 100.0);
+
+        // Convert R-factor to MOS (ITU-T G.107 Annex B)
+        let mos = if r < 6.5 {
+            1.0
+        } else if r > 100.0 {
+            4.5
+        } else {
+            1.0 + 0.035 * r + r * (r - 60.0) * (100.0 - r) * 7e-6
+        };
+
+        mos.clamp(1.0, 5.0) as f32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
