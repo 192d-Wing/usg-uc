@@ -1193,7 +1193,9 @@ function startCall(target) {
     isOnHold = false;
 
     // Transition to call screen
-    document.getElementById('callInfo').classList.add('visible');
+    const callInfo = document.getElementById('callInfo');
+    callInfo.style.display = 'block';
+    callInfo.classList.add('visible');
     document.getElementById('dialInputWrapper').style.display = 'none';
     document.getElementById('dialpad').style.display = 'none';
     document.getElementById('audioDevices').style.display = 'none';
