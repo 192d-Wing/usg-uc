@@ -17,7 +17,7 @@ use proto_sip::header::HeaderName;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Application events broadcast to the GUI.
 #[derive(Debug, Clone)]
@@ -170,7 +170,18 @@ impl ClientApp {
         );
 
         // Load settings
-        let settings_manager = SettingsManager::new()?;
+        #[allow(unused_mut)] // mut only needed with digest-auth feature
+        let mut settings_manager = SettingsManager::new()?;
+
+        // Load any persisted passwords from secure storage (keychain)
+        #[cfg(feature = "digest-auth")]
+        {
+            if let Err(e) = settings_manager.load_persisted_passwords() {
+                warn!("Failed to load persisted passwords: {}", e);
+            } else {
+                info!("Persisted passwords loaded from secure storage");
+            }
+        }
 
         // Load contacts
         let contact_manager = Arc::new(RwLock::new(ContactManager::new()?));
@@ -413,7 +424,14 @@ impl ClientApp {
     pub async fn make_call(&mut self, remote_uri: &str) -> AppResult<String> {
         // Verify we're registered
         if self.state != AppState::Registered {
-            return Err(AppError::Sip("Not registered".to_string()));
+            warn!(
+                current_state = ?self.state,
+                "Cannot make call: not registered"
+            );
+            return Err(AppError::Sip(format!(
+                "Cannot make call: not registered (current state: {:?})",
+                self.state
+            )));
         }
 
         info!(remote_uri = %remote_uri, "Making call");
@@ -870,6 +888,8 @@ impl ClientApp {
     ///
     /// Call this periodically from the main event loop.
     pub async fn poll_events(&mut self) -> AppResult<()> {
+        trace!("poll_events called");
+
         // Collect registration events first, then process them
         // (avoids borrow checker issues with async methods)
         let reg_events: Vec<_> = std::iter::from_fn(|| self.reg_event_rx.try_recv().ok()).collect();
@@ -892,6 +912,9 @@ impl ClientApp {
 
         // Poll call events and send requests via transport
         let call_events = self.call_manager.poll_call_events();
+        if !call_events.is_empty() {
+            info!(count = call_events.len(), "Processing call agent events");
+        }
         for event in call_events {
             self.handle_call_agent_event(event).await?;
         }
@@ -915,13 +938,25 @@ impl ClientApp {
                 destination,
             } => {
                 // Send call signaling (INVITE, BYE, CANCEL, ACK) via transport
+                info!(
+                    method = %request.method,
+                    destination = %destination,
+                    "Processing call SendRequest event"
+                );
+
                 if let Some(ref transport) = self.sip_transport {
                     // Detect transport type from Via header
-                    let use_udp = request
-                        .headers
-                        .get_value(&HeaderName::Via)
+                    let via_header = request.headers.get_value(&HeaderName::Via);
+                    let use_udp = via_header
+                        .as_ref()
                         .map(|via| via.contains("/UDP"))
                         .unwrap_or(false);
+
+                    info!(
+                        via = ?via_header,
+                        use_udp = use_udp,
+                        "Sending call request via transport"
+                    );
 
                     let result = if use_udp {
                         transport.send_request_udp(&request, destination).await
@@ -929,8 +964,12 @@ impl ClientApp {
                         transport.send_request(&request, destination).await
                     };
 
+                    match &result {
+                        Ok(()) => info!(method = %request.method, "Call request sent successfully"),
+                        Err(e) => error!(error = %e, method = %request.method, "Failed to send call request"),
+                    }
+
                     if let Err(e) = result {
-                        error!(error = %e, "Failed to send call request");
                         let _ = self
                             .app_event_tx
                             .send(AppEvent::Error {
