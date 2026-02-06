@@ -1148,6 +1148,9 @@ function endCall() {
     // Reset button states
     updateMuteButton();
     updateHoldButton();
+
+    // Switch to call tab to show "No active call" status
+    switchTab('call');
 }
 
 function updateMuteButton() {
