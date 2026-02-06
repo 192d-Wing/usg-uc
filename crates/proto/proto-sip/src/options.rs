@@ -76,9 +76,18 @@ impl Default for OptionsCapabilities {
         Self {
             methods: DEFAULT_SUPPORTED_METHODS.to_vec(),
             extensions: Vec::new(),
-            accept_types: DEFAULT_ACCEPT_TYPES.iter().map(|s| (*s).to_string()).collect(),
-            accept_encodings: DEFAULT_ACCEPT_ENCODINGS.iter().map(|s| (*s).to_string()).collect(),
-            accept_languages: DEFAULT_ACCEPT_LANGUAGES.iter().map(|s| (*s).to_string()).collect(),
+            accept_types: DEFAULT_ACCEPT_TYPES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            accept_encodings: DEFAULT_ACCEPT_ENCODINGS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            accept_languages: DEFAULT_ACCEPT_LANGUAGES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
             server: None,
         }
     }
@@ -365,14 +374,20 @@ mod tests {
         assert!(caps.methods.contains(&Method::Notify));
         assert!(caps.extensions.contains(&"100rel".to_string()));
         assert!(caps.extensions.contains(&"timer".to_string()));
-        assert!(caps.accept_types.contains(&"application/pidf+xml".to_string()));
+        assert!(
+            caps.accept_types
+                .contains(&"application/pidf+xml".to_string())
+        );
         assert_eq!(caps.server, Some("USG-SIP/1.0".to_string()));
     }
 
     #[test]
     fn test_allow_header_value() {
-        let caps = OptionsCapabilities::new()
-            .with_methods(vec![Method::Invite, Method::Bye, Method::Options]);
+        let caps = OptionsCapabilities::new().with_methods(vec![
+            Method::Invite,
+            Method::Bye,
+            Method::Options,
+        ]);
 
         assert_eq!(caps.allow_header_value(), "INVITE, BYE, OPTIONS");
     }
@@ -383,7 +398,10 @@ mod tests {
             .add_extension("100rel")
             .add_extension("timer");
 
-        assert_eq!(caps.supported_header_value(), Some("100rel, timer".to_string()));
+        assert_eq!(
+            caps.supported_header_value(),
+            Some("100rel, timer".to_string())
+        );
 
         let empty_caps = OptionsCapabilities::new().with_extensions(vec![]);
         assert_eq!(empty_caps.supported_header_value(), None);
@@ -401,8 +419,18 @@ mod tests {
         assert_eq!(response.status, crate::response::StatusCode::OK);
         assert!(response.headers.get_value(&HeaderName::Allow).is_some());
         assert!(response.headers.get_value(&HeaderName::Accept).is_some());
-        assert!(response.headers.get_value(&HeaderName::AcceptEncoding).is_some());
-        assert!(response.headers.get_value(&HeaderName::AcceptLanguage).is_some());
+        assert!(
+            response
+                .headers
+                .get_value(&HeaderName::AcceptEncoding)
+                .is_some()
+        );
+        assert!(
+            response
+                .headers
+                .get_value(&HeaderName::AcceptLanguage)
+                .is_some()
+        );
         assert!(response.headers.get_value(&HeaderName::Supported).is_some());
         assert!(response.headers.get_value(&HeaderName::Server).is_some());
 
@@ -461,7 +489,11 @@ mod tests {
             .add_method(Method::Invite)
             .add_method(Method::Invite); // Duplicate
 
-        let invite_count = caps.methods.iter().filter(|m| **m == Method::Invite).count();
+        let invite_count = caps
+            .methods
+            .iter()
+            .filter(|m| **m == Method::Invite)
+            .count();
         assert_eq!(invite_count, 1, "Should not add duplicate methods");
     }
 

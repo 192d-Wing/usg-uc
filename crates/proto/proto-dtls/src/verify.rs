@@ -690,13 +690,22 @@ mod tests {
 
     #[test]
     fn test_certificate_validation_result_eq() {
-        assert_eq!(CertificateValidationResult::Valid, CertificateValidationResult::Valid);
-        assert_eq!(CertificateValidationResult::SelfSigned, CertificateValidationResult::SelfSigned);
+        assert_eq!(
+            CertificateValidationResult::Valid,
+            CertificateValidationResult::Valid
+        );
+        assert_eq!(
+            CertificateValidationResult::SelfSigned,
+            CertificateValidationResult::SelfSigned
+        );
         assert_eq!(
             CertificateValidationResult::Invalid("test".to_string()),
             CertificateValidationResult::Invalid("test".to_string())
         );
-        assert_ne!(CertificateValidationResult::Valid, CertificateValidationResult::SelfSigned);
+        assert_ne!(
+            CertificateValidationResult::Valid,
+            CertificateValidationResult::SelfSigned
+        );
     }
 
     #[test]
@@ -740,34 +749,44 @@ mod tests {
         let handshake_hash = uc_crypto::hash::sha384(b"test");
 
         let result = FinishedVerifier::verify(&[], &master_secret, &handshake_hash, true);
-        assert!(matches!(result, Err(DtlsError::HandshakeFailed { reason }) if reason.contains("wrong length")));
+        assert!(
+            matches!(result, Err(DtlsError::HandshakeFailed { reason }) if reason.contains("wrong length"))
+        );
     }
 
     #[test]
     fn test_parse_der_length_empty() {
         let result = parse_der_length(&[]);
-        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("empty")));
+        assert!(
+            matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("empty"))
+        );
     }
 
     #[test]
     fn test_parse_der_length_indefinite() {
         let data = [0x80]; // Indefinite length marker
         let result = parse_der_length(&data);
-        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("indefinite")));
+        assert!(
+            matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("indefinite"))
+        );
     }
 
     #[test]
     fn test_parse_der_length_too_many_bytes() {
         let data = [0x85, 0x01, 0x02, 0x03, 0x04, 0x05]; // 5 length bytes (too many)
         let result = parse_der_length(&data);
-        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("invalid length")));
+        assert!(
+            matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("invalid length"))
+        );
     }
 
     #[test]
     fn test_parse_der_length_truncated() {
         let data = [0x82, 0x01]; // Claims 2 bytes but only 1 present
         let result = parse_der_length(&data);
-        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("invalid length")));
+        assert!(
+            matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("invalid length"))
+        );
     }
 
     #[test]
@@ -896,7 +915,9 @@ mod tests {
         // Any certificate that doesn't hash to the expected fingerprint
         let fake_cert = vec![0x30, 0x10, 0x01, 0x02, 0x03];
         let result = validator.validate(&[fake_cert]);
-        assert!(matches!(result, CertificateValidationResult::Invalid(reason) if reason.contains("fingerprint mismatch")));
+        assert!(
+            matches!(result, CertificateValidationResult::Invalid(reason) if reason.contains("fingerprint mismatch"))
+        );
     }
 
     #[test]
@@ -904,7 +925,9 @@ mod tests {
         // Certificate without EC OID
         let cert_der = vec![0x30, 0x10, 0x00, 0x00, 0x00];
         let result = find_and_verify_ec_curve(&cert_der);
-        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("not an EC certificate")));
+        assert!(
+            matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("not an EC certificate"))
+        );
     }
 
     #[test]
@@ -912,14 +935,18 @@ mod tests {
         // Not a SEQUENCE (wrong tag)
         let cert_der = vec![0x02, 0x01, 0x00]; // INTEGER instead of SEQUENCE
         let result = parse_outer_cert_sequence(&cert_der);
-        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("invalid certificate structure")));
+        assert!(
+            matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("invalid certificate structure"))
+        );
     }
 
     #[test]
     fn test_parse_outer_cert_sequence_too_short() {
         let cert_der = vec![0x30, 0x00]; // Too short
         let result = parse_outer_cert_sequence(&cert_der);
-        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("invalid certificate structure")));
+        assert!(
+            matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("invalid certificate structure"))
+        );
     }
 
     #[test]
@@ -927,7 +954,9 @@ mod tests {
         // SEQUENCE claims length 100 but only has 3 bytes
         let cert_der = vec![0x30, 0x64, 0x00, 0x00, 0x00];
         let result = parse_outer_cert_sequence(&cert_der);
-        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("truncated")));
+        assert!(
+            matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("truncated"))
+        );
     }
 
     #[test]
@@ -935,7 +964,9 @@ mod tests {
         // Valid outer sequence but TBS is not a sequence
         let cert_der = vec![0x30, 0x03, 0x02, 0x01, 0x00]; // Inner is INTEGER
         let result = extract_tbs_certificate(&cert_der, 2);
-        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("TBSCertificate not found")));
+        assert!(
+            matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("TBSCertificate not found"))
+        );
     }
 
     #[test]
@@ -943,6 +974,8 @@ mod tests {
         // No SignatureAlgorithm SEQUENCE after TBS
         let cert_der = vec![0x30, 0x05, 0x30, 0x01, 0x00, 0x02, 0x01]; // TBS followed by INTEGER
         let result = extract_cert_signature(&cert_der, 4);
-        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("SignatureAlgorithm not found")));
+        assert!(
+            matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("SignatureAlgorithm not found"))
+        );
     }
 }

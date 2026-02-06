@@ -19,8 +19,8 @@ use sbc_grpc_api::sbc::{
     UndoFailoverRequest, UndoFailoverResponse, WatchClusterRequest,
 };
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 use tracing::info;
@@ -283,7 +283,7 @@ impl ClusterService for ClusterServiceImpl {
                 let response = DrainNodeResponse {
                     success: true,
                     message: format!("Node {} marked for draining", req.node_id),
-                    calls_draining: 0,        // TODO: Track actual calls
+                    calls_draining: 0,          // TODO: Track actual calls
                     registrations_migrating: 0, // TODO: Track registrations
                 };
                 Ok(Response::new(response))

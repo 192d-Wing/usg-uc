@@ -363,9 +363,9 @@ mod tests {
 
     #[test]
     fn test_extract_mapped_address_success() {
-        use crate::{StunAttribute, StunClass, StunMethod};
         use crate::attribute::XorMappedAddress;
         use crate::message::StunMessageType;
+        use crate::{StunAttribute, StunClass, StunMethod};
 
         // Create a success response with XOR-MAPPED-ADDRESS
         let msg_type = StunMessageType::new(StunMethod::Binding, StunClass::SuccessResponse);
@@ -380,8 +380,8 @@ mod tests {
 
     #[test]
     fn test_extract_mapped_address_missing() {
-        use crate::{StunClass, StunMethod};
         use crate::message::StunMessageType;
+        use crate::{StunClass, StunMethod};
 
         // Create a success response without XOR-MAPPED-ADDRESS
         let msg_type = StunMessageType::new(StunMethod::Binding, StunClass::SuccessResponse);
@@ -394,8 +394,8 @@ mod tests {
 
     #[test]
     fn test_extract_mapped_address_error_response() {
-        use crate::{StunAttribute, StunClass, StunMethod};
         use crate::message::StunMessageType;
+        use crate::{StunAttribute, StunClass, StunMethod};
 
         // Create an error response
         let msg_type = StunMessageType::new(StunMethod::Binding, StunClass::ErrorResponse);
@@ -407,13 +407,16 @@ mod tests {
 
         let result = StunClient::extract_mapped_address(&response);
         assert!(result.is_err());
-        assert!(matches!(result, Err(StunError::ServerError { code: 401, .. })));
+        assert!(matches!(
+            result,
+            Err(StunError::ServerError { code: 401, .. })
+        ));
     }
 
     #[test]
     fn test_extract_error_code_with_error() {
-        use crate::{StunAttribute, StunClass, StunMethod};
         use crate::message::StunMessageType;
+        use crate::{StunAttribute, StunClass, StunMethod};
 
         let msg_type = StunMessageType::new(StunMethod::Binding, StunClass::ErrorResponse);
         let mut response = StunMessage::new(msg_type, [1u8; 12]);
@@ -428,18 +431,15 @@ mod tests {
 
     #[test]
     fn test_extract_error_code_missing() {
-        use crate::{StunClass, StunMethod};
         use crate::message::StunMessageType;
+        use crate::{StunClass, StunMethod};
 
         // Error response without error code attribute
         let msg_type = StunMessageType::new(StunMethod::Binding, StunClass::ErrorResponse);
         let response = StunMessage::new(msg_type, [1u8; 12]);
 
         let error = StunClient::extract_error_code(&response);
-        assert!(matches!(
-            error,
-            StunError::ServerError { code: 500, .. }
-        ));
+        assert!(matches!(error, StunError::ServerError { code: 500, .. }));
     }
 
     #[tokio::test]

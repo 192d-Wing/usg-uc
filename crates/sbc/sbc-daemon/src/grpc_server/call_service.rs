@@ -10,8 +10,8 @@ use sbc_grpc_api::sbc::{
     WatchCallsRequest,
 };
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 use tracing::info;
@@ -120,8 +120,7 @@ impl CallService for CallServiceImpl {
         Ok(Response::new(response))
     }
 
-    type WatchCallsStream =
-        Pin<Box<dyn Stream<Item = Result<CallEvent, Status>> + Send + 'static>>;
+    type WatchCallsStream = Pin<Box<dyn Stream<Item = Result<CallEvent, Status>> + Send + 'static>>;
 
     async fn watch_calls(
         &self,

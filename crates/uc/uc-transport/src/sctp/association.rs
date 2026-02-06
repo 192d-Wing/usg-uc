@@ -2393,7 +2393,8 @@ impl AssociationHandle {
                 }
                 Chunk::Unknown(unknown) => {
                     // Handle unknown chunks per RFC 9260 §3.2 high-bit rules
-                    let action = super::chunk::UnknownChunkAction::from_chunk_type(unknown.chunk_type);
+                    let action =
+                        super::chunk::UnknownChunkAction::from_chunk_type(unknown.chunk_type);
                     tracing::debug!(
                         chunk_type = unknown.chunk_type,
                         action = ?action,

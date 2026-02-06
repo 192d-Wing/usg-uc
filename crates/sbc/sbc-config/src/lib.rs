@@ -195,11 +195,9 @@ pub fn load_from_str_with_format(content: &str, format: ConfigFormat) -> ConfigR
         ConfigFormat::Toml => toml::from_str(content).map_err(|e| ConfigError::Parse {
             reason: format!("TOML parse error: {e}"),
         })?,
-        ConfigFormat::Yaml => {
-            serde_yaml_ng::from_str(content).map_err(|e| ConfigError::Parse {
-                reason: format!("YAML parse error: {e}"),
-            })?
-        }
+        ConfigFormat::Yaml => serde_yaml_ng::from_str(content).map_err(|e| ConfigError::Parse {
+            reason: format!("YAML parse error: {e}"),
+        })?,
     };
 
     validate::validate_config(&config)?;
@@ -236,11 +234,9 @@ pub fn serialize_config(config: &SbcConfig, format: ConfigFormat) -> ConfigResul
         ConfigFormat::Toml => toml::to_string_pretty(config).map_err(|e| ConfigError::Parse {
             reason: format!("TOML serialization error: {e}"),
         }),
-        ConfigFormat::Yaml => {
-            serde_yaml_ng::to_string(config).map_err(|e| ConfigError::Parse {
-                reason: format!("YAML serialization error: {e}"),
-            })
-        }
+        ConfigFormat::Yaml => serde_yaml_ng::to_string(config).map_err(|e| ConfigError::Parse {
+            reason: format!("YAML serialization error: {e}"),
+        }),
     }
 }
 
@@ -344,14 +340,23 @@ media:
         let toml_config = load_from_str(toml_content).expect("should parse TOML");
         let yaml_config = load_from_yaml_str(yaml_content).expect("should parse YAML");
 
-        assert_eq!(toml_config.general.instance_name, yaml_config.general.instance_name);
+        assert_eq!(
+            toml_config.general.instance_name,
+            yaml_config.general.instance_name
+        );
         assert_eq!(toml_config.general.max_calls, yaml_config.general.max_calls);
         assert_eq!(
             toml_config.general.max_registrations,
             yaml_config.general.max_registrations
         );
-        assert_eq!(toml_config.media.rtp_port_min, yaml_config.media.rtp_port_min);
-        assert_eq!(toml_config.media.rtp_port_max, yaml_config.media.rtp_port_max);
+        assert_eq!(
+            toml_config.media.rtp_port_min,
+            yaml_config.media.rtp_port_min
+        );
+        assert_eq!(
+            toml_config.media.rtp_port_max,
+            yaml_config.media.rtp_port_max
+        );
     }
 
     #[test]

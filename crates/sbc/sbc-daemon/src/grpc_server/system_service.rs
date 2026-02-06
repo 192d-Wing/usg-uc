@@ -5,12 +5,12 @@
 use crate::api_server::AppState;
 use sbc_grpc_api::sbc::system_service_server::SystemService;
 use sbc_grpc_api::sbc::{
-    GetMetricsRequest, GetMetricsResponse, GetStatsRequest, GetStatsResponse,
-    GetTlsStatusRequest, GetTlsStatusResponse, GetVersionRequest, GetVersionResponse,
-    ReloadTlsRequest, ReloadTlsResponse, ShutdownRequest, ShutdownResponse, TlsStatus,
+    GetMetricsRequest, GetMetricsResponse, GetStatsRequest, GetStatsResponse, GetTlsStatusRequest,
+    GetTlsStatusResponse, GetVersionRequest, GetVersionResponse, ReloadTlsRequest,
+    ReloadTlsResponse, ShutdownRequest, ShutdownResponse, TlsStatus,
 };
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tonic::{Request, Response, Status};
 use tracing::info;
 

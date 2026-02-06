@@ -33,29 +33,49 @@
 // ============================================================================
 
 mod proto_message_tests {
-    use sbc_grpc_api::health::{HealthCheckRequest, HealthCheckResponse, health_check_response::ServingStatus};
+    use sbc_grpc_api::health::{
+        HealthCheckRequest, HealthCheckResponse, health_check_response::ServingStatus,
+    };
     use sbc_grpc_api::sbc::{
+        CallInfo,
+        CallLegInfo,
+        CallState,
+        ContactInfo,
+        DeleteRegistrationRequest,
+        DeleteRegistrationResponse,
+        GetCallRequest,
+        GetCallResponse,
+        GetCallStatsRequest,
+        GetCallStatsResponse,
         // Config service
-        GetConfigRequest, GetConfigResponse,
-        ValidateConfigRequest, ValidateConfigResponse,
-        ReloadConfigRequest, ReloadConfigResponse,
+        GetConfigRequest,
+        GetConfigResponse,
+        GetMetricsRequest,
+        GetMetricsResponse,
+        GetRegistrationRequest,
+        GetRegistrationResponse,
+        GetRegistrationStatsRequest,
+        GetRegistrationStatsResponse,
+        GetStatsRequest,
+        GetStatsResponse,
+        GetTlsStatusRequest,
+        GetTlsStatusResponse,
         // System service
-        GetVersionRequest, GetVersionResponse,
-        GetStatsRequest, GetStatsResponse,
-        GetMetricsRequest, GetMetricsResponse,
-        GetTlsStatusRequest, GetTlsStatusResponse,
+        GetVersionRequest,
+        GetVersionResponse,
         // Call service
-        ListCallsRequest, ListCallsResponse,
-        GetCallRequest, GetCallResponse,
-        GetCallStatsRequest, GetCallStatsResponse,
-        TerminateCallRequest, TerminateCallResponse,
-        CallState, CallInfo, CallLegInfo,
+        ListCallsRequest,
+        ListCallsResponse,
         // Registration service
-        ListRegistrationsRequest, ListRegistrationsResponse,
-        GetRegistrationRequest, GetRegistrationResponse,
-        GetRegistrationStatsRequest, GetRegistrationStatsResponse,
-        DeleteRegistrationRequest, DeleteRegistrationResponse,
-        RegistrationInfo, ContactInfo,
+        ListRegistrationsRequest,
+        ListRegistrationsResponse,
+        RegistrationInfo,
+        ReloadConfigRequest,
+        ReloadConfigResponse,
+        TerminateCallRequest,
+        TerminateCallResponse,
+        ValidateConfigRequest,
+        ValidateConfigResponse,
     };
 
     #[test]
@@ -233,9 +253,7 @@ mod proto_message_tests {
         assert!(get_resp.call.is_none());
 
         // GetCallStats
-        let stats_req = GetCallStatsRequest {
-            time_range_secs: 0,
-        };
+        let stats_req = GetCallStatsRequest { time_range_secs: 0 };
         assert_eq!(stats_req.time_range_secs, 0);
 
         let stats_resp = GetCallStatsResponse {
@@ -355,9 +373,7 @@ mod proto_message_tests {
         };
         assert_eq!(get_req.aor, "sip:alice@example.com");
 
-        let get_resp = GetRegistrationResponse {
-            registration: None,
-        };
+        let get_resp = GetRegistrationResponse { registration: None };
         assert!(get_resp.registration.is_none());
 
         // GetRegistrationStats
@@ -400,25 +416,23 @@ mod proto_message_tests {
     fn test_registration_info_structure() {
         let reg = RegistrationInfo {
             aor: "sip:charlie@example.com".to_string(),
-            contacts: vec![
-                ContactInfo {
-                    uri: "sip:charlie@192.168.1.50:5060".to_string(),
-                    expires: 3600,
-                    q_value: 1.0,
-                    instance_id: "<urn:uuid:abc123>".to_string(),
-                    pub_gruu: String::new(),
-                    temp_gruu: String::new(),
-                    registered_at: Some(prost_types::Timestamp {
-                        seconds: 1700000000,
-                        nanos: 0,
-                    }),
-                    source_addr: "192.168.1.50:5060".to_string(),
-                    transport: "UDP".to_string(),
-                    secure: false,
-                    call_id: "reg-call-1".to_string(),
-                    cseq: 1,
-                },
-            ],
+            contacts: vec![ContactInfo {
+                uri: "sip:charlie@192.168.1.50:5060".to_string(),
+                expires: 3600,
+                q_value: 1.0,
+                instance_id: "<urn:uuid:abc123>".to_string(),
+                pub_gruu: String::new(),
+                temp_gruu: String::new(),
+                registered_at: Some(prost_types::Timestamp {
+                    seconds: 1700000000,
+                    nanos: 0,
+                }),
+                source_addr: "192.168.1.50:5060".to_string(),
+                transport: "UDP".to_string(),
+                secure: false,
+                call_id: "reg-call-1".to_string(),
+                cseq: 1,
+            }],
             registered_at: Some(prost_types::Timestamp {
                 seconds: 1700000000,
                 nanos: 0,
@@ -444,14 +458,10 @@ mod proto_message_tests {
 #[cfg(feature = "grpc-cluster")]
 mod cluster_proto_tests {
     use sbc_grpc_api::sbc::{
-        GetClusterStatusRequest, GetClusterStatusResponse,
-        ListNodesRequest, ListNodesResponse,
-        GetNodeStatusRequest, GetNodeStatusResponse,
-        DrainNodeRequest, DrainNodeResponse,
-        InitiateFailoverRequest, InitiateFailoverResponse,
-        UndoFailoverRequest, UndoFailoverResponse,
-        NodeInfo, NodeMetrics, ClusterHealth, HealthCheckDetail,
-        NodeRole, NodeState,
+        ClusterHealth, DrainNodeRequest, DrainNodeResponse, GetClusterStatusRequest,
+        GetClusterStatusResponse, GetNodeStatusRequest, GetNodeStatusResponse, HealthCheckDetail,
+        InitiateFailoverRequest, InitiateFailoverResponse, ListNodesRequest, ListNodesResponse,
+        NodeInfo, NodeMetrics, NodeRole, NodeState, UndoFailoverRequest, UndoFailoverResponse,
     };
 
     #[test]
@@ -507,23 +517,21 @@ mod cluster_proto_tests {
         assert_eq!(req.include_offline, false);
 
         let resp = ListNodesResponse {
-            nodes: vec![
-                NodeInfo {
-                    node_id: "node-01".to_string(),
-                    role: NodeRole::Primary as i32,
-                    state: NodeState::Active as i32,
-                    address: "[::1]:5070".to_string(),
-                    sip_address: "[::1]:5060".to_string(),
-                    api_address: "[::1]:8080".to_string(),
-                    last_seen: None,
-                    uptime_secs: 86400,
-                    metrics: None,
-                    version: "1.0.0".to_string(),
-                    region: "us-east-1".to_string(),
-                    zone: "us-east-1a".to_string(),
-                    labels: std::collections::HashMap::new(),
-                },
-            ],
+            nodes: vec![NodeInfo {
+                node_id: "node-01".to_string(),
+                role: NodeRole::Primary as i32,
+                state: NodeState::Active as i32,
+                address: "[::1]:5070".to_string(),
+                sip_address: "[::1]:5060".to_string(),
+                api_address: "[::1]:8080".to_string(),
+                last_seen: None,
+                uptime_secs: 86400,
+                metrics: None,
+                version: "1.0.0".to_string(),
+                region: "us-east-1".to_string(),
+                zone: "us-east-1a".to_string(),
+                labels: std::collections::HashMap::new(),
+            }],
             total: 1,
         };
         assert_eq!(resp.nodes.len(), 1);
@@ -693,10 +701,17 @@ mod reflection_tests {
         let descriptor_str = String::from_utf8_lossy(FILE_DESCRIPTOR_SET);
 
         // Check that our service names appear in the descriptor
-        assert!(descriptor_str.contains("ConfigService") || descriptor_str.contains("config_service"));
-        assert!(descriptor_str.contains("SystemService") || descriptor_str.contains("system_service"));
+        assert!(
+            descriptor_str.contains("ConfigService") || descriptor_str.contains("config_service")
+        );
+        assert!(
+            descriptor_str.contains("SystemService") || descriptor_str.contains("system_service")
+        );
         assert!(descriptor_str.contains("CallService") || descriptor_str.contains("call_service"));
-        assert!(descriptor_str.contains("RegistrationService") || descriptor_str.contains("registration_service"));
+        assert!(
+            descriptor_str.contains("RegistrationService")
+                || descriptor_str.contains("registration_service")
+        );
     }
 }
 
@@ -793,7 +808,9 @@ mod service_trait_tests {
     // by implementing mock services
 
     use sbc_grpc_api::health::health_server::Health;
-    use sbc_grpc_api::health::{HealthCheckRequest, HealthCheckResponse, health_check_response::ServingStatus};
+    use sbc_grpc_api::health::{
+        HealthCheckRequest, HealthCheckResponse, health_check_response::ServingStatus,
+    };
     use tonic::{Request, Response, Status};
 
     #[derive(Debug, Default)]
@@ -815,17 +832,22 @@ mod service_trait_tests {
             }))
         }
 
-        type WatchStream = tokio_stream::wrappers::ReceiverStream<Result<HealthCheckResponse, Status>>;
+        type WatchStream =
+            tokio_stream::wrappers::ReceiverStream<Result<HealthCheckResponse, Status>>;
 
         async fn watch(
             &self,
             _request: Request<HealthCheckRequest>,
         ) -> Result<Response<Self::WatchStream>, Status> {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
-            let _ = tx.send(Ok(HealthCheckResponse {
-                status: ServingStatus::Serving as i32,
-            })).await;
-            Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+            let _ = tx
+                .send(Ok(HealthCheckResponse {
+                    status: ServingStatus::Serving as i32,
+                }))
+                .await;
+            Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+                rx,
+            )))
         }
     }
 
@@ -834,19 +856,28 @@ mod service_trait_tests {
         let service = MockHealthService;
 
         // Test check for empty service (overall health)
-        let req = Request::new(HealthCheckRequest { service: String::new() });
+        let req = Request::new(HealthCheckRequest {
+            service: String::new(),
+        });
         let resp = service.check(req).await.unwrap();
         assert_eq!(resp.into_inner().status, ServingStatus::Serving as i32);
 
         // Test check for specific service
-        let req = Request::new(HealthCheckRequest { service: "sbc".to_string() });
+        let req = Request::new(HealthCheckRequest {
+            service: "sbc".to_string(),
+        });
         let resp = service.check(req).await.unwrap();
         assert_eq!(resp.into_inner().status, ServingStatus::Serving as i32);
 
         // Test check for unknown service
-        let req = Request::new(HealthCheckRequest { service: "unknown".to_string() });
+        let req = Request::new(HealthCheckRequest {
+            service: "unknown".to_string(),
+        });
         let resp = service.check(req).await.unwrap();
-        assert_eq!(resp.into_inner().status, ServingStatus::ServiceUnknown as i32);
+        assert_eq!(
+            resp.into_inner().status,
+            ServingStatus::ServiceUnknown as i32
+        );
     }
 }
 
@@ -856,8 +887,10 @@ mod service_trait_tests {
 
 mod serialization_tests {
     use prost::Message;
-    use sbc_grpc_api::sbc::{GetVersionResponse, CallState, CallInfo};
-    use sbc_grpc_api::health::{HealthCheckRequest, HealthCheckResponse, health_check_response::ServingStatus};
+    use sbc_grpc_api::health::{
+        HealthCheckRequest, HealthCheckResponse, health_check_response::ServingStatus,
+    };
+    use sbc_grpc_api::sbc::{CallInfo, CallState, GetVersionResponse};
 
     #[test]
     fn test_health_check_request_encode_decode() {

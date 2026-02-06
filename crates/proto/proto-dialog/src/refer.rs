@@ -562,7 +562,10 @@ mod tests {
     fn test_subscription_state_display() {
         assert_eq!(format!("{}", ReferSubscriptionState::Pending), "pending");
         assert_eq!(format!("{}", ReferSubscriptionState::Active), "active");
-        assert_eq!(format!("{}", ReferSubscriptionState::Terminated), "terminated");
+        assert_eq!(
+            format!("{}", ReferSubscriptionState::Terminated),
+            "terminated"
+        );
     }
 
     #[test]
@@ -584,8 +587,10 @@ mod tests {
     #[test]
     fn test_subscription_state_parse_invalid() {
         let result = "invalid".parse::<ReferSubscriptionState>();
-        assert!(matches!(result, Err(DialogError::InvalidParameter { name, reason })
-            if name == "subscription-state" && reason.contains("unknown state")));
+        assert!(
+            matches!(result, Err(DialogError::InvalidParameter { name, reason })
+            if name == "subscription-state" && reason.contains("unknown state"))
+        );
     }
 
     #[test]
@@ -622,19 +627,17 @@ mod tests {
 
     #[test]
     fn test_refer_request_with_expires() {
-        let request = ReferRequest::new("sip:bob@example.com")
-            .with_expires(Duration::from_secs(300));
+        let request =
+            ReferRequest::new("sip:bob@example.com").with_expires(Duration::from_secs(300));
         assert_eq!(request.expires(), Duration::from_secs(300));
     }
 
     #[test]
     fn test_refer_request_with_no_refer_sub() {
-        let request = ReferRequest::new("sip:bob@example.com")
-            .with_no_refer_sub(true);
+        let request = ReferRequest::new("sip:bob@example.com").with_no_refer_sub(true);
         assert!(request.no_refer_sub());
 
-        let request2 = ReferRequest::new("sip:bob@example.com")
-            .with_no_refer_sub(false);
+        let request2 = ReferRequest::new("sip:bob@example.com").with_no_refer_sub(false);
         assert!(!request2.no_refer_sub());
     }
 
@@ -643,7 +646,10 @@ mod tests {
         let request = ReferRequest::new("sip:bob@example.com");
         assert_eq!(request.refer_to(), "sip:bob@example.com");
         assert!(request.referred_by().is_none());
-        assert_eq!(request.subscription_state(), ReferSubscriptionState::Pending);
+        assert_eq!(
+            request.subscription_state(),
+            ReferSubscriptionState::Pending
+        );
         assert!(request.current_status().is_none());
         assert_eq!(request.expires(), Duration::from_secs(180));
         assert!(!request.no_refer_sub());
@@ -662,22 +668,31 @@ mod tests {
     #[test]
     fn test_refer_request_set_subscription_state() {
         let mut request = ReferRequest::new("sip:bob@example.com");
-        assert_eq!(request.subscription_state(), ReferSubscriptionState::Pending);
+        assert_eq!(
+            request.subscription_state(),
+            ReferSubscriptionState::Pending
+        );
 
         request.set_subscription_state(ReferSubscriptionState::Active);
         assert_eq!(request.subscription_state(), ReferSubscriptionState::Active);
 
         request.set_subscription_state(ReferSubscriptionState::Terminated);
-        assert_eq!(request.subscription_state(), ReferSubscriptionState::Terminated);
+        assert_eq!(
+            request.subscription_state(),
+            ReferSubscriptionState::Terminated
+        );
     }
 
     #[test]
     fn test_refer_request_headers() {
-        let request = ReferRequest::new("sip:bob@example.com")
-            .with_referred_by("sip:alice@example.com");
+        let request =
+            ReferRequest::new("sip:bob@example.com").with_referred_by("sip:alice@example.com");
 
         assert_eq!(request.refer_to_header(), "sip:bob@example.com");
-        assert_eq!(request.referred_by_header(), Some("sip:alice@example.com".to_string()));
+        assert_eq!(
+            request.referred_by_header(),
+            Some("sip:alice@example.com".to_string())
+        );
     }
 
     #[test]
@@ -703,7 +718,10 @@ mod tests {
         let mut request = ReferRequest::new("sip:bob@example.com");
 
         request.update_status(ReferStatus::Failed);
-        assert_eq!(request.subscription_state(), ReferSubscriptionState::Terminated);
+        assert_eq!(
+            request.subscription_state(),
+            ReferSubscriptionState::Terminated
+        );
         assert!(request.is_complete());
     }
 
@@ -727,15 +745,15 @@ mod tests {
 
     #[test]
     fn test_refer_handler_with_referred_by() {
-        let handler = ReferHandler::new("sip:bob@example.com")
-            .with_referred_by("sip:alice@example.com");
+        let handler =
+            ReferHandler::new("sip:bob@example.com").with_referred_by("sip:alice@example.com");
         assert_eq!(handler.referred_by(), Some("sip:alice@example.com"));
     }
 
     #[test]
     fn test_refer_handler_with_expires() {
-        let handler = ReferHandler::new("sip:bob@example.com")
-            .with_expires(Duration::from_secs(60));
+        let handler =
+            ReferHandler::new("sip:bob@example.com").with_expires(Duration::from_secs(60));
         // Can't directly check expires, but we can verify it was set
         // by checking subscription_state_header when active
         let mut handler = handler;
@@ -749,7 +767,10 @@ mod tests {
         let mut handler = ReferHandler::new("sip:bob@example.com");
         handler.reject().unwrap();
 
-        assert_eq!(handler.subscription_state(), ReferSubscriptionState::Terminated);
+        assert_eq!(
+            handler.subscription_state(),
+            ReferSubscriptionState::Terminated
+        );
         assert_eq!(handler.current_status(), ReferStatus::Failed);
         assert!(handler.is_complete());
     }
@@ -761,7 +782,10 @@ mod tests {
 
         // Trying to accept again should fail
         let result = handler.accept();
-        assert!(matches!(result, Err(DialogError::InvalidStateTransition { .. })));
+        assert!(matches!(
+            result,
+            Err(DialogError::InvalidStateTransition { .. })
+        ));
     }
 
     #[test]
@@ -776,7 +800,10 @@ mod tests {
         handler.accept().unwrap();
         handler.update_status(ReferStatus::Success);
 
-        assert_eq!(handler.subscription_state_header(), "terminated;reason=noresource");
+        assert_eq!(
+            handler.subscription_state_header(),
+            "terminated;reason=noresource"
+        );
     }
 
     #[test]
@@ -784,7 +811,10 @@ mod tests {
         let mut handler = ReferHandler::new("sip:bob@example.com");
         handler.reject().unwrap();
 
-        assert_eq!(handler.subscription_state_header(), "terminated;reason=rejected");
+        assert_eq!(
+            handler.subscription_state_header(),
+            "terminated;reason=rejected"
+        );
     }
 
     #[test]
@@ -802,8 +832,8 @@ mod tests {
 
     #[test]
     fn test_refer_handler_clone() {
-        let handler = ReferHandler::new("sip:bob@example.com")
-            .with_referred_by("sip:alice@example.com");
+        let handler =
+            ReferHandler::new("sip:bob@example.com").with_referred_by("sip:alice@example.com");
 
         let cloned = handler.clone();
         assert_eq!(cloned.refer_to(), handler.refer_to());
@@ -850,8 +880,14 @@ mod tests {
 
     #[test]
     fn test_subscription_state_eq() {
-        assert_eq!(ReferSubscriptionState::Pending, ReferSubscriptionState::Pending);
-        assert_ne!(ReferSubscriptionState::Pending, ReferSubscriptionState::Active);
+        assert_eq!(
+            ReferSubscriptionState::Pending,
+            ReferSubscriptionState::Pending
+        );
+        assert_ne!(
+            ReferSubscriptionState::Pending,
+            ReferSubscriptionState::Active
+        );
     }
 
     #[test]

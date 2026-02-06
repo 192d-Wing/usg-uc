@@ -1782,9 +1782,12 @@ mod tests {
         assert!(certificate_msg.len() >= 6 + cert_data.len());
 
         // Extract the certificate data from the message
-        let total_len =
-            u32::from_be_bytes([0, certificate_msg[0], certificate_msg[1], certificate_msg[2]])
-                as usize;
+        let total_len = u32::from_be_bytes([
+            0,
+            certificate_msg[0],
+            certificate_msg[1],
+            certificate_msg[2],
+        ]) as usize;
         assert_eq!(total_len, certificate_msg.len() - 3);
     }
 
@@ -1861,5 +1864,4 @@ mod tests {
         // Cookie should now be set in handshake
         assert_eq!(hs.cookie.len(), 32);
     }
-
 }

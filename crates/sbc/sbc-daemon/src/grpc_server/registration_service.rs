@@ -9,8 +9,8 @@ use sbc_grpc_api::sbc::{
     GetRegistrationResponse, GetRegistrationStatsRequest, GetRegistrationStatsResponse,
     ListRegistrationsRequest, ListRegistrationsResponse,
 };
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tonic::{Request, Response, Status};
 use tracing::info;
 
@@ -49,7 +49,11 @@ impl RegistrationService for RegistrationServiceImpl {
         );
 
         // Get registration counts from stats
-        let active = self.state.stats.registrations_active.load(Ordering::Relaxed);
+        let active = self
+            .state
+            .stats
+            .registrations_active
+            .load(Ordering::Relaxed);
         let total = self.state.stats.registrations_total.load(Ordering::Relaxed);
 
         // TODO: Implement actual registration listing from registrar
@@ -108,9 +112,9 @@ impl RegistrationService for RegistrationServiceImpl {
         let response = GetRegistrationStatsResponse {
             registrations_total: stats.registrations_total.load(Ordering::Relaxed) as i64,
             registrations_active: stats.registrations_active.load(Ordering::Relaxed) as i64,
-            unique_aors: 0,       // TODO: Track unique AORs
-            total_contacts: 0,    // TODO: Track total contacts
-            expiring_soon: 0,     // TODO: Track expiring registrations
+            unique_aors: 0,    // TODO: Track unique AORs
+            total_contacts: 0, // TODO: Track total contacts
+            expiring_soon: 0,  // TODO: Track expiring registrations
             avg_contacts_per_aor: 0.0,
             registrations_per_minute: 0.0,
             reregistrations_per_minute: 0.0,

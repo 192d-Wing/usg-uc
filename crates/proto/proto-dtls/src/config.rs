@@ -347,7 +347,9 @@ mod tests {
         };
 
         let result = config.validate();
-        assert!(matches!(result, Err(DtlsError::InvalidConfig { reason }) if reason.contains("private key is empty")));
+        assert!(
+            matches!(result, Err(DtlsError::InvalidConfig { reason }) if reason.contains("private key is empty"))
+        );
     }
 
     #[test]
@@ -360,7 +362,9 @@ mod tests {
         };
 
         let result = config.validate();
-        assert!(matches!(result, Err(DtlsError::InvalidConfig { reason }) if reason.contains("no SRTP profiles")));
+        assert!(
+            matches!(result, Err(DtlsError::InvalidConfig { reason }) if reason.contains("no SRTP profiles"))
+        );
     }
 
     #[test]
@@ -452,7 +456,9 @@ VGVzdA==
     fn test_parse_pem_private_key_not_found() {
         let pem = b"no key here";
         let result = parse_pem_private_key(pem);
-        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("no private key found")));
+        assert!(
+            matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("no private key found"))
+        );
     }
 
     #[test]
@@ -479,7 +485,9 @@ VGVzdA==
     fn test_base64_decode_invalid_char() {
         let encoded = "SGVs!G8="; // ! is invalid
         let result = base64_decode(encoded);
-        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("invalid base64 character")));
+        assert!(
+            matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("invalid base64 character"))
+        );
     }
 
     #[test]
@@ -527,6 +535,8 @@ VGVzdA==
     fn test_with_pem_files_nonexistent() {
         let config = DtlsConfig::default();
         let result = config.with_pem_files("/nonexistent/cert.pem", "/nonexistent/key.pem");
-        assert!(matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("failed to read cert file")));
+        assert!(
+            matches!(result, Err(DtlsError::CertificateError { reason }) if reason.contains("failed to read cert file"))
+        );
     }
 }

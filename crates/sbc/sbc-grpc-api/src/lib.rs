@@ -142,7 +142,9 @@ pub mod prelude {
 
     // Registration service
     pub use super::sbc::registration_service_client::RegistrationServiceClient;
-    pub use super::sbc::registration_service_server::{RegistrationService, RegistrationServiceServer};
+    pub use super::sbc::registration_service_server::{
+        RegistrationService, RegistrationServiceServer,
+    };
     pub use super::sbc::{
         ContactInfo, DeleteRegistrationRequest, DeleteRegistrationResponse, GetRegistrationRequest,
         GetRegistrationResponse, GetRegistrationStatsRequest, GetRegistrationStatsResponse,

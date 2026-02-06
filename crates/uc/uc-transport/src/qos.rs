@@ -413,7 +413,7 @@ impl QosConfig {
 #[allow(unsafe_code)]
 fn set_ipv6_tclass_windows(socket: &Socket, tclass: u32) -> io::Result<()> {
     use windows::Win32::Networking::WinSock::{
-        setsockopt, IPPROTO_IPV6, IPV6_TCLASS, SOCKET, SOCKET_ERROR,
+        IPPROTO_IPV6, IPV6_TCLASS, SOCKET, SOCKET_ERROR, setsockopt,
     };
 
     let raw_socket = socket.as_raw_socket() as usize;

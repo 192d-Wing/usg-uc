@@ -365,10 +365,22 @@ mod tests {
 
         let km = keying_material.unwrap();
         assert_eq!(km.profile, SrtpProfile::AeadAes256Gcm);
-        assert_eq!(km.client_write_key.len(), SrtpProfile::AeadAes256Gcm.key_len());
-        assert_eq!(km.server_write_key.len(), SrtpProfile::AeadAes256Gcm.key_len());
-        assert_eq!(km.client_write_salt.len(), SrtpProfile::AeadAes256Gcm.salt_len());
-        assert_eq!(km.server_write_salt.len(), SrtpProfile::AeadAes256Gcm.salt_len());
+        assert_eq!(
+            km.client_write_key.len(),
+            SrtpProfile::AeadAes256Gcm.key_len()
+        );
+        assert_eq!(
+            km.server_write_key.len(),
+            SrtpProfile::AeadAes256Gcm.key_len()
+        );
+        assert_eq!(
+            km.client_write_salt.len(),
+            SrtpProfile::AeadAes256Gcm.salt_len()
+        );
+        assert_eq!(
+            km.server_write_salt.len(),
+            SrtpProfile::AeadAes256Gcm.salt_len()
+        );
     }
 
     #[tokio::test]
