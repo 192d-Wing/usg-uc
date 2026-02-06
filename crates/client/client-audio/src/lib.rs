@@ -47,6 +47,9 @@
 //! - [`jitter_buffer`]: Adaptive jitter buffer for RTP reordering
 //! - [`rtp_handler`]: RTP/SRTP packet handling
 //! - [`plc`]: LPC-based packet loss concealment
+//! - [`audio_processing`]: AGC and noise gate for capture path
+//! - [`vad`]: Voice activity detection for discontinuous transmission
+//! - [`comfort_noise`]: Comfort noise generation during silence
 //! - [`pipeline`]: Main audio pipeline coordinator
 
 #![forbid(unsafe_code)]
@@ -62,6 +65,7 @@
 
 pub mod audio_processing;
 pub mod codec;
+pub mod comfort_noise;
 pub mod decode_thread;
 pub mod device;
 pub mod drift_compensator;
@@ -73,9 +77,11 @@ pub mod plc;
 pub mod ringtone;
 pub mod rtp_handler;
 pub mod stream;
+pub mod vad;
 
 pub use audio_processing::AudioProcessor;
 pub use codec::{CodecPipeline, negotiate_codec};
+pub use comfort_noise::ComfortNoiseGenerator;
 pub use decode_thread::DecodeThreadHandle;
 pub use device::{
     DEFAULT_SAMPLE_RATE, DeviceManager, SAMPLE_RATE_8KHZ, SAMPLE_RATE_16KHZ, SAMPLE_RATE_48KHZ,
@@ -91,6 +97,7 @@ pub use plc::PacketLossConcealer;
 pub use ringtone::RingtonePlayer;
 pub use rtp_handler::{RtpReceiver, RtpStats, RtpTransmitter, generate_ssrc};
 pub use stream::{CaptureStream, PlaybackStream, PlaybackStreamHandle, Sample};
+pub use vad::{VadDecision, VoiceActivityDetector};
 
 use thiserror::Error;
 

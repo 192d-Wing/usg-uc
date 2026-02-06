@@ -7,6 +7,7 @@
 //! delays that cause playback gaps.
 
 use crate::codec::CodecPipeline;
+use crate::comfort_noise::ComfortNoiseGenerator;
 use crate::drift_compensator::DriftCompensator;
 use crate::jitter_buffer::{JitterBufferResult, SharedJitterBuffer};
 use crate::pipeline::resample;
@@ -129,6 +130,9 @@ fn decode_loop(
 
     // LPC-based packet loss concealment
     let mut plc = PacketLossConcealer::new(codec_samples);
+    // Comfort noise for remote DTX (jitter buffer empty for extended periods)
+    let mut cng = ComfortNoiseGenerator::new();
+    let mut consecutive_empty: u32 = 0;
 
     debug!(
         "Decode thread: codec={}, codec_rate={}, device_rate={}, \
@@ -183,6 +187,8 @@ fn decode_loop(
 
                 match jitter_buffer.pop() {
                     JitterBufferResult::Packet(packet) => {
+                        consecutive_empty = 0;
+
                         // Decode
                         let codec_pcm = match codec.decode(&packet.payload) {
                             Ok(pcm) => pcm,
@@ -245,6 +251,23 @@ fn decode_loop(
                     }
                     JitterBufferResult::Empty | JitterBufferResult::NotReady => {
                         diag_jb_empty += 1;
+                        consecutive_empty += 1;
+
+                        // After sustained emptiness (5+ frames = 100ms+),
+                        // inject comfort noise to avoid dead air feeling.
+                        // The first few empty reads are normal jitter buffer
+                        // warmup; sustained emptiness indicates remote DTX.
+                        if consecutive_empty >= 5 {
+                            // Set CNG level based on a low background level
+                            // (since we don't know the remote noise floor,
+                            // use a subtle fixed level ≈ -54 dBFS)
+                            cng.update_level(60.0);
+
+                            let mut cn_pcm = vec![0i16; device_samples];
+                            cng.generate(&mut cn_pcm);
+                            producer.push_slice(&cn_pcm);
+                        }
+
                         break;
                     }
                 }

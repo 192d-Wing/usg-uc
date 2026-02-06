@@ -13,6 +13,7 @@ use crate::file_source::FileAudioSource;
 use crate::pipeline::{PipelineStats, resample};
 use crate::rtp_handler::{RtpReceiver, RtpTransmitter};
 use crate::stream::CaptureStream;
+use crate::vad::{VadDecision, VoiceActivityDetector};
 use client_types::{CodecPreference, DtmfDigit, DtmfEvent};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -182,6 +183,8 @@ fn io_loop(
 
     // Audio processing (AGC + noise gate) for capture path
     let mut audio_processor = AudioProcessor::new();
+    // Voice activity detection for discontinuous transmission
+    let mut vad = VoiceActivityDetector::new();
 
     let mut last_capture = Instant::now();
     let mut stats_update_counter: u32 = 0;
@@ -189,6 +192,7 @@ fn io_loop(
     // Diagnostic counters (logged every ~2 seconds)
     let mut diag_frames_captured: u64 = 0;
     let mut diag_capture_underruns: u64 = 0;
+    let mut diag_dtx_frames: u64 = 0;
     let mut diag_last_samples_read: usize = 0;
     let mut diag_max_amplitude: i16 = 0;
     let mut diag_timer = Instant::now();
@@ -222,11 +226,12 @@ fn io_loop(
                 process_moh_frame(&mut codec, &mut transmitter, &mut moh_source);
             } else if !muted.load(Ordering::Relaxed) {
                 // Normal capture mode
-                let (samples_read, max_amp) = process_capture_frame(
+                let (samples_read, max_amp, dtx) = process_capture_frame(
                     &mut codec,
                     &mut transmitter,
                     &mut capture,
                     &mut audio_processor,
+                    &mut vad,
                     capture_device_samples,
                     codec_samples,
                     &stats,
@@ -238,6 +243,9 @@ fn io_loop(
                 }
                 if samples_read < capture_device_samples {
                     diag_capture_underruns += 1;
+                }
+                if dtx {
+                    diag_dtx_frames += 1;
                 }
             }
         }
@@ -258,11 +266,12 @@ fn io_loop(
         if diag_timer.elapsed() >= Duration::from_secs(2) {
             let tx_stats = transmitter.stats();
             info!(
-                "IO diag: frames_captured={}, underruns={}, last_read={}/{}, \
+                "IO diag: frames_captured={}, underruns={}, dtx={}, last_read={}/{}, \
                  max_amp={}, tx_pkts={}, rx_pkts={}, jb_depth={}ms, \
                  muted={}, moh={}",
                 diag_frames_captured,
                 diag_capture_underruns,
+                diag_dtx_frames,
                 diag_last_samples_read,
                 capture_device_samples,
                 diag_max_amplitude,
@@ -273,6 +282,7 @@ fn io_loop(
                 moh_active.load(Ordering::Relaxed),
             );
             diag_max_amplitude = 0;
+            diag_dtx_frames = 0;
             diag_timer = Instant::now();
         }
     }
@@ -285,16 +295,18 @@ fn io_loop(
 
 /// Processes one frame of microphone capture.
 ///
-/// Returns (`samples_read`, `max_amplitude`) for diagnostics.
+/// Returns (`samples_read`, `max_amplitude`, `dtx_suppressed`) for diagnostics.
+#[allow(clippy::too_many_arguments)]
 fn process_capture_frame(
     codec: &mut CodecPipeline,
     transmitter: &mut RtpTransmitter,
     capture: &mut CaptureStream,
     audio_processor: &mut AudioProcessor,
+    vad: &mut VoiceActivityDetector,
     device_samples: usize,
     codec_samples: usize,
     stats: &Arc<Mutex<PipelineStats>>,
-) -> (usize, i16) {
+) -> (usize, i16, bool) {
     // Read captured samples at device rate
     let mut device_pcm = vec![0i16; device_samples];
     let samples_read = capture.read(&mut device_pcm);
@@ -320,6 +332,11 @@ fn process_capture_frame(
         .max()
         .unwrap_or(0);
 
+    // Voice activity detection — skip encode+send during silence (DTX)
+    if vad.detect(&device_pcm[..samples_read]) == VadDecision::Silence {
+        return (samples_read, max_amp, true);
+    }
+
     // Resample from device rate to codec rate (no cross-frame needed for downsampling)
     let codec_pcm = if device_samples == codec_samples {
         device_pcm
@@ -332,7 +349,7 @@ fn process_capture_frame(
         Ok(e) => e.to_vec(),
         Err(e) => {
             warn!("Encode error: {e}");
-            return (samples_read, max_amp);
+            return (samples_read, max_amp, false);
         }
     };
 
@@ -341,7 +358,7 @@ fn process_capture_frame(
         trace!("RTP send error: {e}");
     }
 
-    (samples_read, max_amp)
+    (samples_read, max_amp, false)
 }
 
 /// Processes one frame of Music on Hold audio.
