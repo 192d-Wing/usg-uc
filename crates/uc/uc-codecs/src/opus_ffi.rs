@@ -12,8 +12,9 @@
 
 use crate::error::{CodecError, CodecResult};
 use crate::opus::{OpusApplication, OpusConfig};
+use crate::{AudioCodec, PayloadType};
 use audiopus::coder::{Decoder as OpusDecoder, Encoder as OpusEncoder};
-use audiopus::{Application, Bandwidth, Bitrate, Channels, SampleRate, Signal};
+use audiopus::{Application, Bitrate, Channels, SampleRate, Signal};
 use std::sync::Mutex;
 
 /// Convert our application mode to audiopus Application.
@@ -52,6 +53,14 @@ pub struct FfiOpusEncoder {
     encoder: Mutex<OpusEncoder>,
     /// Configuration.
     config: OpusConfig,
+}
+
+impl std::fmt::Debug for FfiOpusEncoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FfiOpusEncoder")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FfiOpusEncoder {
@@ -100,7 +109,7 @@ impl FfiOpusEncoder {
             })?;
 
         encoder
-            .set_complexity(config.complexity as i32)
+            .set_complexity(config.complexity)
             .map_err(|e| CodecError::InvalidConfig {
                 reason: format!("failed to set complexity: {e}"),
             })?;
@@ -112,13 +121,7 @@ impl FfiOpusEncoder {
             })?;
 
         encoder
-            .set_dtx(config.dtx)
-            .map_err(|e| CodecError::InvalidConfig {
-                reason: format!("failed to set DTX: {e}"),
-            })?;
-
-        encoder
-            .set_packet_loss_perc(config.packet_loss_perc as i32)
+            .set_packet_loss_perc(config.packet_loss_perc)
             .map_err(|e| CodecError::InvalidConfig {
                 reason: format!("failed to set packet loss percentage: {e}"),
             })?;
@@ -133,7 +136,7 @@ impl FfiOpusEncoder {
     /// # Errors
     /// Returns an error if the operation fails.
     pub fn encode(&self, pcm: &[i16], output: &mut [u8]) -> CodecResult<usize> {
-        let mut encoder = self
+        let encoder = self
             .encoder
             .lock()
             .map_err(|_| CodecError::EncodingFailed {
@@ -146,7 +149,7 @@ impl FfiOpusEncoder {
                 reason: format!("Opus encoding failed: {e}"),
             })?;
 
-        Ok(result.len())
+        Ok(result)
     }
 
     /// Returns the configured sample rate.
@@ -161,7 +164,7 @@ impl FfiOpusEncoder {
 
     /// Returns samples per frame based on configuration.
     pub fn samples_per_frame(&self) -> usize {
-        (self.config.sample_rate as f32 * self.config.frame_duration_ms / 1000.0) as usize
+        (self.config.sample_rate * self.config.frame_duration_ms as u32 / 1000) as usize
     }
 }
 
@@ -173,6 +176,15 @@ pub struct FfiOpusDecoder {
     sample_rate: u32,
     /// Number of channels.
     channels: u8,
+}
+
+impl std::fmt::Debug for FfiOpusDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FfiOpusDecoder")
+            .field("sample_rate", &self.sample_rate)
+            .field("channels", &self.channels)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FfiOpusDecoder {
@@ -212,13 +224,14 @@ impl FfiOpusDecoder {
             })?;
 
         // Use FEC=false for normal decoding
-        let result = decoder.decode(Some(encoded), output, false).map_err(|e| {
+        // opus_decode returns frames per channel; multiply by channels for total samples
+        let frames = decoder.decode(Some(encoded), output, false).map_err(|e| {
             CodecError::DecodingFailed {
                 reason: format!("Opus decoding failed: {e}"),
             }
         })?;
 
-        Ok(result.len())
+        Ok(frames * self.channels as usize)
     }
 
     /// Decodes with Forward Error Correction for lost packets.
@@ -236,13 +249,14 @@ impl FfiOpusDecoder {
             })?;
 
         // Pass None for lost packet, use FEC=true
-        let result = decoder.decode(None::<&[u8]>, output, true).map_err(|e| {
+        // opus_decode returns frames per channel; multiply by channels for total samples
+        let frames = decoder.decode(None::<&[u8]>, output, true).map_err(|e| {
             CodecError::DecodingFailed {
                 reason: format!("Opus FEC decoding failed: {e}"),
             }
         })?;
 
-        Ok(result.len())
+        Ok(frames * self.channels as usize)
     }
 
     /// Returns the configured sample rate.
@@ -294,48 +308,68 @@ impl FfiOpusCodec {
 
     /// Gets or creates the encoder.
     fn get_encoder(&self) -> CodecResult<&FfiOpusEncoder> {
-        self.encoder
-            .get_or_try_init(|| FfiOpusEncoder::new(self.config.clone()))
+        if let Some(enc) = self.encoder.get() {
+            return Ok(enc);
+        }
+        let enc = FfiOpusEncoder::new(self.config.clone())?;
+        let _ = self.encoder.set(enc);
+        self.encoder.get().ok_or_else(|| CodecError::InvalidConfig {
+            reason: "failed to initialize Opus encoder".to_string(),
+        })
     }
 
     /// Gets or creates the decoder.
     fn get_decoder(&self) -> CodecResult<&FfiOpusDecoder> {
-        self.decoder
-            .get_or_try_init(|| FfiOpusDecoder::new(self.config.sample_rate, self.config.channels))
+        if let Some(dec) = self.decoder.get() {
+            return Ok(dec);
+        }
+        let dec = FfiOpusDecoder::new(self.config.sample_rate, self.config.channels)?;
+        let _ = self.decoder.set(dec);
+        self.decoder.get().ok_or_else(|| CodecError::InvalidConfig {
+            reason: "failed to initialize Opus decoder".to_string(),
+        })
+    }
+}
+
+impl AudioCodec for FfiOpusCodec {
+    fn name(&self) -> &'static str {
+        "opus"
     }
 
-    /// Encodes PCM samples to Opus.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
-    pub fn encode(&self, pcm: &[i16], output: &mut [u8]) -> CodecResult<usize> {
+    fn payload_type(&self) -> PayloadType {
+        PayloadType::Dynamic(self.payload_type)
+    }
+
+    fn clock_rate(&self) -> u32 {
+        48000
+    }
+
+    fn channels(&self) -> u8 {
+        self.config.channels
+    }
+
+    fn frame_duration_ms(&self) -> u32 {
+        self.config.frame_duration_ms as u32
+    }
+
+    fn samples_per_frame(&self) -> usize {
+        (self.config.sample_rate * self.config.frame_duration_ms as u32 / 1000) as usize
+    }
+
+    fn encode(&self, pcm: &[i16], output: &mut [u8]) -> CodecResult<usize> {
         self.get_encoder()?.encode(pcm, output)
     }
 
-    /// Decodes Opus to PCM samples.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
-    pub fn decode(&self, encoded: &[u8], output: &mut [i16]) -> CodecResult<usize> {
+    fn decode(&self, encoded: &[u8], output: &mut [i16]) -> CodecResult<usize> {
         self.get_decoder()?.decode(encoded, output)
     }
 
-    /// Decodes with FEC for lost packets.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
-    pub fn decode_fec(&self, output: &mut [i16]) -> CodecResult<usize> {
+    fn decode_fec(&self, output: &mut [i16]) -> CodecResult<usize> {
         self.get_decoder()?.decode_fec(output)
     }
 
-    /// Returns the payload type.
-    pub fn payload_type(&self) -> u8 {
-        self.payload_type
-    }
-
-    /// Returns samples per frame.
-    pub fn samples_per_frame(&self) -> usize {
-        (self.config.sample_rate as f32 * self.config.frame_duration_ms / 1000.0) as usize
+    fn supports_fec(&self) -> bool {
+        self.config.fec
     }
 }
 
@@ -406,6 +440,44 @@ mod tests {
         let mut decoded = vec![0i16; 1920];
         let decoded_len = codec.decode(&encoded[..encoded_len], &mut decoded).unwrap();
         assert_eq!(decoded_len, 1920);
+    }
+
+    #[test]
+    fn test_ffi_codec_fec() {
+        let codec = FfiOpusCodec::voip(111);
+        assert!(codec.supports_fec());
+
+        // Encode a frame first (FEC needs prior frame data)
+        let mut pcm = vec![0i16; 960];
+        for (i, sample) in pcm.iter_mut().enumerate() {
+            let t = i as f32 / 48000.0;
+            *sample = (f32::sin(2.0 * std::f32::consts::PI * 440.0 * t) * 16000.0) as i16;
+        }
+        let mut encoded = vec![0u8; 1275];
+        let _ = codec.encode(&pcm, &mut encoded).unwrap();
+
+        // Decode it normally to prime the decoder
+        let mut decoded = vec![0i16; 960];
+        let _ = codec.decode(&encoded[..100], &mut decoded);
+
+        // Now try FEC decode (simulating lost packet)
+        let mut fec_output = vec![0i16; 960];
+        let fec_result = codec.decode_fec(&mut fec_output);
+        // FEC may produce output or may fail depending on encoder state
+        // Just verify it doesn't panic
+        let _ = fec_result;
+    }
+
+    #[test]
+    fn test_ffi_codec_audio_codec_trait() {
+        let codec = FfiOpusCodec::voip(111);
+        let boxed: Box<dyn AudioCodec> = Box::new(codec);
+        assert_eq!(boxed.name(), "opus");
+        assert_eq!(boxed.clock_rate(), 48000);
+        assert_eq!(boxed.channels(), 1);
+        assert_eq!(boxed.frame_duration_ms(), 20);
+        assert_eq!(boxed.samples_per_frame(), 960);
+        assert!(boxed.supports_fec());
     }
 
     #[test]

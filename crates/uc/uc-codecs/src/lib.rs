@@ -94,6 +94,21 @@ pub trait AudioCodec: Send + Sync {
 
     /// Decodes codec format to PCM samples.
     fn decode(&self, encoded: &[u8], output: &mut [i16]) -> CodecResult<usize>;
+
+    /// Decodes with Forward Error Correction for lost packets.
+    ///
+    /// Only supported by codecs with FEC capability (e.g., Opus with inband FEC).
+    /// The default implementation returns an error indicating FEC is not supported.
+    fn decode_fec(&self, _output: &mut [i16]) -> CodecResult<usize> {
+        Err(CodecError::CodecNotAvailable {
+            name: "FEC not supported for this codec".to_string(),
+        })
+    }
+
+    /// Returns true if this codec supports Forward Error Correction.
+    fn supports_fec(&self) -> bool {
+        false
+    }
 }
 
 /// RTP payload type.
