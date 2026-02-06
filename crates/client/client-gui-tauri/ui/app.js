@@ -1122,8 +1122,13 @@ function endCall() {
         callDurationInterval = null;
     }
 
+    // Clear call display and dial input
     document.getElementById('callTarget').textContent = '';
     document.getElementById('callDuration').textContent = '00:00';
+    const dialInput = document.getElementById('dialInput');
+    if (dialInput) {
+        dialInput.value = '';
+    }
 
     // Disable call controls
     document.getElementById('muteBtn').disabled = true;
