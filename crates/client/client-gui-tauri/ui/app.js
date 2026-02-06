@@ -1258,7 +1258,9 @@ function endCall() {
     }
 
     // Transition back to dialer screen
-    document.getElementById('callInfo').classList.remove('visible');
+    const callInfo = document.getElementById('callInfo');
+    callInfo.classList.remove('visible');
+    callInfo.style.display = 'none';
     document.getElementById('dialInputWrapper').style.display = 'block';
     document.getElementById('dialpad').style.display = 'grid';
     document.getElementById('audioDevices').style.display = 'block';
