@@ -1563,6 +1563,8 @@ async function deleteContact(id) {
 }
 
 // Recents Functions
+let allCallHistory = []; // Store full call history for filtering
+
 function initializeRecents() {
     // Load call history when recents tab is shown
     const recentsTab = document.querySelector('[data-tab="recents"]');
@@ -1587,16 +1589,56 @@ function initializeRecents() {
             }
         });
     }
+
+    // Search filter for call history
+    const recentsSearchInput = document.getElementById('recentsSearchInput');
+    if (recentsSearchInput) {
+        recentsSearchInput.addEventListener('input', (e) => {
+            const searchTerm = e.target.value.toLowerCase().trim();
+            filterCallHistory(searchTerm);
+        });
+    }
 }
 
 async function loadCallHistory() {
     try {
         const history = await invoke('get_call_history');
-        renderCallHistory(history || []);
+        allCallHistory = history || [];
+        renderCallHistory(allCallHistory);
+
+        // Clear search input when loading fresh history
+        const recentsSearchInput = document.getElementById('recentsSearchInput');
+        if (recentsSearchInput) {
+            recentsSearchInput.value = '';
+        }
     } catch (error) {
         console.error('Failed to load call history:', error);
+        allCallHistory = [];
         renderCallHistory([]);
     }
+}
+
+function filterCallHistory(searchTerm) {
+    if (!searchTerm) {
+        renderCallHistory(allCallHistory);
+        return;
+    }
+
+    const filtered = allCallHistory.filter(entry => {
+        // Search in remote URI
+        const uriMatch = entry.remote_uri.toLowerCase().includes(searchTerm);
+
+        // Search in contact name if available
+        const nameMatch = entry.contact_name &&
+                         entry.contact_name.toLowerCase().includes(searchTerm);
+
+        // Search in direction
+        const directionMatch = entry.direction.toLowerCase().includes(searchTerm);
+
+        return uriMatch || nameMatch || directionMatch;
+    });
+
+    renderCallHistory(filtered);
 }
 
 function renderCallHistory(history) {
