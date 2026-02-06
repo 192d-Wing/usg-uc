@@ -114,6 +114,22 @@ impl RegistrationAgent {
     pub async fn register(&mut self, account: &SipAccount) -> SipUaResult<()> {
         info!(account_id = %account.id, "Starting registration");
 
+        // Log digest credentials status
+        #[cfg(feature = "digest-auth")]
+        {
+            if let Some(ref creds) = account.digest_credentials {
+                info!(
+                    account_id = %account.id,
+                    username = %creds.username,
+                    password_len = creds.password.len(),
+                    password_persisted = creds.password_persisted,
+                    "Digest credentials available for registration"
+                );
+            } else {
+                info!(account_id = %account.id, "No digest credentials configured");
+            }
+        }
+
         // Parse registrar address upfront
         let registrar_addr = Self::parse_registrar_addr(&account.registrar_uri).await?;
         info!(registrar_addr = %registrar_addr, "Parsed registrar address");
@@ -277,7 +293,21 @@ impl RegistrationAgent {
                 #[cfg(feature = "digest-auth")]
                 {
                     // Try digest auth if credentials are configured
-                    if let Some(ref _creds) = registration.account.digest_credentials {
+                    if let Some(ref creds) = registration.account.digest_credentials {
+                        info!(
+                            account_id = %account_id,
+                            username = %creds.username,
+                            password_len = creds.password.len(),
+                            "Checking digest credentials for 401/407 response"
+                        );
+
+                        // Verify password is not empty
+                        if creds.password.is_empty() {
+                            warn!(
+                                account_id = %account_id,
+                                "Digest credentials present but password is empty"
+                            );
+                        }
                         // Parse WWW-Authenticate / Proxy-Authenticate header
                         let header_name = if status_code == 401 {
                             HeaderName::WwwAuthenticate
@@ -722,6 +752,7 @@ mod tests {
             turn_config: None,
             enabled: true,
             certificate_config: CertificateConfig::default(),
+            caller_id: None,
             #[cfg(feature = "digest-auth")]
             digest_credentials: None,
         }
