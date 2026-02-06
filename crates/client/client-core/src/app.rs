@@ -851,7 +851,11 @@ impl ClientApp {
                 );
 
                 // Route to call manager for handling (INVITE, BYE, CANCEL, etc.)
-                if let Err(e) = self.call_manager.handle_sip_request(&request).await {
+                if let Err(e) = self
+                    .call_manager
+                    .handle_sip_request_from(&request, source)
+                    .await
+                {
                     warn!(error = %e, "Failed to handle incoming SIP request");
                 }
             }

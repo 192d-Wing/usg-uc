@@ -542,22 +542,36 @@ impl CallManager {
     /// Routes an incoming SIP request (e.g., INVITE) to the call manager.
     ///
     /// This handles incoming calls and in-dialog requests.
+    /// Note: For BYE requests, use `handle_sip_request_from` to send 200 OK response.
     pub async fn handle_sip_request(&mut self, request: &SipRequest) -> AppResult<()> {
+        // Default to localhost if source not known
+        let default_addr: SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        self.handle_sip_request_from(request, default_addr).await
+    }
+
+    /// Routes an incoming SIP request with source address for response routing.
+    ///
+    /// This handles incoming calls and in-dialog requests (INVITE, BYE, CANCEL, etc.).
+    pub async fn handle_sip_request_from(
+        &mut self,
+        request: &SipRequest,
+        source: SocketAddr,
+    ) -> AppResult<()> {
         let method = request.method.as_str();
-        debug!(method = %method, "Received incoming SIP request");
+        debug!(method = %method, source = %source, "Received incoming SIP request");
 
         match method {
             "INVITE" => {
                 // Incoming call
-                self.handle_incoming_invite(request).await?;
+                self.handle_incoming_invite_from(request, source).await?;
             }
             "BYE" => {
                 // Remote party hanging up
-                self.handle_incoming_bye(request).await?;
+                self.handle_incoming_bye(request, source).await?;
             }
             "CANCEL" => {
                 // Remote party cancelling
-                self.handle_incoming_cancel(request).await?;
+                self.handle_incoming_cancel(request, source).await?;
             }
             "ACK" => {
                 // Acknowledgement (normally handled by transaction layer)
@@ -580,7 +594,8 @@ impl CallManager {
     ///
     /// This method requires the source address of the INVITE to be known
     /// for sending responses. Use `handle_incoming_invite_from` instead.
-    async fn handle_incoming_invite(&mut self, request: &SipRequest) -> AppResult<()> {
+    #[allow(dead_code)]
+    pub async fn handle_incoming_invite(&mut self, request: &SipRequest) -> AppResult<()> {
         // Default to localhost if source not known (shouldn't happen in real usage)
         let default_addr: SocketAddr = "127.0.0.1:5060".parse().unwrap_or_else(|_| {
             // Fallback that won't panic
@@ -876,34 +891,80 @@ impl CallManager {
     }
 
     /// Handles an incoming BYE request.
-    async fn handle_incoming_bye(&mut self, request: &SipRequest) -> AppResult<()> {
+    ///
+    /// Sends a 200 OK response and terminates the call.
+    async fn handle_incoming_bye(
+        &mut self,
+        request: &SipRequest,
+        source: SocketAddr,
+    ) -> AppResult<()> {
+        use crate::sip_transport::build_response_from_request;
+
         let sip_call_id = match request.headers.get_value(&HeaderName::CallId) {
             Some(id) => id.to_string(),
-            None => return Ok(()),
+            None => {
+                warn!("Received BYE without Call-ID header");
+                return Ok(());
+            }
         };
 
+        // Always send 200 OK response for BYE
+        let ok_response = build_response_from_request(request, StatusCode::OK, None);
+        let _ = self
+            .app_event_tx
+            .send(CallManagerEvent::SendResponse {
+                response: ok_response,
+                destination: source,
+            })
+            .await;
+
         if let Some(call_id) = self.find_call_by_sip_id(&sip_call_id) {
-            info!(call_id = %call_id, "Remote party sent BYE");
+            info!(call_id = %call_id, sip_call_id = %sip_call_id, "Remote party sent BYE, terminating call");
             // Mark the call as terminated - the remote party hung up
             self.handle_state_changed(&call_id, CallState::Terminated, None)
                 .await?;
+        } else {
+            warn!(sip_call_id = %sip_call_id, "Received BYE for unknown call");
         }
 
         Ok(())
     }
 
     /// Handles an incoming CANCEL request.
-    async fn handle_incoming_cancel(&mut self, request: &SipRequest) -> AppResult<()> {
+    ///
+    /// Sends a 200 OK response and terminates the call.
+    async fn handle_incoming_cancel(
+        &mut self,
+        request: &SipRequest,
+        source: SocketAddr,
+    ) -> AppResult<()> {
+        use crate::sip_transport::build_response_from_request;
+
         let sip_call_id = match request.headers.get_value(&HeaderName::CallId) {
             Some(id) => id.to_string(),
-            None => return Ok(()),
+            None => {
+                warn!("Received CANCEL without Call-ID header");
+                return Ok(());
+            }
         };
 
+        // Always send 200 OK response for CANCEL
+        let ok_response = build_response_from_request(request, StatusCode::OK, None);
+        let _ = self
+            .app_event_tx
+            .send(CallManagerEvent::SendResponse {
+                response: ok_response,
+                destination: source,
+            })
+            .await;
+
         if let Some(call_id) = self.find_call_by_sip_id(&sip_call_id) {
-            info!(call_id = %call_id, "Remote party sent CANCEL");
+            info!(call_id = %call_id, sip_call_id = %sip_call_id, "Remote party sent CANCEL, terminating call");
             // Mark the call as terminated - the remote party cancelled
             self.handle_state_changed(&call_id, CallState::Terminated, None)
                 .await?;
+        } else {
+            warn!(sip_call_id = %sip_call_id, "Received CANCEL for unknown call");
         }
 
         Ok(())
