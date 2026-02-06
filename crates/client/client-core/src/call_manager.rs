@@ -114,6 +114,11 @@ pub enum CallManagerEvent {
         /// Remote party display name.
         remote_display_name: Option<String>,
     },
+    /// Incoming call cancelled by remote party before answer.
+    IncomingCallCancelled {
+        /// Call ID.
+        call_id: String,
+    },
     /// Call connected, media ready.
     CallConnected {
         /// Call ID.
@@ -600,6 +605,14 @@ impl CallManager {
         self.call_agent.find_call_by_sip_id(sip_call_id)
     }
 
+    /// Finds a pending incoming call by its SIP Call-ID.
+    fn find_incoming_call_by_sip_id(&self, sip_call_id: &str) -> Option<String> {
+        self.incoming_calls
+            .iter()
+            .find(|(_, info)| info.sip_call_id == sip_call_id)
+            .map(|(_, info)| info.call_id.clone())
+    }
+
     /// Handles an incoming INVITE request.
     ///
     /// This method requires the source address of the INVITE to be known
@@ -977,6 +990,17 @@ impl CallManager {
             // Mark the call as terminated - the remote party cancelled
             self.handle_state_changed(&call_id, CallState::Terminated, None)
                 .await?;
+        } else if let Some(call_id) = self.find_incoming_call_by_sip_id(&sip_call_id) {
+            info!(call_id = %call_id, sip_call_id = %sip_call_id, "Remote party cancelled incoming call before answer");
+            // Remove from pending incoming calls
+            self.incoming_calls.remove(&call_id);
+            // Notify the application so the UI can dismiss the incoming call modal
+            let _ = self
+                .app_event_tx
+                .send(CallManagerEvent::IncomingCallCancelled {
+                    call_id,
+                })
+                .await;
         } else {
             warn!(sip_call_id = %sip_call_id, "Received CANCEL for unknown call");
         }

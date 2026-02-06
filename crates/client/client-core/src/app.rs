@@ -47,6 +47,11 @@ pub enum AppEvent {
         /// Remote party display name.
         remote_display_name: Option<String>,
     },
+    /// Incoming call cancelled by remote party before answer.
+    IncomingCallCancelled {
+        /// Call ID.
+        call_id: String,
+    },
     /// Call ended.
     CallEnded {
         /// Call ID.
@@ -724,6 +729,16 @@ impl ClientApp {
                         call_id,
                         remote_uri,
                         remote_display_name,
+                    })
+                    .await;
+            }
+            CallManagerEvent::IncomingCallCancelled { call_id } => {
+                info!(call_id = %call_id, "Incoming call cancelled by remote party");
+
+                let _ = self
+                    .app_event_tx
+                    .send(AppEvent::IncomingCallCancelled {
+                        call_id,
                     })
                     .await;
             }

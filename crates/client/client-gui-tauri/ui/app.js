@@ -97,6 +97,79 @@ class RingbackTone {
 // Global ringback tone instance
 const ringbackTone = new RingbackTone();
 
+class IncomingRingtone {
+    constructor() {
+        this.audioContext = null;
+        this.isPlaying = false;
+        this.ringInterval = null;
+    }
+
+    start() {
+        if (this.isPlaying) return;
+
+        try {
+            if (!this.audioContext) {
+                this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+
+            this.isPlaying = true;
+
+            // Play ring pattern: 1 second on, 3 seconds off
+            this.playRing();
+            this.ringInterval = setInterval(() => {
+                this.playRing();
+            }, 4000);
+        } catch (error) {
+            console.error('Failed to start incoming ringtone:', error);
+        }
+    }
+
+    playRing() {
+        if (!this.audioContext) return;
+
+        const osc1 = this.audioContext.createOscillator();
+        const osc2 = this.audioContext.createOscillator();
+        const gainNode = this.audioContext.createGain();
+
+        osc1.frequency.value = 440;
+        osc2.frequency.value = 480;
+        osc1.type = 'sine';
+        osc2.type = 'sine';
+
+        osc1.connect(gainNode);
+        osc2.connect(gainNode);
+        gainNode.connect(this.audioContext.destination);
+
+        gainNode.gain.value = 0.15;
+
+        const now = this.audioContext.currentTime;
+        osc1.start(now);
+        osc2.start(now);
+
+        osc1.stop(now + 1.0);
+        osc2.stop(now + 1.0);
+    }
+
+    stop() {
+        if (!this.isPlaying) return;
+
+        this.isPlaying = false;
+
+        if (this.ringInterval) {
+            clearInterval(this.ringInterval);
+            this.ringInterval = null;
+        }
+
+        if (this.audioContext) {
+            this.audioContext.close();
+            this.audioContext = null;
+        }
+    }
+}
+
+// Global incoming ringtone instance
+const incomingRingtone = new IncomingRingtone();
+
 // Rate limiting for backend calls
 const rateLimiter = {
     lastCall: {},
@@ -492,6 +565,12 @@ async function initializeEventListeners() {
         handleIncomingCall(event.payload);
     });
 
+    // Incoming call cancelled by remote party
+    await listen('incoming-call-cancelled', (event) => {
+        console.log('Incoming call cancelled:', event.payload);
+        dismissIncomingCallModal();
+    });
+
     // Call ended
     await listen('call-ended', (event) => {
         console.log('Call ended:', event.payload);
@@ -540,21 +619,27 @@ function handleIncomingCall(payload) {
     incomingCallId = call_id;
 
     // Sanitize caller info for display
-    const caller = escapeHtml(remote_display_name || remote_uri || 'Unknown').slice(0, 100);
-    const accept = confirm(`Incoming call from ${caller}\n\nAccept?`);
+    const callerName = escapeHtml(remote_display_name || 'Unknown').slice(0, 100);
+    const callerUri = escapeHtml(remote_uri || '').slice(0, 256);
 
-    if (accept) {
-        acceptIncomingCall(call_id);
-    } else {
-        rejectIncomingCall(call_id);
-    }
+    document.getElementById('incomingCallerName').textContent = callerName;
+    document.getElementById('incomingCallerUri').textContent = callerUri;
+    document.getElementById('incomingCallModal').classList.add('active');
+
+    incomingRingtone.start();
+}
+
+function dismissIncomingCallModal() {
+    document.getElementById('incomingCallModal').classList.remove('active');
+    incomingRingtone.stop();
+    incomingCallId = null;
 }
 
 async function acceptIncomingCall(callId) {
+    dismissIncomingCallModal();
     if (!rateLimiter.canCall('accept_call')) return;
     try {
         await invoke('accept_call', { callId });
-        // Don't switch tabs - call UI is now in dialer
     } catch (error) {
         console.error('Failed to accept call:', error);
         safeAlert('Failed to accept call');
@@ -562,12 +647,12 @@ async function acceptIncomingCall(callId) {
 }
 
 async function rejectIncomingCall(callId) {
+    dismissIncomingCallModal();
     try {
         await invoke('reject_call', { callId });
     } catch (error) {
         console.error('Failed to reject call:', error);
     }
-    incomingCallId = null;
 }
 
 function handleTransferProgress(payload) {
@@ -1306,8 +1391,10 @@ function endCall() {
     isOnHold = false;
     incomingCallId = null;
 
-    // Stop ringback tone if playing
+    // Stop any ringing tones
     ringbackTone.stop();
+    incomingRingtone.stop();
+    document.getElementById('incomingCallModal').classList.remove('active');
 
     if (callDurationInterval) {
         clearInterval(callDurationInterval);
@@ -1942,6 +2029,14 @@ function initializeCall() {
             hangupInProgress = false;
             endCall();
         }
+    });
+
+    // Incoming call modal buttons
+    document.getElementById('acceptCallBtn').addEventListener('click', () => {
+        if (incomingCallId) acceptIncomingCall(incomingCallId);
+    });
+    document.getElementById('rejectCallBtn').addEventListener('click', () => {
+        if (incomingCallId) rejectIncomingCall(incomingCallId);
     });
 }
 

@@ -1272,6 +1272,7 @@ async fn poll_events(app_handle: AppHandle, event_rx: Arc<Mutex<Option<mpsc::Rec
                 AppEvent::RegistrationStateChanged { .. } => "registration-state-changed",
                 AppEvent::CallStateChanged { .. } => "call-state-changed",
                 AppEvent::IncomingCall { .. } => "incoming-call",
+                AppEvent::IncomingCallCancelled { .. } => "incoming-call-cancelled",
                 AppEvent::CallEnded { .. } => "call-ended",
                 AppEvent::Error { .. } => "error",
                 AppEvent::SettingsChanged => "settings-changed",
@@ -1306,6 +1307,11 @@ async fn poll_events(app_handle: AppHandle, event_rx: Arc<Mutex<Option<mpsc::Rec
                         "call_id": call_id,
                         "remote_uri": remote_uri,
                         "remote_display_name": remote_display_name
+                    })
+                }
+                AppEvent::IncomingCallCancelled { call_id } => {
+                    serde_json::json!({
+                        "call_id": call_id
                     })
                 }
                 AppEvent::CallEnded {
