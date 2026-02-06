@@ -22,7 +22,7 @@ use client_types::DtmfDigit;
 use client_types::audio::CodecPreference;
 use proto_srtp::{SrtpContext, SrtpDirection, SrtpKeyMaterial, SrtpProfile};
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
@@ -115,6 +115,8 @@ pub struct AudioPipeline {
     moh_active: Arc<AtomicBool>,
     /// Whether MOH audio was loaded.
     has_moh_audio: bool,
+    /// Playback underrun counter shared with CPAL callback.
+    playback_underruns: Option<Arc<AtomicU64>>,
     /// Local RTP port (set after start).
     local_port: Option<u16>,
     /// SSRC being used for transmission.
@@ -135,6 +137,7 @@ impl AudioPipeline {
             stats: Arc::new(Mutex::new(PipelineStats::default())),
             moh_active: Arc::new(AtomicBool::new(false)),
             has_moh_audio: false,
+            playback_underruns: None,
             local_port: None,
             ssrc: None,
         }
@@ -253,7 +256,7 @@ impl AudioPipeline {
                 capture_rate, device_rate
             );
         }
-        let (playback_handle, mut producer) = playback.take_producer();
+        let (playback_handle, mut producer, underrun_counter) = playback.take_producer();
 
         // Pre-fill the playback ring buffer with silence so the CPAL callback
         // has a cushion from the first callback.
@@ -293,8 +296,13 @@ impl AudioPipeline {
             codec: config.codec,
             device_rate,
         };
-        let decode_handle =
-            decode_thread::spawn(decode_config, producer, jitter_buffer, self.running.clone());
+        let decode_handle = decode_thread::spawn(
+            decode_config,
+            producer,
+            jitter_buffer,
+            self.running.clone(),
+            underrun_counter.clone(),
+        );
 
         // Create RTCP socket (bound to any available port)
         let rtcp_socket = UdpSocket::bind("0.0.0.0:0")
@@ -339,6 +347,7 @@ impl AudioPipeline {
         self.decode_thread = Some(decode_handle);
         self.io_thread = Some(io_handle);
         self.playback_handle = Some(playback_handle);
+        self.playback_underruns = Some(underrun_counter);
         self.has_moh_audio = has_moh;
         self.local_port = Some(local_port);
         self.ssrc = Some(ssrc);
@@ -378,6 +387,7 @@ impl AudioPipeline {
         self.playback_handle = None;
 
         self.has_moh_audio = false;
+        self.playback_underruns = None;
         self.local_port = None;
         self.ssrc = None;
 
@@ -438,9 +448,15 @@ impl AudioPipeline {
 
     /// Returns the pipeline statistics.
     pub fn stats(&self) -> PipelineStats {
-        self.stats
+        let mut stats = self
+            .stats
             .lock()
-            .map_or_else(|_| PipelineStats::default(), |s| s.clone())
+            .map_or_else(|_| PipelineStats::default(), |s| s.clone());
+        // Merge in the CPAL callback underrun count
+        if let Some(ref counter) = self.playback_underruns {
+            stats.playback_underruns = counter.load(Ordering::Relaxed);
+        }
+        stats
     }
 
     /// Returns the local RTP port.

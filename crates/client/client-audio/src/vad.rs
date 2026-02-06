@@ -24,7 +24,9 @@ const MIN_ENERGY_THRESHOLD: f32 = 50.0;
 /// Ratio above noise floor for speech detection.
 /// A frame is classified as speech if its energy exceeds
 /// `noise_floor * SPEECH_THRESHOLD_RATIO`.
-const SPEECH_THRESHOLD_RATIO: f32 = 3.5;
+/// 2.5 is tuned for Bluetooth HFP capture which has higher
+/// background noise than wired microphones.
+const SPEECH_THRESHOLD_RATIO: f32 = 2.5;
 
 /// Ratio for returning to silence (lower than speech threshold
 /// for hysteresis, avoiding rapid toggling).
@@ -36,9 +38,10 @@ const SILENCE_THRESHOLD_RATIO: f32 = 2.0;
 const ZCR_NOISE_THRESHOLD: f32 = 0.5;
 
 /// Number of frames to hold speech state after energy drops.
-/// Prevents cutting off word endings and plosives.
-/// 10 frames at 20ms = 200ms hold time.
-const HANGOVER_FRAMES: u32 = 10;
+/// Prevents cutting off word endings and inter-word pauses.
+/// 25 frames at 20ms = 500ms hold time. Longer hold avoids
+/// mid-sentence gaps that the remote side hears as breaks.
+const HANGOVER_FRAMES: u32 = 25;
 
 /// Smoothing factor for noise floor adaptation (slow, during silence).
 /// Higher = faster adaptation. 0.02 → ~1 second time constant at 50 fps.

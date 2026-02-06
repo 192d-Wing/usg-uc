@@ -6,31 +6,46 @@
 //! a call, causing the jitter buffer to either grow (remote faster) or
 //! empty (remote slower).
 //!
-//! This module tracks jitter buffer depth over a sliding window and
-//! computes a sample-level adjustment for the resampler: occasionally
-//! producing one more or one fewer output sample per frame to keep the
-//! buffer centered at its target depth.
+//! This module uses an EMA-smoothed jitter buffer depth compared to a
+//! target depth established during warmup. When the smoothed depth
+//! deviates beyond a dead zone, proportional corrections are applied
+//! to the resampler output length (±1 sample per frame).
 
-/// Sliding window size for depth measurements.
-/// At ~25ms per measurement, 200 slots ≈ 5 seconds of history.
-const WINDOW_SIZE: usize = 200;
+/// Number of measurements during warmup to establish the target depth.
+/// At ~5ms per measurement (measure_interval=1 in decode thread),
+/// 40 measurements ≈ 200ms warmup.
+const WARMUP_MEASUREMENTS: usize = 40;
 
-/// Threshold for depth trend (ms/sec) before triggering compensation.
-/// Set above normal network jitter (~0.5-1 ms/sec) to avoid constant
-/// micro-corrections. Only real clock drift (>2 ms/sec) triggers adjustment.
-const DRIFT_THRESHOLD_MS_PER_SEC: f32 = 2.0;
+/// EMA smoothing factor. Lower values = heavier smoothing.
+/// 0.05 gives a time constant of ~20 measurements (≈100ms at 5ms/measurement).
+/// This filters out per-packet jitter (8-16ms) while tracking real drift.
+const SMOOTHING_ALPHA: f32 = 0.05;
+
+/// Dead zone: ignore depth errors smaller than this (in ms).
+/// Normal network jitter causes ±3ms fluctuation. Only correct
+/// when the smoothed depth deviates beyond this threshold.
+const DEAD_ZONE_MS: f32 = 3.0;
+
+/// Proportional correction gain.
+/// Higher values correct faster but may overshoot.
+/// At gain 0.15 with error 10ms: accumulator += 1.5 per measurement.
+/// With ~200 measurements/sec (measure_interval=1), that's ~300/sec,
+/// yielding ~300 corrections/sec = ~300/44100 ≈ 6.8 ms/sec correction rate.
+const CORRECTION_GAIN: f32 = 0.15;
 
 /// Maximum adjustment: +/- 1 sample per frame.
 const MAX_ADJUSTMENT: i32 = 1;
 
 /// Tracks jitter buffer depth and computes resampler adjustments.
 pub struct DriftCompensator {
-    /// Circular buffer of jitter buffer depth measurements (in ms).
-    depth_history: Vec<f32>,
-    /// Write index into `depth_history`.
-    write_idx: usize,
-    /// Number of samples collected so far.
-    sample_count: usize,
+    /// EMA-smoothed jitter buffer depth (ms).
+    smoothed_depth: f32,
+    /// Target depth established during warmup (ms).
+    target_depth: f32,
+    /// Sum of depth measurements during warmup.
+    warmup_sum: f32,
+    /// Number of measurements collected so far.
+    measurement_count: usize,
     /// Measurement interval counter.
     measure_counter: u32,
     /// How many decode cycles between measurements.
@@ -44,13 +59,13 @@ impl DriftCompensator {
     ///
     /// # Arguments
     /// * `measure_interval` - Number of decode cycles between depth measurements.
-    ///   For a decode thread checking every ~5ms, `measure_interval=5` gives
-    ///   one measurement per ~25ms, filling the 200-slot window in ~5 seconds.
+    ///   Use 1 for every decode cycle (~5ms), giving ~200 measurements/sec.
     pub fn new(measure_interval: u32) -> Self {
         Self {
-            depth_history: vec![0.0; WINDOW_SIZE],
-            write_idx: 0,
-            sample_count: 0,
+            smoothed_depth: 0.0,
+            target_depth: 0.0,
+            warmup_sum: 0.0,
+            measurement_count: 0,
             measure_counter: 0,
             measure_interval: measure_interval.max(1),
             fractional_accumulator: 0.0,
@@ -69,38 +84,41 @@ impl DriftCompensator {
         }
         self.measure_counter = 0;
 
-        // Record measurement
-        self.depth_history[self.write_idx] = current_depth_ms;
-        self.write_idx = (self.write_idx + 1) % WINDOW_SIZE;
-        self.sample_count = (self.sample_count + 1).min(WINDOW_SIZE);
+        self.measurement_count += 1;
 
-        // Need at least a quarter of the window before making adjustments
-        // (50 measurements × ~25ms ≈ 1.25 seconds warmup)
-        if self.sample_count < WINDOW_SIZE / 4 {
+        // --- Warmup phase: establish target depth ---
+        if self.measurement_count <= WARMUP_MEASUREMENTS {
+            self.warmup_sum += current_depth_ms;
+
+            if self.measurement_count == WARMUP_MEASUREMENTS {
+                #[allow(clippy::cast_precision_loss)]
+                let avg = self.warmup_sum / WARMUP_MEASUREMENTS as f32;
+                self.target_depth = avg;
+                self.smoothed_depth = avg;
+            }
             return 0;
         }
 
-        // Compute linear regression slope over the window
-        let slope = self.compute_slope();
+        // --- Active phase: EMA smooth and correct ---
+        self.smoothed_depth += SMOOTHING_ALPHA * (current_depth_ms - self.smoothed_depth);
 
-        // slope is in ms per measurement.
-        // Convert to ms/sec: slope * measurements_per_sec.
-        // Each measurement is taken every (measure_interval * ~10ms) ≈ 100ms,
-        // so ~10 measurements per second.
-        #[allow(clippy::cast_precision_loss)]
-        let measurements_per_sec = 1000.0 / (self.measure_interval as f32 * 10.0);
-        let drift_ms_per_sec = slope * measurements_per_sec;
+        let error = self.smoothed_depth - self.target_depth;
 
-        if drift_ms_per_sec > DRIFT_THRESHOLD_MS_PER_SEC {
-            // Buffer growing → remote clock faster → consume faster → fewer output samples
-            self.fractional_accumulator -= 0.1;
-        } else if drift_ms_per_sec < -DRIFT_THRESHOLD_MS_PER_SEC {
-            // Buffer shrinking → remote clock slower → consume slower → more output samples
-            self.fractional_accumulator += 0.1;
+        if error > DEAD_ZONE_MS {
+            // Buffer growing → produce fewer output samples to consume faster
+            // Negative accumulator → negative adjustment
+            self.fractional_accumulator -= (error - DEAD_ZONE_MS) * CORRECTION_GAIN;
+        } else if error < -DEAD_ZONE_MS {
+            // Buffer shrinking → produce more output samples to slow consumption
+            // Positive accumulator → positive adjustment
+            self.fractional_accumulator -= (error + DEAD_ZONE_MS) * CORRECTION_GAIN;
         } else {
-            // Within threshold, slowly decay accumulator toward zero
-            self.fractional_accumulator *= 0.95;
+            // Within dead zone — slowly decay accumulator to avoid residual bias
+            self.fractional_accumulator *= 0.99;
         }
+
+        // Clamp accumulator to prevent runaway after sustained drift
+        self.fractional_accumulator = self.fractional_accumulator.clamp(-5.0, 5.0);
 
         // Extract integer adjustment when accumulator reaches ±1.0
         if self.fractional_accumulator >= 1.0 {
@@ -114,46 +132,12 @@ impl DriftCompensator {
         }
     }
 
-    /// Computes the linear regression slope of depth measurements.
-    #[allow(clippy::similar_names, clippy::suspicious_operation_groupings)]
-    fn compute_slope(&self) -> f32 {
-        #[allow(clippy::cast_precision_loss)]
-        let n = self.sample_count as f32;
-        let mut sum_x: f32 = 0.0;
-        let mut sum_y: f32 = 0.0;
-        let mut sum_xy: f32 = 0.0;
-        let mut sum_x2: f32 = 0.0;
-
-        let start = if self.sample_count == WINDOW_SIZE {
-            self.write_idx
-        } else {
-            0
-        };
-
-        for i in 0..self.sample_count {
-            let idx = (start + i) % WINDOW_SIZE;
-            #[allow(clippy::cast_precision_loss)]
-            let x = i as f32;
-            let y = self.depth_history[idx];
-            sum_x += x;
-            sum_y += y;
-            sum_xy += x * y;
-            sum_x2 += x * x;
-        }
-
-        let denominator = n.mul_add(sum_x2, -(sum_x * sum_x));
-        if denominator.abs() < f32::EPSILON {
-            return 0.0;
-        }
-
-        n.mul_add(sum_xy, -(sum_x * sum_y)) / denominator
-    }
-
     /// Resets the compensator state.
     pub fn reset(&mut self) {
-        self.depth_history.fill(0.0);
-        self.write_idx = 0;
-        self.sample_count = 0;
+        self.smoothed_depth = 0.0;
+        self.target_depth = 0.0;
+        self.warmup_sum = 0.0;
+        self.measurement_count = 0;
         self.measure_counter = 0;
         self.fractional_accumulator = 0.0;
     }
@@ -164,13 +148,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_no_adjustment_initially() {
+    fn test_no_adjustment_during_warmup() {
         let mut dc = DriftCompensator::new(1);
 
-        // First WINDOW_SIZE/4 measurements should return 0 (warmup period)
-        for i in 0..WINDOW_SIZE / 4 {
+        // All warmup measurements should return 0
+        for i in 0..WARMUP_MEASUREMENTS {
             let adj = dc.update(60.0);
-            assert_eq!(adj, 0, "Expected no adjustment at measurement {i}");
+            assert_eq!(adj, 0, "Expected no adjustment at warmup measurement {i}");
         }
     }
 
@@ -178,8 +162,8 @@ mod tests {
     fn test_stable_depth_no_adjustment() {
         let mut dc = DriftCompensator::new(1);
 
-        // Fill the window with constant depth — no drift
-        for _ in 0..WINDOW_SIZE * 2 {
+        // Warmup + many stable measurements → no drift, no correction
+        for _ in 0..WARMUP_MEASUREMENTS + 500 {
             let adj = dc.update(60.0);
             assert_eq!(adj, 0);
         }
@@ -190,13 +174,20 @@ mod tests {
         let mut dc = DriftCompensator::new(1);
         let mut total_adj: i32 = 0;
 
-        // Simulate a growing jitter buffer (remote clock faster)
-        for i in 0..WINDOW_SIZE * 3 {
-            let depth = 60.0 + (i as f32 * 0.05); // Steadily growing
+        // Warmup at 60ms
+        for _ in 0..WARMUP_MEASUREMENTS {
+            dc.update(60.0);
+        }
+
+        // Simulate growing jitter buffer (remote clock faster)
+        // Depth increases from 60ms toward 80ms over 600 measurements
+        for i in 0..600 {
+            #[allow(clippy::cast_precision_loss)]
+            let depth = 60.0 + (i as f32 * 0.05);
             total_adj += dc.update(depth);
         }
 
-        // Over time, should produce negative adjustments (speed up consumption)
+        // Should produce negative adjustments (speed up consumption)
         assert!(
             total_adj < 0,
             "Expected negative total adjustment for growing buffer, got {total_adj}"
@@ -208,13 +199,19 @@ mod tests {
         let mut dc = DriftCompensator::new(1);
         let mut total_adj: i32 = 0;
 
-        // Simulate a shrinking jitter buffer (remote clock slower)
-        for i in 0..WINDOW_SIZE * 3 {
-            let depth = 120.0 - (i as f32 * 0.05); // Steadily shrinking
+        // Warmup at 80ms
+        for _ in 0..WARMUP_MEASUREMENTS {
+            dc.update(80.0);
+        }
+
+        // Simulate shrinking jitter buffer (remote clock slower)
+        for i in 0..600 {
+            #[allow(clippy::cast_precision_loss)]
+            let depth = 80.0 - (i as f32 * 0.05);
             total_adj += dc.update(depth);
         }
 
-        // Over time, should produce positive adjustments (slow down consumption)
+        // Should produce positive adjustments (slow down consumption)
         assert!(
             total_adj > 0,
             "Expected positive total adjustment for shrinking buffer, got {total_adj}"
@@ -222,15 +219,39 @@ mod tests {
     }
 
     #[test]
+    fn test_jittery_but_stable_no_correction() {
+        let mut dc = DriftCompensator::new(1);
+
+        // Warmup at 60ms
+        for _ in 0..WARMUP_MEASUREMENTS {
+            dc.update(60.0);
+        }
+
+        // Jittery depth ±2ms around target (within dead zone)
+        let mut total_adj: i32 = 0;
+        for i in 0..1000 {
+            #[allow(clippy::cast_precision_loss)]
+            let jitter = 2.0 * (i as f32 * 0.1).sin();
+            total_adj += dc.update(60.0 + jitter);
+        }
+
+        // Should be zero or very near zero
+        assert!(
+            total_adj.abs() <= 2,
+            "Expected near-zero adjustment for jittery-but-stable depth, got {total_adj}"
+        );
+    }
+
+    #[test]
     fn test_reset() {
         let mut dc = DriftCompensator::new(1);
-        for i in 0..WINDOW_SIZE {
-            dc.update(60.0 + i as f32 * 0.1);
+        for _ in 0..WARMUP_MEASUREMENTS + 100 {
+            dc.update(60.0);
         }
         dc.reset();
-        assert_eq!(dc.sample_count, 0);
-        assert_eq!(dc.write_idx, 0);
+        assert_eq!(dc.measurement_count, 0);
         assert_eq!(dc.fractional_accumulator, 0.0);
+        assert_eq!(dc.target_depth, 0.0);
     }
 
     #[test]
@@ -241,8 +262,29 @@ mod tests {
         for _ in 0..9 {
             assert_eq!(dc.update(60.0), 0);
         }
-        // 10th call actually records a measurement
-        assert_eq!(dc.update(60.0), 0); // Still 0 because not enough data
-        assert_eq!(dc.sample_count, 1);
+        // 10th call records a measurement
+        assert_eq!(dc.update(60.0), 0); // Still 0 because in warmup
+        assert_eq!(dc.measurement_count, 1);
+    }
+
+    #[test]
+    fn test_accumulator_clamped() {
+        let mut dc = DriftCompensator::new(1);
+
+        // Warmup at 20ms
+        for _ in 0..WARMUP_MEASUREMENTS {
+            dc.update(20.0);
+        }
+
+        // Huge spike — accumulator should not run away
+        for _ in 0..100 {
+            dc.update(200.0);
+        }
+
+        assert!(
+            dc.fractional_accumulator.abs() <= 5.0,
+            "Accumulator should be clamped, got {}",
+            dc.fractional_accumulator
+        );
     }
 }

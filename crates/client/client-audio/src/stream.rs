@@ -10,7 +10,7 @@ use cpal::{SampleFormat, Stream};
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::{debug, error, info};
 
 /// Helper to get device name (cpal 0.17 deprecated `name()`).
@@ -216,6 +216,8 @@ pub struct PlaybackStream {
     is_running: Arc<AtomicBool>,
     /// Sample rate of the stream.
     sample_rate: u32,
+    /// Counter for CPAL callback underruns (callbacks where ring buffer was empty).
+    underrun_count: Arc<AtomicU64>,
 }
 
 impl PlaybackStream {
@@ -241,6 +243,8 @@ impl PlaybackStream {
 
         let is_running = Arc::new(AtomicBool::new(true));
         let is_running_clone = is_running.clone();
+        let underrun_count = Arc::new(AtomicU64::new(0));
+        let underrun_clone = underrun_count.clone();
 
         // Get the sample format
         let supported_config = device
@@ -249,10 +253,10 @@ impl PlaybackStream {
 
         let stream = match supported_config.sample_format() {
             SampleFormat::I16 => {
-                build_output_stream_i16(&device, &config, consumer, is_running_clone)?
+                build_output_stream_i16(&device, &config, consumer, is_running_clone, underrun_clone)?
             }
             SampleFormat::F32 => {
-                build_output_stream_f32(&device, &config, consumer, is_running_clone)?
+                build_output_stream_f32(&device, &config, consumer, is_running_clone, underrun_clone)?
             }
             format => {
                 return Err(AudioError::StreamError(format!(
@@ -272,6 +276,7 @@ impl PlaybackStream {
             producer,
             is_running,
             sample_rate,
+            underrun_count,
         })
     }
 
@@ -308,19 +313,20 @@ impl PlaybackStream {
         debug!("Playback stream stopped");
     }
 
-    /// Splits the playback stream into a handle and a ring buffer producer.
+    /// Splits the playback stream into a handle, ring buffer producer, and underrun counter.
     ///
     /// The producer can be moved to the decode thread while the CPAL stream
-    /// (and its consumer) continues running. After calling this, use the
-    /// returned producer directly instead of `write()`.
+    /// (and its consumer) continues running. The underrun counter is shared
+    /// with the CPAL callback and tracks how many callbacks had buffer underruns.
+    /// After calling this, use the returned producer directly instead of `write()`.
     #[allow(clippy::used_underscore_binding)]
-    pub fn take_producer(self) -> (PlaybackStreamHandle, ringbuf::HeapProd<Sample>) {
+    pub fn take_producer(self) -> (PlaybackStreamHandle, ringbuf::HeapProd<Sample>, Arc<AtomicU64>) {
         let handle = PlaybackStreamHandle {
             _stream: self._stream,
             is_running: self.is_running,
             sample_rate: self.sample_rate,
         };
-        (handle, self.producer)
+        (handle, self.producer, self.underrun_count)
     }
 }
 
@@ -362,6 +368,7 @@ fn build_output_stream_i16(
     config: &cpal::StreamConfig,
     mut consumer: ringbuf::HeapCons<Sample>,
     is_running: Arc<AtomicBool>,
+    underrun_count: Arc<AtomicU64>,
 ) -> AudioResult<Stream> {
     let channels = usize::from(config.channels);
     let mut last_sample: i16 = 0;
@@ -375,12 +382,17 @@ fn build_output_stream_i16(
                     return;
                 }
 
+                let mut had_underrun = false;
+
                 // Fill with samples from ring buffer, holding last value on underrun
                 // to avoid hard silence transitions that cause clicks.
                 if channels == 1 {
                     let read = consumer.pop_slice(data);
                     if read > 0 {
                         last_sample = data[read - 1];
+                    }
+                    if read < data.len() {
+                        had_underrun = true;
                     }
                     // Hold last sample instead of hard zero on underrun
                     for s in &mut data[read..] {
@@ -394,10 +406,15 @@ fn build_output_stream_i16(
                             last_sample = sample;
                             chunk.fill(sample);
                         } else {
+                            had_underrun = true;
                             chunk.fill(last_sample);
                             last_sample = (i32::from(last_sample) * 255 / 256) as i16;
                         }
                     }
+                }
+
+                if had_underrun {
+                    underrun_count.fetch_add(1, Ordering::Relaxed);
                 }
             },
             move |err| {
@@ -416,6 +433,7 @@ fn build_output_stream_f32(
     config: &cpal::StreamConfig,
     mut consumer: ringbuf::HeapCons<Sample>,
     is_running: Arc<AtomicBool>,
+    underrun_count: Arc<AtomicU64>,
 ) -> AudioResult<Stream> {
     let channels = usize::from(config.channels);
     let mut last_sample: f32 = 0.0;
@@ -429,12 +447,15 @@ fn build_output_stream_f32(
                     return;
                 }
 
+                let mut had_underrun = false;
+
                 // Fill with samples from ring buffer, holding last value on underrun
                 if channels == 1 {
                     for sample in data.iter_mut() {
                         if let Some(s) = consumer.try_pop() {
                             last_sample = i16_to_f32(s);
                         } else {
+                            had_underrun = true;
                             // Decay toward zero
                             last_sample *= 255.0 / 256.0;
                         }
@@ -445,10 +466,15 @@ fn build_output_stream_f32(
                         if let Some(s) = consumer.try_pop() {
                             last_sample = i16_to_f32(s);
                         } else {
+                            had_underrun = true;
                             last_sample *= 255.0 / 256.0;
                         }
                         chunk.fill(last_sample);
                     }
+                }
+
+                if had_underrun {
+                    underrun_count.fetch_add(1, Ordering::Relaxed);
                 }
             },
             move |err| {

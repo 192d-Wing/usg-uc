@@ -16,14 +16,21 @@ use crate::stream::Sample;
 use client_types::CodecPreference;
 use ringbuf::traits::{Observer, Producer};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
 /// Target fill level for the playback ring buffer (in frames).
-/// At 20ms per frame, 5 frames = 100ms cushion.
-const TARGET_FILL_FRAMES: usize = 5;
+/// At 20ms per frame, 8 frames = 160ms cushion.
+/// Extra headroom helps Bluetooth A2DP devices that have irregular
+/// callback timing compared to wired outputs.
+const TARGET_FILL_FRAMES: usize = 8;
+
+/// Playback gain applied to decoded remote audio (linear).
+/// G.711 ulaw from typical PSTN sources doesn't use the full i16 range.
+/// 4.0 = +12 dB boost for comfortable listening volume without clipping.
+const PLAYBACK_GAIN: f32 = 4.0;
 
 /// Handle to the running decode thread.
 ///
@@ -71,11 +78,13 @@ pub struct DecodeThreadConfig {
 /// * `producer` - Ring buffer producer (writes decoded audio for CPAL to read)
 /// * `jitter_buffer` - Shared jitter buffer (reads packets pushed by I/O thread)
 /// * `running` - Shared flag to signal shutdown
+/// * `playback_underruns` - Counter shared with CPAL callback for underrun tracking
 pub fn spawn(
     config: DecodeThreadConfig,
     producer: ringbuf::HeapProd<Sample>,
     jitter_buffer: SharedJitterBuffer,
     running: Arc<AtomicBool>,
+    playback_underruns: Arc<AtomicU64>,
 ) -> DecodeThreadHandle {
     let running_clone = running.clone();
 
@@ -83,7 +92,7 @@ pub fn spawn(
         .name("audio-decode".to_string())
         .spawn(move || {
             info!("Decode thread started");
-            decode_loop(config, producer, jitter_buffer, &running_clone);
+            decode_loop(config, producer, jitter_buffer, &running_clone, &playback_underruns);
             info!("Decode thread exited");
         });
 
@@ -105,6 +114,7 @@ fn decode_loop(
     mut producer: ringbuf::HeapProd<Sample>,
     jitter_buffer: SharedJitterBuffer,
     running: &AtomicBool,
+    playback_underruns: &AtomicU64,
 ) {
     // Create codec pipeline (each thread owns its own instance)
     let mut codec = match CodecPipeline::new(config.codec) {
@@ -122,8 +132,8 @@ fn decode_loop(
     let device_samples = (codec_samples as u32 * device_rate / codec_clock_rate) as usize;
     let target_fill = device_samples * TARGET_FILL_FRAMES;
 
-    // Drift compensator: measure every 5 decode cycles (~25-50ms)
-    let mut drift = DriftCompensator::new(5);
+    // Drift compensator: measure every decode cycle for fast response
+    let mut drift = DriftCompensator::new(1);
 
     // Cross-frame state for smooth resampling
     let mut last_resample_input: i16 = 0;
@@ -149,6 +159,8 @@ fn decode_loop(
     let mut diag_frames_decoded: u64 = 0;
     let mut diag_frames_lost: u64 = 0;
     let mut diag_jb_empty: u64 = 0;
+    let mut diag_peak_pre_gain: i16 = 0;
+    let mut diag_peak_post_gain: i16 = 0;
     let mut diag_timer = Instant::now();
 
     while running.load(Ordering::Relaxed) {
@@ -222,13 +234,36 @@ fn decode_loop(
                             resampled
                         };
 
-                        // Write to playback ring buffer
-                        let written = producer.push_slice(&device_pcm);
-                        if written < device_pcm.len() {
+                        // Track peak amplitude before gain
+                        if let Some(&peak) = device_pcm.iter().map(|s| s.saturating_abs()).max().as_ref() {
+                            if peak > diag_peak_pre_gain {
+                                diag_peak_pre_gain = peak;
+                            }
+                        }
+
+                        // Apply playback gain and write to ring buffer
+                        let gained: Vec<i16> = device_pcm
+                            .iter()
+                            .map(|&s| {
+                                #[allow(clippy::cast_possible_truncation)]
+                                let g = (f32::from(s) * PLAYBACK_GAIN).clamp(-32768.0, 32767.0) as i16;
+                                g
+                            })
+                            .collect();
+
+                        // Track peak amplitude after gain
+                        if let Some(&peak) = gained.iter().map(|s| s.saturating_abs()).max().as_ref() {
+                            if peak > diag_peak_post_gain {
+                                diag_peak_post_gain = peak;
+                            }
+                        }
+
+                        let written = producer.push_slice(&gained);
+                        if written < gained.len() {
                             trace!(
                                 "Ring buffer full: wrote {}/{} samples",
                                 written,
-                                device_pcm.len()
+                                gained.len()
                             );
                         }
 
@@ -265,20 +300,31 @@ fn decode_loop(
                         diag_jb_empty += 1;
                         consecutive_empty += 1;
 
-                        // After sustained emptiness (5+ frames = 100ms+),
-                        // inject comfort noise to avoid dead air feeling.
-                        // The first few empty reads are normal jitter buffer
-                        // warmup; sustained emptiness indicates remote DTX.
-                        if consecutive_empty >= 5 {
-                            // Set CNG level based on a low background level
-                            // (since we don't know the remote noise floor,
-                            // use a subtle fixed level ≈ -54 dBFS)
-                            cng.update_level(60.0);
+                        // Smooth silence transition using PLC fadeout for the
+                        // first few empty reads. Without this, the ring buffer
+                        // drains and the CPAL callback abruptly transitions from
+                        // decoded audio to held-last-sample, causing audible static.
+                        // PLC generates a natural continuation that attenuates
+                        // progressively (90% → 72% → 58% → silence).
+                        if consecutive_empty <= 3 {
+                            let concealed = plc.conceal();
+                            let device_pcm = if concealed.len() == device_samples {
+                                concealed
+                            } else {
+                                resample(&concealed, device_samples, last_resample_input)
+                            };
+                            last_resample_input = 0;
+                            producer.push_slice(&device_pcm);
+                        } else if consecutive_empty >= 25 {
+                            // Sustained emptiness → inject subtle comfort noise
+                            cng.update_level(20.0);
 
                             let mut cn_pcm = vec![0i16; device_samples];
                             cng.generate(&mut cn_pcm);
                             producer.push_slice(&cn_pcm);
                         }
+                        // Between 4-24: push nothing, let ring buffer drain
+                        // naturally with the PLC tail still providing cushion.
 
                         break;
                     }
@@ -292,9 +338,11 @@ fn decode_loop(
         // Diagnostic logging every ~2 seconds
         if diag_timer.elapsed() >= Duration::from_secs(2) {
             let jb_stats = jitter_buffer.stats();
+            let underruns = playback_underruns.load(Ordering::Relaxed);
             info!(
                 "Decode diag: decoded={}, lost={}, jb_empty={}, ring_fill={}/{}, \
-                 jb_pkts={}, jb_depth={}ms, jb_jitter={:.1}ms",
+                 jb_pkts={}, jb_depth={}ms, jb_jitter={:.1}ms, pb_underruns={}, \
+                 peak_pre={}, peak_post={}",
                 diag_frames_decoded,
                 diag_frames_lost,
                 diag_jb_empty,
@@ -303,7 +351,12 @@ fn decode_loop(
                 jb_stats.current_packet_count,
                 jb_stats.current_depth_ms,
                 jb_stats.average_jitter_ms,
+                underruns,
+                diag_peak_pre_gain,
+                diag_peak_post_gain,
             );
+            diag_peak_pre_gain = 0;
+            diag_peak_post_gain = 0;
             diag_timer = Instant::now();
         }
     }
@@ -321,13 +374,14 @@ mod tests {
         let jb = SharedJitterBuffer::new(8000, 160, 60);
         let ring = HeapRb::<Sample>::new(48000);
         let (producer, _consumer) = ring.split();
+        let underruns = Arc::new(AtomicU64::new(0));
 
         let config = DecodeThreadConfig {
             codec: CodecPreference::G711Ulaw,
             device_rate: 48000,
         };
 
-        let mut handle = spawn(config, producer, jb, running);
+        let mut handle = spawn(config, producer, jb, running, underruns);
 
         // Let it run briefly
         thread::sleep(Duration::from_millis(50));

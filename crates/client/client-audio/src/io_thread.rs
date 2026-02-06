@@ -206,6 +206,13 @@ fn io_loop(
     let mut last_capture = Instant::now();
     let mut stats_update_counter: u32 = 0;
 
+    // DTX warmup: always send RTP for the first few seconds of a call.
+    // Bluetooth HFP profile negotiation can take 3-8 seconds, during which
+    // the mic captures all zeros. If DTX suppresses those, we send no RTP
+    // and the remote side (symmetric RTP) won't send either → dead air.
+    let dtx_warmup_duration = Duration::from_secs(5);
+    let call_start = Instant::now();
+
     // Diagnostic counters (logged every ~2 seconds)
     let mut diag_frames_captured: u64 = 0;
     let mut diag_capture_underruns: u64 = 0;
@@ -243,6 +250,7 @@ fn io_loop(
                 process_moh_frame(&mut codec, &mut transmitter, &mut moh_source);
             } else if !muted.load(Ordering::Relaxed) {
                 // Normal capture mode
+                let in_warmup = call_start.elapsed() < dtx_warmup_duration;
                 let (samples_read, max_amp, dtx) = process_capture_frame(
                     &mut codec,
                     &mut transmitter,
@@ -252,6 +260,7 @@ fn io_loop(
                     capture_device_samples,
                     codec_samples,
                     &stats,
+                    in_warmup,
                 );
                 diag_frames_captured += 1;
                 diag_last_samples_read = samples_read;
@@ -335,6 +344,7 @@ fn process_capture_frame(
     device_samples: usize,
     codec_samples: usize,
     stats: &Arc<Mutex<PipelineStats>>,
+    skip_dtx: bool,
 ) -> (usize, i16, bool) {
     // Read captured samples at device rate
     let mut device_pcm = vec![0i16; device_samples];
@@ -355,14 +365,17 @@ fn process_capture_frame(
     audio_processor.process(&mut device_pcm[..samples_read]);
 
     // Track max amplitude for diagnostics AFTER processing
+    // Use saturating_abs() because i16::MIN.abs() overflows in debug mode
     let max_amp = device_pcm[..samples_read]
         .iter()
-        .map(|s| s.abs())
+        .map(|s| s.saturating_abs())
         .max()
         .unwrap_or(0);
 
-    // Voice activity detection — skip encode+send during silence (DTX)
-    if vad.detect(&device_pcm[..samples_read]) == VadDecision::Silence {
+    // Voice activity detection — skip encode+send during silence (DTX).
+    // During warmup, always send even if VAD says silence, to ensure the
+    // remote side receives our RTP and starts sending back.
+    if !skip_dtx && vad.detect(&device_pcm[..samples_read]) == VadDecision::Silence {
         return (samples_read, max_amp, true);
     }
 
