@@ -196,8 +196,17 @@ async fn initialize_client(state: State<'_, TauriAppState>) -> Result<(), String
             match client_arc.try_lock() {
                 Ok(mut guard) => {
                     if let Some(ref mut client) = *guard {
-                        if let Err(e) = client.poll_events().await {
-                            error!(error = %e, "Error polling SIP events");
+                        // Use tokio::select with a timeout to ensure we don't hold
+                        // the lock for too long, allowing other commands to proceed
+                        let poll_result = tokio::time::timeout(
+                            tokio::time::Duration::from_millis(20),
+                            client.poll_events()
+                        ).await;
+
+                        match poll_result {
+                            Ok(Ok(())) => {} // Success
+                            Ok(Err(e)) => error!(error = %e, "Error polling SIP events"),
+                            Err(_) => {} // Timeout - this is fine, we'll poll again
                         }
                     }
                 }
@@ -206,7 +215,7 @@ async fn initialize_client(state: State<'_, TauriAppState>) -> Result<(), String
                     // This is expected and fine - we'll poll on next iteration
                 }
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
         }
     });
 
@@ -241,9 +250,10 @@ async fn make_call(target: String, state: State<'_, TauriAppState>) -> Result<St
 /// End the current call.
 #[tauri::command]
 async fn end_call(state: State<'_, TauriAppState>) -> Result<(), String> {
-    info!("end_call command invoked");
+    info!("end_call command invoked, acquiring client lock...");
 
     let mut client_guard = state.client.lock().await;
+    info!("end_call: client lock acquired");
     let client = client_guard
         .as_mut()
         .ok_or_else(|| {
