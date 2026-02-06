@@ -89,6 +89,8 @@ pub struct CallManager {
     moh_file_path: Option<String>,
     /// Negotiated codec per call (from SDP answer).
     negotiated_codecs: HashMap<String, CodecPreference>,
+    /// Effective local media address per call (what was advertised in SDP).
+    effective_media_addrs: HashMap<String, SocketAddr>,
 }
 
 /// Events emitted by the call manager.
@@ -212,6 +214,7 @@ impl CallManager {
             is_muted: false,
             moh_file_path: None,
             negotiated_codecs: HashMap::new(),
+            effective_media_addrs: HashMap::new(),
         }
     }
 
@@ -338,12 +341,16 @@ impl CallManager {
 
         info!(remote_uri = %full_remote_uri, "Making outbound call");
 
+        // Get the effective local media address (this creates and binds a UDP socket)
+        // We must use this SAME address for SDP and for the audio session
+        let effective_media_addr = self.get_effective_media_addr()?;
+
         // Create media session channel
         let (media_tx, _media_rx) = mpsc::channel(32);
 
-        // Create media session for this call
+        // Create media session for this call using the effective address
         let media_session = MediaSession::new(
-            self.local_media_addr,
+            effective_media_addr,
             true, // outbound = controlling
             self.ice_config.clone(),
             self.dtls_cert_chain.clone(),
@@ -351,8 +358,8 @@ impl CallManager {
             media_tx,
         );
 
-        // Generate SDP offer from media session
-        let sdp_offer = self.generate_sdp_offer(&media_session, account)?;
+        // Generate SDP offer using the same effective address
+        let sdp_offer = self.generate_sdp_offer_with_addr(&media_session, account, effective_media_addr)?;
 
         // Make the call via SIP UA
         let call_id = self
@@ -360,6 +367,9 @@ impl CallManager {
             .make_call(&full_remote_uri, &sdp_offer)
             .await
             .map_err(|e| AppError::Sip(e.to_string()))?;
+
+        // Store the effective media address for this call (used when starting audio session)
+        self.effective_media_addrs.insert(call_id.clone(), effective_media_addr);
 
         // Store media session and track the call
         self.media_sessions.insert(call_id.clone(), media_session);
@@ -1394,9 +1404,19 @@ impl CallManager {
 
         info!(call_id = %call_id, codec = ?codec, "Using codec for audio session");
 
+        // Get the local port that was advertised in the SDP offer
+        // This ensures we bind to the same port the remote will send RTP to
+        let local_port = self
+            .effective_media_addrs
+            .get(call_id)
+            .map(|addr| addr.port())
+            .unwrap_or(0);
+
+        info!(call_id = %call_id, local_port = local_port, "Using local port from SDP");
+
         // Configure audio
         let config = AudioSessionConfig {
-            local_port: 0,
+            local_port,
             remote_addr,
             codec,
             jitter_buffer_ms: 60,
@@ -1438,7 +1458,7 @@ impl CallManager {
         state: CallState,
         info: Option<CallInfo>,
     ) -> AppResult<()> {
-        debug!(call_id = %call_id, state = ?state, "Call state changed");
+        info!(call_id = %call_id, state = ?state, "Call state changed");
 
         let call_info = info.unwrap_or_else(|| {
             self.call_agent
@@ -1459,24 +1479,31 @@ impl CallManager {
 
         match state {
             CallState::Connected => {
+                info!(call_id = %call_id, "Processing Connected state");
+
                 // Start media session establishment (ICE + DTLS)
                 if let Some(session) = self.media_sessions.get_mut(call_id) {
+                    info!(call_id = %call_id, "Found media session, attempting to establish");
                     if let Err(e) = session.establish(None).await {
                         warn!(call_id = %call_id, error = %e, "Failed to establish media");
                     }
+                } else {
+                    warn!(call_id = %call_id, "No media session found for call");
                 }
 
                 // Start audio session when call connects
-                // Get remote address from media session after ICE completes
+                // Get remote address from media session - either from ICE or from SDP parsing
                 let remote_addr = self.media_sessions.get(call_id).and_then(|session| {
-                    if session.is_ready() {
-                        session.remote_addr()
+                    // For non-ICE calls, remote_addr is set from SDP c=/m= lines
+                    // For ICE calls, it's set after ICE connectivity check completes
+                    if let Some(addr) = session.remote_addr() {
+                        Some(addr)
                     } else {
                         warn!(
                             call_id = %call_id,
-                            "Media session not ready, using local address as fallback"
+                            "No remote media address available"
                         );
-                        Some(self.local_media_addr)
+                        None
                     }
                 });
 
@@ -1485,6 +1512,8 @@ impl CallManager {
                     if let Err(e) = self.start_audio_session(call_id, addr).await {
                         warn!(call_id = %call_id, error = %e, "Failed to start audio");
                     }
+                } else {
+                    error!(call_id = %call_id, "Cannot start audio: no remote address");
                 }
             }
             CallState::Terminated => {
@@ -1498,8 +1527,9 @@ impl CallManager {
                     let _ = session.close().await;
                 }
 
-                // Clean up negotiated codec
+                // Clean up negotiated codec and effective media address
                 self.negotiated_codecs.remove(call_id);
+                self.effective_media_addrs.remove(call_id);
 
                 // Record in call history
                 let end_reason = call_info
@@ -1550,26 +1580,48 @@ impl CallManager {
             debug!(call_id = %call_id, "No codec found in SDP answer, will use preferred codec");
         }
 
+        // Parse remote media address from SDP (c= and m= lines)
+        // This is used for non-ICE calls where the remote specifies its address directly
+        let remote_media_addr = parse_remote_media_addr_from_sdp(sdp);
+        if let Some(addr) = remote_media_addr {
+            info!(call_id = %call_id, remote_addr = %addr, "Parsed remote media address from SDP");
+        }
+
         // Parse SDP and configure media session
         if let Some(session) = self.media_sessions.get_mut(call_id) {
-            // Extract ICE credentials from SDP
-            if let Some(creds) = parse_ice_credentials_from_sdp(sdp) {
-                session.set_remote_ice_credentials(creds);
+            // Set the remote media address for non-ICE calls
+            // This ensures we have a valid address even if ICE doesn't complete
+            if let Some(addr) = remote_media_addr {
+                session.set_remote_addr(addr);
             }
 
-            // Extract ICE candidates from SDP
-            for line in sdp.lines() {
-                if line.starts_with("a=candidate:") {
-                    if let Err(e) = session.add_remote_ice_candidate(line) {
-                        warn!(error = %e, "Failed to add remote ICE candidate");
+            // Extract ICE credentials from SDP (if present, this is a secure call)
+            let ice_creds = parse_ice_credentials_from_sdp(sdp);
+            let has_ice = ice_creds.is_some();
+
+            if let Some(creds) = ice_creds {
+                session.set_remote_ice_credentials(creds);
+
+                // Extract ICE candidates from SDP
+                for line in sdp.lines() {
+                    if line.starts_with("a=candidate:") {
+                        if let Err(e) = session.add_remote_ice_candidate(line) {
+                            warn!(error = %e, "Failed to add remote ICE candidate");
+                        }
                     }
                 }
+
+                // Start media session only for ICE/DTLS calls
+                // For plain RTP calls, the AudioPipeline handles everything
+                if let Err(e) = session.start().await {
+                    error!(call_id = %call_id, error = %e, "Failed to start media session");
+                }
+            } else {
+                debug!(call_id = %call_id, "Plain RTP call - skipping ICE/DTLS media session start");
             }
 
-            // Start media session
-            if let Err(e) = session.start().await {
-                error!(call_id = %call_id, error = %e, "Failed to start media session");
-            }
+            // Log whether this is a secure or plain RTP call
+            info!(call_id = %call_id, has_ice = has_ice, "SDP answer processed");
         }
 
         Ok(())
@@ -1621,10 +1673,17 @@ impl CallManager {
         session: &MediaSession,
         account: &SipAccount,
     ) -> AppResult<String> {
-        let ssrc = session.local_ssrc();
-
-        // Discover actual local IP if configured with 0.0.0.0
         let effective_media_addr = self.get_effective_media_addr()?;
+        self.generate_sdp_offer_with_addr(session, account, effective_media_addr)
+    }
+
+    fn generate_sdp_offer_with_addr(
+        &self,
+        session: &MediaSession,
+        account: &SipAccount,
+        effective_media_addr: SocketAddr,
+    ) -> AppResult<String> {
+        let ssrc = session.local_ssrc();
 
         // Check if we're using TLS/secure transport
         let use_srtp = matches!(
@@ -1994,6 +2053,45 @@ fn parse_codec_from_sdp(sdp: &str) -> Option<CodecPreference> {
     None
 }
 
+/// Parses the remote media address from an SDP answer.
+///
+/// Extracts the connection address from the c= line and the port from the m=audio line.
+/// This is used for non-ICE calls where the remote endpoint specifies its
+/// media address directly in the SDP.
+///
+/// # Arguments
+/// * `sdp` - The SDP answer string
+///
+/// # Returns
+/// The remote media socket address, or None if not found or invalid
+fn parse_remote_media_addr_from_sdp(sdp: &str) -> Option<SocketAddr> {
+    let mut connection_ip: Option<std::net::IpAddr> = None;
+    let mut audio_port: Option<u16> = None;
+
+    for line in sdp.lines() {
+        // Parse connection line: c=IN IP4 <address> or c=IN IP6 <address>
+        if line.starts_with("c=IN IP4 ") {
+            let addr_str = line.strip_prefix("c=IN IP4 ")?.trim();
+            connection_ip = addr_str.parse().ok();
+        } else if line.starts_with("c=IN IP6 ") {
+            let addr_str = line.strip_prefix("c=IN IP6 ")?.trim();
+            connection_ip = addr_str.parse().ok();
+        }
+        // Parse media line: m=audio <port> <proto> <fmt>...
+        else if line.starts_with("m=audio ") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                audio_port = parts[1].parse().ok();
+            }
+        }
+    }
+
+    match (connection_ip, audio_port) {
+        (Some(ip), Some(port)) if port > 0 => Some(SocketAddr::new(ip, port)),
+        _ => None,
+    }
+}
+
 /// Generates a unique session ID for SDP.
 fn session_id() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2221,5 +2319,69 @@ mod tests {
                    t=0 0\r\n";
 
         assert!(parse_codec_from_sdp(sdp).is_none());
+    }
+
+    #[test]
+    fn test_parse_remote_media_addr_from_sdp_ipv4() {
+        let sdp = "v=0\r\n\
+                   o=- 0 0 IN IP4 192.168.1.100\r\n\
+                   s=-\r\n\
+                   c=IN IP4 192.168.1.100\r\n\
+                   t=0 0\r\n\
+                   m=audio 49170 RTP/AVP 0 8\r\n\
+                   a=rtpmap:0 PCMU/8000\r\n";
+
+        let addr = parse_remote_media_addr_from_sdp(sdp).unwrap();
+        assert_eq!(addr.ip().to_string(), "192.168.1.100");
+        assert_eq!(addr.port(), 49170);
+    }
+
+    #[test]
+    fn test_parse_remote_media_addr_from_sdp_different_port() {
+        let sdp = "v=0\r\n\
+                   o=- 0 0 IN IP4 10.0.0.1\r\n\
+                   s=-\r\n\
+                   c=IN IP4 10.0.0.1\r\n\
+                   t=0 0\r\n\
+                   m=audio 5060 RTP/AVP 0\r\n";
+
+        let addr = parse_remote_media_addr_from_sdp(sdp).unwrap();
+        assert_eq!(addr.ip().to_string(), "10.0.0.1");
+        assert_eq!(addr.port(), 5060);
+    }
+
+    #[test]
+    fn test_parse_remote_media_addr_from_sdp_no_connection() {
+        let sdp = "v=0\r\n\
+                   o=- 0 0 IN IP4 192.168.1.100\r\n\
+                   s=-\r\n\
+                   t=0 0\r\n\
+                   m=audio 49170 RTP/AVP 0\r\n";
+
+        assert!(parse_remote_media_addr_from_sdp(sdp).is_none());
+    }
+
+    #[test]
+    fn test_parse_remote_media_addr_from_sdp_no_audio() {
+        let sdp = "v=0\r\n\
+                   o=- 0 0 IN IP4 192.168.1.100\r\n\
+                   s=-\r\n\
+                   c=IN IP4 192.168.1.100\r\n\
+                   t=0 0\r\n";
+
+        assert!(parse_remote_media_addr_from_sdp(sdp).is_none());
+    }
+
+    #[test]
+    fn test_parse_remote_media_addr_from_sdp_zero_port() {
+        // Port 0 means media is declined
+        let sdp = "v=0\r\n\
+                   o=- 0 0 IN IP4 192.168.1.100\r\n\
+                   s=-\r\n\
+                   c=IN IP4 192.168.1.100\r\n\
+                   t=0 0\r\n\
+                   m=audio 0 RTP/AVP 0\r\n";
+
+        assert!(parse_remote_media_addr_from_sdp(sdp).is_none());
     }
 }

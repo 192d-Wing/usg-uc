@@ -21,6 +21,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tracing::{debug, info, trace, warn};
 
+/// Device sample rate (most devices run at 48kHz).
+const DEVICE_SAMPLE_RATE: u32 = 48000;
+
 /// Audio pipeline state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineState {
@@ -298,7 +301,7 @@ impl AudioPipeline {
         info!("Audio pipeline stopped");
     }
 
-    /// Processes one frame of audio (capture -> encode -> send).
+    /// Processes one frame of audio (capture -> resample -> encode -> send).
     ///
     /// This should be called at regular intervals (e.g., every 20ms for G.711).
     pub async fn process_capture_frame(&mut self) -> AudioResult<()> {
@@ -317,21 +320,26 @@ impl AudioPipeline {
             .as_mut()
             .ok_or_else(|| AudioError::ConfigError("Transmitter not available".to_string()))?;
 
-        // Read captured samples
-        let samples_needed = codec.samples_per_frame();
-        let mut pcm = vec![0i16; samples_needed];
-        let samples_read = capture.read(&mut pcm);
+        // Calculate samples needed at device rate for one codec frame
+        // e.g., for 20ms G.711: 20ms * 48000 Hz = 960 samples from device
+        let codec_clock_rate = codec.clock_rate();
+        let codec_samples = codec.samples_per_frame(); // e.g., 160 for G.711
+        let device_samples = (codec_samples as u32 * DEVICE_SAMPLE_RATE / codec_clock_rate) as usize;
 
-        if samples_read < samples_needed {
+        // Read captured samples at device rate
+        let mut device_pcm = vec![0i16; device_samples];
+        let samples_read = capture.read(&mut device_pcm);
+
+        if samples_read < device_samples {
             // Not enough samples - pad with silence
             trace!(
                 "Capture underrun: got {} samples, needed {}",
-                samples_read, samples_needed
+                samples_read, device_samples
             );
             if let Ok(mut stats) = self.stats.lock() {
                 stats.capture_underruns += 1;
             }
-            pcm[samples_read..].fill(0);
+            device_pcm[samples_read..].fill(0);
         }
 
         // Skip encoding/sending if muted
@@ -339,8 +347,15 @@ impl AudioPipeline {
             return Ok(());
         }
 
+        // Resample from device rate (48kHz) to codec rate (8kHz for G.711)
+        let codec_pcm = if device_samples != codec_samples {
+            resample(&device_pcm, codec_samples)
+        } else {
+            device_pcm
+        };
+
         // Encode
-        let encoded = codec.encode(&pcm)?;
+        let encoded = codec.encode(&codec_pcm)?;
 
         // Send
         transmitter.send(encoded).await?;
@@ -365,28 +380,47 @@ impl AudioPipeline {
             .as_mut()
             .ok_or_else(|| AudioError::ConfigError("Playback stream not available".to_string()))?;
 
+        let codec_clock_rate = codec.clock_rate();
+        let codec_samples = codec.samples_per_frame();
+        // Calculate exact device samples for one codec frame
+        // e.g., 160 * 48000 / 8000 = 960
+        let device_samples = (codec_samples as u32 * DEVICE_SAMPLE_RATE / codec_clock_rate) as usize;
+
         // Get packet from jitter buffer
         match receiver.get_packet() {
             JitterBufferResult::Packet(packet) => {
-                // Decode and play
-                let pcm = codec.decode(&packet.payload)?;
-                playback.write(pcm);
+                // Decode
+                let codec_pcm = codec.decode(&packet.payload)?;
+
+                // Resample from codec rate (8kHz) to device rate (48kHz)
+                let device_pcm = if codec_pcm.len() != device_samples {
+                    resample(codec_pcm, device_samples)
+                } else {
+                    codec_pcm.to_vec()
+                };
+
+                playback.write(&device_pcm);
             }
             JitterBufferResult::Lost { .. } => {
-                // Generate PLC
-                let samples = codec.samples_per_frame();
-                let mut plc = vec![0i16; samples];
+                // Generate PLC at codec rate, then resample to device rate
+                let mut plc = vec![0i16; codec_samples];
                 codec.generate_plc(&mut plc);
-                playback.write(&plc);
+
+                let device_plc = if codec_samples != device_samples {
+                    resample(&plc, device_samples)
+                } else {
+                    plc
+                };
+
+                playback.write(&device_plc);
 
                 if let Ok(mut stats) = self.stats.lock() {
                     stats.playback_underruns += 1;
                 }
             }
             JitterBufferResult::Empty | JitterBufferResult::NotReady => {
-                // No audio to play - output silence
-                let samples = codec.samples_per_frame();
-                let silence = vec![0i16; samples];
+                // No audio to play - output silence at device rate
+                let silence = vec![0i16; device_samples];
                 playback.write(&silence);
             }
         }
@@ -652,6 +686,31 @@ impl Drop for AudioPipeline {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Resample audio to a specific output length using linear interpolation.
+fn resample(input: &[i16], output_len: usize) -> Vec<i16> {
+    if input.len() == output_len {
+        return input.to_vec();
+    }
+
+    let mut output = Vec::with_capacity(output_len);
+    let ratio = (input.len() as f64 - 1.0) / (output_len as f64 - 1.0).max(1.0);
+
+    for i in 0..output_len {
+        let src_pos = i as f64 * ratio;
+        let src_idx = src_pos as usize;
+        let frac = src_pos - src_idx as f64;
+
+        if src_idx + 1 < input.len() {
+            let sample = input[src_idx] as f64 * (1.0 - frac) + input[src_idx + 1] as f64 * frac;
+            output.push(sample.round() as i16);
+        } else {
+            output.push(input[input.len() - 1]);
+        }
+    }
+
+    output
 }
 
 #[cfg(test)]

@@ -196,20 +196,15 @@ async fn initialize_client(state: State<'_, TauriAppState>) -> Result<(), String
             match client_arc.try_lock() {
                 Ok(mut guard) => {
                     if let Some(ref mut client) = *guard {
-                        // Use tokio::select with a timeout to ensure we don't hold
-                        // the lock for too long, allowing other commands to proceed
-                        let poll_result = tokio::time::timeout(
-                            tokio::time::Duration::from_millis(20),
-                            client.poll_events()
-                        ).await;
-
-                        match poll_result {
-                            Ok(Ok(())) => {} // Success
-                            Ok(Err(e)) => error!(error = %e, "Error polling SIP events"),
-                            Err(_) => {} // Timeout - this is fine, we'll poll again
+                        // Poll events - this may do network I/O (sending SIP messages)
+                        // Note: We don't timeout here because tokio::time::timeout doesn't
+                        // actually cancel the future, and network I/O legitimately takes time.
+                        // The try_lock above ensures we don't block commands that need the lock.
+                        if let Err(e) = client.poll_events().await {
+                            error!(error = %e, "Error polling SIP events");
                         }
                     }
-                    // Explicitly drop the guard to release the lock quickly
+                    // Explicitly drop the guard to release the lock
                     drop(guard);
                 }
                 Err(_) => {
@@ -217,7 +212,8 @@ async fn initialize_client(state: State<'_, TauriAppState>) -> Result<(), String
                     // This is expected and fine - we'll poll on next iteration
                 }
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
+            // Poll frequently to ensure responsive message sending
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
         }
     });
 
@@ -254,23 +250,29 @@ async fn make_call(target: String, state: State<'_, TauriAppState>) -> Result<St
 async fn end_call(state: State<'_, TauriAppState>) -> Result<(), String> {
     info!("end_call command invoked, acquiring client lock...");
 
-    // Use timeout to avoid indefinite blocking
-    let mut client_guard = tokio::time::timeout(
-        tokio::time::Duration::from_secs(2),
-        state.client.lock()
-    )
-    .await
-    .map_err(|_| {
-        error!("end_call: Timeout acquiring client lock");
-        "Timeout acquiring client lock".to_string()
-    })?;
+    // Use try_lock first to fail fast if lock is held
+    let mut client_guard = match state.client.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            // Lock is held - use a short timeout for retry
+            tokio::time::timeout(
+                tokio::time::Duration::from_millis(500),
+                state.client.lock(),
+            )
+            .await
+            .map_err(|_| {
+                error!("end_call: Timeout acquiring client lock");
+                "Timeout acquiring client lock - call may still end via background polling"
+                    .to_string()
+            })?
+        }
+    };
+
     info!("end_call: client lock acquired");
-    let client = client_guard
-        .as_mut()
-        .ok_or_else(|| {
-            error!("end_call: Client not initialized");
-            "Client not initialized".to_string()
-        })?;
+    let client = client_guard.as_mut().ok_or_else(|| {
+        error!("end_call: Client not initialized");
+        "Client not initialized".to_string()
+    })?;
 
     info!("end_call: calling client.hangup()");
     match client.hangup().await {
@@ -283,7 +285,9 @@ async fn end_call(state: State<'_, TauriAppState>) -> Result<(), String> {
         }
     }
 
-    // Poll events to send BYE/CANCEL request
+    // Poll events to send the BYE/CANCEL request immediately.
+    // This does network I/O while holding the lock, but the JS side now debounces
+    // hangup clicks to prevent multiple concurrent calls.
     info!("end_call: polling events to send BYE/CANCEL");
     if let Err(e) = client.poll_events().await {
         warn!(error = %e, "Error polling events after end_call");

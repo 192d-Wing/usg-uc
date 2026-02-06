@@ -1922,12 +1922,25 @@ function initializeCall() {
         }
     });
 
+    // Track if hangup is in progress to prevent multiple rapid calls
+    let hangupInProgress = false;
+
     hangupBtn.addEventListener('click', async () => {
+        // Debounce: prevent multiple rapid hangup attempts
+        if (hangupInProgress) {
+            console.log('Hangup already in progress, ignoring');
+            return;
+        }
+        hangupInProgress = true;
+
         try {
             await invoke('end_call');
-            endCall();
         } catch (error) {
             console.error('Failed to end call:', error);
+        } finally {
+            // Always reset state and update UI, even on error
+            hangupInProgress = false;
+            endCall();
         }
     });
 }

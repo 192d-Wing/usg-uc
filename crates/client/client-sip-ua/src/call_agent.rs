@@ -947,6 +947,7 @@ impl CallAgent {
             cseq,
             &from_tag,
             to_tag.as_deref(),
+            &self.transport_type,
         )?;
 
         self.event_tx
@@ -1241,6 +1242,7 @@ impl CallAgent {
             cseq,
             from_tag,
             to_tag,
+            &self.transport_type,
         )?;
 
         self.event_tx
@@ -1324,6 +1326,7 @@ impl CallAgent {
             &from_tag,
             to_tag.as_deref(),
             &branch,
+            &self.transport_type,
         )?;
 
         // Create non-INVITE transaction
@@ -1380,6 +1383,7 @@ impl CallAgent {
             cseq,
             &from_tag,
             to_tag.as_deref(),
+            &self.transport_type,
         )?;
 
         // Create non-INVITE transaction
@@ -1483,6 +1487,7 @@ impl CallAgent {
         from_tag: &str,
         to_tag: Option<&str>,
         branch: &str,
+        transport_type: &str,
     ) -> SipUaResult<SipRequest> {
         let remote_uri: SipUri = remote_uri_str
             .parse()
@@ -1492,7 +1497,7 @@ impl CallAgent {
             .parse()
             .map_err(|e| SipUaError::ConfigError(format!("Invalid AOR: {e}")))?;
 
-        let via = ViaHeader::new("TLS", &local_addr.ip().to_string())
+        let via = ViaHeader::new(transport_type, &local_addr.ip().to_string())
             .with_port(local_addr.port())
             .with_branch(branch.to_string());
 
@@ -1529,6 +1534,7 @@ impl CallAgent {
         cseq: u32,
         from_tag: &str,
         to_tag: Option<&str>,
+        transport_type: &str,
     ) -> SipUaResult<SipRequest> {
         let remote_uri: SipUri = remote_uri_str
             .parse()
@@ -1540,7 +1546,7 @@ impl CallAgent {
 
         let branch = generate_branch();
 
-        let via = ViaHeader::new("TLS", &local_addr.ip().to_string())
+        let via = ViaHeader::new(transport_type, &local_addr.ip().to_string())
             .with_port(local_addr.port())
             .with_branch(branch);
 
@@ -1577,6 +1583,7 @@ impl CallAgent {
         cseq: u32,
         from_tag: &str,
         to_tag: Option<&str>,
+        transport_type: &str,
     ) -> SipUaResult<SipRequest> {
         let remote_uri: SipUri = remote_uri_str
             .parse()
@@ -1588,7 +1595,7 @@ impl CallAgent {
 
         let branch = generate_branch();
 
-        let via = ViaHeader::new("TLS", &local_addr.ip().to_string())
+        let via = ViaHeader::new(transport_type, &local_addr.ip().to_string())
             .with_port(local_addr.port())
             .with_branch(branch);
 

@@ -786,8 +786,13 @@ impl ClientApp {
                         transport.send_response(&response, destination).await
                     };
 
-                    if let Err(e) = result {
-                        error!(error = %e, "Failed to send SIP response");
+                    match &result {
+                        Ok(()) => info!(
+                            status = response.status.code(),
+                            destination = %destination,
+                            "SIP response sent successfully"
+                        ),
+                        Err(e) => error!(error = %e, "Failed to send SIP response"),
                     }
                 } else {
                     warn!("No SIP transport configured, cannot send response");
@@ -946,6 +951,9 @@ impl ClientApp {
         // Collect call manager events (state changes, responses to send, etc.)
         let call_mgr_events: Vec<_> =
             std::iter::from_fn(|| self.call_event_rx.try_recv().ok()).collect();
+        if !call_mgr_events.is_empty() {
+            info!(count = call_mgr_events.len(), "Processing call manager events");
+        }
         for event in call_mgr_events {
             self.handle_call_event(event).await?;
         }

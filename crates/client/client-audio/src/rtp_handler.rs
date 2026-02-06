@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 /// Default RTP payload type for audio.
 pub const DEFAULT_PAYLOAD_TYPE: u8 = 0; // PCMU
@@ -86,7 +86,7 @@ impl RtpTransmitter {
         payload_type: u8,
         timestamp_increment: u32,
     ) -> Self {
-        debug!(
+        info!(
             "Creating RTP transmitter: remote={}, ssrc={}, pt={}",
             remote_addr, ssrc, payload_type
         );
@@ -295,7 +295,7 @@ impl RtpReceiver {
         samples_per_packet: u32,
         jitter_buffer_ms: u32,
     ) -> Self {
-        debug!(
+        info!(
             "Creating RTP receiver: clock_rate={}, jitter_buffer={}ms",
             clock_rate, jitter_buffer_ms
         );

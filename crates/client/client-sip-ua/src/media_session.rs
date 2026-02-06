@@ -207,6 +207,14 @@ impl MediaSession {
         Ok(())
     }
 
+    /// Sets the remote media address directly (for non-ICE calls).
+    ///
+    /// This is used when the remote endpoint doesn't support ICE and the
+    /// remote address must be extracted from the SDP c= and m= lines.
+    pub fn set_remote_addr(&mut self, addr: SocketAddr) {
+        self.remote_addr = Some(addr);
+    }
+
     /// Starts the media session.
     ///
     /// This begins ICE gathering, then connectivity checks,
