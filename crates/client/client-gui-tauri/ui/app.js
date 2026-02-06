@@ -2024,10 +2024,10 @@ function initializeCall() {
             await invoke('end_call');
         } catch (error) {
             console.error('Failed to end call:', error);
-        } finally {
-            // Always reset state and update UI, even on error
-            hangupInProgress = false;
+            // Only reset UI on error — normal path lets backend events drive the transition
             endCall();
+        } finally {
+            hangupInProgress = false;
         }
     });
 
