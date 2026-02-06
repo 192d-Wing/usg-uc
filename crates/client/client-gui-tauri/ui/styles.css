@@ -133,14 +133,20 @@
 }
 
 /* ===== Base Styles ===== */
+html, body {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+}
+
 body {
     font: var(--md-sys-typescale-body-medium);
     font-family: 'Roboto', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     background: var(--md-sys-color-surface);
     color: var(--md-sys-color-on-surface);
-    overflow: hidden;
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-rows: auto 1fr auto;
     height: 100vh;
 }
 
@@ -204,60 +210,31 @@ body {
 
 .app-container {
     display: flex;
-    flex: 1;
     min-height: 0;
     overflow: hidden;
 }
 
-/* ===== App Header ===== */
-.app-header {
+/* ===== Navigation Status Indicator ===== */
+.nav-status {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    padding: 12px 8px;
+    margin: auto 12px 12px 12px;
     background: var(--md-sys-color-surface-container);
-    padding: 12px 24px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    box-shadow: var(--md-sys-elevation-level2);
-    flex-shrink: 0;
-    min-height: 48px;
+    border-radius: var(--md-sys-shape-corner-large);
 }
 
-.app-title {
-    font: var(--md-sys-typescale-title-large);
-    color: var(--md-sys-color-on-surface);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    min-width: 0;
-}
-
-.app-header h1 {
-    font: var(--md-sys-typescale-title-large);
-    color: var(--md-sys-color-on-surface);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    min-width: 0;
-}
-
-.status-indicator {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 16px;
-    background: var(--md-sys-color-surface-container-high);
-    border-radius: var(--md-sys-shape-corner-full);
-    flex-shrink: 0;
-}
-
-.status-dot {
-    width: 8px;
-    height: 8px;
+.nav-status .status-dot {
+    width: 10px;
+    height: 10px;
     border-radius: var(--md-sys-shape-corner-full);
     background: var(--md-sys-color-error);
     animation: pulse 2s var(--md-sys-motion-easing-standard) infinite;
 }
 
-.status-indicator.online .status-dot {
+.nav-status.online .status-dot {
     background: var(--md-sys-color-success);
 }
 
@@ -266,9 +243,10 @@ body {
     50% { opacity: 0.5; }
 }
 
-.status-text {
-    font: var(--md-sys-typescale-label-medium);
+.nav-status .status-text {
+    font: var(--md-sys-typescale-label-small);
     color: var(--md-sys-color-on-surface-variant);
+    text-align: center;
 }
 
 /* ===== Navigation Rail (Sidebar) ===== */
@@ -279,6 +257,8 @@ body {
     background: var(--md-sys-color-surface-container-low);
     padding-top: 0;
     gap: 4px;
+    flex-shrink: 0;
+    overflow-y: auto;
 }
 
 /* Navigation Logo */
@@ -311,7 +291,7 @@ body {
     font: var(--md-sys-typescale-label-medium);
     cursor: pointer;
     transition: background var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard),
-                color var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard);
+        color var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard);
     position: relative;
 }
 
@@ -342,14 +322,17 @@ body {
 
 /* ===== Main Content Wrapper ===== */
 .main-wrapper {
-    flex: 1;
+    flex: 1 1 0;
     display: flex;
     flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
 }
 
 /* ===== Content Area ===== */
 .content-area {
-    flex: 1;
+    flex: 1 1 0;
+    min-height: 0;
     overflow-y: auto;
     padding: 24px;
     background: var(--md-sys-color-surface);
@@ -365,8 +348,15 @@ body {
 }
 
 @keyframes fadeIn {
-    from { opacity: 0; transform: translateY(8px); }
-    to { opacity: 1; transform: translateY(0); }
+    from {
+        opacity: 0;
+        transform: translateY(8px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
 }
 
 /* ===== Dialer Section ===== */
@@ -408,11 +398,30 @@ body {
 }
 
 /* Font size classes for dynamic adjustment */
-.dial-input.size-xl { font-size: 36px; letter-spacing: 3px; }
-.dial-input.size-lg { font-size: 30px; letter-spacing: 2px; }
-.dial-input.size-md { font-size: 24px; letter-spacing: 1px; }
-.dial-input.size-sm { font-size: 20px; letter-spacing: 0.5px; }
-.dial-input.size-xs { font-size: 16px; letter-spacing: 0; }
+.dial-input.size-xl {
+    font-size: 36px;
+    letter-spacing: 3px;
+}
+
+.dial-input.size-lg {
+    font-size: 30px;
+    letter-spacing: 2px;
+}
+
+.dial-input.size-md {
+    font-size: 24px;
+    letter-spacing: 1px;
+}
+
+.dial-input.size-sm {
+    font-size: 20px;
+    letter-spacing: 0.5px;
+}
+
+.dial-input.size-xs {
+    font-size: 16px;
+    letter-spacing: 0;
+}
 
 .dial-input::placeholder {
     color: var(--md-sys-color-on-surface-variant);
@@ -582,8 +591,8 @@ body {
     border-radius: var(--md-sys-shape-corner-full);
     cursor: pointer;
     transition: background var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard),
-                box-shadow var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard),
-                transform var(--md-sys-motion-duration-short3) var(--md-sys-motion-easing-standard);
+        box-shadow var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard),
+        transform var(--md-sys-motion-duration-short3) var(--md-sys-motion-easing-standard);
     position: relative;
     overflow: hidden;
 }
@@ -714,7 +723,7 @@ body {
     border-radius: var(--md-sys-shape-corner-medium);
     margin-bottom: 8px;
     transition: background var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard),
-                transform var(--md-sys-motion-duration-short3) var(--md-sys-motion-easing-standard);
+        transform var(--md-sys-motion-duration-short3) var(--md-sys-motion-easing-standard);
 }
 
 .contact-item:hover {
@@ -748,7 +757,7 @@ body {
     cursor: pointer;
     font: var(--md-sys-typescale-label-large);
     transition: background var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard),
-                box-shadow var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard);
+        box-shadow var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard);
 }
 
 .contact-btn.call {
@@ -819,8 +828,8 @@ body {
     color: var(--md-sys-color-on-surface);
     cursor: pointer;
     transition: background var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard),
-                box-shadow var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard),
-                transform var(--md-sys-motion-duration-short3) var(--md-sys-motion-easing-standard);
+        box-shadow var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard),
+        transform var(--md-sys-motion-duration-short3) var(--md-sys-motion-easing-standard);
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -932,7 +941,7 @@ h2 .section-icon {
     color: var(--md-sys-color-on-surface);
     font: var(--md-sys-typescale-body-large);
     transition: border-color var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard),
-                background var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard);
+        background var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard);
 }
 
 .form-group input:focus,
@@ -1112,7 +1121,7 @@ h2 .section-icon {
     margin-bottom: 8px;
     cursor: pointer;
     transition: background var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard),
-                box-shadow var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard);
+        box-shadow var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard);
 }
 
 .cert-item:hover {
@@ -1269,6 +1278,7 @@ h2 .section-icon {
         opacity: 0;
         transform: scale(0.9) translateY(16px);
     }
+
     to {
         opacity: 1;
         transform: scale(1) translateY(0);
@@ -1335,20 +1345,13 @@ h2 .section-icon {
 
 /* Small window adjustments */
 @media (max-height: 650px) {
-    .app-header {
-        padding: 10px 20px;
+    .nav-status {
+        padding: 8px 6px;
+        margin: auto 8px 8px 8px;
     }
 
-    .app-header h1 {
-        font-size: 18px;
-    }
-
-    .status-indicator {
-        padding: 6px 12px;
-    }
-
-    .status-text {
-        font-size: 12px;
+    .nav-status .status-text {
+        font-size: 10px;
     }
 
     .content-area {
@@ -1460,11 +1463,30 @@ h2 .section-icon {
     }
 
     /* Font size classes - smaller for compact view */
-    .dial-input.size-xl { font-size: 28px; letter-spacing: 2px; }
-    .dial-input.size-lg { font-size: 24px; letter-spacing: 1.5px; }
-    .dial-input.size-md { font-size: 20px; letter-spacing: 1px; }
-    .dial-input.size-sm { font-size: 16px; letter-spacing: 0.5px; }
-    .dial-input.size-xs { font-size: 14px; letter-spacing: 0; }
+    .dial-input.size-xl {
+        font-size: 28px;
+        letter-spacing: 2px;
+    }
+
+    .dial-input.size-lg {
+        font-size: 24px;
+        letter-spacing: 1.5px;
+    }
+
+    .dial-input.size-md {
+        font-size: 20px;
+        letter-spacing: 1px;
+    }
+
+    .dial-input.size-sm {
+        font-size: 16px;
+        letter-spacing: 0.5px;
+    }
+
+    .dial-input.size-xs {
+        font-size: 14px;
+        letter-spacing: 0;
+    }
 
     .dialpad {
         gap: 6px;
@@ -1496,28 +1518,18 @@ h2 .section-icon {
         height: 18px;
     }
 
-    .app-header {
-        padding: 8px 12px;
-        min-height: 40px;
-        gap: 8px;
+    .nav-status {
+        padding: 6px 4px;
+        margin: auto 6px 6px 6px;
     }
 
-    .app-header h1 {
-        font-size: 14px;
+    .nav-status .status-dot {
+        width: 8px;
+        height: 8px;
     }
 
-    .status-indicator {
-        padding: 4px 10px;
-        gap: 6px;
-    }
-
-    .status-dot {
-        width: 6px;
-        height: 6px;
-    }
-
-    .status-text {
-        font-size: 11px;
+    .nav-status .status-text {
+        font-size: 9px;
     }
 
     .tab-nav {

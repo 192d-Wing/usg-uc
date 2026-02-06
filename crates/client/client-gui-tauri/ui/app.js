@@ -299,10 +299,24 @@ async function loadClassification() {
     updateClassificationBars();
 }
 
+
 // Initialize the application
 document.addEventListener('DOMContentLoaded', async () => {
     // Load classification level from storage (async - loads from config file)
     await loadClassification();
+
+    // Debug layout
+    console.log('=== Layout Debug ===');
+    const topBar = document.querySelector('.classification-bar-top');
+    const bottomBar = document.querySelector('.classification-bar-bottom');
+    const appContainer = document.querySelector('.app-container');
+    const body = document.body;
+
+    if (topBar) console.log('Top bar:', topBar.offsetHeight, 'px', getComputedStyle(topBar).display);
+    if (bottomBar) console.log('Bottom bar:', bottomBar.offsetHeight, 'px', getComputedStyle(bottomBar).display);
+    if (appContainer) console.log('App container:', appContainer.offsetHeight, 'px', getComputedStyle(appContainer).flex);
+    console.log('Body:', body.offsetHeight, 'px', 'Window:', window.innerHeight, 'px');
+    console.log('===================');
 
     initializeTabs();
     initializeDialer();
@@ -929,9 +943,15 @@ function initializeDialer() {
     updateDialInputSize(dialInput);
 
     callBtn.addEventListener('click', async () => {
+        console.log('Call button clicked');
+        console.log('dialInput.value:', dialInput.value);
         const target = extractDigits(dialInput.value.trim());
+        console.log('Extracted target:', target);
         if (target) {
             await makeCall(target);
+        } else {
+            console.warn('Call button clicked but no target entered');
+            safeAlert('Please enter a number to call');
         }
     });
 
@@ -1022,25 +1042,33 @@ function initializeDialer() {
 }
 
 async function makeCall(target) {
-    if (!rateLimiter.canCall('make_call')) return;
+    console.log('makeCall called with target:', target);
+
+    if (!rateLimiter.canCall('make_call')) {
+        console.warn('makeCall rate limited');
+        return;
+    }
 
     // Extract digits if formatted, preserve SIP URIs
     const dialTarget = extractDigits(target).slice(0, MAX_URI_LENGTH);
+    console.log('dialTarget after extractDigits:', dialTarget);
 
     // Add sip: prefix if not present
     let sipUri = dialTarget;
     if (!sipUri.startsWith('sip:') && !sipUri.startsWith('sips:')) {
         sipUri = `sip:${dialTarget}`;
     }
+    console.log('Final sipUri:', sipUri);
 
     try {
+        console.log('Invoking make_call with:', sipUri);
         const result = await invoke('make_call', { target: sipUri });
         console.log('Call initiated:', result);
         startCall(target);
         switchTab('call');
     } catch (error) {
         console.error('Failed to make call:', error);
-        safeAlert('Failed to make call');
+        safeAlert('Failed to make call: ' + error);
     }
 }
 
@@ -1927,6 +1955,7 @@ async function loadSipSettings() {
             const displayNameInput = document.getElementById('sipDisplayName');
             const usernameInput = document.getElementById('sipUsername');
             const domainInput = document.getElementById('sipDomain');
+            const callerIdInput = document.getElementById('sipCallerId');
             const registrarInput = document.getElementById('sipRegistrar');
             const portInput = document.getElementById('sipPort');
             const transportSelect = document.getElementById('sipTransport');
@@ -1935,6 +1964,7 @@ async function loadSipSettings() {
             if (displayNameInput) displayNameInput.value = settings.display_name || '';
             if (usernameInput) usernameInput.value = settings.username || '';
             if (domainInput) domainInput.value = settings.domain || '';
+            if (callerIdInput) callerIdInput.value = settings.caller_id || '';
             if (registrarInput) registrarInput.value = settings.registrar || '';
             if (portInput) portInput.value = settings.port || 5060;
             if (transportSelect) transportSelect.value = settings.transport || 'tls';
@@ -1966,6 +1996,7 @@ async function saveSipSettings() {
     const displayName = document.getElementById('sipDisplayName')?.value.trim() || '';
     const username = document.getElementById('sipUsername')?.value.trim() || '';
     const domain = document.getElementById('sipDomain')?.value.trim() || '';
+    const callerId = document.getElementById('sipCallerId')?.value.trim() || '';
     const registrar = document.getElementById('sipRegistrar')?.value.trim() || '';
     const port = parseInt(document.getElementById('sipPort')?.value, 10) || 5060;
     const transport = document.getElementById('sipTransport')?.value || 'tls';
@@ -1991,6 +2022,7 @@ async function saveSipSettings() {
         port: port,
         transport: transport,
         auto_register: autoRegister,
+        caller_id: callerId || null,
     };
 
     // Add digest auth credentials if feature is enabled and fields are filled

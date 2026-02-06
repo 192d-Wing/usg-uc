@@ -56,19 +56,15 @@
                 </svg>
                 <span>Settings</span>
             </button>
+            <!-- Status Indicator -->
+            <div class="nav-status" id="status">
+                <span class="status-dot"></span>
+                <span class="status-text">Offline</span>
+            </div>
         </nav>
 
         <!-- Main Content Wrapper -->
         <div class="main-wrapper">
-            <!-- Header -->
-            <header class="app-header">
-                <h1>DoW Soft Client</h1>
-                <div class="status-indicator" id="status">
-                    <span class="status-dot"></span>
-                    <span class="status-text">Offline</span>
-                </div>
-            </header>
-
             <!-- Main Content -->
             <main class="content-area">
                 <!-- Dialer Tab -->
@@ -227,6 +223,10 @@
                             <div class="form-group">
                                 <label>Domain:</label>
                                 <input type="text" id="sipDomain" placeholder="sip.example.com" maxlength="256">
+                            </div>
+                            <div class="form-group">
+                                <label>Caller ID (DN):</label>
+                                <input type="text" id="sipCallerId" placeholder="+18085551234 (optional)" maxlength="32">
                             </div>
                             <div class="form-group">
                                 <label>Registrar:</label>
