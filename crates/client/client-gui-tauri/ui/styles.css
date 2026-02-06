@@ -779,6 +779,118 @@ body {
     color: var(--md-sys-color-on-error-container);
 }
 
+/* ===== Recents Section ===== */
+.recents-section {
+    max-width: 560px;
+    margin: 0 auto;
+}
+
+.recents-title {
+    font: var(--md-sys-typescale-headline-small);
+    color: var(--md-sys-color-on-surface);
+    margin-bottom: 24px;
+    padding: 0 4px;
+}
+
+.recents-list {
+    max-height: 600px;
+    overflow-y: auto;
+}
+
+.recent-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px;
+    background: var(--md-sys-color-surface-container);
+    border-radius: var(--md-sys-shape-corner-medium);
+    margin-bottom: 8px;
+    transition: background var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard);
+    cursor: pointer;
+}
+
+.recent-item:hover {
+    background: var(--md-sys-color-surface-container-high);
+}
+
+.recent-item-main {
+    display: flex;
+    align-items: center;
+    flex: 1;
+    gap: 12px;
+}
+
+.recent-direction-icon {
+    width: 24px;
+    height: 24px;
+    flex-shrink: 0;
+}
+
+.recent-direction-icon.outbound {
+    color: var(--md-sys-color-primary);
+    transform: rotate(-45deg);
+}
+
+.recent-direction-icon.inbound {
+    color: var(--md-sys-color-success);
+    transform: rotate(135deg);
+}
+
+.recent-direction-icon.missed {
+    color: var(--md-sys-color-error);
+}
+
+.recent-info {
+    flex: 1;
+    min-width: 0;
+}
+
+.recent-name {
+    font: var(--md-sys-typescale-title-medium);
+    color: var(--md-sys-color-on-surface);
+    margin-bottom: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.recent-uri {
+    font: var(--md-sys-typescale-body-small);
+    color: var(--md-sys-color-on-surface-variant);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.recent-meta {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 4px;
+}
+
+.recent-time {
+    font: var(--md-sys-typescale-body-small);
+    color: var(--md-sys-color-on-surface-variant);
+    white-space: nowrap;
+}
+
+.recent-duration {
+    font: var(--md-sys-typescale-body-small);
+    color: var(--md-sys-color-on-surface-variant);
+    white-space: nowrap;
+}
+
+.recents-list:empty::after {
+    content: 'No call history';
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 200px;
+    color: var(--md-sys-color-on-surface-variant);
+    font: var(--md-sys-typescale-body-large);
+}
+
 /* ===== Call Section ===== */
 .call-section {
     max-width: 400px;
@@ -792,6 +904,12 @@ body {
     border-radius: var(--md-sys-shape-corner-extra-large);
     margin-bottom: 32px;
     box-shadow: var(--md-sys-elevation-level1);
+    display: none; /* Hidden by default */
+    text-align: center;
+}
+
+.call-info.visible {
+    display: block;
 }
 
 .call-status {

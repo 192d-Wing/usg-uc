@@ -15,7 +15,7 @@ use client_core::{
     AppEvent, AppState as CoreAppState, CertificateStore, ClientApp, ContactManager,
     SettingsManager, run_udp_receive_loop,
 };
-use client_types::{CertificateInfo, Contact, SipAccount, SmartCardPin};
+use client_types::{CallHistoryEntry, CertificateInfo, Contact, SipAccount, SmartCardPin};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -499,6 +499,17 @@ async fn search_contacts(query: String, state: State<'_, TauriAppState>) -> Resu
     let contacts: Vec<Contact> = manager.search_contacts(&query).into_iter().cloned().collect();
 
     Ok(contacts)
+}
+
+/// Get call history.
+#[tauri::command]
+async fn get_call_history(state: State<'_, TauriAppState>) -> Result<Vec<CallHistoryEntry>, String> {
+    info!("Fetching call history");
+
+    let manager = state.contact_manager.read().await;
+    let history: Vec<CallHistoryEntry> = manager.call_history().into_iter().cloned().collect();
+
+    Ok(history)
 }
 
 /// Get SIP registration settings.
@@ -1415,6 +1426,7 @@ fn main() {
             update_contact,
             delete_contact,
             search_contacts,
+            get_call_history,
             get_sip_settings,
             update_sip_settings,
             save_sip_settings,
