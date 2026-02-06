@@ -191,14 +191,19 @@ async fn initialize_client(state: State<'_, TauriAppState>) -> Result<(), String
     tauri::async_runtime::spawn(async move {
         info!("Starting SIP event polling loop");
         loop {
-            {
-                let mut guard = client_arc.lock().await;
-                if let Some(ref mut client) = *guard {
-                    if let Err(e) = client.poll_events().await {
-                        error!(error = %e, "Error polling SIP events");
+            // Use try_lock to avoid blocking other commands (like end_call)
+            // If the lock is held by a command, we'll just skip this poll cycle
+            match client_arc.try_lock() {
+                Ok(mut guard) => {
+                    if let Some(ref mut client) = *guard {
+                        if let Err(e) = client.poll_events().await {
+                            error!(error = %e, "Error polling SIP events");
+                        }
                     }
-                } else {
-                    warn!("Client not available in polling loop");
+                }
+                Err(_) => {
+                    // Lock is held by another task (e.g., end_call command)
+                    // This is expected and fine - we'll poll on next iteration
                 }
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -236,23 +241,34 @@ async fn make_call(target: String, state: State<'_, TauriAppState>) -> Result<St
 /// End the current call.
 #[tauri::command]
 async fn end_call(state: State<'_, TauriAppState>) -> Result<(), String> {
-    info!("Ending call");
+    info!("end_call command invoked");
 
     let mut client_guard = state.client.lock().await;
     let client = client_guard
         .as_mut()
-        .ok_or_else(|| "Client not initialized".to_string())?;
+        .ok_or_else(|| {
+            error!("end_call: Client not initialized");
+            "Client not initialized".to_string()
+        })?;
 
-    client
-        .hangup()
-        .await
-        .map_err(|e| format!("Failed to end call: {e}"))?;
+    info!("end_call: calling client.hangup()");
+    match client.hangup().await {
+        Ok(()) => {
+            info!("end_call: hangup() succeeded");
+        }
+        Err(e) => {
+            error!(error = %e, "end_call: hangup() failed");
+            return Err(format!("Failed to end call: {e}"));
+        }
+    }
 
     // Poll events to send BYE/CANCEL request
+    info!("end_call: polling events to send BYE/CANCEL");
     if let Err(e) = client.poll_events().await {
         warn!(error = %e, "Error polling events after end_call");
     }
 
+    info!("end_call: completed successfully");
     Ok(())
 }
 
@@ -880,6 +896,78 @@ async fn set_output_device(device_name: Option<String>, state: State<'_, TauriAp
     Ok(())
 }
 
+/// Audio settings for the frontend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioSettings {
+    /// Preferred codec for calls.
+    pub preferred_codec: String,
+    /// Echo cancellation enabled.
+    pub echo_cancellation: bool,
+    /// Noise suppression enabled.
+    pub noise_suppression: bool,
+    /// Jitter buffer minimum depth in milliseconds.
+    pub jitter_buffer_min_ms: u32,
+    /// Jitter buffer maximum depth in milliseconds.
+    pub jitter_buffer_max_ms: u32,
+}
+
+/// Get audio settings.
+#[tauri::command]
+async fn get_audio_settings(state: State<'_, TauriAppState>) -> Result<AudioSettings, String> {
+    info!("Fetching audio settings");
+
+    let manager = state.settings_manager.read().await;
+    let audio = &manager.settings().audio;
+
+    let codec_str = match audio.preferred_codec {
+        client_types::CodecPreference::Opus => "opus",
+        client_types::CodecPreference::G722 => "g722",
+        client_types::CodecPreference::G711Ulaw => "g711_ulaw",
+        client_types::CodecPreference::G711Alaw => "g711_alaw",
+    };
+
+    Ok(AudioSettings {
+        preferred_codec: codec_str.to_string(),
+        echo_cancellation: audio.echo_cancellation,
+        noise_suppression: audio.noise_suppression,
+        jitter_buffer_min_ms: audio.jitter_buffer_min_ms,
+        jitter_buffer_max_ms: audio.jitter_buffer_max_ms,
+    })
+}
+
+/// Save audio settings.
+#[tauri::command]
+async fn save_audio_settings(settings: AudioSettings, state: State<'_, TauriAppState>) -> Result<(), String> {
+    info!("Saving audio settings: codec={}", settings.preferred_codec);
+
+    let mut manager = state.settings_manager.write().await;
+
+    // Parse codec preference
+    let codec = match settings.preferred_codec.as_str() {
+        "opus" => client_types::CodecPreference::Opus,
+        "g722" => client_types::CodecPreference::G722,
+        "g711_ulaw" => client_types::CodecPreference::G711Ulaw,
+        "g711_alaw" => client_types::CodecPreference::G711Alaw,
+        _ => client_types::CodecPreference::Opus, // Default to Opus
+    };
+
+    {
+        let audio = &mut manager.settings_mut().audio;
+        audio.preferred_codec = codec;
+        audio.echo_cancellation = settings.echo_cancellation;
+        audio.noise_suppression = settings.noise_suppression;
+        audio.jitter_buffer_min_ms = settings.jitter_buffer_min_ms;
+        audio.jitter_buffer_max_ms = settings.jitter_buffer_max_ms;
+    }
+
+    manager
+        .save()
+        .map_err(|e| format!("Failed to save audio settings: {e}"))?;
+
+    info!("Audio settings saved");
+    Ok(())
+}
+
 // ============================================================================
 // Smart Card / Certificate Commands
 // ============================================================================
@@ -1317,6 +1405,9 @@ fn main() {
             get_output_devices,
             set_input_device,
             set_output_device,
+            // Audio settings commands
+            get_audio_settings,
+            save_audio_settings,
             // Smart card / certificate commands
             get_certificates,
             get_selected_certificate,

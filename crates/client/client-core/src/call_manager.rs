@@ -394,10 +394,19 @@ impl CallManager {
 
     /// Hangs up the currently focused call.
     pub async fn hangup(&mut self) -> AppResult<()> {
+        info!(
+            focused_call_id = ?self.focused_call_id,
+            active_calls = ?self.active_calls,
+            "hangup() called"
+        );
+
         let call_id = self
             .focused_call_id
             .as_ref()
-            .ok_or_else(|| AppError::Sip("No active call".to_string()))?
+            .ok_or_else(|| {
+                error!("hangup() failed: No focused call. active_calls: {:?}", self.active_calls);
+                AppError::Sip("No active call".to_string())
+            })?
             .clone();
 
         self.hangup_call(&call_id).await
@@ -405,10 +414,11 @@ impl CallManager {
 
     /// Hangs up a specific call.
     pub async fn hangup_call(&mut self, call_id: &str) -> AppResult<()> {
-        info!(call_id = %call_id, "Hanging up call");
+        info!(call_id = %call_id, "hangup_call() called");
 
         // Get call info before hangup
         let call_info = self.call_agent.get_call_info(call_id);
+        debug!(call_id = %call_id, call_info = ?call_info, "Call info before hangup");
 
         // Send hangup via SIP UA
         self.call_agent

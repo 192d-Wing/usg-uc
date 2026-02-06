@@ -1473,9 +1473,13 @@ function initializeSettings() {
     const saveContactBtn = document.getElementById('saveContactBtn');
     const cancelContactBtn = document.getElementById('cancelContactBtn');
     const saveSipSettingsBtn = document.getElementById('saveSipSettingsBtn');
+    const saveAudioSettingsBtn = document.getElementById('saveAudioSettingsBtn');
 
     // Load SIP settings on init
     loadSipSettings();
+
+    // Load audio settings on init
+    loadAudioSettings();
 
     // Save SIP settings button
     if (saveSipSettingsBtn) {
@@ -1486,6 +1490,13 @@ function initializeSettings() {
         });
     } else {
         console.error('Save SIP Settings button NOT found!');
+    }
+
+    // Save audio settings button
+    if (saveAudioSettingsBtn) {
+        saveAudioSettingsBtn.addEventListener('click', async () => {
+            await saveAudioSettings();
+        });
     }
 
     // Open config file button
@@ -2052,5 +2063,55 @@ async function saveSipSettings() {
     } catch (error) {
         console.error('Failed to save SIP settings:', error);
         safeAlert('Failed to save SIP settings: ' + error);
+    }
+}
+
+// ============================================================================
+// Audio Settings Management
+// ============================================================================
+
+// Load audio settings from backend
+async function loadAudioSettings() {
+    try {
+        const settings = await invoke('get_audio_settings');
+        if (settings) {
+            const codecSelect = document.getElementById('audioCodec');
+            const echoCancellationCheckbox = document.getElementById('audioEchoCancellation');
+            const noiseSuppressionCheckbox = document.getElementById('audioNoiseSuppression');
+
+            if (codecSelect) codecSelect.value = settings.preferred_codec || 'opus';
+            if (echoCancellationCheckbox) echoCancellationCheckbox.checked = settings.echo_cancellation !== false;
+            if (noiseSuppressionCheckbox) noiseSuppressionCheckbox.checked = settings.noise_suppression !== false;
+
+            console.log('Audio settings loaded: codec=' + settings.preferred_codec);
+        }
+    } catch (error) {
+        console.log('Could not load audio settings:', error);
+    }
+}
+
+// Save audio settings to backend
+async function saveAudioSettings() {
+    if (!rateLimiter.canCall('save_audio_settings')) return;
+
+    const preferredCodec = document.getElementById('audioCodec')?.value || 'opus';
+    const echoCancellation = document.getElementById('audioEchoCancellation')?.checked !== false;
+    const noiseSuppression = document.getElementById('audioNoiseSuppression')?.checked !== false;
+
+    const settings = {
+        preferred_codec: preferredCodec,
+        echo_cancellation: echoCancellation,
+        noise_suppression: noiseSuppression,
+        jitter_buffer_min_ms: 20,  // Default values
+        jitter_buffer_max_ms: 200,
+    };
+
+    try {
+        await invoke('save_audio_settings', { settings });
+        safeAlert('Audio settings saved successfully');
+        console.log('Audio settings saved: codec=' + preferredCodec);
+    } catch (error) {
+        console.error('Failed to save audio settings:', error);
+        safeAlert('Failed to save audio settings: ' + error);
     }
 }

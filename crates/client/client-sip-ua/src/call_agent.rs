@@ -311,13 +311,26 @@ impl CallAgent {
 
     /// Hangs up an active call.
     pub async fn hangup(&mut self, call_id: &str) -> SipUaResult<()> {
+        debug!(
+            call_id = %call_id,
+            known_calls = ?self.calls.keys().collect::<Vec<_>>(),
+            "CallAgent::hangup() looking up call"
+        );
+
         let state = self
             .calls
             .get(call_id)
-            .ok_or_else(|| SipUaError::InvalidState("Call not found".to_string()))?
+            .ok_or_else(|| {
+                error!(
+                    call_id = %call_id,
+                    known_calls = ?self.calls.keys().collect::<Vec<_>>(),
+                    "CallAgent::hangup() - Call not found in calls map"
+                );
+                SipUaError::InvalidState("Call not found".to_string())
+            })?
             .state;
 
-        info!(call_id = %call_id, state = ?state, "Hanging up call");
+        info!(call_id = %call_id, state = ?state, "CallAgent::hangup() - hanging up call");
 
         match state {
             CallState::Dialing | CallState::Ringing | CallState::EarlyMedia => {
