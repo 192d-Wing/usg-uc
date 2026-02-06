@@ -903,6 +903,21 @@ async fn get_call_status(state: State<'_, TauriAppState>) -> Result<CallStatus, 
     result
 }
 
+/// Get call quality metrics for the active call.
+#[tauri::command]
+async fn get_call_quality_metrics(
+    state: State<'_, TauriAppState>,
+) -> Result<Option<client_types::CallQualityMetrics>, String> {
+    let client_guard = state.client.lock().await;
+
+    let result = match client_guard.as_ref() {
+        Some(client) => Ok(client.call_quality_metrics()),
+        None => Ok(None),
+    };
+    drop(client_guard);
+    result
+}
+
 /// Get available input (microphone) devices.
 #[tauri::command]
 async fn get_input_devices(
@@ -1572,6 +1587,7 @@ fn main() {
             unregister_sip,
             get_registration_status,
             get_call_status,
+            get_call_quality_metrics,
             get_input_devices,
             get_output_devices,
             set_input_device,
