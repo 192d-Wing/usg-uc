@@ -7,6 +7,7 @@
 //! it receives RTP packets from the socket and pushes them into the
 //! shared jitter buffer for the decode thread.
 
+use crate::audio_processing::AudioProcessor;
 use crate::codec::CodecPipeline;
 use crate::file_source::FileAudioSource;
 use crate::pipeline::{PipelineStats, resample};
@@ -179,6 +180,9 @@ fn io_loop(
         capture_interval.as_millis()
     );
 
+    // Audio processing (AGC + noise gate) for capture path
+    let mut audio_processor = AudioProcessor::new();
+
     let mut last_capture = Instant::now();
     let mut stats_update_counter: u32 = 0;
 
@@ -222,6 +226,7 @@ fn io_loop(
                     &mut codec,
                     &mut transmitter,
                     &mut capture,
+                    &mut audio_processor,
                     capture_device_samples,
                     codec_samples,
                     &stats,
@@ -285,6 +290,7 @@ fn process_capture_frame(
     codec: &mut CodecPipeline,
     transmitter: &mut RtpTransmitter,
     capture: &mut CaptureStream,
+    audio_processor: &mut AudioProcessor,
     device_samples: usize,
     codec_samples: usize,
     stats: &Arc<Mutex<PipelineStats>>,
@@ -304,7 +310,10 @@ fn process_capture_frame(
         device_pcm[samples_read..].fill(0);
     }
 
-    // Track max amplitude for diagnostics (detect silent mic)
+    // Apply audio processing (noise gate + AGC) at device rate
+    audio_processor.process(&mut device_pcm[..samples_read]);
+
+    // Track max amplitude for diagnostics AFTER processing
     let max_amp = device_pcm[..samples_read]
         .iter()
         .map(|s| s.abs())

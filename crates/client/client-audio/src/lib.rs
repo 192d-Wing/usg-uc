@@ -60,6 +60,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![cfg_attr(test, allow(clippy::panic))]
 
+pub mod audio_processing;
 pub mod codec;
 pub mod decode_thread;
 pub mod device;
@@ -73,6 +74,7 @@ pub mod ringtone;
 pub mod rtp_handler;
 pub mod stream;
 
+pub use audio_processing::AudioProcessor;
 pub use codec::{CodecPipeline, negotiate_codec};
 pub use decode_thread::DecodeThreadHandle;
 pub use device::{
