@@ -19,10 +19,10 @@ fn get_device_name(device: &cpal::Device) -> String {
     device.name().unwrap_or_else(|_| "Unknown".to_string())
 }
 
-/// Size of the ring buffer in samples (2 seconds at 48kHz).
-/// Large buffer gives ample headroom for decode thread scheduling
+/// Target ring buffer duration in seconds.
+/// 2 seconds gives ample headroom for decode thread scheduling
 /// jitter without causing CPAL playback underruns.
-const RING_BUFFER_SIZE: usize = 96000;
+const RING_BUFFER_DURATION_SECS: u32 = 2;
 
 /// Audio sample type used internally.
 pub type Sample = i16;
@@ -54,8 +54,9 @@ impl CaptureStream {
 
         let sample_rate = config.sample_rate;
 
-        // Create ring buffer for passing samples from callback to consumer
-        let ring = HeapRb::<Sample>::new(RING_BUFFER_SIZE);
+        // Create ring buffer scaled to actual sample rate (~2 seconds)
+        let ring_size = (sample_rate * RING_BUFFER_DURATION_SECS) as usize;
+        let ring = HeapRb::<Sample>::new(ring_size);
         let (producer, consumer) = ring.split();
 
         let is_running = Arc::new(AtomicBool::new(true));
@@ -230,8 +231,9 @@ impl PlaybackStream {
 
         let sample_rate = config.sample_rate;
 
-        // Create ring buffer for passing samples from producer to callback
-        let ring = HeapRb::<Sample>::new(RING_BUFFER_SIZE);
+        // Create ring buffer scaled to actual sample rate (~2 seconds)
+        let ring_size = (sample_rate * RING_BUFFER_DURATION_SECS) as usize;
+        let ring = HeapRb::<Sample>::new(ring_size);
         let (producer, consumer) = ring.split();
 
         let is_running = Arc::new(AtomicBool::new(true));

@@ -26,6 +26,16 @@ pub const SAMPLE_RATE_48KHZ: u32 = 48000;
 /// Default sample rate for audio streams.
 pub const DEFAULT_SAMPLE_RATE: u32 = SAMPLE_RATE_48KHZ;
 
+/// VoIP-friendly sample rates in preference order.
+///
+/// These rates produce integer resampling ratios with common VoIP codecs
+/// (G.711 at 8kHz, G.722 at 16kHz), which use the fast-path integer
+/// resampler for best audio quality. Non-integer ratios (e.g., 44100Hz)
+/// fall back to cubic interpolation which is good but not ideal.
+///
+/// Preference: 48kHz (6:1) > 16kHz (2:1) > 8kHz (1:1) > 32kHz (4:1) > 24kHz (3:1)
+const VOIP_PREFERRED_RATES: &[u32] = &[48000, 16000, 8000, 32000, 24000];
+
 /// Number of audio channels (mono for VoIP).
 pub const CHANNELS: u16 = 1;
 
@@ -214,6 +224,9 @@ impl DeviceManager {
     }
 
     /// Gets the supported stream configuration for an input device.
+    ///
+    /// Tries VoIP-friendly sample rates in preference order to get an
+    /// integer resampling ratio with common codecs (8kHz, 16kHz).
     pub fn get_input_config(&self, device: &cpal::Device) -> AudioResult<cpal::StreamConfig> {
         let default_config = device
             .default_input_config()
@@ -223,33 +236,38 @@ impl DeviceManager {
         // The stream callback handles stereo→mono mixdown.
         let device_channels = default_config.channels();
 
-        // Try to get a config that supports our preferred sample rate
-        let supported_configs = device.supported_input_configs().map_err(|e| {
-            AudioError::StreamError(format!("Failed to get supported configs: {e}"))
-        })?;
+        // Collect supported rate ranges for the device's channel count
+        let supported_ranges: Vec<_> = device
+            .supported_input_configs()
+            .map_err(|e| {
+                AudioError::StreamError(format!("Failed to get supported configs: {e}"))
+            })?
+            .filter(|r| r.channels() == device_channels)
+            .collect();
 
-        for config_range in supported_configs {
-            if config_range.channels() == device_channels {
-                let min = config_range.min_sample_rate();
-                let max = config_range.max_sample_rate();
-                if min <= DEFAULT_SAMPLE_RATE && max >= DEFAULT_SAMPLE_RATE {
-                    debug!(
-                        "Input config: {}Hz, {} channels (preferred)",
-                        DEFAULT_SAMPLE_RATE, device_channels
-                    );
-                    return Ok(cpal::StreamConfig {
-                        channels: device_channels,
-                        sample_rate: DEFAULT_SAMPLE_RATE,
-                        buffer_size: cpal::BufferSize::Default,
-                    });
-                }
+        // Try VoIP-friendly rates in preference order
+        for &rate in VOIP_PREFERRED_RATES {
+            if supported_ranges
+                .iter()
+                .any(|r| r.min_sample_rate() <= rate && r.max_sample_rate() >= rate)
+            {
+                info!(
+                    "Input config: {}Hz, {} channels (VoIP-optimized)",
+                    rate, device_channels
+                );
+                return Ok(cpal::StreamConfig {
+                    channels: device_channels,
+                    sample_rate: rate,
+                    buffer_size: cpal::BufferSize::Default,
+                });
             }
         }
 
         // Fall back to default config
-        debug!(
+        info!(
             "Input config: {}Hz, {} channels (device default)",
-            default_config.sample_rate(), device_channels
+            default_config.sample_rate(),
+            device_channels
         );
         Ok(cpal::StreamConfig {
             channels: device_channels,
@@ -259,6 +277,9 @@ impl DeviceManager {
     }
 
     /// Gets the supported stream configuration for an output device.
+    ///
+    /// Tries VoIP-friendly sample rates in preference order to get an
+    /// integer resampling ratio with common codecs (8kHz, 16kHz).
     pub fn get_output_config(&self, device: &cpal::Device) -> AudioResult<cpal::StreamConfig> {
         let default_config = device
             .default_output_config()
@@ -269,33 +290,38 @@ impl DeviceManager {
         // The stream callback handles mono↔stereo expansion.
         let device_channels = default_config.channels();
 
-        // Try to get a config that supports our preferred sample rate
-        let supported_configs = device.supported_output_configs().map_err(|e| {
-            AudioError::StreamError(format!("Failed to get supported configs: {e}"))
-        })?;
+        // Collect supported rate ranges for the device's channel count
+        let supported_ranges: Vec<_> = device
+            .supported_output_configs()
+            .map_err(|e| {
+                AudioError::StreamError(format!("Failed to get supported configs: {e}"))
+            })?
+            .filter(|r| r.channels() == device_channels)
+            .collect();
 
-        for config_range in supported_configs {
-            if config_range.channels() == device_channels {
-                let min = config_range.min_sample_rate();
-                let max = config_range.max_sample_rate();
-                if min <= DEFAULT_SAMPLE_RATE && max >= DEFAULT_SAMPLE_RATE {
-                    debug!(
-                        "Output config: {}Hz, {} channels (preferred)",
-                        DEFAULT_SAMPLE_RATE, device_channels
-                    );
-                    return Ok(cpal::StreamConfig {
-                        channels: device_channels,
-                        sample_rate: DEFAULT_SAMPLE_RATE,
-                        buffer_size: cpal::BufferSize::Default,
-                    });
-                }
+        // Try VoIP-friendly rates in preference order
+        for &rate in VOIP_PREFERRED_RATES {
+            if supported_ranges
+                .iter()
+                .any(|r| r.min_sample_rate() <= rate && r.max_sample_rate() >= rate)
+            {
+                info!(
+                    "Output config: {}Hz, {} channels (VoIP-optimized)",
+                    rate, device_channels
+                );
+                return Ok(cpal::StreamConfig {
+                    channels: device_channels,
+                    sample_rate: rate,
+                    buffer_size: cpal::BufferSize::Default,
+                });
             }
         }
 
         // Fall back to default config
-        debug!(
+        info!(
             "Output config: {}Hz, {} channels (device default)",
-            default_config.sample_rate(), device_channels
+            default_config.sample_rate(),
+            device_channels
         );
         Ok(cpal::StreamConfig {
             channels: device_channels,

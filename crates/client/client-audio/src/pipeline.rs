@@ -521,31 +521,47 @@ pub(crate) fn resample(input: &[i16], output_len: usize, prev_sample: i16) -> Ve
         return output;
     }
 
-    // General case: linear interpolation for non-integer ratios.
-    // Uses a virtual extended input where index -1 = prev_sample, enabling
-    // smooth cross-frame continuity for upsampling (e.g., 160→882 for 8kHz→44.1kHz).
+    // General case: Catmull-Rom cubic interpolation for non-integer ratios.
+    // Uses 4 input points per output sample for smooth curves, eliminating
+    // the imaging artifacts of linear interpolation on large upsampling
+    // ratios (e.g., 160→882 for 8kHz→44.1kHz, 5.5x).
     let mut output = Vec::with_capacity(output_len);
-    // Map output indices [0..output_len) to virtual input positions [-1..in_len-1],
-    // i.e., from prev_sample through the last input sample.
-    let virtual_len = in_len + 1; // includes prev_sample slot
-    let step = (virtual_len - 1) as f64 / (output_len).max(1) as f64;
+    let step = in_len as f64 / output_len as f64;
+
+    // Helper to fetch input sample with boundary clamping.
+    // Index -1 maps to prev_sample for cross-frame continuity.
+    let sample_at = |idx: i32| -> f64 {
+        if idx < 0 {
+            prev_sample as f64
+        } else if (idx as usize) < in_len {
+            input[idx as usize] as f64
+        } else {
+            input[in_len - 1] as f64
+        }
+    };
 
     for i in 0..output_len {
-        // pos in virtual input space: 0.0 = prev_sample, 1.0 = input[0], etc.
-        let pos = (i + 1) as f64 * step;
-        let idx = pos as usize; // virtual index
-        let frac = pos - idx as f64;
+        let pos = i as f64 * step;
+        let idx = pos.floor() as i32;
+        let t = pos - idx as f64;
 
-        // Map virtual index to actual samples
-        let s0 = if idx == 0 {
-            prev_sample as f64
-        } else {
-            input[(idx - 1).min(in_len - 1)] as f64
-        };
-        let s1 = input[idx.min(in_len - 1)] as f64;
+        // Four points for Catmull-Rom: p0, p1, p2, p3
+        let p0 = sample_at(idx - 1);
+        let p1 = sample_at(idx);
+        let p2 = sample_at(idx + 1);
+        let p3 = sample_at(idx + 2);
 
-        let sample = s0 * (1.0 - frac) + s1 * frac;
-        output.push(sample.round() as i16);
+        // Catmull-Rom spline formula
+        let t2 = t * t;
+        let t3 = t2 * t;
+        let sample = 0.5
+            * ((2.0 * p1)
+                + (-p0 + p2) * t
+                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3);
+
+        // Clamp to i16 range to prevent overflow from cubic overshoot
+        output.push(sample.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16);
     }
 
     output
