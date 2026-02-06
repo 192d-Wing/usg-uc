@@ -1263,6 +1263,7 @@ async fn poll_events(app_handle: AppHandle, event_rx: Arc<Mutex<Option<mpsc::Rec
         };
 
         if let Some(event) = event {
+            info!("poll_events: Received AppEvent: {:?}", event);
             // Emit event to frontend
             let event_name = match &event {
                 AppEvent::RegistrationStateChanged { .. } => "registration-state-changed",
@@ -1352,6 +1353,7 @@ async fn poll_events(app_handle: AppHandle, event_rx: Arc<Mutex<Option<mpsc::Rec
                 }
             };
 
+            info!("poll_events: Emitting event '{}' to frontend", event_name);
             if let Err(e) = app_handle.emit(event_name, payload) {
                 warn!("Failed to emit event {}: {}", event_name, e);
             }

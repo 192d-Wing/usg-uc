@@ -139,7 +139,6 @@ pub struct ClientApp {
     /// Registration event receiver.
     reg_event_rx: mpsc::Receiver<RegistrationEvent>,
     /// Call manager event receiver.
-    #[allow(dead_code)]
     call_event_rx: mpsc::Receiver<CallManagerEvent>,
     /// Transport event receiver.
     transport_event_rx: Option<mpsc::Receiver<TransportEvent>>,
@@ -703,14 +702,20 @@ impl ClientApp {
                 }
 
                 // Notify GUI
-                let _ = self
+                info!(call_id = %call_id, state = ?state, "Sending AppEvent::CallStateChanged to GUI");
+                if let Err(e) = self
                     .app_event_tx
                     .send(AppEvent::CallStateChanged {
                         call_id,
                         state,
                         info,
                     })
-                    .await;
+                    .await
+                {
+                    error!(error = %e, "Failed to send AppEvent::CallStateChanged to GUI");
+                } else {
+                    info!("AppEvent::CallStateChanged sent successfully to GUI channel");
+                }
             }
             CallManagerEvent::IncomingCall {
                 call_id,
@@ -763,10 +768,31 @@ impl ClientApp {
                 destination,
             } => {
                 // Forward response to transport layer
-                debug!(status = response.status.code(), destination = %destination, "Sending SIP response");
+                // Detect transport type from Via header
+                let via_header = response
+                    .headers
+                    .get_value(&proto_sip::header::HeaderName::Via);
+                let use_udp = via_header
+                    .as_ref()
+                    .map(|via| via.contains("/UDP"))
+                    .unwrap_or(false);
+
+                info!(
+                    status = response.status.code(),
+                    destination = %destination,
+                    via = ?via_header,
+                    use_udp = use_udp,
+                    "Sending SIP response"
+                );
 
                 if let Some(transport) = &self.sip_transport {
-                    if let Err(e) = transport.send_response(&response, destination).await {
+                    let result = if use_udp {
+                        transport.send_response_udp(&response, destination).await
+                    } else {
+                        transport.send_response(&response, destination).await
+                    };
+
+                    if let Err(e) = result {
                         error!(error = %e, "Failed to send SIP response");
                     }
                 } else {
@@ -921,6 +947,17 @@ impl ClientApp {
         }
         for event in call_events {
             self.handle_call_agent_event(event).await?;
+        }
+
+        // Collect call manager events (state changes, responses to send, etc.)
+        let call_mgr_events: Vec<_> =
+            std::iter::from_fn(|| self.call_event_rx.try_recv().ok()).collect();
+        if !call_mgr_events.is_empty() {
+            info!(count = call_mgr_events.len(), "Processing call manager events");
+        }
+        for event in call_mgr_events {
+            info!(event = ?event, "Handling call manager event");
+            self.handle_call_event(event).await?;
         }
 
         // Check for expiring registrations and trigger refresh

@@ -865,6 +865,50 @@ impl SipTransport {
         Ok(())
     }
 
+    /// Sends a SIP response via UDP (connectionless).
+    ///
+    /// Used for responding to requests received via UDP (e.g., BYE, CANCEL).
+    pub async fn send_response_udp(
+        &self,
+        response: &SipResponse,
+        destination: SocketAddr,
+    ) -> AppResult<()> {
+        info!(
+            status = response.status.code(),
+            destination = %destination,
+            "Sending SIP response via UDP"
+        );
+
+        // Get or create UDP socket
+        let (socket, is_new) = self.get_or_create_udp_socket().await?;
+
+        // Log socket info for debugging
+        if let Ok(local_addr) = socket.local_addr() {
+            info!(
+                local_addr = %local_addr,
+                is_new_socket = is_new,
+                socket_ptr = ?Arc::as_ptr(&socket),
+                "Using UDP socket for response send"
+            );
+        }
+
+        // Serialize and send
+        let message_bytes = response.to_string();
+        debug!(
+            destination = %destination,
+            size = message_bytes.len(),
+            status = response.status.code(),
+            "Sending SIP response via UDP"
+        );
+
+        socket
+            .send_to(message_bytes.as_bytes(), destination)
+            .await
+            .map_err(|e| AppError::Sip(format!("Failed to send UDP response to {destination}: {e}")))?;
+
+        Ok(())
+    }
+
 
     /// Establishes a TLS connection to a peer.
     async fn connect(&self, peer: SocketAddr) -> AppResult<()> {

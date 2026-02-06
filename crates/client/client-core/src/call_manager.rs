@@ -910,13 +910,17 @@ impl CallManager {
 
         // Always send 200 OK response for BYE
         let ok_response = build_response_from_request(request, StatusCode::OK, None);
-        let _ = self
+        info!(destination = %source, "Queueing 200 OK response for BYE");
+        if let Err(e) = self
             .app_event_tx
             .send(CallManagerEvent::SendResponse {
                 response: ok_response,
                 destination: source,
             })
-            .await;
+            .await
+        {
+            error!(error = %e, "Failed to queue 200 OK response for BYE");
+        }
 
         if let Some(call_id) = self.find_call_by_sip_id(&sip_call_id) {
             info!(call_id = %call_id, sip_call_id = %sip_call_id, "Remote party sent BYE, terminating call");
@@ -1519,14 +1523,18 @@ impl CallManager {
         }
 
         // Notify application
-        let _ = self
+        info!(call_id = %call_id, state = ?state, "Queueing CallStateChanged event");
+        if let Err(e) = self
             .app_event_tx
             .send(CallManagerEvent::CallStateChanged {
                 call_id: call_id.to_string(),
                 state,
                 info: call_info,
             })
-            .await;
+            .await
+        {
+            error!(error = %e, "Failed to queue CallStateChanged event");
+        }
 
         Ok(())
     }
