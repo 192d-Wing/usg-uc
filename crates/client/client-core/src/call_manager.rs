@@ -1552,43 +1552,72 @@ impl CallManager {
         session: &MediaSession,
         account: &SipAccount,
     ) -> AppResult<String> {
-        let creds = session.local_ice_credentials();
-        let fingerprint = session.local_dtls_fingerprint();
         let ssrc = session.local_ssrc();
 
         // Discover actual local IP if configured with 0.0.0.0
         let effective_media_addr = self.get_effective_media_addr()?;
 
-        // Generate basic SDP offer
-        // In production, this would use proto-sdp properly
-        let sdp = format!(
-            "v=0\r\n\
-             o=- {session_id} {session_version} IN IP4 {ip}\r\n\
-             s=USG SIP Client\r\n\
-             c=IN IP4 {ip}\r\n\
-             t=0 0\r\n\
-             m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8\r\n\
-             a=rtpmap:111 opus/48000/2\r\n\
-             a=rtpmap:0 PCMU/8000\r\n\
-             a=rtpmap:8 PCMA/8000\r\n\
-             a=ice-ufrag:{ufrag}\r\n\
-             a=ice-pwd:{pwd}\r\n\
-             a=fingerprint:sha-384 {fingerprint}\r\n\
-             a=setup:actpass\r\n\
-             a=mid:audio\r\n\
-             a=sendrecv\r\n\
-             a=rtcp-mux\r\n\
-             a=ssrc:{ssrc} cname:{cname}\r\n",
-            session_id = session_id(),
-            session_version = 1,
-            ip = effective_media_addr.ip(),
-            port = effective_media_addr.port(),
-            ufrag = creds.ufrag,
-            pwd = creds.pwd,
-            fingerprint = fingerprint,
-            ssrc = ssrc,
-            cname = account.id,
+        // Check if we're using TLS/secure transport
+        let use_srtp = matches!(
+            account.transport,
+            client_types::TransportPreference::TlsOnly
         );
+
+        // Generate SDP based on transport security
+        let sdp = if use_srtp {
+            // Secure RTP with ICE and DTLS fingerprint
+            let creds = session.local_ice_credentials();
+            let fingerprint = session.local_dtls_fingerprint();
+
+            format!(
+                "v=0\r\n\
+                 o=- {session_id} {session_version} IN IP4 {ip}\r\n\
+                 s=USG SIP Client\r\n\
+                 c=IN IP4 {ip}\r\n\
+                 t=0 0\r\n\
+                 m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8\r\n\
+                 a=rtpmap:111 opus/48000/2\r\n\
+                 a=rtpmap:0 PCMU/8000\r\n\
+                 a=rtpmap:8 PCMA/8000\r\n\
+                 a=ice-ufrag:{ufrag}\r\n\
+                 a=ice-pwd:{pwd}\r\n\
+                 a=fingerprint:sha-384 {fingerprint}\r\n\
+                 a=setup:actpass\r\n\
+                 a=mid:audio\r\n\
+                 a=sendrecv\r\n\
+                 a=rtcp-mux\r\n\
+                 a=ssrc:{ssrc} cname:{cname}\r\n",
+                session_id = session_id(),
+                session_version = 1,
+                ip = effective_media_addr.ip(),
+                port = effective_media_addr.port(),
+                ufrag = creds.ufrag,
+                pwd = creds.pwd,
+                fingerprint = fingerprint,
+                ssrc = ssrc,
+                cname = account.id,
+            )
+        } else {
+            // Plain RTP (no SRTP, no ICE, no DTLS)
+            format!(
+                "v=0\r\n\
+                 o=- {session_id} {session_version} IN IP4 {ip}\r\n\
+                 s=USG SIP Client\r\n\
+                 c=IN IP4 {ip}\r\n\
+                 t=0 0\r\n\
+                 m=audio {port} RTP/AVP 0 8\r\n\
+                 a=rtpmap:0 PCMU/8000\r\n\
+                 a=rtpmap:8 PCMA/8000\r\n\
+                 a=sendrecv\r\n\
+                 a=ssrc:{ssrc} cname:{cname}\r\n",
+                session_id = session_id(),
+                session_version = 1,
+                ip = effective_media_addr.ip(),
+                port = effective_media_addr.port(),
+                ssrc = ssrc,
+                cname = account.id,
+            )
+        };
 
         Ok(sdp)
     }
@@ -1648,43 +1677,74 @@ impl CallManager {
             .as_ref()
             .ok_or_else(|| AppError::Sip("No account configured".to_string()))?;
 
-        let creds = session.local_ice_credentials();
-        let fingerprint = session.local_dtls_fingerprint();
         let ssrc = session.local_ssrc();
 
         // Discover actual local IP if configured with 0.0.0.0
         let effective_media_addr = self.get_effective_media_addr()?;
 
-        // Generate SDP with specified direction
-        let sdp = format!(
-            "v=0\r\n\
-             o=- {session_id} {session_version} IN IP4 {ip}\r\n\
-             s=USG SIP Client\r\n\
-             c=IN IP4 {ip}\r\n\
-             t=0 0\r\n\
-             m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8\r\n\
-             a=rtpmap:111 opus/48000/2\r\n\
-             a=rtpmap:0 PCMU/8000\r\n\
-             a=rtpmap:8 PCMA/8000\r\n\
-             a=ice-ufrag:{ufrag}\r\n\
-             a=ice-pwd:{pwd}\r\n\
-             a=fingerprint:sha-384 {fingerprint}\r\n\
-             a=setup:actpass\r\n\
-             a=mid:audio\r\n\
-             a={direction}\r\n\
-             a=rtcp-mux\r\n\
-             a=ssrc:{ssrc} cname:{cname}\r\n",
-            session_id = session_id(),
-            session_version = 2, // Increment version for re-INVITE
-            ip = effective_media_addr.ip(),
-            port = effective_media_addr.port(),
-            ufrag = creds.ufrag,
-            pwd = creds.pwd,
-            fingerprint = fingerprint,
-            direction = direction,
-            ssrc = ssrc,
-            cname = account.id,
+        // Check if we're using TLS/secure transport
+        let use_srtp = matches!(
+            account.transport,
+            client_types::TransportPreference::TlsOnly
         );
+
+        // Generate SDP based on transport security
+        let sdp = if use_srtp {
+            // Secure RTP with ICE and DTLS fingerprint
+            let creds = session.local_ice_credentials();
+            let fingerprint = session.local_dtls_fingerprint();
+
+            format!(
+                "v=0\r\n\
+                 o=- {session_id} {session_version} IN IP4 {ip}\r\n\
+                 s=USG SIP Client\r\n\
+                 c=IN IP4 {ip}\r\n\
+                 t=0 0\r\n\
+                 m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8\r\n\
+                 a=rtpmap:111 opus/48000/2\r\n\
+                 a=rtpmap:0 PCMU/8000\r\n\
+                 a=rtpmap:8 PCMA/8000\r\n\
+                 a=ice-ufrag:{ufrag}\r\n\
+                 a=ice-pwd:{pwd}\r\n\
+                 a=fingerprint:sha-384 {fingerprint}\r\n\
+                 a=setup:actpass\r\n\
+                 a=mid:audio\r\n\
+                 a={direction}\r\n\
+                 a=rtcp-mux\r\n\
+                 a=ssrc:{ssrc} cname:{cname}\r\n",
+                session_id = session_id(),
+                session_version = 2, // Increment version for re-INVITE
+                ip = effective_media_addr.ip(),
+                port = effective_media_addr.port(),
+                ufrag = creds.ufrag,
+                pwd = creds.pwd,
+                fingerprint = fingerprint,
+                direction = direction,
+                ssrc = ssrc,
+                cname = account.id,
+            )
+        } else {
+            // Plain RTP (no SRTP, no ICE, no DTLS)
+            format!(
+                "v=0\r\n\
+                 o=- {session_id} {session_version} IN IP4 {ip}\r\n\
+                 s=USG SIP Client\r\n\
+                 c=IN IP4 {ip}\r\n\
+                 t=0 0\r\n\
+                 m=audio {port} RTP/AVP 0 8\r\n\
+                 a=rtpmap:0 PCMU/8000\r\n\
+                 a=rtpmap:8 PCMA/8000\r\n\
+                 a={direction}\r\n\
+                 a=ssrc:{ssrc} cname:{cname}\r\n",
+                session_id = session_id(),
+                session_version = 2, // Increment version for re-INVITE
+                ip = effective_media_addr.ip(),
+                port = effective_media_addr.port(),
+                direction = direction,
+                ssrc = ssrc,
+                cname = account.id,
+            )
+        };
 
         Ok(sdp)
     }
