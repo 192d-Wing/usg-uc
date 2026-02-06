@@ -11,10 +11,12 @@ use crate::audio_processing::AudioProcessor;
 use crate::codec::CodecPipeline;
 use crate::file_source::FileAudioSource;
 use crate::pipeline::{PipelineStats, resample};
+use crate::rtcp_session::RtcpSession;
 use crate::rtp_handler::{RtpReceiver, RtpTransmitter};
 use crate::stream::CaptureStream;
 use crate::vad::{VadDecision, VoiceActivityDetector};
 use client_types::{CodecPreference, DtmfDigit, DtmfEvent};
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -73,6 +75,12 @@ pub struct IoThreadConfig {
     pub codec: CodecPreference,
     /// Capture (microphone) sample rate (e.g., 16000 for Bluetooth HFP).
     pub capture_rate: u32,
+    /// RTCP socket (bound to local port, for sending RTCP reports).
+    pub rtcp_socket: Option<Arc<UdpSocket>>,
+    /// Remote RTCP address (remote RTP port + 1).
+    pub rtcp_remote_addr: Option<SocketAddr>,
+    /// Local SSRC (for RTCP reports).
+    pub local_ssrc: u32,
 }
 
 /// Spawns the I/O thread.
@@ -186,6 +194,15 @@ fn io_loop(
     // Voice activity detection for discontinuous transmission
     let mut vad = VoiceActivityDetector::new();
 
+    // RTCP session (optional — created if RTCP socket is provided)
+    let mut rtcp_session = config
+        .rtcp_socket
+        .zip(config.rtcp_remote_addr)
+        .map(|(socket, remote_addr)| {
+            let cname = format!("usg-uc-{}", config.local_ssrc);
+            RtcpSession::new(socket, remote_addr, config.local_ssrc, cname)
+        });
+
     let mut last_capture = Instant::now();
     let mut stats_update_counter: u32 = 0;
 
@@ -255,14 +272,26 @@ fn io_loop(
             handle_dtmf(&mut transmitter, cmd);
         }
 
-        // 4. Periodically update shared stats
+        // 4. RTCP: send periodic Sender/Receiver Reports
+        if let Some(ref mut rtcp) = rtcp_session {
+            // Propagate remote SSRC learned from received RTP packets
+            if let Some(remote_ssrc) = receiver.remote_ssrc() {
+                rtcp.set_remote_ssrc(remote_ssrc);
+            }
+            let tx = transmitter.stats();
+            let rx = receiver.stats();
+            let jb = receiver.jitter_buffer_stats();
+            rtcp.maybe_send_report(&tx, &rx, &jb);
+        }
+
+        // 5. Periodically update shared stats
         stats_update_counter += 1;
         if stats_update_counter >= 100 {
             stats_update_counter = 0;
             update_stats(&transmitter, &receiver, &stats);
         }
 
-        // 5. Diagnostic logging every ~2 seconds
+        // 6. Diagnostic logging every ~2 seconds
         if diag_timer.elapsed() >= Duration::from_secs(2) {
             let tx_stats = transmitter.stats();
             info!(

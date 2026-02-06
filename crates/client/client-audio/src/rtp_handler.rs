@@ -295,6 +295,8 @@ pub struct RtpReceiver {
     stats: Arc<Mutex<RtpStats>>,
     /// Buffer for receiving packets.
     recv_buffer: Vec<u8>,
+    /// Remote SSRC (learned from received RTP packets).
+    remote_ssrc: Option<u32>,
 }
 
 impl RtpReceiver {
@@ -309,6 +311,7 @@ impl RtpReceiver {
             jitter_buffer,
             stats: Arc::new(Mutex::new(RtpStats::default())),
             recv_buffer: vec![0u8; MAX_RTP_PACKET_SIZE],
+            remote_ssrc: None,
         }
     }
 
@@ -397,6 +400,12 @@ impl RtpReceiver {
             packet.payload,
         );
 
+        // Track remote SSRC (first packet sets it)
+        if self.remote_ssrc.is_none() {
+            self.remote_ssrc = Some(packet.header.ssrc);
+            debug!("Learned remote SSRC: {}", packet.header.ssrc);
+        }
+
         self.jitter_buffer.push(buffered);
 
         let mut stats = self
@@ -432,6 +441,11 @@ impl RtpReceiver {
     /// Returns the jitter buffer statistics.
     pub fn jitter_buffer_stats(&self) -> crate::jitter_buffer::JitterBufferStats {
         self.jitter_buffer.stats()
+    }
+
+    /// Returns the remote SSRC learned from received RTP packets.
+    pub const fn remote_ssrc(&self) -> Option<u32> {
+        self.remote_ssrc
     }
 }
 

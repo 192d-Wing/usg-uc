@@ -235,8 +235,20 @@ fn decode_loop(
                         diag_frames_decoded += 1;
                     }
                     JitterBufferResult::Lost { .. } => {
-                        // LPC-based packet loss concealment
-                        let concealed = plc.conceal();
+                        // Try FEC recovery first (Opus inband FEC), fall back to PLC
+                        let concealed = if codec.supports_fec() {
+                            match codec.decode_fec() {
+                                Ok(fec_pcm) => {
+                                    trace!("FEC recovered {} samples", fec_pcm.len());
+                                    let v = fec_pcm.to_vec();
+                                    plc.good_frame(&v);
+                                    v
+                                }
+                                Err(_) => plc.conceal(),
+                            }
+                        } else {
+                            plc.conceal()
+                        };
 
                         // Resample from codec rate to device rate
                         let device_pcm = if concealed.len() == device_samples {

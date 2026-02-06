@@ -296,10 +296,32 @@ impl AudioPipeline {
         let decode_handle =
             decode_thread::spawn(decode_config, producer, jitter_buffer, self.running.clone());
 
+        // Create RTCP socket (bound to any available port)
+        let rtcp_socket = UdpSocket::bind("0.0.0.0:0")
+            .map(|s| {
+                // Non-blocking is fine — we only send, never recv
+                let _ = s.set_nonblocking(true);
+                Arc::new(s)
+            })
+            .ok();
+
+        // Remote RTCP address: remote RTP port + 1 (RFC 3550 §11)
+        let rtcp_remote_addr = Some(SocketAddr::new(
+            config.remote_addr.ip(),
+            config.remote_addr.port() + 1,
+        ));
+
+        if rtcp_socket.is_some() {
+            debug!("RTCP socket created for reports to {:?}", rtcp_remote_addr);
+        }
+
         // Spawn I/O thread (uses capture rate for mic read sizing)
         let io_config = IoThreadConfig {
             codec: config.codec,
             capture_rate,
+            rtcp_socket,
+            rtcp_remote_addr,
+            local_ssrc: ssrc,
         };
         let io_handle = io_thread::spawn(
             io_config,

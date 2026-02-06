@@ -7,7 +7,11 @@ use crate::{AudioError, AudioResult};
 use client_types::CodecPreference;
 use tracing::{debug, trace};
 use uc_codecs::opus::OpusConfig;
-use uc_codecs::{AudioCodec, CodecCapability, G711Alaw, G711Ulaw, G722Codec, OpusCodec};
+use uc_codecs::{AudioCodec, CodecCapability, G711Alaw, G711Ulaw, G722Codec};
+#[cfg(feature = "opus-ffi")]
+use uc_codecs::FfiOpusCodec;
+#[cfg(not(feature = "opus-ffi"))]
+use uc_codecs::OpusCodec;
 
 /// Maximum encoded frame size in bytes.
 pub const MAX_ENCODED_SIZE: usize = 1500;
@@ -34,9 +38,7 @@ impl CodecPipeline {
     /// Creates a new codec pipeline with the specified codec.
     pub fn new(preference: CodecPreference) -> AudioResult<Self> {
         let codec: Box<dyn AudioCodec> = match preference {
-            CodecPreference::Opus => {
-                Box::new(OpusCodec::new(OpusConfig::default(), DEFAULT_OPUS_PT))
-            }
+            CodecPreference::Opus => Self::create_opus_codec(),
             CodecPreference::G722 => Box::new(G722Codec::new()),
             CodecPreference::G711Ulaw => Box::new(G711Ulaw::new()),
             CodecPreference::G711Alaw => Box::new(G711Alaw::new()),
@@ -166,6 +168,37 @@ impl CodecPipeline {
         // TODO: Implement proper PLC using previous frame interpolation
         output.fill(0);
         trace!("Generated {} samples of PLC", output.len());
+    }
+
+    /// Decodes with Forward Error Correction for a lost packet.
+    ///
+    /// Only works with codecs that support FEC (e.g., Opus with inband FEC).
+    /// Returns the decoded samples, or an error if FEC is not supported.
+    pub fn decode_fec(&mut self) -> AudioResult<&[i16]> {
+        let decoded_len = self
+            .codec
+            .decode_fec(&mut self.decode_buffer)
+            .map_err(|e| AudioError::CodecError(format!("FEC decode failed: {e}")))?;
+
+        trace!("FEC decoded {} samples ({})", decoded_len, self.codec.name());
+        Ok(&self.decode_buffer[..decoded_len])
+    }
+
+    /// Returns true if this codec supports Forward Error Correction.
+    pub fn supports_fec(&self) -> bool {
+        self.codec.supports_fec()
+    }
+
+    /// Creates the appropriate Opus codec based on feature flags.
+    #[cfg(feature = "opus-ffi")]
+    fn create_opus_codec() -> Box<dyn AudioCodec> {
+        Box::new(FfiOpusCodec::new(OpusConfig::voip(), DEFAULT_OPUS_PT))
+    }
+
+    /// Creates the Opus codec stub (no FFI).
+    #[cfg(not(feature = "opus-ffi"))]
+    fn create_opus_codec() -> Box<dyn AudioCodec> {
+        Box::new(OpusCodec::new(OpusConfig::default(), DEFAULT_OPUS_PT))
     }
 }
 
