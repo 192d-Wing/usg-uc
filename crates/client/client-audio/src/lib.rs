@@ -46,6 +46,7 @@
 //! - [`ringtone`]: Ringtone playback for incoming calls
 //! - [`jitter_buffer`]: Adaptive jitter buffer for RTP reordering
 //! - [`rtp_handler`]: RTP/SRTP packet handling
+//! - [`plc`]: LPC-based packet loss concealment
 //! - [`pipeline`]: Main audio pipeline coordinator
 
 #![forbid(unsafe_code)]
@@ -67,6 +68,7 @@ pub mod file_source;
 pub mod io_thread;
 pub mod jitter_buffer;
 pub mod pipeline;
+pub mod plc;
 pub mod ringtone;
 pub mod rtp_handler;
 pub mod stream;
@@ -83,6 +85,7 @@ pub use jitter_buffer::{
     BufferedPacket, JitterBuffer, JitterBufferResult, JitterBufferStats, SharedJitterBuffer,
 };
 pub use pipeline::{AudioPipeline, PipelineConfig, PipelineState, PipelineStats};
+pub use plc::PacketLossConcealer;
 pub use ringtone::RingtonePlayer;
 pub use rtp_handler::{RtpReceiver, RtpStats, RtpTransmitter, generate_ssrc};
 pub use stream::{CaptureStream, PlaybackStream, PlaybackStreamHandle, Sample};

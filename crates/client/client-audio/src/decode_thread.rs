@@ -9,7 +9,8 @@
 use crate::codec::CodecPipeline;
 use crate::drift_compensator::DriftCompensator;
 use crate::jitter_buffer::{JitterBufferResult, SharedJitterBuffer};
-use crate::pipeline::{fade_out, resample};
+use crate::pipeline::resample;
+use crate::plc::PacketLossConcealer;
 use crate::stream::Sample;
 use client_types::CodecPreference;
 use ringbuf::traits::{Observer, Producer};
@@ -123,9 +124,11 @@ fn decode_loop(
     // Drift compensator: measure every 5 decode cycles (~25-50ms)
     let mut drift = DriftCompensator::new(5);
 
-    // Cross-frame state for smooth resampling and PLC
+    // Cross-frame state for smooth resampling
     let mut last_resample_input: i16 = 0;
-    let mut last_playback_sample: i16 = 0;
+
+    // LPC-based packet loss concealment
+    let mut plc = PacketLossConcealer::new(codec_samples);
 
     debug!(
         "Decode thread: codec={}, codec_rate={}, device_rate={}, \
@@ -189,24 +192,29 @@ fn decode_loop(
                             }
                         };
 
+                        let mut codec_vec = codec_pcm.to_vec();
+
+                        // If recovering from loss, cross-fade for smooth transition
+                        if plc.consecutive_losses() > 0 {
+                            plc.recover(&mut codec_vec);
+                        } else {
+                            plc.good_frame(&codec_vec);
+                        }
+
                         // Resample from codec rate to device rate with drift compensation
-                        let device_pcm = if codec_pcm.len() == adjusted_device_samples {
-                            if let Some(&last_in) = codec_pcm.last() {
+                        let device_pcm = if codec_vec.len() == adjusted_device_samples {
+                            if let Some(&last_in) = codec_vec.last() {
                                 last_resample_input = last_in;
                             }
-                            codec_pcm.to_vec()
+                            codec_vec
                         } else {
                             let resampled =
-                                resample(codec_pcm, adjusted_device_samples, last_resample_input);
-                            if let Some(&last_in) = codec_pcm.last() {
+                                resample(&codec_vec, adjusted_device_samples, last_resample_input);
+                            if let Some(&last_in) = codec_vec.last() {
                                 last_resample_input = last_in;
                             }
                             resampled
                         };
-
-                        if let Some(&last) = device_pcm.last() {
-                            last_playback_sample = last;
-                        }
 
                         // Write to playback ring buffer
                         let written = producer.push_slice(&device_pcm);
@@ -221,13 +229,18 @@ fn decode_loop(
                         diag_frames_decoded += 1;
                     }
                     JitterBufferResult::Lost { .. } => {
-                        // Packet loss concealment: fade out from last known sample
-                        let mut plc = vec![0i16; device_samples];
-                        fade_out(&mut plc, last_playback_sample);
-                        last_playback_sample = 0;
-                        last_resample_input = 0;
+                        // LPC-based packet loss concealment
+                        let concealed = plc.conceal();
 
-                        producer.push_slice(&plc);
+                        // Resample from codec rate to device rate
+                        let device_pcm = if concealed.len() == device_samples {
+                            concealed
+                        } else {
+                            resample(&concealed, device_samples, last_resample_input)
+                        };
+
+                        last_resample_input = 0;
+                        producer.push_slice(&device_pcm);
                         diag_frames_lost += 1;
                     }
                     JitterBufferResult::Empty | JitterBufferResult::NotReady => {

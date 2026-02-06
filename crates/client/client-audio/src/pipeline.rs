@@ -588,19 +588,6 @@ pub(crate) fn resample(input: &[i16], output_len: usize, prev_sample: i16) -> Ve
     output
 }
 
-/// Fade out from `last_sample` to silence over the entire buffer for smooth PLC.
-#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-pub(crate) fn fade_out(buffer: &mut [i16], last_sample: i16) {
-    let len = buffer.len();
-    if len == 0 || last_sample == 0 {
-        return;
-    }
-    for (i, sample) in buffer.iter_mut().enumerate() {
-        let t = 1.0 - (i as f32 / len as f32);
-        *sample = (f32::from(last_sample) * t).round() as i16;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
