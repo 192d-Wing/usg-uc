@@ -166,17 +166,17 @@ impl MediaSession {
     }
 
     /// Gets the current session state.
-    pub fn state(&self) -> MediaSessionState {
+    pub const fn state(&self) -> MediaSessionState {
         self.state
     }
 
     /// Gets the local SSRC.
-    pub fn local_ssrc(&self) -> u32 {
+    pub const fn local_ssrc(&self) -> u32 {
         self.local_ssrc
     }
 
     /// Sets the remote SSRC.
-    pub fn set_remote_ssrc(&mut self, ssrc: u32) {
+    pub const fn set_remote_ssrc(&mut self, ssrc: u32) {
         self.remote_ssrc = Some(ssrc);
     }
 
@@ -211,7 +211,7 @@ impl MediaSession {
     ///
     /// This is used when the remote endpoint doesn't support ICE and the
     /// remote address must be extracted from the SDP c= and m= lines.
-    pub fn set_remote_addr(&mut self, addr: SocketAddr) {
+    pub const fn set_remote_addr(&mut self, addr: SocketAddr) {
         self.remote_addr = Some(addr);
     }
 
@@ -371,6 +371,7 @@ impl MediaSession {
     }
 
     /// Protects (encrypts) an outbound RTP packet.
+    #[allow(clippy::significant_drop_tightening)]
     pub async fn protect_rtp(&self, packet: &RtpPacket) -> SipUaResult<Vec<u8>> {
         let ctx = self
             .outbound_srtp
@@ -396,10 +397,11 @@ impl MediaSession {
 
         let ctx_guard = ctx.read().await;
         let unprotector = SrtpUnprotect::new(&ctx_guard);
-
-        unprotector
+        let result = unprotector
             .unprotect_rtp(srtp_packet)
-            .map_err(|e| SipUaError::DtlsError(format!("SRTP unprotect failed: {e}")))
+            .map_err(|e| SipUaError::DtlsError(format!("SRTP unprotect failed: {e}")));
+        drop(ctx_guard);
+        result
     }
 
     /// Sends an RTP packet (encrypts and sends).
@@ -448,18 +450,18 @@ impl MediaSession {
     /// Returns the remote media address if established.
     ///
     /// This returns `Some(addr)` after ICE connectivity is established.
-    pub fn remote_addr(&self) -> Option<SocketAddr> {
+    pub const fn remote_addr(&self) -> Option<SocketAddr> {
         self.remote_addr
     }
 
     /// Returns the local media address.
-    pub fn local_addr(&self) -> SocketAddr {
+    pub const fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
     /// Returns true if the media session is active and ready for RTP.
-    pub fn is_ready(&self) -> bool {
-        self.state == MediaSessionState::Active
+    pub const fn is_ready(&self) -> bool {
+        matches!(self.state, MediaSessionState::Active)
             && self.remote_addr.is_some()
             && self.outbound_srtp.is_some()
             && self.inbound_srtp.is_some()
@@ -469,7 +471,8 @@ impl MediaSession {
     ///
     /// Returns `(outbound, inbound)` SRTP context references if available.
     /// Use this when you need to handle SRTP encryption separately from
-    /// the MediaSession's built-in send_rtp/recv_rtp methods.
+    /// the `MediaSession`'s built-in `send_rtp`/`recv_rtp` methods.
+    #[allow(clippy::type_complexity)]
     pub fn srtp_contexts(&self) -> Option<(Arc<RwLock<SrtpContext>>, Arc<RwLock<SrtpContext>>)> {
         match (&self.outbound_srtp, &self.inbound_srtp) {
             (Some(out), Some(inp)) => Some((out.clone(), inp.clone())),
@@ -509,12 +512,12 @@ impl MediaSession {
 }
 
 /// Generates a random SSRC.
+#[allow(clippy::cast_possible_truncation)]
 fn rand_ssrc() -> u32 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     // Simple PRNG for SSRC (in production, use a proper RNG)
     ((seed ^ (seed >> 17) ^ (seed << 13)) & 0xFFFF_FFFF) as u32
 }

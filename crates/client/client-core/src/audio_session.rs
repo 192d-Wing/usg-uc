@@ -4,7 +4,7 @@
 //! audio pipeline (capture/encode/transmit/receive/decode/playback).
 //!
 //! The audio pipeline manages its own I/O and decode threads internally.
-//! AudioSession is a thin wrapper providing start/stop lifecycle,
+//! `AudioSession` is a thin wrapper providing start/stop lifecycle,
 //! mute/MOH control, and event notifications.
 
 use crate::{AppError, AppResult};
@@ -39,9 +39,7 @@ impl Default for AudioSessionConfig {
     fn default() -> Self {
         Self {
             local_port: 0,
-            remote_addr: "0.0.0.0:0"
-                .parse()
-                .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0))),
+            remote_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
             codec: CodecPreference::G711Ulaw,
             jitter_buffer_ms: 60,
             srtp_key: None,
@@ -70,7 +68,7 @@ pub enum AudioSessionEvent {
 /// Audio session coordinates the audio pipeline with a media session.
 ///
 /// The pipeline manages its own I/O and decode threads internally.
-/// AudioSession is a thin wrapper that provides start/stop lifecycle
+/// `AudioSession` is a thin wrapper that provides start/stop lifecycle
 /// and mute/MOH control via atomic flags.
 pub struct AudioSession {
     /// Audio pipeline (owned directly — no mutex needed).
@@ -207,7 +205,7 @@ impl AudioSession {
     }
 
     /// Returns whether MOH audio has been loaded.
-    pub fn has_moh(&self) -> bool {
+    pub const fn has_moh(&self) -> bool {
         self.pipeline.has_moh()
     }
 
@@ -237,12 +235,12 @@ impl AudioSession {
     }
 
     /// Returns the local RTP port.
-    pub fn local_port(&self) -> Option<u16> {
+    pub const fn local_port(&self) -> Option<u16> {
         self.pipeline.local_port()
     }
 
     /// Returns the pipeline state.
-    pub fn pipeline_state(&self) -> PipelineState {
+    pub const fn pipeline_state(&self) -> PipelineState {
         self.pipeline.state()
     }
 
@@ -297,38 +295,57 @@ impl AudioSessionConfigBuilder {
     }
 
     /// Sets the local RTP port.
-    pub fn local_port(mut self, port: u16) -> Self {
+    #[must_use]
+    pub const fn local_port(mut self, port: u16) -> Self {
         self.config.local_port = port;
         self
     }
 
     /// Sets the remote RTP address.
-    pub fn remote_addr(mut self, addr: SocketAddr) -> Self {
+    #[must_use]
+    pub const fn remote_addr(mut self, addr: SocketAddr) -> Self {
         self.config.remote_addr = addr;
         self
     }
 
     /// Sets the preferred codec.
-    pub fn codec(mut self, codec: CodecPreference) -> Self {
+    #[must_use]
+    pub const fn codec(mut self, codec: CodecPreference) -> Self {
         self.config.codec = codec;
         self
     }
 
     /// Sets the jitter buffer depth.
-    pub fn jitter_buffer_ms(mut self, ms: u32) -> Self {
+    #[must_use]
+    pub const fn jitter_buffer_ms(mut self, ms: u32) -> Self {
         self.config.jitter_buffer_ms = ms;
         self
     }
 
     /// Sets the SRTP master key.
+    #[must_use]
     pub fn srtp_key(mut self, key: Vec<u8>) -> Self {
         self.config.srtp_key = Some(key);
         self
     }
 
     /// Sets the SRTP master salt.
+    #[must_use]
     pub fn srtp_salt(mut self, salt: Vec<u8>) -> Self {
         self.config.srtp_salt = Some(salt);
+        self
+    }
+
+    /// Sets the Music on Hold file path.
+    #[must_use]
+    pub fn moh_file(mut self, path: String) -> Self {
+        self.config.moh_file_path = Some(path);
+        self
+    }
+
+    /// Sets the effective media addresses.
+    #[must_use]
+    pub fn effective_media_addrs(self, _addrs: Vec<SocketAddr>) -> Self {
         self
     }
 

@@ -22,12 +22,12 @@ pub mod dtmf;
 pub mod error;
 pub mod sensitive;
 
+#[cfg(feature = "digest-auth")]
+pub use account::DigestAuthCredentials;
 pub use account::{
     CertificateConfig, CertificateInfo, CertificateSelectionMode, RegistrationState,
     ServerCertVerificationMode, SipAccount, TransportPreference, TurnConfig,
 };
-#[cfg(feature = "digest-auth")]
-pub use account::DigestAuthCredentials;
 pub use audio::{AudioConfig, AudioDevice, CodecPreference};
 pub use call::{
     CallDirection, CallEndReason, CallFailureReason, CallFocus, CallHistoryEntry, CallInfo,

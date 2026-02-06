@@ -183,6 +183,7 @@ impl<'a> SrtpUnprotect<'a> {
     /// ## Errors
     ///
     /// Returns an error if decryption or authentication fails.
+    #[allow(clippy::unused_async)]
     pub async fn unprotect_rtcp(&self, data: &[u8]) -> SrtpResult<Bytes> {
         let auth_tag_len = self.context.profile().auth_tag_len();
 
@@ -337,8 +338,7 @@ mod tests {
             .unwrap();
 
         // Second unprotect (replay) should fail
-        let result = SrtpUnprotect::new(&receiver)
-            .unprotect_rtp(&protected);
+        let result = SrtpUnprotect::new(&receiver).unprotect_rtp(&protected);
 
         assert!(matches!(result, Err(SrtpError::ReplayDetected { .. })));
     }

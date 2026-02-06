@@ -61,6 +61,7 @@ impl RingtonePlayer {
     }
 
     /// Sets the volume level (0.0 - 1.0).
+    #[allow(clippy::missing_const_for_fn)]
     pub fn set_volume(&mut self, volume: f32) {
         self.volume = volume.clamp(0.0, 1.0);
     }
@@ -93,7 +94,7 @@ impl RingtonePlayer {
 
     /// Returns whether a ringtone file is loaded.
     pub fn has_ringtone(&self) -> bool {
-        self.source.as_ref().is_some_and(|s| s.is_loaded())
+        self.source.as_ref().is_some_and(FileAudioSource::is_loaded)
     }
 
     /// Starts playing the ringtone.
@@ -127,7 +128,7 @@ impl RingtonePlayer {
 
         // Build the output stream
         let is_playing = self.is_playing.clone();
-        let stream = build_ringtone_stream(&device, &config, consumer, is_playing.clone())?;
+        let stream = build_ringtone_stream(&device, &config, consumer, is_playing)?;
 
         stream.play().map_err(|e| {
             AudioError::StreamError(format!("Failed to start ringtone stream: {e}"))
@@ -159,7 +160,10 @@ impl RingtonePlayer {
                     source.read(&mut buffer);
                     // Apply volume
                     for sample in &mut buffer {
-                        *sample = ((*sample as f32) * volume) as i16;
+                        #[allow(clippy::cast_possible_truncation)]
+                        {
+                            *sample = (f32::from(*sample) * volume) as i16;
+                        }
                     }
                 }
             } else {
@@ -178,9 +182,8 @@ impl RingtonePlayer {
             return;
         }
 
-        let producer = match self.producer.as_mut() {
-            Some(p) => p,
-            None => return,
+        let Some(producer) = self.producer.as_mut() else {
+            return;
         };
 
         // Check if we need more data
@@ -194,7 +197,10 @@ impl RingtonePlayer {
             source.read(&mut buffer);
             // Apply volume
             for sample in &mut buffer {
-                *sample = ((*sample as f32) * self.volume) as i16;
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    *sample = (f32::from(*sample) * self.volume) as i16;
+                }
             }
         } else {
             // Generate default tone
@@ -298,15 +304,13 @@ fn build_ringtone_stream(
                             for sample in data.iter_mut() {
                                 *sample = consumer
                                     .try_pop()
-                                    .map(|s| s as f32 / i16::MAX as f32)
-                                    .unwrap_or(0.0);
+                                    .map_or(0.0, |s| f32::from(s) / f32::from(i16::MAX));
                             }
                         } else {
                             for chunk in data.chunks_mut(channels) {
                                 let sample = consumer
                                     .try_pop()
-                                    .map(|s| s as f32 / i16::MAX as f32)
-                                    .unwrap_or(0.0);
+                                    .map_or(0.0, |s| f32::from(s) / f32::from(i16::MAX));
                                 chunk.fill(sample);
                             }
                         }
@@ -320,8 +324,7 @@ fn build_ringtone_stream(
             Ok(stream)
         }
         format => Err(AudioError::StreamError(format!(
-            "Unsupported sample format: {:?}",
-            format
+            "Unsupported sample format: {format:?}"
         ))),
     }
 }
@@ -331,6 +334,7 @@ fn build_ringtone_stream(
 /// Uses a two-tone pattern similar to standard phone rings:
 /// - 440Hz + 480Hz combined for 2 seconds
 /// - 4 seconds of silence
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 fn generate_ringtone_pattern(buffer: &mut [i16], sample_rate: u32, volume: f32) {
     // Simple approach: generate continuous tone for now
     // A more sophisticated version would track pattern state
@@ -342,7 +346,7 @@ fn generate_ringtone_pattern(buffer: &mut [i16], sample_rate: u32, volume: f32) 
         let s1 = (2.0 * std::f32::consts::PI * freq1 * t).sin();
         let s2 = (2.0 * std::f32::consts::PI * freq2 * t).sin();
         let mixed = (s1 + s2) * 0.3 * volume; // 0.3 to reduce amplitude
-        *sample = (mixed * i16::MAX as f32) as i16;
+        *sample = (mixed * f32::from(i16::MAX)) as i16;
     }
 }
 

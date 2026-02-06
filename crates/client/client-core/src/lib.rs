@@ -35,13 +35,16 @@ pub use audio_session::{
 pub use call_manager::{CallManager, CallManagerEvent, IncomingCallInfo};
 pub use cert_store::{CertStoreError, CertStoreResult, CertificateStore, SignatureAlgorithm};
 pub use contact_manager::{ContactManager, ContactStore, create_contact};
-pub use settings::{CertificateFilterSettings, GeneralSettings, NetworkSettings, Settings, SettingsManager, UiSettings};
 #[cfg(feature = "digest-auth")]
 pub use credential_store::{CredentialStore, StorageBackend};
+pub use settings::{
+    CertificateFilterSettings, GeneralSettings, NetworkSettings, Settings, SettingsManager,
+    UiSettings,
+};
 pub use sip_transport::{
     CertVerificationMode, SipTransport, TransportConfig, TransportEvent,
-    build_response_from_request, generate_tag, load_certs_from_pem_file,
-    run_udp_receive_loop, start_udp_receive_thread,
+    build_response_from_request, generate_tag, load_certs_from_pem_file, run_udp_receive_loop,
+    start_udp_receive_thread,
 };
 
 use thiserror::Error;

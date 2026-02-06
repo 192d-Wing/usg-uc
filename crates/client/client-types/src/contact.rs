@@ -40,18 +40,21 @@ impl Contact {
     }
 
     /// Adds a phone number to the contact.
+    #[must_use]
     pub fn with_phone_number(mut self, number: PhoneNumber) -> Self {
         self.phone_numbers.push(number);
         self
     }
 
     /// Sets the contact as a favorite.
-    pub fn with_favorite(mut self, favorite: bool) -> Self {
+    #[must_use]
+    pub const fn with_favorite(mut self, favorite: bool) -> Self {
         self.favorite = favorite;
         self
     }
 
     /// Sets the organization.
+    #[must_use]
     pub fn with_organization(mut self, org: impl Into<String>) -> Self {
         self.organization = Some(org.into());
         self
@@ -110,6 +113,7 @@ impl PhoneNumber {
     }
 
     /// Sets a custom label.
+    #[must_use]
     pub fn with_label(mut self, label: impl Into<String>) -> Self {
         self.label = Some(label.into());
         self
@@ -117,15 +121,13 @@ impl PhoneNumber {
 
     /// Returns the display type string.
     pub fn type_label(&self) -> &str {
-        self.label
-            .as_deref()
-            .unwrap_or_else(|| match self.number_type {
-                PhoneNumberType::Work => "Work",
-                PhoneNumberType::Mobile => "Mobile",
-                PhoneNumberType::Home => "Home",
-                PhoneNumberType::Fax => "Fax",
-                PhoneNumberType::Other => "Other",
-            })
+        self.label.as_deref().unwrap_or(match self.number_type {
+            PhoneNumberType::Work => "Work",
+            PhoneNumberType::Mobile => "Mobile",
+            PhoneNumberType::Home => "Home",
+            PhoneNumberType::Fax => "Fax",
+            PhoneNumberType::Other => "Other",
+        })
     }
 }
 

@@ -14,7 +14,7 @@ use crate::rtp_handler::{RtpReceiver, RtpTransmitter};
 use crate::stream::CaptureStream;
 use client_types::{CodecPreference, DtmfDigit, DtmfEvent};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
@@ -44,17 +44,17 @@ impl IoThreadHandle {
     pub fn send_dtmf(&self, digit: DtmfDigit, duration_ms: u32) {
         let cmd = DtmfCommand { digit, duration_ms };
         if let Err(e) = self.dtmf_tx.send(cmd) {
-            warn!("Failed to send DTMF command: {}", e);
+            warn!("Failed to send DTMF command: {e}");
         }
     }
 
     /// Stops the I/O thread and waits for it to finish.
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
-        if let Some(handle) = self.thread.take() {
-            if let Err(e) = handle.join() {
-                warn!("I/O thread panicked: {:?}", e);
-            }
+        if let Some(handle) = self.thread.take()
+            && let Err(e) = handle.join()
+        {
+            warn!("I/O thread panicked: {e:?}");
         }
     }
 }
@@ -85,6 +85,7 @@ pub struct IoThreadConfig {
 /// * `moh_active` - Shared MOH active flag
 /// * `stats` - Shared statistics
 /// * `running` - Shared flag to signal shutdown
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     config: IoThreadConfig,
     transmitter: RtpTransmitter,
@@ -121,7 +122,7 @@ pub fn spawn(
     let thread = match handle {
         Ok(h) => Some(h),
         Err(e) => {
-            warn!("Failed to spawn I/O thread: {}", e);
+            warn!("Failed to spawn I/O thread: {e}");
             None
         }
     };
@@ -134,7 +135,11 @@ pub fn spawn(
 }
 
 /// Main I/O loop.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::needless_pass_by_value
+)]
 fn io_loop(
     config: IoThreadConfig,
     mut transmitter: RtpTransmitter,
@@ -151,7 +156,7 @@ fn io_loop(
     let mut codec = match CodecPipeline::new(config.codec) {
         Ok(c) => c,
         Err(e) => {
-            warn!("Failed to create codec in I/O thread: {}", e);
+            warn!("Failed to create codec in I/O thread: {e}");
             return;
         }
     };
@@ -160,9 +165,9 @@ fn io_loop(
     let codec_samples = codec.samples_per_frame();
     let capture_rate = config.capture_rate;
     // Number of samples per frame at the capture device rate
-    let capture_device_samples =
-        (codec_samples as u32 * capture_rate / codec_clock_rate) as usize;
-    let capture_interval = Duration::from_millis(codec.frame_duration_ms() as u64);
+    #[allow(clippy::cast_possible_truncation)]
+    let capture_device_samples = (codec_samples as u32 * capture_rate / codec_clock_rate) as usize;
+    let capture_interval = Duration::from_millis(u64::from(codec.frame_duration_ms()));
 
     debug!(
         "I/O thread: codec={}, codec_rate={}, capture_rate={}, \
@@ -189,14 +194,11 @@ fn io_loop(
         //    No burst drain — the main loop runs every ~5ms so burst packets
         //    are naturally picked up across iterations without stalling.
         match receiver.receive() {
-            Ok(true) => {
-                // Packet received and buffered in jitter buffer
-            }
-            Ok(false) => {
-                // Timeout — no packet available
+            Ok(true | false) => {
+                // Packet received and buffered, or timeout — no packet available
             }
             Err(e) => {
-                trace!("RTP receive error: {}", e);
+                trace!("RTP receive error: {e}");
             }
         }
 
@@ -278,7 +280,7 @@ fn io_loop(
 
 /// Processes one frame of microphone capture.
 ///
-/// Returns (samples_read, max_amplitude) for diagnostics.
+/// Returns (`samples_read`, `max_amplitude`) for diagnostics.
 fn process_capture_frame(
     codec: &mut CodecPipeline,
     transmitter: &mut RtpTransmitter,
@@ -294,8 +296,7 @@ fn process_capture_frame(
     if samples_read < device_samples {
         trace!(
             "Capture underrun: got {} samples, needed {}",
-            samples_read,
-            device_samples
+            samples_read, device_samples
         );
         if let Ok(mut s) = stats.lock() {
             s.capture_underruns += 1;
@@ -311,24 +312,24 @@ fn process_capture_frame(
         .unwrap_or(0);
 
     // Resample from device rate to codec rate (no cross-frame needed for downsampling)
-    let codec_pcm = if device_samples != codec_samples {
-        resample(&device_pcm, codec_samples, 0)
-    } else {
+    let codec_pcm = if device_samples == codec_samples {
         device_pcm
+    } else {
+        resample(&device_pcm, codec_samples, 0)
     };
 
     // Encode
     let encoded = match codec.encode(&codec_pcm) {
         Ok(e) => e.to_vec(),
         Err(e) => {
-            warn!("Encode error: {}", e);
+            warn!("Encode error: {e}");
             return (samples_read, max_amp);
         }
     };
 
     // Send
     if let Err(e) = transmitter.send(&encoded) {
-        trace!("RTP send error: {}", e);
+        trace!("RTP send error: {e}");
     }
 
     (samples_read, max_amp)
@@ -352,26 +353,30 @@ fn process_moh_frame(
     let encoded = match codec.encode(&pcm) {
         Ok(e) => e.to_vec(),
         Err(e) => {
-            warn!("MOH encode error: {}", e);
+            warn!("MOH encode error: {e}");
             return;
         }
     };
 
     if let Err(e) = transmitter.send(&encoded) {
-        trace!("MOH send error: {}", e);
+        trace!("MOH send error: {e}");
     }
 }
 
 /// Handles a DTMF command by sending the full event sequence.
+#[allow(clippy::needless_pass_by_value)]
 fn handle_dtmf(transmitter: &mut RtpTransmitter, cmd: DtmfCommand) {
-    info!("Sending DTMF digit '{}' for {}ms", cmd.digit, cmd.duration_ms);
+    info!(
+        "Sending DTMF digit '{}' for {}ms",
+        cmd.digit, cmd.duration_ms
+    );
 
     let duration = DtmfEvent::duration_from_ms(cmd.duration_ms);
 
     // Send initial packet with marker bit
     let event = DtmfEvent::new(cmd.digit, 0);
     if let Err(e) = transmitter.send_dtmf(&event, true) {
-        warn!("DTMF start send error: {}", e);
+        warn!("DTMF start send error: {e}");
         return;
     }
 
@@ -383,17 +388,17 @@ fn handle_dtmf(transmitter: &mut RtpTransmitter, cmd: DtmfCommand) {
         let elapsed = DtmfEvent::duration_from_ms(i * packet_interval_ms);
         let event = DtmfEvent::new(cmd.digit, elapsed);
         if let Err(e) = transmitter.send_dtmf(&event, false) {
-            warn!("DTMF continuation send error: {}", e);
+            warn!("DTMF continuation send error: {e}");
             return;
         }
-        thread::sleep(Duration::from_millis(packet_interval_ms as u64));
+        thread::sleep(Duration::from_millis(u64::from(packet_interval_ms)));
     }
 
     // Send end packets (3x for reliability per RFC 4733)
     for _ in 0..3 {
         let event = DtmfEvent::with_end(cmd.digit, duration);
         if let Err(e) = transmitter.send_dtmf(&event, false) {
-            warn!("DTMF end send error: {}", e);
+            warn!("DTMF end send error: {e}");
         }
     }
 

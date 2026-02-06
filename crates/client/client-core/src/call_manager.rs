@@ -271,8 +271,8 @@ impl CallManager {
     /// The file should be a WAV file that will be played to the remote party
     /// when a call is placed on hold.
     pub fn set_moh_file_path(&mut self, path: Option<String>) {
-        self.moh_file_path = path.clone();
-        if let Some(ref p) = path {
+        self.moh_file_path = path;
+        if let Some(ref p) = self.moh_file_path {
             info!(path = %p, "MOH file path set");
         } else {
             info!("MOH file path cleared");
@@ -285,7 +285,7 @@ impl CallManager {
     }
 
     /// Returns the preferred codec.
-    pub fn preferred_codec(&self) -> CodecPreference {
+    pub const fn preferred_codec(&self) -> CodecPreference {
         self.preferred_codec
     }
 
@@ -304,18 +304,18 @@ impl CallManager {
     pub async fn make_call(&mut self, remote_uri: &str) -> AppResult<String> {
         // Check concurrent call limit
         if self.active_calls.len() >= self.max_concurrent_calls {
+            let max = self.max_concurrent_calls;
             return Err(AppError::Sip(format!(
-                "Maximum concurrent calls ({}) reached",
-                self.max_concurrent_calls
+                "Maximum concurrent calls ({max}) reached"
             )));
         }
 
         // If there's a focused call that's connected, put it on hold first (call waiting)
         if let Some(ref focused_id) = self.focused_call_id.clone() {
-            let state = self.call_agent.get_state(&focused_id);
+            let state = self.call_agent.get_state(focused_id);
             if state == Some(CallState::Connected) {
                 info!(call_id = %focused_id, "Auto-holding current call for new outbound call");
-                self.hold_call_by_id(&focused_id).await?;
+                self.hold_call_by_id(focused_id).await?;
             }
         }
 
@@ -326,22 +326,22 @@ impl CallManager {
             .ok_or_else(|| AppError::Sip("No account configured".to_string()))?;
 
         // If the URI doesn't contain a domain (@), append the account's domain
-        let full_remote_uri = if !remote_uri.contains('@') {
+        let full_remote_uri = if remote_uri.contains('@') {
+            remote_uri.to_string()
+        } else {
             // Extract scheme and user part
-            let (scheme, user_part) = if let Some(rest) = remote_uri.strip_prefix("sips:") {
-                ("sips", rest)
-            } else if let Some(rest) = remote_uri.strip_prefix("sip:") {
-                ("sip", rest)
-            } else {
-                // No scheme, treat as user part with default sip: scheme
-                ("sip", remote_uri)
-            };
+            let (scheme, user_part) = remote_uri.strip_prefix("sips:").map_or_else(
+                || {
+                    remote_uri
+                        .strip_prefix("sip:")
+                        .map_or(("sip", remote_uri), |rest| ("sip", rest))
+                },
+                |rest| ("sips", rest),
+            );
 
             // Get domain from account
             let domain = account.domain().unwrap_or("localhost");
-            format!("{}:{}@{}", scheme, user_part, domain)
-        } else {
-            remote_uri.to_string()
+            format!("{scheme}:{user_part}@{domain}")
         };
 
         info!(remote_uri = %full_remote_uri, "Making outbound call");
@@ -364,7 +364,8 @@ impl CallManager {
         );
 
         // Generate SDP offer using the same effective address
-        let sdp_offer = self.generate_sdp_offer_with_addr(&media_session, account, effective_media_addr)?;
+        let sdp_offer =
+            self.generate_sdp_offer_with_addr(&media_session, account, effective_media_addr);
 
         // Make the call via SIP UA
         let call_id = self
@@ -374,7 +375,8 @@ impl CallManager {
             .map_err(|e| AppError::Sip(e.to_string()))?;
 
         // Store the effective media address for this call (used when starting audio session)
-        self.effective_media_addrs.insert(call_id.clone(), effective_media_addr);
+        self.effective_media_addrs
+            .insert(call_id.clone(), effective_media_addr);
 
         // Store media session and track the call
         self.media_sessions.insert(call_id.clone(), media_session);
@@ -386,7 +388,7 @@ impl CallManager {
             id: call_id.clone(),
             state: CallState::Dialing,
             direction: CallDirection::Outbound,
-            remote_uri: full_remote_uri.clone(),
+            remote_uri: full_remote_uri,
             remote_display_name: None,
             start_time: Utc::now(),
             connect_time: None,
@@ -419,7 +421,10 @@ impl CallManager {
             .focused_call_id
             .as_ref()
             .ok_or_else(|| {
-                error!("hangup() failed: No focused call. active_calls: {:?}", self.active_calls);
+                error!(
+                    "hangup() failed: No focused call. active_calls: {:?}",
+                    self.active_calls
+                );
                 AppError::Sip("No active call".to_string())
             })?
             .clone();
@@ -490,14 +495,11 @@ impl CallManager {
             CallEvent::SdpAnswerReceived { call_id, sdp } => {
                 self.handle_sdp_answer(&call_id, &sdp).await?;
             }
-            CallEvent::SendRequest { .. } => {
-                // Transport layer handles this via poll_call_events()
-            }
-            CallEvent::SendResponse { .. } => {
+            CallEvent::SendRequest { .. } | CallEvent::SendResponse { .. } => {
                 // Transport layer handles this via poll_call_events()
             }
             CallEvent::SdpOfferReceived { call_id, sdp } => {
-                self.handle_sdp_offer(&call_id, &sdp).await?;
+                Self::handle_sdp_offer(&call_id, &sdp);
             }
             CallEvent::TransferProgress {
                 call_id,
@@ -527,13 +529,11 @@ impl CallManager {
     /// for a call (INVITE 1xx/2xx/3xx-6xx, BYE 200, CANCEL 200, etc.).
     pub async fn handle_sip_response(&mut self, response: &SipResponse) -> AppResult<()> {
         // Extract Call-ID from response to find the matching call
-        let sip_call_id = match response.headers.get_value(&HeaderName::CallId) {
-            Some(id) => id.to_string(),
-            None => {
-                warn!("Received response without Call-ID header");
-                return Ok(());
-            }
+        let Some(id) = response.headers.get_value(&HeaderName::CallId) else {
+            warn!("Received response without Call-ID header");
+            return Ok(());
         };
+        let sip_call_id = id.to_string();
 
         // Find the call session with this SIP Call-ID
         if let Some(call_id) = self.find_call_by_sip_id(&sip_call_id) {
@@ -560,7 +560,7 @@ impl CallManager {
     /// Note: For BYE requests, use `handle_sip_request_from` to send 200 OK response.
     pub async fn handle_sip_request(&mut self, request: &SipRequest) -> AppResult<()> {
         // Default to localhost if source not known
-        let default_addr: SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        let default_addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 5060));
         self.handle_sip_request_from(request, default_addr).await
     }
 
@@ -620,10 +620,7 @@ impl CallManager {
     #[allow(dead_code)]
     pub async fn handle_incoming_invite(&mut self, request: &SipRequest) -> AppResult<()> {
         // Default to localhost if source not known (shouldn't happen in real usage)
-        let default_addr: SocketAddr = "127.0.0.1:5060".parse().unwrap_or_else(|_| {
-            // Fallback that won't panic
-            SocketAddr::from(([127, 0, 0, 1], 5060))
-        });
+        let default_addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 5060));
         self.handle_incoming_invite_from(request, default_addr)
             .await
     }
@@ -672,18 +669,16 @@ impl CallManager {
         let from_value = request
             .headers
             .get_value(&HeaderName::From)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+            .map_or_else(|| "unknown".to_string(), std::string::ToString::to_string);
 
         // Parse display name and URI from From header
         let (remote_display_name, remote_uri) = parse_from_header(&from_value);
 
         // Extract SIP Call-ID
-        let sip_call_id = request
-            .headers
-            .get_value(&HeaderName::CallId)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("unknown-{}", generate_tag()));
+        let sip_call_id = request.headers.get_value(&HeaderName::CallId).map_or_else(
+            || format!("unknown-{}", generate_tag()),
+            std::string::ToString::to_string,
+        );
 
         // Generate a unique internal call ID
         let call_id = format!("incoming-{}", generate_tag());
@@ -783,7 +778,7 @@ impl CallManager {
             extract_username_from_sip_uri(&account.sip_uri).unwrap_or_else(|| account.id.clone());
         ok_response.add_header(proto_sip::header::Header::new(
             proto_sip::header::HeaderName::Contact,
-            format!("<sip:{username}@{}>", self.local_media_addr.ip()),
+            format!("<sip:{username}@{ip}>", ip = self.local_media_addr.ip()),
         ));
 
         // Add Content-Type and body
@@ -811,10 +806,10 @@ impl CallManager {
 
         // If there's an existing focused call, put it on hold first
         if let Some(ref focused_id) = self.focused_call_id.clone() {
-            let state = self.call_agent.get_state(&focused_id);
+            let state = self.call_agent.get_state(focused_id);
             if state == Some(CallState::Connected) {
                 info!(call_id = %focused_id, "Auto-holding current call for incoming call");
-                self.hold_call_by_id(&focused_id).await?;
+                self.hold_call_by_id(focused_id).await?;
             }
         }
 
@@ -923,13 +918,11 @@ impl CallManager {
     ) -> AppResult<()> {
         use crate::sip_transport::build_response_from_request;
 
-        let sip_call_id = match request.headers.get_value(&HeaderName::CallId) {
-            Some(id) => id.to_string(),
-            None => {
-                warn!("Received BYE without Call-ID header");
-                return Ok(());
-            }
+        let Some(id) = request.headers.get_value(&HeaderName::CallId) else {
+            warn!("Received BYE without Call-ID header");
+            return Ok(());
         };
+        let sip_call_id = id.to_string();
 
         // Always send 200 OK response for BYE
         let ok_response = build_response_from_request(request, StatusCode::OK, None);
@@ -967,13 +960,11 @@ impl CallManager {
     ) -> AppResult<()> {
         use crate::sip_transport::build_response_from_request;
 
-        let sip_call_id = match request.headers.get_value(&HeaderName::CallId) {
-            Some(id) => id.to_string(),
-            None => {
-                warn!("Received CANCEL without Call-ID header");
-                return Ok(());
-            }
+        let Some(id) = request.headers.get_value(&HeaderName::CallId) else {
+            warn!("Received CANCEL without Call-ID header");
+            return Ok(());
         };
+        let sip_call_id = id.to_string();
 
         // Always send 200 OK response for CANCEL
         let ok_response = build_response_from_request(request, StatusCode::OK, None);
@@ -997,9 +988,7 @@ impl CallManager {
             // Notify the application so the UI can dismiss the incoming call modal
             let _ = self
                 .app_event_tx
-                .send(CallManagerEvent::IncomingCallCancelled {
-                    call_id,
-                })
+                .send(CallManagerEvent::IncomingCallCancelled { call_id })
                 .await;
         } else {
             warn!(sip_call_id = %sip_call_id, "Received CANCEL for unknown call");
@@ -1072,10 +1061,10 @@ impl CallManager {
         self.is_muted = !self.is_muted;
 
         // Update audio session mute state for focused call
-        if let Some(call_id) = &self.focused_call_id {
-            if let Some(session) = self.audio_sessions.get(call_id) {
-                session.set_muted(self.is_muted);
-            }
+        if let Some(call_id) = &self.focused_call_id
+            && let Some(session) = self.audio_sessions.get(call_id)
+        {
+            session.set_muted(self.is_muted);
         }
 
         info!(muted = self.is_muted, "Mute toggled");
@@ -1083,7 +1072,7 @@ impl CallManager {
     }
 
     /// Returns whether currently muted.
-    pub fn is_muted(&self) -> bool {
+    pub const fn is_muted(&self) -> bool {
         self.is_muted
     }
 
@@ -1311,8 +1300,7 @@ impl CallManager {
                 Ok(false) // No longer on hold
             }
             _ => Err(AppError::Sip(format!(
-                "Cannot toggle hold in state {:?}",
-                state
+                "Cannot toggle hold in state {state:?}"
             ))),
         }
     }
@@ -1369,12 +1357,8 @@ impl CallManager {
 
     /// Returns audio pipeline statistics for the focused call.
     pub fn audio_stats(&self) -> Option<PipelineStats> {
-        if let Some(call_id) = &self.focused_call_id {
-            if let Some(session) = self.audio_sessions.get(call_id) {
-                return Some(session.stats());
-            }
-        }
-        None
+        let call_id = self.focused_call_id.as_ref()?;
+        self.audio_sessions.get(call_id).map(AudioSession::stats)
     }
 
     /// Switches focus to a different call.
@@ -1384,16 +1368,16 @@ impl CallManager {
     pub async fn switch_to_call(&mut self, call_id: &str) -> AppResult<()> {
         // Verify target call exists
         if !self.active_calls.contains(&call_id.to_string()) {
-            return Err(AppError::Sip(format!("Call not found: {}", call_id)));
+            return Err(AppError::Sip(format!("Call not found: {call_id}")));
         }
 
         // Put current focused call on hold if it's connected
-        if let Some(ref current) = self.focused_call_id.clone() {
-            if current != call_id {
-                let state = self.call_agent.get_state(&current);
-                if state == Some(CallState::Connected) {
-                    self.hold_call_by_id(&current).await?;
-                }
+        if let Some(ref current) = self.focused_call_id.clone()
+            && current != call_id
+        {
+            let state = self.call_agent.get_state(current);
+            if state == Some(CallState::Connected) {
+                self.hold_call_by_id(current).await?;
             }
         }
 
@@ -1433,8 +1417,7 @@ impl CallManager {
         let local_port = self
             .effective_media_addrs
             .get(call_id)
-            .map(|addr| addr.port())
-            .unwrap_or(0);
+            .map_or(0, std::net::SocketAddr::port);
 
         info!(call_id = %call_id, local_port = local_port, "Using local port from SDP");
 
@@ -1520,15 +1503,14 @@ impl CallManager {
                 let remote_addr = self.media_sessions.get(call_id).and_then(|session| {
                     // For non-ICE calls, remote_addr is set from SDP c=/m= lines
                     // For ICE calls, it's set after ICE connectivity check completes
-                    if let Some(addr) = session.remote_addr() {
-                        Some(addr)
-                    } else {
+                    let addr = session.remote_addr();
+                    if addr.is_none() {
                         warn!(
                             call_id = %call_id,
                             "No remote media address available"
                         );
-                        None
                     }
+                    addr
                 });
 
                 if let Some(addr) = remote_addr {
@@ -1559,8 +1541,7 @@ impl CallManager {
                 let end_reason = call_info
                     .failure_reason
                     .as_ref()
-                    .map(|_| CallEndReason::Failed)
-                    .unwrap_or(CallEndReason::RemoteHangup);
+                    .map_or(CallEndReason::RemoteHangup, |_| CallEndReason::Failed);
 
                 self.record_call_history(&call_info, end_reason).await;
 
@@ -1628,10 +1609,10 @@ impl CallManager {
 
                 // Extract ICE candidates from SDP
                 for line in sdp.lines() {
-                    if line.starts_with("a=candidate:") {
-                        if let Err(e) = session.add_remote_ice_candidate(line) {
-                            warn!(error = %e, "Failed to add remote ICE candidate");
-                        }
+                    if line.starts_with("a=candidate:")
+                        && let Err(e) = session.add_remote_ice_candidate(line)
+                    {
+                        warn!(error = %e, "Failed to add remote ICE candidate");
                     }
                 }
 
@@ -1651,19 +1632,17 @@ impl CallManager {
         Ok(())
     }
 
-    async fn handle_sdp_offer(&mut self, call_id: &str, sdp: &str) -> AppResult<()> {
+    fn handle_sdp_offer(call_id: &str, sdp: &str) {
         debug!(call_id = %call_id, "Received SDP offer");
 
         // For incoming calls, we'd create a media session here
         // and generate an answer
         let _ = (call_id, sdp);
-
-        Ok(())
     }
 
     /// Handles transfer progress updates from REFER NOTIFYs (RFC 3515).
     async fn handle_transfer_progress(
-        &mut self,
+        &self,
         call_id: &str,
         target_uri: &str,
         status: ReferStatus,
@@ -1698,15 +1677,16 @@ impl CallManager {
         account: &SipAccount,
     ) -> AppResult<String> {
         let effective_media_addr = self.get_effective_media_addr()?;
-        self.generate_sdp_offer_with_addr(session, account, effective_media_addr)
+        Ok(self.generate_sdp_offer_with_addr(session, account, effective_media_addr))
     }
 
+    #[allow(clippy::unused_self)]
     fn generate_sdp_offer_with_addr(
         &self,
         session: &MediaSession,
         account: &SipAccount,
         effective_media_addr: SocketAddr,
-    ) -> AppResult<String> {
+    ) -> String {
         let ssrc = session.local_ssrc();
 
         // Check if we're using TLS/secure transport
@@ -1716,7 +1696,7 @@ impl CallManager {
         );
 
         // Generate SDP based on transport security
-        let sdp = if use_srtp {
+        if use_srtp {
             // Secure RTP with ICE and DTLS fingerprint
             let creds = session.local_ice_credentials();
             let fingerprint = session.local_dtls_fingerprint();
@@ -1769,9 +1749,7 @@ impl CallManager {
                 ssrc = ssrc,
                 cname = account.id,
             )
-        };
-
-        Ok(sdp)
+        }
     }
 
     /// Gets the effective media address, discovering the local IP if needed.
@@ -1946,13 +1924,13 @@ fn extract_username_from_sip_uri(uri: &str) -> Option<String> {
 ///
 /// From header format: `"Display Name" <sip:user@host>` or `<sip:user@host>`
 ///
-/// Returns (display_name, uri) where display_name is None if not present.
+/// Returns (`display_name`, uri) where `display_name` is None if not present.
 fn parse_from_header(from_value: &str) -> (Option<String>, String) {
     let trimmed = from_value.trim();
 
     // Check for display name in quotes
     if let Some(quote_end) = trimmed.strip_prefix('"').and_then(|s| s.find('"')) {
-        let display_name = trimmed[1..quote_end + 1].to_string();
+        let display_name = trimmed[1..=quote_end].to_string();
         let rest = &trimmed[quote_end + 2..];
 
         // Extract URI from angle brackets
@@ -2037,12 +2015,12 @@ fn parse_codec_from_sdp(sdp: &str) -> Option<CodecPreference> {
         // e.g., "a=rtpmap:0 PCMU/8000"
         if let Some(rtpmap) = line.strip_prefix("a=rtpmap:") {
             let parts: Vec<&str> = rtpmap.split_whitespace().collect();
-            if parts.len() >= 2 {
-                if let Ok(pt) = parts[0].parse::<u8>() {
-                    // Get the encoding name (before the /)
-                    let codec_name = parts[1].split('/').next().unwrap_or("");
-                    rtpmaps.push((pt, codec_name.to_string()));
-                }
+            if parts.len() >= 2
+                && let Ok(pt) = parts[0].parse::<u8>()
+            {
+                // Get the encoding name (before the /)
+                let codec_name = parts[1].split('/').next().unwrap_or("");
+                rtpmaps.push((pt, codec_name.to_string()));
             }
         }
     }
@@ -2117,6 +2095,7 @@ fn parse_remote_media_addr_from_sdp(sdp: &str) -> Option<SocketAddr> {
 }
 
 /// Generates a unique session ID for SDP.
+#[allow(clippy::cast_possible_truncation)]
 fn session_id() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()

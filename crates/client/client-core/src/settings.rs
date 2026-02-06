@@ -50,6 +50,7 @@ fn default_version() -> String {
 
 /// General application settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct GeneralSettings {
     /// Start minimized to system tray.
     #[serde(default)]
@@ -84,7 +85,7 @@ pub struct GeneralSettings {
     pub auto_answer_delay_secs: u32,
 }
 
-fn default_auto_answer_delay() -> u32 {
+const fn default_auto_answer_delay() -> u32 {
     3
 }
 
@@ -144,15 +145,15 @@ pub struct NetworkSettings {
     pub server_cert_verification: ServerCertVerificationMode,
 }
 
-fn default_rtp_port_start() -> u16 {
+const fn default_rtp_port_start() -> u16 {
     16384
 }
 
-fn default_rtp_port_end() -> u16 {
+const fn default_rtp_port_end() -> u16 {
     32767
 }
 
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
@@ -173,6 +174,7 @@ impl Default for NetworkSettings {
 
 /// UI preferences.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct UiSettings {
     /// Window width.
     #[serde(default = "default_window_width")]
@@ -223,11 +225,11 @@ fn default_classification() -> String {
     "unclassified".to_string()
 }
 
-fn default_window_width() -> u32 {
+const fn default_window_width() -> u32 {
     400
 }
 
-fn default_window_height() -> u32 {
+const fn default_window_height() -> u32 {
     600
 }
 
@@ -251,6 +253,7 @@ impl Default for UiSettings {
 
 /// Certificate filter settings for controlling which certificates are displayed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct CertificateFilterSettings {
     /// Only show certificates from these trusted CA issuers.
     /// If empty, all certificates are shown.
@@ -391,8 +394,7 @@ impl SettingsManager {
         #[cfg(feature = "digest-auth")]
         let config_dir = settings_path
             .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
+            .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
 
         let settings = if settings_path.exists() {
             Self::load_from_file(&settings_path)?
@@ -427,8 +429,7 @@ impl SettingsManager {
         #[cfg(feature = "digest-auth")]
         let config_dir = path
             .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
+            .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
 
         let settings = if path.exists() {
             Self::load_from_file(&path)?
@@ -466,7 +467,7 @@ impl SettingsManager {
     }
 
     /// Loads settings from a TOML file.
-    fn load_from_file(path: &PathBuf) -> AppResult<Settings> {
+    fn load_from_file(path: &std::path::Path) -> AppResult<Settings> {
         let content = fs::read_to_string(path)?;
         let settings: Settings = toml::from_str(&content)
             .map_err(|e| AppError::Serialization(format!("Failed to parse settings: {e}")))?;
@@ -476,14 +477,20 @@ impl SettingsManager {
     }
 
     /// Gets the current settings.
-    pub fn settings(&self) -> &Settings {
+    pub const fn settings(&self) -> &Settings {
         &self.settings
     }
 
     /// Gets mutable access to settings (marks as dirty).
+    #[allow(clippy::missing_const_for_fn)]
     pub fn settings_mut(&mut self) -> &mut Settings {
         self.dirty = true;
         &mut self.settings
+    }
+
+    /// Returns whether settings have unsaved changes.
+    pub const fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
     /// Saves settings to disk.
@@ -506,13 +513,8 @@ impl SettingsManager {
         if self.dirty { self.save() } else { Ok(()) }
     }
 
-    /// Returns whether settings have unsaved changes.
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
-    }
-
     /// Gets the settings file path.
-    pub fn path(&self) -> &PathBuf {
+    pub fn path(&self) -> &std::path::Path {
         &self.settings_path
     }
 
@@ -589,11 +591,9 @@ impl SettingsManager {
         &mut self,
         account_id: &str,
     ) -> AppResult<Option<zeroize::Zeroizing<String>>> {
-        if let Some(ref mut store) = self.credential_store {
-            store.get_password(account_id)
-        } else {
-            Ok(None)
-        }
+        self.credential_store
+            .as_mut()
+            .map_or_else(|| Ok(None), |store| store.get_password(account_id))
     }
 
     /// Deletes a digest password for an account from secure credential storage.
@@ -628,19 +628,17 @@ impl SettingsManager {
             .collect();
 
         // Now load passwords from credential store
-        let store = match self.credential_store.as_mut() {
-            Some(s) => s,
-            None => return Ok(()),
+        let Some(store) = self.credential_store.as_mut() else {
+            return Ok(());
         };
 
         for account_id in accounts_needing_passwords {
-            if let Ok(Some(password)) = store.get_password(&account_id) {
-                if let Some(account) = self.settings.accounts.get_mut(&account_id) {
-                    if let Some(ref mut creds) = account.digest_credentials {
-                        creds.password = password;
-                        debug!(account_id = %account_id, "Loaded persisted password");
-                    }
-                }
+            if let Ok(Some(password)) = store.get_password(&account_id)
+                && let Some(account) = self.settings.accounts.get_mut(&account_id)
+                && let Some(ref mut creds) = account.digest_credentials
+            {
+                creds.password = password;
+                debug!(account_id = %account_id, "Loaded persisted password");
             }
         }
 
@@ -658,23 +656,21 @@ impl SettingsManager {
             .iter()
             .filter_map(|(id, account)| {
                 account.digest_credentials.as_ref().and_then(|creds| {
-                    if !creds.password.is_empty() {
-                        Some((id.clone(), creds.password.to_string()))
-                    } else {
+                    if creds.password.is_empty() {
                         None
+                    } else {
+                        Some((id.clone(), creds.password.to_string()))
                     }
                 })
             })
             .collect();
 
         for (account_id, password) in accounts_to_persist {
-            if self.store_digest_password(&account_id, &password)? {
-                // Mark as persisted in the account
-                if let Some(account) = self.settings.accounts.get_mut(&account_id) {
-                    if let Some(ref mut creds) = account.digest_credentials {
-                        creds.password_persisted = true;
-                    }
-                }
+            if self.store_digest_password(&account_id, &password)?
+                && let Some(account) = self.settings.accounts.get_mut(&account_id)
+                && let Some(ref mut creds) = account.digest_credentials
+            {
+                creds.password_persisted = true;
             }
         }
 
@@ -684,7 +680,7 @@ impl SettingsManager {
     /// Returns information about the credential storage backend being used.
     #[cfg(feature = "digest-auth")]
     pub fn credential_storage_backend(&self) -> Option<crate::credential_store::StorageBackend> {
-        self.credential_store.as_ref().map(|s| s.backend())
+        self.credential_store.as_ref().map(crate::credential_store::CredentialStore::backend)
     }
 }
 

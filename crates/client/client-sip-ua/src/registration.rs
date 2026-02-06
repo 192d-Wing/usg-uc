@@ -41,7 +41,7 @@ struct AccountRegistration {
     transaction: Option<ClientNonInviteTransaction>,
     /// Call-ID used for this registration (reused per RFC 3261).
     call_id: String,
-    /// Current CSeq number.
+    /// Current `CSeq` number.
     cseq: u32,
     /// From tag (reused per RFC 3261).
     from_tag: String,
@@ -61,6 +61,7 @@ struct AccountRegistration {
 
 /// Events emitted by the registration agent.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum RegistrationEvent {
     /// Registration state changed.
     StateChanged {
@@ -87,6 +88,7 @@ pub enum RegistrationEvent {
 
 impl RegistrationAgent {
     /// Creates a new registration agent.
+    #[allow(clippy::missing_const_for_fn)]
     pub fn new(local_addr: SocketAddr, event_tx: mpsc::Sender<RegistrationEvent>) -> Self {
         Self {
             registrations: HashMap::new(),
@@ -104,7 +106,7 @@ impl RegistrationAgent {
     }
 
     /// Returns the current local address.
-    pub fn local_addr(&self) -> SocketAddr {
+    pub const fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
@@ -247,6 +249,7 @@ impl RegistrationAgent {
     }
 
     /// Handles a received SIP response for a registration.
+    #[allow(clippy::too_many_lines)]
     pub async fn handle_response(
         &mut self,
         response: &SipResponse,
@@ -275,7 +278,7 @@ impl RegistrationAgent {
                 let expires = Self::extract_expires(response);
                 registration.state = RegistrationState::Registered;
                 registration.expires_at =
-                    Some(Instant::now() + Duration::from_secs(expires as u64));
+                    Some(Instant::now() + Duration::from_secs(u64::from(expires)));
                 registration.server_expires_secs = expires;
                 registration.transaction = None;
 
@@ -315,44 +318,61 @@ impl RegistrationAgent {
                             HeaderName::ProxyAuthenticate
                         };
 
-                        if let Some(challenge_header) = response.headers.get(&header_name) {
-                            if let Ok(challenge) = challenge_header.value.parse::<proto_sip::auth::DigestChallenge>() {
-                                // Check retry limit to prevent infinite loops
-                                if registration.nonce_count < 3 {
-                                    info!(
-                                        account_id = %account_id,
-                                        realm = %challenge.realm,
-                                        nonce_count = registration.nonce_count,
-                                        "Digest auth challenge received, retrying with credentials"
-                                    );
+                        if let Some(challenge_header) = response.headers.get(&header_name)
+                            && let Ok(challenge) = challenge_header
+                                .value
+                                .parse::<proto_sip::auth::DigestChallenge>()
+                        {
+                            // Check retry limit to prevent infinite loops
+                            if registration.nonce_count < 3 {
+                                info!(
+                                    account_id = %account_id,
+                                    realm = %challenge.realm,
+                                    nonce_count = registration.nonce_count,
+                                    "Digest auth challenge received, retrying with credentials"
+                                );
 
-                                    registration.last_challenge = Some(challenge);
-                                    registration.nonce_count += 1;
-                                    registration.cseq += 1;
+                                registration.last_challenge = Some(challenge);
+                                registration.nonce_count += 1;
+                                registration.cseq += 1;
 
-                                    // Build and send authenticated request
-                                    match Self::build_register_with_auth(registration, self.local_addr) {
-                                        Ok(auth_request) => {
-                                            if let Ok(registrar_addr) = Self::parse_registrar_addr(&registration.account.registrar_uri).await {
-                                                let branch = registration.last_branch.clone().unwrap_or_default();
-                                                let tx_key = TransactionKey::client(&branch, "REGISTER");
-                                                let transaction = ClientNonInviteTransaction::new(tx_key, TransportType::Reliable);
-                                                registration.transaction = Some(transaction);
+                                // Build and send authenticated request
+                                match Self::build_register_with_auth(registration, self.local_addr)
+                                {
+                                    Ok(auth_request) => {
+                                        if let Ok(registrar_addr) = Self::parse_registrar_addr(
+                                            &registration.account.registrar_uri,
+                                        )
+                                        .await
+                                        {
+                                            let branch = registration
+                                                .last_branch
+                                                .clone()
+                                                .unwrap_or_default();
+                                            let tx_key =
+                                                TransactionKey::client(&branch, "REGISTER");
+                                            let transaction = ClientNonInviteTransaction::new(
+                                                tx_key,
+                                                TransportType::Reliable,
+                                            );
+                                            registration.transaction = Some(transaction);
 
-                                                let _ = self.event_tx.send(RegistrationEvent::SendRequest {
+                                            let _ = self
+                                                .event_tx
+                                                .send(RegistrationEvent::SendRequest {
                                                     request: auth_request,
                                                     destination: registrar_addr,
-                                                }).await;
-                                                return Ok(());
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!(account_id = %account_id, error = %e, "Failed to build auth request");
+                                                })
+                                                .await;
+                                            return Ok(());
                                         }
                                     }
-                                } else {
-                                    warn!(account_id = %account_id, "Max digest auth retries exceeded");
+                                    Err(e) => {
+                                        error!(account_id = %account_id, error = %e, "Failed to build auth request");
+                                    }
                                 }
+                            } else {
+                                warn!(account_id = %account_id, "Max digest auth retries exceeded");
                             }
                         }
                     }
@@ -457,6 +477,7 @@ impl RegistrationAgent {
                         .event_tx
                         .send(RegistrationEvent::Expiring {
                             account_id: account_id.clone(),
+                            #[allow(clippy::cast_possible_truncation)]
                             expires_in_secs: time_remaining.as_secs() as u32,
                         })
                         .await;
@@ -507,7 +528,7 @@ impl RegistrationAgent {
         };
 
         // Build Via header
-        let via = ViaHeader::new(transport_str, &local_addr.ip().to_string())
+        let via = ViaHeader::new(transport_str, local_addr.ip().to_string())
             .with_port(local_addr.port())
             .with_branch(branch);
 
@@ -577,7 +598,7 @@ impl RegistrationAgent {
             client_types::TransportPreference::Udp => "udp",
         };
 
-        let via = ViaHeader::new(transport_str, &local_addr.ip().to_string())
+        let via = ViaHeader::new(transport_str, local_addr.ip().to_string())
             .with_port(local_addr.port())
             .with_branch(branch);
 
@@ -621,7 +642,7 @@ impl RegistrationAgent {
         registration: &mut AccountRegistration,
         local_addr: SocketAddr,
     ) -> SipUaResult<SipRequest> {
-        use proto_sip::auth::{create_credentials, generate_cnonce, Md5DigestHasher};
+        use proto_sip::auth::{Md5DigestHasher, create_credentials, generate_cnonce};
 
         // Clone the data we need before mutating registration
         let challenge = registration
@@ -683,14 +704,10 @@ impl RegistrationAgent {
         }
 
         // DNS resolution for hostnames
-        let lookup_host = format!("{}:{}", host, port);
-        let addrs: Vec<_> = tokio::net::lookup_host(&lookup_host)
+        let lookup_host = format!("{host}:{port}");
+        tokio::net::lookup_host(&lookup_host)
             .await
             .map_err(|e| SipUaError::ConfigError(format!("DNS resolution failed for {host}: {e}")))?
-            .collect();
-
-        addrs
-            .into_iter()
             .next()
             .ok_or_else(|| SipUaError::ConfigError(format!("No addresses found for {host}")))
     }
@@ -712,10 +729,10 @@ impl RegistrationAgent {
         }
 
         // Fall back to Expires header
-        if let Some(expires_header) = response.headers.get(&HeaderName::Expires) {
-            if let Ok(expires) = expires_header.value.parse::<u32>() {
-                return expires;
-            }
+        if let Some(expires_header) = response.headers.get(&HeaderName::Expires)
+            && let Ok(expires) = expires_header.value.parse::<u32>()
+        {
+            return expires;
         }
 
         // Default

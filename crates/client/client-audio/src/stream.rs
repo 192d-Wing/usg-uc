@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error, info};
 
-/// Helper to get device name (cpal 0.17 deprecated name()).
+/// Helper to get device name (cpal 0.17 deprecated `name()`).
 #[allow(deprecated)]
 fn get_device_name(device: &cpal::Device) -> String {
     device.name().unwrap_or_else(|_| "Unknown".to_string())
@@ -55,6 +55,7 @@ impl CaptureStream {
         let sample_rate = config.sample_rate;
 
         // Create ring buffer scaled to actual sample rate (~2 seconds)
+        #[allow(clippy::cast_possible_truncation)]
         let ring_size = (sample_rate * RING_BUFFER_DURATION_SECS) as usize;
         let ring = HeapRb::<Sample>::new(ring_size);
         let (producer, consumer) = ring.split();
@@ -76,8 +77,7 @@ impl CaptureStream {
             }
             format => {
                 return Err(AudioError::StreamError(format!(
-                    "Unsupported sample format: {:?}",
-                    format
+                    "Unsupported sample format: {format:?}"
                 )));
             }
         };
@@ -114,7 +114,7 @@ impl CaptureStream {
     }
 
     /// Returns the sample rate of the stream.
-    pub fn sample_rate(&self) -> u32 {
+    pub const fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
 
@@ -126,13 +126,14 @@ impl CaptureStream {
 }
 
 /// Build input stream for i16 samples.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn build_input_stream_i16(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     mut producer: ringbuf::HeapProd<Sample>,
     is_running: Arc<AtomicBool>,
 ) -> AudioResult<Stream> {
-    let channels = config.channels as usize;
+    let channels = usize::from(config.channels);
 
     let stream = device
         .build_input_stream(
@@ -155,7 +156,7 @@ fn build_input_stream_i16(
                 }
             },
             move |err| {
-                error!("Capture stream error: {}", err);
+                error!("Capture stream error: {err}");
             },
             None,
         )
@@ -165,13 +166,14 @@ fn build_input_stream_i16(
 }
 
 /// Build input stream for f32 samples.
+#[allow(clippy::cast_precision_loss)]
 fn build_input_stream_f32(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     mut producer: ringbuf::HeapProd<Sample>,
     is_running: Arc<AtomicBool>,
 ) -> AudioResult<Stream> {
-    let channels = config.channels as usize;
+    let channels = usize::from(config.channels);
 
     let stream = device
         .build_input_stream(
@@ -195,7 +197,7 @@ fn build_input_stream_f32(
                 }
             },
             move |err| {
-                error!("Capture stream error: {}", err);
+                error!("Capture stream error: {err}");
             },
             None,
         )
@@ -232,6 +234,7 @@ impl PlaybackStream {
         let sample_rate = config.sample_rate;
 
         // Create ring buffer scaled to actual sample rate (~2 seconds)
+        #[allow(clippy::cast_possible_truncation)]
         let ring_size = (sample_rate * RING_BUFFER_DURATION_SECS) as usize;
         let ring = HeapRb::<Sample>::new(ring_size);
         let (producer, consumer) = ring.split();
@@ -253,8 +256,7 @@ impl PlaybackStream {
             }
             format => {
                 return Err(AudioError::StreamError(format!(
-                    "Unsupported sample format: {:?}",
-                    format
+                    "Unsupported sample format: {format:?}"
                 )));
             }
         };
@@ -296,7 +298,7 @@ impl PlaybackStream {
     }
 
     /// Returns the sample rate of the stream.
-    pub fn sample_rate(&self) -> u32 {
+    pub const fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
 
@@ -311,6 +313,7 @@ impl PlaybackStream {
     /// The producer can be moved to the decode thread while the CPAL stream
     /// (and its consumer) continues running. After calling this, use the
     /// returned producer directly instead of `write()`.
+    #[allow(clippy::used_underscore_binding)]
     pub fn take_producer(self) -> (PlaybackStreamHandle, ringbuf::HeapProd<Sample>) {
         let handle = PlaybackStreamHandle {
             _stream: self._stream,
@@ -336,7 +339,7 @@ pub struct PlaybackStreamHandle {
 
 impl PlaybackStreamHandle {
     /// Returns the sample rate of the stream.
-    pub fn sample_rate(&self) -> u32 {
+    pub const fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
 
@@ -353,13 +356,14 @@ impl PlaybackStreamHandle {
 }
 
 /// Build output stream for i16 samples.
+#[allow(clippy::cast_possible_truncation)]
 fn build_output_stream_i16(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     mut consumer: ringbuf::HeapCons<Sample>,
     is_running: Arc<AtomicBool>,
 ) -> AudioResult<Stream> {
-    let channels = config.channels as usize;
+    let channels = usize::from(config.channels);
     let mut last_sample: i16 = 0;
 
     let stream = device
@@ -382,7 +386,7 @@ fn build_output_stream_i16(
                     for s in &mut data[read..] {
                         *s = last_sample;
                         // Decay toward zero to avoid DC offset
-                        last_sample = (last_sample as i32 * 255 / 256) as i16;
+                        last_sample = (i32::from(last_sample) * 255 / 256) as i16;
                     }
                 } else {
                     for chunk in data.chunks_mut(channels) {
@@ -391,13 +395,13 @@ fn build_output_stream_i16(
                             chunk.fill(sample);
                         } else {
                             chunk.fill(last_sample);
-                            last_sample = (last_sample as i32 * 255 / 256) as i16;
+                            last_sample = (i32::from(last_sample) * 255 / 256) as i16;
                         }
                     }
                 }
             },
             move |err| {
-                error!("Playback stream error: {}", err);
+                error!("Playback stream error: {err}");
             },
             None,
         )
@@ -413,7 +417,7 @@ fn build_output_stream_f32(
     mut consumer: ringbuf::HeapCons<Sample>,
     is_running: Arc<AtomicBool>,
 ) -> AudioResult<Stream> {
-    let channels = config.channels as usize;
+    let channels = usize::from(config.channels);
     let mut last_sample: f32 = 0.0;
 
     let stream = device
@@ -448,7 +452,7 @@ fn build_output_stream_f32(
                 }
             },
             move |err| {
-                error!("Playback stream error: {}", err);
+                error!("Playback stream error: {err}");
             },
             None,
         )
@@ -459,15 +463,16 @@ fn build_output_stream_f32(
 
 /// Convert f32 sample to i16.
 #[inline]
+#[allow(clippy::cast_possible_truncation)]
 fn f32_to_i16(sample: f32) -> i16 {
     let clamped = sample.clamp(-1.0, 1.0);
-    (clamped * i16::MAX as f32) as i16
+    (clamped * f32::from(i16::MAX)) as i16
 }
 
 /// Convert i16 sample to f32.
 #[inline]
 fn i16_to_f32(sample: i16) -> f32 {
-    sample as f32 / i16::MAX as f32
+    f32::from(sample) / f32::from(i16::MAX)
 }
 
 #[cfg(test)]

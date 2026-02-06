@@ -1,9 +1,9 @@
 //! Certificate store access for smart card authentication.
 //!
 //! Provides access to certificates from various sources:
-//! - Windows: Windows Certificate Store (CryptoAPI)
-//! - macOS: Keychain + PKCS#11 (for YubiKey, etc.)
-//! - Linux: PKCS#11 (for YubiKey, etc.)
+//! - Windows: Windows Certificate Store (`CryptoAPI`)
+//! - macOS: Keychain + PKCS#11 (for `YubiKey`, etc.)
+//! - Linux: PKCS#11 (for `YubiKey`, etc.)
 //!
 //! CAC/PIV smart cards are supported on all platforms through
 //! platform-native APIs or PKCS#11.
@@ -133,7 +133,9 @@ impl CertificateStore {
                 if !filter.trusted_issuers.is_empty() {
                     let issuer_matches = filter.trusted_issuers.iter().any(|trusted| {
                         // Match against issuer CN (case-insensitive)
-                        cert.issuer_cn.to_uppercase().contains(&trusted.to_uppercase())
+                        cert.issuer_cn
+                            .to_uppercase()
+                            .contains(&trusted.to_uppercase())
                     });
                     if !issuer_matches {
                         debug!(
@@ -348,6 +350,7 @@ impl CertificateStore {
 
     /// Lists certificates on macOS from Keychain and PKCS#11.
     #[cfg(target_os = "macos")]
+    #[allow(clippy::unnecessary_wraps)]
     fn list_certificates_stub(&self) -> CertStoreResult<Vec<CertificateInfo>> {
         use std::collections::HashSet;
 
@@ -435,9 +438,10 @@ impl CertificateStore {
         Ok(Self::create_stub_certificates())
     }
 
-    /// Lists certificates from YubiKey using yubico-piv-tool (subprocess).
+    /// Lists certificates from `YubiKey` using yubico-piv-tool (subprocess).
     /// This is more stable than PKCS#11 which can cause segfaults.
     #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_lines, clippy::unused_self)]
     fn list_certificates_yubikey(&self) -> CertStoreResult<Vec<CertificateInfo>> {
         use std::process::Command;
 
@@ -510,8 +514,7 @@ impl CertificateStore {
                     // Slot 9d = Key Management
                     // Slot 9e = Card Authentication
                     let (has_smart_card_logon, has_client_auth) = match slot.as_str() {
-                        "Slot 9a" => (true, true),   // PIV Authentication
-                        "Slot 9e" => (true, true),   // Card Authentication
+                        "Slot 9a" | "Slot 9e" => (true, true), // PIV/Card Authentication
                         _ => (false, false),
                     };
 
@@ -522,8 +525,7 @@ impl CertificateStore {
                         subject_dn: subject.clone(),
                         issuer_cn: current_issuer
                             .as_ref()
-                            .map(|i| extract_cn_from_dn(i))
-                            .unwrap_or_else(|| "Unknown".to_string()),
+                            .map_or_else(|| "Unknown".to_string(), |i| extract_cn_from_dn(i)),
                         issuer_dn,
                         not_before: current_not_before
                             .clone()
@@ -535,7 +537,7 @@ impl CertificateStore {
                             current_not_before.as_deref(),
                             current_not_after.as_deref(),
                         ),
-                        reader_name: Some(format!("YubiKey ({})", slot)),
+                        reader_name: Some(format!("YubiKey ({slot})")),
                         key_algorithm: current_algorithm
                             .clone()
                             .unwrap_or_else(|| "Unknown".to_string()),
@@ -550,7 +552,10 @@ impl CertificateStore {
                         has_smart_card_logon,
                         has_client_auth,
                     };
-                    debug!("Found YubiKey certificate: {} in {}", cert_info.subject_cn, slot);
+                    debug!(
+                        "Found YubiKey certificate: {} in {}",
+                        cert_info.subject_cn, slot
+                    );
                     certificates.push(cert_info);
                 }
 
@@ -563,22 +568,29 @@ impl CertificateStore {
                 current_not_after = None;
                 current_algorithm = None;
             } else if trimmed.starts_with("Subject DN:") {
-                current_subject = Some(trimmed.trim_start_matches("Subject DN:").trim().to_string());
+                current_subject =
+                    Some(trimmed.trim_start_matches("Subject DN:").trim().to_string());
             } else if trimmed.starts_with("Issuer DN:") {
                 current_issuer = Some(trimmed.trim_start_matches("Issuer DN:").trim().to_string());
             } else if trimmed.starts_with("Fingerprint:") {
-                current_fingerprint =
-                    Some(trimmed.trim_start_matches("Fingerprint:").trim().to_string());
+                current_fingerprint = Some(
+                    trimmed
+                        .trim_start_matches("Fingerprint:")
+                        .trim()
+                        .to_string(),
+                );
             } else if trimmed.starts_with("Not Before:") {
                 current_not_before =
                     Some(trimmed.trim_start_matches("Not Before:").trim().to_string());
             } else if trimmed.starts_with("Not After:") {
-                current_not_after = Some(trimmed.trim_start_matches("Not After:").trim().to_string());
-            } else if trimmed.starts_with("Private Key Algorithm:") || trimmed.starts_with("Public Key Algorithm:") {
-                if current_algorithm.is_none() {
-                    let alg = trimmed.split(':').nth(1).map(|s| s.trim().to_string());
-                    current_algorithm = alg;
-                }
+                current_not_after =
+                    Some(trimmed.trim_start_matches("Not After:").trim().to_string());
+            } else if (trimmed.starts_with("Private Key Algorithm:")
+                || trimmed.starts_with("Public Key Algorithm:"))
+                && current_algorithm.is_none()
+            {
+                let alg = trimmed.split(':').nth(1).map(|s| s.trim().to_string());
+                current_algorithm = alg;
             }
         }
 
@@ -588,8 +600,7 @@ impl CertificateStore {
         {
             // Determine EKU based on PIV slot
             let (has_smart_card_logon, has_client_auth) = match slot.as_str() {
-                "Slot 9a" => (true, true),   // PIV Authentication
-                "Slot 9e" => (true, true),   // Card Authentication
+                "Slot 9a" | "Slot 9e" => (true, true), // PIV/Card Authentication
                 _ => (false, false),
             };
 
@@ -600,8 +611,7 @@ impl CertificateStore {
                 subject_dn: subject.clone(),
                 issuer_cn: current_issuer
                     .as_ref()
-                    .map(|i| extract_cn_from_dn(i))
-                    .unwrap_or_else(|| "Unknown".to_string()),
+                    .map_or_else(|| "Unknown".to_string(), |i| extract_cn_from_dn(i)),
                 issuer_dn,
                 not_before: current_not_before
                     .clone()
@@ -613,10 +623,8 @@ impl CertificateStore {
                     current_not_before.as_deref(),
                     current_not_after.as_deref(),
                 ),
-                reader_name: Some(format!("YubiKey ({})", slot)),
-                key_algorithm: current_algorithm
-                    .clone()
-                    .unwrap_or_else(|| "Unknown".to_string()),
+                reader_name: Some(format!("YubiKey ({slot})")),
+                key_algorithm: current_algorithm.unwrap_or_else(|| "Unknown".to_string()),
                 extended_key_usage: if has_smart_card_logon {
                     vec![
                         "1.3.6.1.4.1.311.20.2.2".to_string(), // Smart Card Logon
@@ -628,7 +636,10 @@ impl CertificateStore {
                 has_smart_card_logon,
                 has_client_auth,
             };
-            debug!("Found YubiKey certificate (last): {} in {}", cert_info.subject_cn, slot);
+            debug!(
+                "Found YubiKey certificate (last): {} in {}",
+                cert_info.subject_cn, slot
+            );
             certificates.push(cert_info);
         }
 
@@ -638,6 +649,7 @@ impl CertificateStore {
 
     /// Lists certificates from the macOS Keychain.
     #[cfg(target_os = "macos")]
+    #[allow(clippy::unnecessary_wraps)]
     fn list_certificates_macos_keychain(&self) -> CertStoreResult<Vec<CertificateInfo>> {
         use security_framework::item::{ItemClass, ItemSearchOptions, Reference, SearchResult};
 
@@ -655,19 +667,19 @@ impl CertificateStore {
         match search_results {
             Ok(results) => {
                 for result in results {
-                    if let SearchResult::Ref(Reference::Identity(identity)) = result {
-                        if let Ok(cert) = identity.certificate() {
-                            let der_data = cert.to_der();
-                            if let Some(cert_info) =
-                                self.parse_der_certificate(&der_data, Some("macOS Keychain".to_string()), None)
-                            {
-                                // Update the subject_cn with the actual value from Security Framework
-                                let mut cert_info = cert_info;
-                                cert_info.subject_cn = cert.subject_summary();
-                                cert_info.subject_dn = cert.subject_summary();
-                                certificates.push(cert_info);
-                            }
-                        }
+                    if let SearchResult::Ref(Reference::Identity(identity)) = result
+                        && let Ok(cert) = identity.certificate()
+                    {
+                        let der_data = cert.to_der();
+                        // Update the subject_cn with the actual value from Security Framework
+                        let mut cert_info = self.parse_der_certificate(
+                            &der_data,
+                            Some("macOS Keychain".to_string()),
+                            None,
+                        );
+                        cert_info.subject_cn = cert.subject_summary();
+                        cert_info.subject_dn = cert.subject_summary();
+                        certificates.push(cert_info);
                     }
                 }
                 info!("Found {} identities in Keychain", certificates.len());
@@ -680,8 +692,9 @@ impl CertificateStore {
         Ok(certificates)
     }
 
-    /// Lists certificates from PKCS#11 tokens (YubiKey, smart cards, etc.).
+    /// Lists certificates from PKCS#11 tokens (`YubiKey`, smart cards, etc.).
     #[cfg(target_os = "macos")]
+    #[allow(clippy::unnecessary_wraps)]
     fn list_certificates_pkcs11(&self) -> CertStoreResult<Vec<CertificateInfo>> {
         info!("Listing certificates from PKCS#11 tokens");
 
@@ -739,19 +752,21 @@ impl CertificateStore {
         let result = panic::catch_unwind(|| {
             // Initialize PKCS#11 library
             let pkcs11 = Pkcs11::new(&module_path_owned).map_err(|e| {
-                CertStoreError::StoreNotAvailable(format!("Failed to load PKCS#11 library: {}", e))
+                CertStoreError::StoreNotAvailable(format!("Failed to load PKCS#11 library: {e}"))
             })?;
 
             // Try to initialize - some libraries may already be initialized
             match pkcs11.initialize(CInitializeArgs::OsThreads) {
-                Ok(_) => {}
-                Err(cryptoki::error::Error::Pkcs11(cryptoki::error::RvError::CryptokiAlreadyInitialized, _)) => {
-                    // Library already initialized, that's fine
+                Ok(())
+                | Err(cryptoki::error::Error::Pkcs11(
+                    cryptoki::error::RvError::CryptokiAlreadyInitialized,
+                    _,
+                )) => {
+                    // OK or already initialized - both fine
                 }
                 Err(e) => {
                     return Err(CertStoreError::StoreNotAvailable(format!(
-                        "Failed to initialize PKCS#11: {}",
-                        e
+                        "Failed to initialize PKCS#11: {e}"
                     )));
                 }
             }
@@ -771,7 +786,7 @@ impl CertificateStore {
 
         // Get all slots with tokens
         let slots = pkcs11.get_slots_with_token().map_err(|e| {
-            CertStoreError::StoreNotAvailable(format!("Failed to get PKCS#11 slots: {}", e))
+            CertStoreError::StoreNotAvailable(format!("Failed to get PKCS#11 slots: {e}"))
         })?;
 
         for slot in slots {
@@ -781,12 +796,18 @@ impl CertificateStore {
             let reader_name = token_info
                 .as_ref()
                 .map(|ti| ti.label().trim().to_string())
-                .or_else(|| slot_info.as_ref().map(|si| si.slot_description().trim().to_string()));
+                .or_else(|| {
+                    slot_info
+                        .as_ref()
+                        .map(|si| si.slot_description().trim().to_string())
+                });
 
             debug!(
                 "Found PKCS#11 slot: {:?} with token: {:?}",
-                slot_info.as_ref().map(|s| s.slot_description()),
-                token_info.as_ref().map(|t| t.label())
+                slot_info
+                    .as_ref()
+                    .map(cryptoki::slot::SlotInfo::slot_description),
+                token_info.as_ref().map(cryptoki::slot::TokenInfo::label)
             );
 
             // Open a read-only session (no PIN needed for certificate listing)
@@ -811,13 +832,9 @@ impl CertificateStore {
 
             for handle in cert_handles {
                 // Get certificate attributes
-                let attrs = match session.get_attributes(
-                    handle,
-                    &[
-                        AttributeType::Value,
-                        AttributeType::Label,
-                    ],
-                ) {
+                let attrs = match session
+                    .get_attributes(handle, &[AttributeType::Value, AttributeType::Label])
+                {
                     Ok(a) => a,
                     Err(e) => {
                         debug!("Failed to get certificate attributes: {}", e);
@@ -831,17 +848,16 @@ impl CertificateStore {
                 for attr in attrs {
                     match attr {
                         Attribute::Value(v) => cert_der = Some(v),
-                        Attribute::Label(l) => label = Some(String::from_utf8_lossy(&l).to_string()),
+                        Attribute::Label(l) => {
+                            label = Some(String::from_utf8_lossy(&l).to_string());
+                        }
                         _ => {}
                     }
                 }
 
                 if let Some(der) = cert_der {
-                    if let Some(cert_info) =
-                        self.parse_der_certificate(&der, reader_name.clone(), label)
-                    {
-                        certificates.push(cert_info);
-                    }
+                    let cert_info = self.parse_der_certificate(&der, reader_name.clone(), label);
+                    certificates.push(cert_info);
                 }
             }
         }
@@ -849,23 +865,30 @@ impl CertificateStore {
         Ok(certificates)
     }
 
-    /// Parses a DER-encoded certificate into CertificateInfo.
+    /// Parses a DER-encoded certificate into `CertificateInfo`.
     #[cfg(target_os = "macos")]
+    #[allow(clippy::unused_self)]
     fn parse_der_certificate(
         &self,
         der: &[u8],
         reader_name: Option<String>,
         label: Option<String>,
-    ) -> Option<CertificateInfo> {
+    ) -> CertificateInfo {
         // Calculate SHA-1 thumbprint of DER certificate
         let thumbprint = {
             // Simple hash for now - in production use actual SHA-1
-            let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
             for byte in der {
-                hash ^= *byte as u64;
-                hash = hash.wrapping_mul(0x100000001b3); // FNV prime
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x0100_0000_01b3); // FNV prime
             }
-            format!("{:016X}{:016X}{:016X}{:016X}", hash, hash.rotate_left(16), hash.rotate_left(32), hash.rotate_left(48))
+            format!(
+                "{:016X}{:016X}{:016X}{:016X}",
+                hash,
+                hash.rotate_left(16),
+                hash.rotate_left(32),
+                hash.rotate_left(48)
+            )
         };
 
         // Parse X.509 certificate structure (simplified)
@@ -874,20 +897,20 @@ impl CertificateStore {
             parse_x509_basic_info(der);
 
         let subject_cn = label.unwrap_or(subject_cn);
-        let subject_dn = subject_cn.clone();
-        let issuer_dn = issuer_cn.clone();
+        let full_subject_dn = subject_cn.clone();
+        let full_issuer_dn = issuer_cn.clone();
 
         // Check if certificate is valid based on dates
         let is_valid = check_certificate_validity(&not_before, &not_after);
 
         // For Keychain certs, we assume they may have client auth EKU
         // In a full implementation, we'd parse the EKU extension from the DER
-        Some(CertificateInfo {
+        CertificateInfo {
             thumbprint,
             subject_cn,
-            subject_dn,
+            subject_dn: full_subject_dn,
             issuer_cn,
-            issuer_dn,
+            issuer_dn: full_issuer_dn,
             not_before,
             not_after,
             is_valid,
@@ -896,7 +919,7 @@ impl CertificateStore {
             extended_key_usage: vec![],  // Would need to parse from DER
             has_smart_card_logon: false, // Unknown without parsing EKU
             has_client_auth: false,      // Unknown without parsing EKU
-        })
+        }
     }
 
     /// Lists certificates using Windows CryptoAPI.
@@ -923,7 +946,6 @@ impl CertificateStore {
             .collect();
 
         #[allow(unsafe_code)]
-        #[allow(unsafe_code)]
         unsafe {
             // Open the certificate store
             let store = CertOpenStore(
@@ -935,9 +957,9 @@ impl CertificateStore {
             );
 
             let store = store.map_err(|e| {
+                let name = &self.store_name;
                 CertStoreError::StoreNotAvailable(format!(
-                    "Failed to open certificate store '{}': {}",
-                    self.store_name, e
+                    "Failed to open certificate store '{name}': {e}"
                 ))
             })?;
 
@@ -1542,9 +1564,9 @@ impl CertificateStore {
         pin: Option<&SmartCardPin>,
     ) -> CertStoreResult<Vec<u8>> {
         use windows::Win32::Security::Cryptography::{
-            BCRYPT_PAD_PKCS1, CERT_CONTEXT, CERT_OPEN_STORE_FLAGS,
-            CERT_QUERY_ENCODING_TYPE, CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_CURRENT_USER,
-            CRYPT_ACQUIRE_SILENT_FLAG, CertCloseStore, CertEnumCertificatesInStore, CertOpenStore,
+            BCRYPT_PAD_PKCS1, CERT_CONTEXT, CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE,
+            CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_CURRENT_USER, CRYPT_ACQUIRE_SILENT_FLAG,
+            CertCloseStore, CertEnumCertificatesInStore, CertOpenStore,
             CryptAcquireCertificatePrivateKey, NCRYPT_KEY_HANDLE, NCRYPT_SILENT_FLAG,
             NCryptFreeObject, NCryptSignHash, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
         };
@@ -1651,10 +1673,7 @@ impl CertificateStore {
                 let pin_result = NCryptSetProperty(
                     key_handle.into(),
                     PCWSTR::from_raw(ncrypt_pin_property.as_ptr()),
-                    std::slice::from_raw_parts(
-                        pin_wide.as_ptr() as *const u8,
-                        pin_wide.len() * 2,
-                    ),
+                    std::slice::from_raw_parts(pin_wide.as_ptr() as *const u8, pin_wide.len() * 2),
                     NCRYPT_SILENT_FLAG,
                 );
 
@@ -1759,6 +1778,7 @@ impl CertificateStore {
 
         // Create deterministic fake signature from data hash
         let mut signature = vec![0u8; sig_size];
+        #[allow(clippy::cast_possible_truncation)]
         for (i, byte) in data.iter().cycle().take(sig_size).enumerate() {
             signature[i] = byte.wrapping_add(i as u8);
         }
@@ -1876,10 +1896,7 @@ impl CertificateStore {
             let pin_result = NCryptSetProperty(
                 key_handle.into(),
                 PCWSTR::from_raw(ncrypt_pin_property.as_ptr()),
-                std::slice::from_raw_parts(
-                    pin_wide.as_ptr() as *const u8,
-                    pin_wide.len() * 2,
-                ),
+                std::slice::from_raw_parts(pin_wide.as_ptr() as *const u8, pin_wide.len() * 2),
                 NCRYPT_SILENT_FLAG,
             );
 
@@ -1973,7 +1990,7 @@ fn create_stub_der_certificate() -> Vec<u8> {
 /// Parses basic X.509 certificate information from DER-encoded data.
 ///
 /// This is a simplified parser that extracts key fields without a full ASN.1 library.
-/// Returns (subject_cn, issuer_cn, not_before, not_after, key_algorithm).
+/// Returns (`subject_cn`, `issuer_cn`, `not_before`, `not_after`, `key_algorithm`).
 #[cfg(target_os = "macos")]
 fn parse_x509_basic_info(der: &[u8]) -> (String, String, String, String, String) {
     // Default values
@@ -1996,15 +2013,26 @@ fn parse_x509_basic_info(der: &[u8]) -> (String, String, String, String, String)
     // Look for OID patterns for algorithm identification
 
     // ECDSA with SHA-384 OID: 1.2.840.10045.4.3.3 (06 08 2A 86 48 CE 3D 04 03 03)
-    if contains_bytes(der, &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03]) {
+    if contains_bytes(
+        der,
+        &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03],
+    ) {
         key_algorithm = "ECDSA P-384".to_string();
     }
     // ECDSA with SHA-256 OID: 1.2.840.10045.4.3.2
-    else if contains_bytes(der, &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]) {
+    else if contains_bytes(
+        der,
+        &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02],
+    ) {
         key_algorithm = "ECDSA P-256".to_string();
     }
     // RSA OID: 1.2.840.113549.1.1.1
-    else if contains_bytes(der, &[0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01]) {
+    else if contains_bytes(
+        der,
+        &[
+            0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01,
+        ],
+    ) {
         key_algorithm = "RSA".to_string();
     }
     // EC public key OID with P-384 curve
@@ -2012,14 +2040,17 @@ fn parse_x509_basic_info(der: &[u8]) -> (String, String, String, String, String)
         key_algorithm = "ECDSA P-384".to_string();
     }
     // EC public key OID with P-256 curve
-    else if contains_bytes(der, &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]) {
+    else if contains_bytes(
+        der,
+        &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07],
+    ) {
         key_algorithm = "ECDSA P-256".to_string();
     }
 
     // Try to extract CN from subject/issuer
     // CN OID: 2.5.4.3 (55 04 03)
     if let Some(cn) = extract_cn_from_der(der) {
-        subject_cn = cn.clone();
+        subject_cn.clone_from(&cn);
         issuer_cn = cn; // Simplified - assumes self-signed or same format
     }
 
@@ -2065,7 +2096,9 @@ fn check_certificate_validity(not_before: &str, not_after: &str) -> bool {
 /// Checks if `haystack` contains the byte sequence `needle`.
 #[cfg(target_os = "macos")]
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 /// Extracts Common Name (CN) from DER-encoded certificate.
@@ -2120,8 +2153,12 @@ fn extract_validity_from_der(der: &[u8]) -> Option<(String, String)> {
                         let day = &s[4..6];
                         // Assume 20xx for years 00-49, 19xx for 50-99
                         let year_num: u32 = year.parse().unwrap_or(0);
-                        let full_year = if year_num < 50 { 2000 + year_num } else { 1900 + year_num };
-                        dates.push(format!("{:04}-{}-{}", full_year, month, day));
+                        let full_year = if year_num < 50 {
+                            2000 + year_num
+                        } else {
+                            1900 + year_num
+                        };
+                        dates.push(format!("{full_year:04}-{month}-{day}"));
                     }
                 }
             }
@@ -2131,13 +2168,13 @@ fn extract_validity_from_der(der: &[u8]) -> Option<(String, String)> {
             let len = der[i + 1] as usize;
             if len >= 8 && i + 2 + len <= der.len() {
                 let time_bytes = &der[i + 2..i + 2 + len];
-                if let Ok(s) = std::str::from_utf8(time_bytes) {
-                    if s.len() >= 8 {
-                        let year = &s[0..4];
-                        let month = &s[4..6];
-                        let day = &s[6..8];
-                        dates.push(format!("{}-{}-{}", year, month, day));
-                    }
+                if let Ok(s) = std::str::from_utf8(time_bytes)
+                    && s.len() >= 8
+                {
+                    let year = &s[0..4];
+                    let month = &s[4..6];
+                    let day = &s[6..8];
+                    dates.push(format!("{year}-{month}-{day}"));
                 }
             }
         }
@@ -2165,7 +2202,7 @@ fn extract_cn_from_dn(dn: &str) -> String {
     dn.to_string()
 }
 
-/// Checks if a YubiKey certificate is currently valid based on the date strings
+/// Checks if a `YubiKey` certificate is currently valid based on the date strings
 /// from yubico-piv-tool output (format: "Mon DD HH:MM:SS YYYY GMT")
 #[cfg(target_os = "macos")]
 fn check_yubikey_validity(not_before: Option<&str>, not_after: Option<&str>) -> bool {
@@ -2189,7 +2226,10 @@ fn check_yubikey_validity(not_before: Option<&str>, not_after: Option<&str>) -> 
         None
     };
 
-    match (not_before.and_then(parse_date), not_after.and_then(parse_date)) {
+    match (
+        not_before.and_then(parse_date),
+        not_after.and_then(parse_date),
+    ) {
         (Some(start), Some(end)) => now >= start && now <= end,
         (None, Some(end)) => now <= end,
         (Some(start), None) => now >= start,

@@ -5,8 +5,8 @@ use crate::key::{SessionKeys, SrtpKeyMaterial};
 use crate::{DEFAULT_REPLAY_WINDOW_SIZE, MAX_PACKET_INDEX, SrtpProfile};
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// SRTP direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,7 +186,10 @@ impl SrtpContext {
     ///
     /// Returns an error if replay is detected.
     pub fn check_replay(&self, index: u64) -> SrtpResult<()> {
-        let mut window = self.replay_window.lock().unwrap_or_else(|e| e.into_inner());
+        let mut window = self
+            .replay_window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         window.check_and_update(index)
     }
 

@@ -12,15 +12,15 @@
 
 use client_audio::DeviceManager;
 use client_core::{
-    AppEvent, AppState as CoreAppState, CertificateStore, ClientApp, ContactManager,
-    SettingsManager, run_udp_receive_loop,
+    run_udp_receive_loop, AppEvent, AppState as CoreAppState, CertificateStore, ClientApp,
+    ContactManager, SettingsManager,
 };
 use client_types::{CallHistoryEntry, CertificateInfo, Contact, SipAccount, SmartCardPin};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{error, info, warn};
 
 /// Application state holding the SIP client core.
@@ -113,7 +113,7 @@ pub struct RegistrationStatus {
 pub struct CallStatus {
     /// Call ID.
     pub call_id: Option<String>,
-    /// Current state: "idle", "dialing", "ringing", "connected", "on_hold", "terminated".
+    /// Current state: "idle", "dialing", "ringing", "connected", "`on_hold`", "terminated".
     pub state: String,
     /// Remote party URI.
     pub remote_uri: Option<String>,
@@ -130,8 +130,9 @@ pub struct CallStatus {
 /// Check if digest authentication feature is enabled.
 ///
 /// This allows the UI to conditionally show username/password fields
-/// for testing with commercial VoIP providers like BulkVS.
+/// for testing with commercial `VoIP` providers like `BulkVS`.
 #[tauri::command]
+#[allow(clippy::missing_const_for_fn)]
 fn is_digest_auth_enabled() -> bool {
     cfg!(feature = "digest-auth")
 }
@@ -193,25 +194,21 @@ async fn initialize_client(state: State<'_, TauriAppState>) -> Result<(), String
         loop {
             // Use try_lock to avoid blocking other commands (like end_call)
             // If the lock is held by a command, we'll just skip this poll cycle
-            match client_arc.try_lock() {
-                Ok(mut guard) => {
-                    if let Some(ref mut client) = *guard {
-                        // Poll events - this may do network I/O (sending SIP messages)
-                        // Note: We don't timeout here because tokio::time::timeout doesn't
-                        // actually cancel the future, and network I/O legitimately takes time.
-                        // The try_lock above ensures we don't block commands that need the lock.
-                        if let Err(e) = client.poll_events().await {
-                            error!(error = %e, "Error polling SIP events");
-                        }
+            if let Ok(mut guard) = client_arc.try_lock() {
+                if let Some(ref mut client) = *guard {
+                    // Poll events - this may do network I/O (sending SIP messages)
+                    // Note: We don't timeout here because tokio::time::timeout doesn't
+                    // actually cancel the future, and network I/O legitimately takes time.
+                    // The try_lock above ensures we don't block commands that need the lock.
+                    if let Err(e) = client.poll_events().await {
+                        error!(error = %e, "Error polling SIP events");
                     }
-                    // Explicitly drop the guard to release the lock
-                    drop(guard);
                 }
-                Err(_) => {
-                    // Lock is held by another task (e.g., end_call command)
-                    // This is expected and fine - we'll poll on next iteration
-                }
+                // Explicitly drop the guard to release the lock
+                drop(guard);
             }
+            // else: Lock is held by another task (e.g., end_call command)
+            // This is expected and fine - we'll poll on next iteration
             // Poll frequently to ensure responsive message sending
             tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
         }
@@ -224,7 +221,7 @@ async fn initialize_client(state: State<'_, TauriAppState>) -> Result<(), String
 /// Make a SIP call.
 #[tauri::command]
 async fn make_call(target: String, state: State<'_, TauriAppState>) -> Result<String, String> {
-    info!("Making call to: {}", target);
+    info!("Making call to: {target}");
 
     let mut client_guard = state.client.lock().await;
     let client = client_guard
@@ -242,6 +239,7 @@ async fn make_call(target: String, state: State<'_, TauriAppState>) -> Result<St
         warn!(error = %e, "Error polling events after make_call");
     }
 
+    drop(client_guard);
     Ok(call_id)
 }
 
@@ -255,16 +253,13 @@ async fn end_call(state: State<'_, TauriAppState>) -> Result<(), String> {
         Ok(guard) => guard,
         Err(_) => {
             // Lock is held - use a short timeout for retry
-            tokio::time::timeout(
-                tokio::time::Duration::from_millis(500),
-                state.client.lock(),
-            )
-            .await
-            .map_err(|_| {
-                error!("end_call: Timeout acquiring client lock");
-                "Timeout acquiring client lock - call may still end via background polling"
-                    .to_string()
-            })?
+            tokio::time::timeout(tokio::time::Duration::from_millis(500), state.client.lock())
+                .await
+                .map_err(|_| {
+                    error!("end_call: Timeout acquiring client lock");
+                    "Timeout acquiring client lock - call may still end via background polling"
+                        .to_string()
+                })?
         }
     };
 
@@ -293,6 +288,7 @@ async fn end_call(state: State<'_, TauriAppState>) -> Result<(), String> {
         warn!(error = %e, "Error polling events after end_call");
     }
 
+    drop(client_guard);
     info!("end_call: completed successfully");
     Ok(())
 }
@@ -300,7 +296,7 @@ async fn end_call(state: State<'_, TauriAppState>) -> Result<(), String> {
 /// Accept an incoming call.
 #[tauri::command]
 async fn accept_call(call_id: String, state: State<'_, TauriAppState>) -> Result<(), String> {
-    info!("Accepting call: {}", call_id);
+    info!("Accepting call: {call_id}");
 
     let mut client_guard = state.client.lock().await;
     let client = client_guard
@@ -317,13 +313,14 @@ async fn accept_call(call_id: String, state: State<'_, TauriAppState>) -> Result
         warn!(error = %e, "Error polling events after accept_call");
     }
 
+    drop(client_guard);
     Ok(())
 }
 
 /// Reject an incoming call.
 #[tauri::command]
 async fn reject_call(call_id: String, state: State<'_, TauriAppState>) -> Result<(), String> {
-    info!("Rejecting call: {}", call_id);
+    info!("Rejecting call: {call_id}");
 
     let mut client_guard = state.client.lock().await;
     let client = client_guard
@@ -340,6 +337,7 @@ async fn reject_call(call_id: String, state: State<'_, TauriAppState>) -> Result
         warn!(error = %e, "Error polling events after reject_call");
     }
 
+    drop(client_guard);
     Ok(())
 }
 
@@ -354,6 +352,7 @@ async fn toggle_mute(state: State<'_, TauriAppState>) -> Result<bool, String> {
         .ok_or_else(|| "Client not initialized".to_string())?;
 
     let is_muted = client.toggle_mute();
+    drop(client_guard);
     Ok(is_muted)
 }
 
@@ -377,13 +376,14 @@ async fn toggle_hold(state: State<'_, TauriAppState>) -> Result<bool, String> {
         warn!(error = %e, "Error polling events after toggle_hold");
     }
 
+    drop(client_guard);
     Ok(is_on_hold)
 }
 
 /// Transfer the current call.
 #[tauri::command]
 async fn transfer_call(target: String, state: State<'_, TauriAppState>) -> Result<(), String> {
-    info!("Transferring call to: {}", target);
+    info!("Transferring call to: {target}");
 
     let mut client_guard = state.client.lock().await;
     let client = client_guard
@@ -400,13 +400,14 @@ async fn transfer_call(target: String, state: State<'_, TauriAppState>) -> Resul
         warn!(error = %e, "Error polling events after transfer_call");
     }
 
+    drop(client_guard);
     Ok(())
 }
 
 /// Send a DTMF digit.
 #[tauri::command]
 async fn send_dtmf(digit: String, state: State<'_, TauriAppState>) -> Result<(), String> {
-    info!("Sending DTMF: {}", digit);
+    info!("Sending DTMF: {digit}");
 
     let dtmf_digit = match digit.chars().next() {
         Some('0') => client_types::DtmfDigit::Zero,
@@ -421,10 +422,10 @@ async fn send_dtmf(digit: String, state: State<'_, TauriAppState>) -> Result<(),
         Some('9') => client_types::DtmfDigit::Nine,
         Some('*') => client_types::DtmfDigit::Star,
         Some('#') => client_types::DtmfDigit::Pound,
-        Some('A') | Some('a') => client_types::DtmfDigit::A,
-        Some('B') | Some('b') => client_types::DtmfDigit::B,
-        Some('C') | Some('c') => client_types::DtmfDigit::C,
-        Some('D') | Some('d') => client_types::DtmfDigit::D,
+        Some('A' | 'a') => client_types::DtmfDigit::A,
+        Some('B' | 'b') => client_types::DtmfDigit::B,
+        Some('C' | 'c') => client_types::DtmfDigit::C,
+        Some('D' | 'd') => client_types::DtmfDigit::D,
         _ => return Err(format!("Invalid DTMF digit: {digit}")),
     };
 
@@ -437,6 +438,7 @@ async fn send_dtmf(digit: String, state: State<'_, TauriAppState>) -> Result<(),
         .send_dtmf(dtmf_digit)
         .map_err(|e| format!("Failed to send DTMF: {e}"))?;
 
+    drop(client_guard);
     Ok(())
 }
 
@@ -447,6 +449,7 @@ async fn get_contacts(state: State<'_, TauriAppState>) -> Result<Vec<Contact>, S
 
     let manager = state.contact_manager.read().await;
     let contacts: Vec<Contact> = manager.contacts_sorted().into_iter().cloned().collect();
+    drop(manager);
 
     Ok(contacts)
 }
@@ -461,6 +464,7 @@ async fn add_contact(contact: Contact, state: State<'_, TauriAppState>) -> Resul
     manager
         .save_if_dirty()
         .map_err(|e| format!("Failed to save contact: {e}"))?;
+    drop(manager);
 
     Ok(())
 }
@@ -475,6 +479,7 @@ async fn update_contact(contact: Contact, state: State<'_, TauriAppState>) -> Re
     manager
         .save_if_dirty()
         .map_err(|e| format!("Failed to save contact: {e}"))?;
+    drop(manager);
 
     Ok(())
 }
@@ -482,35 +487,47 @@ async fn update_contact(contact: Contact, state: State<'_, TauriAppState>) -> Re
 /// Delete a contact.
 #[tauri::command]
 async fn delete_contact(id: String, state: State<'_, TauriAppState>) -> Result<(), String> {
-    info!("Deleting contact: {}", id);
+    info!("Deleting contact: {id}");
 
     let mut manager = state.contact_manager.write().await;
     manager.remove_contact(&id);
     manager
         .save_if_dirty()
         .map_err(|e| format!("Failed to save contact: {e}"))?;
+    drop(manager);
 
     Ok(())
 }
 
 /// Search contacts.
 #[tauri::command]
-async fn search_contacts(query: String, state: State<'_, TauriAppState>) -> Result<Vec<Contact>, String> {
-    info!("Searching contacts: {}", query);
+async fn search_contacts(
+    query: String,
+    state: State<'_, TauriAppState>,
+) -> Result<Vec<Contact>, String> {
+    info!("Searching contacts: {query}");
 
     let manager = state.contact_manager.read().await;
-    let contacts: Vec<Contact> = manager.search_contacts(&query).into_iter().cloned().collect();
+    let contacts: Vec<Contact> = manager
+        .search_contacts(&query)
+        .into_iter()
+        .cloned()
+        .collect();
+    drop(manager);
 
     Ok(contacts)
 }
 
 /// Get call history.
 #[tauri::command]
-async fn get_call_history(state: State<'_, TauriAppState>) -> Result<Vec<CallHistoryEntry>, String> {
+async fn get_call_history(
+    state: State<'_, TauriAppState>,
+) -> Result<Vec<CallHistoryEntry>, String> {
     info!("Fetching call history");
 
     let manager = state.contact_manager.read().await;
-    let history: Vec<CallHistoryEntry> = manager.call_history().into_iter().cloned().collect();
+    let history: Vec<CallHistoryEntry> = manager.call_history().to_vec();
+    drop(manager);
 
     Ok(history)
 }
@@ -525,19 +542,21 @@ async fn clear_call_history(state: State<'_, TauriAppState>) -> Result<(), Strin
     manager
         .save_if_dirty()
         .map_err(|e| format!("Failed to save after clearing history: {e}"))?;
+    drop(manager);
 
     Ok(())
 }
 
 /// Get SIP registration settings.
 #[tauri::command]
+#[allow(clippy::option_if_let_else)]
 async fn get_sip_settings(state: State<'_, TauriAppState>) -> Result<SipSettings, String> {
     info!("Fetching SIP settings");
 
     let manager = state.settings_manager.read().await;
     let account = manager.default_account();
 
-    match account {
+    let result = match account {
         Some(acc) => {
             // Extract username from sip_uri (e.g., "sips:user@domain.com" -> "user")
             let username = acc.user().unwrap_or_default().to_string();
@@ -549,8 +568,7 @@ async fn get_sip_settings(state: State<'_, TauriAppState>) -> Result<SipSettings
             let (auth_username, auth_password) = acc
                 .digest_credentials
                 .as_ref()
-                .map(|c| (Some(c.username.clone()), None)) // Never return password
-                .unwrap_or((None, None));
+                .map_or((None, None), |c| (Some(c.username.clone()), None));
             #[cfg(not(feature = "digest-auth"))]
             let (auth_username, auth_password): (Option<String>, Option<String>) = (None, None);
 
@@ -592,12 +610,17 @@ async fn get_sip_settings(state: State<'_, TauriAppState>) -> Result<SipSettings
             auth_username: None,
             auth_password: None,
         }),
-    }
+    };
+    drop(manager);
+    result
 }
 
 /// Update SIP registration settings.
 #[tauri::command]
-async fn update_sip_settings(settings: SipSettings, state: State<'_, TauriAppState>) -> Result<(), String> {
+async fn update_sip_settings(
+    settings: SipSettings,
+    state: State<'_, TauriAppState>,
+) -> Result<(), String> {
     info!("Updating SIP settings");
 
     let mut manager = state.settings_manager.write().await;
@@ -616,31 +639,27 @@ async fn update_sip_settings(settings: SipSettings, state: State<'_, TauriAppSta
     };
 
     // Build SIP URI from username and domain
-    let sip_uri = format!("{}:{}@{}", uri_scheme, settings.username, settings.domain);
+    let sip_uri = format!("{uri_scheme}:{}@{}", settings.username, settings.domain);
 
     // Registrar URI - append port if not default for the transport
     // Strip any existing sip: or sips: prefix from the registrar
-    let registrar_host = settings.registrar
+    let registrar_host = settings
+        .registrar
         .strip_prefix("sips:")
         .or_else(|| settings.registrar.strip_prefix("sip:"))
         .unwrap_or(&settings.registrar);
 
     let default_port = transport_pref.default_port();
     let registrar_uri = if registrar_host.is_empty() {
-        format!("{}:{}", uri_scheme, settings.domain)
+        format!("{uri_scheme}:{}", settings.domain)
     } else if settings.port != default_port {
-        format!("{}:{}:{}", uri_scheme, registrar_host, settings.port)
+        format!("{uri_scheme}:{registrar_host}:{}", settings.port)
     } else {
-        format!("{}:{}", uri_scheme, registrar_host)
+        format!("{uri_scheme}:{registrar_host}")
     };
 
     // Create account from settings
-    let mut account = SipAccount::new(
-        "default",
-        &settings.display_name,
-        &sip_uri,
-        &registrar_uri,
-    );
+    let mut account = SipAccount::new("default", &settings.display_name, &sip_uri, &registrar_uri);
     account.enabled = settings.auto_register;
     account.transport = transport_pref;
 
@@ -653,7 +672,9 @@ async fn update_sip_settings(settings: SipSettings, state: State<'_, TauriAppSta
     // Set digest auth credentials if provided (only when feature enabled)
     #[cfg(feature = "digest-auth")]
     {
-        if let (Some(auth_user), Some(auth_pass)) = (&settings.auth_username, &settings.auth_password) {
+        if let (Some(auth_user), Some(auth_pass)) =
+            (&settings.auth_username, &settings.auth_password)
+        {
             if !auth_user.is_empty() && !auth_pass.is_empty() {
                 info!(
                     auth_user = %auth_user,
@@ -688,7 +709,7 @@ async fn update_sip_settings(settings: SipSettings, state: State<'_, TauriAppSta
     #[cfg(feature = "digest-auth")]
     {
         if let Err(e) = manager.persist_account_passwords() {
-            warn!("Failed to persist passwords to secure storage: {}", e);
+            warn!("Failed to persist passwords to secure storage: {e}");
         } else {
             info!("Digest credentials persisted to secure storage");
         }
@@ -697,13 +718,17 @@ async fn update_sip_settings(settings: SipSettings, state: State<'_, TauriAppSta
     manager
         .save()
         .map_err(|e| format!("Failed to persist settings: {e}"))?;
+    drop(manager);
 
     Ok(())
 }
 
-/// Save SIP settings (alias for update_sip_settings for frontend compatibility).
+/// Save SIP settings (alias for `update_sip_settings` for frontend compatibility).
 #[tauri::command]
-async fn save_sip_settings(settings: SipSettings, state: State<'_, TauriAppState>) -> Result<(), String> {
+async fn save_sip_settings(
+    settings: SipSettings,
+    state: State<'_, TauriAppState>,
+) -> Result<(), String> {
     update_sip_settings(settings, state).await
 }
 
@@ -764,6 +789,7 @@ async fn register_sip(state: State<'_, TauriAppState>) -> Result<(), String> {
         .await
         .map_err(|e| format!("Registration failed: {e}"))?;
 
+    drop(client_guard);
     Ok(())
 }
 
@@ -782,21 +808,26 @@ async fn unregister_sip(state: State<'_, TauriAppState>) -> Result<(), String> {
         .await
         .map_err(|e| format!("Unregistration failed: {e}"))?;
 
+    drop(client_guard);
     Ok(())
 }
 
 /// Get registration status.
 #[tauri::command]
-async fn get_registration_status(state: State<'_, TauriAppState>) -> Result<RegistrationStatus, String> {
+#[allow(clippy::option_if_let_else)]
+async fn get_registration_status(
+    state: State<'_, TauriAppState>,
+) -> Result<RegistrationStatus, String> {
     let client_guard = state.client.lock().await;
 
-    match client_guard.as_ref() {
+    let result = match client_guard.as_ref() {
         Some(client) => {
             let state_str = match client.state() {
-                CoreAppState::Starting | CoreAppState::Ready => "unregistered",
                 CoreAppState::Registering => "registering",
                 CoreAppState::Registered | CoreAppState::InCall => "registered",
-                CoreAppState::ShuttingDown => "unregistered",
+                CoreAppState::Starting | CoreAppState::Ready | CoreAppState::ShuttingDown => {
+                    "unregistered"
+                }
             };
 
             Ok(RegistrationStatus {
@@ -808,15 +839,18 @@ async fn get_registration_status(state: State<'_, TauriAppState>) -> Result<Regi
             state: "unregistered".to_string(),
             error: None,
         }),
-    }
+    };
+    drop(client_guard);
+    result
 }
 
 /// Get current call status.
 #[tauri::command]
+#[allow(clippy::option_if_let_else)]
 async fn get_call_status(state: State<'_, TauriAppState>) -> Result<CallStatus, String> {
     let client_guard = state.client.lock().await;
 
-    match client_guard.as_ref() {
+    let result = match client_guard.as_ref() {
         Some(client) => {
             let calls = client.all_call_info();
 
@@ -864,18 +898,23 @@ async fn get_call_status(state: State<'_, TauriAppState>) -> Result<CallStatus, 
             is_muted: false,
             is_on_hold: false,
         }),
-    }
+    };
+    drop(client_guard);
+    result
 }
 
 /// Get available input (microphone) devices.
 #[tauri::command]
-async fn get_input_devices(state: State<'_, TauriAppState>) -> Result<Vec<AudioDeviceInfo>, String> {
+async fn get_input_devices(
+    state: State<'_, TauriAppState>,
+) -> Result<Vec<AudioDeviceInfo>, String> {
     info!("Fetching input devices");
 
     let manager = state.device_manager.read().await;
     let devices = manager
         .list_input_devices()
         .map_err(|e| format!("Failed to enumerate input devices: {e}"))?;
+    drop(manager);
 
     let result: Vec<AudioDeviceInfo> = devices
         .into_iter()
@@ -892,13 +931,16 @@ async fn get_input_devices(state: State<'_, TauriAppState>) -> Result<Vec<AudioD
 
 /// Get available output (speaker) devices.
 #[tauri::command]
-async fn get_output_devices(state: State<'_, TauriAppState>) -> Result<Vec<AudioDeviceInfo>, String> {
+async fn get_output_devices(
+    state: State<'_, TauriAppState>,
+) -> Result<Vec<AudioDeviceInfo>, String> {
     info!("Fetching output devices");
 
     let manager = state.device_manager.read().await;
     let devices = manager
         .list_output_devices()
         .map_err(|e| format!("Failed to enumerate output devices: {e}"))?;
+    drop(manager);
 
     let result: Vec<AudioDeviceInfo> = devices
         .into_iter()
@@ -915,7 +957,10 @@ async fn get_output_devices(state: State<'_, TauriAppState>) -> Result<Vec<Audio
 
 /// Set the input device.
 #[tauri::command]
-async fn set_input_device(device_name: Option<String>, state: State<'_, TauriAppState>) -> Result<(), String> {
+async fn set_input_device(
+    device_name: Option<String>,
+    state: State<'_, TauriAppState>,
+) -> Result<(), String> {
     info!("Setting input device: {:?}", device_name);
 
     let mut client_guard = state.client.lock().await;
@@ -924,13 +969,17 @@ async fn set_input_device(device_name: Option<String>, state: State<'_, TauriApp
             .switch_input_device(device_name)
             .map_err(|e| format!("Failed to switch input device: {e}"))?;
     }
+    drop(client_guard);
 
     Ok(())
 }
 
 /// Set the output device.
 #[tauri::command]
-async fn set_output_device(device_name: Option<String>, state: State<'_, TauriAppState>) -> Result<(), String> {
+async fn set_output_device(
+    device_name: Option<String>,
+    state: State<'_, TauriAppState>,
+) -> Result<(), String> {
     info!("Setting output device: {:?}", device_name);
 
     let mut client_guard = state.client.lock().await;
@@ -939,6 +988,7 @@ async fn set_output_device(device_name: Option<String>, state: State<'_, TauriAp
             .switch_output_device(device_name)
             .map_err(|e| format!("Failed to switch output device: {e}"))?;
     }
+    drop(client_guard);
 
     Ok(())
 }
@@ -973,29 +1023,35 @@ async fn get_audio_settings(state: State<'_, TauriAppState>) -> Result<AudioSett
         client_types::CodecPreference::G711Alaw => "g711_alaw",
     };
 
-    Ok(AudioSettings {
+    let result = AudioSettings {
         preferred_codec: codec_str.to_string(),
         echo_cancellation: audio.echo_cancellation,
         noise_suppression: audio.noise_suppression,
         jitter_buffer_min_ms: audio.jitter_buffer_min_ms,
         jitter_buffer_max_ms: audio.jitter_buffer_max_ms,
-    })
+    };
+    drop(manager);
+
+    Ok(result)
 }
 
 /// Save audio settings.
 #[tauri::command]
-async fn save_audio_settings(settings: AudioSettings, state: State<'_, TauriAppState>) -> Result<(), String> {
+async fn save_audio_settings(
+    settings: AudioSettings,
+    state: State<'_, TauriAppState>,
+) -> Result<(), String> {
     info!("Saving audio settings: codec={}", settings.preferred_codec);
 
     let mut manager = state.settings_manager.write().await;
 
     // Parse codec preference
     let codec = match settings.preferred_codec.as_str() {
-        "opus" => client_types::CodecPreference::Opus,
         "g722" => client_types::CodecPreference::G722,
         "g711_ulaw" => client_types::CodecPreference::G711Ulaw,
         "g711_alaw" => client_types::CodecPreference::G711Alaw,
-        _ => client_types::CodecPreference::Opus, // Default to Opus
+        // Default to Opus for "opus" and any unknown value
+        _ => client_types::CodecPreference::Opus,
     };
 
     {
@@ -1010,6 +1066,7 @@ async fn save_audio_settings(settings: AudioSettings, state: State<'_, TauriAppS
     manager
         .save()
         .map_err(|e| format!("Failed to save audio settings: {e}"))?;
+    drop(manager);
 
     info!("Audio settings saved");
     Ok(())
@@ -1046,6 +1103,7 @@ async fn get_certificates(state: State<'_, TauriAppState>) -> Result<Vec<Certifi
     let certs = store
         .list_certificates_filtered(&filter)
         .map_err(|e| format!("Failed to list certificates: {e}"))?;
+    drop(store);
 
     info!("Found {} certificates after filtering", certs.len());
     for cert in &certs {
@@ -1060,15 +1118,20 @@ async fn get_certificates(state: State<'_, TauriAppState>) -> Result<Vec<Certifi
 
 /// Get the currently selected certificate thumbprint.
 #[tauri::command]
-async fn get_selected_certificate(state: State<'_, TauriAppState>) -> Result<Option<String>, String> {
+async fn get_selected_certificate(
+    state: State<'_, TauriAppState>,
+) -> Result<Option<String>, String> {
     let selected = state.selected_cert_thumbprint.read().await;
     Ok(selected.clone())
 }
 
 /// Select a certificate by thumbprint for TLS authentication.
 #[tauri::command]
-async fn select_certificate(thumbprint: String, state: State<'_, TauriAppState>) -> Result<CertificateInfo, String> {
-    info!("Selecting certificate: {}", thumbprint);
+async fn select_certificate(
+    thumbprint: String,
+    state: State<'_, TauriAppState>,
+) -> Result<CertificateInfo, String> {
+    info!("Selecting certificate: {thumbprint}");
 
     let store = state.cert_store.read().await;
 
@@ -1076,6 +1139,7 @@ async fn select_certificate(thumbprint: String, state: State<'_, TauriAppState>)
     let cert = store
         .find_by_thumbprint(&thumbprint)
         .map_err(|e| format!("Certificate not found: {e}"))?;
+    drop(store);
 
     if !cert.is_valid {
         return Err("Selected certificate is expired or not yet valid".to_string());
@@ -1098,14 +1162,19 @@ async fn clear_selected_certificate(state: State<'_, TauriAppState>) -> Result<(
 
     let mut selected = state.selected_cert_thumbprint.write().await;
     *selected = None;
+    drop(selected);
 
     Ok(())
 }
 
 /// Verify a smart card PIN for the selected certificate.
 #[tauri::command]
-async fn verify_pin(thumbprint: String, pin: String, state: State<'_, TauriAppState>) -> Result<bool, String> {
-    info!("Verifying PIN for certificate: {}", thumbprint);
+async fn verify_pin(
+    thumbprint: String,
+    pin: String,
+    state: State<'_, TauriAppState>,
+) -> Result<bool, String> {
+    info!("Verifying PIN for certificate: {thumbprint}");
 
     let store = state.cert_store.read().await;
     let smart_card_pin = SmartCardPin::new(&pin);
@@ -1123,8 +1192,11 @@ async fn verify_pin(thumbprint: String, pin: String, state: State<'_, TauriAppSt
 
 /// Check if a certificate has an associated private key (smart card present).
 #[tauri::command]
-async fn check_private_key(thumbprint: String, state: State<'_, TauriAppState>) -> Result<bool, String> {
-    info!("Checking private key for certificate: {}", thumbprint);
+async fn check_private_key(
+    thumbprint: String,
+    state: State<'_, TauriAppState>,
+) -> Result<bool, String> {
+    info!("Checking private key for certificate: {thumbprint}");
 
     let store = state.cert_store.read().await;
     store
@@ -1136,7 +1208,9 @@ async fn check_private_key(thumbprint: String, state: State<'_, TauriAppState>) 
 ///
 /// Refreshes and returns certificates filtered by the configured settings.
 #[tauri::command]
-async fn refresh_certificates(state: State<'_, TauriAppState>) -> Result<Vec<CertificateInfo>, String> {
+async fn refresh_certificates(
+    state: State<'_, TauriAppState>,
+) -> Result<Vec<CertificateInfo>, String> {
     info!("Refreshing certificate list");
 
     // Get certificate filter settings
@@ -1152,6 +1226,7 @@ async fn refresh_certificates(state: State<'_, TauriAppState>) -> Result<Vec<Cer
     let certs = store
         .list_certificates_filtered(&filter)
         .map_err(|e| format!("Failed to list certificates: {e}"))?;
+    drop(store);
 
     info!("Refreshed {} certificates after filtering", certs.len());
     Ok(certs)
@@ -1159,8 +1234,11 @@ async fn refresh_certificates(state: State<'_, TauriAppState>) -> Result<Vec<Cer
 
 /// Get certificate details by thumbprint.
 #[tauri::command]
-async fn get_certificate_details(thumbprint: String, state: State<'_, TauriAppState>) -> Result<CertificateInfo, String> {
-    info!("Getting certificate details: {}", thumbprint);
+async fn get_certificate_details(
+    thumbprint: String,
+    state: State<'_, TauriAppState>,
+) -> Result<CertificateInfo, String> {
+    info!("Getting certificate details: {thumbprint}");
 
     let store = state.cert_store.read().await;
     store
@@ -1174,24 +1252,34 @@ async fn get_certificate_details(thumbprint: String, state: State<'_, TauriAppSt
 
 /// Get the classification configuration.
 #[tauri::command]
-async fn get_classification_config(state: State<'_, TauriAppState>) -> Result<ClassificationConfig, String> {
+async fn get_classification_config(
+    state: State<'_, TauriAppState>,
+) -> Result<ClassificationConfig, String> {
     info!("Fetching classification config");
 
     let manager = state.settings_manager.read().await;
     let ui = &manager.settings().ui;
 
-    Ok(ClassificationConfig {
+    let result = ClassificationConfig {
         level: ui.classification_level.clone(),
         caveats: ui.classification_caveats.clone(),
         dissem: ui.classification_dissem.clone(),
-    })
+    };
+    drop(manager);
+
+    Ok(result)
 }
 
 /// Save the classification configuration.
 #[tauri::command]
-async fn save_classification_config(config: ClassificationConfig, state: State<'_, TauriAppState>) -> Result<(), String> {
-    info!("Saving classification config: level={}, caveats={:?}, dissem={:?}",
-        config.level, config.caveats, config.dissem);
+async fn save_classification_config(
+    config: ClassificationConfig,
+    state: State<'_, TauriAppState>,
+) -> Result<(), String> {
+    info!(
+        "Saving classification config: level={}, caveats={:?}, dissem={:?}",
+        config.level, config.caveats, config.dissem
+    );
 
     let mut manager = state.settings_manager.write().await;
     {
@@ -1204,6 +1292,7 @@ async fn save_classification_config(config: ClassificationConfig, state: State<'
     manager
         .save()
         .map_err(|e| format!("Failed to save classification config: {e}"))?;
+    drop(manager);
 
     info!("Classification config saved");
     Ok(())
@@ -1215,7 +1304,8 @@ async fn open_config_file(state: State<'_, TauriAppState>) -> Result<(), String>
     info!("Opening config file");
 
     let manager = state.settings_manager.read().await;
-    let config_path = manager.path();
+    let config_path = manager.path().to_path_buf();
+    drop(manager);
 
     info!("Config path: {:?}", config_path);
 
@@ -1249,8 +1339,113 @@ async fn open_config_file(state: State<'_, TauriAppState>) -> Result<(), String>
     Ok(())
 }
 
+/// Get the frontend event name for an application event.
+const fn event_name(event: &AppEvent) -> &'static str {
+    match event {
+        AppEvent::RegistrationStateChanged { .. } => "registration-state-changed",
+        AppEvent::CallStateChanged { .. } => "call-state-changed",
+        AppEvent::IncomingCall { .. } => "incoming-call",
+        AppEvent::IncomingCallCancelled { .. } => "incoming-call-cancelled",
+        AppEvent::CallEnded { .. } => "call-ended",
+        AppEvent::Error { .. } => "error",
+        AppEvent::SettingsChanged => "settings-changed",
+        AppEvent::ContactsChanged => "contacts-changed",
+        AppEvent::PinRequired { .. } => "pin-required",
+        AppEvent::PinCompleted { .. } => "pin-completed",
+        AppEvent::TransferProgress { .. } => "transfer-progress",
+    }
+}
+
+/// Serialize an application event to a JSON payload for the frontend.
+fn event_payload(event: &AppEvent) -> serde_json::Value {
+    match event {
+        AppEvent::RegistrationStateChanged { account_id, state } => {
+            serde_json::json!({
+                "account_id": account_id,
+                "state": format!("{state:?}")
+            })
+        }
+        AppEvent::CallStateChanged {
+            call_id,
+            state,
+            info,
+        } => {
+            serde_json::json!({
+                "call_id": call_id,
+                "state": format!("{state:?}"),
+                "remote_uri": info.remote_uri,
+                "remote_display_name": info.remote_display_name
+            })
+        }
+        AppEvent::IncomingCall {
+            call_id,
+            remote_uri,
+            remote_display_name,
+        } => {
+            serde_json::json!({
+                "call_id": call_id,
+                "remote_uri": remote_uri,
+                "remote_display_name": remote_display_name
+            })
+        }
+        AppEvent::IncomingCallCancelled { call_id } => {
+            serde_json::json!({
+                "call_id": call_id
+            })
+        }
+        AppEvent::CallEnded {
+            call_id,
+            duration_secs,
+        } => {
+            serde_json::json!({
+                "call_id": call_id,
+                "duration_secs": duration_secs
+            })
+        }
+        AppEvent::Error { message } => {
+            serde_json::json!({
+                "message": message
+            })
+        }
+        AppEvent::SettingsChanged | AppEvent::ContactsChanged => serde_json::json!({}),
+        AppEvent::PinRequired {
+            operation,
+            thumbprint,
+        } => {
+            serde_json::json!({
+                "operation": format!("{operation:?}"),
+                "thumbprint": thumbprint
+            })
+        }
+        AppEvent::PinCompleted { success, error } => {
+            serde_json::json!({
+                "success": success,
+                "error": error
+            })
+        }
+        AppEvent::TransferProgress {
+            call_id,
+            target_uri,
+            status_code,
+            is_success,
+            is_final,
+        } => {
+            serde_json::json!({
+                "call_id": call_id,
+                "target_uri": target_uri,
+                "status_code": status_code,
+                "is_success": is_success,
+                "is_final": is_final
+            })
+        }
+    }
+}
+
 /// Poll for application events and emit them to the frontend.
-async fn poll_events(app_handle: AppHandle, event_rx: Arc<Mutex<Option<mpsc::Receiver<AppEvent>>>>) {
+async fn poll_events(
+    app_handle: AppHandle,
+    event_rx: Arc<Mutex<Option<mpsc::Receiver<AppEvent>>>>,
+) {
     loop {
         let event = {
             let mut rx_guard = event_rx.lock().await;
@@ -1258,126 +1453,28 @@ async fn poll_events(app_handle: AppHandle, event_rx: Arc<Mutex<Option<mpsc::Rec
                 rx.recv().await
             } else {
                 // No receiver yet, wait a bit
+                drop(rx_guard);
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 continue;
             }
         };
 
         if let Some(event) = event {
-            // Emit event to frontend
-            let event_name = match &event {
-                AppEvent::RegistrationStateChanged { .. } => "registration-state-changed",
-                AppEvent::CallStateChanged { .. } => "call-state-changed",
-                AppEvent::IncomingCall { .. } => "incoming-call",
-                AppEvent::IncomingCallCancelled { .. } => "incoming-call-cancelled",
-                AppEvent::CallEnded { .. } => "call-ended",
-                AppEvent::Error { .. } => "error",
-                AppEvent::SettingsChanged => "settings-changed",
-                AppEvent::ContactsChanged => "contacts-changed",
-                AppEvent::PinRequired { .. } => "pin-required",
-                AppEvent::PinCompleted { .. } => "pin-completed",
-                AppEvent::TransferProgress { .. } => "transfer-progress",
-            };
+            let name = event_name(&event);
+            let payload = event_payload(&event);
 
-            // Serialize event payload
-            let payload = match &event {
-                AppEvent::RegistrationStateChanged { account_id, state } => {
-                    serde_json::json!({
-                        "account_id": account_id,
-                        "state": format!("{:?}", state)
-                    })
-                }
-                AppEvent::CallStateChanged { call_id, state, info } => {
-                    serde_json::json!({
-                        "call_id": call_id,
-                        "state": format!("{:?}", state),
-                        "remote_uri": info.remote_uri,
-                        "remote_display_name": info.remote_display_name
-                    })
-                }
-                AppEvent::IncomingCall {
-                    call_id,
-                    remote_uri,
-                    remote_display_name,
-                } => {
-                    serde_json::json!({
-                        "call_id": call_id,
-                        "remote_uri": remote_uri,
-                        "remote_display_name": remote_display_name
-                    })
-                }
-                AppEvent::IncomingCallCancelled { call_id } => {
-                    serde_json::json!({
-                        "call_id": call_id
-                    })
-                }
-                AppEvent::CallEnded {
-                    call_id,
-                    duration_secs,
-                } => {
-                    serde_json::json!({
-                        "call_id": call_id,
-                        "duration_secs": duration_secs
-                    })
-                }
-                AppEvent::Error { message } => {
-                    serde_json::json!({
-                        "message": message
-                    })
-                }
-                AppEvent::SettingsChanged => serde_json::json!({}),
-                AppEvent::ContactsChanged => serde_json::json!({}),
-                AppEvent::PinRequired {
-                    operation,
-                    thumbprint,
-                } => {
-                    serde_json::json!({
-                        "operation": format!("{:?}", operation),
-                        "thumbprint": thumbprint
-                    })
-                }
-                AppEvent::PinCompleted { success, error } => {
-                    serde_json::json!({
-                        "success": success,
-                        "error": error
-                    })
-                }
-                AppEvent::TransferProgress {
-                    call_id,
-                    target_uri,
-                    status_code,
-                    is_success,
-                    is_final,
-                } => {
-                    serde_json::json!({
-                        "call_id": call_id,
-                        "target_uri": target_uri,
-                        "status_code": status_code,
-                        "is_success": is_success,
-                        "is_final": is_final
-                    })
-                }
-            };
-
-            if let Err(e) = app_handle.emit(event_name, payload) {
-                warn!("Failed to emit event {}: {}", event_name, e);
+            if let Err(e) = app_handle.emit(name, payload) {
+                warn!("Failed to emit event {name}: {e}");
             }
         }
     }
 }
 
-fn main() {
-    // Initialize logging - use RUST_LOG env var if set, otherwise default to INFO
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_target(true)
-        .init();
+/// Shared event receiver passed between app state and the event polling task.
+type EventReceiver = Arc<Mutex<Option<mpsc::Receiver<AppEvent>>>>;
 
-    info!("USG SIP Soft Client (Tauri) starting...");
-
+/// Initialize application state: settings, contacts, audio devices, certificates.
+fn create_app_state() -> Option<(TauriAppState, EventReceiver)> {
     // Create settings manager
     #[allow(unused_mut)] // mut only needed with digest-auth feature
     let settings_manager = match SettingsManager::new() {
@@ -1386,7 +1483,7 @@ fn main() {
             #[cfg(feature = "digest-auth")]
             {
                 if let Err(e) = m.load_persisted_passwords() {
-                    warn!("Failed to load persisted passwords: {}", e);
+                    warn!("Failed to load persisted passwords: {e}");
                 } else {
                     info!("Persisted passwords loaded from secure storage");
                 }
@@ -1394,8 +1491,8 @@ fn main() {
             Arc::new(RwLock::new(m))
         }
         Err(e) => {
-            error!("Failed to create settings manager: {}", e);
-            return;
+            error!("Failed to create settings manager: {e}");
+            return None;
         }
     };
 
@@ -1403,8 +1500,8 @@ fn main() {
     let contact_manager = match ContactManager::new() {
         Ok(m) => Arc::new(RwLock::new(m)),
         Err(e) => {
-            error!("Failed to create contact manager: {}", e);
-            return;
+            error!("Failed to create contact manager: {e}");
+            return None;
         }
     };
 
@@ -1426,6 +1523,25 @@ fn main() {
         cert_store,
         selected_cert_thumbprint: Arc::new(RwLock::new(None)),
         event_rx: event_rx.clone(),
+    };
+
+    Some((app_state, event_rx))
+}
+
+fn main() {
+    // Initialize logging - use RUST_LOG env var if set, otherwise default to INFO
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(true)
+        .init();
+
+    info!("USG SIP Soft Client (Tauri) starting...");
+
+    let Some((app_state, event_rx)) = create_app_state() else {
+        return;
     };
 
     tauri::Builder::default()
@@ -1489,7 +1605,7 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| {
-            error!("Error running Tauri application: {}", e);
+            error!("Error running Tauri application: {e}");
         });
 
     info!("Application shutting down");

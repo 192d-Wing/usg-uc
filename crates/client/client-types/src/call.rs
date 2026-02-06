@@ -48,7 +48,7 @@ impl std::fmt::Display for CallState {
 
 impl CallState {
     /// Returns true if the call is in an active state.
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         matches!(
             self,
             Self::Dialing
@@ -63,7 +63,7 @@ impl CallState {
     }
 
     /// Returns true if media should be flowing.
-    pub fn has_media(&self) -> bool {
+    pub const fn has_media(&self) -> bool {
         matches!(self, Self::EarlyMedia | Self::Connected)
     }
 }
@@ -224,14 +224,15 @@ impl CallInfo {
         self.connect_time.map(|ct| {
             let now = Utc::now();
             let diff = now.signed_duration_since(ct);
-            Duration::from_secs(diff.num_seconds().max(0) as u64)
+            Duration::from_secs(diff.num_seconds().max(0).cast_unsigned())
         })
     }
 
     /// Returns a formatted duration string (MM:SS or HH:MM:SS).
     pub fn duration_string(&self) -> String {
-        match self.duration() {
-            Some(d) => {
+        self.duration().map_or_else(
+            || "0:00".to_string(),
+            |d| {
                 let total_secs = d.as_secs();
                 let hours = total_secs / 3600;
                 let minutes = (total_secs % 3600) / 60;
@@ -242,9 +243,8 @@ impl CallInfo {
                 } else {
                     format!("{minutes}:{seconds:02}")
                 }
-            }
-            None => "0:00".to_string(),
-        }
+            },
+        )
     }
 }
 
@@ -277,7 +277,7 @@ impl CallHistoryEntry {
         let now = Utc::now();
         let duration_secs = info.connect_time.map(|ct| {
             let diff = now.signed_duration_since(ct);
-            diff.num_seconds().max(0) as u64
+            diff.num_seconds().max(0).cast_unsigned()
         });
 
         Self {
@@ -295,8 +295,9 @@ impl CallHistoryEntry {
 
     /// Returns a formatted duration string.
     pub fn duration_string(&self) -> String {
-        match self.duration_secs {
-            Some(total_secs) => {
+        self.duration_secs.map_or_else(
+            || "0:00".to_string(),
+            |total_secs| {
                 let hours = total_secs / 3600;
                 let minutes = (total_secs % 3600) / 60;
                 let seconds = total_secs % 60;
@@ -306,9 +307,8 @@ impl CallHistoryEntry {
                 } else {
                     format!("{minutes}:{seconds:02}")
                 }
-            }
-            None => "0:00".to_string(),
-        }
+            },
+        )
     }
 }
 

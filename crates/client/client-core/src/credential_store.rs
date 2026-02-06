@@ -95,7 +95,7 @@ impl CredentialStore {
     }
 
     /// Returns which backend is being used.
-    pub fn backend(&self) -> StorageBackend {
+    pub const fn backend(&self) -> StorageBackend {
         self.backend
     }
 
@@ -126,6 +126,7 @@ impl CredentialStore {
     // ========== Keyring Backend ==========
 
     #[cfg(feature = "digest-auth")]
+    #[allow(clippy::unused_self)]
     fn store_keyring(&self, account_id: &str, password: &str) -> AppResult<()> {
         let entry = keyring::Entry::new(SERVICE_NAME, account_id)
             .map_err(|e| AppError::Settings(format!("Failed to create keyring entry: {e}")))?;
@@ -146,6 +147,7 @@ impl CredentialStore {
     }
 
     #[cfg(feature = "digest-auth")]
+    #[allow(clippy::unused_self)]
     fn get_keyring(&self, account_id: &str) -> AppResult<Option<Zeroizing<String>>> {
         let entry = keyring::Entry::new(SERVICE_NAME, account_id)
             .map_err(|e| AppError::Settings(format!("Failed to create keyring entry: {e}")))?;
@@ -173,6 +175,7 @@ impl CredentialStore {
     }
 
     #[cfg(feature = "digest-auth")]
+    #[allow(clippy::unused_self)]
     fn delete_keyring(&self, account_id: &str) -> AppResult<()> {
         let entry = keyring::Entry::new(SERVICE_NAME, account_id)
             .map_err(|e| AppError::Settings(format!("Failed to create keyring entry: {e}")))?;
@@ -208,8 +211,7 @@ impl CredentialStore {
             // Derive key from machine-specific data
             // We use: hostname + username + config dir path as the input key material
             let hostname = hostname::get()
-                .map(|h| h.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "unknown".to_string());
+                .map_or_else(|_| "unknown".to_string(), |h| h.to_string_lossy().to_string());
             let username = whoami::username();
             let config_path = self.config_dir.to_string_lossy();
 
@@ -228,9 +230,10 @@ impl CredentialStore {
         }
 
         // Safe because we just set it
-        Ok(self.encryption_key.as_ref().ok_or_else(|| {
-            AppError::Settings("Encryption key not initialized".to_string())
-        })?)
+        self
+            .encryption_key
+            .as_ref()
+            .ok_or_else(|| AppError::Settings("Encryption key not initialized".to_string()))
     }
 
     /// Gets the path to the encrypted credentials file.
@@ -251,9 +254,7 @@ impl CredentialStore {
 
         if encrypted_data.len() < 12 {
             // Nonce is 12 bytes
-            return Err(AppError::Settings(
-                "Corrupted credentials file".to_string(),
-            ));
+            return Err(AppError::Settings("Corrupted credentials file".to_string()));
         }
 
         // First 12 bytes are the nonce
@@ -328,16 +329,16 @@ impl CredentialStore {
     #[cfg(feature = "digest-auth")]
     fn get_encrypted_file(&mut self, account_id: &str) -> AppResult<Option<Zeroizing<String>>> {
         let map = self.load_credentials_map()?;
-        match map.get(account_id) {
-            Some(password) => {
-                debug!(account_id = %account_id, "Password retrieved from encrypted file");
-                Ok(Some(Zeroizing::new(password.clone())))
-            }
-            None => {
+        Ok(map.get(account_id).map_or_else(
+            || {
                 debug!(account_id = %account_id, "No password found in encrypted file");
-                Ok(None)
-            }
-        }
+                None
+            },
+            |password| {
+                debug!(account_id = %account_id, "Password retrieved from encrypted file");
+                Some(Zeroizing::new(password.clone()))
+            },
+        ))
     }
 
     #[cfg(not(feature = "digest-auth"))]
@@ -415,7 +416,10 @@ mod tests {
 
         // Retrieve
         let retrieved = store.get_encrypted_file("test-account").unwrap();
-        assert_eq!(retrieved.map(|p| p.as_str().to_string()), Some("secret-password".to_string()));
+        assert_eq!(
+            retrieved.map(|p| p.as_str().to_string()),
+            Some("secret-password".to_string())
+        );
 
         // Delete
         store.delete_encrypted_file("test-account").unwrap();
@@ -435,19 +439,21 @@ mod tests {
             encryption_key: None,
         };
 
-        store
-            .store_encrypted_file("account1", "password1")
-            .unwrap();
-        store
-            .store_encrypted_file("account2", "password2")
-            .unwrap();
+        store.store_encrypted_file("account1", "password1").unwrap();
+        store.store_encrypted_file("account2", "password2").unwrap();
 
         assert_eq!(
-            store.get_encrypted_file("account1").unwrap().map(|p| p.as_str().to_string()),
+            store
+                .get_encrypted_file("account1")
+                .unwrap()
+                .map(|p| p.as_str().to_string()),
             Some("password1".to_string())
         );
         assert_eq!(
-            store.get_encrypted_file("account2").unwrap().map(|p| p.as_str().to_string()),
+            store
+                .get_encrypted_file("account2")
+                .unwrap()
+                .map(|p| p.as_str().to_string()),
             Some("password2".to_string())
         );
 
@@ -455,7 +461,10 @@ mod tests {
         store.delete_encrypted_file("account1").unwrap();
         assert!(store.get_encrypted_file("account1").unwrap().is_none());
         assert_eq!(
-            store.get_encrypted_file("account2").unwrap().map(|p| p.as_str().to_string()),
+            store
+                .get_encrypted_file("account2")
+                .unwrap()
+                .map(|p| p.as_str().to_string()),
             Some("password2".to_string())
         );
     }

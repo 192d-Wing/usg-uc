@@ -13,7 +13,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// The PIN is automatically zeroed from memory when dropped.
 /// This type does not implement `Debug` or `Display` to prevent
 /// accidental logging of the PIN.
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Default, Zeroize, ZeroizeOnDrop)]
 pub struct SmartCardPin {
     pin: String,
 }
@@ -34,12 +34,12 @@ impl SmartCardPin {
     }
 
     /// Returns the length of the PIN.
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.pin.len()
     }
 
     /// Returns whether the PIN is empty.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.pin.is_empty()
     }
 }
@@ -47,12 +47,6 @@ impl SmartCardPin {
 impl fmt::Debug for SmartCardPin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SmartCardPin([REDACTED, len={}])", self.pin.len())
-    }
-}
-
-impl Default for SmartCardPin {
-    fn default() -> Self {
-        Self { pin: String::new() }
     }
 }
 
@@ -73,7 +67,7 @@ impl SessionToken {
     }
 
     /// Creates an empty session token.
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self { token: Vec::new() }
     }
 
@@ -87,12 +81,12 @@ impl SessionToken {
     }
 
     /// Returns the length of the token.
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.token.len()
     }
 
     /// Returns whether the token is empty.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.token.is_empty()
     }
 }
@@ -112,7 +106,7 @@ impl Default for SessionToken {
 /// SRTP keying material that is automatically zeroed when dropped.
 ///
 /// Contains the master key and salt for SRTP encryption.
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Default, Zeroize, ZeroizeOnDrop)]
 pub struct SrtpKeyMaterial {
     /// Master key (32 bytes for AES-256).
     master_key: Vec<u8>,
@@ -146,17 +140,17 @@ impl SrtpKeyMaterial {
     }
 
     /// Returns the key length.
-    pub fn key_len(&self) -> usize {
+    pub const fn key_len(&self) -> usize {
         self.master_key.len()
     }
 
     /// Returns the salt length.
-    pub fn salt_len(&self) -> usize {
+    pub const fn salt_len(&self) -> usize {
         self.master_salt.len()
     }
 
     /// Validates that the key material has correct sizes for AES-256-GCM.
-    pub fn is_valid_aes256(&self) -> bool {
+    pub const fn is_valid_aes256(&self) -> bool {
         self.master_key.len() == 32 && self.master_salt.len() == 12
     }
 }
@@ -172,20 +166,11 @@ impl fmt::Debug for SrtpKeyMaterial {
     }
 }
 
-impl Default for SrtpKeyMaterial {
-    fn default() -> Self {
-        Self {
-            master_key: Vec::new(),
-            master_salt: Vec::new(),
-        }
-    }
-}
-
 /// A sensitive string that is zeroed on drop.
 ///
 /// Use this for any string that might contain sensitive data
 /// that should not persist in memory.
-#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Default, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct SensitiveString {
     #[serde(skip)]
     value: String,
@@ -205,12 +190,12 @@ impl SensitiveString {
     }
 
     /// Returns whether the string is empty.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.value.is_empty()
     }
 
     /// Returns the length of the string.
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.value.len()
     }
 }
@@ -224,14 +209,6 @@ impl fmt::Debug for SensitiveString {
 impl fmt::Display for SensitiveString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[REDACTED]")
-    }
-}
-
-impl Default for SensitiveString {
-    fn default() -> Self {
-        Self {
-            value: String::new(),
-        }
     }
 }
 

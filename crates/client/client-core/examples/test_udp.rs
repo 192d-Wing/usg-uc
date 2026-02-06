@@ -26,8 +26,11 @@ Content-Length: 0\r\n\
     let mut buf = [0u8; 4096];
     println!("Waiting for response...");
 
-    match tokio::time::timeout(tokio::time::Duration::from_secs(5), socket.recv_from(&mut buf))
-        .await
+    match tokio::time::timeout(
+        tokio::time::Duration::from_secs(5),
+        socket.recv_from(&mut buf),
+    )
+    .await
     {
         Ok(Ok((n, src))) => {
             println!("Received {} bytes from {}", n, src);

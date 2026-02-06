@@ -5,14 +5,14 @@
 //! is NOT supported for CNSA 2.0 compliance.
 //!
 //! Note: The `digest-auth` feature enables username/password authentication
-//! for testing with commercial VoIP providers. This is NOT CNSA 2.0 compliant.
+//! for testing with commercial `VoIP` providers. This is NOT CNSA 2.0 compliant.
 
 use serde::{Deserialize, Serialize};
 
 /// Digest authentication credentials for testing with commercial providers.
 ///
 /// WARNING: This is NOT CNSA 2.0 compliant and should only be used for
-/// interoperability testing with commercial VoIP providers that do not
+/// interoperability testing with commercial `VoIP` providers that do not
 /// support mTLS client certificates.
 #[cfg(feature = "digest-auth")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,7 +52,7 @@ impl DigestAuthCredentials {
     }
 
     /// Returns whether the password is stored in secure credential storage.
-    pub fn is_persisted(&self) -> bool {
+    pub const fn is_persisted(&self) -> bool {
         self.password_persisted
     }
 }
@@ -181,12 +181,12 @@ impl std::fmt::Display for TransportPreference {
 
 impl TransportPreference {
     /// Returns true if this transport is CNSA 2.0 compliant.
-    pub fn is_secure(&self) -> bool {
+    pub const fn is_secure(&self) -> bool {
         matches!(self, Self::TlsOnly)
     }
 
     /// Returns the default port for this transport.
-    pub fn default_port(&self) -> u16 {
+    pub const fn default_port(&self) -> u16 {
         match self {
             Self::TlsOnly => 5061,
             Self::Udp | Self::Tcp => 5060,
@@ -240,6 +240,7 @@ impl CertificateConfig {
     }
 
     /// Uses a specific certificate by thumbprint.
+    #[must_use]
     pub fn with_thumbprint(mut self, thumbprint: impl Into<String>) -> Self {
         self.selection_mode = CertificateSelectionMode::SpecificCertificate;
         self.certificate_thumbprint = Some(thumbprint.into());
@@ -314,7 +315,7 @@ impl std::fmt::Display for ServerCertVerificationMode {
 
 impl ServerCertVerificationMode {
     /// Returns all available modes for UI selection.
-    pub fn all_modes() -> &'static [(&'static str, &'static str)] {
+    pub const fn all_modes() -> &'static [(&'static str, &'static str)] {
         &[
             ("System", "Use the operating system's trusted CA store"),
             ("Custom", "Use a custom CA certificate file"),
@@ -323,7 +324,7 @@ impl ServerCertVerificationMode {
     }
 
     /// Returns the display label for this mode.
-    pub fn label(&self) -> &str {
+    pub const fn label(&self) -> &str {
         match self {
             Self::System => "System CA Store",
             Self::Custom { .. } => "Custom CA File",
@@ -332,7 +333,7 @@ impl ServerCertVerificationMode {
     }
 
     /// Returns whether this is the insecure mode.
-    pub fn is_insecure(&self) -> bool {
+    pub const fn is_insecure(&self) -> bool {
         matches!(self, Self::Insecure)
     }
 

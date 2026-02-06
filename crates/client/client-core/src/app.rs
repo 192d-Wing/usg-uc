@@ -181,7 +181,7 @@ impl ClientApp {
         #[cfg(feature = "digest-auth")]
         {
             if let Err(e) = settings_manager.load_persisted_passwords() {
-                warn!("Failed to load persisted passwords: {}", e);
+                warn!("Failed to load persisted passwords: {e}");
             } else {
                 info!("Persisted passwords loaded from secure storage");
             }
@@ -252,6 +252,7 @@ impl ClientApp {
     /// This configures:
     /// - SIP transport for mTLS with the registrar
     /// - Call manager for DTLS-SRTP with media endpoints
+    #[allow(clippy::needless_pass_by_value)] // cert_chain is consumed by set_dtls_credentials
     pub fn set_client_certificate(&mut self, cert_chain: Vec<Vec<u8>>, thumbprint: &str) {
         info!(
             thumbprint = %thumbprint,
@@ -266,7 +267,7 @@ impl ClientApp {
         // For smart card certificates, the private key stays on the card
         // and signing operations are performed by the Windows CryptoAPI
         self.call_manager
-            .set_dtls_credentials(cert_chain.clone(), Vec::new());
+            .set_dtls_credentials(cert_chain, Vec::new());
 
         // Note: For smart card mTLS, we pass the cert chain without private key.
         // The Windows TLS stack handles smart card signing natively.
@@ -345,7 +346,7 @@ impl ClientApp {
     }
 
     /// Returns whether a client certificate is configured.
-    pub fn has_client_certificate(&self) -> bool {
+    pub const fn has_client_certificate(&self) -> bool {
         self.client_cert_chain.is_some()
     }
 
@@ -361,8 +362,10 @@ impl ClientApp {
     /// Returns `None` if the transport is not initialized.
     pub async fn get_udp_socket_for_receive(
         &mut self,
-    ) -> Option<(std::sync::Arc<tokio::net::UdpSocket>, tokio::sync::mpsc::Sender<TransportEvent>)>
-    {
+    ) -> Option<(
+        std::sync::Arc<tokio::net::UdpSocket>,
+        tokio::sync::mpsc::Sender<TransportEvent>,
+    )> {
         if let Some(ref transport) = self.sip_transport {
             match transport.get_or_create_udp_socket().await {
                 Ok((socket, _is_new)) => {
@@ -432,9 +435,9 @@ impl ClientApp {
                 current_state = ?self.state,
                 "Cannot make call: not registered"
             );
+            let state = self.state;
             return Err(AppError::Sip(format!(
-                "Cannot make call: not registered (current state: {:?})",
-                self.state
+                "Cannot make call: not registered (current state: {state:?})"
             )));
         }
 
@@ -475,7 +478,7 @@ impl ClientApp {
     }
 
     /// Returns whether currently muted.
-    pub fn is_muted(&self) -> bool {
+    pub const fn is_muted(&self) -> bool {
         self.call_manager.is_muted()
     }
 
@@ -553,7 +556,7 @@ impl ClientApp {
     }
 
     /// Returns the current application state.
-    pub fn state(&self) -> AppState {
+    pub const fn state(&self) -> AppState {
         self.state
     }
 
@@ -570,17 +573,17 @@ impl ClientApp {
     }
 
     /// Returns the settings manager.
-    pub fn settings(&self) -> &SettingsManager {
+    pub const fn settings(&self) -> &SettingsManager {
         &self.settings_manager
     }
 
     /// Returns mutable reference to settings manager.
-    pub fn settings_mut(&mut self) -> &mut SettingsManager {
+    pub const fn settings_mut(&mut self) -> &mut SettingsManager {
         &mut self.settings_manager
     }
 
     /// Returns the contact manager.
-    pub fn contacts(&self) -> &Arc<RwLock<ContactManager>> {
+    pub const fn contacts(&self) -> &Arc<RwLock<ContactManager>> {
         &self.contact_manager
     }
 
@@ -648,10 +651,7 @@ impl ClientApp {
                 if let Some(ref transport) = self.sip_transport {
                     // Detect transport type from Via header (e.g., "SIP/2.0/UDP" or "SIP/2.0/TLS")
                     let via_header = request.headers.get_value(&HeaderName::Via);
-                    let use_udp = via_header
-                        .as_ref()
-                        .map(|via| via.contains("/UDP"))
-                        .unwrap_or(false);
+                    let use_udp = via_header.as_ref().is_some_and(|via| via.contains("/UDP"));
 
                     debug!(
                         via = ?via_header,
@@ -670,7 +670,7 @@ impl ClientApp {
                         let _ = self
                             .app_event_tx
                             .send(AppEvent::Error {
-                                message: format!("Failed to send registration: {}", e),
+                                message: format!("Failed to send registration: {e}"),
                             })
                             .await;
                     }
@@ -684,6 +684,7 @@ impl ClientApp {
     }
 
     /// Handles a call manager event.
+    #[allow(clippy::too_many_lines)]
     pub async fn handle_call_event(&mut self, event: CallManagerEvent) -> AppResult<()> {
         match event {
             CallManagerEvent::CallStateChanged {
@@ -737,9 +738,7 @@ impl ClientApp {
 
                 let _ = self
                     .app_event_tx
-                    .send(AppEvent::IncomingCallCancelled {
-                        call_id,
-                    })
+                    .send(AppEvent::IncomingCallCancelled { call_id })
                     .await;
             }
             CallManagerEvent::CallEnded {
@@ -761,11 +760,8 @@ impl ClientApp {
                     })
                     .await;
             }
-            CallManagerEvent::CallConnected { .. } => {
-                // Already handled via state change
-            }
-            CallManagerEvent::MediaStateChanged { .. } => {
-                // Internal event, not forwarded to GUI
+            CallManagerEvent::CallConnected { .. } | CallManagerEvent::MediaStateChanged { .. } => {
+                // Already handled via state change / internal event, not forwarded to GUI
             }
             CallManagerEvent::Error { call_id, message } => {
                 error!(call_id = ?call_id, message = %message, "Call error");
@@ -781,10 +777,7 @@ impl ClientApp {
                 let via_header = response
                     .headers
                     .get_value(&proto_sip::header::HeaderName::Via);
-                let use_udp = via_header
-                    .as_ref()
-                    .map(|via| via.contains("/UDP"))
-                    .unwrap_or(false);
+                let use_udp = via_header.as_ref().is_some_and(|via| via.contains("/UDP"));
 
                 info!(
                     status = response.status.code(),
@@ -862,19 +855,17 @@ impl ClientApp {
                 let cseq_value = response
                     .headers
                     .get_value(&proto_sip::header::HeaderName::CSeq);
-                let is_register_response = cseq_value
-                    .map(|v| v.to_uppercase().contains("REGISTER"))
-                    .unwrap_or(false);
+                let is_register_response =
+                    cseq_value.is_some_and(|v| v.to_uppercase().contains("REGISTER"));
 
                 if is_register_response {
-                    if let Some(ref account_id) = self.current_account_id {
-                        if let Err(e) = self
+                    if let Some(ref account_id) = self.current_account_id
+                        && let Err(e) = self
                             .registration_agent
                             .handle_response(&response, account_id)
                             .await
-                        {
-                            warn!(error = %e, "Failed to handle registration response");
-                        }
+                    {
+                        warn!(error = %e, "Failed to handle registration response");
                     }
                 } else {
                     // Route to call manager for call-related responses
@@ -945,11 +936,12 @@ impl ClientApp {
         }
 
         // Collect transport events first, then process them
-        let transport_events: Vec<_> = if let Some(ref mut rx) = self.transport_event_rx {
-            std::iter::from_fn(|| rx.try_recv().ok()).collect()
-        } else {
-            vec![]
-        };
+        let transport_events: Vec<_> = self
+            .transport_event_rx
+            .as_mut()
+            .map_or_else(Vec::new, |rx| {
+                std::iter::from_fn(|| rx.try_recv().ok()).collect()
+            });
         for event in transport_events {
             self.handle_transport_event(event).await?;
         }
@@ -967,7 +959,10 @@ impl ClientApp {
         let call_mgr_events: Vec<_> =
             std::iter::from_fn(|| self.call_event_rx.try_recv().ok()).collect();
         if !call_mgr_events.is_empty() {
-            info!(count = call_mgr_events.len(), "Processing call manager events");
+            info!(
+                count = call_mgr_events.len(),
+                "Processing call manager events"
+            );
         }
         for event in call_mgr_events {
             self.handle_call_event(event).await?;
@@ -983,6 +978,7 @@ impl ClientApp {
     }
 
     /// Handles a call agent event.
+    #[allow(clippy::too_many_lines)]
     async fn handle_call_agent_event(&mut self, event: client_sip_ua::CallEvent) -> AppResult<()> {
         use client_sip_ua::CallEvent;
 
@@ -1001,10 +997,7 @@ impl ClientApp {
                 if let Some(ref transport) = self.sip_transport {
                     // Detect transport type from Via header
                     let via_header = request.headers.get_value(&HeaderName::Via);
-                    let use_udp = via_header
-                        .as_ref()
-                        .map(|via| via.contains("/UDP"))
-                        .unwrap_or(false);
+                    let use_udp = via_header.as_ref().is_some_and(|via| via.contains("/UDP"));
 
                     info!(
                         via = ?via_header,
@@ -1020,7 +1013,9 @@ impl ClientApp {
 
                     match &result {
                         Ok(()) => info!(method = %request.method, "Call request sent successfully"),
-                        Err(e) => error!(error = %e, method = %request.method, "Failed to send call request"),
+                        Err(e) => {
+                            error!(error = %e, method = %request.method, "Failed to send call request");
+                        }
                     }
 
                     if let Err(e) = result {
@@ -1117,6 +1112,7 @@ impl ClientApp {
         // Save contacts
         let mut contacts = self.contact_manager.write().await;
         contacts.save_if_dirty()?;
+        drop(contacts);
 
         Ok(())
     }

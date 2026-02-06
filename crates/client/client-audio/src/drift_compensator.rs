@@ -1,6 +1,6 @@
 //! Clock drift compensation between remote sender and local hardware clock.
 //!
-//! VoIP audio has two independent clocks: the remote sender generates
+//! `VoIP` audio has two independent clocks: the remote sender generates
 //! packets at its clock rate, and the local hardware consumes samples at
 //! its own rate. Even small differences (e.g., 50 ppm) accumulate over
 //! a call, causing the jitter buffer to either grow (remote faster) or
@@ -27,7 +27,7 @@ const MAX_ADJUSTMENT: i32 = 1;
 pub struct DriftCompensator {
     /// Circular buffer of jitter buffer depth measurements (in ms).
     depth_history: Vec<f32>,
-    /// Write index into depth_history.
+    /// Write index into `depth_history`.
     write_idx: usize,
     /// Number of samples collected so far.
     sample_count: usize,
@@ -87,6 +87,7 @@ impl DriftCompensator {
         // Convert to ms/sec: slope * measurements_per_sec.
         // Each measurement is taken every (measure_interval * ~10ms) ≈ 100ms,
         // so ~10 measurements per second.
+        #[allow(clippy::cast_precision_loss)]
         let measurements_per_sec = 1000.0 / (self.measure_interval as f32 * 10.0);
         let drift_ms_per_sec = slope * measurements_per_sec;
 
@@ -114,7 +115,9 @@ impl DriftCompensator {
     }
 
     /// Computes the linear regression slope of depth measurements.
+    #[allow(clippy::similar_names, clippy::suspicious_operation_groupings)]
     fn compute_slope(&self) -> f32 {
+        #[allow(clippy::cast_precision_loss)]
         let n = self.sample_count as f32;
         let mut sum_x: f32 = 0.0;
         let mut sum_y: f32 = 0.0;
@@ -129,6 +132,7 @@ impl DriftCompensator {
 
         for i in 0..self.sample_count {
             let idx = (start + i) % WINDOW_SIZE;
+            #[allow(clippy::cast_precision_loss)]
             let x = i as f32;
             let y = self.depth_history[idx];
             sum_x += x;
@@ -137,12 +141,12 @@ impl DriftCompensator {
             sum_x2 += x * x;
         }
 
-        let denominator = n * sum_x2 - sum_x * sum_x;
+        let denominator = n.mul_add(sum_x2, -(sum_x * sum_x));
         if denominator.abs() < f32::EPSILON {
             return 0.0;
         }
 
-        (n * sum_xy - sum_x * sum_y) / denominator
+        n.mul_add(sum_xy, -(sum_x * sum_y)) / denominator
     }
 
     /// Resets the compensator state.

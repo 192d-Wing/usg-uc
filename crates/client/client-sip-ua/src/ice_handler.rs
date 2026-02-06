@@ -103,16 +103,19 @@ impl IceHandler {
     }
 
     /// Gets the current ICE state.
+    #[allow(clippy::missing_const_for_fn)]
     pub fn state(&self) -> IceState {
         self.agent.state()
     }
 
     /// Gets the current gathering state.
+    #[allow(clippy::missing_const_for_fn)]
     pub fn gathering_state(&self) -> GatheringState {
         self.agent.gathering_state()
     }
 
     /// Gets the ICE role.
+    #[allow(clippy::missing_const_for_fn)]
     pub fn role(&self) -> IceRole {
         self.agent.role()
     }
@@ -276,7 +279,7 @@ impl IceHandler {
         self.agent
             .local_candidates()
             .iter()
-            .map(|c| c.to_sdp())
+            .map(Candidate::to_sdp)
             .collect()
     }
 

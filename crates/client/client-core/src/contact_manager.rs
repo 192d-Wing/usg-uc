@@ -85,7 +85,7 @@ impl ContactManager {
     }
 
     /// Loads contacts from a JSON file.
-    fn load_from_file(path: &PathBuf) -> AppResult<ContactStore> {
+    fn load_from_file(path: &std::path::Path) -> AppResult<ContactStore> {
         let content = fs::read_to_string(path)?;
         let store: ContactStore = serde_json::from_str(&content)
             .map_err(|e| AppError::Serialization(format!("Failed to parse contacts: {e}")))?;
@@ -120,7 +120,7 @@ impl ContactManager {
     }
 
     /// Returns whether contacts have unsaved changes.
-    pub fn is_dirty(&self) -> bool {
+    pub const fn is_dirty(&self) -> bool {
         self.dirty
     }
 
@@ -244,7 +244,7 @@ impl ContactManager {
     }
 
     /// Gets the total number of call history entries.
-    pub fn call_history_count(&self) -> usize {
+    pub const fn call_history_count(&self) -> usize {
         self.store.call_history.len()
     }
 
@@ -260,7 +260,7 @@ impl ContactManager {
 
 /// Normalizes a phone number for comparison (removes non-digits).
 fn normalize_number(number: &str) -> String {
-    number.chars().filter(|c| c.is_ascii_digit()).collect()
+    number.chars().filter(char::is_ascii_digit).collect()
 }
 
 /// Creates a new contact with a generated ID.

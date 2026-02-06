@@ -122,15 +122,15 @@ struct ClientCertResolver {
 
 impl ClientCertResolver {
     /// Creates a new resolver without a certificate.
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             certified_key: None,
         }
     }
 
     /// Creates a resolver with the given certificate chain and private key.
-    fn with_cert(cert_chain: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Self {
-        let signing_key = match rustls::crypto::aws_lc_rs::sign::any_supported_type(&key) {
+    fn with_cert(cert_chain: Vec<CertificateDer<'static>>, key: &PrivateKeyDer<'static>) -> Self {
+        let signing_key = match rustls::crypto::aws_lc_rs::sign::any_supported_type(key) {
             Ok(key) => key,
             Err(e) => {
                 error!(error = %e, "Failed to parse private key for client auth");
@@ -167,7 +167,7 @@ const MAX_SIP_MESSAGE_SIZE: usize = 65536;
 
 /// Starts a UDP receive loop in a dedicated thread using blocking I/O.
 ///
-/// This is a workaround for Tauri's async runtime issues with tokio::spawn.
+/// This is a workaround for Tauri's async runtime issues with `tokio::spawn`.
 /// The thread will run indefinitely, receiving UDP packets and sending them
 /// through the provided channel.
 ///
@@ -176,7 +176,7 @@ const MAX_SIP_MESSAGE_SIZE: usize = 65536;
 /// * `event_tx` - Async channel to send transport events to
 ///
 /// # Returns
-/// A JoinHandle for the spawned thread (can be ignored if you don't need to join).
+/// A `JoinHandle` for the spawned thread (can be ignored if you don't need to join).
 pub fn start_udp_receive_thread(
     local_addr: std::net::SocketAddr,
     event_tx: mpsc::Sender<TransportEvent>,
@@ -196,7 +196,7 @@ pub fn start_udp_receive_thread(
             }
         };
 
-        let mut buf = [0u8; MAX_SIP_MESSAGE_SIZE];
+        let mut buf = vec![0u8; MAX_SIP_MESSAGE_SIZE];
         info!("UDP receive thread: entering receive loop");
 
         loop {
@@ -247,17 +247,14 @@ pub fn start_udp_receive_thread(
 /// which works around issues with Tauri's async runtime and tokio's UDP socket.
 ///
 /// NOTE: This function takes ownership of the Arc<UdpSocket> and converts it to a
-/// std::net::UdpSocket for blocking receive. The socket should not be used for
+/// `std::net::UdpSocket` for blocking receive. The socket should not be used for
 /// send after calling this function - use a separate socket or call this before
 /// the socket is stored for sending.
 ///
 /// # Arguments
 /// * `socket` - The UDP socket to receive from (will be converted to blocking)
 /// * `event_tx` - Channel to send transport events to
-pub async fn run_udp_receive_loop(
-    socket: Arc<UdpSocket>,
-    event_tx: mpsc::Sender<TransportEvent>,
-) {
+pub async fn run_udp_receive_loop(socket: Arc<UdpSocket>, event_tx: mpsc::Sender<TransportEvent>) {
     // Log socket info for debugging
     let local_addr = socket.local_addr().ok();
     if let Some(ref addr) = local_addr {
@@ -274,10 +271,10 @@ pub async fn run_udp_receive_loop(
     // Let's spawn a blocking task instead
 
     // Use tokio's spawn_blocking for actual blocking receive
-    let socket_clone = socket.clone();
+    let socket_clone = socket;
     tokio::task::spawn_blocking(move || {
         info!("UDP receive thread started (blocking)");
-        let mut buf = [0u8; MAX_SIP_MESSAGE_SIZE];
+        let mut buf = vec![0u8; MAX_SIP_MESSAGE_SIZE];
 
         loop {
             // Use the tokio socket's underlying std socket for blocking receive
@@ -316,12 +313,13 @@ pub async fn run_udp_receive_loop(
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Periodic log
+                    static COUNTER: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
                     // No data available, sleep a bit and try again
                     std::thread::sleep(std::time::Duration::from_millis(10));
-                    // Periodic log
-                    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if count % 500 == 0 {
+                    if count.is_multiple_of(500) {
                         info!(poll_count = count, "UDP receive (blocking) still polling");
                     }
                 }
@@ -433,9 +431,8 @@ impl TlsConnection {
     fn try_parse_message(&mut self) -> AppResult<Option<SipMessage>> {
         // Look for end of headers (\r\n\r\n)
         let data = &self.read_buffer[..];
-        let header_end = match find_header_end(data) {
-            Some(pos) => pos,
-            None => return Ok(None), // Need more data
+        let Some(header_end) = find_header_end(data) else {
+            return Ok(None); // Need more data
         };
 
         // Parse headers to find Content-Length
@@ -471,7 +468,7 @@ pub struct TransportConfig {
     /// Client certificate chain for mTLS (DER-encoded).
     pub client_cert_chain: Option<Vec<Vec<u8>>>,
     /// Client private key for mTLS (DER-encoded).
-    /// If None and client_cert_chain is Some, smart card signing is assumed.
+    /// If `None` and `client_cert_chain` is `Some`, smart card signing is assumed.
     pub client_private_key: Option<Vec<u8>>,
 }
 
@@ -482,12 +479,14 @@ impl TransportConfig {
     }
 
     /// Sets the verification mode.
+    #[must_use]
     pub fn with_verification_mode(mut self, mode: CertVerificationMode) -> Self {
         self.verification_mode = mode;
         self
     }
 
     /// Sets the client certificate for mTLS.
+    #[must_use]
     pub fn with_client_certificate(
         mut self,
         cert_chain: Vec<Vec<u8>>,
@@ -509,7 +508,7 @@ pub struct SipTransport {
     /// Active TLS connections by peer address.
     connections: Arc<Mutex<HashMap<SocketAddr, TlsConnection>>>,
     /// UDP socket for connectionless transport.
-    /// Uses RwLock so receive task can access socket without blocking sends.
+    /// Uses `RwLock` so receive task can access socket without blocking sends.
     udp_socket: Arc<RwLock<Option<Arc<UdpSocket>>>>,
     /// Event sender.
     event_tx: mpsc::Sender<TransportEvent>,
@@ -553,14 +552,13 @@ impl SipTransport {
 
         // Rebuild TLS config
         let new_tls_config = Self::create_tls_config(&config)?;
+        drop(config);
 
         // Update the TLS config
-        let mut tls = self.tls_config.write().await;
-        *tls = Arc::new(new_tls_config);
+        *self.tls_config.write().await = Arc::new(new_tls_config);
 
         // Close existing connections (they'll reconnect with new config)
-        let mut connections = self.connections.lock().await;
-        connections.clear();
+        self.connections.lock().await.clear();
 
         Ok(())
     }
@@ -569,7 +567,7 @@ impl SipTransport {
     ///
     /// # Arguments
     /// * `cert_chain` - DER-encoded certificate chain (end-entity first)
-    /// * `private_key` - Optional DER-encoded private key. If None, smart card signing is assumed.
+    /// * `private_key` - Optional DER-encoded private key. If `None`, smart card signing is assumed.
     ///
     /// This will close all existing connections and rebuild the TLS config.
     pub async fn set_client_certificate(
@@ -589,14 +587,13 @@ impl SipTransport {
 
         // Rebuild TLS config
         let new_tls_config = Self::create_tls_config(&config)?;
+        drop(config);
 
         // Update the TLS config
-        let mut tls = self.tls_config.write().await;
-        *tls = Arc::new(new_tls_config);
+        *self.tls_config.write().await = Arc::new(new_tls_config);
 
         // Close existing connections (they'll reconnect with new config)
-        let mut connections = self.connections.lock().await;
-        connections.clear();
+        self.connections.lock().await.clear();
 
         Ok(())
     }
@@ -623,7 +620,7 @@ impl SipTransport {
             }
             CertVerificationMode::System => {
                 // Use platform's trusted CA store
-                let root_store = load_system_root_certs()?;
+                let root_store = load_system_root_certs();
                 info!(
                     cert_count = root_store.len(),
                     "Loaded system trusted CA certificates"
@@ -669,7 +666,7 @@ impl SipTransport {
                 );
 
                 // Use custom resolver for client certificates
-                let resolver = ClientCertResolver::with_cert(certs, key);
+                let resolver = ClientCertResolver::with_cert(certs, &key);
                 Ok(builder.with_client_cert_resolver(Arc::new(resolver)))
             }
             (Some(cert_chain), None) => {
@@ -780,7 +777,9 @@ impl SipTransport {
     pub async fn get_or_create_udp_socket(&self) -> AppResult<(Arc<UdpSocket>, bool)> {
         let socket_guard = self.udp_socket.read().await;
         if let Some(ref sock) = *socket_guard {
-            return Ok((sock.clone(), false));
+            let result = Ok((sock.clone(), false));
+            drop(socket_guard);
+            return result;
         }
         drop(socket_guard);
 
@@ -788,7 +787,9 @@ impl SipTransport {
         let mut socket_guard = self.udp_socket.write().await;
         // Double-check in case another task created it
         if let Some(ref sock) = *socket_guard {
-            return Ok((sock.clone(), false));
+            let result = Ok((sock.clone(), false));
+            drop(socket_guard);
+            return result;
         }
 
         // Bind to any available port
@@ -810,6 +811,7 @@ impl SipTransport {
         info!(local_addr = %local_addr, "UDP socket bound");
         let socket = Arc::new(socket);
         *socket_guard = Some(socket.clone());
+        drop(socket_guard);
         Ok((socket, true))
     }
 
@@ -822,7 +824,7 @@ impl SipTransport {
 
     /// Sends a SIP request via UDP (connectionless).
     ///
-    /// For testing with non-TLS providers like BulkVS.
+    /// For testing with non-TLS providers like `BulkVS`.
     /// NOTE: The caller is responsible for starting the UDP receive loop.
     /// In Tauri context, use `tauri::async_runtime::spawn` with `run_udp_receive_loop`.
     pub async fn send_request_udp(
@@ -904,11 +906,12 @@ impl SipTransport {
         socket
             .send_to(message_bytes.as_bytes(), destination)
             .await
-            .map_err(|e| AppError::Sip(format!("Failed to send UDP response to {destination}: {e}")))?;
+            .map_err(|e| {
+                AppError::Sip(format!("Failed to send UDP response to {destination}: {e}"))
+            })?;
 
         Ok(())
     }
-
 
     /// Establishes a TLS connection to a peer.
     async fn connect(&self, peer: SocketAddr) -> AppResult<()> {
@@ -1029,7 +1032,7 @@ impl SipTransport {
 /// - From
 /// - To (with optional tag for new dialogs)
 /// - Call-ID
-/// - CSeq
+/// - `CSeq`
 ///
 /// # Arguments
 /// * `request` - The original SIP request
@@ -1059,16 +1062,17 @@ pub fn build_response_from_request(
 
     // Copy To header, adding tag if provided
     if let Some(to) = request.headers.get_value(&HeaderName::To) {
-        let to_value = if let Some(tag) = to_tag {
-            // Add or replace tag
-            if to.contains(";tag=") {
-                to.to_string()
-            } else {
-                format!("{to};tag={tag}")
-            }
-        } else {
-            to.to_string()
-        };
+        let to_value = to_tag.map_or_else(
+            || to.to_string(),
+            |tag| {
+                // Add or replace tag
+                if to.contains(";tag=") {
+                    to.to_string()
+                } else {
+                    format!("{to};tag={tag}")
+                }
+            },
+        );
         response.add_header(Header::new(HeaderName::To, to_value));
     }
 
@@ -1101,7 +1105,8 @@ pub fn generate_tag() -> String {
         .unwrap_or(0);
 
     // Format as base36 for compact representation
-    format!("{:x}-{:x}", now, now.wrapping_mul(31))
+    let hash = now.wrapping_mul(31);
+    format!("{now:x}-{hash:x}")
 }
 
 /// Finds the end of SIP headers (\r\n\r\n).
@@ -1132,7 +1137,7 @@ fn extract_content_length(headers: &str) -> Option<usize> {
 /// - Windows: Windows Certificate Store (ROOT store)
 /// - macOS: Keychain
 /// - Linux: /etc/ssl/certs or distribution-specific locations
-fn load_system_root_certs() -> AppResult<RootCertStore> {
+fn load_system_root_certs() -> RootCertStore {
     let mut root_store = RootCertStore::empty();
 
     // Load native certificates - returns CertificateResult in 0.8+
@@ -1167,7 +1172,7 @@ fn load_system_root_certs() -> AppResult<RootCertStore> {
         warn!("No system root certificates loaded - server verification may fail");
     }
 
-    Ok(root_store)
+    root_store
 }
 
 /// Loads custom trusted CA certificates from DER-encoded bytes.
@@ -1219,7 +1224,8 @@ pub fn load_certs_from_pem_file(path: &std::path::Path) -> AppResult<Vec<Vec<u8>
     use std::fs;
 
     let content = fs::read(path).map_err(|e| {
-        AppError::Sip(format!("Failed to read CA file '{}': {}", path.display(), e))
+        let display = path.display();
+        AppError::Sip(format!("Failed to read CA file '{display}': {e}"))
     })?;
 
     // Check if it's a DER file (starts with ASN.1 SEQUENCE tag 0x30)
@@ -1234,15 +1240,16 @@ pub fn load_certs_from_pem_file(path: &std::path::Path) -> AppResult<Vec<Vec<u8>
 
     // Parse as PEM
     let pem_str = String::from_utf8(content).map_err(|e| {
-        AppError::Sip(format!("Invalid UTF-8 in CA file '{}': {}", path.display(), e))
+        let display = path.display();
+        AppError::Sip(format!("Invalid UTF-8 in CA file '{display}': {e}"))
     })?;
 
-    let certs = parse_pem_certificates(&pem_str)?;
+    let certs = parse_pem_certificates(&pem_str);
 
     if certs.is_empty() {
+        let display = path.display();
         return Err(AppError::Sip(format!(
-            "No valid certificates found in '{}'",
-            path.display()
+            "No valid certificates found in '{display}'"
         )));
     }
 
@@ -1258,7 +1265,7 @@ pub fn load_certs_from_pem_file(path: &std::path::Path) -> AppResult<Vec<Vec<u8>
 /// Parses PEM-encoded certificates from a string.
 ///
 /// Extracts all CERTIFICATE blocks from the PEM data.
-fn parse_pem_certificates(pem_data: &str) -> AppResult<Vec<Vec<u8>>> {
+fn parse_pem_certificates(pem_data: &str) -> Vec<Vec<u8>> {
     use base64::prelude::*;
 
     const BEGIN_CERT: &str = "-----BEGIN CERTIFICATE-----";
@@ -1291,7 +1298,7 @@ fn parse_pem_certificates(pem_data: &str) -> AppResult<Vec<Vec<u8>>> {
         }
     }
 
-    Ok(certs)
+    certs
 }
 
 #[cfg(test)]
@@ -1375,7 +1382,7 @@ mod tests {
         let event = TransportEvent::Connected {
             peer: "127.0.0.1:5060".parse().unwrap(),
         };
-        let debug_str = format!("{:?}", event);
+        let debug_str = format!("{event:?}");
         assert!(debug_str.contains("Connected"));
         assert!(debug_str.contains("127.0.0.1:5060"));
     }
@@ -1385,7 +1392,7 @@ mod tests {
         let event = TransportEvent::Error {
             message: "Test error".to_string(),
         };
-        let debug_str = format!("{:?}", event);
+        let debug_str = format!("{event:?}");
         assert!(debug_str.contains("Error"));
         assert!(debug_str.contains("Test error"));
     }
@@ -1396,7 +1403,7 @@ mod tests {
             peer: "192.168.1.1:5061".parse().unwrap(),
             reason: "Connection reset".to_string(),
         };
-        let debug_str = format!("{:?}", event);
+        let debug_str = format!("{event:?}");
         assert!(debug_str.contains("Disconnected"));
         assert!(debug_str.contains("192.168.1.1:5061"));
         assert!(debug_str.contains("Connection reset"));
@@ -1492,8 +1499,8 @@ mod tests {
     #[test]
     fn test_load_system_root_certs() {
         // This should succeed on all platforms, though may load 0 certs
-        let result = load_system_root_certs();
-        assert!(result.is_ok(), "Loading system root certs should succeed");
+        let _root_store = load_system_root_certs();
+        // Function always succeeds, just verify it returns a store
     }
 
     #[test]

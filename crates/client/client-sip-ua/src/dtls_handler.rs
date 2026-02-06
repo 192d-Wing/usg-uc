@@ -65,7 +65,7 @@ impl DtlsHandler {
     /// * `config` - DTLS configuration with certificates
     /// * `local_addr` - Local address for DTLS
     /// * `event_tx` - Channel for sending DTLS events
-    pub fn new(
+    pub const fn new(
         config: DtlsConfig,
         local_addr: SocketAddr,
         event_tx: mpsc::Sender<DtlsEvent>,
@@ -110,36 +110,37 @@ impl DtlsHandler {
     /// `sha-384 XX:XX:XX:...`
     pub fn local_fingerprint(&self) -> String {
         // Create a temporary connection to get fingerprint
-        if let Some(conn) = &self.connection {
-            conn.local_fingerprint().to_string()
-        } else {
-            // Create temp connection just for fingerprint
-            let temp_addr: SocketAddr = "0.0.0.0:0".parse().unwrap_or(self.local_addr);
-            let local_sbc: SbcSocketAddr = self.local_addr.into();
-            let temp_sbc: SbcSocketAddr = temp_addr.into();
-            if let Ok(conn) = DtlsConnection::new(self.config.clone(), local_sbc, temp_sbc) {
-                conn.local_fingerprint().to_string()
-            } else {
-                String::new()
-            }
-        }
+        self.connection.as_ref().map_or_else(
+            || {
+                // Create temp connection just for fingerprint
+                let temp_addr: SocketAddr = "0.0.0.0:0".parse().unwrap_or(self.local_addr);
+                let local_sbc: SbcSocketAddr = self.local_addr.into();
+                let temp_sbc: SbcSocketAddr = temp_addr.into();
+                DtlsConnection::new(self.config.clone(), local_sbc, temp_sbc).map_or_else(
+                    |_| String::new(),
+                    |conn| conn.local_fingerprint().to_string(),
+                )
+            },
+            |conn| conn.local_fingerprint().to_string(),
+        )
     }
 
     /// Sets the expected remote fingerprint from SDP.
     ///
     /// This will be verified during the handshake.
     /// Note: This is a no-op if no connection exists yet; fingerprint
-    /// will be set when handshake() is called.
+    /// will be set when `handshake()` is called.
+    #[allow(clippy::unused_async)]
     pub async fn set_remote_fingerprint(&self, fingerprint: &str) {
-        if let Some(conn) = &self.connection {
-            if let Ok(fp) = CertificateFingerprint::from_sdp(fingerprint) {
-                conn.set_remote_fingerprint(fp).await;
-            }
+        if let Some(conn) = &self.connection
+            && let Ok(fp) = CertificateFingerprint::from_sdp(fingerprint)
+        {
+            conn.set_remote_fingerprint(fp).await;
         }
     }
 
     /// Gets the DTLS role.
-    pub fn role(&self) -> DtlsRole {
+    pub const fn role(&self) -> DtlsRole {
         self.config.role
     }
 
@@ -147,8 +148,7 @@ impl DtlsHandler {
     pub fn state(&self) -> DtlsState {
         self.connection
             .as_ref()
-            .map(|c| c.state())
-            .unwrap_or(DtlsState::New)
+            .map_or(DtlsState::New, DtlsConnection::state)
     }
 
     /// Sets the UDP socket to use for DTLS.
@@ -193,10 +193,10 @@ impl DtlsHandler {
         };
 
         // Set remote fingerprint if provided
-        if let Some(fp_str) = remote_fingerprint {
-            if let Ok(fp) = CertificateFingerprint::from_sdp(fp_str) {
-                connection.set_remote_fingerprint(fp).await;
-            }
+        if let Some(fp_str) = remote_fingerprint
+            && let Ok(fp) = CertificateFingerprint::from_sdp(fp_str)
+        {
+            connection.set_remote_fingerprint(fp).await;
         }
 
         // Notify state change
@@ -268,7 +268,7 @@ impl DtlsHandler {
     }
 
     /// Gets the SRTP profile (always AES-256-GCM for CNSA 2.0).
-    pub fn srtp_profile(&self) -> SrtpProfile {
+    pub const fn srtp_profile(&self) -> SrtpProfile {
         SrtpProfile::AeadAes256Gcm
     }
 
@@ -317,10 +317,9 @@ impl DtlsHandler {
     /// Returns the role we should use based on their setup.
     pub fn parse_remote_setup(setup: &str) -> DtlsRole {
         match setup.to_lowercase().as_str() {
-            "active" => DtlsRole::Server,  // They're active, we're passive
-            "passive" => DtlsRole::Client, // They're passive, we're active
-            "actpass" => DtlsRole::Client, // They support both, we choose active
-            _ => DtlsRole::Client,         // Default to client
+            "active" => DtlsRole::Server, // They're active, we're passive
+            // They're passive, we're active; "actpass" = they support both, we choose active
+            _ => DtlsRole::Client,
         }
     }
 }

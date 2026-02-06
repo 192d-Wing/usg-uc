@@ -18,8 +18,8 @@ use crate::jitter_buffer::SharedJitterBuffer;
 use crate::rtp_handler::{RtpReceiver, RtpStats, RtpTransmitter, generate_ssrc};
 use crate::stream::{PlaybackStream, PlaybackStreamHandle};
 use crate::{AudioError, AudioResult};
-use client_types::audio::CodecPreference;
 use client_types::DtmfDigit;
+use client_types::audio::CodecPreference;
 use proto_srtp::{SrtpContext, SrtpDirection, SrtpKeyMaterial, SrtpProfile};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,7 +65,7 @@ impl Default for PipelineConfig {
         Self {
             codec: CodecPreference::G711Ulaw,
             local_port: 0, // Auto-assign
-            remote_addr: "0.0.0.0:0".parse().unwrap(),
+            remote_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
             jitter_buffer_ms: 60,
             srtp_master_key: None,
             srtp_master_salt: None,
@@ -141,12 +141,12 @@ impl AudioPipeline {
     }
 
     /// Returns a reference to the device manager.
-    pub fn device_manager(&self) -> &DeviceManager {
+    pub const fn device_manager(&self) -> &DeviceManager {
         &self.device_manager
     }
 
     /// Returns a mutable reference to the device manager.
-    pub fn device_manager_mut(&mut self) -> &mut DeviceManager {
+    pub const fn device_manager_mut(&mut self) -> &mut DeviceManager {
         &mut self.device_manager
     }
 
@@ -154,7 +154,10 @@ impl AudioPipeline {
     ///
     /// Creates the UDP socket, CPAL streams, jitter buffer, and spawns
     /// the I/O and decode threads. Returns the local RTP port.
+    #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
     pub fn start(&mut self, config: PipelineConfig) -> AudioResult<u16> {
+        use ringbuf::traits::Producer;
+
         if self.state != PipelineState::Stopped {
             return Err(AudioError::ConfigError(
                 "Pipeline already running".to_string(),
@@ -167,13 +170,15 @@ impl AudioPipeline {
         // Create a temporary codec to query parameters
         let temp_codec = CodecPipeline::new(config.codec)?;
         let clock_rate = temp_codec.clock_rate();
+        #[allow(clippy::cast_possible_truncation)]
         let samples_per_frame = temp_codec.samples_per_frame() as u32;
         let payload_type = temp_codec.payload_type();
         drop(temp_codec);
 
         // Bind std::net::UdpSocket (blocking)
-        let bind_addr = format!("0.0.0.0:{}", config.local_port);
-        let socket = UdpSocket::bind(&bind_addr)
+        let local_port_cfg = config.local_port;
+        let bind_addr = format!("0.0.0.0:{local_port_cfg}");
+        let socket = UdpSocket::bind(bind_addr)
             .map_err(|e| AudioError::StreamError(format!("Failed to bind socket: {e}")))?;
 
         let local_port = socket
@@ -253,9 +258,9 @@ impl AudioPipeline {
         // Pre-fill the playback ring buffer with silence so the CPAL callback
         // has a cushion from the first callback.
         let prefill_ms = 100;
+        #[allow(clippy::cast_possible_truncation)]
         let prefill_samples = (device_rate * prefill_ms / 1000) as usize;
         let silence = vec![0i16; prefill_samples];
-        use ringbuf::traits::Producer;
         producer.push_slice(&silence);
         debug!(
             "Pre-filled playback buffer with {}ms of silence",
@@ -263,7 +268,7 @@ impl AudioPipeline {
         );
 
         // Load MOH if configured
-        let moh_source = if let Some(ref moh_path) = config.moh_file_path {
+        let moh_source = config.moh_file_path.as_ref().and_then(|moh_path| {
             let mut source = FileAudioSource::new(clock_rate);
             match source.load(moh_path) {
                 Ok(()) => {
@@ -271,13 +276,11 @@ impl AudioPipeline {
                     Some(source)
                 }
                 Err(e) => {
-                    warn!("Failed to load MOH file: {}", e);
+                    warn!("Failed to load MOH file: {e}");
                     None
                 }
             }
-        } else {
-            None
-        };
+        });
         let has_moh = moh_source.is_some();
 
         // Set running flag
@@ -290,12 +293,8 @@ impl AudioPipeline {
             codec: config.codec,
             device_rate,
         };
-        let decode_handle = decode_thread::spawn(
-            decode_config,
-            producer,
-            jitter_buffer,
-            self.running.clone(),
-        );
+        let decode_handle =
+            decode_thread::spawn(decode_config, producer, jitter_buffer, self.running.clone());
 
         // Spawn I/O thread (uses capture rate for mic read sizing)
         let io_config = IoThreadConfig {
@@ -401,12 +400,12 @@ impl AudioPipeline {
     }
 
     /// Returns whether MOH audio has been loaded.
-    pub fn has_moh(&self) -> bool {
+    pub const fn has_moh(&self) -> bool {
         self.has_moh_audio
     }
 
     /// Returns the current pipeline state.
-    pub fn state(&self) -> PipelineState {
+    pub const fn state(&self) -> PipelineState {
         self.state
     }
 
@@ -417,22 +416,25 @@ impl AudioPipeline {
 
     /// Returns the pipeline statistics.
     pub fn stats(&self) -> PipelineStats {
-        self.stats.lock().map(|s| s.clone()).unwrap_or_default()
+        self.stats
+            .lock()
+            .map_or_else(|_| PipelineStats::default(), |s| s.clone())
     }
 
     /// Returns the local RTP port.
-    pub fn local_port(&self) -> Option<u16> {
+    pub const fn local_port(&self) -> Option<u16> {
         self.local_port
     }
 
     /// Returns the SSRC being used for transmission.
-    pub fn ssrc(&self) -> Option<u32> {
+    pub const fn ssrc(&self) -> Option<u32> {
         self.ssrc
     }
 
     /// Switches the input (microphone) device.
     ///
     /// Updates the device manager selection. Takes effect on next pipeline start.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn switch_input_device(&mut self, device_name: Option<String>) -> AudioResult<()> {
         info!("Setting input device to: {:?}", device_name);
         self.device_manager.set_input_device(device_name);
@@ -442,6 +444,7 @@ impl AudioPipeline {
     /// Switches the output (speaker) device.
     ///
     /// Updates the device manager selection. Takes effect on next pipeline start.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn switch_output_device(&mut self, device_name: Option<String>) -> AudioResult<()> {
         info!("Setting output device to: {:?}", device_name);
         self.device_manager.set_output_device(device_name);
@@ -473,7 +476,7 @@ impl Drop for AudioPipeline {
 
 /// Resample audio using linear interpolation with cross-frame continuity.
 ///
-/// For VoIP (G.711 at 8kHz ↔ device at 48kHz), the codec already band-limits
+/// For `VoIP` (G.711 at 8kHz ↔ device at 48kHz), the codec already band-limits
 /// to 4kHz, so linear interpolation is clean for upsampling and simple
 /// averaging-decimation works for downsampling.
 ///
@@ -482,6 +485,13 @@ impl Drop for AudioPipeline {
 /// upsampling creates a step discontinuity every 20ms (50 Hz artifact) because
 /// the last few output samples hold the final input value flat, then the next
 /// frame jumps to its first sample.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::suboptimal_flops
+)]
 pub(crate) fn resample(input: &[i16], output_len: usize, prev_sample: i16) -> Vec<i16> {
     if input.len() == output_len {
         return input.to_vec();
@@ -490,14 +500,18 @@ pub(crate) fn resample(input: &[i16], output_len: usize, prev_sample: i16) -> Ve
     let in_len = input.len();
 
     // Fast path: integer ratio upsampling (common case: 6:1 for 8kHz→48kHz)
-    if output_len > in_len && output_len % in_len == 0 {
+    if output_len > in_len && output_len.is_multiple_of(in_len) {
         let ratio = output_len / in_len;
         let mut output = Vec::with_capacity(output_len);
         for i in 0..in_len {
             // Interpolate from previous sample toward current sample.
             // At i=0, use prev_sample from the previous frame for continuity.
-            let s0 = if i == 0 { prev_sample as i32 } else { input[i - 1] as i32 };
-            let s1 = input[i] as i32;
+            let s0 = if i == 0 {
+                i32::from(prev_sample)
+            } else {
+                i32::from(input[i - 1])
+            };
+            let s1 = i32::from(input[i]);
             for j in 0..ratio {
                 // t ranges from 1/ratio to ratio/ratio (=1.0), so the last
                 // output sample in each group exactly equals input[i].
@@ -510,12 +524,15 @@ pub(crate) fn resample(input: &[i16], output_len: usize, prev_sample: i16) -> Ve
     }
 
     // Fast path: integer ratio downsampling (common case: 6:1 for 48kHz→8kHz)
-    if in_len > output_len && in_len % output_len == 0 {
+    if in_len > output_len && in_len.is_multiple_of(output_len) {
         let ratio = in_len / output_len;
         let mut output = Vec::with_capacity(output_len);
         for i in 0..output_len {
             let start = i * ratio;
-            let sum: i32 = input[start..start + ratio].iter().map(|&s| s as i32).sum();
+            let sum: i32 = input[start..start + ratio]
+                .iter()
+                .map(|&s| i32::from(s))
+                .sum();
             output.push((sum / ratio as i32) as i16);
         }
         return output;
@@ -532,18 +549,18 @@ pub(crate) fn resample(input: &[i16], output_len: usize, prev_sample: i16) -> Ve
     // Index -1 maps to prev_sample for cross-frame continuity.
     let sample_at = |idx: i32| -> f64 {
         if idx < 0 {
-            prev_sample as f64
+            f64::from(prev_sample)
         } else if (idx as usize) < in_len {
-            input[idx as usize] as f64
+            f64::from(input[idx as usize])
         } else {
-            input[in_len - 1] as f64
+            f64::from(input[in_len - 1])
         }
     };
 
     for i in 0..output_len {
         let pos = i as f64 * step;
         let idx = pos.floor() as i32;
-        let t = pos - idx as f64;
+        let t = pos - f64::from(idx);
 
         // Four points for Catmull-Rom: p0, p1, p2, p3
         let p0 = sample_at(idx - 1);
@@ -561,21 +578,26 @@ pub(crate) fn resample(input: &[i16], output_len: usize, prev_sample: i16) -> Ve
                 + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3);
 
         // Clamp to i16 range to prevent overflow from cubic overshoot
-        output.push(sample.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16);
+        output.push(
+            sample
+                .round()
+                .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16,
+        );
     }
 
     output
 }
 
 /// Fade out from `last_sample` to silence over the entire buffer for smooth PLC.
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 pub(crate) fn fade_out(buffer: &mut [i16], last_sample: i16) {
     let len = buffer.len();
     if len == 0 || last_sample == 0 {
         return;
     }
-    for i in 0..len {
+    for (i, sample) in buffer.iter_mut().enumerate() {
         let t = 1.0 - (i as f32 / len as f32);
-        buffer[i] = (last_sample as f32 * t).round() as i16;
+        *sample = (f32::from(last_sample) * t).round() as i16;
     }
 }
 

@@ -3,7 +3,7 @@
 //! This module handles RTP packet construction, parsing, and SRTP
 //! encryption/decryption for secure audio streams.
 //!
-//! All operations are synchronous — no tokio dependency.
+//! All operations are synchronous -- no tokio dependency.
 
 use crate::jitter_buffer::{BufferedPacket, SharedJitterBuffer};
 use crate::{AudioError, AudioResult};
@@ -119,6 +119,7 @@ impl RtpTransmitter {
     }
 
     /// Sends an RTP packet with the given audio payload.
+    #[allow(clippy::cast_sign_loss, clippy::significant_drop_tightening)]
     pub fn send(&mut self, payload: &[u8]) -> AudioResult<()> {
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
         let ts = self
@@ -134,7 +135,9 @@ impl RtpTransmitter {
 
         // Apply SRTP if configured
         let send_bytes = if let Some(ref srtp) = self.srtp {
-            let srtp_guard = srtp.lock().unwrap_or_else(|e| e.into_inner());
+            let srtp_guard = srtp
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let protector = SrtpProtect::new(&srtp_guard);
             match protector.protect_rtp(&packet) {
                 Ok(protected) => protected.to_vec(),
@@ -177,11 +180,13 @@ impl RtpTransmitter {
 
     /// Returns the current statistics.
     pub fn stats(&self) -> RtpStats {
-        self.stats.lock().map(|s| s.clone()).unwrap_or_default()
+        self.stats
+            .lock()
+            .map_or_else(|_| RtpStats::default(), |s| s.clone())
     }
 
     /// Returns the SSRC.
-    pub fn ssrc(&self) -> u32 {
+    pub const fn ssrc(&self) -> u32 {
         self.ssrc
     }
 
@@ -195,6 +200,7 @@ impl RtpTransmitter {
     /// # Arguments
     /// * `event` - The DTMF event to send
     /// * `marker` - Set to true for the first packet of a new event
+    #[allow(clippy::cast_sign_loss, clippy::significant_drop_tightening)]
     pub fn send_dtmf(&mut self, event: &DtmfEvent, marker: bool) -> AudioResult<()> {
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
 
@@ -203,10 +209,10 @@ impl RtpTransmitter {
         let ts = if marker {
             // Start of a new event - get a new timestamp
             self.dtmf_timestamp
-                .fetch_add(event.duration as u32, Ordering::Relaxed)
+                .fetch_add(u32::from(event.duration), Ordering::Relaxed)
         } else {
             // Continuation - use the current timestamp without incrementing
-            self.dtmf_timestamp.load(Ordering::Relaxed) - event.duration as u32
+            self.dtmf_timestamp.load(Ordering::Relaxed) - u32::from(event.duration)
         };
 
         // Build RTP header with DTMF payload type
@@ -224,7 +230,9 @@ impl RtpTransmitter {
 
         // Apply SRTP if configured
         let send_bytes = if let Some(ref srtp) = self.srtp {
-            let srtp_guard = srtp.lock().unwrap_or_else(|e| e.into_inner());
+            let srtp_guard = srtp
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let protector = SrtpProtect::new(&srtp_guard);
             match protector.protect_rtp(&packet) {
                 Ok(protected) => protected.to_vec(),
@@ -291,10 +299,7 @@ pub struct RtpReceiver {
 
 impl RtpReceiver {
     /// Creates a new RTP receiver.
-    pub fn new(
-        socket: Arc<UdpSocket>,
-        jitter_buffer: SharedJitterBuffer,
-    ) -> Self {
+    pub fn new(socket: Arc<UdpSocket>, jitter_buffer: SharedJitterBuffer) -> Self {
         info!("Creating RTP receiver");
 
         Self {
@@ -308,7 +313,7 @@ impl RtpReceiver {
     }
 
     /// Sets the expected remote address for packet filtering.
-    pub fn set_expected_remote(&mut self, addr: SocketAddr) {
+    pub const fn set_expected_remote(&mut self, addr: SocketAddr) {
         self.expected_remote = Some(addr);
     }
 
@@ -318,7 +323,7 @@ impl RtpReceiver {
         debug!("SRTP decryption enabled for receiver");
     }
 
-    /// Receives an RTP packet (blocking, respects socket recv_timeout).
+    /// Receives an RTP packet (blocking, respects socket `recv_timeout`).
     ///
     /// Returns `Ok(true)` if a packet was received and buffered,
     /// `Ok(false)` if no packet was available (timeout/would-block),
@@ -329,11 +334,11 @@ impl RtpReceiver {
         match result {
             Ok((len, addr)) => {
                 // Check if from expected remote
-                if let Some(expected) = self.expected_remote {
-                    if addr != expected {
-                        trace!("Ignoring packet from unexpected address: {}", addr);
-                        return Ok(false);
-                    }
+                if let Some(expected) = self.expected_remote
+                    && addr != expected
+                {
+                    trace!("Ignoring packet from unexpected address: {addr}");
+                    return Ok(false);
                 }
 
                 // Process the packet (copy to avoid borrow conflict with self)
@@ -353,10 +358,13 @@ impl RtpReceiver {
     }
 
     /// Processes a received packet.
+    #[allow(clippy::needless_pass_by_ref_mut, clippy::significant_drop_tightening)]
     fn process_packet(&mut self, data: &[u8]) -> AudioResult<()> {
         // Decrypt if SRTP is configured
         let packet = if let Some(ref srtp) = self.srtp {
-            let srtp_guard = srtp.lock().unwrap_or_else(|e| e.into_inner());
+            let srtp_guard = srtp
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let unprotector = SrtpUnprotect::new(&srtp_guard);
             match unprotector.unprotect_rtp(data) {
                 Ok(pkt) => pkt,
@@ -386,7 +394,7 @@ impl RtpReceiver {
             packet.header.sequence_number,
             packet.header.timestamp,
             packet.header.payload_type,
-            packet.payload.clone(),
+            packet.payload,
         );
 
         self.jitter_buffer.push(buffered);
@@ -396,7 +404,10 @@ impl RtpReceiver {
             .lock()
             .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
         stats.packets_received += 1;
-        stats.bytes_received += data.len() as u64;
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            stats.bytes_received += data.len() as u64;
+        }
 
         Ok(())
     }
@@ -413,7 +424,9 @@ impl RtpReceiver {
 
     /// Returns the current statistics.
     pub fn stats(&self) -> RtpStats {
-        self.stats.lock().map(|s| s.clone()).unwrap_or_default()
+        self.stats
+            .lock()
+            .map_or_else(|_| RtpStats::default(), |s| s.clone())
     }
 
     /// Returns the jitter buffer statistics.
@@ -423,6 +436,7 @@ impl RtpReceiver {
 }
 
 /// Generates a random u16 for sequence number initialization.
+#[allow(clippy::cast_possible_truncation)]
 fn rand_u16() -> u16 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
@@ -433,6 +447,7 @@ fn rand_u16() -> u16 {
 }
 
 /// Generates a random u32 for SSRC/timestamp initialization.
+#[allow(clippy::cast_possible_truncation)]
 fn rand_u32() -> u32 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()

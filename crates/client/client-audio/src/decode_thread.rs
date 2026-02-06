@@ -13,8 +13,8 @@ use crate::pipeline::{fade_out, resample};
 use crate::stream::Sample;
 use client_types::CodecPreference;
 use ringbuf::traits::{Observer, Producer};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
@@ -37,10 +37,10 @@ impl DecodeThreadHandle {
     /// Stops the decode thread and waits for it to finish.
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
-        if let Some(handle) = self.thread.take() {
-            if let Err(e) = handle.join() {
-                warn!("Decode thread panicked: {:?}", e);
-            }
+        if let Some(handle) = self.thread.take()
+            && let Err(e) = handle.join()
+        {
+            warn!("Decode thread panicked: {e:?}");
         }
     }
 }
@@ -88,7 +88,7 @@ pub fn spawn(
     let thread = match handle {
         Ok(h) => Some(h),
         Err(e) => {
-            warn!("Failed to spawn decode thread: {}", e);
+            warn!("Failed to spawn decode thread: {e}");
             None
         }
     };
@@ -97,6 +97,7 @@ pub fn spawn(
 }
 
 /// Main decode loop.
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 fn decode_loop(
     config: DecodeThreadConfig,
     mut producer: ringbuf::HeapProd<Sample>,
@@ -107,7 +108,7 @@ fn decode_loop(
     let mut codec = match CodecPipeline::new(config.codec) {
         Ok(c) => c,
         Err(e) => {
-            warn!("Failed to create codec in decode thread: {}", e);
+            warn!("Failed to create codec in decode thread: {e}");
             return;
         }
     };
@@ -115,6 +116,7 @@ fn decode_loop(
     let codec_clock_rate = codec.clock_rate();
     let codec_samples = codec.samples_per_frame();
     let device_rate = config.device_rate;
+    #[allow(clippy::cast_possible_truncation)]
     let device_samples = (codec_samples as u32 * device_rate / codec_clock_rate) as usize;
     let target_fill = device_samples * TARGET_FILL_FRAMES;
 
@@ -164,14 +166,17 @@ fn decode_loop(
                 1
             };
 
-            let mut decoded_any = false;
-
             for _ in 0..frames_to_decode {
                 // Get drift adjustment from compensator
+                #[allow(clippy::cast_precision_loss)]
                 let depth_ms = jitter_buffer.buffered_duration_ms() as f32;
                 let drift_adj = drift.update(depth_ms);
-                let adjusted_device_samples =
-                    (device_samples as i32 + drift_adj).max(1) as usize;
+                #[allow(
+                    clippy::cast_sign_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_possible_wrap
+                )]
+                let adjusted_device_samples = (device_samples as i32 + drift_adj).max(1) as usize;
 
                 match jitter_buffer.pop() {
                     JitterBufferResult::Packet(packet) => {
@@ -179,27 +184,24 @@ fn decode_loop(
                         let codec_pcm = match codec.decode(&packet.payload) {
                             Ok(pcm) => pcm,
                             Err(e) => {
-                                warn!("Decode error: {}", e);
+                                warn!("Decode error: {e}");
                                 break;
                             }
                         };
 
                         // Resample from codec rate to device rate with drift compensation
-                        let device_pcm = if codec_pcm.len() != adjusted_device_samples {
-                            let resampled = resample(
-                                codec_pcm,
-                                adjusted_device_samples,
-                                last_resample_input,
-                            );
-                            if let Some(&last_in) = codec_pcm.last() {
-                                last_resample_input = last_in;
-                            }
-                            resampled
-                        } else {
+                        let device_pcm = if codec_pcm.len() == adjusted_device_samples {
                             if let Some(&last_in) = codec_pcm.last() {
                                 last_resample_input = last_in;
                             }
                             codec_pcm.to_vec()
+                        } else {
+                            let resampled =
+                                resample(codec_pcm, adjusted_device_samples, last_resample_input);
+                            if let Some(&last_in) = codec_pcm.last() {
+                                last_resample_input = last_in;
+                            }
+                            resampled
                         };
 
                         if let Some(&last) = device_pcm.last() {
@@ -216,7 +218,6 @@ fn decode_loop(
                             );
                         }
 
-                        decoded_any = true;
                         diag_frames_decoded += 1;
                     }
                     JitterBufferResult::Lost { .. } => {
@@ -227,7 +228,6 @@ fn decode_loop(
                         last_resample_input = 0;
 
                         producer.push_slice(&plc);
-                        decoded_any = true;
                         diag_frames_lost += 1;
                     }
                     JitterBufferResult::Empty | JitterBufferResult::NotReady => {
@@ -237,14 +237,8 @@ fn decode_loop(
                 }
             }
 
-            // Sleep based on decode result
-            if decoded_any {
-                // Decoded something — short sleep then re-check fill level
-                thread::sleep(Duration::from_millis(5));
-            } else {
-                // Nothing to decode (jitter buffer empty) — wait before retrying
-                thread::sleep(Duration::from_millis(5));
-            }
+            // Sleep before re-checking fill level (5ms whether we decoded or not)
+            thread::sleep(Duration::from_millis(5));
         }
 
         // Diagnostic logging every ~2 seconds

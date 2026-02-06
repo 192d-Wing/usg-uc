@@ -66,8 +66,7 @@ impl CodecPipeline {
             96..=127 => CodecPreference::Opus, // Dynamic PT, assume Opus
             _ => {
                 return Err(AudioError::CodecError(format!(
-                    "Unknown payload type: {}",
-                    payload_type
+                    "Unknown payload type: {payload_type}"
                 )));
             }
         };
@@ -144,7 +143,7 @@ impl CodecPipeline {
     }
 
     /// Returns the codec preference.
-    pub fn preference(&self) -> CodecPreference {
+    pub const fn preference(&self) -> CodecPreference {
         self.preference
     }
 
@@ -176,7 +175,7 @@ impl std::fmt::Debug for CodecPipeline {
             .field("name", &self.codec.name())
             .field("clock_rate", &self.codec.clock_rate())
             .field("preference", &self.preference)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -197,7 +196,7 @@ pub fn negotiate_codec(
             .iter()
             .any(|c| c.name.eq_ignore_ascii_case(name))
         {
-            debug!("Negotiated codec: {:?}", pref);
+            debug!("Negotiated codec: {pref:?}");
             return Some(*pref);
         }
     }

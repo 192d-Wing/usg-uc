@@ -8,19 +8,19 @@ use client_types::audio::{AudioDevice, AudioDeviceType};
 use cpal::traits::{DeviceTrait, HostTrait};
 use tracing::{debug, info, warn};
 
-/// Helper to get device name (cpal 0.17 deprecated name() in favor of id()/description()).
+/// Helper to get device name (cpal 0.17 deprecated `name()` in favor of `id()`/`description()`).
 #[allow(deprecated)]
 fn get_device_name(device: &cpal::Device) -> Option<String> {
     device.name().ok()
 }
 
-/// Supported sample rate for VoIP audio (narrowband).
+/// Supported sample rate for `VoIP` audio (narrowband).
 pub const SAMPLE_RATE_8KHZ: u32 = 8000;
 
-/// Supported sample rate for VoIP audio (wideband).
+/// Supported sample rate for `VoIP` audio (wideband).
 pub const SAMPLE_RATE_16KHZ: u32 = 16000;
 
-/// Supported sample rate for VoIP audio (super-wideband).
+/// Supported sample rate for `VoIP` audio (super-wideband).
 pub const SAMPLE_RATE_48KHZ: u32 = 48000;
 
 /// Default sample rate for audio streams.
@@ -28,7 +28,7 @@ pub const DEFAULT_SAMPLE_RATE: u32 = SAMPLE_RATE_48KHZ;
 
 /// VoIP-friendly sample rates in preference order.
 ///
-/// These rates produce integer resampling ratios with common VoIP codecs
+/// These rates produce integer resampling ratios with common `VoIP` codecs
 /// (G.711 at 8kHz, G.722 at 16kHz), which use the fast-path integer
 /// resampler for best audio quality. Non-integer ratios (e.g., 44100Hz)
 /// fall back to cubic interpolation which is good but not ideal.
@@ -36,7 +36,7 @@ pub const DEFAULT_SAMPLE_RATE: u32 = SAMPLE_RATE_48KHZ;
 /// Preference: 48kHz (6:1) > 16kHz (2:1) > 8kHz (1:1) > 32kHz (4:1) > 24kHz (3:1)
 const VOIP_PREFERRED_RATES: &[u32] = &[48000, 16000, 8000, 32000, 24000];
 
-/// Number of audio channels (mono for VoIP).
+/// Number of audio channels (mono for `VoIP`).
 pub const CHANNELS: u16 = 1;
 
 /// Audio device manager for enumerating and selecting audio devices.
@@ -50,7 +50,7 @@ pub struct DeviceManager {
 
 impl DeviceManager {
     /// Creates a new device manager with default device selection.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             input_device_name: None,
             output_device_name: None,
@@ -71,9 +71,9 @@ impl DeviceManager {
         let mut result = Vec::new();
         for device in devices {
             if let Some(name) = get_device_name(&device) {
-                let is_default = default_name.as_ref().map(|n| n == &name).unwrap_or(false);
+                let is_default = default_name.as_ref().is_some_and(|n| n == &name);
 
-                let (channels, sample_rates) = self.get_device_info(&device);
+                let (channels, sample_rates) = get_device_info(&device);
 
                 result.push(AudioDevice {
                     name: name.clone(),
@@ -104,9 +104,9 @@ impl DeviceManager {
         let mut result = Vec::new();
         for device in devices {
             if let Some(name) = get_device_name(&device) {
-                let is_default = default_name.as_ref().map(|n| n == &name).unwrap_or(false);
+                let is_default = default_name.as_ref().is_some_and(|n| n == &name);
 
-                let (channels, sample_rates) = self.get_device_info(&device);
+                let (channels, sample_rates) = get_device_info(&device);
 
                 result.push(AudioDevice {
                     name: name.clone(),
@@ -121,41 +121,6 @@ impl DeviceManager {
 
         debug!("Found {} output devices", result.len());
         Ok(result)
-    }
-
-    /// Gets device information (channels and sample rates).
-    fn get_device_info(&self, device: &cpal::Device) -> (u16, Vec<u32>) {
-        let mut channels = 1u16;
-        let mut sample_rates = Vec::new();
-
-        // Try input config first, then output
-        if let Ok(configs) = device.supported_input_configs() {
-            for config in configs {
-                channels = channels.max(config.channels());
-                let min = config.min_sample_rate();
-                let max = config.max_sample_rate();
-                // Add common sample rates within range
-                for rate in [8000, 16000, 44100, 48000] {
-                    if rate >= min && rate <= max && !sample_rates.contains(&rate) {
-                        sample_rates.push(rate);
-                    }
-                }
-            }
-        } else if let Ok(configs) = device.supported_output_configs() {
-            for config in configs {
-                channels = channels.max(config.channels());
-                let min = config.min_sample_rate();
-                let max = config.max_sample_rate();
-                for rate in [8000, 16000, 44100, 48000] {
-                    if rate >= min && rate <= max && !sample_rates.contains(&rate) {
-                        sample_rates.push(rate);
-                    }
-                }
-            }
-        }
-
-        sample_rates.sort_unstable();
-        (channels, sample_rates)
     }
 
     /// Sets the input device by name.
@@ -181,11 +146,9 @@ impl DeviceManager {
             })?;
 
             for device in devices {
-                if let Some(device_name) = get_device_name(&device) {
-                    if &device_name == name {
-                        debug!("Using input device: {}", name);
-                        return Ok(device);
-                    }
+                if get_device_name(&device).is_some_and(|device_name| &device_name == name) {
+                    debug!("Using input device: {}", name);
+                    return Ok(device);
                 }
             }
 
@@ -207,11 +170,9 @@ impl DeviceManager {
             })?;
 
             for device in devices {
-                if let Some(device_name) = get_device_name(&device) {
-                    if &device_name == name {
-                        debug!("Using output device: {}", name);
-                        return Ok(device);
-                    }
+                if get_device_name(&device).is_some_and(|device_name| &device_name == name) {
+                    debug!("Using output device: {}", name);
+                    return Ok(device);
                 }
             }
 
@@ -239,9 +200,7 @@ impl DeviceManager {
         // Collect supported rate ranges for the device's channel count
         let supported_ranges: Vec<_> = device
             .supported_input_configs()
-            .map_err(|e| {
-                AudioError::StreamError(format!("Failed to get supported configs: {e}"))
-            })?
+            .map_err(|e| AudioError::StreamError(format!("Failed to get supported configs: {e}")))?
             .filter(|r| r.channels() == device_channels)
             .collect();
 
@@ -293,9 +252,7 @@ impl DeviceManager {
         // Collect supported rate ranges for the device's channel count
         let supported_ranges: Vec<_> = device
             .supported_output_configs()
-            .map_err(|e| {
-                AudioError::StreamError(format!("Failed to get supported configs: {e}"))
-            })?
+            .map_err(|e| AudioError::StreamError(format!("Failed to get supported configs: {e}")))?
             .filter(|r| r.channels() == device_channels)
             .collect();
 
@@ -349,11 +306,9 @@ impl DeviceManager {
             .map_err(|e| AudioError::StreamError(format!("Failed to enumerate devices: {e}")))?;
 
         for device in devices {
-            if let Some(device_name) = get_device_name(&device) {
-                if device_name == name {
-                    debug!("Using output device: {}", name);
-                    return Ok(device);
-                }
+            if get_device_name(&device).is_some_and(|device_name| device_name == name) {
+                debug!("Using output device: {}", name);
+                return Ok(device);
             }
         }
 
@@ -361,6 +316,41 @@ impl DeviceManager {
         host.default_output_device()
             .ok_or(AudioError::NoOutputDevice)
     }
+}
+
+/// Gets device information (channels and sample rates).
+fn get_device_info(device: &cpal::Device) -> (u16, Vec<u32>) {
+    let mut channels = 1u16;
+    let mut sample_rates = Vec::new();
+
+    // Try input config first, then output
+    if let Ok(configs) = device.supported_input_configs() {
+        for config in configs {
+            channels = channels.max(config.channels());
+            let min = config.min_sample_rate();
+            let max = config.max_sample_rate();
+            // Add common sample rates within range
+            for rate in [8000, 16000, 44100, 48000] {
+                if rate >= min && rate <= max && !sample_rates.contains(&rate) {
+                    sample_rates.push(rate);
+                }
+            }
+        }
+    } else if let Ok(configs) = device.supported_output_configs() {
+        for config in configs {
+            channels = channels.max(config.channels());
+            let min = config.min_sample_rate();
+            let max = config.max_sample_rate();
+            for rate in [8000, 16000, 44100, 48000] {
+                if rate >= min && rate <= max && !sample_rates.contains(&rate) {
+                    sample_rates.push(rate);
+                }
+            }
+        }
+    }
+
+    sample_rates.sort_unstable();
+    (channels, sample_rates)
 }
 
 impl Default for DeviceManager {

@@ -53,7 +53,7 @@ impl DtmfDigit {
     /// - 11: # (pound)
     /// - 12-15: A, B, C, D
     #[must_use]
-    pub fn event_code(&self) -> u8 {
+    pub const fn event_code(&self) -> u8 {
         match self {
             Self::Zero => 0,
             Self::One => 1,
@@ -76,7 +76,7 @@ impl DtmfDigit {
 
     /// Creates a DTMF digit from an RFC 4733 event code.
     #[must_use]
-    pub fn from_event_code(code: u8) -> Option<Self> {
+    pub const fn from_event_code(code: u8) -> Option<Self> {
         match code {
             0 => Some(Self::Zero),
             1 => Some(Self::One),
@@ -100,7 +100,7 @@ impl DtmfDigit {
 
     /// Creates a DTMF digit from a character.
     #[must_use]
-    pub fn from_char(c: char) -> Option<Self> {
+    pub const fn from_char(c: char) -> Option<Self> {
         match c {
             '0' => Some(Self::Zero),
             '1' => Some(Self::One),
@@ -124,7 +124,7 @@ impl DtmfDigit {
 
     /// Returns the character representation of this digit.
     #[must_use]
-    pub fn to_char(&self) -> char {
+    pub const fn to_char(&self) -> char {
         match self {
             Self::Zero => '0',
             Self::One => '1',
@@ -194,7 +194,7 @@ impl DtmfEvent {
 
     /// Creates a new DTMF event.
     #[must_use]
-    pub fn new(digit: DtmfDigit, duration: u16) -> Self {
+    pub const fn new(digit: DtmfDigit, duration: u16) -> Self {
         Self {
             digit,
             end: false,
@@ -205,7 +205,7 @@ impl DtmfEvent {
 
     /// Creates a DTMF event with the end flag set.
     #[must_use]
-    pub fn with_end(digit: DtmfDigit, duration: u16) -> Self {
+    pub const fn with_end(digit: DtmfDigit, duration: u16) -> Self {
         Self {
             digit,
             end: true,
@@ -216,12 +216,13 @@ impl DtmfEvent {
 
     /// Encodes the event to 4 bytes per RFC 4733.
     #[must_use]
-    pub fn encode(&self) -> [u8; 4] {
+    pub const fn encode(&self) -> [u8; 4] {
         let mut bytes = [0u8; 4];
         bytes[0] = self.digit.event_code();
         bytes[1] = if self.end { 0x80 } else { 0x00 } | (self.volume & 0x3F);
-        bytes[2] = (self.duration >> 8) as u8;
-        bytes[3] = self.duration as u8;
+        let duration_bytes = self.duration.to_be_bytes();
+        bytes[2] = duration_bytes[0];
+        bytes[3] = duration_bytes[1];
         bytes
     }
 
@@ -245,12 +246,15 @@ impl DtmfEvent {
     #[must_use]
     pub fn duration_from_ms(ms: u32) -> u16 {
         // 8000 samples/sec * ms / 1000 = 8 * ms
-        (8 * ms).min(u16::MAX as u32) as u16
+        #[allow(clippy::cast_possible_truncation)] // value clamped to u16::MAX
+        let result = (8 * ms).min(u32::from(u16::MAX)) as u16;
+        result
     }
 
     /// Converts duration in timestamp units to milliseconds.
     #[must_use]
-    pub fn duration_to_ms(&self) -> u32 {
+    #[allow(clippy::cast_lossless)] // u16 -> u32 widening; u32::from() not const-stable yet
+    pub const fn duration_to_ms(&self) -> u32 {
         self.duration as u32 / 8
     }
 }

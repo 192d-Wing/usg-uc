@@ -290,8 +290,7 @@ impl JitterBuffer {
             self.stats.packets_lost += 1;
             let expected_timestamp = self
                 .last_playout_timestamp
-                .map(|ts| ts.wrapping_add(self.samples_per_packet))
-                .unwrap_or(0);
+                .map_or(0, |ts| ts.wrapping_add(self.samples_per_packet));
 
             self.next_playout_sequence = Some(expected_seq.wrapping_add(1));
             self.last_playout_timestamp = Some(expected_timestamp);
@@ -320,6 +319,7 @@ impl JitterBuffer {
         if let (Some(last_arrival), Some(last_ts)) = (self.last_arrival, self.last_timestamp) {
             // Calculate interarrival jitter per RFC 3550
             let arrival_diff = now.duration_since(last_arrival).as_secs_f32();
+            #[allow(clippy::cast_precision_loss)]
             let timestamp_diff =
                 timestamp_diff(packet.timestamp, last_ts) as f32 / self.clock_rate as f32;
 
@@ -334,6 +334,7 @@ impl JitterBuffer {
 
     /// Calculates the buffered duration in milliseconds.
     pub fn buffered_duration_ms(&self) -> u32 {
+        #[allow(clippy::cast_possible_truncation)]
         let packet_count = self.packets.len() as u32;
         let packet_duration_ms = (self.samples_per_packet * 1000) / self.clock_rate;
         packet_count * packet_duration_ms
@@ -387,12 +388,12 @@ impl JitterBuffer {
     }
 
     /// Returns the current statistics.
-    pub fn stats(&self) -> &JitterBufferStats {
+    pub const fn stats(&self) -> &JitterBufferStats {
         &self.stats
     }
 
     /// Returns the target buffer depth in milliseconds.
-    pub fn target_depth_ms(&self) -> u32 {
+    pub const fn target_depth_ms(&self) -> u32 {
         self.target_depth_ms
     }
 
@@ -413,7 +414,7 @@ impl JitterBuffer {
     }
 
     /// Returns whether the buffer is primed and ready for playout.
-    pub fn is_ready(&self) -> bool {
+    pub const fn is_ready(&self) -> bool {
         self.is_primed
     }
 }
@@ -442,18 +443,14 @@ impl SharedJitterBuffer {
 
     /// Adds a packet to the jitter buffer.
     pub fn push(&self, packet: BufferedPacket) -> bool {
-        match self.inner.lock() {
-            Ok(mut jb) => jb.push(packet),
-            Err(_) => false,
-        }
+        self.inner.lock().is_ok_and(|mut jb| jb.push(packet))
     }
 
     /// Gets the next packet for playout.
     pub fn pop(&self) -> JitterBufferResult {
-        match self.inner.lock() {
-            Ok(mut jb) => jb.pop(),
-            Err(_) => JitterBufferResult::Empty,
-        }
+        self.inner
+            .lock()
+            .map_or(JitterBufferResult::Empty, |mut jb| jb.pop())
     }
 
     /// Returns the number of packets currently buffered.
@@ -497,14 +494,13 @@ impl SharedJitterBuffer {
 
 /// Calculates the difference between two sequence numbers, handling wrap-around.
 fn sequence_diff(a: u16, b: u16) -> i32 {
-    let diff = a.wrapping_sub(b) as i16;
+    let diff = a.wrapping_sub(b).cast_signed();
     i32::from(diff)
 }
 
 /// Calculates the difference between two timestamps, handling wrap-around.
-fn timestamp_diff(a: u32, b: u32) -> i32 {
-    let diff = a.wrapping_sub(b) as i32;
-    diff
+const fn timestamp_diff(a: u32, b: u32) -> i32 {
+    a.wrapping_sub(b).cast_signed()
 }
 
 #[cfg(test)]

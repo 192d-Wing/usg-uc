@@ -61,7 +61,7 @@ struct CallSession {
     from_tag: String,
     /// To tag (from remote).
     to_tag: Option<String>,
-    /// CSeq number.
+    /// `CSeq` number.
     cseq: u32,
     /// Remote party URI.
     remote_uri: String,
@@ -179,8 +179,8 @@ impl CallAgent {
         self.aor = if let Some(cid) = caller_id {
             // Parse the AOR and replace the user part
             if let Some(at_pos) = aor.find('@') {
-                let scheme_end = aor.find(':').map(|p| p + 1).unwrap_or(0);
-                format!("{}{}{}", &aor[..scheme_end], cid, &aor[at_pos..])
+                let scheme_end = aor.find(':').map_or(0, |p| p + 1);
+                format!("{}{cid}{}", &aor[..scheme_end], &aor[at_pos..])
             } else {
                 aor
             }
@@ -222,7 +222,8 @@ impl CallAgent {
         let destination = Self::parse_destination(remote_uri).await?;
 
         // Get the local IP address that can reach the destination
-        let effective_local_addr = Self::get_local_addr_for_destination(destination, self.local_addr).await?;
+        let effective_local_addr =
+            Self::get_local_addr_for_destination(destination, self.local_addr).await?;
         debug!(
             destination = %destination,
             local_addr = %effective_local_addr,
@@ -450,7 +451,8 @@ impl CallAgent {
         };
 
         let destination = Self::parse_destination(&remote_uri).await?;
-        let effective_local_addr = Self::get_local_addr_for_destination(destination, self.local_addr).await?;
+        let effective_local_addr =
+            Self::get_local_addr_for_destination(destination, self.local_addr).await?;
 
         // Build REFER request
         let request = Self::build_refer_request_static(
@@ -525,7 +527,8 @@ impl CallAgent {
         };
 
         let destination = Self::parse_destination(&remote_uri).await?;
-        let effective_local_addr = Self::get_local_addr_for_destination(destination, self.local_addr).await?;
+        let effective_local_addr =
+            Self::get_local_addr_for_destination(destination, self.local_addr).await?;
         let branch = generate_branch();
 
         // Build re-INVITE request
@@ -604,10 +607,10 @@ impl CallAgent {
         );
 
         // Update transaction state
-        if let Some(session) = self.calls.get_mut(call_id) {
-            if let Some(ref mut tx) = session.invite_transaction {
-                let _ = tx.receive_response(status_code);
-            }
+        if let Some(session) = self.calls.get_mut(call_id)
+            && let Some(ref mut tx) = session.invite_transaction
+        {
+            let _ = tx.receive_response(status_code);
         }
 
         match status_code {
@@ -668,12 +671,9 @@ impl CallAgent {
             .to_string();
 
         // Find the call session by SIP Call-ID
-        let call_id = self
-            .find_call_by_sip_id(&sip_call_id)
-            .ok_or_else(|| {
-                SipUaError::InvalidState(format!("No call found for Call-ID: {sip_call_id}"))
-            })?
-            .to_string();
+        let call_id = self.find_call_by_sip_id(&sip_call_id).ok_or_else(|| {
+            SipUaError::InvalidState(format!("No call found for Call-ID: {sip_call_id}"))
+        })?;
 
         // Verify this is a REFER notification (Event: refer)
         let event_header = request.headers.get_value(&HeaderName::Event).unwrap_or("");
@@ -684,7 +684,7 @@ impl CallAgent {
                 event = %event_header,
                 "Received NOTIFY for non-refer event, ignoring"
             );
-            return self.build_200_ok_for_notify(request);
+            return Ok(Self::build_200_ok_for_notify(request));
         }
 
         // Parse Subscription-State header
@@ -693,14 +693,16 @@ impl CallAgent {
         let is_final = sub_state_header.is_some_and(|s| s.starts_with("terminated"));
 
         // Parse sipfrag body to get transfer status
-        let status = if let Some(body) = &request.body {
-            let body_str = String::from_utf8_lossy(body);
-            Self::parse_sipfrag(&body_str)
-        } else {
-            // No body means we can't determine status
-            warn!(call_id = %call_id, "NOTIFY without sipfrag body");
-            None
-        };
+        let status = request.body.as_ref().map_or_else(
+            || {
+                warn!(call_id = %call_id, "NOTIFY without sipfrag body");
+                None
+            },
+            |body| {
+                let body_str = String::from_utf8_lossy(body);
+                Self::parse_sipfrag(&body_str)
+            },
+        );
 
         // Get transfer target and update refer request state
         let transfer_target = {
@@ -774,7 +776,7 @@ impl CallAgent {
         }
 
         // Build 200 OK response
-        self.build_200_ok_for_notify(request)
+        Ok(Self::build_200_ok_for_notify(request))
     }
 
     /// Parses a sipfrag body to extract the SIP status code.
@@ -798,13 +800,13 @@ impl CallAgent {
     }
 
     /// Builds a 200 OK response for a NOTIFY request.
-    fn build_200_ok_for_notify(&self, request: &SipRequest) -> SipUaResult<SipResponse> {
+    fn build_200_ok_for_notify(request: &SipRequest) -> SipResponse {
         use proto_sip::header::Header;
         use proto_sip::response::StatusCode;
 
         let mut response = SipResponse::new(StatusCode::OK);
 
-        // Copy Via headers (all, in order) - RFC 3261 §8.2.6.1
+        // Copy Via headers (all, in order) - RFC 3261 section 8.2.6.1
         for via in request.headers.get_all(&HeaderName::Via) {
             response.add_header(Header::new(HeaderName::Via, &via.value));
         }
@@ -833,7 +835,7 @@ impl CallAgent {
         response.add_header(Header::new(HeaderName::UserAgent, USER_AGENT));
         response.add_header(Header::new(HeaderName::ContentLength, "0"));
 
-        Ok(response)
+        response
     }
 
     async fn handle_provisional_response(
@@ -866,27 +868,27 @@ impl CallAgent {
         }
 
         // Extract early SDP if present (183)
-        if status_code == 183 {
-            if let Some(body) = &response.body {
-                let sdp = String::from_utf8_lossy(body).to_string();
-                if let Some(session) = self.calls.get_mut(call_id) {
-                    session.remote_sdp = Some(sdp.clone());
-                }
-                let _ = self
-                    .event_tx
-                    .send(CallEvent::SdpAnswerReceived {
-                        call_id: call_id.to_string(),
-                        sdp,
-                    })
-                    .await;
+        if status_code == 183
+            && let Some(body) = &response.body
+        {
+            let sdp = String::from_utf8_lossy(body).to_string();
+            if let Some(session) = self.calls.get_mut(call_id) {
+                session.remote_sdp = Some(sdp.clone());
             }
+            let _ = self
+                .event_tx
+                .send(CallEvent::SdpAnswerReceived {
+                    call_id: call_id.to_string(),
+                    sdp,
+                })
+                .await;
         }
 
         // Extract To tag if present
-        if let Some(session) = self.calls.get_mut(call_id) {
-            if session.to_tag.is_none() {
-                session.to_tag = Self::extract_to_tag(response);
-            }
+        if let Some(session) = self.calls.get_mut(call_id)
+            && session.to_tag.is_none()
+        {
+            session.to_tag = Self::extract_to_tag(response);
         }
 
         Ok(())
@@ -952,7 +954,8 @@ impl CallAgent {
 
         // Send ACK
         let destination = Self::parse_destination(&remote_uri).await?;
-        let effective_local_addr = Self::get_local_addr_for_destination(destination, self.local_addr).await?;
+        let effective_local_addr =
+            Self::get_local_addr_for_destination(destination, self.local_addr).await?;
         let ack_request = Self::build_ack_request_static(
             &remote_uri,
             &self.aor,
@@ -1247,7 +1250,8 @@ impl CallAgent {
         _response: &SipResponse,
     ) -> SipUaResult<()> {
         let destination = Self::parse_destination(remote_uri).await?;
-        let effective_local_addr = Self::get_local_addr_for_destination(destination, self.local_addr).await?;
+        let effective_local_addr =
+            Self::get_local_addr_for_destination(destination, self.local_addr).await?;
         let ack_request = Self::build_ack_request_static(
             remote_uri,
             &self.aor,
@@ -1328,7 +1332,8 @@ impl CallAgent {
         };
 
         let destination = Self::parse_destination(&remote_uri).await?;
-        let effective_local_addr = Self::get_local_addr_for_destination(destination, self.local_addr).await?;
+        let effective_local_addr =
+            Self::get_local_addr_for_destination(destination, self.local_addr).await?;
 
         // Build CANCEL request
         let request = Self::build_cancel_request_static(
@@ -1386,7 +1391,8 @@ impl CallAgent {
         };
 
         let destination = Self::parse_destination(&remote_uri).await?;
-        let effective_local_addr = Self::get_local_addr_for_destination(destination, self.local_addr).await?;
+        let effective_local_addr =
+            Self::get_local_addr_for_destination(destination, self.local_addr).await?;
 
         // Build BYE request
         let request = Self::build_bye_request_static(
@@ -1453,7 +1459,7 @@ impl CallAgent {
             .parse()
             .map_err(|e| SipUaError::ConfigError(format!("Invalid AOR: {e}")))?;
 
-        let via = ViaHeader::new(transport_type, &local_addr.ip().to_string())
+        let via = ViaHeader::new(transport_type, local_addr.ip().to_string())
             .with_port(local_addr.port())
             .with_branch(branch.to_string());
 
@@ -1512,7 +1518,7 @@ impl CallAgent {
             .parse()
             .map_err(|e| SipUaError::ConfigError(format!("Invalid AOR: {e}")))?;
 
-        let via = ViaHeader::new(transport_type, &local_addr.ip().to_string())
+        let via = ViaHeader::new(transport_type, local_addr.ip().to_string())
             .with_port(local_addr.port())
             .with_branch(branch.to_string());
 
@@ -1561,7 +1567,7 @@ impl CallAgent {
 
         let branch = generate_branch();
 
-        let via = ViaHeader::new(transport_type, &local_addr.ip().to_string())
+        let via = ViaHeader::new(transport_type, local_addr.ip().to_string())
             .with_port(local_addr.port())
             .with_branch(branch);
 
@@ -1610,7 +1616,7 @@ impl CallAgent {
 
         let branch = generate_branch();
 
-        let via = ViaHeader::new(transport_type, &local_addr.ip().to_string())
+        let via = ViaHeader::new(transport_type, local_addr.ip().to_string())
             .with_port(local_addr.port())
             .with_branch(branch);
 
@@ -1658,7 +1664,7 @@ impl CallAgent {
             .parse()
             .map_err(|e| SipUaError::ConfigError(format!("Invalid AOR: {e}")))?;
 
-        let via = ViaHeader::new("TLS", &local_addr.ip().to_string())
+        let via = ViaHeader::new("TLS", local_addr.ip().to_string())
             .with_port(local_addr.port())
             .with_branch(branch.to_string());
 
@@ -1722,7 +1728,7 @@ impl CallAgent {
 
         let branch = generate_branch();
 
-        let via = ViaHeader::new("TLS", &local_addr.ip().to_string())
+        let via = ViaHeader::new("TLS", local_addr.ip().to_string())
             .with_port(local_addr.port())
             .with_branch(branch);
 
@@ -1786,29 +1792,22 @@ impl CallAgent {
 
         // DNS resolution for hostnames
         debug!(host = %host, "parse_destination: performing DNS resolution");
-        let lookup_host = format!("{}:{}", host, port);
-        let addrs: Vec<_> = tokio::net::lookup_host(&lookup_host)
-            .await
-            .map_err(|e| {
-                error!(host = %host, error = %e, "parse_destination: DNS resolution failed");
-                SipUaError::ConfigError(format!("DNS resolution failed for {host}: {e}"))
-            })?
-            .collect();
+        let lookup_host = format!("{host}:{port}");
+        let mut addrs = tokio::net::lookup_host(&lookup_host).await.map_err(|e| {
+            error!(host = %host, error = %e, "parse_destination: DNS resolution failed");
+            SipUaError::ConfigError(format!("DNS resolution failed for {host}: {e}"))
+        })?;
+
+        let result = addrs.next().ok_or_else(|| {
+            error!(host = %host, "parse_destination: no addresses found");
+            SipUaError::ConfigError(format!("No addresses found for {host}"))
+        })?;
 
         debug!(
             host = %host,
-            count = addrs.len(),
-            addresses = ?addrs,
-            "parse_destination: DNS resolution returned addresses"
+            resolved = %result,
+            "parse_destination: DNS resolution returned address"
         );
-
-        let result = addrs
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                error!(host = %host, "parse_destination: no addresses found");
-                SipUaError::ConfigError(format!("No addresses found for {host}"))
-            })?;
 
         info!(
             uri = %uri,
@@ -1821,10 +1820,11 @@ impl CallAgent {
 
     /// Gets the local address to use for reaching a destination.
     ///
-    /// If the configured local_addr is unspecified (0.0.0.0), this function
+    /// If the configured `local_addr` is unspecified (0.0.0.0), this function
     /// determines the appropriate local IP by creating a UDP socket connected
     /// to the destination. This ensures the Via/Contact headers contain a
     /// routable IP address.
+    #[allow(clippy::unused_async)]
     async fn get_local_addr_for_destination(
         destination: SocketAddr,
         configured_addr: SocketAddr,

@@ -28,7 +28,8 @@ pub struct FileAudioSource {
 
 impl FileAudioSource {
     /// Creates a new empty file audio source.
-    pub fn new(target_sample_rate: u32) -> Self {
+    #[must_use]
+    pub const fn new(target_sample_rate: u32) -> Self {
         Self {
             samples: Vec::new(),
             position: 0,
@@ -41,6 +42,7 @@ impl FileAudioSource {
     /// Loads audio from a WAV file.
     ///
     /// The audio is converted to mono at the target sample rate.
+    #[allow(clippy::cast_precision_loss)]
     pub fn load<P: AsRef<Path>>(&mut self, path: P) -> AudioResult<()> {
         let path = path.as_ref();
         info!(path = %path.display(), "Loading MOH audio file");
@@ -57,14 +59,15 @@ impl FileAudioSource {
         );
 
         // Read all samples
+        #[allow(clippy::cast_possible_truncation)]
         let raw_samples: Vec<i32> = match spec.sample_format {
             hound::SampleFormat::Int => reader
                 .into_samples::<i32>()
-                .filter_map(|s| s.ok())
+                .filter_map(std::result::Result::ok)
                 .collect(),
             hound::SampleFormat::Float => reader
                 .into_samples::<f32>()
-                .filter_map(|s| s.ok())
+                .filter_map(std::result::Result::ok)
                 .map(|s| (s * 32767.0) as i32)
                 .collect(),
         };
@@ -83,7 +86,7 @@ impl FileAudioSource {
                     let left = chunk.first().copied().unwrap_or(0);
                     let right = chunk.get(1).copied().unwrap_or(0);
                     // Average both channels, normalize to i16 range
-                    let mixed = (left + right) / 2;
+                    let mixed = i32::midpoint(left, right);
                     Self::normalize_sample(mixed, spec.bits_per_sample)
                 })
                 .collect()
@@ -95,10 +98,10 @@ impl FileAudioSource {
         };
 
         // Resample to target rate if needed
-        let resampled = if spec.sample_rate != self.target_sample_rate {
-            Self::resample(&mono_samples, spec.sample_rate, self.target_sample_rate)
-        } else {
+        let resampled = if spec.sample_rate == self.target_sample_rate {
             mono_samples
+        } else {
+            Self::resample(&mono_samples, spec.sample_rate, self.target_sample_rate)
         };
 
         info!(
@@ -116,23 +119,29 @@ impl FileAudioSource {
     }
 
     /// Normalizes a sample to i16 range based on the original bit depth.
-    fn normalize_sample(sample: i32, bits: u16) -> i16 {
+    #[allow(clippy::cast_possible_truncation)]
+    const fn normalize_sample(sample: i32, bits: u16) -> i16 {
         match bits {
             8 => ((sample - 128) * 256) as i16,
-            16 => sample as i16,
             24 => (sample >> 8) as i16,
             32 => (sample >> 16) as i16,
+            // 16-bit and anything else passes through
             _ => sample as i16,
         }
     }
 
     /// Simple linear resampling from source rate to target rate.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     fn resample(samples: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
         if from_rate == to_rate {
             return samples.to_vec();
         }
 
-        let ratio = from_rate as f64 / to_rate as f64;
+        let ratio = f64::from(from_rate) / f64::from(to_rate);
         let output_len = (samples.len() as f64 / ratio).ceil() as usize;
         let mut output = Vec::with_capacity(output_len);
 
@@ -143,9 +152,9 @@ impl FileAudioSource {
 
             // Linear interpolation
             let sample = if src_idx + 1 < samples.len() {
-                let s0 = samples[src_idx] as f64;
-                let s1 = samples[src_idx + 1] as f64;
-                (s0 + frac * (s1 - s0)) as i16
+                let s0 = f64::from(samples[src_idx]);
+                let s1 = f64::from(samples[src_idx + 1]);
+                frac.mul_add(s1 - s0, s0) as i16
             } else if src_idx < samples.len() {
                 samples[src_idx]
             } else {
@@ -189,16 +198,18 @@ impl FileAudioSource {
     }
 
     /// Resets playback to the beginning.
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.position = 0;
     }
 
     /// Returns whether audio has been loaded.
-    pub fn is_loaded(&self) -> bool {
+    #[must_use]
+    pub const fn is_loaded(&self) -> bool {
         self.loaded
     }
 
     /// Returns the duration of the loaded audio in seconds.
+    #[allow(clippy::cast_precision_loss)]
     pub fn duration_secs(&self) -> f32 {
         if self.loaded && self.target_sample_rate > 0 {
             self.samples.len() as f32 / self.target_sample_rate as f32

@@ -130,5 +130,7 @@ fn main() {
 #[cfg(not(feature = "digest-auth"))]
 fn main() {
     println!("This example requires the digest-auth feature.");
-    println!("Run with: cargo run -p client-core --features digest-auth --example test_credentials");
+    println!(
+        "Run with: cargo run -p client-core --features digest-auth --example test_credentials"
+    );
 }
