@@ -811,6 +811,11 @@ body {
 .call-duration {
     font: var(--md-sys-typescale-display-small);
     color: var(--md-sys-color-primary);
+    display: none; /* Hidden by default */
+}
+
+.call-duration.active {
+    display: block; /* Show during active call */
 }
 
 .call-controls {

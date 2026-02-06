@@ -1080,6 +1080,12 @@ function startCall(target) {
 
     document.getElementById('callTarget').textContent = target;
 
+    // Show call duration
+    const durationElement = document.getElementById('callDuration');
+    if (durationElement) {
+        durationElement.classList.add('active');
+    }
+
     // Enable call controls
     document.getElementById('muteBtn').disabled = false;
     document.getElementById('holdBtn').disabled = false;
@@ -1124,7 +1130,9 @@ function endCall() {
 
     // Clear call display and dial input
     document.getElementById('callTarget').textContent = '';
-    document.getElementById('callDuration').textContent = '00:00';
+    const durationElement = document.getElementById('callDuration');
+    durationElement.textContent = '00:00';
+    durationElement.classList.remove('active');
     const dialInput = document.getElementById('dialInput');
     if (dialInput) {
         dialInput.value = '';
