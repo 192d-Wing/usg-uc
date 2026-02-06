@@ -1956,13 +1956,13 @@ h2 .section-icon {
 
 /* Classification bar colors via data attributes */
 .classification-bar[data-classification="unclassified"] {
-    background-color: #5cb85c;
+    background-color: #007A33;
     color: #ffffff;
 }
 
 .classification-bar[data-classification="cui"] {
-    background-color: #5bc0de;
-    color: #000000;
+    background-color: #502B85;
+    color: #ffffff;
 }
 
 .classification-bar[data-classification="confidential"] {
@@ -1976,11 +1976,11 @@ h2 .section-icon {
 }
 
 .classification-bar[data-classification="top-secret"] {
-    background-color: #ff8200;
+    background-color: #FF8C00;
     color: #000000;
 }
 
 .classification-bar[data-classification="top-secret-sci"] {
-    background-color: #ffc700;
+    background-color: #FFE11A;
     color: #000000;
 }

@@ -1185,7 +1185,6 @@ async function makeCall(target) {
         const result = await invoke('make_call', { target: sipUri });
         console.log('Call initiated:', result);
         startCall(target);
-        switchTab('call');
     } catch (error) {
         console.error('Failed to make call:', error);
         safeAlert('Failed to make call: ' + error);
