@@ -1010,15 +1010,33 @@ function initializeDialer() {
         updateDialInputSize(dialInput);
     });
 
-    // Auto-format on manual input with length limit
+    // Auto-format on manual input with length limit and sanitization
     dialInput.addEventListener('input', (e) => {
         const cursorPos = e.target.selectionStart;
         let oldValue = e.target.value;
 
-        // Enforce max length on raw digits
+        // Sanitize input: allow only digits, +, @, and SIP URI characters (letters, dots, hyphens, colons)
+        // For SIP URIs: sip:user@domain.com or sips:user@domain.com
+        const sanitizedValue = oldValue.replace(/[^0-9+@.:a-zA-Z\-]/g, '');
+
+        if (sanitizedValue !== oldValue) {
+            // Invalid characters were removed, update the value
+            oldValue = sanitizedValue;
+            e.target.value = sanitizedValue;
+        }
+
+        // Enforce max length on raw digits (for phone numbers)
         const digits = oldValue.replace(/\D/g, '');
-        if (digits.length > MAX_DIAL_LENGTH) {
+        if (digits.length > MAX_DIAL_LENGTH && !oldValue.includes('@')) {
+            // Only enforce digit limit if it's not a SIP URI
             oldValue = oldValue.slice(0, -1);
+            e.target.value = oldValue;
+            return;
+        }
+
+        // Enforce max URI length for SIP URIs
+        if (oldValue.includes('@') && oldValue.length > MAX_URI_LENGTH) {
+            oldValue = oldValue.slice(0, MAX_URI_LENGTH);
             e.target.value = oldValue;
             return;
         }
@@ -1465,9 +1483,24 @@ function escapeHtml(text) {
 }
 
 function filterContacts(query) {
+    // Input validation: enforce max length and sanitize
+    if (!query) {
+        renderContacts(contacts);
+        return;
+    }
+
+    // Trim and enforce max length
+    const sanitizedQuery = query.trim().slice(0, MAX_SEARCH_LENGTH).toLowerCase();
+
+    if (!sanitizedQuery) {
+        renderContacts(contacts);
+        return;
+    }
+
+    // Filter with sanitized search term
     const filtered = contacts.filter(contact =>
-        contact.name.toLowerCase().includes(query.toLowerCase()) ||
-        contact.sip_uri.toLowerCase().includes(query.toLowerCase())
+        contact.name.toLowerCase().includes(sanitizedQuery) ||
+        contact.sip_uri.toLowerCase().includes(sanitizedQuery)
     );
     renderContacts(filtered);
 }
