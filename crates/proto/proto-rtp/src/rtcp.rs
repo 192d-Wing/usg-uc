@@ -295,6 +295,19 @@ impl SenderInfo {
             sender_octet_count: cursor.get_u32(),
         })
     }
+
+    /// Serializes sender info to bytes (24 bytes).
+    #[must_use]
+    pub fn to_bytes(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(24);
+        buf.put_u32(self.ssrc);
+        buf.put_u32(self.ntp_timestamp_msw);
+        buf.put_u32(self.ntp_timestamp_lsw);
+        buf.put_u32(self.rtp_timestamp);
+        buf.put_u32(self.sender_packet_count);
+        buf.put_u32(self.sender_octet_count);
+        buf.freeze()
+    }
 }
 
 /// Reception report block.
@@ -354,6 +367,24 @@ impl ReceptionReport {
             last_sr,
             delay_since_last_sr,
         })
+    }
+
+    /// Serializes a reception report to bytes (24 bytes).
+    #[must_use]
+    pub fn to_bytes(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(24);
+        buf.put_u32(self.ssrc);
+        buf.put_u8(self.fraction_lost);
+        // 24-bit cumulative lost (big-endian, 3 bytes)
+        let lost_be = self.cumulative_lost.to_be_bytes();
+        buf.put_u8(lost_be[1]);
+        buf.put_u8(lost_be[2]);
+        buf.put_u8(lost_be[3]);
+        buf.put_u32(self.extended_highest_seq);
+        buf.put_u32(self.jitter);
+        buf.put_u32(self.last_sr);
+        buf.put_u32(self.delay_since_last_sr);
+        buf.freeze()
     }
 }
 

@@ -75,6 +75,7 @@ pub mod jitter_buffer;
 pub mod pipeline;
 pub mod plc;
 pub mod ringtone;
+pub mod rtcp_session;
 pub mod rtp_handler;
 pub mod stream;
 pub mod vad;
@@ -94,6 +95,7 @@ pub use jitter_buffer::{
 };
 pub use pipeline::{AudioPipeline, PipelineConfig, PipelineState, PipelineStats};
 pub use plc::PacketLossConcealer;
+pub use rtcp_session::RtcpSession;
 pub use ringtone::RingtonePlayer;
 pub use rtp_handler::{RtpReceiver, RtpStats, RtpTransmitter, generate_ssrc};
 pub use stream::{CaptureStream, PlaybackStream, PlaybackStreamHandle, Sample};
