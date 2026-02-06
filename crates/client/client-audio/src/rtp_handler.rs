@@ -420,6 +420,11 @@ impl RtpReceiver {
         self.stats.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
+    /// Returns the number of packets currently buffered in the jitter buffer.
+    pub fn buffered_count(&self) -> usize {
+        self.jitter_buffer.len()
+    }
+
     /// Returns the jitter buffer statistics.
     pub fn jitter_buffer_stats(&self) -> crate::jitter_buffer::JitterBufferStats {
         self.jitter_buffer.stats().clone()

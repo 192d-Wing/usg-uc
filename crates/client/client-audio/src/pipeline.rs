@@ -118,6 +118,8 @@ pub struct AudioPipeline {
     moh_source: Option<FileAudioSource>,
     /// Whether MOH is currently active (call on hold).
     moh_active: AtomicBool,
+    /// Last playback sample for smooth PLC fade-out.
+    last_playback_sample: i16,
 }
 
 impl AudioPipeline {
@@ -138,6 +140,7 @@ impl AudioPipeline {
             stats: Arc::new(std::sync::Mutex::new(PipelineStats::default())),
             moh_source: None,
             moh_active: AtomicBool::new(false),
+            last_playback_sample: 0,
         }
     }
 
@@ -305,6 +308,13 @@ impl AudioPipeline {
     ///
     /// This should be called at regular intervals (e.g., every 20ms for G.711).
     pub async fn process_capture_frame(&mut self) -> AudioResult<()> {
+        // Read device sample rate before mutable borrows
+        let device_rate = self
+            .capture
+            .as_ref()
+            .map(|c| c.sample_rate())
+            .unwrap_or(DEVICE_SAMPLE_RATE);
+
         let codec = self
             .codec
             .as_mut()
@@ -321,10 +331,11 @@ impl AudioPipeline {
             .ok_or_else(|| AudioError::ConfigError("Transmitter not available".to_string()))?;
 
         // Calculate samples needed at device rate for one codec frame
-        // e.g., for 20ms G.711: 20ms * 48000 Hz = 960 samples from device
+        // e.g., for 20ms G.711 at 48kHz: 160 * 48000 / 8000 = 960 samples
+        // For Bluetooth at 16kHz: 160 * 16000 / 8000 = 320 samples
         let codec_clock_rate = codec.clock_rate();
         let codec_samples = codec.samples_per_frame(); // e.g., 160 for G.711
-        let device_samples = (codec_samples as u32 * DEVICE_SAMPLE_RATE / codec_clock_rate) as usize;
+        let device_samples = (codec_samples as u32 * device_rate / codec_clock_rate) as usize;
 
         // Read captured samples at device rate
         let mut device_pcm = vec![0i16; device_samples];
@@ -364,7 +375,17 @@ impl AudioPipeline {
     }
 
     /// Processes received packets and outputs to playback.
+    ///
+    /// Drains all available packets from the jitter buffer each tick to prevent
+    /// accumulation when packets arrive in bursts due to network jitter.
     pub fn process_playback_frame(&mut self) -> AudioResult<()> {
+        // Read device sample rate before mutable borrows
+        let device_rate = self
+            .playback
+            .as_ref()
+            .map(|p| p.sample_rate())
+            .unwrap_or(DEVICE_SAMPLE_RATE);
+
         let codec = self
             .codec
             .as_mut()
@@ -383,45 +404,52 @@ impl AudioPipeline {
         let codec_clock_rate = codec.clock_rate();
         let codec_samples = codec.samples_per_frame();
         // Calculate exact device samples for one codec frame
-        // e.g., 160 * 48000 / 8000 = 960
-        let device_samples = (codec_samples as u32 * DEVICE_SAMPLE_RATE / codec_clock_rate) as usize;
+        // e.g., at 48kHz: 160 * 48000 / 8000 = 960
+        // at 16kHz (Bluetooth): 160 * 16000 / 8000 = 320
+        let device_samples = (codec_samples as u32 * device_rate / codec_clock_rate) as usize;
 
-        // Get packet from jitter buffer
-        match receiver.get_packet() {
-            JitterBufferResult::Packet(packet) => {
-                // Decode
-                let codec_pcm = codec.decode(&packet.payload)?;
+        // Drain all available packets from the jitter buffer to prevent accumulation.
+        // The receive_packets() call drains ALL UDP packets into the jitter buffer each
+        // tick, so we must also drain all ready packets here to keep up.
+        const MAX_FRAMES_PER_TICK: usize = 10; // Safety limit to avoid blocking too long
+        for _ in 0..MAX_FRAMES_PER_TICK {
+            match receiver.get_packet() {
+                JitterBufferResult::Packet(packet) => {
+                    // Decode
+                    let codec_pcm = codec.decode(&packet.payload)?;
 
-                // Resample from codec rate (8kHz) to device rate (48kHz)
-                let device_pcm = if codec_pcm.len() != device_samples {
-                    resample(codec_pcm, device_samples)
-                } else {
-                    codec_pcm.to_vec()
-                };
+                    // Resample from codec rate (8kHz) to device rate (48kHz)
+                    let mut device_pcm = if codec_pcm.len() != device_samples {
+                        resample(codec_pcm, device_samples)
+                    } else {
+                        codec_pcm.to_vec()
+                    };
 
-                playback.write(&device_pcm);
-            }
-            JitterBufferResult::Lost { .. } => {
-                // Generate PLC at codec rate, then resample to device rate
-                let mut plc = vec![0i16; codec_samples];
-                codec.generate_plc(&mut plc);
+                    // Crossfade from last sample to smooth any discontinuity
+                    crossfade_in(&mut device_pcm, self.last_playback_sample);
 
-                let device_plc = if codec_samples != device_samples {
-                    resample(&plc, device_samples)
-                } else {
-                    plc
-                };
+                    if let Some(&last) = device_pcm.last() {
+                        self.last_playback_sample = last;
+                    }
 
-                playback.write(&device_plc);
-
-                if let Ok(mut stats) = self.stats.lock() {
-                    stats.playback_underruns += 1;
+                    playback.write(&device_pcm);
                 }
-            }
-            JitterBufferResult::Empty | JitterBufferResult::NotReady => {
-                // No audio to play - output silence at device rate
-                let silence = vec![0i16; device_samples];
-                playback.write(&silence);
+                JitterBufferResult::Lost { .. } => {
+                    // Generate fade-out from last known sample instead of hard silence
+                    let mut plc = vec![0i16; device_samples];
+                    fade_out(&mut plc, self.last_playback_sample);
+                    self.last_playback_sample = 0;
+
+                    playback.write(&plc);
+
+                    if let Ok(mut stats) = self.stats.lock() {
+                        stats.playback_underruns += 1;
+                    }
+                }
+                JitterBufferResult::Empty | JitterBufferResult::NotReady => {
+                    // No more packets available - stop draining
+                    break;
+                }
             }
         }
 
@@ -688,29 +716,96 @@ impl Drop for AudioPipeline {
     }
 }
 
-/// Resample audio to a specific output length using linear interpolation.
+/// Resample audio using windowed sinc interpolation with anti-aliasing.
+///
+/// Uses a Hann-windowed sinc kernel (half-width = 8 taps) which provides
+/// good stopband attenuation (~44 dB) for clean voice audio. When
+/// downsampling, the sinc cutoff is lowered to prevent aliasing.
 fn resample(input: &[i16], output_len: usize) -> Vec<i16> {
     if input.len() == output_len {
         return input.to_vec();
     }
 
+    const SINC_HALF_WIDTH: usize = 8;
+
+    let in_len = input.len();
+    let ratio = in_len as f64 / output_len as f64; // >1 when downsampling
+    // When downsampling, lower the cutoff to prevent aliasing
+    let cutoff = if ratio > 1.0 { 1.0 / ratio } else { 1.0 };
+    // When downsampling, widen the kernel to cover more input samples
+    let kernel_scale = ratio.max(1.0);
+
     let mut output = Vec::with_capacity(output_len);
-    let ratio = (input.len() as f64 - 1.0) / (output_len as f64 - 1.0).max(1.0);
 
     for i in 0..output_len {
-        let src_pos = i as f64 * ratio;
-        let src_idx = src_pos as usize;
-        let frac = src_pos - src_idx as f64;
+        let src_pos = (i as f64 + 0.5) * ratio - 0.5;
+        let src_center = src_pos.floor() as isize;
 
-        if src_idx + 1 < input.len() {
-            let sample = input[src_idx] as f64 * (1.0 - frac) + input[src_idx + 1] as f64 * frac;
-            output.push(sample.round() as i16);
-        } else {
-            output.push(input[input.len() - 1]);
+        let tap_count = (SINC_HALF_WIDTH as f64 * kernel_scale).ceil() as isize;
+        let mut sum = 0.0f64;
+        let mut weight_sum = 0.0f64;
+
+        for j in -tap_count..=tap_count {
+            let src_idx = src_center + j;
+            if src_idx < 0 || src_idx >= in_len as isize {
+                continue;
+            }
+
+            let x = (src_idx as f64 - src_pos) * cutoff;
+
+            // sinc(x) * hann_window(x / tap_count)
+            let sinc = if x.abs() < 1e-9 {
+                1.0
+            } else {
+                let px = std::f64::consts::PI * x;
+                px.sin() / px
+            };
+
+            let window_pos = (src_idx as f64 - src_pos) / kernel_scale;
+            let hann = if window_pos.abs() < SINC_HALF_WIDTH as f64 {
+                0.5 + 0.5 * (std::f64::consts::PI * window_pos / SINC_HALF_WIDTH as f64).cos()
+            } else {
+                0.0
+            };
+
+            let w = sinc * hann * cutoff;
+            sum += input[src_idx as usize] as f64 * w;
+            weight_sum += w;
         }
+
+        let sample = if weight_sum.abs() > 1e-9 {
+            (sum / weight_sum).round().clamp(-32768.0, 32767.0) as i16
+        } else {
+            0
+        };
+        output.push(sample);
     }
 
     output
+}
+
+/// Short crossfade from `prev_sample` into the start of `buffer` to eliminate clicks
+/// at frame boundaries caused by sample discontinuities.
+fn crossfade_in(buffer: &mut [i16], prev_sample: i16) {
+    const CROSSFADE_SAMPLES: usize = 16;
+    let len = buffer.len().min(CROSSFADE_SAMPLES);
+    for i in 0..len {
+        let t = (i + 1) as f32 / (len + 1) as f32; // 0→1 fade
+        let blended = prev_sample as f32 * (1.0 - t) + buffer[i] as f32 * t;
+        buffer[i] = blended.round().clamp(-32768.0, 32767.0) as i16;
+    }
+}
+
+/// Fade out from `last_sample` to silence over the entire buffer for smooth PLC.
+fn fade_out(buffer: &mut [i16], last_sample: i16) {
+    let len = buffer.len();
+    if len == 0 || last_sample == 0 {
+        return;
+    }
+    for i in 0..len {
+        let t = 1.0 - (i as f32 / len as f32);
+        buffer[i] = (last_sample as f32 * t).round() as i16;
+    }
 }
 
 #[cfg(test)]
