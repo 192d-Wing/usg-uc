@@ -11,6 +11,92 @@ const MAX_CONTACT_NAME = 100;
 const MAX_URI_LENGTH = 256;
 const MAX_SEARCH_LENGTH = 100;
 
+// ============================================================================
+// Ringback Tone Generator
+// ============================================================================
+
+class RingbackTone {
+    constructor() {
+        this.audioContext = null;
+        this.oscillator = null;
+        this.gainNode = null;
+        this.isPlaying = false;
+        this.ringInterval = null;
+    }
+
+    start() {
+        if (this.isPlaying) return;
+
+        try {
+            // Create audio context if needed
+            if (!this.audioContext) {
+                this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+
+            this.isPlaying = true;
+
+            // Play ring pattern: 2 seconds on, 4 seconds off (US ringback)
+            this.playRing();
+            this.ringInterval = setInterval(() => {
+                this.playRing();
+            }, 6000); // Total cycle: 2s ring + 4s silence
+        } catch (error) {
+            console.error('Failed to start ringback tone:', error);
+        }
+    }
+
+    playRing() {
+        if (!this.audioContext) return;
+
+        // Create oscillator for 440 Hz + 480 Hz (US ringback tone)
+        const osc1 = this.audioContext.createOscillator();
+        const osc2 = this.audioContext.createOscillator();
+        const gainNode = this.audioContext.createGain();
+
+        osc1.frequency.value = 440; // A4 note
+        osc2.frequency.value = 480; // Slightly sharp
+        osc1.type = 'sine';
+        osc2.type = 'sine';
+
+        // Connect oscillators to gain
+        osc1.connect(gainNode);
+        osc2.connect(gainNode);
+        gainNode.connect(this.audioContext.destination);
+
+        // Set volume (quieter than full volume)
+        gainNode.gain.value = 0.1;
+
+        // Start playing
+        const now = this.audioContext.currentTime;
+        osc1.start(now);
+        osc2.start(now);
+
+        // Stop after 2 seconds
+        osc1.stop(now + 2.0);
+        osc2.stop(now + 2.0);
+    }
+
+    stop() {
+        if (!this.isPlaying) return;
+
+        this.isPlaying = false;
+
+        if (this.ringInterval) {
+            clearInterval(this.ringInterval);
+            this.ringInterval = null;
+        }
+
+        // Clean up audio context
+        if (this.audioContext) {
+            this.audioContext.close();
+            this.audioContext = null;
+        }
+    }
+}
+
+// Global ringback tone instance
+const ringbackTone = new RingbackTone();
+
 // Rate limiting for backend calls
 const rateLimiter = {
     lastCall: {},
@@ -403,17 +489,23 @@ async function initializeEventListeners() {
 function handleCallStateChange(payload) {
     const { call_id, state, remote_uri, remote_display_name } = payload;
 
-    if (state === 'Connected' || state === 'connected') {
+    if (state === 'Ringing' || state === 'ringing') {
+        // Play ringback tone while waiting for answer
+        ringbackTone.start();
+    } else if (state === 'Connected' || state === 'connected') {
+        // Stop ringback tone when call is answered
+        ringbackTone.stop();
         if (!callActive) {
             startCall(remote_display_name || remote_uri);
         }
+        isOnHold = false;
+        updateHoldButton();
     } else if (state === 'Terminated' || state === 'terminated') {
+        // Stop ringback tone when call ends
+        ringbackTone.stop();
         endCall();
     } else if (state === 'OnHold' || state === 'on_hold') {
         isOnHold = true;
-        updateHoldButton();
-    } else if (state === 'Connected' || state === 'connected') {
-        isOnHold = false;
         updateHoldButton();
     }
 }
@@ -1122,6 +1214,9 @@ function endCall() {
     isMuted = false;
     isOnHold = false;
     incomingCallId = null;
+
+    // Stop ringback tone if playing
+    ringbackTone.stop();
 
     if (callDurationInterval) {
         clearInterval(callDurationInterval);
