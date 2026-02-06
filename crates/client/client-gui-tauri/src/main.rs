@@ -209,6 +209,8 @@ async fn initialize_client(state: State<'_, TauriAppState>) -> Result<(), String
                             Err(_) => {} // Timeout - this is fine, we'll poll again
                         }
                     }
+                    // Explicitly drop the guard to release the lock quickly
+                    drop(guard);
                 }
                 Err(_) => {
                     // Lock is held by another task (e.g., end_call command)
@@ -252,7 +254,16 @@ async fn make_call(target: String, state: State<'_, TauriAppState>) -> Result<St
 async fn end_call(state: State<'_, TauriAppState>) -> Result<(), String> {
     info!("end_call command invoked, acquiring client lock...");
 
-    let mut client_guard = state.client.lock().await;
+    // Use timeout to avoid indefinite blocking
+    let mut client_guard = tokio::time::timeout(
+        tokio::time::Duration::from_secs(2),
+        state.client.lock()
+    )
+    .await
+    .map_err(|_| {
+        error!("end_call: Timeout acquiring client lock");
+        "Timeout acquiring client lock".to_string()
+    })?;
     info!("end_call: client lock acquired");
     let client = client_guard
         .as_mut()
