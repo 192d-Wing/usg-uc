@@ -512,6 +512,20 @@ async fn get_call_history(state: State<'_, TauriAppState>) -> Result<Vec<CallHis
     Ok(history)
 }
 
+/// Clear all call history.
+#[tauri::command]
+async fn clear_call_history(state: State<'_, TauriAppState>) -> Result<(), String> {
+    info!("Clearing call history");
+
+    let mut manager = state.contact_manager.write().await;
+    manager.clear_call_history();
+    manager
+        .save_if_dirty()
+        .map_err(|e| format!("Failed to save after clearing history: {e}"))?;
+
+    Ok(())
+}
+
 /// Get SIP registration settings.
 #[tauri::command]
 async fn get_sip_settings(state: State<'_, TauriAppState>) -> Result<SipSettings, String> {
@@ -1427,6 +1441,7 @@ fn main() {
             delete_contact,
             search_contacts,
             get_call_history,
+            clear_call_history,
             get_sip_settings,
             update_sip_settings,
             save_sip_settings,

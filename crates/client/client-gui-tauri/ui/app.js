@@ -1571,6 +1571,22 @@ function initializeRecents() {
             await loadCallHistory();
         });
     }
+
+    // Clear call history button
+    const clearRecentsBtn = document.getElementById('clearRecentsBtn');
+    if (clearRecentsBtn) {
+        clearRecentsBtn.addEventListener('click', async () => {
+            if (confirm('Are you sure you want to clear all call history?')) {
+                try {
+                    await invoke('clear_call_history');
+                    await loadCallHistory(); // Reload to show empty list
+                } catch (error) {
+                    console.error('Failed to clear call history:', error);
+                    safeAlert('Failed to clear call history: ' + error);
+                }
+            }
+        });
+    }
 }
 
 async function loadCallHistory() {
