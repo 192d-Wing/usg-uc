@@ -72,6 +72,10 @@ pub struct SipSettings {
     pub transport: String,
     /// Whether auto-registration is enabled.
     pub auto_register: bool,
+    /// Caller ID / DN (Directory Number) for outgoing calls.
+    /// Used in the From header as the calling party number.
+    #[serde(default)]
+    pub caller_id: Option<String>,
     /// Authentication username (for digest auth testing).
     #[serde(default)]
     pub auth_username: Option<String>,
@@ -220,6 +224,12 @@ async fn make_call(target: String, state: State<'_, TauriAppState>) -> Result<St
         .await
         .map_err(|e| format!("Failed to make call: {e}"))?;
 
+    // Poll events immediately to send the INVITE request
+    // (call_agent.make_call() queues the SendRequest event which needs to be processed)
+    if let Err(e) = client.poll_events().await {
+        warn!(error = %e, "Error polling events after make_call");
+    }
+
     Ok(call_id)
 }
 
@@ -237,6 +247,11 @@ async fn end_call(state: State<'_, TauriAppState>) -> Result<(), String> {
         .hangup()
         .await
         .map_err(|e| format!("Failed to end call: {e}"))?;
+
+    // Poll events to send BYE/CANCEL request
+    if let Err(e) = client.poll_events().await {
+        warn!(error = %e, "Error polling events after end_call");
+    }
 
     Ok(())
 }
@@ -256,6 +271,11 @@ async fn accept_call(call_id: String, state: State<'_, TauriAppState>) -> Result
         .await
         .map_err(|e| format!("Failed to accept call: {e}"))?;
 
+    // Poll events to send 200 OK response
+    if let Err(e) = client.poll_events().await {
+        warn!(error = %e, "Error polling events after accept_call");
+    }
+
     Ok(())
 }
 
@@ -273,6 +293,11 @@ async fn reject_call(call_id: String, state: State<'_, TauriAppState>) -> Result
         .reject_incoming_call(&call_id)
         .await
         .map_err(|e| format!("Failed to reject call: {e}"))?;
+
+    // Poll events to send 486/603 response
+    if let Err(e) = client.poll_events().await {
+        warn!(error = %e, "Error polling events after reject_call");
+    }
 
     Ok(())
 }
@@ -306,6 +331,11 @@ async fn toggle_hold(state: State<'_, TauriAppState>) -> Result<bool, String> {
         .await
         .map_err(|e| format!("Failed to toggle hold: {e}"))?;
 
+    // Poll events to send re-INVITE request
+    if let Err(e) = client.poll_events().await {
+        warn!(error = %e, "Error polling events after toggle_hold");
+    }
+
     Ok(is_on_hold)
 }
 
@@ -323,6 +353,11 @@ async fn transfer_call(target: String, state: State<'_, TauriAppState>) -> Resul
         .transfer_call(&target)
         .await
         .map_err(|e| format!("Failed to transfer call: {e}"))?;
+
+    // Poll events to send REFER request
+    if let Err(e) = client.poll_events().await {
+        warn!(error = %e, "Error polling events after transfer_call");
+    }
 
     Ok(())
 }
@@ -475,6 +510,7 @@ async fn get_sip_settings(state: State<'_, TauriAppState>) -> Result<SipSettings
                 port: default_port,
                 transport: transport.to_string(),
                 auto_register: acc.enabled,
+                caller_id: acc.caller_id.clone(),
                 auth_username,
                 auth_password,
             })
@@ -487,6 +523,7 @@ async fn get_sip_settings(state: State<'_, TauriAppState>) -> Result<SipSettings
             port: 5061,
             transport: "tls".to_string(),
             auto_register: false,
+            caller_id: None,
             auth_username: None,
             auth_password: None,
         }),
@@ -542,6 +579,12 @@ async fn update_sip_settings(settings: SipSettings, state: State<'_, TauriAppSta
     account.enabled = settings.auto_register;
     account.transport = transport_pref;
 
+    // Set caller ID if provided
+    account.caller_id = settings.caller_id.filter(|s| !s.is_empty());
+    if let Some(ref cid) = account.caller_id {
+        info!(caller_id = %cid, "Caller ID configured");
+    }
+
     // Set digest auth credentials if provided (only when feature enabled)
     #[cfg(feature = "digest-auth")]
     {
@@ -575,6 +618,16 @@ async fn update_sip_settings(settings: SipSettings, state: State<'_, TauriAppSta
 
     manager.set_account(account);
     manager.set_default_account(Some("default".to_string()));
+
+    // Persist digest credentials to secure storage (keychain)
+    #[cfg(feature = "digest-auth")]
+    {
+        if let Err(e) = manager.persist_account_passwords() {
+            warn!("Failed to persist passwords to secure storage: {}", e);
+        } else {
+            info!("Digest credentials persisted to secure storage");
+        }
+    }
 
     manager
         .save()
@@ -1185,8 +1238,20 @@ fn main() {
     info!("USG SIP Soft Client (Tauri) starting...");
 
     // Create settings manager
+    #[allow(unused_mut)] // mut only needed with digest-auth feature
     let settings_manager = match SettingsManager::new() {
-        Ok(m) => Arc::new(RwLock::new(m)),
+        Ok(mut m) => {
+            // Load any persisted passwords from secure storage (keychain)
+            #[cfg(feature = "digest-auth")]
+            {
+                if let Err(e) = m.load_persisted_passwords() {
+                    warn!("Failed to load persisted passwords: {}", e);
+                } else {
+                    info!("Persisted passwords loaded from secure storage");
+                }
+            }
+            Arc::new(RwLock::new(m))
+        }
         Err(e) => {
             error!("Failed to create settings manager: {}", e);
             return;
