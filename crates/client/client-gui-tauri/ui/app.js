@@ -318,8 +318,14 @@ function setClassification(level, caveats = [], dissem = []) {
 
     const classLevel = levelMap[normalizedLevel] || 'unclassified';
     currentClassification = classLevel;
-    classificationCaveats = caveats;
-    classificationDissem = dissem;
+
+    // Validate caveats and dissemination controls against whitelists
+    classificationCaveats = Array.isArray(caveats)
+        ? caveats.filter(c => SCI_CAVEATS.includes(c))
+        : [];
+    classificationDissem = Array.isArray(dissem)
+        ? dissem.filter(d => DISSEM_CONTROLS.includes(d))
+        : [];
 
     updateClassificationBars();
 
@@ -407,6 +413,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     initializeTabs();
     initializeDialer();
     initializeContacts();
+    initializeRecents();
     initializeCall();
     initializeSettings();
     initializeEventListeners();
@@ -1133,6 +1140,14 @@ function initializeDialer() {
     });
 }
 
+// Validates dial target for safe SIP URI characters
+function isValidDialTarget(target) {
+    // Whitelist approach: only allow valid SIP URI characters
+    // Allow: alphanumeric, +, @, ., :, _, -, and sip/sips scheme
+    const validPattern = /^(sips?:)?[a-zA-Z0-9+@.:_-]+$/;
+    return validPattern.test(target) && target.length <= MAX_URI_LENGTH;
+}
+
 async function makeCall(target) {
     console.log('makeCall called with target:', target);
 
@@ -1144,6 +1159,13 @@ async function makeCall(target) {
     // Extract digits if formatted, preserve SIP URIs
     const dialTarget = extractDigits(target).slice(0, MAX_URI_LENGTH);
     console.log('dialTarget after extractDigits:', dialTarget);
+
+    // Validate dial target to prevent SIP header injection
+    if (!isValidDialTarget(dialTarget)) {
+        console.error('Invalid dial target characters detected');
+        safeAlert('Invalid dial target. Only alphanumeric characters and basic SIP URI characters are allowed.');
+        return;
+    }
 
     // Add sip: prefix if not present
     let sipUri = dialTarget;
@@ -1171,11 +1193,11 @@ function startCall(target) {
     isOnHold = false;
 
     // Transition to call screen
-    document.getElementById('callInfo').style.display = 'block';
+    document.getElementById('callInfo').classList.add('visible');
     document.getElementById('dialInputWrapper').style.display = 'none';
     document.getElementById('dialpad').style.display = 'none';
     document.getElementById('audioDevices').style.display = 'none';
-    document.getElementById('callControls').style.display = 'flex';
+    document.getElementById('callControls').style.display = 'grid';
 
     // Show hangup button, hide call button and backspace
     document.getElementById('callBtn').style.display = 'none';
@@ -1236,7 +1258,7 @@ function endCall() {
     }
 
     // Transition back to dialer screen
-    document.getElementById('callInfo').style.display = 'none';
+    document.getElementById('callInfo').classList.remove('visible');
     document.getElementById('dialInputWrapper').style.display = 'block';
     document.getElementById('dialpad').style.display = 'grid';
     document.getElementById('audioDevices').style.display = 'block';
@@ -1353,6 +1375,7 @@ function renderContacts(contactsToRender) {
         // Escape HTML to prevent XSS
         const safeName = escapeHtml(contact.name);
         const safeUri = escapeHtml(contact.sip_uri);
+        const safeId = escapeHtml(contact.id);
 
         item.innerHTML = `
             <div class="contact-info">
@@ -1360,9 +1383,9 @@ function renderContacts(contactsToRender) {
                 <div class="contact-uri">${safeUri}</div>
             </div>
             <div class="contact-actions">
-                <button class="contact-btn call" data-id="${contact.id}" title="Call">📞</button>
-                <button class="contact-btn edit" data-id="${contact.id}" title="Edit">✏️</button>
-                <button class="contact-btn delete" data-id="${contact.id}" title="Delete">🗑️</button>
+                <button class="contact-btn call" data-id="${safeId}" title="Call">📞</button>
+                <button class="contact-btn edit" data-id="${safeId}" title="Edit">✏️</button>
+                <button class="contact-btn delete" data-id="${safeId}" title="Delete">🗑️</button>
             </div>
         `;
 
@@ -1487,6 +1510,134 @@ async function deleteContact(id) {
     } catch (error) {
         console.error('Failed to delete contact:', error);
         safeAlert('Failed to delete contact');
+    }
+}
+
+// Recents Functions
+function initializeRecents() {
+    // Load call history when recents tab is shown
+    const recentsTab = document.querySelector('[data-tab="recents"]');
+    if (recentsTab) {
+        recentsTab.addEventListener('click', async () => {
+            await loadCallHistory();
+        });
+    }
+}
+
+async function loadCallHistory() {
+    try {
+        const history = await invoke('get_call_history');
+        renderCallHistory(history || []);
+    } catch (error) {
+        console.error('Failed to load call history:', error);
+        renderCallHistory([]);
+    }
+}
+
+function renderCallHistory(history) {
+    const recentsList = document.getElementById('recentsList');
+    if (!recentsList) return;
+
+    recentsList.innerHTML = '';
+
+    // Sort by most recent first
+    const sorted = [...history].sort((a, b) => {
+        const timeA = new Date(a.end_time).getTime();
+        const timeB = new Date(b.end_time).getTime();
+        return timeB - timeA;
+    });
+
+    sorted.forEach(entry => {
+        const item = document.createElement('div');
+        item.className = 'recent-item';
+
+        // Determine direction and icon
+        const isOutbound = entry.direction === 'Outbound';
+        const isMissed = entry.duration_secs === null || entry.duration_secs === 0;
+        const directionClass = isMissed ? 'missed' : (isOutbound ? 'outbound' : 'inbound');
+
+        // Format time (relative or absolute)
+        const callTime = new Date(entry.end_time);
+        const now = new Date();
+        const diffMs = now - callTime;
+        const diffMins = Math.floor(diffMs / 60000);
+        const diffHours = Math.floor(diffMs / 3600000);
+        const diffDays = Math.floor(diffMs / 86400000);
+
+        let timeStr;
+        if (diffMins < 1) {
+            timeStr = 'Just now';
+        } else if (diffMins < 60) {
+            timeStr = `${diffMins}m ago`;
+        } else if (diffHours < 24) {
+            timeStr = `${diffHours}h ago`;
+        } else if (diffDays === 1) {
+            timeStr = 'Yesterday';
+        } else if (diffDays < 7) {
+            timeStr = `${diffDays}d ago`;
+        } else {
+            timeStr = callTime.toLocaleDateString();
+        }
+
+        // Format duration
+        const durationStr = entry.duration_secs
+            ? formatDuration(entry.duration_secs)
+            : (isMissed ? 'Missed' : 'No answer');
+
+        // Extract just the number/user part from SIP URI
+        const extractNumber = (sipUri) => {
+            // Remove sip: or sips: prefix
+            let uri = sipUri.replace(/^sips?:/, '');
+            // Extract the part before @ (the user/number part)
+            const atIndex = uri.indexOf('@');
+            if (atIndex !== -1) {
+                uri = uri.substring(0, atIndex);
+            }
+            return uri;
+        };
+
+        // Get display name or just the number
+        const displayName = escapeHtml(entry.remote_display_name || extractNumber(entry.remote_uri));
+        const uri = entry.remote_display_name ? escapeHtml(extractNumber(entry.remote_uri)) : '';
+
+        // Direction icon (phone arrow)
+        const arrowIcon = `<svg class="recent-direction-icon ${directionClass}" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M6.62 10.79c1.44 2.83 3.76 5.14 6.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1-9.39 0-17-7.61-17-17 0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z" />
+        </svg>`;
+
+        item.innerHTML = `
+            <div class="recent-item-main">
+                ${arrowIcon}
+                <div class="recent-info">
+                    <div class="recent-name">${displayName}</div>
+                    ${uri ? `<div class="recent-uri">${uri}</div>` : ''}
+                </div>
+            </div>
+            <div class="recent-meta">
+                <div class="recent-time">${timeStr}</div>
+                <div class="recent-duration">${durationStr}</div>
+            </div>
+        `;
+
+        // Click to call back
+        item.addEventListener('click', () => {
+            makeCall(entry.remote_uri);
+            switchTab('dialer');
+        });
+
+        recentsList.appendChild(item);
+    });
+}
+
+function formatDuration(seconds) {
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = seconds % 60;
+
+    if (hours > 0) {
+        return `${hours}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+    } else {
+        return `${minutes}:${String(secs).padStart(2, '0')}`;
     }
 }
 
@@ -2058,6 +2209,11 @@ async function submitPin() {
         const success = await invoke('verify_pin', { thumbprint, pin });
 
         if (success) {
+            // Securely clear PIN from input by overwriting multiple times
+            pinInput.value = '0'.repeat(pin.length);
+            pinInput.value = 'X'.repeat(pin.length);
+            pinInput.value = '';
+
             closePinModal();
 
             // Call callback with success
@@ -2067,12 +2223,17 @@ async function submitPin() {
             }
         } else {
             pinError.textContent = 'PIN incorrect. Please try again.';
+            // Overwrite before clearing
+            pinInput.value = '0'.repeat(pin.length);
             pinInput.value = '';
             pinInput.focus();
         }
     } catch (error) {
-        console.error('PIN verification failed:', error);
-        pinError.textContent = error.toString();
+        // Don't log the actual error as it might contain sensitive data
+        console.error('PIN verification failed');
+        pinError.textContent = 'Verification failed. Please try again.';
+        // Overwrite before clearing
+        pinInput.value = '0'.repeat(pin.length);
         pinInput.value = '';
         pinInput.focus();
     } finally {
