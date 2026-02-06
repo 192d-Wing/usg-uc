@@ -898,6 +898,128 @@ body {
     font: var(--md-sys-typescale-body-large);
 }
 
+/* ===== Favorites / Speed Dial Section ===== */
+.favorites-section {
+    max-width: 560px;
+    margin: 0 auto;
+}
+
+.favorites-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 24px;
+    padding: 0 4px;
+}
+
+.favorites-title {
+    font: var(--md-sys-typescale-headline-small);
+    color: var(--md-sys-color-on-surface);
+    margin: 0;
+}
+
+.speed-dial-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+}
+
+.speed-dial-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: 24px 16px;
+    background: var(--md-sys-color-surface-container);
+    border: none;
+    border-radius: var(--md-sys-shape-corner-large);
+    cursor: pointer;
+    transition: background var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard),
+        box-shadow var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard),
+        transform var(--md-sys-motion-duration-short3) var(--md-sys-motion-easing-standard);
+    box-shadow: var(--md-sys-elevation-level1);
+    min-height: 120px;
+}
+
+.speed-dial-btn:hover {
+    background: var(--md-sys-color-surface-container-high);
+    box-shadow: var(--md-sys-elevation-level2);
+    transform: translateY(-2px);
+}
+
+.speed-dial-btn:active {
+    transform: scale(0.98) translateY(0);
+}
+
+.speed-dial-avatar {
+    width: 48px;
+    height: 48px;
+    border-radius: var(--md-sys-shape-corner-full);
+    background: var(--md-sys-color-primary-container);
+    color: var(--md-sys-color-on-primary-container);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font: var(--md-sys-typescale-title-large);
+    font-weight: 500;
+}
+
+.speed-dial-name {
+    font: var(--md-sys-typescale-title-small);
+    color: var(--md-sys-color-on-surface);
+    text-align: center;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
+}
+
+.speed-dial-uri {
+    font: var(--md-sys-typescale-body-small);
+    color: var(--md-sys-color-on-surface-variant);
+    text-align: center;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
+}
+
+.favorites-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 300px;
+    color: var(--md-sys-color-on-surface-variant);
+    text-align: center;
+    padding: 24px;
+}
+
+.favorites-empty .empty-icon {
+    width: 64px;
+    height: 64px;
+    opacity: 0.5;
+    margin-bottom: 16px;
+}
+
+.favorites-empty p {
+    font: var(--md-sys-typescale-title-medium);
+    margin: 0 0 8px 0;
+}
+
+.favorites-empty span {
+    font: var(--md-sys-typescale-body-medium);
+    opacity: 0.7;
+    max-width: 280px;
+}
+
+/* Hide empty state when grid has content */
+.speed-dial-grid:not(:empty) + .favorites-empty {
+    display: none;
+}
+
 /* ===== Call Section ===== */
 .call-section {
     max-width: 400px;

@@ -413,6 +413,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     initializeTabs();
     initializeDialer();
     initializeContacts();
+    initializeFavorites();
     initializeRecents();
     initializeCall();
     initializeSettings();
@@ -1538,6 +1539,8 @@ async function saveContact() {
         }
 
         await loadContacts();
+        // Also refresh favorites if they're being shown
+        renderFavorites();
         closeContactModal();
     } catch (error) {
         console.error('Failed to save contact:', error);
@@ -1556,10 +1559,79 @@ async function deleteContact(id) {
     try {
         await invoke('delete_contact', { id });
         await loadContacts();
+        // Also refresh favorites if they're being shown
+        renderFavorites();
     } catch (error) {
         console.error('Failed to delete contact:', error);
         safeAlert('Failed to delete contact');
     }
+}
+
+// ============================================================================
+// Favorites / Speed Dial Functions
+// ============================================================================
+
+function initializeFavorites() {
+    // Load favorites when tab is shown
+    const favoritesTab = document.querySelector('[data-tab="favorites"]');
+    if (favoritesTab) {
+        favoritesTab.addEventListener('click', () => {
+            renderFavorites();
+        });
+    }
+}
+
+function renderFavorites() {
+    const speedDialGrid = document.getElementById('speedDialGrid');
+    const favoritesEmpty = document.getElementById('favoritesEmpty');
+    if (!speedDialGrid) return;
+
+    // Get only favorite contacts
+    const favorites = contacts.filter(c => c.favorite);
+
+    speedDialGrid.innerHTML = '';
+
+    if (favorites.length === 0) {
+        if (favoritesEmpty) favoritesEmpty.style.display = 'flex';
+        return;
+    }
+
+    if (favoritesEmpty) favoritesEmpty.style.display = 'none';
+
+    // Sort alphabetically
+    const sorted = [...favorites].sort((a, b) => a.name.localeCompare(b.name));
+
+    sorted.forEach(contact => {
+        const btn = document.createElement('button');
+        btn.className = 'speed-dial-btn';
+
+        // Get initials for avatar
+        const initials = getInitials(contact.name);
+        const safeName = escapeHtml(contact.name);
+        const safeUri = escapeHtml(contact.sip_uri);
+
+        btn.innerHTML = `
+            <div class="speed-dial-avatar">${initials}</div>
+            <div class="speed-dial-name">${safeName}</div>
+            <div class="speed-dial-uri">${safeUri}</div>
+        `;
+
+        btn.title = `Call ${contact.name}`;
+        btn.addEventListener('click', () => {
+            makeCall(contact.sip_uri);
+        });
+
+        speedDialGrid.appendChild(btn);
+    });
+}
+
+function getInitials(name) {
+    if (!name) return '?';
+    const parts = name.trim().split(/\s+/);
+    if (parts.length === 1) {
+        return parts[0].charAt(0).toUpperCase();
+    }
+    return (parts[0].charAt(0) + parts[parts.length - 1].charAt(0)).toUpperCase();
 }
 
 // Recents Functions

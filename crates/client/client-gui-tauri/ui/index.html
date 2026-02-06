@@ -46,6 +46,13 @@
                 </svg>
                 <span>Keypad</span>
             </button>
+            <button class="tab-btn" data-tab="favorites">
+                <svg class="nav-icon" viewBox="0 0 24 24" fill="currentColor">
+                    <path
+                        d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z" />
+                </svg>
+                <span>Favorites</span>
+            </button>
             <button class="tab-btn" data-tab="contacts">
                 <svg class="nav-icon" viewBox="0 0 24 24" fill="currentColor">
                     <path
@@ -185,6 +192,27 @@
                                     <option value="">Default Speaker</option>
                                 </select>
                             </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Favorites Tab (Speed Dials) -->
+                <div id="favorites" class="tab-content">
+                    <div class="favorites-section">
+                        <div class="favorites-header">
+                            <h2 class="favorites-title">Speed Dial</h2>
+                        </div>
+
+                        <div class="speed-dial-grid" id="speedDialGrid">
+                            <!-- Speed dial buttons will be loaded dynamically -->
+                        </div>
+
+                        <div class="favorites-empty" id="favoritesEmpty">
+                            <svg class="empty-icon" viewBox="0 0 24 24" fill="currentColor">
+                                <path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z" />
+                            </svg>
+                            <p>No favorites yet</p>
+                            <span>Mark contacts as favorites to add them here for quick dialing</span>
                         </div>
                     </div>
                 </div>
