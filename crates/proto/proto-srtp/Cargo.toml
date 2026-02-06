@@ -13,7 +13,6 @@ categories.workspace = true
 uc-types.workspace = true
 uc-crypto.workspace = true
 proto-rtp = { path = "../proto-rtp" }
-tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytes.workspace = true

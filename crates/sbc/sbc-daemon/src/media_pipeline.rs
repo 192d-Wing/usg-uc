@@ -421,7 +421,6 @@ impl MediaPipeline {
             let unprotect = SrtpUnprotect::new(ctx);
             unprotect
                 .unprotect_rtp(data)
-                .await
                 .map_err(|e| MediaPipelineError::DecryptionFailed(e.to_string()))?
         } else {
             // Parse as unencrypted RTP

@@ -2,18 +2,18 @@
 //!
 //! This module handles RTP packet construction, parsing, and SRTP
 //! encryption/decryption for secure audio streams.
+//!
+//! All operations are synchronous — no tokio dependency.
 
-use crate::jitter_buffer::{BufferedPacket, JitterBuffer, JitterBufferResult};
+use crate::jitter_buffer::{BufferedPacket, SharedJitterBuffer};
 use crate::{AudioError, AudioResult};
 use bytes::Bytes;
 use client_types::DtmfEvent;
 use proto_rtp::{RtpHeader, RtpPacket};
 use proto_srtp::{SrtpContext, SrtpProtect, SrtpUnprotect};
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
-use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info, trace};
 
 /// Default RTP payload type for audio.
@@ -70,7 +70,7 @@ pub struct RtpTransmitter {
     /// SRTP context for encryption.
     srtp: Option<Arc<Mutex<SrtpContext>>>,
     /// Statistics.
-    stats: Arc<std::sync::Mutex<RtpStats>>,
+    stats: Arc<Mutex<RtpStats>>,
     /// DTMF payload type (telephone-event).
     dtmf_payload_type: u8,
     /// Current DTMF timestamp (separate from audio).
@@ -100,7 +100,7 @@ impl RtpTransmitter {
             payload_type,
             timestamp_increment,
             srtp: None,
-            stats: Arc::new(std::sync::Mutex::new(RtpStats::default())),
+            stats: Arc::new(Mutex::new(RtpStats::default())),
             dtmf_payload_type: DTMF_PAYLOAD_TYPE,
             dtmf_timestamp: AtomicU32::new(rand_u32()),
         }
@@ -119,7 +119,7 @@ impl RtpTransmitter {
     }
 
     /// Sends an RTP packet with the given audio payload.
-    pub async fn send(&mut self, payload: &[u8]) -> AudioResult<()> {
+    pub fn send(&mut self, payload: &[u8]) -> AudioResult<()> {
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
         let ts = self
             .timestamp
@@ -134,7 +134,7 @@ impl RtpTransmitter {
 
         // Apply SRTP if configured
         let send_bytes = if let Some(ref srtp) = self.srtp {
-            let srtp_guard = srtp.lock().await;
+            let srtp_guard = srtp.lock().unwrap_or_else(|e| e.into_inner());
             let protector = SrtpProtect::new(&srtp_guard);
             match protector.protect_rtp(&packet) {
                 Ok(protected) => protected.to_vec(),
@@ -153,7 +153,7 @@ impl RtpTransmitter {
         };
 
         // Send packet
-        match self.socket.send_to(&send_bytes, self.remote_addr).await {
+        match self.socket.send_to(&send_bytes, self.remote_addr) {
             Ok(sent) => {
                 trace!("Sent RTP packet: seq={}, ts={}, size={}", seq, ts, sent);
                 let mut stats = self
@@ -195,17 +195,15 @@ impl RtpTransmitter {
     /// # Arguments
     /// * `event` - The DTMF event to send
     /// * `marker` - Set to true for the first packet of a new event
-    pub async fn send_dtmf(&mut self, event: &DtmfEvent, marker: bool) -> AudioResult<()> {
+    pub fn send_dtmf(&mut self, event: &DtmfEvent, marker: bool) -> AudioResult<()> {
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
 
         // For DTMF, timestamp stays the same for the duration of the event
         // (it's the timestamp of when the event started)
         let ts = if marker {
             // Start of a new event - get a new timestamp
-            let new_ts = self
-                .dtmf_timestamp
-                .fetch_add(event.duration as u32, Ordering::Relaxed);
-            new_ts
+            self.dtmf_timestamp
+                .fetch_add(event.duration as u32, Ordering::Relaxed)
         } else {
             // Continuation - use the current timestamp without incrementing
             self.dtmf_timestamp.load(Ordering::Relaxed) - event.duration as u32
@@ -226,7 +224,7 @@ impl RtpTransmitter {
 
         // Apply SRTP if configured
         let send_bytes = if let Some(ref srtp) = self.srtp {
-            let srtp_guard = srtp.lock().await;
+            let srtp_guard = srtp.lock().unwrap_or_else(|e| e.into_inner());
             let protector = SrtpProtect::new(&srtp_guard);
             match protector.protect_rtp(&packet) {
                 Ok(protected) => protected.to_vec(),
@@ -245,7 +243,7 @@ impl RtpTransmitter {
         };
 
         // Send packet
-        match self.socket.send_to(&send_bytes, self.remote_addr).await {
+        match self.socket.send_to(&send_bytes, self.remote_addr) {
             Ok(sent) => {
                 trace!(
                     "Sent DTMF packet: digit={}, seq={}, ts={}, end={}, marker={}",
@@ -272,6 +270,10 @@ impl RtpTransmitter {
 }
 
 /// RTP receiver for receiving audio packets.
+///
+/// Receives RTP packets from a `std::net::UdpSocket` (blocking with
+/// `recv_timeout`), decrypts via SRTP if configured, and pushes into
+/// a `SharedJitterBuffer` for consumption by the decode thread.
 pub struct RtpReceiver {
     /// UDP socket for receiving.
     socket: Arc<UdpSocket>,
@@ -279,10 +281,10 @@ pub struct RtpReceiver {
     expected_remote: Option<SocketAddr>,
     /// SRTP context for decryption.
     srtp: Option<Arc<Mutex<SrtpContext>>>,
-    /// Jitter buffer for packet reordering.
-    jitter_buffer: JitterBuffer,
+    /// Shared jitter buffer (also read by decode thread).
+    jitter_buffer: SharedJitterBuffer,
     /// Statistics.
-    stats: Arc<std::sync::Mutex<RtpStats>>,
+    stats: Arc<Mutex<RtpStats>>,
     /// Buffer for receiving packets.
     recv_buffer: Vec<u8>,
 }
@@ -291,21 +293,16 @@ impl RtpReceiver {
     /// Creates a new RTP receiver.
     pub fn new(
         socket: Arc<UdpSocket>,
-        clock_rate: u32,
-        samples_per_packet: u32,
-        jitter_buffer_ms: u32,
+        jitter_buffer: SharedJitterBuffer,
     ) -> Self {
-        info!(
-            "Creating RTP receiver: clock_rate={}, jitter_buffer={}ms",
-            clock_rate, jitter_buffer_ms
-        );
+        info!("Creating RTP receiver");
 
         Self {
             socket,
             expected_remote: None,
             srtp: None,
-            jitter_buffer: JitterBuffer::new(clock_rate, samples_per_packet, jitter_buffer_ms),
-            stats: Arc::new(std::sync::Mutex::new(RtpStats::default())),
+            jitter_buffer,
+            stats: Arc::new(Mutex::new(RtpStats::default())),
             recv_buffer: vec![0u8; MAX_RTP_PACKET_SIZE],
         }
     }
@@ -321,12 +318,13 @@ impl RtpReceiver {
         debug!("SRTP decryption enabled for receiver");
     }
 
-    /// Receives an RTP packet (non-blocking).
+    /// Receives an RTP packet (blocking, respects socket recv_timeout).
     ///
-    /// This should be called in a loop to receive incoming packets.
-    pub async fn receive(&mut self) -> AudioResult<bool> {
-        // Try to receive a packet
-        let result = self.socket.try_recv_from(&mut self.recv_buffer);
+    /// Returns `Ok(true)` if a packet was received and buffered,
+    /// `Ok(false)` if no packet was available (timeout/would-block),
+    /// or `Err` on socket/protocol error.
+    pub fn receive(&mut self) -> AudioResult<bool> {
+        let result = self.socket.recv_from(&mut self.recv_buffer);
 
         match result {
             Ok((len, addr)) => {
@@ -338,13 +336,16 @@ impl RtpReceiver {
                     }
                 }
 
-                // Process the packet
-                self.process_packet(&self.recv_buffer[..len].to_vec())
-                    .await?;
+                // Process the packet (copy to avoid borrow conflict with self)
+                let data = self.recv_buffer[..len].to_vec();
+                self.process_packet(&data)?;
                 Ok(true)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No packet available
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // No packet available within timeout
                 Ok(false)
             }
             Err(e) => Err(AudioError::RtpError(format!("Receive failed: {e}"))),
@@ -352,12 +353,12 @@ impl RtpReceiver {
     }
 
     /// Processes a received packet.
-    async fn process_packet(&mut self, data: &[u8]) -> AudioResult<()> {
+    fn process_packet(&mut self, data: &[u8]) -> AudioResult<()> {
         // Decrypt if SRTP is configured
         let packet = if let Some(ref srtp) = self.srtp {
-            let srtp_guard = srtp.lock().await;
+            let srtp_guard = srtp.lock().unwrap_or_else(|e| e.into_inner());
             let unprotector = SrtpUnprotect::new(&srtp_guard);
-            match unprotector.unprotect_rtp(data).await {
+            match unprotector.unprotect_rtp(data) {
                 Ok(pkt) => pkt,
                 Err(e) => {
                     drop(srtp_guard);
@@ -380,7 +381,7 @@ impl RtpReceiver {
             packet.header.sequence_number, packet.header.timestamp, packet.header.payload_type
         );
 
-        // Add to jitter buffer
+        // Add to shared jitter buffer
         let buffered = BufferedPacket::new(
             packet.header.sequence_number,
             packet.header.timestamp,
@@ -400,18 +401,13 @@ impl RtpReceiver {
         Ok(())
     }
 
-    /// Gets the next packet from the jitter buffer for playback.
-    pub fn get_packet(&mut self) -> JitterBufferResult {
-        self.jitter_buffer.pop()
-    }
-
     /// Returns whether the jitter buffer is ready for playback.
     pub fn is_ready(&self) -> bool {
         self.jitter_buffer.is_ready()
     }
 
     /// Resets the receiver state.
-    pub fn reset(&mut self) {
+    pub fn reset(&self) {
         self.jitter_buffer.reset();
     }
 
@@ -420,14 +416,9 @@ impl RtpReceiver {
         self.stats.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
-    /// Returns the number of packets currently buffered in the jitter buffer.
-    pub fn buffered_count(&self) -> usize {
-        self.jitter_buffer.len()
-    }
-
     /// Returns the jitter buffer statistics.
     pub fn jitter_buffer_stats(&self) -> crate::jitter_buffer::JitterBufferStats {
-        self.jitter_buffer.stats().clone()
+        self.jitter_buffer.stats()
     }
 }
 
@@ -487,9 +478,9 @@ mod tests {
         assert_eq!(stats.bytes_received, 0);
     }
 
-    #[tokio::test]
-    async fn test_rtp_transmitter_creation() {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    #[test]
+    fn test_rtp_transmitter_creation() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let socket = Arc::new(socket);
         let remote: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
@@ -497,12 +488,13 @@ mod tests {
         assert_eq!(tx.ssrc(), 12345);
     }
 
-    #[tokio::test]
-    async fn test_rtp_receiver_creation() {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    #[test]
+    fn test_rtp_receiver_creation() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let socket = Arc::new(socket);
+        let jb = SharedJitterBuffer::new(8000, 160, 60);
 
-        let rx = RtpReceiver::new(socket, 8000, 160, 60);
+        let rx = RtpReceiver::new(socket, jb);
         assert!(!rx.is_ready());
     }
 
@@ -512,11 +504,11 @@ mod tests {
         assert_eq!(DTMF_CLOCK_RATE, 8000);
     }
 
-    #[tokio::test]
-    async fn test_dtmf_send() {
+    #[test]
+    fn test_dtmf_send() {
         use client_types::DtmfDigit;
 
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let socket = Arc::new(socket);
         let remote: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
@@ -527,7 +519,7 @@ mod tests {
 
         // Send should not panic (will fail because remote isn't listening, but that's OK)
         // We're just testing the packet construction
-        let result = tx.send_dtmf(&event, true).await;
+        let result = tx.send_dtmf(&event, true);
         // The send will succeed even if no one is listening (UDP)
         assert!(result.is_ok());
     }

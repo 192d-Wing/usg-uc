@@ -244,7 +244,7 @@ async fn test_audio_stats_no_call() {
     let manager = CallManager::new(sip_addr, media_addr, tx);
 
     // No active call - should return None
-    let stats = manager.audio_stats().await;
+    let stats = manager.audio_stats();
     assert!(stats.is_none());
 }
 

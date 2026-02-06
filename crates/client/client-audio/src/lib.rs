@@ -60,8 +60,11 @@
 #![cfg_attr(test, allow(clippy::panic))]
 
 pub mod codec;
+pub mod decode_thread;
 pub mod device;
+pub mod drift_compensator;
 pub mod file_source;
+pub mod io_thread;
 pub mod jitter_buffer;
 pub mod pipeline;
 pub mod ringtone;
@@ -69,15 +72,20 @@ pub mod rtp_handler;
 pub mod stream;
 
 pub use codec::{CodecPipeline, negotiate_codec};
+pub use decode_thread::DecodeThreadHandle;
 pub use device::{
     DEFAULT_SAMPLE_RATE, DeviceManager, SAMPLE_RATE_8KHZ, SAMPLE_RATE_16KHZ, SAMPLE_RATE_48KHZ,
 };
+pub use drift_compensator::DriftCompensator;
 pub use file_source::FileAudioSource;
-pub use jitter_buffer::{BufferedPacket, JitterBuffer, JitterBufferResult, JitterBufferStats};
+pub use io_thread::IoThreadHandle;
+pub use jitter_buffer::{
+    BufferedPacket, JitterBuffer, JitterBufferResult, JitterBufferStats, SharedJitterBuffer,
+};
 pub use pipeline::{AudioPipeline, PipelineConfig, PipelineState, PipelineStats};
 pub use ringtone::RingtonePlayer;
 pub use rtp_handler::{RtpReceiver, RtpStats, RtpTransmitter, generate_ssrc};
-pub use stream::{CaptureStream, PlaybackStream, Sample};
+pub use stream::{CaptureStream, PlaybackStream, PlaybackStreamHandle, Sample};
 
 use thiserror::Error;
 

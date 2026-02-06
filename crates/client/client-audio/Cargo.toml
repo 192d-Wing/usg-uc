@@ -12,7 +12,6 @@ client-types = { path = "../client-types" }
 uc-codecs.workspace = true
 proto-rtp.workspace = true
 proto-srtp.workspace = true
-tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytes.workspace = true

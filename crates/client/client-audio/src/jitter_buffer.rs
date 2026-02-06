@@ -333,7 +333,7 @@ impl JitterBuffer {
     }
 
     /// Calculates the buffered duration in milliseconds.
-    fn buffered_duration_ms(&self) -> u32 {
+    pub fn buffered_duration_ms(&self) -> u32 {
         let packet_count = self.packets.len() as u32;
         let packet_duration_ms = (self.samples_per_packet * 1000) / self.clock_rate;
         packet_count * packet_duration_ms
@@ -415,6 +415,83 @@ impl JitterBuffer {
     /// Returns whether the buffer is primed and ready for playout.
     pub fn is_ready(&self) -> bool {
         self.is_primed
+    }
+}
+
+/// Thread-safe wrapper around [`JitterBuffer`] for cross-thread access.
+///
+/// Shared between the RTP I/O thread (push) and the decode thread (pop).
+/// The inner `BTreeMap` typically holds <10 packets, so the mutex is held
+/// for less than 1 microsecond per operation.
+#[derive(Clone)]
+pub struct SharedJitterBuffer {
+    inner: std::sync::Arc<std::sync::Mutex<JitterBuffer>>,
+}
+
+impl SharedJitterBuffer {
+    /// Creates a new shared jitter buffer.
+    pub fn new(clock_rate: u32, samples_per_packet: u32, target_depth_ms: u32) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(JitterBuffer::new(
+                clock_rate,
+                samples_per_packet,
+                target_depth_ms,
+            ))),
+        }
+    }
+
+    /// Adds a packet to the jitter buffer.
+    pub fn push(&self, packet: BufferedPacket) -> bool {
+        match self.inner.lock() {
+            Ok(mut jb) => jb.push(packet),
+            Err(_) => false,
+        }
+    }
+
+    /// Gets the next packet for playout.
+    pub fn pop(&self) -> JitterBufferResult {
+        match self.inner.lock() {
+            Ok(mut jb) => jb.pop(),
+            Err(_) => JitterBufferResult::Empty,
+        }
+    }
+
+    /// Returns the number of packets currently buffered.
+    pub fn len(&self) -> usize {
+        self.inner.lock().map(|jb| jb.len()).unwrap_or(0)
+    }
+
+    /// Returns whether the buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns whether the buffer is primed and ready for playout.
+    pub fn is_ready(&self) -> bool {
+        self.inner.lock().map(|jb| jb.is_ready()).unwrap_or(false)
+    }
+
+    /// Returns the current statistics.
+    pub fn stats(&self) -> JitterBufferStats {
+        self.inner
+            .lock()
+            .map(|jb| jb.stats().clone())
+            .unwrap_or_default()
+    }
+
+    /// Returns the buffered duration in milliseconds.
+    pub fn buffered_duration_ms(&self) -> u32 {
+        self.inner
+            .lock()
+            .map(|jb| jb.buffered_duration_ms())
+            .unwrap_or(0)
+    }
+
+    /// Resets the jitter buffer state.
+    pub fn reset(&self) {
+        if let Ok(mut jb) = self.inner.lock() {
+            jb.reset();
+        }
     }
 }
 

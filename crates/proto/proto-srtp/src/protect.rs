@@ -134,7 +134,7 @@ impl<'a> SrtpUnprotect<'a> {
     /// ## Errors
     ///
     /// Returns an error if decryption or authentication fails.
-    pub async fn unprotect_rtp(&self, data: &[u8]) -> SrtpResult<RtpPacket> {
+    pub fn unprotect_rtp(&self, data: &[u8]) -> SrtpResult<RtpPacket> {
         let auth_tag_len = self.context.profile().auth_tag_len();
 
         if data.len() < proto_rtp::RTP_HEADER_MIN_SIZE + auth_tag_len {
@@ -153,7 +153,7 @@ impl<'a> SrtpUnprotect<'a> {
         let index = self.context.compute_rtp_index(header.sequence_number);
 
         // Check replay protection
-        self.context.check_replay(index).await?;
+        self.context.check_replay(index)?;
 
         // Compute nonce
         let nonce = self
@@ -214,7 +214,7 @@ impl<'a> SrtpUnprotect<'a> {
         let index = (index_word & 0x7FFFFFFF) as u64;
 
         // Check replay
-        self.context.check_replay(index).await?;
+        self.context.check_replay(index)?;
 
         // AAD is first 8 bytes
         let aad = &data[..8];
@@ -279,8 +279,8 @@ mod tests {
         (sender, receiver)
     }
 
-    #[tokio::test]
-    async fn test_rtp_protect_unprotect() {
+    #[test]
+    fn test_rtp_protect_unprotect() {
         let (sender, receiver) = test_contexts();
 
         // Create RTP packet
@@ -297,15 +297,14 @@ mod tests {
         // Unprotect
         let unprotected = SrtpUnprotect::new(&receiver)
             .unprotect_rtp(&protected)
-            .await
             .unwrap();
 
         assert_eq!(unprotected.payload.as_ref(), payload.as_slice());
         assert_eq!(unprotected.header.sequence_number, 1000);
     }
 
-    #[tokio::test]
-    async fn test_tampered_packet() {
+    #[test]
+    fn test_tampered_packet() {
         let (sender, receiver) = test_contexts();
 
         let header = RtpHeader::new(0, 1000, 160000, 0xDEADBEEF);
@@ -318,13 +317,13 @@ mod tests {
         tampered[20] ^= 0xFF;
 
         // Should fail authentication
-        let result = SrtpUnprotect::new(&receiver).unprotect_rtp(&tampered).await;
+        let result = SrtpUnprotect::new(&receiver).unprotect_rtp(&tampered);
 
         assert!(matches!(result, Err(SrtpError::AuthenticationFailed)));
     }
 
-    #[tokio::test]
-    async fn test_replay_detection() {
+    #[test]
+    fn test_replay_detection() {
         let (sender, receiver) = test_contexts();
 
         let header = RtpHeader::new(0, 1000, 160000, 0xDEADBEEF);
@@ -335,13 +334,11 @@ mod tests {
         // First unprotect should succeed
         SrtpUnprotect::new(&receiver)
             .unprotect_rtp(&protected)
-            .await
             .unwrap();
 
         // Second unprotect (replay) should fail
         let result = SrtpUnprotect::new(&receiver)
-            .unprotect_rtp(&protected)
-            .await;
+            .unprotect_rtp(&protected);
 
         assert!(matches!(result, Err(SrtpError::ReplayDetected { .. })));
     }

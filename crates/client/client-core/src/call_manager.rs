@@ -1094,7 +1094,7 @@ impl CallManager {
     /// # Arguments
     /// * `digit` - The DTMF digit to send (0-9, *, #, A-D)
     /// * `duration_ms` - Duration of the tone in milliseconds (typical: 100ms)
-    pub async fn send_dtmf(&self, digit: DtmfDigit, duration_ms: u32) -> AppResult<()> {
+    pub fn send_dtmf(&self, digit: DtmfDigit, duration_ms: u32) -> AppResult<()> {
         let call_id = self
             .focused_call_id
             .as_ref()
@@ -1106,7 +1106,7 @@ impl CallManager {
             .ok_or_else(|| AppError::Audio("No audio session for call".to_string()))?;
 
         info!(digit = %digit, duration_ms = duration_ms, "Sending DTMF");
-        session.send_dtmf(digit, duration_ms).await
+        session.send_dtmf(digit, duration_ms)
     }
 
     /// Transfers the focused call to another party (blind transfer).
@@ -1162,7 +1162,7 @@ impl CallManager {
     ///
     /// # Arguments
     /// * `device_name` - Name of the new input device, or None for default
-    pub async fn switch_input_device(&self, device_name: Option<String>) -> AppResult<()> {
+    pub fn switch_input_device(&mut self, device_name: Option<String>) -> AppResult<()> {
         let call_id = self
             .focused_call_id
             .as_ref()
@@ -1170,11 +1170,11 @@ impl CallManager {
 
         let session = self
             .audio_sessions
-            .get(call_id)
+            .get_mut(call_id)
             .ok_or_else(|| AppError::Audio("No audio session for call".to_string()))?;
 
         info!(device = ?device_name, "Switching input device");
-        session.switch_input_device(device_name).await
+        session.switch_input_device(device_name)
     }
 
     /// Switches the output (speaker) device for the active call.
@@ -1183,7 +1183,7 @@ impl CallManager {
     ///
     /// # Arguments
     /// * `device_name` - Name of the new output device, or None for default
-    pub async fn switch_output_device(&self, device_name: Option<String>) -> AppResult<()> {
+    pub fn switch_output_device(&mut self, device_name: Option<String>) -> AppResult<()> {
         let call_id = self
             .focused_call_id
             .as_ref()
@@ -1191,25 +1191,25 @@ impl CallManager {
 
         let session = self
             .audio_sessions
-            .get(call_id)
+            .get_mut(call_id)
             .ok_or_else(|| AppError::Audio("No audio session for call".to_string()))?;
 
         info!(device = ?device_name, "Switching output device");
-        session.switch_output_device(device_name).await
+        session.switch_output_device(device_name)
     }
 
     /// Returns the current input device name for the active call.
-    pub async fn current_input_device(&self) -> Option<String> {
+    pub fn current_input_device(&self) -> Option<String> {
         let call_id = self.focused_call_id.as_ref()?;
         let session = self.audio_sessions.get(call_id)?;
-        session.input_device_name().await
+        session.input_device_name().map(String::from)
     }
 
     /// Returns the current output device name for the active call.
-    pub async fn current_output_device(&self) -> Option<String> {
+    pub fn current_output_device(&self) -> Option<String> {
         let call_id = self.focused_call_id.as_ref()?;
         let session = self.audio_sessions.get(call_id)?;
-        session.output_device_name().await
+        session.output_device_name().map(String::from)
     }
 
     /// Puts the focused call on hold.
@@ -1241,7 +1241,7 @@ impl CallManager {
         // Activate MOH for this call's audio session
         if let Some(audio_session) = self.audio_sessions.get(call_id) {
             // Enable MOH (will send MOH audio instead of microphone)
-            audio_session.set_moh_active(true).await;
+            audio_session.set_moh_active(true);
             debug!(call_id = %call_id, "MOH activated for held call");
         }
 
@@ -1277,7 +1277,7 @@ impl CallManager {
         // Resume audio session and deactivate MOH
         if let Some(audio_session) = self.audio_sessions.get(call_id) {
             // Deactivate MOH (return to normal microphone capture)
-            audio_session.set_moh_active(false).await;
+            audio_session.set_moh_active(false);
             audio_session.set_muted(self.is_muted);
             debug!(call_id = %call_id, "MOH deactivated for resumed call");
         }
@@ -1368,10 +1368,10 @@ impl CallManager {
     }
 
     /// Returns audio pipeline statistics for the focused call.
-    pub async fn audio_stats(&self) -> Option<PipelineStats> {
+    pub fn audio_stats(&self) -> Option<PipelineStats> {
         if let Some(call_id) = &self.focused_call_id {
             if let Some(session) = self.audio_sessions.get(call_id) {
-                return Some(session.stats().await);
+                return Some(session.stats());
             }
         }
         None

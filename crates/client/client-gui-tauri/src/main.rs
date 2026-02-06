@@ -435,7 +435,6 @@ async fn send_dtmf(digit: String, state: State<'_, TauriAppState>) -> Result<(),
 
     client
         .send_dtmf(dtmf_digit)
-        .await
         .map_err(|e| format!("Failed to send DTMF: {e}"))?;
 
     Ok(())
@@ -919,11 +918,10 @@ async fn get_output_devices(state: State<'_, TauriAppState>) -> Result<Vec<Audio
 async fn set_input_device(device_name: Option<String>, state: State<'_, TauriAppState>) -> Result<(), String> {
     info!("Setting input device: {:?}", device_name);
 
-    let client_guard = state.client.lock().await;
-    if let Some(client) = client_guard.as_ref() {
+    let mut client_guard = state.client.lock().await;
+    if let Some(client) = client_guard.as_mut() {
         client
             .switch_input_device(device_name)
-            .await
             .map_err(|e| format!("Failed to switch input device: {e}"))?;
     }
 
@@ -935,11 +933,10 @@ async fn set_input_device(device_name: Option<String>, state: State<'_, TauriApp
 async fn set_output_device(device_name: Option<String>, state: State<'_, TauriAppState>) -> Result<(), String> {
     info!("Setting output device: {:?}", device_name);
 
-    let client_guard = state.client.lock().await;
-    if let Some(client) = client_guard.as_ref() {
+    let mut client_guard = state.client.lock().await;
+    if let Some(client) = client_guard.as_mut() {
         client
             .switch_output_device(device_name)
-            .await
             .map_err(|e| format!("Failed to switch output device: {e}"))?;
     }
 

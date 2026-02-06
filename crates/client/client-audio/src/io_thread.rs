@@ -1,0 +1,428 @@
+//! Dedicated I/O thread for RTP receive, mic capture, and RTP send.
+//!
+//! This thread handles all network and capture I/O on a dedicated
+//! `std::thread`, avoiding tokio cooperative scheduling delays.
+//! It reads from the capture ring buffer (filled by CPAL callback),
+//! resamples, encodes, and sends via the UDP socket. Simultaneously,
+//! it receives RTP packets from the socket and pushes them into the
+//! shared jitter buffer for the decode thread.
+
+use crate::codec::CodecPipeline;
+use crate::file_source::FileAudioSource;
+use crate::pipeline::{PipelineStats, resample};
+use crate::rtp_handler::{RtpReceiver, RtpTransmitter};
+use crate::stream::CaptureStream;
+use client_types::{CodecPreference, DtmfDigit, DtmfEvent};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+use tracing::{debug, info, trace, warn};
+
+/// DTMF command sent from the main thread to the I/O thread.
+pub struct DtmfCommand {
+    /// The DTMF digit to send.
+    pub digit: DtmfDigit,
+    /// Duration of the tone in milliseconds.
+    pub duration_ms: u32,
+}
+
+/// Handle to the running I/O thread.
+///
+/// When dropped, signals the thread to stop and joins it.
+pub struct IoThreadHandle {
+    /// The thread join handle.
+    thread: Option<thread::JoinHandle<()>>,
+    /// Shared running flag.
+    running: Arc<AtomicBool>,
+    /// Channel to send DTMF commands to the I/O thread.
+    dtmf_tx: mpsc::Sender<DtmfCommand>,
+}
+
+impl IoThreadHandle {
+    /// Sends a DTMF digit via the I/O thread.
+    pub fn send_dtmf(&self, digit: DtmfDigit, duration_ms: u32) {
+        let cmd = DtmfCommand { digit, duration_ms };
+        if let Err(e) = self.dtmf_tx.send(cmd) {
+            warn!("Failed to send DTMF command: {}", e);
+        }
+    }
+
+    /// Stops the I/O thread and waits for it to finish.
+    pub fn stop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.thread.take() {
+            if let Err(e) = handle.join() {
+                warn!("I/O thread panicked: {:?}", e);
+            }
+        }
+    }
+}
+
+impl Drop for IoThreadHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Configuration for the I/O thread.
+pub struct IoThreadConfig {
+    /// Codec preference for creating the encode pipeline.
+    pub codec: CodecPreference,
+    /// Capture (microphone) sample rate (e.g., 16000 for Bluetooth HFP).
+    pub capture_rate: u32,
+}
+
+/// Spawns the I/O thread.
+///
+/// # Arguments
+/// * `config` - I/O thread configuration
+/// * `transmitter` - RTP transmitter for sending packets
+/// * `receiver` - RTP receiver for receiving packets
+/// * `capture` - Capture stream for reading microphone audio
+/// * `moh_source` - Optional Music on Hold audio source
+/// * `muted` - Shared mute flag
+/// * `moh_active` - Shared MOH active flag
+/// * `stats` - Shared statistics
+/// * `running` - Shared flag to signal shutdown
+pub fn spawn(
+    config: IoThreadConfig,
+    transmitter: RtpTransmitter,
+    receiver: RtpReceiver,
+    capture: CaptureStream,
+    moh_source: Option<FileAudioSource>,
+    muted: Arc<AtomicBool>,
+    moh_active: Arc<AtomicBool>,
+    stats: Arc<Mutex<PipelineStats>>,
+    running: Arc<AtomicBool>,
+) -> IoThreadHandle {
+    let running_clone = running.clone();
+    let (dtmf_tx, dtmf_rx) = mpsc::channel();
+
+    let handle = thread::Builder::new()
+        .name("audio-io".to_string())
+        .spawn(move || {
+            info!("I/O thread started");
+            io_loop(
+                config,
+                transmitter,
+                receiver,
+                capture,
+                moh_source,
+                muted,
+                moh_active,
+                stats,
+                &running_clone,
+                dtmf_rx,
+            );
+            info!("I/O thread exited");
+        });
+
+    let thread = match handle {
+        Ok(h) => Some(h),
+        Err(e) => {
+            warn!("Failed to spawn I/O thread: {}", e);
+            None
+        }
+    };
+
+    IoThreadHandle {
+        thread,
+        running,
+        dtmf_tx,
+    }
+}
+
+/// Main I/O loop.
+#[allow(clippy::too_many_arguments)]
+fn io_loop(
+    config: IoThreadConfig,
+    mut transmitter: RtpTransmitter,
+    mut receiver: RtpReceiver,
+    mut capture: CaptureStream,
+    mut moh_source: Option<FileAudioSource>,
+    muted: Arc<AtomicBool>,
+    moh_active: Arc<AtomicBool>,
+    stats: Arc<Mutex<PipelineStats>>,
+    running: &AtomicBool,
+    dtmf_rx: mpsc::Receiver<DtmfCommand>,
+) {
+    // Create codec pipeline for encoding (each thread owns its own)
+    let mut codec = match CodecPipeline::new(config.codec) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Failed to create codec in I/O thread: {}", e);
+            return;
+        }
+    };
+
+    let codec_clock_rate = codec.clock_rate();
+    let codec_samples = codec.samples_per_frame();
+    let capture_rate = config.capture_rate;
+    // Number of samples per frame at the capture device rate
+    let capture_device_samples =
+        (codec_samples as u32 * capture_rate / codec_clock_rate) as usize;
+    let capture_interval = Duration::from_millis(codec.frame_duration_ms() as u64);
+
+    debug!(
+        "I/O thread: codec={}, codec_rate={}, capture_rate={}, \
+         capture_samples={}, capture_interval={}ms",
+        codec.name(),
+        codec_clock_rate,
+        capture_rate,
+        capture_device_samples,
+        capture_interval.as_millis()
+    );
+
+    let mut last_capture = Instant::now();
+    let mut stats_update_counter: u32 = 0;
+
+    // Diagnostic counters (logged every ~2 seconds)
+    let mut diag_frames_captured: u64 = 0;
+    let mut diag_capture_underruns: u64 = 0;
+    let mut diag_last_samples_read: usize = 0;
+    let mut diag_max_amplitude: i16 = 0;
+    let mut diag_timer = Instant::now();
+
+    while running.load(Ordering::Relaxed) {
+        // 1. Receive one RTP packet (blocking with 5ms timeout on socket).
+        //    No burst drain — the main loop runs every ~5ms so burst packets
+        //    are naturally picked up across iterations without stalling.
+        match receiver.receive() {
+            Ok(true) => {
+                // Packet received and buffered in jitter buffer
+            }
+            Ok(false) => {
+                // Timeout — no packet available
+            }
+            Err(e) => {
+                trace!("RTP receive error: {}", e);
+            }
+        }
+
+        // 2. Capture and send audio at frame intervals.
+        //    Uses additive timing to maintain exact cadence (e.g., every 20ms)
+        //    regardless of processing time or recv_timeout jitter.
+        if last_capture.elapsed() >= capture_interval {
+            last_capture += capture_interval;
+            // If we've fallen behind by more than 2 frame intervals (e.g.,
+            // after a stall), reset to avoid burst-sending a backlog of frames.
+            if last_capture.elapsed() > capture_interval * 2 {
+                last_capture = Instant::now();
+            }
+
+            if moh_active.load(Ordering::Relaxed) {
+                // Music on Hold mode
+                process_moh_frame(&mut codec, &mut transmitter, &mut moh_source);
+            } else if !muted.load(Ordering::Relaxed) {
+                // Normal capture mode
+                let (samples_read, max_amp) = process_capture_frame(
+                    &mut codec,
+                    &mut transmitter,
+                    &mut capture,
+                    capture_device_samples,
+                    codec_samples,
+                    &stats,
+                );
+                diag_frames_captured += 1;
+                diag_last_samples_read = samples_read;
+                if max_amp > diag_max_amplitude {
+                    diag_max_amplitude = max_amp;
+                }
+                if samples_read < capture_device_samples {
+                    diag_capture_underruns += 1;
+                }
+            }
+        }
+
+        // 3. Check for DTMF commands
+        if let Ok(cmd) = dtmf_rx.try_recv() {
+            handle_dtmf(&mut transmitter, cmd);
+        }
+
+        // 4. Periodically update shared stats
+        stats_update_counter += 1;
+        if stats_update_counter >= 100 {
+            stats_update_counter = 0;
+            update_stats(&transmitter, &receiver, &stats);
+        }
+
+        // 5. Diagnostic logging every ~2 seconds
+        if diag_timer.elapsed() >= Duration::from_secs(2) {
+            let tx_stats = transmitter.stats();
+            info!(
+                "IO diag: frames_captured={}, underruns={}, last_read={}/{}, \
+                 max_amp={}, tx_pkts={}, rx_pkts={}, jb_depth={}ms, \
+                 muted={}, moh={}",
+                diag_frames_captured,
+                diag_capture_underruns,
+                diag_last_samples_read,
+                capture_device_samples,
+                diag_max_amplitude,
+                tx_stats.packets_sent,
+                receiver.stats().packets_received,
+                receiver.jitter_buffer_stats().current_depth_ms,
+                muted.load(Ordering::Relaxed),
+                moh_active.load(Ordering::Relaxed),
+            );
+            diag_max_amplitude = 0;
+            diag_timer = Instant::now();
+        }
+    }
+
+    // Final stats update on exit
+    update_stats(&transmitter, &receiver, &stats);
+    capture.stop();
+    debug!("I/O thread cleanup complete");
+}
+
+/// Processes one frame of microphone capture.
+///
+/// Returns (samples_read, max_amplitude) for diagnostics.
+fn process_capture_frame(
+    codec: &mut CodecPipeline,
+    transmitter: &mut RtpTransmitter,
+    capture: &mut CaptureStream,
+    device_samples: usize,
+    codec_samples: usize,
+    stats: &Arc<Mutex<PipelineStats>>,
+) -> (usize, i16) {
+    // Read captured samples at device rate
+    let mut device_pcm = vec![0i16; device_samples];
+    let samples_read = capture.read(&mut device_pcm);
+
+    if samples_read < device_samples {
+        trace!(
+            "Capture underrun: got {} samples, needed {}",
+            samples_read,
+            device_samples
+        );
+        if let Ok(mut s) = stats.lock() {
+            s.capture_underruns += 1;
+        }
+        device_pcm[samples_read..].fill(0);
+    }
+
+    // Track max amplitude for diagnostics (detect silent mic)
+    let max_amp = device_pcm[..samples_read]
+        .iter()
+        .map(|s| s.abs())
+        .max()
+        .unwrap_or(0);
+
+    // Resample from device rate to codec rate (no cross-frame needed for downsampling)
+    let codec_pcm = if device_samples != codec_samples {
+        resample(&device_pcm, codec_samples, 0)
+    } else {
+        device_pcm
+    };
+
+    // Encode
+    let encoded = match codec.encode(&codec_pcm) {
+        Ok(e) => e.to_vec(),
+        Err(e) => {
+            warn!("Encode error: {}", e);
+            return (samples_read, max_amp);
+        }
+    };
+
+    // Send
+    if let Err(e) = transmitter.send(&encoded) {
+        trace!("RTP send error: {}", e);
+    }
+
+    (samples_read, max_amp)
+}
+
+/// Processes one frame of Music on Hold audio.
+fn process_moh_frame(
+    codec: &mut CodecPipeline,
+    transmitter: &mut RtpTransmitter,
+    moh_source: &mut Option<FileAudioSource>,
+) {
+    let source = match moh_source.as_mut() {
+        Some(s) if s.is_loaded() => s,
+        _ => return,
+    };
+
+    let samples_needed = codec.samples_per_frame();
+    let mut pcm = vec![0i16; samples_needed];
+    source.read(&mut pcm);
+
+    let encoded = match codec.encode(&pcm) {
+        Ok(e) => e.to_vec(),
+        Err(e) => {
+            warn!("MOH encode error: {}", e);
+            return;
+        }
+    };
+
+    if let Err(e) = transmitter.send(&encoded) {
+        trace!("MOH send error: {}", e);
+    }
+}
+
+/// Handles a DTMF command by sending the full event sequence.
+fn handle_dtmf(transmitter: &mut RtpTransmitter, cmd: DtmfCommand) {
+    info!("Sending DTMF digit '{}' for {}ms", cmd.digit, cmd.duration_ms);
+
+    let duration = DtmfEvent::duration_from_ms(cmd.duration_ms);
+
+    // Send initial packet with marker bit
+    let event = DtmfEvent::new(cmd.digit, 0);
+    if let Err(e) = transmitter.send_dtmf(&event, true) {
+        warn!("DTMF start send error: {}", e);
+        return;
+    }
+
+    // Send continuation packets every 20ms
+    let packet_interval_ms = 20u32;
+    let num_continuation = cmd.duration_ms.saturating_sub(packet_interval_ms) / packet_interval_ms;
+
+    for i in 1..=num_continuation {
+        let elapsed = DtmfEvent::duration_from_ms(i * packet_interval_ms);
+        let event = DtmfEvent::new(cmd.digit, elapsed);
+        if let Err(e) = transmitter.send_dtmf(&event, false) {
+            warn!("DTMF continuation send error: {}", e);
+            return;
+        }
+        thread::sleep(Duration::from_millis(packet_interval_ms as u64));
+    }
+
+    // Send end packets (3x for reliability per RFC 4733)
+    for _ in 0..3 {
+        let event = DtmfEvent::with_end(cmd.digit, duration);
+        if let Err(e) = transmitter.send_dtmf(&event, false) {
+            warn!("DTMF end send error: {}", e);
+        }
+    }
+
+    debug!("DTMF digit '{}' sent successfully", cmd.digit);
+}
+
+/// Updates shared statistics from transmitter and receiver.
+fn update_stats(
+    transmitter: &RtpTransmitter,
+    receiver: &RtpReceiver,
+    stats: &Arc<Mutex<PipelineStats>>,
+) {
+    if let Ok(mut s) = stats.lock() {
+        s.tx_stats = transmitter.stats();
+        s.rx_stats = receiver.stats();
+        s.jitter_stats = receiver.jitter_buffer_stats();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dtmf_command() {
+        let cmd = DtmfCommand {
+            digit: DtmfDigit::Five,
+            duration_ms: 100,
+        };
+        assert_eq!(cmd.duration_ms, 100);
+    }
+}

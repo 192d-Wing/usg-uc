@@ -6,7 +6,7 @@ use crate::{DEFAULT_REPLAY_WINDOW_SIZE, MAX_PACKET_INDEX, SrtpProfile};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 
 /// SRTP direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,8 +185,8 @@ impl SrtpContext {
     /// ## Errors
     ///
     /// Returns an error if replay is detected.
-    pub async fn check_replay(&self, index: u64) -> SrtpResult<()> {
-        let mut window = self.replay_window.lock().await;
+    pub fn check_replay(&self, index: u64) -> SrtpResult<()> {
+        let mut window = self.replay_window.lock().unwrap_or_else(|e| e.into_inner());
         window.check_and_update(index)
     }
 
@@ -325,8 +325,8 @@ mod tests {
         assert_eq!(&nonce[2..6], &[0x12, 0x34, 0x56, 0x78]);
     }
 
-    #[tokio::test]
-    async fn test_replay_window() {
+    #[test]
+    fn test_replay_window() {
         let mut window = ReplayWindow::new(64);
 
         // First packet should succeed

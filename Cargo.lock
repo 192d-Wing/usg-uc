@@ -4794,7 +4794,6 @@ dependencies = [
  "bytes",
  "proto-rtp",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
  "uc-crypto",
  "uc-types",

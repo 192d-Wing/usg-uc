@@ -19,8 +19,10 @@ fn get_device_name(device: &cpal::Device) -> String {
     device.name().unwrap_or_else(|_| "Unknown".to_string())
 }
 
-/// Size of the ring buffer in samples (enough for ~500ms at 48kHz).
-const RING_BUFFER_SIZE: usize = 48000;
+/// Size of the ring buffer in samples (2 seconds at 48kHz).
+/// Large buffer gives ample headroom for decode thread scheduling
+/// jitter without causing CPAL playback underruns.
+const RING_BUFFER_SIZE: usize = 96000;
 
 /// Audio sample type used internally.
 pub type Sample = i16;
@@ -294,6 +296,51 @@ impl PlaybackStream {
     /// Returns the sample rate of the stream.
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    /// Stops the playback stream.
+    pub fn stop(&self) {
+        self.is_running.store(false, Ordering::Relaxed);
+        debug!("Playback stream stopped");
+    }
+
+    /// Splits the playback stream into a handle and a ring buffer producer.
+    ///
+    /// The producer can be moved to the decode thread while the CPAL stream
+    /// (and its consumer) continues running. After calling this, use the
+    /// returned producer directly instead of `write()`.
+    pub fn take_producer(self) -> (PlaybackStreamHandle, ringbuf::HeapProd<Sample>) {
+        let handle = PlaybackStreamHandle {
+            _stream: self._stream,
+            is_running: self.is_running,
+            sample_rate: self.sample_rate,
+        };
+        (handle, self.producer)
+    }
+}
+
+/// Handle to a running playback stream after the producer has been extracted.
+///
+/// Holds the CPAL stream alive and provides stop/metadata functionality.
+/// The ring buffer producer has been moved to the decode thread.
+pub struct PlaybackStreamHandle {
+    /// The underlying CPAL stream (kept alive).
+    _stream: Stream,
+    /// Whether the stream is currently running.
+    is_running: Arc<AtomicBool>,
+    /// Sample rate of the stream.
+    sample_rate: u32,
+}
+
+impl PlaybackStreamHandle {
+    /// Returns the sample rate of the stream.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Returns whether the stream is running.
+    pub fn is_running(&self) -> bool {
+        self.is_running.load(Ordering::Relaxed)
     }
 
     /// Stops the playback stream.

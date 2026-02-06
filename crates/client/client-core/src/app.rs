@@ -485,10 +485,10 @@ impl ClientApp {
     ///
     /// # Arguments
     /// * `digit` - The DTMF digit to send (0-9, *, #, A-D)
-    pub async fn send_dtmf(&self, digit: DtmfDigit) -> AppResult<()> {
+    pub fn send_dtmf(&self, digit: DtmfDigit) -> AppResult<()> {
         // Use standard DTMF duration of 100ms
         const DTMF_DURATION_MS: u32 = 100;
-        self.call_manager.send_dtmf(digit, DTMF_DURATION_MS).await
+        self.call_manager.send_dtmf(digit, DTMF_DURATION_MS)
     }
 
     /// Transfers the active call to another party (blind transfer).
@@ -508,8 +508,8 @@ impl ClientApp {
     ///
     /// # Arguments
     /// * `device_name` - Name of the new input device, or None for default
-    pub async fn switch_input_device(&self, device_name: Option<String>) -> AppResult<()> {
-        self.call_manager.switch_input_device(device_name).await
+    pub fn switch_input_device(&mut self, device_name: Option<String>) -> AppResult<()> {
+        self.call_manager.switch_input_device(device_name)
     }
 
     /// Switches the output (speaker) device during an active call.
@@ -518,18 +518,18 @@ impl ClientApp {
     ///
     /// # Arguments
     /// * `device_name` - Name of the new output device, or None for default
-    pub async fn switch_output_device(&self, device_name: Option<String>) -> AppResult<()> {
-        self.call_manager.switch_output_device(device_name).await
+    pub fn switch_output_device(&mut self, device_name: Option<String>) -> AppResult<()> {
+        self.call_manager.switch_output_device(device_name)
     }
 
     /// Returns the current input device name for the active call.
-    pub async fn current_input_device(&self) -> Option<String> {
-        self.call_manager.current_input_device().await
+    pub fn current_input_device(&self) -> Option<String> {
+        self.call_manager.current_input_device()
     }
 
     /// Returns the current output device name for the active call.
-    pub async fn current_output_device(&self) -> Option<String> {
-        self.call_manager.current_output_device().await
+    pub fn current_output_device(&self) -> Option<String> {
+        self.call_manager.current_output_device()
     }
 
     /// Toggles hold state for the active call.

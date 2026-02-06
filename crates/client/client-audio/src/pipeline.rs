@@ -1,28 +1,30 @@
 //! Main audio pipeline coordinating capture, playback, codec, and RTP.
 //!
-//! This module provides the `AudioPipeline` which orchestrates the full
-//! audio path from microphone capture through encoding, RTP transmission,
-//! reception, decoding, and speaker playback.
+//! The pipeline is a **setup coordinator** — it creates all the audio
+//! components and spawns two dedicated `std::thread`s for processing:
+//!
+//! - **I/O thread**: RTP receive, microphone capture, encode, RTP send
+//! - **Decode thread**: jitter buffer → decode → resample → playback ring buffer
+//!
+//! The CPAL playback callback runs on a real-time OS thread and reads
+//! from the ring buffer lock-free. No tokio in the audio path.
 
 use crate::codec::CodecPipeline;
+use crate::decode_thread::{self, DecodeThreadConfig, DecodeThreadHandle};
 use crate::device::DeviceManager;
 use crate::file_source::FileAudioSource;
-use crate::jitter_buffer::JitterBufferResult;
+use crate::io_thread::{self, IoThreadConfig, IoThreadHandle};
+use crate::jitter_buffer::SharedJitterBuffer;
 use crate::rtp_handler::{RtpReceiver, RtpStats, RtpTransmitter, generate_ssrc};
-use crate::stream::{CaptureStream, PlaybackStream};
+use crate::stream::{PlaybackStream, PlaybackStreamHandle};
 use crate::{AudioError, AudioResult};
 use client_types::audio::CodecPreference;
-use client_types::{DtmfDigit, DtmfEvent};
+use client_types::DtmfDigit;
 use proto_srtp::{SrtpContext, SrtpDirection, SrtpKeyMaterial, SrtpProfile};
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
-use tracing::{debug, info, trace, warn};
-
-/// Device sample rate (most devices run at 48kHz).
-const DEVICE_SAMPLE_RATE: u32 = 48000;
+use std::sync::{Arc, Mutex};
+use tracing::{debug, info, warn};
 
 /// Audio pipeline state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,37 +91,34 @@ pub struct PipelineStats {
 }
 
 /// Audio pipeline coordinating the full audio path.
+///
+/// Creates all audio components on `start()`, spawns the I/O and decode
+/// threads, and joins them on `stop()`. No async methods.
 pub struct AudioPipeline {
     /// Device manager for audio device selection.
     device_manager: DeviceManager,
-    /// Pipeline configuration.
-    config: PipelineConfig,
     /// Current pipeline state.
     state: PipelineState,
-    /// Codec pipeline for encode/decode.
-    codec: Option<CodecPipeline>,
-    /// RTP transmitter.
-    transmitter: Option<RtpTransmitter>,
-    /// RTP receiver.
-    receiver: Option<RtpReceiver>,
-    /// UDP socket for RTP.
-    socket: Option<Arc<UdpSocket>>,
-    /// Capture stream.
-    capture: Option<CaptureStream>,
-    /// Playback stream.
-    playback: Option<PlaybackStream>,
+    /// Handle to the running decode thread.
+    decode_thread: Option<DecodeThreadHandle>,
+    /// Handle to the running I/O thread.
+    io_thread: Option<IoThreadHandle>,
+    /// Handle to the CPAL playback stream (keeps it alive).
+    playback_handle: Option<PlaybackStreamHandle>,
     /// Whether TX is muted.
-    muted: AtomicBool,
-    /// Running flag for background tasks.
+    muted: Arc<AtomicBool>,
+    /// Running flag for background threads.
     running: Arc<AtomicBool>,
-    /// Statistics.
-    stats: Arc<std::sync::Mutex<PipelineStats>>,
-    /// Music on Hold audio source.
-    moh_source: Option<FileAudioSource>,
-    /// Whether MOH is currently active (call on hold).
-    moh_active: AtomicBool,
-    /// Last playback sample for smooth PLC fade-out.
-    last_playback_sample: i16,
+    /// Shared statistics (written by I/O thread, read by UI).
+    stats: Arc<Mutex<PipelineStats>>,
+    /// Whether MOH is currently active.
+    moh_active: Arc<AtomicBool>,
+    /// Whether MOH audio was loaded.
+    has_moh_audio: bool,
+    /// Local RTP port (set after start).
+    local_port: Option<u16>,
+    /// SSRC being used for transmission.
+    ssrc: Option<u32>,
 }
 
 impl AudioPipeline {
@@ -127,20 +126,17 @@ impl AudioPipeline {
     pub fn new() -> Self {
         Self {
             device_manager: DeviceManager::new(),
-            config: PipelineConfig::default(),
             state: PipelineState::Stopped,
-            codec: None,
-            transmitter: None,
-            receiver: None,
-            socket: None,
-            capture: None,
-            playback: None,
-            muted: AtomicBool::new(false),
+            decode_thread: None,
+            io_thread: None,
+            playback_handle: None,
+            muted: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(false)),
-            stats: Arc::new(std::sync::Mutex::new(PipelineStats::default())),
-            moh_source: None,
-            moh_active: AtomicBool::new(false),
-            last_playback_sample: 0,
+            stats: Arc::new(Mutex::new(PipelineStats::default())),
+            moh_active: Arc::new(AtomicBool::new(false)),
+            has_moh_audio: false,
+            local_port: None,
+            ssrc: None,
         }
     }
 
@@ -155,7 +151,10 @@ impl AudioPipeline {
     }
 
     /// Starts the audio pipeline with the given configuration.
-    pub async fn start(&mut self, config: PipelineConfig) -> AudioResult<u16> {
+    ///
+    /// Creates the UDP socket, CPAL streams, jitter buffer, and spawns
+    /// the I/O and decode threads. Returns the local RTP port.
+    pub fn start(&mut self, config: PipelineConfig) -> AudioResult<u16> {
         if self.state != PipelineState::Stopped {
             return Err(AudioError::ConfigError(
                 "Pipeline already running".to_string(),
@@ -165,16 +164,16 @@ impl AudioPipeline {
         self.state = PipelineState::Starting;
         info!("Starting audio pipeline: codec={:?}", config.codec);
 
-        // Create codec pipeline
-        let codec = CodecPipeline::new(config.codec)?;
-        let clock_rate = codec.clock_rate();
-        let samples_per_frame = codec.samples_per_frame() as u32;
-        let payload_type = codec.payload_type();
+        // Create a temporary codec to query parameters
+        let temp_codec = CodecPipeline::new(config.codec)?;
+        let clock_rate = temp_codec.clock_rate();
+        let samples_per_frame = temp_codec.samples_per_frame() as u32;
+        let payload_type = temp_codec.payload_type();
+        drop(temp_codec);
 
-        // Bind UDP socket
+        // Bind std::net::UdpSocket (blocking)
         let bind_addr = format!("0.0.0.0:{}", config.local_port);
         let socket = UdpSocket::bind(&bind_addr)
-            .await
             .map_err(|e| AudioError::StreamError(format!("Failed to bind socket: {e}")))?;
 
         let local_port = socket
@@ -182,9 +181,18 @@ impl AudioPipeline {
             .map_err(|e| AudioError::StreamError(format!("Failed to get local address: {e}")))?
             .port();
 
+        // Set recv_timeout for the I/O thread (5ms — quick return if no packet)
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_millis(5)))
+            .map_err(|e| AudioError::StreamError(format!("Failed to set recv timeout: {e}")))?;
+
         debug!("Bound RTP socket to port {}", local_port);
 
         let socket = Arc::new(socket);
+
+        // Create shared jitter buffer (used by I/O thread and decode thread)
+        let jitter_buffer =
+            SharedJitterBuffer::new(clock_rate, samples_per_frame, config.jitter_buffer_ms);
 
         // Create transmitter
         let ssrc = generate_ssrc();
@@ -197,30 +205,22 @@ impl AudioPipeline {
         );
 
         // Create receiver
-        let mut receiver = RtpReceiver::new(
-            socket.clone(),
-            clock_rate,
-            samples_per_frame,
-            config.jitter_buffer_ms,
-        );
+        let mut receiver = RtpReceiver::new(socket, jitter_buffer.clone());
 
         // Set up SRTP if keys are provided
         if let (Some(key), Some(salt)) = (&config.srtp_master_key, &config.srtp_master_salt) {
-            // Create key material
             let key_material =
                 SrtpKeyMaterial::new(SrtpProfile::AeadAes256Gcm, key.clone(), salt.clone())
                     .map_err(|e| {
                         AudioError::SrtpError(format!("Failed to create SRTP key material: {e}"))
                     })?;
 
-            // Create outbound context for transmitter
             let tx_context = SrtpContext::new(&key_material, SrtpDirection::Outbound, ssrc)
                 .map_err(|e| {
                     AudioError::SrtpError(format!("Failed to create TX SRTP context: {e}"))
                 })?;
             transmitter.set_srtp(Arc::new(Mutex::new(tx_context)));
 
-            // Create inbound context for receiver (SSRC will be learned from first packet)
             let rx_context =
                 SrtpContext::new(&key_material, SrtpDirection::Inbound, 0).map_err(|e| {
                     AudioError::SrtpError(format!("Failed to create RX SRTP context: {e}"))
@@ -231,10 +231,36 @@ impl AudioPipeline {
         }
 
         // Start capture stream
-        let capture = CaptureStream::new(&self.device_manager)?;
+        let capture = crate::stream::CaptureStream::new(&self.device_manager)?;
+        let capture_rate = capture.sample_rate();
 
-        // Start playback stream
-        let mut playback = PlaybackStream::new(&self.device_manager)?;
+        // Start playback stream and split off the producer
+        let playback = PlaybackStream::new(&self.device_manager)?;
+        let device_rate = playback.sample_rate();
+
+        info!(
+            "Audio rates: capture={}Hz, playback={}Hz, codec={}Hz",
+            capture_rate, device_rate, clock_rate
+        );
+        if capture_rate != device_rate {
+            warn!(
+                "Capture rate ({}) != playback rate ({}), capture may be misaligned!",
+                capture_rate, device_rate
+            );
+        }
+        let (playback_handle, mut producer) = playback.take_producer();
+
+        // Pre-fill the playback ring buffer with silence so the CPAL callback
+        // has a cushion from the first callback.
+        let prefill_ms = 100;
+        let prefill_samples = (device_rate * prefill_ms / 1000) as usize;
+        let silence = vec![0i16; prefill_samples];
+        use ringbuf::traits::Producer;
+        producer.push_slice(&silence);
+        debug!(
+            "Pre-filled playback buffer with {}ms of silence",
+            prefill_ms
+        );
 
         // Load MOH if configured
         let moh_source = if let Some(ref moh_path) = config.moh_file_path {
@@ -252,30 +278,49 @@ impl AudioPipeline {
         } else {
             None
         };
+        let has_moh = moh_source.is_some();
 
-        // Pre-fill the playback ring buffer with silence so the CPAL callback
-        // has a cushion from the very first callback. Without this, the callback
-        // starts consuming immediately from an empty buffer, causing clicks until
-        // the jitter buffer primes and the processing loop starts writing audio.
-        let prefill_ms = 100; // 100ms of silence = 5 frames at 20ms
-        let prefill_rate = playback.sample_rate();
-        let prefill_samples = (prefill_rate * prefill_ms / 1000) as usize;
-        let silence = vec![0i16; prefill_samples];
-        playback.write(&silence);
-        debug!("Pre-filled playback buffer with {}ms of silence", prefill_ms);
-
-        // Store components
-        self.codec = Some(codec);
-        self.transmitter = Some(transmitter);
-        self.receiver = Some(receiver);
-        self.socket = Some(socket);
-        self.capture = Some(capture);
-        self.playback = Some(playback);
-        self.moh_source = moh_source;
+        // Set running flag
+        self.muted.store(config.muted, Ordering::Relaxed);
         self.moh_active.store(false, Ordering::Relaxed);
-        self.config = config;
-        self.muted.store(self.config.muted, Ordering::Relaxed);
         self.running.store(true, Ordering::Relaxed);
+
+        // Spawn decode thread
+        let decode_config = DecodeThreadConfig {
+            codec: config.codec,
+            device_rate,
+        };
+        let decode_handle = decode_thread::spawn(
+            decode_config,
+            producer,
+            jitter_buffer,
+            self.running.clone(),
+        );
+
+        // Spawn I/O thread (uses capture rate for mic read sizing)
+        let io_config = IoThreadConfig {
+            codec: config.codec,
+            capture_rate,
+        };
+        let io_handle = io_thread::spawn(
+            io_config,
+            transmitter,
+            receiver,
+            capture,
+            moh_source,
+            self.muted.clone(),
+            self.moh_active.clone(),
+            self.stats.clone(),
+            self.running.clone(),
+        );
+
+        // Store handles
+        self.decode_thread = Some(decode_handle);
+        self.io_thread = Some(io_handle);
+        self.playback_handle = Some(playback_handle);
+        self.has_moh_audio = has_moh;
+        self.local_port = Some(local_port);
+        self.ssrc = Some(ssrc);
 
         self.state = PipelineState::Running;
         info!("Audio pipeline started on port {}", local_port);
@@ -291,217 +336,45 @@ impl AudioPipeline {
 
         info!("Stopping audio pipeline");
         self.state = PipelineState::Stopping;
+
+        // Signal threads to stop
         self.running.store(false, Ordering::Relaxed);
 
-        // Stop capture
-        if let Some(ref capture) = self.capture {
-            capture.stop();
+        // Join I/O thread first (it owns the socket and capture)
+        if let Some(mut handle) = self.io_thread.take() {
+            handle.stop();
         }
 
-        // Stop playback
-        if let Some(ref playback) = self.playback {
-            playback.stop();
+        // Join decode thread
+        if let Some(mut handle) = self.decode_thread.take() {
+            handle.stop();
         }
 
-        // Clear components
-        self.capture = None;
-        self.playback = None;
-        self.transmitter = None;
-        self.receiver = None;
-        self.socket = None;
-        self.codec = None;
+        // Stop CPAL playback stream
+        if let Some(ref handle) = self.playback_handle {
+            handle.stop();
+        }
+        self.playback_handle = None;
+
+        self.has_moh_audio = false;
+        self.local_port = None;
+        self.ssrc = None;
 
         self.state = PipelineState::Stopped;
         info!("Audio pipeline stopped");
     }
 
-    /// Processes one frame of audio (capture -> resample -> encode -> send).
+    /// Sends a DTMF digit using RFC 4733 telephone-event.
     ///
-    /// This should be called at regular intervals (e.g., every 20ms for G.711).
-    pub async fn process_capture_frame(&mut self) -> AudioResult<()> {
-        // Read device sample rate before mutable borrows
-        let device_rate = self
-            .capture
+    /// The command is sent to the I/O thread via a channel; the actual
+    /// packet sequence is generated there.
+    pub fn send_dtmf(&self, digit: DtmfDigit, duration_ms: u32) -> AudioResult<()> {
+        let io = self
+            .io_thread
             .as_ref()
-            .map(|c| c.sample_rate())
-            .unwrap_or(DEVICE_SAMPLE_RATE);
+            .ok_or_else(|| AudioError::ConfigError("Pipeline not running".to_string()))?;
 
-        let codec = self
-            .codec
-            .as_mut()
-            .ok_or_else(|| AudioError::ConfigError("Pipeline not started".to_string()))?;
-
-        let capture = self
-            .capture
-            .as_mut()
-            .ok_or_else(|| AudioError::ConfigError("Capture stream not available".to_string()))?;
-
-        let transmitter = self
-            .transmitter
-            .as_mut()
-            .ok_or_else(|| AudioError::ConfigError("Transmitter not available".to_string()))?;
-
-        // Calculate samples needed at device rate for one codec frame
-        // e.g., for 20ms G.711 at 48kHz: 160 * 48000 / 8000 = 960 samples
-        // For Bluetooth at 16kHz: 160 * 16000 / 8000 = 320 samples
-        let codec_clock_rate = codec.clock_rate();
-        let codec_samples = codec.samples_per_frame(); // e.g., 160 for G.711
-        let device_samples = (codec_samples as u32 * device_rate / codec_clock_rate) as usize;
-
-        // Read captured samples at device rate
-        let mut device_pcm = vec![0i16; device_samples];
-        let samples_read = capture.read(&mut device_pcm);
-
-        if samples_read < device_samples {
-            // Not enough samples - pad with silence
-            trace!(
-                "Capture underrun: got {} samples, needed {}",
-                samples_read, device_samples
-            );
-            if let Ok(mut stats) = self.stats.lock() {
-                stats.capture_underruns += 1;
-            }
-            device_pcm[samples_read..].fill(0);
-        }
-
-        // Skip encoding/sending if muted
-        if self.muted.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-
-        // Resample from device rate (48kHz) to codec rate (8kHz for G.711)
-        let codec_pcm = if device_samples != codec_samples {
-            resample(&device_pcm, codec_samples)
-        } else {
-            device_pcm
-        };
-
-        // Encode
-        let encoded = codec.encode(&codec_pcm)?;
-
-        // Send
-        transmitter.send(encoded).await?;
-
-        Ok(())
-    }
-
-    /// Processes received packets and outputs to playback.
-    ///
-    /// Drains all available packets from the jitter buffer each tick to prevent
-    /// accumulation when packets arrive in bursts due to network jitter.
-    pub fn process_playback_frame(&mut self) -> AudioResult<()> {
-        // Read device sample rate before mutable borrows
-        let device_rate = self
-            .playback
-            .as_ref()
-            .map(|p| p.sample_rate())
-            .unwrap_or(DEVICE_SAMPLE_RATE);
-
-        let codec = self
-            .codec
-            .as_mut()
-            .ok_or_else(|| AudioError::ConfigError("Pipeline not started".to_string()))?;
-
-        let receiver = self
-            .receiver
-            .as_mut()
-            .ok_or_else(|| AudioError::ConfigError("Receiver not available".to_string()))?;
-
-        let playback = self
-            .playback
-            .as_mut()
-            .ok_or_else(|| AudioError::ConfigError("Playback stream not available".to_string()))?;
-
-        let codec_clock_rate = codec.clock_rate();
-        let codec_samples = codec.samples_per_frame();
-        // Calculate exact device samples for one codec frame
-        // e.g., at 48kHz: 160 * 48000 / 8000 = 960
-        // at 16kHz (Bluetooth): 160 * 16000 / 8000 = 320
-        let device_samples = (codec_samples as u32 * device_rate / codec_clock_rate) as usize;
-
-        // Adaptive frame processing: use the playback ring buffer occupancy to
-        // decide how many frames to decode. The CPAL callback continuously drains
-        // the ring buffer on a real-time thread; we need to keep it fed.
-        // Target: 3 frames (~60ms) buffered to absorb jitter between our tokio
-        // tick and the hardware callback timing.
-        let ring_occupancy = playback.buffered();
-        let target_cushion = device_samples * 5; // 5 frames (~100ms)
-        let jitter_buffered = receiver.buffered_count();
-
-        let frames_to_process = if jitter_buffered > 6 {
-            // Jitter buffer overflowing — drain excess to prevent accumulation
-            (jitter_buffered - 3).min(5)
-        } else if ring_occupancy < device_samples {
-            // Critical: ring buffer nearly empty, risk of underrun.
-            // Decode up to 3 frames to recover quickly.
-            3
-        } else if ring_occupancy < target_cushion {
-            // Below target cushion — decode 2 frames to build back up
-            2
-        } else {
-            // Healthy — decode 1 frame to maintain level
-            1
-        };
-
-        for _ in 0..frames_to_process {
-            match receiver.get_packet() {
-                JitterBufferResult::Packet(packet) => {
-                    // Decode
-                    let codec_pcm = codec.decode(&packet.payload)?;
-
-                    // Resample from codec rate (8kHz) to device rate (48kHz)
-                    let device_pcm = if codec_pcm.len() != device_samples {
-                        resample(codec_pcm, device_samples)
-                    } else {
-                        codec_pcm.to_vec()
-                    };
-
-                    if let Some(&last) = device_pcm.last() {
-                        self.last_playback_sample = last;
-                    }
-
-                    playback.write(&device_pcm);
-                }
-                JitterBufferResult::Lost { .. } => {
-                    // Generate fade-out from last known sample instead of hard silence
-                    let mut plc = vec![0i16; device_samples];
-                    fade_out(&mut plc, self.last_playback_sample);
-                    self.last_playback_sample = 0;
-
-                    playback.write(&plc);
-
-                    if let Ok(mut stats) = self.stats.lock() {
-                        stats.playback_underruns += 1;
-                    }
-                }
-                JitterBufferResult::Empty | JitterBufferResult::NotReady => {
-                    break;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Receives any pending RTP packets.
-    pub async fn receive_packets(&mut self) -> AudioResult<()> {
-        let receiver = self
-            .receiver
-            .as_mut()
-            .ok_or_else(|| AudioError::ConfigError("Receiver not available".to_string()))?;
-
-        // Receive all available packets
-        loop {
-            match receiver.receive().await {
-                Ok(true) => continue, // Got a packet, try for more
-                Ok(false) => break,   // No more packets
-                Err(e) => {
-                    warn!("RTP receive error: {}", e);
-                    break;
-                }
-            }
-        }
-
+        io.send_dtmf(digit, duration_ms);
         Ok(())
     }
 
@@ -517,9 +390,6 @@ impl AudioPipeline {
     }
 
     /// Sets the Music on Hold active state.
-    ///
-    /// When MOH is active, `process_moh_frame` will send MOH audio instead of
-    /// using the microphone capture.
     pub fn set_moh_active(&self, active: bool) {
         self.moh_active.store(active, Ordering::Relaxed);
         debug!("MOH active: {}", active);
@@ -532,91 +402,7 @@ impl AudioPipeline {
 
     /// Returns whether MOH audio has been loaded.
     pub fn has_moh(&self) -> bool {
-        self.moh_source.as_ref().is_some_and(|s| s.is_loaded())
-    }
-
-    /// Processes one frame of MOH audio (read file -> encode -> send).
-    ///
-    /// This should be called instead of `process_capture_frame` when the call
-    /// is on hold and we want to send MOH to the remote party.
-    pub async fn process_moh_frame(&mut self) -> AudioResult<()> {
-        let moh_source = match self.moh_source.as_mut() {
-            Some(source) if source.is_loaded() => source,
-            _ => return Ok(()), // No MOH configured, do nothing
-        };
-
-        let codec = self
-            .codec
-            .as_mut()
-            .ok_or_else(|| AudioError::ConfigError("Pipeline not started".to_string()))?;
-
-        let transmitter = self
-            .transmitter
-            .as_mut()
-            .ok_or_else(|| AudioError::ConfigError("Transmitter not available".to_string()))?;
-
-        // Read samples from MOH file
-        let samples_needed = codec.samples_per_frame();
-        let mut pcm = vec![0i16; samples_needed];
-        moh_source.read(&mut pcm);
-
-        // Encode
-        let encoded = codec.encode(&pcm)?;
-
-        // Send
-        transmitter.send(encoded).await?;
-
-        Ok(())
-    }
-
-    /// Sends a DTMF digit using RFC 4733 telephone-event.
-    ///
-    /// This method handles the full DTMF event lifecycle:
-    /// 1. Sends initial packet with marker bit
-    /// 2. Sends continuation packets during duration
-    /// 3. Sends final packets with end bit (3x for reliability)
-    ///
-    /// # Arguments
-    /// * `digit` - The DTMF digit to send
-    /// * `duration_ms` - Duration of the tone in milliseconds (40-500ms typical)
-    pub async fn send_dtmf(&mut self, digit: DtmfDigit, duration_ms: u32) -> AudioResult<()> {
-        let transmitter = self
-            .transmitter
-            .as_mut()
-            .ok_or_else(|| AudioError::ConfigError("Transmitter not available".to_string()))?;
-
-        let duration = DtmfEvent::duration_from_ms(duration_ms);
-        info!("Sending DTMF digit '{}' for {}ms", digit, duration_ms);
-
-        // Send initial packet with marker bit
-        let event = DtmfEvent::new(digit, 0);
-        transmitter.send_dtmf(&event, true).await?;
-
-        // Send continuation packets every 20ms
-        let packet_interval_ms = 20u32;
-        let num_continuation_packets =
-            duration_ms.saturating_sub(packet_interval_ms) / packet_interval_ms;
-
-        for i in 1..=num_continuation_packets {
-            let elapsed_duration = DtmfEvent::duration_from_ms(i * packet_interval_ms);
-            let event = DtmfEvent::new(digit, elapsed_duration);
-            transmitter.send_dtmf(&event, false).await?;
-
-            // Wait between packets (in real usage, this would be handled by the audio processing loop)
-            tokio::time::sleep(tokio::time::Duration::from_millis(
-                packet_interval_ms as u64,
-            ))
-            .await;
-        }
-
-        // Send end packets (3x for reliability per RFC 4733)
-        for _ in 0..3 {
-            let event = DtmfEvent::with_end(digit, duration);
-            transmitter.send_dtmf(&event, false).await?;
-        }
-
-        debug!("DTMF digit '{}' sent successfully", digit);
-        Ok(())
+        self.has_moh_audio
     }
 
     /// Returns the current pipeline state.
@@ -631,92 +417,34 @@ impl AudioPipeline {
 
     /// Returns the pipeline statistics.
     pub fn stats(&self) -> PipelineStats {
-        let mut stats = self.stats.lock().map(|s| s.clone()).unwrap_or_default();
-
-        // Update from transmitter
-        if let Some(ref tx) = self.transmitter {
-            stats.tx_stats = tx.stats();
-        }
-
-        // Update from receiver
-        if let Some(ref rx) = self.receiver {
-            stats.rx_stats = rx.stats();
-            stats.jitter_stats = rx.jitter_buffer_stats();
-        }
-
-        stats
+        self.stats.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
     /// Returns the local RTP port.
     pub fn local_port(&self) -> Option<u16> {
-        self.socket
-            .as_ref()
-            .and_then(|s| s.local_addr().ok())
-            .map(|a| a.port())
+        self.local_port
     }
 
     /// Returns the SSRC being used for transmission.
     pub fn ssrc(&self) -> Option<u32> {
-        self.transmitter.as_ref().map(|tx| tx.ssrc())
+        self.ssrc
     }
 
-    /// Switches the input (microphone) device while the pipeline is running.
+    /// Switches the input (microphone) device.
     ///
-    /// This recreates the capture stream with the new device without stopping
-    /// the rest of the pipeline (RTP, playback, etc.).
-    ///
-    /// # Arguments
-    /// * `device_name` - Name of the new input device, or None for default
+    /// Updates the device manager selection. Takes effect on next pipeline start.
     pub fn switch_input_device(&mut self, device_name: Option<String>) -> AudioResult<()> {
-        if self.state != PipelineState::Running {
-            return Err(AudioError::ConfigError("Pipeline not running".to_string()));
-        }
-
-        info!("Switching input device to: {:?}", device_name);
-
-        // Update device manager
+        info!("Setting input device to: {:?}", device_name);
         self.device_manager.set_input_device(device_name);
-
-        // Stop old capture stream
-        if let Some(ref capture) = self.capture {
-            capture.stop();
-        }
-
-        // Create new capture stream with updated device
-        let capture = CaptureStream::new(&self.device_manager)?;
-        self.capture = Some(capture);
-
-        info!("Input device switched successfully");
         Ok(())
     }
 
-    /// Switches the output (speaker) device while the pipeline is running.
+    /// Switches the output (speaker) device.
     ///
-    /// This recreates the playback stream with the new device without stopping
-    /// the rest of the pipeline (RTP, capture, etc.).
-    ///
-    /// # Arguments
-    /// * `device_name` - Name of the new output device, or None for default
+    /// Updates the device manager selection. Takes effect on next pipeline start.
     pub fn switch_output_device(&mut self, device_name: Option<String>) -> AudioResult<()> {
-        if self.state != PipelineState::Running {
-            return Err(AudioError::ConfigError("Pipeline not running".to_string()));
-        }
-
-        info!("Switching output device to: {:?}", device_name);
-
-        // Update device manager
+        info!("Setting output device to: {:?}", device_name);
         self.device_manager.set_output_device(device_name);
-
-        // Stop old playback stream
-        if let Some(ref playback) = self.playback {
-            playback.stop();
-        }
-
-        // Create new playback stream with updated device
-        let playback = PlaybackStream::new(&self.device_manager)?;
-        self.playback = Some(playback);
-
-        info!("Output device switched successfully");
         Ok(())
     }
 
@@ -743,29 +471,37 @@ impl Drop for AudioPipeline {
     }
 }
 
-/// Resample audio using linear interpolation.
+/// Resample audio using linear interpolation with cross-frame continuity.
 ///
 /// For VoIP (G.711 at 8kHz ↔ device at 48kHz), the codec already band-limits
 /// to 4kHz, so linear interpolation is clean for upsampling and simple
-/// averaging-decimation works for downsampling. This avoids the edge effects
-/// that windowed sinc resampling introduces at frame boundaries.
-fn resample(input: &[i16], output_len: usize) -> Vec<i16> {
+/// averaging-decimation works for downsampling.
+///
+/// The `prev_sample` parameter provides the last input sample from the previous
+/// frame, enabling smooth interpolation across frame boundaries. Without this,
+/// upsampling creates a step discontinuity every 20ms (50 Hz artifact) because
+/// the last few output samples hold the final input value flat, then the next
+/// frame jumps to its first sample.
+pub(crate) fn resample(input: &[i16], output_len: usize, prev_sample: i16) -> Vec<i16> {
     if input.len() == output_len {
         return input.to_vec();
     }
 
     let in_len = input.len();
 
-    // Fast path: integer ratio (common case: 6:1 for 8kHz↔48kHz)
+    // Fast path: integer ratio upsampling (common case: 6:1 for 8kHz→48kHz)
     if output_len > in_len && output_len % in_len == 0 {
-        // Upsampling by integer ratio — linear interpolation between samples
         let ratio = output_len / in_len;
         let mut output = Vec::with_capacity(output_len);
         for i in 0..in_len {
-            let s0 = input[i] as i32;
-            let s1 = if i + 1 < in_len { input[i + 1] as i32 } else { s0 };
+            // Interpolate from previous sample toward current sample.
+            // At i=0, use prev_sample from the previous frame for continuity.
+            let s0 = if i == 0 { prev_sample as i32 } else { input[i - 1] as i32 };
+            let s1 = input[i] as i32;
             for j in 0..ratio {
-                let t = j as i32;
+                // t ranges from 1/ratio to ratio/ratio (=1.0), so the last
+                // output sample in each group exactly equals input[i].
+                let t = (j + 1) as i32;
                 let sample = s0 + (s1 - s0) * t / ratio as i32;
                 output.push(sample as i16);
             }
@@ -773,8 +509,8 @@ fn resample(input: &[i16], output_len: usize) -> Vec<i16> {
         return output;
     }
 
+    // Fast path: integer ratio downsampling (common case: 6:1 for 48kHz→8kHz)
     if in_len > output_len && in_len % output_len == 0 {
-        // Downsampling by integer ratio — average groups of samples
         let ratio = in_len / output_len;
         let mut output = Vec::with_capacity(output_len);
         for i in 0..output_len {
@@ -785,28 +521,38 @@ fn resample(input: &[i16], output_len: usize) -> Vec<i16> {
         return output;
     }
 
-    // General case: linear interpolation for non-integer ratios
+    // General case: linear interpolation for non-integer ratios.
+    // Uses a virtual extended input where index -1 = prev_sample, enabling
+    // smooth cross-frame continuity for upsampling (e.g., 160→882 for 8kHz→44.1kHz).
     let mut output = Vec::with_capacity(output_len);
-    let step = (in_len - 1) as f64 / (output_len - 1).max(1) as f64;
+    // Map output indices [0..output_len) to virtual input positions [-1..in_len-1],
+    // i.e., from prev_sample through the last input sample.
+    let virtual_len = in_len + 1; // includes prev_sample slot
+    let step = (virtual_len - 1) as f64 / (output_len).max(1) as f64;
 
     for i in 0..output_len {
-        let pos = i as f64 * step;
-        let idx = pos as usize;
+        // pos in virtual input space: 0.0 = prev_sample, 1.0 = input[0], etc.
+        let pos = (i + 1) as f64 * step;
+        let idx = pos as usize; // virtual index
         let frac = pos - idx as f64;
 
-        if idx + 1 < in_len {
-            let sample = input[idx] as f64 * (1.0 - frac) + input[idx + 1] as f64 * frac;
-            output.push(sample.round() as i16);
+        // Map virtual index to actual samples
+        let s0 = if idx == 0 {
+            prev_sample as f64
         } else {
-            output.push(input[in_len - 1]);
-        }
+            input[(idx - 1).min(in_len - 1)] as f64
+        };
+        let s1 = input[idx.min(in_len - 1)] as f64;
+
+        let sample = s0 * (1.0 - frac) + s1 * frac;
+        output.push(sample.round() as i16);
     }
 
     output
 }
 
 /// Fade out from `last_sample` to silence over the entire buffer for smooth PLC.
-fn fade_out(buffer: &mut [i16], last_sample: i16) {
+pub(crate) fn fade_out(buffer: &mut [i16], last_sample: i16) {
     let len = buffer.len();
     if len == 0 || last_sample == 0 {
         return;

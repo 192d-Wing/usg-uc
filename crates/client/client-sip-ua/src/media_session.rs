@@ -399,7 +399,6 @@ impl MediaSession {
 
         unprotector
             .unprotect_rtp(srtp_packet)
-            .await
             .map_err(|e| SipUaError::DtlsError(format!("SRTP unprotect failed: {e}")))
     }
 
