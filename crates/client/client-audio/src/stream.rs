@@ -281,6 +281,11 @@ impl PlaybackStream {
         self.producer.vacant_len()
     }
 
+    /// Returns the number of samples currently buffered for playback.
+    pub fn buffered(&self) -> usize {
+        self.producer.occupied_len()
+    }
+
     /// Returns whether the stream is running.
     pub fn is_running(&self) -> bool {
         self.is_running.load(Ordering::Relaxed)
@@ -306,29 +311,38 @@ fn build_output_stream_i16(
     is_running: Arc<AtomicBool>,
 ) -> AudioResult<Stream> {
     let channels = config.channels as usize;
+    let mut last_sample: i16 = 0;
 
     let stream = device
         .build_output_stream(
             config,
             move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
                 if !is_running.load(Ordering::Relaxed) {
-                    // Output silence when stopped
                     data.fill(0);
                     return;
                 }
 
-                // Fill with samples from ring buffer
+                // Fill with samples from ring buffer, holding last value on underrun
+                // to avoid hard silence transitions that cause clicks.
                 if channels == 1 {
                     let read = consumer.pop_slice(data);
-                    // Fill remainder with silence
-                    data[read..].fill(0);
+                    if read > 0 {
+                        last_sample = data[read - 1];
+                    }
+                    // Hold last sample instead of hard zero on underrun
+                    for s in &mut data[read..] {
+                        *s = last_sample;
+                        // Decay toward zero to avoid DC offset
+                        last_sample = (last_sample as i32 * 255 / 256) as i16;
+                    }
                 } else {
-                    // Expand mono to multi-channel
                     for chunk in data.chunks_mut(channels) {
                         if let Some(sample) = consumer.try_pop() {
+                            last_sample = sample;
                             chunk.fill(sample);
                         } else {
-                            chunk.fill(0);
+                            chunk.fill(last_sample);
+                            last_sample = (last_sample as i32 * 255 / 256) as i16;
                         }
                     }
                 }
@@ -351,6 +365,7 @@ fn build_output_stream_f32(
     is_running: Arc<AtomicBool>,
 ) -> AudioResult<Stream> {
     let channels = config.channels as usize;
+    let mut last_sample: f32 = 0.0;
 
     let stream = device
         .build_output_stream(
@@ -361,14 +376,25 @@ fn build_output_stream_f32(
                     return;
                 }
 
+                // Fill with samples from ring buffer, holding last value on underrun
                 if channels == 1 {
                     for sample in data.iter_mut() {
-                        *sample = consumer.try_pop().map(i16_to_f32).unwrap_or(0.0);
+                        if let Some(s) = consumer.try_pop() {
+                            last_sample = i16_to_f32(s);
+                        } else {
+                            // Decay toward zero
+                            last_sample *= 255.0 / 256.0;
+                        }
+                        *sample = last_sample;
                     }
                 } else {
                     for chunk in data.chunks_mut(channels) {
-                        let sample = consumer.try_pop().map(i16_to_f32).unwrap_or(0.0);
-                        chunk.fill(sample);
+                        if let Some(s) = consumer.try_pop() {
+                            last_sample = i16_to_f32(s);
+                        } else {
+                            last_sample *= 255.0 / 256.0;
+                        }
+                        chunk.fill(last_sample);
                     }
                 }
             },

@@ -215,19 +215,30 @@ impl DeviceManager {
 
     /// Gets the supported stream configuration for an input device.
     pub fn get_input_config(&self, device: &cpal::Device) -> AudioResult<cpal::StreamConfig> {
+        let default_config = device
+            .default_input_config()
+            .map_err(|e| AudioError::StreamError(format!("Failed to get default config: {e}")))?;
+
+        // Use the device's native channel count to avoid mismatches.
+        // The stream callback handles stereo→mono mixdown.
+        let device_channels = default_config.channels();
+
         // Try to get a config that supports our preferred sample rate
         let supported_configs = device.supported_input_configs().map_err(|e| {
             AudioError::StreamError(format!("Failed to get supported configs: {e}"))
         })?;
 
-        // Look for a config that supports mono and our preferred sample rate
         for config_range in supported_configs {
-            if config_range.channels() >= CHANNELS {
+            if config_range.channels() == device_channels {
                 let min = config_range.min_sample_rate();
                 let max = config_range.max_sample_rate();
                 if min <= DEFAULT_SAMPLE_RATE && max >= DEFAULT_SAMPLE_RATE {
+                    debug!(
+                        "Input config: {}Hz, {} channels (preferred)",
+                        DEFAULT_SAMPLE_RATE, device_channels
+                    );
                     return Ok(cpal::StreamConfig {
-                        channels: CHANNELS,
+                        channels: device_channels,
                         sample_rate: DEFAULT_SAMPLE_RATE,
                         buffer_size: cpal::BufferSize::Default,
                     });
@@ -236,12 +247,12 @@ impl DeviceManager {
         }
 
         // Fall back to default config
-        let default_config = device
-            .default_input_config()
-            .map_err(|e| AudioError::StreamError(format!("Failed to get default config: {e}")))?;
-
+        debug!(
+            "Input config: {}Hz, {} channels (device default)",
+            default_config.sample_rate(), device_channels
+        );
         Ok(cpal::StreamConfig {
-            channels: CHANNELS.min(default_config.channels()),
+            channels: device_channels,
             sample_rate: default_config.sample_rate(),
             buffer_size: cpal::BufferSize::Default,
         })
@@ -249,19 +260,31 @@ impl DeviceManager {
 
     /// Gets the supported stream configuration for an output device.
     pub fn get_output_config(&self, device: &cpal::Device) -> AudioResult<cpal::StreamConfig> {
+        let default_config = device
+            .default_output_config()
+            .map_err(|e| AudioError::StreamError(format!("Failed to get default config: {e}")))?;
+
+        // Use the device's native channel count to avoid mismatches
+        // (e.g., Bluetooth devices that only support stereo).
+        // The stream callback handles mono↔stereo expansion.
+        let device_channels = default_config.channels();
+
         // Try to get a config that supports our preferred sample rate
         let supported_configs = device.supported_output_configs().map_err(|e| {
             AudioError::StreamError(format!("Failed to get supported configs: {e}"))
         })?;
 
-        // Look for a config that supports mono and our preferred sample rate
         for config_range in supported_configs {
-            if config_range.channels() >= CHANNELS {
+            if config_range.channels() == device_channels {
                 let min = config_range.min_sample_rate();
                 let max = config_range.max_sample_rate();
                 if min <= DEFAULT_SAMPLE_RATE && max >= DEFAULT_SAMPLE_RATE {
+                    debug!(
+                        "Output config: {}Hz, {} channels (preferred)",
+                        DEFAULT_SAMPLE_RATE, device_channels
+                    );
                     return Ok(cpal::StreamConfig {
-                        channels: CHANNELS,
+                        channels: device_channels,
                         sample_rate: DEFAULT_SAMPLE_RATE,
                         buffer_size: cpal::BufferSize::Default,
                     });
@@ -270,12 +293,12 @@ impl DeviceManager {
         }
 
         // Fall back to default config
-        let default_config = device
-            .default_output_config()
-            .map_err(|e| AudioError::StreamError(format!("Failed to get default config: {e}")))?;
-
+        debug!(
+            "Output config: {}Hz, {} channels (device default)",
+            default_config.sample_rate(), device_channels
+        );
         Ok(cpal::StreamConfig {
-            channels: CHANNELS.min(default_config.channels()),
+            channels: device_channels,
             sample_rate: default_config.sample_rate(),
             buffer_size: cpal::BufferSize::Default,
         })

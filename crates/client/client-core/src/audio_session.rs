@@ -11,9 +11,8 @@ use client_types::audio::CodecPreference;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc};
-use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 /// Configuration for an audio session.
@@ -77,8 +76,10 @@ pub enum AudioSessionEvent {
 pub struct AudioSession {
     /// Audio pipeline.
     pipeline: Arc<Mutex<AudioPipeline>>,
-    /// Audio processing task handle.
-    process_task: Option<JoinHandle<()>>,
+    /// Tokio task for RTP I/O and capture.
+    io_task: Option<tokio::task::JoinHandle<()>>,
+    /// Dedicated OS thread for playback (decode → ring buffer fill).
+    playback_thread: Option<std::thread::JoinHandle<()>>,
     /// Running flag.
     running: Arc<AtomicBool>,
     /// Muted flag.
@@ -92,7 +93,8 @@ impl AudioSession {
     pub fn new(event_tx: mpsc::Sender<AudioSessionEvent>) -> Self {
         Self {
             pipeline: Arc::new(Mutex::new(AudioPipeline::new())),
-            process_task: None,
+            io_task: None,
+            playback_thread: None,
             running: Arc::new(AtomicBool::new(false)),
             muted: Arc::new(AtomicBool::new(false)),
             event_tx,
@@ -196,10 +198,16 @@ impl AudioSession {
 
         self.running.store(false, Ordering::Relaxed);
 
-        // Cancel processing task
-        if let Some(handle) = self.process_task.take() {
+        // Abort the I/O task
+        if let Some(handle) = self.io_task.take() {
             handle.abort();
         }
+
+        // The playback thread exits within ~10ms when it sees running=false.
+        self.playback_thread.take();
+
+        // The pipeline lock ensures the playback thread has released it
+        // before we stop the pipeline.
 
         // Stop pipeline
         {
@@ -339,103 +347,188 @@ impl AudioSession {
         pipeline.output_device_name().map(String::from)
     }
 
-    /// Starts the audio processing task.
+    /// Starts the audio processing tasks.
+    ///
+    /// Spawns two concurrent paths:
+    /// - A **tokio task** for RTP I/O and capture (network operations)
+    /// - A **dedicated OS thread** for playback (decode → ring buffer fill)
+    ///
+    /// The playback thread uses `try_lock()` so it never blocks waiting for
+    /// the mutex — if the I/O task holds the lock, it simply skips that tick
+    /// and tries again in 10ms. The ring buffer's pre-fill cushion absorbs
+    /// occasional skipped ticks.
     fn start_processing_task(&mut self) {
         let pipeline = self.pipeline.clone();
         let running = self.running.clone();
         let muted = self.muted.clone();
         let event_tx = self.event_tx.clone();
 
-        let handle = tokio::spawn(async move {
-            audio_processing_loop(pipeline, running, muted, event_tx).await;
+        // Tokio task: RTP receive + capture/encode/send
+        let io_pipeline = pipeline.clone();
+        let io_running = running.clone();
+        let io_muted = muted.clone();
+        let io_handle = tokio::spawn(async move {
+            io_processing_loop(io_pipeline, io_running, io_muted, event_tx).await;
         });
+        self.io_task = Some(io_handle);
 
-        self.process_task = Some(handle);
+        // Dedicated OS thread: playback (decode → resample → ring buffer fill)
+        let pb_pipeline = pipeline;
+        let pb_running = running;
+        let pb_handle = std::thread::Builder::new()
+            .name("audio-playback".into())
+            .spawn(move || {
+                #[cfg(target_os = "macos")]
+                set_thread_qos_user_interactive();
+
+                playback_processing_loop(pb_pipeline, pb_running);
+            })
+            .expect("Failed to spawn audio playback thread");
+        self.playback_thread = Some(pb_handle);
     }
 }
 
 impl Drop for AudioSession {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
-        if let Some(handle) = self.process_task.take() {
+        if let Some(handle) = self.io_task.take() {
             handle.abort();
         }
+        // Playback thread exits on next iteration when it sees running=false.
+        self.playback_thread.take();
     }
 }
 
-/// Audio processing loop that runs at regular intervals.
+/// I/O processing loop (runs on tokio).
 ///
-/// This loop handles:
-/// - Receiving RTP packets
-/// - Processing capture frames (capture → encode → send)
-/// - Processing playback frames (receive → decode → playback)
-async fn audio_processing_loop(
+/// Handles RTP packet receive and microphone capture/encode/send.
+/// These are I/O-bound operations that benefit from tokio's async reactor.
+/// Runs at 10ms intervals: receive every tick, capture every other tick (20ms).
+async fn io_processing_loop(
     pipeline: Arc<Mutex<AudioPipeline>>,
     running: Arc<AtomicBool>,
     muted: Arc<AtomicBool>,
     event_tx: mpsc::Sender<AudioSessionEvent>,
 ) {
-    // Frame interval: 20ms for G.711/G.722, Opus typically 20ms too
-    let frame_interval = Duration::from_millis(20);
-    let mut interval = tokio::time::interval(frame_interval);
+    let mut interval = tokio::time::interval(Duration::from_millis(10));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Stats reporting interval (every 5 seconds)
+    let mut capture_tick = false;
     let mut stats_counter = 0u32;
-    const STATS_INTERVAL: u32 = 250; // 250 * 20ms = 5 seconds
+    const STATS_INTERVAL: u32 = 500; // 500 * 10ms = 5s
 
-    info!("Audio processing loop started");
+    info!("I/O processing loop started");
 
     while running.load(Ordering::Relaxed) {
         interval.tick().await;
+        capture_tick = !capture_tick;
 
-        let mut pipeline_guard = pipeline.lock().await;
-
-        // Skip if pipeline isn't running
-        if !pipeline_guard.is_running() {
-            continue;
-        }
-
-        // Update mute state
-        pipeline_guard.set_muted(muted.load(Ordering::Relaxed));
-
-        // Receive any pending RTP packets
-        if let Err(e) = pipeline_guard.receive_packets().await {
-            warn!(error = %e, "Error receiving RTP packets");
-        }
-
-        // Process capture frame (capture → encode → send)
-        // Use MOH if active and available, otherwise use microphone capture
-        let capture_result = if pipeline_guard.is_moh_active() && pipeline_guard.has_moh() {
-            pipeline_guard.process_moh_frame().await
-        } else {
-            pipeline_guard.process_capture_frame().await
-        };
-
-        if let Err(e) = capture_result {
-            // Don't spam logs for normal errors like no samples available
-            if !matches!(e, client_audio::AudioError::StreamError(_)) {
-                warn!(error = %e, "Error processing capture frame");
+        // Receive RTP packets (brief lock — try_recv_from is non-blocking)
+        {
+            let mut guard = pipeline.lock().await;
+            if !guard.is_running() {
+                continue;
+            }
+            if let Err(e) = guard.receive_packets().await {
+                warn!(error = %e, "Error receiving RTP packets");
             }
         }
 
-        // Process playback frame (jitter buffer → decode → playback)
-        if let Err(e) = pipeline_guard.process_playback_frame() {
-            if !matches!(e, client_audio::AudioError::StreamError(_)) {
-                warn!(error = %e, "Error processing playback frame");
+        // Capture every other tick (20ms) — separate lock acquisition to
+        // minimize lock hold time and give the playback thread more chances
+        // to grab the lock between operations.
+        if capture_tick {
+            let mut guard = pipeline.lock().await;
+            if !guard.is_running() {
+                continue;
+            }
+            guard.set_muted(muted.load(Ordering::Relaxed));
+
+            let result = if guard.is_moh_active() && guard.has_moh() {
+                guard.process_moh_frame().await
+            } else {
+                guard.process_capture_frame().await
+            };
+
+            if let Err(e) = result {
+                if !matches!(e, client_audio::AudioError::StreamError(_)) {
+                    warn!(error = %e, "Error processing capture frame");
+                }
             }
         }
 
-        // Periodic stats reporting
+        // Stats
         stats_counter += 1;
         if stats_counter >= STATS_INTERVAL {
             stats_counter = 0;
-            let stats = pipeline_guard.stats();
+            let guard = pipeline.lock().await;
+            let stats = guard.stats();
             let _ = event_tx.send(AudioSessionEvent::StatsUpdate(stats)).await;
         }
     }
 
-    info!("Audio processing loop stopped");
+    info!("I/O processing loop stopped");
+}
+
+/// Playback processing loop (runs on dedicated OS thread).
+///
+/// Handles jitter buffer → decode → resample → ring buffer fill.
+/// Uses `try_lock()` so it never blocks — if the I/O task holds the
+/// pipeline mutex, this just skips the tick. The ring buffer's pre-fill
+/// cushion absorbs occasional skips.
+///
+/// On macOS, this thread runs at QOS_CLASS_USER_INTERACTIVE priority
+/// for near-real-time scheduling.
+fn playback_processing_loop(
+    pipeline: Arc<Mutex<AudioPipeline>>,
+    running: Arc<AtomicBool>,
+) {
+    let frame_interval = Duration::from_millis(10);
+
+    info!("Playback processing thread started");
+
+    while running.load(Ordering::Relaxed) {
+        let tick_start = Instant::now();
+
+        // try_lock: never block. If the I/O task holds the lock, skip
+        // this tick — the ring buffer cushion absorbs it.
+        if let Ok(mut guard) = pipeline.try_lock() {
+            if guard.is_running() {
+                if let Err(e) = guard.process_playback_frame() {
+                    if !matches!(e, client_audio::AudioError::StreamError(_)) {
+                        warn!(error = %e, "Error processing playback frame");
+                    }
+                }
+            }
+        }
+
+        let elapsed = tick_start.elapsed();
+        if elapsed < frame_interval {
+            std::thread::sleep(frame_interval - elapsed);
+        }
+    }
+
+    info!("Playback processing thread stopped");
+}
+
+/// Sets the current thread's QoS class to USER_INTERACTIVE on macOS.
+///
+/// This is the highest non-realtime QoS class, used for work that must
+/// be immediately responsive. It gives the audio thread priority over
+/// normal application work and background tasks.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn set_thread_qos_user_interactive() {
+    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    }
+    let ret = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
+    if ret != 0 {
+        warn!("Failed to set audio thread QoS class: {}", ret);
+    } else {
+        debug!("Audio thread QoS set to USER_INTERACTIVE");
+    }
 }
 
 /// Builder for audio session configuration.

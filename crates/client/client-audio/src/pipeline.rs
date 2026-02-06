@@ -234,7 +234,7 @@ impl AudioPipeline {
         let capture = CaptureStream::new(&self.device_manager)?;
 
         // Start playback stream
-        let playback = PlaybackStream::new(&self.device_manager)?;
+        let mut playback = PlaybackStream::new(&self.device_manager)?;
 
         // Load MOH if configured
         let moh_source = if let Some(ref moh_path) = config.moh_file_path {
@@ -252,6 +252,17 @@ impl AudioPipeline {
         } else {
             None
         };
+
+        // Pre-fill the playback ring buffer with silence so the CPAL callback
+        // has a cushion from the very first callback. Without this, the callback
+        // starts consuming immediately from an empty buffer, causing clicks until
+        // the jitter buffer primes and the processing loop starts writing audio.
+        let prefill_ms = 100; // 100ms of silence = 5 frames at 20ms
+        let prefill_rate = playback.sample_rate();
+        let prefill_samples = (prefill_rate * prefill_ms / 1000) as usize;
+        let silence = vec![0i16; prefill_samples];
+        playback.write(&silence);
+        debug!("Pre-filled playback buffer with {}ms of silence", prefill_ms);
 
         // Store components
         self.codec = Some(codec);
@@ -408,25 +419,42 @@ impl AudioPipeline {
         // at 16kHz (Bluetooth): 160 * 16000 / 8000 = 320
         let device_samples = (codec_samples as u32 * device_rate / codec_clock_rate) as usize;
 
-        // Drain all available packets from the jitter buffer to prevent accumulation.
-        // The receive_packets() call drains ALL UDP packets into the jitter buffer each
-        // tick, so we must also drain all ready packets here to keep up.
-        const MAX_FRAMES_PER_TICK: usize = 10; // Safety limit to avoid blocking too long
-        for _ in 0..MAX_FRAMES_PER_TICK {
+        // Adaptive frame processing: use the playback ring buffer occupancy to
+        // decide how many frames to decode. The CPAL callback continuously drains
+        // the ring buffer on a real-time thread; we need to keep it fed.
+        // Target: 3 frames (~60ms) buffered to absorb jitter between our tokio
+        // tick and the hardware callback timing.
+        let ring_occupancy = playback.buffered();
+        let target_cushion = device_samples * 5; // 5 frames (~100ms)
+        let jitter_buffered = receiver.buffered_count();
+
+        let frames_to_process = if jitter_buffered > 6 {
+            // Jitter buffer overflowing — drain excess to prevent accumulation
+            (jitter_buffered - 3).min(5)
+        } else if ring_occupancy < device_samples {
+            // Critical: ring buffer nearly empty, risk of underrun.
+            // Decode up to 3 frames to recover quickly.
+            3
+        } else if ring_occupancy < target_cushion {
+            // Below target cushion — decode 2 frames to build back up
+            2
+        } else {
+            // Healthy — decode 1 frame to maintain level
+            1
+        };
+
+        for _ in 0..frames_to_process {
             match receiver.get_packet() {
                 JitterBufferResult::Packet(packet) => {
                     // Decode
                     let codec_pcm = codec.decode(&packet.payload)?;
 
                     // Resample from codec rate (8kHz) to device rate (48kHz)
-                    let mut device_pcm = if codec_pcm.len() != device_samples {
+                    let device_pcm = if codec_pcm.len() != device_samples {
                         resample(codec_pcm, device_samples)
                     } else {
                         codec_pcm.to_vec()
                     };
-
-                    // Crossfade from last sample to smooth any discontinuity
-                    crossfade_in(&mut device_pcm, self.last_playback_sample);
 
                     if let Some(&last) = device_pcm.last() {
                         self.last_playback_sample = last;
@@ -447,7 +475,6 @@ impl AudioPipeline {
                     }
                 }
                 JitterBufferResult::Empty | JitterBufferResult::NotReady => {
-                    // No more packets available - stop draining
                     break;
                 }
             }
@@ -716,84 +743,66 @@ impl Drop for AudioPipeline {
     }
 }
 
-/// Resample audio using windowed sinc interpolation with anti-aliasing.
+/// Resample audio using linear interpolation.
 ///
-/// Uses a Hann-windowed sinc kernel (half-width = 8 taps) which provides
-/// good stopband attenuation (~44 dB) for clean voice audio. When
-/// downsampling, the sinc cutoff is lowered to prevent aliasing.
+/// For VoIP (G.711 at 8kHz ↔ device at 48kHz), the codec already band-limits
+/// to 4kHz, so linear interpolation is clean for upsampling and simple
+/// averaging-decimation works for downsampling. This avoids the edge effects
+/// that windowed sinc resampling introduces at frame boundaries.
 fn resample(input: &[i16], output_len: usize) -> Vec<i16> {
     if input.len() == output_len {
         return input.to_vec();
     }
 
-    const SINC_HALF_WIDTH: usize = 8;
-
     let in_len = input.len();
-    let ratio = in_len as f64 / output_len as f64; // >1 when downsampling
-    // When downsampling, lower the cutoff to prevent aliasing
-    let cutoff = if ratio > 1.0 { 1.0 / ratio } else { 1.0 };
-    // When downsampling, widen the kernel to cover more input samples
-    let kernel_scale = ratio.max(1.0);
 
+    // Fast path: integer ratio (common case: 6:1 for 8kHz↔48kHz)
+    if output_len > in_len && output_len % in_len == 0 {
+        // Upsampling by integer ratio — linear interpolation between samples
+        let ratio = output_len / in_len;
+        let mut output = Vec::with_capacity(output_len);
+        for i in 0..in_len {
+            let s0 = input[i] as i32;
+            let s1 = if i + 1 < in_len { input[i + 1] as i32 } else { s0 };
+            for j in 0..ratio {
+                let t = j as i32;
+                let sample = s0 + (s1 - s0) * t / ratio as i32;
+                output.push(sample as i16);
+            }
+        }
+        return output;
+    }
+
+    if in_len > output_len && in_len % output_len == 0 {
+        // Downsampling by integer ratio — average groups of samples
+        let ratio = in_len / output_len;
+        let mut output = Vec::with_capacity(output_len);
+        for i in 0..output_len {
+            let start = i * ratio;
+            let sum: i32 = input[start..start + ratio].iter().map(|&s| s as i32).sum();
+            output.push((sum / ratio as i32) as i16);
+        }
+        return output;
+    }
+
+    // General case: linear interpolation for non-integer ratios
     let mut output = Vec::with_capacity(output_len);
+    let step = (in_len - 1) as f64 / (output_len - 1).max(1) as f64;
 
     for i in 0..output_len {
-        let src_pos = (i as f64 + 0.5) * ratio - 0.5;
-        let src_center = src_pos.floor() as isize;
+        let pos = i as f64 * step;
+        let idx = pos as usize;
+        let frac = pos - idx as f64;
 
-        let tap_count = (SINC_HALF_WIDTH as f64 * kernel_scale).ceil() as isize;
-        let mut sum = 0.0f64;
-        let mut weight_sum = 0.0f64;
-
-        for j in -tap_count..=tap_count {
-            let src_idx = src_center + j;
-            if src_idx < 0 || src_idx >= in_len as isize {
-                continue;
-            }
-
-            let x = (src_idx as f64 - src_pos) * cutoff;
-
-            // sinc(x) * hann_window(x / tap_count)
-            let sinc = if x.abs() < 1e-9 {
-                1.0
-            } else {
-                let px = std::f64::consts::PI * x;
-                px.sin() / px
-            };
-
-            let window_pos = (src_idx as f64 - src_pos) / kernel_scale;
-            let hann = if window_pos.abs() < SINC_HALF_WIDTH as f64 {
-                0.5 + 0.5 * (std::f64::consts::PI * window_pos / SINC_HALF_WIDTH as f64).cos()
-            } else {
-                0.0
-            };
-
-            let w = sinc * hann * cutoff;
-            sum += input[src_idx as usize] as f64 * w;
-            weight_sum += w;
-        }
-
-        let sample = if weight_sum.abs() > 1e-9 {
-            (sum / weight_sum).round().clamp(-32768.0, 32767.0) as i16
+        if idx + 1 < in_len {
+            let sample = input[idx] as f64 * (1.0 - frac) + input[idx + 1] as f64 * frac;
+            output.push(sample.round() as i16);
         } else {
-            0
-        };
-        output.push(sample);
+            output.push(input[in_len - 1]);
+        }
     }
 
     output
-}
-
-/// Short crossfade from `prev_sample` into the start of `buffer` to eliminate clicks
-/// at frame boundaries caused by sample discontinuities.
-fn crossfade_in(buffer: &mut [i16], prev_sample: i16) {
-    const CROSSFADE_SAMPLES: usize = 16;
-    let len = buffer.len().min(CROSSFADE_SAMPLES);
-    for i in 0..len {
-        let t = (i + 1) as f32 / (len + 1) as f32; // 0→1 fade
-        let blended = prev_sample as f32 * (1.0 - t) + buffer[i] as f32 * t;
-        buffer[i] = blended.round().clamp(-32768.0, 32767.0) as i16;
-    }
 }
 
 /// Fade out from `last_sample` to silence over the entire buffer for smooth PLC.
