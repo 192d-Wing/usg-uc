@@ -904,6 +904,21 @@ impl CallAgent {
                 .get_mut(call_id)
                 .ok_or_else(|| SipUaError::InvalidState("Call not found".to_string()))?;
 
+            // 200 OK for a BYE (call is Terminating) — just confirm termination
+            if session.state == CallState::Terminating {
+                info!(call_id = %call_id, "BYE confirmed (200 OK), call terminated");
+                session.state = CallState::Terminated;
+                let _ = self
+                    .event_tx
+                    .send(CallEvent::StateChanged {
+                        call_id: call_id.to_string(),
+                        state: CallState::Terminated,
+                        info: None,
+                    })
+                    .await;
+                return Ok(());
+            }
+
             session.state = CallState::Connected;
             session.connected_at = Some(Instant::now());
             session.invite_transaction = None;
