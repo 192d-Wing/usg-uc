@@ -23,6 +23,8 @@ pub mod audio_session;
 pub mod call_manager;
 pub mod cert_store;
 pub mod contact_manager;
+#[cfg(feature = "digest-auth")]
+pub mod credential_store;
 pub mod settings;
 pub mod sip_transport;
 
@@ -34,6 +36,8 @@ pub use call_manager::{CallManager, CallManagerEvent, IncomingCallInfo};
 pub use cert_store::{CertStoreError, CertStoreResult, CertificateStore, SignatureAlgorithm};
 pub use contact_manager::{ContactManager, ContactStore, create_contact};
 pub use settings::{CertificateFilterSettings, GeneralSettings, NetworkSettings, Settings, SettingsManager, UiSettings};
+#[cfg(feature = "digest-auth")]
+pub use credential_store::{CredentialStore, StorageBackend};
 pub use sip_transport::{
     CertVerificationMode, SipTransport, TransportConfig, TransportEvent,
     build_response_from_request, generate_tag, load_certs_from_pem_file,

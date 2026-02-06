@@ -19,10 +19,16 @@ use serde::{Deserialize, Serialize};
 pub struct DigestAuthCredentials {
     /// Authentication username (often the SIP username).
     pub username: String,
-    /// Authentication password (zeroized on drop, never persisted to disk).
-    /// The password must be provided at runtime and is never serialized.
+    /// Authentication password (zeroized on drop).
+    /// The password is not directly serialized - it's stored separately
+    /// in secure credential storage when `password_persisted` is true.
     #[serde(skip)]
     pub password: zeroize::Zeroizing<String>,
+    /// Indicates whether the password is stored in secure credential storage.
+    /// When true, the password can be retrieved from platform keyring or
+    /// encrypted file on application startup.
+    #[serde(default)]
+    pub password_persisted: bool,
 }
 
 #[cfg(feature = "digest-auth")]
@@ -32,7 +38,22 @@ impl DigestAuthCredentials {
         Self {
             username: username.into(),
             password: zeroize::Zeroizing::new(password.into()),
+            password_persisted: false,
         }
+    }
+
+    /// Creates credentials with the password already persisted flag set.
+    pub fn with_persisted(username: impl Into<String>, password: impl Into<String>) -> Self {
+        Self {
+            username: username.into(),
+            password: zeroize::Zeroizing::new(password.into()),
+            password_persisted: true,
+        }
+    }
+
+    /// Returns whether the password is stored in secure credential storage.
+    pub fn is_persisted(&self) -> bool {
+        self.password_persisted
     }
 }
 
@@ -64,6 +85,11 @@ pub struct SipAccount {
     pub enabled: bool,
     /// Smart card certificate configuration.
     pub certificate_config: CertificateConfig,
+    /// Caller ID / DN (Directory Number) for outgoing calls.
+    /// If set, this will be used in the From header instead of the SIP URI user part.
+    /// Format: E.164 number (e.g., "+18085551234") or just digits.
+    #[serde(default)]
+    pub caller_id: Option<String>,
     /// Optional digest auth credentials for testing (NOT CNSA 2.0 compliant).
     #[cfg(feature = "digest-auth")]
     pub digest_credentials: Option<DigestAuthCredentials>,
@@ -83,6 +109,7 @@ impl Default for SipAccount {
             turn_config: None,
             enabled: true,
             certificate_config: CertificateConfig::default(),
+            caller_id: None,
             #[cfg(feature = "digest-auth")]
             digest_credentials: None,
         }

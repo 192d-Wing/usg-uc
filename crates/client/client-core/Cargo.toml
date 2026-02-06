@@ -9,7 +9,15 @@ repository.workspace = true
 
 [features]
 default = []
-digest-auth = ["client-types/digest-auth", "client-sip-ua/digest-auth"]
+# Digest authentication with optional credential persistence
+digest-auth = [
+    "client-types/digest-auth",
+    "client-sip-ua/digest-auth",
+    "keyring",
+    "uc-crypto",
+    "hostname",
+    "whoami",
+]
 
 [dependencies]
 client-types = { path = "../client-types" }
@@ -39,13 +47,25 @@ base64 = "0.22"
 # Platform utilities
 directories.workspace = true
 
-# Windows smart card/PKI support
+# Secure credential storage (optional)
+# Note: Platform-specific features are enabled via target-specific dependencies below
+uc-crypto = { path = "../../uc/uc-crypto", optional = true }
+hostname = { version = "0.4", optional = true }
+whoami = { version = "1.5", optional = true }
+
+# Windows smart card/PKI support + keyring with native backend
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+keyring = { version = "3", features = ["windows-native"], optional = true }
 
-# macOS keychain/security support
+# macOS keychain/security support + keyring with native backend
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
+keyring = { version = "3", features = ["apple-native"], optional = true }
+
+# Linux keyring with native backend (using Secret Service)
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["linux-native-sync-persistent", "crypto-rust"], optional = true }
 
 # PKCS#11 for cross-platform smart card support (YubiKey, etc.)
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]

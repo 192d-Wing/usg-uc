@@ -378,12 +378,21 @@ pub struct SettingsManager {
     settings_path: PathBuf,
     /// Whether settings have been modified since last save.
     dirty: bool,
+    /// Secure credential storage (when digest-auth feature is enabled).
+    #[cfg(feature = "digest-auth")]
+    credential_store: Option<crate::credential_store::CredentialStore>,
 }
 
 impl SettingsManager {
     /// Creates a new settings manager, loading from disk if available.
     pub fn new() -> AppResult<Self> {
         let settings_path = Self::settings_file_path()?;
+
+        #[cfg(feature = "digest-auth")]
+        let config_dir = settings_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
 
         let settings = if settings_path.exists() {
             Self::load_from_file(&settings_path)?
@@ -392,25 +401,50 @@ impl SettingsManager {
             Settings::default()
         };
 
+        #[cfg(feature = "digest-auth")]
+        let credential_store = match crate::credential_store::CredentialStore::new(config_dir) {
+            Ok(store) => {
+                info!(backend = %store.backend(), "Credential store initialized");
+                Some(store)
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to initialize credential store");
+                None
+            }
+        };
+
         Ok(Self {
             settings,
             settings_path,
             dirty: false,
+            #[cfg(feature = "digest-auth")]
+            credential_store,
         })
     }
 
     /// Creates a settings manager with a custom path (for testing).
     pub fn with_path(path: PathBuf) -> AppResult<Self> {
+        #[cfg(feature = "digest-auth")]
+        let config_dir = path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+
         let settings = if path.exists() {
             Self::load_from_file(&path)?
         } else {
             Settings::default()
         };
 
+        #[cfg(feature = "digest-auth")]
+        let credential_store = crate::credential_store::CredentialStore::new(config_dir).ok();
+
         Ok(Self {
             settings,
             settings_path: path,
             dirty: false,
+            #[cfg(feature = "digest-auth")]
+            credential_store,
         })
     }
 
@@ -525,6 +559,133 @@ impl SettingsManager {
         self.dirty = true;
         warn!("Settings reset to defaults");
     }
+
+    // ========== Credential Storage Methods ==========
+
+    /// Stores a digest password for an account in secure credential storage.
+    ///
+    /// This stores the password in platform keyring (macOS Keychain, Windows
+    /// Credential Manager) or an encrypted file as fallback.
+    ///
+    /// Returns `Ok(true)` if the password was stored, `Ok(false)` if credential
+    /// storage is not available.
+    #[cfg(feature = "digest-auth")]
+    pub fn store_digest_password(&mut self, account_id: &str, password: &str) -> AppResult<bool> {
+        if let Some(ref mut store) = self.credential_store {
+            store.store_password(account_id, password)?;
+            info!(account_id = %account_id, "Digest password stored in credential storage");
+            Ok(true)
+        } else {
+            warn!("Credential storage not available");
+            Ok(false)
+        }
+    }
+
+    /// Retrieves a digest password for an account from secure credential storage.
+    ///
+    /// Returns `None` if no password is stored or credential storage is not available.
+    #[cfg(feature = "digest-auth")]
+    pub fn get_digest_password(
+        &mut self,
+        account_id: &str,
+    ) -> AppResult<Option<zeroize::Zeroizing<String>>> {
+        if let Some(ref mut store) = self.credential_store {
+            store.get_password(account_id)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Deletes a digest password for an account from secure credential storage.
+    #[cfg(feature = "digest-auth")]
+    pub fn delete_digest_password(&mut self, account_id: &str) -> AppResult<()> {
+        if let Some(ref mut store) = self.credential_store {
+            store.delete_password(account_id)?;
+            info!(account_id = %account_id, "Digest password deleted from credential storage");
+        }
+        Ok(())
+    }
+
+    /// Loads persisted passwords for all accounts that have `password_persisted` set.
+    ///
+    /// Call this after loading settings to populate passwords from credential storage.
+    #[cfg(feature = "digest-auth")]
+    pub fn load_persisted_passwords(&mut self) -> AppResult<()> {
+        // First, collect account IDs that need password loading
+        let accounts_needing_passwords: Vec<String> = self
+            .settings
+            .accounts
+            .iter()
+            .filter_map(|(id, account)| {
+                account.digest_credentials.as_ref().and_then(|creds| {
+                    if creds.password_persisted && creds.password.is_empty() {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        // Now load passwords from credential store
+        let store = match self.credential_store.as_mut() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        for account_id in accounts_needing_passwords {
+            if let Ok(Some(password)) = store.get_password(&account_id) {
+                if let Some(account) = self.settings.accounts.get_mut(&account_id) {
+                    if let Some(ref mut creds) = account.digest_credentials {
+                        creds.password = password;
+                        debug!(account_id = %account_id, "Loaded persisted password");
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Persists passwords for all accounts that have non-empty passwords.
+    ///
+    /// Call this after modifying account credentials to save them to credential storage.
+    #[cfg(feature = "digest-auth")]
+    pub fn persist_account_passwords(&mut self) -> AppResult<()> {
+        let accounts_to_persist: Vec<(String, String)> = self
+            .settings
+            .accounts
+            .iter()
+            .filter_map(|(id, account)| {
+                account.digest_credentials.as_ref().and_then(|creds| {
+                    if !creds.password.is_empty() {
+                        Some((id.clone(), creds.password.to_string()))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        for (account_id, password) in accounts_to_persist {
+            if self.store_digest_password(&account_id, &password)? {
+                // Mark as persisted in the account
+                if let Some(account) = self.settings.accounts.get_mut(&account_id) {
+                    if let Some(ref mut creds) = account.digest_credentials {
+                        creds.password_persisted = true;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns information about the credential storage backend being used.
+    #[cfg(feature = "digest-auth")]
+    pub fn credential_storage_backend(&self) -> Option<crate::credential_store::StorageBackend> {
+        self.credential_store.as_ref().map(|s| s.backend())
+    }
 }
 
 #[cfg(test)]
@@ -546,6 +707,9 @@ mod tests {
             turn_config: None,
             enabled: true,
             certificate_config: CertificateConfig::default(),
+            caller_id: None,
+            #[cfg(feature = "digest-auth")]
+            digest_credentials: None,
         }
     }
 
