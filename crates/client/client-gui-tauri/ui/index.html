@@ -4,6 +4,22 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <!-- Security Headers -->
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self';
+                   script-src 'self' 'unsafe-inline';
+                   style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
+                   font-src 'self' https://fonts.gstatic.com;
+                   img-src 'self' data:;
+                   connect-src 'self';
+                   frame-ancestors 'none';
+                   base-uri 'self';
+                   form-action 'none';">
+    <meta http-equiv="X-Frame-Options" content="DENY">
+    <meta http-equiv="X-Content-Type-Options" content="nosniff">
+    <meta name="referrer" content="no-referrer">
+
     <title>DoW Soft Client</title>
     <!-- Material Design 3 - Roboto Font -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -42,6 +58,13 @@
                 </svg>
                 <span>Contacts</span>
             </button>
+            <button class="tab-btn" data-tab="recents">
+                <svg class="nav-icon" viewBox="0 0 24 24" fill="currentColor">
+                    <path
+                        d="M13 3c-4.97 0-9 4.03-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42C8.27 19.99 10.51 21 13 21c4.97 0 9-4.03 9-9s-4.03-9-9-9zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z" />
+                </svg>
+                <span>Recents</span>
+            </button>
             <button class="tab-btn" data-tab="settings">
                 <svg class="nav-icon" viewBox="0 0 24 24" fill="currentColor">
                     <path
@@ -64,14 +87,14 @@
                 <div id="dialer" class="tab-content active">
                     <div class="dialer-section">
                         <!-- Call Info (shown during active call) -->
-                        <div class="call-info" id="callInfo" style="display: none;">
+                        <div class="call-info" id="callInfo">
                             <div class="call-target" id="callTarget"></div>
                             <div class="call-duration" id="callDuration">00:00</div>
                         </div>
 
                         <!-- Dial Input (shown when no active call) -->
                         <div class="dial-input-wrapper" id="dialInputWrapper">
-                            <input type="text" id="dialInput" class="dial-input" placeholder="Enter number" maxlength="40" autocomplete="off">
+                            <input type="text" id="dialInput" class="dial-input" placeholder="Enter number" maxlength="30" autocomplete="off">
                         </div>
 
                         <!-- Dialpad (shown when no active call) -->
@@ -193,6 +216,17 @@
                             </svg>
                             Add Contact
                         </button>
+                    </div>
+                </div>
+
+                <!-- Recents Tab -->
+                <div id="recents" class="tab-content">
+                    <div class="recents-section">
+                        <h2 class="recents-title">Call History</h2>
+
+                        <div class="recents-list" id="recentsList">
+                            <!-- Call history will be loaded dynamically -->
+                        </div>
                     </div>
                 </div>
 
