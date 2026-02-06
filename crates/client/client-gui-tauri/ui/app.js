@@ -529,7 +529,7 @@ async function acceptIncomingCall(callId) {
     if (!rateLimiter.canCall('accept_call')) return;
     try {
         await invoke('accept_call', { callId });
-        switchTab('call');
+        // Don't switch tabs - call UI is now in dialer
     } catch (error) {
         console.error('Failed to accept call:', error);
         safeAlert('Failed to accept call');
@@ -1170,6 +1170,18 @@ function startCall(target) {
     isMuted = false;
     isOnHold = false;
 
+    // Transition to call screen
+    document.getElementById('callInfo').style.display = 'block';
+    document.getElementById('dialInputWrapper').style.display = 'none';
+    document.getElementById('dialpad').style.display = 'none';
+    document.getElementById('audioDevices').style.display = 'none';
+    document.getElementById('callControls').style.display = 'flex';
+
+    // Show hangup button, hide call button and backspace
+    document.getElementById('callBtn').style.display = 'none';
+    document.getElementById('backspaceBtn').style.display = 'none';
+    document.getElementById('hangupBtn').style.display = 'block';
+
     document.getElementById('callTarget').textContent = target;
 
     // Show call duration
@@ -1223,6 +1235,18 @@ function endCall() {
         callDurationInterval = null;
     }
 
+    // Transition back to dialer screen
+    document.getElementById('callInfo').style.display = 'none';
+    document.getElementById('dialInputWrapper').style.display = 'block';
+    document.getElementById('dialpad').style.display = 'grid';
+    document.getElementById('audioDevices').style.display = 'block';
+    document.getElementById('callControls').style.display = 'none';
+
+    // Show call button and backspace, hide hangup button
+    document.getElementById('callBtn').style.display = 'block';
+    document.getElementById('backspaceBtn').style.display = 'block';
+    document.getElementById('hangupBtn').style.display = 'none';
+
     // Clear call display and dial input
     document.getElementById('callTarget').textContent = '';
     const durationElement = document.getElementById('callDuration');
@@ -1244,8 +1268,8 @@ function endCall() {
     updateMuteButton();
     updateHoldButton();
 
-    // Switch to call tab to show "No active call" status
-    switchTab('call');
+    // Stay on dialer tab (don't switch tabs)
+    switchTab('dialer');
 }
 
 function updateMuteButton() {
