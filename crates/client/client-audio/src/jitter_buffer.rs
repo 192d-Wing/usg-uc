@@ -7,7 +7,7 @@
 //! - Smooths playback timing to remove network jitter
 
 use bytes::Bytes;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use tracing::{debug, trace, warn};
 
 /// Minimum jitter buffer depth in milliseconds.
@@ -27,6 +27,19 @@ const LATE_THRESHOLD: u32 = 3;
 
 /// Number of consecutive on-time packets before decreasing buffer depth.
 const ONTIME_THRESHOLD: u32 = 100;
+
+/// Number of jitter samples to keep for percentile calculation.
+const JITTER_HISTORY_SIZE: usize = 200;
+
+/// Margin added to the p95 jitter estimate for target depth (in ms).
+const JITTER_MARGIN_MS: f32 = 20.0;
+
+/// How many packets between adaptive depth recalculations.
+const ADAPT_INTERVAL: u32 = 50;
+
+/// Smoothing factor for target depth transitions (0.0-1.0).
+/// 0.15 means move 15% toward the new target each adaptation cycle.
+const ADAPT_SMOOTHING: f32 = 0.15;
 
 /// A buffered RTP packet with metadata.
 #[derive(Debug, Clone)]
@@ -123,6 +136,10 @@ pub struct JitterBuffer {
     last_arrival: Option<std::time::Instant>,
     /// Last packet timestamp for jitter calculation.
     last_timestamp: Option<u32>,
+    /// History of per-packet jitter values for percentile calculation.
+    jitter_history: VecDeque<f32>,
+    /// Counter for periodic adaptation.
+    adapt_counter: u32,
 }
 
 impl JitterBuffer {
@@ -157,6 +174,8 @@ impl JitterBuffer {
             jitter_accumulator: 0.0,
             last_arrival: None,
             last_timestamp: None,
+            jitter_history: VecDeque::with_capacity(JITTER_HISTORY_SIZE),
+            adapt_counter: 0,
         }
     }
 
@@ -228,6 +247,13 @@ impl JitterBuffer {
         self.ontime_count += 1;
         self.late_count = 0;
         self.maybe_decrease_depth();
+
+        // Periodically run percentile-based adaptation
+        self.adapt_counter += 1;
+        if self.adapt_counter >= ADAPT_INTERVAL {
+            self.adapt_counter = 0;
+            self.adapt_depth();
+        }
 
         true
     }
@@ -312,7 +338,7 @@ impl JitterBuffer {
         JitterBufferResult::Empty
     }
 
-    /// Updates jitter calculation based on RFC 3550.
+    /// Updates jitter calculation based on RFC 3550 and records history.
     fn update_jitter(&mut self, packet: &BufferedPacket) {
         let now = packet.received_at;
 
@@ -326,10 +352,51 @@ impl JitterBuffer {
             let d = (arrival_diff - timestamp_diff).abs();
             self.jitter_accumulator += (d - self.jitter_accumulator) / 16.0;
             self.stats.average_jitter_ms = self.jitter_accumulator * 1000.0;
+
+            // Record per-packet jitter in history for percentile calculation
+            let jitter_ms = d * 1000.0;
+            if self.jitter_history.len() >= JITTER_HISTORY_SIZE {
+                self.jitter_history.pop_front();
+            }
+            self.jitter_history.push_back(jitter_ms);
         }
 
         self.last_arrival = Some(now);
         self.last_timestamp = Some(packet.timestamp);
+    }
+
+    /// Periodically adapts the target buffer depth based on observed jitter.
+    ///
+    /// Uses the 95th percentile of recent jitter measurements plus a safety
+    /// margin. Transitions are smoothed to avoid rapid oscillation.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn adapt_depth(&mut self) {
+        // Need enough history for meaningful percentile
+        if self.jitter_history.len() < 20 {
+            return;
+        }
+
+        let p95 = percentile_95(&self.jitter_history);
+        let ideal_target = p95 + JITTER_MARGIN_MS;
+
+        // Clamp to allowed range
+        #[allow(clippy::cast_precision_loss)]
+        let clamped = ideal_target.clamp(MIN_DEPTH_MS as f32, MAX_DEPTH_MS as f32);
+
+        // Smooth transition toward new target
+        #[allow(clippy::cast_precision_loss)]
+        let current = self.target_depth_ms as f32;
+        let new_target = current.mul_add(1.0 - ADAPT_SMOOTHING, clamped * ADAPT_SMOOTHING);
+        let new_depth = (new_target.round() as u32).clamp(MIN_DEPTH_MS, MAX_DEPTH_MS);
+
+        if new_depth != self.target_depth_ms {
+            trace!(
+                "Adaptive depth: {}ms -> {}ms (p95_jitter={:.1}ms, ideal={:.1}ms)",
+                self.target_depth_ms, new_depth, p95, ideal_target
+            );
+            self.target_depth_ms = new_depth;
+            self.stats.current_depth_ms = new_depth;
+        }
     }
 
     /// Calculates the buffered duration in milliseconds.
@@ -384,6 +451,8 @@ impl JitterBuffer {
         self.last_arrival = None;
         self.last_timestamp = None;
         self.jitter_accumulator = 0.0;
+        self.jitter_history.clear();
+        self.adapt_counter = 0;
         self.stats.current_packet_count = 0;
     }
 
@@ -501,6 +570,20 @@ fn sequence_diff(a: u16, b: u16) -> i32 {
 /// Calculates the difference between two timestamps, handling wrap-around.
 const fn timestamp_diff(a: u32, b: u32) -> i32 {
     a.wrapping_sub(b).cast_signed()
+}
+
+/// Computes the 95th percentile of a jitter history buffer.
+///
+/// Uses a partial sort approach (selection) for efficiency.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+fn percentile_95(history: &VecDeque<f32>) -> f32 {
+    if history.is_empty() {
+        return 0.0;
+    }
+    let mut sorted: Vec<f32> = history.iter().copied().collect();
+    sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((sorted.len() as f32 * 0.95) as usize).min(sorted.len() - 1);
+    sorted[idx]
 }
 
 #[cfg(test)]
@@ -651,5 +734,84 @@ mod tests {
 
         jb.set_target_depth_ms(500); // Above maximum
         assert_eq!(jb.target_depth_ms(), MAX_DEPTH_MS);
+    }
+
+    #[test]
+    fn test_percentile_95() {
+        let mut history = VecDeque::new();
+        // 100 values: 0.0, 1.0, 2.0, ..., 99.0
+        for i in 0..100 {
+            history.push_back(i as f32);
+        }
+        let p95 = percentile_95(&history);
+        // 95th percentile of 0..99 should be ~95
+        assert!(p95 >= 94.0 && p95 <= 96.0, "Expected ~95, got {p95}");
+    }
+
+    #[test]
+    fn test_percentile_95_empty() {
+        let history = VecDeque::new();
+        assert!((percentile_95(&history) - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_adaptive_depth_increases_with_jitter() {
+        let mut jb = JitterBuffer::new(8000, 160, 40);
+
+        // Simulate high-jitter packets by injecting jitter history directly
+        for _ in 0..JITTER_HISTORY_SIZE {
+            jb.jitter_history.push_back(50.0); // 50ms jitter
+        }
+
+        let before = jb.target_depth_ms();
+        jb.adapt_depth();
+        let after = jb.target_depth_ms();
+
+        // With 50ms p95 jitter + 20ms margin = 70ms ideal target
+        // Should increase from 40ms toward 70ms
+        assert!(
+            after > before,
+            "Expected depth to increase from {before}ms with high jitter, got {after}ms"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_depth_decreases_with_low_jitter() {
+        let mut jb = JitterBuffer::new(8000, 160, 100);
+
+        // Simulate low-jitter packets
+        for _ in 0..JITTER_HISTORY_SIZE {
+            jb.jitter_history.push_back(2.0); // 2ms jitter
+        }
+
+        let before = jb.target_depth_ms();
+        jb.adapt_depth();
+        let after = jb.target_depth_ms();
+
+        // With 2ms p95 jitter + 20ms margin = 22ms ideal
+        // Should decrease from 100ms toward 22ms (but smoothed)
+        assert!(
+            after < before,
+            "Expected depth to decrease from {before}ms with low jitter, got {after}ms"
+        );
+    }
+
+    #[test]
+    fn test_jitter_history_bounded() {
+        let mut jb = JitterBuffer::new(8000, 160, 60);
+
+        // Push many more packets than JITTER_HISTORY_SIZE
+        for i in 0..500u16 {
+            let pkt = make_packet(i, u32::from(i) * 160);
+            jb.push(pkt);
+        }
+
+        // History should be bounded
+        assert!(
+            jb.jitter_history.len() <= JITTER_HISTORY_SIZE,
+            "History size {} exceeds max {}",
+            jb.jitter_history.len(),
+            JITTER_HISTORY_SIZE
+        );
     }
 }
