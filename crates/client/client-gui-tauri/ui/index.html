@@ -8,8 +8,8 @@
     <!-- Security Headers -->
     <meta http-equiv="Content-Security-Policy"
           content="default-src 'self';
-                   script-src 'self' 'unsafe-inline';
-                   style-src 'self' 'unsafe-inline';
+                   script-src 'self';
+                   style-src 'self';
                    font-src 'self';
                    img-src 'self' data:;
                    connect-src 'self';
@@ -24,10 +24,7 @@
     <!-- Material Design 3 - Roboto Font (Local) -->
     <link rel="stylesheet" href="fonts/roboto.css">
     <link rel="stylesheet" href="styles.css">
-    <script type="module">
-        // Tauri 2.0 API is injected automatically, make it available globally
-        window.__TAURI_INVOKE__ = window.__TAURI_INTERNALS__.invoke;
-    </script>
+    <script src="init.js"></script>
 </head>
 
 <body>
@@ -85,7 +82,7 @@
                 <div id="dialer" class="tab-content active">
                     <div class="dialer-section">
                         <!-- Call Info (shown during active call) -->
-                        <div class="call-info" id="callInfo">
+                        <div class="call-info hidden" id="callInfo">
                             <div class="call-target" id="callTarget"></div>
                             <div class="call-duration" id="callDuration">00:00</div>
                         </div>
@@ -115,7 +112,7 @@
                         </div>
 
                         <!-- Call Controls (shown during active call) -->
-                        <div class="call-controls" id="callControls" style="display: none;">
+                        <div class="call-controls hidden" id="callControls">
                             <button id="muteBtn" class="control-btn" disabled>
                                 <svg class="control-icon" viewBox="0 0 24 24" fill="currentColor">
                                     <path d="M7 9v6h4l5 5V4l-5 5H7z" />
@@ -159,7 +156,7 @@
                                 </svg>
                                 Call
                             </button>
-                            <button id="hangupBtn" class="action-btn danger" style="display: none;">
+                            <button id="hangupBtn" class="action-btn danger hidden">
                                 <svg class="btn-icon" viewBox="0 0 24 24" fill="currentColor">
                                     <path
                                         d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.28-.7.28-.28 0-.53-.11-.71-.29L.29 13.08c-.18-.17-.29-.42-.29-.7 0-.28.11-.53.29-.71C3.34 8.78 7.46 7 12 7s8.66 1.78 11.71 4.67c.18.18.29.43.29.71 0 .28-.11.53-.29.71l-2.48 2.48c-.18.18-.43.29-.71.29-.27 0-.52-.11-.7-.28-.79-.74-1.69-1.36-2.67-1.85-.33-.16-.56-.5-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z" />
@@ -306,7 +303,7 @@
                         </div>
 
                         <!-- Digest Auth Section (hidden by default, shown when feature enabled) -->
-                        <div id="digestAuthSection">
+                        <div id="digestAuthSection" class="hidden">
                             <h3><svg class="section-icon" viewBox="0 0 24 24" fill="currentColor">
                                     <path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V12H5V6.3l7-3.11v8.8z" />
                                 </svg> Testing Authentication (BulkVS)</h3>

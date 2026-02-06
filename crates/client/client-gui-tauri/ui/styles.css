@@ -1934,3 +1934,53 @@ h2 .section-icon {
         font-size: 10px;
     }
 }
+
+/* ===== Utility Classes for CSP Compliance ===== */
+/* Replace inline style manipulation with CSS classes */
+
+.hidden {
+    display: none !important;
+}
+
+.visible-block {
+    display: block !important;
+}
+
+.visible-grid {
+    display: grid !important;
+}
+
+.visible-flex {
+    display: flex !important;
+}
+
+/* Classification bar colors via data attributes */
+.classification-bar[data-classification="unclassified"] {
+    background-color: #5cb85c;
+    color: #ffffff;
+}
+
+.classification-bar[data-classification="cui"] {
+    background-color: #5bc0de;
+    color: #000000;
+}
+
+.classification-bar[data-classification="confidential"] {
+    background-color: #0033a0;
+    color: #ffffff;
+}
+
+.classification-bar[data-classification="secret"] {
+    background-color: #c8102e;
+    color: #ffffff;
+}
+
+.classification-bar[data-classification="top-secret"] {
+    background-color: #ff8200;
+    color: #000000;
+}
+
+.classification-bar[data-classification="top-secret-sci"] {
+    background-color: #ffc700;
+    color: #000000;
+}

@@ -342,8 +342,8 @@ function updateClassificationBars() {
     const bars = document.querySelectorAll('.classification-bar');
 
     bars.forEach(bar => {
-        bar.style.backgroundColor = config.color;
-        bar.style.color = config.textColor;
+        // Set classification level as data attribute for CSS styling
+        bar.dataset.classification = currentClassification;
         const textEl = bar.querySelector('.classification-text');
         if (textEl) {
             textEl.textContent = label;
@@ -443,7 +443,13 @@ async function initializeDigestAuth() {
         const digestAuthEnabled = await invoke('is_digest_auth_enabled');
         const digestAuthSection = document.getElementById('digestAuthSection');
         if (digestAuthSection) {
-            digestAuthSection.style.display = digestAuthEnabled ? 'block' : 'none';
+            if (digestAuthEnabled) {
+                digestAuthSection.classList.remove('hidden');
+                digestAuthSection.classList.add('visible-block');
+            } else {
+                digestAuthSection.classList.add('hidden');
+                digestAuthSection.classList.remove('visible-block');
+            }
         }
         if (digestAuthEnabled) {
             console.log('Digest auth feature enabled - testing mode available');
@@ -1194,17 +1200,37 @@ function startCall(target) {
 
     // Transition to call screen
     const callInfo = document.getElementById('callInfo');
-    callInfo.style.display = 'block';
-    callInfo.classList.add('visible');
-    document.getElementById('dialInputWrapper').style.display = 'none';
-    document.getElementById('dialpad').style.display = 'none';
-    document.getElementById('audioDevices').style.display = 'none';
-    document.getElementById('callControls').style.display = 'grid';
+    callInfo.classList.remove('hidden');
+    callInfo.classList.add('visible-block', 'visible');
+
+    const dialInputWrapper = document.getElementById('dialInputWrapper');
+    dialInputWrapper.classList.add('hidden');
+    dialInputWrapper.classList.remove('visible-block');
+
+    const dialpad = document.getElementById('dialpad');
+    dialpad.classList.add('hidden');
+    dialpad.classList.remove('visible-grid');
+
+    const audioDevices = document.getElementById('audioDevices');
+    audioDevices.classList.add('hidden');
+    audioDevices.classList.remove('visible-block');
+
+    const callControls = document.getElementById('callControls');
+    callControls.classList.remove('hidden');
+    callControls.classList.add('visible-grid');
 
     // Show hangup button, hide call button and backspace
-    document.getElementById('callBtn').style.display = 'none';
-    document.getElementById('backspaceBtn').style.display = 'none';
-    document.getElementById('hangupBtn').style.display = 'block';
+    const callBtn = document.getElementById('callBtn');
+    callBtn.classList.add('hidden');
+    callBtn.classList.remove('visible-block');
+
+    const backspaceBtn = document.getElementById('backspaceBtn');
+    backspaceBtn.classList.add('hidden');
+    backspaceBtn.classList.remove('visible-block');
+
+    const hangupBtn = document.getElementById('hangupBtn');
+    hangupBtn.classList.remove('hidden');
+    hangupBtn.classList.add('visible-block');
 
     document.getElementById('callTarget').textContent = target;
 
@@ -1261,17 +1287,37 @@ function endCall() {
 
     // Transition back to dialer screen
     const callInfo = document.getElementById('callInfo');
-    callInfo.classList.remove('visible');
-    callInfo.style.display = 'none';
-    document.getElementById('dialInputWrapper').style.display = 'block';
-    document.getElementById('dialpad').style.display = 'grid';
-    document.getElementById('audioDevices').style.display = 'block';
-    document.getElementById('callControls').style.display = 'none';
+    callInfo.classList.remove('visible', 'visible-block');
+    callInfo.classList.add('hidden');
+
+    const dialInputWrapper = document.getElementById('dialInputWrapper');
+    dialInputWrapper.classList.remove('hidden');
+    dialInputWrapper.classList.add('visible-block');
+
+    const dialpad = document.getElementById('dialpad');
+    dialpad.classList.remove('hidden');
+    dialpad.classList.add('visible-grid');
+
+    const audioDevices = document.getElementById('audioDevices');
+    audioDevices.classList.remove('hidden');
+    audioDevices.classList.add('visible-block');
+
+    const callControls = document.getElementById('callControls');
+    callControls.classList.add('hidden');
+    callControls.classList.remove('visible-grid');
 
     // Show call button and backspace, hide hangup button
-    document.getElementById('callBtn').style.display = 'block';
-    document.getElementById('backspaceBtn').style.display = 'block';
-    document.getElementById('hangupBtn').style.display = 'none';
+    const callBtn = document.getElementById('callBtn');
+    callBtn.classList.remove('hidden');
+    callBtn.classList.add('visible-block');
+
+    const backspaceBtn = document.getElementById('backspaceBtn');
+    backspaceBtn.classList.remove('hidden');
+    backspaceBtn.classList.add('visible-block');
+
+    const hangupBtn = document.getElementById('hangupBtn');
+    hangupBtn.classList.add('hidden');
+    hangupBtn.classList.remove('visible-block');
 
     // Clear call display and dial input
     document.getElementById('callTarget').textContent = '';
