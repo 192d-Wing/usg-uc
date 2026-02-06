@@ -1594,8 +1594,8 @@ function initializeRecents() {
     const recentsSearchInput = document.getElementById('recentsSearchInput');
     if (recentsSearchInput) {
         recentsSearchInput.addEventListener('input', (e) => {
-            const searchTerm = e.target.value.toLowerCase().trim();
-            filterCallHistory(searchTerm);
+            // Pass raw value to filter function which will sanitize
+            filterCallHistory(e.target.value);
         });
     }
 }
@@ -1619,21 +1619,31 @@ async function loadCallHistory() {
 }
 
 function filterCallHistory(searchTerm) {
+    // Input validation: enforce max length and sanitize
     if (!searchTerm) {
         renderCallHistory(allCallHistory);
         return;
     }
 
+    // Trim and enforce max length
+    const sanitizedTerm = searchTerm.trim().slice(0, MAX_SEARCH_LENGTH).toLowerCase();
+
+    if (!sanitizedTerm) {
+        renderCallHistory(allCallHistory);
+        return;
+    }
+
+    // Filter with sanitized search term
     const filtered = allCallHistory.filter(entry => {
         // Search in remote URI
-        const uriMatch = entry.remote_uri.toLowerCase().includes(searchTerm);
+        const uriMatch = entry.remote_uri.toLowerCase().includes(sanitizedTerm);
 
         // Search in contact name if available
         const nameMatch = entry.contact_name &&
-                         entry.contact_name.toLowerCase().includes(searchTerm);
+                         entry.contact_name.toLowerCase().includes(sanitizedTerm);
 
         // Search in direction
-        const directionMatch = entry.direction.toLowerCase().includes(searchTerm);
+        const directionMatch = entry.direction.toLowerCase().includes(sanitizedTerm);
 
         return uriMatch || nameMatch || directionMatch;
     });
