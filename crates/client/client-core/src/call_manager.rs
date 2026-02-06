@@ -1556,6 +1556,9 @@ impl CallManager {
         let fingerprint = session.local_dtls_fingerprint();
         let ssrc = session.local_ssrc();
 
+        // Discover actual local IP if configured with 0.0.0.0
+        let effective_media_addr = self.get_effective_media_addr()?;
+
         // Generate basic SDP offer
         // In production, this would use proto-sdp properly
         let sdp = format!(
@@ -1578,8 +1581,8 @@ impl CallManager {
              a=ssrc:{ssrc} cname:{cname}\r\n",
             session_id = session_id(),
             session_version = 1,
-            ip = self.local_media_addr.ip(),
-            port = self.local_media_addr.port(),
+            ip = effective_media_addr.ip(),
+            port = effective_media_addr.port(),
             ufrag = creds.ufrag,
             pwd = creds.pwd,
             fingerprint = fingerprint,
@@ -1588,6 +1591,39 @@ impl CallManager {
         );
 
         Ok(sdp)
+    }
+
+    /// Gets the effective media address, discovering the local IP if needed.
+    ///
+    /// If `local_media_addr` is unspecified (0.0.0.0), discovers the actual
+    /// local IP by creating a UDP socket. Also assigns an ephemeral port if
+    /// the configured port is 0.
+    fn get_effective_media_addr(&self) -> AppResult<SocketAddr> {
+        if !self.local_media_addr.ip().is_unspecified() && self.local_media_addr.port() != 0 {
+            return Ok(self.local_media_addr);
+        }
+
+        // Create a UDP socket to discover local IP and get an ephemeral port
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0")
+            .map_err(|e| AppError::Sip(format!("Failed to bind UDP socket: {e}")))?;
+
+        // Connect to a public address to discover our local IP
+        // Using Google's DNS as a well-known routable address
+        socket
+            .connect("8.8.8.8:53")
+            .map_err(|e| AppError::Sip(format!("Failed to discover local IP: {e}")))?;
+
+        let local_addr = socket
+            .local_addr()
+            .map_err(|e| AppError::Sip(format!("Failed to get local address: {e}")))?;
+
+        info!(
+            configured = %self.local_media_addr,
+            effective = %local_addr,
+            "Discovered effective media address"
+        );
+
+        Ok(local_addr)
     }
 
     /// Generates SDP for putting a call on hold (sendonly direction).
@@ -1616,6 +1652,9 @@ impl CallManager {
         let fingerprint = session.local_dtls_fingerprint();
         let ssrc = session.local_ssrc();
 
+        // Discover actual local IP if configured with 0.0.0.0
+        let effective_media_addr = self.get_effective_media_addr()?;
+
         // Generate SDP with specified direction
         let sdp = format!(
             "v=0\r\n\
@@ -1637,8 +1676,8 @@ impl CallManager {
              a=ssrc:{ssrc} cname:{cname}\r\n",
             session_id = session_id(),
             session_version = 2, // Increment version for re-INVITE
-            ip = self.local_media_addr.ip(),
-            port = self.local_media_addr.port(),
+            ip = effective_media_addr.ip(),
+            port = effective_media_addr.port(),
             ufrag = creds.ufrag,
             pwd = creds.pwd,
             fingerprint = fingerprint,
