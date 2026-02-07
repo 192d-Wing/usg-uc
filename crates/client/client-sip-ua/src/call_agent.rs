@@ -465,6 +465,7 @@ impl CallAgent {
             &from_tag,
             to_tag.as_deref(),
             transfer_target,
+            &self.transport_type,
         )?;
 
         // Create non-INVITE transaction for REFER
@@ -543,6 +544,7 @@ impl CallAgent {
             to_tag.as_deref(),
             &branch,
             sdp,
+            &self.transport_type,
         )?;
 
         // Create INVITE transaction for re-INVITE
@@ -900,7 +902,7 @@ impl CallAgent {
         response: &SipResponse,
     ) -> SipUaResult<()> {
         // Extract data needed for ACK
-        let (remote_uri, sip_call_id, cseq, from_tag, to_tag) = {
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag, current_state) = {
             let session = self
                 .calls
                 .get_mut(call_id)
@@ -921,8 +923,12 @@ impl CallAgent {
                 return Ok(());
             }
 
-            session.state = CallState::Connected;
-            session.connected_at = Some(Instant::now());
+            // For a hold re-INVITE 200 OK, preserve the OnHold state.
+            // Only transition to Connected for the initial INVITE or resume.
+            if session.state != CallState::OnHold {
+                session.state = CallState::Connected;
+                session.connected_at = Some(Instant::now());
+            }
             session.invite_transaction = None;
 
             if session.to_tag.is_none() {
@@ -941,7 +947,8 @@ impl CallAgent {
                     .await;
             }
 
-            info!(call_id = %call_id, "Call connected");
+            let current_state = session.state;
+            info!(call_id = %call_id, state = ?current_state, "INVITE 200 OK processed");
 
             (
                 session.remote_uri.clone(),
@@ -949,6 +956,7 @@ impl CallAgent {
                 session.cseq,
                 session.from_tag.clone(),
                 session.to_tag.clone(),
+                current_state,
             )
         };
 
@@ -979,7 +987,7 @@ impl CallAgent {
         self.event_tx
             .send(CallEvent::StateChanged {
                 call_id: call_id.to_string(),
-                state: CallState::Connected,
+                state: current_state,
                 info: None,
             })
             .await
@@ -1655,6 +1663,7 @@ impl CallAgent {
         to_tag: Option<&str>,
         branch: &str,
         sdp: &str,
+        transport_type: &str,
     ) -> SipUaResult<SipRequest> {
         let remote_uri: SipUri = remote_uri_str
             .parse()
@@ -1664,7 +1673,7 @@ impl CallAgent {
             .parse()
             .map_err(|e| SipUaError::ConfigError(format!("Invalid AOR: {e}")))?;
 
-        let via = ViaHeader::new("TLS", local_addr.ip().to_string())
+        let via = ViaHeader::new(transport_type, local_addr.ip().to_string())
             .with_port(local_addr.port())
             .with_branch(branch.to_string());
 
@@ -1679,8 +1688,10 @@ impl CallAgent {
 
         // Contact header for in-dialog request
         let mut contact_uri = SipUri::new(local_addr.ip().to_string())
-            .with_port(local_addr.port())
-            .with_param("transport", Some("tls".to_string()));
+            .with_port(local_addr.port());
+        if transport_type != "UDP" {
+            contact_uri = contact_uri.with_param("transport", Some(transport_type.to_lowercase()));
+        }
         if let Some(user) = &aor_uri.user {
             contact_uri = contact_uri.with_user(user.clone());
         }
@@ -1715,6 +1726,7 @@ impl CallAgent {
         from_tag: &str,
         to_tag: Option<&str>,
         transfer_target: &str,
+        transport_type: &str,
     ) -> SipUaResult<SipRequest> {
         use proto_sip::method::Method;
 
@@ -1728,7 +1740,7 @@ impl CallAgent {
 
         let branch = generate_branch();
 
-        let via = ViaHeader::new("TLS", local_addr.ip().to_string())
+        let via = ViaHeader::new(transport_type, local_addr.ip().to_string())
             .with_port(local_addr.port())
             .with_branch(branch);
 
@@ -1743,8 +1755,10 @@ impl CallAgent {
 
         // Contact header for in-dialog request
         let mut contact_uri = SipUri::new(local_addr.ip().to_string())
-            .with_port(local_addr.port())
-            .with_param("transport", Some("tls".to_string()));
+            .with_port(local_addr.port());
+        if transport_type != "UDP" {
+            contact_uri = contact_uri.with_param("transport", Some(transport_type.to_lowercase()));
+        }
         if let Some(user) = &aor_uri.user {
             contact_uri = contact_uri.with_user(user.clone());
         }
