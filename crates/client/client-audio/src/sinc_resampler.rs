@@ -80,8 +80,8 @@ impl SincResampler {
             // Compute each polyphase output
             for phase in &self.phases {
                 let mut sum = 0.0f32;
-                for k in 0..TAPS_PER_PHASE {
-                    sum = self.history[k].mul_add(phase[k], sum);
+                for (k, &coeff) in phase.iter().enumerate() {
+                    sum = self.history[k].mul_add(coeff, sum);
                 }
                 output.push(sum.round().clamp(-32768.0, 32767.0) as i16);
             }
@@ -129,7 +129,7 @@ impl SincResampler {
 /// at frame boundaries.
 ///
 /// Introduces a fixed delay of `FRAC_HALF_TAPS` input samples (~1ms at
-/// 8kHz) which is imperceptible for VoIP.
+/// 8kHz) which is imperceptible for `VoIP`.
 ///
 /// For integer ratios, prefer [`SincResampler`] which pre-computes
 /// polyphase coefficient tables for better efficiency.
@@ -139,7 +139,7 @@ pub struct FractionalSincResampler {
     /// Input-domain advance per output sample (1/ratio).
     step: f64,
     /// Input sample history buffer (newest at index 0, oldest at end).
-    /// Size = 2 * FRAC_HALF_TAPS + 1, giving FRAC_HALF_TAPS taps on
+    /// Size = 2 * `FRAC_HALF_TAPS` + 1, giving `FRAC_HALF_TAPS` taps on
     /// each side of the kernel center for full symmetric support.
     history: Vec<f32>,
     /// Fractional position within the current input sample interval.
@@ -150,7 +150,7 @@ pub struct FractionalSincResampler {
 }
 
 /// History buffer size for fractional resampler: enough for a symmetric
-/// kernel with FRAC_HALF_TAPS taps on each side, plus the center.
+/// kernel with `FRAC_HALF_TAPS` taps on each side, plus the center.
 const FRAC_HIST_SIZE: usize = 2 * FRAC_HALF_TAPS + 1;
 
 impl FractionalSincResampler {
@@ -170,7 +170,7 @@ impl FractionalSincResampler {
     ///
     /// The exact count is `round(input.len() * ratio)`. The internal phase
     /// accumulator ensures sample-accurate timing across frames.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
     pub fn process(&mut self, input: &[i16]) -> Vec<i16> {
         let output_len = ((input.len() as f64) * self.ratio).round() as usize;
         self.process_inner(input, output_len)
@@ -186,9 +186,9 @@ impl FractionalSincResampler {
     /// For each input sample, shifts the history buffer and produces output
     /// samples while the phase accumulator is within the current input
     /// interval. The kernel center is placed at `FRAC_HALF_TAPS - 1 + phase`
-    /// in the history buffer, ensuring FRAC_HALF_TAPS taps on each side
+    /// in the history buffer, ensuring `FRAC_HALF_TAPS` taps on each side
     /// are always available — no edge effects at frame boundaries.
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     fn process_inner(&mut self, input: &[i16], output_len: usize) -> Vec<i16> {
         let half = FRAC_HALF_TAPS as f64;
         let mut output = Vec::with_capacity(output_len);
@@ -223,7 +223,7 @@ impl FractionalSincResampler {
                         (PI * x).sin() / (PI * x)
                     };
 
-                    let arg = (1.0 - (x / half).powi(2)).max(0.0).sqrt();
+                    let arg = (x / half).mul_add(-(x / half), 1.0).max(0.0).sqrt();
                     let win = bessel_i0(KAISER_BETA * arg) * self.inv_bessel;
 
                     let coeff = sinc_val * win;
@@ -252,8 +252,8 @@ impl FractionalSincResampler {
         output
     }
 
-    /// Returns the resampling ratio (output_rate / input_rate).
-    pub fn ratio(&self) -> f64 {
+    /// Returns the resampling ratio (`output_rate` / `input_rate`).
+    pub const fn ratio(&self) -> f64 {
         self.ratio
     }
 }
@@ -282,31 +282,31 @@ impl Resampler {
     /// Automatically selects the most efficient algorithm.
     pub fn new(input_rate: u32, output_rate: u32) -> Self {
         if input_rate == output_rate {
-            Resampler::Passthrough
-        } else if output_rate >= input_rate && output_rate % input_rate == 0 {
+            Self::Passthrough
+        } else if output_rate >= input_rate && output_rate.is_multiple_of(input_rate) {
             #[allow(clippy::cast_possible_truncation)]
             let ratio = (output_rate / input_rate) as usize;
-            Resampler::Integer(SincResampler::new(ratio))
+            Self::Integer(SincResampler::new(ratio))
         } else {
-            Resampler::Fractional(FractionalSincResampler::new(input_rate, output_rate))
+            Self::Fractional(FractionalSincResampler::new(input_rate, output_rate))
         }
     }
 
     /// Resamples the input to the target rate.
     pub fn process(&mut self, input: &[i16]) -> Vec<i16> {
         match self {
-            Resampler::Integer(r) => r.process(input),
-            Resampler::Fractional(r) => r.process(input),
-            Resampler::Passthrough => input.to_vec(),
+            Self::Integer(r) => r.process(input),
+            Self::Fractional(r) => r.process(input),
+            Self::Passthrough => input.to_vec(),
         }
     }
 
     /// Resamples with an adjusted output length for drift compensation.
     pub fn process_adjusted(&mut self, input: &[i16], output_len: usize) -> Vec<i16> {
         match self {
-            Resampler::Integer(r) => r.process_adjusted(input, output_len),
-            Resampler::Fractional(r) => r.process_adjusted(input, output_len),
-            Resampler::Passthrough => {
+            Self::Integer(r) => r.process_adjusted(input, output_len),
+            Self::Fractional(r) => r.process_adjusted(input, output_len),
+            Self::Passthrough => {
                 let mut result = input.to_vec();
                 match output_len.cmp(&result.len()) {
                     std::cmp::Ordering::Equal => {}
@@ -322,11 +322,11 @@ impl Resampler {
     }
 
     /// Returns a description of the algorithm being used.
-    pub fn algorithm_name(&self) -> &'static str {
+    pub const fn algorithm_name(&self) -> &'static str {
         match self {
-            Resampler::Integer(_) => "polyphase sinc",
-            Resampler::Fractional(_) => "fractional sinc",
-            Resampler::Passthrough => "passthrough",
+            Self::Integer(_) => "polyphase sinc",
+            Self::Fractional(_) => "fractional sinc",
+            Self::Passthrough => "passthrough",
         }
     }
 }
@@ -337,6 +337,7 @@ impl Resampler {
 ///
 /// The filter is a low-pass at `1/(2*ratio)` normalized frequency (i.e.,
 /// the input Nyquist), with a Kaiser window for sidelobe control.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 fn compute_polyphase_coefficients(ratio: usize) -> Vec<[f32; TAPS_PER_PHASE]> {
     let total_taps = ratio * TAPS_PER_PHASE;
     let center = (total_taps - 1) as f64 / 2.0;
@@ -382,6 +383,7 @@ fn compute_polyphase_coefficients(ratio: usize) -> Vec<[f32; TAPS_PER_PHASE]> {
 }
 
 /// Evaluates the Kaiser window function at sample index `n`.
+#[allow(clippy::cast_precision_loss)]
 fn kaiser_window(n: usize, length: usize, beta: f64) -> f64 {
     if length <= 1 {
         return 1.0;
@@ -400,7 +402,7 @@ fn bessel_i0(x: f64) -> f64 {
     let mut term = 1.0;
     let x_half = x / 2.0;
     for k in 1..25 {
-        let k_f = k as f64;
+        let k_f = f64::from(k);
         term *= (x_half / k_f) * (x_half / k_f);
         sum += term;
         if term < 1e-15 * sum {

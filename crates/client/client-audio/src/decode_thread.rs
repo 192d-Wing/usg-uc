@@ -32,7 +32,7 @@ const DUMP_ENV_VAR: &str = "DUMP_DECODED_AUDIO";
 const TARGET_FILL_FRAMES: usize = 8;
 
 /// Playback gain applied to decoded remote audio (linear).
-/// Unity gain: logs show G.711 ulaw from BulkVS peaks at 20000-29000
+/// Unity gain: logs show G.711 ulaw from `BulkVS` peaks at 20000-29000
 /// (already -3 to -1 dBFS). Any gain above 1.0 causes hard clipping
 /// at 32767, producing audible distortion ("static").
 const PLAYBACK_GAIN: f32 = 1.0;
@@ -321,10 +321,9 @@ fn decode_loop(
                         // Track peak amplitude after gain
                         if let Some(&post_peak) =
                             gained.iter().map(|s| s.saturating_abs()).max().as_ref()
+                            && post_peak > diag_peak_post_gain
                         {
-                            if post_peak > diag_peak_post_gain {
-                                diag_peak_post_gain = post_peak;
-                            }
+                            diag_peak_post_gain = post_peak;
                         }
 
                         // Track last output for fade-out
@@ -409,6 +408,7 @@ fn decode_loop(
                             #[allow(clippy::cast_precision_loss)]
                             let len_f = device_samples as f32;
                             for (i, sample) in fade.iter_mut().enumerate() {
+                                #[allow(clippy::cast_precision_loss)]
                                 let t = i as f32 / len_f;
                                 let gain = 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
                                 #[allow(clippy::cast_possible_truncation)]

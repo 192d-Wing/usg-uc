@@ -12,7 +12,7 @@
 //! to the resampler output length (±1 sample per frame).
 
 /// Number of measurements during warmup to establish the target depth.
-/// At ~5ms per measurement (measure_interval=1 in decode thread),
+/// At ~5ms per measurement (`measure_interval=1` in decode thread),
 /// 40 measurements ≈ 200ms warmup.
 const WARMUP_MEASUREMENTS: usize = 40;
 
@@ -29,7 +29,7 @@ const DEAD_ZONE_MS: f32 = 3.0;
 /// Proportional correction gain.
 /// Higher values correct faster but may overshoot.
 /// At gain 0.15 with error 10ms: accumulator += 1.5 per measurement.
-/// With ~200 measurements/sec (measure_interval=1), that's ~300/sec,
+/// With ~200 measurements/sec (`measure_interval=1`), that's ~300/sec,
 /// yielding ~300 corrections/sec = ~300/44100 ≈ 6.8 ms/sec correction rate.
 const CORRECTION_GAIN: f32 = 0.15;
 
@@ -133,7 +133,7 @@ impl DriftCompensator {
     }
 
     /// Resets the compensator state.
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.smoothed_depth = 0.0;
         self.target_depth = 0.0;
         self.warmup_sum = 0.0;
