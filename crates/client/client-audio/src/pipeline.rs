@@ -474,6 +474,14 @@ impl AudioPipeline {
         if let Some(ref io) = self.io_thread {
             io.switch_input_device(device_name);
         }
+        // Refresh the playback stream too: on macOS, switching away from a
+        // Bluetooth mic triggers an HFP→A2DP profile change that alters the
+        // output device's sample rate. Re-creating the CPAL playback stream
+        // picks up the new rate so audio doesn't go robotic.
+        if let Some(ref decode) = self.decode_thread {
+            let output_name = self.device_manager.output_device_name().map(String::from);
+            decode.switch_output_device(output_name);
+        }
         Ok(())
     }
 
