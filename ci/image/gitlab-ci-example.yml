@@ -1,0 +1,23 @@
+# Example .gitlab-ci.yml snippet for using the custom CI image
+#
+# Replace the .rust-base section in your .gitlab-ci.yml with this:
+
+.rust-base:
+  image: registry.gitlab.com/<your-group>/<your-project>/ci-image:latest
+  tags:
+    - saas-linux-medium-amd64
+  <<: *cargo-cache
+  before_script:
+    # These tools are now pre-installed in the image!
+    - rustc --version
+    - cargo --version
+    - go version      # Verify Go is available
+    - cmake --version # Verify cmake is available
+
+# Alternative: Pin to a specific version
+# .rust-base:
+#   image: registry.gitlab.com/<your-group>/<your-project>/ci-image:v1.0.0
+#   ...
+
+# Note: Replace <your-group>/<your-project> with your actual GitLab project path
+# Example: registry.gitlab.com/acme-corp/usg-uc/ci-image:latest

@@ -1,0 +1,5 @@
+# Ignore everything by default (we don't copy files into this image)
+*
+
+# Allow the README
+!README.md

@@ -23,13 +23,15 @@ variables:
 
 # Base image for Rust jobs
 .rust-base:
-  image: rust:latest
+  image: registry.gitlab.com/192d-wing/usg-uc/ci-image:latest
   tags:
     - saas-linux-medium-amd64
   <<: *cargo-cache
   before_script:
     - rustc --version
     - cargo --version
+    - go version # Now available!
+    - cmake --version # Now available!
 
 # Format check
 fmt:
