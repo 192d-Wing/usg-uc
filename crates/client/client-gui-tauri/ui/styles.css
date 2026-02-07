@@ -214,6 +214,120 @@ body {
     overflow: hidden;
 }
 
+/* ===== Sidebar Audio Device Selectors ===== */
+.nav-audio-devices {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: auto 0 0 0;
+}
+
+.nav-audio-btn-wrapper {
+    position: relative;
+}
+
+.nav-audio-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    padding: 12px 0;
+    margin: 0 12px;
+    width: calc(100% - 24px);
+    background: transparent;
+    border: none;
+    border-radius: var(--md-sys-shape-corner-large);
+    color: var(--md-sys-color-on-surface-variant);
+    cursor: pointer;
+    font: var(--md-sys-typescale-label-small);
+    transition: background var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard);
+}
+
+.nav-audio-btn:hover {
+    background: var(--md-sys-color-surface-container);
+}
+
+.nav-audio-btn.active {
+    background: var(--md-sys-color-secondary-container);
+    color: var(--md-sys-color-on-secondary-container);
+}
+
+.nav-audio-btn .nav-icon {
+    width: 24px;
+    height: 24px;
+}
+
+.nav-audio-btn span {
+    font: var(--md-sys-typescale-label-small);
+}
+
+/* Flyout menu — fixed position so it overlays the content area
+   instead of being clipped by .tab-nav overflow. Positioned by JS. */
+.nav-audio-menu {
+    display: none;
+    position: fixed;
+    min-width: 240px;
+    max-height: 300px;
+    overflow-y: auto;
+    background: var(--md-sys-color-surface-container-high);
+    border-radius: var(--md-sys-shape-corner-medium);
+    box-shadow: var(--md-sys-elevation-2);
+    z-index: 1000;
+    padding: 8px 0;
+}
+
+.nav-audio-menu.open {
+    display: block;
+    animation: menuEnter 200ms var(--md-sys-motion-easing-emphasized-decelerate);
+}
+
+@keyframes menuEnter {
+    from { opacity: 0; transform: translateX(-8px); }
+    to   { opacity: 1; transform: translateX(0); }
+}
+
+.nav-audio-menu-title {
+    padding: 12px 16px 8px;
+    font: var(--md-sys-typescale-label-medium);
+    color: var(--md-sys-color-on-surface-variant);
+    white-space: nowrap;
+}
+
+.nav-audio-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    cursor: pointer;
+    color: var(--md-sys-color-on-surface);
+    font: var(--md-sys-typescale-body-medium);
+    border: none;
+    background: transparent;
+    width: 100%;
+    text-align: left;
+    white-space: nowrap;
+    transition: background var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard);
+}
+
+.nav-audio-menu-item:hover {
+    background: var(--md-sys-color-surface-container-highest);
+}
+
+.nav-audio-menu-item.selected {
+    color: var(--md-sys-color-primary);
+}
+
+.nav-audio-menu-item .check-icon {
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+    opacity: 0;
+}
+
+.nav-audio-menu-item.selected .check-icon {
+    opacity: 1;
+}
+
 /* ===== Navigation Status Indicator ===== */
 .nav-status {
     display: flex;
@@ -221,7 +335,7 @@ body {
     align-items: center;
     gap: 4px;
     padding: 12px 8px;
-    margin: auto 12px 12px 12px;
+    margin: 0 12px 12px 12px;
     background: var(--md-sys-color-surface-container);
     border-radius: var(--md-sys-shape-corner-large);
 }
@@ -513,69 +627,6 @@ body {
     display: flex;
     gap: 12px;
     margin-bottom: 24px;
-}
-
-/* ===== Elegant Audio Device Selector ===== */
-.audio-devices-compact {
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-    padding: 0;
-    background: transparent;
-    border-radius: 0;
-}
-
-.audio-device-row {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    position: relative;
-    padding-left: 8px;
-}
-
-.audio-device-row .audio-icon {
-    width: 24px;
-    height: 24px;
-    flex-shrink: 0;
-    color: var(--md-sys-color-primary);
-    z-index: 1;
-}
-
-/* Custom select wrapper for elegant dropdown */
-.audio-device-row select {
-    flex: 1;
-    padding: 14px 40px 14px 16px;
-    font: var(--md-sys-typescale-body-medium);
-    background: var(--md-sys-color-surface-container);
-    border: none;
-    border-radius: var(--md-sys-shape-corner-small);
-    color: var(--md-sys-color-on-surface);
-    cursor: pointer;
-    appearance: none;
-    -webkit-appearance: none;
-    -moz-appearance: none;
-    transition: all var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard);
-    /* Custom dropdown arrow */
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='%23C6C5D0'%3E%3Cpath d='M7 10l5 5 5-5z'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: right 12px center;
-    background-size: 20px;
-}
-
-.audio-device-row select:hover {
-    background-color: var(--md-sys-color-surface-container-high);
-}
-
-.audio-device-row select:focus {
-    outline: none;
-    background-color: var(--md-sys-color-surface-container-high);
-    box-shadow: 0 0 0 2px var(--md-sys-color-primary);
-}
-
-.audio-device-row select option {
-    background: var(--md-sys-color-surface-container-high);
-    color: var(--md-sys-color-on-surface);
-    padding: 12px;
 }
 
 /* ===== M3 Buttons ===== */

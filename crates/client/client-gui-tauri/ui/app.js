@@ -1325,10 +1325,6 @@ function startCall(target) {
     dialpad.classList.add('hidden');
     dialpad.classList.remove('visible-grid');
 
-    const audioDevices = document.getElementById('audioDevices');
-    audioDevices.classList.add('hidden');
-    audioDevices.classList.remove('visible-block');
-
     const callControls = document.getElementById('callControls');
     callControls.classList.remove('hidden');
     callControls.classList.add('visible-grid');
@@ -1413,10 +1409,6 @@ function endCall() {
     const dialpad = document.getElementById('dialpad');
     dialpad.classList.remove('hidden');
     dialpad.classList.add('visible-grid');
-
-    const audioDevices = document.getElementById('audioDevices');
-    audioDevices.classList.remove('hidden');
-    audioDevices.classList.add('visible-block');
 
     const callControls = document.getElementById('callControls');
     callControls.classList.add('hidden');
@@ -2190,51 +2182,128 @@ async function loadAudioDevices() {
         const inputDevices = await invoke('get_input_devices');
         const outputDevices = await invoke('get_output_devices');
 
-        const inputSelect = document.getElementById('inputDevice');
-        const outputSelect = document.getElementById('outputDevice');
-
-        if (inputSelect) {
-            inputSelect.innerHTML = '<option value="">Default</option>';
+        // Populate microphone flyout menu
+        const micList = document.getElementById('micDeviceList');
+        if (micList) {
+            micList.innerHTML = '';
+            // Default option
+            const defaultItem = createDeviceMenuItem('Default', '', true, 'set_input_device');
+            micList.appendChild(defaultItem);
             inputDevices.forEach(device => {
-                const option = document.createElement('option');
-                option.value = device.name;
-                option.textContent = device.display_name;
-                if (device.is_default) option.selected = true;
-                inputSelect.appendChild(option);
-            });
-
-            inputSelect.addEventListener('change', async () => {
-                const deviceName = inputSelect.value || null;
-                try {
-                    await invoke('set_input_device', { deviceName });
-                } catch (error) {
-                    console.error('Failed to set input device:', error);
+                const item = createDeviceMenuItem(
+                    device.display_name, device.name, device.is_default, 'set_input_device'
+                );
+                if (device.is_default) {
+                    defaultItem.classList.remove('selected');
+                    item.classList.add('selected');
                 }
+                micList.appendChild(item);
             });
         }
 
-        if (outputSelect) {
-            outputSelect.innerHTML = '<option value="">Default</option>';
+        // Populate speaker flyout menu
+        const speakerList = document.getElementById('speakerDeviceList');
+        if (speakerList) {
+            speakerList.innerHTML = '';
+            const defaultItem = createDeviceMenuItem('Default', '', true, 'set_output_device');
+            speakerList.appendChild(defaultItem);
             outputDevices.forEach(device => {
-                const option = document.createElement('option');
-                option.value = device.name;
-                option.textContent = device.display_name;
-                if (device.is_default) option.selected = true;
-                outputSelect.appendChild(option);
-            });
-
-            outputSelect.addEventListener('change', async () => {
-                const deviceName = outputSelect.value || null;
-                try {
-                    await invoke('set_output_device', { deviceName });
-                } catch (error) {
-                    console.error('Failed to set output device:', error);
+                const item = createDeviceMenuItem(
+                    device.display_name, device.name, device.is_default, 'set_output_device'
+                );
+                if (device.is_default) {
+                    defaultItem.classList.remove('selected');
+                    item.classList.add('selected');
                 }
+                speakerList.appendChild(item);
             });
         }
+
+        // Set up flyout toggle buttons
+        setupAudioDeviceMenus();
     } catch (error) {
         console.error('Failed to load audio devices:', error);
     }
+}
+
+function createDeviceMenuItem(displayName, deviceName, isSelected, invokeCmd) {
+    const item = document.createElement('button');
+    item.className = 'nav-audio-menu-item' + (isSelected ? ' selected' : '');
+    item.innerHTML = `<svg class="check-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg><span>${displayName}</span>`;
+    item.addEventListener('click', async () => {
+        // Update selection UI
+        const list = item.parentElement;
+        list.querySelectorAll('.nav-audio-menu-item').forEach(el => el.classList.remove('selected'));
+        item.classList.add('selected');
+        // Invoke backend
+        try {
+            await invoke(invokeCmd, { deviceName: deviceName || null });
+        } catch (error) {
+            console.error(`Failed to ${invokeCmd}:`, error);
+        }
+        // Close menu after selection
+        closeAllAudioMenus();
+    });
+    return item;
+}
+
+function positionMenuByButton(btn, menu) {
+    const rect = btn.getBoundingClientRect();
+    const navWidth = 80;
+    // Place menu to the right of the nav rail, aligned to button bottom
+    menu.style.left = navWidth + 'px';
+    // Align bottom of menu with bottom of button, but clamp to viewport
+    const menuHeight = menu.scrollHeight || 200;
+    let top = rect.bottom - menuHeight;
+    if (top < 8) top = 8;
+    menu.style.top = top + 'px';
+}
+
+function setupAudioDeviceMenus() {
+    const micBtn = document.getElementById('micDeviceBtn');
+    const speakerBtn = document.getElementById('speakerDeviceBtn');
+    const micMenu = document.getElementById('micDeviceMenu');
+    const speakerMenu = document.getElementById('speakerDeviceMenu');
+
+    if (micBtn && micMenu) {
+        micBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const isOpen = micMenu.classList.contains('open');
+            closeAllAudioMenus();
+            if (!isOpen) {
+                micMenu.classList.add('open');
+                micBtn.classList.add('active');
+                positionMenuByButton(micBtn, micMenu);
+            }
+        });
+    }
+
+    if (speakerBtn && speakerMenu) {
+        speakerBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const isOpen = speakerMenu.classList.contains('open');
+            closeAllAudioMenus();
+            if (!isOpen) {
+                speakerMenu.classList.add('open');
+                speakerBtn.classList.add('active');
+                positionMenuByButton(speakerBtn, speakerMenu);
+            }
+        });
+    }
+
+    // Close menus when clicking outside
+    document.addEventListener('click', () => {
+        closeAllAudioMenus();
+    });
+
+    // Prevent menu clicks from bubbling to document
+    if (micMenu) micMenu.addEventListener('click', (e) => e.stopPropagation());
+    if (speakerMenu) speakerMenu.addEventListener('click', (e) => e.stopPropagation());
+}
+
+function closeAllAudioMenus() {
+    document.querySelectorAll('.nav-audio-menu').forEach(m => m.classList.remove('open'));
+    document.querySelectorAll('.nav-audio-btn').forEach(b => b.classList.remove('active'));
 }
 
 // Status Management
