@@ -12,11 +12,12 @@ use crate::drift_compensator::DriftCompensator;
 use crate::jitter_buffer::{JitterBufferResult, SharedJitterBuffer};
 use crate::plc::PacketLossConcealer;
 use crate::sinc_resampler::Resampler;
-use crate::stream::Sample;
+use crate::stream::{PlaybackStream, PlaybackStreamHandle, Sample};
 use client_types::CodecPreference;
 use ringbuf::traits::{Observer, Producer};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
@@ -53,6 +54,12 @@ const GAIN_HOLD_FRAMES: u32 = 15;
 /// 0.15 gives a ~130ms time constant (smooth, no audible steps).
 const GAIN_RAMP_SPEED: f32 = 0.15;
 
+/// Command sent from the main thread to the decode thread.
+pub enum DecodeCommand {
+    /// Switch the playback (output) device. `None` = system default.
+    SwitchOutputDevice(Option<String>),
+}
+
 /// Handle to the running decode thread.
 ///
 /// When dropped, signals the thread to stop and joins it.
@@ -61,9 +68,18 @@ pub struct DecodeThreadHandle {
     thread: Option<thread::JoinHandle<()>>,
     /// Shared running flag.
     running: Arc<AtomicBool>,
+    /// Channel to send commands to the decode thread.
+    cmd_tx: mpsc::Sender<DecodeCommand>,
 }
 
 impl DecodeThreadHandle {
+    /// Switches the playback (output) device during an active call.
+    pub fn switch_output_device(&self, device_name: Option<String>) {
+        if let Err(e) = self.cmd_tx.send(DecodeCommand::SwitchOutputDevice(device_name)) {
+            warn!("Failed to send output device switch command: {e}");
+        }
+    }
+
     /// Stops the decode thread and waits for it to finish.
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
@@ -92,28 +108,40 @@ pub struct DecodeThreadConfig {
 /// Spawns the decode thread.
 ///
 /// The thread monitors the playback ring buffer fill level and decodes
-/// frames from the jitter buffer as needed.
+/// frames from the jitter buffer as needed. It also owns the CPAL
+/// playback stream handle so it can hot-swap the output device.
 ///
 /// # Arguments
 /// * `config` - Decode thread configuration
 /// * `producer` - Ring buffer producer (writes decoded audio for CPAL to read)
+/// * `playback_handle` - CPAL playback stream handle (kept alive by this thread)
 /// * `jitter_buffer` - Shared jitter buffer (reads packets pushed by I/O thread)
 /// * `running` - Shared flag to signal shutdown
 /// * `playback_underruns` - Counter shared with CPAL callback for underrun tracking
 pub fn spawn(
     config: DecodeThreadConfig,
     producer: ringbuf::HeapProd<Sample>,
+    playback_handle: PlaybackStreamHandle,
     jitter_buffer: SharedJitterBuffer,
     running: Arc<AtomicBool>,
     playback_underruns: Arc<AtomicU64>,
 ) -> DecodeThreadHandle {
     let running_clone = running.clone();
+    let (cmd_tx, cmd_rx) = mpsc::channel();
 
     let handle = thread::Builder::new()
         .name("audio-decode".to_string())
         .spawn(move || {
             info!("Decode thread started");
-            decode_loop(config, producer, jitter_buffer, &running_clone, &playback_underruns);
+            decode_loop(
+                config,
+                producer,
+                playback_handle,
+                jitter_buffer,
+                &running_clone,
+                &playback_underruns,
+                cmd_rx,
+            );
             info!("Decode thread exited");
         });
 
@@ -125,17 +153,27 @@ pub fn spawn(
         }
     };
 
-    DecodeThreadHandle { thread, running }
+    DecodeThreadHandle {
+        thread,
+        running,
+        cmd_tx,
+    }
 }
 
 /// Main decode loop.
-#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::needless_pass_by_value
+)]
 fn decode_loop(
     config: DecodeThreadConfig,
     mut producer: ringbuf::HeapProd<Sample>,
+    mut _playback_handle: PlaybackStreamHandle,
     jitter_buffer: SharedJitterBuffer,
     running: &AtomicBool,
     playback_underruns: &AtomicU64,
+    cmd_rx: mpsc::Receiver<DecodeCommand>,
 ) {
     // Create codec pipeline (each thread owns its own instance)
     let mut codec = match CodecPipeline::new(config.codec) {
@@ -148,10 +186,10 @@ fn decode_loop(
 
     let codec_clock_rate = codec.clock_rate();
     let codec_samples = codec.samples_per_frame();
-    let device_rate = config.device_rate;
+    let mut device_rate = config.device_rate;
     #[allow(clippy::cast_possible_truncation)]
-    let device_samples = (codec_samples as u32 * device_rate / codec_clock_rate) as usize;
-    let target_fill = device_samples * TARGET_FILL_FRAMES;
+    let mut device_samples = (codec_samples as u32 * device_rate / codec_clock_rate) as usize;
+    let mut target_fill = device_samples * TARGET_FILL_FRAMES;
 
     // Drift compensator: measure every decode cycle for fast response
     let mut drift = DriftCompensator::new(1);
@@ -440,6 +478,58 @@ fn decode_loop(
             thread::sleep(Duration::from_millis(5));
         }
 
+        // Check for commands (output device switch)
+        if let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                DecodeCommand::SwitchOutputDevice(device_name) => {
+                    info!("Decode thread: switching output device to {:?}", device_name);
+                    let mut dm = crate::device::DeviceManager::new();
+                    dm.set_output_device(device_name);
+                    match PlaybackStream::new(&dm) {
+                        Ok(new_playback) => {
+                            let new_rate = new_playback.sample_rate();
+                            let (new_handle, new_producer, _new_underruns) =
+                                new_playback.take_producer();
+
+                            // Pre-fill new ring buffer with silence for cushion
+                            // (done by decode loop naturally — target_fill will trigger decode)
+
+                            // Swap producer and playback handle
+                            producer = new_producer;
+                            _playback_handle.stop();
+                            _playback_handle = new_handle;
+
+                            if new_rate != device_rate {
+                                let old_rate = device_rate;
+                                device_rate = new_rate;
+                                #[allow(clippy::cast_possible_truncation)]
+                                {
+                                    device_samples = (codec_samples as u32 * device_rate
+                                        / codec_clock_rate)
+                                        as usize;
+                                }
+                                target_fill = device_samples * TARGET_FILL_FRAMES;
+                                resampler = Resampler::new(codec_clock_rate, device_rate);
+                                drift = DriftCompensator::new(1);
+                                info!(
+                                    "Decode thread: playback rate changed {}→{}Hz, \
+                                     using {} resampler, frame size {} samples",
+                                    old_rate,
+                                    device_rate,
+                                    resampler.algorithm_name(),
+                                    device_samples
+                                );
+                            }
+                            info!("Decode thread: output device switched successfully");
+                        }
+                        Err(e) => {
+                            warn!("Decode thread: failed to switch output device: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
         // Diagnostic logging every ~2 seconds
         if diag_timer.elapsed() >= Duration::from_secs(2) {
             let jb_stats = jitter_buffer.stats();
@@ -471,23 +561,25 @@ fn decode_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ringbuf::HeapRb;
-    use ringbuf::traits::Split;
 
     #[test]
     fn test_spawn_and_stop() {
+        // Create a real playback stream (skip if no audio device available)
+        let dm = crate::device::DeviceManager::new();
+        let playback = match PlaybackStream::new(&dm) {
+            Ok(p) => p,
+            Err(_) => return, // skip if no audio device
+        };
+        let (playback_handle, producer, underruns) = playback.take_producer();
         let running = Arc::new(AtomicBool::new(true));
         let jb = SharedJitterBuffer::new(8000, 160, 60);
-        let ring = HeapRb::<Sample>::new(48000);
-        let (producer, _consumer) = ring.split();
-        let underruns = Arc::new(AtomicU64::new(0));
 
         let config = DecodeThreadConfig {
             codec: CodecPreference::G711Ulaw,
-            device_rate: 48000,
+            device_rate: playback_handle.sample_rate(),
         };
 
-        let mut handle = spawn(config, producer, jb, running, underruns);
+        let mut handle = spawn(config, producer, playback_handle, jb, running, underruns);
 
         // Let it run briefly
         thread::sleep(Duration::from_millis(50));

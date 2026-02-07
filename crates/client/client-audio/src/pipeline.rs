@@ -16,7 +16,7 @@ use crate::file_source::FileAudioSource;
 use crate::io_thread::{self, IoThreadConfig, IoThreadHandle};
 use crate::jitter_buffer::SharedJitterBuffer;
 use crate::rtp_handler::{RtpReceiver, RtpStats, RtpTransmitter, generate_ssrc};
-use crate::stream::{PlaybackStream, PlaybackStreamHandle};
+use crate::stream::PlaybackStream;
 use crate::{AudioError, AudioResult};
 use client_types::DtmfDigit;
 use client_types::audio::CodecPreference;
@@ -103,8 +103,6 @@ pub struct AudioPipeline {
     decode_thread: Option<DecodeThreadHandle>,
     /// Handle to the running I/O thread.
     io_thread: Option<IoThreadHandle>,
-    /// Handle to the CPAL playback stream (keeps it alive).
-    playback_handle: Option<PlaybackStreamHandle>,
     /// Whether TX is muted.
     muted: Arc<AtomicBool>,
     /// Running flag for background threads.
@@ -131,7 +129,6 @@ impl AudioPipeline {
             state: PipelineState::Stopped,
             decode_thread: None,
             io_thread: None,
-            playback_handle: None,
             muted: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(Mutex::new(PipelineStats::default())),
@@ -299,6 +296,7 @@ impl AudioPipeline {
         let decode_handle = decode_thread::spawn(
             decode_config,
             producer,
+            playback_handle,
             jitter_buffer,
             self.running.clone(),
             underrun_counter.clone(),
@@ -343,10 +341,9 @@ impl AudioPipeline {
             self.running.clone(),
         );
 
-        // Store handles
+        // Store handles (playback_handle is owned by the decode thread)
         self.decode_thread = Some(decode_handle);
         self.io_thread = Some(io_handle);
-        self.playback_handle = Some(playback_handle);
         self.playback_underruns = Some(underrun_counter);
         self.has_moh_audio = has_moh;
         self.local_port = Some(local_port);
@@ -380,11 +377,8 @@ impl AudioPipeline {
             handle.stop();
         }
 
-        // Stop CPAL playback stream
-        if let Some(ref handle) = self.playback_handle {
-            handle.stop();
-        }
-        self.playback_handle = None;
+        // CPAL playback stream is owned by the decode thread and
+        // dropped when it exits — no explicit stop needed here.
 
         self.has_moh_audio = false;
         self.playback_underruns = None;
@@ -485,11 +479,15 @@ impl AudioPipeline {
 
     /// Switches the output (speaker) device.
     ///
-    /// Updates the device manager selection. Takes effect on next pipeline start.
+    /// If the pipeline is running, hot-swaps the playback stream on the
+    /// decode thread. Also stores the preference for future pipeline starts.
     #[allow(clippy::needless_pass_by_value)]
     pub fn switch_output_device(&mut self, device_name: Option<String>) -> AudioResult<()> {
         info!("Setting output device to: {:?}", device_name);
-        self.device_manager.set_output_device(device_name);
+        self.device_manager.set_output_device(device_name.clone());
+        if let Some(ref decode) = self.decode_thread {
+            decode.switch_output_device(device_name);
+        }
         Ok(())
     }
 
