@@ -48,6 +48,7 @@
 //! - [`rtp_handler`]: RTP/SRTP packet handling
 //! - [`plc`]: LPC-based packet loss concealment
 //! - [`postfilter`]: G.711 decoder-side postfilter for quantization noise
+//! - [`noise_shaper`]: G.711 encoder-side noise shaping (Appendix III)
 //! - [`audio_processing`]: AGC and noise gate for capture path
 //! - [`vad`]: Voice activity detection for discontinuous transmission
 //! - [`comfort_noise`]: Comfort noise generation during silence
@@ -75,6 +76,7 @@ pub mod dtmf_tones;
 pub mod file_source;
 pub mod io_thread;
 pub mod jitter_buffer;
+pub mod noise_shaper;
 pub mod pipeline;
 pub mod plc;
 pub mod postfilter;

@@ -17,6 +17,7 @@ use crate::pipeline::{PipelineStats, resample};
 use crate::rtcp_session::RtcpSession;
 use crate::rtp_handler::{RtpReceiver, RtpTransmitter};
 use crate::stream::CaptureStream;
+use crate::noise_shaper::{CompandingLaw, NoiseShaper};
 use crate::vad::{VadDecision, VoiceActivityDetector};
 use client_types::{CodecPreference, DtmfDigit, DtmfEvent};
 use std::net::{SocketAddr, UdpSocket};
@@ -227,6 +228,14 @@ fn io_loop(
     // Voice activity detection for discontinuous transmission
     let mut vad = VoiceActivityDetector::new();
 
+    // Encoder-side noise shaping (G.711 Appendix III)
+    let noise_shaper_law = match config.codec {
+        CodecPreference::G711Ulaw => Some(CompandingLaw::MuLaw),
+        CodecPreference::G711Alaw => Some(CompandingLaw::ALaw),
+        _ => None,
+    };
+    let mut noise_shaper = NoiseShaper::new_optional(noise_shaper_law);
+
     // RTCP session (optional — created if RTCP socket is provided)
     let mut rtcp_session =
         config
@@ -309,6 +318,7 @@ fn io_loop(
                     &mut capture,
                     &mut audio_processor,
                     &mut vad,
+                    &mut noise_shaper,
                     capture_device_samples,
                     codec_samples,
                     &stats,
@@ -480,6 +490,7 @@ fn process_capture_frame(
     capture: &mut CaptureStream,
     audio_processor: &mut AudioProcessor,
     vad: &mut VoiceActivityDetector,
+    noise_shaper: &mut NoiseShaper,
     device_samples: usize,
     codec_samples: usize,
     stats: &Arc<Mutex<PipelineStats>>,
@@ -519,11 +530,14 @@ fn process_capture_frame(
     }
 
     // Resample from device rate to codec rate (no cross-frame needed for downsampling)
-    let codec_pcm = if device_samples == codec_samples {
+    let mut codec_pcm = if device_samples == codec_samples {
         device_pcm
     } else {
         resample(&device_pcm, codec_samples, 0)
     };
+
+    // Noise shaping (G.711 only — reshapes quantization noise before encoding)
+    noise_shaper.process(&mut codec_pcm);
 
     // Encode
     let encoded = match codec.encode(&codec_pcm) {

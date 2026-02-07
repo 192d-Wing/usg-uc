@@ -165,16 +165,16 @@ RFC 3389 comfort noise payload support with VAD/DTX integration:
 
 **Files**: `comfort_noise.rs` (encode/decode), `io_thread.rs` (send CN), `decode_thread.rs` (receive CN), `rtp_handler.rs` (send_cn method), `call_manager.rs` (SDP)
 
-### Appendix III / Amendment 2: Quality Enhancement Toolbox — PARTIALLY IMPLEMENTED (3 of 4)
+### Appendix III / Amendment 2: Quality Enhancement Toolbox — FULLY IMPLEMENTED (4 of 4)
 
 Four optional tools from G.711.1 context:
 
-1. **Noise Shaping (NS)** — encoder-side, perceptually shapes quantization noise — **Not implemented** (marginal benefit at 64 kbps, risk of audible artifacts)
+1. **Noise Shaping (NS)** — encoder-side, perceptually shapes quantization noise — **IMPLEMENTED** (`noise_shaper.rs`, first-order error feedback α=0.5, NTF(z) = 1 - 0.5·z⁻¹, -6 dB DC / +3.5 dB Nyquist)
 2. **Frame Erasure Concealment (FERC)** — decoder-side, alternative to Appendix I PLC — **IMPLEMENTED** (`plc.rs`, LPC-based Levinson-Durbin with progressive attenuation and cross-fade recovery)
 3. **Noise Gate (NG)** — decoder-side, cleans up quasi-silent periods — **IMPLEMENTED** (`audio_processing.rs`, adaptive noise gate with attack/release envelope)
 4. **Postfilter (PF)** — decoder-side, reduces PCM quantization noise — **IMPLEMENTED** (`postfilter.rs`, first-order tilt filter `y[n] = x[n] - 0.4·x[n-1]`, operates at 8 kHz before resampling)
 
-**Impact**: These are enhancement tools, not required for base compliance. Three of four are implemented, providing comprehensive decoder-side quality improvement.
+**Impact**: These are enhancement tools, not required for base compliance. All four are implemented, providing comprehensive encoder- and decoder-side quality improvement.
 
 ### Amendment 1: Lossless Encoding (G.711.0) — NOT APPLICABLE
 
@@ -196,7 +196,7 @@ Points to G.711.0 for lossless compression of G.711 frames. Not relevant for sta
 | All-zero suppression (µ-law) | COMPLIANT | — |
 | Packet Loss Concealment | IMPLEMENTED (LPC-based) | — |
 | Comfort Noise Generation | IMPLEMENTED (RFC 3389) | — |
-| Quality Enhancement Toolbox | Partially implemented (3 of 4) | Low (optional) |
+| Quality Enhancement Toolbox | Fully implemented (4 of 4) | — |
 | RTP payload types | COMPLIANT (PCMU=0, PCMA=8) | — |
 | Sampling rate | COMPLIANT (8000 Hz) | — |
 | Frame size | COMPLIANT (configurable, default 20ms) | — |
@@ -208,7 +208,7 @@ Points to G.711.0 for lossless compression of G.711 frames. Not relevant for sta
 
 ### Remaining Optional Items
 
-1. **Encoder-side Noise Shaping** — Optional per Appendix III; marginal benefit at G.711's 64 kbps bitrate.
+All optional Appendix III Quality Enhancement tools are implemented.
 
 ---
 
@@ -224,3 +224,4 @@ Points to G.711.0 for lossless compression of G.711 frames. Not relevant for sta
 | 2026-02-07 | Implemented µ-law all-zero suppression (§3.2) | Claude Code |
 | 2026-02-07 | Implemented decoder-side postfilter (Appendix III §4) | Claude Code |
 | 2026-02-07 | Documented existing Noise Gate and PLC as Appendix III tools | Claude Code |
+| 2026-02-07 | Implemented encoder-side noise shaping (Appendix III §4, 4/4 complete) | Claude Code |
