@@ -453,6 +453,85 @@ impl fmt::Display for RepeatTimes {
     }
 }
 
+// ============================================================================
+// RFC 8866 §5.8 - Bandwidth (b= line)
+// ============================================================================
+
+/// Bandwidth information (b= line) per RFC 8866 §5.8.
+///
+/// Specifies the proposed bandwidth for the session or media.
+///
+/// Common bandwidth types:
+/// - `CT` - Conference Total: total bandwidth for all media at all sites
+/// - `AS` - Application Specific: bandwidth for a single media stream
+/// - `TIAS` - Transport Independent Application Specific (RFC 3890)
+///
+/// ## Example
+///
+/// ```
+/// use proto_sdp::session::BandwidthInfo;
+///
+/// let bw = BandwidthInfo::new("AS", 128);
+/// assert_eq!(bw.bwtype(), "AS");
+/// assert_eq!(bw.bandwidth(), 128);
+/// assert_eq!(bw.to_string(), "b=AS:128");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BandwidthInfo {
+    /// Bandwidth type (e.g., "CT", "AS", "TIAS").
+    bwtype: String,
+    /// Bandwidth value (kbps for CT/AS, bps for TIAS).
+    bandwidth: u64,
+}
+
+impl BandwidthInfo {
+    /// Creates a new bandwidth info.
+    #[must_use]
+    pub fn new(bwtype: impl Into<String>, bandwidth: u64) -> Self {
+        Self {
+            bwtype: bwtype.into(),
+            bandwidth,
+        }
+    }
+
+    /// Returns the bandwidth type.
+    #[must_use]
+    pub fn bwtype(&self) -> &str {
+        &self.bwtype
+    }
+
+    /// Returns the bandwidth value.
+    #[must_use]
+    pub const fn bandwidth(&self) -> u64 {
+        self.bandwidth
+    }
+
+    /// Parses bandwidth from b= line value.
+    ///
+    /// # Errors
+    /// Returns an error if the format is invalid.
+    pub fn parse(s: &str) -> SdpResult<Self> {
+        let (bwtype, bw_str) = s.split_once(':').ok_or_else(|| SdpError::ParseError {
+            reason: "bandwidth requires format 'type:value'".to_string(),
+        })?;
+
+        let bandwidth = bw_str.parse().map_err(|_| SdpError::ParseError {
+            reason: format!("invalid bandwidth value: {bw_str}"),
+        })?;
+
+        Ok(Self {
+            bwtype: bwtype.to_string(),
+            bandwidth,
+        })
+    }
+}
+
+impl fmt::Display for BandwidthInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "b={}:{}", self.bwtype, self.bandwidth)
+    }
+}
+
 /// Complete SDP session description.
 #[derive(Debug, Clone)]
 pub struct SessionDescription {
@@ -472,8 +551,14 @@ pub struct SessionDescription {
     pub phones: Vec<String>,
     /// Session-level connection data (optional).
     pub connection: Option<ConnectionData>,
+    /// Bandwidth lines (b=).
+    pub bandwidth: Vec<BandwidthInfo>,
     /// Timing.
     pub timing: Timing,
+    /// Time zone adjustments (z= line, raw value).
+    pub time_zones: Option<String>,
+    /// Encryption key (k= line, raw value, deprecated).
+    pub encryption_key: Option<String>,
     /// Session-level attributes.
     pub attributes: Vec<Attribute>,
     /// Media descriptions.
@@ -493,7 +578,10 @@ impl SessionDescription {
             emails: Vec::new(),
             phones: Vec::new(),
             connection: None,
+            bandwidth: Vec::new(),
             timing: Timing::permanent(),
+            time_zones: None,
+            encryption_key: None,
             attributes: Vec::new(),
             media: Vec::new(),
         }
@@ -610,8 +698,23 @@ impl fmt::Display for SessionDescription {
             writeln!(f, "{conn}")?;
         }
 
+        // b= lines
+        for bw in &self.bandwidth {
+            writeln!(f, "{bw}")?;
+        }
+
         // t= line
         writeln!(f, "{}", self.timing)?;
+
+        // z= line (optional)
+        if let Some(ref tz) = self.time_zones {
+            writeln!(f, "z={tz}")?;
+        }
+
+        // k= line (optional, deprecated)
+        if let Some(ref key) = self.encryption_key {
+            writeln!(f, "k={key}")?;
+        }
 
         // Session attributes
         for attr in &self.attributes {
@@ -638,7 +741,10 @@ struct SdpParseState {
     emails: Vec<String>,
     phones: Vec<String>,
     connection: Option<ConnectionData>,
+    bandwidth: Vec<BandwidthInfo>,
     timing: Option<Timing>,
+    time_zones: Option<String>,
+    encryption_key: Option<String>,
     attributes: Vec<Attribute>,
     media: Vec<MediaDescription>,
     current_media: Option<MediaDescription>,
@@ -657,11 +763,14 @@ impl SdpParseState {
             'e' => self.parse_email(value),
             'p' => self.parse_phone(value),
             'c' => self.parse_connection(value),
+            'b' => self.parse_bandwidth(value),
             't' => self.parse_timing(value),
             'r' => self.parse_repeat(value, line_num),
+            'z' => self.parse_time_zones(value),
+            'k' => self.parse_encryption_key(value),
             'a' => self.parse_attribute(value),
             'm' => self.parse_media(value),
-            _ => Ok(()), // Ignore unknown line types
+            _ => Ok(()), // Ignore truly unknown line types
         }
     }
 
@@ -684,7 +793,9 @@ impl SdpParseState {
     }
 
     fn parse_info(&mut self, value: &str) -> SdpResult<()> {
-        if self.current_media.is_none() {
+        if let Some(ref mut m) = self.current_media {
+            m.info = Some(value.to_string());
+        } else {
             self.session_info = Some(value.to_string());
         }
         Ok(())
@@ -717,6 +828,30 @@ impl SdpParseState {
 
     fn parse_timing(&mut self, value: &str) -> SdpResult<()> {
         self.timing = Some(Timing::parse(value)?);
+        Ok(())
+    }
+
+    fn parse_bandwidth(&mut self, value: &str) -> SdpResult<()> {
+        let bw = BandwidthInfo::parse(value)?;
+        if let Some(ref mut m) = self.current_media {
+            m.bandwidth.push(bw);
+        } else {
+            self.bandwidth.push(bw);
+        }
+        Ok(())
+    }
+
+    fn parse_time_zones(&mut self, value: &str) -> SdpResult<()> {
+        self.time_zones = Some(value.to_string());
+        Ok(())
+    }
+
+    fn parse_encryption_key(&mut self, value: &str) -> SdpResult<()> {
+        if let Some(ref mut m) = self.current_media {
+            m.encryption_key = Some(value.to_string());
+        } else {
+            self.encryption_key = Some(value.to_string());
+        }
         Ok(())
     }
 
@@ -786,7 +921,10 @@ impl SdpParseState {
             emails: self.emails,
             phones: self.phones,
             connection: self.connection,
+            bandwidth: self.bandwidth,
             timing,
+            time_zones: self.time_zones,
+            encryption_key: self.encryption_key,
             attributes: self.attributes,
             media: self.media,
         })
