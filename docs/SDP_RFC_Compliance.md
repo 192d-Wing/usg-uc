@@ -226,6 +226,43 @@ The client implements comprehensive SDP functionality for audio-only calls with 
 
 ---
 
+## Proto-SDP Library Crate (`crates/proto/proto-sdp`)
+
+### RFC 8866 Parser/Generator ✅ COMPLIANT
+
+**Status**: Fully compliant for all SDP line types
+**Updated**: 2026-02-07
+
+The `proto-sdp` crate provides structured SDP parsing and generation used by `client-sip-ua`, `uc-webrtc`, `uc-siprec`, and integration tests.
+
+#### Implemented ✅
+
+- **All required lines**: `v=`, `o=`, `s=`, `t=` - parsed and generated
+- **All optional lines**: `i=`, `u=`, `e=`, `p=`, `c=`, `b=`, `z=`, `k=`, `a=`, `m=` - **FIXED 2026-02-07**
+  - `b=` (Bandwidth, §5.8): Session-level and media-level bandwidth parsing/generation via `BandwidthInfo` struct
+  - `z=` (Time Zones, §5.11): Parsed and round-tripped as raw string
+  - `k=` (Encryption Key, §5.12): Parsed at session and media level (deprecated but preserved)
+  - `i=` (Media Information, §5.4): Now stored on `MediaDescription` instead of being silently dropped
+- **Repeat times** (`r=` §5.10-5.11): Full structured parsing with compact time values (`7d`, `1h`, etc.)
+- **Offer/Answer model** (RFC 3264): `generate_answer()`, `validate_answer()`, hold/resume/disable/enable
+- **Multicast** (RFC 8866 §5.7): IPv4/IPv6 multicast address parsing, TTL, address count
+- **SRTP-SDES** (RFC 4568): `CryptoAttribute` parsing/generation, cipher suite negotiation
+
+#### Security Fixes
+
+- **SRTP keying material PRNG** - **FIXED 2026-02-07**
+  - Before: Timestamp-based pseudo-random generation (predictable, unsuitable for crypto)
+  - After: `getrandom::fill()` using OS CSPRNG
+  - Impact: Keying material now cryptographically random per NIST SP 800-90A
+
+#### Code Quality Fixes (2026-02-07)
+
+- Updated all RFC 4566 references to RFC 8866 (the current standard)
+- Removed 16+ duplicate `# Errors` doc comment blocks
+- Exported `BandwidthInfo` from crate root
+
+---
+
 ## Implementation Files
 
 ### Core SDP Files
@@ -237,6 +274,17 @@ The client implements comprehensive SDP functionality for audio-only calls with 
 | `crates/client/client-audio/src/rtcp_session.rs` | RTCP SR/RR/SDES compound packets |
 | `crates/client/client-sip-ua/src/media_session.rs` | ICE/DTLS SDP attributes |
 | `crates/client/client-sip-ua/src/call_agent.rs` | SIP INVITE/re-INVITE |
+
+### Proto-SDP Library Files
+
+| File | Purpose |
+|------|---------|
+| `crates/proto/proto-sdp/src/session.rs` | SDP session parsing/generation, `BandwidthInfo`, `Timing`, `RepeatTimes` |
+| `crates/proto/proto-sdp/src/media.rs` | `MediaDescription` with b=/i=/k= support |
+| `crates/proto/proto-sdp/src/attribute.rs` | SDP attribute types and parsing |
+| `crates/proto/proto-sdp/src/srtp.rs` | SRTP-SDES crypto attributes, key generation (CSPRNG) |
+| `crates/proto/proto-sdp/src/offer_answer.rs` | RFC 3264 offer/answer model |
+| `crates/proto/proto-sdp/src/multicast.rs` | Multicast address parsing and negotiation |
 
 ---
 
@@ -377,6 +425,10 @@ The client implements comprehensive SDP functionality for audio-only calls with 
 | 2026-02-07 | **FIXED**: SSRC randomness with multi-source entropy + splitmix64 | Claude Sonnet 4.5 |
 | 2026-02-07 | **VERIFIED**: RTCP fully implemented (SR/RR/SDES compound packets) | Claude Sonnet 4.5 |
 | 2026-02-07 | Updated compliance: Overall (90%→98%), all action items completed | Claude Sonnet 4.5 |
+| 2026-02-07 | **FIXED**: proto-sdp: Added b=/z=/k= line parsing and media-level i= support | Claude Sonnet 4.5 |
+| 2026-02-07 | **FIXED**: proto-sdp: Replaced weak PRNG with OS CSPRNG for SRTP keying material | Claude Sonnet 4.5 |
+| 2026-02-07 | **FIXED**: proto-sdp: Updated RFC 4566 references to RFC 8866 | Claude Sonnet 4.5 |
+| 2026-02-07 | **FIXED**: proto-sdp: Removed duplicate doc comments, exported BandwidthInfo | Claude Sonnet 4.5 |
 
 ---
 
