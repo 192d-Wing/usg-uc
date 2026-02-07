@@ -236,7 +236,7 @@ impl CallQualityMetrics {
 
     /// Estimates MOS score from packet loss rate and jitter.
     ///
-    /// Uses simplified E-model: R = 93.2 - packet_loss_effect - jitter_effect
+    /// Uses simplified E-model: R = 93.2 - `packet_loss_effect` - `jitter_effect`
     /// Then maps R to MOS via standard formula.
     #[allow(clippy::cast_possible_truncation)]
     fn estimate_mos(packet_loss_rate: f64, jitter_ms: f32) -> f32 {
@@ -253,7 +253,7 @@ impl CallQualityMetrics {
         // Id increases with delay; assume 100ms base + jitter
         let effective_delay_ms = 100.0 + f64::from(jitter_ms);
         let id = if effective_delay_ms > 177.3 {
-            0.024 * effective_delay_ms + 0.11 * (effective_delay_ms - 177.3)
+            0.024f64.mul_add(effective_delay_ms, 0.11 * (effective_delay_ms - 177.3))
         } else {
             0.024 * effective_delay_ms
         };
@@ -266,7 +266,7 @@ impl CallQualityMetrics {
         } else if r > 100.0 {
             4.5
         } else {
-            1.0 + 0.035 * r + r * (r - 60.0) * (100.0 - r) * 7e-6
+            (r * (r - 60.0) * (100.0 - r)).mul_add(7e-6, 0.035f64.mul_add(r, 1.0))
         };
 
         mos.clamp(1.0, 5.0) as f32
