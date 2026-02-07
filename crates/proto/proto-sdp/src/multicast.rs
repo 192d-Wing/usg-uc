@@ -18,7 +18,7 @@
 //! 4. **Many-to-Many**: Multiple senders and receivers can participate
 //!    in the same multicast session.
 //!
-//! ## Connection Address Format (RFC 4566 §5.7)
+//! ## Connection Address Format (RFC 8866 §5.7)
 //!
 //! For multicast IPv4:
 //! ```text
@@ -46,7 +46,7 @@ use std::str::FromStr;
 
 /// Multicast address with TTL and address count.
 ///
-/// Per RFC 4566 §5.7, multicast connection data may include:
+/// Per RFC 8866 §5.7, multicast connection data may include:
 /// - TTL (IPv4 only): Time-to-live for multicast packets
 /// - Number of addresses: For hierarchical encoding (deprecated)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,7 +273,7 @@ impl MulticastAddress {
 
 /// Checks if a connection address is multicast.
 ///
-/// Per RFC 4566, multicast addresses are:
+/// Per RFC 8866, multicast addresses are:
 /// - IPv4: 224.0.0.0/4 (224.0.0.0 - 239.255.255.255)
 /// - IPv6: `ff00::/8`
 #[must_use]

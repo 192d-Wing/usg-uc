@@ -1,4 +1,4 @@
-//! SDP attributes per RFC 4566.
+//! SDP attributes per RFC 8866.
 
 use crate::error::{SdpError, SdpResult};
 use std::fmt;

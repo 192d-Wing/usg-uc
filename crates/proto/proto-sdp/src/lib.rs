@@ -10,7 +10,7 @@
 //!
 //! ## RFC Compliance
 //!
-//! - **RFC 4566**: SDP: Session Description Protocol
+//! - **RFC 8866**: SDP: Session Description Protocol
 //! - **RFC 3264**: An Offer/Answer Model with SDP
 //! - **RFC 5245**: ICE candidates in SDP
 //! - **RFC 4572**: Fingerprint attribute for DTLS
@@ -50,7 +50,7 @@ pub use offer_answer::{
     compute_answer_direction, disable_media_stream, enable_media_stream, generate_answer,
     hold_media_stream, resume_media_stream, validate_answer,
 };
-pub use session::{Origin, RepeatTimes, SessionDescription, TimeValue, Timing};
+pub use session::{BandwidthInfo, Origin, RepeatTimes, SessionDescription, TimeValue, Timing};
 
 // RFC 3264 §6.2 Multicast stream negotiation
 pub use multicast::{
@@ -64,7 +64,7 @@ pub use srtp::{
     extract_crypto_attributes, supports_sdes, uses_dtls_srtp,
 };
 
-/// SDP protocol version (always 0 per RFC 4566).
+/// SDP protocol version (always 0 per RFC 8866).
 pub const SDP_VERSION: u8 = 0;
 
 #[cfg(test)]

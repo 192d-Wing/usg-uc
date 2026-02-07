@@ -688,12 +688,16 @@ impl SrtpNegotiator {
     }
 
     /// Generates keying material for a cipher suite using the OS CSPRNG.
-    #[must_use]
-    pub fn generate_keying_material(cipher: CipherSuite) -> Vec<u8> {
+    ///
+    /// # Errors
+    /// Returns an error if the OS CSPRNG is unavailable.
+    pub fn generate_keying_material(cipher: CipherSuite) -> SdpResult<Vec<u8>> {
         let length = cipher.keying_material_length();
         let mut material = vec![0u8; length];
-        getrandom::fill(&mut material).expect("OS CSPRNG unavailable");
-        material
+        getrandom::fill(&mut material).map_err(|e| SdpError::ParseError {
+            reason: format!("CSPRNG unavailable: {e}"),
+        })?;
+        Ok(material)
     }
 }
 
@@ -936,8 +940,10 @@ mod tests {
 
     #[test]
     fn test_keying_material_generation() {
-        let material1 = SrtpNegotiator::generate_keying_material(CipherSuite::AesCm128HmacSha1_80);
-        let material2 = SrtpNegotiator::generate_keying_material(CipherSuite::AeadAes256Gcm);
+        let material1 =
+            SrtpNegotiator::generate_keying_material(CipherSuite::AesCm128HmacSha1_80).unwrap();
+        let material2 =
+            SrtpNegotiator::generate_keying_material(CipherSuite::AeadAes256Gcm).unwrap();
 
         assert_eq!(material1.len(), 30); // 16 + 14
         assert_eq!(material2.len(), 44); // 32 + 12

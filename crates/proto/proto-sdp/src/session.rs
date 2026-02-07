@@ -1,4 +1,4 @@
-//! SDP session description per RFC 4566.
+//! SDP session description per RFC 8866.
 
 use crate::SDP_VERSION;
 use crate::attribute::{Attribute, AttributeName};
@@ -90,7 +90,7 @@ pub struct Timing {
     pub start_time: u64,
     /// Stop time (0 = unbounded).
     pub stop_time: u64,
-    /// Repeat times (r= lines) per RFC 4566 §5.11.
+    /// Repeat times (r= lines) per RFC 8866 §5.11.
     pub repeat_times: Vec<RepeatTimes>,
 }
 
@@ -172,10 +172,10 @@ impl fmt::Display for Timing {
 }
 
 // ============================================================================
-// RFC 4566 §5.11 - Repeat Times (r= line)
+// RFC 8866 §5.11 - Repeat Times (r= line)
 // ============================================================================
 
-/// Time value that can be specified in compact form per RFC 4566 §5.10.
+/// Time value that can be specified in compact form per RFC 8866 §5.10.
 ///
 /// Values can be in seconds, or with a unit suffix:
 /// - `d` - days
@@ -286,7 +286,7 @@ impl fmt::Display for TimeValue {
     }
 }
 
-/// Repeat times (r= line) per RFC 4566 §5.11.
+/// Repeat times (r= line) per RFC 8866 §5.11.
 ///
 /// Repeat times specify periodic sessions for things like weekly broadcasts.
 /// The format is:
@@ -310,7 +310,7 @@ impl fmt::Display for TimeValue {
 /// assert_eq!(repeat.duration.as_seconds(), 3600);
 /// ```
 ///
-/// ## RFC 4566 Example
+/// ## RFC 8866 Example
 ///
 /// For a session active on Monday 10:00-11:00 and Tuesday 10:00-11:00:
 /// ```text
@@ -1037,7 +1037,7 @@ mod tests {
     }
 
     // ========================================================================
-    // RFC 4566 §5.11 - Repeat Times Tests
+    // RFC 8866 §5.11 - Repeat Times Tests
     // ========================================================================
 
     #[test]
@@ -1146,7 +1146,7 @@ mod tests {
 
     #[test]
     fn test_repeat_times_parse_rfc_example() {
-        // RFC 4566 example: weekly, 1 hour, offsets at 0 and 90000
+        // RFC 8866 example: weekly, 1 hour, offsets at 0 and 90000
         let repeat = RepeatTimes::parse("604800 3600 0 90000").unwrap();
 
         assert_eq!(repeat.interval_seconds(), 604_800);
