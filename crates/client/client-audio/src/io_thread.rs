@@ -31,6 +31,14 @@ pub struct DtmfCommand {
     pub duration_ms: u32,
 }
 
+/// Command sent from the main thread to the I/O thread.
+pub enum IoCommand {
+    /// Send a DTMF digit.
+    Dtmf(DtmfCommand),
+    /// Switch the capture (input) device. `None` = system default.
+    SwitchInputDevice(Option<String>),
+}
+
 /// Handle to the running I/O thread.
 ///
 /// When dropped, signals the thread to stop and joins it.
@@ -39,16 +47,23 @@ pub struct IoThreadHandle {
     thread: Option<thread::JoinHandle<()>>,
     /// Shared running flag.
     running: Arc<AtomicBool>,
-    /// Channel to send DTMF commands to the I/O thread.
-    dtmf_tx: mpsc::Sender<DtmfCommand>,
+    /// Channel to send commands to the I/O thread.
+    cmd_tx: mpsc::Sender<IoCommand>,
 }
 
 impl IoThreadHandle {
     /// Sends a DTMF digit via the I/O thread.
     pub fn send_dtmf(&self, digit: DtmfDigit, duration_ms: u32) {
         let cmd = DtmfCommand { digit, duration_ms };
-        if let Err(e) = self.dtmf_tx.send(cmd) {
+        if let Err(e) = self.cmd_tx.send(IoCommand::Dtmf(cmd)) {
             warn!("Failed to send DTMF command: {e}");
+        }
+    }
+
+    /// Switches the capture (input) device during an active call.
+    pub fn switch_input_device(&self, device_name: Option<String>) {
+        if let Err(e) = self.cmd_tx.send(IoCommand::SwitchInputDevice(device_name)) {
+            warn!("Failed to send device switch command: {e}");
         }
     }
 
@@ -108,7 +123,7 @@ pub fn spawn(
     running: Arc<AtomicBool>,
 ) -> IoThreadHandle {
     let running_clone = running.clone();
-    let (dtmf_tx, dtmf_rx) = mpsc::channel();
+    let (cmd_tx, cmd_rx) = mpsc::channel();
 
     let handle = thread::Builder::new()
         .name("audio-io".to_string())
@@ -124,7 +139,7 @@ pub fn spawn(
                 moh_active,
                 stats,
                 &running_clone,
-                dtmf_rx,
+                cmd_rx,
             );
             info!("I/O thread exited");
         });
@@ -140,7 +155,7 @@ pub fn spawn(
     IoThreadHandle {
         thread,
         running,
-        dtmf_tx,
+        cmd_tx,
     }
 }
 
@@ -160,7 +175,7 @@ fn io_loop(
     moh_active: Arc<AtomicBool>,
     stats: Arc<Mutex<PipelineStats>>,
     running: &AtomicBool,
-    dtmf_rx: mpsc::Receiver<DtmfCommand>,
+    cmd_rx: mpsc::Receiver<IoCommand>,
 ) {
     // Create codec pipeline for encoding (each thread owns its own)
     let mut codec = match CodecPipeline::new(config.codec) {
@@ -211,7 +226,8 @@ fn io_loop(
     // the mic captures all zeros. If DTX suppresses those, we send no RTP
     // and the remote side (symmetric RTP) won't send either → dead air.
     let dtx_warmup_duration = Duration::from_secs(5);
-    let call_start = Instant::now();
+    let mut dtx_warmup_start = Instant::now();
+    let mut prev_moh_active = false;
 
     // Diagnostic counters (logged every ~2 seconds)
     let mut diag_frames_captured: u64 = 0;
@@ -245,12 +261,22 @@ fn io_loop(
                 last_capture = Instant::now();
             }
 
-            if moh_active.load(Ordering::Relaxed) {
+            let current_moh = moh_active.load(Ordering::Relaxed);
+            if prev_moh_active && !current_moh {
+                // MOH just deactivated (resume from hold) — reset DTX warmup
+                // to force-send frames, ensuring the remote side's jitter
+                // buffer refills before DTX kicks in again.
+                dtx_warmup_start = Instant::now();
+                info!("Hold ended, resetting DTX warmup to force-send frames");
+            }
+            prev_moh_active = current_moh;
+
+            if current_moh {
                 // Music on Hold mode
                 process_moh_frame(&mut codec, &mut transmitter, &mut moh_source);
             } else if !muted.load(Ordering::Relaxed) {
                 // Normal capture mode
-                let in_warmup = call_start.elapsed() < dtx_warmup_duration;
+                let in_warmup = dtx_warmup_start.elapsed() < dtx_warmup_duration;
                 let (samples_read, max_amp, dtx) = process_capture_frame(
                     &mut codec,
                     &mut transmitter,
@@ -276,9 +302,36 @@ fn io_loop(
             }
         }
 
-        // 3. Check for DTMF commands
-        if let Ok(cmd) = dtmf_rx.try_recv() {
-            handle_dtmf(&mut transmitter, cmd);
+        // 3. Check for commands (DTMF, device switch)
+        if let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                IoCommand::Dtmf(dtmf_cmd) => {
+                    handle_dtmf(&mut transmitter, dtmf_cmd);
+                }
+                IoCommand::SwitchInputDevice(device_name) => {
+                    info!("I/O thread: switching input device to {:?}", device_name);
+                    let mut dm = crate::device::DeviceManager::new();
+                    dm.set_input_device(device_name);
+                    match CaptureStream::new(&dm) {
+                        Ok(new_capture) => {
+                            capture.stop();
+                            let new_rate = new_capture.sample_rate();
+                            capture = new_capture;
+                            if new_rate != capture_rate {
+                                info!(
+                                    "I/O thread: capture rate changed {}→{}Hz, \
+                                     resampler unchanged (codec rate stays {}Hz)",
+                                    capture_rate, new_rate, codec_clock_rate
+                                );
+                            }
+                            info!("I/O thread: input device switched successfully");
+                        }
+                        Err(e) => {
+                            warn!("I/O thread: failed to switch input device: {e}");
+                        }
+                    }
+                }
+            }
         }
 
         // 4. RTCP: send periodic Sender/Receiver Reports

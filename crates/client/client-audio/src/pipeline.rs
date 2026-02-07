@@ -471,11 +471,15 @@ impl AudioPipeline {
 
     /// Switches the input (microphone) device.
     ///
-    /// Updates the device manager selection. Takes effect on next pipeline start.
+    /// If the pipeline is running, hot-swaps the capture stream on the I/O
+    /// thread. Also stores the preference for future pipeline starts.
     #[allow(clippy::needless_pass_by_value)]
     pub fn switch_input_device(&mut self, device_name: Option<String>) -> AudioResult<()> {
         info!("Setting input device to: {:?}", device_name);
-        self.device_manager.set_input_device(device_name);
+        self.device_manager.set_input_device(device_name.clone());
+        if let Some(ref io) = self.io_thread {
+            io.switch_input_device(device_name);
+        }
         Ok(())
     }
 
