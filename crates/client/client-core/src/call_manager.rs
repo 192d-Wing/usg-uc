@@ -1515,38 +1515,44 @@ impl CallManager {
             CallState::Connected => {
                 info!(call_id = %call_id, "Processing Connected state");
 
-                // Start media session establishment (ICE + DTLS)
-                if let Some(session) = self.media_sessions.get_mut(call_id) {
-                    info!(call_id = %call_id, "Found media session, attempting to establish");
-                    if let Err(e) = session.establish(None).await {
-                        warn!(call_id = %call_id, error = %e, "Failed to establish media");
-                    }
+                // If audio session already exists (e.g. resume from hold),
+                // skip starting a new one — the existing pipeline is still running.
+                if self.audio_sessions.contains_key(call_id) {
+                    info!(call_id = %call_id, "Audio session already active, skipping start");
                 } else {
-                    warn!(call_id = %call_id, "No media session found for call");
-                }
-
-                // Start audio session when call connects
-                // Get remote address from media session - either from ICE or from SDP parsing
-                let remote_addr = self.media_sessions.get(call_id).and_then(|session| {
-                    // For non-ICE calls, remote_addr is set from SDP c=/m= lines
-                    // For ICE calls, it's set after ICE connectivity check completes
-                    let addr = session.remote_addr();
-                    if addr.is_none() {
-                        warn!(
-                            call_id = %call_id,
-                            "No remote media address available"
-                        );
+                    // Start media session establishment (ICE + DTLS)
+                    if let Some(session) = self.media_sessions.get_mut(call_id) {
+                        info!(call_id = %call_id, "Found media session, attempting to establish");
+                        if let Err(e) = session.establish(None).await {
+                            warn!(call_id = %call_id, error = %e, "Failed to establish media");
+                        }
+                    } else {
+                        warn!(call_id = %call_id, "No media session found for call");
                     }
-                    addr
-                });
 
-                if let Some(addr) = remote_addr {
-                    info!(call_id = %call_id, remote_addr = %addr, "Starting audio session");
-                    if let Err(e) = self.start_audio_session(call_id, addr).await {
-                        warn!(call_id = %call_id, error = %e, "Failed to start audio");
+                    // Start audio session when call connects
+                    // Get remote address from media session - either from ICE or from SDP parsing
+                    let remote_addr = self.media_sessions.get(call_id).and_then(|session| {
+                        // For non-ICE calls, remote_addr is set from SDP c=/m= lines
+                        // For ICE calls, it's set after ICE connectivity check completes
+                        let addr = session.remote_addr();
+                        if addr.is_none() {
+                            warn!(
+                                call_id = %call_id,
+                                "No remote media address available"
+                            );
+                        }
+                        addr
+                    });
+
+                    if let Some(addr) = remote_addr {
+                        info!(call_id = %call_id, remote_addr = %addr, "Starting audio session");
+                        if let Err(e) = self.start_audio_session(call_id, addr).await {
+                            warn!(call_id = %call_id, error = %e, "Failed to start audio");
+                        }
+                    } else {
+                        error!(call_id = %call_id, "Cannot start audio: no remote address");
                     }
-                } else {
-                    error!(call_id = %call_id, "Cannot start audio: no remote address");
                 }
             }
             CallState::Terminated => {
