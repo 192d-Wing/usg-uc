@@ -42,9 +42,6 @@ impl Origin {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     pub fn parse(s: &str) -> SdpResult<Self> {
         let parts: Vec<&str> = s.split_whitespace().collect();
         if parts.len() != 6 {
@@ -140,9 +137,6 @@ impl Timing {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     pub fn parse(s: &str) -> SdpResult<Self> {
         let parts: Vec<&str> = s.split_whitespace().collect();
         if parts.len() != 2 {
@@ -228,9 +222,6 @@ impl TimeValue {
     }
 
     /// Parses a time value from a string (compact form supported).
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     ///
     /// # Errors
     /// Returns an error if the operation fails.
@@ -364,9 +355,6 @@ impl RepeatTimes {
     }
 
     /// Parses repeat times from r= line value.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     ///
     /// # Errors
     /// Returns an error if the operation fails.

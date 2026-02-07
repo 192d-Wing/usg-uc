@@ -557,9 +557,6 @@ pub enum HoldType {
 ///
 /// # Errors
 /// Returns an error if the operation fails.
-///
-/// # Errors
-/// Returns an error if the operation fails.
 pub fn disable_media_stream(sdp: &mut SessionDescription, media_index: usize) -> SdpResult<()> {
     let media = sdp
         .media

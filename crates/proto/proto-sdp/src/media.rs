@@ -175,9 +175,6 @@ impl ConnectionData {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     pub fn parse(s: &str) -> SdpResult<Self> {
         let parts: Vec<&str> = s.split_whitespace().collect();
         if parts.len() != 3 {
@@ -330,9 +327,6 @@ impl MediaDescription {
     }
 
     /// Parses a media description from an m= line.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     ///
     /// # Errors
     /// Returns an error if the operation fails.

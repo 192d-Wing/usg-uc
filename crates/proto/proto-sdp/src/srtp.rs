@@ -161,9 +161,6 @@ impl KeyParams {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     pub fn from_base64(encoded: &str) -> SdpResult<Self> {
         let key_material = BASE64
             .decode(encoded)
@@ -248,9 +245,6 @@ impl KeyParams {
     }
 
     /// Validates the keying material length against a cipher suite.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     ///
     /// # Errors
     /// Returns an error if the operation fails.
@@ -363,9 +357,6 @@ impl SessionParams {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     pub fn parse(s: &str) -> SdpResult<Self> {
         let mut params = Self::new();
 
@@ -475,9 +466,6 @@ impl CryptoAttribute {
     }
 
     /// Parses a crypto attribute value (without the "crypto:" prefix).
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     ///
     /// # Errors
     /// Returns an error if the operation fails.
@@ -599,9 +587,6 @@ impl CryptoAttribute {
     }
 
     /// Validates this crypto attribute.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     ///
     /// # Errors
     /// Returns an error if the operation fails.

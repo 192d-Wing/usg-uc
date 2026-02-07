@@ -72,12 +72,6 @@ impl MulticastAddress {
     /// # Errors
     ///
     /// Returns error if address is not a valid IPv4 multicast address.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     pub fn new_ipv4(address: &str, ttl: u8) -> SdpResult<Self> {
         let addr: Ipv4Addr = address.parse().map_err(|_| SdpError::InvalidConnection {
             reason: format!("invalid IPv4 address: {address}"),
@@ -106,12 +100,6 @@ impl MulticastAddress {
     /// # Errors
     ///
     /// Returns error if address is not a valid IPv6 multicast address.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     pub fn new_ipv6(address: &str) -> SdpResult<Self> {
         let addr: Ipv6Addr = address.parse().map_err(|_| SdpError::InvalidConnection {
             reason: format!("invalid IPv6 address: {address}"),
@@ -136,9 +124,6 @@ impl MulticastAddress {
     /// Handles formats:
     /// - IPv4: `<address>/<ttl>` or `<address>/<ttl>/<num>`
     /// - IPv6: `<address>` or `<address>/<num>`
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     ///
     /// # Errors
     /// Returns an error if the operation fails.
