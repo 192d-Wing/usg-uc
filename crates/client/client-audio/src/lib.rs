@@ -47,6 +47,7 @@
 //! - [`jitter_buffer`]: Adaptive jitter buffer for RTP reordering
 //! - [`rtp_handler`]: RTP/SRTP packet handling
 //! - [`plc`]: LPC-based packet loss concealment
+//! - [`postfilter`]: G.711 decoder-side postfilter for quantization noise
 //! - [`audio_processing`]: AGC and noise gate for capture path
 //! - [`vad`]: Voice activity detection for discontinuous transmission
 //! - [`comfort_noise`]: Comfort noise generation during silence
@@ -76,6 +77,7 @@ pub mod io_thread;
 pub mod jitter_buffer;
 pub mod pipeline;
 pub mod plc;
+pub mod postfilter;
 pub mod ringtone;
 pub mod rtcp_session;
 pub mod rtp_handler;

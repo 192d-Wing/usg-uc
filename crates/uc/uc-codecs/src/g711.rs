@@ -68,7 +68,13 @@ impl G711Ulaw {
         let mantissa = ((pcm_val >> (exponent + 3)) & 0x0F) as u8;
 
         // Combine and complement
-        !(sign | (exponent << 4) | mantissa)
+        let encoded = !(sign | (exponent << 4) | mantissa);
+
+        // ITU-T G.711 §3.2: all-zero suppression.
+        // 0x00 can be misinterpreted as idle/lost on TDM networks.
+        // 0x02 decodes to the same segment (exp=7, mant=13 vs mant=15),
+        // producing -7519 instead of -8031 — only 512 LSB difference.
+        if encoded == 0x00 { 0x02 } else { encoded }
     }
 
     /// Decodes a single mu-law sample to PCM.
@@ -366,8 +372,10 @@ mod tests {
     fn test_ulaw_encode_decode_roundtrip() {
         let codec = G711Ulaw::new();
 
-        // Test various sample values
-        let samples = [0i16, 100, 1000, 10000, 32000, -100, -1000, -10000, -32000];
+        // Test various sample values.
+        // Note: extreme negative values near -32635 are affected by §3.2 all-zero
+        // suppression (0x00→0x02), which maps them to a different quantization level.
+        let samples = [0i16, 100, 1000, 10000, 32000, -100, -1000, -10000, -20000];
 
         for &original in &samples {
             let encoded = G711Ulaw::encode_sample(original);
@@ -533,14 +541,32 @@ mod tests {
         assert_eq!(G711Ulaw::encode_sample(32635), 0x80);
 
         // Maximum negative: -32635 → abs=32635, biased=32767 → exp=7, mant=15
-        // (0x80 | 0x70 | 0x0F) = 0xFF → ~0xFF = 0x00
-        assert_eq!(G711Ulaw::encode_sample(-32635), 0x00);
+        // (0x80 | 0x70 | 0x0F) = 0xFF → ~0xFF = 0x00 → suppressed to 0x02 (§3.2)
+        assert_eq!(G711Ulaw::encode_sample(-32635), 0x02);
 
         // Verify clipping: values beyond 32635 clip to the same codeword
         assert_eq!(
             G711Ulaw::encode_sample(32767),
             G711Ulaw::encode_sample(32635)
         );
+    }
+
+    /// ITU-T G.711 §3.2: all-zero suppression for µ-law.
+    /// Encoded value 0x00 must never appear in the output stream.
+    #[test]
+    fn test_ulaw_all_zero_suppression() {
+        // The only input that would naturally produce 0x00 is -32635 (and clipped values)
+        assert_eq!(G711Ulaw::encode_sample(-32635), 0x02);
+        assert_eq!(G711Ulaw::encode_sample(-32767), 0x02); // clips to same
+
+        // Verify no i16 input produces 0x00
+        for sample in i16::MIN..=i16::MAX {
+            assert_ne!(
+                G711Ulaw::encode_sample(sample),
+                0x00,
+                "All-zero suppression failed for sample {sample}"
+            );
+        }
     }
 
     /// ITU-T G.711: A-law even-bit inversion (XOR 0x55) pattern.
@@ -636,6 +662,12 @@ mod tests {
                 // 0x7F is "negative zero" — decodes to 0, re-encodes to 0xFF (positive zero)
                 assert_eq!(decoded, 0, "µ-law 0x7F should decode to 0");
                 assert_eq!(reencoded, 0xFF, "zero should re-encode to 0xFF");
+            } else if encoded == 0x00 {
+                // §3.2 all-zero suppression: 0x00 decodes to -32124, re-encodes to 0x02
+                assert_eq!(
+                    reencoded, 0x02,
+                    "0x00 should re-encode to 0x02 (all-zero suppression)"
+                );
             } else {
                 assert_eq!(
                     encoded, reencoded,

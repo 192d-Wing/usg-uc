@@ -11,6 +11,7 @@ use crate::comfort_noise::{ComfortNoiseGenerator, decode_cn_payload};
 use crate::drift_compensator::DriftCompensator;
 use crate::jitter_buffer::{JitterBufferResult, SharedJitterBuffer};
 use crate::plc::PacketLossConcealer;
+use crate::postfilter::Postfilter;
 use crate::sinc_resampler::Resampler;
 use crate::stream::{PlaybackStream, PlaybackStreamHandle, Sample};
 use client_types::CodecPreference;
@@ -219,6 +220,8 @@ fn decode_loop(
 
     // LPC-based packet loss concealment
     let mut plc = PacketLossConcealer::new(codec_samples);
+    // Decoder-side postfilter: reduces G.711 quantization noise
+    let mut postfilter = Postfilter::new();
     // Comfort noise for remote DTX (jitter buffer empty for extended periods)
     let mut cng = ComfortNoiseGenerator::new();
     let mut consecutive_empty: u32 = 0;
@@ -334,6 +337,10 @@ fn decode_loop(
                         } else {
                             plc.good_frame(&codec_vec);
                         }
+
+                        // Postfilter: reduce G.711 quantization noise
+                        // (operates at codec rate before resampling for maximum effect)
+                        postfilter.process(&mut codec_vec);
 
                         // Resample from codec rate to device rate
                         let device_pcm =

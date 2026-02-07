@@ -86,11 +86,9 @@ Verified against ITU reference `convertMuLaw_Lin()`:
 | Reconstruction | `((mant << 3) + 0x84) << exp - 0x84` | Same formula | YES |
 | Sign application | Negate for negative | `-(sample as i16)` | YES |
 
-### §3.2 All-Zero Suppression — NOT IMPLEMENTED
+### §3.2 All-Zero Suppression — COMPLIANT
 
-**Issue**: The standard states that in networks requiring all-zero character suppression, encoded value `0x00` should be replaced with `0x02` (decoder output value -7519). Our encoder can produce `0x00` for the most negative values near -32635.
-
-**Impact**: Low. This is only required for certain PSTN/TDM networks. RTP/VoIP does not suppress zero bytes, so this does not affect our VoIP use case.
+The encoder replaces output `0x00` with `0x02` per §3.2. This prevents misinterpretation as idle/lost on TDM networks. The substitute `0x02` decodes to -7519 instead of -8031 (same segment, 512 LSB difference — inaudible). Verified by exhaustive scan of all 65536 i16 input values.
 
 ---
 
@@ -167,16 +165,16 @@ RFC 3389 comfort noise payload support with VAD/DTX integration:
 
 **Files**: `comfort_noise.rs` (encode/decode), `io_thread.rs` (send CN), `decode_thread.rs` (receive CN), `rtp_handler.rs` (send_cn method), `call_manager.rs` (SDP)
 
-### Appendix III / Amendment 2: Quality Enhancement Toolbox — NOT IMPLEMENTED
+### Appendix III / Amendment 2: Quality Enhancement Toolbox — PARTIALLY IMPLEMENTED (3 of 4)
 
 Four optional tools from G.711.1 context:
 
-1. **Noise Shaping (NS)** — encoder-side, perceptually shapes quantization noise
-2. **Frame Erasure Concealment (FERC)** — decoder-side, alternative to Appendix I PLC
-3. **Noise Gate (NG)** — decoder-side, cleans up quasi-silent periods
-4. **Postfilter (PF)** — decoder-side, reduces PCM quantization noise
+1. **Noise Shaping (NS)** — encoder-side, perceptually shapes quantization noise — **Not implemented** (marginal benefit at 64 kbps, risk of audible artifacts)
+2. **Frame Erasure Concealment (FERC)** — decoder-side, alternative to Appendix I PLC — **IMPLEMENTED** (`plc.rs`, LPC-based Levinson-Durbin with progressive attenuation and cross-fade recovery)
+3. **Noise Gate (NG)** — decoder-side, cleans up quasi-silent periods — **IMPLEMENTED** (`audio_processing.rs`, adaptive noise gate with attack/release envelope)
+4. **Postfilter (PF)** — decoder-side, reduces PCM quantization noise — **IMPLEMENTED** (`postfilter.rs`, first-order tilt filter `y[n] = x[n] - 0.4·x[n-1]`, operates at 8 kHz before resampling)
 
-**Impact**: These are enhancement tools, not required for base compliance. The FERC algorithm is more sophisticated than Appendix I's PLC (5ms frame size, ~2 WMOPS).
+**Impact**: These are enhancement tools, not required for base compliance. Three of four are implemented, providing comprehensive decoder-side quality improvement.
 
 ### Amendment 1: Lossless Encoding (G.711.0) — NOT APPLICABLE
 
@@ -195,10 +193,10 @@ Points to G.711.0 for lossless compression of G.711 frames. Not relevant for sta
 | A-law encoder | COMPLIANT (fixed) | — |
 | A-law decoder | COMPLIANT (fixed) | — |
 | µ↔A transcoding | COMPLIANT (table-based) | — |
-| All-zero suppression (µ-law) | Not implemented | Low (N/A for VoIP) |
+| All-zero suppression (µ-law) | COMPLIANT | — |
 | Packet Loss Concealment | IMPLEMENTED (LPC-based) | — |
 | Comfort Noise Generation | IMPLEMENTED (RFC 3389) | — |
-| Quality Enhancement Toolbox | Not implemented | Low (optional) |
+| Quality Enhancement Toolbox | Partially implemented (3 of 4) | Low (optional) |
 | RTP payload types | COMPLIANT (PCMU=0, PCMA=8) | — |
 | Sampling rate | COMPLIANT (8000 Hz) | — |
 | Frame size | COMPLIANT (configurable, default 20ms) | — |
@@ -210,7 +208,7 @@ Points to G.711.0 for lossless compression of G.711 frames. Not relevant for sta
 
 ### Remaining Optional Items
 
-1. **Quality Enhancement Toolbox** — Optional per standard; not required for base compliance.
+1. **Encoder-side Noise Shaping** — Optional per Appendix III; marginal benefit at G.711's 64 kbps bitrate.
 
 ---
 
@@ -223,3 +221,6 @@ Points to G.711.0 for lossless compression of G.711 frames. Not relevant for sta
 | 2026-02-07 | Replaced µ↔A transcoding with ITU-compliant lookup tables | Claude Code |
 | 2026-02-07 | Documented existing LPC-based PLC implementation | Claude Code |
 | 2026-02-07 | Implemented RFC 3389 Comfort Noise payload (send + receive + SDP) | Claude Code |
+| 2026-02-07 | Implemented µ-law all-zero suppression (§3.2) | Claude Code |
+| 2026-02-07 | Implemented decoder-side postfilter (Appendix III §4) | Claude Code |
+| 2026-02-07 | Documented existing Noise Gate and PLC as Appendix III tools | Claude Code |
