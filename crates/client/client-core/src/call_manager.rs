@@ -91,6 +91,10 @@ pub struct CallManager {
     negotiated_codecs: HashMap<String, CodecPreference>,
     /// Effective local media address per call (what was advertised in SDP).
     effective_media_addrs: HashMap<String, SocketAddr>,
+    /// Selected input device name (persists across calls).
+    selected_input_device: Option<String>,
+    /// Selected output device name (persists across calls).
+    selected_output_device: Option<String>,
 }
 
 /// Events emitted by the call manager.
@@ -220,6 +224,8 @@ impl CallManager {
             moh_file_path: None,
             negotiated_codecs: HashMap::new(),
             effective_media_addrs: HashMap::new(),
+            selected_input_device: None,
+            selected_output_device: None,
         }
     }
 
@@ -1152,18 +1158,21 @@ impl CallManager {
     /// # Arguments
     /// * `device_name` - Name of the new input device, or None for default
     pub fn switch_input_device(&mut self, device_name: Option<String>) -> AppResult<()> {
-        let call_id = self
+        info!(device = ?device_name, "Switching input device");
+
+        // Also update the active session if one exists
+        if let Some(session) = self
             .focused_call_id
             .as_ref()
-            .ok_or_else(|| AppError::Sip("No active call".to_string()))?;
+            .and_then(|id| self.audio_sessions.get_mut(id))
+        {
+            session.switch_input_device(device_name.clone())?;
+        }
 
-        let session = self
-            .audio_sessions
-            .get_mut(call_id)
-            .ok_or_else(|| AppError::Audio("No audio session for call".to_string()))?;
+        // Always persist the preference for future calls
+        self.selected_input_device = device_name;
 
-        info!(device = ?device_name, "Switching input device");
-        session.switch_input_device(device_name)
+        Ok(())
     }
 
     /// Switches the output (speaker) device for the active call.
@@ -1173,32 +1182,43 @@ impl CallManager {
     /// # Arguments
     /// * `device_name` - Name of the new output device, or None for default
     pub fn switch_output_device(&mut self, device_name: Option<String>) -> AppResult<()> {
-        let call_id = self
+        info!(device = ?device_name, "Switching output device");
+
+        // Also update the active session if one exists
+        if let Some(session) = self
             .focused_call_id
             .as_ref()
-            .ok_or_else(|| AppError::Sip("No active call".to_string()))?;
+            .and_then(|id| self.audio_sessions.get_mut(id))
+        {
+            session.switch_output_device(device_name.clone())?;
+        }
 
-        let session = self
-            .audio_sessions
-            .get_mut(call_id)
-            .ok_or_else(|| AppError::Audio("No audio session for call".to_string()))?;
+        // Always persist the preference for future calls
+        self.selected_output_device = device_name;
 
-        info!(device = ?device_name, "Switching output device");
-        session.switch_output_device(device_name)
+        Ok(())
     }
 
-    /// Returns the current input device name for the active call.
+    /// Returns the current input device name (from active call or stored preference).
     pub fn current_input_device(&self) -> Option<String> {
-        let call_id = self.focused_call_id.as_ref()?;
-        let session = self.audio_sessions.get(call_id)?;
-        session.input_device_name().map(String::from)
+        // Try active session first, fall back to stored preference
+        self.focused_call_id
+            .as_ref()
+            .and_then(|id| self.audio_sessions.get(id))
+            .and_then(|session| session.input_device_name())
+            .map(String::from)
+            .or_else(|| self.selected_input_device.clone())
     }
 
-    /// Returns the current output device name for the active call.
+    /// Returns the current output device name (from active call or stored preference).
     pub fn current_output_device(&self) -> Option<String> {
-        let call_id = self.focused_call_id.as_ref()?;
-        let session = self.audio_sessions.get(call_id)?;
-        session.output_device_name().map(String::from)
+        // Try active session first, fall back to stored preference
+        self.focused_call_id
+            .as_ref()
+            .and_then(|id| self.audio_sessions.get(id))
+            .and_then(|session| session.output_device_name())
+            .map(String::from)
+            .or_else(|| self.selected_output_device.clone())
     }
 
     /// Puts the focused call on hold.
@@ -1400,8 +1420,15 @@ impl CallManager {
     ) -> AppResult<()> {
         info!(call_id = %call_id, remote = %remote_addr, "Starting audio session");
 
-        // Create audio session
+        // Create audio session and apply stored device preferences
         let mut audio_session = AudioSession::new(self.audio_event_tx.clone());
+
+        if let Some(ref name) = self.selected_input_device {
+            let _ = audio_session.switch_input_device(Some(name.clone()));
+        }
+        if let Some(ref name) = self.selected_output_device {
+            let _ = audio_session.switch_output_device(Some(name.clone()));
+        }
 
         // Use the negotiated codec from SDP answer if available, otherwise fall back to preferred
         let codec = self
