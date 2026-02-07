@@ -44,7 +44,7 @@ pub mod translator;
 
 pub use error::{RtpError, RtpResult};
 pub use packet::{RtpHeader, RtpPacket};
-pub use rtcp::{RtcpHeader, RtcpPacket, RtcpType, ReceptionReport, SenderInfo};
+pub use rtcp::{ReceptionReport, RtcpHeader, RtcpPacket, RtcpType, SenderInfo};
 pub use scheduler::{
     INITIAL_AVG_RTCP_SIZE, IntervalBounds, RTCP_BANDWIDTH_FRACTION, RTCP_COMPENSATION_FACTOR,
     RTCP_MIN_INTERVAL_SECS, RTCP_SENDER_BANDWIDTH_FRACTION, RtcpScheduler, SessionParams,

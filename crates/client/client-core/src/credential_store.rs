@@ -210,8 +210,10 @@ impl CredentialStore {
         if self.encryption_key.is_none() {
             // Derive key from machine-specific data
             // We use: hostname + username + config dir path as the input key material
-            let hostname = hostname::get()
-                .map_or_else(|_| "unknown".to_string(), |h| h.to_string_lossy().to_string());
+            let hostname = hostname::get().map_or_else(
+                |_| "unknown".to_string(),
+                |h| h.to_string_lossy().to_string(),
+            );
             let username = whoami::username();
             let config_path = self.config_dir.to_string_lossy();
 
@@ -230,8 +232,7 @@ impl CredentialStore {
         }
 
         // Safe because we just set it
-        self
-            .encryption_key
+        self.encryption_key
             .as_ref()
             .ok_or_else(|| AppError::Settings("Encryption key not initialized".to_string()))
     }

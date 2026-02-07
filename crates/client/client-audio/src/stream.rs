@@ -252,12 +252,20 @@ impl PlaybackStream {
             .map_err(|e| AudioError::StreamError(format!("Failed to get config: {e}")))?;
 
         let stream = match supported_config.sample_format() {
-            SampleFormat::I16 => {
-                build_output_stream_i16(&device, &config, consumer, is_running_clone, underrun_clone)?
-            }
-            SampleFormat::F32 => {
-                build_output_stream_f32(&device, &config, consumer, is_running_clone, underrun_clone)?
-            }
+            SampleFormat::I16 => build_output_stream_i16(
+                &device,
+                &config,
+                consumer,
+                is_running_clone,
+                underrun_clone,
+            )?,
+            SampleFormat::F32 => build_output_stream_f32(
+                &device,
+                &config,
+                consumer,
+                is_running_clone,
+                underrun_clone,
+            )?,
             format => {
                 return Err(AudioError::StreamError(format!(
                     "Unsupported sample format: {format:?}"
@@ -320,7 +328,13 @@ impl PlaybackStream {
     /// with the CPAL callback and tracks how many callbacks had buffer underruns.
     /// After calling this, use the returned producer directly instead of `write()`.
     #[allow(clippy::used_underscore_binding)]
-    pub fn take_producer(self) -> (PlaybackStreamHandle, ringbuf::HeapProd<Sample>, Arc<AtomicU64>) {
+    pub fn take_producer(
+        self,
+    ) -> (
+        PlaybackStreamHandle,
+        ringbuf::HeapProd<Sample>,
+        Arc<AtomicU64>,
+    ) {
         let handle = PlaybackStreamHandle {
             _stream: self._stream,
             is_running: self.is_running,

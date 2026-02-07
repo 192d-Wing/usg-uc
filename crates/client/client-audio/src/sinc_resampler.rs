@@ -170,7 +170,11 @@ impl FractionalSincResampler {
     ///
     /// The exact count is `round(input.len() * ratio)`. The internal phase
     /// accumulator ensures sample-accurate timing across frames.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
     pub fn process(&mut self, input: &[i16]) -> Vec<i16> {
         let output_len = ((input.len() as f64) * self.ratio).round() as usize;
         self.process_inner(input, output_len)
@@ -437,7 +441,10 @@ mod tests {
         let mut resampler = SincResampler::new(6);
         let input = vec![0i16; 160];
         let output = resampler.process(&input);
-        assert!(output.iter().all(|&s| s == 0), "Silence should produce silence");
+        assert!(
+            output.iter().all(|&s| s == 0),
+            "Silence should produce silence"
+        );
     }
 
     #[test]
@@ -529,10 +536,7 @@ mod tests {
     #[test]
     fn test_kaiser_window_center() {
         let val = kaiser_window(24, 49, 5.0);
-        assert!(
-            (val - 1.0).abs() < 0.001,
-            "Center should be 1.0, got {val}"
-        );
+        assert!((val - 1.0).abs() < 0.001, "Center should be 1.0, got {val}");
     }
 
     #[test]

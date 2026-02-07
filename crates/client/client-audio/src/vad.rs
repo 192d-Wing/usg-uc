@@ -171,7 +171,9 @@ impl VoiceActivityDetector {
         // Only adapt if energy is reasonable (not a burst of noise)
         if energy < self.noise_floor * SPEECH_THRESHOLD_RATIO {
             self.noise_floor += (energy - self.noise_floor) * NOISE_FLOOR_ADAPT_RATE;
-            self.noise_floor = self.noise_floor.clamp(MIN_ENERGY_THRESHOLD, MAX_NOISE_FLOOR);
+            self.noise_floor = self
+                .noise_floor
+                .clamp(MIN_ENERGY_THRESHOLD, MAX_NOISE_FLOOR);
         }
     }
 }
@@ -197,7 +199,8 @@ fn compute_zcr(pcm: &[i16]) -> f32 {
     if pcm.len() < 2 {
         return 0.0;
     }
-    let crossings = pcm.windows(2)
+    let crossings = pcm
+        .windows(2)
         .filter(|w| (w[0] >= 0) != (w[1] >= 0))
         .count();
     crossings as f32 / (pcm.len() - 1) as f32
@@ -237,8 +240,8 @@ mod tests {
         let signal: Vec<i16> = (0..160)
             .map(|i| {
                 #[allow(clippy::cast_possible_truncation)]
-                let s = (f64::sin(2.0 * std::f64::consts::PI * 200.0
-                    * f64::from(i) / 8000.0) * 5000.0) as i16;
+                let s = (f64::sin(2.0 * std::f64::consts::PI * 200.0 * f64::from(i) / 8000.0)
+                    * 5000.0) as i16;
                 s
             })
             .collect();
@@ -319,8 +322,8 @@ mod tests {
         let signal: Vec<i16> = (0..160)
             .map(|i| {
                 #[allow(clippy::cast_possible_truncation)]
-                let s = (f64::sin(2.0 * std::f64::consts::PI * 200.0
-                    * f64::from(i) / 8000.0) * 10000.0) as i16;
+                let s = (f64::sin(2.0 * std::f64::consts::PI * 200.0 * f64::from(i) / 8000.0)
+                    * 10000.0) as i16;
                 s
             })
             .collect();
@@ -353,10 +356,8 @@ mod tests {
 
         // Marginal energy: above silence threshold but below speech threshold
         // This tests that the higher threshold is needed to re-enter speech
-        let marginal: Vec<i16> = vec![
-            (MIN_ENERGY_THRESHOLD * SILENCE_THRESHOLD_RATIO * 1.1) as i16;
-            160
-        ];
+        let marginal: Vec<i16> =
+            vec![(MIN_ENERGY_THRESHOLD * SILENCE_THRESHOLD_RATIO * 1.1) as i16; 160];
         let result = vad.detect(&marginal);
         // Should still be silence because we need SPEECH_THRESHOLD_RATIO to enter speech
         assert_eq!(result, VadDecision::Silence);

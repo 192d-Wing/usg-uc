@@ -83,7 +83,10 @@ impl DecodeThreadHandle {
 
     /// Switches the playback (output) device during an active call.
     pub fn switch_output_device(&self, device_name: Option<String>) {
-        if let Err(e) = self.cmd_tx.send(DecodeCommand::SwitchOutputDevice(device_name)) {
+        if let Err(e) = self
+            .cmd_tx
+            .send(DecodeCommand::SwitchOutputDevice(device_name))
+        {
             warn!("Failed to send output device switch command: {e}");
         }
     }
@@ -177,7 +180,7 @@ pub fn spawn(
 fn decode_loop(
     config: DecodeThreadConfig,
     mut producer: ringbuf::HeapProd<Sample>,
-    mut _playback_handle: PlaybackStreamHandle,
+    mut playback_handle: PlaybackStreamHandle,
     jitter_buffer: SharedJitterBuffer,
     running: &AtomicBool,
     playback_underruns: &AtomicU64,
@@ -415,8 +418,7 @@ fn decode_loop(
                         };
 
                         // Resample concealed audio to device rate
-                        let device_pcm =
-                            resampler.process_adjusted(&concealed, device_samples);
+                        let device_pcm = resampler.process_adjusted(&concealed, device_samples);
 
                         if let Some(&last) = device_pcm.last() {
                             last_output_sample = last;
@@ -459,8 +461,7 @@ fn decode_loop(
                                 let gain = 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
                                 #[allow(clippy::cast_possible_truncation)]
                                 {
-                                    *sample =
-                                        (f32::from(last_output_sample) * gain) as i16;
+                                    *sample = (f32::from(last_output_sample) * gain) as i16;
                                 }
                             }
                             last_output_sample = 0;
@@ -490,7 +491,10 @@ fn decode_loop(
         if let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 DecodeCommand::SwitchOutputDevice(device_name) => {
-                    info!("Decode thread: switching output device to {:?}", device_name);
+                    info!(
+                        "Decode thread: switching output device to {:?}",
+                        device_name
+                    );
                     let mut dm = crate::device::DeviceManager::new();
                     dm.set_output_device(device_name);
                     match PlaybackStream::new(&dm) {
@@ -507,9 +511,9 @@ fn decode_loop(
                             new_producer.push_slice(&silence);
 
                             // Stop old stream first, then swap to new
-                            _playback_handle.stop();
+                            playback_handle.stop();
                             producer = new_producer;
-                            _playback_handle = new_handle;
+                            playback_handle = new_handle;
 
                             if new_rate != device_rate {
                                 let old_rate = device_rate;

@@ -1687,8 +1687,7 @@ impl CallAgent {
         }
 
         // Contact header for in-dialog request
-        let mut contact_uri = SipUri::new(local_addr.ip().to_string())
-            .with_port(local_addr.port());
+        let mut contact_uri = SipUri::new(local_addr.ip().to_string()).with_port(local_addr.port());
         if transport_type != "UDP" {
             contact_uri = contact_uri.with_param("transport", Some(transport_type.to_lowercase()));
         }
@@ -1754,8 +1753,7 @@ impl CallAgent {
         }
 
         // Contact header for in-dialog request
-        let mut contact_uri = SipUri::new(local_addr.ip().to_string())
-            .with_port(local_addr.port());
+        let mut contact_uri = SipUri::new(local_addr.ip().to_string()).with_port(local_addr.port());
         if transport_type != "UDP" {
             contact_uri = contact_uri.with_param("transport", Some(transport_type.to_lowercase()));
         }

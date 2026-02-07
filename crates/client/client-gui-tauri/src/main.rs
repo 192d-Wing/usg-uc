@@ -910,7 +910,9 @@ async fn get_call_quality_metrics(
 ) -> Result<Option<client_types::CallQualityMetrics>, String> {
     let client_guard = state.client.lock().await;
 
-    let result = Ok(client_guard.as_ref().and_then(client_core::ClientApp::call_quality_metrics));
+    let result = Ok(client_guard
+        .as_ref()
+        .and_then(client_core::ClientApp::call_quality_metrics));
     drop(client_guard);
     result
 }

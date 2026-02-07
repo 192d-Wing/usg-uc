@@ -680,7 +680,9 @@ impl SettingsManager {
     /// Returns information about the credential storage backend being used.
     #[cfg(feature = "digest-auth")]
     pub fn credential_storage_backend(&self) -> Option<crate::credential_store::StorageBackend> {
-        self.credential_store.as_ref().map(crate::credential_store::CredentialStore::backend)
+        self.credential_store
+            .as_ref()
+            .map(crate::credential_store::CredentialStore::backend)
     }
 }
 

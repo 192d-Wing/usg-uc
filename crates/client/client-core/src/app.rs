@@ -12,7 +12,9 @@ use crate::settings::SettingsManager;
 use crate::sip_transport::{CertVerificationMode, SipTransport, TransportEvent};
 use crate::{AppError, AppResult};
 use client_sip_ua::{RegistrationAgent, RegistrationEvent};
-use client_types::{CallInfo, CallQualityMetrics, CallState, DtmfDigit, RegistrationState, SipAccount};
+use client_types::{
+    CallInfo, CallQualityMetrics, CallState, DtmfDigit, RegistrationState, SipAccount,
+};
 use proto_sip::header::HeaderName;
 use std::net::SocketAddr;
 use std::sync::Arc;

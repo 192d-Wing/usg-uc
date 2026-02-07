@@ -97,8 +97,8 @@ pub use jitter_buffer::{
 };
 pub use pipeline::{AudioPipeline, PipelineConfig, PipelineState, PipelineStats};
 pub use plc::PacketLossConcealer;
-pub use rtcp_session::RtcpSession;
 pub use ringtone::RingtonePlayer;
+pub use rtcp_session::RtcpSession;
 pub use rtp_handler::{RtpReceiver, RtpStats, RtpTransmitter, generate_ssrc};
 pub use sinc_resampler::{FractionalSincResampler, Resampler, SincResampler};
 pub use stream::{CaptureStream, PlaybackStream, PlaybackStreamHandle, Sample};

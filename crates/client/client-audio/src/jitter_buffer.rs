@@ -575,7 +575,11 @@ const fn timestamp_diff(a: u32, b: u32) -> i32 {
 /// Computes the 95th percentile of a jitter history buffer.
 ///
 /// Uses a partial sort approach (selection) for efficiency.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 fn percentile_95(history: &VecDeque<f32>) -> f32 {
     if history.is_empty() {
         return 0.0;

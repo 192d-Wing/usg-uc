@@ -215,7 +215,7 @@ impl Default for DiameterConfig {
             verify_cert: true,
             timeout_ms: 5000,
             watchdog_interval_secs: 30,
-            vendor_id: 10415,         // 3GPP vendor ID
+            vendor_id: 10415,           // 3GPP vendor ID
             application_id: 16_777_216, // 3GPP Cx interface
         }
     }

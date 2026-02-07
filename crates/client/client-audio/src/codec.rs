@@ -6,12 +6,12 @@
 use crate::{AudioError, AudioResult};
 use client_types::CodecPreference;
 use tracing::{debug, trace};
-use uc_codecs::opus::OpusConfig;
-use uc_codecs::{AudioCodec, CodecCapability, G711Alaw, G711Ulaw, G722Codec};
 #[cfg(feature = "opus-ffi")]
 use uc_codecs::FfiOpusCodec;
 #[cfg(not(feature = "opus-ffi"))]
 use uc_codecs::OpusCodec;
+use uc_codecs::opus::OpusConfig;
+use uc_codecs::{AudioCodec, CodecCapability, G711Alaw, G711Ulaw, G722Codec};
 
 /// Maximum encoded frame size in bytes.
 pub const MAX_ENCODED_SIZE: usize = 1500;
@@ -180,7 +180,11 @@ impl CodecPipeline {
             .decode_fec(&mut self.decode_buffer)
             .map_err(|e| AudioError::CodecError(format!("FEC decode failed: {e}")))?;
 
-        trace!("FEC decoded {} samples ({})", decoded_len, self.codec.name());
+        trace!(
+            "FEC decoded {} samples ({})",
+            decoded_len,
+            self.codec.name()
+        );
         Ok(&self.decode_buffer[..decoded_len])
     }
 

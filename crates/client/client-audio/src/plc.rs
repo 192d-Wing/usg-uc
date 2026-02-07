@@ -120,12 +120,14 @@ impl PacketLossConcealer {
         let synthetic_tail = &self.history;
 
         // Cross-fade: blend synthetic tail → real frame over CROSSFADE_SAMPLES
-        let fade_len = CROSSFADE_SAMPLES.min(real_frame.len()).min(synthetic_tail.len());
+        let fade_len = CROSSFADE_SAMPLES
+            .min(real_frame.len())
+            .min(synthetic_tail.len());
         #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
         for i in 0..fade_len {
             let t = (i as f32 + 1.0) / (fade_len as f32 + 1.0);
-            let blended = f32::from(synthetic_tail[i])
-                .mul_add(1.0 - t, f32::from(real_frame[i]) * t);
+            let blended =
+                f32::from(synthetic_tail[i]).mul_add(1.0 - t, f32::from(real_frame[i]) * t);
             real_frame[i] = blended.clamp(-32768.0, 32767.0) as i16;
         }
 
@@ -314,7 +316,10 @@ mod tests {
 
         // After MAX_CONCEAL_FRAMES, should be silence
         let frame = plc.conceal();
-        assert!(frame.iter().all(|&s| s == 0), "Should be silent after max losses");
+        assert!(
+            frame.iter().all(|&s| s == 0),
+            "Should be silent after max losses"
+        );
     }
 
     #[test]

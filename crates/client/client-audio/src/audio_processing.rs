@@ -80,7 +80,7 @@ impl AudioProcessor {
     /// Call this when switching input devices to prevent stale state
     /// (e.g., gain tuned for a quiet Bluetooth mic) from affecting the
     /// first frames from the new device.
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.current_gain = 1.0;
         self.gate_open = false;
         self.gate_hold_counter = 0;

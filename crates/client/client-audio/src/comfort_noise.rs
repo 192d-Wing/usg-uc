@@ -82,8 +82,8 @@ impl ComfortNoiseGenerator {
             let scaled = white * self.target_level;
 
             // Apply simple one-pole low-pass filter for spectral shaping
-            self.lp_state = LP_FILTER_COEFF
-                .mul_add(self.lp_state, (1.0 - LP_FILTER_COEFF) * scaled);
+            self.lp_state =
+                LP_FILTER_COEFF.mul_add(self.lp_state, (1.0 - LP_FILTER_COEFF) * scaled);
 
             // Convert to i16 with clamping
             *sample = self.lp_state.clamp(-32768.0, 32767.0) as i16;

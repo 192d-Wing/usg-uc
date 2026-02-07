@@ -19,7 +19,7 @@
 use crate::jitter_buffer::JitterBufferStats;
 use crate::rtp_handler::RtpStats;
 use bytes::{BufMut, BytesMut};
-use proto_rtp::{RtcpHeader, RtcpType, ReceptionReport, SenderInfo};
+use proto_rtp::{ReceptionReport, RtcpHeader, RtcpType, SenderInfo};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -161,7 +161,10 @@ impl RtcpSession {
         // Send
         match self.socket.send_to(&compound, self.remote_addr) {
             Ok(sent) => {
-                trace!("Sent RTCP compound packet: {} bytes to {}", sent, self.remote_addr);
+                trace!(
+                    "Sent RTCP compound packet: {} bytes to {}",
+                    sent, self.remote_addr
+                );
             }
             Err(e) => {
                 trace!("RTCP send failed: {e}");
@@ -290,9 +293,9 @@ impl RtcpSession {
 
         // DLSR (delay since last SR in 1/65536 seconds)
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let dlsr = self.last_received_sr_time.map_or(0, |t| {
-            (t.elapsed().as_secs_f64() * 65536.0) as u32
-        });
+        let dlsr = self
+            .last_received_sr_time
+            .map_or(0, |t| (t.elapsed().as_secs_f64() * 65536.0) as u32);
 
         let report = ReceptionReport {
             ssrc: remote_ssrc,
