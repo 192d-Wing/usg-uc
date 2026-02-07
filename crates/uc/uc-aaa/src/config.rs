@@ -216,7 +216,7 @@ impl Default for DiameterConfig {
             timeout_ms: 5000,
             watchdog_interval_secs: 30,
             vendor_id: 10415,         // 3GPP vendor ID
-            application_id: 16777216, // 3GPP Cx interface
+            application_id: 16_777_216, // 3GPP Cx interface
         }
     }
 }

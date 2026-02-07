@@ -552,7 +552,7 @@ mod stub {
                 .field("server", &self.config.server)
                 .field("origin_host", &self.config.origin_host)
                 .field("stub", &true)
-                .finish()
+                .finish_non_exhaustive()
         }
     }
 }

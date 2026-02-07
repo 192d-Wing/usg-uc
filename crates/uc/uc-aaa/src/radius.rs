@@ -880,7 +880,7 @@ mod stub {
                 .field("backup_servers", &self.config.backup_servers.len())
                 .field("nas_identifier", &self.config.nas_identifier)
                 .field("stub", &true)
-                .finish()
+                .finish_non_exhaustive()
         }
     }
 }
