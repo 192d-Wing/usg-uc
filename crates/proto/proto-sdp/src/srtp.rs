@@ -702,31 +702,12 @@ impl SrtpNegotiator {
         offer_cryptos.first()
     }
 
-    /// Generates keying material for a cipher suite.
+    /// Generates keying material for a cipher suite using the OS CSPRNG.
     #[must_use]
     pub fn generate_keying_material(cipher: CipherSuite) -> Vec<u8> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
         let length = cipher.keying_material_length();
         let mut material = vec![0u8; length];
-
-        // Use timestamp-based pseudo-random generation
-        // Note: In production, use a proper CSPRNG
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-
-        for (i, byte) in material.iter_mut().enumerate() {
-            // Use modulo to prevent shift overflow (128 bits in u128)
-            let shift = (i * 8) % 128;
-            // Truncation is intentional: extracting byte from u128
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                *byte = ((timestamp >> shift) ^ (i as u128).wrapping_mul(17)) as u8;
-            }
-        }
-
+        getrandom::fill(&mut material).expect("OS CSPRNG unavailable");
         material
     }
 }
