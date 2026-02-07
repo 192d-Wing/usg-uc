@@ -35,12 +35,13 @@ impl RecordingId {
 
         static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+        #[allow(clippy::cast_possible_truncation)] // nanos won't overflow u64 until year 2554
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
             .as_nanos() as u64;
         let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-        Self(format!("rec-{:x}-{counter:x}", timestamp))
+        Self(format!("rec-{timestamp:x}-{counter:x}"))
     }
 
     /// Returns the ID as a string.
