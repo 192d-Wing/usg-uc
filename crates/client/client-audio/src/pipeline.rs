@@ -394,17 +394,22 @@ impl AudioPipeline {
         info!("Audio pipeline stopped");
     }
 
-    /// Sends a DTMF digit using RFC 4733 telephone-event.
+    /// Sends a DTMF digit using RFC 4733 telephone-event and/or in-band tones.
     ///
     /// The command is sent to the I/O thread via a channel; the actual
     /// packet sequence is generated there.
-    pub fn send_dtmf(&self, digit: DtmfDigit, duration_ms: u32) -> AudioResult<()> {
+    ///
+    /// # Arguments
+    /// * `digit` - The DTMF digit to send
+    /// * `duration_ms` - Duration in milliseconds
+    /// * `use_rfc2833` - Whether to send RFC 2833 packets (if false, in-band only)
+    pub fn send_dtmf(&self, digit: DtmfDigit, duration_ms: u32, use_rfc2833: bool) -> AudioResult<()> {
         let io = self
             .io_thread
             .as_ref()
             .ok_or_else(|| AudioError::ConfigError("Pipeline not running".to_string()))?;
 
-        io.send_dtmf(digit, duration_ms);
+        io.send_dtmf(digit, duration_ms, use_rfc2833);
         Ok(())
     }
 

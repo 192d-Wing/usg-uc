@@ -75,6 +75,9 @@ pub struct RtpTransmitter {
     dtmf_payload_type: u8,
     /// Current DTMF timestamp (separate from audio).
     dtmf_timestamp: AtomicU32,
+    /// Timestamp of the current DTMF event (stays constant for one event).
+    #[allow(dead_code)] // Read via atomic operations
+    dtmf_event_timestamp: AtomicU32,
 }
 
 impl RtpTransmitter {
@@ -103,6 +106,7 @@ impl RtpTransmitter {
             stats: Arc::new(Mutex::new(RtpStats::default())),
             dtmf_payload_type: DTMF_PAYLOAD_TYPE,
             dtmf_timestamp: AtomicU32::new(rand_u32()),
+            dtmf_event_timestamp: AtomicU32::new(0),
         }
     }
 
@@ -207,13 +211,20 @@ impl RtpTransmitter {
         // For DTMF, timestamp stays the same for the duration of the event
         // (it's the timestamp of when the event started)
         let ts = if marker {
-            // Start of a new event - get a new timestamp
-            self.dtmf_timestamp
-                .fetch_add(u32::from(event.duration), Ordering::Relaxed)
+            // Start of a new event - get a new timestamp and store it
+            let new_ts = self.dtmf_timestamp.load(Ordering::Relaxed);
+            self.dtmf_event_timestamp.store(new_ts, Ordering::Relaxed);
+            new_ts
         } else {
-            // Continuation - use the current timestamp without incrementing
-            self.dtmf_timestamp.load(Ordering::Relaxed) - u32::from(event.duration)
+            // Continuation/end - use the stored event timestamp
+            self.dtmf_event_timestamp.load(Ordering::Relaxed)
         };
+
+        // Advance the timestamp counter only at the end of the event
+        if event.end {
+            self.dtmf_timestamp
+                .fetch_add(u32::from(event.duration), Ordering::Relaxed);
+        }
 
         // Build RTP header with DTMF payload type
         let mut header = RtpHeader::new(self.dtmf_payload_type, seq, ts, self.ssrc);

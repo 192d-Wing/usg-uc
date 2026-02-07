@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
+use crate::dtmf_tones::DtmfToneGenerator;
 
 /// DTMF command sent from the main thread to the I/O thread.
 pub struct DtmfCommand {
@@ -30,6 +31,8 @@ pub struct DtmfCommand {
     pub digit: DtmfDigit,
     /// Duration of the tone in milliseconds.
     pub duration_ms: u32,
+    /// Whether to send RFC 2833 telephone-event packets (true) or in-band only (false).
+    pub use_rfc2833: bool,
 }
 
 /// Command sent from the main thread to the I/O thread.
@@ -54,8 +57,17 @@ pub struct IoThreadHandle {
 
 impl IoThreadHandle {
     /// Sends a DTMF digit via the I/O thread.
-    pub fn send_dtmf(&self, digit: DtmfDigit, duration_ms: u32) {
-        let cmd = DtmfCommand { digit, duration_ms };
+    ///
+    /// # Arguments
+    /// * `digit` - The DTMF digit to send
+    /// * `duration_ms` - Duration in milliseconds
+    /// * `use_rfc2833` - Whether to send RFC 2833 packets (if false, in-band only)
+    pub fn send_dtmf(&self, digit: DtmfDigit, duration_ms: u32, use_rfc2833: bool) {
+        let cmd = DtmfCommand {
+            digit,
+            duration_ms,
+            use_rfc2833,
+        };
         if let Err(e) = self.cmd_tx.send(IoCommand::Dtmf(cmd)) {
             warn!("Failed to send DTMF command: {e}");
         }
@@ -318,7 +330,7 @@ fn io_loop(
         if let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 IoCommand::Dtmf(dtmf_cmd) => {
-                    handle_dtmf(&mut transmitter, dtmf_cmd);
+                    handle_dtmf(&mut transmitter, &mut codec, dtmf_cmd);
                 }
                 IoCommand::SwitchInputDevice(device_name) => {
                     info!(
@@ -543,42 +555,82 @@ fn process_moh_frame(
     }
 }
 
-/// Handles a DTMF command by sending the full event sequence.
+/// Handles a DTMF command by sending RFC 2833 and/or in-band tones.
+///
+/// Sends DTMF using one or both methods based on negotiation:
+/// 1. RFC 2833 (RFC 4733) telephone-event packets (out-of-band) - if supported
+/// 2. In-band audio tones (ITU-T Q.23 dual-tone frequencies) - always sent
+///
+/// This ensures DTMF works with providers that support RFC 2833
+/// as well as those that only support in-band DTMF.
 #[allow(clippy::needless_pass_by_value)]
-fn handle_dtmf(transmitter: &mut RtpTransmitter, cmd: DtmfCommand) {
+fn handle_dtmf(transmitter: &mut RtpTransmitter, codec: &mut CodecPipeline, cmd: DtmfCommand) {
+    let method = if cmd.use_rfc2833 {
+        "RFC2833 + in-band"
+    } else {
+        "in-band only"
+    };
     info!(
-        "Sending DTMF digit '{}' for {}ms",
-        cmd.digit, cmd.duration_ms
+        "Sending DTMF digit '{}' for {}ms ({})",
+        cmd.digit, cmd.duration_ms, method
     );
 
     let duration = DtmfEvent::duration_from_ms(cmd.duration_ms);
+    let codec_sample_rate = 8000; // G.711 is 8kHz
+    let packet_interval_ms = 20u32;
+    let samples_per_packet = (codec_sample_rate * packet_interval_ms / 1000) as usize;
 
-    // Send initial packet with marker bit
-    let event = DtmfEvent::new(cmd.digit, 0);
-    if let Err(e) = transmitter.send_dtmf(&event, true) {
-        warn!("DTMF start send error: {e}");
-        return;
+    // Create in-band tone generator
+    let mut tone_gen = DtmfToneGenerator::new(cmd.digit, codec_sample_rate);
+
+    // Send initial RFC 2833 packet with marker bit (if supported)
+    if cmd.use_rfc2833 {
+        let event = DtmfEvent::new(cmd.digit, 0);
+        if let Err(e) = transmitter.send_dtmf(&event, true) {
+            warn!("RFC2833 start send error: {e}");
+        }
     }
 
-    // Send continuation packets every 20ms
-    let packet_interval_ms = 20u32;
-    let num_continuation = cmd.duration_ms.saturating_sub(packet_interval_ms) / packet_interval_ms;
+    // Send continuation packets every 20ms with in-band audio (and RFC 2833 if supported)
+    let num_packets = cmd.duration_ms / packet_interval_ms;
 
-    for i in 1..=num_continuation {
-        let elapsed = DtmfEvent::duration_from_ms(i * packet_interval_ms);
-        let event = DtmfEvent::new(cmd.digit, elapsed);
-        if let Err(e) = transmitter.send_dtmf(&event, false) {
-            warn!("DTMF continuation send error: {e}");
-            return;
+    for i in 0..num_packets {
+        // Generate in-band DTMF tone samples
+        let mut tone_samples = vec![0i16; samples_per_packet];
+        tone_gen.generate_samples(&mut tone_samples);
+
+        // Encode the tone samples using the active codec
+        match codec.encode(&tone_samples) {
+            Ok(encoded) => {
+                // Send as regular RTP audio packet (in-band)
+                if let Err(e) = transmitter.send(&encoded) {
+                    trace!("In-band DTMF send error: {e}");
+                }
+            }
+            Err(e) => {
+                warn!("DTMF encode error: {e}");
+            }
         }
+
+        // Also send RFC 2833 continuation packet (out-of-band) if supported
+        if cmd.use_rfc2833 && i > 0 {
+            let elapsed = DtmfEvent::duration_from_ms(i * packet_interval_ms);
+            let event = DtmfEvent::new(cmd.digit, elapsed);
+            if let Err(e) = transmitter.send_dtmf(&event, false) {
+                trace!("RFC2833 continuation send error: {e}");
+            }
+        }
+
         thread::sleep(Duration::from_millis(u64::from(packet_interval_ms)));
     }
 
-    // Send end packets (3x for reliability per RFC 4733)
-    for _ in 0..3 {
-        let event = DtmfEvent::with_end(cmd.digit, duration);
-        if let Err(e) = transmitter.send_dtmf(&event, false) {
-            warn!("DTMF end send error: {e}");
+    // Send RFC 2833 end packets (3x for reliability per RFC 4733) if supported
+    if cmd.use_rfc2833 {
+        for _ in 0..3 {
+            let event = DtmfEvent::with_end(cmd.digit, duration);
+            if let Err(e) = transmitter.send_dtmf(&event, false) {
+                trace!("RFC2833 end send error: {e}");
+            }
         }
     }
 
@@ -607,6 +659,7 @@ mod tests {
         let cmd = DtmfCommand {
             digit: DtmfDigit::Five,
             duration_ms: 100,
+            use_rfc2833: true,
         };
         assert_eq!(cmd.duration_ms, 100);
     }

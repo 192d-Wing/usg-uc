@@ -89,6 +89,8 @@ pub struct CallManager {
     moh_file_path: Option<String>,
     /// Negotiated codec per call (from SDP answer).
     negotiated_codecs: HashMap<String, CodecPreference>,
+    /// Whether telephone-event (RFC 2833) was negotiated per call.
+    telephone_event_supported: HashMap<String, bool>,
     /// Effective local media address per call (what was advertised in SDP).
     effective_media_addrs: HashMap<String, SocketAddr>,
     /// Selected input device name (persists across calls).
@@ -223,6 +225,7 @@ impl CallManager {
             is_muted: false,
             moh_file_path: None,
             negotiated_codecs: HashMap::new(),
+            telephone_event_supported: HashMap::new(),
             effective_media_addrs: HashMap::new(),
             selected_input_device: None,
             selected_output_device: None,
@@ -1100,8 +1103,20 @@ impl CallManager {
             .get(call_id)
             .ok_or_else(|| AppError::Audio("No audio session for call".to_string()))?;
 
-        info!(digit = %digit, duration_ms = duration_ms, "Sending DTMF");
-        session.send_dtmf(digit, duration_ms)
+        // Check if remote party supports RFC 2833 (default to false if not negotiated yet)
+        let use_rfc2833 = self
+            .telephone_event_supported
+            .get(call_id)
+            .copied()
+            .unwrap_or(false);
+
+        let method = if use_rfc2833 {
+            "RFC2833+in-band"
+        } else {
+            "in-band only"
+        };
+        info!(digit = %digit, duration_ms = duration_ms, method = method, "Sending DTMF");
+        session.send_dtmf(digit, duration_ms, use_rfc2833)
     }
 
     /// Transfers the focused call to another party (blind transfer).
@@ -1618,6 +1633,16 @@ impl CallManager {
             debug!(call_id = %call_id, "No codec found in SDP answer, will use preferred codec");
         }
 
+        // Check if telephone-event was negotiated for DTMF support
+        let dtmf_supported = check_telephone_event_support(sdp);
+        self.telephone_event_supported.insert(call_id.to_string(), dtmf_supported);
+
+        if dtmf_supported {
+            info!(call_id = %call_id, "✓ Remote party supports RFC 2833/4733 telephone-event for DTMF");
+        } else {
+            warn!(call_id = %call_id, "✗ Remote party does NOT support RFC 2833/4733 - using in-band DTMF only");
+        }
+
         // Parse remote media address from SDP (c= and m= lines)
         // This is used for non-ICE calls where the remote specifies its address directly
         let remote_media_addr = parse_remote_media_addr_from_sdp(sdp);
@@ -1740,10 +1765,12 @@ impl CallManager {
                  s=USG SIP Client\r\n\
                  c=IN IP4 {ip}\r\n\
                  t=0 0\r\n\
-                 m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8\r\n\
+                 m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8 101\r\n\
                  a=rtpmap:111 opus/48000/2\r\n\
                  a=rtpmap:0 PCMU/8000\r\n\
                  a=rtpmap:8 PCMA/8000\r\n\
+                 a=rtpmap:101 telephone-event/8000\r\n\
+                 a=fmtp:101 0-15\r\n\
                  a=ice-ufrag:{ufrag}\r\n\
                  a=ice-pwd:{pwd}\r\n\
                  a=fingerprint:sha-384 {fingerprint}\r\n\
@@ -1770,9 +1797,11 @@ impl CallManager {
                  s=USG SIP Client\r\n\
                  c=IN IP4 {ip}\r\n\
                  t=0 0\r\n\
-                 m=audio {port} RTP/AVP 0 8\r\n\
+                 m=audio {port} RTP/AVP 0 8 101\r\n\
                  a=rtpmap:0 PCMU/8000\r\n\
                  a=rtpmap:8 PCMA/8000\r\n\
+                 a=rtpmap:101 telephone-event/8000\r\n\
+                 a=fmtp:101 0-15\r\n\
                  a=sendrecv\r\n\
                  a=ssrc:{ssrc} cname:{cname}\r\n",
                 session_id = session_id(),
@@ -1863,10 +1892,12 @@ impl CallManager {
                  s=USG SIP Client\r\n\
                  c=IN IP4 {ip}\r\n\
                  t=0 0\r\n\
-                 m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8\r\n\
+                 m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8 101\r\n\
                  a=rtpmap:111 opus/48000/2\r\n\
                  a=rtpmap:0 PCMU/8000\r\n\
                  a=rtpmap:8 PCMA/8000\r\n\
+                 a=rtpmap:101 telephone-event/8000\r\n\
+                 a=fmtp:101 0-15\r\n\
                  a=ice-ufrag:{ufrag}\r\n\
                  a=ice-pwd:{pwd}\r\n\
                  a=fingerprint:sha-384 {fingerprint}\r\n\
@@ -1894,9 +1925,11 @@ impl CallManager {
                  s=USG SIP Client\r\n\
                  c=IN IP4 {ip}\r\n\
                  t=0 0\r\n\
-                 m=audio {port} RTP/AVP 0 8\r\n\
+                 m=audio {port} RTP/AVP 0 8 101\r\n\
                  a=rtpmap:0 PCMU/8000\r\n\
                  a=rtpmap:8 PCMA/8000\r\n\
+                 a=rtpmap:101 telephone-event/8000\r\n\
+                 a=fmtp:101 0-15\r\n\
                  a={direction}\r\n\
                  a=ssrc:{ssrc} cname:{cname}\r\n",
                 session_id = session_id(),
@@ -2013,6 +2046,37 @@ fn parse_ice_credentials_from_sdp(sdp: &str) -> Option<proto_ice::IceCredentials
         (Some(ufrag), Some(pwd)) => Some(proto_ice::IceCredentials { ufrag, pwd }),
         _ => None,
     }
+}
+
+/// Checks if the SDP includes telephone-event support (RFC 4733).
+///
+/// Looks for both the payload type in the m=audio line and the corresponding
+/// rtpmap attribute indicating telephone-event.
+///
+/// # Arguments
+/// * `sdp` - The SDP answer or offer string
+///
+/// # Returns
+/// True if telephone-event is supported, false otherwise
+fn check_telephone_event_support(sdp: &str) -> bool {
+    let mut has_telephone_event_in_media = false;
+    let mut has_telephone_event_rtpmap = false;
+
+    for line in sdp.lines() {
+        // Check if payload type 101 is in the m=audio line
+        // Format: m=audio <port> <proto> <fmt> <fmt> ...
+        if line.starts_with("m=audio") && line.contains(" 101") {
+            has_telephone_event_in_media = true;
+        }
+
+        // Check for rtpmap with telephone-event
+        // Format: a=rtpmap:101 telephone-event/8000
+        if line.starts_with("a=rtpmap:101") && line.contains("telephone-event") {
+            has_telephone_event_rtpmap = true;
+        }
+    }
+
+    has_telephone_event_in_media && has_telephone_event_rtpmap
 }
 
 /// Parses the negotiated codec from an SDP answer.

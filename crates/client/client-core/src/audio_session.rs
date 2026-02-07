@@ -209,18 +209,19 @@ impl AudioSession {
         self.pipeline.has_moh()
     }
 
-    /// Sends a DTMF digit via RFC 4733 telephone-event.
+    /// Sends a DTMF digit via RFC 2833 telephone-event and/or in-band tones.
     ///
     /// # Arguments
     /// * `digit` - The DTMF digit to send (0-9, *, #, A-D)
     /// * `duration_ms` - Duration of the tone in milliseconds (typical: 100ms)
-    pub fn send_dtmf(&self, digit: DtmfDigit, duration_ms: u32) -> AppResult<()> {
+    /// * `use_rfc2833` - Whether to send RFC 2833 packets (if false, in-band only)
+    pub fn send_dtmf(&self, digit: DtmfDigit, duration_ms: u32, use_rfc2833: bool) -> AppResult<()> {
         if !self.pipeline.is_running() {
             return Err(AppError::Audio("Audio session not running".to_string()));
         }
 
         self.pipeline
-            .send_dtmf(digit, duration_ms)
+            .send_dtmf(digit, duration_ms, use_rfc2833)
             .map_err(|e| AppError::Audio(e.to_string()))
     }
 

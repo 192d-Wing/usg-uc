@@ -70,6 +70,7 @@ pub mod comfort_noise;
 pub mod decode_thread;
 pub mod device;
 pub mod drift_compensator;
+pub mod dtmf_tones;
 pub mod file_source;
 pub mod io_thread;
 pub mod jitter_buffer;
