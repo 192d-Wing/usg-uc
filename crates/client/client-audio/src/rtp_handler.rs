@@ -460,29 +460,66 @@ impl RtpReceiver {
     }
 }
 
-/// Generates a random u16 for sequence number initialization.
+/// Mixes multiple entropy sources into a u64 for SSRC/sequence randomness.
+///
+/// Per RFC 3550 Section 5.1, SSRC should be chosen randomly. We combine
+/// multiple entropy sources and apply a mixing function for good distribution
+/// without requiring an external RNG crate.
+fn entropy_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Source 1: High-resolution timestamp (nanoseconds)
+    let time_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+
+    // Source 2: Thread ID (different per thread)
+    let thread_id = {
+        let id = format!("{:?}", std::thread::current().id());
+        let mut h: u64 = 0;
+        for b in id.bytes() {
+            h = h.wrapping_mul(31).wrapping_add(u64::from(b));
+        }
+        h
+    };
+
+    // Source 3: Stack address (ASLR provides entropy across runs)
+    let stack_var: u64 = 0;
+    let stack_addr = std::ptr::addr_of!(stack_var) as u64;
+
+    // Source 4: Process ID
+    let pid = u64::from(std::process::id());
+
+    // Mix all sources with xorshift-style mixing (splitmix64)
+    let mut state = time_nanos
+        ^ thread_id.wrapping_shl(17)
+        ^ stack_addr.wrapping_shl(31)
+        ^ pid.wrapping_shl(47);
+
+    // splitmix64 finalizer for good avalanche properties
+    state ^= state >> 30;
+    state = state.wrapping_mul(0xbf58476d1ce4e5b9);
+    state ^= state >> 27;
+    state = state.wrapping_mul(0x94d049bb133111eb);
+    state ^= state >> 31;
+
+    state
+}
+
+/// Generates a random u16 for sequence number initialization (RFC 3550).
 #[allow(clippy::cast_possible_truncation)]
 fn rand_u16() -> u16 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    (now & 0xFFFF) as u16
+    (entropy_seed() & 0xFFFF) as u16
 }
 
-/// Generates a random u32 for SSRC/timestamp initialization.
+/// Generates a random u32 for SSRC/timestamp initialization (RFC 3550).
 #[allow(clippy::cast_possible_truncation)]
 fn rand_u32() -> u32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    (now & 0xFFFF_FFFF) as u32
+    (entropy_seed() & 0xFFFF_FFFF) as u32
 }
 
-/// Generates a random SSRC.
+/// Generates a random SSRC per RFC 3550 Section 5.1.
 pub fn generate_ssrc() -> u32 {
     rand_u32()
 }
