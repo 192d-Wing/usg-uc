@@ -329,6 +329,10 @@ impl AudioPipeline {
             rtcp_remote_addr,
             local_ssrc: ssrc,
         };
+        // Give the I/O thread a sender to the decode thread so it can
+        // trigger a playback stream refresh after input device switches
+        // (handles macOS Bluetooth HFP→A2DP profile changes).
+        let decode_cmd_tx = Some(decode_handle.cmd_sender());
         let io_handle = io_thread::spawn(
             io_config,
             transmitter,
@@ -339,6 +343,7 @@ impl AudioPipeline {
             self.moh_active.clone(),
             self.stats.clone(),
             self.running.clone(),
+            decode_cmd_tx,
         );
 
         // Store handles (playback_handle is owned by the decode thread)
@@ -473,14 +478,6 @@ impl AudioPipeline {
         self.device_manager.set_input_device(device_name.clone());
         if let Some(ref io) = self.io_thread {
             io.switch_input_device(device_name);
-        }
-        // Refresh the playback stream too: on macOS, switching away from a
-        // Bluetooth mic triggers an HFP→A2DP profile change that alters the
-        // output device's sample rate. Re-creating the CPAL playback stream
-        // picks up the new rate so audio doesn't go robotic.
-        if let Some(ref decode) = self.decode_thread {
-            let output_name = self.device_manager.output_device_name().map(String::from);
-            decode.switch_output_device(output_name);
         }
         Ok(())
     }

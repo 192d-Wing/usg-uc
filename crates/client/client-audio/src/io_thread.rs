@@ -9,6 +9,7 @@
 
 use crate::audio_processing::AudioProcessor;
 use crate::codec::CodecPipeline;
+use crate::decode_thread::DecodeCommand;
 use crate::file_source::FileAudioSource;
 use crate::pipeline::{PipelineStats, resample};
 use crate::rtcp_session::RtcpSession;
@@ -121,6 +122,7 @@ pub fn spawn(
     moh_active: Arc<AtomicBool>,
     stats: Arc<Mutex<PipelineStats>>,
     running: Arc<AtomicBool>,
+    decode_cmd_tx: Option<mpsc::Sender<DecodeCommand>>,
 ) -> IoThreadHandle {
     let running_clone = running.clone();
     let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -140,6 +142,7 @@ pub fn spawn(
                 stats,
                 &running_clone,
                 cmd_rx,
+                decode_cmd_tx,
             );
             info!("I/O thread exited");
         });
@@ -176,6 +179,7 @@ fn io_loop(
     stats: Arc<Mutex<PipelineStats>>,
     running: &AtomicBool,
     cmd_rx: mpsc::Receiver<IoCommand>,
+    decode_cmd_tx: Option<mpsc::Sender<DecodeCommand>>,
 ) {
     // Create codec pipeline for encoding (each thread owns its own)
     let mut codec = match CodecPipeline::new(config.codec) {
@@ -221,6 +225,12 @@ fn io_loop(
 
     let mut last_capture = Instant::now();
     let mut stats_update_counter: u32 = 0;
+
+    // Pending input device switch: CaptureStream creation runs on a
+    // background thread so the I/O loop continues receiving RTP.
+    // Without this, the 200-500ms CaptureStream::new() call blocks RTP
+    // reception, draining the jitter buffer and causing robotic playback.
+    let mut pending_capture_rx: Option<mpsc::Receiver<Result<CaptureStream, String>>> = None;
 
     // DTX warmup: always send RTP for the first few seconds of a call.
     // Bluetooth HFP profile negotiation can take 3-8 seconds, during which
@@ -310,44 +320,73 @@ fn io_loop(
                     handle_dtmf(&mut transmitter, dtmf_cmd);
                 }
                 IoCommand::SwitchInputDevice(device_name) => {
-                    info!("I/O thread: switching input device to {:?}", device_name);
-                    let mut dm = crate::device::DeviceManager::new();
-                    dm.set_input_device(device_name);
-                    match CaptureStream::new(&dm) {
-                        Ok(new_capture) => {
-                            capture.stop();
-                            let new_rate = new_capture.sample_rate();
-                            if new_rate != capture_rate {
-                                let old_rate = capture_rate;
-                                capture_rate = new_rate;
-                                #[allow(clippy::cast_possible_truncation)]
-                                {
-                                    capture_device_samples = (codec_samples as u32
-                                        * capture_rate
-                                        / codec_clock_rate)
-                                        as usize;
-                                }
-                                info!(
-                                    "I/O thread: capture rate changed {}→{}Hz, \
-                                     frame size now {} samples (codec {}Hz)",
-                                    old_rate, capture_rate,
-                                    capture_device_samples, codec_clock_rate
-                                );
-                            }
-                            capture = new_capture;
+                    info!("I/O thread: switching input device to {:?} (async)", device_name);
+                    // Spawn CaptureStream creation on a background thread so
+                    // the I/O loop keeps receiving RTP during the switch.
+                    let (tx, rx) = mpsc::channel();
+                    thread::Builder::new()
+                        .name("capture-switch".to_string())
+                        .spawn(move || {
+                            let mut dm = crate::device::DeviceManager::new();
+                            dm.set_input_device(device_name);
+                            let result = CaptureStream::new(&dm)
+                                .map_err(|e| e.to_string());
+                            let _ = tx.send(result);
+                        })
+                        .ok();
+                    pending_capture_rx = Some(rx);
+                }
+            }
+        }
 
-                            // Reset processing state for clean transition:
-                            // - AGC gain tuned for old device would mis-amplify new device
-                            // - Frame timer prevents burst-sending backed-up frames
-                            // - DTX warmup ensures continuous RTP through the switch
-                            audio_processor.reset();
-                            last_capture = Instant::now();
-                            dtx_warmup_start = Instant::now();
-                            info!("I/O thread: input device switched successfully");
+        // 3b. Check if async capture switch completed
+        if let Some(ref rx) = pending_capture_rx {
+            if let Ok(result) = rx.try_recv() {
+                pending_capture_rx = None;
+                match result {
+                    Ok(new_capture) => {
+                        capture.stop();
+                        let new_rate = new_capture.sample_rate();
+                        if new_rate != capture_rate {
+                            let old_rate = capture_rate;
+                            capture_rate = new_rate;
+                            #[allow(clippy::cast_possible_truncation)]
+                            {
+                                capture_device_samples = (codec_samples as u32
+                                    * capture_rate
+                                    / codec_clock_rate)
+                                    as usize;
+                            }
+                            info!(
+                                "I/O thread: capture rate changed {}→{}Hz, \
+                                 frame size now {} samples (codec {}Hz)",
+                                old_rate, capture_rate,
+                                capture_device_samples, codec_clock_rate
+                            );
                         }
-                        Err(e) => {
-                            warn!("I/O thread: failed to switch input device: {e}");
+                        capture = new_capture;
+
+                        // Reset processing state for clean transition:
+                        // - AGC gain tuned for old device would mis-amplify new device
+                        // - Frame timer prevents burst-sending backed-up frames
+                        // - DTX warmup ensures continuous RTP through the switch
+                        audio_processor.reset();
+                        last_capture = Instant::now();
+                        dtx_warmup_start = Instant::now();
+                        info!("I/O thread: input device switched successfully");
+
+                        // Refresh the playback stream: on macOS, switching away
+                        // from a Bluetooth mic triggers an HFP→A2DP profile change
+                        // that alters the output device's sample rate. By this point
+                        // (~200-500ms after the switch started), the profile change
+                        // has completed and the decode thread will pick up the new rate.
+                        if let Some(ref tx) = decode_cmd_tx {
+                            info!("I/O thread: requesting playback stream refresh");
+                            let _ = tx.send(DecodeCommand::SwitchOutputDevice(None));
                         }
+                    }
+                    Err(e) => {
+                        warn!("I/O thread: failed to switch input device: {e}");
                     }
                 }
             }

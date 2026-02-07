@@ -73,6 +73,14 @@ pub struct DecodeThreadHandle {
 }
 
 impl DecodeThreadHandle {
+    /// Returns a clone of the command sender for cross-thread signaling.
+    ///
+    /// Used by the I/O thread to trigger a playback stream refresh after
+    /// an input device switch (macOS Bluetooth HFP→A2DP profile change).
+    pub fn cmd_sender(&self) -> mpsc::Sender<DecodeCommand> {
+        self.cmd_tx.clone()
+    }
+
     /// Switches the playback (output) device during an active call.
     pub fn switch_output_device(&self, device_name: Option<String>) {
         if let Err(e) = self.cmd_tx.send(DecodeCommand::SwitchOutputDevice(device_name)) {
@@ -488,15 +496,19 @@ fn decode_loop(
                     match PlaybackStream::new(&dm) {
                         Ok(new_playback) => {
                             let new_rate = new_playback.sample_rate();
-                            let (new_handle, new_producer, _new_underruns) =
+                            let (new_handle, mut new_producer, _new_underruns) =
                                 new_playback.take_producer();
 
-                            // Pre-fill new ring buffer with silence for cushion
-                            // (done by decode loop naturally — target_fill will trigger decode)
+                            // Pre-fill new ring buffer with silence so CPAL has
+                            // a cushion before the decode loop catches up.
+                            #[allow(clippy::cast_possible_truncation)]
+                            let prefill = (new_rate * 100 / 1000) as usize; // 100ms
+                            let silence = vec![0i16; prefill];
+                            new_producer.push_slice(&silence);
 
-                            // Swap producer and playback handle
-                            producer = new_producer;
+                            // Stop old stream first, then swap to new
                             _playback_handle.stop();
+                            producer = new_producer;
                             _playback_handle = new_handle;
 
                             if new_rate != device_rate {
