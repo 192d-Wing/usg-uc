@@ -239,6 +239,7 @@ impl Runtime {
     }
 
     /// Runs the SBC daemon.
+    #[allow(clippy::too_many_lines)]
     pub async fn run(&mut self) -> Result<(), RuntimeError> {
         // Start cluster services if configured
         #[cfg(feature = "cluster")]

@@ -101,7 +101,14 @@
 #[cfg(feature = "reflection")]
 pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("sbc_descriptor");
 
-#[allow(missing_docs)]
+#[allow(
+    missing_docs,
+    clippy::default_trait_access,
+    clippy::missing_const_for_fn,
+    clippy::too_many_lines,
+    clippy::too_long_first_doc_paragraph,
+    clippy::struct_excessive_bools
+)]
 pub mod sbc {
     tonic::include_proto!("sbc.api.v1");
 }
@@ -115,7 +122,14 @@ pub mod sbc {
 /// - Load balancers to route traffic
 /// - Kubernetes for liveness/readiness probes
 /// - Monitoring systems to track service health
-#[allow(missing_docs)]
+#[allow(
+    missing_docs,
+    clippy::default_trait_access,
+    clippy::missing_const_for_fn,
+    clippy::too_many_lines,
+    clippy::too_long_first_doc_paragraph,
+    clippy::struct_excessive_bools
+)]
 pub mod health {
     tonic::include_proto!("grpc.health.v1");
 }
