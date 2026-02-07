@@ -403,8 +403,7 @@ impl CallManager {
             .insert(call_id.clone(), effective_media_addr);
 
         // Store SDP session ID and version for this call
-        self.sdp_session_ids
-            .insert(call_id.clone(), sdp_session_id);
+        self.sdp_session_ids.insert(call_id.clone(), sdp_session_id);
         self.sdp_session_versions
             .insert(call_id.clone(), sdp_session_version);
 
@@ -1668,7 +1667,8 @@ impl CallManager {
 
         // Check if telephone-event was negotiated for DTMF support
         let dtmf_supported = check_telephone_event_support(sdp);
-        self.telephone_event_supported.insert(call_id.to_string(), dtmf_supported);
+        self.telephone_event_supported
+            .insert(call_id.to_string(), dtmf_supported);
 
         if dtmf_supported {
             info!(call_id = %call_id, "✓ Remote party supports RFC 2833/4733 telephone-event for DTMF");
@@ -1779,10 +1779,7 @@ impl CallManager {
             )
         } else {
             // Plain RTP offers: PCMU (0), PCMA (8), telephone-event (101)
-            matches!(
-                codec,
-                CodecPreference::G711Ulaw | CodecPreference::G711Alaw
-            )
+            matches!(codec, CodecPreference::G711Ulaw | CodecPreference::G711Alaw)
         }
     }
 
@@ -1810,7 +1807,8 @@ impl CallManager {
     /// Per RFC 8866, the version must increment each time the SDP is modified.
     fn increment_sdp_session_version(&mut self, call_id: &str) {
         let version = self.sdp_session_versions.get(call_id).copied().unwrap_or(1);
-        self.sdp_session_versions.insert(call_id.to_string(), version + 1);
+        self.sdp_session_versions
+            .insert(call_id.to_string(), version + 1);
     }
 
     fn generate_sdp_offer(
