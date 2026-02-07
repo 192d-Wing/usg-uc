@@ -50,6 +50,7 @@
 //! - [`audio_processing`]: AGC and noise gate for capture path
 //! - [`vad`]: Voice activity detection for discontinuous transmission
 //! - [`comfort_noise`]: Comfort noise generation during silence
+//! - [`sinc_resampler`]: Polyphase sinc resampler for anti-imaging
 //! - [`pipeline`]: Main audio pipeline coordinator
 
 #![forbid(unsafe_code)]
@@ -77,6 +78,7 @@ pub mod plc;
 pub mod ringtone;
 pub mod rtcp_session;
 pub mod rtp_handler;
+pub mod sinc_resampler;
 pub mod stream;
 pub mod vad;
 
@@ -98,6 +100,7 @@ pub use plc::PacketLossConcealer;
 pub use rtcp_session::RtcpSession;
 pub use ringtone::RingtonePlayer;
 pub use rtp_handler::{RtpReceiver, RtpStats, RtpTransmitter, generate_ssrc};
+pub use sinc_resampler::{FractionalSincResampler, Resampler, SincResampler};
 pub use stream::{CaptureStream, PlaybackStream, PlaybackStreamHandle, Sample};
 pub use vad::{VadDecision, VoiceActivityDetector};
 

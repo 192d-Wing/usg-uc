@@ -83,6 +83,7 @@ impl G711Ulaw {
 
         let mut sample = ((mantissa as i32) << 3) + 0x84;
         sample <<= exponent;
+        sample -= 0x84; // Subtract bias to restore correct PCM level
 
         if sign != 0 {
             -(sample as i16)
@@ -374,14 +375,10 @@ mod tests {
 
     #[test]
     fn test_ulaw_silence() {
-        // Silence (zero) encodes with bias, so decoded value won't be exactly 0
-        // mu-law has a bias of 132 (0x84) which affects small values
+        // Silence (zero) should round-trip to 0 after bias subtraction
         let encoded = G711Ulaw::encode_sample(0);
         let decoded = G711Ulaw::decode_sample(encoded);
-
-        // G.711 mu-law bias causes small values to have quantization offset
-        // The decoded value should be small but not necessarily < 100
-        assert!(decoded.abs() < 500, "silence decoded to {decoded}");
+        assert_eq!(decoded, 0, "silence should decode to 0, got {decoded}");
     }
 
     #[test]

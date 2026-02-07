@@ -10,8 +10,8 @@ use crate::codec::CodecPipeline;
 use crate::comfort_noise::ComfortNoiseGenerator;
 use crate::drift_compensator::DriftCompensator;
 use crate::jitter_buffer::{JitterBufferResult, SharedJitterBuffer};
-use crate::pipeline::resample;
 use crate::plc::PacketLossConcealer;
+use crate::sinc_resampler::Resampler;
 use crate::stream::Sample;
 use client_types::CodecPreference;
 use ringbuf::traits::{Observer, Producer};
@@ -21,6 +21,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
+/// Environment variable to enable audio dump for debugging.
+/// Set `DUMP_DECODED_AUDIO=1` to write decoded audio to `/tmp/decoded-audio.raw`.
+const DUMP_ENV_VAR: &str = "DUMP_DECODED_AUDIO";
+
 /// Target fill level for the playback ring buffer (in frames).
 /// At 20ms per frame, 8 frames = 160ms cushion.
 /// Extra headroom helps Bluetooth A2DP devices that have irregular
@@ -28,9 +32,26 @@ use tracing::{debug, info, trace, warn};
 const TARGET_FILL_FRAMES: usize = 8;
 
 /// Playback gain applied to decoded remote audio (linear).
-/// G.711 ulaw from typical PSTN sources doesn't use the full i16 range.
-/// 4.0 = +12 dB boost for comfortable listening volume without clipping.
-const PLAYBACK_GAIN: f32 = 4.0;
+/// Unity gain: logs show G.711 ulaw from BulkVS peaks at 20000-29000
+/// (already -3 to -1 dBFS). Any gain above 1.0 causes hard clipping
+/// at 32767, producing audible distortion ("static").
+const PLAYBACK_GAIN: f32 = 1.0;
+
+/// Peak amplitude threshold to open the gain gate (speech detected).
+/// G.711 ulaw speech is well above 2000 during active speech.
+const GATE_OPEN_PEAK: i16 = 2000;
+
+/// Peak amplitude threshold to close the gain gate (back to unity).
+/// Below this, quantization noise dominates — don't amplify it.
+const GATE_CLOSE_PEAK: i16 = 500;
+
+/// Frames to hold the gain gate open after the last speech frame.
+/// 15 frames * 20ms = 300ms — covers inter-word pauses and sentence tails.
+const GAIN_HOLD_FRAMES: u32 = 15;
+
+/// Exponential ramp speed for gain transitions (per frame).
+/// 0.15 gives a ~130ms time constant (smooth, no audible steps).
+const GAIN_RAMP_SPEED: f32 = 0.15;
 
 /// Handle to the running decode thread.
 ///
@@ -135,14 +156,29 @@ fn decode_loop(
     // Drift compensator: measure every decode cycle for fast response
     let mut drift = DriftCompensator::new(1);
 
-    // Cross-frame state for smooth resampling
-    let mut last_resample_input: i16 = 0;
+    // Sinc resampler: automatically selects polyphase (integer ratio) or
+    // fractional sinc (arbitrary ratio). Both provide ~50 dB stopband
+    // attenuation, eliminating imaging artifacts ("static").
+    let mut resampler = Resampler::new(codec_clock_rate, device_rate);
+    info!(
+        "Using {} resampler ({codec_clock_rate}Hz→{device_rate}Hz)",
+        resampler.algorithm_name()
+    );
+
+    // Last sample pushed to ring buffer — used for fade-out on jitter buffer empty
+    let mut last_output_sample: i16 = 0;
 
     // LPC-based packet loss concealment
     let mut plc = PacketLossConcealer::new(codec_samples);
     // Comfort noise for remote DTX (jitter buffer empty for extended periods)
     let mut cng = ComfortNoiseGenerator::new();
     let mut consecutive_empty: u32 = 0;
+
+    // Gain gate state: holds the gate open during speech to prevent
+    // gain fluctuation at speech boundaries that amplifies quantization noise.
+    let mut gain_gate_open = false;
+    let mut gain_hold_remaining: u32 = 0;
+    let mut current_gain: f32 = 1.0;
 
     debug!(
         "Decode thread: codec={}, codec_rate={}, device_rate={}, \
@@ -154,6 +190,24 @@ fn decode_loop(
         device_samples,
         target_fill
     );
+
+    // Optional audio dump file for debugging (set DUMP_DECODED_AUDIO=1)
+    let mut audio_dump: Option<std::io::BufWriter<std::fs::File>> = std::env::var(DUMP_ENV_VAR)
+        .ok()
+        .filter(|v| v == "1")
+        .and_then(|_| {
+            let path = "/tmp/decoded-audio.raw";
+            match std::fs::File::create(path) {
+                Ok(f) => {
+                    info!("Audio dump enabled: writing decoded audio to {path} (s16le, {device_rate}Hz, mono)");
+                    Some(std::io::BufWriter::new(f))
+                }
+                Err(e) => {
+                    warn!("Failed to create audio dump file: {e}");
+                    None
+                }
+            }
+        });
 
     // Diagnostic counters
     let mut diag_frames_decoded: u64 = 0;
@@ -170,7 +224,7 @@ fn decode_loop(
         if occupied >= target_fill {
             // Healthy — sleep and check again. 10ms is fine: at 48kHz the
             // CPAL callback consumes ~480 samples per 10ms, well within the
-            // 100ms (4800 sample) cushion.
+            // 160ms (7680 sample) cushion.
             thread::sleep(Duration::from_millis(10));
         } else {
             // Determine how many frames to decode based on urgency
@@ -184,6 +238,8 @@ fn decode_loop(
                 // Below target but not critical — 1 frame
                 1
             };
+
+            let mut decoded_this_cycle: u32 = 0;
 
             for _ in 0..frames_to_decode {
                 // Get drift adjustment from compensator
@@ -200,6 +256,7 @@ fn decode_loop(
                 match jitter_buffer.pop() {
                     JitterBufferResult::Packet(packet) => {
                         consecutive_empty = 0;
+                        decoded_this_cycle += 1;
 
                         // Decode
                         let codec_pcm = match codec.decode(&packet.payload) {
@@ -219,42 +276,68 @@ fn decode_loop(
                             plc.good_frame(&codec_vec);
                         }
 
-                        // Resample from codec rate to device rate with drift compensation
-                        let device_pcm = if codec_vec.len() == adjusted_device_samples {
-                            if let Some(&last_in) = codec_vec.last() {
-                                last_resample_input = last_in;
-                            }
-                            codec_vec
-                        } else {
-                            let resampled =
-                                resample(&codec_vec, adjusted_device_samples, last_resample_input);
-                            if let Some(&last_in) = codec_vec.last() {
-                                last_resample_input = last_in;
-                            }
-                            resampled
-                        };
+                        // Resample from codec rate to device rate
+                        let device_pcm =
+                            resampler.process_adjusted(&codec_vec, adjusted_device_samples);
 
                         // Track peak amplitude before gain
-                        if let Some(&peak) = device_pcm.iter().map(|s| s.saturating_abs()).max().as_ref() {
-                            if peak > diag_peak_pre_gain {
-                                diag_peak_pre_gain = peak;
-                            }
+                        let peak = device_pcm
+                            .iter()
+                            .map(|s| s.saturating_abs())
+                            .max()
+                            .unwrap_or(0);
+                        if peak > diag_peak_pre_gain {
+                            diag_peak_pre_gain = peak;
                         }
 
-                        // Apply playback gain and write to ring buffer
+                        // Update gain gate with hold timer.
+                        // The gate stays open for GAIN_HOLD_FRAMES after the last
+                        // speech-level peak, preventing gain fluctuation at the
+                        // tail of sentences (where quantization noise is worst).
+                        if peak >= GATE_OPEN_PEAK {
+                            gain_gate_open = true;
+                            gain_hold_remaining = GAIN_HOLD_FRAMES;
+                        } else if gain_hold_remaining > 0 {
+                            gain_hold_remaining -= 1;
+                        } else if peak < GATE_CLOSE_PEAK {
+                            gain_gate_open = false;
+                        }
+
+                        // Smooth exponential ramp toward target gain
+                        let target_gain = if gain_gate_open { PLAYBACK_GAIN } else { 1.0 };
+                        current_gain += (target_gain - current_gain) * GAIN_RAMP_SPEED;
+
+                        // Apply gain
                         let gained: Vec<i16> = device_pcm
                             .iter()
                             .map(|&s| {
                                 #[allow(clippy::cast_possible_truncation)]
-                                let g = (f32::from(s) * PLAYBACK_GAIN).clamp(-32768.0, 32767.0) as i16;
+                                let g =
+                                    (f32::from(s) * current_gain).clamp(-32768.0, 32767.0) as i16;
                                 g
                             })
                             .collect();
 
                         // Track peak amplitude after gain
-                        if let Some(&peak) = gained.iter().map(|s| s.saturating_abs()).max().as_ref() {
-                            if peak > diag_peak_post_gain {
-                                diag_peak_post_gain = peak;
+                        if let Some(&post_peak) =
+                            gained.iter().map(|s| s.saturating_abs()).max().as_ref()
+                        {
+                            if post_peak > diag_peak_post_gain {
+                                diag_peak_post_gain = post_peak;
+                            }
+                        }
+
+                        // Track last output for fade-out
+                        if let Some(&last) = gained.last() {
+                            last_output_sample = last;
+                        }
+
+                        // Write to audio dump file if enabled
+                        if let Some(ref mut dump) = audio_dump {
+                            use std::io::Write;
+                            // Write i16 samples as little-endian bytes
+                            for &s in &gained {
+                                let _ = dump.write_all(&s.to_le_bytes());
                             }
                         }
 
@@ -270,6 +353,7 @@ fn decode_loop(
                         diag_frames_decoded += 1;
                     }
                     JitterBufferResult::Lost { .. } => {
+                        decoded_this_cycle += 1;
                         // Try FEC recovery first (Opus inband FEC), fall back to PLC
                         let concealed = if codec.supports_fec() {
                             match codec.decode_fec() {
@@ -285,46 +369,67 @@ fn decode_loop(
                             plc.conceal()
                         };
 
-                        // Resample from codec rate to device rate
-                        let device_pcm = if concealed.len() == device_samples {
-                            concealed
-                        } else {
-                            resample(&concealed, device_samples, last_resample_input)
-                        };
+                        // Resample concealed audio to device rate
+                        let device_pcm =
+                            resampler.process_adjusted(&concealed, device_samples);
 
-                        last_resample_input = 0;
+                        if let Some(&last) = device_pcm.last() {
+                            last_output_sample = last;
+                        }
+
                         producer.push_slice(&device_pcm);
                         diag_frames_lost += 1;
                     }
                     JitterBufferResult::Empty | JitterBufferResult::NotReady => {
+                        // If we already decoded real audio this cycle, just stop.
+                        if decoded_this_cycle > 0 {
+                            break;
+                        }
+
                         diag_jb_empty += 1;
+
+                        // The JB is momentarily empty. Check the ring buffer:
+                        // if it still has a healthy cushion (> 2 frames), the
+                        // existing samples will carry CPAL through until the next
+                        // JB packet arrives (~20ms). Do NOT push silence/fade here
+                        // because it interleaves gaps between real audio frames —
+                        // the primary cause of choppiness.
+                        let current_fill = producer.occupied_len();
+                        if current_fill > device_samples * 2 {
+                            break;
+                        }
+
+                        // Ring buffer critically low AND JB starved — inject
+                        // fade/silence to prevent CPAL hard underrun.
                         consecutive_empty += 1;
 
-                        // Smooth silence transition using PLC fadeout for the
-                        // first few empty reads. Without this, the ring buffer
-                        // drains and the CPAL callback abruptly transitions from
-                        // decoded audio to held-last-sample, causing audible static.
-                        // PLC generates a natural continuation that attenuates
-                        // progressively (90% → 72% → 58% → silence).
-                        if consecutive_empty <= 3 {
-                            let concealed = plc.conceal();
-                            let device_pcm = if concealed.len() == device_samples {
-                                concealed
-                            } else {
-                                resample(&concealed, device_samples, last_resample_input)
-                            };
-                            last_resample_input = 0;
-                            producer.push_slice(&device_pcm);
-                        } else if consecutive_empty >= 25 {
-                            // Sustained emptiness → inject subtle comfort noise
+                        if consecutive_empty == 1 {
+                            // Cosine fade-out from last output to zero.
+                            let mut fade = vec![0i16; device_samples];
+                            #[allow(clippy::cast_precision_loss)]
+                            let len_f = device_samples as f32;
+                            for (i, sample) in fade.iter_mut().enumerate() {
+                                let t = i as f32 / len_f;
+                                let gain = 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
+                                #[allow(clippy::cast_possible_truncation)]
+                                {
+                                    *sample =
+                                        (f32::from(last_output_sample) * gain) as i16;
+                                }
+                            }
+                            last_output_sample = 0;
+                            producer.push_slice(&fade);
+                        } else if consecutive_empty >= 10 {
+                            // After sustained emptiness, inject comfort noise
                             cng.update_level(20.0);
-
                             let mut cn_pcm = vec![0i16; device_samples];
                             cng.generate(&mut cn_pcm);
                             producer.push_slice(&cn_pcm);
+                        } else {
+                            // Push silence to prevent ring buffer underrun.
+                            let silence = vec![0i16; device_samples];
+                            producer.push_slice(&silence);
                         }
-                        // Between 4-24: push nothing, let ring buffer drain
-                        // naturally with the PLC tail still providing cushion.
 
                         break;
                     }
@@ -342,7 +447,7 @@ fn decode_loop(
             info!(
                 "Decode diag: decoded={}, lost={}, jb_empty={}, ring_fill={}/{}, \
                  jb_pkts={}, jb_depth={}ms, jb_jitter={:.1}ms, pb_underruns={}, \
-                 peak_pre={}, peak_post={}",
+                 peak_pre={}, peak_post={}, gain={:.2}",
                 diag_frames_decoded,
                 diag_frames_lost,
                 diag_jb_empty,
@@ -354,6 +459,7 @@ fn decode_loop(
                 underruns,
                 diag_peak_pre_gain,
                 diag_peak_post_gain,
+                current_gain,
             );
             diag_peak_pre_gain = 0;
             diag_peak_post_gain = 0;
