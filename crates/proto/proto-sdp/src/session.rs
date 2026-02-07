@@ -1,4 +1,4 @@
-//! SDP session description per RFC 4566.
+//! SDP session description per RFC 8866.
 
 use crate::SDP_VERSION;
 use crate::attribute::{Attribute, AttributeName};
@@ -39,9 +39,6 @@ impl Origin {
     }
 
     /// Parses origin from o= line value.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     ///
     /// # Errors
     /// Returns an error if the operation fails.
@@ -93,7 +90,7 @@ pub struct Timing {
     pub start_time: u64,
     /// Stop time (0 = unbounded).
     pub stop_time: u64,
-    /// Repeat times (r= lines) per RFC 4566 §5.11.
+    /// Repeat times (r= lines) per RFC 8866 §5.11.
     pub repeat_times: Vec<RepeatTimes>,
 }
 
@@ -140,9 +137,6 @@ impl Timing {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     pub fn parse(s: &str) -> SdpResult<Self> {
         let parts: Vec<&str> = s.split_whitespace().collect();
         if parts.len() != 2 {
@@ -178,10 +172,10 @@ impl fmt::Display for Timing {
 }
 
 // ============================================================================
-// RFC 4566 §5.11 - Repeat Times (r= line)
+// RFC 8866 §5.11 - Repeat Times (r= line)
 // ============================================================================
 
-/// Time value that can be specified in compact form per RFC 4566 §5.10.
+/// Time value that can be specified in compact form per RFC 8866 §5.10.
 ///
 /// Values can be in seconds, or with a unit suffix:
 /// - `d` - days
@@ -228,9 +222,6 @@ impl TimeValue {
     }
 
     /// Parses a time value from a string (compact form supported).
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     ///
     /// # Errors
     /// Returns an error if the operation fails.
@@ -295,7 +286,7 @@ impl fmt::Display for TimeValue {
     }
 }
 
-/// Repeat times (r= line) per RFC 4566 §5.11.
+/// Repeat times (r= line) per RFC 8866 §5.11.
 ///
 /// Repeat times specify periodic sessions for things like weekly broadcasts.
 /// The format is:
@@ -319,7 +310,7 @@ impl fmt::Display for TimeValue {
 /// assert_eq!(repeat.duration.as_seconds(), 3600);
 /// ```
 ///
-/// ## RFC 4566 Example
+/// ## RFC 8866 Example
 ///
 /// For a session active on Monday 10:00-11:00 and Tuesday 10:00-11:00:
 /// ```text
@@ -364,9 +355,6 @@ impl RepeatTimes {
     }
 
     /// Parses repeat times from r= line value.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     ///
     /// # Errors
     /// Returns an error if the operation fails.
@@ -453,6 +441,85 @@ impl fmt::Display for RepeatTimes {
     }
 }
 
+// ============================================================================
+// RFC 8866 §5.8 - Bandwidth (b= line)
+// ============================================================================
+
+/// Bandwidth information (b= line) per RFC 8866 §5.8.
+///
+/// Specifies the proposed bandwidth for the session or media.
+///
+/// Common bandwidth types:
+/// - `CT` - Conference Total: total bandwidth for all media at all sites
+/// - `AS` - Application Specific: bandwidth for a single media stream
+/// - `TIAS` - Transport Independent Application Specific (RFC 3890)
+///
+/// ## Example
+///
+/// ```
+/// use proto_sdp::session::BandwidthInfo;
+///
+/// let bw = BandwidthInfo::new("AS", 128);
+/// assert_eq!(bw.bwtype(), "AS");
+/// assert_eq!(bw.bandwidth(), 128);
+/// assert_eq!(bw.to_string(), "b=AS:128");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BandwidthInfo {
+    /// Bandwidth type (e.g., "CT", "AS", "TIAS").
+    bwtype: String,
+    /// Bandwidth value (kbps for CT/AS, bps for TIAS).
+    bandwidth: u64,
+}
+
+impl BandwidthInfo {
+    /// Creates a new bandwidth info.
+    #[must_use]
+    pub fn new(bwtype: impl Into<String>, bandwidth: u64) -> Self {
+        Self {
+            bwtype: bwtype.into(),
+            bandwidth,
+        }
+    }
+
+    /// Returns the bandwidth type.
+    #[must_use]
+    pub fn bwtype(&self) -> &str {
+        &self.bwtype
+    }
+
+    /// Returns the bandwidth value.
+    #[must_use]
+    pub const fn bandwidth(&self) -> u64 {
+        self.bandwidth
+    }
+
+    /// Parses bandwidth from b= line value.
+    ///
+    /// # Errors
+    /// Returns an error if the format is invalid.
+    pub fn parse(s: &str) -> SdpResult<Self> {
+        let (bwtype, bw_str) = s.split_once(':').ok_or_else(|| SdpError::ParseError {
+            reason: "bandwidth requires format 'type:value'".to_string(),
+        })?;
+
+        let bandwidth = bw_str.parse().map_err(|_| SdpError::ParseError {
+            reason: format!("invalid bandwidth value: {bw_str}"),
+        })?;
+
+        Ok(Self {
+            bwtype: bwtype.to_string(),
+            bandwidth,
+        })
+    }
+}
+
+impl fmt::Display for BandwidthInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "b={}:{}", self.bwtype, self.bandwidth)
+    }
+}
+
 /// Complete SDP session description.
 #[derive(Debug, Clone)]
 pub struct SessionDescription {
@@ -472,8 +539,14 @@ pub struct SessionDescription {
     pub phones: Vec<String>,
     /// Session-level connection data (optional).
     pub connection: Option<ConnectionData>,
+    /// Bandwidth lines (b=).
+    pub bandwidth: Vec<BandwidthInfo>,
     /// Timing.
     pub timing: Timing,
+    /// Time zone adjustments (z= line, raw value).
+    pub time_zones: Option<String>,
+    /// Encryption key (k= line, raw value, deprecated).
+    pub encryption_key: Option<String>,
     /// Session-level attributes.
     pub attributes: Vec<Attribute>,
     /// Media descriptions.
@@ -493,7 +566,10 @@ impl SessionDescription {
             emails: Vec::new(),
             phones: Vec::new(),
             connection: None,
+            bandwidth: Vec::new(),
             timing: Timing::permanent(),
+            time_zones: None,
+            encryption_key: None,
             attributes: Vec::new(),
             media: Vec::new(),
         }
@@ -610,8 +686,23 @@ impl fmt::Display for SessionDescription {
             writeln!(f, "{conn}")?;
         }
 
+        // b= lines
+        for bw in &self.bandwidth {
+            writeln!(f, "{bw}")?;
+        }
+
         // t= line
         writeln!(f, "{}", self.timing)?;
+
+        // z= line (optional)
+        if let Some(ref tz) = self.time_zones {
+            writeln!(f, "z={tz}")?;
+        }
+
+        // k= line (optional, deprecated)
+        if let Some(ref key) = self.encryption_key {
+            writeln!(f, "k={key}")?;
+        }
 
         // Session attributes
         for attr in &self.attributes {
@@ -638,7 +729,10 @@ struct SdpParseState {
     emails: Vec<String>,
     phones: Vec<String>,
     connection: Option<ConnectionData>,
+    bandwidth: Vec<BandwidthInfo>,
     timing: Option<Timing>,
+    time_zones: Option<String>,
+    encryption_key: Option<String>,
     attributes: Vec<Attribute>,
     media: Vec<MediaDescription>,
     current_media: Option<MediaDescription>,
@@ -657,11 +751,14 @@ impl SdpParseState {
             'e' => self.parse_email(value),
             'p' => self.parse_phone(value),
             'c' => self.parse_connection(value),
+            'b' => self.parse_bandwidth(value),
             't' => self.parse_timing(value),
             'r' => self.parse_repeat(value, line_num),
+            'z' => self.parse_time_zones(value),
+            'k' => self.parse_encryption_key(value),
             'a' => self.parse_attribute(value),
             'm' => self.parse_media(value),
-            _ => Ok(()), // Ignore unknown line types
+            _ => Ok(()), // Ignore truly unknown line types
         }
     }
 
@@ -684,7 +781,9 @@ impl SdpParseState {
     }
 
     fn parse_info(&mut self, value: &str) -> SdpResult<()> {
-        if self.current_media.is_none() {
+        if let Some(ref mut m) = self.current_media {
+            m.info = Some(value.to_string());
+        } else {
             self.session_info = Some(value.to_string());
         }
         Ok(())
@@ -717,6 +816,30 @@ impl SdpParseState {
 
     fn parse_timing(&mut self, value: &str) -> SdpResult<()> {
         self.timing = Some(Timing::parse(value)?);
+        Ok(())
+    }
+
+    fn parse_bandwidth(&mut self, value: &str) -> SdpResult<()> {
+        let bw = BandwidthInfo::parse(value)?;
+        if let Some(ref mut m) = self.current_media {
+            m.bandwidth.push(bw);
+        } else {
+            self.bandwidth.push(bw);
+        }
+        Ok(())
+    }
+
+    fn parse_time_zones(&mut self, value: &str) -> SdpResult<()> {
+        self.time_zones = Some(value.to_string());
+        Ok(())
+    }
+
+    fn parse_encryption_key(&mut self, value: &str) -> SdpResult<()> {
+        if let Some(ref mut m) = self.current_media {
+            m.encryption_key = Some(value.to_string());
+        } else {
+            self.encryption_key = Some(value.to_string());
+        }
         Ok(())
     }
 
@@ -786,7 +909,10 @@ impl SdpParseState {
             emails: self.emails,
             phones: self.phones,
             connection: self.connection,
+            bandwidth: self.bandwidth,
             timing,
+            time_zones: self.time_zones,
+            encryption_key: self.encryption_key,
             attributes: self.attributes,
             media: self.media,
         })
@@ -911,7 +1037,7 @@ mod tests {
     }
 
     // ========================================================================
-    // RFC 4566 §5.11 - Repeat Times Tests
+    // RFC 8866 §5.11 - Repeat Times Tests
     // ========================================================================
 
     #[test]
@@ -1020,7 +1146,7 @@ mod tests {
 
     #[test]
     fn test_repeat_times_parse_rfc_example() {
-        // RFC 4566 example: weekly, 1 hour, offsets at 0 and 90000
+        // RFC 8866 example: weekly, 1 hour, offsets at 0 and 90000
         let repeat = RepeatTimes::parse("604800 3600 0 90000").unwrap();
 
         assert_eq!(repeat.interval_seconds(), 604_800);

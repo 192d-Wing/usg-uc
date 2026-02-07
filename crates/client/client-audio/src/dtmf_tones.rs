@@ -148,11 +148,12 @@ mod tests {
     fn test_tone_generator() {
         let mut generator = DtmfToneGenerator::new(DtmfDigit::Five, 8000);
 
-        // Generate some samples
+        // First sample is 0 because sin(0)=0 for both oscillators, skip it
+        let _first = generator.next_sample();
         let sample1 = generator.next_sample();
         let sample2 = generator.next_sample();
 
-        // Samples should be non-zero (tone is active)
+        // Samples should be non-zero (tone is active after phase 0)
         assert_ne!(sample1, 0);
         assert_ne!(sample2, 0);
 
@@ -177,9 +178,10 @@ mod tests {
         let mut generator = DtmfToneGenerator::new(DtmfDigit::Zero, 8000);
 
         // Generate many samples and check they're in valid range
+        // Cast to i32 to allow meaningful range check (i16::abs() is always <= 32767)
         for _ in 0..1000 {
             let sample = generator.next_sample();
-            assert!(sample.abs() <= 32767);
+            assert!(i32::from(sample).abs() <= 32767);
         }
     }
 
@@ -187,13 +189,16 @@ mod tests {
     fn test_phase_continuity() {
         let mut generator = DtmfToneGenerator::new(DtmfDigit::Five, 8000);
 
-        // Generate samples and verify phase doesn't jump
+        // Generate samples and verify no extreme jumps
+        // Dual-tone signals (770 Hz + 1336 Hz) at 8kHz sample rate can have
+        // large inter-sample differences due to constructive/destructive interference.
+        // Max theoretical diff for two 0.5-amplitude tones: ~32767 per sample.
+        // We check for truly discontinuous jumps (> 75% of full range).
         let mut prev = generator.next_sample();
         for _ in 0..100 {
             let current = generator.next_sample();
-            // Adjacent samples shouldn't differ by more than ~10% of range
-            let diff = i32::from(current).abs_diff(i32::from(prev)) as i32;
-            assert!(diff < 6000, "Phase discontinuity detected: diff={diff}");
+            let diff = i32::from(current).abs_diff(i32::from(prev));
+            assert!(diff < 30000, "Phase discontinuity detected: diff={diff}");
             prev = current;
         }
     }

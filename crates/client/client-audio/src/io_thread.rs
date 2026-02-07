@@ -10,6 +10,7 @@
 use crate::audio_processing::AudioProcessor;
 use crate::codec::CodecPipeline;
 use crate::decode_thread::DecodeCommand;
+use crate::dtmf_tones::DtmfToneGenerator;
 use crate::file_source::FileAudioSource;
 use crate::pipeline::{PipelineStats, resample};
 use crate::rtcp_session::RtcpSession;
@@ -23,7 +24,6 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
-use crate::dtmf_tones::DtmfToneGenerator;
 
 /// DTMF command sent from the main thread to the I/O thread.
 pub struct DtmfCommand {
@@ -368,9 +368,8 @@ fn io_loop(
                         capture_rate = new_rate;
                         #[allow(clippy::cast_possible_truncation)]
                         {
-                            capture_device_samples = (codec_samples as u32 * capture_rate
-                                / codec_clock_rate)
-                                as usize;
+                            capture_device_samples =
+                                (codec_samples as u32 * capture_rate / codec_clock_rate) as usize;
                         }
                         info!(
                             "I/O thread: capture rate changed {}→{}Hz, \

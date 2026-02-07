@@ -1,7 +1,8 @@
-//! SDP media description per RFC 4566.
+//! SDP media description per RFC 8866.
 
 use crate::attribute::{Attribute, AttributeName, Direction};
 use crate::error::{SdpError, SdpResult};
+use crate::session::BandwidthInfo;
 use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -174,9 +175,6 @@ impl ConnectionData {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     pub fn parse(s: &str) -> SdpResult<Self> {
         let parts: Vec<&str> = s.split_whitespace().collect();
         if parts.len() != 3 {
@@ -218,8 +216,14 @@ pub struct MediaDescription {
     pub protocol: TransportProtocol,
     /// Format/payload types.
     pub formats: Vec<String>,
+    /// Media information (i= line, optional).
+    pub info: Option<String>,
     /// Connection data (optional, inherits from session).
     pub connection: Option<ConnectionData>,
+    /// Bandwidth lines (b=).
+    pub bandwidth: Vec<BandwidthInfo>,
+    /// Encryption key (k= line, raw value, deprecated).
+    pub encryption_key: Option<String>,
     /// Media-level attributes.
     pub attributes: Vec<Attribute>,
 }
@@ -234,7 +238,10 @@ impl MediaDescription {
             num_ports: None,
             protocol,
             formats: Vec::new(),
+            info: None,
             connection: None,
+            bandwidth: Vec::new(),
+            encryption_key: None,
             attributes: Vec::new(),
         }
     }
@@ -323,9 +330,6 @@ impl MediaDescription {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     pub fn parse_mline(line: &str) -> SdpResult<Self> {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 4 {
@@ -364,7 +368,10 @@ impl MediaDescription {
             num_ports,
             protocol,
             formats,
+            info: None,
             connection: None,
+            bandwidth: Vec::new(),
+            encryption_key: None,
             attributes: Vec::new(),
         })
     }
@@ -385,9 +392,24 @@ impl fmt::Display for MediaDescription {
         }
         writeln!(f)?;
 
+        // i= line (optional)
+        if let Some(ref info) = self.info {
+            writeln!(f, "i={info}")?;
+        }
+
         // c= line (if present)
         if let Some(ref conn) = self.connection {
             writeln!(f, "{conn}")?;
+        }
+
+        // b= lines
+        for bw in &self.bandwidth {
+            writeln!(f, "{bw}")?;
+        }
+
+        // k= line (optional, deprecated)
+        if let Some(ref key) = self.encryption_key {
+            writeln!(f, "k={key}")?;
         }
 
         // Attributes

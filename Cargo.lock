@@ -4773,6 +4773,7 @@ name = "proto-sdp"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "getrandom 0.3.4",
  "thiserror 2.0.18",
  "tracing",
  "uc-types",

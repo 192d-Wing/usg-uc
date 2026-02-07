@@ -403,7 +403,12 @@ impl AudioPipeline {
     /// * `digit` - The DTMF digit to send
     /// * `duration_ms` - Duration in milliseconds
     /// * `use_rfc2833` - Whether to send RFC 2833 packets (if false, in-band only)
-    pub fn send_dtmf(&self, digit: DtmfDigit, duration_ms: u32, use_rfc2833: bool) -> AudioResult<()> {
+    pub fn send_dtmf(
+        &self,
+        digit: DtmfDigit,
+        duration_ms: u32,
+        use_rfc2833: bool,
+    ) -> AudioResult<()> {
         let io = self
             .io_thread
             .as_ref()

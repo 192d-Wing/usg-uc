@@ -161,9 +161,6 @@ impl KeyParams {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     pub fn from_base64(encoded: &str) -> SdpResult<Self> {
         let key_material = BASE64
             .decode(encoded)
@@ -248,9 +245,6 @@ impl KeyParams {
     }
 
     /// Validates the keying material length against a cipher suite.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     ///
     /// # Errors
     /// Returns an error if the operation fails.
@@ -363,9 +357,6 @@ impl SessionParams {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     pub fn parse(s: &str) -> SdpResult<Self> {
         let mut params = Self::new();
 
@@ -475,9 +466,6 @@ impl CryptoAttribute {
     }
 
     /// Parses a crypto attribute value (without the "crypto:" prefix).
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     ///
     /// # Errors
     /// Returns an error if the operation fails.
@@ -602,9 +590,6 @@ impl CryptoAttribute {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     pub fn validate(&self) -> SdpResult<()> {
         // Tag must be 1-9 digits
         if self.tag > 999_999_999 {
@@ -702,32 +687,17 @@ impl SrtpNegotiator {
         offer_cryptos.first()
     }
 
-    /// Generates keying material for a cipher suite.
-    #[must_use]
-    pub fn generate_keying_material(cipher: CipherSuite) -> Vec<u8> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
+    /// Generates keying material for a cipher suite using the OS CSPRNG.
+    ///
+    /// # Errors
+    /// Returns an error if the OS CSPRNG is unavailable.
+    pub fn generate_keying_material(cipher: CipherSuite) -> SdpResult<Vec<u8>> {
         let length = cipher.keying_material_length();
         let mut material = vec![0u8; length];
-
-        // Use timestamp-based pseudo-random generation
-        // Note: In production, use a proper CSPRNG
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-
-        for (i, byte) in material.iter_mut().enumerate() {
-            // Use modulo to prevent shift overflow (128 bits in u128)
-            let shift = (i * 8) % 128;
-            // Truncation is intentional: extracting byte from u128
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                *byte = ((timestamp >> shift) ^ (i as u128).wrapping_mul(17)) as u8;
-            }
-        }
-
-        material
+        getrandom::fill(&mut material).map_err(|e| SdpError::ParseError {
+            reason: format!("CSPRNG unavailable: {e}"),
+        })?;
+        Ok(material)
     }
 }
 
@@ -970,8 +940,10 @@ mod tests {
 
     #[test]
     fn test_keying_material_generation() {
-        let material1 = SrtpNegotiator::generate_keying_material(CipherSuite::AesCm128HmacSha1_80);
-        let material2 = SrtpNegotiator::generate_keying_material(CipherSuite::AeadAes256Gcm);
+        let material1 =
+            SrtpNegotiator::generate_keying_material(CipherSuite::AesCm128HmacSha1_80).unwrap();
+        let material2 =
+            SrtpNegotiator::generate_keying_material(CipherSuite::AeadAes256Gcm).unwrap();
 
         assert_eq!(material1.len(), 30); // 16 + 14
         assert_eq!(material2.len(), 44); // 32 + 12

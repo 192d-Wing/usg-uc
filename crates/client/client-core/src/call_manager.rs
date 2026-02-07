@@ -93,6 +93,10 @@ pub struct CallManager {
     telephone_event_supported: HashMap<String, bool>,
     /// Effective local media address per call (what was advertised in SDP).
     effective_media_addrs: HashMap<String, SocketAddr>,
+    /// SDP session ID per call (RFC 8866 - must remain constant for session).
+    sdp_session_ids: HashMap<String, u64>,
+    /// SDP session version per call (RFC 8866 - increments on modifications).
+    sdp_session_versions: HashMap<String, u64>,
     /// Selected input device name (persists across calls).
     selected_input_device: Option<String>,
     /// Selected output device name (persists across calls).
@@ -227,6 +231,8 @@ impl CallManager {
             negotiated_codecs: HashMap::new(),
             telephone_event_supported: HashMap::new(),
             effective_media_addrs: HashMap::new(),
+            sdp_session_ids: HashMap::new(),
+            sdp_session_versions: HashMap::new(),
             selected_input_device: None,
             selected_output_device: None,
         }
@@ -372,9 +378,18 @@ impl CallManager {
             media_tx,
         );
 
+        // Generate session ID for this call (version starts at 1)
+        let sdp_session_id = session_id();
+        let sdp_session_version = 1;
+
         // Generate SDP offer using the same effective address
-        let sdp_offer =
-            self.generate_sdp_offer_with_addr(&media_session, account, effective_media_addr);
+        let sdp_offer = self.generate_sdp_offer_with_addr(
+            &media_session,
+            account,
+            effective_media_addr,
+            sdp_session_id,
+            sdp_session_version,
+        );
 
         // Make the call via SIP UA
         let call_id = self
@@ -386,6 +401,11 @@ impl CallManager {
         // Store the effective media address for this call (used when starting audio session)
         self.effective_media_addrs
             .insert(call_id.clone(), effective_media_addr);
+
+        // Store SDP session ID and version for this call
+        self.sdp_session_ids.insert(call_id.clone(), sdp_session_id);
+        self.sdp_session_versions
+            .insert(call_id.clone(), sdp_session_version);
 
         // Store media session and track the call
         self.media_sessions.insert(call_id.clone(), media_session);
@@ -773,7 +793,7 @@ impl CallManager {
         );
 
         // Generate SDP answer
-        let sdp_answer = self.generate_sdp_offer(&media_session, &account)?;
+        let sdp_answer = self.generate_sdp_offer(&call_id, &media_session, &account)?;
 
         // Build 200 OK with SDP body
         let mut ok_response = build_response_from_request(
@@ -1627,6 +1647,18 @@ impl CallManager {
 
         // Parse the negotiated codec from the SDP answer
         if let Some(codec) = parse_codec_from_sdp(sdp) {
+            // Validate codec is in our offer (RFC 3264 Section 6.1)
+            let account = self
+                .account
+                .as_ref()
+                .ok_or_else(|| AppError::Sip("No account configured".to_string()))?;
+
+            if !self.is_codec_offered(codec, account) {
+                return Err(AppError::Sip(format!(
+                    "Remote party selected codec {codec:?} which was not in our offer"
+                )));
+            }
+
             info!(call_id = %call_id, codec = ?codec, "Negotiated codec from SDP answer");
             self.negotiated_codecs.insert(call_id.to_string(), codec);
         } else {
@@ -1635,7 +1667,8 @@ impl CallManager {
 
         // Check if telephone-event was negotiated for DTMF support
         let dtmf_supported = check_telephone_event_support(sdp);
-        self.telephone_event_supported.insert(call_id.to_string(), dtmf_supported);
+        self.telephone_event_supported
+            .insert(call_id.to_string(), dtmf_supported);
 
         if dtmf_supported {
             info!(call_id = %call_id, "✓ Remote party supports RFC 2833/4733 telephone-event for DTMF");
@@ -1729,13 +1762,71 @@ impl CallManager {
         Ok(())
     }
 
+    /// Validates that a codec was included in our SDP offer.
+    /// Per RFC 3264 Section 6.1, the answer must only contain codecs from the offer.
+    fn is_codec_offered(&self, codec: CodecPreference, account: &SipAccount) -> bool {
+        // Check if we're using TLS/secure transport (determines which codecs we offer)
+        let use_srtp = matches!(
+            account.transport,
+            client_types::TransportPreference::TlsOnly
+        );
+
+        if use_srtp {
+            // SRTP offers: Opus (111), PCMU (0), PCMA (8), telephone-event (101)
+            matches!(
+                codec,
+                CodecPreference::Opus | CodecPreference::G711Ulaw | CodecPreference::G711Alaw
+            )
+        } else {
+            // Plain RTP offers: PCMU (0), PCMA (8), telephone-event (101)
+            matches!(codec, CodecPreference::G711Ulaw | CodecPreference::G711Alaw)
+        }
+    }
+
+    /// Gets the SDP session ID for a call, creating one if it doesn't exist.
+    /// Per RFC 8866, the session ID must remain constant for the duration of the session.
+    fn get_or_create_sdp_session_id(&mut self, call_id: &str) -> u64 {
+        if let Some(&id) = self.sdp_session_ids.get(call_id) {
+            id
+        } else {
+            let id = session_id();
+            self.sdp_session_ids.insert(call_id.to_string(), id);
+            // Initialize version to 1
+            self.sdp_session_versions.insert(call_id.to_string(), 1);
+            id
+        }
+    }
+
+    /// Gets the current SDP session version for a call.
+    /// Returns 1 if the call doesn't have a version yet.
+    fn get_sdp_session_version(&self, call_id: &str) -> u64 {
+        self.sdp_session_versions.get(call_id).copied().unwrap_or(1)
+    }
+
+    /// Increments the SDP session version for a call (used on re-INVITE).
+    /// Per RFC 8866, the version must increment each time the SDP is modified.
+    fn increment_sdp_session_version(&mut self, call_id: &str) {
+        let version = self.sdp_session_versions.get(call_id).copied().unwrap_or(1);
+        self.sdp_session_versions
+            .insert(call_id.to_string(), version + 1);
+    }
+
     fn generate_sdp_offer(
-        &self,
+        &mut self,
+        call_id: &str,
         session: &MediaSession,
         account: &SipAccount,
     ) -> AppResult<String> {
         let effective_media_addr = self.get_effective_media_addr()?;
-        Ok(self.generate_sdp_offer_with_addr(session, account, effective_media_addr))
+        let sdp_session_id = self.get_or_create_sdp_session_id(call_id);
+        let sdp_session_version = self.get_sdp_session_version(call_id);
+        Ok(self.generate_sdp_offer_with_addr(
+            session,
+            account,
+            effective_media_addr,
+            sdp_session_id,
+            sdp_session_version,
+        ))
     }
 
     #[allow(clippy::unused_self)]
@@ -1744,6 +1835,8 @@ impl CallManager {
         session: &MediaSession,
         account: &SipAccount,
         effective_media_addr: SocketAddr,
+        sdp_session_id: u64,
+        sdp_session_version: u64,
     ) -> String {
         let ssrc = session.local_ssrc();
 
@@ -1759,18 +1852,23 @@ impl CallManager {
             let creds = session.local_ice_credentials();
             let fingerprint = session.local_dtls_fingerprint();
 
+            let addr_type = sdp_addr_type(&effective_media_addr);
             format!(
                 "v=0\r\n\
-                 o=- {session_id} {session_version} IN IP4 {ip}\r\n\
+                 o=- {session_id} {session_version} IN {addr_type} {ip}\r\n\
                  s=USG SIP Client\r\n\
-                 c=IN IP4 {ip}\r\n\
+                 c=IN {addr_type} {ip}\r\n\
+                 b=AS:100\r\n\
                  t=0 0\r\n\
                  m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8 101\r\n\
                  a=rtpmap:111 opus/48000/2\r\n\
+                 a=fmtp:111 minptime=20;useinbandfec=1;stereo=1\r\n\
                  a=rtpmap:0 PCMU/8000\r\n\
                  a=rtpmap:8 PCMA/8000\r\n\
                  a=rtpmap:101 telephone-event/8000\r\n\
                  a=fmtp:101 0-15\r\n\
+                 a=ptime:20\r\n\
+                 a=maxptime:120\r\n\
                  a=ice-ufrag:{ufrag}\r\n\
                  a=ice-pwd:{pwd}\r\n\
                  a=fingerprint:sha-384 {fingerprint}\r\n\
@@ -1779,8 +1877,9 @@ impl CallManager {
                  a=sendrecv\r\n\
                  a=rtcp-mux\r\n\
                  a=ssrc:{ssrc} cname:{cname}\r\n",
-                session_id = session_id(),
-                session_version = 1,
+                session_id = sdp_session_id,
+                session_version = sdp_session_version,
+                addr_type = addr_type,
                 ip = effective_media_addr.ip(),
                 port = effective_media_addr.port(),
                 ufrag = creds.ufrag,
@@ -1791,21 +1890,26 @@ impl CallManager {
             )
         } else {
             // Plain RTP (no SRTP, no ICE, no DTLS)
+            let addr_type = sdp_addr_type(&effective_media_addr);
             format!(
                 "v=0\r\n\
-                 o=- {session_id} {session_version} IN IP4 {ip}\r\n\
+                 o=- {session_id} {session_version} IN {addr_type} {ip}\r\n\
                  s=USG SIP Client\r\n\
-                 c=IN IP4 {ip}\r\n\
+                 c=IN {addr_type} {ip}\r\n\
+                 b=AS:80\r\n\
                  t=0 0\r\n\
                  m=audio {port} RTP/AVP 0 8 101\r\n\
                  a=rtpmap:0 PCMU/8000\r\n\
                  a=rtpmap:8 PCMA/8000\r\n\
                  a=rtpmap:101 telephone-event/8000\r\n\
                  a=fmtp:101 0-15\r\n\
+                 a=ptime:20\r\n\
+                 a=maxptime:120\r\n\
                  a=sendrecv\r\n\
                  a=ssrc:{ssrc} cname:{cname}\r\n",
-                session_id = session_id(),
-                session_version = 1,
+                session_id = sdp_session_id,
+                session_version = sdp_session_version,
+                addr_type = addr_type,
                 ip = effective_media_addr.ip(),
                 port = effective_media_addr.port(),
                 ssrc = ssrc,
@@ -1848,17 +1952,23 @@ impl CallManager {
     }
 
     /// Generates SDP for putting a call on hold (sendonly direction).
-    fn generate_hold_sdp(&self, call_id: &str) -> AppResult<String> {
+    fn generate_hold_sdp(&mut self, call_id: &str) -> AppResult<String> {
         self.generate_sdp_with_direction(call_id, "sendonly")
     }
 
     /// Generates SDP for resuming a call (sendrecv direction).
-    fn generate_resume_sdp(&self, call_id: &str) -> AppResult<String> {
+    fn generate_resume_sdp(&mut self, call_id: &str) -> AppResult<String> {
         self.generate_sdp_with_direction(call_id, "sendrecv")
     }
 
     /// Generates SDP with the specified media direction.
-    fn generate_sdp_with_direction(&self, call_id: &str, direction: &str) -> AppResult<String> {
+    fn generate_sdp_with_direction(&mut self, call_id: &str, direction: &str) -> AppResult<String> {
+        // Get session ID and increment version for re-INVITE (RFC 8866 Section 5.2)
+        // MUST do this before borrowing session to avoid borrow checker issues
+        let sdp_session_id = self.get_or_create_sdp_session_id(call_id);
+        self.increment_sdp_session_version(call_id);
+        let sdp_session_version = self.get_sdp_session_version(call_id);
+
         let session = self
             .media_sessions
             .get(call_id)
@@ -1881,6 +1991,7 @@ impl CallManager {
         );
 
         // Generate SDP based on transport security
+        let addr_type = sdp_addr_type(&effective_media_addr);
         let sdp = if use_srtp {
             // Secure RTP with ICE and DTLS fingerprint
             let creds = session.local_ice_credentials();
@@ -1888,16 +1999,20 @@ impl CallManager {
 
             format!(
                 "v=0\r\n\
-                 o=- {session_id} {session_version} IN IP4 {ip}\r\n\
+                 o=- {session_id} {session_version} IN {addr_type} {ip}\r\n\
                  s=USG SIP Client\r\n\
-                 c=IN IP4 {ip}\r\n\
+                 c=IN {addr_type} {ip}\r\n\
+                 b=AS:100\r\n\
                  t=0 0\r\n\
                  m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8 101\r\n\
                  a=rtpmap:111 opus/48000/2\r\n\
+                 a=fmtp:111 minptime=20;useinbandfec=1;stereo=1\r\n\
                  a=rtpmap:0 PCMU/8000\r\n\
                  a=rtpmap:8 PCMA/8000\r\n\
                  a=rtpmap:101 telephone-event/8000\r\n\
                  a=fmtp:101 0-15\r\n\
+                 a=ptime:20\r\n\
+                 a=maxptime:120\r\n\
                  a=ice-ufrag:{ufrag}\r\n\
                  a=ice-pwd:{pwd}\r\n\
                  a=fingerprint:sha-384 {fingerprint}\r\n\
@@ -1906,8 +2021,9 @@ impl CallManager {
                  a={direction}\r\n\
                  a=rtcp-mux\r\n\
                  a=ssrc:{ssrc} cname:{cname}\r\n",
-                session_id = session_id(),
-                session_version = 2, // Increment version for re-INVITE
+                session_id = sdp_session_id,
+                session_version = sdp_session_version,
+                addr_type = addr_type,
                 ip = effective_media_addr.ip(),
                 port = effective_media_addr.port(),
                 ufrag = creds.ufrag,
@@ -1921,19 +2037,23 @@ impl CallManager {
             // Plain RTP (no SRTP, no ICE, no DTLS)
             format!(
                 "v=0\r\n\
-                 o=- {session_id} {session_version} IN IP4 {ip}\r\n\
+                 o=- {session_id} {session_version} IN {addr_type} {ip}\r\n\
                  s=USG SIP Client\r\n\
-                 c=IN IP4 {ip}\r\n\
+                 c=IN {addr_type} {ip}\r\n\
+                 b=AS:80\r\n\
                  t=0 0\r\n\
                  m=audio {port} RTP/AVP 0 8 101\r\n\
                  a=rtpmap:0 PCMU/8000\r\n\
                  a=rtpmap:8 PCMA/8000\r\n\
                  a=rtpmap:101 telephone-event/8000\r\n\
                  a=fmtp:101 0-15\r\n\
+                 a=ptime:20\r\n\
+                 a=maxptime:120\r\n\
                  a={direction}\r\n\
                  a=ssrc:{ssrc} cname:{cname}\r\n",
-                session_id = session_id(),
-                session_version = 2, // Increment version for re-INVITE
+                session_id = sdp_session_id,
+                session_version = sdp_session_version,
+                addr_type = addr_type,
                 ip = effective_media_addr.ip(),
                 port = effective_media_addr.port(),
                 direction = direction,
@@ -2191,14 +2311,37 @@ fn parse_remote_media_addr_from_sdp(sdp: &str) -> Option<SocketAddr> {
     }
 }
 
-/// Generates a unique session ID for SDP.
+/// Generates a unique session ID for SDP per RFC 8866 Section 5.2.
+///
+/// Uses NTP timestamp format for better uniqueness:
+/// - High 32 bits: seconds since Jan 1, 1970 (UNIX epoch)
+/// - Low 32 bits: fractional seconds (nanoseconds scaled to 2^32)
+///
+/// This provides much better collision resistance than millisecond timestamps.
 #[allow(clippy::cast_possible_truncation)]
 fn session_id() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
+
+    let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .unwrap_or_default();
+
+    let secs = duration.as_secs();
+    let nanos = duration.subsec_nanos();
+
+    // Convert nanoseconds to NTP fractional format (scaled to 2^32)
+    // nanos is 0..1_000_000_000, we want 0..4_294_967_296
+    let frac = ((u64::from(nanos) * 0x1_0000_0000) / 1_000_000_000) as u32;
+
+    // Combine: high 32 bits = seconds, low 32 bits = fractional
+    (secs << 32) | u64::from(frac)
+}
+
+/// Returns SDP address type string for a socket address (RFC 8866 Section 5.7).
+///
+/// Returns `"IP4"` for IPv4 addresses or `"IP6"` for IPv6 addresses.
+fn sdp_addr_type(addr: &SocketAddr) -> &'static str {
+    if addr.is_ipv4() { "IP4" } else { "IP6" }
 }
 
 #[cfg(test)]

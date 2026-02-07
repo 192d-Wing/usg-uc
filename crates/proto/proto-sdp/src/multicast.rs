@@ -18,7 +18,7 @@
 //! 4. **Many-to-Many**: Multiple senders and receivers can participate
 //!    in the same multicast session.
 //!
-//! ## Connection Address Format (RFC 4566 §5.7)
+//! ## Connection Address Format (RFC 8866 §5.7)
 //!
 //! For multicast IPv4:
 //! ```text
@@ -46,7 +46,7 @@ use std::str::FromStr;
 
 /// Multicast address with TTL and address count.
 ///
-/// Per RFC 4566 §5.7, multicast connection data may include:
+/// Per RFC 8866 §5.7, multicast connection data may include:
 /// - TTL (IPv4 only): Time-to-live for multicast packets
 /// - Number of addresses: For hierarchical encoding (deprecated)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,12 +72,6 @@ impl MulticastAddress {
     /// # Errors
     ///
     /// Returns error if address is not a valid IPv4 multicast address.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     pub fn new_ipv4(address: &str, ttl: u8) -> SdpResult<Self> {
         let addr: Ipv4Addr = address.parse().map_err(|_| SdpError::InvalidConnection {
             reason: format!("invalid IPv4 address: {address}"),
@@ -106,12 +100,6 @@ impl MulticastAddress {
     /// # Errors
     ///
     /// Returns error if address is not a valid IPv6 multicast address.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     pub fn new_ipv6(address: &str) -> SdpResult<Self> {
         let addr: Ipv6Addr = address.parse().map_err(|_| SdpError::InvalidConnection {
             reason: format!("invalid IPv6 address: {address}"),
@@ -136,9 +124,6 @@ impl MulticastAddress {
     /// Handles formats:
     /// - IPv4: `<address>/<ttl>` or `<address>/<ttl>/<num>`
     /// - IPv6: `<address>` or `<address>/<num>`
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
     ///
     /// # Errors
     /// Returns an error if the operation fails.
@@ -288,7 +273,7 @@ impl MulticastAddress {
 
 /// Checks if a connection address is multicast.
 ///
-/// Per RFC 4566, multicast addresses are:
+/// Per RFC 8866, multicast addresses are:
 /// - IPv4: 224.0.0.0/4 (224.0.0.0 - 239.255.255.255)
 /// - IPv6: `ff00::/8`
 #[must_use]
