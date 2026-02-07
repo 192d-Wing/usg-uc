@@ -188,10 +188,11 @@ fn io_loop(
 
     let codec_clock_rate = codec.clock_rate();
     let codec_samples = codec.samples_per_frame();
-    let capture_rate = config.capture_rate;
+    let mut capture_rate = config.capture_rate;
     // Number of samples per frame at the capture device rate
     #[allow(clippy::cast_possible_truncation)]
-    let capture_device_samples = (codec_samples as u32 * capture_rate / codec_clock_rate) as usize;
+    let mut capture_device_samples =
+        (codec_samples as u32 * capture_rate / codec_clock_rate) as usize;
     let capture_interval = Duration::from_millis(u64::from(codec.frame_duration_ms()));
 
     debug!(
@@ -316,14 +317,24 @@ fn io_loop(
                         Ok(new_capture) => {
                             capture.stop();
                             let new_rate = new_capture.sample_rate();
-                            capture = new_capture;
                             if new_rate != capture_rate {
+                                let old_rate = capture_rate;
+                                capture_rate = new_rate;
+                                #[allow(clippy::cast_possible_truncation)]
+                                {
+                                    capture_device_samples = (codec_samples as u32
+                                        * capture_rate
+                                        / codec_clock_rate)
+                                        as usize;
+                                }
                                 info!(
                                     "I/O thread: capture rate changed {}→{}Hz, \
-                                     resampler unchanged (codec rate stays {}Hz)",
-                                    capture_rate, new_rate, codec_clock_rate
+                                     frame size now {} samples (codec {}Hz)",
+                                    old_rate, capture_rate,
+                                    capture_device_samples, codec_clock_rate
                                 );
                             }
+                            capture = new_capture;
                             info!("I/O thread: input device switched successfully");
                         }
                         Err(e) => {
