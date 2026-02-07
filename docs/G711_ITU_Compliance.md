@@ -156,14 +156,16 @@ Our PLC uses an LPC-based approach (different from the pitch-repetition algorith
 
 While not a byte-for-byte implementation of the Appendix I algorithm, the LPC approach provides equivalent or better concealment quality for speech signals.
 
-### Appendix II: Comfort Noise Generation — NOT IMPLEMENTED
+### Appendix II: Comfort Noise Generation — IMPLEMENTED (RFC 3389)
 
-Defines a comfort noise payload format for use with VAD/DTX:
+RFC 3389 comfort noise payload support with VAD/DTX integration:
 
-- Noise level (1 byte) + reflection coefficients (M bytes)
-- Enables bandwidth savings of ~38% with VAD/DTX
+- **Send side**: VAD detects silence → DTX suppresses RTP → one CN packet (PT=13) sent at speech→silence transition with the VAD noise floor encoded as -dBov
+- **Receive side**: PT=13 packets update the CNG generator's noise level; CNG produces shaped background noise during remote silence
+- **SDP**: CN/8000 (PT=13) advertised in m= line and rtpmap
+- **Payload format**: 1-byte noise level (-dBov, 0=max, 127=silent). Spectral coefficients (bytes 2+) not used — CNG shapes noise independently.
 
-**Impact**: Without CNG, silence periods transmit full-rate packets. This wastes bandwidth but doesn't affect audio quality. Lower priority than PLC.
+**Files**: `comfort_noise.rs` (encode/decode), `io_thread.rs` (send CN), `decode_thread.rs` (receive CN), `rtp_handler.rs` (send_cn method), `call_manager.rs` (SDP)
 
 ### Appendix III / Amendment 2: Quality Enhancement Toolbox — NOT IMPLEMENTED
 
@@ -195,7 +197,7 @@ Points to G.711.0 for lossless compression of G.711 frames. Not relevant for sta
 | µ↔A transcoding | COMPLIANT (table-based) | — |
 | All-zero suppression (µ-law) | Not implemented | Low (N/A for VoIP) |
 | Packet Loss Concealment | IMPLEMENTED (LPC-based) | — |
-| Comfort Noise Generation | Not implemented | Low (bandwidth) |
+| Comfort Noise Generation | IMPLEMENTED (RFC 3389) | — |
 | Quality Enhancement Toolbox | Not implemented | Low (optional) |
 | RTP payload types | COMPLIANT (PCMU=0, PCMA=8) | — |
 | Sampling rate | COMPLIANT (8000 Hz) | — |
@@ -208,8 +210,7 @@ Points to G.711.0 for lossless compression of G.711 frames. Not relevant for sta
 
 ### Remaining Optional Items
 
-1. **Comfort Noise Generation** — Low priority; only saves bandwidth during silence with VAD/DTX.
-2. **Quality Enhancement Toolbox** — Optional per standard; not required for base compliance.
+1. **Quality Enhancement Toolbox** — Optional per standard; not required for base compliance.
 
 ---
 
@@ -221,3 +222,4 @@ Points to G.711.0 for lossless compression of G.711 frames. Not relevant for sta
 | 2026-02-07 | Fixed A-law sign polarity (encoder + decoder) | Claude Code |
 | 2026-02-07 | Replaced µ↔A transcoding with ITU-compliant lookup tables | Claude Code |
 | 2026-02-07 | Documented existing LPC-based PLC implementation | Claude Code |
+| 2026-02-07 | Implemented RFC 3389 Comfort Noise payload (send + receive + SDP) | Claude Code |

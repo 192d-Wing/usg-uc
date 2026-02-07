@@ -1860,11 +1860,12 @@ impl CallManager {
                  c=IN {addr_type} {ip}\r\n\
                  b=AS:100\r\n\
                  t=0 0\r\n\
-                 m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8 101\r\n\
+                 m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8 13 101\r\n\
                  a=rtpmap:111 opus/48000/2\r\n\
                  a=fmtp:111 minptime=20;useinbandfec=1;stereo=1\r\n\
                  a=rtpmap:0 PCMU/8000\r\n\
                  a=rtpmap:8 PCMA/8000\r\n\
+                 a=rtpmap:13 CN/8000\r\n\
                  a=rtpmap:101 telephone-event/8000\r\n\
                  a=fmtp:101 0-15\r\n\
                  a=ptime:20\r\n\
@@ -1898,9 +1899,10 @@ impl CallManager {
                  c=IN {addr_type} {ip}\r\n\
                  b=AS:80\r\n\
                  t=0 0\r\n\
-                 m=audio {port} RTP/AVP 0 8 101\r\n\
+                 m=audio {port} RTP/AVP 0 8 13 101\r\n\
                  a=rtpmap:0 PCMU/8000\r\n\
                  a=rtpmap:8 PCMA/8000\r\n\
+                 a=rtpmap:13 CN/8000\r\n\
                  a=rtpmap:101 telephone-event/8000\r\n\
                  a=fmtp:101 0-15\r\n\
                  a=ptime:20\r\n\
@@ -2004,11 +2006,12 @@ impl CallManager {
                  c=IN {addr_type} {ip}\r\n\
                  b=AS:100\r\n\
                  t=0 0\r\n\
-                 m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8 101\r\n\
+                 m=audio {port} UDP/TLS/RTP/SAVPF 111 0 8 13 101\r\n\
                  a=rtpmap:111 opus/48000/2\r\n\
                  a=fmtp:111 minptime=20;useinbandfec=1;stereo=1\r\n\
                  a=rtpmap:0 PCMU/8000\r\n\
                  a=rtpmap:8 PCMA/8000\r\n\
+                 a=rtpmap:13 CN/8000\r\n\
                  a=rtpmap:101 telephone-event/8000\r\n\
                  a=fmtp:101 0-15\r\n\
                  a=ptime:20\r\n\
@@ -2042,9 +2045,10 @@ impl CallManager {
                  c=IN {addr_type} {ip}\r\n\
                  b=AS:80\r\n\
                  t=0 0\r\n\
-                 m=audio {port} RTP/AVP 0 8 101\r\n\
+                 m=audio {port} RTP/AVP 0 8 13 101\r\n\
                  a=rtpmap:0 PCMU/8000\r\n\
                  a=rtpmap:8 PCMA/8000\r\n\
+                 a=rtpmap:13 CN/8000\r\n\
                  a=rtpmap:101 telephone-event/8000\r\n\
                  a=fmtp:101 0-15\r\n\
                  a=ptime:20\r\n\

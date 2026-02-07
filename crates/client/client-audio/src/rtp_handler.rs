@@ -194,6 +194,65 @@ impl RtpTransmitter {
         self.ssrc
     }
 
+    /// Sends an RFC 3389 Comfort Noise payload.
+    ///
+    /// CN packets share the same RTP sequence/timestamp space as audio packets
+    /// (RFC 3389 §4). Only the payload type changes to PT=13.
+    /// Call this once at the speech→silence transition.
+    #[allow(clippy::cast_sign_loss, clippy::significant_drop_tightening)]
+    pub fn send_cn(&mut self, payload: &[u8]) -> AudioResult<()> {
+        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let ts = self
+            .timestamp
+            .fetch_add(self.timestamp_increment, Ordering::Relaxed);
+
+        let header = RtpHeader::new(proto_rtp::payload_types::CN, seq, ts, self.ssrc);
+        let packet = RtpPacket::new(header, Bytes::copy_from_slice(payload));
+        let packet_bytes = packet.to_bytes();
+
+        let send_bytes = if let Some(ref srtp) = self.srtp {
+            let srtp_guard = srtp
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let protector = SrtpProtect::new(&srtp_guard);
+            match protector.protect_rtp(&packet) {
+                Ok(protected) => protected.to_vec(),
+                Err(e) => {
+                    drop(srtp_guard);
+                    let mut stats = self
+                        .stats
+                        .lock()
+                        .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
+                    stats.srtp_errors += 1;
+                    return Err(AudioError::SrtpError(format!("SRTP protect failed: {e}")));
+                }
+            }
+        } else {
+            packet_bytes.to_vec()
+        };
+
+        match self.socket.send_to(&send_bytes, self.remote_addr) {
+            Ok(sent) => {
+                debug!("Sent CN packet: seq={}, ts={}, size={}", seq, ts, sent);
+                let mut stats = self
+                    .stats
+                    .lock()
+                    .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
+                stats.packets_sent += 1;
+                stats.bytes_sent += sent as u64;
+                Ok(())
+            }
+            Err(e) => {
+                let mut stats = self
+                    .stats
+                    .lock()
+                    .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
+                stats.packets_dropped += 1;
+                Err(AudioError::RtpError(format!("CN send failed: {e}")))
+            }
+        }
+    }
+
     /// Sends a DTMF event packet (RFC 4733 telephone-event).
     ///
     /// For proper DTMF signaling, call this method multiple times:

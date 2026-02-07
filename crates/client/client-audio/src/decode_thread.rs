@@ -7,7 +7,7 @@
 //! delays that cause playback gaps.
 
 use crate::codec::CodecPipeline;
-use crate::comfort_noise::ComfortNoiseGenerator;
+use crate::comfort_noise::{ComfortNoiseGenerator, decode_cn_payload};
 use crate::drift_compensator::DriftCompensator;
 use crate::jitter_buffer::{JitterBufferResult, SharedJitterBuffer};
 use crate::plc::PacketLossConcealer;
@@ -307,6 +307,16 @@ fn decode_loop(
                         consecutive_empty = 0;
                         decoded_this_cycle += 1;
 
+                        // Handle RFC 3389 Comfort Noise packets (PT=13)
+                        if packet.payload_type == proto_rtp::payload_types::CN {
+                            let noise_level = decode_cn_payload(&packet.payload);
+                            cng.update_level(noise_level);
+                            let mut cn_pcm = vec![0i16; adjusted_device_samples];
+                            cng.generate(&mut cn_pcm);
+                            producer.push_slice(&cn_pcm);
+                            continue;
+                        }
+
                         // Decode
                         let codec_pcm = match codec.decode(&packet.payload) {
                             Ok(pcm) => pcm,
@@ -467,7 +477,8 @@ fn decode_loop(
                             last_output_sample = 0;
                             producer.push_slice(&fade);
                         } else if consecutive_empty >= 10 {
-                            // After sustained emptiness, inject comfort noise
+                            // After sustained emptiness, inject comfort noise.
+                            // Default level when no CN packet was received from remote.
                             cng.update_level(20.0);
                             let mut cn_pcm = vec![0i16; device_samples];
                             cng.generate(&mut cn_pcm);

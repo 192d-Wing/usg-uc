@@ -9,6 +9,7 @@
 
 use crate::audio_processing::AudioProcessor;
 use crate::codec::CodecPipeline;
+use crate::comfort_noise::encode_cn_payload;
 use crate::decode_thread::DecodeCommand;
 use crate::dtmf_tones::DtmfToneGenerator;
 use crate::file_source::FileAudioSource;
@@ -252,6 +253,7 @@ fn io_loop(
     let dtx_warmup_duration = Duration::from_secs(5);
     let mut dtx_warmup_start = Instant::now();
     let mut prev_moh_active = false;
+    let mut was_speech_last_frame = false;
 
     // Diagnostic counters (logged every ~2 seconds)
     let mut diag_frames_captured: u64 = 0;
@@ -301,7 +303,7 @@ fn io_loop(
             } else if !muted.load(Ordering::Relaxed) {
                 // Normal capture mode
                 let in_warmup = dtx_warmup_start.elapsed() < dtx_warmup_duration;
-                let (samples_read, max_amp, dtx) = process_capture_frame(
+                let (samples_read, max_amp, dtx, noise_floor) = process_capture_frame(
                     &mut codec,
                     &mut transmitter,
                     &mut capture,
@@ -322,6 +324,18 @@ fn io_loop(
                 }
                 if dtx {
                     diag_dtx_frames += 1;
+                    // Send one CN packet at the speech→silence transition (RFC 3389)
+                    if let Some(nf) = noise_floor
+                        && was_speech_last_frame
+                    {
+                        let cn_payload = encode_cn_payload(nf);
+                        if let Err(e) = transmitter.send_cn(&cn_payload) {
+                            trace!("CN send error: {e}");
+                        }
+                    }
+                    was_speech_last_frame = false;
+                } else {
+                    was_speech_last_frame = true;
                 }
             }
         }
@@ -456,7 +470,9 @@ fn io_loop(
 
 /// Processes one frame of microphone capture.
 ///
-/// Returns (`samples_read`, `max_amplitude`, `dtx_suppressed`) for diagnostics.
+/// Returns (`samples_read`, `max_amplitude`, `dtx_suppressed`, `noise_floor`).
+/// When DTX suppresses the frame, `noise_floor` carries the VAD's estimate
+/// so the caller can send an RFC 3389 CN packet at the speech→silence transition.
 #[allow(clippy::too_many_arguments)]
 fn process_capture_frame(
     codec: &mut CodecPipeline,
@@ -468,7 +484,7 @@ fn process_capture_frame(
     codec_samples: usize,
     stats: &Arc<Mutex<PipelineStats>>,
     skip_dtx: bool,
-) -> (usize, i16, bool) {
+) -> (usize, i16, bool, Option<f32>) {
     // Read captured samples at device rate
     let mut device_pcm = vec![0i16; device_samples];
     let samples_read = capture.read(&mut device_pcm);
@@ -499,7 +515,7 @@ fn process_capture_frame(
     // During warmup, always send even if VAD says silence, to ensure the
     // remote side receives our RTP and starts sending back.
     if !skip_dtx && vad.detect(&device_pcm[..samples_read]) == VadDecision::Silence {
-        return (samples_read, max_amp, true);
+        return (samples_read, max_amp, true, Some(vad.noise_floor()));
     }
 
     // Resample from device rate to codec rate (no cross-frame needed for downsampling)
@@ -514,7 +530,7 @@ fn process_capture_frame(
         Ok(e) => e.to_vec(),
         Err(e) => {
             warn!("Encode error: {e}");
-            return (samples_read, max_amp, false);
+            return (samples_read, max_amp, false, None);
         }
     };
 
@@ -523,7 +539,7 @@ fn process_capture_frame(
         trace!("RTP send error: {e}");
     }
 
-    (samples_read, max_amp, false)
+    (samples_read, max_amp, false, None)
 }
 
 /// Processes one frame of Music on Hold audio.

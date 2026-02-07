@@ -23,6 +23,62 @@
 /// 0.5 = half the noise floor energy (subtle, non-intrusive).
 const CN_LEVEL_FACTOR: f32 = 0.5;
 
+/// Full-scale reference for dBov conversion (16-bit PCM).
+const FULL_SCALE: f32 = 32768.0;
+
+/// Converts an RMS amplitude to dBov (decibels relative to overload).
+///
+/// dBov = 20 * log10(rms / 32768). Result is always <= 0.
+/// Returns -127.0 for silence (rms < 1.0).
+fn rms_to_dbov(rms: f32) -> f32 {
+    if rms < 1.0 {
+        return -127.0;
+    }
+    (20.0 * (rms / FULL_SCALE).log10()).clamp(-127.0, 0.0)
+}
+
+/// Converts a dBov value back to RMS amplitude.
+///
+/// rms = 32768 * 10^(dbov/20). Input should be <= 0.
+fn dbov_to_rms(dbov: f32) -> f32 {
+    FULL_SCALE * 10.0_f32.powf(dbov / 20.0)
+}
+
+/// Encodes an RFC 3389 Comfort Noise payload from the VAD noise floor RMS.
+///
+/// The minimum CN payload is 1 byte: the noise level in -dBov (0 = max, 127 = silence).
+/// Optional spectral information (bytes 2+) is not generated — the receiver's
+/// CNG will shape the noise independently.
+///
+/// # Wire format (RFC 3389 §3)
+/// ```text
+///  0                   1
+///  0 1 2 3 4 5 6 7 8 9 0 1 ...
+/// +-+-+-+-+-+-+-+-+-+-+-+-+
+/// |  noise level  | spec  |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+
+/// ```
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn encode_cn_payload(noise_floor_rms: f32) -> Vec<u8> {
+    let dbov = rms_to_dbov(noise_floor_rms);
+    // CN byte = -dBov, clamped to 0..127
+    let level = (-dbov).clamp(0.0, 127.0) as u8;
+    vec![level]
+}
+
+/// Decodes an RFC 3389 Comfort Noise payload to an RMS noise level.
+///
+/// Reads byte 0 as noise level in -dBov and converts to RMS.
+/// Returns a default low level if the payload is empty.
+pub fn decode_cn_payload(payload: &[u8]) -> f32 {
+    if payload.is_empty() {
+        // RFC 3389 §3: empty payload = silence, use minimum audible level
+        return dbov_to_rms(-127.0);
+    }
+    let neg_dbov = f32::from(payload[0]);
+    dbov_to_rms(-neg_dbov)
+}
+
 /// Simple one-pole low-pass filter coefficient for noise shaping.
 /// Higher values = more smoothing (lower frequency content).
 /// 0.7 produces a gentle roll-off above ~500 Hz at 8 kHz sample rate.
@@ -213,6 +269,81 @@ mod tests {
 
         cng.update_level(0.0);
         assert!(!cng.is_active());
+    }
+
+    #[test]
+    fn test_cn_payload_roundtrip() {
+        // Various RMS levels should survive encode → decode with reasonable accuracy
+        for &rms in &[10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0] {
+            let payload = encode_cn_payload(rms);
+            assert_eq!(payload.len(), 1, "CN payload should be 1 byte");
+            let decoded = decode_cn_payload(&payload);
+            // The single-byte quantization loses precision; verify within 1 dB
+            let original_dbov = rms_to_dbov(rms);
+            let decoded_dbov = rms_to_dbov(decoded);
+            assert!(
+                (original_dbov - decoded_dbov).abs() <= 1.0,
+                "Roundtrip error too large for rms={rms}: {original_dbov:.1} vs {decoded_dbov:.1} dBov"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cn_payload_known_values() {
+        // Near-silence should encode to 127 (maximum attenuation)
+        let payload = encode_cn_payload(0.5);
+        assert_eq!(payload[0], 127);
+
+        // Full-scale should encode to 0 (no attenuation)
+        let payload = encode_cn_payload(32768.0);
+        assert_eq!(payload[0], 0);
+    }
+
+    #[test]
+    fn test_cn_payload_empty_decode() {
+        // Empty payload = silence per RFC 3389
+        let rms = decode_cn_payload(&[]);
+        assert!(
+            rms < 1.0,
+            "Empty CN payload should decode to near-silence, got {rms}"
+        );
+    }
+
+    #[test]
+    fn test_cn_payload_decode_extremes() {
+        // Level 0 = 0 dBov = full scale
+        let rms = decode_cn_payload(&[0]);
+        assert!(
+            (rms - 32768.0).abs() < 1.0,
+            "Level 0 should decode to full scale, got {rms}"
+        );
+
+        // Level 127 = -127 dBov ≈ silence
+        let rms = decode_cn_payload(&[127]);
+        assert!(
+            rms < 1.0,
+            "Level 127 should decode to near-silence, got {rms}"
+        );
+    }
+
+    #[test]
+    fn test_dbov_conversion() {
+        // Full-scale = 0 dBov
+        assert!((rms_to_dbov(32768.0) - 0.0).abs() < 0.01);
+
+        // Half scale ≈ -6 dBov
+        assert!((rms_to_dbov(16384.0) - (-6.02)).abs() < 0.1);
+
+        // Near-silence clamps to -127
+        assert!((rms_to_dbov(0.1) - (-127.0)).abs() < 0.01);
+
+        // Roundtrip
+        let rms = 200.0;
+        let back = dbov_to_rms(rms_to_dbov(rms));
+        assert!(
+            (rms - back).abs() < 1.0,
+            "dBov roundtrip failed: {rms} → {back}"
+        );
     }
 
     #[test]
