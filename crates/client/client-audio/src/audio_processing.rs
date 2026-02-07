@@ -75,6 +75,17 @@ impl AudioProcessor {
         }
     }
 
+    /// Resets all processing state (AGC gain, noise gate).
+    ///
+    /// Call this when switching input devices to prevent stale state
+    /// (e.g., gain tuned for a quiet Bluetooth mic) from affecting the
+    /// first frames from the new device.
+    pub fn reset(&mut self) {
+        self.current_gain = 1.0;
+        self.gate_open = false;
+        self.gate_hold_counter = 0;
+    }
+
     /// Enables or disables the AGC.
     pub const fn set_agc_enabled(&mut self, enabled: bool) {
         self.agc_enabled = enabled;

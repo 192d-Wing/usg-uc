@@ -335,6 +335,14 @@ fn io_loop(
                                 );
                             }
                             capture = new_capture;
+
+                            // Reset processing state for clean transition:
+                            // - AGC gain tuned for old device would mis-amplify new device
+                            // - Frame timer prevents burst-sending backed-up frames
+                            // - DTX warmup ensures continuous RTP through the switch
+                            audio_processor.reset();
+                            last_capture = Instant::now();
+                            dtx_warmup_start = Instant::now();
                             info!("I/O thread: input device switched successfully");
                         }
                         Err(e) => {
