@@ -277,147 +277,97 @@ impl fmt::Display for HeaderName {
     }
 }
 
+/// Static lookup table mapping lowercase header names to `HeaderName` variants.
+/// Used by `FromStr` to avoid heap allocation during case-insensitive matching.
+const HEADER_NAME_TABLE: &[(&str, HeaderName)] = &[
+    ("via", HeaderName::Via),
+    ("route", HeaderName::Route),
+    ("record-route", HeaderName::RecordRoute),
+    ("max-forwards", HeaderName::MaxForwards),
+    ("path", HeaderName::Path),
+    ("call-id", HeaderName::CallId),
+    ("cseq", HeaderName::CSeq),
+    ("from", HeaderName::From),
+    ("to", HeaderName::To),
+    ("content-type", HeaderName::ContentType),
+    ("content-length", HeaderName::ContentLength),
+    ("content-encoding", HeaderName::ContentEncoding),
+    ("content-disposition", HeaderName::ContentDisposition),
+    ("content-language", HeaderName::ContentLanguage),
+    ("contact", HeaderName::Contact),
+    ("expires", HeaderName::Expires),
+    ("min-expires", HeaderName::MinExpires),
+    ("www-authenticate", HeaderName::WwwAuthenticate),
+    ("authorization", HeaderName::Authorization),
+    ("proxy-authenticate", HeaderName::ProxyAuthenticate),
+    ("proxy-authorization", HeaderName::ProxyAuthorization),
+    ("allow", HeaderName::Allow),
+    ("supported", HeaderName::Supported),
+    ("require", HeaderName::Require),
+    ("proxy-require", HeaderName::ProxyRequire),
+    ("unsupported", HeaderName::Unsupported),
+    ("accept", HeaderName::Accept),
+    ("accept-encoding", HeaderName::AcceptEncoding),
+    ("accept-language", HeaderName::AcceptLanguage),
+    ("alert-info", HeaderName::AlertInfo),
+    ("call-info", HeaderName::CallInfo),
+    ("date", HeaderName::Date),
+    ("error-info", HeaderName::ErrorInfo),
+    ("in-reply-to", HeaderName::InReplyTo),
+    ("mime-version", HeaderName::MimeVersion),
+    ("organization", HeaderName::Organization),
+    ("priority", HeaderName::Priority),
+    ("reply-to", HeaderName::ReplyTo),
+    ("retry-after", HeaderName::RetryAfter),
+    ("server", HeaderName::Server),
+    ("subject", HeaderName::Subject),
+    ("timestamp", HeaderName::Timestamp),
+    ("user-agent", HeaderName::UserAgent),
+    ("warning", HeaderName::Warning),
+    ("event", HeaderName::Event),
+    ("subscription-state", HeaderName::SubscriptionState),
+    ("allow-events", HeaderName::AllowEvents),
+    ("session-expires", HeaderName::SessionExpires),
+    ("min-se", HeaderName::MinSe),
+    ("identity", HeaderName::Identity),
+    ("p-asserted-identity", HeaderName::PAssertedIdentity),
+    ("p-preferred-identity", HeaderName::PPreferredIdentity),
+    ("reason", HeaderName::Reason),
+    ("refer-to", HeaderName::ReferTo),
+    ("referred-by", HeaderName::ReferredBy),
+    ("replaces", HeaderName::Replaces),
+];
+
 impl FromStr for HeaderName {
     type Err = SipError;
 
     fn from_str(s: &str) -> SipResult<Self> {
         // Handle compact forms (RFC 3261 Section 7.3.3)
         if s.len() == 1 {
-            match s.chars().next() {
-                Some('v' | 'V') => return Ok(Self::Via),
-                Some('f' | 'F') => return Ok(Self::From),
-                Some('t' | 'T') => return Ok(Self::To),
-                Some('i' | 'I') => return Ok(Self::CallId),
-                Some('m' | 'M') => return Ok(Self::Contact),
-                Some('c' | 'C') => return Ok(Self::ContentType),
-                Some('l' | 'L') => return Ok(Self::ContentLength),
-                Some('k' | 'K') => return Ok(Self::Supported),
-                Some('s' | 'S') => return Ok(Self::Subject),
-                Some('r' | 'R') => return Ok(Self::ReferTo),
-                Some('u' | 'U') => return Ok(Self::AllowEvents),
-                Some('o' | 'O') => return Ok(Self::Event),
+            match s.as_bytes()[0] {
+                b'v' | b'V' => return Ok(Self::Via),
+                b'f' | b'F' => return Ok(Self::From),
+                b't' | b'T' => return Ok(Self::To),
+                b'i' | b'I' => return Ok(Self::CallId),
+                b'm' | b'M' => return Ok(Self::Contact),
+                b'c' | b'C' => return Ok(Self::ContentType),
+                b'l' | b'L' => return Ok(Self::ContentLength),
+                b'k' | b'K' => return Ok(Self::Supported),
+                b's' | b'S' => return Ok(Self::Subject),
+                b'r' | b'R' => return Ok(Self::ReferTo),
+                b'u' | b'U' => return Ok(Self::AllowEvents),
+                b'o' | b'O' => return Ok(Self::Event),
                 _ => {}
             }
         }
 
-        // Case-insensitive comparison without allocation
-        // (avoids s.to_lowercase() heap allocation per header)
-        let name = if s.eq_ignore_ascii_case("via") {
-            Self::Via
-        } else if s.eq_ignore_ascii_case("route") {
-            Self::Route
-        } else if s.eq_ignore_ascii_case("record-route") {
-            Self::RecordRoute
-        } else if s.eq_ignore_ascii_case("max-forwards") {
-            Self::MaxForwards
-        } else if s.eq_ignore_ascii_case("path") {
-            Self::Path
-        } else if s.eq_ignore_ascii_case("call-id") {
-            Self::CallId
-        } else if s.eq_ignore_ascii_case("cseq") {
-            Self::CSeq
-        } else if s.eq_ignore_ascii_case("from") {
-            Self::From
-        } else if s.eq_ignore_ascii_case("to") {
-            Self::To
-        } else if s.eq_ignore_ascii_case("content-type") {
-            Self::ContentType
-        } else if s.eq_ignore_ascii_case("content-length") {
-            Self::ContentLength
-        } else if s.eq_ignore_ascii_case("content-encoding") {
-            Self::ContentEncoding
-        } else if s.eq_ignore_ascii_case("content-disposition") {
-            Self::ContentDisposition
-        } else if s.eq_ignore_ascii_case("content-language") {
-            Self::ContentLanguage
-        } else if s.eq_ignore_ascii_case("contact") {
-            Self::Contact
-        } else if s.eq_ignore_ascii_case("expires") {
-            Self::Expires
-        } else if s.eq_ignore_ascii_case("min-expires") {
-            Self::MinExpires
-        } else if s.eq_ignore_ascii_case("www-authenticate") {
-            Self::WwwAuthenticate
-        } else if s.eq_ignore_ascii_case("authorization") {
-            Self::Authorization
-        } else if s.eq_ignore_ascii_case("proxy-authenticate") {
-            Self::ProxyAuthenticate
-        } else if s.eq_ignore_ascii_case("proxy-authorization") {
-            Self::ProxyAuthorization
-        } else if s.eq_ignore_ascii_case("allow") {
-            Self::Allow
-        } else if s.eq_ignore_ascii_case("supported") {
-            Self::Supported
-        } else if s.eq_ignore_ascii_case("require") {
-            Self::Require
-        } else if s.eq_ignore_ascii_case("proxy-require") {
-            Self::ProxyRequire
-        } else if s.eq_ignore_ascii_case("unsupported") {
-            Self::Unsupported
-        } else if s.eq_ignore_ascii_case("accept") {
-            Self::Accept
-        } else if s.eq_ignore_ascii_case("accept-encoding") {
-            Self::AcceptEncoding
-        } else if s.eq_ignore_ascii_case("accept-language") {
-            Self::AcceptLanguage
-        } else if s.eq_ignore_ascii_case("alert-info") {
-            Self::AlertInfo
-        } else if s.eq_ignore_ascii_case("call-info") {
-            Self::CallInfo
-        } else if s.eq_ignore_ascii_case("date") {
-            Self::Date
-        } else if s.eq_ignore_ascii_case("error-info") {
-            Self::ErrorInfo
-        } else if s.eq_ignore_ascii_case("in-reply-to") {
-            Self::InReplyTo
-        } else if s.eq_ignore_ascii_case("mime-version") {
-            Self::MimeVersion
-        } else if s.eq_ignore_ascii_case("organization") {
-            Self::Organization
-        } else if s.eq_ignore_ascii_case("priority") {
-            Self::Priority
-        } else if s.eq_ignore_ascii_case("reply-to") {
-            Self::ReplyTo
-        } else if s.eq_ignore_ascii_case("retry-after") {
-            Self::RetryAfter
-        } else if s.eq_ignore_ascii_case("server") {
-            Self::Server
-        } else if s.eq_ignore_ascii_case("subject") {
-            Self::Subject
-        } else if s.eq_ignore_ascii_case("timestamp") {
-            Self::Timestamp
-        } else if s.eq_ignore_ascii_case("user-agent") {
-            Self::UserAgent
-        } else if s.eq_ignore_ascii_case("warning") {
-            Self::Warning
-        } else if s.eq_ignore_ascii_case("event") {
-            Self::Event
-        } else if s.eq_ignore_ascii_case("subscription-state") {
-            Self::SubscriptionState
-        } else if s.eq_ignore_ascii_case("allow-events") {
-            Self::AllowEvents
-        } else if s.eq_ignore_ascii_case("session-expires") {
-            Self::SessionExpires
-        } else if s.eq_ignore_ascii_case("min-se") {
-            Self::MinSe
-        } else if s.eq_ignore_ascii_case("identity") {
-            Self::Identity
-        } else if s.eq_ignore_ascii_case("p-asserted-identity") {
-            Self::PAssertedIdentity
-        } else if s.eq_ignore_ascii_case("p-preferred-identity") {
-            Self::PPreferredIdentity
-        } else if s.eq_ignore_ascii_case("reason") {
-            Self::Reason
-        } else if s.eq_ignore_ascii_case("refer-to") {
-            Self::ReferTo
-        } else if s.eq_ignore_ascii_case("referred-by") {
-            Self::ReferredBy
-        } else if s.eq_ignore_ascii_case("replaces") {
-            Self::Replaces
-        } else {
-            Self::Custom(s.to_string())
-        };
-        Ok(name)
+        // Case-insensitive lookup via static table (zero allocation)
+        for &(name, ref variant) in HEADER_NAME_TABLE {
+            if s.eq_ignore_ascii_case(name) {
+                return Ok(variant.clone());
+            }
+        }
+        Ok(Self::Custom(s.to_string()))
     }
 }
 
