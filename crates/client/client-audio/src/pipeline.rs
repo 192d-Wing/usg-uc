@@ -239,6 +239,9 @@ impl AudioPipeline {
             receiver.set_redundancy_pt(pt);
         }
 
+        // Set local SSRC on receiver for collision detection (RFC 3550 §8.2)
+        receiver.set_local_ssrc(ssrc);
+
         // Set up SRTP if keys are provided
         if let (Some(key), Some(salt)) = (&config.srtp_master_key, &config.srtp_master_salt) {
             let key_material =

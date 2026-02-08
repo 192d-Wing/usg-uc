@@ -105,6 +105,12 @@ impl RtcpSession {
         }
     }
 
+    /// Updates the local SSRC (used after SSRC collision resolution).
+    pub fn set_local_ssrc(&mut self, ssrc: u32) {
+        debug!("RTCP session SSRC updated to {:#010x}", ssrc);
+        self.local_ssrc = ssrc;
+    }
+
     /// Checks if it's time to send an RTCP report and sends one if so.
     ///
     /// Call this from the I/O thread on every iteration. It internally

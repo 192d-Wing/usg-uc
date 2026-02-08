@@ -298,6 +298,20 @@ fn io_loop(
             }
         }
 
+        // SSRC collision handling (RFC 3550 §8.2): if the receiver
+        // detected that the remote's SSRC matches our local SSRC,
+        // regenerate ours so both sides have unique identifiers.
+        if receiver.ssrc_collision_detected() {
+            let new_ssrc = crate::rtp_handler::generate_ssrc();
+            transmitter.change_ssrc(new_ssrc);
+            receiver.set_local_ssrc(new_ssrc);
+            receiver.clear_ssrc_collision();
+            if let Some(ref mut rtcp) = rtcp_session {
+                rtcp.set_local_ssrc(new_ssrc);
+            }
+            warn!("SSRC collision resolved: new local SSRC={:#010x}", new_ssrc);
+        }
+
         // 2. Capture and send audio at frame intervals.
         //    Uses additive timing to maintain exact cadence (e.g., every 20ms)
         //    regardless of processing time or recv_timeout jitter.

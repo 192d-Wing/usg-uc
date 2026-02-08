@@ -178,6 +178,15 @@ impl RtpTransmitter {
         debug!("RFC 2198 redundancy enabled, PT={}", pt);
     }
 
+    /// Changes the local SSRC (used after collision detection per RFC 3550 §8.2).
+    pub fn change_ssrc(&mut self, new_ssrc: u32) {
+        info!(
+            "Changing local SSRC: {:#010x} -> {:#010x} (collision resolution)",
+            self.ssrc, new_ssrc
+        );
+        self.ssrc = new_ssrc;
+    }
+
     /// Sets the DTMF payload type (default is 101).
     pub fn set_dtmf_payload_type(&mut self, pt: u8) {
         self.dtmf_payload_type = pt;
@@ -471,6 +480,10 @@ pub struct RtpReceiver {
     remote_ssrc: Option<u32>,
     /// RFC 2198 redundancy payload type (if negotiated).
     redundancy_pt: Option<u8>,
+    /// Our local SSRC (for collision detection per RFC 3550 §8.2).
+    local_ssrc: Option<u32>,
+    /// Set to `true` when an incoming SSRC matches our local SSRC.
+    ssrc_collision: bool,
 }
 
 impl RtpReceiver {
@@ -488,6 +501,8 @@ impl RtpReceiver {
             process_buffer: vec![0u8; MAX_RTP_PACKET_SIZE],
             remote_ssrc: None,
             redundancy_pt: None,
+            local_ssrc: None,
+            ssrc_collision: false,
         }
     }
 
@@ -500,6 +515,21 @@ impl RtpReceiver {
     pub fn set_srtp(&mut self, context: SrtpContext) {
         self.srtp = Some(context);
         debug!("SRTP decryption enabled for receiver");
+    }
+
+    /// Sets the local SSRC for collision detection (RFC 3550 §8.2).
+    pub fn set_local_ssrc(&mut self, ssrc: u32) {
+        self.local_ssrc = Some(ssrc);
+    }
+
+    /// Returns `true` if an SSRC collision has been detected since last clear.
+    pub const fn ssrc_collision_detected(&self) -> bool {
+        self.ssrc_collision
+    }
+
+    /// Clears the collision flag after the caller has handled it.
+    pub fn clear_ssrc_collision(&mut self) {
+        self.ssrc_collision = false;
     }
 
     /// Enables RFC 2198 redundancy reception with the given payload type.
@@ -588,6 +618,19 @@ impl RtpReceiver {
             };
 
         trace!("Received RTP packet: seq={}, ts={}, pt={}", seq, ts, pt);
+
+        // SSRC collision detection (RFC 3550 §8.2): if the incoming
+        // packet's SSRC matches our own local SSRC, flag the collision
+        // so the I/O thread can regenerate our SSRC.
+        if let Some(local) = self.local_ssrc {
+            if ssrc == local {
+                warn!(
+                    "SSRC collision detected: remote sent SSRC={:#010x} which matches our local SSRC",
+                    ssrc
+                );
+                self.ssrc_collision = true;
+            }
+        }
 
         // Track remote SSRC — detect changes mid-call (RFC 3550 §8.2).
         match self.remote_ssrc {
@@ -1064,5 +1107,89 @@ mod tests {
         let result = tx.send_dtmf(&event, true);
         // The send will succeed even if no one is listening (UDP)
         assert!(result.is_ok());
+    }
+
+    // ── SSRC collision detection (RFC 3550 §8.2) ────────────────
+
+    #[test]
+    fn test_ssrc_collision_detection() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let jb = SharedJitterBuffer::new(8000, 160, 60);
+        let mut rx = RtpReceiver::new(Arc::new(socket), jb);
+
+        let local_ssrc = 0xDEAD_BEEF;
+        rx.set_local_ssrc(local_ssrc);
+        assert!(!rx.ssrc_collision_detected());
+
+        // Simulate receiving a packet with our own SSRC — collision!
+        let mut pkt = vec![0u8; RTP_HEADER_SIZE + 160];
+        pkt[0] = 0x80; // V=2
+        pkt[1] = 0;    // PT=0
+        pkt[2..4].copy_from_slice(&1u16.to_be_bytes());
+        pkt[4..8].copy_from_slice(&160u32.to_be_bytes());
+        pkt[8..12].copy_from_slice(&local_ssrc.to_be_bytes());
+
+        rx.process_buffer[..pkt.len()].copy_from_slice(&pkt);
+        rx.process_packet(pkt.len()).unwrap();
+
+        assert!(rx.ssrc_collision_detected());
+    }
+
+    #[test]
+    fn test_ssrc_no_collision_different_ssrc() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let jb = SharedJitterBuffer::new(8000, 160, 60);
+        let mut rx = RtpReceiver::new(Arc::new(socket), jb);
+
+        rx.set_local_ssrc(0xAAAA_BBBB);
+
+        // Packet with a different SSRC — no collision
+        let mut pkt = vec![0u8; RTP_HEADER_SIZE + 160];
+        pkt[0] = 0x80;
+        pkt[1] = 0;
+        pkt[2..4].copy_from_slice(&1u16.to_be_bytes());
+        pkt[4..8].copy_from_slice(&160u32.to_be_bytes());
+        pkt[8..12].copy_from_slice(&0xCCCC_DDDDu32.to_be_bytes());
+
+        rx.process_buffer[..pkt.len()].copy_from_slice(&pkt);
+        rx.process_packet(pkt.len()).unwrap();
+
+        assert!(!rx.ssrc_collision_detected());
+    }
+
+    #[test]
+    fn test_ssrc_collision_clear() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let jb = SharedJitterBuffer::new(8000, 160, 60);
+        let mut rx = RtpReceiver::new(Arc::new(socket), jb);
+
+        let local_ssrc = 0x1234_5678;
+        rx.set_local_ssrc(local_ssrc);
+
+        // Trigger collision
+        let mut pkt = vec![0u8; RTP_HEADER_SIZE + 160];
+        pkt[0] = 0x80;
+        pkt[1] = 0;
+        pkt[2..4].copy_from_slice(&1u16.to_be_bytes());
+        pkt[4..8].copy_from_slice(&160u32.to_be_bytes());
+        pkt[8..12].copy_from_slice(&local_ssrc.to_be_bytes());
+
+        rx.process_buffer[..pkt.len()].copy_from_slice(&pkt);
+        rx.process_packet(pkt.len()).unwrap();
+
+        assert!(rx.ssrc_collision_detected());
+        rx.clear_ssrc_collision();
+        assert!(!rx.ssrc_collision_detected());
+    }
+
+    #[test]
+    fn test_transmitter_change_ssrc() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let mut tx = RtpTransmitter::new(Arc::new(socket), remote, 0xAAAA, 0, 160);
+
+        assert_eq!(tx.ssrc(), 0xAAAA);
+        tx.change_ssrc(0xBBBB);
+        assert_eq!(tx.ssrc(), 0xBBBB);
     }
 }
