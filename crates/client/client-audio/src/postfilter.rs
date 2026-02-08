@@ -1,23 +1,33 @@
 //! Decoder-side postfilter for G.711 quantization noise reduction.
 //!
 //! G.711 companding (µ-law/A-law) uses non-uniform quantization steps that
-//! introduce noise correlated with the signal. This postfilter applies a
-//! mild spectral tilt to reduce perceived quantization noise while
-//! preserving speech clarity.
+//! introduce noise correlated with the signal. Our encoder-side noise shaper
+//! (Appendix III) pushes quantization noise energy toward high frequencies
+//! (NTF = 1 − 0.5z⁻¹ → +3.5 dB at Nyquist). This postfilter compensates
+//! by applying a gain-normalized low-pass tilt that attenuates the
+//! high-frequency noise while preserving speech fundamentals and formants.
 //!
 //! Based on ITU-T G.711 Appendix III §4 recommendations. The filter
 //! operates at codec rate (8 kHz) before resampling for maximum effect.
 
-/// Tilt filter coefficient (0.0 = bypass, higher = more tilt).
-/// 0.4 provides gentle high-frequency emphasis that masks quantization
-/// noise without altering speech timbre noticeably.
-const TILT_ALPHA: f32 = 0.4;
-
-/// Decoder-side postfilter using a first-order tilt filter.
+/// Low-pass tilt coefficient (0.0 = bypass, higher = more HF attenuation).
 ///
-/// Implements `y[n] = x[n] - α * x[n-1]`, a simple high-pass tilt
-/// that attenuates low-frequency quantization noise energy while
-/// gently boosting speech formant frequencies (1-4 kHz at 8 kHz sample rate).
+/// Frequency response (8 kHz sample rate):
+/// - DC (0 Hz): 1.0 (unity — no bass boost)
+/// - 1 kHz: ~0.97 (−0.3 dB, negligible)
+/// - 2 kHz: ~0.89 (−1.0 dB, mild)
+/// - 4 kHz (Nyquist): (1−α)/(1+α) = 0.54 (−5.4 dB, significant)
+const TILT_ALPHA: f32 = 0.3;
+
+/// Gain normalization factor: 1/(1+α).
+/// Ensures DC gain is exactly 1.0 (no bass boost).
+const GAIN_NORM: f32 = 1.0 / (1.0 + TILT_ALPHA);
+
+/// Decoder-side postfilter using a gain-normalized low-pass tilt filter.
+///
+/// Implements `y[n] = (x[n] + α * x[n-1]) / (1 + α)`, which gently
+/// attenuates high-frequency quantization noise pushed there by the
+/// encoder-side noise shaper, while preserving speech fundamentals.
 #[derive(Debug)]
 pub struct Postfilter {
     /// Previous input sample for the tilt filter.
@@ -53,8 +63,8 @@ impl Postfilter {
 
     /// Applies the postfilter to a frame of decoded PCM in-place.
     ///
-    /// The tilt filter `y[n] = x[n] - α * x[n-1]` provides mild
-    /// high-pass emphasis. This is a zero-allocation operation.
+    /// The low-pass tilt `y[n] = (x[n] + α * x[n-1]) / (1 + α)` gently
+    /// rolls off high-frequency quantization noise. Zero-allocation operation.
     #[allow(clippy::cast_possible_truncation)]
     pub fn process(&mut self, pcm: &mut [i16]) {
         if !self.enabled {
@@ -63,7 +73,7 @@ impl Postfilter {
 
         for sample in pcm.iter_mut() {
             let x = f32::from(*sample);
-            let y = TILT_ALPHA.mul_add(-self.prev_input, x);
+            let y = TILT_ALPHA.mul_add(self.prev_input, x) * GAIN_NORM;
             self.prev_input = x;
             *sample = y.clamp(-32768.0, 32767.0) as i16;
         }
@@ -106,26 +116,25 @@ mod tests {
     }
 
     #[test]
-    fn test_dc_attenuated() {
-        // A constant DC signal should be attenuated by the tilt filter
+    fn test_dc_preserved() {
+        // A constant DC signal should pass through at unity gain
+        // (the gain normalization factor 1/(1+α) cancels the (1+α) DC gain)
         let mut pf = Postfilter::new();
         let mut dc = vec![1000i16; 160];
         pf.process(&mut dc);
 
-        // First sample passes through (prev=0), subsequent samples reduced
-        assert_eq!(dc[0], 1000);
-        // After settling, output ≈ x - 0.4*x = 0.6*x = 600
+        // After settling, output ≈ (x + α*x) / (1+α) = x = 1000
         let settled = dc[159];
         assert!(
-            (settled - 600).abs() < 10,
-            "Settled DC should be ~600 (60% of input), got {settled}"
+            (settled - 1000).abs() < 10,
+            "Settled DC should be ~1000 (unity gain), got {settled}"
         );
     }
 
     #[test]
-    fn test_high_freq_preserved() {
-        // An alternating signal (+1000, -1000) is high frequency
-        // and should be relatively preserved by the high-pass tilt
+    fn test_high_freq_attenuated() {
+        // An alternating signal (+1000, -1000) is at Nyquist frequency
+        // and should be attenuated by the low-pass tilt
         let mut pf = Postfilter::new();
         let mut alt: Vec<i16> = (0..160)
             .map(|i| if i % 2 == 0 { 1000 } else { -1000 })
@@ -136,10 +145,11 @@ mod tests {
 
         let filtered_energy: f64 = alt.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
 
-        // High-frequency energy should be boosted or roughly preserved (not attenuated)
+        // Nyquist gain = (1-α)/(1+α) = 0.7/1.3 ≈ 0.538, energy ≈ 0.29x
+        // Allow some margin for the transient at the start
         assert!(
-            filtered_energy >= original_energy * 0.9,
-            "High-frequency signal should be preserved: original={original_energy}, filtered={filtered_energy}"
+            filtered_energy < original_energy * 0.5,
+            "Nyquist signal should be significantly attenuated: original={original_energy}, filtered={filtered_energy}"
         );
     }
 

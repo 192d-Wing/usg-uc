@@ -11,7 +11,7 @@ use crate::comfort_noise::{ComfortNoiseGenerator, decode_cn_payload};
 use crate::drift_compensator::DriftCompensator;
 use crate::dtmf_tones::DtmfToneGenerator;
 use crate::jitter_buffer::{JitterBufferResult, SharedJitterBuffer};
-use crate::plc::PacketLossConcealer;
+use crate::wsola::WsolaPlc;
 use crate::postfilter::Postfilter;
 use crate::rtp_handler::DTMF_PAYLOAD_TYPE;
 use crate::sinc_resampler::Resampler;
@@ -222,12 +222,10 @@ fn decode_loop(
     let mut last_output_sample: i16 = 0;
 
     // LPC-based packet loss concealment
-    let mut plc = PacketLossConcealer::new(codec_samples);
-    // Decoder-side postfilter: reduces G.711 quantization noise
-    // Disabled: the tilt filter (α=0.4) attenuates voice fundamentals
-    // (100-300 Hz) by ~4 dB, making speech sound robotic/thin.
+    let mut plc = WsolaPlc::new(codec_samples);
+    // Decoder-side postfilter: low-pass tilt complements the encoder-side
+    // noise shaper by attenuating the high-frequency noise it boosted.
     let mut postfilter = Postfilter::new();
-    postfilter.set_enabled(false);
     // Comfort noise for remote DTX (jitter buffer empty for extended periods)
     let mut cng = ComfortNoiseGenerator::new();
     let mut consecutive_empty: u32 = 0;
