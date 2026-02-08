@@ -74,19 +74,19 @@ fn bench_g711_ulaw_decode(c: &mut Criterion) {
 
 fn bench_resample_8k_to_48k(c: &mut Criterion) {
     let mut resampler = Resampler::new(8000, 48000);
-    // 20ms at 8kHz = 160 samples
     let input: Vec<i16> = (0..160).map(|i| (i * 200 - 16000) as i16).collect();
-    c.bench_function("resample 8kHz→48kHz (160→960 samples)", |b| {
-        b.iter(|| resampler.process(black_box(&input)));
+    let mut output = vec![0i16; 960];
+    c.bench_function("resample 8kHz→48kHz zero-alloc (160→960)", |b| {
+        b.iter(|| resampler.process_adjusted_into(black_box(&input), &mut output));
     });
 }
 
 fn bench_resample_48k_to_8k(c: &mut Criterion) {
     let mut resampler = Resampler::new(48000, 8000);
-    // 20ms at 48kHz = 960 samples
     let input: Vec<i16> = (0..960).map(|i| (i * 34 - 16000) as i16).collect();
-    c.bench_function("resample 48kHz→8kHz (960→160 samples)", |b| {
-        b.iter(|| resampler.process(black_box(&input)));
+    let mut output = vec![0i16; 160];
+    c.bench_function("resample 48kHz→8kHz zero-alloc (960→160)", |b| {
+        b.iter(|| resampler.process_adjusted_into(black_box(&input), &mut output));
     });
 }
 
