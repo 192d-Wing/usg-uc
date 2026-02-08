@@ -9,7 +9,7 @@ use crate::jitter_buffer::{BufferedPacket, SharedJitterBuffer};
 use crate::{AudioError, AudioResult};
 use bytes::Bytes;
 use client_types::DtmfEvent;
-use proto_rtp::{RtpHeader, RtpPacket};
+use proto_rtp::RtpHeader;
 use proto_srtp::{SrtpContext, SrtpProtect, SrtpUnprotect};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
@@ -448,59 +448,77 @@ impl RtpReceiver {
     }
 
     /// Processes a received packet from `self.process_buffer[..len]`.
+    ///
+    /// Non-SRTP path: parses only the 4 header fields we need (PT, seq, ts,
+    /// SSRC) directly from bytes — avoids constructing the intermediate
+    /// `RtpHeader` (with `Vec<u32>` csrc) and `RtpPacket` structs.
+    ///
+    /// SRTP path: delegates to `unprotect_rtp` which must construct the full
+    /// header for AAD computation, then extracts the same 4 fields.
     #[allow(clippy::needless_pass_by_ref_mut)]
     fn process_packet(&mut self, len: usize) -> AudioResult<()> {
         let data = &self.process_buffer[..len];
 
-        // Decrypt if SRTP is configured
-        let packet = if let Some(ref srtp) = self.srtp {
-            let unprotector = SrtpUnprotect::new(srtp);
-            match unprotector.unprotect_rtp(data) {
-                Ok(pkt) => pkt,
-                Err(e) => {
-                    self.stats.srtp_errors.fetch_add(1, Ordering::Relaxed);
-                    return Err(AudioError::SrtpError(format!("SRTP unprotect failed: {e}")));
+        // Extract the 4 fields + payload, choosing the right path.
+        let (pt, seq, ts, ssrc, payload): (u8, u16, u32, u32, Bytes) =
+            if let Some(ref srtp) = self.srtp {
+                let unprotector = SrtpUnprotect::new(srtp);
+                match unprotector.unprotect_rtp(data) {
+                    Ok(pkt) => (
+                        pkt.header.payload_type,
+                        pkt.header.sequence_number,
+                        pkt.header.timestamp,
+                        pkt.header.ssrc,
+                        pkt.payload,
+                    ),
+                    Err(e) => {
+                        self.stats.srtp_errors.fetch_add(1, Ordering::Relaxed);
+                        return Err(AudioError::SrtpError(format!(
+                            "SRTP unprotect failed: {e}"
+                        )));
+                    }
                 }
-            }
-        } else {
-            RtpPacket::parse(data)
-                .map_err(|e| AudioError::RtpError(format!("Parse failed: {e}")))?
-        };
+            } else {
+                // Inline minimal parse — no RtpHeader/RtpPacket constructed.
+                let (pt, seq, ts, ssrc, payload_start, payload_end) =
+                    parse_rtp_fields(data)?;
+                (
+                    pt,
+                    seq,
+                    ts,
+                    ssrc,
+                    Bytes::copy_from_slice(&data[payload_start..payload_end]),
+                )
+            };
 
-        trace!(
-            "Received RTP packet: seq={}, ts={}, pt={}",
-            packet.header.sequence_number, packet.header.timestamp, packet.header.payload_type
-        );
+        trace!("Received RTP packet: seq={}, ts={}, pt={}", seq, ts, pt);
 
         // Track remote SSRC — detect changes mid-call (RFC 3550 §8.2).
         match self.remote_ssrc {
             None => {
-                self.remote_ssrc = Some(packet.header.ssrc);
-                debug!("Learned remote SSRC: {:#010x}", packet.header.ssrc);
+                self.remote_ssrc = Some(ssrc);
+                debug!("Learned remote SSRC: {:#010x}", ssrc);
             }
-            Some(prev) if prev != packet.header.ssrc => {
+            Some(prev) if prev != ssrc => {
                 warn!(
                     "Remote SSRC changed: {:#010x} -> {:#010x}, resetting jitter buffer",
-                    prev, packet.header.ssrc
+                    prev, ssrc
                 );
-                self.remote_ssrc = Some(packet.header.ssrc);
+                self.remote_ssrc = Some(ssrc);
                 self.jitter_buffer.reset();
             }
             _ => {}
         }
 
         // Add to shared jitter buffer
-        let buffered = BufferedPacket::new(
-            packet.header.sequence_number,
-            packet.header.timestamp,
-            packet.header.payload_type,
-            packet.payload,
-        );
+        let buffered = BufferedPacket::new(seq, ts, pt, payload);
         self.jitter_buffer.push(buffered);
 
         self.stats.packets_received.fetch_add(1, Ordering::Relaxed);
         #[allow(clippy::cast_possible_truncation)]
-        self.stats.bytes_received.fetch_add(len as u64, Ordering::Relaxed);
+        self.stats
+            .bytes_received
+            .fetch_add(len as u64, Ordering::Relaxed);
 
         Ok(())
     }
@@ -595,6 +613,57 @@ pub fn generate_ssrc() -> u32 {
     rand_u32()
 }
 
+/// Extracts essential RTP fields from raw packet data without constructing
+/// an intermediate `RtpHeader` or `RtpPacket`.
+///
+/// Returns `(payload_type, sequence_number, timestamp, ssrc, payload_start, payload_end)`.
+#[inline]
+fn parse_rtp_fields(data: &[u8]) -> AudioResult<(u8, u16, u32, u32, usize, usize)> {
+    if data.len() < RTP_HEADER_SIZE {
+        return Err(AudioError::RtpError("packet too short".into()));
+    }
+    let first = data[0];
+    let version = (first >> 6) & 0x03;
+    if version != 2 {
+        return Err(AudioError::RtpError("invalid RTP version".into()));
+    }
+
+    let has_padding = (first & 0x20) != 0;
+    let has_extension = (first & 0x10) != 0;
+    let csrc_count = (first & 0x0F) as usize;
+
+    let payload_type = data[1] & 0x7F;
+    let sequence_number = u16::from_be_bytes([data[2], data[3]]);
+    let timestamp = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+    let ssrc = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+
+    let mut header_end = RTP_HEADER_SIZE + csrc_count * 4;
+    if data.len() < header_end {
+        return Err(AudioError::RtpError("packet too short for CSRC".into()));
+    }
+
+    // Skip extension header if present
+    if has_extension {
+        if data.len() < header_end + 4 {
+            return Err(AudioError::RtpError("extension header too short".into()));
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let ext_len =
+            u16::from_be_bytes([data[header_end + 2], data[header_end + 3]]) as usize * 4;
+        header_end += 4 + ext_len;
+    }
+
+    let mut payload_end = data.len();
+    if has_padding {
+        let pad_len = data[data.len() - 1] as usize;
+        if pad_len > 0 && pad_len <= data.len() - header_end {
+            payload_end -= pad_len;
+        }
+    }
+
+    Ok((payload_type, sequence_number, timestamp, ssrc, header_end, payload_end))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,6 +719,39 @@ mod tests {
     fn test_dtmf_payload_type_default() {
         assert_eq!(DTMF_PAYLOAD_TYPE, 101);
         assert_eq!(DTMF_CLOCK_RATE, 8000);
+    }
+
+    #[test]
+    fn test_parse_rtp_fields_basic() {
+        // Build a minimal RTP packet: V=2, PT=0, seq=100, ts=1600, ssrc=0xABCDEF01
+        let header = proto_rtp::RtpHeader::new(0, 100, 1600, 0xABCDEF01);
+        let header_bytes = header.to_bytes();
+        let payload = [0u8; 160];
+        let mut packet = Vec::with_capacity(header_bytes.len() + payload.len());
+        packet.extend_from_slice(&header_bytes);
+        packet.extend_from_slice(&payload);
+
+        let (pt, seq, ts, ssrc, payload_start, payload_end) =
+            parse_rtp_fields(&packet).unwrap();
+        assert_eq!(pt, 0);
+        assert_eq!(seq, 100);
+        assert_eq!(ts, 1600);
+        assert_eq!(ssrc, 0xABCDEF01);
+        assert_eq!(payload_start, 12);
+        assert_eq!(payload_end, 12 + 160);
+    }
+
+    #[test]
+    fn test_parse_rtp_fields_too_short() {
+        let data = [0u8; 8];
+        assert!(parse_rtp_fields(&data).is_err());
+    }
+
+    #[test]
+    fn test_parse_rtp_fields_bad_version() {
+        let mut data = [0u8; 12];
+        data[0] = 0xC0; // Version 3
+        assert!(parse_rtp_fields(&data).is_err());
     }
 
     #[test]
