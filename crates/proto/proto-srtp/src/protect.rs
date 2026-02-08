@@ -72,6 +72,40 @@ impl<'a> SrtpProtect<'a> {
         Ok(output.freeze())
     }
 
+    /// Protects (encrypts) an RTP payload given a header and raw payload
+    /// bytes, without requiring construction of an [`RtpPacket`] (avoids
+    /// the `Bytes::copy_from_slice` allocation in the caller).
+    ///
+    /// # Errors
+    /// Returns an error if encryption fails.
+    pub fn protect_rtp_parts(&self, header: &RtpHeader, payload: &[u8]) -> SrtpResult<Bytes> {
+        let index = self.context.compute_rtp_index(header.sequence_number);
+        self.context.update_rtp_state(header.sequence_number);
+
+        let nonce = self
+            .context
+            .compute_nonce(self.context.rtp_salt(), header.ssrc, index);
+
+        // Write header into stack buffer for AAD (max header: 12 + 15*4 = 72 bytes)
+        let mut header_buf = [0u8; 128];
+        let header_size = header.write_into(&mut header_buf);
+        let aad = &header_buf[..header_size];
+
+        let key = create_key(self.context.rtp_key())?;
+
+        let ciphertext =
+            key.seal(&nonce, aad, payload)
+                .map_err(|_| SrtpError::EncryptionFailed {
+                    reason: "AES-256-GCM encryption failed".to_string(),
+                })?;
+
+        let mut output = BytesMut::with_capacity(header_size + ciphertext.len());
+        output.put_slice(aad);
+        output.put(ciphertext.as_slice());
+
+        Ok(output.freeze())
+    }
+
     /// Protects (encrypts) an RTCP packet.
     ///
     /// ## Errors

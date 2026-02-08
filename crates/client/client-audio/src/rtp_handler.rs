@@ -124,6 +124,8 @@ pub struct RtpTransmitter {
     /// Timestamp of the current DTMF event (stays constant for one event).
     #[allow(dead_code)] // Read via atomic operations
     dtmf_event_timestamp: AtomicU32,
+    /// Pre-allocated buffer for serializing non-SRTP packets (header + payload).
+    send_buffer: Vec<u8>,
 }
 
 impl RtpTransmitter {
@@ -153,6 +155,7 @@ impl RtpTransmitter {
             dtmf_payload_type: DTMF_PAYLOAD_TYPE,
             dtmf_timestamp: AtomicU32::new(rand_u32()),
             dtmf_event_timestamp: AtomicU32::new(0),
+            send_buffer: vec![0u8; MAX_RTP_PACKET_SIZE],
         }
     }
 
@@ -169,6 +172,12 @@ impl RtpTransmitter {
     }
 
     /// Sends an RTP packet with the given audio payload.
+    ///
+    /// Non-SRTP path: zero-allocation — header + payload are written directly
+    /// into a pre-allocated `send_buffer` and sent from there.
+    ///
+    /// SRTP path: one allocation for the encrypted output (unavoidable), but
+    /// avoids the intermediate `Bytes::copy_from_slice` on the payload.
     #[allow(clippy::cast_sign_loss)]
     pub fn send(&mut self, payload: &[u8]) -> AudioResult<()> {
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
@@ -177,13 +186,11 @@ impl RtpTransmitter {
             .fetch_add(self.timestamp_increment, Ordering::Relaxed);
 
         let header = RtpHeader::new(self.payload_type, seq, ts, self.ssrc);
-        let packet = RtpPacket::new(header, Bytes::copy_from_slice(payload));
 
-        // Protect with SRTP and send — Bytes derefs to &[u8] so no .to_vec() needed.
         let protected: Bytes;
         let send_data: &[u8] = if let Some(ref srtp) = self.srtp {
             let protector = SrtpProtect::new(srtp);
-            match protector.protect_rtp(&packet) {
+            match protector.protect_rtp_parts(&header, payload) {
                 Ok(p) => {
                     protected = p;
                     &protected
@@ -194,8 +201,11 @@ impl RtpTransmitter {
                 }
             }
         } else {
-            protected = packet.to_bytes();
-            &protected
+            // Zero-alloc: write header + payload into pre-allocated send_buffer.
+            let header_size = header.write_into(&mut self.send_buffer);
+            let total = header_size + payload.len();
+            self.send_buffer[header_size..total].copy_from_slice(payload);
+            &self.send_buffer[..total]
         };
 
         match self.socket.send_to(send_data, self.remote_addr) {
@@ -235,12 +245,11 @@ impl RtpTransmitter {
             .fetch_add(self.timestamp_increment, Ordering::Relaxed);
 
         let header = RtpHeader::new(proto_rtp::payload_types::CN, seq, ts, self.ssrc);
-        let packet = RtpPacket::new(header, Bytes::copy_from_slice(payload));
 
         let protected: Bytes;
         let send_data: &[u8] = if let Some(ref srtp) = self.srtp {
             let protector = SrtpProtect::new(srtp);
-            match protector.protect_rtp(&packet) {
+            match protector.protect_rtp_parts(&header, payload) {
                 Ok(p) => {
                     protected = p;
                     &protected
@@ -251,8 +260,10 @@ impl RtpTransmitter {
                 }
             }
         } else {
-            protected = packet.to_bytes();
-            &protected
+            let header_size = header.write_into(&mut self.send_buffer);
+            let total = header_size + payload.len();
+            self.send_buffer[header_size..total].copy_from_slice(payload);
+            &self.send_buffer[..total]
         };
 
         match self.socket.send_to(send_data, self.remote_addr) {
@@ -310,13 +321,10 @@ impl RtpTransmitter {
         // Encode DTMF event payload (4 bytes per RFC 4733)
         let payload = event.encode();
 
-        // Build packet
-        let packet = RtpPacket::new(header, Bytes::copy_from_slice(&payload));
-
         let protected: Bytes;
         let send_data: &[u8] = if let Some(ref srtp) = self.srtp {
             let protector = SrtpProtect::new(srtp);
-            match protector.protect_rtp(&packet) {
+            match protector.protect_rtp_parts(&header, &payload) {
                 Ok(p) => {
                     protected = p;
                     &protected
@@ -327,8 +335,10 @@ impl RtpTransmitter {
                 }
             }
         } else {
-            protected = packet.to_bytes();
-            &protected
+            let header_size = header.write_into(&mut self.send_buffer);
+            let total = header_size + payload.len();
+            self.send_buffer[header_size..total].copy_from_slice(&payload);
+            &self.send_buffer[..total]
         };
 
         match self.socket.send_to(send_data, self.remote_addr) {

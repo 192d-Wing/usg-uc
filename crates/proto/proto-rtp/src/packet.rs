@@ -154,6 +154,48 @@ impl RtpHeader {
         size
     }
 
+    /// Serializes the header directly into `buf`, returning the number of
+    /// bytes written.
+    ///
+    /// # Panics
+    /// Panics if `buf` is shorter than [`Self::size()`].
+    #[must_use]
+    pub fn write_into(&self, buf: &mut [u8]) -> usize {
+        let size = self.size();
+        debug_assert!(buf.len() >= size, "buffer too small for RTP header");
+
+        // First byte: V=2, P, X, CC
+        buf[0] = (RTP_VERSION << 6)
+            | (if self.padding { 0x20 } else { 0 })
+            | (if self.extension { 0x10 } else { 0 })
+            | ((self.csrc.len() as u8) & 0x0F);
+
+        // Second byte: M, PT
+        buf[1] = (if self.marker { 0x80 } else { 0 }) | (self.payload_type & 0x7F);
+
+        buf[2..4].copy_from_slice(&self.sequence_number.to_be_bytes());
+        buf[4..8].copy_from_slice(&self.timestamp.to_be_bytes());
+        buf[8..12].copy_from_slice(&self.ssrc.to_be_bytes());
+
+        let mut pos = 12;
+        for &csrc in &self.csrc {
+            buf[pos..pos + 4].copy_from_slice(&csrc.to_be_bytes());
+            pos += 4;
+        }
+
+        if let Some(ref ext) = self.extension_header {
+            buf[pos..pos + 2].copy_from_slice(&ext.profile.to_be_bytes());
+            #[allow(clippy::cast_possible_truncation)]
+            let ext_len = (ext.data.len() / 4) as u16;
+            buf[pos + 2..pos + 4].copy_from_slice(&ext_len.to_be_bytes());
+            pos += 4;
+            buf[pos..pos + ext.data.len()].copy_from_slice(&ext.data);
+            pos += ext.data.len();
+        }
+
+        pos
+    }
+
     /// Parses an RTP header from bytes.
     ///
     /// ## Errors
@@ -424,5 +466,33 @@ mod tests {
         assert!(display.contains("PT=0"));
         assert!(display.contains("seq=1234"));
         assert!(display.contains("0x12345678"));
+    }
+
+    #[test]
+    fn test_header_write_into_matches_to_bytes() {
+        let header = RtpHeader::new(96, 1000, 160000, 0xDEADBEEF)
+            .with_marker(true)
+            .with_csrc(0x11111111);
+
+        let expected = header.to_bytes();
+
+        let mut buf = [0u8; 128];
+        let written = header.write_into(&mut buf);
+
+        assert_eq!(written, expected.len());
+        assert_eq!(&buf[..written], &expected[..]);
+    }
+
+    #[test]
+    fn test_header_write_into_minimal() {
+        let header = RtpHeader::new(0, 100, 1600, 0xABCDEF01);
+
+        let expected = header.to_bytes();
+
+        let mut buf = [0u8; 12];
+        let written = header.write_into(&mut buf);
+
+        assert_eq!(written, 12);
+        assert_eq!(&buf[..], &expected[..]);
     }
 }
