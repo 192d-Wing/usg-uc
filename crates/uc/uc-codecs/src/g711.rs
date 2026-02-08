@@ -3,9 +3,58 @@
 //! Pure Rust implementation of G.711 PCM encoding:
 //! - mu-law (PCMU) - North America/Japan
 //! - a-law (PCMA) - Europe/rest of world
+//!
+//! Encoding and decoding use pre-computed lookup tables for O(1) per-sample
+//! performance (matching pjproject's approach). The algorithmic implementations
+//! are retained as `_algo` methods for ITU compliance verification.
 
 use crate::error::{CodecError, CodecResult};
 use crate::{AudioCodec, PayloadType, payload_types};
+use std::sync::LazyLock;
+
+// ---------------------------------------------------------------------------
+// Lookup tables — computed once from the algorithmic encode/decode on first use
+// ---------------------------------------------------------------------------
+
+/// Mu-law encode lookup table (65536 entries, 64 KB).
+///
+/// Indexed directly by `sample as u16 as usize` for zero-overhead O(1) lookup.
+/// Full 64KB table avoids bucket-boundary issues with the 16K-entry shift approach
+/// (all-zero suppression boundary at mantissa=15 straddles 4-sample buckets).
+static ULAW_ENCODE_LUT: LazyLock<Box<[u8; 65536]>> = LazyLock::new(|| {
+    let mut table = Box::new([0u8; 65536]);
+    for raw in i16::MIN..=i16::MAX {
+        table[raw as u16 as usize] = G711Ulaw::encode_sample_algo(raw);
+    }
+    table
+});
+
+/// Mu-law decode lookup table (256 entries, 512 bytes).
+static ULAW_DECODE_LUT: LazyLock<[i16; 256]> = LazyLock::new(|| {
+    let mut table = [0i16; 256];
+    for i in 0u16..256 {
+        table[i as usize] = G711Ulaw::decode_sample_algo(i as u8);
+    }
+    table
+});
+
+/// A-law encode lookup table (65536 entries, 64 KB).
+static ALAW_ENCODE_LUT: LazyLock<Box<[u8; 65536]>> = LazyLock::new(|| {
+    let mut table = Box::new([0u8; 65536]);
+    for raw in i16::MIN..=i16::MAX {
+        table[raw as u16 as usize] = G711Alaw::encode_sample_algo(raw);
+    }
+    table
+});
+
+/// A-law decode lookup table (256 entries, 512 bytes).
+static ALAW_DECODE_LUT: LazyLock<[i16; 256]> = LazyLock::new(|| {
+    let mut table = [0i16; 256];
+    for i in 0u16..256 {
+        table[i as usize] = G711Alaw::decode_sample_algo(i as u8);
+    }
+    table
+});
 
 /// G.711 mu-law codec.
 #[derive(Debug, Clone, Default)]
@@ -27,9 +76,21 @@ impl G711Ulaw {
         }
     }
 
-    /// Encodes a single PCM sample to mu-law.
+    /// Encodes a single PCM sample to mu-law (lookup table, O(1)).
     #[inline]
     pub fn encode_sample(sample: i16) -> u8 {
+        ULAW_ENCODE_LUT[sample as u16 as usize]
+    }
+
+    /// Decodes a single mu-law sample to PCM (lookup table, O(1)).
+    #[inline]
+    pub fn decode_sample(ulaw: u8) -> i16 {
+        ULAW_DECODE_LUT[ulaw as usize]
+    }
+
+    /// Encodes a single PCM sample to mu-law (algorithmic reference).
+    #[inline]
+    pub fn encode_sample_algo(sample: i16) -> u8 {
         // Bias and clip the sample
         const BIAS: i32 = 0x84;
         const CLIP: i32 = 32635;
@@ -77,9 +138,9 @@ impl G711Ulaw {
         if encoded == 0x00 { 0x02 } else { encoded }
     }
 
-    /// Decodes a single mu-law sample to PCM.
+    /// Decodes a single mu-law sample to PCM (algorithmic reference).
     #[inline]
-    pub fn decode_sample(ulaw: u8) -> i16 {
+    pub fn decode_sample_algo(ulaw: u8) -> i16 {
         // Complement
         let ulaw = !ulaw;
 
@@ -171,9 +232,21 @@ impl G711Alaw {
         }
     }
 
-    /// Encodes a single PCM sample to a-law.
+    /// Encodes a single PCM sample to a-law (lookup table, O(1)).
     #[inline]
     pub fn encode_sample(sample: i16) -> u8 {
+        ALAW_ENCODE_LUT[sample as u16 as usize]
+    }
+
+    /// Decodes a single a-law sample to PCM (lookup table, O(1)).
+    #[inline]
+    pub fn decode_sample(alaw: u8) -> i16 {
+        ALAW_DECODE_LUT[alaw as usize]
+    }
+
+    /// Encodes a single PCM sample to a-law (algorithmic reference).
+    #[inline]
+    pub fn encode_sample_algo(sample: i16) -> u8 {
         let mut pcm_val = sample as i32;
 
         // Get sign — ITU-T G.711 Table 1a: positive → bit 7 = 1, negative → bit 7 = 0
@@ -210,9 +283,9 @@ impl G711Alaw {
         (sign | (exponent << 4) | mantissa) ^ 0x55
     }
 
-    /// Decodes a single a-law sample to PCM.
+    /// Decodes a single a-law sample to PCM (algorithmic reference).
     #[inline]
-    pub fn decode_sample(alaw: u8) -> i16 {
+    pub fn decode_sample_algo(alaw: u8) -> i16 {
         let alaw = alaw ^ 0x55;
 
         // ITU-T G.711 Table 1a: bit 7 = 1 → positive, bit 7 = 0 → negative
@@ -771,6 +844,60 @@ mod tests {
                 i & 0x80,
                 u & 0x80,
                 "A→µ sign mismatch: A=0x{i:02X} → µ=0x{u:02X}"
+            );
+        }
+    }
+
+    // ---- Lookup table verification tests ----
+
+    /// Verify mu-law encode LUT matches algorithmic for all 65536 i16 values.
+    #[test]
+    fn test_ulaw_encode_lut_matches_algo() {
+        for sample in i16::MIN..=i16::MAX {
+            let lut = G711Ulaw::encode_sample(sample);
+            let algo = G711Ulaw::encode_sample_algo(sample);
+            assert_eq!(
+                lut, algo,
+                "µ-law encode LUT mismatch for sample {sample}: LUT=0x{lut:02X}, algo=0x{algo:02X}"
+            );
+        }
+    }
+
+    /// Verify mu-law decode LUT matches algorithmic for all 256 codewords.
+    #[test]
+    fn test_ulaw_decode_lut_matches_algo() {
+        for codeword in 0u8..=255 {
+            let lut = G711Ulaw::decode_sample(codeword);
+            let algo = G711Ulaw::decode_sample_algo(codeword);
+            assert_eq!(
+                lut, algo,
+                "µ-law decode LUT mismatch for 0x{codeword:02X}: LUT={lut}, algo={algo}"
+            );
+        }
+    }
+
+    /// Verify A-law encode LUT matches algorithmic for all 65536 i16 values.
+    #[test]
+    fn test_alaw_encode_lut_matches_algo() {
+        for sample in i16::MIN..=i16::MAX {
+            let lut = G711Alaw::encode_sample(sample);
+            let algo = G711Alaw::encode_sample_algo(sample);
+            assert_eq!(
+                lut, algo,
+                "A-law encode LUT mismatch for sample {sample}: LUT=0x{lut:02X}, algo=0x{algo:02X}"
+            );
+        }
+    }
+
+    /// Verify A-law decode LUT matches algorithmic for all 256 codewords.
+    #[test]
+    fn test_alaw_decode_lut_matches_algo() {
+        for codeword in 0u8..=255 {
+            let lut = G711Alaw::decode_sample(codeword);
+            let algo = G711Alaw::decode_sample_algo(codeword);
+            assert_eq!(
+                lut, algo,
+                "A-law decode LUT mismatch for 0x{codeword:02X}: LUT={lut}, algo={algo}"
             );
         }
     }
