@@ -111,6 +111,10 @@ pub struct IoThreadConfig {
     pub rtcp_remote_addr: Option<SocketAddr>,
     /// Local SSRC (for RTCP reports).
     pub local_ssrc: u32,
+    /// DTMF volume level for RFC 4733 packets (0-63, default 10).
+    pub dtmf_volume: u8,
+    /// Inter-digit pause in milliseconds (default 100).
+    pub dtmf_inter_digit_pause_ms: u32,
 }
 
 /// Spawns the I/O thread.
@@ -247,7 +251,7 @@ fn io_loop(
             });
 
     // Non-blocking DTMF sender state machine
-    let mut dtmf_sender = DtmfSender::new();
+    let mut dtmf_sender = DtmfSender::new(config.dtmf_volume, u64::from(config.dtmf_inter_digit_pause_ms));
 
     let mut last_capture = Instant::now();
     let mut stats_update_counter: u32 = 0;

@@ -426,6 +426,7 @@ async fn send_dtmf(digit: String, state: State<'_, TauriAppState>) -> Result<(),
         Some('B' | 'b') => client_types::DtmfDigit::B,
         Some('C' | 'c') => client_types::DtmfDigit::C,
         Some('D' | 'd') => client_types::DtmfDigit::D,
+        Some('F' | 'f' | '!') => client_types::DtmfDigit::Flash,
         _ => return Err(format!("Invalid DTMF digit: {digit}")),
     };
 

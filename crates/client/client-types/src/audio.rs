@@ -39,6 +39,28 @@ pub struct AudioConfig {
     /// on the ring device. If not set, a default system beep is used.
     #[serde(default)]
     pub ringtone_file_path: Option<String>,
+    /// DTMF volume level for RFC 4733 telephone-event packets (0-63).
+    ///
+    /// 0 is loudest (0 dBm0), 63 is quietest (-63 dBm0).
+    /// Default is 10 (-10 dBm0), the de facto standard.
+    #[serde(default = "default_dtmf_volume")]
+    pub dtmf_volume: u8,
+    /// Inter-digit pause between consecutive DTMF digits in milliseconds.
+    ///
+    /// Default is 100ms. Lower values allow faster IVR navigation,
+    /// higher values improve compatibility with slow decoders.
+    #[serde(default = "default_dtmf_inter_digit_pause_ms")]
+    pub dtmf_inter_digit_pause_ms: u32,
+}
+
+/// Default DTMF volume (-10 dBm0).
+const fn default_dtmf_volume() -> u8 {
+    10
+}
+
+/// Default inter-digit pause (100ms).
+const fn default_dtmf_inter_digit_pause_ms() -> u32 {
+    100
 }
 
 impl Default for AudioConfig {
@@ -57,6 +79,8 @@ impl Default for AudioConfig {
             jitter_buffer_max_ms: 200,
             moh_file_path: None,
             ringtone_file_path: None,
+            dtmf_volume: default_dtmf_volume(),
+            dtmf_inter_digit_pause_ms: default_dtmf_inter_digit_pause_ms(),
         }
     }
 }
@@ -78,6 +102,12 @@ impl AudioConfig {
         }
         if self.jitter_buffer_max_ms > 500 {
             return Err("Jitter buffer max cannot exceed 500ms".to_string());
+        }
+        if self.dtmf_volume > 63 {
+            return Err("DTMF volume must be 0-63".to_string());
+        }
+        if self.dtmf_inter_digit_pause_ms > 1000 {
+            return Err("DTMF inter-digit pause cannot exceed 1000ms".to_string());
         }
         Ok(())
     }

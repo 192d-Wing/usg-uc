@@ -35,6 +35,10 @@ pub struct AudioSessionConfig {
     pub moh_file_path: Option<String>,
     /// DTMF telephone-event payload type from SDP (`None` = use default 101).
     pub dtmf_payload_type: Option<u8>,
+    /// DTMF volume level for RFC 4733 packets (0-63, default 10).
+    pub dtmf_volume: u8,
+    /// Inter-digit pause in milliseconds (default 100).
+    pub dtmf_inter_digit_pause_ms: u32,
 }
 
 impl Default for AudioSessionConfig {
@@ -48,6 +52,8 @@ impl Default for AudioSessionConfig {
             srtp_salt: None,
             moh_file_path: None,
             dtmf_payload_type: None,
+            dtmf_volume: 10,
+            dtmf_inter_digit_pause_ms: 100,
         }
     }
 }
@@ -118,6 +124,8 @@ impl AudioSession {
             srtp_salt: None,
             moh_file_path: None,
             dtmf_payload_type: None,
+            dtmf_volume: 10,
+            dtmf_inter_digit_pause_ms: 100,
         };
 
         self.start(config).await
@@ -146,6 +154,8 @@ impl AudioSession {
             muted: self.pipeline.is_muted(),
             moh_file_path: config.moh_file_path,
             dtmf_payload_type: config.dtmf_payload_type,
+            dtmf_volume: config.dtmf_volume,
+            dtmf_inter_digit_pause_ms: config.dtmf_inter_digit_pause_ms,
         };
 
         // Start pipeline (sync — pipeline spawns its own threads)

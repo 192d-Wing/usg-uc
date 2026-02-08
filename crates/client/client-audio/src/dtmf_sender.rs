@@ -49,6 +49,10 @@ pub struct DtmfSender {
     queue: VecDeque<DtmfCommand>,
     /// Current digit being sent.
     current: Option<ActiveDigit>,
+    /// RFC 4733 volume level (0-63, where 0 = loudest).
+    volume: u8,
+    /// Inter-digit pause in milliseconds.
+    inter_digit_pause_ms: u64,
 }
 
 /// State for the digit currently being transmitted.
@@ -73,18 +77,20 @@ struct ActiveDigit {
 
 impl Default for DtmfSender {
     fn default() -> Self {
-        Self::new()
+        Self::new(DtmfEvent::DEFAULT_VOLUME, INTER_DIGIT_PAUSE_MS)
     }
 }
 
 impl DtmfSender {
-    /// Creates a new idle sender.
+    /// Creates a new idle sender with the given DTMF configuration.
     #[must_use]
-    pub const fn new() -> Self {
+    pub const fn new(volume: u8, inter_digit_pause_ms: u64) -> Self {
         Self {
             phase: DtmfPhase::Idle,
             queue: VecDeque::new(),
             current: None,
+            volume,
+            inter_digit_pause_ms,
         }
     }
 
@@ -232,7 +238,8 @@ impl DtmfSender {
             return;
         }
 
-        let event = DtmfEvent::new(digit.cmd.digit, elapsed_ts);
+        let mut event = DtmfEvent::new(digit.cmd.digit, elapsed_ts);
+        event.volume = self.volume;
         if let Err(e) = transmitter.send_dtmf(&event, is_marker) {
             if is_marker {
                 warn!("RFC4733 start send error: {e}");
@@ -293,7 +300,8 @@ impl DtmfSender {
             return;
         }
 
-        let event = DtmfEvent::with_end(digit.cmd.digit, digit.total_duration_ts);
+        let mut event = DtmfEvent::with_end(digit.cmd.digit, digit.total_duration_ts);
+        event.volume = self.volume;
         if let Err(e) = transmitter.send_dtmf(&event, false) {
             trace!("RFC4733 end send error: {e}");
         }
@@ -308,7 +316,7 @@ impl DtmfSender {
             .as_ref()
             .map_or(Duration::ZERO, |d| d.phase_start.elapsed());
 
-        if elapsed >= Duration::from_millis(INTER_DIGIT_PAUSE_MS) {
+        if elapsed >= Duration::from_millis(self.inter_digit_pause_ms) {
             self.current = None;
             self.try_start_next();
         }
@@ -348,14 +356,14 @@ mod tests {
 
     #[test]
     fn test_new_sender_is_idle() {
-        let sender = DtmfSender::new();
+        let sender = DtmfSender::default();
         assert!(!sender.is_active());
         assert!(!sender.is_inband_active());
     }
 
     #[test]
     fn test_enqueue_activates() {
-        let mut sender = DtmfSender::new();
+        let mut sender = DtmfSender::default();
         let ok = sender.enqueue(make_cmd(DtmfDigit::Five, 100, true));
         assert!(ok);
         assert!(sender.is_active());
@@ -364,14 +372,14 @@ mod tests {
 
     #[test]
     fn test_enqueue_inband_detects_active() {
-        let mut sender = DtmfSender::new();
+        let mut sender = DtmfSender::default();
         sender.enqueue(make_cmd(DtmfDigit::Five, 100, false));
         assert!(sender.is_inband_active());
     }
 
     #[test]
     fn test_queue_overflow() {
-        let mut sender = DtmfSender::new();
+        let mut sender = DtmfSender::default();
         for i in 0..MAX_DIGIT_QUEUE {
             let ok = sender.enqueue(make_cmd(DtmfDigit::Zero, 100, true));
             assert!(ok, "digit {i} should enqueue");
@@ -397,7 +405,7 @@ mod tests {
 
     #[test]
     fn test_phase_transition_rfc4733() {
-        let mut sender = DtmfSender::new();
+        let mut sender = DtmfSender::default();
         sender.enqueue(make_cmd(DtmfDigit::Five, 100, true));
         assert_eq!(sender.phase, DtmfPhase::Sending);
         assert!(sender.current.is_some());
@@ -405,7 +413,7 @@ mod tests {
 
     #[test]
     fn test_phase_transition_inband() {
-        let mut sender = DtmfSender::new();
+        let mut sender = DtmfSender::default();
         sender.enqueue(make_cmd(DtmfDigit::Five, 100, false));
         assert_eq!(sender.phase, DtmfPhase::Sending);
         assert!(sender.current.as_ref().unwrap().tone_gen.is_some());

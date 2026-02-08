@@ -87,6 +87,10 @@ pub struct CallManager {
     is_muted: bool,
     /// Music on Hold file path (optional).
     moh_file_path: Option<String>,
+    /// DTMF volume level for RFC 4733 packets (0-63, default 10).
+    dtmf_volume: u8,
+    /// Inter-digit pause in milliseconds (default 100).
+    dtmf_inter_digit_pause_ms: u32,
     /// Negotiated codec per call (from SDP answer).
     negotiated_codecs: HashMap<String, CodecPreference>,
     /// Negotiated telephone-event payload type per call (None = not supported).
@@ -237,6 +241,8 @@ impl CallManager {
             max_concurrent_calls: 2, // Support call waiting with 2 calls
             is_muted: false,
             moh_file_path: None,
+            dtmf_volume: 10,
+            dtmf_inter_digit_pause_ms: 100,
             negotiated_codecs: HashMap::new(),
             telephone_event_pt: HashMap::new(),
             effective_media_addrs: HashMap::new(),
@@ -306,6 +312,18 @@ impl CallManager {
     /// Returns the currently configured MOH file path.
     pub fn moh_file_path(&self) -> Option<&str> {
         self.moh_file_path.as_deref()
+    }
+
+    /// Sets the DTMF volume level (0-63, where 0 is loudest).
+    pub fn set_dtmf_volume(&mut self, volume: u8) {
+        self.dtmf_volume = volume.min(63);
+        info!(volume = self.dtmf_volume, "DTMF volume set");
+    }
+
+    /// Sets the inter-digit pause between consecutive DTMF digits.
+    pub fn set_dtmf_inter_digit_pause_ms(&mut self, pause_ms: u32) {
+        self.dtmf_inter_digit_pause_ms = pause_ms;
+        info!(pause_ms, "DTMF inter-digit pause set");
     }
 
     /// Returns the preferred codec.
@@ -1599,6 +1617,8 @@ impl CallManager {
             srtp_salt: None,
             moh_file_path: self.moh_file_path.clone(),
             dtmf_payload_type,
+            dtmf_volume: self.dtmf_volume,
+            dtmf_inter_digit_pause_ms: self.dtmf_inter_digit_pause_ms,
         };
 
         // Start the audio session
@@ -1973,7 +1993,7 @@ impl CallManager {
                  a=rtpmap:8 PCMA/8000\r\n\
                  a=rtpmap:13 CN/8000\r\n\
                  a=rtpmap:101 telephone-event/8000\r\n\
-                 a=fmtp:101 0-15\r\n\
+                 a=fmtp:101 0-16\r\n\
                  a=ptime:20\r\n\
                  a=maxptime:120\r\n\
                  a=ice-ufrag:{ufrag}\r\n\
@@ -2010,7 +2030,7 @@ impl CallManager {
                  a=rtpmap:8 PCMA/8000\r\n\
                  a=rtpmap:13 CN/8000\r\n\
                  a=rtpmap:101 telephone-event/8000\r\n\
-                 a=fmtp:101 0-15\r\n\
+                 a=fmtp:101 0-16\r\n\
                  a=ptime:20\r\n\
                  a=maxptime:120\r\n\
                  a=sendrecv\r\n\
@@ -2119,7 +2139,7 @@ impl CallManager {
                  a=rtpmap:8 PCMA/8000\r\n\
                  a=rtpmap:13 CN/8000\r\n\
                  a=rtpmap:101 telephone-event/8000\r\n\
-                 a=fmtp:101 0-15\r\n\
+                 a=fmtp:101 0-16\r\n\
                  a=ptime:20\r\n\
                  a=maxptime:120\r\n\
                  a=ice-ufrag:{ufrag}\r\n\
@@ -2156,7 +2176,7 @@ impl CallManager {
                  a=rtpmap:8 PCMA/8000\r\n\
                  a=rtpmap:13 CN/8000\r\n\
                  a=rtpmap:101 telephone-event/8000\r\n\
-                 a=fmtp:101 0-15\r\n\
+                 a=fmtp:101 0-16\r\n\
                  a=ptime:20\r\n\
                  a=maxptime:120\r\n\
                  a={direction}\r\n\
@@ -2800,7 +2820,7 @@ mod tests {
                    a=rtpmap:0 PCMU/8000\r\n\
                    a=rtpmap:8 PCMA/8000\r\n\
                    a=rtpmap:101 telephone-event/8000\r\n\
-                   a=fmtp:101 0-15\r\n";
+                   a=fmtp:101 0-16\r\n";
 
         assert_eq!(parse_telephone_event_pt(sdp), Some(101));
     }

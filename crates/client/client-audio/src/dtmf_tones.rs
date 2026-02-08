@@ -7,7 +7,8 @@ use client_types::DtmfDigit;
 use std::f32::consts::PI;
 
 /// DTMF frequency pairs (low, high) in Hz per ITU-T Q.23.
-const DTMF_FREQUENCIES: [(f32, f32); 16] = [
+/// Index 16 (flash) has no in-band tone — it is a hookswitch signal only.
+const DTMF_FREQUENCIES: [(f32, f32); 17] = [
     (941.0, 1336.0), // 0
     (697.0, 1209.0), // 1
     (697.0, 1336.0), // 2
@@ -24,6 +25,7 @@ const DTMF_FREQUENCIES: [(f32, f32); 16] = [
     (770.0, 1633.0), // B
     (852.0, 1633.0), // C
     (941.0, 1633.0), // D
+    (0.0, 0.0),      // Flash (no in-band tone)
 ];
 
 /// DTMF tone generator for in-band signaling.
@@ -54,7 +56,7 @@ impl DtmfToneGenerator {
     ///
     /// # Returns
     /// A new tone generator ready to produce samples
-    pub fn new(digit: DtmfDigit, sample_rate: u32) -> Self {
+    pub const fn new(digit: DtmfDigit, sample_rate: u32) -> Self {
         let (low_freq, high_freq) = DTMF_FREQUENCIES[digit.event_code() as usize];
 
         Self {
@@ -76,8 +78,8 @@ impl DtmfToneGenerator {
     /// A 16-bit PCM sample value (-32768 to 32767)
     pub fn next_sample(&mut self) -> i16 {
         // Generate sine waves for both frequencies
-        let low_sample = (self.low_phase.sin() * self.amplitude) as f32;
-        let high_sample = (self.high_phase.sin() * self.amplitude) as f32;
+        let low_sample = self.low_phase.sin() * self.amplitude;
+        let high_sample = self.high_phase.sin() * self.amplitude;
 
         // Sum the two tones
         let mixed = low_sample + high_sample;
@@ -87,6 +89,7 @@ impl DtmfToneGenerator {
         let pcm = (mixed * 32767.0) as i16;
 
         // Advance phases
+        #[allow(clippy::cast_precision_loss)] // sample rates ≤ 48000 fit in f32
         let sample_rate_f32 = self.sample_rate as f32;
         self.low_phase += 2.0 * PI * self.low_freq / sample_rate_f32;
         self.high_phase += 2.0 * PI * self.high_freq / sample_rate_f32;

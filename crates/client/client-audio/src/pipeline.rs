@@ -60,6 +60,10 @@ pub struct PipelineConfig {
     pub moh_file_path: Option<String>,
     /// DTMF telephone-event payload type from SDP (`None` = use default 101).
     pub dtmf_payload_type: Option<u8>,
+    /// DTMF volume level for RFC 4733 packets (0-63, default 10).
+    pub dtmf_volume: u8,
+    /// Inter-digit pause in milliseconds (default 100).
+    pub dtmf_inter_digit_pause_ms: u32,
 }
 
 impl Default for PipelineConfig {
@@ -74,6 +78,8 @@ impl Default for PipelineConfig {
             muted: false,
             moh_file_path: None,
             dtmf_payload_type: None,
+            dtmf_volume: 10,
+            dtmf_inter_digit_pause_ms: 100,
         }
     }
 }
@@ -336,6 +342,8 @@ impl AudioPipeline {
             rtcp_socket,
             rtcp_remote_addr,
             local_ssrc: ssrc,
+            dtmf_volume: config.dtmf_volume,
+            dtmf_inter_digit_pause_ms: config.dtmf_inter_digit_pause_ms,
         };
         // Give the I/O thread a sender to the decode thread so it can
         // trigger a playback stream refresh after input device switches

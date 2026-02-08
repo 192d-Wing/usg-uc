@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 
 /// DTMF digit representation.
 ///
-/// Supports standard DTMF tones (0-9, A-D, *, #) as defined in RFC 4733.
+/// Supports standard DTMF tones (0-9, A-D, *, #) and the flash event (16)
+/// as defined in RFC 4733 and RFC 4730.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DtmfDigit {
     /// Digit 0.
@@ -42,6 +43,8 @@ pub enum DtmfDigit {
     C,
     /// Letter D.
     D,
+    /// Flash (hookswitch) event, RFC 4730, event code 16.
+    Flash,
 }
 
 impl DtmfDigit {
@@ -52,6 +55,7 @@ impl DtmfDigit {
     /// - 10: * (star)
     /// - 11: # (pound)
     /// - 12-15: A, B, C, D
+    /// - 16: flash (RFC 4730)
     #[must_use]
     pub const fn event_code(&self) -> u8 {
         match self {
@@ -71,6 +75,7 @@ impl DtmfDigit {
             Self::B => 13,
             Self::C => 14,
             Self::D => 15,
+            Self::Flash => 16,
         }
     }
 
@@ -94,6 +99,7 @@ impl DtmfDigit {
             13 => Some(Self::B),
             14 => Some(Self::C),
             15 => Some(Self::D),
+            16 => Some(Self::Flash),
             _ => None,
         }
     }
@@ -118,6 +124,7 @@ impl DtmfDigit {
             'B' | 'b' => Some(Self::B),
             'C' | 'c' => Some(Self::C),
             'D' | 'd' => Some(Self::D),
+            'F' | 'f' | '!' => Some(Self::Flash),
             _ => None,
         }
     }
@@ -142,6 +149,7 @@ impl DtmfDigit {
             Self::B => 'B',
             Self::C => 'C',
             Self::D => 'D',
+            Self::Flash => '!',
         }
     }
 }
@@ -271,6 +279,7 @@ mod tests {
         assert_eq!(DtmfDigit::Pound.event_code(), 11);
         assert_eq!(DtmfDigit::A.event_code(), 12);
         assert_eq!(DtmfDigit::D.event_code(), 15);
+        assert_eq!(DtmfDigit::Flash.event_code(), 16);
     }
 
     #[test]
@@ -278,7 +287,8 @@ mod tests {
         assert_eq!(DtmfDigit::from_event_code(0), Some(DtmfDigit::Zero));
         assert_eq!(DtmfDigit::from_event_code(10), Some(DtmfDigit::Star));
         assert_eq!(DtmfDigit::from_event_code(15), Some(DtmfDigit::D));
-        assert_eq!(DtmfDigit::from_event_code(16), None);
+        assert_eq!(DtmfDigit::from_event_code(16), Some(DtmfDigit::Flash));
+        assert_eq!(DtmfDigit::from_event_code(17), None);
     }
 
     #[test]
@@ -288,6 +298,8 @@ mod tests {
         assert_eq!(DtmfDigit::from_char('#'), Some(DtmfDigit::Pound));
         assert_eq!(DtmfDigit::from_char('A'), Some(DtmfDigit::A));
         assert_eq!(DtmfDigit::from_char('a'), Some(DtmfDigit::A));
+        assert_eq!(DtmfDigit::from_char('!'), Some(DtmfDigit::Flash));
+        assert_eq!(DtmfDigit::from_char('F'), Some(DtmfDigit::Flash));
         assert_eq!(DtmfDigit::from_char('X'), None);
     }
 
