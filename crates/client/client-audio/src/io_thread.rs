@@ -248,7 +248,7 @@ fn io_loop(
             .zip(config.rtcp_remote_addr)
             .map(|(socket, remote_addr)| {
                 let cname = format!("usg-uc-{}", config.local_ssrc);
-                RtcpSession::new(socket, remote_addr, config.local_ssrc, cname)
+                RtcpSession::new(socket, remote_addr, config.local_ssrc, codec_clock_rate, cname)
             });
 
     // Non-blocking DTMF sender state machine
@@ -451,16 +451,17 @@ fn io_loop(
             }
         }
 
-        // 4. RTCP: send periodic Sender/Receiver Reports
+        // 4. RTCP: receive incoming SR and send periodic SR/RR reports
         if let Some(ref mut rtcp) = rtcp_session {
+            // Receive incoming RTCP (non-blocking, parses SR for DLSR/RTT)
+            rtcp.try_receive();
             // Propagate remote SSRC learned from received RTP packets
             if let Some(remote_ssrc) = receiver.remote_ssrc() {
                 rtcp.set_remote_ssrc(remote_ssrc);
             }
             let tx = transmitter.stats();
-            let rx = receiver.stats();
             let jb = receiver.jitter_buffer_stats();
-            rtcp.maybe_send_report(&tx, &rx, &jb);
+            rtcp.maybe_send_report(&tx, &jb);
         }
 
         // 5. Periodically update shared stats

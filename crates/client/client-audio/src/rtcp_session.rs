@@ -46,6 +46,8 @@ pub struct RtcpSession {
     remote_ssrc: Option<u32>,
     /// CNAME for SDES (e.g., "user@host").
     cname: String,
+    /// Codec clock rate (for jitter timestamp conversion).
+    clock_rate: u32,
     /// Last time an RTCP packet was sent.
     last_send_time: Instant,
     /// Snapshot of TX stats at the time of last SR.
@@ -56,12 +58,12 @@ pub struct RtcpSession {
     last_received_sr_ntp: u32,
     /// When the last SR was received (for DLSR calc).
     last_received_sr_time: Option<Instant>,
-    /// Previous highest sequence number (for fraction lost calc).
-    prev_highest_seq: u32,
     /// Previous cumulative packets received (for fraction lost calc).
     prev_packets_received: u64,
     /// Previous cumulative lost (for fraction lost calc).
     prev_cumulative_lost: u64,
+    /// Receive buffer for incoming RTCP packets.
+    recv_buffer: Vec<u8>,
 }
 
 impl RtcpSession {
@@ -71,16 +73,18 @@ impl RtcpSession {
     /// * `socket` - UDP socket (should be bound to RTP port + 1)
     /// * `remote_addr` - Remote RTCP address (remote RTP port + 1)
     /// * `local_ssrc` - Local SSRC (same as RTP stream)
+    /// * `clock_rate` - Codec clock rate (Hz) for jitter conversion
     /// * `cname` - Canonical name for SDES
     pub fn new(
         socket: Arc<UdpSocket>,
         remote_addr: SocketAddr,
         local_ssrc: u32,
+        clock_rate: u32,
         cname: String,
     ) -> Self {
         debug!(
-            "RTCP session created: remote={}, ssrc={}, cname={}",
-            remote_addr, local_ssrc, cname
+            "RTCP session created: remote={}, ssrc={}, clock_rate={}, cname={}",
+            remote_addr, local_ssrc, clock_rate, cname
         );
 
         Self {
@@ -89,14 +93,15 @@ impl RtcpSession {
             local_ssrc,
             remote_ssrc: None,
             cname,
+            clock_rate,
             last_send_time: Instant::now(),
             last_sr_tx_stats: RtpStats::default(),
             last_rtp_timestamp: 0,
             last_received_sr_ntp: 0,
             last_received_sr_time: None,
-            prev_highest_seq: 0,
             prev_packets_received: 0,
             prev_cumulative_lost: 0,
+            recv_buffer: vec![0u8; 512],
         }
     }
 
@@ -107,7 +112,6 @@ impl RtcpSession {
     pub fn maybe_send_report(
         &mut self,
         tx_stats: &RtpStats,
-        rx_stats: &RtpStats,
         jb_stats: &JitterBufferStats,
     ) {
         if self.last_send_time.elapsed() < RTCP_INTERVAL {
@@ -115,7 +119,7 @@ impl RtcpSession {
         }
         self.last_send_time = Instant::now();
 
-        self.send_compound_report(tx_stats, rx_stats, jb_stats);
+        self.send_compound_report(tx_stats, jb_stats);
     }
 
     /// Updates the last RTP timestamp (call after each RTP send).
@@ -138,21 +142,52 @@ impl RtcpSession {
         self.last_received_sr_time = Some(Instant::now());
     }
 
+    /// Receives and processes an incoming RTCP packet (non-blocking).
+    ///
+    /// Parses Sender Report headers from the remote to enable DLSR
+    /// calculation in our outgoing Receiver Reports.
+    pub fn try_receive(&mut self) {
+        let result = self.socket.recv_from(&mut self.recv_buffer);
+        match result {
+            Ok((len, _addr)) if len >= 8 => {
+                let data = &self.recv_buffer[..len];
+                // Minimal RTCP header check: V=2, PT=200 (SR)
+                let version = (data[0] >> 6) & 0x03;
+                let pt = data[1];
+                if version == 2 && pt == 200 && len >= 28 {
+                    // Sender Report: NTP timestamp at bytes 8-15
+                    let ntp_sec = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+                    let ntp_frac =
+                        u32::from_be_bytes([data[12], data[13], data[14], data[15]]);
+                    self.received_sender_report(ntp_sec, ntp_frac);
+                    trace!(
+                        "Received RTCP SR: ntp={}.{}, lsr={:#010x}",
+                        ntp_sec,
+                        ntp_frac,
+                        self.last_received_sr_ntp
+                    );
+                }
+            }
+            Ok(_) | Err(_) => {
+                // No packet or too short — ignore
+            }
+        }
+    }
+
     /// Sends a compound RTCP packet (SR + SDES or RR + SDES).
     fn send_compound_report(
         &mut self,
         tx_stats: &RtpStats,
-        rx_stats: &RtpStats,
         jb_stats: &JitterBufferStats,
     ) {
         let mut compound = BytesMut::with_capacity(256);
 
         if tx_stats.packets_sent > 0 {
             // We are a sender — send Sender Report
-            self.build_sender_report(&mut compound, tx_stats, rx_stats, jb_stats);
+            self.build_sender_report(&mut compound, tx_stats, jb_stats);
         } else {
             // Receive-only — send Receiver Report
-            self.build_receiver_report(&mut compound, rx_stats, jb_stats);
+            self.build_receiver_report(&mut compound, jb_stats);
         }
 
         // Always append SDES (CNAME)
@@ -179,12 +214,11 @@ impl RtcpSession {
         &mut self,
         buf: &mut BytesMut,
         tx_stats: &RtpStats,
-        rx_stats: &RtpStats,
         jb_stats: &JitterBufferStats,
     ) {
         let (ntp_sec, ntp_frac) = get_ntp_timestamp();
 
-        let has_rr = self.remote_ssrc.is_some() && rx_stats.packets_received > 0;
+        let has_rr = self.remote_ssrc.is_some() && jb_stats.packets_received > 0;
         let rc = u8::from(has_rr);
 
         #[allow(clippy::cast_possible_truncation)]
@@ -201,7 +235,7 @@ impl RtcpSession {
 
         // Build reception report block if we have a remote SSRC
         let rr_bytes = if has_rr {
-            Some(self.build_reception_report_block(rx_stats, jb_stats))
+            Some(self.build_reception_report_block(jb_stats))
         } else {
             None
         };
@@ -232,10 +266,9 @@ impl RtcpSession {
     fn build_receiver_report(
         &mut self,
         buf: &mut BytesMut,
-        rx_stats: &RtpStats,
         jb_stats: &JitterBufferStats,
     ) {
-        let has_rr = self.remote_ssrc.is_some() && rx_stats.packets_received > 0;
+        let has_rr = self.remote_ssrc.is_some() && jb_stats.packets_received > 0;
         let rc = u8::from(has_rr);
 
         // RR: 4 (header) + 4 (SSRC) + 24*rc
@@ -250,25 +283,30 @@ impl RtcpSession {
         buf.put_u32(self.local_ssrc);
 
         if has_rr {
-            let rr = self.build_reception_report_block(rx_stats, jb_stats);
+            let rr = self.build_reception_report_block(jb_stats);
             buf.put(rr);
         }
     }
 
     /// Builds a single reception report block (24 bytes).
+    ///
+    /// Uses jitter buffer stats for loss/jitter (the authoritative source
+    /// for actual stream loss), and `self.clock_rate` for correct jitter
+    /// timestamp conversion.
     fn build_reception_report_block(
         &mut self,
-        rx_stats: &RtpStats,
         jb_stats: &JitterBufferStats,
     ) -> bytes::Bytes {
         let remote_ssrc = self.remote_ssrc.unwrap_or(0);
 
-        // Fraction lost: packets lost in this interval / packets expected in this interval
-        let received_this_interval = rx_stats
+        // Fraction lost: packets lost in this interval / packets expected in this interval.
+        // Use jb_stats.packets_lost (actual stream gaps detected by the jitter buffer)
+        // instead of rx_stats.packets_dropped (which counts SRTP/socket errors).
+        let received_this_interval = jb_stats
             .packets_received
             .saturating_sub(self.prev_packets_received);
-        let lost_this_interval = rx_stats
-            .packets_dropped
+        let lost_this_interval = jb_stats
+            .packets_lost
             .saturating_sub(self.prev_cumulative_lost);
         let expected_this_interval = received_this_interval + lost_this_interval;
 
@@ -281,15 +319,20 @@ impl RtcpSession {
 
         // Cumulative lost (total)
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let cumulative_lost = rx_stats.packets_dropped as i32;
+        let cumulative_lost = jb_stats.packets_lost as i32;
 
-        // Extended highest sequence (we don't track wraps, use packets_received as proxy)
+        // Extended highest sequence (use total received + lost as proxy for highest seq)
         #[allow(clippy::cast_possible_truncation)]
-        let extended_highest_seq = rx_stats.packets_received as u32;
+        let extended_highest_seq = (jb_stats.packets_received + jb_stats.packets_lost) as u32;
 
-        // Jitter in timestamp units (convert ms to timestamp units at 8kHz)
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let jitter = (jb_stats.average_jitter_ms * 8.0) as u32;
+        // Jitter in timestamp units: ms × (clock_rate / 1000)
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let jitter =
+            (jb_stats.average_jitter_ms * (self.clock_rate as f32 / 1000.0)) as u32;
 
         // DLSR (delay since last SR in 1/65536 seconds)
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -308,12 +351,8 @@ impl RtcpSession {
         };
 
         // Update previous values for next interval
-        self.prev_packets_received = rx_stats.packets_received;
-        self.prev_cumulative_lost = rx_stats.packets_dropped;
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            self.prev_highest_seq = rx_stats.packets_received as u32;
-        }
+        self.prev_packets_received = jb_stats.packets_received;
+        self.prev_cumulative_lost = jb_stats.packets_lost;
 
         report.to_bytes()
     }
@@ -387,7 +426,7 @@ mod tests {
         let socket = Arc::new(socket);
         let remote: SocketAddr = "127.0.0.1:5001".parse().unwrap();
 
-        let session = RtcpSession::new(socket, remote, 12345, "user@host".to_string());
+        let session = RtcpSession::new(socket, remote, 12345, 8000, "user@host".to_string());
         assert_eq!(session.local_ssrc, 12345);
         assert!(session.remote_ssrc.is_none());
     }
@@ -398,19 +437,18 @@ mod tests {
         let socket = Arc::new(socket);
         let remote: SocketAddr = "127.0.0.1:5001".parse().unwrap();
 
-        let mut session = RtcpSession::new(socket, remote, 12345, "test@host".to_string());
+        let mut session = RtcpSession::new(socket, remote, 12345, 8000, "test@host".to_string());
 
         let tx_stats = RtpStats {
             packets_sent: 100,
             bytes_sent: 16000,
             ..RtpStats::default()
         };
-        let rx_stats = RtpStats::default();
         let jb_stats = JitterBufferStats::default();
 
         // Force immediate send by backdating last_send_time
         session.last_send_time = Instant::now() - Duration::from_secs(10);
-        session.maybe_send_report(&tx_stats, &rx_stats, &jb_stats);
+        session.maybe_send_report(&tx_stats, &jb_stats);
         // Should not panic; packet sent to non-listening address is fine for UDP
     }
 
@@ -420,23 +458,19 @@ mod tests {
         let socket = Arc::new(socket);
         let remote: SocketAddr = "127.0.0.1:5001".parse().unwrap();
 
-        let mut session = RtcpSession::new(socket, remote, 12345, "test@host".to_string());
+        let mut session = RtcpSession::new(socket, remote, 12345, 8000, "test@host".to_string());
         session.set_remote_ssrc(67890);
 
         let tx_stats = RtpStats::default(); // Not sending → RR
-        let rx_stats = RtpStats {
-            packets_received: 500,
-            bytes_received: 80000,
-            packets_dropped: 5,
-            ..RtpStats::default()
-        };
         let jb_stats = JitterBufferStats {
+            packets_received: 500,
+            packets_lost: 5,
             average_jitter_ms: 10.5,
             ..JitterBufferStats::default()
         };
 
         session.last_send_time = Instant::now() - Duration::from_secs(10);
-        session.maybe_send_report(&tx_stats, &rx_stats, &jb_stats);
+        session.maybe_send_report(&tx_stats, &jb_stats);
     }
 
     #[test]
@@ -445,15 +479,14 @@ mod tests {
         let socket = Arc::new(socket);
         let remote: SocketAddr = "127.0.0.1:5001".parse().unwrap();
 
-        let mut session = RtcpSession::new(socket, remote, 12345, "test@host".to_string());
+        let mut session = RtcpSession::new(socket, remote, 12345, 8000, "test@host".to_string());
 
         let tx_stats = RtpStats::default();
-        let rx_stats = RtpStats::default();
         let jb_stats = JitterBufferStats::default();
 
         // Should NOT send (just created, interval not elapsed)
         let before = session.last_send_time;
-        session.maybe_send_report(&tx_stats, &rx_stats, &jb_stats);
+        session.maybe_send_report(&tx_stats, &jb_stats);
         assert_eq!(
             session.last_send_time, before,
             "Should not have sent (interval not elapsed)"
@@ -466,7 +499,7 @@ mod tests {
         let socket = Arc::new(socket);
         let remote: SocketAddr = "127.0.0.1:5001".parse().unwrap();
 
-        let mut session = RtcpSession::new(socket, remote, 12345, "test@host".to_string());
+        let mut session = RtcpSession::new(socket, remote, 12345, 8000, "test@host".to_string());
 
         // Simulate receiving an SR with NTP timestamp
         session.received_sender_report(0xDEAD_BEEF, 0x1234_5678);
@@ -480,7 +513,8 @@ mod tests {
         let socket = Arc::new(socket);
         let remote: SocketAddr = "127.0.0.1:5001".parse().unwrap();
 
-        let session = RtcpSession::new(socket, remote, 12345, "alice@example.com".to_string());
+        let session =
+            RtcpSession::new(socket, remote, 12345, 8000, "alice@example.com".to_string());
 
         let mut buf = BytesMut::new();
         session.build_sdes(&mut buf);
@@ -497,20 +531,43 @@ mod tests {
         let socket = Arc::new(socket);
         let remote: SocketAddr = "127.0.0.1:5001".parse().unwrap();
 
-        let mut session = RtcpSession::new(socket, remote, 12345, "test@host".to_string());
+        let mut session = RtcpSession::new(socket, remote, 12345, 8000, "test@host".to_string());
         session.set_remote_ssrc(67890);
 
-        // First interval: 100 received, 10 dropped → 10/110 ≈ 9% → fraction ≈ 23/256
-        let rx_stats = RtpStats {
+        // First interval: 100 received, 10 lost → 10/110 ≈ 9% → fraction ≈ 23/256
+        let jb_stats = JitterBufferStats {
             packets_received: 100,
-            packets_dropped: 10,
-            ..RtpStats::default()
+            packets_lost: 10,
+            ..JitterBufferStats::default()
         };
-        let jb_stats = JitterBufferStats::default();
 
-        let rr_bytes = session.build_reception_report_block(&rx_stats, &jb_stats);
+        let rr_bytes = session.build_reception_report_block(&jb_stats);
         let rr = ReceptionReport::parse(&rr_bytes).unwrap();
         assert!(rr.fraction_lost > 0, "Should report some loss");
         assert!(rr.fraction_lost < 50, "Should not be extreme loss");
+    }
+
+    #[test]
+    fn test_jitter_clock_rate_conversion() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let socket = Arc::new(socket);
+        let remote: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+
+        // 48kHz clock rate (e.g., Opus)
+        let mut session =
+            RtcpSession::new(socket, remote, 12345, 48000, "test@host".to_string());
+        session.set_remote_ssrc(67890);
+
+        let jb_stats = JitterBufferStats {
+            packets_received: 100,
+            average_jitter_ms: 10.0, // 10ms jitter
+            ..JitterBufferStats::default()
+        };
+
+        let rr_bytes = session.build_reception_report_block(&jb_stats);
+        let rr = ReceptionReport::parse(&rr_bytes).unwrap();
+
+        // 10ms × 48 = 480 timestamp units (at 48kHz)
+        assert_eq!(rr.jitter, 480);
     }
 }
