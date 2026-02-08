@@ -1680,7 +1680,7 @@ mod tests {
         let response = build_response_from_request(&request, StatusCode::RINGING, Some("xyz"));
 
         // Count Via headers - should have 2
-        let via_headers = response.headers.get_all(&HeaderName::Via);
+        let via_headers: Vec<_> = response.headers.get_all(&HeaderName::Via).collect();
         assert_eq!(via_headers.len(), 2);
 
         // Verify order preserved (proxy first, then client)

@@ -277,7 +277,7 @@ impl RequestForwarder {
     /// Counts Via headers in the request.
     fn count_via_headers(&self, request: &SipRequest) -> usize {
         let _ = self; // Silence unused_self - method may use self in future for caching
-        request.headers.get_all(&HeaderName::Via).len()
+        request.headers.get_all(&HeaderName::Via).count()
     }
 
     /// Detects loops by checking Via headers.
@@ -531,7 +531,6 @@ impl ResponseProcessor {
         let via_headers: Vec<Header> = response
             .headers
             .get_all(&HeaderName::Via)
-            .into_iter()
             .cloned()
             .collect();
 
@@ -773,7 +772,7 @@ mod tests {
         assert_eq!(mf.value.parse::<u8>().unwrap(), 69);
 
         // Check Via was added
-        let via_count = forwarded.headers.get_all(&HeaderName::Via).len();
+        let via_count = forwarded.headers.get_all(&HeaderName::Via).count();
         assert_eq!(via_count, 2); // Original + proxy
 
         // Check Record-Route was added
@@ -840,7 +839,7 @@ mod tests {
         let processed = processor.process_response(&response).unwrap();
 
         // Our Via should be removed
-        let via_count = processed.headers.get_all(&HeaderName::Via).len();
+        let via_count = processed.headers.get_all(&HeaderName::Via).count();
         assert_eq!(via_count, 1); // Only original Via remains
     }
 

@@ -418,7 +418,6 @@ impl TopologyHider {
         // Get existing Record-Route headers
         let routes: Vec<String> = headers
             .get_all(&HeaderName::RecordRoute)
-            .iter()
             .map(|h| h.value.clone())
             .collect();
 

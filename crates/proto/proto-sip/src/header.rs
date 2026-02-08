@@ -508,9 +508,11 @@ impl Headers {
     }
 
     /// Gets all headers with the given name.
-    #[must_use]
-    pub fn get_all(&self, name: &HeaderName) -> Vec<&Header> {
-        self.headers.iter().filter(|h| &h.name == name).collect()
+    ///
+    /// Returns an iterator to avoid allocating a `Vec` on every call.
+    pub fn get_all(&self, name: &HeaderName) -> impl Iterator<Item = &Header> {
+        let name = name.clone();
+        self.headers.iter().filter(move |h| h.name == name)
     }
 
     /// Gets the first header value with the given name.
@@ -586,7 +588,6 @@ impl Headers {
     #[must_use]
     pub fn via_all_parsed(&self) -> Vec<ViaHeader> {
         self.get_all(&HeaderName::Via)
-            .iter()
             .filter_map(|h| h.value.parse().ok())
             .collect()
     }
@@ -649,7 +650,6 @@ impl Headers {
     #[must_use]
     pub fn route_values(&self) -> Vec<String> {
         self.get_all(&HeaderName::Route)
-            .iter()
             .map(|h| h.value.clone())
             .collect()
     }
@@ -658,7 +658,6 @@ impl Headers {
     #[must_use]
     pub fn record_route_values(&self) -> Vec<String> {
         self.get_all(&HeaderName::RecordRoute)
-            .iter()
             .map(|h| h.value.clone())
             .collect()
     }
@@ -720,7 +719,6 @@ impl Headers {
     #[must_use]
     pub fn path_values(&self) -> Vec<String> {
         self.get_all(&HeaderName::Path)
-            .iter()
             .map(|h| h.value.clone())
             .collect()
     }
@@ -922,8 +920,7 @@ mod tests {
         headers.add(Header::new(HeaderName::Via, "first"));
         headers.add(Header::new(HeaderName::Via, "second"));
 
-        let via_headers = headers.get_all(&HeaderName::Via);
-        assert_eq!(via_headers.len(), 2);
+        assert_eq!(headers.get_all(&HeaderName::Via).count(), 2);
     }
 
     #[test]
