@@ -81,6 +81,7 @@ pub mod noise_shaper;
 pub mod pipeline;
 pub mod plc;
 pub mod postfilter;
+pub mod wsola;
 pub mod ringtone;
 pub mod rtcp_session;
 pub mod rtp_handler;
