@@ -1507,6 +1507,59 @@ impl CallManager {
         }
     }
 
+    /// Changes the codec for an active call via SIP re-INVITE.
+    ///
+    /// Sends a re-INVITE with SDP offering only the requested codec.
+    /// When the remote accepts, the audio session is automatically
+    /// restarted with the new codec (handled in `handle_sdp_answer`).
+    pub async fn change_codec(
+        &mut self,
+        call_id: &str,
+        new_codec: CodecPreference,
+    ) -> AppResult<()> {
+        // Verify call exists and is connected
+        let current_state = self
+            .call_agent
+            .get_state(call_id)
+            .ok_or_else(|| AppError::Sip("Call not found".to_string()))?;
+
+        if current_state != CallState::Connected {
+            return Err(AppError::Sip(format!(
+                "Cannot change codec in state {current_state:?}"
+            )));
+        }
+
+        // Check if codec is actually different
+        let current_codec = self
+            .negotiated_codecs
+            .get(call_id)
+            .copied()
+            .unwrap_or(self.preferred_codec);
+
+        if current_codec == new_codec {
+            info!(call_id = %call_id, codec = ?new_codec, "Codec unchanged, skipping re-INVITE");
+            return Ok(());
+        }
+
+        info!(
+            call_id = %call_id,
+            from = ?current_codec,
+            to = ?new_codec,
+            "Changing codec via re-INVITE"
+        );
+
+        // Generate SDP with the target codec as the only offered codec
+        let sdp = self.generate_sdp_for_codec_change(call_id, new_codec)?;
+
+        // Send re-INVITE via call agent
+        self.call_agent
+            .send_media_update(call_id, &sdp)
+            .await
+            .map_err(|e| AppError::Sip(e.to_string()))?;
+
+        Ok(())
+    }
+
     /// Returns the focused call ID.
     pub fn active_call_id(&self) -> Option<&str> {
         self.focused_call_id.as_deref()
@@ -1809,6 +1862,9 @@ impl CallManager {
     async fn handle_sdp_answer(&mut self, call_id: &str, sdp: &str) -> AppResult<()> {
         debug!(call_id = %call_id, "Received SDP answer");
 
+        // Remember the previous codec to detect mid-call codec changes
+        let previous_codec = self.negotiated_codecs.get(call_id).copied();
+
         // Parse the negotiated codec from the SDP answer
         if let Some(codec) = parse_codec_from_sdp(sdp) {
             // Validate codec is in our offer (RFC 3264 Section 6.1)
@@ -1825,6 +1881,24 @@ impl CallManager {
 
             info!(call_id = %call_id, codec = ?codec, "Negotiated codec from SDP answer");
             self.negotiated_codecs.insert(call_id.to_string(), codec);
+
+            // Detect mid-call codec change: if the codec changed and we have a
+            // running audio session, stop it so handle_state_changed(Connected)
+            // will restart it with the new codec.
+            if let Some(prev) = previous_codec
+                && prev != codec
+                && self.audio_sessions.contains_key(call_id)
+            {
+                info!(
+                    call_id = %call_id,
+                    from = ?prev,
+                    to = ?codec,
+                    "Codec changed via re-INVITE, restarting audio session"
+                );
+                if let Err(e) = self.stop_audio_session(call_id).await {
+                    warn!(call_id = %call_id, error = %e, "Failed to stop audio session for codec change");
+                }
+            }
         } else {
             debug!(call_id = %call_id, "No codec found in SDP answer, will use preferred codec");
         }
@@ -1943,14 +2017,20 @@ impl CallManager {
         );
 
         if use_srtp {
-            // SRTP offers: Opus (111), PCMU (0), PCMA (8), telephone-event (101)
+            // SRTP offers: Opus (111), G.722 (9), PCMU (0), PCMA (8)
             matches!(
                 codec,
-                CodecPreference::Opus | CodecPreference::G711Ulaw | CodecPreference::G711Alaw
+                CodecPreference::Opus
+                    | CodecPreference::G722
+                    | CodecPreference::G711Ulaw
+                    | CodecPreference::G711Alaw
             )
         } else {
-            // Plain RTP offers: PCMU (0), PCMA (8), telephone-event (101)
-            matches!(codec, CodecPreference::G711Ulaw | CodecPreference::G711Alaw)
+            // Plain RTP offers: G.722 (9), PCMU (0), PCMA (8)
+            matches!(
+                codec,
+                CodecPreference::G722 | CodecPreference::G711Ulaw | CodecPreference::G711Alaw
+            )
         }
     }
 
@@ -2138,6 +2218,117 @@ impl CallManager {
     /// Generates SDP for resuming a call (sendrecv direction).
     fn generate_resume_sdp(&mut self, call_id: &str) -> AppResult<String> {
         self.generate_sdp_with_direction(call_id, "sendrecv")
+    }
+
+    /// Generates SDP for a codec change re-INVITE.
+    ///
+    /// Offers only the target codec (plus telephone-event and redundancy)
+    /// to force the remote party to use the requested codec.
+    fn generate_sdp_for_codec_change(
+        &mut self,
+        call_id: &str,
+        codec: CodecPreference,
+    ) -> AppResult<String> {
+        let sdp_session_id = self.get_or_create_sdp_session_id(call_id);
+        self.increment_sdp_session_version(call_id);
+        let sdp_session_version = self.get_sdp_session_version(call_id);
+
+        let session = self
+            .media_sessions
+            .get(call_id)
+            .ok_or_else(|| AppError::Sip("No media session for call".to_string()))?;
+
+        let account = self
+            .account
+            .as_ref()
+            .ok_or_else(|| AppError::Sip("No account configured".to_string()))?;
+
+        let ssrc = session.local_ssrc();
+
+        // Use the effective media addr already advertised for this call
+        let effective_media_addr = self
+            .effective_media_addrs
+            .get(call_id)
+            .copied()
+            .ok_or_else(|| AppError::Sip("No effective media address for call".to_string()))?;
+
+        let use_srtp = matches!(
+            account.transport,
+            client_types::TransportPreference::TlsOnly
+        );
+
+        let addr_type = sdp_addr_type(&effective_media_addr);
+
+        // Build codec-specific m= line and rtpmap attributes
+        let (codec_pts, codec_rtpmap, codec_fmtp) = match codec {
+            CodecPreference::Opus => (
+                "111",
+                "a=rtpmap:111 opus/48000/2\r\n",
+                "a=fmtp:111 minptime=20;useinbandfec=1;stereo=1\r\n",
+            ),
+            CodecPreference::G722 => ("9", "a=rtpmap:9 G722/8000\r\n", ""),
+            CodecPreference::G711Ulaw => ("0", "a=rtpmap:0 PCMU/8000\r\n", ""),
+            CodecPreference::G711Alaw => ("8", "a=rtpmap:8 PCMA/8000\r\n", ""),
+        };
+
+        let profile = if use_srtp {
+            "UDP/TLS/RTP/SAVPF"
+        } else {
+            "RTP/AVP"
+        };
+
+        // Build m= line: codec PT + CN(13) + telephone-event(101) + red(121)
+        let m_line = format!(
+            "m=audio {port} {profile} {codec_pts} 13 101 121\r\n",
+            port = effective_media_addr.port(),
+        );
+
+        let mut sdp = format!(
+            "v=0\r\n\
+             o=- {session_id} {session_version} IN {addr_type} {ip}\r\n\
+             s=USG SIP Client\r\n\
+             c=IN {addr_type} {ip}\r\n\
+             b=AS:80\r\n\
+             t=0 0\r\n\
+             {m_line}\
+             {codec_rtpmap}\
+             {codec_fmtp}\
+             a=rtpmap:13 CN/8000\r\n\
+             a=rtpmap:101 telephone-event/8000\r\n\
+             a=fmtp:101 0-16\r\n\
+             a=rtpmap:121 red/8000\r\n\
+             a=fmtp:121 0/0\r\n\
+             a=ptime:20\r\n\
+             a=maxptime:120\r\n",
+            session_id = sdp_session_id,
+            session_version = sdp_session_version,
+            addr_type = addr_type,
+            ip = effective_media_addr.ip(),
+        );
+
+        // Add ICE/DTLS attributes for secure calls
+        if use_srtp {
+            let creds = session.local_ice_credentials();
+            let fingerprint = session.local_dtls_fingerprint();
+            sdp.push_str(&format!(
+                "a=ice-ufrag:{ufrag}\r\n\
+                 a=ice-pwd:{pwd}\r\n\
+                 a=fingerprint:sha-384 {fingerprint}\r\n\
+                 a=setup:actpass\r\n\
+                 a=mid:audio\r\n\
+                 a=rtcp-mux\r\n",
+                ufrag = creds.ufrag,
+                pwd = creds.pwd,
+            ));
+        }
+
+        sdp.push_str("a=sendrecv\r\n");
+        sdp.push_str(&format!(
+            "a=ssrc:{ssrc} cname:{cname}\r\n",
+            cname = account.id,
+        ));
+
+        Ok(sdp)
     }
 
     /// Generates SDP with the specified media direction.
@@ -3217,6 +3408,66 @@ a=rtpmap:96 speex/16000\r\n";
         assert_eq!(
             negotiate_codec_from_sdp_offer("", CodecPreference::G711Ulaw),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_codec_offered_plain_rtp_includes_g722() {
+        // Plain RTP offers G.722 (9), PCMU (0), PCMA (8) in SDP
+        let (tx, _rx) = mpsc::channel(10);
+        let sip_addr: SocketAddr = "192.168.1.100:5060".parse().unwrap();
+        let media_addr: SocketAddr = "192.168.1.100:16384".parse().unwrap();
+        let manager = CallManager::new(sip_addr, media_addr, tx);
+
+        let mut account = SipAccount::default();
+        account.transport = client_types::TransportPreference::Udp;
+
+        assert!(manager.is_codec_offered(CodecPreference::G722, &account));
+        assert!(manager.is_codec_offered(CodecPreference::G711Ulaw, &account));
+        assert!(manager.is_codec_offered(CodecPreference::G711Alaw, &account));
+        // Opus not offered on plain RTP
+        assert!(!manager.is_codec_offered(CodecPreference::Opus, &account));
+    }
+
+    #[tokio::test]
+    async fn test_is_codec_offered_srtp_includes_all() {
+        // SRTP offers Opus (111), G.722 (9), PCMU (0), PCMA (8)
+        let (tx, _rx) = mpsc::channel(10);
+        let sip_addr: SocketAddr = "192.168.1.100:5060".parse().unwrap();
+        let media_addr: SocketAddr = "192.168.1.100:16384".parse().unwrap();
+        let manager = CallManager::new(sip_addr, media_addr, tx);
+
+        let account = SipAccount::default(); // TlsOnly by default
+
+        assert!(manager.is_codec_offered(CodecPreference::Opus, &account));
+        assert!(manager.is_codec_offered(CodecPreference::G722, &account));
+        assert!(manager.is_codec_offered(CodecPreference::G711Ulaw, &account));
+        assert!(manager.is_codec_offered(CodecPreference::G711Alaw, &account));
+    }
+
+    #[test]
+    fn test_codec_change_detected_in_sdp_answer() {
+        // Verify parse_codec_from_sdp correctly identifies different codecs
+        // This tests the codec detection that drives audio session restart
+        let sdp_g711 = "\
+m=audio 5000 RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n";
+        assert_eq!(parse_codec_from_sdp(sdp_g711), Some(CodecPreference::G711Ulaw));
+
+        let sdp_g722 = "\
+m=audio 5000 RTP/AVP 9\r\n\
+a=rtpmap:9 G722/8000\r\n";
+        assert_eq!(parse_codec_from_sdp(sdp_g722), Some(CodecPreference::G722));
+
+        let sdp_alaw = "\
+m=audio 5000 RTP/AVP 8\r\n\
+a=rtpmap:8 PCMA/8000\r\n";
+        assert_eq!(parse_codec_from_sdp(sdp_alaw), Some(CodecPreference::G711Alaw));
+
+        // Codecs are distinct — change detection works
+        assert_ne!(
+            parse_codec_from_sdp(sdp_g711),
+            parse_codec_from_sdp(sdp_g722)
         );
     }
 }

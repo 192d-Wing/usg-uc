@@ -12,6 +12,7 @@ use crate::settings::SettingsManager;
 use crate::sip_transport::{CertVerificationMode, SipTransport, TransportEvent};
 use crate::{AppError, AppResult};
 use client_sip_ua::{RegistrationAgent, RegistrationEvent};
+use client_types::audio::CodecPreference;
 use client_types::{
     CallInfo, CallQualityMetrics, CallState, DtmfDigit, RegistrationState, SipAccount,
 };
@@ -552,6 +553,18 @@ impl ClientApp {
     /// Returns `true` if call is now on hold, `false` if resumed.
     pub async fn toggle_hold(&mut self) -> AppResult<bool> {
         self.call_manager.toggle_hold().await
+    }
+
+    /// Changes the codec for an active call via SIP re-INVITE.
+    ///
+    /// The call must be in Connected state. The audio session will be
+    /// automatically restarted with the new codec when the remote accepts.
+    pub async fn change_codec(
+        &mut self,
+        call_id: &str,
+        codec: CodecPreference,
+    ) -> AppResult<()> {
+        self.call_manager.change_codec(call_id, codec).await
     }
 
     /// Switches focus to a different call.

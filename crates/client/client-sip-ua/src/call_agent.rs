@@ -395,6 +395,29 @@ impl CallAgent {
         self.send_reinvite(call_id, resume_sdp, false).await
     }
 
+    /// Sends a re-INVITE to update the media session (e.g., codec change).
+    ///
+    /// Unlike hold/resume, this does not change hold state. The call remains
+    /// Connected and the SDP offer contains the desired media parameters.
+    /// Used for mid-call codec renegotiation per RFC 3261 Section 14.
+    pub async fn send_media_update(&mut self, call_id: &str, sdp: &str) -> SipUaResult<()> {
+        let session = self
+            .calls
+            .get(call_id)
+            .ok_or_else(|| SipUaError::InvalidState("Call not found".to_string()))?;
+
+        if session.state != CallState::Connected {
+            return Err(SipUaError::InvalidState(format!(
+                "Cannot update media in state {:?}",
+                session.state
+            )));
+        }
+
+        info!(call_id = %call_id, "Sending media update re-INVITE");
+
+        self.send_reinvite(call_id, sdp, false).await
+    }
+
     /// Transfers a call to another party (blind transfer).
     ///
     /// Sends a REFER request per RFC 3515 to transfer the call to the
