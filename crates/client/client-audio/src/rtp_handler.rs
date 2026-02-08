@@ -28,6 +28,9 @@ pub const MAX_RTP_PACKET_SIZE: usize = 1500;
 /// SRTP authentication tag size for AES-256-GCM.
 pub const SRTP_AUTH_TAG_SIZE: usize = 16;
 
+/// Default RTP payload type for RFC 2198 redundancy.
+pub const REDUNDANCY_PAYLOAD_TYPE: u8 = 121;
+
 /// Default payload type for telephone-event (DTMF).
 pub const DTMF_PAYLOAD_TYPE: u8 = 101;
 
@@ -126,6 +129,12 @@ pub struct RtpTransmitter {
     dtmf_event_timestamp: AtomicU32,
     /// Pre-allocated buffer for serializing non-SRTP packets (header + payload).
     send_buffer: Vec<u8>,
+    /// RFC 2198 redundancy: previous frame's encoded payload.
+    prev_payload: Vec<u8>,
+    /// Whether RFC 2198 redundancy is enabled.
+    redundancy_enabled: bool,
+    /// RTP payload type for RFC 2198 redundancy packets.
+    redundancy_pt: u8,
 }
 
 impl RtpTransmitter {
@@ -156,7 +165,17 @@ impl RtpTransmitter {
             dtmf_timestamp: AtomicU32::new(rand_u32()),
             dtmf_event_timestamp: AtomicU32::new(0),
             send_buffer: vec![0u8; MAX_RTP_PACKET_SIZE],
+            prev_payload: Vec::new(),
+            redundancy_enabled: false,
+            redundancy_pt: REDUNDANCY_PAYLOAD_TYPE,
         }
+    }
+
+    /// Enables RFC 2198 redundancy (sends previous frame alongside current).
+    pub fn enable_redundancy(&mut self, pt: u8) {
+        self.redundancy_enabled = true;
+        self.redundancy_pt = pt;
+        debug!("RFC 2198 redundancy enabled, PT={}", pt);
     }
 
     /// Sets the DTMF payload type (default is 101).
@@ -173,6 +192,10 @@ impl RtpTransmitter {
 
     /// Sends an RTP packet with the given audio payload.
     ///
+    /// When RFC 2198 redundancy is enabled, the previous frame is included
+    /// alongside the current frame in a single packet. The RTP payload type
+    /// is set to the negotiated redundancy PT.
+    ///
     /// Non-SRTP path: zero-allocation — header + payload are written directly
     /// into a pre-allocated `send_buffer` and sent from there.
     ///
@@ -185,12 +208,77 @@ impl RtpTransmitter {
             .timestamp
             .fetch_add(self.timestamp_increment, Ordering::Relaxed);
 
-        let header = RtpHeader::new(self.payload_type, seq, ts, self.ssrc);
+        // Build the actual payload: RFC 2198 redundancy or plain.
+        let effective_pt;
+        let rtp_payload_start;
+        let rtp_payload_end;
+
+        if self.redundancy_enabled && !self.prev_payload.is_empty() {
+            // RFC 2198 format:
+            //   Header block 1 (4 bytes): F=1 | PT | timestamp_offset(14) | block_len(10)
+            //   Header block 2 (1 byte):  F=0 | PT
+            //   Redundant data (prev_payload)
+            //   Primary data (payload)
+            effective_pt = self.redundancy_pt;
+
+            // We write the RFC 2198 body into send_buffer AFTER the RTP header.
+            // The RTP header will be written at offset 0 later.
+            // Use a temp offset that we'll adjust after writing the header.
+            let prev_len = self.prev_payload.len();
+            let red_header_size = 5; // 4 + 1 bytes
+            let body_len = red_header_size + prev_len + payload.len();
+
+            // Build redundancy headers in send_buffer (after space for 12-byte RTP header).
+            let off = RTP_HEADER_SIZE;
+            // Redundant block header (4 bytes):
+            //   bit 0: F=1 (more blocks follow)
+            //   bits 1-7: block PT (original codec PT)
+            //   bits 8-21: timestamp offset (14 bits)
+            //   bits 22-31: block length (10 bits)
+            let ts_offset = self.timestamp_increment;
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                self.send_buffer[off] = 0x80 | (self.payload_type & 0x7F);
+                self.send_buffer[off + 1] = ((ts_offset >> 6) & 0xFF) as u8;
+                self.send_buffer[off + 2] =
+                    (((ts_offset & 0x3F) << 2) as u8) | ((prev_len >> 8) as u8 & 0x03);
+                self.send_buffer[off + 3] = prev_len as u8;
+            }
+            // Primary block header (1 byte): F=0 | PT
+            self.send_buffer[off + 4] = self.payload_type & 0x7F;
+
+            // Copy redundant data (previous frame)
+            let red_data_start = off + red_header_size;
+            self.send_buffer[red_data_start..red_data_start + prev_len]
+                .copy_from_slice(&self.prev_payload);
+
+            // Copy primary data (current frame)
+            let pri_data_start = red_data_start + prev_len;
+            self.send_buffer[pri_data_start..pri_data_start + payload.len()]
+                .copy_from_slice(payload);
+
+            rtp_payload_start = off;
+            rtp_payload_end = off + body_len;
+        } else {
+            effective_pt = self.payload_type;
+            rtp_payload_start = RTP_HEADER_SIZE;
+            rtp_payload_end = RTP_HEADER_SIZE + payload.len();
+            self.send_buffer[rtp_payload_start..rtp_payload_end].copy_from_slice(payload);
+        }
+
+        // Store current payload for next frame's redundancy
+        if self.redundancy_enabled {
+            self.prev_payload.clear();
+            self.prev_payload.extend_from_slice(payload);
+        }
+
+        let header = RtpHeader::new(effective_pt, seq, ts, self.ssrc);
 
         let protected: Bytes;
         let send_data: &[u8] = if let Some(ref srtp) = self.srtp {
             let protector = SrtpProtect::new(srtp);
-            match protector.protect_rtp_parts(&header, payload) {
+            let rtp_body = &self.send_buffer[rtp_payload_start..rtp_payload_end];
+            match protector.protect_rtp_parts(&header, rtp_body) {
                 Ok(p) => {
                     protected = p;
                     &protected
@@ -201,11 +289,10 @@ impl RtpTransmitter {
                 }
             }
         } else {
-            // Zero-alloc: write header + payload into pre-allocated send_buffer.
+            // Zero-alloc: write header into send_buffer, payload is already there.
             let header_size = header.write_into(&mut self.send_buffer);
-            let total = header_size + payload.len();
-            self.send_buffer[header_size..total].copy_from_slice(payload);
-            &self.send_buffer[..total]
+            debug_assert_eq!(header_size, RTP_HEADER_SIZE);
+            &self.send_buffer[..rtp_payload_end]
         };
 
         match self.socket.send_to(send_data, self.remote_addr) {
@@ -382,6 +469,8 @@ pub struct RtpReceiver {
     process_buffer: Vec<u8>,
     /// Remote SSRC (learned from received RTP packets).
     remote_ssrc: Option<u32>,
+    /// RFC 2198 redundancy payload type (if negotiated).
+    redundancy_pt: Option<u8>,
 }
 
 impl RtpReceiver {
@@ -398,6 +487,7 @@ impl RtpReceiver {
             recv_buffer: vec![0u8; MAX_RTP_PACKET_SIZE],
             process_buffer: vec![0u8; MAX_RTP_PACKET_SIZE],
             remote_ssrc: None,
+            redundancy_pt: None,
         }
     }
 
@@ -410,6 +500,12 @@ impl RtpReceiver {
     pub fn set_srtp(&mut self, context: SrtpContext) {
         self.srtp = Some(context);
         debug!("SRTP decryption enabled for receiver");
+    }
+
+    /// Enables RFC 2198 redundancy reception with the given payload type.
+    pub fn set_redundancy_pt(&mut self, pt: u8) {
+        self.redundancy_pt = Some(pt);
+        debug!("RFC 2198 redundancy reception enabled, PT={}", pt);
     }
 
     /// Receives an RTP packet (blocking, respects socket `recv_timeout`).
@@ -510,9 +606,39 @@ impl RtpReceiver {
             _ => {}
         }
 
-        // Add to shared jitter buffer
-        let buffered = BufferedPacket::new(seq, ts, pt, payload);
-        self.jitter_buffer.push(buffered);
+        // RFC 2198 redundancy: extract primary + redundant payloads.
+        if self.redundancy_pt == Some(pt) {
+            if let Some((primary_pt, primary_data, redundant)) =
+                parse_rfc2198(&payload, ts)
+            {
+                // Push redundant blocks first (they represent older packets).
+                for (red_pt, ts_offset, red_data) in &redundant {
+                    let red_ts = ts.wrapping_sub(*ts_offset);
+                    let red_seq = seq.wrapping_sub(1); // assume 1 frame offset
+                    let red_pkt = BufferedPacket::new(
+                        red_seq,
+                        red_ts,
+                        *red_pt,
+                        Bytes::copy_from_slice(red_data),
+                    );
+                    self.jitter_buffer.push(red_pkt);
+                }
+                // Push primary payload
+                let buffered = BufferedPacket::new(
+                    seq,
+                    ts,
+                    primary_pt,
+                    Bytes::copy_from_slice(primary_data),
+                );
+                self.jitter_buffer.push(buffered);
+            } else {
+                warn!("Failed to parse RFC 2198 payload, dropping packet");
+            }
+        } else {
+            // Normal (non-redundant) packet
+            let buffered = BufferedPacket::new(seq, ts, pt, payload);
+            self.jitter_buffer.push(buffered);
+        }
 
         self.stats.packets_received.fetch_add(1, Ordering::Relaxed);
         #[allow(clippy::cast_possible_truncation)]
@@ -611,6 +737,64 @@ fn rand_u32() -> u32 {
 /// Generates a random SSRC per RFC 3550 Section 5.1.
 pub fn generate_ssrc() -> u32 {
     rand_u32()
+}
+
+/// Parses an RFC 2198 redundancy payload.
+///
+/// Returns `(primary_pt, primary_data, redundant_entries)` where each
+/// redundant entry is `(pt, timestamp_offset, data)`.
+fn parse_rfc2198(
+    data: &[u8],
+    rtp_timestamp: u32,
+) -> Option<(u8, &[u8], Vec<(u8, u32, &[u8])>)> {
+    if data.is_empty() {
+        return None;
+    }
+
+    let mut offset = 0;
+    let mut redundant_headers: Vec<(u8, u32, usize)> = Vec::new(); // (pt, ts_offset, block_len)
+
+    // Parse header blocks
+    loop {
+        if offset >= data.len() {
+            return None;
+        }
+        let f_bit = (data[offset] & 0x80) != 0;
+        let block_pt = data[offset] & 0x7F;
+
+        if f_bit {
+            // Redundant block header: 4 bytes
+            if offset + 4 > data.len() {
+                return None;
+            }
+            let ts_offset = (u32::from(data[offset + 1]) << 6)
+                | (u32::from(data[offset + 2]) >> 2);
+            let block_len = (usize::from(data[offset + 2] & 0x03) << 8)
+                | usize::from(data[offset + 3]);
+            redundant_headers.push((block_pt, ts_offset, block_len));
+            offset += 4;
+        } else {
+            // Primary block header: 1 byte (F=0)
+            offset += 1;
+
+            // Now parse data blocks
+            let mut data_offset = offset;
+            let mut redundant_entries = Vec::with_capacity(redundant_headers.len());
+            for &(pt, ts_off, block_len) in &redundant_headers {
+                if data_offset + block_len > data.len() {
+                    return None;
+                }
+                let block_data = &data[data_offset..data_offset + block_len];
+                redundant_entries.push((pt, ts_off, block_data));
+                data_offset += block_len;
+            }
+
+            // Remaining data is primary
+            let primary_data = &data[data_offset..];
+            let _ = rtp_timestamp; // available for future use
+            return Some((block_pt, primary_data, redundant_entries));
+        }
+    }
 }
 
 /// Extracts essential RTP fields from raw packet data without constructing
@@ -752,6 +936,114 @@ mod tests {
         let mut data = [0u8; 12];
         data[0] = 0xC0; // Version 3
         assert!(parse_rtp_fields(&data).is_err());
+    }
+
+    #[test]
+    fn test_parse_rfc2198_single_redundant() {
+        // Build an RFC 2198 payload with one redundant block + primary.
+        //
+        // Redundant header (4 bytes): F=1 | PT=0 | ts_offset=160 | block_len=160
+        // Primary header (1 byte): F=0 | PT=0
+        // Redundant data: 160 bytes of 0xAA
+        // Primary data: 160 bytes of 0xBB
+        let ts_offset: u32 = 160;
+        let block_len: usize = 160;
+        let primary_pt: u8 = 0;
+        let redundant_pt: u8 = 0;
+
+        let mut payload = Vec::new();
+        // Redundant block header (4 bytes)
+        payload.push(0x80 | (redundant_pt & 0x7F));
+        payload.push(((ts_offset >> 6) & 0xFF) as u8);
+        payload.push((((ts_offset & 0x3F) << 2) as u8) | ((block_len >> 8) as u8 & 0x03));
+        payload.push(block_len as u8);
+        // Primary block header (1 byte)
+        payload.push(primary_pt & 0x7F);
+        // Redundant data
+        payload.extend_from_slice(&[0xAA; 160]);
+        // Primary data
+        payload.extend_from_slice(&[0xBB; 160]);
+
+        let rtp_ts = 1000u32;
+        let (parsed_pt, primary_data, redundant) = parse_rfc2198(&payload, rtp_ts).unwrap();
+
+        assert_eq!(parsed_pt, primary_pt);
+        assert_eq!(primary_data.len(), 160);
+        assert!(primary_data.iter().all(|&b| b == 0xBB));
+        assert_eq!(redundant.len(), 1);
+        assert_eq!(redundant[0].0, redundant_pt); // pt
+        assert_eq!(redundant[0].1, ts_offset); // ts_offset
+        assert_eq!(redundant[0].2.len(), 160);
+        assert!(redundant[0].2.iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn test_parse_rfc2198_empty_payload() {
+        assert!(parse_rfc2198(&[], 0).is_none());
+    }
+
+    #[test]
+    fn test_parse_rfc2198_truncated_header() {
+        // Only 2 bytes: F=1 but not enough for the 4-byte redundant header
+        let payload = [0x80, 0x00];
+        assert!(parse_rfc2198(&payload, 0).is_none());
+    }
+
+    #[test]
+    fn test_parse_rfc2198_primary_only() {
+        // F=0 | PT=0, then 80 bytes of primary data (no redundant blocks)
+        let mut payload = vec![0x00u8]; // F=0, PT=0
+        payload.extend_from_slice(&[0xCC; 80]);
+
+        let (pt, primary_data, redundant) = parse_rfc2198(&payload, 500).unwrap();
+        assert_eq!(pt, 0);
+        assert_eq!(primary_data.len(), 80);
+        assert!(primary_data.iter().all(|&b| b == 0xCC));
+        assert!(redundant.is_empty());
+    }
+
+    #[test]
+    fn test_rfc2198_send_roundtrip() {
+        // Verify that the transmitter's RFC 2198 encoding can be parsed back.
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_addr = socket.local_addr().unwrap();
+        let socket = Arc::new(socket);
+
+        // Create a transmitter that sends to itself
+        let mut tx = RtpTransmitter::new(socket.clone(), local_addr, 12345, 0, 160);
+        tx.enable_redundancy(REDUNDANCY_PAYLOAD_TYPE);
+
+        // First send — no redundancy yet (prev_payload is empty)
+        let frame1 = [0x11u8; 160];
+        tx.send(&frame1).unwrap();
+
+        // Receive the first packet — should be plain (PT=0, not redundancy)
+        let mut buf = [0u8; MAX_RTP_PACKET_SIZE];
+        let (len, _) = socket.recv_from(&mut buf).unwrap();
+        let (pt1, _, _, _, ps1, pe1) = parse_rtp_fields(&buf[..len]).unwrap();
+        assert_eq!(pt1, 0, "first packet should have audio PT (no prev frame)");
+        assert_eq!(pe1 - ps1, 160);
+
+        // Second send — now redundancy kicks in
+        let frame2 = [0x22u8; 160];
+        tx.send(&frame2).unwrap();
+
+        let (len2, _) = socket.recv_from(&mut buf).unwrap();
+        let (pt2, _, ts2, _, ps2, pe2) = parse_rtp_fields(&buf[..len2]).unwrap();
+        assert_eq!(pt2, REDUNDANCY_PAYLOAD_TYPE, "second packet should use redundancy PT");
+
+        // Parse the RFC 2198 body
+        let rfc2198_body = &buf[ps2..pe2];
+        let (primary_pt, primary_data, redundant) =
+            parse_rfc2198(rfc2198_body, ts2).unwrap();
+        assert_eq!(primary_pt, 0);
+        assert_eq!(primary_data.len(), 160);
+        assert!(primary_data.iter().all(|&b| b == 0x22));
+        assert_eq!(redundant.len(), 1);
+        assert_eq!(redundant[0].0, 0); // redundant PT = audio PT
+        assert_eq!(redundant[0].1, 160); // ts_offset = timestamp_increment
+        assert_eq!(redundant[0].2.len(), 160);
+        assert!(redundant[0].2.iter().all(|&b| b == 0x11));
     }
 
     #[test]
