@@ -55,7 +55,7 @@
 //! - [`sinc_resampler`]: Polyphase sinc resampler for anti-imaging
 //! - [`pipeline`]: Main audio pipeline coordinator
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![deny(warnings)]
 #![deny(missing_docs)]
 #![deny(clippy::unwrap_used)]
@@ -87,6 +87,7 @@ pub mod rtcp_session;
 pub mod rtp_handler;
 pub mod sinc_resampler;
 pub mod stream;
+pub(crate) mod thread_priority;
 pub mod vad;
 
 pub use audio_processing::AudioProcessor;

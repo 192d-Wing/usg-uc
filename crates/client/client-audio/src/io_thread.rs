@@ -148,6 +148,7 @@ pub fn spawn(
     let handle = thread::Builder::new()
         .name("audio-io".to_string())
         .spawn(move || {
+            crate::thread_priority::set_realtime_priority("I/O");
             info!("I/O thread started");
             io_loop(
                 config,

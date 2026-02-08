@@ -147,6 +147,7 @@ pub fn spawn(
     let handle = thread::Builder::new()
         .name("audio-decode".to_string())
         .spawn(move || {
+            crate::thread_priority::set_realtime_priority("decode");
             info!("Decode thread started");
             decode_loop(
                 config,
