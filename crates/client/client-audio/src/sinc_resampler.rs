@@ -22,6 +22,14 @@
 
 use std::f64::consts::PI;
 
+#[cfg(target_arch = "aarch64")]
+use core::arch::aarch64::{vaddvq_f32, vfmaq_f32, vld1q_f32, vmulq_f32};
+#[cfg(target_arch = "x86_64")]
+use core::arch::x86_64::{
+    _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_loadu_ps, _mm_movehl_ps, _mm_mul_ps,
+    _mm_shuffle_ps,
+};
+
 /// Number of filter taps per polyphase sub-filter.
 /// 16 taps with 6 phases = 96 total taps, achieving ~50 dB stopband
 /// attenuation. Cost: 16 multiply-adds per output sample (negligible).
@@ -77,12 +85,9 @@ impl SincResampler {
             self.history.copy_within(0..TAPS_PER_PHASE - 1, 1);
             self.history[0] = f32::from(sample);
 
-            // Compute each polyphase output
+            // Compute each polyphase output (SIMD-accelerated dot product)
             for phase in &self.phases {
-                let mut sum = 0.0f32;
-                for (k, &coeff) in phase.iter().enumerate() {
-                    sum = self.history[k].mul_add(coeff, sum);
-                }
+                let sum = dot_product_16(&self.history, phase);
                 output.push(sum.round().clamp(-32768.0, 32767.0) as i16);
             }
         }
@@ -129,10 +134,7 @@ impl SincResampler {
                 if pos >= output_len {
                     return;
                 }
-                let mut sum = 0.0f32;
-                for (k, &coeff) in phase.iter().enumerate() {
-                    sum = self.history[k].mul_add(coeff, sum);
-                }
+                let sum = dot_product_16(&self.history, phase);
                 output[pos] = sum.round().clamp(-32768.0, 32767.0) as i16;
                 pos += 1;
             }
@@ -534,9 +536,167 @@ fn bessel_i0(x: f64) -> f64 {
     sum
 }
 
+// ─── SIMD-accelerated dot product ─────────────────────────────────────
+
+/// Computes the dot product of `history[0..16]` and `coeffs[0..16]`.
+///
+/// Dispatches to NEON (aarch64), SSE2 (x86_64), or scalar fallback.
+#[inline(always)]
+fn dot_product_16(history: &[f32; TAPS_PER_PHASE], coeffs: &[f32; TAPS_PER_PHASE]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        dot_product_16_neon(history, coeffs)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        dot_product_16_sse2(history, coeffs)
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        dot_product_16_scalar(history, coeffs)
+    }
+}
+
+/// NEON-accelerated 16-element f32 dot product.
+///
+/// NEON is mandatory on all aarch64 targets (ARMv8-A baseline).
+/// Uses `vfmaq_f32` fused multiply-add and `vaddvq_f32` horizontal sum.
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_code)]
+#[inline(always)]
+fn dot_product_16_neon(history: &[f32; TAPS_PER_PHASE], coeffs: &[f32; TAPS_PER_PHASE]) -> f32 {
+    // SAFETY: NEON is always available on aarch64. vld1q_f32 supports
+    // unaligned loads. Arrays are exactly 16 elements so all loads are in-bounds.
+    unsafe {
+        let h0 = vld1q_f32(history.as_ptr());
+        let h1 = vld1q_f32(history.as_ptr().add(4));
+        let h2 = vld1q_f32(history.as_ptr().add(8));
+        let h3 = vld1q_f32(history.as_ptr().add(12));
+
+        let c0 = vld1q_f32(coeffs.as_ptr());
+        let c1 = vld1q_f32(coeffs.as_ptr().add(4));
+        let c2 = vld1q_f32(coeffs.as_ptr().add(8));
+        let c3 = vld1q_f32(coeffs.as_ptr().add(12));
+
+        let mut acc = vmulq_f32(h0, c0);
+        acc = vfmaq_f32(acc, h1, c1);
+        acc = vfmaq_f32(acc, h2, c2);
+        acc = vfmaq_f32(acc, h3, c3);
+
+        vaddvq_f32(acc)
+    }
+}
+
+/// SSE2-accelerated 16-element f32 dot product.
+///
+/// SSE2 is mandatory on all x86_64 targets (AMD64 baseline).
+/// Uses `_mm_mul_ps` + `_mm_add_ps` (no FMA requirement).
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)]
+#[inline(always)]
+fn dot_product_16_sse2(history: &[f32; TAPS_PER_PHASE], coeffs: &[f32; TAPS_PER_PHASE]) -> f32 {
+    // SAFETY: SSE2 is always available on x86_64. _mm_loadu_ps supports
+    // unaligned loads. Arrays are exactly 16 elements so all loads are in-bounds.
+    unsafe {
+        let h0 = _mm_loadu_ps(history.as_ptr());
+        let h1 = _mm_loadu_ps(history.as_ptr().add(4));
+        let h2 = _mm_loadu_ps(history.as_ptr().add(8));
+        let h3 = _mm_loadu_ps(history.as_ptr().add(12));
+
+        let c0 = _mm_loadu_ps(coeffs.as_ptr());
+        let c1 = _mm_loadu_ps(coeffs.as_ptr().add(4));
+        let c2 = _mm_loadu_ps(coeffs.as_ptr().add(8));
+        let c3 = _mm_loadu_ps(coeffs.as_ptr().add(12));
+
+        let mut acc = _mm_mul_ps(h0, c0);
+        acc = _mm_add_ps(acc, _mm_mul_ps(h1, c1));
+        acc = _mm_add_ps(acc, _mm_mul_ps(h2, c2));
+        acc = _mm_add_ps(acc, _mm_mul_ps(h3, c3));
+
+        // Horizontal sum: [a, b, c, d] → a+b+c+d
+        let hi = _mm_movehl_ps(acc, acc); // [c, d, c, d]
+        let sum01 = _mm_add_ps(acc, hi); // [a+c, b+d, ?, ?]
+        let shuf = _mm_shuffle_ps(sum01, sum01, 1); // [b+d, ?, ?, ?]
+        let total = _mm_add_ss(sum01, shuf); // [a+b+c+d, ?, ?, ?]
+
+        _mm_cvtss_f32(total)
+    }
+}
+
+/// Scalar fallback using 4-lane accumulation order for consistency with SIMD paths.
+#[cfg(any(
+    not(any(target_arch = "aarch64", target_arch = "x86_64")),
+    test
+))]
+fn dot_product_16_scalar(history: &[f32; TAPS_PER_PHASE], coeffs: &[f32; TAPS_PER_PHASE]) -> f32 {
+    let mut acc0 = history[0] * coeffs[0];
+    let mut acc1 = history[1] * coeffs[1];
+    let mut acc2 = history[2] * coeffs[2];
+    let mut acc3 = history[3] * coeffs[3];
+
+    acc0 = history[4].mul_add(coeffs[4], acc0);
+    acc1 = history[5].mul_add(coeffs[5], acc1);
+    acc2 = history[6].mul_add(coeffs[6], acc2);
+    acc3 = history[7].mul_add(coeffs[7], acc3);
+
+    acc0 = history[8].mul_add(coeffs[8], acc0);
+    acc1 = history[9].mul_add(coeffs[9], acc1);
+    acc2 = history[10].mul_add(coeffs[10], acc2);
+    acc3 = history[11].mul_add(coeffs[11], acc3);
+
+    acc0 = history[12].mul_add(coeffs[12], acc0);
+    acc1 = history[13].mul_add(coeffs[13], acc1);
+    acc2 = history[14].mul_add(coeffs[14], acc2);
+    acc3 = history[15].mul_add(coeffs[15], acc3);
+
+    (acc0 + acc2) + (acc1 + acc3)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── SIMD dot product tests ───────────────────────────────────
+
+    #[test]
+    fn test_dot_product_16_known_values() {
+        let history = [1.0f32; TAPS_PER_PHASE];
+        let coeffs = [2.0f32; TAPS_PER_PHASE];
+        let result = dot_product_16(&history, &coeffs);
+        assert!(
+            (result - 32.0).abs() < 1e-5,
+            "1.0 * 2.0 * 16 = 32.0, got {result}"
+        );
+    }
+
+    #[test]
+    fn test_dot_product_16_matches_scalar() {
+        let mut history = [0.0f32; TAPS_PER_PHASE];
+        let mut coeffs = [0.0f32; TAPS_PER_PHASE];
+        #[allow(clippy::cast_precision_loss)]
+        for i in 0..TAPS_PER_PHASE {
+            history[i] = (i as f32 * 1234.5) - 8000.0;
+            coeffs[i] = (i as f32 * 0.0625) - 0.5;
+        }
+
+        let simd_result = dot_product_16(&history, &coeffs);
+        let scalar_result = dot_product_16_scalar(&history, &coeffs);
+
+        assert!(
+            (simd_result - scalar_result).abs() < 1.0,
+            "SIMD={simd_result}, scalar={scalar_result}"
+        );
+    }
+
+    #[test]
+    fn test_dot_product_16_zeros() {
+        let history = [0.0f32; TAPS_PER_PHASE];
+        let coeffs = [1.0f32; TAPS_PER_PHASE];
+        let result = dot_product_16(&history, &coeffs);
+        assert!(result.abs() < 1e-10, "Zero input should produce zero: {result}");
+    }
 
     // ─── Integer polyphase tests ───────────────────────────────────
 

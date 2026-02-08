@@ -90,6 +90,15 @@ fn bench_resample_48k_to_8k(c: &mut Criterion) {
     });
 }
 
+fn bench_resample_8k_to_48k_10frames(c: &mut Criterion) {
+    let mut resampler = Resampler::new(8000, 48000);
+    let input: Vec<i16> = (0..1600).map(|i| (i * 20 - 16000) as i16).collect();
+    let mut output = vec![0i16; 9600];
+    c.bench_function("resample 8kHz→48kHz 10×(160→960)", |b| {
+        b.iter(|| resampler.process_adjusted_into(black_box(&input), &mut output));
+    });
+}
+
 fn bench_jitter_buffer_push_pop(c: &mut Criterion) {
     c.bench_function("jitter_buffer push+pop (160B, depth=60ms)", |b| {
         b.iter(|| {
@@ -120,6 +129,7 @@ criterion_group!(
     bench_g711_ulaw_decode,
     bench_resample_8k_to_48k,
     bench_resample_48k_to_8k,
+    bench_resample_8k_to_48k_10frames,
     bench_jitter_buffer_push_pop,
 );
 criterion_main!(benches);
