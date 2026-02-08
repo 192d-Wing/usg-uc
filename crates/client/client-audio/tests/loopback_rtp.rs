@@ -68,7 +68,6 @@ fn loopback_g711_alaw() {
 }
 
 #[test]
-#[ignore = "G.722 codec decode produces constant max amplitude — pre-existing codec bug"]
 fn loopback_g722() {
     loopback_codec(CodecPreference::G722, 9);
 }
