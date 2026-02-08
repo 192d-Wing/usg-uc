@@ -743,7 +743,7 @@ pub fn generate_ssrc() -> u32 {
 ///
 /// Returns `(primary_pt, primary_data, redundant_entries)` where each
 /// redundant entry is `(pt, timestamp_offset, data)`.
-fn parse_rfc2198(
+pub fn parse_rfc2198(
     data: &[u8],
     rtp_timestamp: u32,
 ) -> Option<(u8, &[u8], Vec<(u8, u32, &[u8])>)> {
@@ -802,7 +802,7 @@ fn parse_rfc2198(
 ///
 /// Returns `(payload_type, sequence_number, timestamp, ssrc, payload_start, payload_end)`.
 #[inline]
-fn parse_rtp_fields(data: &[u8]) -> AudioResult<(u8, u16, u32, u32, usize, usize)> {
+pub fn parse_rtp_fields(data: &[u8]) -> AudioResult<(u8, u16, u32, u32, usize, usize)> {
     if data.len() < RTP_HEADER_SIZE {
         return Err(AudioError::RtpError("packet too short".into()));
     }

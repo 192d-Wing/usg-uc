@@ -218,6 +218,7 @@ windows = { version = "0.62", features = [
 ] }
 uuid = { version = "1.20", features = ["v4"] }
 tempfile = "3.24"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [workspace.lints.rust]
 # Use deny instead of forbid to allow platform-specific unsafe code with explicit #[allow(unsafe_code)]
