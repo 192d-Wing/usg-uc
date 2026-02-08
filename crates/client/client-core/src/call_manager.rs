@@ -826,6 +826,34 @@ impl CallManager {
             media_tx,
         );
 
+        // Parse the remote's SDP offer from the INVITE body to negotiate
+        // codec, DTMF PT, and redundancy PT.
+        if let Some(remote_sdp) = incoming
+            .invite_request
+            .body
+            .as_ref()
+            .and_then(|b| std::str::from_utf8(b).ok())
+        {
+            // Negotiate best codec from intersection of offer and our capabilities
+            if let Some(codec) = negotiate_codec_from_sdp_offer(remote_sdp, self.preferred_codec) {
+                info!(call_id = %call_id, codec = ?codec, "Negotiated codec from incoming SDP offer");
+                self.negotiated_codecs.insert(call_id.to_string(), codec);
+            }
+            // Parse DTMF telephone-event PT from remote offer
+            let dtmf_pt = parse_telephone_event_pt(remote_sdp);
+            self.telephone_event_pt
+                .insert(call_id.to_string(), dtmf_pt);
+            if let Some(pt) = dtmf_pt {
+                info!(call_id = %call_id, pt = pt, "Remote offer supports telephone-event PT={pt}");
+            }
+            // Parse RFC 2198 redundancy PT from remote offer
+            let red_pt = parse_redundancy_pt(remote_sdp);
+            self.redundancy_pt.insert(call_id.to_string(), red_pt);
+            if let Some(pt) = red_pt {
+                info!(call_id = %call_id, pt = pt, "Remote offer supports redundancy PT={pt}");
+            }
+        }
+
         // Generate SDP answer
         let sdp_answer = self.generate_sdp_offer(&call_id, &media_session, &account)?;
 
@@ -2520,6 +2548,101 @@ fn parse_codec_from_sdp(sdp: &str) -> Option<CodecPreference> {
     None
 }
 
+/// Parses all offered codecs from an SDP body and selects the best match.
+///
+/// Unlike `parse_codec_from_sdp` (which takes just the first PT), this
+/// function builds the full list of offered codecs, then picks the one
+/// that best matches our local preference order:
+///   1. Our preferred codec (if offered)
+///   2. Remaining codecs in *our* preference order
+///
+/// This implements RFC 3264 §6.1 answerer behaviour: the answerer selects
+/// the best codec from the intersection of offered and supported codecs.
+fn negotiate_codec_from_sdp_offer(
+    sdp: &str,
+    preferred: CodecPreference,
+) -> Option<CodecPreference> {
+    let mut payload_types: Vec<u8> = Vec::new();
+    let mut rtpmaps: Vec<(u8, String)> = Vec::new();
+
+    for line in sdp.lines() {
+        if line.starts_with("m=audio") {
+            // Parse all payload types from the m= line
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            for pt_str in parts.iter().skip(3) {
+                if let Ok(pt) = pt_str.parse::<u8>() {
+                    payload_types.push(pt);
+                }
+            }
+        }
+        if let Some(rtpmap) = line.strip_prefix("a=rtpmap:") {
+            let parts: Vec<&str> = rtpmap.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let Ok(pt) = parts[0].parse::<u8>() {
+                    let codec_name = parts[1].split('/').next().unwrap_or("");
+                    rtpmaps.push((pt, codec_name.to_string()));
+                }
+            }
+        }
+    }
+
+    // Resolve each offered PT to a CodecPreference
+    let mut offered_codecs: Vec<CodecPreference> = Vec::new();
+    for pt in &payload_types {
+        let codec = match *pt {
+            0 => Some(CodecPreference::G711Ulaw),
+            8 => Some(CodecPreference::G711Alaw),
+            9 => Some(CodecPreference::G722),
+            _ => {
+                // Look up dynamic PT in rtpmaps
+                rtpmaps.iter().find(|(rpt, _)| rpt == pt).and_then(|(_, name)| {
+                    let lower = name.to_lowercase();
+                    if lower == "pcmu" {
+                        Some(CodecPreference::G711Ulaw)
+                    } else if lower == "pcma" {
+                        Some(CodecPreference::G711Alaw)
+                    } else if lower == "g722" {
+                        Some(CodecPreference::G722)
+                    } else if lower == "opus" {
+                        Some(CodecPreference::Opus)
+                    } else {
+                        None
+                    }
+                })
+            }
+        };
+        if let Some(c) = codec {
+            if !offered_codecs.contains(&c) {
+                offered_codecs.push(c);
+            }
+        }
+    }
+
+    if offered_codecs.is_empty() {
+        return None;
+    }
+
+    // Prefer our preferred codec if the remote offers it
+    if offered_codecs.contains(&preferred) {
+        return Some(preferred);
+    }
+
+    // Fall back to our preference order
+    let our_order = [
+        CodecPreference::Opus,
+        CodecPreference::G722,
+        CodecPreference::G711Ulaw,
+        CodecPreference::G711Alaw,
+    ];
+    for candidate in &our_order {
+        if offered_codecs.contains(candidate) {
+            return Some(*candidate);
+        }
+    }
+
+    None
+}
+
 /// Parses the remote media address from an SDP answer.
 ///
 /// Extracts the connection address from the c= line and the port from the m=audio line.
@@ -3017,5 +3140,83 @@ m=audio 5000 RTP/AVP 0 101\r\n\
 a=rtpmap:0 PCMU/8000\r\n\
 a=rtpmap:101 telephone-event/8000\r\n";
         assert_eq!(parse_redundancy_pt(sdp), None);
+    }
+
+    // ── SDP offer codec negotiation ─────────────────────────────
+
+    #[test]
+    fn test_negotiate_preferred_codec_offered() {
+        // Remote offers PCMU and PCMA, we prefer PCMU → pick PCMU
+        let sdp = "\
+m=audio 5000 RTP/AVP 8 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:8 PCMA/8000\r\n";
+        assert_eq!(
+            negotiate_codec_from_sdp_offer(sdp, CodecPreference::G711Ulaw),
+            Some(CodecPreference::G711Ulaw)
+        );
+    }
+
+    #[test]
+    fn test_negotiate_preferred_not_offered_fallback() {
+        // Remote offers only PCMA and PCMU, we prefer Opus → fallback to G722? No, G711Ulaw
+        let sdp = "\
+m=audio 5000 RTP/AVP 0 8\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:8 PCMA/8000\r\n";
+        assert_eq!(
+            negotiate_codec_from_sdp_offer(sdp, CodecPreference::Opus),
+            Some(CodecPreference::G711Ulaw) // highest in our preference order that's offered
+        );
+    }
+
+    #[test]
+    fn test_negotiate_opus_from_dynamic_pt() {
+        // Remote offers Opus as dynamic PT 111
+        let sdp = "\
+m=audio 5000 RTP/AVP 111 0 8\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:8 PCMA/8000\r\n";
+        assert_eq!(
+            negotiate_codec_from_sdp_offer(sdp, CodecPreference::G711Ulaw),
+            Some(CodecPreference::G711Ulaw) // we prefer PCMU and it's offered
+        );
+        assert_eq!(
+            negotiate_codec_from_sdp_offer(sdp, CodecPreference::Opus),
+            Some(CodecPreference::Opus) // we prefer Opus and it's offered
+        );
+    }
+
+    #[test]
+    fn test_negotiate_g722_preferred() {
+        let sdp = "\
+m=audio 5000 RTP/AVP 9 0\r\n\
+a=rtpmap:9 G722/8000\r\n\
+a=rtpmap:0 PCMU/8000\r\n";
+        assert_eq!(
+            negotiate_codec_from_sdp_offer(sdp, CodecPreference::G722),
+            Some(CodecPreference::G722)
+        );
+    }
+
+    #[test]
+    fn test_negotiate_no_supported_codecs() {
+        // Remote offers only an unknown codec
+        let sdp = "\
+m=audio 5000 RTP/AVP 96\r\n\
+a=rtpmap:96 speex/16000\r\n";
+        assert_eq!(
+            negotiate_codec_from_sdp_offer(sdp, CodecPreference::G711Ulaw),
+            None
+        );
+    }
+
+    #[test]
+    fn test_negotiate_empty_sdp() {
+        assert_eq!(
+            negotiate_codec_from_sdp_offer("", CodecPreference::G711Ulaw),
+            None
+        );
     }
 }
