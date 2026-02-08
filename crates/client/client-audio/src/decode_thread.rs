@@ -274,9 +274,11 @@ fn decode_loop(
     // `scratch` is used for comfort noise, DTMF tones, fade-out, and silence.
     // `codec_scratch` receives the decoded PCM from the codec (which returns
     // a borrow of its internal buffer — we need a mutable copy for postfilter).
+    // `resample_buf` receives resampled output (replaces Vec allocation per frame).
     // +16 headroom for drift adjustment that can slightly increase device_samples.
     let mut scratch = vec![0i16; device_samples + 16];
     let mut codec_scratch = vec![0i16; codec_samples];
+    let mut resample_buf = vec![0i16; device_samples + 16];
 
     // Diagnostic counters
     let mut diag_frames_decoded: u64 = 0;
@@ -399,9 +401,9 @@ fn decode_loop(
                         // (operates at codec rate before resampling for maximum effect)
                         postfilter.process(codec_buf);
 
-                        // Resample from codec rate to device rate
-                        let mut device_pcm =
-                            resampler.process_adjusted(codec_buf, adjusted_device_samples);
+                        // Resample from codec rate to device rate (zero-alloc)
+                        let device_pcm = &mut resample_buf[..adjusted_device_samples];
+                        resampler.process_adjusted_into(codec_buf, device_pcm);
 
                         // Track peak amplitude before gain
                         let peak = device_pcm
@@ -431,7 +433,7 @@ fn decode_loop(
                         current_gain += (target_gain - current_gain) * GAIN_RAMP_SPEED;
 
                         // Apply gain in-place (no .collect() allocation)
-                        for s in &mut device_pcm {
+                        for s in &mut *device_pcm {
                             #[allow(clippy::cast_possible_truncation)]
                             {
                                 *s = (f32::from(*s) * current_gain).clamp(-32768.0, 32767.0) as i16;
@@ -454,12 +456,12 @@ fn decode_loop(
                         // Write to audio dump file if enabled
                         if let Some(ref mut dump) = audio_dump {
                             use std::io::Write;
-                            for &s in &device_pcm {
+                            for &s in &*device_pcm {
                                 let _ = dump.write_all(&s.to_le_bytes());
                             }
                         }
 
-                        let written = producer.push_slice(&device_pcm);
+                        let written = producer.push_slice(device_pcm);
                         if written < device_pcm.len() {
                             trace!(
                                 "Ring buffer full: wrote {}/{} samples",
@@ -490,14 +492,15 @@ fn decode_loop(
                             plc.conceal()
                         };
 
-                        // Resample concealed audio to device rate
-                        let device_pcm = resampler.process_adjusted(&concealed, device_samples);
+                        // Resample concealed audio to device rate (zero-alloc)
+                        let device_pcm = &mut resample_buf[..device_samples];
+                        resampler.process_adjusted_into(&concealed, device_pcm);
 
                         if let Some(&last) = device_pcm.last() {
                             last_output_sample = last;
                         }
 
-                        producer.push_slice(&device_pcm);
+                        producer.push_slice(device_pcm);
                         diag_frames_lost += 1;
                     }
                     JitterBufferResult::Empty | JitterBufferResult::NotReady => {
@@ -599,6 +602,7 @@ fn decode_loop(
                                 }
                                 target_fill = device_samples * TARGET_FILL_FRAMES;
                                 scratch.resize(device_samples + 16, 0);
+                                resample_buf.resize(device_samples + 16, 0);
                                 resampler = Resampler::new(codec_clock_rate, device_rate);
                                 drift = DriftCompensator::new(1);
                                 info!(
