@@ -346,25 +346,26 @@ impl fmt::Display for NameAddr {
 
 /// Parses a quoted display name from a name-addr string.
 fn parse_quoted_display_name(s: &str) -> SipResult<(String, &str)> {
-    let mut end = 1;
-    let chars: Vec<char> = s.chars().collect();
-    while end < chars.len() {
-        if chars[end] == '"' && (end == 0 || chars[end - 1] != '\\') {
+    // Scan for the closing quote using byte offsets. The delimiters ('"' and
+    // '\\') are ASCII so byte-level scanning is safe for UTF-8 strings.
+    let bytes = s.as_bytes();
+    let mut pos = 1;
+    while pos < bytes.len() {
+        if bytes[pos] == b'"' && (pos == 0 || bytes[pos - 1] != b'\\') {
             break;
         }
-        end += 1;
+        pos += 1;
     }
 
-    if end >= chars.len() {
+    if pos >= bytes.len() {
         return Err(SipError::InvalidHeader {
             name: "From/To".to_string(),
             reason: "unclosed display name quote".to_string(),
         });
     }
 
-    let name: String = chars[1..end].iter().collect();
-    let name = name.replace("\\\"", "\"");
-    Ok((name, &s[end + 1..]))
+    let name = s[1..pos].replace("\\\"", "\"");
+    Ok((name, &s[pos + 1..]))
 }
 
 /// Extracts display name and remaining string from a name-addr.
