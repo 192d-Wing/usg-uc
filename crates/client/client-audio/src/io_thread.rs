@@ -13,7 +13,7 @@ use crate::comfort_noise::encode_cn_payload;
 use crate::decode_thread::DecodeCommand;
 use crate::dtmf_sender::DtmfSender;
 use crate::file_source::FileAudioSource;
-use crate::pipeline::{PipelineStats, resample};
+use crate::pipeline::{PipelineStats, resample_into};
 use crate::rtcp_session::RtcpSession;
 use crate::rtp_handler::{RtpReceiver, RtpTransmitter};
 use crate::stream::CaptureStream;
@@ -255,6 +255,7 @@ fn io_loop(
 
     // Pre-allocated scratch buffers — reused every frame to avoid heap allocs.
     let mut capture_pcm = vec![0i16; capture_device_samples];
+    let mut codec_pcm_buf = vec![0i16; codec_samples];
     let mut moh_pcm = vec![0i16; codec_samples];
 
     let mut last_capture = Instant::now();
@@ -331,7 +332,7 @@ fn io_loop(
                     &mut vad,
                     &mut noise_shaper,
                     &mut capture_pcm,
-                    codec_samples,
+                    &mut codec_pcm_buf,
                     &stats,
                     in_warmup,
                 );
@@ -505,7 +506,7 @@ fn io_loop(
 /// When DTX suppresses the frame, `noise_floor` carries the VAD's estimate
 /// so the caller can send an RFC 3389 CN packet at the speech→silence transition.
 ///
-/// `device_pcm` is a pre-allocated buffer (caller manages its lifetime).
+/// `device_pcm` and `codec_pcm_buf` are pre-allocated buffers (caller manages lifetimes).
 #[allow(clippy::too_many_arguments)]
 fn process_capture_frame(
     codec: &mut CodecPipeline,
@@ -515,11 +516,12 @@ fn process_capture_frame(
     vad: &mut VoiceActivityDetector,
     noise_shaper: &mut NoiseShaper,
     device_pcm: &mut [i16],
-    codec_samples: usize,
+    codec_pcm_buf: &mut [i16],
     stats: &Arc<Mutex<PipelineStats>>,
     skip_dtx: bool,
 ) -> (usize, i16, bool, Option<f32>) {
     let device_samples = device_pcm.len();
+    let codec_samples = codec_pcm_buf.len();
     device_pcm.fill(0);
 
     // Read captured samples at device rate
@@ -552,16 +554,12 @@ fn process_capture_frame(
         return (samples_read, max_amp, true, Some(vad.noise_floor()));
     }
 
-    // Resample from device rate to codec rate (no cross-frame needed for downsampling)
-    let mut resampled;
+    // Resample from device rate to codec rate (zero-alloc)
     let codec_pcm: &mut [i16] = if device_samples == codec_samples {
         &mut device_pcm[..codec_samples]
     } else {
-        // resample() returns Vec — this allocation remains because changing
-        // the resampler API is a deeper change. Only affects capture path
-        // (50 calls/sec), not the hotter decode/playback path.
-        resampled = resample(device_pcm, codec_samples, 0);
-        &mut resampled
+        resample_into(device_pcm, codec_pcm_buf, 0);
+        codec_pcm_buf
     };
 
     // Noise shaping (G.711 only — reshapes quantization noise before encoding)

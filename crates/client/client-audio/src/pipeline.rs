@@ -552,10 +552,11 @@ impl Drop for AudioPipeline {
 /// averaging-decimation works for downsampling.
 ///
 /// The `prev_sample` parameter provides the last input sample from the previous
-/// frame, enabling smooth interpolation across frame boundaries. Without this,
-/// upsampling creates a step discontinuity every 20ms (50 Hz artifact) because
-/// the last few output samples hold the final input value flat, then the next
-/// frame jumps to its first sample.
+/// frame, enabling smooth interpolation across frame boundaries.
+///
+/// `output` must have exactly the desired number of output samples. Uses
+/// integer-ratio linear interpolation, integer-ratio averaging, or
+/// Catmull-Rom cubic for arbitrary ratios.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -563,20 +564,20 @@ impl Drop for AudioPipeline {
     clippy::cast_possible_wrap,
     clippy::suboptimal_flops
 )]
-pub(crate) fn resample(input: &[i16], output_len: usize, prev_sample: i16) -> Vec<i16> {
-    if input.len() == output_len {
-        return input.to_vec();
+pub(crate) fn resample_into(input: &[i16], output: &mut [i16], prev_sample: i16) {
+    let in_len = input.len();
+    let output_len = output.len();
+
+    if in_len == output_len {
+        output.copy_from_slice(input);
+        return;
     }
 
-    let in_len = input.len();
-
-    // Fast path: integer ratio upsampling (common case: 6:1 for 8kHz→48kHz)
+    // Fast path: integer ratio upsampling
     if output_len > in_len && output_len.is_multiple_of(in_len) {
         let ratio = output_len / in_len;
-        let mut output = Vec::with_capacity(output_len);
+        let mut pos = 0;
         for i in 0..in_len {
-            // Interpolate from previous sample toward current sample.
-            // At i=0, use prev_sample from the previous frame for continuity.
             let s0 = if i == 0 {
                 i32::from(prev_sample)
             } else {
@@ -584,40 +585,32 @@ pub(crate) fn resample(input: &[i16], output_len: usize, prev_sample: i16) -> Ve
             };
             let s1 = i32::from(input[i]);
             for j in 0..ratio {
-                // t ranges from 1/ratio to ratio/ratio (=1.0), so the last
-                // output sample in each group exactly equals input[i].
                 let t = (j + 1) as i32;
                 let sample = s0 + (s1 - s0) * t / ratio as i32;
-                output.push(sample as i16);
+                output[pos] = sample as i16;
+                pos += 1;
             }
         }
-        return output;
+        return;
     }
 
-    // Fast path: integer ratio downsampling (common case: 6:1 for 48kHz→8kHz)
+    // Fast path: integer ratio downsampling
     if in_len > output_len && in_len.is_multiple_of(output_len) {
         let ratio = in_len / output_len;
-        let mut output = Vec::with_capacity(output_len);
         for i in 0..output_len {
             let start = i * ratio;
             let sum: i32 = input[start..start + ratio]
                 .iter()
                 .map(|&s| i32::from(s))
                 .sum();
-            output.push((sum / ratio as i32) as i16);
+            output[i] = (sum / ratio as i32) as i16;
         }
-        return output;
+        return;
     }
 
-    // General case: Catmull-Rom cubic interpolation for non-integer ratios.
-    // Uses 4 input points per output sample for smooth curves, eliminating
-    // the imaging artifacts of linear interpolation on large upsampling
-    // ratios (e.g., 160→882 for 8kHz→44.1kHz, 5.5x).
-    let mut output = Vec::with_capacity(output_len);
+    // General case: Catmull-Rom cubic interpolation
     let step = in_len as f64 / output_len as f64;
 
-    // Helper to fetch input sample with boundary clamping.
-    // Index -1 maps to prev_sample for cross-frame continuity.
     let sample_at = |idx: i32| -> f64 {
         if idx < 0 {
             f64::from(prev_sample)
@@ -633,13 +626,11 @@ pub(crate) fn resample(input: &[i16], output_len: usize, prev_sample: i16) -> Ve
         let idx = pos.floor() as i32;
         let t = pos - f64::from(idx);
 
-        // Four points for Catmull-Rom: p0, p1, p2, p3
         let p0 = sample_at(idx - 1);
         let p1 = sample_at(idx);
         let p2 = sample_at(idx + 1);
         let p3 = sample_at(idx + 2);
 
-        // Catmull-Rom spline formula
         let t2 = t * t;
         let t3 = t2 * t;
         let sample = 0.5
@@ -648,15 +639,10 @@ pub(crate) fn resample(input: &[i16], output_len: usize, prev_sample: i16) -> Ve
                 + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
                 + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3);
 
-        // Clamp to i16 range to prevent overflow from cubic overshoot
-        output.push(
-            sample
-                .round()
-                .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16,
-        );
+        output[i] = sample
+            .round()
+            .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16;
     }
-
-    output
 }
 
 #[cfg(test)]
