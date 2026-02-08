@@ -58,6 +58,8 @@ pub struct PipelineConfig {
     pub muted: bool,
     /// Music on Hold file path (optional).
     pub moh_file_path: Option<String>,
+    /// DTMF telephone-event payload type from SDP (`None` = use default 101).
+    pub dtmf_payload_type: Option<u8>,
 }
 
 impl Default for PipelineConfig {
@@ -71,6 +73,7 @@ impl Default for PipelineConfig {
             srtp_master_salt: None,
             muted: false,
             moh_file_path: None,
+            dtmf_payload_type: None,
         }
     }
 }
@@ -208,6 +211,11 @@ impl AudioPipeline {
             payload_type,
             samples_per_frame,
         );
+
+        // Apply negotiated DTMF payload type (if different from default 101)
+        if let Some(pt) = config.dtmf_payload_type {
+            transmitter.set_dtmf_payload_type(pt);
+        }
 
         // Create receiver
         let mut receiver = RtpReceiver::new(socket, jitter_buffer.clone());

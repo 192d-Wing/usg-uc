@@ -5,7 +5,7 @@
 
 use crate::{SipUaError, SipUaResult};
 use chrono::Utc;
-use client_types::{CallDirection, CallFailureReason, CallInfo, CallState};
+use client_types::{CallDirection, CallFailureReason, CallInfo, CallState, DtmfDigit};
 use proto_dialog::Dialog;
 use proto_dialog::refer::{ReferRequest, ReferStatus};
 use proto_sip::builder::{RequestBuilder, generate_branch, generate_call_id, generate_tag};
@@ -1443,6 +1443,129 @@ impl CallAgent {
             .map_err(|e| SipUaError::TransportError(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// Sends a DTMF digit via SIP INFO (RFC 6086 fallback).
+    ///
+    /// Used when telephone-event is not negotiated in SDP. Sends an INFO
+    /// request with `Content-Type: application/dtmf-relay` body.
+    pub async fn send_info_dtmf(
+        &mut self,
+        call_id: &str,
+        digit: DtmfDigit,
+        duration_ms: u32,
+    ) -> SipUaResult<()> {
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag) = {
+            let session = self
+                .calls
+                .get_mut(call_id)
+                .ok_or_else(|| SipUaError::InvalidState("Call not found".to_string()))?;
+
+            // Must be in connected state for in-dialog INFO
+            if session.state != CallState::Connected {
+                return Err(SipUaError::InvalidState(
+                    "Cannot send INFO DTMF in non-connected state".to_string(),
+                ));
+            }
+
+            session.cseq += 1;
+
+            (
+                session.remote_uri.clone(),
+                session.sip_call_id.clone(),
+                session.cseq,
+                session.from_tag.clone(),
+                session.to_tag.clone(),
+            )
+        };
+
+        let destination = Self::parse_destination(&remote_uri).await?;
+        let effective_local_addr =
+            Self::get_local_addr_for_destination(destination, self.local_addr).await?;
+
+        let request = Self::build_info_request_static(
+            &remote_uri,
+            &self.aor,
+            &self.display_name,
+            effective_local_addr,
+            &sip_call_id,
+            cseq,
+            &from_tag,
+            to_tag.as_deref(),
+            &self.transport_type,
+            digit,
+            duration_ms,
+        )?;
+
+        self.event_tx
+            .send(CallEvent::SendRequest {
+                request,
+                destination,
+            })
+            .await
+            .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+        info!(call_id = %call_id, digit = %digit, "Sent SIP INFO DTMF");
+        Ok(())
+    }
+
+    /// Builds a SIP INFO request for DTMF relay.
+    #[allow(clippy::too_many_arguments)]
+    fn build_info_request_static(
+        remote_uri_str: &str,
+        aor: &str,
+        display_name: &str,
+        local_addr: SocketAddr,
+        sip_call_id: &str,
+        cseq: u32,
+        from_tag: &str,
+        to_tag: Option<&str>,
+        transport_type: &str,
+        digit: DtmfDigit,
+        duration_ms: u32,
+    ) -> SipUaResult<SipRequest> {
+        use proto_sip::method::Method;
+
+        let remote_uri: SipUri = remote_uri_str
+            .parse()
+            .map_err(|e| SipUaError::ConfigError(format!("Invalid remote URI: {e}")))?;
+
+        let aor_uri: SipUri = aor
+            .parse()
+            .map_err(|e| SipUaError::ConfigError(format!("Invalid AOR: {e}")))?;
+
+        let branch = generate_branch();
+
+        let via = ViaHeader::new(transport_type, local_addr.ip().to_string())
+            .with_port(local_addr.port())
+            .with_branch(branch);
+
+        let from = NameAddr::new(aor_uri)
+            .with_display_name(display_name)
+            .with_tag(from_tag.to_string());
+
+        let mut to = NameAddr::new(remote_uri.clone());
+        if let Some(tag) = to_tag {
+            to = to.with_tag(tag.to_string());
+        }
+
+        // Duration in RTP timestamp units (8 samples/ms at 8kHz)
+        let rtp_duration = duration_ms * 8;
+        let body = format!("Signal={}\r\nDuration={rtp_duration}", digit.to_char());
+
+        let request = RequestBuilder::new(Method::Info, remote_uri)
+            .via(&via)
+            .from(&from)
+            .to(&to)
+            .call_id(sip_call_id)
+            .cseq(cseq)
+            .max_forwards(70)
+            .content_type("application/dtmf-relay")
+            .body(body)
+            .build()
+            .map_err(|e| SipUaError::TransactionError(e.to_string()))?;
+
+        Ok(request)
     }
 
     /// Builds an INVITE request (static version to avoid borrow issues).

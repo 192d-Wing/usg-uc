@@ -33,6 +33,8 @@ pub struct AudioSessionConfig {
     pub srtp_salt: Option<Vec<u8>>,
     /// Music on Hold file path (optional).
     pub moh_file_path: Option<String>,
+    /// DTMF telephone-event payload type from SDP (`None` = use default 101).
+    pub dtmf_payload_type: Option<u8>,
 }
 
 impl Default for AudioSessionConfig {
@@ -45,6 +47,7 @@ impl Default for AudioSessionConfig {
             srtp_key: None,
             srtp_salt: None,
             moh_file_path: None,
+            dtmf_payload_type: None,
         }
     }
 }
@@ -114,6 +117,7 @@ impl AudioSession {
             srtp_key: None,
             srtp_salt: None,
             moh_file_path: None,
+            dtmf_payload_type: None,
         };
 
         self.start(config).await
@@ -141,6 +145,7 @@ impl AudioSession {
             srtp_master_salt: config.srtp_salt,
             muted: self.pipeline.is_muted(),
             moh_file_path: config.moh_file_path,
+            dtmf_payload_type: config.dtmf_payload_type,
         };
 
         // Start pipeline (sync — pipeline spawns its own threads)
@@ -346,6 +351,13 @@ impl AudioSessionConfigBuilder {
     #[must_use]
     pub fn moh_file(mut self, path: String) -> Self {
         self.config.moh_file_path = Some(path);
+        self
+    }
+
+    /// Sets the DTMF telephone-event payload type.
+    #[must_use]
+    pub const fn dtmf_payload_type(mut self, pt: u8) -> Self {
+        self.config.dtmf_payload_type = Some(pt);
         self
     }
 

@@ -97,6 +97,15 @@ pub enum AppEvent {
         /// Whether this is the final status.
         is_final: bool,
     },
+    /// DTMF digit received via SIP INFO.
+    DtmfReceived {
+        /// Call ID.
+        call_id: String,
+        /// DTMF digit character (0-9, *, #, A-D).
+        digit: char,
+        /// Duration in timestamp units.
+        duration: u16,
+    },
 }
 
 /// Type of operation requiring a PIN.
@@ -486,14 +495,15 @@ impl ClientApp {
 
     /// Sends a DTMF digit on the active call.
     ///
-    /// Uses RFC 4733 telephone-event for out-of-band DTMF signaling.
+    /// Uses RFC 4733 telephone-event when available, falling back to SIP INFO
+    /// plus in-band tones when telephone-event is not negotiated.
     ///
     /// # Arguments
     /// * `digit` - The DTMF digit to send (0-9, *, #, A-D)
-    pub fn send_dtmf(&self, digit: DtmfDigit) -> AppResult<()> {
+    pub async fn send_dtmf(&mut self, digit: DtmfDigit) -> AppResult<()> {
         // Use standard DTMF duration of 100ms
         const DTMF_DURATION_MS: u32 = 100;
-        self.call_manager.send_dtmf(digit, DTMF_DURATION_MS)
+        self.call_manager.send_dtmf(digit, DTMF_DURATION_MS).await
     }
 
     /// Transfers the active call to another party (blind transfer).
@@ -858,6 +868,22 @@ impl ClientApp {
                         status_code,
                         is_success,
                         is_final,
+                    })
+                    .await;
+            }
+            CallManagerEvent::DtmfReceived {
+                call_id,
+                digit,
+                duration,
+            } => {
+                info!(call_id = %call_id, digit = %digit, duration = duration, "DTMF received via SIP INFO");
+
+                let _ = self
+                    .app_event_tx
+                    .send(AppEvent::DtmfReceived {
+                        call_id,
+                        digit,
+                        duration,
                     })
                     .await;
             }

@@ -11,7 +11,7 @@ use crate::audio_processing::AudioProcessor;
 use crate::codec::CodecPipeline;
 use crate::comfort_noise::encode_cn_payload;
 use crate::decode_thread::DecodeCommand;
-use crate::dtmf_tones::DtmfToneGenerator;
+use crate::dtmf_sender::DtmfSender;
 use crate::file_source::FileAudioSource;
 use crate::pipeline::{PipelineStats, resample};
 use crate::rtcp_session::RtcpSession;
@@ -19,7 +19,7 @@ use crate::rtp_handler::{RtpReceiver, RtpTransmitter};
 use crate::stream::CaptureStream;
 use crate::noise_shaper::{CompandingLaw, NoiseShaper};
 use crate::vad::{VadDecision, VoiceActivityDetector};
-use client_types::{CodecPreference, DtmfDigit, DtmfEvent};
+use client_types::{CodecPreference, DtmfDigit};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -246,6 +246,9 @@ fn io_loop(
                 RtcpSession::new(socket, remote_addr, config.local_ssrc, cname)
             });
 
+    // Non-blocking DTMF sender state machine
+    let mut dtmf_sender = DtmfSender::new();
+
     let mut last_capture = Instant::now();
     let mut stats_update_counter: u32 = 0;
 
@@ -309,7 +312,7 @@ fn io_loop(
             if current_moh {
                 // Music on Hold mode
                 process_moh_frame(&mut codec, &mut transmitter, &mut moh_source);
-            } else if !muted.load(Ordering::Relaxed) {
+            } else if !muted.load(Ordering::Relaxed) && !dtmf_sender.is_inband_active() {
                 // Normal capture mode
                 let in_warmup = dtx_warmup_start.elapsed() < dtx_warmup_duration;
                 let (samples_read, max_amp, dtx, noise_floor) = process_capture_frame(
@@ -354,7 +357,9 @@ fn io_loop(
         if let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 IoCommand::Dtmf(dtmf_cmd) => {
-                    handle_dtmf(&mut transmitter, &mut codec, dtmf_cmd);
+                    if !dtmf_sender.enqueue(dtmf_cmd) {
+                        warn!("DTMF digit dropped (queue full)");
+                    }
                 }
                 IoCommand::SwitchInputDevice(device_name) => {
                     info!(
@@ -378,7 +383,14 @@ fn io_loop(
             }
         }
 
-        // 3b. Check if async capture switch completed
+        // 3b. Poll DTMF state machine (non-blocking, sends at most one packet)
+        if let Some(inband_frame) = dtmf_sender.poll(&mut transmitter, &mut codec)
+            && let Err(e) = transmitter.send(&inband_frame)
+        {
+            trace!("In-band DTMF send error: {e}");
+        }
+
+        // 3c. Check if async capture switch completed
         if let Some(ref rx) = pending_capture_rx
             && let Ok(result) = rx.try_recv()
         {
@@ -582,88 +594,6 @@ fn process_moh_frame(
     if let Err(e) = transmitter.send(&encoded) {
         trace!("MOH send error: {e}");
     }
-}
-
-/// Handles a DTMF command by sending RFC 2833 and/or in-band tones.
-///
-/// Sends DTMF using one or both methods based on negotiation:
-/// 1. RFC 2833 (RFC 4733) telephone-event packets (out-of-band) - if supported
-/// 2. In-band audio tones (ITU-T Q.23 dual-tone frequencies) - always sent
-///
-/// This ensures DTMF works with providers that support RFC 2833
-/// as well as those that only support in-band DTMF.
-#[allow(clippy::needless_pass_by_value)]
-fn handle_dtmf(transmitter: &mut RtpTransmitter, codec: &mut CodecPipeline, cmd: DtmfCommand) {
-    let method = if cmd.use_rfc2833 {
-        "RFC2833 + in-band"
-    } else {
-        "in-band only"
-    };
-    info!(
-        "Sending DTMF digit '{}' for {}ms ({})",
-        cmd.digit, cmd.duration_ms, method
-    );
-
-    let duration = DtmfEvent::duration_from_ms(cmd.duration_ms);
-    let codec_sample_rate = 8000; // G.711 is 8kHz
-    let packet_interval_ms = 20u32;
-    let samples_per_packet = (codec_sample_rate * packet_interval_ms / 1000) as usize;
-
-    // Create in-band tone generator
-    let mut tone_gen = DtmfToneGenerator::new(cmd.digit, codec_sample_rate);
-
-    // Send initial RFC 2833 packet with marker bit (if supported)
-    if cmd.use_rfc2833 {
-        let event = DtmfEvent::new(cmd.digit, 0);
-        if let Err(e) = transmitter.send_dtmf(&event, true) {
-            warn!("RFC2833 start send error: {e}");
-        }
-    }
-
-    // Send continuation packets every 20ms with in-band audio (and RFC 2833 if supported)
-    let num_packets = cmd.duration_ms / packet_interval_ms;
-
-    for i in 0..num_packets {
-        // Generate in-band DTMF tone samples
-        let mut tone_samples = vec![0i16; samples_per_packet];
-        tone_gen.generate_samples(&mut tone_samples);
-
-        // Encode the tone samples using the active codec
-        match codec.encode(&tone_samples) {
-            Ok(encoded) => {
-                // Send as regular RTP audio packet (in-band)
-                if let Err(e) = transmitter.send(&encoded) {
-                    trace!("In-band DTMF send error: {e}");
-                }
-            }
-            Err(e) => {
-                warn!("DTMF encode error: {e}");
-            }
-        }
-
-        // Also send RFC 2833 continuation packet (out-of-band) if supported
-        if cmd.use_rfc2833 && i > 0 {
-            let elapsed = DtmfEvent::duration_from_ms(i * packet_interval_ms);
-            let event = DtmfEvent::new(cmd.digit, elapsed);
-            if let Err(e) = transmitter.send_dtmf(&event, false) {
-                trace!("RFC2833 continuation send error: {e}");
-            }
-        }
-
-        thread::sleep(Duration::from_millis(u64::from(packet_interval_ms)));
-    }
-
-    // Send RFC 2833 end packets (3x for reliability per RFC 4733) if supported
-    if cmd.use_rfc2833 {
-        for _ in 0..3 {
-            let event = DtmfEvent::with_end(cmd.digit, duration);
-            if let Err(e) = transmitter.send_dtmf(&event, false) {
-                trace!("RFC2833 end send error: {e}");
-            }
-        }
-    }
-
-    debug!("DTMF digit '{}' sent successfully", cmd.digit);
 }
 
 /// Updates shared statistics from transmitter and receiver.

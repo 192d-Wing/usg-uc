@@ -429,13 +429,14 @@ async fn send_dtmf(digit: String, state: State<'_, TauriAppState>) -> Result<(),
         _ => return Err(format!("Invalid DTMF digit: {digit}")),
     };
 
-    let client_guard = state.client.lock().await;
+    let mut client_guard = state.client.lock().await;
     let client = client_guard
-        .as_ref()
+        .as_mut()
         .ok_or_else(|| "Client not initialized".to_string())?;
 
     client
         .send_dtmf(dtmf_digit)
+        .await
         .map_err(|e| format!("Failed to send DTMF: {e}"))?;
 
     drop(client_guard);
@@ -1367,6 +1368,7 @@ const fn event_name(event: &AppEvent) -> &'static str {
         AppEvent::PinRequired { .. } => "pin-required",
         AppEvent::PinCompleted { .. } => "pin-completed",
         AppEvent::TransferProgress { .. } => "transfer-progress",
+        AppEvent::DtmfReceived { .. } => "dtmf-received",
     }
 }
 
@@ -1450,6 +1452,17 @@ fn event_payload(event: &AppEvent) -> serde_json::Value {
                 "status_code": status_code,
                 "is_success": is_success,
                 "is_final": is_final
+            })
+        }
+        AppEvent::DtmfReceived {
+            call_id,
+            digit,
+            duration,
+        } => {
+            serde_json::json!({
+                "call_id": call_id,
+                "digit": digit.to_string(),
+                "duration": duration
             })
         }
     }

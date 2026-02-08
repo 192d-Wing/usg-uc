@@ -89,8 +89,8 @@ pub struct CallManager {
     moh_file_path: Option<String>,
     /// Negotiated codec per call (from SDP answer).
     negotiated_codecs: HashMap<String, CodecPreference>,
-    /// Whether telephone-event (RFC 2833) was negotiated per call.
-    telephone_event_supported: HashMap<String, bool>,
+    /// Negotiated telephone-event payload type per call (None = not supported).
+    telephone_event_pt: HashMap<String, Option<u8>>,
     /// Effective local media address per call (what was advertised in SDP).
     effective_media_addrs: HashMap<String, SocketAddr>,
     /// SDP session ID per call (RFC 8866 - must remain constant for session).
@@ -181,6 +181,15 @@ pub enum CallManagerEvent {
         /// Whether this is the final status.
         is_final: bool,
     },
+    /// DTMF digit received via SIP INFO.
+    DtmfReceived {
+        /// Call ID.
+        call_id: String,
+        /// DTMF digit (0-9, *, #, A-D).
+        digit: char,
+        /// Duration in RFC 4733 timestamp units (typically 8000 Hz clock).
+        duration: u16,
+    },
 }
 
 impl CallManager {
@@ -229,7 +238,7 @@ impl CallManager {
             is_muted: false,
             moh_file_path: None,
             negotiated_codecs: HashMap::new(),
-            telephone_event_supported: HashMap::new(),
+            telephone_event_pt: HashMap::new(),
             effective_media_addrs: HashMap::new(),
             sdp_session_ids: HashMap::new(),
             sdp_session_versions: HashMap::new(),
@@ -620,6 +629,10 @@ impl CallManager {
             "ACK" => {
                 // Acknowledgement (normally handled by transaction layer)
                 debug!("Received ACK");
+            }
+            "INFO" => {
+                // In-dialog INFO (e.g. SIP INFO DTMF relay)
+                self.handle_incoming_info(request, source).await?;
             }
             _ => {
                 debug!(method = %method, "Ignoring unsupported request method");
@@ -1026,6 +1039,73 @@ impl CallManager {
         Ok(())
     }
 
+    /// Handles an incoming SIP INFO request.
+    ///
+    /// Parses `application/dtmf-relay` bodies and emits a `DtmfReceived` event.
+    /// Always responds with 200 OK to the sender.
+    async fn handle_incoming_info(
+        &mut self,
+        request: &SipRequest,
+        source: SocketAddr,
+    ) -> AppResult<()> {
+        use crate::sip_transport::build_response_from_request;
+
+        // Always send 200 OK for INFO
+        let ok_response = build_response_from_request(request, StatusCode::OK, None);
+        let _ = self
+            .app_event_tx
+            .send(CallManagerEvent::SendResponse {
+                response: ok_response,
+                destination: source,
+            })
+            .await;
+
+        // Check Content-Type for dtmf-relay
+        let content_type = request
+            .headers
+            .get_value(&HeaderName::ContentType)
+            .unwrap_or_default();
+        if !content_type.contains("dtmf-relay") && !content_type.contains("dtmf") {
+            debug!(content_type = %content_type, "INFO request is not DTMF relay, ignoring body");
+            return Ok(());
+        }
+
+        // Parse Signal= and Duration= from body
+        let body_str = request
+            .body
+            .as_ref()
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .unwrap_or("");
+
+        let Some((digit, duration)) = parse_dtmf_relay_body(body_str) else {
+            warn!("INFO dtmf-relay body missing Signal= field");
+            return Ok(());
+        };
+
+        // Find the call
+        let sip_call_id = request
+            .headers
+            .get_value(&HeaderName::CallId)
+            .unwrap_or_default()
+            .to_string();
+        let call_id = self
+            .find_call_by_sip_id(&sip_call_id)
+            .unwrap_or_else(|| sip_call_id.clone());
+
+        info!(call_id = %call_id, digit = %digit, duration = duration, "Received DTMF via SIP INFO");
+
+        let _ = self
+            .app_event_tx
+            .send(CallManagerEvent::DtmfReceived {
+                call_id,
+                digit,
+                duration,
+            })
+            .await;
+
+        Ok(())
+    }
+
     /// Handles a media session event.
     pub async fn handle_media_event(
         &mut self,
@@ -1107,36 +1187,54 @@ impl CallManager {
 
     /// Sends a DTMF digit on the focused call.
     ///
-    /// Uses RFC 4733 telephone-event for out-of-band DTMF signaling.
+    /// Uses RFC 4733 telephone-event when negotiated. Falls back to SIP INFO
+    /// (`application/dtmf-relay`) plus in-band audio tones when telephone-event
+    /// is not available.
     ///
     /// # Arguments
     /// * `digit` - The DTMF digit to send (0-9, *, #, A-D)
     /// * `duration_ms` - Duration of the tone in milliseconds (typical: 100ms)
-    pub fn send_dtmf(&self, digit: DtmfDigit, duration_ms: u32) -> AppResult<()> {
+    pub async fn send_dtmf(&mut self, digit: DtmfDigit, duration_ms: u32) -> AppResult<()> {
         let call_id = self
             .focused_call_id
-            .as_ref()
+            .clone()
             .ok_or_else(|| AppError::Sip("No active call".to_string()))?;
 
-        let session = self
-            .audio_sessions
-            .get(call_id)
-            .ok_or_else(|| AppError::Audio("No audio session for call".to_string()))?;
-
-        // Check if remote party supports RFC 2833 (default to false if not negotiated yet)
-        let use_rfc2833 = self
-            .telephone_event_supported
-            .get(call_id)
+        // Check if remote party supports RFC 4733 telephone-event
+        let dtmf_pt = self
+            .telephone_event_pt
+            .get(&call_id)
             .copied()
-            .unwrap_or(false);
+            .flatten();
+        let use_rfc2833 = dtmf_pt.is_some();
 
-        let method = if use_rfc2833 {
-            "RFC2833+in-band"
+        if use_rfc2833 {
+            // RFC 4733 path via audio pipeline
+            let session = self
+                .audio_sessions
+                .get(&call_id)
+                .ok_or_else(|| AppError::Audio("No audio session for call".to_string()))?;
+            info!(digit = %digit, duration_ms = duration_ms, method = "RFC4733", "Sending DTMF");
+            session.send_dtmf(digit, duration_ms, true)
         } else {
-            "in-band only"
-        };
-        info!(digit = %digit, duration_ms = duration_ms, method = method, "Sending DTMF");
-        session.send_dtmf(digit, duration_ms, use_rfc2833)
+            // SIP INFO fallback + in-band audio
+            info!(digit = %digit, duration_ms = duration_ms, method = "SIP-INFO+in-band", "Sending DTMF");
+
+            // Send SIP INFO for reliable signaling
+            if let Err(e) = self
+                .call_agent
+                .send_info_dtmf(&call_id, digit, duration_ms)
+                .await
+            {
+                warn!(error = %e, "SIP INFO DTMF failed, relying on in-band only");
+            }
+
+            // Also send in-band tones as belt-and-suspenders
+            if let Some(session) = self.audio_sessions.get(&call_id) {
+                session.send_dtmf(digit, duration_ms, false)?;
+            }
+            Ok(())
+        }
     }
 
     /// Transfers the focused call to another party (blind transfer).
@@ -1484,6 +1582,13 @@ impl CallManager {
         info!(call_id = %call_id, local_port = local_port, "Using local port from SDP");
 
         // Configure audio
+        // Get negotiated DTMF payload type for this call
+        let dtmf_payload_type = self
+            .telephone_event_pt
+            .get(call_id)
+            .copied()
+            .flatten();
+
         let config = AudioSessionConfig {
             local_port,
             remote_addr,
@@ -1493,6 +1598,7 @@ impl CallManager {
             srtp_key: None,
             srtp_salt: None,
             moh_file_path: self.moh_file_path.clone(),
+            dtmf_payload_type,
         };
 
         // Start the audio session
@@ -1666,14 +1772,14 @@ impl CallManager {
         }
 
         // Check if telephone-event was negotiated for DTMF support
-        let dtmf_supported = check_telephone_event_support(sdp);
-        self.telephone_event_supported
-            .insert(call_id.to_string(), dtmf_supported);
+        let dtmf_pt = parse_telephone_event_pt(sdp);
+        self.telephone_event_pt
+            .insert(call_id.to_string(), dtmf_pt);
 
-        if dtmf_supported {
-            info!(call_id = %call_id, "✓ Remote party supports RFC 2833/4733 telephone-event for DTMF");
+        if let Some(pt) = dtmf_pt {
+            info!(call_id = %call_id, pt = pt, "Remote supports RFC 2833/4733 telephone-event PT={pt}");
         } else {
-            warn!(call_id = %call_id, "✗ Remote party does NOT support RFC 2833/4733 - using in-band DTMF only");
+            warn!(call_id = %call_id, "Remote does NOT support RFC 2833/4733 telephone-event");
         }
 
         // Parse remote media address from SDP (c= and m= lines)
@@ -2172,35 +2278,86 @@ fn parse_ice_credentials_from_sdp(sdp: &str) -> Option<proto_ice::IceCredentials
     }
 }
 
-/// Checks if the SDP includes telephone-event support (RFC 4733).
+/// Parses the telephone-event payload type from an SDP body.
 ///
-/// Looks for both the payload type in the m=audio line and the corresponding
-/// rtpmap attribute indicating telephone-event.
+/// Looks for `a=rtpmap:<N> telephone-event/8000` and verifies the payload
+/// type is also listed in the `m=audio` line. Returns the dynamic PT number
+/// (commonly 101, but can be any value 96-127).
 ///
 /// # Arguments
 /// * `sdp` - The SDP answer or offer string
 ///
 /// # Returns
-/// True if telephone-event is supported, false otherwise
-fn check_telephone_event_support(sdp: &str) -> bool {
-    let mut has_telephone_event_in_media = false;
-    let mut has_telephone_event_rtpmap = false;
+/// `Some(pt)` if telephone-event is supported, `None` otherwise
+fn parse_telephone_event_pt(sdp: &str) -> Option<u8> {
+    // First, find a=rtpmap:<N> telephone-event and extract the PT
+    let mut candidate_pt: Option<u8> = None;
+    let mut media_line_pts = String::new();
 
     for line in sdp.lines() {
-        // Check if payload type 101 is in the m=audio line
-        // Format: m=audio <port> <proto> <fmt> <fmt> ...
-        if line.starts_with("m=audio") && line.contains(" 101") {
-            has_telephone_event_in_media = true;
+        // Capture the m=audio line for cross-checking
+        if line.starts_with("m=audio") {
+            media_line_pts = line.to_string();
         }
 
-        // Check for rtpmap with telephone-event
-        // Format: a=rtpmap:101 telephone-event/8000
-        if line.starts_with("a=rtpmap:101") && line.contains("telephone-event") {
-            has_telephone_event_rtpmap = true;
+        // Look for: a=rtpmap:<N> telephone-event/8000
+        if let Some(rest) = line.strip_prefix("a=rtpmap:") {
+            if rest.contains("telephone-event") {
+                // Extract PT number from "101 telephone-event/8000"
+                if let Some(pt_str) = rest.split_whitespace().next() {
+                    if let Ok(pt) = pt_str.parse::<u8>() {
+                        candidate_pt = Some(pt);
+                    }
+                }
+            }
         }
     }
 
-    has_telephone_event_in_media && has_telephone_event_rtpmap
+    // Cross-check: the PT must also appear in the m=audio line
+    let pt = candidate_pt?;
+    let pt_token = format!(" {pt}");
+    if media_line_pts.contains(&pt_token) {
+        Some(pt)
+    } else {
+        None
+    }
+}
+
+/// Parses a `application/dtmf-relay` body from a SIP INFO request.
+///
+/// Expected format:
+/// ```text
+/// Signal=5
+/// Duration=160
+/// ```
+///
+/// Returns `(digit, duration)` on success, or `None` if the body lacks a `Signal=` field.
+fn parse_dtmf_relay_body(body: &str) -> Option<(char, u16)> {
+    let mut digit: Option<char> = None;
+    let mut duration: u16 = 160; // default ~20ms at 8kHz
+
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(rest) = line
+            .strip_prefix("Signal=")
+            .or_else(|| line.strip_prefix("signal="))
+        {
+            let rest = rest.trim();
+            if let Some(ch) = rest.chars().next() {
+                digit = Some(ch);
+            }
+        } else if let Some(rest) = line
+            .strip_prefix("Duration=")
+            .or_else(|| line.strip_prefix("duration="))
+        {
+            let rest = rest.trim();
+            if let Ok(d) = rest.parse::<u16>() {
+                duration = d;
+            }
+        }
+    }
+
+    digit.map(|d| (d, duration))
 }
 
 /// Parses the negotiated codec from an SDP answer.
@@ -2630,5 +2787,96 @@ mod tests {
                    m=audio 0 RTP/AVP 0\r\n";
 
         assert!(parse_remote_media_addr_from_sdp(sdp).is_none());
+    }
+
+    #[test]
+    fn test_parse_telephone_event_pt_standard() {
+        let sdp = "v=0\r\n\
+                   o=- 0 0 IN IP4 192.168.1.1\r\n\
+                   s=-\r\n\
+                   c=IN IP4 192.168.1.1\r\n\
+                   t=0 0\r\n\
+                   m=audio 49170 RTP/AVP 0 8 101\r\n\
+                   a=rtpmap:0 PCMU/8000\r\n\
+                   a=rtpmap:8 PCMA/8000\r\n\
+                   a=rtpmap:101 telephone-event/8000\r\n\
+                   a=fmtp:101 0-15\r\n";
+
+        assert_eq!(parse_telephone_event_pt(sdp), Some(101));
+    }
+
+    #[test]
+    fn test_parse_telephone_event_pt_non_standard() {
+        // Some providers use PT=96 or PT=100
+        let sdp = "v=0\r\n\
+                   o=- 0 0 IN IP4 192.168.1.1\r\n\
+                   s=-\r\n\
+                   c=IN IP4 192.168.1.1\r\n\
+                   t=0 0\r\n\
+                   m=audio 49170 RTP/AVP 0 96\r\n\
+                   a=rtpmap:0 PCMU/8000\r\n\
+                   a=rtpmap:96 telephone-event/8000\r\n";
+
+        assert_eq!(parse_telephone_event_pt(sdp), Some(96));
+    }
+
+    #[test]
+    fn test_parse_telephone_event_pt_missing() {
+        let sdp = "v=0\r\n\
+                   o=- 0 0 IN IP4 192.168.1.1\r\n\
+                   s=-\r\n\
+                   c=IN IP4 192.168.1.1\r\n\
+                   t=0 0\r\n\
+                   m=audio 49170 RTP/AVP 0 8\r\n\
+                   a=rtpmap:0 PCMU/8000\r\n\
+                   a=rtpmap:8 PCMA/8000\r\n";
+
+        assert_eq!(parse_telephone_event_pt(sdp), None);
+    }
+
+    #[test]
+    fn test_parse_telephone_event_pt_rtpmap_but_not_in_media_line() {
+        // rtpmap present but PT not in m= line
+        let sdp = "v=0\r\n\
+                   o=- 0 0 IN IP4 192.168.1.1\r\n\
+                   s=-\r\n\
+                   c=IN IP4 192.168.1.1\r\n\
+                   t=0 0\r\n\
+                   m=audio 49170 RTP/AVP 0 8\r\n\
+                   a=rtpmap:0 PCMU/8000\r\n\
+                   a=rtpmap:101 telephone-event/8000\r\n";
+
+        assert_eq!(parse_telephone_event_pt(sdp), None);
+    }
+
+    #[test]
+    fn test_parse_dtmf_relay_body_standard() {
+        let body = "Signal=5\r\nDuration=800\r\n";
+        let (digit, duration) = parse_dtmf_relay_body(body).unwrap();
+        assert_eq!(digit, '5');
+        assert_eq!(duration, 800);
+    }
+
+    #[test]
+    fn test_parse_dtmf_relay_body_lowercase() {
+        let body = "signal=*\r\nduration=160\r\n";
+        let (digit, duration) = parse_dtmf_relay_body(body).unwrap();
+        assert_eq!(digit, '*');
+        assert_eq!(duration, 160);
+    }
+
+    #[test]
+    fn test_parse_dtmf_relay_body_missing_signal() {
+        let body = "Duration=800\r\n";
+        assert!(parse_dtmf_relay_body(body).is_none());
+    }
+
+    #[test]
+    fn test_parse_dtmf_relay_body_signal_only() {
+        // Duration defaults to 160 when missing
+        let body = "Signal=#\r\n";
+        let (digit, duration) = parse_dtmf_relay_body(body).unwrap();
+        assert_eq!(digit, '#');
+        assert_eq!(duration, 160);
     }
 }
