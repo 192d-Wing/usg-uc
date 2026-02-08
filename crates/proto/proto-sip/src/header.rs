@@ -300,66 +300,124 @@ impl FromStr for HeaderName {
             }
         }
 
-        // Case-insensitive comparison
-        match s.to_lowercase().as_str() {
-            "via" => Ok(Self::Via),
-            "route" => Ok(Self::Route),
-            "record-route" => Ok(Self::RecordRoute),
-            "max-forwards" => Ok(Self::MaxForwards),
-            "path" => Ok(Self::Path),
-            "call-id" => Ok(Self::CallId),
-            "cseq" => Ok(Self::CSeq),
-            "from" => Ok(Self::From),
-            "to" => Ok(Self::To),
-            "content-type" => Ok(Self::ContentType),
-            "content-length" => Ok(Self::ContentLength),
-            "content-encoding" => Ok(Self::ContentEncoding),
-            "content-disposition" => Ok(Self::ContentDisposition),
-            "content-language" => Ok(Self::ContentLanguage),
-            "contact" => Ok(Self::Contact),
-            "expires" => Ok(Self::Expires),
-            "min-expires" => Ok(Self::MinExpires),
-            "www-authenticate" => Ok(Self::WwwAuthenticate),
-            "authorization" => Ok(Self::Authorization),
-            "proxy-authenticate" => Ok(Self::ProxyAuthenticate),
-            "proxy-authorization" => Ok(Self::ProxyAuthorization),
-            "allow" => Ok(Self::Allow),
-            "supported" => Ok(Self::Supported),
-            "require" => Ok(Self::Require),
-            "proxy-require" => Ok(Self::ProxyRequire),
-            "unsupported" => Ok(Self::Unsupported),
-            "accept" => Ok(Self::Accept),
-            "accept-encoding" => Ok(Self::AcceptEncoding),
-            "accept-language" => Ok(Self::AcceptLanguage),
-            "alert-info" => Ok(Self::AlertInfo),
-            "call-info" => Ok(Self::CallInfo),
-            "date" => Ok(Self::Date),
-            "error-info" => Ok(Self::ErrorInfo),
-            "in-reply-to" => Ok(Self::InReplyTo),
-            "mime-version" => Ok(Self::MimeVersion),
-            "organization" => Ok(Self::Organization),
-            "priority" => Ok(Self::Priority),
-            "reply-to" => Ok(Self::ReplyTo),
-            "retry-after" => Ok(Self::RetryAfter),
-            "server" => Ok(Self::Server),
-            "subject" => Ok(Self::Subject),
-            "timestamp" => Ok(Self::Timestamp),
-            "user-agent" => Ok(Self::UserAgent),
-            "warning" => Ok(Self::Warning),
-            "event" => Ok(Self::Event),
-            "subscription-state" => Ok(Self::SubscriptionState),
-            "allow-events" => Ok(Self::AllowEvents),
-            "session-expires" => Ok(Self::SessionExpires),
-            "min-se" => Ok(Self::MinSe),
-            "identity" => Ok(Self::Identity),
-            "p-asserted-identity" => Ok(Self::PAssertedIdentity),
-            "p-preferred-identity" => Ok(Self::PPreferredIdentity),
-            "reason" => Ok(Self::Reason),
-            "refer-to" => Ok(Self::ReferTo),
-            "referred-by" => Ok(Self::ReferredBy),
-            "replaces" => Ok(Self::Replaces),
-            _ => Ok(Self::Custom(s.to_string())),
-        }
+        // Case-insensitive comparison without allocation
+        // (avoids s.to_lowercase() heap allocation per header)
+        let name = if s.eq_ignore_ascii_case("via") {
+            Self::Via
+        } else if s.eq_ignore_ascii_case("route") {
+            Self::Route
+        } else if s.eq_ignore_ascii_case("record-route") {
+            Self::RecordRoute
+        } else if s.eq_ignore_ascii_case("max-forwards") {
+            Self::MaxForwards
+        } else if s.eq_ignore_ascii_case("path") {
+            Self::Path
+        } else if s.eq_ignore_ascii_case("call-id") {
+            Self::CallId
+        } else if s.eq_ignore_ascii_case("cseq") {
+            Self::CSeq
+        } else if s.eq_ignore_ascii_case("from") {
+            Self::From
+        } else if s.eq_ignore_ascii_case("to") {
+            Self::To
+        } else if s.eq_ignore_ascii_case("content-type") {
+            Self::ContentType
+        } else if s.eq_ignore_ascii_case("content-length") {
+            Self::ContentLength
+        } else if s.eq_ignore_ascii_case("content-encoding") {
+            Self::ContentEncoding
+        } else if s.eq_ignore_ascii_case("content-disposition") {
+            Self::ContentDisposition
+        } else if s.eq_ignore_ascii_case("content-language") {
+            Self::ContentLanguage
+        } else if s.eq_ignore_ascii_case("contact") {
+            Self::Contact
+        } else if s.eq_ignore_ascii_case("expires") {
+            Self::Expires
+        } else if s.eq_ignore_ascii_case("min-expires") {
+            Self::MinExpires
+        } else if s.eq_ignore_ascii_case("www-authenticate") {
+            Self::WwwAuthenticate
+        } else if s.eq_ignore_ascii_case("authorization") {
+            Self::Authorization
+        } else if s.eq_ignore_ascii_case("proxy-authenticate") {
+            Self::ProxyAuthenticate
+        } else if s.eq_ignore_ascii_case("proxy-authorization") {
+            Self::ProxyAuthorization
+        } else if s.eq_ignore_ascii_case("allow") {
+            Self::Allow
+        } else if s.eq_ignore_ascii_case("supported") {
+            Self::Supported
+        } else if s.eq_ignore_ascii_case("require") {
+            Self::Require
+        } else if s.eq_ignore_ascii_case("proxy-require") {
+            Self::ProxyRequire
+        } else if s.eq_ignore_ascii_case("unsupported") {
+            Self::Unsupported
+        } else if s.eq_ignore_ascii_case("accept") {
+            Self::Accept
+        } else if s.eq_ignore_ascii_case("accept-encoding") {
+            Self::AcceptEncoding
+        } else if s.eq_ignore_ascii_case("accept-language") {
+            Self::AcceptLanguage
+        } else if s.eq_ignore_ascii_case("alert-info") {
+            Self::AlertInfo
+        } else if s.eq_ignore_ascii_case("call-info") {
+            Self::CallInfo
+        } else if s.eq_ignore_ascii_case("date") {
+            Self::Date
+        } else if s.eq_ignore_ascii_case("error-info") {
+            Self::ErrorInfo
+        } else if s.eq_ignore_ascii_case("in-reply-to") {
+            Self::InReplyTo
+        } else if s.eq_ignore_ascii_case("mime-version") {
+            Self::MimeVersion
+        } else if s.eq_ignore_ascii_case("organization") {
+            Self::Organization
+        } else if s.eq_ignore_ascii_case("priority") {
+            Self::Priority
+        } else if s.eq_ignore_ascii_case("reply-to") {
+            Self::ReplyTo
+        } else if s.eq_ignore_ascii_case("retry-after") {
+            Self::RetryAfter
+        } else if s.eq_ignore_ascii_case("server") {
+            Self::Server
+        } else if s.eq_ignore_ascii_case("subject") {
+            Self::Subject
+        } else if s.eq_ignore_ascii_case("timestamp") {
+            Self::Timestamp
+        } else if s.eq_ignore_ascii_case("user-agent") {
+            Self::UserAgent
+        } else if s.eq_ignore_ascii_case("warning") {
+            Self::Warning
+        } else if s.eq_ignore_ascii_case("event") {
+            Self::Event
+        } else if s.eq_ignore_ascii_case("subscription-state") {
+            Self::SubscriptionState
+        } else if s.eq_ignore_ascii_case("allow-events") {
+            Self::AllowEvents
+        } else if s.eq_ignore_ascii_case("session-expires") {
+            Self::SessionExpires
+        } else if s.eq_ignore_ascii_case("min-se") {
+            Self::MinSe
+        } else if s.eq_ignore_ascii_case("identity") {
+            Self::Identity
+        } else if s.eq_ignore_ascii_case("p-asserted-identity") {
+            Self::PAssertedIdentity
+        } else if s.eq_ignore_ascii_case("p-preferred-identity") {
+            Self::PPreferredIdentity
+        } else if s.eq_ignore_ascii_case("reason") {
+            Self::Reason
+        } else if s.eq_ignore_ascii_case("refer-to") {
+            Self::ReferTo
+        } else if s.eq_ignore_ascii_case("referred-by") {
+            Self::ReferredBy
+        } else if s.eq_ignore_ascii_case("replaces") {
+            Self::Replaces
+        } else {
+            Self::Custom(s.to_string())
+        };
+        Ok(name)
     }
 }
 
