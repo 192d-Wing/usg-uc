@@ -10,18 +10,18 @@
 //! Based on ITU-T G.711 Appendix III §4 recommendations. The filter
 //! operates at codec rate (8 kHz) before resampling for maximum effect.
 
-/// Low-pass tilt coefficient (0.0 = bypass, higher = more HF attenuation).
-///
-/// Frequency response (8 kHz sample rate):
-/// - DC (0 Hz): 1.0 (unity — no bass boost)
-/// - 1 kHz: ~0.97 (−0.3 dB, negligible)
-/// - 2 kHz: ~0.89 (−1.0 dB, mild)
-/// - 4 kHz (Nyquist): (1−α)/(1+α) = 0.54 (−5.4 dB, significant)
-const TILT_ALPHA: f32 = 0.3;
+/// Configuration for the decoder-side postfilter.
+#[derive(Debug, Clone)]
+pub struct PostfilterConfig {
+    /// Low-pass tilt coefficient (0.0 = bypass, higher = more HF attenuation).
+    pub tilt_alpha: f32,
+}
 
-/// Gain normalization factor: 1/(1+α).
-/// Ensures DC gain is exactly 1.0 (no bass boost).
-const GAIN_NORM: f32 = 1.0 / (1.0 + TILT_ALPHA);
+impl Default for PostfilterConfig {
+    fn default() -> Self {
+        Self { tilt_alpha: 0.3 }
+    }
+}
 
 /// Decoder-side postfilter using a gain-normalized low-pass tilt filter.
 ///
@@ -34,6 +34,10 @@ pub struct Postfilter {
     prev_input: f32,
     /// Whether the postfilter is active.
     enabled: bool,
+    /// Tilt coefficient.
+    tilt_alpha: f32,
+    /// Gain normalization factor: 1/(1+α).
+    gain_norm: f32,
 }
 
 impl Default for Postfilter {
@@ -44,10 +48,17 @@ impl Default for Postfilter {
 
 impl Postfilter {
     /// Creates a new postfilter (enabled by default).
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
+        Self::with_config(PostfilterConfig::default())
+    }
+
+    /// Creates a postfilter with custom configuration.
+    pub fn with_config(cfg: PostfilterConfig) -> Self {
         Self {
             prev_input: 0.0,
             enabled: true,
+            tilt_alpha: cfg.tilt_alpha,
+            gain_norm: 1.0 / (1.0 + cfg.tilt_alpha),
         }
     }
 
@@ -73,7 +84,7 @@ impl Postfilter {
 
         for sample in pcm.iter_mut() {
             let x = f32::from(*sample);
-            let y = TILT_ALPHA.mul_add(self.prev_input, x) * GAIN_NORM;
+            let y = self.tilt_alpha.mul_add(self.prev_input, x) * self.gain_norm;
             self.prev_input = x;
             *sample = y.clamp(-32768.0, 32767.0) as i16;
         }

@@ -19,9 +19,31 @@
 //! Local silence (VAD) → Skip RTP send (or send CN payload type 13)
 //! ```
 
-/// Target comfort noise level relative to the estimated noise floor.
-/// 0.5 = half the noise floor energy (subtle, non-intrusive).
-const CN_LEVEL_FACTOR: f32 = 0.5;
+/// Configuration for Comfort Noise Generation.
+#[derive(Debug, Clone)]
+pub struct ComfortNoiseConfig {
+    /// Target noise level relative to estimated noise floor (0.5 = half energy).
+    pub level_factor: f32,
+    /// One-pole low-pass filter coefficient for spectral shaping (0.0-1.0).
+    /// Used as fallback when no LPC model is available.
+    pub lp_filter_coeff: f32,
+    /// LPC order for spectral shaping (4-8). Higher values capture more
+    /// spectral detail but cost more CPU. 0 disables LPC (uses LP filter).
+    pub lpc_order: usize,
+    /// Crossfade duration in samples when transitioning between CNG and real audio.
+    pub crossfade_samples: usize,
+}
+
+impl Default for ComfortNoiseConfig {
+    fn default() -> Self {
+        Self {
+            level_factor: 0.5,
+            lp_filter_coeff: 0.7,
+            lpc_order: 6,
+            crossfade_samples: 40, // ~5ms at 8kHz
+        }
+    }
+}
 
 /// Full-scale reference for dBov conversion (16-bit PCM).
 const FULL_SCALE: f32 = 32768.0;
@@ -79,20 +101,33 @@ pub fn decode_cn_payload(payload: &[u8]) -> f32 {
     dbov_to_rms(-neg_dbov)
 }
 
-/// Simple one-pole low-pass filter coefficient for noise shaping.
-/// Higher values = more smoothing (lower frequency content).
-/// 0.7 produces a gentle roll-off above ~500 Hz at 8 kHz sample rate.
-const LP_FILTER_COEFF: f32 = 0.7;
+/// Maximum LPC order supported.
+const MAX_LPC_ORDER: usize = 8;
 
-/// Comfort noise generator using shaped white noise.
+/// Comfort noise generator using spectrally shaped white noise.
+///
+/// When an LPC noise model is available (updated via `update_spectrum()`),
+/// the generator drives white noise through an all-pole LPC synthesis filter
+/// to match the spectral envelope of the actual background noise. Falls back
+/// to a one-pole LP filter when no model is available.
 #[derive(Debug)]
 pub struct ComfortNoiseGenerator {
     /// PRNG state (xorshift32).
     rng_state: u32,
     /// Target noise level (RMS amplitude, from VAD noise floor).
     target_level: f32,
-    /// Low-pass filter state (previous output sample).
+    /// Low-pass filter state (previous output sample, fallback path).
     lp_state: f32,
+    /// LPC coefficients for spectral shaping (a[1]..a[p]).
+    lpc_coeffs: [f32; MAX_LPC_ORDER],
+    /// LPC synthesis filter memory (previous output samples).
+    lpc_memory: [f32; MAX_LPC_ORDER],
+    /// Active LPC order (0 = disabled, uses fallback LP).
+    lpc_order: usize,
+    /// Whether a valid LPC model has been computed.
+    has_lpc_model: bool,
+    /// Configuration parameters.
+    cfg: ComfortNoiseConfig,
 }
 
 impl Default for ComfortNoiseGenerator {
@@ -103,11 +138,22 @@ impl Default for ComfortNoiseGenerator {
 
 impl ComfortNoiseGenerator {
     /// Creates a new comfort noise generator.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
+        Self::with_config(ComfortNoiseConfig::default())
+    }
+
+    /// Creates a comfort noise generator with custom configuration.
+    pub fn with_config(cfg: ComfortNoiseConfig) -> Self {
+        let lpc_order = cfg.lpc_order.min(MAX_LPC_ORDER);
         Self {
             rng_state: 0x1234_5678,
             target_level: 0.0,
             lp_state: 0.0,
+            lpc_coeffs: [0.0; MAX_LPC_ORDER],
+            lpc_memory: [0.0; MAX_LPC_ORDER],
+            lpc_order,
+            has_lpc_model: false,
+            cfg,
         }
     }
 
@@ -116,33 +162,155 @@ impl ComfortNoiseGenerator {
     /// Call this periodically (e.g., every time VAD transitions to silence)
     /// so the comfort noise level tracks the actual background.
     pub fn update_level(&mut self, noise_floor_rms: f32) {
-        self.target_level = noise_floor_rms * CN_LEVEL_FACTOR;
+        self.target_level = noise_floor_rms * self.cfg.level_factor;
+    }
+
+    /// Updates the spectral model from a recent noise frame.
+    ///
+    /// Computes LPC coefficients from the autocorrelation of the given PCM
+    /// using Levinson-Durbin recursion. Call this periodically during silence
+    /// (every ~500ms) so the CNG spectrum tracks the actual noise.
+    pub fn update_spectrum(&mut self, noise_pcm: &[i16]) {
+        if self.lpc_order == 0 || noise_pcm.len() < self.lpc_order * 2 {
+            return;
+        }
+
+        // Compute autocorrelation R[0..p]
+        let order = self.lpc_order;
+        let mut r = [0.0_f64; MAX_LPC_ORDER + 1];
+        let n = noise_pcm.len();
+        for lag in 0..=order {
+            let mut sum = 0.0_f64;
+            for i in lag..n {
+                sum += f64::from(noise_pcm[i]) * f64::from(noise_pcm[i - lag]);
+            }
+            r[lag] = sum;
+        }
+
+        // Bail if signal has no energy (all zeros)
+        if r[0] < 1.0 {
+            return;
+        }
+
+        // Levinson-Durbin recursion to compute LPC coefficients
+        let mut a = [0.0_f64; MAX_LPC_ORDER + 1];
+        let mut a_prev = [0.0_f64; MAX_LPC_ORDER + 1];
+        a[0] = 1.0;
+        a_prev[0] = 1.0;
+        let mut error = r[0];
+
+        for i in 1..=order {
+            // Compute reflection coefficient k[i]
+            let mut lambda = 0.0_f64;
+            for j in 1..i {
+                lambda += a_prev[j] * r[i - j];
+            }
+            lambda = -(r[i] + lambda) / error;
+
+            // Check stability: |k| must be < 1
+            if lambda.abs() >= 1.0 {
+                // Unstable — keep previous model
+                return;
+            }
+
+            // Update coefficients
+            a[i] = lambda;
+            for j in 1..i {
+                a[j] = a_prev[j] + lambda * a_prev[i - j];
+            }
+            error *= 1.0 - lambda * lambda;
+            a_prev[..=i].copy_from_slice(&a[..=i]);
+        }
+
+        // Store as f32 (skip a[0] which is always 1.0)
+        for k in 0..order {
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                self.lpc_coeffs[k] = a[k + 1] as f32;
+            }
+        }
+        self.has_lpc_model = true;
     }
 
     /// Generates a frame of comfort noise into the provided buffer.
     ///
-    /// The output is shaped white noise at the configured level.
+    /// Uses LPC synthesis filter when a spectral model is available,
+    /// otherwise falls back to one-pole LP filter.
     #[allow(clippy::cast_possible_truncation)]
     pub fn generate(&mut self, output: &mut [i16]) {
         if self.target_level < 1.0 {
-            // Level too low to be audible — fill with silence
             output.fill(0);
             return;
         }
 
+        if self.has_lpc_model && self.lpc_order > 0 {
+            self.generate_lpc(output);
+        } else {
+            self.generate_lp(output);
+        }
+    }
+
+    /// Generates comfort noise using LPC synthesis filter.
+    #[allow(clippy::cast_possible_truncation)]
+    fn generate_lpc(&mut self, output: &mut [i16]) {
+        let order = self.lpc_order;
         for sample in output.iter_mut() {
-            // Generate white noise sample in -1.0..1.0
+            let excitation = self.next_random() * self.target_level;
+
+            // All-pole synthesis: y[n] = x[n] - a1*y[n-1] - a2*y[n-2] - ...
+            let mut y = excitation;
+            for k in 0..order {
+                y -= self.lpc_coeffs[k] * self.lpc_memory[k];
+            }
+
+            // Shift memory
+            for k in (1..order).rev() {
+                self.lpc_memory[k] = self.lpc_memory[k - 1];
+            }
+            if order > 0 {
+                self.lpc_memory[0] = y;
+            }
+
+            *sample = y.clamp(-32768.0, 32767.0) as i16;
+        }
+    }
+
+    /// Generates comfort noise using simple one-pole LP filter (fallback).
+    #[allow(clippy::cast_possible_truncation)]
+    fn generate_lp(&mut self, output: &mut [i16]) {
+        for sample in output.iter_mut() {
             let white = self.next_random();
-
-            // Scale to target level
             let scaled = white * self.target_level;
-
-            // Apply simple one-pole low-pass filter for spectral shaping
-            self.lp_state =
-                LP_FILTER_COEFF.mul_add(self.lp_state, (1.0 - LP_FILTER_COEFF) * scaled);
-
-            // Convert to i16 with clamping
+            let lp = self.cfg.lp_filter_coeff;
+            self.lp_state = lp.mul_add(self.lp_state, (1.0 - lp) * scaled);
             *sample = self.lp_state.clamp(-32768.0, 32767.0) as i16;
+        }
+    }
+
+    /// Applies a crossfade from CNG to real audio at the start of `output`.
+    ///
+    /// Call this when transitioning from CNG to decoded audio. The first
+    /// `crossfade_samples` of `output` are blended with comfort noise to
+    /// avoid an abrupt transition.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn crossfade_to_real(&mut self, output: &mut [i16]) {
+        let fade_len = self.cfg.crossfade_samples.min(output.len());
+        if fade_len == 0 || self.target_level < 1.0 {
+            return;
+        }
+
+        // Generate CNG for the fade region
+        let mut cng_buf = vec![0i16; fade_len];
+        self.generate(&mut cng_buf);
+
+        // Linear crossfade: CNG fades out, real audio fades in
+        #[allow(clippy::cast_precision_loss)]
+        let fade_len_f = fade_len as f32;
+        for i in 0..fade_len {
+            #[allow(clippy::cast_precision_loss)]
+            let t = i as f32 / fade_len_f;
+            let blended = f32::from(cng_buf[i]) * (1.0 - t) + f32::from(output[i]) * t;
+            output[i] = blended.clamp(-32768.0, 32767.0) as i16;
         }
     }
 
@@ -156,6 +324,11 @@ impl ComfortNoiseGenerator {
         self.target_level
     }
 
+    /// Returns whether a valid LPC spectral model is available.
+    pub const fn has_spectrum(&self) -> bool {
+        self.has_lpc_model
+    }
+
     /// Generates a random f32 in the range -1.0..1.0 using xorshift32.
     #[allow(clippy::cast_precision_loss)]
     fn next_random(&mut self) -> f32 {
@@ -165,7 +338,6 @@ impl ComfortNoiseGenerator {
         self.rng_state ^= self.rng_state << 5;
 
         // Map u32 to -1.0..1.0
-        // Use the upper bits (better distribution) by converting to signed
         #[allow(clippy::cast_possible_wrap)]
         let signed = self.rng_state as i32;
         signed as f32 / i32::MAX as f32
@@ -344,6 +516,82 @@ mod tests {
             (rms - back).abs() < 1.0,
             "dBov roundtrip failed: {rms} → {back}"
         );
+    }
+
+    #[test]
+    fn test_lpc_spectrum_update() {
+        let mut cng = ComfortNoiseGenerator::new();
+        assert!(!cng.has_spectrum());
+
+        // Feed a noise frame with some spectral content
+        let noise: Vec<i16> = (0..320)
+            .map(|i| ((i as f32 * 0.3).sin() * 500.0 + (i as f32 * 0.7).cos() * 300.0) as i16)
+            .collect();
+        cng.update_spectrum(&noise);
+        assert!(cng.has_spectrum());
+    }
+
+    #[test]
+    fn test_lpc_shaped_noise_differs_from_fallback() {
+        // LPC-shaped CNG should produce different output than LP fallback
+        let noise: Vec<i16> = (0..320)
+            .map(|i| ((i as f32 * 0.1).sin() * 1000.0) as i16)
+            .collect();
+
+        let mut cng_lpc = ComfortNoiseGenerator::new();
+        cng_lpc.update_level(200.0);
+        cng_lpc.update_spectrum(&noise);
+
+        let mut cng_lp = ComfortNoiseGenerator::with_config(ComfortNoiseConfig {
+            lpc_order: 0, // Disable LPC
+            ..ComfortNoiseConfig::default()
+        });
+        cng_lp.update_level(200.0);
+
+        let mut out_lpc = vec![0i16; 160];
+        let mut out_lp = vec![0i16; 160];
+        cng_lpc.generate(&mut out_lpc);
+        cng_lp.generate(&mut out_lp);
+
+        // Both should produce non-zero output
+        assert!(out_lpc.iter().any(|&s| s != 0));
+        assert!(out_lp.iter().any(|&s| s != 0));
+
+        // They should differ (different spectral shape)
+        assert_ne!(out_lpc, out_lp, "LPC and LP noise should differ");
+    }
+
+    #[test]
+    fn test_crossfade_to_real() {
+        let mut cng = ComfortNoiseGenerator::new();
+        cng.update_level(500.0);
+
+        // Create "real audio" buffer
+        let mut output: Vec<i16> = (0..160).map(|i| (i * 200) as i16).collect();
+        let original = output.clone();
+
+        cng.crossfade_to_real(&mut output);
+
+        // First sample should be mostly CNG
+        // Last samples should be unchanged (beyond crossfade region)
+        let fade_len = cng.cfg.crossfade_samples;
+        assert_eq!(output[fade_len..], original[fade_len..]);
+        // First sample should differ from original (blended with CNG)
+        assert_ne!(output[0], original[0]);
+    }
+
+    #[test]
+    fn test_lpc_stability() {
+        // All-zeros input should not crash or set model
+        let mut cng = ComfortNoiseGenerator::new();
+        let zeros = vec![0i16; 320];
+        cng.update_spectrum(&zeros);
+        assert!(!cng.has_spectrum(), "All-zeros should not produce a model");
+
+        // Very short input should not crash
+        let short = vec![100i16; 4];
+        cng.update_spectrum(&short);
+        assert!(!cng.has_spectrum());
     }
 
     #[test]

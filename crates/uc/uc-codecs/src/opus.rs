@@ -81,6 +81,10 @@ pub struct OpusConfig {
     pub fec: bool,
     /// Enable DTX (discontinuous transmission).
     pub dtx: bool,
+    /// Enable VBR (variable bitrate). Default: true.
+    pub vbr: bool,
+    /// Enable constrained VBR (limits bitrate variation). Default: true.
+    pub vbr_constraint: bool,
     /// Frame duration in milliseconds (2.5, 5, 10, 20, 40, 60).
     pub frame_duration_ms: f32,
     /// Complexity (0-10).
@@ -99,6 +103,8 @@ impl Default for OpusConfig {
             signal: OpusSignal::Auto,
             fec: true,
             dtx: false,
+            vbr: true,
+            vbr_constraint: true,
             frame_duration_ms: 20.0,
             complexity: 9,
             packet_loss_perc: 0,
@@ -108,6 +114,8 @@ impl Default for OpusConfig {
 
 impl OpusConfig {
     /// Creates a VoIP-optimized configuration.
+    ///
+    /// Optimized for speech: mono, 32kbps VBR, DTX for silence, FEC for loss recovery.
     pub fn voip() -> Self {
         Self {
             sample_rate: 48000,
@@ -117,6 +125,8 @@ impl OpusConfig {
             signal: OpusSignal::Voice,
             fec: true,
             dtx: true,
+            vbr: true,
+            vbr_constraint: true,
             frame_duration_ms: 20.0,
             complexity: 9,
             packet_loss_perc: 10,
@@ -124,6 +134,8 @@ impl OpusConfig {
     }
 
     /// Creates an audio/music-optimized configuration.
+    ///
+    /// Optimized for music: stereo, 96kbps CBR, no DTX, high complexity.
     pub fn audio() -> Self {
         Self {
             sample_rate: 48000,
@@ -133,6 +145,8 @@ impl OpusConfig {
             signal: OpusSignal::Music,
             fec: false,
             dtx: false,
+            vbr: false,
+            vbr_constraint: false,
             frame_duration_ms: 20.0,
             complexity: 10,
             packet_loss_perc: 0,
@@ -140,6 +154,8 @@ impl OpusConfig {
     }
 
     /// Creates a low-delay configuration.
+    ///
+    /// Minimizes encoding latency: 10ms frames, no FEC/DTX overhead.
     pub fn low_delay() -> Self {
         Self {
             sample_rate: 48000,
@@ -149,6 +165,8 @@ impl OpusConfig {
             signal: OpusSignal::Voice,
             fec: false,
             dtx: false,
+            vbr: true,
+            vbr_constraint: true,
             frame_duration_ms: 10.0,
             complexity: 9,
             packet_loss_perc: 0,
@@ -362,7 +380,35 @@ mod tests {
         assert_eq!(config.channels, 1);
         assert!(config.fec);
         assert!(config.dtx);
+        assert!(config.vbr);
+        assert!(config.vbr_constraint);
         assert_eq!(config.application, OpusApplication::Voip);
+    }
+
+    #[test]
+    fn test_opus_config_audio_preset() {
+        let config = OpusConfig::audio();
+        assert_eq!(config.channels, 2);
+        assert_eq!(config.bitrate, 96000);
+        assert!(!config.fec);
+        assert!(!config.dtx);
+        assert!(!config.vbr, "Music preset uses CBR");
+        assert!(!config.vbr_constraint);
+        assert_eq!(config.complexity, 10);
+        assert_eq!(config.application, OpusApplication::Audio);
+    }
+
+    #[test]
+    fn test_opus_config_low_delay() {
+        let config = OpusConfig::low_delay();
+        assert!(!config.fec);
+        assert!(!config.dtx);
+        assert!(config.vbr);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(config.frame_duration_ms, 10.0);
+        }
+        assert_eq!(config.application, OpusApplication::LowDelay);
     }
 
     #[test]

@@ -162,6 +162,7 @@ impl AudioSession {
             dtmf_inter_digit_pause_ms: config.dtmf_inter_digit_pause_ms,
             redundancy_pt: config.redundancy_pt,
             echo_cancellation: true,
+            audio: Default::default(),
         };
 
         // Start pipeline (sync — pipeline spawns its own threads)

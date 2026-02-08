@@ -7,19 +7,19 @@
 //! it receives RTP packets from the socket and pushes them into the
 //! shared jitter buffer for the decode thread.
 
-use crate::aec::{AecProcessor, AecReference};
-use crate::audio_processing::AudioProcessor;
+use crate::aec::{AecConfig, AecProcessor, AecReference};
+use crate::audio_processing::{AgcConfig, AudioProcessor, NoiseGateConfig};
 use crate::codec::CodecPipeline;
 use crate::comfort_noise::encode_cn_payload;
 use crate::decode_thread::DecodeCommand;
 use crate::dtmf_sender::DtmfSender;
 use crate::file_source::FileAudioSource;
+use crate::noise_shaper::{CompandingLaw, NoiseShaper, NoiseShaperConfig};
 use crate::pipeline::{PipelineStats, resample_into};
 use crate::rtcp_session::RtcpSession;
 use crate::rtp_handler::{RtpReceiver, RtpTransmitter};
 use crate::stream::CaptureStream;
-use crate::noise_shaper::{CompandingLaw, NoiseShaper};
-use crate::vad::{VadDecision, VoiceActivityDetector};
+use crate::vad::{VadConfig, VadDecision, VoiceActivityDetector};
 use client_types::{CodecPreference, DtmfDigit};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -119,6 +119,16 @@ pub struct IoThreadConfig {
     /// AEC far-end reference buffer (shared with decode thread).
     /// When present, an `AecProcessor` is created to cancel echo on captured audio.
     pub aec_ref: Option<Arc<AecReference>>,
+    /// AGC configuration.
+    pub agc: AgcConfig,
+    /// Noise gate configuration.
+    pub noise_gate: NoiseGateConfig,
+    /// VAD configuration.
+    pub vad: VadConfig,
+    /// AEC configuration.
+    pub aec: AecConfig,
+    /// Noise shaper configuration.
+    pub noise_shaper: NoiseShaperConfig,
 }
 
 /// Spawns the I/O thread.
@@ -239,9 +249,9 @@ fn io_loop(
     );
 
     // Audio processing (AGC + noise gate) for capture path
-    let mut audio_processor = AudioProcessor::new();
+    let mut audio_processor = AudioProcessor::with_config(config.agc, config.noise_gate);
     // Voice activity detection for discontinuous transmission
-    let mut vad = VoiceActivityDetector::new();
+    let mut vad = VoiceActivityDetector::with_config(config.vad);
 
     // Encoder-side noise shaping (G.711 Appendix III)
     let noise_shaper_law = match config.codec {
@@ -249,7 +259,10 @@ fn io_loop(
         CodecPreference::G711Alaw => Some(CompandingLaw::ALaw),
         _ => None,
     };
-    let mut noise_shaper = NoiseShaper::new_optional(noise_shaper_law);
+    let mut noise_shaper = match noise_shaper_law {
+        Some(law) => NoiseShaper::with_config(law, config.noise_shaper),
+        None => NoiseShaper::new_optional(None),
+    };
 
     // RTCP session (optional — created if RTCP socket is provided)
     let mut rtcp_session =
@@ -262,9 +275,10 @@ fn io_loop(
             });
 
     // Acoustic echo cancellation (AEC) processor
+    let aec_cfg = config.aec;
     let mut aec = config.aec_ref.map(|aec_ref| {
         info!("AEC enabled: creating NLMS processor at {codec_clock_rate}Hz");
-        AecProcessor::new(codec_clock_rate, aec_ref)
+        AecProcessor::with_config(codec_clock_rate, aec_ref, aec_cfg)
     });
 
     // Non-blocking DTMF sender state machine
@@ -277,6 +291,7 @@ fn io_loop(
 
     let mut last_capture = Instant::now();
     let mut stats_update_counter: u32 = 0;
+    let mut dtmf_sent_count: u64 = 0;
 
     // Pending input device switch: CaptureStream creation runs on a
     // background thread so the I/O loop continues receiving RTP.
@@ -326,6 +341,23 @@ fn io_loop(
                 rtcp.set_local_ssrc(new_ssrc);
             }
             warn!("SSRC collision resolved: new local SSRC={:#010x}", new_ssrc);
+        }
+
+        // 1b. Auto-recover from capture device disappearance (USB/Bluetooth disconnect).
+        //     If the CPAL error callback fired, initiate an async switch to the default
+        //     device. Skip if a switch is already in progress.
+        if capture.has_error() && pending_capture_rx.is_none() {
+            warn!("I/O thread: capture device error detected, switching to default input");
+            let (tx, rx) = mpsc::channel();
+            thread::Builder::new()
+                .name("capture-recovery".to_string())
+                .spawn(move || {
+                    let dm = crate::device::DeviceManager::new();
+                    let result = CaptureStream::new(&dm).map_err(|e| e.to_string());
+                    let _ = tx.send(result);
+                })
+                .ok();
+            pending_capture_rx = Some(rx);
         }
 
         // 2. Capture and send audio at frame intervals.
@@ -398,7 +430,9 @@ fn io_loop(
         if let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 IoCommand::Dtmf(dtmf_cmd) => {
-                    if !dtmf_sender.enqueue(dtmf_cmd) {
+                    if dtmf_sender.enqueue(dtmf_cmd) {
+                        dtmf_sent_count += 1;
+                    } else {
                         warn!("DTMF digit dropped (queue full)");
                     }
                 }
@@ -504,6 +538,14 @@ fn io_loop(
         if stats_update_counter >= 100 {
             stats_update_counter = 0;
             update_stats(&transmitter, &receiver, &rtcp_session, &stats);
+            // Merge I/O-thread-local metrics into shared stats
+            if let Ok(mut s) = stats.lock() {
+                s.dtmf_events_sent = dtmf_sent_count;
+                s.agc_current_gain = audio_processor.current_gain();
+                if let Some(ref aec_proc) = aec {
+                    s.aec_erle_db = aec_proc.erle_db();
+                }
+            }
         }
 
         // 6. Diagnostic logging every ~2 seconds

@@ -11,30 +11,33 @@
 //! deviates beyond a dead zone, proportional corrections are applied
 //! to the resampler output length (±1 sample per frame).
 
-/// Number of measurements during warmup to establish the target depth.
-/// At ~5ms per measurement (`measure_interval=1` in decode thread),
-/// 40 measurements ≈ 200ms warmup.
-const WARMUP_MEASUREMENTS: usize = 40;
+/// Configuration for clock drift compensation.
+#[derive(Debug, Clone)]
+pub struct DriftConfig {
+    /// Number of measurements during warmup to establish the target depth.
+    /// At ~5ms per measurement, 40 measurements ≈ 200ms warmup.
+    pub warmup_measurements: usize,
+    /// EMA smoothing factor (0.0-1.0). Lower = heavier smoothing.
+    pub smoothing_alpha: f32,
+    /// Dead zone: ignore depth errors smaller than this (ms).
+    pub dead_zone_ms: f32,
+    /// Proportional correction gain. Higher = faster correction but may overshoot.
+    pub correction_gain: f32,
+    /// Maximum adjustment per frame in samples.
+    pub max_adjustment: i32,
+}
 
-/// EMA smoothing factor. Lower values = heavier smoothing.
-/// 0.05 gives a time constant of ~20 measurements (≈100ms at 5ms/measurement).
-/// This filters out per-packet jitter (8-16ms) while tracking real drift.
-const SMOOTHING_ALPHA: f32 = 0.05;
-
-/// Dead zone: ignore depth errors smaller than this (in ms).
-/// Normal network jitter causes ±3ms fluctuation. Only correct
-/// when the smoothed depth deviates beyond this threshold.
-const DEAD_ZONE_MS: f32 = 3.0;
-
-/// Proportional correction gain.
-/// Higher values correct faster but may overshoot.
-/// At gain 0.15 with error 10ms: accumulator += 1.5 per measurement.
-/// With ~200 measurements/sec (`measure_interval=1`), that's ~300/sec,
-/// yielding ~300 corrections/sec = ~300/44100 ≈ 6.8 ms/sec correction rate.
-const CORRECTION_GAIN: f32 = 0.15;
-
-/// Maximum adjustment: +/- 1 sample per frame.
-const MAX_ADJUSTMENT: i32 = 1;
+impl Default for DriftConfig {
+    fn default() -> Self {
+        Self {
+            warmup_measurements: 40,
+            smoothing_alpha: 0.05,
+            dead_zone_ms: 3.0,
+            correction_gain: 0.15,
+            max_adjustment: 1,
+        }
+    }
+}
 
 /// Tracks jitter buffer depth and computes resampler adjustments.
 pub struct DriftCompensator {
@@ -52,15 +55,22 @@ pub struct DriftCompensator {
     measure_interval: u32,
     /// Cumulative fractional adjustment.
     fractional_accumulator: f32,
+    /// Configuration parameters.
+    cfg: DriftConfig,
 }
 
 impl DriftCompensator {
-    /// Creates a new drift compensator.
+    /// Creates a new drift compensator with default configuration.
     ///
     /// # Arguments
     /// * `measure_interval` - Number of decode cycles between depth measurements.
     ///   Use 1 for every decode cycle (~5ms), giving ~200 measurements/sec.
     pub fn new(measure_interval: u32) -> Self {
+        Self::with_config(measure_interval, DriftConfig::default())
+    }
+
+    /// Creates a drift compensator with custom configuration.
+    pub fn with_config(measure_interval: u32, cfg: DriftConfig) -> Self {
         Self {
             smoothed_depth: 0.0,
             target_depth: 0.0,
@@ -69,6 +79,7 @@ impl DriftCompensator {
             measure_counter: 0,
             measure_interval: measure_interval.max(1),
             fractional_accumulator: 0.0,
+            cfg,
         }
     }
 
@@ -87,12 +98,12 @@ impl DriftCompensator {
         self.measurement_count += 1;
 
         // --- Warmup phase: establish target depth ---
-        if self.measurement_count <= WARMUP_MEASUREMENTS {
+        if self.measurement_count <= self.cfg.warmup_measurements {
             self.warmup_sum += current_depth_ms;
 
-            if self.measurement_count == WARMUP_MEASUREMENTS {
+            if self.measurement_count == self.cfg.warmup_measurements {
                 #[allow(clippy::cast_precision_loss)]
-                let avg = self.warmup_sum / WARMUP_MEASUREMENTS as f32;
+                let avg = self.warmup_sum / self.cfg.warmup_measurements as f32;
                 self.target_depth = avg;
                 self.smoothed_depth = avg;
             }
@@ -100,18 +111,21 @@ impl DriftCompensator {
         }
 
         // --- Active phase: EMA smooth and correct ---
-        self.smoothed_depth += SMOOTHING_ALPHA * (current_depth_ms - self.smoothed_depth);
+        self.smoothed_depth +=
+            self.cfg.smoothing_alpha * (current_depth_ms - self.smoothed_depth);
 
         let error = self.smoothed_depth - self.target_depth;
 
-        if error > DEAD_ZONE_MS {
+        if error > self.cfg.dead_zone_ms {
             // Buffer growing → produce fewer output samples to consume faster
             // Negative accumulator → negative adjustment
-            self.fractional_accumulator -= (error - DEAD_ZONE_MS) * CORRECTION_GAIN;
-        } else if error < -DEAD_ZONE_MS {
+            self.fractional_accumulator -=
+                (error - self.cfg.dead_zone_ms) * self.cfg.correction_gain;
+        } else if error < -self.cfg.dead_zone_ms {
             // Buffer shrinking → produce more output samples to slow consumption
             // Positive accumulator → positive adjustment
-            self.fractional_accumulator -= (error + DEAD_ZONE_MS) * CORRECTION_GAIN;
+            self.fractional_accumulator -=
+                (error + self.cfg.dead_zone_ms) * self.cfg.correction_gain;
         } else {
             // Within dead zone — slowly decay accumulator to avoid residual bias
             self.fractional_accumulator *= 0.99;
@@ -123,10 +137,10 @@ impl DriftCompensator {
         // Extract integer adjustment when accumulator reaches ±1.0
         if self.fractional_accumulator >= 1.0 {
             self.fractional_accumulator -= 1.0;
-            MAX_ADJUSTMENT
+            self.cfg.max_adjustment
         } else if self.fractional_accumulator <= -1.0 {
             self.fractional_accumulator += 1.0;
-            -MAX_ADJUSTMENT
+            -self.cfg.max_adjustment
         } else {
             0
         }
@@ -152,7 +166,7 @@ mod tests {
         let mut dc = DriftCompensator::new(1);
 
         // All warmup measurements should return 0
-        for i in 0..WARMUP_MEASUREMENTS {
+        for i in 0..DriftConfig::default().warmup_measurements {
             let adj = dc.update(60.0);
             assert_eq!(adj, 0, "Expected no adjustment at warmup measurement {i}");
         }
@@ -163,7 +177,7 @@ mod tests {
         let mut dc = DriftCompensator::new(1);
 
         // Warmup + many stable measurements → no drift, no correction
-        for _ in 0..WARMUP_MEASUREMENTS + 500 {
+        for _ in 0..DriftConfig::default().warmup_measurements + 500 {
             let adj = dc.update(60.0);
             assert_eq!(adj, 0);
         }
@@ -175,7 +189,7 @@ mod tests {
         let mut total_adj: i32 = 0;
 
         // Warmup at 60ms
-        for _ in 0..WARMUP_MEASUREMENTS {
+        for _ in 0..DriftConfig::default().warmup_measurements {
             dc.update(60.0);
         }
 
@@ -200,7 +214,7 @@ mod tests {
         let mut total_adj: i32 = 0;
 
         // Warmup at 80ms
-        for _ in 0..WARMUP_MEASUREMENTS {
+        for _ in 0..DriftConfig::default().warmup_measurements {
             dc.update(80.0);
         }
 
@@ -223,7 +237,7 @@ mod tests {
         let mut dc = DriftCompensator::new(1);
 
         // Warmup at 60ms
-        for _ in 0..WARMUP_MEASUREMENTS {
+        for _ in 0..DriftConfig::default().warmup_measurements {
             dc.update(60.0);
         }
 
@@ -245,7 +259,7 @@ mod tests {
     #[test]
     fn test_reset() {
         let mut dc = DriftCompensator::new(1);
-        for _ in 0..WARMUP_MEASUREMENTS + 100 {
+        for _ in 0..DriftConfig::default().warmup_measurements + 100 {
             dc.update(60.0);
         }
         dc.reset();
@@ -272,7 +286,7 @@ mod tests {
         let mut dc = DriftCompensator::new(1);
 
         // Warmup at 20ms
-        for _ in 0..WARMUP_MEASUREMENTS {
+        for _ in 0..DriftConfig::default().warmup_measurements {
             dc.update(20.0);
         }
 

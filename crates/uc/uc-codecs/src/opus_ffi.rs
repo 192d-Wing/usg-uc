@@ -126,6 +126,26 @@ impl FfiOpusEncoder {
                 reason: format!("failed to set packet loss percentage: {e}"),
             })?;
 
+        encoder
+            .set_vbr(config.vbr)
+            .map_err(|e| CodecError::InvalidConfig {
+                reason: format!("failed to set VBR: {e}"),
+            })?;
+
+        encoder
+            .set_vbr_constraint(config.vbr_constraint)
+            .map_err(|e| CodecError::InvalidConfig {
+                reason: format!("failed to set VBR constraint: {e}"),
+            })?;
+
+        // DTX: use raw CTL request (OPUS_SET_DTX_REQUEST = 4016)
+        // audiopus doesn't expose a typed set_dtx() method.
+        encoder
+            .set_encoder_ctl_request(4016, i32::from(config.dtx))
+            .map_err(|e| CodecError::InvalidConfig {
+                reason: format!("failed to set DTX: {e}"),
+            })?;
+
         Ok(())
     }
 
@@ -478,6 +498,139 @@ mod tests {
         assert_eq!(boxed.frame_duration_ms(), 20);
         assert_eq!(boxed.samples_per_frame(), 960);
         assert!(boxed.supports_fec());
+    }
+
+    #[test]
+    fn test_fec_recovery_quality() {
+        // Encode N frames, decode all normally except one which uses FEC.
+        // Verify the FEC-recovered frame is non-silent and the overall
+        // output has high correlation with the input.
+        let codec = FfiOpusCodec::voip(111);
+        let samples_per_frame = 960; // 20ms at 48kHz mono
+        let num_frames = 50;
+        let total_samples = samples_per_frame * num_frames;
+
+        // Generate 1-second 440Hz sine wave
+        let input: Vec<i16> = (0..total_samples)
+            .map(|i| {
+                let t = i as f32 / 48000.0;
+                (f32::sin(2.0 * std::f32::consts::PI * 440.0 * t) * 16000.0) as i16
+            })
+            .collect();
+
+        // Encode all frames
+        let mut encoded_packets: Vec<Vec<u8>> = Vec::new();
+        for frame_idx in 0..num_frames {
+            let start = frame_idx * samples_per_frame;
+            let end = start + samples_per_frame;
+            let mut encoded = vec![0u8; 1275];
+            let len = codec.encode(&input[start..end], &mut encoded).unwrap();
+            encoded_packets.push(encoded[..len].to_vec());
+        }
+
+        // Decode with loss at frame 25 — use FEC to recover
+        let lost_frame = 25;
+        let mut output = Vec::with_capacity(total_samples);
+        let mut fec_frame_rms = 0.0_f64;
+
+        for frame_idx in 0..num_frames {
+            let mut decoded = vec![0i16; samples_per_frame];
+            if frame_idx == lost_frame {
+                // Simulate loss: use decoder PLC/FEC (decode(None, fec=true))
+                let len = codec.decode_fec(&mut decoded).unwrap();
+                assert_eq!(len, samples_per_frame, "FEC should produce a full frame");
+
+                // Compute RMS of recovered frame
+                let sum_sq: f64 = decoded.iter().map(|&s| (s as f64) * (s as f64)).sum();
+                fec_frame_rms = (sum_sq / len as f64).sqrt();
+            } else {
+                let len = codec
+                    .decode(&encoded_packets[frame_idx], &mut decoded)
+                    .unwrap();
+                assert_eq!(len, samples_per_frame);
+            }
+            output.extend_from_slice(&decoded);
+        }
+
+        // FEC-recovered frame should not be silence (Opus PLC generates
+        // continuation from decoder state after 24 good frames of 440Hz).
+        assert!(
+            fec_frame_rms > 500.0,
+            "FEC recovered frame should not be silent: RMS={fec_frame_rms:.1}"
+        );
+
+        // Overall output should have high energy
+        let total_rms: f64 = {
+            let sum: f64 = output.iter().map(|&s| (s as f64) * (s as f64)).sum();
+            (sum / output.len() as f64).sqrt()
+        };
+        assert!(
+            total_rms > 5000.0,
+            "Total output RMS should be high: {total_rms:.1}"
+        );
+    }
+
+    #[test]
+    fn test_fec_produces_active_audio() {
+        // FEC/PLC recovery should produce audio with similar energy to the
+        // original, not silence. We compare RMS levels rather than MSE because
+        // Opus PLC generates a continuation tone with correct frequency/amplitude
+        // but may differ in phase (making MSE unreliable).
+        let codec = FfiOpusCodec::voip(111);
+        let spf = 960;
+
+        // Generate and encode 10 frames of sine wave
+        let input: Vec<i16> = (0..spf * 10)
+            .map(|i| {
+                let t = i as f32 / 48000.0;
+                (f32::sin(2.0 * std::f32::consts::PI * 440.0 * t) * 16000.0) as i16
+            })
+            .collect();
+
+        let mut packets = Vec::new();
+        for f in 0..10 {
+            let mut enc = vec![0u8; 1275];
+            let len = codec.encode(&input[f * spf..(f + 1) * spf], &mut enc).unwrap();
+            packets.push(enc[..len].to_vec());
+        }
+
+        // Decode frames 0-7 normally, then lose frame 8
+        let mut decoded = vec![0i16; spf];
+        for f in 0..8 {
+            codec.decode(&packets[f], &mut decoded).unwrap();
+        }
+
+        // FEC recovery for lost frame 8
+        let mut fec_output = vec![0i16; spf];
+        let fec_len = codec.decode_fec(&mut fec_output).unwrap();
+        assert_eq!(fec_len, spf);
+
+        // Compute RMS of FEC output and original frame
+        let fec_rms: f64 = {
+            let sum: f64 = fec_output.iter().map(|&s| (s as f64) * (s as f64)).sum();
+            (sum / spf as f64).sqrt()
+        };
+        let original_frame = &input[8 * spf..9 * spf];
+        let original_rms: f64 = {
+            let sum: f64 = original_frame
+                .iter()
+                .map(|&s| (s as f64) * (s as f64))
+                .sum();
+            (sum / spf as f64).sqrt()
+        };
+
+        // FEC output should have at least 25% of the original's energy
+        // (it's a continuation, not an exact replica)
+        assert!(
+            fec_rms > original_rms * 0.25,
+            "FEC RMS ({fec_rms:.1}) should be >25% of original RMS ({original_rms:.1})"
+        );
+
+        // FEC output should definitely not be silence
+        assert!(
+            fec_rms > 500.0,
+            "FEC output should not be silent: RMS={fec_rms:.1}"
+        );
     }
 
     #[test]

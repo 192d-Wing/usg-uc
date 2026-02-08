@@ -26,32 +26,66 @@
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use std::sync::Arc;
 
-/// AEC filter length in milliseconds.
-/// 128ms covers typical room echo paths for headset/speakerphone use.
-const FILTER_LENGTH_MS: usize = 128;
+/// Configuration for Acoustic Echo Cancellation.
+#[derive(Debug, Clone)]
+pub struct AecConfig {
+    /// Filter length in milliseconds.
+    pub filter_length_ms: usize,
+    /// NLMS step size (mu). Controls convergence speed vs. steady-state error.
+    pub nlms_mu: f32,
+    /// Double-talk detection threshold.
+    pub doubletalk_threshold: f32,
+    /// Minimum far-end energy to enable filter updates.
+    pub min_farend_energy: f32,
+    /// Residual echo suppression gain (linear).
+    pub nlp_suppression: f32,
+    /// NLP engagement threshold: echo-to-error ratio above which NLP kicks in.
+    pub nlp_threshold: f32,
+}
 
-/// NLMS step size (mu). Controls convergence speed vs. steady-state error.
-/// 0.5 is a good compromise for speech.
-const NLMS_MU: f32 = 0.5;
+impl Default for AecConfig {
+    fn default() -> Self {
+        Self {
+            filter_length_ms: 128,
+            nlms_mu: 0.5,
+            doubletalk_threshold: 2.0,
+            min_farend_energy: 100.0,
+            nlp_suppression: 0.1,
+            nlp_threshold: 0.3,
+        }
+    }
+}
+
+impl AecConfig {
+    /// Preset for headsets (short echo path, low tail length).
+    pub fn headset() -> Self {
+        Self {
+            filter_length_ms: 64,
+            nlms_mu: 0.6,
+            doubletalk_threshold: 2.5,
+            ..Self::default()
+        }
+    }
+
+    /// Preset for built-in laptop/desktop speakers (medium tail length).
+    pub fn speakers() -> Self {
+        Self::default() // 128ms is already appropriate
+    }
+
+    /// Preset for speakerphone/room (long echo path, conservative adaptation).
+    pub fn room() -> Self {
+        Self {
+            filter_length_ms: 256,
+            nlms_mu: 0.3,
+            doubletalk_threshold: 1.5,
+            nlp_suppression: 0.05,
+            ..Self::default()
+        }
+    }
+}
 
 /// Regularization constant to prevent division by zero in NLMS.
 const NLMS_DELTA: f32 = 1e-6;
-
-/// Double-talk detection threshold. When the ratio of near-end energy to
-/// echo estimate energy exceeds this, the filter update is frozen to
-/// prevent divergence.
-const DOUBLETALK_THRESHOLD: f32 = 2.0;
-
-/// Minimum far-end energy to enable filter updates. Prevents adapting
-/// on noise during silence.
-const MIN_FAREND_ENERGY: f32 = 100.0;
-
-/// Residual echo suppression gain (linear). Applied to the error signal
-/// when the echo estimate is strong relative to the residual.
-const NLP_SUPPRESSION: f32 = 0.1;
-
-/// NLP engagement threshold: echo-to-error ratio above which NLP kicks in.
-const NLP_THRESHOLD: f32 = 0.3;
 
 /// Shared far-end reference buffer for cross-thread AEC.
 ///
@@ -113,6 +147,10 @@ impl std::fmt::Debug for AecReference {
     }
 }
 
+/// Smoothing factor for ERLE estimation (exponential moving average).
+/// 0.01 → ~100 frame time constant (~2s at 20ms frames).
+const ERLE_SMOOTHING: f32 = 0.01;
+
 /// NLMS adaptive filter for acoustic echo cancellation.
 ///
 /// Processes mic audio frame-by-frame, subtracting the estimated echo
@@ -135,16 +173,29 @@ pub struct AecProcessor {
     ref_pull_buf: Vec<i16>,
     /// Whether AEC is enabled.
     enabled: bool,
+    /// Configuration parameters.
+    cfg: AecConfig,
+    /// Running input (before cancellation) power estimate.
+    input_power: f32,
+    /// Running output (after cancellation) power estimate.
+    output_power: f32,
+    /// Current ERLE estimate in dB.
+    erle_db: f32,
 }
 
 impl AecProcessor {
-    /// Creates a new AEC processor.
+    /// Creates a new AEC processor with default configuration.
     ///
     /// `sample_rate` is the codec sample rate (e.g., 8000 for G.711).
     /// `aec_ref` is the shared reference buffer from the decode thread.
     pub fn new(sample_rate: u32, aec_ref: Arc<AecReference>) -> Self {
+        Self::with_config(sample_rate, aec_ref, AecConfig::default())
+    }
+
+    /// Creates a new AEC processor with custom configuration.
+    pub fn with_config(sample_rate: u32, aec_ref: Arc<AecReference>, cfg: AecConfig) -> Self {
         #[allow(clippy::cast_possible_truncation)]
-        let filter_len = (sample_rate as usize * FILTER_LENGTH_MS) / 1000;
+        let filter_len = (sample_rate as usize * cfg.filter_length_ms) / 1000;
         Self {
             filter: vec![0.0; filter_len],
             reference_history: vec![0.0; filter_len],
@@ -154,6 +205,10 @@ impl AecProcessor {
             aec_ref,
             ref_pull_buf: vec![0; 960], // Max frame size at any rate
             enabled: true,
+            cfg,
+            input_power: 0.0,
+            output_power: 0.0,
+            erle_db: 0.0,
         }
     }
 
@@ -165,7 +220,20 @@ impl AecProcessor {
             self.filter.fill(0.0);
             self.reference_history.fill(0.0);
             self.ref_power = 0.0;
+            self.input_power = 0.0;
+            self.output_power = 0.0;
+            self.erle_db = 0.0;
         }
+    }
+
+    /// Returns the current ERLE (Echo Return Loss Enhancement) estimate in dB.
+    ///
+    /// Higher values indicate better echo cancellation. Typical values:
+    /// - 0-6 dB: poor / not converged
+    /// - 6-12 dB: acceptable
+    /// - 12+ dB: good
+    pub fn erle_db(&self) -> f32 {
+        self.erle_db
     }
 
     /// Processes a frame of mic audio in-place, removing estimated echo.
@@ -187,6 +255,10 @@ impl AecProcessor {
         if ref_pulled == 0 {
             return;
         }
+
+        // Accumulate frame-level input/output power for ERLE estimation.
+        let mut frame_input_power = 0.0_f32;
+        let mut frame_output_power = 0.0_f32;
 
         // Process sample by sample
         for i in 0..frame_len {
@@ -216,32 +288,47 @@ impl AecProcessor {
             let mic_f = mic_pcm[i] as f32;
             let error = mic_f - echo_estimate;
 
+            // Accumulate power for ERLE
+            frame_input_power += mic_f * mic_f;
+            frame_output_power += error * error;
+
             // Double-talk detection: compare mic energy to echo estimate energy
             let mic_energy = mic_f * mic_f;
             let echo_energy = echo_estimate * echo_estimate;
-            let is_doubletalk = echo_energy > MIN_FAREND_ENERGY
-                && mic_energy > DOUBLETALK_THRESHOLD * echo_energy;
+            let is_doubletalk = echo_energy > self.cfg.min_farend_energy
+                && mic_energy > self.cfg.doubletalk_threshold * echo_energy;
 
             // NLMS filter update (skip during double-talk)
-            if !is_doubletalk && self.ref_power > MIN_FAREND_ENERGY {
-                let norm = NLMS_MU / (self.ref_power + NLMS_DELTA);
+            if !is_doubletalk && self.ref_power > self.cfg.min_farend_energy {
+                let norm = self.cfg.nlms_mu / (self.ref_power + NLMS_DELTA);
                 for k in 0..self.filter_len {
                     let ref_idx = (self.ref_pos + self.filter_len - k) % self.filter_len;
                     self.filter[k] += norm * error * self.reference_history[ref_idx];
                 }
             }
 
-            // Non-linear processing (NLP): suppress residual echo
-            let output = if echo_energy > MIN_FAREND_ENERGY {
+            // Non-linear processing (NLP): gated on ERLE.
+            // When ERLE is high (>10 dB), the adaptive filter is doing its job
+            // and NLP can use the configured threshold. When ERLE is low (<6 dB),
+            // the filter hasn't converged — apply NLP more aggressively.
+            let output = if echo_energy > self.cfg.min_farend_energy {
                 let echo_ratio = echo_estimate.abs() / (error.abs() + 1.0);
-                if echo_ratio > NLP_THRESHOLD {
-                    error * NLP_SUPPRESSION
+                let effective_threshold = if self.erle_db < 6.0 {
+                    // Aggressive NLP: lower threshold to suppress more residual echo
+                    self.cfg.nlp_threshold * 0.5
+                } else {
+                    self.cfg.nlp_threshold
+                };
+                if echo_ratio > effective_threshold {
+                    error * self.cfg.nlp_suppression
                 } else {
                     error
                 }
             } else {
                 error
             };
+
+            frame_output_power += output * output - error * error;
 
             // Write back
             #[allow(clippy::cast_possible_truncation)]
@@ -251,6 +338,17 @@ impl AecProcessor {
 
             // Advance reference position
             self.ref_pos = (self.ref_pos + 1) % self.filter_len;
+        }
+
+        // Update running ERLE estimate (exponential moving average).
+        // Only update when there's meaningful input signal to avoid
+        // division by zero and meaningless ERLE during silence.
+        if frame_input_power > self.cfg.min_farend_energy {
+            self.input_power += ERLE_SMOOTHING * (frame_input_power - self.input_power);
+            self.output_power += ERLE_SMOOTHING * (frame_output_power.max(NLMS_DELTA) - self.output_power);
+            if self.output_power > NLMS_DELTA {
+                self.erle_db = 10.0 * (self.input_power / self.output_power).log10();
+            }
         }
     }
 }
@@ -385,6 +483,61 @@ mod tests {
             erle > 6.0,
             "ERLE too low: {erle:.1} dB (expected >6 dB echo reduction)"
         );
+    }
+
+    #[test]
+    fn test_aec_erle_estimation() {
+        let aec_ref = AecReference::new(8000, 200);
+        let mut processor = AecProcessor::new(8000, aec_ref.clone());
+
+        let num_frames = 50;
+        let frame_size = 160;
+
+        // Generate far-end tone and echo
+        let total_samples = num_frames * frame_size;
+        let farend: Vec<i16> = (0..total_samples)
+            .map(|i| (8000.0 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 8000.0).sin()) as i16)
+            .collect();
+        let echo_delay = 40;
+        let echo_gain = 0.5_f32;
+        let mic_echo: Vec<i16> = (0..total_samples)
+            .map(|i| {
+                if i >= echo_delay {
+                    #[allow(clippy::cast_possible_truncation)]
+                    { (farend[i - echo_delay] as f32 * echo_gain) as i16 }
+                } else { 0 }
+            })
+            .collect();
+
+        // Process frames
+        for frame_idx in 0..num_frames {
+            let start = frame_idx * frame_size;
+            let end = start + frame_size;
+            aec_ref.push(&farend[start..end]);
+            let mut mic_frame = mic_echo[start..end].to_vec();
+            processor.process(&mut mic_frame);
+        }
+
+        // After convergence, ERLE should be positive (some echo reduction)
+        let erle = processor.erle_db();
+        assert!(
+            erle > 0.0,
+            "ERLE should be positive after convergence, got {erle:.1} dB"
+        );
+    }
+
+    #[test]
+    fn test_aec_config_presets() {
+        let headset = AecConfig::headset();
+        assert_eq!(headset.filter_length_ms, 64);
+        assert!(headset.nlms_mu > AecConfig::default().nlms_mu);
+
+        let speakers = AecConfig::speakers();
+        assert_eq!(speakers.filter_length_ms, 128);
+
+        let room = AecConfig::room();
+        assert_eq!(room.filter_length_ms, 256);
+        assert!(room.nlms_mu < AecConfig::default().nlms_mu);
     }
 
     #[test]

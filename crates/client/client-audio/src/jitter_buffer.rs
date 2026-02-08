@@ -24,36 +24,41 @@ pub const MAX_DEPTH_MS: u32 = 200;
 /// Maximum number of packets to hold in the buffer.
 const MAX_BUFFER_PACKETS: usize = 100;
 
-/// Number of consecutive late packets before increasing buffer depth.
-const LATE_THRESHOLD: u32 = 3;
-
-/// Number of consecutive on-time packets before decreasing buffer depth.
-const ONTIME_THRESHOLD: u32 = 100;
-
 /// Number of jitter samples to keep for percentile calculation.
 const JITTER_HISTORY_SIZE: usize = 200;
 
-/// Margin added to the p95 jitter estimate for target depth (in ms).
-const JITTER_MARGIN_MS: f32 = 20.0;
+/// Configuration for the adaptive jitter buffer.
+#[derive(Debug, Clone)]
+pub struct JitterBufferConfig {
+    /// Consecutive late packets before increasing depth.
+    pub late_threshold: u32,
+    /// Consecutive on-time packets before decreasing depth.
+    pub ontime_threshold: u32,
+    /// Margin added to p95 jitter for target depth (ms).
+    pub jitter_margin_ms: f32,
+    /// Timestamp jump (seconds) that triggers a discontinuity resync.
+    pub timestamp_discontinuity_secs: u32,
+    /// Packets between adaptive depth recalculations.
+    pub adapt_interval: u32,
+    /// Smoothing factor for target depth transitions (0.0-1.0).
+    pub adapt_smoothing: f32,
+    /// Maximum consecutive lost packets before skipping ahead.
+    pub max_consecutive_lost: u32,
+}
 
-/// Timestamp jump (in seconds) that triggers a discontinuity resync.
-/// Hold/resume, transfer, or codec change can produce jumps of seconds
-/// to minutes. 2 seconds is well above normal jitter but catches real
-/// discontinuities promptly.
-const TIMESTAMP_DISCONTINUITY_SECS: u32 = 2;
-
-/// How many packets between adaptive depth recalculations.
-const ADAPT_INTERVAL: u32 = 50;
-
-/// Smoothing factor for target depth transitions (0.0-1.0).
-/// 0.15 means move 15% toward the new target each adaptation cycle.
-const ADAPT_SMOOTHING: f32 = 0.15;
-
-/// Maximum consecutive lost packets before skipping ahead to the first
-/// available packet. Prevents an infinite chase when the playout pointer
-/// falls far behind (e.g., after a DTMF tone fills the ring buffer and
-/// stalls the decode thread).
-const MAX_CONSECUTIVE_LOST: u32 = 10;
+impl Default for JitterBufferConfig {
+    fn default() -> Self {
+        Self {
+            late_threshold: 3,
+            ontime_threshold: 100,
+            jitter_margin_ms: 20.0,
+            timestamp_discontinuity_secs: 2,
+            adapt_interval: 50,
+            adapt_smoothing: 0.15,
+            max_consecutive_lost: 10,
+        }
+    }
+}
 
 /// A buffered RTP packet with metadata.
 #[derive(Debug, Clone)]
@@ -162,16 +167,33 @@ pub struct JitterBuffer {
     sort_scratch: Vec<f32>,
     /// RTT hint from RTCP (milliseconds). Used as a minimum floor for target depth.
     rtt_hint_ms: Option<f32>,
+    /// Configuration parameters.
+    cfg: JitterBufferConfig,
 }
 
 impl JitterBuffer {
-    /// Creates a new jitter buffer.
+    /// Creates a new jitter buffer with default configuration.
     ///
     /// # Arguments
     /// * `clock_rate` - Codec clock rate in Hz (e.g., 8000 for G.711, 48000 for Opus)
     /// * `samples_per_packet` - Number of samples per packet (e.g., 160 for 20ms at 8kHz)
     /// * `target_depth_ms` - Initial target buffer depth in milliseconds
     pub fn new(clock_rate: u32, samples_per_packet: u32, target_depth_ms: u32) -> Self {
+        Self::with_config(
+            clock_rate,
+            samples_per_packet,
+            target_depth_ms,
+            JitterBufferConfig::default(),
+        )
+    }
+
+    /// Creates a jitter buffer with custom configuration.
+    pub fn with_config(
+        clock_rate: u32,
+        samples_per_packet: u32,
+        target_depth_ms: u32,
+        cfg: JitterBufferConfig,
+    ) -> Self {
         let target_depth_ms = target_depth_ms.clamp(MIN_DEPTH_MS, MAX_DEPTH_MS);
 
         debug!(
@@ -201,6 +223,7 @@ impl JitterBuffer {
             consecutive_lost: 0,
             sort_scratch: Vec::with_capacity(JITTER_HISTORY_SIZE),
             rtt_hint_ms: None,
+            cfg,
         }
     }
 
@@ -226,11 +249,11 @@ impl JitterBuffer {
         self.stats.packets_received += 1;
 
         // Detect timestamp discontinuity (hold/resume, transfer, codec change).
-        // A jump larger than TIMESTAMP_DISCONTINUITY_SECS indicates the remote
+        // A jump larger than self.cfg.timestamp_discontinuity_secs indicates the remote
         // stream has restarted — flush the buffer and re-prime.
         if let Some(last_ts) = self.last_timestamp {
             let ts_jump = timestamp_diff(packet.timestamp, last_ts).unsigned_abs();
-            let threshold = self.clock_rate * TIMESTAMP_DISCONTINUITY_SECS;
+            let threshold = self.clock_rate * self.cfg.timestamp_discontinuity_secs;
             if ts_jump > threshold {
                 warn!(
                     "Timestamp discontinuity: last_ts={}, pkt_ts={}, jump={} samples ({:.1}s), resync",
@@ -295,7 +318,7 @@ impl JitterBuffer {
 
         // Periodically run percentile-based adaptation
         self.adapt_counter += 1;
-        if self.adapt_counter >= ADAPT_INTERVAL {
+        if self.adapt_counter >= self.cfg.adapt_interval {
             self.adapt_counter = 0;
             self.adapt_depth();
         }
@@ -363,7 +386,7 @@ impl JitterBuffer {
             // If we've had too many consecutive losses, the playout pointer
             // has fallen far behind the buffer contents (e.g., after a stall).
             // Skip ahead to the first available packet to resync.
-            if self.consecutive_lost > MAX_CONSECUTIVE_LOST {
+            if self.consecutive_lost > self.cfg.max_consecutive_lost {
                 if let Some(&first_seq) = self.packets.keys().next() {
                     let skipped = sequence_diff(first_seq, expected_seq);
                     warn!(
@@ -442,7 +465,7 @@ impl JitterBuffer {
         }
 
         let p95 = percentile_95(&self.jitter_history, &mut self.sort_scratch);
-        let ideal_target = p95 + JITTER_MARGIN_MS;
+        let ideal_target = p95 + self.cfg.jitter_margin_ms;
 
         // Apply RTT-based floor: one-way delay ≈ RTT/2
         let rtt_floor = self.rtt_hint_ms.map_or(0.0, |rtt| rtt / 2.0);
@@ -455,7 +478,7 @@ impl JitterBuffer {
         // Smooth transition toward new target
         #[allow(clippy::cast_precision_loss)]
         let current = self.target_depth_ms as f32;
-        let new_target = current.mul_add(1.0 - ADAPT_SMOOTHING, clamped * ADAPT_SMOOTHING);
+        let new_target = current.mul_add(1.0 - self.cfg.adapt_smoothing, clamped * self.cfg.adapt_smoothing);
         let new_depth = (new_target.round() as u32).clamp(MIN_DEPTH_MS, MAX_DEPTH_MS);
 
         if new_depth != self.target_depth_ms {
@@ -478,7 +501,7 @@ impl JitterBuffer {
 
     /// Maybe increase buffer depth due to late packets.
     fn maybe_increase_depth(&mut self) {
-        if self.late_count >= LATE_THRESHOLD {
+        if self.late_count >= self.cfg.late_threshold {
             let new_depth = (self.target_depth_ms + 10).min(MAX_DEPTH_MS);
             if new_depth != self.target_depth_ms {
                 debug!(
@@ -494,7 +517,7 @@ impl JitterBuffer {
 
     /// Maybe decrease buffer depth due to consistent on-time packets.
     fn maybe_decrease_depth(&mut self) {
-        if self.ontime_count >= ONTIME_THRESHOLD {
+        if self.ontime_count >= self.cfg.ontime_threshold {
             let new_depth = (self.target_depth_ms.saturating_sub(10)).max(MIN_DEPTH_MS);
             if new_depth != self.target_depth_ms {
                 debug!(
