@@ -96,7 +96,7 @@ pub enum JitterBufferResult {
 }
 
 /// Statistics for the jitter buffer.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct JitterBufferStats {
     /// Total packets received.
     pub packets_received: u64,
@@ -571,11 +571,11 @@ impl SharedJitterBuffer {
         self.inner.lock().map(|jb| jb.is_ready()).unwrap_or(false)
     }
 
-    /// Returns the current statistics.
+    /// Returns the current statistics (Copy — no heap allocation).
     pub fn stats(&self) -> JitterBufferStats {
         self.inner
             .lock()
-            .map(|jb| jb.stats().clone())
+            .map(|jb| *jb.stats())
             .unwrap_or_default()
     }
 
