@@ -160,6 +160,8 @@ pub struct JitterBuffer {
     consecutive_lost: u32,
     /// Reusable scratch buffer for percentile_95 sort (avoids allocation every 50 packets).
     sort_scratch: Vec<f32>,
+    /// RTT hint from RTCP (milliseconds). Used as a minimum floor for target depth.
+    rtt_hint_ms: Option<f32>,
 }
 
 impl JitterBuffer {
@@ -198,6 +200,7 @@ impl JitterBuffer {
             adapt_counter: 0,
             consecutive_lost: 0,
             sort_scratch: Vec::with_capacity(JITTER_HISTORY_SIZE),
+            rtt_hint_ms: None,
         }
     }
 
@@ -441,9 +444,13 @@ impl JitterBuffer {
         let p95 = percentile_95(&self.jitter_history, &mut self.sort_scratch);
         let ideal_target = p95 + JITTER_MARGIN_MS;
 
+        // Apply RTT-based floor: one-way delay ≈ RTT/2
+        let rtt_floor = self.rtt_hint_ms.map_or(0.0, |rtt| rtt / 2.0);
+        let floored = ideal_target.max(rtt_floor);
+
         // Clamp to allowed range
         #[allow(clippy::cast_precision_loss)]
-        let clamped = ideal_target.clamp(MIN_DEPTH_MS as f32, MAX_DEPTH_MS as f32);
+        let clamped = floored.clamp(MIN_DEPTH_MS as f32, MAX_DEPTH_MS as f32);
 
         // Smooth transition toward new target
         #[allow(clippy::cast_precision_loss)]
@@ -534,6 +541,15 @@ impl JitterBuffer {
         self.stats.current_depth_ms = self.target_depth_ms;
     }
 
+    /// Provides an RTCP-measured RTT hint for adaptive depth calculation.
+    ///
+    /// The jitter buffer uses RTT/2 (approximate one-way delay) as a
+    /// minimum floor for the target depth, since packets can't arrive
+    /// faster than the one-way network delay.
+    pub fn set_rtt_hint_ms(&mut self, rtt_ms: f32) {
+        self.rtt_hint_ms = Some(rtt_ms);
+    }
+
     /// Returns the number of packets currently buffered.
     pub fn len(&self) -> usize {
         self.packets.len()
@@ -619,6 +635,13 @@ impl SharedJitterBuffer {
     pub fn reset(&self) {
         if let Ok(mut jb) = self.inner.lock() {
             jb.reset();
+        }
+    }
+
+    /// Provides an RTCP-measured RTT hint for adaptive depth calculation.
+    pub fn set_rtt_hint_ms(&self, rtt_ms: f32) {
+        if let Ok(mut jb) = self.inner.lock() {
+            jb.set_rtt_hint_ms(rtt_ms);
         }
     }
 }
@@ -862,6 +885,29 @@ mod tests {
         assert!(
             after < before,
             "Expected depth to decrease from {before}ms with low jitter, got {after}ms"
+        );
+    }
+
+    #[test]
+    fn test_rtt_hint_floor_prevents_low_depth() {
+        let mut jb = JitterBuffer::new(8000, 160, 100);
+
+        // Set a high RTT hint (200ms → one-way = 100ms floor)
+        jb.set_rtt_hint_ms(200.0);
+
+        // Simulate low-jitter packets (would normally pull depth down to ~22ms)
+        for _ in 0..JITTER_HISTORY_SIZE {
+            jb.jitter_history.push_back(2.0); // 2ms jitter
+        }
+
+        jb.adapt_depth();
+        let after = jb.target_depth_ms();
+
+        // With 2ms jitter + 20ms margin = 22ms, but RTT floor = 100ms
+        // Smoothed: 100 * 0.85 + 100 * 0.15 = 100 (no change, floor prevents decrease)
+        assert!(
+            after >= 100,
+            "RTT floor should prevent depth from dropping below 100ms, got {after}ms"
         );
     }
 

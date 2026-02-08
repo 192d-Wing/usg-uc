@@ -64,6 +64,8 @@ pub struct RtcpSession {
     prev_cumulative_lost: u64,
     /// Receive buffer for incoming RTCP packets.
     recv_buffer: Vec<u8>,
+    /// Latest measured round-trip time in milliseconds (from RR block LSR/DLSR).
+    rtt_ms: Option<f32>,
 }
 
 impl RtcpSession {
@@ -102,6 +104,7 @@ impl RtcpSession {
             prev_packets_received: 0,
             prev_cumulative_lost: 0,
             recv_buffer: vec![0u8; 512],
+            rtt_ms: None,
         }
     }
 
@@ -156,15 +159,24 @@ impl RtcpSession {
         let result = self.socket.recv_from(&mut self.recv_buffer);
         match result {
             Ok((len, _addr)) if len >= 8 => {
-                let data = &self.recv_buffer[..len];
-                // Minimal RTCP header check: V=2, PT=200 (SR)
-                let version = (data[0] >> 6) & 0x03;
-                let pt = data[1];
+                // Minimal RTCP header check: V=2
+                let version = (self.recv_buffer[0] >> 6) & 0x03;
+                let pt = self.recv_buffer[1];
+                let rc = self.recv_buffer[0] & 0x1F; // report count
                 if version == 2 && pt == 200 && len >= 28 {
                     // Sender Report: NTP timestamp at bytes 8-15
-                    let ntp_sec = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
-                    let ntp_frac =
-                        u32::from_be_bytes([data[12], data[13], data[14], data[15]]);
+                    let ntp_sec = u32::from_be_bytes([
+                        self.recv_buffer[8],
+                        self.recv_buffer[9],
+                        self.recv_buffer[10],
+                        self.recv_buffer[11],
+                    ]);
+                    let ntp_frac = u32::from_be_bytes([
+                        self.recv_buffer[12],
+                        self.recv_buffer[13],
+                        self.recv_buffer[14],
+                        self.recv_buffer[15],
+                    ]);
                     self.received_sender_report(ntp_sec, ntp_frac);
                     trace!(
                         "Received RTCP SR: ntp={}.{}, lsr={:#010x}",
@@ -172,12 +184,79 @@ impl RtcpSession {
                         ntp_frac,
                         self.last_received_sr_ntp
                     );
+
+                    // Parse RR blocks within the SR (start at byte 28, each 24 bytes)
+                    self.extract_rtt_from_rr_blocks(len, 28, rc);
+                } else if version == 2 && pt == 201 && len >= 8 {
+                    // Receiver Report: RR blocks start at byte 8 (after header + SSRC)
+                    self.extract_rtt_from_rr_blocks(len, 8, rc);
                 }
             }
             Ok(_) | Err(_) => {
                 // No packet or too short — ignore
             }
         }
+    }
+
+    /// Extracts RTT from Reception Report blocks.
+    ///
+    /// Each RR block is 24 bytes. We look for one whose LSR matches our
+    /// last sent SR (middle 32 bits of our NTP timestamp). RTT is then:
+    ///   RTT = now_ntp_middle32 - LSR - DLSR
+    #[allow(clippy::cast_precision_loss)]
+    fn extract_rtt_from_rr_blocks(&mut self, data_len: usize, start: usize, count: u8) {
+        for i in 0..count as usize {
+            let offset = start + i * 24;
+            if offset + 24 > data_len {
+                break;
+            }
+            // RR block layout (24 bytes):
+            //   0-3: SSRC of source
+            //   4:   fraction lost
+            //   5-7: cumulative lost (24 bits)
+            //   8-11: extended highest seq
+            //  12-15: interarrival jitter
+            //  16-19: LSR (last SR NTP middle 32 bits)
+            //  20-23: DLSR (delay since last SR, 1/65536 sec units)
+            let lsr = u32::from_be_bytes([
+                self.recv_buffer[offset + 16],
+                self.recv_buffer[offset + 17],
+                self.recv_buffer[offset + 18],
+                self.recv_buffer[offset + 19],
+            ]);
+            let dlsr = u32::from_be_bytes([
+                self.recv_buffer[offset + 20],
+                self.recv_buffer[offset + 21],
+                self.recv_buffer[offset + 22],
+                self.recv_buffer[offset + 23],
+            ]);
+
+            // Skip if remote hasn't received an SR from us yet
+            if lsr == 0 {
+                continue;
+            }
+
+            // Current NTP time as middle 32 bits
+            let (ntp_sec, ntp_frac) = get_ntp_timestamp();
+            let now_mid = ((ntp_sec & 0xFFFF) << 16) | ((ntp_frac >> 16) & 0xFFFF);
+
+            // RTT in 1/65536 second units
+            let rtt_fixed = now_mid.wrapping_sub(lsr).wrapping_sub(dlsr);
+
+            // Convert to milliseconds: rtt_fixed / 65536 * 1000
+            let rtt = (rtt_fixed as f32 / 65536.0) * 1000.0;
+
+            // Sanity check: RTT should be positive and < 10 seconds
+            if rtt > 0.0 && rtt < 10_000.0 {
+                debug!("RTCP RTT measured: {:.1}ms (LSR={:#010x}, DLSR={:#010x})", rtt, lsr, dlsr);
+                self.rtt_ms = Some(rtt);
+            }
+        }
+    }
+
+    /// Returns the latest measured RTT in milliseconds, or `None` if not yet available.
+    pub const fn rtt_ms(&self) -> Option<f32> {
+        self.rtt_ms
     }
 
     /// Sends a compound RTCP packet (SR + SDES or RR + SDES).

@@ -473,6 +473,10 @@ fn io_loop(
             if let Some(remote_ssrc) = receiver.remote_ssrc() {
                 rtcp.set_remote_ssrc(remote_ssrc);
             }
+            // Feed RTCP RTT measurement to jitter buffer for adaptive depth
+            if let Some(rtt) = rtcp.rtt_ms() {
+                receiver.set_rtt_hint_ms(rtt);
+            }
             let tx = transmitter.stats();
             let jb = receiver.jitter_buffer_stats();
             rtcp.maybe_send_report(&tx, &jb);

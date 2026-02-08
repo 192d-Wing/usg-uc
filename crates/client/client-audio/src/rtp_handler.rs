@@ -712,6 +712,11 @@ impl RtpReceiver {
         self.jitter_buffer.stats()
     }
 
+    /// Provides an RTCP RTT hint to the jitter buffer for adaptive depth.
+    pub fn set_rtt_hint_ms(&self, rtt_ms: f32) {
+        self.jitter_buffer.set_rtt_hint_ms(rtt_ms);
+    }
+
     /// Returns the remote SSRC learned from received RTP packets.
     pub const fn remote_ssrc(&self) -> Option<u32> {
         self.remote_ssrc
