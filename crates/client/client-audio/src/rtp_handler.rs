@@ -12,7 +12,7 @@ use client_types::DtmfEvent;
 use proto_rtp::{RtpHeader, RtpPacket};
 use proto_srtp::{SrtpContext, SrtpProtect, SrtpUnprotect};
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, trace};
 
@@ -51,6 +51,52 @@ pub struct RtpStats {
     pub srtp_errors: u64,
 }
 
+/// Lock-free atomic counters for RTP statistics.
+///
+/// Replaces `Mutex<RtpStats>` on the hot path — every `send()` and
+/// `receive()` now updates counters with a single `fetch_add(Relaxed)`
+/// instead of a lock/unlock pair (~100+ times per second).
+pub(crate) struct AtomicRtpStats {
+    /// Packets sent.
+    packets_sent: AtomicU64,
+    /// Packets received.
+    packets_received: AtomicU64,
+    /// Bytes sent (including headers).
+    bytes_sent: AtomicU64,
+    /// Bytes received (including headers).
+    bytes_received: AtomicU64,
+    /// Packets dropped due to errors.
+    packets_dropped: AtomicU64,
+    /// SRTP protection errors.
+    srtp_errors: AtomicU64,
+}
+
+impl AtomicRtpStats {
+    /// Creates zeroed atomic counters.
+    fn new() -> Self {
+        Self {
+            packets_sent: AtomicU64::new(0),
+            packets_received: AtomicU64::new(0),
+            bytes_sent: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
+            packets_dropped: AtomicU64::new(0),
+            srtp_errors: AtomicU64::new(0),
+        }
+    }
+
+    /// Takes a consistent snapshot as a plain `RtpStats`.
+    fn snapshot(&self) -> RtpStats {
+        RtpStats {
+            packets_sent: self.packets_sent.load(Ordering::Relaxed),
+            packets_received: self.packets_received.load(Ordering::Relaxed),
+            bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
+            bytes_received: self.bytes_received.load(Ordering::Relaxed),
+            packets_dropped: self.packets_dropped.load(Ordering::Relaxed),
+            srtp_errors: self.srtp_errors.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// RTP transmitter for sending audio packets.
 pub struct RtpTransmitter {
     /// UDP socket for sending.
@@ -69,8 +115,8 @@ pub struct RtpTransmitter {
     timestamp_increment: u32,
     /// SRTP context for encryption.
     srtp: Option<Arc<Mutex<SrtpContext>>>,
-    /// Statistics.
-    stats: Arc<Mutex<RtpStats>>,
+    /// Statistics (lock-free atomic counters).
+    stats: Arc<AtomicRtpStats>,
     /// DTMF payload type (telephone-event).
     dtmf_payload_type: u8,
     /// Current DTMF timestamp (separate from audio).
@@ -103,7 +149,7 @@ impl RtpTransmitter {
             payload_type,
             timestamp_increment,
             srtp: None,
-            stats: Arc::new(Mutex::new(RtpStats::default())),
+            stats: Arc::new(AtomicRtpStats::new()),
             dtmf_payload_type: DTMF_PAYLOAD_TYPE,
             dtmf_timestamp: AtomicU32::new(rand_u32()),
             dtmf_event_timestamp: AtomicU32::new(0),
@@ -123,60 +169,47 @@ impl RtpTransmitter {
     }
 
     /// Sends an RTP packet with the given audio payload.
-    #[allow(clippy::cast_sign_loss, clippy::significant_drop_tightening)]
+    #[allow(clippy::cast_sign_loss)]
     pub fn send(&mut self, payload: &[u8]) -> AudioResult<()> {
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
         let ts = self
             .timestamp
             .fetch_add(self.timestamp_increment, Ordering::Relaxed);
 
-        // Build RTP header
         let header = RtpHeader::new(self.payload_type, seq, ts, self.ssrc);
-
-        // Build packet
         let packet = RtpPacket::new(header, Bytes::copy_from_slice(payload));
-        let packet_bytes = packet.to_bytes();
 
-        // Apply SRTP if configured
-        let send_bytes = if let Some(ref srtp) = self.srtp {
+        // Protect with SRTP and send — Bytes derefs to &[u8] so no .to_vec() needed.
+        let protected: Bytes;
+        let send_data: &[u8] = if let Some(ref srtp) = self.srtp {
             let srtp_guard = srtp
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let protector = SrtpProtect::new(&srtp_guard);
             match protector.protect_rtp(&packet) {
-                Ok(protected) => protected.to_vec(),
+                Ok(p) => {
+                    protected = p;
+                    &protected
+                }
                 Err(e) => {
-                    drop(srtp_guard);
-                    let mut stats = self
-                        .stats
-                        .lock()
-                        .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
-                    stats.srtp_errors += 1;
+                    self.stats.srtp_errors.fetch_add(1, Ordering::Relaxed);
                     return Err(AudioError::SrtpError(format!("SRTP protect failed: {e}")));
                 }
             }
         } else {
-            packet_bytes.to_vec()
+            protected = packet.to_bytes();
+            &protected
         };
 
-        // Send packet
-        match self.socket.send_to(&send_bytes, self.remote_addr) {
+        match self.socket.send_to(send_data, self.remote_addr) {
             Ok(sent) => {
                 trace!("Sent RTP packet: seq={}, ts={}, size={}", seq, ts, sent);
-                let mut stats = self
-                    .stats
-                    .lock()
-                    .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
-                stats.packets_sent += 1;
-                stats.bytes_sent += sent as u64;
+                self.stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                self.stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
                 Ok(())
             }
             Err(e) => {
-                let mut stats = self
-                    .stats
-                    .lock()
-                    .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
-                stats.packets_dropped += 1;
+                self.stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                 Err(AudioError::RtpError(format!("Send failed: {e}")))
             }
         }
@@ -184,9 +217,7 @@ impl RtpTransmitter {
 
     /// Returns the current statistics.
     pub fn stats(&self) -> RtpStats {
-        self.stats
-            .lock()
-            .map_or_else(|_| RtpStats::default(), |s| s.clone())
+        self.stats.snapshot()
     }
 
     /// Returns the SSRC.
@@ -199,7 +230,7 @@ impl RtpTransmitter {
     /// CN packets share the same RTP sequence/timestamp space as audio packets
     /// (RFC 3389 §4). Only the payload type changes to PT=13.
     /// Call this once at the speech→silence transition.
-    #[allow(clippy::cast_sign_loss, clippy::significant_drop_tightening)]
+    #[allow(clippy::cast_sign_loss)]
     pub fn send_cn(&mut self, payload: &[u8]) -> AudioResult<()> {
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
         let ts = self
@@ -208,46 +239,37 @@ impl RtpTransmitter {
 
         let header = RtpHeader::new(proto_rtp::payload_types::CN, seq, ts, self.ssrc);
         let packet = RtpPacket::new(header, Bytes::copy_from_slice(payload));
-        let packet_bytes = packet.to_bytes();
 
-        let send_bytes = if let Some(ref srtp) = self.srtp {
+        let protected: Bytes;
+        let send_data: &[u8] = if let Some(ref srtp) = self.srtp {
             let srtp_guard = srtp
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let protector = SrtpProtect::new(&srtp_guard);
             match protector.protect_rtp(&packet) {
-                Ok(protected) => protected.to_vec(),
+                Ok(p) => {
+                    protected = p;
+                    &protected
+                }
                 Err(e) => {
-                    drop(srtp_guard);
-                    let mut stats = self
-                        .stats
-                        .lock()
-                        .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
-                    stats.srtp_errors += 1;
+                    self.stats.srtp_errors.fetch_add(1, Ordering::Relaxed);
                     return Err(AudioError::SrtpError(format!("SRTP protect failed: {e}")));
                 }
             }
         } else {
-            packet_bytes.to_vec()
+            protected = packet.to_bytes();
+            &protected
         };
 
-        match self.socket.send_to(&send_bytes, self.remote_addr) {
+        match self.socket.send_to(send_data, self.remote_addr) {
             Ok(sent) => {
                 debug!("Sent CN packet: seq={}, ts={}, size={}", seq, ts, sent);
-                let mut stats = self
-                    .stats
-                    .lock()
-                    .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
-                stats.packets_sent += 1;
-                stats.bytes_sent += sent as u64;
+                self.stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                self.stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
                 Ok(())
             }
             Err(e) => {
-                let mut stats = self
-                    .stats
-                    .lock()
-                    .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
-                stats.packets_dropped += 1;
+                self.stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                 Err(AudioError::RtpError(format!("CN send failed: {e}")))
             }
         }
@@ -263,7 +285,7 @@ impl RtpTransmitter {
     /// # Arguments
     /// * `event` - The DTMF event to send
     /// * `marker` - Set to true for the first packet of a new event
-    #[allow(clippy::cast_sign_loss, clippy::significant_drop_tightening)]
+    #[allow(clippy::cast_sign_loss)]
     pub fn send_dtmf(&mut self, event: &DtmfEvent, marker: bool) -> AudioResult<()> {
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
 
@@ -296,51 +318,40 @@ impl RtpTransmitter {
 
         // Build packet
         let packet = RtpPacket::new(header, Bytes::copy_from_slice(&payload));
-        let packet_bytes = packet.to_bytes();
 
-        // Apply SRTP if configured
-        let send_bytes = if let Some(ref srtp) = self.srtp {
+        let protected: Bytes;
+        let send_data: &[u8] = if let Some(ref srtp) = self.srtp {
             let srtp_guard = srtp
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let protector = SrtpProtect::new(&srtp_guard);
             match protector.protect_rtp(&packet) {
-                Ok(protected) => protected.to_vec(),
+                Ok(p) => {
+                    protected = p;
+                    &protected
+                }
                 Err(e) => {
-                    drop(srtp_guard);
-                    let mut stats = self
-                        .stats
-                        .lock()
-                        .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
-                    stats.srtp_errors += 1;
+                    self.stats.srtp_errors.fetch_add(1, Ordering::Relaxed);
                     return Err(AudioError::SrtpError(format!("SRTP protect failed: {e}")));
                 }
             }
         } else {
-            packet_bytes.to_vec()
+            protected = packet.to_bytes();
+            &protected
         };
 
-        // Send packet
-        match self.socket.send_to(&send_bytes, self.remote_addr) {
+        match self.socket.send_to(send_data, self.remote_addr) {
             Ok(sent) => {
                 trace!(
                     "Sent DTMF packet: digit={}, seq={}, ts={}, end={}, marker={}",
                     event.digit, seq, ts, event.end, marker
                 );
-                let mut stats = self
-                    .stats
-                    .lock()
-                    .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
-                stats.packets_sent += 1;
-                stats.bytes_sent += sent as u64;
+                self.stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                self.stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
                 Ok(())
             }
             Err(e) => {
-                let mut stats = self
-                    .stats
-                    .lock()
-                    .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
-                stats.packets_dropped += 1;
+                self.stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                 Err(AudioError::RtpError(format!("DTMF send failed: {e}")))
             }
         }
@@ -361,10 +372,13 @@ pub struct RtpReceiver {
     srtp: Option<Arc<Mutex<SrtpContext>>>,
     /// Shared jitter buffer (also read by decode thread).
     jitter_buffer: SharedJitterBuffer,
-    /// Statistics.
-    stats: Arc<Mutex<RtpStats>>,
+    /// Statistics (lock-free atomic counters).
+    stats: Arc<AtomicRtpStats>,
     /// Buffer for receiving packets.
     recv_buffer: Vec<u8>,
+    /// Pre-allocated buffer to avoid `.to_vec()` on receive
+    /// (needed to break the self-borrow between `recv_buffer` and `process_packet`).
+    process_buffer: Vec<u8>,
     /// Remote SSRC (learned from received RTP packets).
     remote_ssrc: Option<u32>,
 }
@@ -379,8 +393,9 @@ impl RtpReceiver {
             expected_remote: None,
             srtp: None,
             jitter_buffer,
-            stats: Arc::new(Mutex::new(RtpStats::default())),
+            stats: Arc::new(AtomicRtpStats::new()),
             recv_buffer: vec![0u8; MAX_RTP_PACKET_SIZE],
+            process_buffer: vec![0u8; MAX_RTP_PACKET_SIZE],
             remote_ssrc: None,
         }
     }
@@ -414,9 +429,10 @@ impl RtpReceiver {
                     return Ok(false);
                 }
 
-                // Process the packet (copy to avoid borrow conflict with self)
-                let data = self.recv_buffer[..len].to_vec();
-                self.process_packet(&data)?;
+                // Copy into process_buffer to break the self-borrow on recv_buffer.
+                // Uses a pre-allocated buffer instead of .to_vec() heap allocation.
+                self.process_buffer[..len].copy_from_slice(&self.recv_buffer[..len]);
+                self.process_packet(len)?;
                 Ok(true)
             }
             Err(e)
@@ -430,9 +446,11 @@ impl RtpReceiver {
         }
     }
 
-    /// Processes a received packet.
-    #[allow(clippy::needless_pass_by_ref_mut, clippy::significant_drop_tightening)]
-    fn process_packet(&mut self, data: &[u8]) -> AudioResult<()> {
+    /// Processes a received packet from `self.process_buffer[..len]`.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn process_packet(&mut self, len: usize) -> AudioResult<()> {
+        let data = &self.process_buffer[..len];
+
         // Decrypt if SRTP is configured
         let packet = if let Some(ref srtp) = self.srtp {
             let srtp_guard = srtp
@@ -442,17 +460,11 @@ impl RtpReceiver {
             match unprotector.unprotect_rtp(data) {
                 Ok(pkt) => pkt,
                 Err(e) => {
-                    drop(srtp_guard);
-                    let mut stats = self
-                        .stats
-                        .lock()
-                        .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
-                    stats.srtp_errors += 1;
+                    self.stats.srtp_errors.fetch_add(1, Ordering::Relaxed);
                     return Err(AudioError::SrtpError(format!("SRTP unprotect failed: {e}")));
                 }
             }
         } else {
-            // Parse RTP packet directly
             RtpPacket::parse(data)
                 .map_err(|e| AudioError::RtpError(format!("Parse failed: {e}")))?
         };
@@ -462,6 +474,12 @@ impl RtpReceiver {
             packet.header.sequence_number, packet.header.timestamp, packet.header.payload_type
         );
 
+        // Track remote SSRC (first packet sets it)
+        if self.remote_ssrc.is_none() {
+            self.remote_ssrc = Some(packet.header.ssrc);
+            debug!("Learned remote SSRC: {}", packet.header.ssrc);
+        }
+
         // Add to shared jitter buffer
         let buffered = BufferedPacket::new(
             packet.header.sequence_number,
@@ -469,24 +487,11 @@ impl RtpReceiver {
             packet.header.payload_type,
             packet.payload,
         );
-
-        // Track remote SSRC (first packet sets it)
-        if self.remote_ssrc.is_none() {
-            self.remote_ssrc = Some(packet.header.ssrc);
-            debug!("Learned remote SSRC: {}", packet.header.ssrc);
-        }
-
         self.jitter_buffer.push(buffered);
 
-        let mut stats = self
-            .stats
-            .lock()
-            .map_err(|_| AudioError::RtpError("Failed to lock stats".to_string()))?;
-        stats.packets_received += 1;
+        self.stats.packets_received.fetch_add(1, Ordering::Relaxed);
         #[allow(clippy::cast_possible_truncation)]
-        {
-            stats.bytes_received += data.len() as u64;
-        }
+        self.stats.bytes_received.fetch_add(len as u64, Ordering::Relaxed);
 
         Ok(())
     }
@@ -503,9 +508,7 @@ impl RtpReceiver {
 
     /// Returns the current statistics.
     pub fn stats(&self) -> RtpStats {
-        self.stats
-            .lock()
-            .map_or_else(|_| RtpStats::default(), |s| s.clone())
+        self.stats.snapshot()
     }
 
     /// Returns the jitter buffer statistics.

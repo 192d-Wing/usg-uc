@@ -253,6 +253,10 @@ fn io_loop(
     // Non-blocking DTMF sender state machine
     let mut dtmf_sender = DtmfSender::new(config.dtmf_volume, u64::from(config.dtmf_inter_digit_pause_ms));
 
+    // Pre-allocated scratch buffers — reused every frame to avoid heap allocs.
+    let mut capture_pcm = vec![0i16; capture_device_samples];
+    let mut moh_pcm = vec![0i16; codec_samples];
+
     let mut last_capture = Instant::now();
     let mut stats_update_counter: u32 = 0;
 
@@ -315,7 +319,7 @@ fn io_loop(
 
             if current_moh {
                 // Music on Hold mode
-                process_moh_frame(&mut codec, &mut transmitter, &mut moh_source);
+                process_moh_frame(&mut codec, &mut transmitter, &mut moh_source, &mut moh_pcm);
             } else if !muted.load(Ordering::Relaxed) && !dtmf_sender.is_inband_active() {
                 // Normal capture mode
                 let in_warmup = dtx_warmup_start.elapsed() < dtx_warmup_duration;
@@ -326,7 +330,7 @@ fn io_loop(
                     &mut audio_processor,
                     &mut vad,
                     &mut noise_shaper,
-                    capture_device_samples,
+                    &mut capture_pcm,
                     codec_samples,
                     &stats,
                     in_warmup,
@@ -411,6 +415,7 @@ fn io_loop(
                             capture_device_samples =
                                 (codec_samples as u32 * capture_rate / codec_clock_rate) as usize;
                         }
+                        capture_pcm.resize(capture_device_samples, 0);
                         info!(
                             "I/O thread: capture rate changed {}→{}Hz, \
                              frame size now {} samples (codec {}Hz)",
@@ -499,6 +504,8 @@ fn io_loop(
 /// Returns (`samples_read`, `max_amplitude`, `dtx_suppressed`, `noise_floor`).
 /// When DTX suppresses the frame, `noise_floor` carries the VAD's estimate
 /// so the caller can send an RFC 3389 CN packet at the speech→silence transition.
+///
+/// `device_pcm` is a pre-allocated buffer (caller manages its lifetime).
 #[allow(clippy::too_many_arguments)]
 fn process_capture_frame(
     codec: &mut CodecPipeline,
@@ -507,14 +514,16 @@ fn process_capture_frame(
     audio_processor: &mut AudioProcessor,
     vad: &mut VoiceActivityDetector,
     noise_shaper: &mut NoiseShaper,
-    device_samples: usize,
+    device_pcm: &mut [i16],
     codec_samples: usize,
     stats: &Arc<Mutex<PipelineStats>>,
     skip_dtx: bool,
 ) -> (usize, i16, bool, Option<f32>) {
+    let device_samples = device_pcm.len();
+    device_pcm.fill(0);
+
     // Read captured samples at device rate
-    let mut device_pcm = vec![0i16; device_samples];
-    let samples_read = capture.read(&mut device_pcm);
+    let samples_read = capture.read(device_pcm);
 
     if samples_read < device_samples {
         trace!(
@@ -524,14 +533,12 @@ fn process_capture_frame(
         if let Ok(mut s) = stats.lock() {
             s.capture_underruns += 1;
         }
-        device_pcm[samples_read..].fill(0);
     }
 
     // Apply audio processing (noise gate + AGC) at device rate
     audio_processor.process(&mut device_pcm[..samples_read]);
 
     // Track max amplitude for diagnostics AFTER processing
-    // Use saturating_abs() because i16::MIN.abs() overflows in debug mode
     let max_amp = device_pcm[..samples_read]
         .iter()
         .map(|s| s.saturating_abs())
@@ -546,57 +553,65 @@ fn process_capture_frame(
     }
 
     // Resample from device rate to codec rate (no cross-frame needed for downsampling)
-    let mut codec_pcm = if device_samples == codec_samples {
-        device_pcm
+    let mut resampled;
+    let codec_pcm: &mut [i16] = if device_samples == codec_samples {
+        &mut device_pcm[..codec_samples]
     } else {
-        resample(&device_pcm, codec_samples, 0)
+        // resample() returns Vec — this allocation remains because changing
+        // the resampler API is a deeper change. Only affects capture path
+        // (50 calls/sec), not the hotter decode/playback path.
+        resampled = resample(device_pcm, codec_samples, 0);
+        &mut resampled
     };
 
     // Noise shaping (G.711 only — reshapes quantization noise before encoding)
-    noise_shaper.process(&mut codec_pcm);
+    noise_shaper.process(codec_pcm);
 
-    // Encode
-    let encoded = match codec.encode(&codec_pcm) {
-        Ok(e) => e.to_vec(),
+    // Encode and send — codec.encode() returns &[u8] borrowing its internal
+    // buffer, passed directly to send() without .to_vec().
+    match codec.encode(codec_pcm) {
+        Ok(encoded) => {
+            if let Err(e) = transmitter.send(encoded) {
+                trace!("RTP send error: {e}");
+            }
+        }
         Err(e) => {
             warn!("Encode error: {e}");
             return (samples_read, max_amp, false, None);
         }
-    };
-
-    // Send
-    if let Err(e) = transmitter.send(&encoded) {
-        trace!("RTP send error: {e}");
     }
 
     (samples_read, max_amp, false, None)
 }
 
 /// Processes one frame of Music on Hold audio.
+///
+/// `pcm` is a pre-allocated buffer of `codec.samples_per_frame()` elements.
 fn process_moh_frame(
     codec: &mut CodecPipeline,
     transmitter: &mut RtpTransmitter,
     moh_source: &mut Option<FileAudioSource>,
+    pcm: &mut [i16],
 ) {
     let source = match moh_source.as_mut() {
         Some(s) if s.is_loaded() => s,
         _ => return,
     };
 
-    let samples_needed = codec.samples_per_frame();
-    let mut pcm = vec![0i16; samples_needed];
-    source.read(&mut pcm);
+    pcm.fill(0);
+    source.read(pcm);
 
-    let encoded = match codec.encode(&pcm) {
-        Ok(e) => e.to_vec(),
+    // codec.encode() returns &[u8] borrowing its internal buffer —
+    // pass directly to send() without .to_vec().
+    match codec.encode(pcm) {
+        Ok(encoded) => {
+            if let Err(e) = transmitter.send(encoded) {
+                trace!("MOH send error: {e}");
+            }
+        }
         Err(e) => {
             warn!("MOH encode error: {e}");
-            return;
         }
-    };
-
-    if let Err(e) = transmitter.send(&encoded) {
-        trace!("MOH send error: {e}");
     }
 }
 

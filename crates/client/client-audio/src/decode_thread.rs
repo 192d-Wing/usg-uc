@@ -270,6 +270,14 @@ fn decode_loop(
             }
         });
 
+    // Pre-allocated scratch buffers — reused every frame to avoid heap allocs.
+    // `scratch` is used for comfort noise, DTMF tones, fade-out, and silence.
+    // `codec_scratch` receives the decoded PCM from the codec (which returns
+    // a borrow of its internal buffer — we need a mutable copy for postfilter).
+    // +16 headroom for drift adjustment that can slightly increase device_samples.
+    let mut scratch = vec![0i16; device_samples + 16];
+    let mut codec_scratch = vec![0i16; codec_samples];
+
     // Diagnostic counters
     let mut diag_frames_decoded: u64 = 0;
     let mut diag_frames_lost: u64 = 0;
@@ -323,9 +331,10 @@ fn decode_loop(
                         if packet.payload_type == proto_rtp::payload_types::CN {
                             let noise_level = decode_cn_payload(&packet.payload);
                             cng.update_level(noise_level);
-                            let mut cn_pcm = vec![0i16; adjusted_device_samples];
-                            cng.generate(&mut cn_pcm);
-                            producer.push_slice(&cn_pcm);
+                            let cn_buf = &mut scratch[..adjusted_device_samples];
+                            cn_buf.fill(0);
+                            cng.generate(cn_buf);
+                            producer.push_slice(cn_buf);
                             continue;
                         }
 
@@ -348,12 +357,12 @@ fn decode_loop(
                                     // Generate one frame (20ms) tone at device rate.
                                     // Longer tones overfill the ring buffer and stall
                                     // the decode thread, causing jitter buffer desync.
-                                    let tone_samples = device_samples;
                                     let mut tone_gen =
                                         DtmfToneGenerator::new(event.digit, device_rate);
-                                    let mut tone = vec![0i16; tone_samples];
-                                    tone_gen.generate_samples(&mut tone);
-                                    producer.push_slice(&tone);
+                                    let tone_buf = &mut scratch[..device_samples];
+                                    tone_buf.fill(0);
+                                    tone_gen.generate_samples(tone_buf);
+                                    producer.push_slice(tone_buf);
                                 }
                             }
                             // Clear tracking on end packet
@@ -363,7 +372,7 @@ fn decode_loop(
                             continue;
                         }
 
-                        // Decode
+                        // Decode into codec's internal buffer, then copy to our scratch
                         let codec_pcm = match codec.decode(&packet.payload) {
                             Ok(pcm) => pcm,
                             Err(e) => {
@@ -372,22 +381,27 @@ fn decode_loop(
                             }
                         };
 
-                        let mut codec_vec = codec_pcm.to_vec();
+                        // Copy to pre-allocated buffer (codec returns a borrow
+                        // of its internal buffer; we need a mutable copy for
+                        // PLC cross-fade and postfilter).
+                        let decoded_len = codec_pcm.len();
+                        codec_scratch[..decoded_len].copy_from_slice(codec_pcm);
+                        let codec_buf = &mut codec_scratch[..decoded_len];
 
                         // If recovering from loss, cross-fade for smooth transition
                         if plc.consecutive_losses() > 0 {
-                            plc.recover(&mut codec_vec);
+                            plc.recover(codec_buf);
                         } else {
-                            plc.good_frame(&codec_vec);
+                            plc.good_frame(codec_buf);
                         }
 
                         // Postfilter: reduce G.711 quantization noise
                         // (operates at codec rate before resampling for maximum effect)
-                        postfilter.process(&mut codec_vec);
+                        postfilter.process(codec_buf);
 
                         // Resample from codec rate to device rate
-                        let device_pcm =
-                            resampler.process_adjusted(&codec_vec, adjusted_device_samples);
+                        let mut device_pcm =
+                            resampler.process_adjusted(codec_buf, adjusted_device_samples);
 
                         // Track peak amplitude before gain
                         let peak = device_pcm
@@ -416,45 +430,41 @@ fn decode_loop(
                         let target_gain = if gain_gate_open { PLAYBACK_GAIN } else { 1.0 };
                         current_gain += (target_gain - current_gain) * GAIN_RAMP_SPEED;
 
-                        // Apply gain
-                        let gained: Vec<i16> = device_pcm
-                            .iter()
-                            .map(|&s| {
-                                #[allow(clippy::cast_possible_truncation)]
-                                let g =
-                                    (f32::from(s) * current_gain).clamp(-32768.0, 32767.0) as i16;
-                                g
-                            })
-                            .collect();
+                        // Apply gain in-place (no .collect() allocation)
+                        for s in &mut device_pcm {
+                            #[allow(clippy::cast_possible_truncation)]
+                            {
+                                *s = (f32::from(*s) * current_gain).clamp(-32768.0, 32767.0) as i16;
+                            }
+                        }
 
                         // Track peak amplitude after gain
                         if let Some(&post_peak) =
-                            gained.iter().map(|s| s.saturating_abs()).max().as_ref()
+                            device_pcm.iter().map(|s| s.saturating_abs()).max().as_ref()
                             && post_peak > diag_peak_post_gain
                         {
                             diag_peak_post_gain = post_peak;
                         }
 
                         // Track last output for fade-out
-                        if let Some(&last) = gained.last() {
+                        if let Some(&last) = device_pcm.last() {
                             last_output_sample = last;
                         }
 
                         // Write to audio dump file if enabled
                         if let Some(ref mut dump) = audio_dump {
                             use std::io::Write;
-                            // Write i16 samples as little-endian bytes
-                            for &s in &gained {
+                            for &s in &device_pcm {
                                 let _ = dump.write_all(&s.to_le_bytes());
                             }
                         }
 
-                        let written = producer.push_slice(&gained);
-                        if written < gained.len() {
+                        let written = producer.push_slice(&device_pcm);
+                        if written < device_pcm.len() {
                             trace!(
                                 "Ring buffer full: wrote {}/{} samples",
                                 written,
-                                gained.len()
+                                device_pcm.len()
                             );
                         }
 
@@ -462,14 +472,17 @@ fn decode_loop(
                     }
                     JitterBufferResult::Lost { .. } => {
                         decoded_this_cycle += 1;
-                        // Try FEC recovery first (Opus inband FEC), fall back to PLC
+                        // Try FEC recovery first (Opus inband FEC), fall back to PLC.
+                        // PLC conceal() allocates internally (WSOLA time stretch) —
+                        // acceptable since loss events are rare (<1% of frames).
                         let concealed = if codec.supports_fec() {
                             match codec.decode_fec() {
                                 Ok(fec_pcm) => {
                                     trace!("FEC recovered {} samples", fec_pcm.len());
-                                    let v = fec_pcm.to_vec();
-                                    plc.good_frame(&v);
-                                    v
+                                    let fec_len = fec_pcm.len();
+                                    codec_scratch[..fec_len].copy_from_slice(fec_pcm);
+                                    plc.good_frame(&codec_scratch[..fec_len]);
+                                    codec_scratch[..fec_len].to_vec()
                                 }
                                 Err(_) => plc.conceal(),
                             }
@@ -510,12 +523,12 @@ fn decode_loop(
                         // fade/silence to prevent CPAL hard underrun.
                         consecutive_empty += 1;
 
+                        let fill_buf = &mut scratch[..device_samples];
                         if consecutive_empty == 1 {
                             // Cosine fade-out from last output to zero.
-                            let mut fade = vec![0i16; device_samples];
                             #[allow(clippy::cast_precision_loss)]
                             let len_f = device_samples as f32;
-                            for (i, sample) in fade.iter_mut().enumerate() {
+                            for (i, sample) in fill_buf.iter_mut().enumerate() {
                                 #[allow(clippy::cast_precision_loss)]
                                 let t = i as f32 / len_f;
                                 let gain = 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
@@ -525,18 +538,17 @@ fn decode_loop(
                                 }
                             }
                             last_output_sample = 0;
-                            producer.push_slice(&fade);
+                            producer.push_slice(fill_buf);
                         } else if consecutive_empty >= 10 {
                             // After sustained emptiness, inject comfort noise.
-                            // Default level when no CN packet was received from remote.
                             cng.update_level(20.0);
-                            let mut cn_pcm = vec![0i16; device_samples];
-                            cng.generate(&mut cn_pcm);
-                            producer.push_slice(&cn_pcm);
+                            fill_buf.fill(0);
+                            cng.generate(fill_buf);
+                            producer.push_slice(fill_buf);
                         } else {
                             // Push silence to prevent ring buffer underrun.
-                            let silence = vec![0i16; device_samples];
-                            producer.push_slice(&silence);
+                            fill_buf.fill(0);
+                            producer.push_slice(fill_buf);
                         }
 
                         break;
@@ -586,6 +598,7 @@ fn decode_loop(
                                         as usize;
                                 }
                                 target_fill = device_samples * TARGET_FILL_FRAMES;
+                                scratch.resize(device_samples + 16, 0);
                                 resampler = Resampler::new(codec_clock_rate, device_rate);
                                 drift = DriftCompensator::new(1);
                                 info!(
