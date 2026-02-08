@@ -6,6 +6,7 @@
 //! `std::thread` (not a tokio task), it avoids cooperative scheduling
 //! delays that cause playback gaps.
 
+use crate::aec::AecReference;
 use crate::codec::CodecPipeline;
 use crate::comfort_noise::{ComfortNoiseGenerator, decode_cn_payload};
 use crate::drift_compensator::DriftCompensator;
@@ -119,6 +120,9 @@ pub struct DecodeThreadConfig {
     pub device_rate: u32,
     /// DTMF telephone-event payload type (from SDP negotiation, default 101).
     pub dtmf_payload_type: u8,
+    /// AEC far-end reference buffer (shared with I/O thread).
+    /// When present, decoded codec-rate PCM is pushed here for echo cancellation.
+    pub aec_ref: Option<Arc<AecReference>>,
 }
 
 /// Spawns the decode thread.
@@ -406,6 +410,12 @@ fn decode_loop(
                         // (operates at codec rate before resampling for maximum effect)
                         postfilter.process(codec_buf);
 
+                        // Push codec-rate PCM to AEC reference buffer (before resample).
+                        // The I/O thread pulls this as the far-end reference signal.
+                        if let Some(ref aec_ref) = config.aec_ref {
+                            aec_ref.push(codec_buf);
+                        }
+
                         // Resample from codec rate to device rate (zero-alloc)
                         let device_pcm = &mut resample_buf[..adjusted_device_samples];
                         resampler.process_adjusted_into(codec_buf, device_pcm);
@@ -680,6 +690,7 @@ mod tests {
             codec: CodecPreference::G711Ulaw,
             device_rate: playback_handle.sample_rate(),
             dtmf_payload_type: 101,
+            aec_ref: None,
         };
 
         let mut handle = spawn(config, producer, playback_handle, jb, running, underruns);
@@ -697,6 +708,7 @@ mod tests {
             codec: CodecPreference::G711Ulaw,
             device_rate: 48000,
             dtmf_payload_type: 101,
+            aec_ref: None,
         };
         assert_eq!(config.device_rate, 48000);
         assert_eq!(config.dtmf_payload_type, 101);

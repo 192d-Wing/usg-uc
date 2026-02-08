@@ -66,6 +66,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![cfg_attr(test, allow(clippy::panic))]
 
+pub mod aec;
 pub mod audio_processing;
 pub mod codec;
 pub mod comfort_noise;
@@ -90,6 +91,7 @@ pub mod stream;
 pub(crate) mod thread_priority;
 pub mod vad;
 
+pub use aec::{AecProcessor, AecReference};
 pub use audio_processing::AudioProcessor;
 pub use codec::{CodecPipeline, negotiate_codec};
 pub use comfort_noise::ComfortNoiseGenerator;

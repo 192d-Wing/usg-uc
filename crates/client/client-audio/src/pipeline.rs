@@ -9,6 +9,7 @@
 //! The CPAL playback callback runs on a real-time OS thread and reads
 //! from the ring buffer lock-free. No tokio in the audio path.
 
+use crate::aec::AecReference;
 use crate::codec::CodecPipeline;
 use crate::decode_thread::{self, DecodeThreadConfig, DecodeThreadHandle};
 use crate::device::DeviceManager;
@@ -66,6 +67,8 @@ pub struct PipelineConfig {
     pub dtmf_inter_digit_pause_ms: u32,
     /// RFC 2198 redundancy payload type from SDP (`None` = disabled).
     pub redundancy_pt: Option<u8>,
+    /// Whether acoustic echo cancellation is enabled.
+    pub echo_cancellation: bool,
 }
 
 impl Default for PipelineConfig {
@@ -83,6 +86,7 @@ impl Default for PipelineConfig {
             dtmf_volume: 10,
             dtmf_inter_digit_pause_ms: 100,
             redundancy_pt: None,
+            echo_cancellation: true,
         }
     }
 }
@@ -322,11 +326,21 @@ impl AudioPipeline {
         self.moh_active.store(false, Ordering::Relaxed);
         self.running.store(true, Ordering::Relaxed);
 
+        // Create AEC reference buffer (shared between decode and I/O threads)
+        let aec_ref = if config.echo_cancellation {
+            let aec = AecReference::new(clock_rate, 300); // 300ms buffer
+            info!("AEC enabled: created reference buffer at {}Hz", clock_rate);
+            Some(aec)
+        } else {
+            None
+        };
+
         // Spawn decode thread
         let decode_config = DecodeThreadConfig {
             codec: config.codec,
             device_rate,
             dtmf_payload_type: config.dtmf_payload_type.unwrap_or(crate::rtp_handler::DTMF_PAYLOAD_TYPE),
+            aec_ref: aec_ref.clone(),
         };
         let decode_handle = decode_thread::spawn(
             decode_config,
@@ -365,6 +379,7 @@ impl AudioPipeline {
             local_ssrc: ssrc,
             dtmf_volume: config.dtmf_volume,
             dtmf_inter_digit_pause_ms: config.dtmf_inter_digit_pause_ms,
+            aec_ref,
         };
         // Give the I/O thread a sender to the decode thread so it can
         // trigger a playback stream refresh after input device switches

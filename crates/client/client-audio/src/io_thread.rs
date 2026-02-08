@@ -7,6 +7,7 @@
 //! it receives RTP packets from the socket and pushes them into the
 //! shared jitter buffer for the decode thread.
 
+use crate::aec::{AecProcessor, AecReference};
 use crate::audio_processing::AudioProcessor;
 use crate::codec::CodecPipeline;
 use crate::comfort_noise::encode_cn_payload;
@@ -115,6 +116,9 @@ pub struct IoThreadConfig {
     pub dtmf_volume: u8,
     /// Inter-digit pause in milliseconds (default 100).
     pub dtmf_inter_digit_pause_ms: u32,
+    /// AEC far-end reference buffer (shared with decode thread).
+    /// When present, an `AecProcessor` is created to cancel echo on captured audio.
+    pub aec_ref: Option<Arc<AecReference>>,
 }
 
 /// Spawns the I/O thread.
@@ -257,6 +261,12 @@ fn io_loop(
                 RtcpSession::new(socket, remote_addr, config.local_ssrc, codec_clock_rate, cname)
             });
 
+    // Acoustic echo cancellation (AEC) processor
+    let mut aec = config.aec_ref.map(|aec_ref| {
+        info!("AEC enabled: creating NLMS processor at {codec_clock_rate}Hz");
+        AecProcessor::new(codec_clock_rate, aec_ref)
+    });
+
     // Non-blocking DTMF sender state machine
     let mut dtmf_sender = DtmfSender::new(config.dtmf_volume, u64::from(config.dtmf_inter_digit_pause_ms));
 
@@ -352,6 +362,7 @@ fn io_loop(
                     &mut audio_processor,
                     &mut vad,
                     &mut noise_shaper,
+                    &mut aec,
                     &mut capture_pcm,
                     &mut codec_pcm_buf,
                     &stats,
@@ -541,6 +552,7 @@ fn process_capture_frame(
     audio_processor: &mut AudioProcessor,
     vad: &mut VoiceActivityDetector,
     noise_shaper: &mut NoiseShaper,
+    aec: &mut Option<AecProcessor>,
     device_pcm: &mut [i16],
     codec_pcm_buf: &mut [i16],
     stats: &Arc<Mutex<PipelineStats>>,
@@ -587,6 +599,12 @@ fn process_capture_frame(
         resample_into(device_pcm, codec_pcm_buf, 0);
         codec_pcm_buf
     };
+
+    // AEC: remove echo from captured audio at codec rate.
+    // The reference signal (decoded far-end) is pushed by the decode thread.
+    if let Some(aec_proc) = aec {
+        aec_proc.process(codec_pcm);
+    }
 
     // Noise shaping (G.711 only — reshapes quantization noise before encoding)
     noise_shaper.process(codec_pcm);

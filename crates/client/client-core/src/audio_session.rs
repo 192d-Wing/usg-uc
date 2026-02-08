@@ -161,6 +161,7 @@ impl AudioSession {
             dtmf_volume: config.dtmf_volume,
             dtmf_inter_digit_pause_ms: config.dtmf_inter_digit_pause_ms,
             redundancy_pt: config.redundancy_pt,
+            echo_cancellation: true,
         };
 
         // Start pipeline (sync — pipeline spawns its own threads)
