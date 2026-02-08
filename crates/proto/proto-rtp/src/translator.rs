@@ -189,7 +189,7 @@ impl RtpTranslator {
             .sources
             .get_mut(&ssrc)
             .ok_or_else(|| RtpError::InvalidRtcp {
-                reason: "source state not found".to_string(),
+                reason: "source state not found",
             })?;
 
         // Update sequence tracking

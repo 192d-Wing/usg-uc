@@ -6,6 +6,10 @@ use thiserror::Error;
 pub type RtpResult<T> = Result<T, RtpError>;
 
 /// RTP errors.
+///
+/// String fields use `&'static str` to avoid heap allocation on error paths.
+/// Dynamic values (padding size, RTCP version) get dedicated variants with
+/// structured fields instead of `format!()`.
 #[derive(Debug, Error)]
 pub enum RtpError {
     /// Packet too short.
@@ -24,25 +28,39 @@ pub enum RtpError {
         version: u8,
     },
 
-    /// Invalid padding.
+    /// Invalid padding (static reason).
     #[error("invalid padding: {reason}")]
     InvalidPadding {
         /// Error description.
-        reason: String,
+        reason: &'static str,
     },
 
-    /// Invalid extension.
+    /// Invalid padding size (structured).
+    #[error("invalid padding size: {padding_size}")]
+    InvalidPaddingSize {
+        /// The invalid padding size byte.
+        padding_size: usize,
+    },
+
+    /// Invalid extension header.
     #[error("invalid extension header: {reason}")]
     InvalidExtension {
         /// Error description.
-        reason: String,
+        reason: &'static str,
     },
 
-    /// Invalid RTCP packet.
+    /// Invalid RTCP packet (static reason).
     #[error("invalid RTCP packet: {reason}")]
     InvalidRtcp {
         /// Error description.
-        reason: String,
+        reason: &'static str,
+    },
+
+    /// Invalid RTCP version.
+    #[error("invalid RTCP version: {version}")]
+    InvalidRtcpVersion {
+        /// The invalid version.
+        version: u8,
     },
 
     /// Sequence number discontinuity.

@@ -99,7 +99,7 @@ impl RtcpHeader {
     pub fn parse(data: &[u8]) -> RtpResult<Self> {
         if data.len() < 4 {
             return Err(RtpError::InvalidRtcp {
-                reason: "header too short".to_string(),
+                reason: "header too short",
             });
         }
 
@@ -107,9 +107,7 @@ impl RtcpHeader {
         let version = (first_byte >> 6) & 0x03;
 
         if version != RTP_VERSION {
-            return Err(RtpError::InvalidRtcp {
-                reason: format!("invalid RTCP version: {version}"),
-            });
+            return Err(RtpError::InvalidRtcpVersion { version });
         }
 
         let padding = (first_byte & 0x20) != 0;
@@ -181,7 +179,7 @@ impl RtcpPacket {
 
         if data.len() < 4 + payload_len {
             return Err(RtpError::InvalidRtcp {
-                reason: "packet too short for declared length".to_string(),
+                reason: "packet too short for declared length",
             });
         }
 
@@ -212,7 +210,7 @@ impl RtcpPacket {
 
             if offset + packet_len > data.len() {
                 return Err(RtpError::InvalidRtcp {
-                    reason: "compound packet too short".to_string(),
+                    reason: "compound packet too short",
                 });
             }
 
@@ -281,7 +279,7 @@ impl SenderInfo {
     pub fn parse(data: &[u8]) -> RtpResult<Self> {
         if data.len() < 24 {
             return Err(RtpError::InvalidRtcp {
-                reason: "sender info too short".to_string(),
+                reason: "sender info too short",
             });
         }
 
@@ -341,7 +339,7 @@ impl ReceptionReport {
     pub fn parse(data: &[u8]) -> RtpResult<Self> {
         if data.len() < 24 {
             return Err(RtpError::InvalidRtcp {
-                reason: "reception report too short".to_string(),
+                reason: "reception report too short",
             });
         }
 

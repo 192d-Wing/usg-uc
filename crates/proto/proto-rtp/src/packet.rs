@@ -50,7 +50,7 @@ fn parse_extension_header(
 
     if data.len() < header_size + 4 {
         return Err(RtpError::InvalidExtension {
-            reason: "extension header too short".to_string(),
+            reason: "extension header too short",
         });
     }
 
@@ -60,7 +60,7 @@ fn parse_extension_header(
 
     if data.len() < header_size + 4 + length {
         return Err(RtpError::InvalidExtension {
-            reason: "extension data too short".to_string(),
+            reason: "extension data too short",
         });
     }
 
@@ -331,15 +331,13 @@ impl RtpPacket {
         if header.padding {
             if data.is_empty() {
                 return Err(RtpError::InvalidPadding {
-                    reason: "padding flag set but no padding length".to_string(),
+                    reason: "padding flag set but no padding length",
                 });
             }
 
             padding_size = data[data.len() - 1] as usize;
             if padding_size == 0 || padding_size > data.len() - header_size {
-                return Err(RtpError::InvalidPadding {
-                    reason: format!("invalid padding size: {padding_size}"),
-                });
+                return Err(RtpError::InvalidPaddingSize { padding_size });
             }
 
             payload_end -= padding_size;
