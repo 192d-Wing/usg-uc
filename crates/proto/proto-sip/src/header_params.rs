@@ -223,21 +223,27 @@ impl FromStr for ViaHeader {
         let mut params = HashMap::new();
 
         for param in rest_parts.iter().skip(1) {
-            let (name, value) = if let Some((n, v)) = param.split_once('=') {
-                (n.trim().to_lowercase(), Some(v.trim().to_string()))
+            // Split name=value without allocating; only allocate for the
+            // matched field or for unknown params that go into the HashMap.
+            let (raw_name, raw_value) = if let Some((n, v)) = param.split_once('=') {
+                (n.trim(), Some(v.trim()))
             } else {
-                (param.trim().to_lowercase(), None)
+                (param.trim(), None::<&str>)
             };
 
-            match name.as_str() {
-                "branch" => branch = value,
-                "received" => received = value,
-                "rport" => rport = value.and_then(|v| v.parse().ok()),
-                "ttl" => ttl = value.and_then(|v| v.parse().ok()),
-                "maddr" => maddr = value,
-                _ => {
-                    params.insert(name, value);
-                }
+            if raw_name.eq_ignore_ascii_case("branch") {
+                branch = raw_value.map(String::from);
+            } else if raw_name.eq_ignore_ascii_case("received") {
+                received = raw_value.map(String::from);
+            } else if raw_name.eq_ignore_ascii_case("rport") {
+                rport = raw_value.and_then(|v| v.parse().ok());
+            } else if raw_name.eq_ignore_ascii_case("ttl") {
+                ttl = raw_value.and_then(|v| v.parse().ok());
+            } else if raw_name.eq_ignore_ascii_case("maddr") {
+                maddr = raw_value.map(String::from);
+            } else {
+                // Only allocate for unknown params
+                params.insert(raw_name.to_lowercase(), raw_value.map(String::from));
             }
         }
 
