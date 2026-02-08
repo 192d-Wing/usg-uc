@@ -112,6 +112,39 @@ impl SincResampler {
         result
     }
 
+    /// Resamples into a caller-provided buffer, avoiding heap allocation.
+    ///
+    /// Writes exactly `output.len()` samples. The nominal count is
+    /// `input.len() * ratio`; drift adjustment truncates or extends as needed.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn process_into(&mut self, input: &[i16], output: &mut [i16]) {
+        let output_len = output.len();
+        let mut pos = 0;
+
+        for &sample in input {
+            self.history.copy_within(0..TAPS_PER_PHASE - 1, 1);
+            self.history[0] = f32::from(sample);
+
+            for phase in &self.phases {
+                if pos >= output_len {
+                    return;
+                }
+                let mut sum = 0.0f32;
+                for (k, &coeff) in phase.iter().enumerate() {
+                    sum = self.history[k].mul_add(coeff, sum);
+                }
+                output[pos] = sum.round().clamp(-32768.0, 32767.0) as i16;
+                pos += 1;
+            }
+        }
+
+        // If output is longer than nominal, extend with last sample
+        if pos < output_len {
+            let last = if pos > 0 { output[pos - 1] } else { 0 };
+            output[pos..].fill(last);
+        }
+    }
+
     /// Returns the upsampling ratio.
     pub const fn ratio(&self) -> usize {
         self.ratio
@@ -185,6 +218,13 @@ impl FractionalSincResampler {
         self.process_inner(input, output_len)
     }
 
+    /// Resamples into a caller-provided buffer, avoiding heap allocation.
+    ///
+    /// Writes exactly `output.len()` samples using windowed-sinc interpolation.
+    pub fn process_into(&mut self, input: &[i16], output: &mut [i16]) {
+        self.process_inner_into(input, output);
+    }
+
     /// Core resampling: sample-by-sample windowed-sinc interpolation.
     ///
     /// For each input sample, shifts the history buffer and produces output
@@ -256,6 +296,64 @@ impl FractionalSincResampler {
         output
     }
 
+    /// Core resampling into a caller-provided buffer.
+    ///
+    /// Same algorithm as `process_inner` but writes directly into `output`
+    /// instead of allocating a `Vec`.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn process_inner_into(&mut self, input: &[i16], output: &mut [i16]) {
+        let half = FRAC_HALF_TAPS as f64;
+        let output_len = output.len();
+        let mut out_pos = 0;
+
+        for &sample in input {
+            self.history.copy_within(0..FRAC_HIST_SIZE - 1, 1);
+            self.history[0] = f32::from(sample);
+
+            while self.phase < 1.0 && out_pos < output_len {
+                let center_pos = half - self.phase;
+
+                let mut sum = 0.0f64;
+                let mut coeff_sum = 0.0f64;
+
+                for k in 0..FRAC_HIST_SIZE {
+                    let x = k as f64 - center_pos;
+                    if x.abs() > half {
+                        continue;
+                    }
+
+                    let sinc_val = if x.abs() < 1e-10 {
+                        1.0
+                    } else {
+                        (PI * x).sin() / (PI * x)
+                    };
+
+                    let arg = (x / half).mul_add(-(x / half), 1.0).max(0.0).sqrt();
+                    let win = bessel_i0(KAISER_BETA * arg) * self.inv_bessel;
+
+                    let coeff = sinc_val * win;
+                    sum += f64::from(self.history[k]) * coeff;
+                    coeff_sum += coeff;
+                }
+
+                if coeff_sum.abs() > 1e-10 {
+                    sum /= coeff_sum;
+                }
+
+                output[out_pos] = sum.round().clamp(-32768.0, 32767.0) as i16;
+                out_pos += 1;
+                self.phase += self.step;
+            }
+            self.phase -= 1.0;
+        }
+
+        // Extend if output is longer than produced
+        if out_pos < output_len {
+            let last = if out_pos > 0 { output[out_pos - 1] } else { 0 };
+            output[out_pos..].fill(last);
+        }
+    }
+
     /// Returns the resampling ratio (`output_rate` / `input_rate`).
     pub const fn ratio(&self) -> f64 {
         self.ratio
@@ -321,6 +419,26 @@ impl Resampler {
                     }
                 }
                 result
+            }
+        }
+    }
+
+    /// Resamples into a caller-provided buffer, avoiding heap allocation.
+    ///
+    /// Writes exactly `output.len()` samples. For passthrough, copies input
+    /// with truncation or extension as needed.
+    pub fn process_adjusted_into(&mut self, input: &[i16], output: &mut [i16]) {
+        match self {
+            Self::Integer(r) => r.process_into(input, output),
+            Self::Fractional(r) => r.process_into(input, output),
+            Self::Passthrough => {
+                let out_len = output.len();
+                let copy_len = input.len().min(out_len);
+                output[..copy_len].copy_from_slice(&input[..copy_len]);
+                if copy_len < out_len {
+                    let last = if copy_len > 0 { input[copy_len - 1] } else { 0 };
+                    output[copy_len..].fill(last);
+                }
             }
         }
     }
@@ -765,5 +883,78 @@ mod tests {
         let input = vec![5000i16; 160];
         let output = r.process_adjusted(&input, 162);
         assert_eq!(output.len(), 162);
+    }
+
+    // ─── process_into / process_adjusted_into tests ───────────────
+
+    #[test]
+    fn test_integer_process_into_matches_process() {
+        let input: Vec<i16> = (0..160).map(|i| (i * 100) as i16).collect();
+
+        let mut r1 = SincResampler::new(6);
+        let expected = r1.process(&input);
+
+        let mut r2 = SincResampler::new(6);
+        let mut output = vec![0i16; 960];
+        r2.process_into(&input, &mut output);
+
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn test_integer_process_into_shorter() {
+        let mut r = SincResampler::new(6);
+        let input = vec![1000i16; 160];
+        let mut output = vec![0i16; 959];
+        r.process_into(&input, &mut output);
+        assert_eq!(output.len(), 959);
+    }
+
+    #[test]
+    fn test_integer_process_into_longer() {
+        let mut r = SincResampler::new(6);
+        let input = vec![1000i16; 160];
+        let mut output = vec![0i16; 961];
+        r.process_into(&input, &mut output);
+        assert_eq!(output.len(), 961);
+    }
+
+    #[test]
+    fn test_fractional_process_into_matches_process_adjusted() {
+        let input: Vec<i16> = (0..160).map(|i| (i * 50) as i16).collect();
+
+        let mut r1 = FractionalSincResampler::new(8000, 44100);
+        let expected = r1.process_adjusted(&input, 882);
+
+        let mut r2 = FractionalSincResampler::new(8000, 44100);
+        let mut output = vec![0i16; 882];
+        r2.process_into(&input, &mut output);
+
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn test_resampler_adjusted_into_integer() {
+        let input: Vec<i16> = (0..160).map(|i| (i * 100) as i16).collect();
+
+        let mut r1 = Resampler::new(8000, 48000);
+        let expected = r1.process_adjusted(&input, 960);
+
+        let mut r2 = Resampler::new(8000, 48000);
+        let mut output = vec![0i16; 960];
+        r2.process_adjusted_into(&input, &mut output);
+
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn test_resampler_adjusted_into_passthrough() {
+        let mut r = Resampler::new(8000, 8000);
+        let input = vec![5000i16; 160];
+        let mut output = vec![0i16; 162];
+        r.process_adjusted_into(&input, &mut output);
+        assert_eq!(output[..160], input[..]);
+        assert_eq!(output[160], 5000);
+        assert_eq!(output[161], 5000);
     }
 }
