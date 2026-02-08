@@ -233,6 +233,11 @@ pub struct CallQualityMetrics {
     /// - 3.0-3.5: Fair
     /// - <3.0: Poor
     pub mos_score: f32,
+    /// Round-trip time in milliseconds (from RTCP SR/RR exchange).
+    /// `None` if not yet measured.
+    pub rtt_ms: Option<f32>,
+    /// Active codec name (e.g., "G.711 \u{03BC}-law", "G.722", "Opus").
+    pub codec: String,
 }
 
 impl CallQualityMetrics {
@@ -248,6 +253,8 @@ impl CallQualityMetrics {
         capture_underruns: u64,
         playback_underruns: u64,
         srtp_errors: u64,
+        rtt_ms: Option<f32>,
+        codec: String,
     ) -> Self {
         let mos_score = Self::estimate_mos(packet_loss_rate, jitter_ms);
         Self {
@@ -261,6 +268,8 @@ impl CallQualityMetrics {
             playback_underruns,
             srtp_errors,
             mos_score,
+            rtt_ms,
+            codec,
         }
     }
 

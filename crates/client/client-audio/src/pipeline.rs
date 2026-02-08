@@ -100,6 +100,10 @@ pub struct PipelineStats {
     pub capture_underruns: u64,
     /// Playback underruns (buffer empty).
     pub playback_underruns: u64,
+    /// Round-trip time in milliseconds (from RTCP).
+    pub rtt_ms: Option<f32>,
+    /// Active codec name.
+    pub codec_name: String,
 }
 
 /// Audio pipeline coordinating the full audio path.

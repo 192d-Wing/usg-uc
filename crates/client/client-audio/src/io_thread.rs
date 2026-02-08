@@ -210,7 +210,13 @@ fn io_loop(
     };
 
     let codec_clock_rate = codec.clock_rate();
+    let codec_name = codec.name().to_string();
     let codec_samples = codec.samples_per_frame();
+
+    // Store codec name in shared stats (constant for the call duration)
+    if let Ok(mut s) = stats.lock() {
+        s.codec_name = codec_name.clone();
+    }
     let mut capture_rate = config.capture_rate;
     // Number of samples per frame at the capture device rate
     #[allow(clippy::cast_possible_truncation)]
@@ -486,7 +492,7 @@ fn io_loop(
         stats_update_counter += 1;
         if stats_update_counter >= 100 {
             stats_update_counter = 0;
-            update_stats(&transmitter, &receiver, &stats);
+            update_stats(&transmitter, &receiver, &rtcp_session, &stats);
         }
 
         // 6. Diagnostic logging every ~2 seconds
@@ -515,7 +521,7 @@ fn io_loop(
     }
 
     // Final stats update on exit
-    update_stats(&transmitter, &receiver, &stats);
+    update_stats(&transmitter, &receiver, &rtcp_session, &stats);
     capture.stop();
     debug!("I/O thread cleanup complete");
 }
@@ -637,12 +643,14 @@ fn process_moh_frame(
 fn update_stats(
     transmitter: &RtpTransmitter,
     receiver: &RtpReceiver,
+    rtcp_session: &Option<RtcpSession>,
     stats: &Arc<Mutex<PipelineStats>>,
 ) {
     if let Ok(mut s) = stats.lock() {
         s.tx_stats = transmitter.stats();
         s.rx_stats = receiver.stats();
         s.jitter_stats = receiver.jitter_buffer_stats();
+        s.rtt_ms = rtcp_session.as_ref().and_then(RtcpSession::rtt_ms);
     }
 }
 
