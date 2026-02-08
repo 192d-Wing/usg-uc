@@ -129,6 +129,58 @@ impl AudioProcessingConfig {
             ..Self::default()
         }
     }
+
+    /// Preset for USB headsets (close-talking mic, short echo path).
+    pub fn usb_headset() -> Self {
+        Self {
+            agc: AgcConfig {
+                max_gain: 3.0,
+                ..AgcConfig::default()
+            },
+            noise_gate: NoiseGateConfig {
+                threshold: 100.0,
+                ..NoiseGateConfig::default()
+            },
+            aec: AecConfig {
+                filter_length_ms: 64,
+                ..AecConfig::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    /// Preset for conference speakerphones (long echo path, room noise).
+    pub fn speakerphone() -> Self {
+        Self {
+            noise_gate: NoiseGateConfig {
+                threshold: 250.0,
+                ..NoiseGateConfig::default()
+            },
+            vad: VadConfig {
+                speech_threshold_ratio: 3.5,
+                hangover_frames: 35,
+                ..VadConfig::default()
+            },
+            aec: AecConfig {
+                filter_length_ms: 256,
+                ..AecConfig::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    /// Returns the appropriate preset for a detected device category.
+    pub fn for_device_category(category: client_types::audio::DeviceCategory) -> Self {
+        use client_types::audio::DeviceCategory;
+        match category {
+            DeviceCategory::Bluetooth => Self::bluetooth(),
+            DeviceCategory::UsbHeadset => Self::usb_headset(),
+            DeviceCategory::Speakerphone => Self::speakerphone(),
+            DeviceCategory::BuiltInSpeaker
+            | DeviceCategory::BuiltInMic
+            | DeviceCategory::Unknown => Self::default(),
+        }
+    }
 }
 
 /// Configuration for the audio pipeline.

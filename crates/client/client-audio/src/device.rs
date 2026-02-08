@@ -4,7 +4,7 @@
 //! using the CPAL library.
 
 use crate::{AudioError, AudioResult};
-use client_types::audio::{AudioDevice, AudioDeviceType};
+use client_types::audio::{AudioDevice, AudioDeviceType, DeviceCategory};
 use cpal::traits::{DeviceTrait, HostTrait};
 use tracing::{debug, info, warn};
 
@@ -38,6 +38,39 @@ const VOIP_PREFERRED_RATES: &[u32] = &[48000, 16000, 8000, 32000, 24000];
 
 /// Number of audio channels (mono for `VoIP`).
 pub const CHANNELS: u16 = 1;
+
+/// Detects the device category from its name for automatic profile selection.
+pub fn detect_category(name: &str, device_type: AudioDeviceType) -> DeviceCategory {
+    let lower = name.to_lowercase();
+
+    if lower.contains("bluetooth") {
+        return DeviceCategory::Bluetooth;
+    }
+
+    // Check speakerphone before USB brand names since some speakers
+    // use brand names like "Jabra Speakerphone".
+    if lower.contains("speakerphone") || lower.contains("conference") {
+        return DeviceCategory::Speakerphone;
+    }
+
+    if lower.contains("jabra")
+        || lower.contains("plantronics")
+        || lower.contains("poly ")
+        || lower.contains("usb audio")
+        || lower.contains("usb headset")
+    {
+        return DeviceCategory::UsbHeadset;
+    }
+
+    if lower.contains("macbook") || lower.contains("built-in") {
+        return match device_type {
+            AudioDeviceType::Input => DeviceCategory::BuiltInMic,
+            AudioDeviceType::Output => DeviceCategory::BuiltInSpeaker,
+        };
+    }
+
+    DeviceCategory::Unknown
+}
 
 /// Audio device manager for enumerating and selecting audio devices.
 #[derive(Debug)]
@@ -75,11 +108,13 @@ impl DeviceManager {
 
                 let (channels, sample_rates) = get_device_info(&device);
 
+                let category = detect_category(&name, AudioDeviceType::Input);
                 result.push(AudioDevice {
                     name: name.clone(),
                     display_name: name,
                     is_default,
                     device_type: AudioDeviceType::Input,
+                    category,
                     channels,
                     sample_rates,
                 });
@@ -108,11 +143,13 @@ impl DeviceManager {
 
                 let (channels, sample_rates) = get_device_info(&device);
 
+                let category = detect_category(&name, AudioDeviceType::Output);
                 result.push(AudioDevice {
                     name: name.clone(),
                     display_name: name,
                     is_default,
                     device_type: AudioDeviceType::Output,
+                    category,
                     channels,
                     sample_rates,
                 });
@@ -410,5 +447,69 @@ mod tests {
     fn test_default_device_manager() {
         let manager = DeviceManager::default();
         assert!(manager.input_device_name().is_none());
+    }
+
+    #[test]
+    fn test_detect_category_bluetooth() {
+        assert_eq!(
+            detect_category("Bluetooth Audio Device", AudioDeviceType::Input),
+            DeviceCategory::Bluetooth
+        );
+        assert_eq!(
+            detect_category("AirPods Pro (Bluetooth)", AudioDeviceType::Output),
+            DeviceCategory::Bluetooth
+        );
+    }
+
+    #[test]
+    fn test_detect_category_usb_headset() {
+        assert_eq!(
+            detect_category("Jabra Evolve2 75", AudioDeviceType::Input),
+            DeviceCategory::UsbHeadset
+        );
+        assert_eq!(
+            detect_category("Plantronics Voyager", AudioDeviceType::Input),
+            DeviceCategory::UsbHeadset
+        );
+        assert_eq!(
+            detect_category("Poly Sync 20", AudioDeviceType::Output),
+            DeviceCategory::UsbHeadset
+        );
+    }
+
+    #[test]
+    fn test_detect_category_built_in() {
+        assert_eq!(
+            detect_category("MacBook Pro Microphone", AudioDeviceType::Input),
+            DeviceCategory::BuiltInMic
+        );
+        assert_eq!(
+            detect_category("MacBook Pro Speakers", AudioDeviceType::Output),
+            DeviceCategory::BuiltInSpeaker
+        );
+        assert_eq!(
+            detect_category("Built-in Output", AudioDeviceType::Output),
+            DeviceCategory::BuiltInSpeaker
+        );
+    }
+
+    #[test]
+    fn test_detect_category_speakerphone() {
+        assert_eq!(
+            detect_category("Jabra Speakerphone 710", AudioDeviceType::Input),
+            DeviceCategory::Speakerphone
+        );
+        assert_eq!(
+            detect_category("Conference Room Mic", AudioDeviceType::Input),
+            DeviceCategory::Speakerphone
+        );
+    }
+
+    #[test]
+    fn test_detect_category_unknown() {
+        assert_eq!(
+            detect_category("Some Random Device", AudioDeviceType::Input),
+            DeviceCategory::Unknown
+        );
     }
 }

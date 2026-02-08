@@ -149,10 +149,33 @@ pub struct AudioDevice {
     pub is_default: bool,
     /// Device type.
     pub device_type: AudioDeviceType,
+    /// Detected device category for audio processing profile selection.
+    pub category: DeviceCategory,
     /// Number of channels supported.
     pub channels: u16,
     /// Sample rates supported.
     pub sample_rates: Vec<u32>,
+}
+
+/// Device category for automatic audio processing profile selection.
+///
+/// Detected from the device name to apply optimized VAD, AEC, AGC,
+/// and noise gate settings for each device class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeviceCategory {
+    /// Built-in speakers (MacBook, iMac).
+    BuiltInSpeaker,
+    /// Built-in microphone.
+    BuiltInMic,
+    /// USB headset (Jabra, Plantronics, Poly, generic USB audio).
+    UsbHeadset,
+    /// Bluetooth HFP/A2DP device.
+    Bluetooth,
+    /// Conference speakerphone.
+    Speakerphone,
+    /// Unknown or unrecognized device.
+    #[default]
+    Unknown,
 }
 
 /// Audio device type.
