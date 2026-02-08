@@ -163,8 +163,6 @@ pub struct JitterBuffer {
     adapt_counter: u32,
     /// Counter for consecutive lost packets (for skip-ahead detection).
     consecutive_lost: u32,
-    /// Reusable scratch buffer for percentile_95 sort (avoids allocation every 50 packets).
-    sort_scratch: Vec<f32>,
     /// RTT hint from RTCP (milliseconds). Used as a minimum floor for target depth.
     rtt_hint_ms: Option<f32>,
     /// Configuration parameters.
@@ -221,7 +219,6 @@ impl JitterBuffer {
             jitter_history: VecDeque::with_capacity(JITTER_HISTORY_SIZE),
             adapt_counter: 0,
             consecutive_lost: 0,
-            sort_scratch: Vec::with_capacity(JITTER_HISTORY_SIZE),
             rtt_hint_ms: None,
             cfg,
         }
@@ -464,7 +461,7 @@ impl JitterBuffer {
             return;
         }
 
-        let p95 = percentile_95(&self.jitter_history, &mut self.sort_scratch);
+        let p95 = percentile_95(&self.jitter_history);
         let ideal_target = p95 + self.cfg.jitter_margin_ms;
 
         // Apply RTT-based floor: one-way delay ≈ RTT/2
@@ -688,15 +685,19 @@ const fn timestamp_diff(a: u32, b: u32) -> i32 {
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
-fn percentile_95(history: &VecDeque<f32>, scratch: &mut Vec<f32>) -> f32 {
+fn percentile_95(history: &VecDeque<f32>) -> f32 {
     if history.is_empty() {
         return 0.0;
     }
-    scratch.clear();
-    scratch.extend(history.iter().copied());
-    scratch.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let idx = ((scratch.len() as f32 * 0.95) as usize).min(scratch.len() - 1);
-    scratch[idx]
+    let mut scratch = [0.0f32; JITTER_HISTORY_SIZE];
+    let len = history.len().min(JITTER_HISTORY_SIZE);
+    for (i, &v) in history.iter().take(len).enumerate() {
+        scratch[i] = v;
+    }
+    let s = &mut scratch[..len];
+    s.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((len as f32 * 0.95) as usize).min(len - 1);
+    s[idx]
 }
 
 #[cfg(test)]
@@ -852,12 +853,11 @@ mod tests {
     #[test]
     fn test_percentile_95() {
         let mut history = VecDeque::new();
-        let mut scratch = Vec::new();
         // 100 values: 0.0, 1.0, 2.0, ..., 99.0
         for i in 0..100 {
             history.push_back(i as f32);
         }
-        let p95 = percentile_95(&history, &mut scratch);
+        let p95 = percentile_95(&history);
         // 95th percentile of 0..99 should be ~95
         assert!(p95 >= 94.0 && p95 <= 96.0, "Expected ~95, got {p95}");
     }
@@ -865,8 +865,7 @@ mod tests {
     #[test]
     fn test_percentile_95_empty() {
         let history = VecDeque::new();
-        let mut scratch = Vec::new();
-        assert!((percentile_95(&history, &mut scratch) - 0.0).abs() < f32::EPSILON);
+        assert!((percentile_95(&history) - 0.0).abs() < f32::EPSILON);
     }
 
     #[test]

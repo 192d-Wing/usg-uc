@@ -174,7 +174,7 @@ impl RtpTranslator {
     ///
     /// # Errors
     /// Returns an error if the operation fails.
-    pub fn forward_packet(&mut self, packet: &RtpPacket) -> RtpResult<RtpPacket> {
+    pub fn forward_packet(&mut self, mut packet: RtpPacket) -> RtpResult<RtpPacket> {
         let ssrc = packet.header.ssrc;
 
         // Get or create source state
@@ -208,18 +208,15 @@ impl RtpTranslator {
         state.last_timestamp = packet.header.timestamp;
         state.active = true;
 
-        // Create forwarded packet
-        let mut forwarded_header = packet.header.clone();
-
-        // Apply SSRC translation if enabled
+        // Apply SSRC translation in-place (no clone needed)
         if self.translate_ssrc
             && let Some(ref mapping) = self.ssrc_mapping
             && let Some(&new_ssrc) = mapping.get(&ssrc)
         {
-            forwarded_header.ssrc = new_ssrc;
+            packet.header.ssrc = new_ssrc;
         }
 
-        Ok(RtpPacket::new(forwarded_header, packet.payload.clone()))
+        Ok(packet)
     }
 
     /// Returns the state for a specific source.
@@ -741,7 +738,7 @@ mod tests {
         let header = RtpHeader::new(0, 100, 1600, 0x12345678);
         let packet = RtpPacket::new(header, vec![0u8; 160]);
 
-        let forwarded = translator.forward_packet(&packet).unwrap();
+        let forwarded = translator.forward_packet(packet).unwrap();
 
         assert_eq!(forwarded.header.ssrc, 0x12345678);
         assert_eq!(forwarded.header.sequence_number, 100);
@@ -759,7 +756,7 @@ mod tests {
         let header = RtpHeader::new(0, 100, 1600, 0x12345678);
         let packet = RtpPacket::new(header, vec![0u8; 160]);
 
-        let forwarded = translator.forward_packet(&packet).unwrap();
+        let forwarded = translator.forward_packet(packet).unwrap();
 
         assert_eq!(forwarded.header.ssrc, 0xABCDEF01);
     }
@@ -854,7 +851,7 @@ mod tests {
         for seq in 100..110 {
             let header = RtpHeader::new(0, seq, (seq as u32) * 160, 0x12345678);
             let packet = RtpPacket::new(header, vec![0u8; 160]);
-            translator.forward_packet(&packet).unwrap();
+            translator.forward_packet(packet).unwrap();
         }
 
         let reports = translator.generate_reception_reports();

@@ -180,9 +180,10 @@ impl AudioProcessor {
             self.gate_open = false;
             let fade_len = self.gate.fade_samples.min(pcm.len());
             #[allow(clippy::cast_precision_loss)]
+            let inv_fade_len = 1.0 / fade_len as f32;
             for (i, sample) in pcm.iter_mut().enumerate() {
                 if i < fade_len {
-                    let t = 1.0 - (i as f32 / fade_len as f32);
+                    let t = 1.0 - (i as f32 * inv_fade_len);
                     *sample = apply_gain(*sample, t);
                 } else {
                     *sample = 0;

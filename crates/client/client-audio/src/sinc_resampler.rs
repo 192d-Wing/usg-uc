@@ -50,14 +50,23 @@ const FRAC_HALF_TAPS: usize = 8;
 /// Maintains internal state (input history) for seamless cross-frame
 /// filtering. Create one instance per audio session and call
 /// [`process`](SincResampler::process) for each frame.
+///
+/// Uses a double-length circular buffer for history: each new sample is
+/// written at two positions, so `history[pos..pos+16]` is always a
+/// contiguous view. This replaces the previous `copy_within` shift
+/// (60 bytes/sample → 8 bytes/sample).
 pub struct SincResampler {
     /// Upsampling ratio (e.g., 6 for 8kHz to 48kHz).
     ratio: usize,
     /// Polyphase sub-filter coefficients: `phases[p][k]` is the k-th tap
     /// of the p-th polyphase sub-filter.
     phases: Vec<[f32; TAPS_PER_PHASE]>,
-    /// Input sample history buffer (newest at index 0).
-    history: [f32; TAPS_PER_PHASE],
+    /// Double-length circular history buffer. Reading at `pos` gives a
+    /// contiguous `TAPS_PER_PHASE`-element view (newest at offset 0).
+    history: [f32; TAPS_PER_PHASE * 2],
+    /// Current write position; decrements on each new sample, wraps to
+    /// `TAPS_PER_PHASE - 1` when it underflows.
+    pos: usize,
 }
 
 impl SincResampler {
@@ -68,8 +77,35 @@ impl SincResampler {
         Self {
             ratio,
             phases,
-            history: [0.0; TAPS_PER_PHASE],
+            history: [0.0; TAPS_PER_PHASE * 2],
+            pos: 0,
         }
+    }
+
+    /// Returns a reference to the current history view (contiguous 16-element slice).
+    ///
+    /// # Safety
+    /// `self.pos` is always in `[0, TAPS_PER_PHASE)`, so `pos..pos+TAPS_PER_PHASE`
+    /// is always within the 32-element double buffer.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    fn history_view(&self) -> &[f32; TAPS_PER_PHASE] {
+        // SAFETY: pos is maintained in [0, TAPS_PER_PHASE) by wrapping logic,
+        // so pos + TAPS_PER_PHASE <= 2 * TAPS_PER_PHASE = history.len().
+        // The array is contiguous f32 with proper alignment.
+        unsafe { &*(self.history.as_ptr().add(self.pos).cast::<[f32; TAPS_PER_PHASE]>()) }
+    }
+
+    /// Inserts a new sample into the circular history buffer.
+    #[inline(always)]
+    fn push_sample(&mut self, sample: f32) {
+        self.pos = if self.pos == 0 {
+            TAPS_PER_PHASE - 1
+        } else {
+            self.pos - 1
+        };
+        self.history[self.pos] = sample;
+        self.history[self.pos + TAPS_PER_PHASE] = sample;
     }
 
     /// Resamples the input, producing exactly `input.len() * ratio` output samples.
@@ -81,13 +117,12 @@ impl SincResampler {
         let mut output = Vec::with_capacity(output_len);
 
         for &sample in input {
-            // Shift history right by 1 and insert new sample at [0]
-            self.history.copy_within(0..TAPS_PER_PHASE - 1, 1);
-            self.history[0] = f32::from(sample);
+            self.push_sample(f32::from(sample));
+            let hist = self.history_view();
 
             // Compute each polyphase output (SIMD-accelerated dot product)
             for phase in &self.phases {
-                let sum = dot_product_16(&self.history, phase);
+                let sum = dot_product_16(hist, phase);
                 output.push(sum.round().clamp(-32768.0, 32767.0) as i16);
             }
         }
@@ -124,26 +159,26 @@ impl SincResampler {
     #[allow(clippy::cast_possible_truncation)]
     pub fn process_into(&mut self, input: &[i16], output: &mut [i16]) {
         let output_len = output.len();
-        let mut pos = 0;
+        let mut out_pos = 0;
 
         for &sample in input {
-            self.history.copy_within(0..TAPS_PER_PHASE - 1, 1);
-            self.history[0] = f32::from(sample);
+            self.push_sample(f32::from(sample));
+            let hist = self.history_view();
 
             for phase in &self.phases {
-                if pos >= output_len {
+                if out_pos >= output_len {
                     return;
                 }
-                let sum = dot_product_16(&self.history, phase);
-                output[pos] = sum.round().clamp(-32768.0, 32767.0) as i16;
-                pos += 1;
+                let sum = dot_product_16(hist, phase);
+                output[out_pos] = sum.round().clamp(-32768.0, 32767.0) as i16;
+                out_pos += 1;
             }
         }
 
         // If output is longer than nominal, extend with last sample
-        if pos < output_len {
-            let last = if pos > 0 { output[pos - 1] } else { 0 };
-            output[pos..].fill(last);
+        if out_pos < output_len {
+            let last = if out_pos > 0 { output[out_pos - 1] } else { 0 };
+            output[out_pos..].fill(last);
         }
     }
 
@@ -173,32 +208,153 @@ pub struct FractionalSincResampler {
     ratio: f64,
     /// Input-domain advance per output sample (1/ratio).
     step: f64,
-    /// Input sample history buffer (newest at index 0, oldest at end).
-    /// Size = 2 * `FRAC_HALF_TAPS` + 1, giving `FRAC_HALF_TAPS` taps on
-    /// each side of the kernel center for full symmetric support.
+    /// Double-length circular history buffer. `history[pos..pos+FRAC_HIST_SIZE]`
+    /// is always a contiguous view (newest at offset 0).
     history: Vec<f32>,
+    /// Current write position; decrements on each new sample.
+    hist_pos: usize,
     /// Fractional position within the current input sample interval.
     /// Range: [0, 1). When phase < 1.0, output samples are produced.
     phase: f64,
-    /// Pre-computed 1/I0(beta) for Kaiser window evaluation.
-    inv_bessel: f64,
+    /// Pre-computed Kaiser window LUT (replaces per-tap `bessel_i0()` calls).
+    kaiser_lut: KaiserLut,
+    /// Pre-computed sinc LUT (replaces per-tap `sin()` + division).
+    sinc_lut: SincLut,
 }
 
 /// History buffer size for fractional resampler: enough for a symmetric
 /// kernel with `FRAC_HALF_TAPS` taps on each side, plus the center.
 const FRAC_HIST_SIZE: usize = 2 * FRAC_HALF_TAPS + 1;
 
+/// Number of intervals in the Kaiser window lookup table.
+/// 1024 intervals gives linear interpolation error < 10⁻⁶ — inaudible.
+const KAISER_LUT_INTERVALS: usize = 1024;
+
+/// Number of intervals in the sinc function lookup table.
+/// 2048 intervals over [0, `FRAC_HALF_TAPS`] gives step ≈ 0.004,
+/// with interpolation error < 3×10⁻⁵ at the steepest point (x≈0).
+const SINC_LUT_INTERVALS: usize = 2048;
+
+/// Pre-computed Kaiser window lookup table.
+///
+/// Maps normalized distance `|x/half| ∈ [0, 1]` to
+/// `I₀(β·√(1-u²)) / I₀(β)` via linear interpolation.
+/// Eliminates per-tap `bessel_i0()` calls (~25 iterations each).
+struct KaiserLut {
+    table: Vec<f64>,
+}
+
+impl KaiserLut {
+    /// Builds a Kaiser window LUT for the given beta parameter.
+    #[allow(clippy::cast_precision_loss)]
+    fn new(beta: f64) -> Self {
+        let inv_i0_beta = 1.0 / bessel_i0(beta);
+        let size = KAISER_LUT_INTERVALS + 1;
+        let mut table = Vec::with_capacity(size);
+        for i in 0..size {
+            let u = i as f64 / KAISER_LUT_INTERVALS as f64;
+            let arg = (1.0 - u * u).max(0.0).sqrt();
+            table.push(bessel_i0(beta * arg) * inv_i0_beta);
+        }
+        Self { table }
+    }
+
+    /// Evaluates the Kaiser window at normalized position `u_abs = |x/half|`.
+    ///
+    /// Returns 0.0 for `u_abs >= 1.0` (outside the window).
+    #[inline]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
+    fn evaluate(&self, u_abs: f64) -> f64 {
+        if u_abs >= 1.0 {
+            return 0.0;
+        }
+        let pos = u_abs * KAISER_LUT_INTERVALS as f64;
+        let idx = pos as usize;
+        let frac = pos - idx as f64;
+        self.table[idx].mul_add(1.0 - frac, self.table[idx + 1] * frac)
+    }
+}
+
+/// Pre-computed sinc function lookup table.
+///
+/// Maps `|x| ∈ [0, FRAC_HALF_TAPS]` to `sin(πx)/(πx)` via linear
+/// interpolation. Eliminates per-tap `sin()` + division.
+struct SincLut {
+    table: Vec<f64>,
+    /// Reciprocal of the step size for fast index computation.
+    inv_step: f64,
+}
+
+impl SincLut {
+    /// Builds a sinc LUT covering `[0, max_x]`.
+    #[allow(clippy::cast_precision_loss)]
+    fn new(max_x: f64) -> Self {
+        let size = SINC_LUT_INTERVALS + 1;
+        let step = max_x / SINC_LUT_INTERVALS as f64;
+        let mut table = Vec::with_capacity(size);
+        for i in 0..size {
+            let x = i as f64 * step;
+            table.push(if x < 1e-10 {
+                1.0
+            } else {
+                (PI * x).sin() / (PI * x)
+            });
+        }
+        Self {
+            table,
+            inv_step: 1.0 / step,
+        }
+    }
+
+    /// Evaluates `sinc(|x|) = sin(π|x|)/(π|x|)`.
+    ///
+    /// Returns 0.0 for values beyond the table range.
+    #[inline]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn evaluate(&self, x_abs: f64) -> f64 {
+        let pos = x_abs * self.inv_step;
+        let idx = pos as usize;
+        if idx >= SINC_LUT_INTERVALS {
+            return 0.0;
+        }
+        let frac = pos - idx as f64;
+        self.table[idx].mul_add(1.0 - frac, self.table[idx + 1] * frac)
+    }
+}
+
 impl FractionalSincResampler {
     /// Creates a new fractional sinc resampler for the given rate pair.
+    ///
+    /// Pre-computes Kaiser window and sinc LUTs (~25 KB total) to avoid
+    /// per-sample transcendental function evaluation in the inner loop.
+    #[allow(clippy::cast_precision_loss)]
     pub fn new(input_rate: u32, output_rate: u32) -> Self {
         let ratio = f64::from(output_rate) / f64::from(input_rate);
         Self {
             ratio,
             step: 1.0 / ratio,
-            history: vec![0.0; FRAC_HIST_SIZE],
+            history: vec![0.0; FRAC_HIST_SIZE * 2],
+            hist_pos: 0,
             phase: 0.0,
-            inv_bessel: 1.0 / bessel_i0(KAISER_BETA),
+            kaiser_lut: KaiserLut::new(KAISER_BETA),
+            sinc_lut: SincLut::new(FRAC_HALF_TAPS as f64),
         }
+    }
+
+    /// Inserts a new sample into the fractional resampler's circular history.
+    #[inline]
+    fn push_sample(&mut self, sample: f32) {
+        self.hist_pos = if self.hist_pos == 0 {
+            FRAC_HIST_SIZE - 1
+        } else {
+            self.hist_pos - 1
+        };
+        self.history[self.hist_pos] = sample;
+        self.history[self.hist_pos + FRAC_HIST_SIZE] = sample;
     }
 
     /// Resamples the input, producing approximately `input.len() * ratio` output samples.
@@ -237,21 +393,17 @@ impl FractionalSincResampler {
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     fn process_inner(&mut self, input: &[i16], output_len: usize) -> Vec<i16> {
         let half = FRAC_HALF_TAPS as f64;
+        let inv_half = 1.0 / half;
         let mut output = Vec::with_capacity(output_len);
 
         for &sample in input {
-            // Shift history right by 1 and insert new sample at [0]
-            // (newest at index 0, oldest at index FRAC_HIST_SIZE-1)
-            self.history.copy_within(0..FRAC_HIST_SIZE - 1, 1);
-            self.history[0] = f32::from(sample);
+            self.push_sample(f32::from(sample));
 
             // Produce output samples while within current input interval
             while self.phase < 1.0 && output.len() < output_len {
                 // Kernel center in history coordinates.
                 // phase=0 → center at FRAC_HALF_TAPS (8 taps of "future" history ahead)
                 // phase→1 → center at FRAC_HALF_TAPS-1 (approaching next input sample)
-                // This ensures the output advances forward in time as phase increases,
-                // with FRAC_HALF_TAPS taps on each side for full kernel support.
                 let center_pos = half - self.phase;
 
                 let mut sum = 0.0f64;
@@ -259,21 +411,16 @@ impl FractionalSincResampler {
 
                 for k in 0..FRAC_HIST_SIZE {
                     let x = k as f64 - center_pos;
-                    if x.abs() > half {
+                    let x_abs = x.abs();
+                    if x_abs > half {
                         continue;
                     }
 
-                    let sinc_val = if x.abs() < 1e-10 {
-                        1.0
-                    } else {
-                        (PI * x).sin() / (PI * x)
-                    };
-
-                    let arg = (x / half).mul_add(-(x / half), 1.0).max(0.0).sqrt();
-                    let win = bessel_i0(KAISER_BETA * arg) * self.inv_bessel;
+                    let sinc_val = self.sinc_lut.evaluate(x_abs);
+                    let win = self.kaiser_lut.evaluate(x_abs * inv_half);
 
                     let coeff = sinc_val * win;
-                    sum += f64::from(self.history[k]) * coeff;
+                    sum += f64::from(self.history[self.hist_pos + k]) * coeff;
                     coeff_sum += coeff;
                 }
 
@@ -305,12 +452,12 @@ impl FractionalSincResampler {
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     fn process_inner_into(&mut self, input: &[i16], output: &mut [i16]) {
         let half = FRAC_HALF_TAPS as f64;
+        let inv_half = 1.0 / half;
         let output_len = output.len();
         let mut out_pos = 0;
 
         for &sample in input {
-            self.history.copy_within(0..FRAC_HIST_SIZE - 1, 1);
-            self.history[0] = f32::from(sample);
+            self.push_sample(f32::from(sample));
 
             while self.phase < 1.0 && out_pos < output_len {
                 let center_pos = half - self.phase;
@@ -320,21 +467,16 @@ impl FractionalSincResampler {
 
                 for k in 0..FRAC_HIST_SIZE {
                     let x = k as f64 - center_pos;
-                    if x.abs() > half {
+                    let x_abs = x.abs();
+                    if x_abs > half {
                         continue;
                     }
 
-                    let sinc_val = if x.abs() < 1e-10 {
-                        1.0
-                    } else {
-                        (PI * x).sin() / (PI * x)
-                    };
-
-                    let arg = (x / half).mul_add(-(x / half), 1.0).max(0.0).sqrt();
-                    let win = bessel_i0(KAISER_BETA * arg) * self.inv_bessel;
+                    let sinc_val = self.sinc_lut.evaluate(x_abs);
+                    let win = self.kaiser_lut.evaluate(x_abs * inv_half);
 
                     let coeff = sinc_val * win;
-                    sum += f64::from(self.history[k]) * coeff;
+                    sum += f64::from(self.history[self.hist_pos + k]) * coeff;
                     coeff_sum += coeff;
                 }
 

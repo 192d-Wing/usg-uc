@@ -129,6 +129,8 @@ pub struct RtpTransmitter {
     dtmf_event_timestamp: AtomicU32,
     /// Pre-allocated buffer for serializing non-SRTP packets (header + payload).
     send_buffer: Vec<u8>,
+    /// Scratch buffer reused by SRTP `seal_into` to avoid per-packet allocation.
+    srtp_scratch: Vec<u8>,
     /// RFC 2198 redundancy: previous frame's encoded payload.
     prev_payload: Vec<u8>,
     /// Whether RFC 2198 redundancy is enabled.
@@ -174,6 +176,7 @@ impl RtpTransmitter {
             dtmf_timestamp: AtomicU32::new(rand_u32()),
             dtmf_event_timestamp: AtomicU32::new(0),
             send_buffer: vec![0u8; MAX_RTP_PACKET_SIZE],
+            srtp_scratch: Vec::with_capacity(MAX_RTP_PACKET_SIZE),
             prev_payload: Vec::new(),
             redundancy_enabled: false,
             redundancy_pt: REDUNDANCY_PAYLOAD_TYPE,
@@ -355,7 +358,7 @@ impl RtpTransmitter {
         let send_data: &[u8] = if let Some(ref srtp) = self.srtp {
             let protector = SrtpProtect::new(srtp);
             let rtp_body = &self.send_buffer[rtp_payload_start..rtp_payload_end];
-            match protector.protect_rtp_parts(&header, rtp_body) {
+            match protector.protect_rtp_parts_into(&header, rtp_body, &mut self.srtp_scratch) {
                 Ok(p) => {
                     protected = p;
                     &protected
@@ -413,7 +416,7 @@ impl RtpTransmitter {
         let protected: Bytes;
         let send_data: &[u8] = if let Some(ref srtp) = self.srtp {
             let protector = SrtpProtect::new(srtp);
-            match protector.protect_rtp_parts(&header, payload) {
+            match protector.protect_rtp_parts_into(&header, payload, &mut self.srtp_scratch) {
                 Ok(p) => {
                     protected = p;
                     &protected
@@ -488,7 +491,7 @@ impl RtpTransmitter {
         let protected: Bytes;
         let send_data: &[u8] = if let Some(ref srtp) = self.srtp {
             let protector = SrtpProtect::new(srtp);
-            match protector.protect_rtp_parts(&header, &payload) {
+            match protector.protect_rtp_parts_into(&header, &payload, &mut self.srtp_scratch) {
                 Ok(p) => {
                     protected = p;
                     &protected
@@ -871,6 +874,11 @@ pub fn generate_ssrc() -> u32 {
     rand_u32()
 }
 
+/// Maximum redundant blocks supported in RFC 2198 parsing.
+/// Typical use: 1-2 redundant copies. 4 provides generous headroom
+/// while keeping allocations off the heap.
+const MAX_REDUNDANT_BLOCKS: usize = 4;
+
 /// Parses an RFC 2198 redundancy payload.
 ///
 /// Returns `(primary_pt, primary_data, redundant_entries)` where each
@@ -884,7 +892,9 @@ pub fn parse_rfc2198(
     }
 
     let mut offset = 0;
-    let mut redundant_headers: Vec<(u8, u32, usize)> = Vec::new(); // (pt, ts_offset, block_len)
+    // Stack-allocated header array (avoids per-packet heap allocation)
+    let mut redundant_headers = [(0u8, 0u32, 0usize); MAX_REDUNDANT_BLOCKS];
+    let mut num_redundant = 0;
 
     // Parse header blocks
     loop {
@@ -896,14 +906,15 @@ pub fn parse_rfc2198(
 
         if f_bit {
             // Redundant block header: 4 bytes
-            if offset + 4 > data.len() {
+            if offset + 4 > data.len() || num_redundant >= MAX_REDUNDANT_BLOCKS {
                 return None;
             }
             let ts_offset = (u32::from(data[offset + 1]) << 6)
                 | (u32::from(data[offset + 2]) >> 2);
             let block_len = (usize::from(data[offset + 2] & 0x03) << 8)
                 | usize::from(data[offset + 3]);
-            redundant_headers.push((block_pt, ts_offset, block_len));
+            redundant_headers[num_redundant] = (block_pt, ts_offset, block_len);
+            num_redundant += 1;
             offset += 4;
         } else {
             // Primary block header: 1 byte (F=0)
@@ -911,8 +922,8 @@ pub fn parse_rfc2198(
 
             // Now parse data blocks
             let mut data_offset = offset;
-            let mut redundant_entries = Vec::with_capacity(redundant_headers.len());
-            for &(pt, ts_off, block_len) in &redundant_headers {
+            let mut redundant_entries = Vec::with_capacity(num_redundant);
+            for &(pt, ts_off, block_len) in &redundant_headers[..num_redundant] {
                 if data_offset + block_len > data.len() {
                     return None;
                 }

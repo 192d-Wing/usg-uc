@@ -113,8 +113,7 @@ impl VoiceActivityDetector {
             return VadDecision::Silence;
         }
 
-        let energy = compute_rms(pcm);
-        let zcr = compute_zcr(pcm);
+        let (energy, zcr) = compute_rms_and_zcr(pcm);
 
         self.frame_count = self.frame_count.saturating_add(1);
 
@@ -185,22 +184,43 @@ impl VoiceActivityDetector {
     }
 }
 
-/// Computes the RMS (Root Mean Square) energy of a PCM buffer.
-#[allow(clippy::cast_precision_loss)]
-fn compute_rms(pcm: &[i16]) -> f32 {
+/// Computes RMS energy and zero-crossing rate in a single pass over the PCM buffer.
+///
+/// Returns `(rms, zcr)` where:
+/// - `rms` is the Root Mean Square energy (f32)
+/// - `zcr` is the zero-crossing rate in 0.0..1.0
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn compute_rms_and_zcr(pcm: &[i16]) -> (f32, f32) {
     if pcm.is_empty() {
-        return 0.0;
+        return (0.0, 0.0);
     }
-    let sum_sq: f64 = pcm.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
-    #[allow(clippy::cast_possible_truncation)]
+
+    let mut sum_sq: f64 = f64::from(pcm[0]) * f64::from(pcm[0]);
+    let mut crossings: u32 = 0;
+    let mut prev = pcm[0];
+
+    for &s in &pcm[1..] {
+        sum_sq += f64::from(s) * f64::from(s);
+        if (prev >= 0) != (s >= 0) {
+            crossings += 1;
+        }
+        prev = s;
+    }
+
     let rms = (sum_sq / pcm.len() as f64).sqrt() as f32;
-    rms
+    let zcr = if pcm.len() > 1 {
+        crossings as f32 / (pcm.len() - 1) as f32
+    } else {
+        0.0
+    };
+    (rms, zcr)
 }
 
-/// Computes the zero-crossing rate of a PCM buffer.
+/// Computes the zero-crossing rate of a PCM buffer (standalone, used in tests).
 ///
 /// Returns a value in 0.0..1.0 where 0.0 means no zero crossings
 /// and 1.0 means every consecutive pair crosses zero.
+#[cfg(test)]
 #[allow(clippy::cast_precision_loss)]
 fn compute_zcr(pcm: &[i16]) -> f32 {
     if pcm.len() < 2 {

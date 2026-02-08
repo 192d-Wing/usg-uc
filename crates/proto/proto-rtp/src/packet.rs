@@ -433,7 +433,7 @@ impl ExtensionHeader {
 
     /// Parses one-byte extension elements (profile `0xBEDE`).
     fn parse_one_byte_elements(&self) -> Vec<ExtensionElement> {
-        let mut elements = Vec::new();
+        let mut elements = Vec::with_capacity(4);
         let data = &self.data[..];
         let mut pos = 0;
 
@@ -467,7 +467,7 @@ impl ExtensionHeader {
 
     /// Parses two-byte extension elements (profile `0x100X`).
     fn parse_two_byte_elements(&self) -> Vec<ExtensionElement> {
-        let mut elements = Vec::new();
+        let mut elements = Vec::with_capacity(8);
         let data = &self.data[..];
         let mut pos = 0;
 
@@ -568,7 +568,7 @@ impl RtpPacket {
             BytesMut::with_capacity(self.header.size() + self.payload.len() + self.padding_size);
 
         buf.put(self.header.to_bytes());
-        buf.put(self.payload.clone());
+        buf.put_slice(&self.payload);
 
         if self.padding_size > 0 {
             buf.put_bytes(0, self.padding_size - 1);

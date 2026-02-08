@@ -543,20 +543,20 @@ fn decode_loop(
                         let target_gain = if gain_gate_open { PLAYBACK_GAIN } else { 1.0 };
                         current_gain += (target_gain - current_gain) * GAIN_RAMP_SPEED;
 
-                        // Apply gain in-place (no .collect() allocation)
+                        // Apply gain in-place and track post-gain peak in a single pass
+                        let mut frame_post_peak: i16 = 0;
                         for s in &mut *device_pcm {
                             #[allow(clippy::cast_possible_truncation)]
                             {
                                 *s = (f32::from(*s) * current_gain).clamp(-32768.0, 32767.0) as i16;
                             }
+                            let abs = s.saturating_abs();
+                            if abs > frame_post_peak {
+                                frame_post_peak = abs;
+                            }
                         }
-
-                        // Track peak amplitude after gain
-                        if let Some(&post_peak) =
-                            device_pcm.iter().map(|s| s.saturating_abs()).max().as_ref()
-                            && post_peak > diag_peak_post_gain
-                        {
-                            diag_peak_post_gain = post_peak;
+                        if frame_post_peak > diag_peak_post_gain {
+                            diag_peak_post_gain = frame_post_peak;
                         }
 
                         // Track last output for fade-out
@@ -586,10 +586,8 @@ fn decode_loop(
                     JitterBufferResult::Lost { .. } => {
                         decoded_this_cycle += 1;
                         // Try FEC recovery first (Opus inband FEC), fall back to PLC.
-                        // PLC conceal() allocates internally (WSOLA time stretch) —
-                        // acceptable since loss events are rare (<1% of frames).
-                        // FEC path borrows codec_scratch directly (zero-alloc).
-                        let plc_buf;
+                        // PLC conceal() reuses an internal scratch buffer (zero-alloc).
+                        // FEC path borrows codec_scratch directly (also zero-alloc).
                         let concealed: &[i16] = if codec.supports_fec() {
                             if let Ok(fec_pcm) = codec.decode_fec() {
                                 trace!("FEC recovered {} samples", fec_pcm.len());
@@ -599,14 +597,12 @@ fn decode_loop(
                                 metrics.fec_recovered.fetch_add(1, Ordering::Relaxed);
                                 &codec_scratch[..fec_len]
                             } else {
-                                plc_buf = plc.conceal();
                                 metrics.plc_generated.fetch_add(1, Ordering::Relaxed);
-                                &plc_buf
+                                plc.conceal()
                             }
                         } else {
-                            plc_buf = plc.conceal();
                             metrics.plc_generated.fetch_add(1, Ordering::Relaxed);
-                            &plc_buf
+                            plc.conceal()
                         };
 
                         // Resample concealed audio to device rate (zero-alloc)

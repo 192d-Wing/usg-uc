@@ -233,7 +233,7 @@ impl RtcpPacket {
     pub fn to_bytes(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(4 + self.payload.len());
         buf.put(self.header.to_bytes());
-        buf.put(self.payload.clone());
+        buf.put_slice(&self.payload);
         buf.freeze()
     }
 }

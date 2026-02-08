@@ -159,9 +159,11 @@ const ERLE_SMOOTHING: f32 = 0.01;
 pub struct AecProcessor {
     /// Adaptive filter coefficients.
     filter: Vec<f32>,
-    /// Far-end reference signal history (ring buffer for filter convolution).
+    /// Double-length far-end reference history buffer. Writing each sample at
+    /// `ref_pos` and `ref_pos + filter_len` allows modulo-free reads:
+    /// `reference_history[ref_pos + filter_len - k]` is always in-bounds.
     reference_history: Vec<f32>,
-    /// Current write position in reference history.
+    /// Current write position in reference history (wraps within `[0, filter_len)`).
     ref_pos: usize,
     /// Filter length in samples.
     filter_len: usize,
@@ -198,7 +200,7 @@ impl AecProcessor {
         let filter_len = (sample_rate as usize * cfg.filter_length_ms) / 1000;
         Self {
             filter: vec![0.0; filter_len],
-            reference_history: vec![0.0; filter_len],
+            reference_history: vec![0.0; filter_len * 2],
             ref_pos: 0,
             filter_len,
             ref_power: 0.0,
@@ -240,6 +242,11 @@ impl AecProcessor {
     ///
     /// `mic_pcm` is the captured audio at codec rate (modified in-place).
     /// The far-end reference is automatically pulled from the shared buffer.
+    #[allow(
+        clippy::needless_range_loop,
+        clippy::cast_lossless,
+        clippy::cast_precision_loss
+    )]
     pub fn process(&mut self, mic_pcm: &mut [i16]) {
         if !self.enabled {
             return;
@@ -269,8 +276,9 @@ impl AecProcessor {
                 0.0
             };
 
-            // Update reference history (circular buffer)
+            // Update reference history (double-buffer: write at both halves)
             self.reference_history[self.ref_pos] = ref_sample;
+            self.reference_history[self.ref_pos + self.filter_len] = ref_sample;
 
             // Update running power estimate (add new sample, subtract oldest)
             self.ref_power += ref_sample * ref_sample;
@@ -278,10 +286,12 @@ impl AecProcessor {
             self.ref_power *= 1.0 - (1.0 / self.filter_len as f32);
 
             // Compute echo estimate: y_hat = sum(w[k] * x[n-k])
+            // Double-buffer indexing: ref_pos + filter_len - k is always in-bounds
             let mut echo_estimate = 0.0_f32;
+            let base = self.ref_pos + self.filter_len;
             for k in 0..self.filter_len {
-                let ref_idx = (self.ref_pos + self.filter_len - k) % self.filter_len;
-                echo_estimate = self.filter[k].mul_add(self.reference_history[ref_idx], echo_estimate);
+                echo_estimate =
+                    self.filter[k].mul_add(self.reference_history[base - k], echo_estimate);
             }
 
             // Error signal: mic - echo_estimate
@@ -300,10 +310,9 @@ impl AecProcessor {
 
             // NLMS filter update (skip during double-talk)
             if !is_doubletalk && self.ref_power > self.cfg.min_farend_energy {
-                let norm = self.cfg.nlms_mu / (self.ref_power + NLMS_DELTA);
+                let norm_error = self.cfg.nlms_mu / (self.ref_power + NLMS_DELTA) * error;
                 for k in 0..self.filter_len {
-                    let ref_idx = (self.ref_pos + self.filter_len - k) % self.filter_len;
-                    self.filter[k] += norm * error * self.reference_history[ref_idx];
+                    self.filter[k] += norm_error * self.reference_history[base - k];
                 }
             }
 
@@ -336,8 +345,11 @@ impl AecProcessor {
                 mic_pcm[i] = output.clamp(-32768.0, 32767.0) as i16;
             }
 
-            // Advance reference position
-            self.ref_pos = (self.ref_pos + 1) % self.filter_len;
+            // Advance reference position (branchless wrap)
+            self.ref_pos += 1;
+            if self.ref_pos >= self.filter_len {
+                self.ref_pos = 0;
+            }
         }
 
         // Update running ERLE estimate (exponential moving average).
