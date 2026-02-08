@@ -478,24 +478,27 @@ fn decode_loop(
                         // Try FEC recovery first (Opus inband FEC), fall back to PLC.
                         // PLC conceal() allocates internally (WSOLA time stretch) —
                         // acceptable since loss events are rare (<1% of frames).
-                        let concealed = if codec.supports_fec() {
-                            match codec.decode_fec() {
-                                Ok(fec_pcm) => {
-                                    trace!("FEC recovered {} samples", fec_pcm.len());
-                                    let fec_len = fec_pcm.len();
-                                    codec_scratch[..fec_len].copy_from_slice(fec_pcm);
-                                    plc.good_frame(&codec_scratch[..fec_len]);
-                                    codec_scratch[..fec_len].to_vec()
-                                }
-                                Err(_) => plc.conceal(),
+                        // FEC path borrows codec_scratch directly (zero-alloc).
+                        let plc_buf;
+                        let concealed: &[i16] = if codec.supports_fec() {
+                            if let Ok(fec_pcm) = codec.decode_fec() {
+                                trace!("FEC recovered {} samples", fec_pcm.len());
+                                let fec_len = fec_pcm.len();
+                                codec_scratch[..fec_len].copy_from_slice(fec_pcm);
+                                plc.good_frame(&codec_scratch[..fec_len]);
+                                &codec_scratch[..fec_len]
+                            } else {
+                                plc_buf = plc.conceal();
+                                &plc_buf
                             }
                         } else {
-                            plc.conceal()
+                            plc_buf = plc.conceal();
+                            &plc_buf
                         };
 
                         // Resample concealed audio to device rate (zero-alloc)
                         let device_pcm = &mut resample_buf[..device_samples];
-                        resampler.process_adjusted_into(&concealed, device_pcm);
+                        resampler.process_adjusted_into(concealed, device_pcm);
 
                         if let Some(&last) = device_pcm.last() {
                             last_output_sample = last;
