@@ -13,7 +13,6 @@ use crate::dtmf_tones::DtmfToneGenerator;
 use crate::jitter_buffer::{JitterBufferResult, SharedJitterBuffer};
 use crate::wsola::WsolaPlc;
 use crate::postfilter::Postfilter;
-use crate::rtp_handler::DTMF_PAYLOAD_TYPE;
 use crate::sinc_resampler::Resampler;
 use crate::stream::{PlaybackStream, PlaybackStreamHandle, Sample};
 use client_types::{CodecPreference, DtmfEvent};
@@ -118,6 +117,8 @@ pub struct DecodeThreadConfig {
     pub codec: CodecPreference,
     /// Device sample rate (e.g., 48000).
     pub device_rate: u32,
+    /// DTMF telephone-event payload type (from SDP negotiation, default 101).
+    pub dtmf_payload_type: u8,
 }
 
 /// Spawns the decode thread.
@@ -230,6 +231,9 @@ fn decode_loop(
     // Comfort noise for remote DTX (jitter buffer empty for extended periods)
     let mut cng = ComfortNoiseGenerator::new();
     let mut consecutive_empty: u32 = 0;
+
+    // DTMF payload type from SDP negotiation (typically 101)
+    let dtmf_pt = config.dtmf_payload_type;
 
     // Track current inbound DTMF event to avoid replaying. RFC 4733 sends
     // multiple packets per event (start + continuations + 3× end), all sharing
@@ -346,7 +350,7 @@ fn decode_loop(
                         // continuations every 20ms + 3× end), all with the same
                         // RTP timestamp. Generate one tone on the first packet
                         // only; skip continuations and end packets.
-                        if packet.payload_type == DTMF_PAYLOAD_TYPE {
+                        if packet.payload_type == dtmf_pt {
                             let is_new = current_dtmf_ts != Some(packet.timestamp);
                             if is_new && packet.payload.len() >= 4 {
                                 let bytes: [u8; 4] = [
@@ -675,6 +679,7 @@ mod tests {
         let config = DecodeThreadConfig {
             codec: CodecPreference::G711Ulaw,
             device_rate: playback_handle.sample_rate(),
+            dtmf_payload_type: 101,
         };
 
         let mut handle = spawn(config, producer, playback_handle, jb, running, underruns);
@@ -691,7 +696,9 @@ mod tests {
         let config = DecodeThreadConfig {
             codec: CodecPreference::G711Ulaw,
             device_rate: 48000,
+            dtmf_payload_type: 101,
         };
         assert_eq!(config.device_rate, 48000);
+        assert_eq!(config.dtmf_payload_type, 101);
     }
 }

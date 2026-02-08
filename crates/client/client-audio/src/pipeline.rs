@@ -306,6 +306,7 @@ impl AudioPipeline {
         let decode_config = DecodeThreadConfig {
             codec: config.codec,
             device_rate,
+            dtmf_payload_type: config.dtmf_payload_type.unwrap_or(crate::rtp_handler::DTMF_PAYLOAD_TYPE),
         };
         let decode_handle = decode_thread::spawn(
             decode_config,
