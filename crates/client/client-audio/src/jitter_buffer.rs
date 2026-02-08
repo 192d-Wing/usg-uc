@@ -36,6 +36,12 @@ const JITTER_HISTORY_SIZE: usize = 200;
 /// Margin added to the p95 jitter estimate for target depth (in ms).
 const JITTER_MARGIN_MS: f32 = 20.0;
 
+/// Timestamp jump (in seconds) that triggers a discontinuity resync.
+/// Hold/resume, transfer, or codec change can produce jumps of seconds
+/// to minutes. 2 seconds is well above normal jitter but catches real
+/// discontinuities promptly.
+const TIMESTAMP_DISCONTINUITY_SECS: u32 = 2;
+
 /// How many packets between adaptive depth recalculations.
 const ADAPT_INTERVAL: u32 = 50;
 
@@ -114,6 +120,8 @@ pub struct JitterBufferStats {
     pub current_packet_count: usize,
     /// Average jitter in milliseconds.
     pub average_jitter_ms: f32,
+    /// Number of timestamp discontinuity resyncs.
+    pub timestamp_resyncs: u64,
 }
 
 /// Adaptive jitter buffer for RTP audio streams.
@@ -213,6 +221,26 @@ impl JitterBuffer {
     /// Returns `true` if the packet was added, `false` if it was dropped.
     pub fn push(&mut self, packet: BufferedPacket) -> bool {
         self.stats.packets_received += 1;
+
+        // Detect timestamp discontinuity (hold/resume, transfer, codec change).
+        // A jump larger than TIMESTAMP_DISCONTINUITY_SECS indicates the remote
+        // stream has restarted — flush the buffer and re-prime.
+        if let Some(last_ts) = self.last_timestamp {
+            let ts_jump = timestamp_diff(packet.timestamp, last_ts).unsigned_abs();
+            let threshold = self.clock_rate * TIMESTAMP_DISCONTINUITY_SECS;
+            if ts_jump > threshold {
+                warn!(
+                    "Timestamp discontinuity: last_ts={}, pkt_ts={}, jump={} samples ({:.1}s), resync",
+                    last_ts,
+                    packet.timestamp,
+                    ts_jump,
+                    ts_jump as f64 / f64::from(self.clock_rate),
+                );
+                self.stats.timestamp_resyncs += 1;
+                self.reset();
+                // Fall through to insert this packet as the first in the new stream.
+            }
+        }
 
         // Update jitter calculation
         self.update_jitter(&packet);
@@ -835,6 +863,47 @@ mod tests {
             after < before,
             "Expected depth to decrease from {before}ms with low jitter, got {after}ms"
         );
+    }
+
+    #[test]
+    fn test_timestamp_discontinuity_resyncs() {
+        let mut jb = JitterBuffer::new(8000, 160, 40);
+
+        // Push a few normal packets
+        jb.push(make_packet(0, 0));
+        jb.push(make_packet(1, 160));
+        jb.push(make_packet(2, 320));
+        jb.next_playout_sequence = Some(0);
+        jb.is_primed = true;
+
+        // Consume one packet
+        jb.pop();
+        assert_eq!(jb.stats().timestamp_resyncs, 0);
+        assert!(!jb.is_empty());
+
+        // Now push a packet with a huge timestamp jump (>2s at 8kHz = >16000)
+        // Simulates hold/resume or transfer.
+        jb.push(make_packet(100, 100_000));
+
+        // The discontinuity detection should have reset the buffer and
+        // accepted the new packet as the first in the stream.
+        assert_eq!(jb.stats().timestamp_resyncs, 1);
+        assert!(!jb.is_ready()); // reset clears primed state
+        assert_eq!(jb.len(), 1); // only the new packet
+    }
+
+    #[test]
+    fn test_timestamp_no_false_positive() {
+        let mut jb = JitterBuffer::new(8000, 160, 40);
+
+        // Normal consecutive packets — no discontinuity
+        jb.push(make_packet(0, 0));
+        jb.push(make_packet(1, 160));
+        jb.push(make_packet(2, 320));
+        jb.push(make_packet(3, 480));
+
+        assert_eq!(jb.stats().timestamp_resyncs, 0);
+        assert_eq!(jb.len(), 4);
     }
 
     #[test]
