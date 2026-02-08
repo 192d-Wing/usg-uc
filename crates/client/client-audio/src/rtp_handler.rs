@@ -13,7 +13,7 @@ use proto_rtp::{RtpHeader, RtpPacket};
 use proto_srtp::{SrtpContext, SrtpProtect, SrtpUnprotect};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tracing::{debug, info, trace};
 
 /// Default RTP payload type for audio.
@@ -113,8 +113,8 @@ pub struct RtpTransmitter {
     payload_type: u8,
     /// Timestamp increment per packet.
     timestamp_increment: u32,
-    /// SRTP context for encryption.
-    srtp: Option<Arc<Mutex<SrtpContext>>>,
+    /// SRTP context for encryption (no Mutex needed — interior mutability).
+    srtp: Option<SrtpContext>,
     /// Statistics (lock-free atomic counters).
     stats: Arc<AtomicRtpStats>,
     /// DTMF payload type (telephone-event).
@@ -163,7 +163,7 @@ impl RtpTransmitter {
     }
 
     /// Sets the SRTP context for encryption.
-    pub fn set_srtp(&mut self, context: Arc<Mutex<SrtpContext>>) {
+    pub fn set_srtp(&mut self, context: SrtpContext) {
         self.srtp = Some(context);
         debug!("SRTP encryption enabled for transmitter");
     }
@@ -182,10 +182,7 @@ impl RtpTransmitter {
         // Protect with SRTP and send — Bytes derefs to &[u8] so no .to_vec() needed.
         let protected: Bytes;
         let send_data: &[u8] = if let Some(ref srtp) = self.srtp {
-            let srtp_guard = srtp
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let protector = SrtpProtect::new(&srtp_guard);
+            let protector = SrtpProtect::new(srtp);
             match protector.protect_rtp(&packet) {
                 Ok(p) => {
                     protected = p;
@@ -242,10 +239,7 @@ impl RtpTransmitter {
 
         let protected: Bytes;
         let send_data: &[u8] = if let Some(ref srtp) = self.srtp {
-            let srtp_guard = srtp
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let protector = SrtpProtect::new(&srtp_guard);
+            let protector = SrtpProtect::new(srtp);
             match protector.protect_rtp(&packet) {
                 Ok(p) => {
                     protected = p;
@@ -321,10 +315,7 @@ impl RtpTransmitter {
 
         let protected: Bytes;
         let send_data: &[u8] = if let Some(ref srtp) = self.srtp {
-            let srtp_guard = srtp
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let protector = SrtpProtect::new(&srtp_guard);
+            let protector = SrtpProtect::new(srtp);
             match protector.protect_rtp(&packet) {
                 Ok(p) => {
                     protected = p;
@@ -368,8 +359,8 @@ pub struct RtpReceiver {
     socket: Arc<UdpSocket>,
     /// Expected remote address (for filtering).
     expected_remote: Option<SocketAddr>,
-    /// SRTP context for decryption.
-    srtp: Option<Arc<Mutex<SrtpContext>>>,
+    /// SRTP context for decryption (no Mutex needed — interior mutability).
+    srtp: Option<SrtpContext>,
     /// Shared jitter buffer (also read by decode thread).
     jitter_buffer: SharedJitterBuffer,
     /// Statistics (lock-free atomic counters).
@@ -406,7 +397,7 @@ impl RtpReceiver {
     }
 
     /// Sets the SRTP context for decryption.
-    pub fn set_srtp(&mut self, context: Arc<Mutex<SrtpContext>>) {
+    pub fn set_srtp(&mut self, context: SrtpContext) {
         self.srtp = Some(context);
         debug!("SRTP decryption enabled for receiver");
     }
@@ -453,10 +444,7 @@ impl RtpReceiver {
 
         // Decrypt if SRTP is configured
         let packet = if let Some(ref srtp) = self.srtp {
-            let srtp_guard = srtp
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let unprotector = SrtpUnprotect::new(&srtp_guard);
+            let unprotector = SrtpUnprotect::new(srtp);
             match unprotector.unprotect_rtp(data) {
                 Ok(pkt) => pkt,
                 Err(e) => {

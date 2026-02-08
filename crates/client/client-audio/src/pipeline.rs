@@ -238,13 +238,13 @@ impl AudioPipeline {
                 .map_err(|e| {
                     AudioError::SrtpError(format!("Failed to create TX SRTP context: {e}"))
                 })?;
-            transmitter.set_srtp(Arc::new(Mutex::new(tx_context)));
+            transmitter.set_srtp(tx_context);
 
             let rx_context =
                 SrtpContext::new(&key_material, SrtpDirection::Inbound, 0).map_err(|e| {
                     AudioError::SrtpError(format!("Failed to create RX SRTP context: {e}"))
                 })?;
-            receiver.set_srtp(Arc::new(Mutex::new(rx_context)));
+            receiver.set_srtp(rx_context);
 
             debug!("SRTP enabled for audio pipeline");
         }
