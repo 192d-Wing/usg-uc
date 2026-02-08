@@ -14,7 +14,9 @@ use tracing::{debug, trace, warn};
 pub const MIN_DEPTH_MS: u32 = 20;
 
 /// Default jitter buffer depth in milliseconds.
-pub const DEFAULT_DEPTH_MS: u32 = 60;
+/// 40ms is sufficient for broadband; the adaptive algorithm will
+/// increase this if network jitter warrants it.
+pub const DEFAULT_DEPTH_MS: u32 = 40;
 
 /// Maximum jitter buffer depth in milliseconds.
 pub const MAX_DEPTH_MS: u32 = 200;
@@ -40,6 +42,12 @@ const ADAPT_INTERVAL: u32 = 50;
 /// Smoothing factor for target depth transitions (0.0-1.0).
 /// 0.15 means move 15% toward the new target each adaptation cycle.
 const ADAPT_SMOOTHING: f32 = 0.15;
+
+/// Maximum consecutive lost packets before skipping ahead to the first
+/// available packet. Prevents an infinite chase when the playout pointer
+/// falls far behind (e.g., after a DTMF tone fills the ring buffer and
+/// stalls the decode thread).
+const MAX_CONSECUTIVE_LOST: u32 = 10;
 
 /// A buffered RTP packet with metadata.
 #[derive(Debug, Clone)]
@@ -140,6 +148,8 @@ pub struct JitterBuffer {
     jitter_history: VecDeque<f32>,
     /// Counter for periodic adaptation.
     adapt_counter: u32,
+    /// Counter for consecutive lost packets (for skip-ahead detection).
+    consecutive_lost: u32,
 }
 
 impl JitterBuffer {
@@ -176,6 +186,7 @@ impl JitterBuffer {
             last_timestamp: None,
             jitter_history: VecDeque::with_capacity(JITTER_HISTORY_SIZE),
             adapt_counter: 0,
+            consecutive_lost: 0,
         }
     }
 
@@ -301,6 +312,7 @@ impl JitterBuffer {
             self.last_playout_timestamp = Some(packet.timestamp);
             self.next_playout_sequence = Some(expected_seq.wrapping_add(1));
             self.stats.current_packet_count = self.packets.len();
+            self.consecutive_lost = 0;
             return JitterBufferResult::Packet(packet);
         }
 
@@ -312,6 +324,25 @@ impl JitterBuffer {
             .any(|&seq| sequence_diff(seq, expected_seq) > 0);
 
         if have_future_packets {
+            self.consecutive_lost += 1;
+
+            // If we've had too many consecutive losses, the playout pointer
+            // has fallen far behind the buffer contents (e.g., after a stall).
+            // Skip ahead to the first available packet to resync.
+            if self.consecutive_lost > MAX_CONSECUTIVE_LOST {
+                if let Some(&first_seq) = self.packets.keys().next() {
+                    let skipped = sequence_diff(first_seq, expected_seq);
+                    warn!(
+                        "Skipping ahead after {} consecutive losses: seq {} -> {} (skipped {})",
+                        self.consecutive_lost, expected_seq, first_seq, skipped
+                    );
+                    self.next_playout_sequence = Some(first_seq);
+                    self.consecutive_lost = 0;
+                    // Retry with corrected sequence
+                    return self.pop();
+                }
+            }
+
             // We have later packets, so this one is lost
             self.stats.packets_lost += 1;
             let expected_timestamp = self

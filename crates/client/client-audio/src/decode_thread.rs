@@ -9,12 +9,14 @@
 use crate::codec::CodecPipeline;
 use crate::comfort_noise::{ComfortNoiseGenerator, decode_cn_payload};
 use crate::drift_compensator::DriftCompensator;
+use crate::dtmf_tones::DtmfToneGenerator;
 use crate::jitter_buffer::{JitterBufferResult, SharedJitterBuffer};
 use crate::plc::PacketLossConcealer;
 use crate::postfilter::Postfilter;
+use crate::rtp_handler::DTMF_PAYLOAD_TYPE;
 use crate::sinc_resampler::Resampler;
 use crate::stream::{PlaybackStream, PlaybackStreamHandle, Sample};
-use client_types::CodecPreference;
+use client_types::{CodecPreference, DtmfEvent};
 use ringbuf::traits::{Observer, Producer};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,10 +30,11 @@ use tracing::{debug, info, trace, warn};
 const DUMP_ENV_VAR: &str = "DUMP_DECODED_AUDIO";
 
 /// Target fill level for the playback ring buffer (in frames).
-/// At 20ms per frame, 8 frames = 160ms cushion.
-/// Extra headroom helps Bluetooth A2DP devices that have irregular
-/// callback timing compared to wired outputs.
-const TARGET_FILL_FRAMES: usize = 8;
+/// At 20ms per frame, 3 frames = 60ms cushion.
+/// Keep this low for real-time VoIP — every extra frame adds 20ms
+/// of end-to-end latency. 3 frames is enough to absorb scheduling
+/// jitter while keeping mouth-to-ear delay acceptable.
+const TARGET_FILL_FRAMES: usize = 3;
 
 /// Playback gain applied to decoded remote audio (linear).
 /// Unity gain: logs show G.711 ulaw from `BulkVS` peaks at 20000-29000
@@ -221,10 +224,18 @@ fn decode_loop(
     // LPC-based packet loss concealment
     let mut plc = PacketLossConcealer::new(codec_samples);
     // Decoder-side postfilter: reduces G.711 quantization noise
+    // Disabled: the tilt filter (α=0.4) attenuates voice fundamentals
+    // (100-300 Hz) by ~4 dB, making speech sound robotic/thin.
     let mut postfilter = Postfilter::new();
+    postfilter.set_enabled(false);
     // Comfort noise for remote DTX (jitter buffer empty for extended periods)
     let mut cng = ComfortNoiseGenerator::new();
     let mut consecutive_empty: u32 = 0;
+
+    // Track current inbound DTMF event to avoid replaying. RFC 4733 sends
+    // multiple packets per event (start + continuations + 3× end), all sharing
+    // the same RTP timestamp. We only generate a tone on the first packet.
+    let mut current_dtmf_ts: Option<u32> = None;
 
     // Gain gate state: holds the gate open during speech to prevent
     // gain fluctuation at speech boundaries that amplifies quantization noise.
@@ -317,6 +328,40 @@ fn decode_loop(
                             let mut cn_pcm = vec![0i16; adjusted_device_samples];
                             cng.generate(&mut cn_pcm);
                             producer.push_slice(&cn_pcm);
+                            continue;
+                        }
+
+                        // Handle RFC 4733 telephone-event packets (PT=101)
+                        // RFC 4733 sends multiple packets per event (start +
+                        // continuations every 20ms + 3× end), all with the same
+                        // RTP timestamp. Generate one tone on the first packet
+                        // only; skip continuations and end packets.
+                        if packet.payload_type == DTMF_PAYLOAD_TYPE {
+                            let is_new = current_dtmf_ts != Some(packet.timestamp);
+                            if is_new && packet.payload.len() >= 4 {
+                                let bytes: [u8; 4] = [
+                                    packet.payload[0],
+                                    packet.payload[1],
+                                    packet.payload[2],
+                                    packet.payload[3],
+                                ];
+                                if let Some(event) = DtmfEvent::decode(&bytes) {
+                                    current_dtmf_ts = Some(packet.timestamp);
+                                    // Generate one frame (20ms) tone at device rate.
+                                    // Longer tones overfill the ring buffer and stall
+                                    // the decode thread, causing jitter buffer desync.
+                                    let tone_samples = device_samples;
+                                    let mut tone_gen =
+                                        DtmfToneGenerator::new(event.digit, device_rate);
+                                    let mut tone = vec![0i16; tone_samples];
+                                    tone_gen.generate_samples(&mut tone);
+                                    producer.push_slice(&tone);
+                                }
+                            }
+                            // Clear tracking on end packet
+                            if packet.payload.len() >= 2 && (packet.payload[1] & 0x80) != 0 {
+                                current_dtmf_ts = None;
+                            }
                             continue;
                         }
 
