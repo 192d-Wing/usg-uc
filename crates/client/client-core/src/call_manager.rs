@@ -95,6 +95,8 @@ pub struct CallManager {
     negotiated_codecs: HashMap<String, CodecPreference>,
     /// Negotiated telephone-event payload type per call (None = not supported).
     telephone_event_pt: HashMap<String, Option<u8>>,
+    /// Negotiated RFC 2198 redundancy payload type per call (None = not supported).
+    redundancy_pt: HashMap<String, Option<u8>>,
     /// Effective local media address per call (what was advertised in SDP).
     effective_media_addrs: HashMap<String, SocketAddr>,
     /// SDP session ID per call (RFC 8866 - must remain constant for session).
@@ -245,6 +247,7 @@ impl CallManager {
             dtmf_inter_digit_pause_ms: 100,
             negotiated_codecs: HashMap::new(),
             telephone_event_pt: HashMap::new(),
+            redundancy_pt: HashMap::new(),
             effective_media_addrs: HashMap::new(),
             sdp_session_ids: HashMap::new(),
             sdp_session_versions: HashMap::new(),
@@ -1607,6 +1610,12 @@ impl CallManager {
             .copied()
             .flatten();
 
+        let redundancy_pt = self
+            .redundancy_pt
+            .get(call_id)
+            .copied()
+            .flatten();
+
         let config = AudioSessionConfig {
             local_port,
             remote_addr,
@@ -1619,6 +1628,7 @@ impl CallManager {
             dtmf_payload_type,
             dtmf_volume: self.dtmf_volume,
             dtmf_inter_digit_pause_ms: self.dtmf_inter_digit_pause_ms,
+            redundancy_pt,
         };
 
         // Start the audio session
@@ -1800,6 +1810,13 @@ impl CallManager {
             info!(call_id = %call_id, pt = pt, "Remote supports RFC 2833/4733 telephone-event PT={pt}");
         } else {
             warn!(call_id = %call_id, "Remote does NOT support RFC 2833/4733 telephone-event");
+        }
+
+        // Check if RFC 2198 redundancy was negotiated
+        let red_pt = parse_redundancy_pt(sdp);
+        self.redundancy_pt.insert(call_id.to_string(), red_pt);
+        if let Some(pt) = red_pt {
+            info!(call_id = %call_id, pt = pt, "Remote supports RFC 2198 redundancy PT={pt}");
         }
 
         // Parse remote media address from SDP (c= and m= lines)
@@ -1986,7 +2003,7 @@ impl CallManager {
                  c=IN {addr_type} {ip}\r\n\
                  b=AS:100\r\n\
                  t=0 0\r\n\
-                 m=audio {port} UDP/TLS/RTP/SAVPF 111 9 0 8 13 101\r\n\
+                 m=audio {port} UDP/TLS/RTP/SAVPF 111 9 0 8 13 101 121\r\n\
                  a=rtpmap:111 opus/48000/2\r\n\
                  a=fmtp:111 minptime=20;useinbandfec=1;stereo=1\r\n\
                  a=rtpmap:9 G722/8000\r\n\
@@ -1995,6 +2012,8 @@ impl CallManager {
                  a=rtpmap:13 CN/8000\r\n\
                  a=rtpmap:101 telephone-event/8000\r\n\
                  a=fmtp:101 0-16\r\n\
+                 a=rtpmap:121 red/8000\r\n\
+                 a=fmtp:121 0/0\r\n\
                  a=ptime:20\r\n\
                  a=maxptime:120\r\n\
                  a=ice-ufrag:{ufrag}\r\n\
@@ -2026,13 +2045,15 @@ impl CallManager {
                  c=IN {addr_type} {ip}\r\n\
                  b=AS:80\r\n\
                  t=0 0\r\n\
-                 m=audio {port} RTP/AVP 9 0 8 13 101\r\n\
+                 m=audio {port} RTP/AVP 9 0 8 13 101 121\r\n\
                  a=rtpmap:9 G722/8000\r\n\
                  a=rtpmap:0 PCMU/8000\r\n\
                  a=rtpmap:8 PCMA/8000\r\n\
                  a=rtpmap:13 CN/8000\r\n\
                  a=rtpmap:101 telephone-event/8000\r\n\
                  a=fmtp:101 0-16\r\n\
+                 a=rtpmap:121 red/8000\r\n\
+                 a=fmtp:121 0/0\r\n\
                  a=ptime:20\r\n\
                  a=maxptime:120\r\n\
                  a=sendrecv\r\n\
@@ -2134,7 +2155,7 @@ impl CallManager {
                  c=IN {addr_type} {ip}\r\n\
                  b=AS:100\r\n\
                  t=0 0\r\n\
-                 m=audio {port} UDP/TLS/RTP/SAVPF 111 9 0 8 13 101\r\n\
+                 m=audio {port} UDP/TLS/RTP/SAVPF 111 9 0 8 13 101 121\r\n\
                  a=rtpmap:111 opus/48000/2\r\n\
                  a=fmtp:111 minptime=20;useinbandfec=1;stereo=1\r\n\
                  a=rtpmap:9 G722/8000\r\n\
@@ -2143,6 +2164,8 @@ impl CallManager {
                  a=rtpmap:13 CN/8000\r\n\
                  a=rtpmap:101 telephone-event/8000\r\n\
                  a=fmtp:101 0-16\r\n\
+                 a=rtpmap:121 red/8000\r\n\
+                 a=fmtp:121 0/0\r\n\
                  a=ptime:20\r\n\
                  a=maxptime:120\r\n\
                  a=ice-ufrag:{ufrag}\r\n\
@@ -2174,13 +2197,15 @@ impl CallManager {
                  c=IN {addr_type} {ip}\r\n\
                  b=AS:80\r\n\
                  t=0 0\r\n\
-                 m=audio {port} RTP/AVP 9 0 8 13 101\r\n\
+                 m=audio {port} RTP/AVP 9 0 8 13 101 121\r\n\
                  a=rtpmap:9 G722/8000\r\n\
                  a=rtpmap:0 PCMU/8000\r\n\
                  a=rtpmap:8 PCMA/8000\r\n\
                  a=rtpmap:13 CN/8000\r\n\
                  a=rtpmap:101 telephone-event/8000\r\n\
                  a=fmtp:101 0-16\r\n\
+                 a=rtpmap:121 red/8000\r\n\
+                 a=fmtp:121 0/0\r\n\
                  a=ptime:20\r\n\
                  a=maxptime:120\r\n\
                  a={direction}\r\n\
@@ -2328,6 +2353,44 @@ fn parse_telephone_event_pt(sdp: &str) -> Option<u8> {
         if let Some(rest) = line.strip_prefix("a=rtpmap:") {
             if rest.contains("telephone-event") {
                 // Extract PT number from "101 telephone-event/8000"
+                if let Some(pt_str) = rest.split_whitespace().next() {
+                    if let Ok(pt) = pt_str.parse::<u8>() {
+                        candidate_pt = Some(pt);
+                    }
+                }
+            }
+        }
+    }
+
+    // Cross-check: the PT must also appear in the m=audio line
+    let pt = candidate_pt?;
+    let pt_token = format!(" {pt}");
+    if media_line_pts.contains(&pt_token) {
+        Some(pt)
+    } else {
+        None
+    }
+}
+
+/// Parses the RFC 2198 redundancy payload type from an SDP body.
+///
+/// Looks for `a=rtpmap:<N> red/8000` (or `red/<clock>`) and verifies the
+/// payload type is also listed in the `m=audio` line. Returns the dynamic
+/// PT number (commonly 121, but can be any value 96-127).
+fn parse_redundancy_pt(sdp: &str) -> Option<u8> {
+    let mut candidate_pt: Option<u8> = None;
+    let mut media_line_pts = String::new();
+
+    for line in sdp.lines() {
+        if line.starts_with("m=audio") {
+            media_line_pts = line.to_string();
+        }
+
+        // Look for: a=rtpmap:<N> red/<clock>
+        if let Some(rest) = line.strip_prefix("a=rtpmap:") {
+            // Trim whitespace — remote SDPs may have inconsistent spacing
+            let rest = rest.trim();
+            if rest.contains("red/") || rest.contains("RED/") {
                 if let Some(pt_str) = rest.split_whitespace().next() {
                     if let Ok(pt) = pt_str.parse::<u8>() {
                         candidate_pt = Some(pt);
@@ -2902,5 +2965,57 @@ mod tests {
         let (digit, duration) = parse_dtmf_relay_body(body).unwrap();
         assert_eq!(digit, '#');
         assert_eq!(duration, 160);
+    }
+
+    // ── RFC 2198 redundancy PT parsing ──────────────────────────────
+
+    #[test]
+    fn test_parse_redundancy_pt_standard() {
+        let sdp = "\
+v=0\r\n\
+o=- 1234 5678 IN IP4 10.0.0.1\r\n\
+s=-\r\n\
+c=IN IP4 10.0.0.1\r\n\
+m=audio 10000 RTP/AVP 0 121 101\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:121 red/8000\r\n\
+a=fmtp:121 0/0\r\n\
+a=rtpmap:101 telephone-event/8000\r\n";
+        assert_eq!(parse_redundancy_pt(sdp), Some(121));
+    }
+
+    #[test]
+    fn test_parse_redundancy_pt_different_pt() {
+        let sdp = "\
+m=audio 5000 RTP/AVP 0 96 101\r\n\
+a=rtpmap:96 red/8000\r\n\
+a=fmtp:96 0/0\r\n";
+        assert_eq!(parse_redundancy_pt(sdp), Some(96));
+    }
+
+    #[test]
+    fn test_parse_redundancy_pt_case_insensitive() {
+        let sdp = "\
+m=audio 5000 RTP/AVP 0 121\r\n\
+a=rtpmap:121 RED/8000\r\n";
+        assert_eq!(parse_redundancy_pt(sdp), Some(121));
+    }
+
+    #[test]
+    fn test_parse_redundancy_pt_not_in_m_line() {
+        // rtpmap present but PT not listed in m= line → None
+        let sdp = "\
+m=audio 5000 RTP/AVP 0 101\r\n\
+a=rtpmap:121 red/8000\r\n";
+        assert_eq!(parse_redundancy_pt(sdp), None);
+    }
+
+    #[test]
+    fn test_parse_redundancy_pt_absent() {
+        let sdp = "\
+m=audio 5000 RTP/AVP 0 101\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n";
+        assert_eq!(parse_redundancy_pt(sdp), None);
     }
 }

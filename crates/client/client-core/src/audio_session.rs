@@ -39,6 +39,8 @@ pub struct AudioSessionConfig {
     pub dtmf_volume: u8,
     /// Inter-digit pause in milliseconds (default 100).
     pub dtmf_inter_digit_pause_ms: u32,
+    /// RFC 2198 redundancy payload type from SDP (`None` = disabled).
+    pub redundancy_pt: Option<u8>,
 }
 
 impl Default for AudioSessionConfig {
@@ -54,6 +56,7 @@ impl Default for AudioSessionConfig {
             dtmf_payload_type: None,
             dtmf_volume: 10,
             dtmf_inter_digit_pause_ms: 100,
+            redundancy_pt: None,
         }
     }
 }
@@ -126,6 +129,7 @@ impl AudioSession {
             dtmf_payload_type: None,
             dtmf_volume: 10,
             dtmf_inter_digit_pause_ms: 100,
+            redundancy_pt: None,
         };
 
         self.start(config).await
@@ -156,6 +160,7 @@ impl AudioSession {
             dtmf_payload_type: config.dtmf_payload_type,
             dtmf_volume: config.dtmf_volume,
             dtmf_inter_digit_pause_ms: config.dtmf_inter_digit_pause_ms,
+            redundancy_pt: config.redundancy_pt,
         };
 
         // Start pipeline (sync — pipeline spawns its own threads)

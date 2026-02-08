@@ -64,6 +64,8 @@ pub struct PipelineConfig {
     pub dtmf_volume: u8,
     /// Inter-digit pause in milliseconds (default 100).
     pub dtmf_inter_digit_pause_ms: u32,
+    /// RFC 2198 redundancy payload type from SDP (`None` = disabled).
+    pub redundancy_pt: Option<u8>,
 }
 
 impl Default for PipelineConfig {
@@ -80,6 +82,7 @@ impl Default for PipelineConfig {
             dtmf_payload_type: None,
             dtmf_volume: 10,
             dtmf_inter_digit_pause_ms: 100,
+            redundancy_pt: None,
         }
     }
 }
@@ -223,8 +226,18 @@ impl AudioPipeline {
             transmitter.set_dtmf_payload_type(pt);
         }
 
+        // Enable RFC 2198 redundancy if negotiated in SDP
+        if let Some(pt) = config.redundancy_pt {
+            transmitter.enable_redundancy(pt);
+        }
+
         // Create receiver
         let mut receiver = RtpReceiver::new(socket, jitter_buffer.clone());
+
+        // Enable RFC 2198 redundancy reception if negotiated in SDP
+        if let Some(pt) = config.redundancy_pt {
+            receiver.set_redundancy_pt(pt);
+        }
 
         // Set up SRTP if keys are provided
         if let (Some(key), Some(salt)) = (&config.srtp_master_key, &config.srtp_master_salt) {
