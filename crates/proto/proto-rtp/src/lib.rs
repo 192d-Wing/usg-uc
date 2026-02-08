@@ -43,7 +43,10 @@ pub mod sequence;
 pub mod translator;
 
 pub use error::{RtpError, RtpResult};
-pub use packet::{RtpHeader, RtpPacket};
+pub use packet::{
+    ExtensionElement, ExtensionFormat, ExtensionHeader, RtpHeader, RtpPacket,
+    EXTENSION_PROFILE_ONE_BYTE, EXTENSION_PROFILE_TWO_BYTE, EXTENSION_PROFILE_TWO_BYTE_MASK,
+};
 pub use rtcp::{ReceptionReport, RtcpHeader, RtcpPacket, RtcpType, SenderInfo};
 pub use scheduler::{
     INITIAL_AVG_RTCP_SIZE, IntervalBounds, RTCP_BANDWIDTH_FRACTION, RTCP_COMPENSATION_FACTOR,

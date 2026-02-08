@@ -415,6 +415,7 @@ impl G722Encoder {
         };
 
         let mut mil = 1;
+        #[allow(clippy::needless_range_loop)]
         for i in 1..30 {
             let hdu = ((Q6[i] << 3) as i64) * (self.lower.det as i64);
             let wd1 = (hdu >> 15) as i32;

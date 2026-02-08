@@ -97,6 +97,8 @@ pub struct CallManager {
     telephone_event_pt: HashMap<String, Option<u8>>,
     /// Negotiated RFC 2198 redundancy payload type per call (None = not supported).
     redundancy_pt: HashMap<String, Option<u8>>,
+    /// Negotiated RTP header extension IDs per call (from SDP `a=extmap`).
+    negotiated_extension_ids: HashMap<String, Vec<(u8, String)>>,
     /// Effective local media address per call (what was advertised in SDP).
     effective_media_addrs: HashMap<String, SocketAddr>,
     /// SDP session ID per call (RFC 8866 - must remain constant for session).
@@ -248,6 +250,7 @@ impl CallManager {
             negotiated_codecs: HashMap::new(),
             telephone_event_pt: HashMap::new(),
             redundancy_pt: HashMap::new(),
+            negotiated_extension_ids: HashMap::new(),
             effective_media_addrs: HashMap::new(),
             sdp_session_ids: HashMap::new(),
             sdp_session_versions: HashMap::new(),
@@ -852,6 +855,13 @@ impl CallManager {
             if let Some(pt) = red_pt {
                 info!(call_id = %call_id, pt = pt, "Remote offer supports redundancy PT={pt}");
             }
+            // Parse RTP header extensions from remote offer (RFC 5285)
+            let ext_ids = parse_extmap_attributes(remote_sdp);
+            if !ext_ids.is_empty() {
+                info!(call_id = %call_id, count = ext_ids.len(), "Remote offer supports RTP extensions");
+            }
+            self.negotiated_extension_ids
+                .insert(call_id.to_string(), ext_ids);
         }
 
         // Generate SDP answer
@@ -1697,6 +1707,12 @@ impl CallManager {
             .copied()
             .flatten();
 
+        let extension_ids = self
+            .negotiated_extension_ids
+            .get(call_id)
+            .cloned()
+            .unwrap_or_default();
+
         let config = AudioSessionConfig {
             local_port,
             remote_addr,
@@ -1710,6 +1726,7 @@ impl CallManager {
             dtmf_volume: self.dtmf_volume,
             dtmf_inter_digit_pause_ms: self.dtmf_inter_digit_pause_ms,
             redundancy_pt,
+            extension_ids,
         };
 
         // Start the audio session
@@ -1921,6 +1938,21 @@ impl CallManager {
             info!(call_id = %call_id, pt = pt, "Remote supports RFC 2198 redundancy PT={pt}");
         }
 
+        // Parse negotiated RTP header extensions (RFC 5285)
+        let ext_ids = parse_extmap_attributes(sdp);
+        if !ext_ids.is_empty() {
+            info!(
+                call_id = %call_id,
+                count = ext_ids.len(),
+                "Negotiated RTP header extensions"
+            );
+            for (id, uri) in &ext_ids {
+                debug!(call_id = %call_id, id = id, uri = %uri, "Extension negotiated");
+            }
+        }
+        self.negotiated_extension_ids
+            .insert(call_id.to_string(), ext_ids);
+
         // Parse remote media address from SDP (c= and m= lines)
         // This is used for non-ICE calls where the remote specifies its address directly
         let remote_media_addr = parse_remote_media_addr_from_sdp(sdp);
@@ -2122,6 +2154,7 @@ impl CallManager {
                  a=fmtp:101 0-16\r\n\
                  a=rtpmap:121 red/8000\r\n\
                  a=fmtp:121 0/0\r\n\
+                 a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\n\
                  a=ptime:20\r\n\
                  a=maxptime:120\r\n\
                  a=ice-ufrag:{ufrag}\r\n\
@@ -2162,6 +2195,7 @@ impl CallManager {
                  a=fmtp:101 0-16\r\n\
                  a=rtpmap:121 red/8000\r\n\
                  a=fmtp:121 0/0\r\n\
+                 a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\n\
                  a=ptime:20\r\n\
                  a=maxptime:120\r\n\
                  a=sendrecv\r\n\
@@ -2298,6 +2332,7 @@ impl CallManager {
              a=fmtp:101 0-16\r\n\
              a=rtpmap:121 red/8000\r\n\
              a=fmtp:121 0/0\r\n\
+             a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\n\
              a=ptime:20\r\n\
              a=maxptime:120\r\n",
             session_id = sdp_session_id,
@@ -2385,6 +2420,7 @@ impl CallManager {
                  a=fmtp:101 0-16\r\n\
                  a=rtpmap:121 red/8000\r\n\
                  a=fmtp:121 0/0\r\n\
+                 a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\n\
                  a=ptime:20\r\n\
                  a=maxptime:120\r\n\
                  a=ice-ufrag:{ufrag}\r\n\
@@ -2425,6 +2461,7 @@ impl CallManager {
                  a=fmtp:101 0-16\r\n\
                  a=rtpmap:121 red/8000\r\n\
                  a=fmtp:121 0/0\r\n\
+                 a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\n\
                  a=ptime:20\r\n\
                  a=maxptime:120\r\n\
                  a={direction}\r\n\
@@ -2627,6 +2664,40 @@ fn parse_redundancy_pt(sdp: &str) -> Option<u8> {
     } else {
         None
     }
+}
+
+/// Parses `a=extmap` attributes from an SDP body.
+///
+/// Returns a list of `(id, uri)` pairs for negotiated RTP header extensions.
+/// Only includes extensions we support (currently: ssrc-audio-level).
+///
+/// Format: `a=extmap:<id>[/<direction>] <URI> [<extensionattributes>]`
+fn parse_extmap_attributes(sdp: &str) -> Vec<(u8, String)> {
+    /// Extension URIs we support.
+    const SUPPORTED_URIS: &[&str] = &["urn:ietf:params:rtp-hdrext:ssrc-audio-level"];
+
+    let mut extensions = Vec::new();
+
+    for line in sdp.lines() {
+        if let Some(rest) = line.strip_prefix("a=extmap:") {
+            let rest = rest.trim();
+            // Split into id_part and URI (+ optional attrs)
+            if let Some((id_part, uri_part)) = rest.split_once(' ') {
+                // Parse ID (strip optional direction suffix like "1/sendrecv")
+                let id_str = id_part.split('/').next().unwrap_or(id_part);
+                if let Ok(id) = id_str.parse::<u8>() {
+                    // Extract just the URI (first token of the rest)
+                    let uri = uri_part.split_whitespace().next().unwrap_or(uri_part);
+                    // Only include extensions we support
+                    if SUPPORTED_URIS.iter().any(|&s| s == uri) {
+                        extensions.push((id, uri.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    extensions
 }
 
 /// Parses a `application/dtmf-relay` body from a SIP INFO request.
@@ -3469,5 +3540,62 @@ a=rtpmap:8 PCMA/8000\r\n";
             parse_codec_from_sdp(sdp_g711),
             parse_codec_from_sdp(sdp_g722)
         );
+    }
+
+    // ── RFC 5285 extmap parsing tests ─────────────────────────────
+
+    #[test]
+    fn test_parse_extmap_audio_level() {
+        let sdp = "\
+v=0\r\n\
+o=- 1234 1 IN IP4 10.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 49170 RTP/AVP 0 101\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\n\
+a=sendrecv\r\n";
+
+        let exts = parse_extmap_attributes(sdp);
+        assert_eq!(exts.len(), 1);
+        assert_eq!(exts[0].0, 1);
+        assert_eq!(
+            exts[0].1,
+            "urn:ietf:params:rtp-hdrext:ssrc-audio-level"
+        );
+    }
+
+    #[test]
+    fn test_parse_extmap_with_direction() {
+        let sdp = "\
+m=audio 5004 RTP/AVP 0\r\n\
+a=extmap:2/sendonly urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\n";
+
+        let exts = parse_extmap_attributes(sdp);
+        assert_eq!(exts.len(), 1);
+        assert_eq!(exts[0].0, 2);
+    }
+
+    #[test]
+    fn test_parse_extmap_unsupported_ignored() {
+        let sdp = "\
+m=audio 5004 RTP/AVP 0\r\n\
+a=extmap:3 urn:ietf:params:rtp-hdrext:toffset\r\n\
+a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\n";
+
+        let exts = parse_extmap_attributes(sdp);
+        // toffset is not in our supported list
+        assert_eq!(exts.len(), 1);
+        assert_eq!(exts[0].0, 1);
+    }
+
+    #[test]
+    fn test_parse_extmap_none() {
+        let sdp = "\
+m=audio 5004 RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n";
+
+        let exts = parse_extmap_attributes(sdp);
+        assert!(exts.is_empty());
     }
 }

@@ -163,7 +163,7 @@ pub struct AudioDevice {
 /// and noise gate settings for each device class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DeviceCategory {
-    /// Built-in speakers (MacBook, iMac).
+    /// Built-in speakers (`MacBook`, iMac).
     BuiltInSpeaker,
     /// Built-in microphone.
     BuiltInMic,

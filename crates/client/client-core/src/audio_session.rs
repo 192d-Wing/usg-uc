@@ -41,6 +41,8 @@ pub struct AudioSessionConfig {
     pub dtmf_inter_digit_pause_ms: u32,
     /// RFC 2198 redundancy payload type from SDP (`None` = disabled).
     pub redundancy_pt: Option<u8>,
+    /// Negotiated RTP header extensions (id, URI) from SDP `a=extmap`.
+    pub extension_ids: Vec<(u8, String)>,
 }
 
 impl Default for AudioSessionConfig {
@@ -57,6 +59,7 @@ impl Default for AudioSessionConfig {
             dtmf_volume: 10,
             dtmf_inter_digit_pause_ms: 100,
             redundancy_pt: None,
+            extension_ids: Vec::new(),
         }
     }
 }
@@ -130,6 +133,7 @@ impl AudioSession {
             dtmf_volume: 10,
             dtmf_inter_digit_pause_ms: 100,
             redundancy_pt: None,
+            extension_ids: Vec::new(),
         };
 
         self.start(config).await
@@ -163,6 +167,7 @@ impl AudioSession {
             redundancy_pt: config.redundancy_pt,
             echo_cancellation: true,
             audio: Default::default(),
+            extension_ids: config.extension_ids,
         };
 
         // Start pipeline (sync — pipeline spawns its own threads)

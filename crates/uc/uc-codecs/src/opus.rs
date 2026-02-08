@@ -66,6 +66,7 @@ impl OpusBandwidth {
 
 /// Opus codec configuration.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct OpusConfig {
     /// Sample rate (8000, 12000, 16000, 24000, or 48000 Hz).
     pub sample_rate: u32,

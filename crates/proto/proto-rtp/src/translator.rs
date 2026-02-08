@@ -188,7 +188,7 @@ impl RtpTranslator {
         let state = self
             .sources
             .get_mut(&ssrc)
-            .ok_or_else(|| RtpError::InvalidRtcp {
+            .ok_or(RtpError::InvalidRtcp {
                 reason: "source state not found",
             })?;
 

@@ -9,7 +9,7 @@ use crate::jitter_buffer::{BufferedPacket, SharedJitterBuffer};
 use crate::{AudioError, AudioResult};
 use bytes::Bytes;
 use client_types::DtmfEvent;
-use proto_rtp::RtpHeader;
+use proto_rtp::{ExtensionElement, RtpHeader};
 use proto_srtp::{SrtpContext, SrtpProtect, SrtpUnprotect};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
@@ -135,6 +135,15 @@ pub struct RtpTransmitter {
     redundancy_enabled: bool,
     /// RTP payload type for RFC 2198 redundancy packets.
     redundancy_pt: u8,
+    /// Negotiated RTP header extension map (id → URI).
+    ///
+    /// When set, outgoing packets include a one-byte extension header
+    /// with elements for each negotiated extension.
+    extension_map: Vec<(u8, String)>,
+    /// Cached pre-built extension header (rebuilt on `set_extension_map`).
+    cached_ext_header: Option<proto_rtp::ExtensionHeader>,
+    /// Total RTP header size including any extension (12 when no extension).
+    header_size: usize,
 }
 
 impl RtpTransmitter {
@@ -168,6 +177,9 @@ impl RtpTransmitter {
             prev_payload: Vec::new(),
             redundancy_enabled: false,
             redundancy_pt: REDUNDANCY_PAYLOAD_TYPE,
+            extension_map: Vec::new(),
+            cached_ext_header: None,
+            header_size: RTP_HEADER_SIZE,
         }
     }
 
@@ -199,6 +211,52 @@ impl RtpTransmitter {
         debug!("SRTP encryption enabled for transmitter");
     }
 
+    /// Sets the negotiated RTP header extension map.
+    ///
+    /// Each entry is `(id, uri)` where `id` is the one-byte extension ID (1-14)
+    /// and `uri` identifies the extension type (e.g., `urn:ietf:params:rtp-hdrext:ssrc-audio-level`).
+    ///
+    /// Pre-builds a cached extension header for zero-allocation sending.
+    pub fn set_extension_map(&mut self, map: Vec<(u8, String)>) {
+        debug!("RTP extension map set: {} extensions", map.len());
+        for (id, uri) in &map {
+            debug!("  ext id={}: {}", id, uri);
+        }
+
+        if map.is_empty() {
+            self.extension_map = map;
+            self.cached_ext_header = None;
+            self.header_size = RTP_HEADER_SIZE;
+            return;
+        }
+
+        // Build default extension elements (placeholder data).
+        // ssrc-audio-level: 1 byte = 0x7F (V=0, level=127 = silence)
+        let elements: Vec<ExtensionElement> = map
+            .iter()
+            .map(|(id, _uri)| ExtensionElement {
+                id: *id,
+                data: Bytes::from_static(&[0x7F]),
+            })
+            .collect();
+
+        match proto_rtp::ExtensionHeader::build_one_byte(&elements) {
+            Ok(ext) => {
+                // Calculate total header size: 12 (fixed) + 4 (ext profile+length) + ext.data.len()
+                self.header_size = RTP_HEADER_SIZE + 4 + ext.data.len();
+                self.cached_ext_header = Some(ext);
+                debug!("Cached extension header: {} bytes total", self.header_size);
+            }
+            Err(e) => {
+                warn!("Failed to build extension header: {}, extensions disabled", e);
+                self.cached_ext_header = None;
+                self.header_size = RTP_HEADER_SIZE;
+            }
+        }
+
+        self.extension_map = map;
+    }
+
     /// Sends an RTP packet with the given audio payload.
     ///
     /// When RFC 2198 redundancy is enabled, the previous frame is included
@@ -222,6 +280,9 @@ impl RtpTransmitter {
         let rtp_payload_start;
         let rtp_payload_end;
 
+        // Use the actual header size (12 without extensions, larger with).
+        let hdr_size = self.header_size;
+
         if self.redundancy_enabled && !self.prev_payload.is_empty() {
             // RFC 2198 format:
             //   Header block 1 (4 bytes): F=1 | PT | timestamp_offset(14) | block_len(10)
@@ -232,13 +293,12 @@ impl RtpTransmitter {
 
             // We write the RFC 2198 body into send_buffer AFTER the RTP header.
             // The RTP header will be written at offset 0 later.
-            // Use a temp offset that we'll adjust after writing the header.
             let prev_len = self.prev_payload.len();
             let red_header_size = 5; // 4 + 1 bytes
             let body_len = red_header_size + prev_len + payload.len();
 
-            // Build redundancy headers in send_buffer (after space for 12-byte RTP header).
-            let off = RTP_HEADER_SIZE;
+            // Build redundancy headers in send_buffer (after space for RTP header).
+            let off = hdr_size;
             // Redundant block header (4 bytes):
             //   bit 0: F=1 (more blocks follow)
             //   bits 1-7: block PT (original codec PT)
@@ -270,8 +330,8 @@ impl RtpTransmitter {
             rtp_payload_end = off + body_len;
         } else {
             effective_pt = self.payload_type;
-            rtp_payload_start = RTP_HEADER_SIZE;
-            rtp_payload_end = RTP_HEADER_SIZE + payload.len();
+            rtp_payload_start = hdr_size;
+            rtp_payload_end = hdr_size + payload.len();
             self.send_buffer[rtp_payload_start..rtp_payload_end].copy_from_slice(payload);
         }
 
@@ -281,7 +341,15 @@ impl RtpTransmitter {
             self.prev_payload.extend_from_slice(payload);
         }
 
-        let header = RtpHeader::new(effective_pt, seq, ts, self.ssrc);
+        // Build RTP header, attaching extension if negotiated.
+        let header = {
+            let h = RtpHeader::new(effective_pt, seq, ts, self.ssrc);
+            if let Some(ref ext) = self.cached_ext_header {
+                h.with_extension(ext.clone())
+            } else {
+                h
+            }
+        };
 
         let protected: Bytes;
         let send_data: &[u8] = if let Some(ref srtp) = self.srtp {
@@ -299,8 +367,8 @@ impl RtpTransmitter {
             }
         } else {
             // Zero-alloc: write header into send_buffer, payload is already there.
-            let header_size = header.write_into(&mut self.send_buffer);
-            debug_assert_eq!(header_size, RTP_HEADER_SIZE);
+            let written = header.write_into(&mut self.send_buffer);
+            debug_assert_eq!(written, hdr_size);
             &self.send_buffer[..rtp_payload_end]
         };
 
@@ -484,6 +552,8 @@ pub struct RtpReceiver {
     local_ssrc: Option<u32>,
     /// Set to `true` when an incoming SSRC matches our local SSRC.
     ssrc_collision: bool,
+    /// Negotiated RTP header extension map (id → URI) for incoming packets.
+    extension_map: Vec<(u8, String)>,
 }
 
 impl RtpReceiver {
@@ -503,6 +573,7 @@ impl RtpReceiver {
             redundancy_pt: None,
             local_ssrc: None,
             ssrc_collision: false,
+            extension_map: Vec::new(),
         }
     }
 
@@ -536,6 +607,19 @@ impl RtpReceiver {
     pub fn set_redundancy_pt(&mut self, pt: u8) {
         self.redundancy_pt = Some(pt);
         debug!("RFC 2198 redundancy reception enabled, PT={}", pt);
+    }
+
+    /// Sets the negotiated RTP header extension map for incoming packets.
+    ///
+    /// Each entry is `(id, uri)` for interpreting received extension elements.
+    pub fn set_extension_map(&mut self, map: Vec<(u8, String)>) {
+        debug!("RX extension map set: {} extensions", map.len());
+        self.extension_map = map;
+    }
+
+    /// Returns the negotiated extension map.
+    pub fn extension_map(&self) -> &[(u8, String)] {
+        &self.extension_map
     }
 
     /// Receives an RTP packet (blocking, respects socket `recv_timeout`).
@@ -1196,5 +1280,80 @@ mod tests {
         assert_eq!(tx.ssrc(), 0xAAAA);
         tx.change_ssrc(0xBBBB);
         assert_eq!(tx.ssrc(), 0xBBBB);
+    }
+
+    // ── RTP header extension tests ──────────────────────────────
+
+    #[test]
+    fn test_transmitter_extension_map_send() {
+        // Verify that setting an extension map produces packets with extensions.
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_addr = socket.local_addr().unwrap();
+        let socket = Arc::new(socket);
+
+        let mut tx = RtpTransmitter::new(socket.clone(), local_addr, 0xABCD, 0, 160);
+        tx.set_extension_map(vec![(
+            1,
+            "urn:ietf:params:rtp-hdrext:ssrc-audio-level".to_string(),
+        )]);
+
+        // Header size should be larger than 12 now
+        assert!(tx.header_size > RTP_HEADER_SIZE);
+
+        // Send a packet and receive it
+        let payload = [0x42u8; 160];
+        tx.send(&payload).unwrap();
+
+        let mut buf = [0u8; MAX_RTP_PACKET_SIZE];
+        let (len, _) = socket.recv_from(&mut buf).unwrap();
+
+        // The extension bit should be set (byte 0, bit 4)
+        assert_ne!(buf[0] & 0x10, 0, "Extension bit should be set");
+
+        // Parse the packet — parse_rtp_fields skips the extension correctly
+        let (pt, _seq, _ts, ssrc, payload_start, payload_end) =
+            parse_rtp_fields(&buf[..len]).unwrap();
+        assert_eq!(pt, 0);
+        assert_eq!(ssrc, 0xABCD);
+        // Payload should still be 160 bytes
+        assert_eq!(payload_end - payload_start, 160);
+        // Payload should match what we sent
+        assert!(buf[payload_start..payload_end].iter().all(|&b| b == 0x42));
+    }
+
+    #[test]
+    fn test_transmitter_no_extension_default() {
+        // Without extension map, no extension header in packets.
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_addr = socket.local_addr().unwrap();
+        let socket = Arc::new(socket);
+
+        let mut tx = RtpTransmitter::new(socket.clone(), local_addr, 0x1234, 0, 160);
+        assert_eq!(tx.header_size, RTP_HEADER_SIZE);
+
+        let payload = [0xAA; 160];
+        tx.send(&payload).unwrap();
+
+        let mut buf = [0u8; MAX_RTP_PACKET_SIZE];
+        let (len, _) = socket.recv_from(&mut buf).unwrap();
+
+        // Extension bit should NOT be set
+        assert_eq!(buf[0] & 0x10, 0, "Extension bit should not be set");
+        assert_eq!(len, RTP_HEADER_SIZE + 160);
+    }
+
+    #[test]
+    fn test_receiver_extension_map() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let jb = SharedJitterBuffer::new(8000, 160, 60);
+        let mut rx = RtpReceiver::new(Arc::new(socket), jb);
+
+        assert!(rx.extension_map().is_empty());
+        rx.set_extension_map(vec![(
+            1,
+            "urn:ietf:params:rtp-hdrext:ssrc-audio-level".to_string(),
+        )]);
+        assert_eq!(rx.extension_map().len(), 1);
+        assert_eq!(rx.extension_map()[0].0, 1);
     }
 }

@@ -214,6 +214,12 @@ pub struct PipelineConfig {
     pub echo_cancellation: bool,
     /// Audio processing component configuration.
     pub audio: AudioProcessingConfig,
+    /// Negotiated RTP header extensions (id, URI) from SDP `a=extmap`.
+    ///
+    /// When non-empty, the RTP transmitter includes a one-byte extension
+    /// header in outgoing packets, and the receiver can interpret extension
+    /// elements in incoming packets.
+    pub extension_ids: Vec<(u8, String)>,
 }
 
 impl Default for PipelineConfig {
@@ -233,6 +239,7 @@ impl Default for PipelineConfig {
             redundancy_pt: None,
             echo_cancellation: true,
             audio: AudioProcessingConfig::default(),
+            extension_ids: Vec::new(),
         }
     }
 }
@@ -481,6 +488,12 @@ impl AudioPipeline {
 
         // Set local SSRC on receiver for collision detection (RFC 3550 §8.2)
         receiver.set_local_ssrc(ssrc);
+
+        // Set negotiated RTP header extensions on both transmitter and receiver
+        if !config.extension_ids.is_empty() {
+            transmitter.set_extension_map(config.extension_ids.clone());
+            receiver.set_extension_map(config.extension_ids.clone());
+        }
 
         // Set up SRTP if keys are provided
         if let (Some(key), Some(salt)) = (&config.srtp_master_key, &config.srtp_master_salt) {
