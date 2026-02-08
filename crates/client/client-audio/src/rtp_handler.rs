@@ -14,7 +14,7 @@ use proto_srtp::{SrtpContext, SrtpProtect, SrtpUnprotect};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 /// Default RTP payload type for audio.
 pub const DEFAULT_PAYLOAD_TYPE: u8 = 0; // PCMU
@@ -472,10 +472,21 @@ impl RtpReceiver {
             packet.header.sequence_number, packet.header.timestamp, packet.header.payload_type
         );
 
-        // Track remote SSRC (first packet sets it)
-        if self.remote_ssrc.is_none() {
-            self.remote_ssrc = Some(packet.header.ssrc);
-            debug!("Learned remote SSRC: {}", packet.header.ssrc);
+        // Track remote SSRC — detect changes mid-call (RFC 3550 §8.2).
+        match self.remote_ssrc {
+            None => {
+                self.remote_ssrc = Some(packet.header.ssrc);
+                debug!("Learned remote SSRC: {:#010x}", packet.header.ssrc);
+            }
+            Some(prev) if prev != packet.header.ssrc => {
+                warn!(
+                    "Remote SSRC changed: {:#010x} -> {:#010x}, resetting jitter buffer",
+                    prev, packet.header.ssrc
+                );
+                self.remote_ssrc = Some(packet.header.ssrc);
+                self.jitter_buffer.reset();
+            }
+            _ => {}
         }
 
         // Add to shared jitter buffer
