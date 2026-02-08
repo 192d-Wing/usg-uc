@@ -405,16 +405,17 @@ fn parse_nameaddr_params(params_str: &str) -> (Option<String>, HashMap<String, O
     let mut params = HashMap::new();
 
     for param in params_str.split(';').filter(|p| !p.is_empty()) {
-        let (name, value) = if let Some((n, v)) = param.split_once('=') {
-            (n.trim().to_lowercase(), Some(v.trim().to_string()))
+        let (raw_name, raw_value) = if let Some((n, v)) = param.split_once('=') {
+            (n.trim(), Some(v.trim()))
         } else {
-            (param.trim().to_lowercase(), None)
+            (param.trim(), None::<&str>)
         };
 
-        if name == "tag" {
-            tag = value;
+        if raw_name.eq_ignore_ascii_case("tag") {
+            tag = raw_value.map(String::from);
         } else {
-            params.insert(name, value);
+            // Only allocate for unknown params
+            params.insert(raw_name.to_lowercase(), raw_value.map(String::from));
         }
     }
 
