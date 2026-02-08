@@ -284,12 +284,17 @@ fn decode_loop(
 
     // Track current inbound DTMF event to avoid replaying. RFC 4733 sends
     // multiple packets per event (start + continuations + 3× end), all sharing
-    // the same RTP timestamp. We only generate a tone on the first packet.
+    // the same RTP timestamp. We keep this set even after end so retransmitted
+    // end packets are still filtered by the is_new check.
     let mut current_dtmf_ts: Option<u32> = None;
     // Track duration of the current DTMF event for validation.
     // RFC 4733 duration increases monotonically across continuation packets;
     // a decrease indicates a malformed packet.
     let mut current_dtmf_duration: u16 = 0;
+    // Persistent tone generator: produces sustained DTMF tone across multiple
+    // decode cycles until the end packet arrives. Without this, only one 20ms
+    // frame is generated per event (sounds like a click instead of a tone).
+    let mut active_dtmf_gen: Option<DtmfToneGenerator> = None;
 
     // Gain gate state: holds the gate open during speech to prevent
     // gain fluctuation at speech boundaries that amplifies quantization noise.
@@ -399,8 +404,13 @@ fn decode_loop(
                         // Handle RFC 4733 telephone-event packets (PT=101)
                         // RFC 4733 sends multiple packets per event (start +
                         // continuations every 20ms + 3× end), all with the same
-                        // RTP timestamp. Generate one tone on the first packet
-                        // only; skip continuations and end packets.
+                        // RTP timestamp.
+                        //
+                        // On the first packet of a new event, create a persistent
+                        // DtmfToneGenerator. Each decode cycle that has an active
+                        // generator produces one frame of tone. The end packet
+                        // stops the generator but does NOT clear current_dtmf_ts,
+                        // so retransmitted end packets are still filtered as dupes.
                         if packet.payload_type == dtmf_pt {
                             if packet.payload.len() < 4 {
                                 // RFC 4733 requires exactly 4 bytes
@@ -417,6 +427,18 @@ fn decode_loop(
                             let is_new = current_dtmf_ts != Some(packet.timestamp);
                             match DtmfEvent::decode(&bytes) {
                                 Some(event) => {
+                                    debug!(
+                                        "DTMF rx: digit={:?} ts={} seq={} end={} dur={} ({}ms) is_new={} gen_active={}",
+                                        event.digit,
+                                        packet.timestamp,
+                                        packet.sequence,
+                                        event.end,
+                                        event.duration,
+                                        event.duration_to_ms(),
+                                        is_new,
+                                        active_dtmf_gen.is_some(),
+                                    );
+
                                     // Validate duration range (40ms-5000ms at 8kHz)
                                     if event.duration > DTMF_MAX_DURATION {
                                         trace!(
@@ -455,19 +477,25 @@ fn decode_loop(
                                         current_dtmf_ts = Some(packet.timestamp);
                                         current_dtmf_duration = event.duration;
                                         metrics.dtmf_received.fetch_add(1, Ordering::Relaxed);
-                                        // Generate one frame (20ms) tone at device rate.
-                                        let mut tone_gen =
-                                            DtmfToneGenerator::new(event.digit, device_rate);
+                                        // Create persistent tone generator for this event.
+                                        active_dtmf_gen =
+                                            Some(DtmfToneGenerator::new(event.digit, device_rate));
+                                    }
+
+                                    // Generate one frame of tone while the generator is active
+                                    // (covers both the initial packet and continuations).
+                                    if let Some(ref mut tone_gen) = active_dtmf_gen {
                                         let tone_buf = &mut scratch[..device_samples];
                                         tone_buf.fill(0);
                                         tone_gen.generate_samples(tone_buf);
                                         producer.push_slice(tone_buf);
                                     }
 
-                                    // Clear tracking on end packet
+                                    // End packet: stop generating tone but keep
+                                    // current_dtmf_ts so retransmitted end packets
+                                    // are still filtered by the is_new check.
                                     if event.end {
-                                        current_dtmf_ts = None;
-                                        current_dtmf_duration = 0;
+                                        active_dtmf_gen = None;
                                     }
                                 }
                                 None => {
@@ -476,6 +504,17 @@ fn decode_loop(
                                     metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
+                            continue;
+                        }
+
+                        // During an active DTMF event, discard interleaved audio
+                        // packets. Some PBXes (e.g. BulkVS) continue sending audio
+                        // alongside telephone-event packets. Don't generate output
+                        // here — the DTMF packet handler already produces tone frames
+                        // at the correct rate. Generating tone for audio packets too
+                        // would overfill the ring buffer (~2× rate) and cause robotic
+                        // audio after the DTMF event ends.
+                        if active_dtmf_gen.is_some() {
                             continue;
                         }
 
@@ -585,6 +624,19 @@ fn decode_loop(
                     }
                     JitterBufferResult::Lost { .. } => {
                         decoded_this_cycle += 1;
+
+                        // During an active DTMF event, a "lost" packet is just
+                        // a delayed DTMF continuation — generate tone instead
+                        // of PLC concealment audio (which would interleave
+                        // speech fragments with the tone → rapid clicks).
+                        if let Some(ref mut tone_gen) = active_dtmf_gen {
+                            let tone_buf = &mut scratch[..device_samples];
+                            tone_buf.fill(0);
+                            tone_gen.generate_samples(tone_buf);
+                            producer.push_slice(tone_buf);
+                            continue;
+                        }
+
                         // Try FEC recovery first (Opus inband FEC), fall back to PLC.
                         // PLC conceal() reuses an internal scratch buffer (zero-alloc).
                         // FEC path borrows codec_scratch directly (also zero-alloc).
@@ -619,6 +671,17 @@ fn decode_loop(
                     JitterBufferResult::Empty | JitterBufferResult::NotReady => {
                         // If we already decoded real audio this cycle, just stop.
                         if decoded_this_cycle > 0 {
+                            break;
+                        }
+
+                        // If a DTMF tone is active, keep generating frames
+                        // even though the JB is empty (DTMF packets may arrive
+                        // sparsely while the tone should sustain continuously).
+                        if let Some(ref mut tone_gen) = active_dtmf_gen {
+                            let tone_buf = &mut scratch[..device_samples];
+                            tone_buf.fill(0);
+                            tone_gen.generate_samples(tone_buf);
+                            producer.push_slice(tone_buf);
                             break;
                         }
 
