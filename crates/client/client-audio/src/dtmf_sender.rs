@@ -165,8 +165,9 @@ impl DtmfSender {
     /// Polls the state machine. Call once per I/O loop iteration.
     ///
     /// Returns an encoded audio frame (in-band DTMF tone) that the caller
-    /// should send via `transmitter.send()`. For RFC 4733 mode this provides
-    /// dual-send (telephone-event + in-band audio simultaneously).
+    /// should send via `transmitter.send()`. For RFC 4733 mode, returns
+    /// `None` (only telephone-event packets are sent, no inband audio),
+    /// matching pjproject's approach.
     pub fn poll(
         &mut self,
         transmitter: &mut RtpTransmitter,
@@ -177,11 +178,7 @@ impl DtmfSender {
             DtmfPhase::Sending => self.poll_sending(transmitter, codec),
             DtmfPhase::EndPackets => {
                 self.poll_end_packets(transmitter);
-                // Continue inband tone during end packets so the remote's
-                // audio RTP stream stays continuous (no gap → no robotic
-                // speech after DTMF). transmitter.send() in the caller
-                // advances the audio timestamp naturally.
-                self.generate_tone_frame(codec)
+                None
             }
             DtmfPhase::InterDigitPause => {
                 self.poll_pause();
@@ -202,11 +199,11 @@ impl DtmfSender {
 
     /// Begins transmission of a single digit.
     ///
-    /// Always creates a tone generator regardless of mode — for RFC 4733,
-    /// the tone is sent alongside telephone-event packets (dual-send).
+    /// For RFC 4733: sends only telephone-event packets (no inband audio).
+    /// For pure inband: creates a tone generator and sends encoded audio.
     fn start_digit(&mut self, cmd: DtmfCommand) {
         let method = if cmd.use_rfc2833 {
-            "RFC4733+inband"
+            "RFC4733"
         } else {
             "in-band"
         };
@@ -216,7 +213,12 @@ impl DtmfSender {
         );
 
         let total_duration_ts = DtmfEvent::duration_from_ms(cmd.duration_ms);
-        let tone_gen = Some(DtmfToneGenerator::new(cmd.digit, self.codec_clock_rate));
+        // Only create tone generator for inband-only mode
+        let tone_gen = if cmd.use_rfc2833 {
+            None
+        } else {
+            Some(DtmfToneGenerator::new(cmd.digit, self.codec_clock_rate))
+        };
 
         let now = Instant::now();
         self.current = Some(ActiveDigit {
@@ -234,8 +236,8 @@ impl DtmfSender {
 
     /// Polls during the Sending phase.
     ///
-    /// For RFC 4733: sends telephone-event packet AND returns in-band tone
-    /// frame (dual-send). For pure in-band: returns tone frame only.
+    /// For RFC 4733: sends only the telephone-event packet (no inband audio),
+    /// matching pjproject. For pure in-band: returns tone frame only.
     fn poll_sending(
         &mut self,
         transmitter: &mut RtpTransmitter,
@@ -247,13 +249,9 @@ impl DtmfSender {
         if !digit.marker_sent || digit.last_packet_time.elapsed() >= PACKET_INTERVAL {
             if digit.cmd.use_rfc2833 {
                 self.send_rfc4733_packet(transmitter);
-                // Always generate inband tone — even on the frame that
-                // transitions to EndPackets. The tone sustains continuously
-                // through the entire event to prevent audio RTP gaps.
-                return self.generate_tone_frame(codec);
-            } else {
-                return self.send_inband_packet(codec);
+                return None; // RFC 4733 only — no inband audio
             }
+            return self.send_inband_packet(codec);
         }
         None
     }
@@ -354,9 +352,17 @@ impl DtmfSender {
         };
 
         if digit.end_packets_sent >= END_PACKET_REPEATS {
-            // No advance_dtmf_timestamp needed — inband tone frames sent
-            // during EndPackets already advance the audio timestamp via
-            // transmitter.send() in the caller.
+            // Advance audio timestamp past the DTMF event so the next
+            // audio packet resumes at the correct position. Without this,
+            // the timestamp would be stale (no send() calls during DTMF).
+            if digit.cmd.use_rfc2833 {
+                #[allow(clippy::cast_possible_truncation)]
+                let total_frames =
+                    digit.packets_sent + END_PACKET_REPEATS;
+                let advance =
+                    total_frames * self.codec_samples_per_frame as u32;
+                transmitter.advance_dtmf_timestamp(advance);
+            }
             self.transition_to_pause();
             return;
         }
