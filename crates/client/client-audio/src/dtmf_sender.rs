@@ -17,7 +17,8 @@ use tracing::{debug, info, trace, warn};
 const MAX_DIGIT_QUEUE: usize = 32;
 
 /// Default inter-digit pause in milliseconds.
-const INTER_DIGIT_PAUSE_MS: u64 = 100;
+/// pjproject uses 0ms by default (PJMEDIA_DTMF_DIGIT_PAUSE_LEN = 0).
+const INTER_DIGIT_PAUSE_MS: u64 = 0;
 
 /// Number of end-of-event packets sent for reliability (RFC 4733).
 const END_PACKET_REPEATS: u32 = 3;
