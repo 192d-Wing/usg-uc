@@ -388,6 +388,32 @@ impl DtmfSender {
         }
     }
 
+    /// Sends a forced end packet if DTMF is mid-send, then clears all state.
+    ///
+    /// Called during stream teardown so the remote knows the event is over
+    /// (matches pjproject's `stream_destroy` behavior).
+    pub fn flush(&mut self, transmitter: &mut RtpTransmitter) {
+        if let Some(ref digit) = self.current {
+            if digit.cmd.use_rfc2833
+                && matches!(self.phase, DtmfPhase::Sending | DtmfPhase::EndPackets)
+            {
+                let duration = if self.phase == DtmfPhase::Sending {
+                    DtmfEvent::duration_from_ms((digit.packets_sent + 1) * 20)
+                        .min(digit.total_duration_ts)
+                } else {
+                    digit.total_duration_ts
+                };
+                let mut event = DtmfEvent::with_end(digit.cmd.digit, duration);
+                event.volume = self.volume;
+                let _ = transmitter.send_dtmf(&event, false);
+                info!("DTMF flush: sent forced end for '{}'", digit.cmd.digit);
+            }
+        }
+        self.phase = DtmfPhase::Idle;
+        self.current = None;
+        self.queue.clear();
+    }
+
     /// Transitions to the inter-digit pause (or idle if queue is empty).
     fn transition_to_pause(&mut self) {
         if self.queue.is_empty() {

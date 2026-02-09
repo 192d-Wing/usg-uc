@@ -583,6 +583,9 @@ fn io_loop(
         }
     }
 
+    // Flush any in-progress DTMF (forced end-bit) before teardown
+    dtmf_sender.flush(&mut transmitter);
+
     // Final stats update on exit
     update_stats(&transmitter, &receiver, &rtcp_session, &stats);
     capture.stop();
