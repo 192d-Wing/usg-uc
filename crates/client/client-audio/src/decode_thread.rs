@@ -29,12 +29,18 @@ use tracing::{debug, info, trace, warn};
 /// Set `DUMP_DECODED_AUDIO=1` to write decoded audio to `/tmp/decoded-audio.raw`.
 const DUMP_ENV_VAR: &str = "DUMP_DECODED_AUDIO";
 
-/// Target fill level for the playback ring buffer (in frames).
-/// At 20ms per frame, 3 frames = 60ms cushion.
-/// Keep this low for real-time VoIP — every extra frame adds 20ms
-/// of end-to-end latency. 3 frames is enough to absorb scheduling
-/// jitter while keeping mouth-to-ear delay acceptable.
-const TARGET_FILL_FRAMES: usize = 3;
+/// Initial target fill level for the playback ring buffer (in frames).
+/// At 20ms per frame, 3 frames = 60ms cushion. This is the starting
+/// value; it adapts down based on jitter buffer health.
+const INITIAL_FILL_FRAMES: usize = 3;
+
+/// Minimum adaptive fill (in frames). Never go below 2 frames (40ms)
+/// to absorb scheduling jitter, even on low-latency networks.
+const MIN_FILL_FRAMES: usize = 2;
+
+/// Maximum adaptive fill (in frames). Cap at 4 frames (80ms) to bound
+/// latency even on high-jitter networks.
+const MAX_FILL_FRAMES: usize = 4;
 
 /// Playback gain applied to decoded remote audio (linear).
 /// Unity gain: logs show G.711 ulaw from `BulkVS` peaks at 20000-29000
@@ -63,6 +69,10 @@ const DTMF_MIN_DURATION: u16 = 320;
 
 /// Maximum valid DTMF duration in timestamp units (5000ms at 8kHz = 40000).
 const DTMF_MAX_DURATION: u16 = 40000;
+
+/// DTMF tone attenuation when mixed with decoded audio (linear).
+/// 0.2 ≈ -14 dB, clearly audible without dominating speech.
+const DTMF_TONE_MIX_GAIN: f32 = 0.2;
 
 /// Command sent from the main thread to the decode thread.
 pub enum DecodeCommand {
@@ -252,7 +262,8 @@ fn decode_loop(
     let mut device_rate = config.device_rate;
     #[allow(clippy::cast_possible_truncation)]
     let mut device_samples = (codec_samples as u32 * device_rate / codec_clock_rate) as usize;
-    let mut target_fill = device_samples * TARGET_FILL_FRAMES;
+    let mut target_fill_frames: usize = INITIAL_FILL_FRAMES;
+    let mut target_fill = device_samples * target_fill_frames;
 
     // Drift compensator: measure every decode cycle for fast response
     let drift_cfg = config.drift.clone();
@@ -354,10 +365,11 @@ fn decode_loop(
         let occupied = producer.occupied_len();
 
         if occupied >= target_fill {
-            // Healthy — sleep and check again. 10ms is fine: at 48kHz the
-            // CPAL callback consumes ~480 samples per 10ms, well within the
-            // 160ms (7680 sample) cushion.
-            thread::sleep(Duration::from_millis(10));
+            // Healthy — wait for condvar signal from I/O thread (packet push).
+            // Falls back to 10ms timeout if no packet arrives (e.g., silence
+            // suppression / DTX). At 48kHz the CPAL callback consumes ~480
+            // samples per 10ms, well within the ring buffer cushion.
+            jitter_buffer.wait_for_push(Duration::from_millis(10));
         } else {
             // Determine how many frames to decode based on urgency
             let frames_to_decode = if occupied < device_samples {
@@ -388,7 +400,6 @@ fn decode_loop(
                 match jitter_buffer.pop() {
                     JitterBufferResult::Packet(packet) => {
                         consecutive_empty = 0;
-                        decoded_this_cycle += 1;
 
                         // Handle RFC 3389 Comfort Noise packets (PT=13)
                         if packet.payload_type == proto_rtp::payload_types::CN {
@@ -398,6 +409,7 @@ fn decode_loop(
                             cn_buf.fill(0);
                             cng.generate(cn_buf);
                             producer.push_slice(cn_buf);
+                            decoded_this_cycle += 1;
                             continue;
                         }
 
@@ -489,14 +501,10 @@ fn decode_loop(
                                     // continuation already covered this time slot.
                                     if event.end {
                                         active_dtmf_gen = None;
-                                    } else if let Some(ref mut tone_gen) = active_dtmf_gen {
-                                        // Generate one frame of tone for start/continuation
-                                        // packets (not end packets).
-                                        let tone_buf = &mut scratch[..device_samples];
-                                        tone_buf.fill(0);
-                                        tone_gen.generate_samples(tone_buf);
-                                        producer.push_slice(tone_buf);
                                     }
+                                    // Tone is mixed into decoded audio frames below
+                                    // (no standalone push here — avoids 2× output rate
+                                    // when PBX sends interleaved audio + telephone-event).
                                 }
                                 None => {
                                     // Invalid event code (>16)
@@ -507,16 +515,10 @@ fn decode_loop(
                             continue;
                         }
 
-                        // During an active DTMF event, discard interleaved audio
-                        // packets. Some PBXes (e.g. BulkVS) continue sending audio
-                        // alongside telephone-event packets. Don't generate output
-                        // here — the DTMF packet handler already produces tone frames
-                        // at the correct rate. Generating tone for audio packets too
-                        // would overfill the ring buffer (~2× rate) and cause robotic
-                        // audio after the DTMF event ends.
-                        if active_dtmf_gen.is_some() {
-                            continue;
-                        }
+                        // Audio packet: decode normally even during DTMF.
+                        // Keeping the codec fed preserves ADPCM/LPC state,
+                        // preventing robotic speech when DTMF ends.
+                        decoded_this_cycle += 1;
 
                         // Decode into codec's internal buffer, then copy to our scratch
                         let codec_pcm = match codec.decode(&packet.payload) {
@@ -603,6 +605,19 @@ fn decode_loop(
                             last_output_sample = last;
                         }
 
+                        // Mix DTMF tone overlay if a received event is active.
+                        // Decoding audio normally keeps codec state fresh; the
+                        // attenuated tone provides local feedback for the digit.
+                        if let Some(ref mut tone_gen) = active_dtmf_gen {
+                            for s in &mut *device_pcm {
+                                let tone = tone_gen.next_sample();
+                                #[allow(clippy::cast_possible_truncation)]
+                                let scaled =
+                                    (f32::from(tone) * DTMF_TONE_MIX_GAIN) as i16;
+                                *s = s.saturating_add(scaled);
+                            }
+                        }
+
                         // Write to audio dump file if enabled
                         if let Some(ref mut dump) = audio_dump {
                             use std::io::Write;
@@ -624,18 +639,6 @@ fn decode_loop(
                     }
                     JitterBufferResult::Lost { .. } => {
                         decoded_this_cycle += 1;
-
-                        // During an active DTMF event, a "lost" packet is just
-                        // a delayed DTMF continuation — generate tone instead
-                        // of PLC concealment audio (which would interleave
-                        // speech fragments with the tone → rapid clicks).
-                        if let Some(ref mut tone_gen) = active_dtmf_gen {
-                            let tone_buf = &mut scratch[..device_samples];
-                            tone_buf.fill(0);
-                            tone_gen.generate_samples(tone_buf);
-                            producer.push_slice(tone_buf);
-                            continue;
-                        }
 
                         // Try FEC recovery first (Opus inband FEC), fall back to PLC.
                         // PLC conceal() reuses an internal scratch buffer (zero-alloc).
@@ -660,6 +663,17 @@ fn decode_loop(
                         // Resample concealed audio to device rate (zero-alloc)
                         let device_pcm = &mut resample_buf[..device_samples];
                         resampler.process_adjusted_into(concealed, device_pcm);
+
+                        // Mix DTMF tone if active (sustain tone during packet loss)
+                        if let Some(ref mut tone_gen) = active_dtmf_gen {
+                            for s in &mut *device_pcm {
+                                let tone = tone_gen.next_sample();
+                                #[allow(clippy::cast_possible_truncation)]
+                                let scaled =
+                                    (f32::from(tone) * DTMF_TONE_MIX_GAIN) as i16;
+                                *s = s.saturating_add(scaled);
+                            }
+                        }
 
                         if let Some(&last) = device_pcm.last() {
                             last_output_sample = last;
@@ -735,8 +749,12 @@ fn decode_loop(
                 }
             }
 
-            // Sleep before re-checking fill level (5ms whether we decoded or not)
-            thread::sleep(Duration::from_millis(5));
+            // Wait for next packet notification instead of blind sleep.
+            // After a successful decode, use 1ms timeout to quickly drain
+            // burst arrivals. If JB was empty, use 5ms (matches the I/O
+            // thread's socket recv_timeout).
+            let wait_ms = if decoded_this_cycle > 0 { 1 } else { 5 };
+            jitter_buffer.wait_for_push(Duration::from_millis(wait_ms));
         }
 
         // Check for commands (output device switch)
@@ -776,7 +794,7 @@ fn decode_loop(
                                         / codec_clock_rate)
                                         as usize;
                                 }
-                                target_fill = device_samples * TARGET_FILL_FRAMES;
+                                target_fill = device_samples * target_fill_frames;
                                 scratch.resize(device_samples + 16, 0);
                                 resample_buf.resize(device_samples + 16, 0);
                                 resampler = Resampler::new(codec_clock_rate, device_rate);
@@ -830,7 +848,7 @@ fn decode_loop(
                             device_samples = (codec_samples as u32 * device_rate
                                 / codec_clock_rate) as usize;
                         }
-                        target_fill = device_samples * TARGET_FILL_FRAMES;
+                        target_fill = device_samples * target_fill_frames;
                         scratch.resize(device_samples + 16, 0);
                         resample_buf.resize(device_samples + 16, 0);
                         resampler = Resampler::new(codec_clock_rate, device_rate);
@@ -850,12 +868,39 @@ fn decode_loop(
             }
         }
 
-        // Diagnostic logging every ~2 seconds
+        // Diagnostic logging + adaptive ring buffer fill — every ~2 seconds
         if diag_timer.elapsed() >= Duration::from_secs(2) {
             let jb_stats = jitter_buffer.stats();
             let underruns = playback_underruns.load(Ordering::Relaxed);
+
+            // Adapt ring buffer target fill based on JB health.
+            // Lower fill = lower latency, higher underrun risk.
+            let new_fill_frames = if underruns > 0 {
+                // Underruns detected — stay conservative
+                INITIAL_FILL_FRAMES
+            } else if jb_stats.current_depth_ms <= 30 {
+                // JB converged to low depth — safe to use fewer frames
+                MIN_FILL_FRAMES
+            } else if jb_stats.current_depth_ms <= 50 {
+                // Intermediate: ceil(depth / 20) clamped to [MIN, MAX]
+                #[allow(clippy::cast_possible_truncation)]
+                let frames = ((jb_stats.current_depth_ms + 19) / 20) as usize;
+                frames.clamp(MIN_FILL_FRAMES, MAX_FILL_FRAMES)
+            } else {
+                INITIAL_FILL_FRAMES
+            };
+
+            if new_fill_frames != target_fill_frames {
+                debug!(
+                    "Adaptive fill: {} -> {} frames (jb_depth={}ms, underruns={})",
+                    target_fill_frames, new_fill_frames, jb_stats.current_depth_ms, underruns,
+                );
+                target_fill_frames = new_fill_frames;
+                target_fill = device_samples * target_fill_frames;
+            }
+
             info!(
-                "Decode diag: decoded={}, lost={}, jb_empty={}, ring_fill={}/{}, \
+                "Decode diag: decoded={}, lost={}, jb_empty={}, ring_fill={}/{} ({}f), \
                  jb_pkts={}, jb_depth={}ms, jb_jitter={:.1}ms, pb_underruns={}, \
                  peak_pre={}, peak_post={}, gain={:.2}",
                 diag_frames_decoded,
@@ -863,6 +908,7 @@ fn decode_loop(
                 diag_jb_empty,
                 producer.occupied_len(),
                 target_fill,
+                target_fill_frames,
                 jb_stats.current_packet_count,
                 jb_stats.current_depth_ms,
                 jb_stats.average_jitter_ms,
