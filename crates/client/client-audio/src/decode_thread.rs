@@ -12,6 +12,7 @@ use crate::comfort_noise::{ComfortNoiseConfig, ComfortNoiseGenerator, decode_cn_
 use crate::drift_compensator::{DriftCompensator, DriftConfig};
 use crate::dtmf_tones::DtmfToneGenerator;
 use crate::jitter_buffer::{JitterBufferResult, SharedJitterBuffer};
+use crate::rtp_handler::SharedDtmfQueue;
 use crate::postfilter::{Postfilter, PostfilterConfig};
 use crate::sinc_resampler::Resampler;
 use crate::wsola::WsolaPlc;
@@ -175,6 +176,9 @@ pub struct DecodeThreadConfig {
     /// Channel for received DTMF digit notifications.
     /// When present, the decode thread sends each new DTMF digit here.
     pub dtmf_rx_tx: Option<mpsc::Sender<DtmfDigit>>,
+    /// Shared DTMF packet queue (JB bypass).
+    /// When present, DTMF packets arrive here instead of the jitter buffer.
+    pub dtmf_queue: Option<SharedDtmfQueue>,
 }
 
 /// Spawns the decode thread.
@@ -387,6 +391,47 @@ fn decode_loop(
             };
 
             let mut decoded_this_cycle: u32 = 0;
+
+            // Drain DTMF bypass queue (packets arrive here instead of JB
+            // when set_dtmf_bypass is configured on the RTP receiver).
+            if let Some(ref dtmf_queue) = config.dtmf_queue {
+                while let Some(packet) = dtmf_queue.pop() {
+                    if packet.payload.len() < 4 {
+                        metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    let bytes: [u8; 4] = [
+                        packet.payload[0],
+                        packet.payload[1],
+                        packet.payload[2],
+                        packet.payload[3],
+                    ];
+                    let is_new = current_dtmf_ts != Some(packet.timestamp);
+                    if let Some(event) = DtmfEvent::decode(&bytes) {
+                        if !is_new && event.duration < current_dtmf_duration {
+                            continue; // Non-monotonic duration within event
+                        }
+                        current_dtmf_duration = event.duration;
+
+                        if is_new {
+                            if event.end && event.duration < DTMF_MIN_DURATION {
+                                metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            current_dtmf_ts = Some(packet.timestamp);
+                            metrics.dtmf_received.fetch_add(1, Ordering::Relaxed);
+                            active_dtmf_gen =
+                                Some(DtmfToneGenerator::new(event.digit, device_rate));
+                            if let Some(ref tx) = config.dtmf_rx_tx {
+                                let _ = tx.send(event.digit);
+                            }
+                        }
+                        if event.end {
+                            active_dtmf_gen = None;
+                        }
+                    }
+                }
+            }
 
             for _ in 0..frames_to_decode {
                 // Get drift adjustment from compensator
@@ -956,6 +1001,7 @@ mod tests {
             postfilter: PostfilterConfig::default(),
             comfort_noise: ComfortNoiseConfig::default(),
             dtmf_rx_tx: None,
+            dtmf_queue: None,
         };
 
         let metrics = DecodeMetrics::new();
@@ -979,6 +1025,7 @@ mod tests {
             postfilter: PostfilterConfig::default(),
             comfort_noise: ComfortNoiseConfig::default(),
             dtmf_rx_tx: None,
+            dtmf_queue: None,
         };
         assert_eq!(config.device_rate, 48000);
         assert_eq!(config.dtmf_payload_type, 101);

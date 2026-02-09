@@ -486,6 +486,9 @@ impl AudioPipeline {
             transmitter.enable_redundancy(pt);
         }
 
+        // Create shared DTMF queue for JB bypass
+        let dtmf_queue = crate::rtp_handler::SharedDtmfQueue::new();
+
         // Create receiver
         let mut receiver = RtpReceiver::new(socket, jitter_buffer.clone());
 
@@ -496,6 +499,10 @@ impl AudioPipeline {
 
         // Set local SSRC on receiver for collision detection (RFC 3550 §8.2)
         receiver.set_local_ssrc(ssrc);
+
+        // Enable DTMF JB bypass (telephone-event packets routed to dedicated queue)
+        let dtmf_pt = config.dtmf_payload_type.unwrap_or(crate::rtp_handler::DTMF_PAYLOAD_TYPE);
+        receiver.set_dtmf_bypass(dtmf_pt, dtmf_queue.clone());
 
         // Set negotiated RTP header extensions on both transmitter and receiver
         if !config.extension_ids.is_empty() {
@@ -601,6 +608,7 @@ impl AudioPipeline {
             postfilter: config.audio.postfilter.clone(),
             comfort_noise: config.audio.comfort_noise.clone(),
             dtmf_rx_tx: Some(dtmf_rx_tx),
+            dtmf_queue: Some(dtmf_queue.clone()),
         };
         let decode_metrics = decode_thread::DecodeMetrics::new();
         let decode_handle = decode_thread::spawn(

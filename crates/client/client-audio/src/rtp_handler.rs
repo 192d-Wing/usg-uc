@@ -11,11 +11,46 @@ use bytes::Bytes;
 use client_types::DtmfEvent;
 use proto_rtp::{ExtensionElement, RtpHeader};
 use proto_srtp::{SrtpContext, SrtpProtect, SrtpUnprotect};
+use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{debug, info, trace, warn};
+
+/// Shared DTMF packet queue for jitter buffer bypass.
+///
+/// DTMF telephone-event packets are routed here instead of the jitter
+/// buffer, matching pjproject's approach where DTMF is intercepted at
+/// the RTP receive level.
+#[derive(Clone)]
+pub struct SharedDtmfQueue {
+    inner: Arc<Mutex<VecDeque<BufferedPacket>>>,
+}
+
+impl SharedDtmfQueue {
+    /// Creates a new shared DTMF queue.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(VecDeque::with_capacity(16))),
+        }
+    }
+
+    /// Pushes a DTMF packet into the queue.
+    pub fn push(&self, packet: BufferedPacket) {
+        if let Ok(mut q) = self.inner.lock() {
+            // Cap at 32 to prevent unbounded growth if consumer stalls
+            if q.len() < 32 {
+                q.push_back(packet);
+            }
+        }
+    }
+
+    /// Pops the next DTMF packet from the queue.
+    pub fn pop(&self) -> Option<BufferedPacket> {
+        self.inner.lock().ok()?.pop_front()
+    }
+}
 
 /// Default RTP payload type for audio.
 pub const DEFAULT_PAYLOAD_TYPE: u8 = 0; // PCMU
@@ -581,6 +616,10 @@ pub struct RtpReceiver {
     ssrc_collision: bool,
     /// Negotiated RTP header extension map (id → URI) for incoming packets.
     extension_map: Vec<(u8, String)>,
+    /// DTMF telephone-event payload type (bypasses JB when set).
+    dtmf_pt: Option<u8>,
+    /// Shared queue for DTMF packets (bypasses jitter buffer).
+    dtmf_queue: Option<SharedDtmfQueue>,
 }
 
 impl RtpReceiver {
@@ -601,7 +640,19 @@ impl RtpReceiver {
             local_ssrc: None,
             ssrc_collision: false,
             extension_map: Vec::new(),
+            dtmf_pt: None,
+            dtmf_queue: None,
         }
+    }
+
+    /// Configures DTMF jitter buffer bypass.
+    ///
+    /// When set, telephone-event packets matching `pt` are routed to the
+    /// dedicated DTMF queue instead of the jitter buffer (matches pjproject).
+    pub fn set_dtmf_bypass(&mut self, pt: u8, queue: SharedDtmfQueue) {
+        self.dtmf_pt = Some(pt);
+        self.dtmf_queue = Some(queue);
+        debug!("DTMF JB bypass enabled for PT={}", pt);
     }
 
     /// Sets the expected remote address for packet filtering.
@@ -758,6 +809,22 @@ impl RtpReceiver {
                 self.jitter_buffer.reset();
             }
             _ => {}
+        }
+
+        // DTMF JB bypass: route telephone-event packets to the dedicated
+        // queue instead of the jitter buffer (matches pjproject).
+        if self.dtmf_pt == Some(pt) {
+            if let Some(ref queue) = self.dtmf_queue {
+                let buffered = BufferedPacket::new(seq, ts, pt, payload);
+                queue.push(buffered);
+                self.stats.packets_received.fetch_add(1, Ordering::Relaxed);
+                #[allow(clippy::cast_possible_truncation)]
+                self.stats
+                    .bytes_received
+                    .fetch_add(len as u64, Ordering::Relaxed);
+                return Ok(());
+            }
+            // No queue configured — fall through to JB (legacy path)
         }
 
         // RFC 2198 redundancy: extract primary + redundant payloads.
