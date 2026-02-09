@@ -140,6 +140,15 @@ impl DtmfSender {
         self.phase != DtmfPhase::Idle
     }
 
+    /// Returns `true` if DTMF tone/packets are being actively sent.
+    ///
+    /// Unlike [`is_active()`](Self::is_active), this returns `false` during
+    /// the inter-digit pause, allowing normal mic audio to resume between
+    /// digits (matches pjproject behavior).
+    pub fn is_sending_tone(&self) -> bool {
+        matches!(self.phase, DtmfPhase::Sending | DtmfPhase::EndPackets)
+    }
+
     /// Returns `true` if an in-band DTMF tone is currently being sent.
     ///
     /// When true, the caller should suppress normal mic capture sends

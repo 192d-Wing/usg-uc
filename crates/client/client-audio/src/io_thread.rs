@@ -389,10 +389,11 @@ fn io_loop(
             if current_moh {
                 // Music on Hold mode
                 process_moh_frame(&mut codec, &mut transmitter, &mut moh_source, &mut moh_pcm);
-            } else if dtmf_sender.is_active() {
-                // Suppress mic capture during DTMF (RFC 4733 or in-band)
-                // to prevent locally-played DTMF tone from leaking into mic audio.
-                trace!("Mic suppressed: DTMF active");
+            } else if dtmf_sender.is_sending_tone() {
+                // Suppress mic capture during active DTMF tone/packets, but
+                // NOT during inter-digit pause — normal mic audio resumes
+                // between digits (matches pjproject behavior).
+                trace!("Mic suppressed: DTMF tone active");
             } else if !muted.load(Ordering::Relaxed) {
                 // Normal capture mode
                 let in_warmup = dtx_warmup_start.elapsed() < dtx_warmup_duration;
