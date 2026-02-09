@@ -16,7 +16,7 @@ use crate::postfilter::{Postfilter, PostfilterConfig};
 use crate::sinc_resampler::Resampler;
 use crate::wsola::WsolaPlc;
 use crate::stream::{PlaybackStream, PlaybackStreamHandle, Sample};
-use client_types::{CodecPreference, DtmfEvent};
+use client_types::{CodecPreference, DtmfDigit, DtmfEvent};
 use ringbuf::traits::{Observer, Producer};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -172,6 +172,9 @@ pub struct DecodeThreadConfig {
     pub postfilter: PostfilterConfig,
     /// Comfort noise generator configuration.
     pub comfort_noise: ComfortNoiseConfig,
+    /// Channel for received DTMF digit notifications.
+    /// When present, the decode thread sends each new DTMF digit here.
+    pub dtmf_rx_tx: Option<mpsc::Sender<DtmfDigit>>,
 }
 
 /// Spawns the decode thread.
@@ -492,6 +495,10 @@ fn decode_loop(
                                         // Create persistent tone generator for this event.
                                         active_dtmf_gen =
                                             Some(DtmfToneGenerator::new(event.digit, device_rate));
+                                        // Notify application layer of received digit.
+                                        if let Some(ref tx) = config.dtmf_rx_tx {
+                                            let _ = tx.send(event.digit);
+                                        }
                                     }
 
                                     // End packet: stop generating tone but keep
@@ -948,6 +955,7 @@ mod tests {
             drift: DriftConfig::default(),
             postfilter: PostfilterConfig::default(),
             comfort_noise: ComfortNoiseConfig::default(),
+            dtmf_rx_tx: None,
         };
 
         let metrics = DecodeMetrics::new();
@@ -970,6 +978,7 @@ mod tests {
             drift: DriftConfig::default(),
             postfilter: PostfilterConfig::default(),
             comfort_noise: ComfortNoiseConfig::default(),
+            dtmf_rx_tx: None,
         };
         assert_eq!(config.device_rate, 48000);
         assert_eq!(config.dtmf_payload_type, 101);

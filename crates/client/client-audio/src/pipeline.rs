@@ -228,7 +228,7 @@ impl Default for PipelineConfig {
             codec: CodecPreference::G711Ulaw,
             local_port: 0, // Auto-assign
             remote_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
-            jitter_buffer_ms: 60,
+            jitter_buffer_ms: 40,
             srtp_master_key: None,
             srtp_master_salt: None,
             muted: false,
@@ -377,6 +377,9 @@ pub struct AudioPipeline {
     local_port: Option<u16>,
     /// SSRC being used for transmission.
     ssrc: Option<u32>,
+    /// Receiver for DTMF digits detected by the decode thread.
+    /// Wrapped in Mutex for Sync (needed by async Tauri command handlers).
+    dtmf_rx: Option<Mutex<std::sync::mpsc::Receiver<DtmfDigit>>>,
 }
 
 impl AudioPipeline {
@@ -396,6 +399,7 @@ impl AudioPipeline {
             decode_metrics: None,
             local_port: None,
             ssrc: None,
+            dtmf_rx: None,
         }
     }
 
@@ -455,8 +459,12 @@ impl AudioPipeline {
         let socket = Arc::new(socket);
 
         // Create shared jitter buffer (used by I/O thread and decode thread)
-        let jitter_buffer =
-            SharedJitterBuffer::new(clock_rate, samples_per_frame, config.jitter_buffer_ms);
+        let jitter_buffer = SharedJitterBuffer::with_config(
+            clock_rate,
+            samples_per_frame,
+            config.jitter_buffer_ms,
+            config.audio.jitter_buffer.clone(),
+        );
 
         // Create transmitter
         let ssrc = generate_ssrc();
@@ -580,6 +588,9 @@ impl AudioPipeline {
             None
         };
 
+        // Create DTMF receive notification channel
+        let (dtmf_rx_tx, dtmf_rx_rx) = std::sync::mpsc::channel();
+
         // Spawn decode thread
         let decode_config = DecodeThreadConfig {
             codec: config.codec,
@@ -589,6 +600,7 @@ impl AudioPipeline {
             drift: config.audio.drift.clone(),
             postfilter: config.audio.postfilter.clone(),
             comfort_noise: config.audio.comfort_noise.clone(),
+            dtmf_rx_tx: Some(dtmf_rx_tx),
         };
         let decode_metrics = decode_thread::DecodeMetrics::new();
         let decode_handle = decode_thread::spawn(
@@ -661,6 +673,7 @@ impl AudioPipeline {
         self.has_moh_audio = has_moh;
         self.local_port = Some(local_port);
         self.ssrc = Some(ssrc);
+        self.dtmf_rx = Some(Mutex::new(dtmf_rx_rx));
 
         self.state = PipelineState::Running;
         info!("Audio pipeline started on port {}", local_port);
@@ -742,6 +755,18 @@ impl AudioPipeline {
     pub fn set_moh_active(&self, active: bool) {
         self.moh_active.store(active, Ordering::Relaxed);
         debug!("MOH active: {}", active);
+    }
+
+    /// Drains all received DTMF digits from the decode thread.
+    ///
+    /// Returns an iterator of `DtmfDigit` values. Call this periodically
+    /// (e.g., from a timer or event loop) to process incoming DTMF events.
+    pub fn drain_received_dtmf(&self) -> Vec<DtmfDigit> {
+        self.dtmf_rx
+            .as_ref()
+            .and_then(|m| m.lock().ok())
+            .map(|rx| rx.try_iter().collect())
+            .unwrap_or_default()
     }
 
     /// Returns whether Music on Hold is currently active.
@@ -953,7 +978,7 @@ mod tests {
     fn test_pipeline_config_default() {
         let config = PipelineConfig::default();
         assert_eq!(config.codec, CodecPreference::G711Ulaw);
-        assert_eq!(config.jitter_buffer_ms, 60);
+        assert_eq!(config.jitter_buffer_ms, 40);
         assert!(!config.muted);
     }
 
