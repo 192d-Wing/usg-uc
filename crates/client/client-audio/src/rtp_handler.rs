@@ -14,6 +14,7 @@ use proto_srtp::{SrtpContext, SrtpProtect, SrtpUnprotect};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{debug, info, trace, warn};
 
 /// Default RTP payload type for audio.
@@ -122,10 +123,8 @@ pub struct RtpTransmitter {
     stats: Arc<AtomicRtpStats>,
     /// DTMF payload type (telephone-event).
     dtmf_payload_type: u8,
-    /// Current DTMF timestamp (separate from audio).
-    dtmf_timestamp: AtomicU32,
     /// Timestamp of the current DTMF event (stays constant for one event).
-    #[allow(dead_code)] // Read via atomic operations
+    /// Per RFC 4733, this is the audio stream timestamp at event start.
     dtmf_event_timestamp: AtomicU32,
     /// Pre-allocated buffer for serializing non-SRTP packets (header + payload).
     send_buffer: Vec<u8>,
@@ -146,6 +145,11 @@ pub struct RtpTransmitter {
     cached_ext_header: Option<proto_rtp::ExtensionHeader>,
     /// Total RTP header size including any extension (12 when no extension).
     header_size: usize,
+    /// Wall-clock time of the last `send()` / `send_cn()` / `send_dtmf()` call.
+    /// Used to catch up the audio timestamp before DTMF events when the
+    /// stream has been silent (muted/DTX) — otherwise the marker timestamp
+    /// would be "stale" and the remote end's jitter buffer might drop it.
+    last_send_time: Instant,
 }
 
 impl RtpTransmitter {
@@ -173,7 +177,6 @@ impl RtpTransmitter {
             srtp: None,
             stats: Arc::new(AtomicRtpStats::new()),
             dtmf_payload_type: DTMF_PAYLOAD_TYPE,
-            dtmf_timestamp: AtomicU32::new(rand_u32()),
             dtmf_event_timestamp: AtomicU32::new(0),
             send_buffer: vec![0u8; MAX_RTP_PACKET_SIZE],
             srtp_scratch: Vec::with_capacity(MAX_RTP_PACKET_SIZE),
@@ -183,6 +186,7 @@ impl RtpTransmitter {
             extension_map: Vec::new(),
             cached_ext_header: None,
             header_size: RTP_HEADER_SIZE,
+            last_send_time: Instant::now(),
         }
     }
 
@@ -380,6 +384,7 @@ impl RtpTransmitter {
                 trace!("Sent RTP packet: seq={}, ts={}, size={}", seq, ts, sent);
                 self.stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                 self.stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                self.last_send_time = Instant::now();
                 Ok(())
             }
             Err(e) => {
@@ -438,6 +443,7 @@ impl RtpTransmitter {
                 debug!("Sent CN packet: seq={}, ts={}, size={}", seq, ts, sent);
                 self.stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                 self.stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                self.last_send_time = Instant::now();
                 Ok(())
             }
             Err(e) => {
@@ -457,27 +463,35 @@ impl RtpTransmitter {
     /// # Arguments
     /// * `event` - The DTMF event to send
     /// * `marker` - Set to true for the first packet of a new event
-    #[allow(clippy::cast_sign_loss)]
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     pub fn send_dtmf(&mut self, event: &DtmfEvent, marker: bool) -> AudioResult<()> {
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
 
-        // For DTMF, timestamp stays the same for the duration of the event
-        // (it's the timestamp of when the event started)
+        // Per RFC 4733, the DTMF event timestamp must be on the same
+        // timeline as the audio stream. The marker packet uses the current
+        // audio timestamp; continuations/end packets reuse it.
         let ts = if marker {
-            // Start of a new event - get a new timestamp and store it
-            let new_ts = self.dtmf_timestamp.load(Ordering::Relaxed);
+            // If audio has been silent (muted/DTX), the audio timestamp is
+            // stale. Advance it to "now" so the DTMF event isn't dropped by
+            // the remote jitter buffer as too-late.
+            let elapsed = self.last_send_time.elapsed();
+            let elapsed_samples = (elapsed.as_millis() as u32) * 8; // 8 samples/ms at 8kHz
+            let catch_up =
+                (elapsed_samples / self.timestamp_increment) * self.timestamp_increment;
+            if catch_up > 0 {
+                self.timestamp.fetch_add(catch_up, Ordering::Relaxed);
+                debug!(
+                    "DTMF timestamp catch-up: advanced {} samples ({}ms silence)",
+                    catch_up,
+                    catch_up / 8
+                );
+            }
+            let new_ts = self.timestamp.load(Ordering::Relaxed);
             self.dtmf_event_timestamp.store(new_ts, Ordering::Relaxed);
             new_ts
         } else {
-            // Continuation/end - use the stored event timestamp
             self.dtmf_event_timestamp.load(Ordering::Relaxed)
         };
-
-        // Advance the timestamp counter only at the end of the event
-        if event.end {
-            self.dtmf_timestamp
-                .fetch_add(u32::from(event.duration), Ordering::Relaxed);
-        }
 
         // Build RTP header with DTMF payload type
         let mut header = RtpHeader::new(self.dtmf_payload_type, seq, ts, self.ssrc);
@@ -516,6 +530,7 @@ impl RtpTransmitter {
                 );
                 self.stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                 self.stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                self.last_send_time = Instant::now();
                 Ok(())
             }
             Err(e) => {
@@ -523,6 +538,15 @@ impl RtpTransmitter {
                 Err(AudioError::RtpError(format!("DTMF send failed: {e}")))
             }
         }
+    }
+
+    /// Advances the audio timestamp after a DTMF event completes.
+    ///
+    /// Must be called exactly once per event, after all end packets are sent.
+    /// This keeps the audio timestamp timeline continuous: the next audio
+    /// packet after DTMF resumes at `event_start + duration + end_periods`.
+    pub fn advance_dtmf_timestamp(&self, duration: u32) {
+        self.timestamp.fetch_add(duration, Ordering::Relaxed);
     }
 }
 

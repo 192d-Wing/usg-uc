@@ -482,20 +482,20 @@ fn decode_loop(
                                             Some(DtmfToneGenerator::new(event.digit, device_rate));
                                     }
 
-                                    // Generate one frame of tone while the generator is active
-                                    // (covers both the initial packet and continuations).
-                                    if let Some(ref mut tone_gen) = active_dtmf_gen {
+                                    // End packet: stop generating tone but keep
+                                    // current_dtmf_ts so retransmitted end packets
+                                    // are still filtered by the is_new check.
+                                    // Don't generate tone for end packets — the last
+                                    // continuation already covered this time slot.
+                                    if event.end {
+                                        active_dtmf_gen = None;
+                                    } else if let Some(ref mut tone_gen) = active_dtmf_gen {
+                                        // Generate one frame of tone for start/continuation
+                                        // packets (not end packets).
                                         let tone_buf = &mut scratch[..device_samples];
                                         tone_buf.fill(0);
                                         tone_gen.generate_samples(tone_buf);
                                         producer.push_slice(tone_buf);
-                                    }
-
-                                    // End packet: stop generating tone but keep
-                                    // current_dtmf_ts so retransmitted end packets
-                                    // are still filtered by the is_new check.
-                                    if event.end {
-                                        active_dtmf_gen = None;
                                     }
                                 }
                                 None => {

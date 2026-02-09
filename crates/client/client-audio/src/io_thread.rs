@@ -281,8 +281,13 @@ fn io_loop(
         AecProcessor::with_config(codec_clock_rate, aec_ref, aec_cfg)
     });
 
-    // Non-blocking DTMF sender state machine
-    let mut dtmf_sender = DtmfSender::new(config.dtmf_volume, u64::from(config.dtmf_inter_digit_pause_ms));
+    // Non-blocking DTMF sender state machine (dual-send: RFC 4733 + in-band)
+    let mut dtmf_sender = DtmfSender::new(
+        config.dtmf_volume,
+        u64::from(config.dtmf_inter_digit_pause_ms),
+        codec_clock_rate,
+        codec_samples,
+    );
 
     // Pre-allocated scratch buffers — reused every frame to avoid heap allocs.
     let mut capture_pcm = vec![0i16; capture_device_samples];
@@ -384,7 +389,11 @@ fn io_loop(
             if current_moh {
                 // Music on Hold mode
                 process_moh_frame(&mut codec, &mut transmitter, &mut moh_source, &mut moh_pcm);
-            } else if !muted.load(Ordering::Relaxed) && !dtmf_sender.is_inband_active() {
+            } else if dtmf_sender.is_active() {
+                // Suppress mic capture during DTMF (RFC 4733 or in-band)
+                // to prevent locally-played DTMF tone from leaking into mic audio.
+                trace!("Mic suppressed: DTMF active");
+            } else if !muted.load(Ordering::Relaxed) {
                 // Normal capture mode
                 let in_warmup = dtx_warmup_start.elapsed() < dtx_warmup_duration;
                 let (samples_read, max_amp, dtx, noise_floor) = process_capture_frame(
