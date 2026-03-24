@@ -51,7 +51,7 @@ impl Default for AudioSessionConfig {
             local_port: 0,
             remote_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
             codec: CodecPreference::G711Ulaw,
-            jitter_buffer_ms: 60,
+            jitter_buffer_ms: 40,
             srtp_key: None,
             srtp_salt: None,
             moh_file_path: None,
@@ -125,7 +125,7 @@ impl AudioSession {
             local_port: 0,
             remote_addr,
             codec,
-            jitter_buffer_ms: 60,
+            jitter_buffer_ms: 40,
             srtp_key: None,
             srtp_salt: None,
             moh_file_path: None,
@@ -430,7 +430,7 @@ mod tests {
     fn test_audio_session_config_default() {
         let config = AudioSessionConfig::default();
         assert_eq!(config.local_port, 0);
-        assert_eq!(config.jitter_buffer_ms, 60);
+        assert_eq!(config.jitter_buffer_ms, 40);
         assert_eq!(config.codec, CodecPreference::G711Ulaw);
     }
 

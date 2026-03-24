@@ -591,26 +591,72 @@ impl JitterBuffer {
 /// Shared between the RTP I/O thread (push) and the decode thread (pop).
 /// The inner `BTreeMap` typically holds <10 packets, so the mutex is held
 /// for less than 1 microsecond per operation.
+///
+/// Includes a [`Condvar`] so the decode thread can sleep efficiently and
+/// wake immediately when the I/O thread pushes a new packet, instead of
+/// polling on a fixed timer.
 #[derive(Clone)]
 pub struct SharedJitterBuffer {
     inner: std::sync::Arc<std::sync::Mutex<JitterBuffer>>,
+    /// Condvar + dummy mutex for decode-thread wake notification.
+    /// The I/O thread signals after each successful `push()`.
+    wake: std::sync::Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
 }
 
 impl SharedJitterBuffer {
-    /// Creates a new shared jitter buffer.
+    /// Creates a new shared jitter buffer with default configuration.
     pub fn new(clock_rate: u32, samples_per_packet: u32, target_depth_ms: u32) -> Self {
+        Self::with_config(
+            clock_rate,
+            samples_per_packet,
+            target_depth_ms,
+            JitterBufferConfig::default(),
+        )
+    }
+
+    /// Creates a new shared jitter buffer with custom configuration.
+    pub fn with_config(
+        clock_rate: u32,
+        samples_per_packet: u32,
+        target_depth_ms: u32,
+        cfg: JitterBufferConfig,
+    ) -> Self {
         Self {
-            inner: std::sync::Arc::new(std::sync::Mutex::new(JitterBuffer::new(
+            inner: std::sync::Arc::new(std::sync::Mutex::new(JitterBuffer::with_config(
                 clock_rate,
                 samples_per_packet,
                 target_depth_ms,
+                cfg,
             ))),
+            wake: std::sync::Arc::new((
+                std::sync::Mutex::new(()),
+                std::sync::Condvar::new(),
+            )),
         }
     }
 
     /// Adds a packet to the jitter buffer.
+    ///
+    /// Notifies the decode thread via condvar after a successful push.
     pub fn push(&self, packet: BufferedPacket) -> bool {
-        self.inner.lock().is_ok_and(|mut jb| jb.push(packet))
+        let pushed = self.inner.lock().is_ok_and(|mut jb| jb.push(packet));
+        if pushed {
+            self.wake.1.notify_one();
+        }
+        pushed
+    }
+
+    /// Waits for a push notification with the given timeout.
+    ///
+    /// The decode thread calls this instead of `thread::sleep()`. Returns
+    /// immediately if the I/O thread signals a push, or after `timeout`
+    /// elapses — whichever comes first. Spurious wakes are harmless
+    /// because the decode thread re-checks the ring buffer fill level
+    /// on every iteration regardless.
+    pub fn wait_for_push(&self, timeout: std::time::Duration) {
+        if let Ok(guard) = self.wake.0.lock() {
+            let _ = self.wake.1.wait_timeout(guard, timeout);
+        }
     }
 
     /// Gets the next packet for playout.

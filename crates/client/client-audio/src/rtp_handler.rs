@@ -12,11 +12,16 @@ use client_types::DtmfEvent;
 use proto_rtp::{ExtensionElement, RtpHeader};
 use proto_srtp::{SrtpContext, SrtpProtect, SrtpUnprotect};
 use std::collections::VecDeque;
+use std::io::Write;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{debug, info, trace, warn};
+
+/// Environment variable to enable RTP packet capture.
+/// Set `DUMP_DTMF=1` to write all received RTP packets to `/tmp/rtp-capture.pcap`.
+const DUMP_DTMF_ENV: &str = "DUMP_DTMF";
 
 /// Shared DTMF packet queue for jitter buffer bypass.
 ///
@@ -620,12 +625,51 @@ pub struct RtpReceiver {
     dtmf_pt: Option<u8>,
     /// Shared queue for DTMF packets (bypasses jitter buffer).
     dtmf_queue: Option<SharedDtmfQueue>,
+    /// Optional pcap dump file for packet capture (set `DUMP_DTMF=1`).
+    pcap_dump: Option<std::io::BufWriter<std::fs::File>>,
+    /// Start time for pcap timestamps.
+    pcap_start: Instant,
 }
 
 impl RtpReceiver {
     /// Creates a new RTP receiver.
     pub fn new(socket: Arc<UdpSocket>, jitter_buffer: SharedJitterBuffer) -> Self {
         info!("Creating RTP receiver");
+
+        // Initialize pcap dump if DUMP_DTMF=1
+        let pcap_dump = std::env::var(DUMP_DTMF_ENV)
+            .ok()
+            .filter(|v| v == "1")
+            .and_then(|_| {
+                let path = "/tmp/rtp-capture.pcap";
+                match std::fs::File::create(path) {
+                    Ok(f) => {
+                        let mut w = std::io::BufWriter::new(f);
+                        // Write pcap global header (little-endian)
+                        // Magic=0xa1b2c3d4, v2.4, tz=0, sigfigs=0, snaplen=65535,
+                        // LINKTYPE_USER0=147 (raw RTP, decode-as in Wireshark)
+                        let header: [u8; 24] = [
+                            0xd4, 0xc3, 0xb2, 0xa1,
+                            0x02, 0x00, 0x04, 0x00,
+                            0x00, 0x00, 0x00, 0x00,
+                            0x00, 0x00, 0x00, 0x00,
+                            0xff, 0xff, 0x00, 0x00,
+                            0x93, 0x00, 0x00, 0x00,
+                        ];
+                        if w.write_all(&header).is_ok() {
+                            info!("RTP pcap capture enabled: {path} (open in Wireshark, Decode As → RTP)");
+                            Some(w)
+                        } else {
+                            warn!("Failed to write pcap header");
+                            None
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to create pcap file: {e}");
+                        None
+                    }
+                }
+            });
 
         Self {
             socket,
@@ -642,6 +686,8 @@ impl RtpReceiver {
             extension_map: Vec::new(),
             dtmf_pt: None,
             dtmf_queue: None,
+            pcap_dump,
+            pcap_start: Instant::now(),
         }
     }
 
@@ -721,6 +767,23 @@ impl RtpReceiver {
                 // Copy into process_buffer to break the self-borrow on recv_buffer.
                 // Uses a pre-allocated buffer instead of .to_vec() heap allocation.
                 self.process_buffer[..len].copy_from_slice(&self.recv_buffer[..len]);
+
+                // Write raw packet to pcap (before SRTP decrypt — captures wire format)
+                if let Some(ref mut pcap) = self.pcap_dump {
+                    let elapsed = self.pcap_start.elapsed();
+                    #[allow(clippy::cast_possible_truncation)]
+                    let ts_sec = (elapsed.as_secs() as u32).to_le_bytes();
+                    let ts_usec = elapsed.subsec_micros().to_le_bytes();
+                    #[allow(clippy::cast_possible_truncation)]
+                    let pkt_len = (len as u32).to_le_bytes();
+                    let _ = pcap.write_all(&ts_sec);
+                    let _ = pcap.write_all(&ts_usec);
+                    let _ = pcap.write_all(&pkt_len); // incl_len
+                    let _ = pcap.write_all(&pkt_len); // orig_len
+                    let _ = pcap.write_all(&self.recv_buffer[..len]);
+                    let _ = pcap.flush();
+                }
+
                 self.process_packet(len)?;
                 Ok(true)
             }

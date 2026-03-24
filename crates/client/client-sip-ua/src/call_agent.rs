@@ -39,6 +39,9 @@ pub struct CallAgent {
     display_name: String,
     /// Transport type for SIP signaling (UDP, TCP, or TLS).
     transport_type: String,
+    /// Digest auth credentials for INVITE challenges (BulkVS etc.).
+    #[cfg(feature = "digest-auth")]
+    digest_credentials: Option<client_types::DigestAuthCredentials>,
 }
 
 /// State for a single call session.
@@ -86,6 +89,12 @@ struct CallSession {
     refer_request: Option<ReferRequest>,
     /// Transfer target URI when transfer is in progress.
     transfer_target: Option<String>,
+    /// Nonce count for digest auth retries on this call's INVITE.
+    #[cfg(feature = "digest-auth")]
+    nonce_count: u32,
+    /// Last digest challenge received for this call.
+    #[cfg(feature = "digest-auth")]
+    last_challenge: Option<proto_sip::auth::DigestChallenge>,
 }
 
 /// Events emitted by the call agent.
@@ -158,6 +167,8 @@ impl CallAgent {
             aor,
             display_name,
             transport_type: "TLS".to_string(), // Default to TLS, updated by configure()
+            #[cfg(feature = "digest-auth")]
+            digest_credentials: None,
         }
     }
 
@@ -168,12 +179,14 @@ impl CallAgent {
     /// * `display_name` - Display name for From header
     /// * `caller_id` - Optional Caller ID to use instead of the AOR user part
     /// * `transport` - Transport type string ("UDP", "TCP", or "TLS")
+    /// * `digest_credentials` - Optional digest auth credentials for INVITE challenges
     pub fn configure(
         &mut self,
         aor: String,
         display_name: String,
         caller_id: Option<String>,
         transport: &str,
+        #[cfg(feature = "digest-auth")] digest_credentials: Option<client_types::DigestAuthCredentials>,
     ) {
         // If caller_id is provided, replace the user part of the AOR
         self.aor = if let Some(cid) = caller_id {
@@ -189,6 +202,10 @@ impl CallAgent {
         };
         self.display_name = display_name;
         self.transport_type = transport.to_uppercase();
+        #[cfg(feature = "digest-auth")]
+        {
+            self.digest_credentials = digest_credentials;
+        }
         info!(
             aor = %self.aor,
             display_name = %self.display_name,
@@ -257,6 +274,10 @@ impl CallAgent {
             failure_reason: None,
             refer_request: None,
             transfer_target: None,
+            #[cfg(feature = "digest-auth")]
+            nonce_count: 0,
+            #[cfg(feature = "digest-auth")]
+            last_challenge: None,
         };
 
         // Build request before storing session
@@ -630,6 +651,18 @@ impl CallAgent {
             state = ?current_state,
             "Received call response"
         );
+
+        // Skip responses for already-terminated calls. Retransmitted 401s
+        // and late responses arrive after we've moved on; processing them
+        // would re-trigger state changes or duplicate ACKs.
+        if current_state == CallState::Terminated {
+            debug!(
+                call_id = %call_id,
+                status_code = status_code,
+                "Ignoring response for terminated call"
+            );
+            return Ok(());
+        }
 
         // Update transaction state
         if let Some(session) = self.calls.get_mut(call_id)
@@ -1053,14 +1086,180 @@ impl CallAgent {
         status_code: u16,
         response: &SipResponse,
     ) -> SipUaResult<()> {
+        // Try digest auth if feature is enabled and credentials are available
+        #[cfg(feature = "digest-auth")]
+        {
+            if let Some(ref creds) = self.digest_credentials {
+                use proto_sip::auth::{Md5DigestHasher, create_credentials, generate_cnonce};
+
+                let header_name = if status_code == 401 {
+                    HeaderName::WwwAuthenticate
+                } else {
+                    HeaderName::ProxyAuthenticate
+                };
+
+                if let Some(challenge_header) = response.headers.get(&header_name)
+                    && let Ok(challenge) = challenge_header
+                        .value
+                        .parse::<proto_sip::auth::DigestChallenge>()
+                {
+                    // Skip retransmitted 401s — if the nonce matches the last
+                    // challenge we already processed, this is a retransmit from
+                    // the server for a previous INVITE we already ACK'd.
+                    #[cfg(feature = "digest-auth")]
+                    {
+                        let is_retransmit = self
+                            .calls
+                            .get(call_id)
+                            .and_then(|s| s.last_challenge.as_ref())
+                            .is_some_and(|last| last.nonce == challenge.nonce);
+
+                        if is_retransmit {
+                            debug!(
+                                call_id = %call_id,
+                                "Ignoring retransmitted 401 (same nonce), already sent auth'd INVITE"
+                            );
+                            return Ok(());
+                        }
+                    }
+
+                    // ACK the challenged INVITE (RFC 3261 §22.2)
+                    let (remote_uri, sip_call_id, cseq, from_tag, to_tag) =
+                        self.extract_session_data_for_ack(call_id)?;
+
+                    self.send_ack_for_failure(
+                        call_id,
+                        &remote_uri,
+                        &sip_call_id,
+                        cseq,
+                        &from_tag,
+                        to_tag.as_deref(),
+                        response,
+                    )
+                    .await?;
+
+                    let session = self.calls.get_mut(call_id).ok_or_else(|| {
+                        SipUaError::InvalidState("Call not found".to_string())
+                    })?;
+
+                    // Only retry once — BulkVS flow is: INVITE → 401 → auth'd INVITE → 200 OK.
+                    // A second genuine 401 (different nonce) means credentials are wrong.
+                    if session.nonce_count < 1 {
+                        info!(
+                            call_id = %call_id,
+                            realm = %challenge.realm,
+                            nonce_count = session.nonce_count,
+                            "INVITE 401 challenge, retrying with digest credentials"
+                        );
+
+                        session.last_challenge = Some(challenge.clone());
+                        session.nonce_count += 1;
+                        session.cseq += 1;
+                        let new_cseq = session.cseq;
+
+                        // Re-derive effective local address for the new request
+                        let destination = Self::parse_destination(&remote_uri).await?;
+                        let effective_local_addr =
+                            Self::get_local_addr_for_destination(destination, self.local_addr)
+                                .await?;
+
+                        // Rebuild the INVITE with a new branch (new transaction)
+                        let new_branch = generate_branch();
+                        let sdp_offer = self
+                            .calls
+                            .get(call_id)
+                            .and_then(|s| s.local_sdp.clone())
+                            .unwrap_or_default();
+
+                        let mut request = Self::build_invite_request_static(
+                            &remote_uri,
+                            &self.aor,
+                            &self.display_name,
+                            effective_local_addr,
+                            &sip_call_id,
+                            new_cseq,
+                            &from_tag,
+                            &new_branch,
+                            &sdp_offer,
+                            &self.transport_type,
+                        )?;
+
+                        // Compute and add Authorization header
+                        let hasher = Md5DigestHasher;
+                        let cnonce = generate_cnonce();
+
+                        // Use the Request-URI for the digest URI
+                        let digest_uri = remote_uri.clone();
+
+                        let auth_creds = create_credentials(
+                            &hasher,
+                            &challenge,
+                            &creds.username,
+                            &creds.password,
+                            "INVITE",
+                            &digest_uri,
+                            Some(&cnonce),
+                            Some(1_u32),
+                            None,
+                        )
+                        .map_err(|e| SipUaError::TransactionError(e.to_string()))?;
+
+                        // Use Authorization for 401, Proxy-Authorization for 407
+                        let auth_header = if status_code == 401 {
+                            HeaderName::Authorization
+                        } else {
+                            HeaderName::ProxyAuthorization
+                        };
+                        request.headers.set(auth_header, auth_creds.to_string());
+
+                        // Create new INVITE transaction
+                        let tx_key = TransactionKey::client(&new_branch, "INVITE");
+                        let transaction =
+                            ClientInviteTransaction::new(tx_key, TransportType::Reliable);
+
+                        if let Some(session) = self.calls.get_mut(call_id) {
+                            session.invite_transaction = Some(transaction);
+                            session.last_branch = Some(new_branch);
+                        }
+
+                        // Send the authenticated INVITE
+                        info!(call_id = %call_id, "Sending authenticated INVITE");
+                        self.event_tx
+                            .send(CallEvent::SendRequest {
+                                request,
+                                destination,
+                            })
+                            .await
+                            .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+                        return Ok(());
+                    }
+                    warn!(call_id = %call_id, "INVITE digest auth failed (credentials rejected by server)");
+                }
+            }
+        }
+
+        // Fall through: no digest credentials, feature disabled, or auth failed.
+        // ACK the 401 before terminating.
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag) =
+            self.extract_session_data_for_ack(call_id)?;
+
+        self.send_ack_for_failure(
+            call_id,
+            &remote_uri,
+            &sip_call_id,
+            cseq,
+            &from_tag,
+            to_tag.as_deref(),
+            response,
+        )
+        .await?;
+
         error!(
             call_id = %call_id,
             status_code = status_code,
-            "Server requested digest auth, mTLS-only supported"
+            "INVITE auth challenge failed — no digest credentials available"
         );
-
-        let (remote_uri, sip_call_id, cseq, from_tag, to_tag) =
-            self.extract_session_data_for_ack(call_id)?;
 
         if let Some(session) = self.calls.get_mut(call_id) {
             session.state = CallState::Terminated;
@@ -1077,16 +1276,7 @@ impl CallAgent {
             .await
             .map_err(|e| SipUaError::TransportError(e.to_string()))?;
 
-        self.send_ack_for_failure(
-            call_id,
-            &remote_uri,
-            &sip_call_id,
-            cseq,
-            &from_tag,
-            to_tag.as_deref(),
-            response,
-        )
-        .await
+        Ok(())
     }
 
     async fn handle_unavailable_response(

@@ -274,6 +274,8 @@ impl CallManager {
             account.display_name.clone(),
             account.caller_id.clone(),
             transport_str,
+            #[cfg(feature = "digest-auth")]
+            account.digest_credentials.clone(),
         );
         self.account = Some(account.clone());
         info!(
@@ -1717,7 +1719,7 @@ impl CallManager {
             local_port,
             remote_addr,
             codec,
-            jitter_buffer_ms: 60,
+            jitter_buffer_ms: 40,
             // SRTP keys will be obtained from media session in production
             srtp_key: None,
             srtp_salt: None,
@@ -1789,14 +1791,24 @@ impl CallManager {
                 if self.audio_sessions.contains_key(call_id) {
                     info!(call_id = %call_id, "Audio session already active, skipping start");
                 } else {
-                    // Start media session establishment (ICE + DTLS)
-                    if let Some(session) = self.media_sessions.get_mut(call_id) {
-                        info!(call_id = %call_id, "Found media session, attempting to establish");
-                        if let Err(e) = session.establish(None).await {
-                            warn!(call_id = %call_id, error = %e, "Failed to establish media");
+                    // Start media session establishment (ICE + DTLS) — only
+                    // for TLS transport. Plain RTP calls (UDP/TCP) don't use
+                    // ICE and establish() would always fail with "No ICE candidates".
+                    let use_ice = self
+                        .account
+                        .as_ref()
+                        .is_some_and(|a| matches!(a.transport, client_types::TransportPreference::TlsOnly));
+                    if use_ice {
+                        if let Some(session) = self.media_sessions.get_mut(call_id) {
+                            info!(call_id = %call_id, "Found media session, attempting to establish");
+                            if let Err(e) = session.establish(None).await {
+                                warn!(call_id = %call_id, error = %e, "Failed to establish media");
+                            }
+                        } else {
+                            warn!(call_id = %call_id, "No media session found for call");
                         }
                     } else {
-                        warn!(call_id = %call_id, "No media session found for call");
+                        debug!(call_id = %call_id, "Skipping ICE/DTLS for plain RTP call");
                     }
 
                     // Start audio session when call connects
