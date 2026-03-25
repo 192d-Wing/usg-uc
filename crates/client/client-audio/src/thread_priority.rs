@@ -6,7 +6,9 @@
 //!
 //! On other platforms, this is a no-op.
 
-use tracing::{debug, warn};
+use tracing::debug;
+#[cfg(target_os = "macos")]
+use tracing::warn;
 
 /// Promotes the calling thread to real-time priority.
 ///
