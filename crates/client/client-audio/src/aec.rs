@@ -41,6 +41,11 @@ pub struct AecConfig {
     pub nlp_suppression: f32,
     /// NLP engagement threshold: echo-to-error ratio above which NLP kicks in.
     pub nlp_threshold: f32,
+    /// Delay applied to the far-end reference signal in milliseconds.
+    /// Compensates for the playback pipeline latency (ring buffer fill +
+    /// CPAL buffer + DAC) so the reference aligns with when the echo
+    /// actually appears in the microphone.
+    pub reference_delay_ms: usize,
 }
 
 impl Default for AecConfig {
@@ -50,8 +55,11 @@ impl Default for AecConfig {
             nlms_mu: 0.5,
             doubletalk_threshold: 2.0,
             min_farend_energy: 100.0,
-            nlp_suppression: 0.05, // Stronger residual echo suppression (was 0.1)
-            nlp_threshold: 0.15,   // Lower threshold so NLP engages more readily (was 0.3)
+            nlp_suppression: 0.05,
+            nlp_threshold: 0.15,
+            // ~50ms compensates for: ring buffer target fill (40ms at 48kHz)
+            // + CPAL output buffer (~10ms) + DAC latency (~2ms).
+            reference_delay_ms: 50,
         }
     }
 }
@@ -183,6 +191,12 @@ pub struct AecProcessor {
     output_power: f32,
     /// Current ERLE estimate in dB.
     erle_db: f32,
+    /// Delay line for reference signal alignment.
+    /// Compensates for playback pipeline latency so the reference
+    /// arrives at the filter at the same time as the echo in the mic.
+    delay_line: std::collections::VecDeque<i16>,
+    /// Target delay line length in samples.
+    delay_samples: usize,
 }
 
 impl AecProcessor {
@@ -198,6 +212,9 @@ impl AecProcessor {
     pub fn with_config(sample_rate: u32, aec_ref: Arc<AecReference>, cfg: AecConfig) -> Self {
         #[allow(clippy::cast_possible_truncation)]
         let filter_len = (sample_rate as usize * cfg.filter_length_ms) / 1000;
+        #[allow(clippy::cast_possible_truncation)]
+        let delay_samples = (sample_rate as usize * cfg.reference_delay_ms) / 1000;
+        let delay_line = std::collections::VecDeque::from(vec![0i16; delay_samples]);
         Self {
             filter: vec![0.0; filter_len],
             reference_history: vec![0.0; filter_len * 2],
@@ -211,6 +228,8 @@ impl AecProcessor {
             input_power: 0.0,
             output_power: 0.0,
             erle_db: 0.0,
+            delay_line,
+            delay_samples,
         }
     }
 
@@ -225,6 +244,8 @@ impl AecProcessor {
             self.input_power = 0.0;
             self.output_power = 0.0;
             self.erle_db = 0.0;
+            self.delay_line.clear();
+            self.delay_line.resize(self.delay_samples, 0);
         }
     }
 
@@ -261,6 +282,16 @@ impl AecProcessor {
         // If no reference available, can't cancel echo — pass through
         if ref_pulled == 0 {
             return;
+        }
+
+        // Apply delay to reference signal to compensate for playback pipeline
+        // latency (ring buffer + CPAL + DAC + acoustic path). Push new samples
+        // into the back of the delay line, pop delayed samples from the front.
+        if self.delay_samples > 0 {
+            for i in 0..ref_pulled {
+                self.delay_line.push_back(self.ref_pull_buf[i]);
+                self.ref_pull_buf[i] = self.delay_line.pop_front().unwrap_or(0);
+            }
         }
 
         // Accumulate frame-level input/output power for ERLE estimation.
