@@ -90,7 +90,7 @@ impl AudioProcessor {
     }
 
     /// Creates an audio processor with custom configuration.
-    pub fn with_config(agc: AgcConfig, gate: NoiseGateConfig) -> Self {
+    pub const fn with_config(agc: AgcConfig, gate: NoiseGateConfig) -> Self {
         Self {
             agc_enabled: true,
             noise_gate_enabled: true,
@@ -183,7 +183,8 @@ impl AudioProcessor {
             let inv_fade_len = 1.0 / fade_len as f32;
             for (i, sample) in pcm.iter_mut().enumerate() {
                 if i < fade_len {
-                    let t = 1.0 - (i as f32 * inv_fade_len);
+                    #[allow(clippy::cast_precision_loss)]
+                    let t = (i as f32).mul_add(-inv_fade_len, 1.0);
                     *sample = apply_gain(*sample, t);
                 } else {
                     *sample = 0;
@@ -267,6 +268,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn test_loud_signal_not_gated() {
         let mut proc = AudioProcessor::new();
         // Create a signal well above the noise gate threshold

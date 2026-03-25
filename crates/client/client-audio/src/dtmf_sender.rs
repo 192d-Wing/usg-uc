@@ -17,7 +17,7 @@ use tracing::{debug, info, trace, warn};
 const MAX_DIGIT_QUEUE: usize = 32;
 
 /// Default inter-digit pause in milliseconds.
-/// pjproject uses 0ms by default (PJMEDIA_DTMF_DIGIT_PAUSE_LEN = 0).
+/// pjproject uses 0ms by default (`PJMEDIA_DTMF_DIGIT_PAUSE_LEN` = 0).
 const INTER_DIGIT_PAUSE_MS: u64 = 0;
 
 /// Number of end-of-event packets sent for reliability (RFC 4733).
@@ -153,7 +153,7 @@ impl DtmfSender {
     /// Unlike [`is_active()`](Self::is_active), this returns `false` during
     /// the inter-digit pause, allowing normal mic audio to resume between
     /// digits (matches pjproject behavior).
-    pub fn is_sending_tone(&self) -> bool {
+    pub const fn is_sending_tone(&self) -> bool {
         matches!(self.phase, DtmfPhase::Sending | DtmfPhase::EndPackets)
     }
 
@@ -362,6 +362,7 @@ impl DtmfSender {
             if digit.cmd.use_rfc2833 {
                 #[allow(clippy::cast_possible_truncation)]
                 let total_frames = digit.packets_sent + END_PACKET_REPEATS;
+                #[allow(clippy::cast_possible_truncation)]
                 let advance = total_frames * self.codec_samples_per_frame as u32;
                 transmitter.advance_dtmf_timestamp(advance);
             }
@@ -402,21 +403,20 @@ impl DtmfSender {
     /// Called during stream teardown so the remote knows the event is over
     /// (matches pjproject's `stream_destroy` behavior).
     pub fn flush(&mut self, transmitter: &mut RtpTransmitter) {
-        if let Some(ref digit) = self.current {
-            if digit.cmd.use_rfc2833
-                && matches!(self.phase, DtmfPhase::Sending | DtmfPhase::EndPackets)
-            {
-                let duration = if self.phase == DtmfPhase::Sending {
-                    DtmfEvent::duration_from_ms((digit.packets_sent + 1) * 20)
-                        .min(digit.total_duration_ts)
-                } else {
-                    digit.total_duration_ts
-                };
-                let mut event = DtmfEvent::with_end(digit.cmd.digit, duration);
-                event.volume = self.volume;
-                let _ = transmitter.send_dtmf(&event, false);
-                info!("DTMF flush: sent forced end for '{}'", digit.cmd.digit);
-            }
+        if let Some(ref digit) = self.current
+            && digit.cmd.use_rfc2833
+            && matches!(self.phase, DtmfPhase::Sending | DtmfPhase::EndPackets)
+        {
+            let duration = if self.phase == DtmfPhase::Sending {
+                DtmfEvent::duration_from_ms((digit.packets_sent + 1) * 20)
+                    .min(digit.total_duration_ts)
+            } else {
+                digit.total_duration_ts
+            };
+            let mut event = DtmfEvent::with_end(digit.cmd.digit, duration);
+            event.volume = self.volume;
+            let _ = transmitter.send_dtmf(&event, false);
+            info!("DTMF flush: sent forced end for '{}'", digit.cmd.digit);
         }
         self.phase = DtmfPhase::Idle;
         self.current = None;

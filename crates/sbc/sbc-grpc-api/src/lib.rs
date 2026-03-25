@@ -82,6 +82,7 @@
 /// - `RegistrationService` - SIP registration management
 /// - `SystemService` - System-level operations (version, stats, TLS)
 /// - `ClusterService` - Cluster management (requires `cluster` feature)
+///
 /// File descriptor set for gRPC reflection service.
 ///
 /// This constant contains the serialized protobuf file descriptors for all

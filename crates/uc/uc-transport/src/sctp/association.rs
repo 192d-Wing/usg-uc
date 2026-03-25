@@ -312,7 +312,7 @@ impl AssociationInner {
             data_chunks_since_sack: 0,
             heartbeat_enabled: true,
             last_data_sent: None,
-            pmtu: config.path_mtu.into(),
+            pmtu: config.path_mtu,
             pmtu_min: 576, // IPv4 minimum
             pmtu_max: 1500,
             pmtu_probe_pending: false,
@@ -1188,7 +1188,7 @@ impl AssociationInner {
                 let offset = tsn.wrapping_sub(cum_tsn);
                 // Only include TSNs above cumulative (offset > 0)
                 // and within u16 range (RFC limits)
-                if offset > 0 && offset <= u32::from(u16::MAX) {
+                if offset > 0 && u16::try_from(offset).is_ok() {
                     Some(offset)
                 } else {
                     None
@@ -1209,7 +1209,6 @@ impl AssociationInner {
             for offset in iter {
                 if offset == end + 1 {
                     // Extend current block
-                    end = offset;
                 } else {
                     // Save current block, start new one
                     blocks.push(GapAckBlock {
@@ -1217,8 +1216,8 @@ impl AssociationInner {
                         end: end as u16,
                     });
                     start = offset;
-                    end = offset;
                 }
+                end = offset;
             }
 
             // Don't forget the last block
@@ -1296,7 +1295,7 @@ impl AssociationInner {
     /// ERROR chunks are used to report non-fatal errors to the peer.
     /// They do NOT cause association termination - that requires ABORT.
     /// The error causes are logged for diagnostic purposes.
-    fn process_error_chunk(&mut self, error: &ErrorChunk) {
+    fn process_error_chunk(&self, error: &ErrorChunk) {
         for cause in &error.causes {
             match cause {
                 ErrorCause::InvalidStreamIdentifier { stream_id } => {
@@ -1389,7 +1388,7 @@ impl AssociationInner {
     /// CWR (Congestion Window Reduced) indicates that the peer has received
     /// our ECNE and reduced its congestion window. This is purely informational
     /// and requires no action other than logging.
-    fn process_cwr(&mut self) {
+    fn process_cwr(&self) {
         tracing::debug!("Received CWR, peer has reduced its congestion window");
         // No action required - the CWR is just an acknowledgment
         // that the peer received our ECNE and acted on it
@@ -1410,7 +1409,7 @@ impl AssociationInner {
         // RFC 5061 §5.2: Check serial number to detect duplicates and ordering
         if let Some(peer_serial) = self.peer_asconf_serial_number {
             // Serial numbers use serial number arithmetic (like TSN)
-            let diff = serial.wrapping_sub(peer_serial) as i32;
+            let diff = serial.wrapping_sub(peer_serial).cast_signed();
 
             if diff < 0 {
                 // Old ASCONF - already processed, return empty ACK
@@ -1471,9 +1470,6 @@ impl AssociationInner {
                     if self.peer_addresses.contains(&addr) || addr == self.peer_addr {
                         // Address already exists
                         tracing::debug!(addr = %addr, "ADD-IP: Address already exists");
-                        AsconfAckParam::Success {
-                            correlation_id: *correlation_id,
-                        }
                     } else {
                         // Add the new address
                         self.peer_addresses.insert(addr);
@@ -1482,9 +1478,9 @@ impl AssociationInner {
                         self.paths.add_path(self.local_addr, addr);
 
                         tracing::info!(addr = %addr, "ADD-IP: Added new peer address");
-                        AsconfAckParam::Success {
-                            correlation_id: *correlation_id,
-                        }
+                    }
+                    AsconfAckParam::Success {
+                        correlation_id: *correlation_id,
                     }
                 } else {
                     // No valid address provided
@@ -1639,7 +1635,7 @@ impl AssociationInner {
     ///
     /// ASCONF-ACK confirms the result of our ASCONF request.
     /// Each parameter in the ACK corresponds to a parameter we sent.
-    fn process_asconf_ack(&mut self, asconf_ack: &AsconfAckChunk) {
+    fn process_asconf_ack(&self, asconf_ack: &AsconfAckChunk) {
         let serial = asconf_ack.serial_number;
 
         tracing::debug!(
@@ -1829,7 +1825,7 @@ impl AssociationInner {
 
                     // Check sequence number to prevent replays
                     if let Some(peer_seq) = self.peer_reconfig_req_seq_num {
-                        let diff = req_seq_num.wrapping_sub(peer_seq) as i32;
+                        let diff = req_seq_num.wrapping_sub(peer_seq).cast_signed();
                         if diff <= 0 {
                             // Old or duplicate request
                             response_params.push(ReConfigParam::Response {
@@ -1879,7 +1875,7 @@ impl AssociationInner {
 
                     // Check sequence number
                     if let Some(peer_seq) = self.peer_reconfig_req_seq_num {
-                        let diff = req_seq_num.wrapping_sub(peer_seq) as i32;
+                        let diff = req_seq_num.wrapping_sub(peer_seq).cast_signed();
                         if diff <= 0 {
                             response_params.push(ReConfigParam::Response {
                                 resp_seq_num: *req_seq_num,
@@ -1919,7 +1915,7 @@ impl AssociationInner {
 
                     // Check sequence number
                     if let Some(peer_seq) = self.peer_reconfig_req_seq_num {
-                        let diff = req_seq_num.wrapping_sub(peer_seq) as i32;
+                        let diff = req_seq_num.wrapping_sub(peer_seq).cast_signed();
                         if diff <= 0 {
                             response_params.push(ReConfigParam::Response {
                                 resp_seq_num: *req_seq_num,
@@ -2775,6 +2771,7 @@ fn tsn_le(a: u32, b: u32) -> bool {
 // =============================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

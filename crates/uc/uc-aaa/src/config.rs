@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 /// AAA configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AaaConfig {
     /// Enable AAA.
@@ -104,7 +104,7 @@ impl std::fmt::Display for AaaProviderType {
 }
 
 /// RADIUS configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RadiusConfig {
     /// Primary RADIUS server.
@@ -170,7 +170,7 @@ impl RadiusConfig {
 }
 
 /// Diameter configuration (RFC 6733, 3GPP Cx/Dx).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DiameterConfig {
     /// Diameter server address (HSS).
@@ -268,7 +268,7 @@ impl DiameterConfig {
 }
 
 /// Local authentication configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct LocalConfig {
     /// Whether to allow any credentials (for testing).
@@ -278,7 +278,7 @@ pub struct LocalConfig {
 }
 
 /// Failover configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FailoverConfig {
     /// Enable failover to backup servers.
@@ -303,6 +303,7 @@ impl Default for FailoverConfig {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

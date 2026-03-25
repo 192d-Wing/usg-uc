@@ -273,6 +273,7 @@ impl std::fmt::Debug for DtlsSession {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::SrtpProfile;
@@ -477,7 +478,7 @@ mod tests {
             .await
             .unwrap();
 
-        let debug_str = format!("{:?}", session);
+        let debug_str = format!("{session:?}");
         assert!(debug_str.contains("DtlsSession"));
         assert!(debug_str.contains("Client"));
         assert!(debug_str.contains("established"));

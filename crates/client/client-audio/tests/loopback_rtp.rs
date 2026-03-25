@@ -4,6 +4,24 @@
 //! sending it over UDP loopback, receiving through the jitter buffer,
 //! and decoding back to PCM. Checks that output resembles input within
 //! G.711 quantization tolerance.
+#![allow(
+    clippy::similar_names,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines,
+    clippy::unwrap_used,
+    clippy::needless_range_loop,
+    clippy::collapsible_if,
+    clippy::redundant_clone,
+    clippy::branches_sharing_code,
+    clippy::suboptimal_flops,
+    clippy::range_plus_one,
+    clippy::unchecked_time_subtraction,
+    clippy::missing_docs_in_private_items,
+    clippy::vec_init_then_push
+)]
 
 use client_audio::{
     CodecPipeline, JitterBufferResult, RtpReceiver, RtpTransmitter, SharedJitterBuffer,

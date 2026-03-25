@@ -1,3 +1,6 @@
+//! UDP test example.
+#![allow(clippy::uninlined_format_args, clippy::missing_docs_in_private_items)]
+
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 

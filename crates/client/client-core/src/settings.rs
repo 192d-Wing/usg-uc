@@ -726,7 +726,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("settings.toml");
 
-        let manager = SettingsManager::with_path(path.clone()).unwrap();
+        let manager = SettingsManager::with_path(path).unwrap();
 
         assert!(!manager.is_dirty());
         assert!(manager.settings().accounts.is_empty());

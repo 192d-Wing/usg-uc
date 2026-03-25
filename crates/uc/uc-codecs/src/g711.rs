@@ -653,7 +653,7 @@ mod tests {
             let natural = encoded ^ 0x55;
 
             // After removing XOR 0x55: sign bit should be clean
-            let _sign = natural & 0x80;
+            let _ = natural & 0x80;
             let exp = (natural >> 4) & 0x07;
             let mant = natural & 0x0F;
 

@@ -132,11 +132,9 @@ impl AecReference {
     /// Pulls far-end reference samples into the provided buffer.
     /// Returns the number of samples actually read.
     pub fn pull(&self, output: &mut [i16]) -> usize {
-        if let Ok(mut cons) = self.consumer.lock() {
-            cons.pop_slice(output)
-        } else {
-            0
-        }
+        self.consumer
+            .lock()
+            .map_or(0, |mut cons| cons.pop_slice(output))
     }
 
     /// Returns the number of samples available to read.
@@ -205,7 +203,7 @@ impl AecProcessor {
     }
 
     /// Enables or disables AEC processing.
-    pub fn set_enabled(&mut self, enabled: bool) {
+    pub const fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         if !enabled {
             self.ref_power = 0.0;
@@ -221,7 +219,7 @@ impl AecProcessor {
     /// - 0-6 dB: poor / not converged
     /// - 6-12 dB: acceptable
     /// - 12+ dB: good
-    pub fn erle_db(&self) -> f32 {
+    pub const fn erle_db(&self) -> f32 {
         self.erle_db
     }
 
@@ -234,7 +232,12 @@ impl AecProcessor {
     ///
     /// `mic_pcm` is the captured audio at codec rate (modified in-place).
     /// The far-end reference is automatically pulled from the shared buffer.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_lossless,
+        clippy::cast_precision_loss,
+        clippy::items_after_statements
+    )]
     pub fn process(&mut self, mic_pcm: &mut [i16]) {
         if !self.enabled {
             return;
@@ -328,6 +331,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn test_aec_reference_push_pull() {
         let aec_ref = AecReference::new(8000, 100); // 100ms buffer
 
@@ -344,6 +348,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn test_aec_reference_overflow() {
         let aec_ref = AecReference::new(8000, 20); // 20ms = 160 samples
 
@@ -361,6 +366,7 @@ mod tests {
         let mut processor = AecProcessor::new(8000, aec_ref);
 
         // With no reference signal, mic should pass through unchanged
+        #[allow(clippy::cast_possible_truncation)]
         let mut mic: Vec<i16> = (0..160).map(|i| (i * 100) as i16).collect();
         let original = mic.clone();
         processor.process(&mut mic);
@@ -369,6 +375,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     fn test_aec_processor_disabled() {
         let aec_ref = AecReference::new(8000, 100);
         let mut processor = AecProcessor::new(8000, aec_ref.clone());
@@ -381,13 +388,18 @@ mod tests {
         aec_ref.push(&ref_signal);
 
         // Mic should pass through when disabled
-        let mut mic = ref_signal.clone();
+        let mut mic = ref_signal;
         let original = mic.clone();
         processor.process(&mut mic);
         assert_eq!(mic, original);
     }
 
     #[test]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_lossless
+    )]
     fn test_aec_reduces_echo() {
         let aec_ref = AecReference::new(8000, 200);
         let mut processor = AecProcessor::new(8000, aec_ref.clone());
@@ -411,10 +423,7 @@ mod tests {
         let mic_echo: Vec<i16> = (0..total_samples)
             .map(|i| {
                 if i >= echo_delay {
-                    #[allow(clippy::cast_possible_truncation)]
-                    {
-                        (farend[i - echo_delay] as f32 * echo_gain) as i16
-                    }
+                    (f32::from(farend[i - echo_delay]) * echo_gain) as i16
                 } else {
                     0
                 }
@@ -434,11 +443,11 @@ mod tests {
 
             // Process mic (echo only, no near-end speech)
             let mut mic_frame = mic_echo[start..end].to_vec();
-            let input_rms: f64 = mic_frame.iter().map(|&s| (s as f64).powi(2)).sum();
+            let input_rms: f64 = mic_frame.iter().map(|&s| f64::from(s).powi(2)).sum();
 
             processor.process(&mut mic_frame);
 
-            let output_rms: f64 = mic_frame.iter().map(|&s| (s as f64).powi(2)).sum();
+            let output_rms: f64 = mic_frame.iter().map(|&s| f64::from(s).powi(2)).sum();
 
             // Only count frames after convergence (skip first 20 frames)
             if frame_idx >= 20 {
@@ -462,6 +471,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     fn test_aec_erle_estimation() {
         let aec_ref = AecReference::new(8000, 200);
         let mut processor = AecProcessor::new(8000, aec_ref.clone());
@@ -483,7 +493,7 @@ mod tests {
                 if i >= echo_delay {
                     #[allow(clippy::cast_possible_truncation)]
                     {
-                        (farend[i - echo_delay] as f32 * echo_gain) as i16
+                        (f32::from(farend[i - echo_delay]) * echo_gain) as i16
                     }
                 } else {
                     0
@@ -523,6 +533,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     fn test_aec_preserves_near_end_speech() {
         let aec_ref = AecReference::new(8000, 200);
         let mut processor = AecProcessor::new(8000, aec_ref.clone());
@@ -550,11 +561,11 @@ mod tests {
             aec_ref.push(&silence);
 
             let mut mic_frame = speech[start..end].to_vec();
-            input_energy += mic_frame.iter().map(|&s| (s as f64).powi(2)).sum::<f64>();
+            input_energy += mic_frame.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>();
 
             processor.process(&mut mic_frame);
 
-            output_energy += mic_frame.iter().map(|&s| (s as f64).powi(2)).sum::<f64>();
+            output_energy += mic_frame.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>();
         }
 
         // Near-end speech should be mostly preserved (within 3dB)

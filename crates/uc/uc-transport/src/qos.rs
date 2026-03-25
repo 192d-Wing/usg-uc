@@ -630,6 +630,10 @@ impl QosPolicyManager {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::decimal_literal_representation,
+    clippy::decimal_bitwise_operands
+)]
 mod tests {
     use super::*;
 

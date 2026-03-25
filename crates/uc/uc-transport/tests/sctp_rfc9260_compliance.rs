@@ -12,6 +12,21 @@
 //! - Section 9: Termination of Association
 
 #![cfg(feature = "sctp")]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreadable_literal,
+    clippy::doc_markdown,
+    clippy::redundant_clone,
+    clippy::needless_pass_by_value,
+    clippy::unnecessary_mut_passed,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::items_after_statements,
+    clippy::bool_assert_comparison,
+    clippy::used_underscore_binding,
+    unused_imports
+)]
 
 use bytes::{Bytes, BytesMut};
 use std::net::{Ipv4Addr, SocketAddr};

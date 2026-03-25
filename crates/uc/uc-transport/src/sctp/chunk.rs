@@ -2166,9 +2166,9 @@ impl ReConfigParam {
                 receiver_next_tsn,
             } => {
                 let has_tsns = sender_next_tsn.is_some() && receiver_next_tsn.is_some();
-                let length = if has_tsns { 20 } else { 12 };
+                let length: u16 = if has_tsns { 20 } else { 12 };
                 buf.put_u16(Self::RESPONSE);
-                buf.put_u16(length as u16);
+                buf.put_u16(length);
                 buf.put_u32(*resp_seq_num);
                 buf.put_u32(*result as u32);
                 if let (Some(sender), Some(receiver)) = (sender_next_tsn, receiver_next_tsn) {
@@ -2605,11 +2605,21 @@ impl AsconfParam {
 
         match addr_type {
             Self::IPV4_ADDRESS if data.len() >= 8 => {
-                let octets: [u8; 4] = data[4..8].try_into().unwrap();
+                let octets: [u8; 4] =
+                    data[4..8]
+                        .try_into()
+                        .map_err(|_| TransportError::ReceiveFailed {
+                            reason: "invalid IPv4 address bytes".to_string(),
+                        })?;
                 Ok((Some(std::net::Ipv4Addr::from(octets)), None))
             }
             Self::IPV6_ADDRESS if data.len() >= 20 => {
-                let octets: [u8; 16] = data[4..20].try_into().unwrap();
+                let octets: [u8; 16] =
+                    data[4..20]
+                        .try_into()
+                        .map_err(|_| TransportError::ReceiveFailed {
+                            reason: "invalid IPv6 address bytes".to_string(),
+                        })?;
                 Ok((None, Some(std::net::Ipv6Addr::from(octets))))
             }
             _ => Ok((None, None)),
@@ -2772,19 +2782,28 @@ impl AsconfChunk {
         let addr_type = u16::from_be_bytes([chunk_data[8], chunk_data[9]]);
         let addr_len = u16::from_be_bytes([chunk_data[10], chunk_data[11]]) as usize;
 
-        let (sender_ipv4, sender_ipv6, params_offset) = match addr_type {
-            5 if chunk_data.len() >= 16 => {
-                // IPv4
-                let octets: [u8; 4] = chunk_data[12..16].try_into().unwrap();
-                (Some(std::net::Ipv4Addr::from(octets)), None, 16)
-            }
-            6 if chunk_data.len() >= 28 => {
-                // IPv6
-                let octets: [u8; 16] = chunk_data[12..28].try_into().unwrap();
-                (None, Some(std::net::Ipv6Addr::from(octets)), 28)
-            }
-            _ => (None, None, 8 + padded_length(addr_len)),
-        };
+        let (sender_ipv4, sender_ipv6, params_offset) =
+            match addr_type {
+                5 if chunk_data.len() >= 16 => {
+                    // IPv4
+                    let octets: [u8; 4] = chunk_data[12..16].try_into().map_err(|_| {
+                        TransportError::ReceiveFailed {
+                            reason: "invalid IPv4 address bytes in ASCONF".to_string(),
+                        }
+                    })?;
+                    (Some(std::net::Ipv4Addr::from(octets)), None, 16)
+                }
+                6 if chunk_data.len() >= 28 => {
+                    // IPv6
+                    let octets: [u8; 16] = chunk_data[12..28].try_into().map_err(|_| {
+                        TransportError::ReceiveFailed {
+                            reason: "invalid IPv6 address bytes in ASCONF".to_string(),
+                        }
+                    })?;
+                    (None, Some(std::net::Ipv6Addr::from(octets)), 28)
+                }
+                _ => (None, None, 8 + padded_length(addr_len)),
+            };
 
         // Decode ASCONF parameters
         let mut params = Vec::new();
@@ -3290,6 +3309,13 @@ const fn padded_length(length: usize) -> usize {
 // =============================================================================
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::redundant_clone,
+    clippy::ip_constant
+)]
 mod tests {
     use super::*;
 

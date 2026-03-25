@@ -274,6 +274,7 @@ impl std::fmt::Debug for TelemetryProvider {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -67,6 +67,7 @@ impl UdptlPacket {
 
     /// Encodes the UDPTL packet to bytes.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // Lengths are bounded by protocol limits
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(MAX_UDPTL_SIZE);
 
@@ -135,7 +136,6 @@ impl UdptlPacket {
         } else {
             let ec_type = data.get_u8();
             match ec_type {
-                0 => ErrorCorrectionData::None,
                 1 => {
                     // Redundancy
                     let count = data.get_u8() as usize;
@@ -278,6 +278,7 @@ impl UdptlTransport {
             while history.len() > 16 {
                 history.pop_front();
             }
+            drop(history);
         }
 
         // Send
@@ -319,6 +320,7 @@ impl UdptlTransport {
             while seqs.len() > 64 {
                 seqs.pop_front();
             }
+            drop(seqs);
         }
 
         debug!(seq = packet.seq_num, "Received UDPTL packet");
@@ -349,12 +351,13 @@ impl UdptlTransport {
                 // Redundant packets are in reverse order (most recent first)
                 for (i, data) in packets.iter().enumerate() {
                     // Calculate the sequence number this redundant packet represents
+                    #[allow(clippy::cast_possible_truncation)]
                     let redundant_seq = target_seq.wrapping_sub(i as u16 + 1);
-                    if redundant_seq == target_seq {
-                        if let Ok(ifp) = IfpPacket::decode(data.clone()) {
-                            debug!(seq = target_seq, "Recovered packet from redundancy");
-                            return Some(ifp);
-                        }
+                    if redundant_seq == target_seq
+                        && let Ok(ifp) = IfpPacket::decode(data.clone())
+                    {
+                        debug!(seq = target_seq, "Recovered packet from redundancy");
+                        return Some(ifp);
                     }
                 }
                 None
@@ -383,6 +386,7 @@ impl std::fmt::Debug for UdptlTransport {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::ifp::DataType;

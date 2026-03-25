@@ -57,7 +57,7 @@ mod implementation {
     const VENDOR_3GPP: u32 = 10415;
 
     // 3GPP Cx Application ID
-    const APP_CX: u32 = 16777216;
+    const APP_CX: u32 = 16_777_216;
 
     // Diameter base AVP codes
     const AVP_ORIGIN_HOST: u32 = 264;
@@ -147,8 +147,10 @@ mod implementation {
                     self.send_cer(&mut client).await?;
 
                     // Store client
-                    let mut transport = self.transport.write().await;
-                    *transport = Some(client);
+                    {
+                        let mut transport = self.transport.write().await;
+                        *transport = Some(client);
+                    }
                     self.connected.store(true, Ordering::Relaxed);
 
                     info!(server = %server_addr, "Connected to Diameter server");
@@ -415,6 +417,8 @@ mod implementation {
         }
     }
 
+    // Intentionally omit transport/dictionary/server_index/failures from Debug output
+    #[allow(clippy::missing_fields_in_debug)]
     impl std::fmt::Debug for DiameterClient {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("DiameterClient")
@@ -585,7 +589,7 @@ mod tests {
     #[test]
     fn test_debug_format() {
         let client = create_test_client();
-        let debug_str = format!("{:?}", client);
+        let debug_str = format!("{client:?}");
         assert!(debug_str.contains("DiameterClient"));
         assert!(debug_str.contains("sbc.test.com"));
     }

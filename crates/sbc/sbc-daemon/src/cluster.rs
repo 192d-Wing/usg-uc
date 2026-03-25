@@ -1,8 +1,8 @@
 //! Cluster integration module.
 //!
 //! This module coordinates clustering components:
-//! - Storage backends (in-memory, Redis, PostgreSQL)
-//! - Service discovery (static, DNS, Kubernetes)
+//! - Storage backends (in-memory, `Redis`, `PostgreSQL`)
+//! - Service discovery (static, DNS, `Kubernetes`)
 //! - Cluster membership and failover
 //! - State synchronization
 //!
@@ -128,27 +128,27 @@ impl ClusterManager {
     }
 
     /// Returns the storage manager.
-    pub fn storage(&self) -> &Arc<StorageManager> {
+    pub const fn storage(&self) -> &Arc<StorageManager> {
         &self.storage
     }
 
     /// Returns the discovery manager.
-    pub fn discovery(&self) -> &Arc<DiscoveryManager> {
+    pub const fn discovery(&self) -> &Arc<DiscoveryManager> {
         &self.discovery
     }
 
     /// Returns the cluster membership tracker.
-    pub fn membership(&self) -> &Arc<ClusterMembership> {
+    pub const fn membership(&self) -> &Arc<ClusterMembership> {
         &self.membership
     }
 
     /// Returns the async location service for SIP registrations.
-    pub fn location_service(&self) -> &Arc<AsyncLocationService> {
+    pub const fn location_service(&self) -> &Arc<AsyncLocationService> {
         &self.location_service
     }
 
     /// Returns the local node ID.
-    pub fn node_id(&self) -> &NodeId {
+    pub const fn node_id(&self) -> &NodeId {
         &self.node_id
     }
 
@@ -165,7 +165,7 @@ impl ClusterManager {
                 info!(peer_count = peers.len(), "Discovered cluster peers");
                 for peer in &peers {
                     debug!(
-                        peer_id = peer.node_id.as_ref().map(|n| n.as_str()).unwrap_or("unknown"),
+                        peer_id = peer.node_id.as_ref().map_or("unknown", |n| n.as_str()),
                         address = %peer.address,
                         "Found peer"
                     );
@@ -241,6 +241,7 @@ impl ClusterManager {
 
 /// Cluster health status.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ClusterHealth {
     /// Overall health status.
     pub healthy: bool,

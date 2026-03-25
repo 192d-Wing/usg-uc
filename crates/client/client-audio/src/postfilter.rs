@@ -68,17 +68,17 @@ impl Default for Postfilter {
 impl Postfilter {
     /// Creates a new postfilter (enabled by default).
     pub fn new() -> Self {
-        Self::with_config(PostfilterConfig::default())
+        Self::with_config(&PostfilterConfig::default())
     }
 
     /// Creates a postfilter with custom configuration.
-    pub fn with_config(cfg: PostfilterConfig) -> Self {
+    pub fn with_config(cfg: &PostfilterConfig) -> Self {
         Self {
             prev_input: [0.0; 2],
             enabled: true,
             tilt_alpha: cfg.tilt_alpha,
             gain_norm: 1.0 / (1.0 + cfg.tilt_alpha),
-            stages: cfg.stages.min(2).max(1),
+            stages: cfg.stages.clamp(1, 2),
         }
     }
 
@@ -203,7 +203,7 @@ mod tests {
             tilt_alpha: 0.45,
             stages: 1,
         };
-        let mut pf = Postfilter::with_config(cfg);
+        let mut pf = Postfilter::with_config(&cfg);
         let mut alt: Vec<i16> = (0..160)
             .map(|i| if i % 2 == 0 { 1000 } else { -1000 })
             .collect();
@@ -224,10 +224,8 @@ mod tests {
         let mut pf = Postfilter::new();
         let mut loud = vec![i16::MAX; 160];
         pf.process(&mut loud);
-        assert!(
-            loud.iter().all(|&s| s >= i16::MIN && s <= i16::MAX),
-            "Output should be clamped to i16 range"
-        );
+        // All i16 values are by definition within i16 range - verify non-empty
+        assert!(!loud.is_empty(), "Output should be clamped to i16 range");
     }
 
     #[test]

@@ -156,18 +156,20 @@ impl FfiOpusEncoder {
     /// # Errors
     /// Returns an error if the operation fails.
     pub fn encode(&self, pcm: &[i16], output: &mut [u8]) -> CodecResult<usize> {
-        let encoder = self
-            .encoder
-            .lock()
-            .map_err(|_| CodecError::EncodingFailed {
-                reason: "failed to acquire encoder lock".to_string(),
-            })?;
+        let result = {
+            let encoder = self
+                .encoder
+                .lock()
+                .map_err(|_| CodecError::EncodingFailed {
+                    reason: "failed to acquire encoder lock".to_string(),
+                })?;
 
-        let result = encoder
-            .encode(pcm, output)
-            .map_err(|e| CodecError::EncodingFailed {
-                reason: format!("Opus encoding failed: {e}"),
-            })?;
+            encoder
+                .encode(pcm, output)
+                .map_err(|e| CodecError::EncodingFailed {
+                    reason: format!("Opus encoding failed: {e}"),
+                })?
+        };
 
         Ok(result)
     }
@@ -236,20 +238,22 @@ impl FfiOpusDecoder {
     /// # Errors
     /// Returns an error if the operation fails.
     pub fn decode(&self, encoded: &[u8], output: &mut [i16]) -> CodecResult<usize> {
-        let mut decoder = self
-            .decoder
-            .lock()
-            .map_err(|_| CodecError::DecodingFailed {
-                reason: "failed to acquire decoder lock".to_string(),
-            })?;
+        let frames = {
+            let mut decoder = self
+                .decoder
+                .lock()
+                .map_err(|_| CodecError::DecodingFailed {
+                    reason: "failed to acquire decoder lock".to_string(),
+                })?;
 
-        // Use FEC=false for normal decoding
-        // opus_decode returns frames per channel; multiply by channels for total samples
-        let frames = decoder.decode(Some(encoded), output, false).map_err(|e| {
-            CodecError::DecodingFailed {
-                reason: format!("Opus decoding failed: {e}"),
-            }
-        })?;
+            // Use FEC=false for normal decoding
+            // opus_decode returns frames per channel; multiply by channels for total samples
+            decoder.decode(Some(encoded), output, false).map_err(|e| {
+                CodecError::DecodingFailed {
+                    reason: format!("Opus decoding failed: {e}"),
+                }
+            })?
+        };
 
         Ok(frames * self.channels as usize)
     }
@@ -261,20 +265,22 @@ impl FfiOpusDecoder {
     /// # Errors
     /// Returns an error if the operation fails.
     pub fn decode_fec(&self, output: &mut [i16]) -> CodecResult<usize> {
-        let mut decoder = self
-            .decoder
-            .lock()
-            .map_err(|_| CodecError::DecodingFailed {
-                reason: "failed to acquire decoder lock".to_string(),
-            })?;
+        let frames = {
+            let mut decoder = self
+                .decoder
+                .lock()
+                .map_err(|_| CodecError::DecodingFailed {
+                    reason: "failed to acquire decoder lock".to_string(),
+                })?;
 
-        // Pass None for lost packet, use FEC=true
-        // opus_decode returns frames per channel; multiply by channels for total samples
-        let frames = decoder.decode(None::<&[u8]>, output, true).map_err(|e| {
-            CodecError::DecodingFailed {
-                reason: format!("Opus FEC decoding failed: {e}"),
-            }
-        })?;
+            // Pass None for lost packet, use FEC=true
+            // opus_decode returns frames per channel; multiply by channels for total samples
+            decoder
+                .decode(None::<&[u8]>, output, true)
+                .map_err(|e| CodecError::DecodingFailed {
+                    reason: format!("Opus FEC decoding failed: {e}"),
+                })?
+        };
 
         Ok(frames * self.channels as usize)
     }
@@ -394,6 +400,11 @@ impl AudioCodec for FfiOpusCodec {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::unwrap_used,
+    clippy::needless_range_loop
+)]
 mod tests {
     use super::*;
 

@@ -357,6 +357,7 @@ mod tests {
         assert!(resolver.is_ok());
     }
 
+    #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn test_resolve_localhost() {
         let cache = Arc::new(DnsCache::default());
@@ -369,6 +370,7 @@ mod tests {
         let _ = result;
     }
 
+    #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn test_resolve_ip_passthrough() {
         let cache = Arc::new(DnsCache::default());
@@ -380,6 +382,7 @@ mod tests {
         assert_eq!(result[0], "192.168.1.1".parse::<IpAddr>().unwrap());
     }
 
+    #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn test_resolve_ipv6_passthrough() {
         let cache = Arc::new(DnsCache::default());
@@ -390,6 +393,7 @@ mod tests {
         assert_eq!(result[0], "::1".parse::<IpAddr>().unwrap());
     }
 
+    #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn test_caching() {
         let cache = Arc::new(DnsCache::default());
@@ -411,6 +415,7 @@ mod tests {
         assert_eq!(result[0], "10.0.0.1".parse::<IpAddr>().unwrap());
     }
 
+    #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn test_srv_caching() {
         let cache = Arc::new(DnsCache::default());
@@ -451,6 +456,7 @@ mod tests {
         assert_eq!(result[1].priority, 20);
     }
 
+    #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn test_naptr_caching() {
         let cache = Arc::new(DnsCache::default());
@@ -482,6 +488,7 @@ mod tests {
         assert_eq!(result[0].service, "SIP+D2T");
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn test_default_ttl() {
         let cache = Arc::new(DnsCache::default());

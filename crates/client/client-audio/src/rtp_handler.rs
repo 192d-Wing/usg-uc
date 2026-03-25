@@ -33,6 +33,12 @@ pub struct SharedDtmfQueue {
     inner: Arc<Mutex<VecDeque<BufferedPacket>>>,
 }
 
+impl Default for SharedDtmfQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SharedDtmfQueue {
     /// Creates a new shared DTMF queue.
     pub fn new() -> Self {
@@ -117,7 +123,7 @@ pub(crate) struct AtomicRtpStats {
 
 impl AtomicRtpStats {
     /// Creates zeroed atomic counters.
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             packets_sent: AtomicU64::new(0),
             packets_received: AtomicU64::new(0),
@@ -721,7 +727,7 @@ impl RtpReceiver {
     }
 
     /// Sets the local SSRC for collision detection (RFC 3550 §8.2).
-    pub fn set_local_ssrc(&mut self, ssrc: u32) {
+    pub const fn set_local_ssrc(&mut self, ssrc: u32) {
         self.local_ssrc = Some(ssrc);
     }
 
@@ -731,7 +737,7 @@ impl RtpReceiver {
     }
 
     /// Clears the collision flag after the caller has handled it.
-    pub fn clear_ssrc_collision(&mut self) {
+    pub const fn clear_ssrc_collision(&mut self) {
         self.ssrc_collision = false;
     }
 
@@ -781,11 +787,11 @@ impl RtpReceiver {
                     let elapsed = self.pcap_start.elapsed();
                     #[allow(clippy::cast_possible_truncation)]
                     let ts_sec = (elapsed.as_secs() as u32).to_le_bytes();
-                    let ts_usec = elapsed.subsec_micros().to_le_bytes();
+                    let ts_microsec = elapsed.subsec_micros().to_le_bytes();
                     #[allow(clippy::cast_possible_truncation)]
                     let pkt_len = (len as u32).to_le_bytes();
                     let _ = pcap.write_all(&ts_sec);
-                    let _ = pcap.write_all(&ts_usec);
+                    let _ = pcap.write_all(&ts_microsec);
                     let _ = pcap.write_all(&pkt_len); // incl_len
                     let _ = pcap.write_all(&pkt_len); // orig_len
                     let _ = pcap.write_all(&self.recv_buffer[..len]);
@@ -852,14 +858,14 @@ impl RtpReceiver {
         // SSRC collision detection (RFC 3550 §8.2): if the incoming
         // packet's SSRC matches our own local SSRC, flag the collision
         // so the I/O thread can regenerate our SSRC.
-        if let Some(local) = self.local_ssrc {
-            if ssrc == local {
-                warn!(
-                    "SSRC collision detected: remote sent SSRC={:#010x} which matches our local SSRC",
-                    ssrc
-                );
-                self.ssrc_collision = true;
-            }
+        if let Some(local) = self.local_ssrc
+            && ssrc == local
+        {
+            warn!(
+                "SSRC collision detected: remote sent SSRC={:#010x} which matches our local SSRC",
+                ssrc
+            );
+            self.ssrc_collision = true;
         }
 
         // Track remote SSRC — detect changes mid-call (RFC 3550 §8.2).
@@ -881,17 +887,17 @@ impl RtpReceiver {
 
         // DTMF JB bypass: route telephone-event packets to the dedicated
         // queue instead of the jitter buffer (matches pjproject).
-        if self.dtmf_pt == Some(pt) {
-            if let Some(ref queue) = self.dtmf_queue {
-                let buffered = BufferedPacket::new(seq, ts, pt, payload);
-                queue.push(buffered);
-                self.stats.packets_received.fetch_add(1, Ordering::Relaxed);
-                #[allow(clippy::cast_possible_truncation)]
-                self.stats
-                    .bytes_received
-                    .fetch_add(len as u64, Ordering::Relaxed);
-                return Ok(());
-            }
+        if self.dtmf_pt == Some(pt)
+            && let Some(ref queue) = self.dtmf_queue
+        {
+            let buffered = BufferedPacket::new(seq, ts, pt, payload);
+            queue.push(buffered);
+            self.stats.packets_received.fetch_add(1, Ordering::Relaxed);
+            #[allow(clippy::cast_possible_truncation)]
+            self.stats
+                .bytes_received
+                .fetch_add(len as u64, Ordering::Relaxed);
+            return Ok(());
             // No queue configured — fall through to JB (legacy path)
         }
 
@@ -974,7 +980,11 @@ fn entropy_seed() -> u64 {
     // Source 1: High-resolution timestamp (nanoseconds)
     let time_nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
+        .map(|d| {
+            #[allow(clippy::cast_possible_truncation)]
+            let nanos = d.as_nanos() as u64;
+            nanos
+        })
         .unwrap_or(0);
 
     // Source 2: Thread ID (different per thread)
@@ -1002,9 +1012,9 @@ fn entropy_seed() -> u64 {
 
     // splitmix64 finalizer for good avalanche properties
     state ^= state >> 30;
-    state = state.wrapping_mul(0xbf58476d1ce4e5b9);
+    state = state.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     state ^= state >> 27;
-    state = state.wrapping_mul(0x94d049bb133111eb);
+    state = state.wrapping_mul(0x94d0_49bb_1331_11eb);
     state ^= state >> 31;
 
     state
@@ -1036,6 +1046,7 @@ const MAX_REDUNDANT_BLOCKS: usize = 4;
 ///
 /// Returns `(primary_pt, primary_data, redundant_entries)` where each
 /// redundant entry is `(pt, timestamp_offset, data)`.
+#[allow(clippy::type_complexity)]
 pub fn parse_rfc2198(
     data: &[u8],
     rtp_timestamp: u32,
@@ -1208,8 +1219,8 @@ mod tests {
 
     #[test]
     fn test_parse_rtp_fields_basic() {
-        // Build a minimal RTP packet: V=2, PT=0, seq=100, ts=1600, ssrc=0xABCDEF01
-        let header = proto_rtp::RtpHeader::new(0, 100, 1600, 0xABCDEF01);
+        // Build a minimal RTP packet: V=2, PT=0, seq=100, ts=1600, ssrc=0xABCD_EF01
+        let header = proto_rtp::RtpHeader::new(0, 100, 1600, 0xABCD_EF01);
         let header_bytes = header.to_bytes();
         let payload = [0u8; 160];
         let mut packet = Vec::with_capacity(header_bytes.len() + payload.len());
@@ -1220,7 +1231,7 @@ mod tests {
         assert_eq!(pt, 0);
         assert_eq!(seq, 100);
         assert_eq!(ts, 1600);
-        assert_eq!(ssrc, 0xABCDEF01);
+        assert_eq!(ssrc, 0xABCD_EF01);
         assert_eq!(payload_start, 12);
         assert_eq!(payload_end, 12 + 160);
     }
@@ -1251,12 +1262,13 @@ mod tests {
         let primary_pt: u8 = 0;
         let redundant_pt: u8 = 0;
 
-        let mut payload = Vec::new();
-        // Redundant block header (4 bytes)
-        payload.push(0x80 | (redundant_pt & 0x7F));
-        payload.push(((ts_offset >> 6) & 0xFF) as u8);
-        payload.push((((ts_offset & 0x3F) << 2) as u8) | ((block_len >> 8) as u8 & 0x03));
-        payload.push(block_len as u8);
+        #[allow(clippy::cast_possible_truncation)]
+        let mut payload = vec![
+            0x80 | (redundant_pt & 0x7F),
+            ((ts_offset >> 6) & 0xFF) as u8,
+            (((ts_offset & 0x3F) << 2) as u8) | ((block_len >> 8) as u8 & 0x03),
+            block_len as u8,
+        ];
         // Primary block header (1 byte)
         payload.push(primary_pt & 0x7F);
         // Redundant data

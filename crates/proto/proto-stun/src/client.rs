@@ -287,6 +287,7 @@ impl std::fmt::Debug for StunClient {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::ip_constant)]
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
@@ -356,7 +357,7 @@ mod tests {
         let server = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 3478);
         let client = StunClient::new(Arc::new(socket), server);
 
-        let debug_str = format!("{:?}", client);
+        let debug_str = format!("{client:?}");
         assert!(debug_str.contains("StunClient"));
         assert!(debug_str.contains("192.0.2.1"));
     }

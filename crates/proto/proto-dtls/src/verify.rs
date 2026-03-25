@@ -718,11 +718,11 @@ mod tests {
     #[test]
     fn test_certificate_validation_result_debug() {
         let result = CertificateValidationResult::Valid;
-        let debug_str = format!("{:?}", result);
+        let debug_str = format!("{result:?}");
         assert!(debug_str.contains("Valid"));
 
         let invalid = CertificateValidationResult::Invalid("reason".to_string());
-        let debug_str = format!("{:?}", invalid);
+        let debug_str = format!("{invalid:?}");
         assert!(debug_str.contains("Invalid"));
         assert!(debug_str.contains("reason"));
     }

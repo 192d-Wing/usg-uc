@@ -663,6 +663,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn test_sip_target_creation() {
         let addr: SocketAddr = "192.168.1.1:5060".parse().unwrap();
@@ -673,6 +674,7 @@ mod tests {
         assert!(!target.is_secure());
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn test_sip_target_secure() {
         let addr: SocketAddr = "192.168.1.1:5061".parse().unwrap();
@@ -681,6 +683,7 @@ mod tests {
         assert!(target.is_secure());
     }
 
+    #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn test_resolve_numeric_ip() {
         let resolver = SipResolver::with_defaults();
@@ -694,6 +697,7 @@ mod tests {
         assert_eq!(targets[0].transport, TransportPref::Udp);
     }
 
+    #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn test_resolve_numeric_ipv6() {
         let resolver = SipResolver::with_defaults();
@@ -707,6 +711,7 @@ mod tests {
         assert_eq!(targets[0].transport, TransportPref::Tcp);
     }
 
+    #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn test_resolve_numeric_default_port() {
         let resolver = SipResolver::with_defaults();
@@ -719,6 +724,7 @@ mod tests {
         assert_eq!(targets[0].address.port(), 5061); // TLS default port
     }
 
+    #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn test_resolve_with_cached_addresses() {
         let cache = Arc::new(DnsCache::default());
@@ -746,6 +752,7 @@ mod tests {
         assert_eq!(targets.len(), 2);
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn test_sip_target_with_details() {
         let addr: SocketAddr = "10.0.0.1:5060".parse().unwrap();

@@ -51,7 +51,7 @@ pub enum PipelineState {
 /// Each sub-config has a `Default` impl matching the original hardcoded constants,
 /// so `AudioProcessingConfig::default()` produces identical behavior to before.
 /// Use named constructors like `low_latency()` or `bluetooth()` for presets.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AudioProcessingConfig {
     /// Automatic gain control settings.
     pub agc: AgcConfig,
@@ -71,22 +71,6 @@ pub struct AudioProcessingConfig {
     pub drift: DriftConfig,
     /// Jitter buffer adaptive algorithm settings.
     pub jitter_buffer: JitterBufferConfig,
-}
-
-impl Default for AudioProcessingConfig {
-    fn default() -> Self {
-        Self {
-            agc: AgcConfig::default(),
-            noise_gate: NoiseGateConfig::default(),
-            vad: VadConfig::default(),
-            aec: AecConfig::default(),
-            noise_shaper: NoiseShaperConfig::default(),
-            postfilter: PostfilterConfig::default(),
-            comfort_noise: ComfortNoiseConfig::default(),
-            drift: DriftConfig::default(),
-            jitter_buffer: JitterBufferConfig::default(),
-        }
-    }
 }
 
 impl AudioProcessingConfig {
@@ -304,7 +288,7 @@ impl CallQualityReport {
     /// R is then converted to MOS via the standard formula.
     pub fn from_stats(stats: &PipelineStats) -> Self {
         let total_expected = stats.jitter_stats.packets_played + stats.jitter_stats.packets_lost;
-        #[allow(clippy::cast_precision_loss)]
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
         let loss_pct = if total_expected > 0 {
             (stats.jitter_stats.packets_lost as f64 / total_expected as f64 * 100.0) as f32
         } else {
@@ -317,7 +301,7 @@ impl CallQualityReport {
         // Simplified E-model (ITU-T G.107/G.113)
         let one_way_delay = rtt_ms / 2.0;
         let id = if one_way_delay > 177.3 {
-            0.024 * one_way_delay + 0.11 * (one_way_delay - 177.3)
+            0.024f32.mul_add(one_way_delay, 0.11 * (one_way_delay - 177.3))
         } else {
             0.024 * one_way_delay
         };
@@ -333,7 +317,7 @@ impl CallQualityReport {
         } else if r > 100.0 {
             4.5
         } else {
-            1.0 + 0.035 * r + r * (r - 60.0) * (100.0 - r) * 7e-6
+            (r * (r - 60.0) * (100.0 - r)).mul_add(7e-6, 0.035f32.mul_add(r, 1.0))
         };
 
         Self {
@@ -616,7 +600,7 @@ impl AudioPipeline {
             postfilter: config.audio.postfilter.clone(),
             comfort_noise: config.audio.comfort_noise.clone(),
             dtmf_rx_tx: Some(dtmf_rx_tx),
-            dtmf_queue: Some(dtmf_queue.clone()),
+            dtmf_queue: Some(dtmf_queue),
         };
         let decode_metrics = decode_thread::DecodeMetrics::new();
         let decode_handle = decode_thread::spawn(
@@ -939,13 +923,13 @@ pub(crate) fn resample_into(input: &[i16], output: &mut [i16], prev_sample: i16)
     // Fast path: integer ratio downsampling
     if in_len > output_len && in_len.is_multiple_of(output_len) {
         let ratio = in_len / output_len;
-        for i in 0..output_len {
+        for (i, out_sample) in output.iter_mut().enumerate().take(output_len) {
             let start = i * ratio;
             let sum: i32 = input[start..start + ratio]
                 .iter()
                 .map(|&s| i32::from(s))
                 .sum();
-            output[i] = (sum / ratio as i32) as i16;
+            *out_sample = (sum / ratio as i32) as i16;
         }
         return;
     }
@@ -963,7 +947,7 @@ pub(crate) fn resample_into(input: &[i16], output: &mut [i16], prev_sample: i16)
         }
     };
 
-    for i in 0..output_len {
+    for (i, out_sample) in output.iter_mut().enumerate().take(output_len) {
         let pos = i as f64 * step;
         let idx = pos.floor() as i32;
         let t = pos - f64::from(idx);
@@ -981,7 +965,7 @@ pub(crate) fn resample_into(input: &[i16], output: &mut [i16], prev_sample: i16)
                 + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
                 + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3);
 
-        output[i] = sample
+        *out_sample = sample
             .round()
             .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16;
     }

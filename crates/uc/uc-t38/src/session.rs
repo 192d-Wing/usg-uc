@@ -431,25 +431,27 @@ impl T38SessionManager {
     /// Returns an error if the session limit is reached.
     pub async fn create_session(&self, id: impl Into<String>) -> T38Result<String> {
         let id = id.into();
-        let mut sessions = self.sessions.write().await;
+        {
+            let mut sessions = self.sessions.write().await;
 
-        if sessions.len() >= self.config.session.max_sessions {
-            return Err(T38Error::SessionNotFound {
-                session_id: format!(
-                    "max sessions ({}) reached",
-                    self.config.session.max_sessions
-                ),
-            });
+            if sessions.len() >= self.config.session.max_sessions {
+                return Err(T38Error::SessionNotFound {
+                    session_id: format!(
+                        "max sessions ({}) reached",
+                        self.config.session.max_sessions
+                    ),
+                });
+            }
+
+            if sessions.contains_key(&id) {
+                return Err(T38Error::SessionExists {
+                    session_id: id.clone(),
+                });
+            }
+
+            let session = T38Session::new(id.clone(), self.config.clone());
+            sessions.insert(id.clone(), session);
         }
-
-        if sessions.contains_key(&id) {
-            return Err(T38Error::SessionExists {
-                session_id: id.clone(),
-            });
-        }
-
-        let session = T38Session::new(id.clone(), self.config.clone());
-        sessions.insert(id.clone(), session);
 
         info!(session_id = %id, "Created T.38 session");
         Ok(id)
@@ -458,7 +460,7 @@ impl T38SessionManager {
     /// Gets a session by ID.
     pub async fn get_session(&self, id: &str) -> Option<T38SessionState> {
         let sessions = self.sessions.read().await;
-        sessions.get(id).map(|s| s.state())
+        sessions.get(id).map(T38Session::state)
     }
 
     /// Updates a session with a closure.
@@ -471,13 +473,14 @@ impl T38SessionManager {
         F: FnOnce(&mut T38Session) -> R,
     {
         let mut sessions = self.sessions.write().await;
-        if let Some(session) = sessions.get_mut(id) {
-            Ok(f(session))
-        } else {
-            Err(T38Error::SessionNotFound {
-                session_id: id.to_string(),
-            })
-        }
+        sessions.get_mut(id).map_or_else(
+            || {
+                Err(T38Error::SessionNotFound {
+                    session_id: id.to_string(),
+                })
+            },
+            |session| Ok(f(session)),
+        )
     }
 
     /// Removes a session.
@@ -494,18 +497,25 @@ impl T38SessionManager {
 
     /// Cleans up expired sessions.
     pub async fn cleanup_expired(&self) -> usize {
-        let mut sessions = self.sessions.write().await;
-        let idle_timeout = self.config.session.idle_timeout;
+        let (count, expired_ids) = {
+            let mut sessions = self.sessions.write().await;
+            let idle_timeout = self.config.session.idle_timeout;
 
-        let expired: Vec<String> = sessions
-            .iter()
-            .filter(|(_, s)| s.idle_time() > idle_timeout && s.state.is_ended())
-            .map(|(id, _)| id.clone())
-            .collect();
+            let expired: Vec<String> = sessions
+                .iter()
+                .filter(|(_, s)| s.idle_time() > idle_timeout && s.state.is_ended())
+                .map(|(id, _)| id.clone())
+                .collect();
 
-        let count = expired.len();
-        for id in expired {
-            sessions.remove(&id);
+            let count = expired.len();
+            for id in &expired {
+                sessions.remove(id);
+            }
+            drop(sessions);
+            (count, expired)
+        };
+
+        for id in &expired_ids {
             debug!(session_id = %id, "Cleaned up expired T.38 session");
         }
 

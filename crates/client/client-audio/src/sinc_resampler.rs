@@ -86,8 +86,8 @@ impl SincResampler {
     /// # Safety
     /// `self.pos` is always in `[0, TAPS_PER_PHASE)`, so `pos..pos+TAPS_PER_PHASE`
     /// is always within the 32-element double buffer.
-    #[inline(always)]
-    #[allow(unsafe_code)]
+    #[inline]
+    #[allow(unsafe_code, clippy::missing_const_for_fn)]
     fn history_view(&self) -> &[f32; TAPS_PER_PHASE] {
         // SAFETY: pos is maintained in [0, TAPS_PER_PHASE) by wrapping logic,
         // so pos + TAPS_PER_PHASE <= 2 * TAPS_PER_PHASE = history.len().
@@ -102,8 +102,8 @@ impl SincResampler {
     }
 
     /// Inserts a new sample into the circular history buffer.
-    #[inline(always)]
-    fn push_sample(&mut self, sample: f32) {
+    #[inline]
+    const fn push_sample(&mut self, sample: f32) {
         self.pos = if self.pos == 0 {
             TAPS_PER_PHASE - 1
         } else {
@@ -258,7 +258,7 @@ impl KaiserLut {
         let mut table = Vec::with_capacity(size);
         for i in 0..size {
             let u = i as f64 / KAISER_LUT_INTERVALS as f64;
-            let arg = (1.0 - u * u).max(0.0).sqrt();
+            let arg = u.mul_add(-u, 1.0).max(0.0).sqrt();
             table.push(bessel_i0(beta * arg) * inv_i0_beta);
         }
         Self { table }
@@ -319,7 +319,11 @@ impl SincLut {
     ///
     /// Returns 0.0 for values beyond the table range.
     #[inline]
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
     fn evaluate(&self, x_abs: f64) -> f64 {
         let pos = x_abs * self.inv_step;
         let idx = pos as usize;
@@ -687,8 +691,8 @@ fn bessel_i0(x: f64) -> f64 {
 
 /// Computes the dot product of `history[0..16]` and `coeffs[0..16]`.
 ///
-/// Dispatches to NEON (aarch64), SSE2 (x86_64), or scalar fallback.
-#[inline(always)]
+/// Dispatches to NEON (aarch64), SSE2 (`x86_64`), or scalar fallback.
+#[inline]
 fn dot_product_16(history: &[f32; TAPS_PER_PHASE], coeffs: &[f32; TAPS_PER_PHASE]) -> f32 {
     #[cfg(target_arch = "aarch64")]
     {
@@ -712,7 +716,7 @@ fn dot_product_16(history: &[f32; TAPS_PER_PHASE], coeffs: &[f32; TAPS_PER_PHASE
 /// Uses `vfmaq_f32` fused multiply-add and `vaddvq_f32` horizontal sum.
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_code)]
-#[inline(always)]
+#[inline]
 fn dot_product_16_neon(history: &[f32; TAPS_PER_PHASE], coeffs: &[f32; TAPS_PER_PHASE]) -> f32 {
     // SAFETY: NEON is always available on aarch64. vld1q_f32 supports
     // unaligned loads. Arrays are exactly 16 elements so all loads are in-bounds.
@@ -821,8 +825,8 @@ mod tests {
         let mut coeffs = [0.0f32; TAPS_PER_PHASE];
         #[allow(clippy::cast_precision_loss)]
         for i in 0..TAPS_PER_PHASE {
-            history[i] = (i as f32 * 1234.5) - 8000.0;
-            coeffs[i] = (i as f32 * 0.0625) - 0.5;
+            history[i] = (i as f32).mul_add(1234.5, -8000.0);
+            coeffs[i] = (i as f32).mul_add(0.0625, -0.5);
         }
 
         let simd_result = dot_product_16(&history, &coeffs);
@@ -986,10 +990,11 @@ mod tests {
     #[test]
     fn test_bessel_i0_known() {
         // I0(1) = 1.2660658...
-        assert!((bessel_i0(1.0) - 1.2660658).abs() < 1e-5);
+        assert!((bessel_i0(1.0) - 1.266_065_8).abs() < 1e-5);
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss)]
     fn test_sine_energy_preserved() {
         let mut resampler = SincResampler::new(6);
         // 400 Hz sine at 8kHz → expect similar energy at 48kHz
@@ -1113,6 +1118,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss)]
     fn test_fractional_sine_energy() {
         let mut resampler = FractionalSincResampler::new(8000, 44100);
         let input: Vec<i16> = (0..160)
@@ -1195,6 +1201,7 @@ mod tests {
     // ─── process_into / process_adjusted_into tests ───────────────
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn test_integer_process_into_matches_process() {
         let input: Vec<i16> = (0..160).map(|i| (i * 100) as i16).collect();
 
@@ -1227,6 +1234,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn test_fractional_process_into_matches_process_adjusted() {
         let input: Vec<i16> = (0..160).map(|i| (i * 50) as i16).collect();
 
@@ -1241,6 +1249,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn test_resampler_adjusted_into_integer() {
         let input: Vec<i16> = (0..160).map(|i| (i * 100) as i16).collect();
 

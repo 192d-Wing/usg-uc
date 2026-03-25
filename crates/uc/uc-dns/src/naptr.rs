@@ -406,6 +406,7 @@ mod tests {
         assert!(NaptrService::SipsWs.is_secure());
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn test_naptr_resolver() {
         let mut resolver = NaptrResolver::new();
@@ -419,6 +420,7 @@ mod tests {
         assert_eq!(best.unwrap().service, "SIP+D2T");
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn test_parse_record() {
         let record = NaptrResolver::parse_record(

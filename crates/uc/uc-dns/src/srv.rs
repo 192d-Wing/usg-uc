@@ -281,6 +281,7 @@ mod tests {
         assert!(r3 < r1);
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn test_srv_resolver_selection() {
         let mut resolver = SrvResolver::new();
@@ -307,6 +308,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn test_parse_record() {
         let record =

@@ -257,7 +257,7 @@ impl JitterBuffer {
                     last_ts,
                     packet.timestamp,
                     ts_jump,
-                    ts_jump as f64 / f64::from(self.clock_rate),
+                    f64::from(ts_jump) / f64::from(self.clock_rate),
                 );
                 self.stats.timestamp_resyncs += 1;
                 self.reset();
@@ -383,18 +383,18 @@ impl JitterBuffer {
             // If we've had too many consecutive losses, the playout pointer
             // has fallen far behind the buffer contents (e.g., after a stall).
             // Skip ahead to the first available packet to resync.
-            if self.consecutive_lost > self.cfg.max_consecutive_lost {
-                if let Some(&first_seq) = self.packets.keys().next() {
-                    let skipped = sequence_diff(first_seq, expected_seq);
-                    warn!(
-                        "Skipping ahead after {} consecutive losses: seq {} -> {} (skipped {})",
-                        self.consecutive_lost, expected_seq, first_seq, skipped
-                    );
-                    self.next_playout_sequence = Some(first_seq);
-                    self.consecutive_lost = 0;
-                    // Retry with corrected sequence
-                    return self.pop();
-                }
+            if self.consecutive_lost > self.cfg.max_consecutive_lost
+                && let Some(&first_seq) = self.packets.keys().next()
+            {
+                let skipped = sequence_diff(first_seq, expected_seq);
+                warn!(
+                    "Skipping ahead after {} consecutive losses: seq {} -> {} (skipped {})",
+                    self.consecutive_lost, expected_seq, first_seq, skipped
+                );
+                self.next_playout_sequence = Some(first_seq);
+                self.consecutive_lost = 0;
+                // Retry with corrected sequence
+                return self.pop();
             }
 
             // We have later packets, so this one is lost
@@ -569,7 +569,7 @@ impl JitterBuffer {
     /// The jitter buffer uses RTT/2 (approximate one-way delay) as a
     /// minimum floor for the target depth, since packets can't arrive
     /// faster than the one-way network delay.
-    pub fn set_rtt_hint_ms(&mut self, rtt_ms: f32) {
+    pub const fn set_rtt_hint_ms(&mut self, rtt_ms: f32) {
         self.rtt_hint_ms = Some(rtt_ms);
     }
 
@@ -789,7 +789,7 @@ mod tests {
         // After priming, we should get packets
         match jb.pop() {
             JitterBufferResult::Packet(p) => assert_eq!(p.sequence, 0),
-            other => panic!("Expected packet, got {:?}", other),
+            other => panic!("Expected packet, got {other:?}"),
         }
     }
 
@@ -898,11 +898,12 @@ mod tests {
         let mut history = VecDeque::new();
         // 100 values: 0.0, 1.0, 2.0, ..., 99.0
         for i in 0..100 {
+            #[allow(clippy::cast_precision_loss)]
             history.push_back(i as f32);
         }
         let p95 = percentile_95(&history);
         // 95th percentile of 0..99 should be ~95
-        assert!(p95 >= 94.0 && p95 <= 96.0, "Expected ~95, got {p95}");
+        assert!((94.0..=96.0).contains(&p95), "Expected ~95, got {p95}");
     }
 
     #[test]

@@ -85,13 +85,10 @@ mod implementation {
             if index == 0 {
                 SocketAddr::new(self.config.server.ip(), self.config.auth_port)
             } else {
-                self.config
-                    .backup_servers
-                    .get(index - 1)
-                    .map(|s| SocketAddr::new(s.ip(), self.config.auth_port))
-                    .unwrap_or_else(|| {
-                        SocketAddr::new(self.config.server.ip(), self.config.auth_port)
-                    })
+                self.config.backup_servers.get(index - 1).map_or_else(
+                    || SocketAddr::new(self.config.server.ip(), self.config.auth_port),
+                    |s| SocketAddr::new(s.ip(), self.config.auth_port),
+                )
             }
         }
 
@@ -101,13 +98,10 @@ mod implementation {
             if index == 0 {
                 SocketAddr::new(self.config.server.ip(), self.config.acct_port)
             } else {
-                self.config
-                    .backup_servers
-                    .get(index - 1)
-                    .map(|s| SocketAddr::new(s.ip(), self.config.acct_port))
-                    .unwrap_or_else(|| {
-                        SocketAddr::new(self.config.server.ip(), self.config.acct_port)
-                    })
+                self.config.backup_servers.get(index - 1).map_or_else(
+                    || SocketAddr::new(self.config.server.ip(), self.config.acct_port),
+                    |s| SocketAddr::new(s.ip(), self.config.acct_port),
+                )
             }
         }
 
@@ -354,6 +348,7 @@ mod implementation {
         }
 
         /// Builds an Accounting-Request packet.
+        #[allow(clippy::too_many_lines)]
         fn build_accounting_request(&self, record: &AccountingRecord) -> AaaResult<Packet> {
             let identifier = self.next_identifier();
 
@@ -403,16 +398,14 @@ mod implementation {
             );
 
             // Add source IP if available
-            if let Some(ip) = record.source_ip {
-                if let std::net::IpAddr::V4(v4) = ip {
-                    packet.add_attribute(
-                        Attribute::ipv4(AttributeType::NasIpAddress as u8, v4.octets()).map_err(
-                            |e| AaaError::RadiusError {
-                                reason: format!("Failed to create NAS-IP-Address attribute: {e}"),
-                            },
-                        )?,
-                    );
-                }
+            if let Some(std::net::IpAddr::V4(v4)) = record.source_ip {
+                packet.add_attribute(
+                    Attribute::ipv4(AttributeType::NasIpAddress as u8, v4.octets()).map_err(
+                        |e| AaaError::RadiusError {
+                            reason: format!("Failed to create NAS-IP-Address attribute: {e}"),
+                        },
+                    )?,
+                );
             }
 
             // Add session time for stop records
@@ -477,20 +470,21 @@ mod implementation {
 
             // Add termination cause for stop records
             if matches!(record.record_type, AccountingRecordType::Stop) {
-                let cause = if let Some(ref reason) = record.termination_cause {
-                    // Map common reasons to RADIUS termination causes
-                    match reason.as_str() {
-                        "user_request" | "BYE" => AcctTerminateCause::UserRequest,
-                        "idle_timeout" => AcctTerminateCause::IdleTimeout,
-                        "session_timeout" => AcctTerminateCause::SessionTimeout,
-                        "admin_reset" | "CANCEL" => AcctTerminateCause::AdminReset,
-                        "lost_carrier" => AcctTerminateCause::LostCarrier,
-                        "lost_service" => AcctTerminateCause::LostService,
-                        _ => AcctTerminateCause::NasRequest,
-                    }
-                } else {
-                    AcctTerminateCause::NasRequest
-                };
+                let cause = record.termination_cause.as_ref().map_or(
+                    AcctTerminateCause::NasRequest,
+                    |reason| {
+                        // Map common reasons to RADIUS termination causes
+                        match reason.as_str() {
+                            "user_request" | "BYE" => AcctTerminateCause::UserRequest,
+                            "idle_timeout" => AcctTerminateCause::IdleTimeout,
+                            "session_timeout" => AcctTerminateCause::SessionTimeout,
+                            "admin_reset" | "CANCEL" => AcctTerminateCause::AdminReset,
+                            "lost_carrier" => AcctTerminateCause::LostCarrier,
+                            "lost_service" => AcctTerminateCause::LostService,
+                            _ => AcctTerminateCause::NasRequest,
+                        }
+                    },
+                );
 
                 packet.add_attribute(
                     Attribute::integer(AttributeType::AcctTerminateCause as u8, cause.as_u32())
@@ -586,10 +580,9 @@ mod implementation {
 
                     // Extract Session-Timeout if present
                     if let Some(attr) = response.find_attribute(AttributeType::SessionTimeout as u8)
+                        && let Ok(timeout_val) = attr.as_integer()
                     {
-                        if let Ok(timeout_val) = attr.as_integer() {
-                            auth_response = auth_response.with_timeout(timeout_val);
-                        }
+                        auth_response = auth_response.with_timeout(timeout_val);
                     }
 
                     // Extract other attributes
@@ -911,7 +904,7 @@ mod tests {
     #[test]
     fn test_debug_format() {
         let client = create_test_client();
-        let debug_str = format!("{:?}", client);
+        let debug_str = format!("{client:?}");
         assert!(debug_str.contains("RadiusClient"));
         assert!(debug_str.contains("127.0.0.1"));
     }
@@ -934,13 +927,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_accounting_stub() {
-        let client = create_test_client();
+        let _client = create_test_client();
         let record = AccountingRecord::start("sess-001", "testuser");
 
         // When radius feature is not enabled, stub always succeeds
         #[cfg(not(feature = "radius"))]
         {
-            let result = client.account(record).await;
+            let result = _client.account(record).await;
             assert!(result.is_ok());
         }
 

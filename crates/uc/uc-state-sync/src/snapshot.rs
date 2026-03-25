@@ -273,6 +273,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn test_snapshot_serialization() {
         let mut snapshot = StateSnapshot::new(1, "node1");
@@ -300,6 +301,7 @@ mod tests {
         assert_eq!(snapshot.len(), 2);
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn test_snapshot_chunking() {
         let mut writer = SnapshotWriter::new(1, "node1", 50); // Small chunks
@@ -316,6 +318,7 @@ mod tests {
         assert!(chunks.len() > 1); // Should be split into multiple chunks
     }
 
+    #[allow(clippy::unwrap_used, clippy::float_cmp)]
     #[test]
     fn test_snapshot_reader() {
         // Create a snapshot

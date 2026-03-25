@@ -179,6 +179,7 @@ impl std::fmt::Display for SpanContextError {
 impl std::error::Error for SpanContextError {}
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

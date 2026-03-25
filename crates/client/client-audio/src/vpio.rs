@@ -1,6 +1,6 @@
 //! macOS Voice Processing I/O (VPIO) capture stream.
 //!
-//! Uses CoreAudio's `kAudioUnitSubType_VoiceProcessingIO` audio unit which
+//! Uses `CoreAudio`'s `kAudioUnitSubType_VoiceProcessingIO` audio unit which
 //! provides hardware-level acoustic echo cancellation. The OS knows exactly
 //! what audio is being played to the speaker and cancels it from the mic
 //! input, enabling full-duplex conversation without half-duplex suppression.
@@ -17,18 +17,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info};
 
-/// CoreAudio property: enable/disable I/O on a bus.
+/// `CoreAudio` property: enable/disable I/O on a bus.
 const KAUDIO_OUTPUT_UNIT_PROPERTY_ENABLE_IO: u32 = 2003;
 
-/// Ring buffer capacity in milliseconds (matches CaptureStream).
+/// Ring buffer capacity in milliseconds (matches `CaptureStream`).
 const RING_BUFFER_DURATION_MS: u32 = 500;
 
 /// Capture stream using macOS Voice Processing I/O.
 ///
-/// Drop-in replacement for `CaptureStream` when using built-in MacBook
+/// Drop-in replacement for `CaptureStream` when using built-in `MacBook`
 /// mic + speakers. Provides hardware AEC via the OS.
 pub struct VpioCaptureStream {
-    /// The CoreAudio VPIO audio unit (owns the real-time callback).
+    /// The `CoreAudio` VPIO audio unit (owns the real-time callback).
     _audio_unit: AudioUnit,
     /// Consumer end of the ring buffer for reading captured audio.
     consumer: ringbuf::HeapCons<Sample>,
@@ -99,6 +99,7 @@ impl VpioCaptureStream {
             .input_stream_format()
             .map_err(|e| AudioError::StreamError(format!("Failed to get VPIO format: {e}")))?;
 
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let sample_rate = stream_format.sample_rate as u32;
         let channels = stream_format.channels as usize;
         info!(
@@ -138,6 +139,7 @@ impl VpioCaptureStream {
                 } else {
                     for chunk in samples.chunks(channels) {
                         let sum: f32 = chunk.iter().copied().sum();
+                        #[allow(clippy::cast_precision_loss)]
                         let mono = sum / channels as f32;
                         #[allow(clippy::cast_possible_truncation)]
                         let sample = (mono * 32767.0_f32).clamp(-32768.0, 32767.0) as i16;

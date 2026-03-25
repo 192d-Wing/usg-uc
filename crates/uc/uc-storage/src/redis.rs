@@ -394,6 +394,7 @@ impl std::fmt::Debug for RedisBackend {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::similar_names)]
 mod tests {
     use super::*;
 
@@ -637,6 +638,6 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        format!("{:x}", nanos)
+        format!("{nanos:x}")
     }
 }

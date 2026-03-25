@@ -530,6 +530,7 @@ impl std::error::Error for StreamError {}
 // =============================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

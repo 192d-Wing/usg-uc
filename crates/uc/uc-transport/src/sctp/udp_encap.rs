@@ -427,6 +427,7 @@ pub const fn is_sctp_udp_port(port: u16) -> bool {
 // =============================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::redundant_clone)]
 mod tests {
     use super::*;
     use crate::sctp::chunk::{Chunk, DataChunk};

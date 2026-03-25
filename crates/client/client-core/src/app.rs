@@ -627,7 +627,7 @@ impl ClientApp {
             stats.playback_underruns,
             stats.rx_stats.srtp_errors,
             stats.rtt_ms,
-            stats.codec_name.clone(),
+            stats.codec_name,
         ))
     }
 

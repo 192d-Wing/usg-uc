@@ -302,11 +302,11 @@ mod tests {
 
     #[test]
     fn test_load_yaml_string() {
-        let yaml_content = r#"
+        let yaml_content = r"
 general:
   instance_name: test-sbc-yaml
   max_calls: 7500
-"#;
+";
 
         let config = load_from_yaml_str(yaml_content).expect("should parse YAML");
         assert_eq!(config.general.instance_name, "test-sbc-yaml");
@@ -326,7 +326,7 @@ rtp_port_min = 20000
 rtp_port_max = 30000
 "#;
 
-        let yaml_content = r#"
+        let yaml_content = r"
 general:
   instance_name: equiv-test
   max_calls: 10000
@@ -335,7 +335,7 @@ general:
 media:
   rtp_port_min: 20000
   rtp_port_max: 30000
-"#;
+";
 
         let toml_config = load_from_str(toml_content).expect("should parse TOML");
         let yaml_config = load_from_yaml_str(yaml_content).expect("should parse YAML");

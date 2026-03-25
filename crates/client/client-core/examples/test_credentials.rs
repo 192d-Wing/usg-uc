@@ -1,6 +1,15 @@
 //! Test credential persistence functionality.
 //!
-//! Run with: cargo run -p client-core --features digest-auth --example test_credentials
+//! Run with: `cargo run -p client-core --features digest-auth --example test_credentials`
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::uninlined_format_args,
+    clippy::collapsible_if,
+    clippy::doc_markdown,
+    clippy::needless_raw_string_hashes,
+    clippy::dbg_macro
+)]
 
 #[cfg(feature = "digest-auth")]
 fn main() {
@@ -18,8 +27,8 @@ fn main() {
     let _ = std::fs::remove_file(&settings_path);
     let _ = std::fs::remove_file(temp_dir.join("credentials.enc"));
 
-    println!("Test directory: {:?}", temp_dir);
-    println!("Settings path: {:?}\n", settings_path);
+    println!("Test directory: {}", temp_dir.display());
+    println!("Settings path: {}\n", settings_path.display());
 
     // Test 1: Create and store credentials
     println!("--- Test 1: Store credentials ---");

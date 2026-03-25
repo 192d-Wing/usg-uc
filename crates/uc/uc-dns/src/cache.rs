@@ -279,6 +279,7 @@ mod tests {
         assert!(record.age() < Duration::from_millis(100));
     }
 
+    #[allow(clippy::unwrap_used, clippy::panic)]
     #[tokio::test]
     async fn test_cache_put_get() {
         let cache = DnsCache::default();

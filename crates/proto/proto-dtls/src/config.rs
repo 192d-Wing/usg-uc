@@ -526,7 +526,7 @@ VGVzdA==
     #[test]
     fn test_config_debug() {
         let config = DtlsConfig::default();
-        let debug_str = format!("{:?}", config);
+        let debug_str = format!("{config:?}");
         assert!(debug_str.contains("DtlsConfig"));
         assert!(debug_str.contains("role"));
     }

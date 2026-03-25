@@ -464,6 +464,7 @@ fn decode_socket_addr(buf: &mut Bytes) -> Result<SocketAddr, CookieError> {
 // =============================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

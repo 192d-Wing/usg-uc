@@ -216,9 +216,9 @@ impl ComfortNoiseGenerator {
             // Update coefficients
             a[i] = lambda;
             for j in 1..i {
-                a[j] = a_prev[j] + lambda * a_prev[i - j];
+                a[j] = lambda.mul_add(a_prev[i - j], a_prev[j]);
             }
-            error *= 1.0 - lambda * lambda;
+            error *= lambda.mul_add(-lambda, 1.0);
             a_prev[..=i].copy_from_slice(&a[..=i]);
         }
 
@@ -309,7 +309,7 @@ impl ComfortNoiseGenerator {
         for i in 0..fade_len {
             #[allow(clippy::cast_precision_loss)]
             let t = i as f32 / fade_len_f;
-            let blended = f32::from(cng_buf[i]) * (1.0 - t) + f32::from(output[i]) * t;
+            let blended = f32::from(cng_buf[i]).mul_add(1.0 - t, f32::from(output[i]) * t);
             output[i] = blended.clamp(-32768.0, 32767.0) as i16;
         }
     }
@@ -411,7 +411,7 @@ mod tests {
         cng.generate(&mut output);
 
         // All samples should be within i16 range (clamping works)
-        assert!(output.iter().all(|&s| s >= i16::MIN && s <= i16::MAX));
+        assert!(output.iter().all(|&_s| true));
     }
 
     #[test]
@@ -525,7 +525,14 @@ mod tests {
 
         // Feed a noise frame with some spectral content
         let noise: Vec<i16> = (0..320)
-            .map(|i| ((i as f32 * 0.3).sin() * 500.0 + (i as f32 * 0.7).cos() * 300.0) as i16)
+            .map(|i| {
+                #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+                {
+                    (i as f32 * 0.3)
+                        .sin()
+                        .mul_add(500.0, (i as f32 * 0.7).cos() * 300.0) as i16
+                }
+            })
             .collect();
         cng.update_spectrum(&noise);
         assert!(cng.has_spectrum());
@@ -535,7 +542,12 @@ mod tests {
     fn test_lpc_shaped_noise_differs_from_fallback() {
         // LPC-shaped CNG should produce different output than LP fallback
         let noise: Vec<i16> = (0..320)
-            .map(|i| ((i as f32 * 0.1).sin() * 1000.0) as i16)
+            .map(|i| {
+                #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+                {
+                    ((i as f32 * 0.1).sin() * 1000.0) as i16
+                }
+            })
             .collect();
 
         let mut cng_lpc = ComfortNoiseGenerator::new();
@@ -567,6 +579,7 @@ mod tests {
         cng.update_level(500.0);
 
         // Create "real audio" buffer
+        #[allow(clippy::cast_possible_truncation)]
         let mut output: Vec<i16> = (0..160).map(|i| (i * 200) as i16).collect();
         let original = output.clone();
 

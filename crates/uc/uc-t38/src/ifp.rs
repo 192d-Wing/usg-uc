@@ -230,7 +230,8 @@ impl IfpPacket {
         if let Some(ind) = self.indication {
             buf.put_u8(ind as u8);
         } else if !self.data.is_empty() {
-            buf.put_u8(self.data.len() as u8);
+            #[allow(clippy::cast_possible_truncation)]
+            buf.put_u8(self.data.len() as u8); // IFP data length fits in u8
             buf.put_slice(&self.data);
         } else {
             buf.put_u8(0);
@@ -295,6 +296,7 @@ impl IfpPacket {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

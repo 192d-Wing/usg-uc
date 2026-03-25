@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
 /// SNMP configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SnmpConfig {
     /// Enable SNMP traps.
@@ -45,7 +45,7 @@ impl SnmpConfig {
 }
 
 /// Trap destination configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrapDestination {
     /// Destination address.
     pub address: SocketAddr,
@@ -69,6 +69,7 @@ impl TrapDestination {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

@@ -649,6 +649,12 @@ impl std::fmt::Debug for TurnClient {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::ip_constant,
+    clippy::unchecked_time_subtraction
+)]
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
@@ -921,7 +927,7 @@ mod tests {
         let creds = TurnCredentials::new("user", "pass");
         let client = TurnClient::new(Arc::new(socket), server, creds);
 
-        let debug_str = format!("{:?}", client);
+        let debug_str = format!("{client:?}");
         assert!(debug_str.contains("TurnClient"));
         assert!(debug_str.contains("<credentials>"));
         assert!(debug_str.contains("<mutex>"));

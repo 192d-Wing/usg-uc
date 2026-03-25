@@ -573,6 +573,12 @@ impl std::fmt::Debug for PostgresBackend {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::similar_names,
+    clippy::uninlined_format_args
+)]
 mod tests {
     use super::*;
 

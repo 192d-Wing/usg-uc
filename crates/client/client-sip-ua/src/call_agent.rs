@@ -39,7 +39,7 @@ pub struct CallAgent {
     display_name: String,
     /// Transport type for SIP signaling (UDP, TCP, or TLS).
     transport_type: String,
-    /// Digest auth credentials for INVITE challenges (BulkVS etc.).
+    /// Digest auth credentials for INVITE challenges (`BulkVS` etc.).
     #[cfg(feature = "digest-auth")]
     digest_credentials: Option<client_types::DigestAuthCredentials>,
 }
@@ -1078,6 +1078,7 @@ impl CallAgent {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn handle_auth_challenge(
         &mut self,
         call_id: &str,

@@ -470,7 +470,7 @@ fn rand_initial_tsn() -> u32 {
 // =============================================================================
 
 #[cfg(test)]
-#[allow(deprecated)]
+#[allow(deprecated, clippy::unwrap_used)]
 mod tests {
     use super::*;
 

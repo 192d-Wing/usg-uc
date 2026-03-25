@@ -1343,7 +1343,12 @@ fn prf_sha384(secret: &[u8], label: &[u8], seed: &[u8], length: usize) -> Vec<u8
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::unreadable_literal,
+    clippy::redundant_clone
+)]
 mod tests {
     use super::*;
 
@@ -1555,7 +1560,7 @@ mod tests {
 
         // Test Debug and Clone
         for state in states {
-            let _ = format!("{:?}", state);
+            let _ = format!("{state:?}");
             let cloned = state;
             assert_eq!(state, cloned);
         }

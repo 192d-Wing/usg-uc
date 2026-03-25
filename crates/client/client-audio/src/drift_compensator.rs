@@ -196,7 +196,7 @@ mod tests {
         // Depth increases from 60ms toward 80ms over 600 measurements
         for i in 0..600 {
             #[allow(clippy::cast_precision_loss)]
-            let depth = 60.0 + (i as f32 * 0.05);
+            let depth = (i as f32).mul_add(0.05, 60.0);
             total_adj += dc.update(depth);
         }
 
@@ -220,7 +220,7 @@ mod tests {
         // Simulate shrinking jitter buffer (remote clock slower)
         for i in 0..600 {
             #[allow(clippy::cast_precision_loss)]
-            let depth = 80.0 - (i as f32 * 0.05);
+            let depth = (i as f32).mul_add(-0.05, 80.0);
             total_adj += dc.update(depth);
         }
 
@@ -263,8 +263,8 @@ mod tests {
         }
         dc.reset();
         assert_eq!(dc.measurement_count, 0);
-        assert_eq!(dc.fractional_accumulator, 0.0);
-        assert_eq!(dc.target_depth, 0.0);
+        assert!(dc.fractional_accumulator.abs() < f32::EPSILON);
+        assert!(dc.target_depth.abs() < f32::EPSILON);
     }
 
     #[test]

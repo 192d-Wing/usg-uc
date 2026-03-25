@@ -725,10 +725,7 @@ async fn io_loop(
                         // Get all paths that need heartbeats
                         let heartbeat_targets = handle.get_heartbeat_targets().await;
 
-                        if heartbeat_targets.is_empty() {
-                            // No paths need heartbeats yet, just restart timer
-                            handle.restart_heartbeat_timer().await;
-                        } else {
+                        if !heartbeat_targets.is_empty() {
                             // Send heartbeat to each path that needs one
                             for (path_id, target_addr) in heartbeat_targets {
                                 trace!(target = %target_addr, path = %path_id, "Sending HEARTBEAT");
@@ -742,9 +739,9 @@ async fn io_loop(
                                     handle.mark_heartbeat_sent(path_id).await;
                                 }
                             }
-                            // Restart heartbeat timer
-                            handle.restart_heartbeat_timer().await;
                         }
+                        // Restart heartbeat timer
+                        handle.restart_heartbeat_timer().await;
                     }
                 }
             }
@@ -961,6 +958,7 @@ async fn send_heartbeat_to_path(
 // =============================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

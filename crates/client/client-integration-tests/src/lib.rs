@@ -18,8 +18,22 @@
 
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_docs_in_private_items)]
-#![cfg_attr(test, allow(clippy::unwrap_used))]
-#![cfg_attr(test, allow(clippy::panic))]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::doc_markdown,
+        clippy::uninlined_format_args,
+        clippy::similar_names,
+        clippy::collapsible_if,
+        clippy::items_after_statements,
+        clippy::needless_pass_by_ref_mut,
+        clippy::manual_strip,
+        clippy::needless_collect,
+    )
+)]
 
 #[cfg(test)]
 mod certificate_tests;

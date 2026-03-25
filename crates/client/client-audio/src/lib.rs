@@ -107,7 +107,9 @@ pub use io_thread::IoThreadHandle;
 pub use jitter_buffer::{
     BufferedPacket, JitterBuffer, JitterBufferResult, JitterBufferStats, SharedJitterBuffer,
 };
-pub use pipeline::{AudioPipeline, PipelineConfig, PipelineState, PipelineStats};
+pub use pipeline::{
+    AudioPipeline, AudioProcessingConfig, PipelineConfig, PipelineState, PipelineStats,
+};
 pub use plc::PacketLossConcealer;
 pub use ringtone::RingtonePlayer;
 pub use rtcp_session::RtcpSession;

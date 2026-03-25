@@ -626,7 +626,7 @@ mod tests {
         ];
 
         let info = SenderInfo::parse(&data).unwrap();
-        assert_eq!(info.ssrc, 0x12345678);
+        assert_eq!(info.ssrc, 0x1234_5678);
         assert_eq!(info.ntp_timestamp_msw, 1);
         assert_eq!(info.ntp_timestamp_lsw, 2);
         assert_eq!(info.rtp_timestamp, 3);
@@ -659,12 +659,12 @@ mod tests {
         ];
 
         let report = ReceptionReport::parse(&data).unwrap();
-        assert_eq!(report.ssrc, 0xABCDEF01);
+        assert_eq!(report.ssrc, 0xABCD_EF01);
         assert_eq!(report.fraction_lost, 0x19);
         assert_eq!(report.cumulative_lost, 10);
         assert_eq!(report.extended_highest_seq, 65536);
         assert_eq!(report.jitter, 80);
-        assert_eq!(report.last_sr, 0x12345678);
+        assert_eq!(report.last_sr, 0x1234_5678);
         assert_eq!(report.delay_since_last_sr, 1000);
     }
 

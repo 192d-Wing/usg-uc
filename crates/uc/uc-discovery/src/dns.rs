@@ -251,6 +251,7 @@ pub fn select_weighted_peer(peers: &[DiscoveredPeer]) -> Option<&DiscoveredPeer>
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

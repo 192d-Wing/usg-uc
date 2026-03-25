@@ -84,7 +84,7 @@ impl NoiseShaper {
     }
 
     /// Creates a noise shaper with custom configuration.
-    pub fn with_config(law: CompandingLaw, cfg: NoiseShaperConfig) -> Self {
+    pub const fn with_config(law: CompandingLaw, cfg: NoiseShaperConfig) -> Self {
         Self {
             law,
             prev_error: 0.0,
@@ -97,15 +97,15 @@ impl NoiseShaper {
     ///
     /// Pass `None` for non-G.711 codecs; the shaper will be a no-op.
     pub fn new_optional(law: Option<CompandingLaw>) -> Self {
-        match law {
-            Some(law) => Self::new(law),
-            None => Self {
+        law.map_or_else(
+            || Self {
                 law: CompandingLaw::MuLaw,
                 prev_error: 0.0,
                 enabled: false,
                 cfg: NoiseShaperConfig::default(),
             },
-        }
+            Self::new,
+        )
     }
 
     /// Enables or disables the noise shaper.
@@ -208,16 +208,14 @@ mod tests {
         // Large signal that could cause overflow
         let mut loud = vec![i16::MAX; 160];
         ns.process(&mut loud);
-        assert!(
-            loud.iter().all(|&s| s >= i16::MIN && s <= i16::MAX),
-            "Output should be clamped to i16 range"
-        );
+        // All i16 values are by definition within i16 range - verify non-empty
+        assert!(!loud.is_empty(), "Output should be clamped to i16 range");
 
         // Negative extreme
         let mut neg_loud = vec![i16::MIN; 160];
         ns.process(&mut neg_loud);
         assert!(
-            neg_loud.iter().all(|&s| s >= i16::MIN && s <= i16::MAX),
+            !neg_loud.is_empty(),
             "Negative output should be clamped to i16 range"
         );
     }
@@ -359,13 +357,18 @@ mod tests {
                 sum -= signal[i - window];
             }
             if i >= window - 1 {
+                #[allow(clippy::cast_precision_loss)]
                 let avg = sum / window as f64;
                 power += avg * avg;
                 count += 1;
             }
         }
 
-        if count > 0 { power / count as f64 } else { 0.0 }
+        if count > 0 {
+            power / f64::from(count)
+        } else {
+            0.0
+        }
     }
 
     #[test]

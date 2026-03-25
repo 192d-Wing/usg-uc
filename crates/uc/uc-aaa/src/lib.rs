@@ -37,7 +37,7 @@ pub mod error;
 pub mod provider;
 pub mod radius;
 
-pub use config::{AaaConfig, DiameterConfig, RadiusConfig};
+pub use config::{AaaConfig, AaaProviderType, DiameterConfig, RadiusConfig};
 pub use diameter::DiameterClient;
 pub use error::{AaaError, AaaResult};
 pub use provider::{AaaProvider, AccountingRecord, AuthRequest, AuthResponse};

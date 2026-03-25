@@ -225,6 +225,7 @@ impl From<&str> for SensitiveString {
 }
 
 #[cfg(test)]
+#[allow(clippy::uninlined_format_args, clippy::single_char_pattern)]
 mod tests {
     use super::*;
 

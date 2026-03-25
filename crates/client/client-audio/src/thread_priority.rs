@@ -1,7 +1,7 @@
 //! Real-time thread priority for audio threads.
 //!
 //! On macOS, uses `pthread_set_qos_class_self_np` to set the thread to
-//! User-Interactive QoS, which the kernel schedules with the lowest
+//! User-Interactive `QoS`, which the kernel schedules with the lowest
 //! latency and highest priority (short of real-time Mach threads).
 //!
 //! On other platforms, this is a no-op.
@@ -12,10 +12,10 @@ use tracing::warn;
 
 /// Promotes the calling thread to real-time priority.
 ///
-/// On macOS, sets QoS to `QOS_CLASS_USER_INTERACTIVE` (value 0x21).
+/// On macOS, sets `QoS` to `QOS_CLASS_USER_INTERACTIVE` (value 0x21).
 /// Returns `true` if the priority was set successfully.
 #[allow(unsafe_code)]
-pub(crate) fn set_realtime_priority(thread_name: &str) -> bool {
+pub fn set_realtime_priority(thread_name: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
         // QOS_CLASS_USER_INTERACTIVE = 0x21 (from <sys/qos.h>)

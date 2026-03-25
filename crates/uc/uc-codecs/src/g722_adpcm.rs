@@ -557,6 +557,7 @@ impl Default for G722Decoder {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_precision_loss)]
 mod tests {
     use super::*;
 

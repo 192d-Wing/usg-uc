@@ -4,6 +4,18 @@
 //! including the 4-way handshake, data transfer, and shutdown procedures.
 
 #![cfg(feature = "sctp")]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_const_for_fn,
+    clippy::doc_markdown,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::used_underscore_binding,
+    clippy::nonminimal_bool,
+    clippy::stable_sort_primitive,
+    clippy::needless_pass_by_value
+)]
 
 use bytes::Bytes;
 use std::net::SocketAddr;
@@ -250,7 +262,7 @@ async fn test_association_handle_data_transfer() {
     // TSN should be non-zero (it's a 32-bit wrapped counter)
     // The send operation succeeding means the association is established
     // and data was queued successfully
-    assert!(tsn > 0 || tsn == 0); // TSN can be any value including 0
+    let _ = tsn; // TSN can be any value including 0
 
     // Verify we can send multiple messages
     let tsn2 = client
@@ -365,7 +377,7 @@ async fn test_association_handle_multi_stream() {
 
     // Verify each chunk is on a different stream
     let mut streams: Vec<u16> = chunks.iter().map(|c| c.stream_id).collect();
-    streams.sort();
+    streams.sort_unstable();
     assert_eq!(streams, vec![0, 1, 2]);
 }
 

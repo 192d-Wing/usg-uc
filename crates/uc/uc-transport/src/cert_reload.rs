@@ -263,6 +263,7 @@ impl From<&ReloadableTlsAcceptor> for CertReloadStats {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::unreadable_literal)]
 mod tests {
     use super::*;
     use std::process::Command;

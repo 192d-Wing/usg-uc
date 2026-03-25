@@ -260,6 +260,7 @@ mod tests {
         assert_eq!(format!("{}", CrdtType::LWWRegister), "lww_register");
     }
 
+    #[allow(clippy::panic)]
     #[test]
     fn test_batch_payload() {
         let batch = ReplicationPayload::Batch {

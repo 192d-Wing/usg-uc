@@ -320,7 +320,7 @@ fn decode_loop(
     let mut plc = WsolaPlc::new(codec_samples);
     // Decoder-side postfilter: low-pass tilt complements the encoder-side
     // noise shaper by attenuating the high-frequency noise it boosted.
-    let mut postfilter = Postfilter::with_config(config.postfilter);
+    let mut postfilter = Postfilter::with_config(&config.postfilter);
     // Comfort noise for remote DTX (jitter buffer empty for extended periods)
     let mut cng = ComfortNoiseGenerator::with_config(config.comfort_noise);
     let mut consecutive_empty: u32 = 0;
@@ -601,100 +601,97 @@ fn decode_loop(
                                 packet.payload[3],
                             ];
                             let is_new = current_dtmf_ts != Some(packet.timestamp);
-                            match DtmfEvent::decode(&bytes) {
-                                Some(event) => {
-                                    info!(
-                                        "DTMF jb: digit={:?} ts={} seq={} end={} dur={} ({}ms) is_new={} gen_active={}",
+                            if let Some(event) = DtmfEvent::decode(&bytes) {
+                                info!(
+                                    "DTMF jb: digit={:?} ts={} seq={} end={} dur={} ({}ms) is_new={} gen_active={}",
+                                    event.digit,
+                                    packet.timestamp,
+                                    packet.sequence,
+                                    event.end,
+                                    event.duration,
+                                    event.duration_to_ms(),
+                                    is_new,
+                                    active_dtmf_gen.is_some(),
+                                );
+
+                                // Validate duration range (40ms-5000ms at 8kHz)
+                                if event.duration > DTMF_MAX_DURATION {
+                                    warn!(
+                                        "Malformed DTMF: duration {} exceeds max {}",
+                                        event.duration, DTMF_MAX_DURATION
+                                    );
+                                    metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
+
+                                // Validate monotonic duration within same event:
+                                // continuation packets must have non-decreasing duration.
+                                if !is_new && event.duration < current_dtmf_duration {
+                                    warn!(
+                                        "Malformed DTMF: duration decreased {}→{} within event",
+                                        current_dtmf_duration, event.duration
+                                    );
+                                    metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
+                                current_dtmf_duration = event.duration;
+
+                                if is_new {
+                                    // Validate minimum duration on first packet.
+                                    // Allow start packets with 0 duration (some PBXes
+                                    // send initial duration=0 then increment).
+                                    if event.end && event.duration < DTMF_MIN_DURATION {
+                                        warn!(
+                                            "Malformed DTMF: end with short duration {}",
+                                            event.duration
+                                        );
+                                        metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
+                                        continue;
+                                    }
+
+                                    current_dtmf_ts = Some(packet.timestamp);
+                                    current_dtmf_duration = event.duration;
+                                    metrics.dtmf_received.fetch_add(1, Ordering::Relaxed);
+                                    // Create persistent tone generator for this event.
+                                    active_dtmf_gen =
+                                        Some(DtmfToneGenerator::new(event.digit, device_rate));
+                                    // Notify application layer of received digit.
+                                    if let Some(ref tx) = config.dtmf_rx_tx {
+                                        let _ = tx.send(event.digit);
+                                    }
+                                }
+
+                                // Write DTMF trace entry (JB path)
+                                if let Some(ref mut trace) = dtmf_trace {
+                                    use std::io::Write;
+                                    let _ = writeln!(
+                                        trace,
+                                        "{},jb,{:?},{},{},{},{},{},{}",
+                                        dtmf_diag_start.elapsed().as_micros(),
                                         event.digit,
-                                        packet.timestamp,
-                                        packet.sequence,
-                                        event.end,
                                         event.duration,
                                         event.duration_to_ms(),
+                                        event.end,
                                         is_new,
                                         active_dtmf_gen.is_some(),
+                                        decoded_this_cycle,
                                     );
-
-                                    // Validate duration range (40ms-5000ms at 8kHz)
-                                    if event.duration > DTMF_MAX_DURATION {
-                                        warn!(
-                                            "Malformed DTMF: duration {} exceeds max {}",
-                                            event.duration, DTMF_MAX_DURATION
-                                        );
-                                        metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
-                                        continue;
-                                    }
-
-                                    // Validate monotonic duration within same event:
-                                    // continuation packets must have non-decreasing duration.
-                                    if !is_new && event.duration < current_dtmf_duration {
-                                        warn!(
-                                            "Malformed DTMF: duration decreased {}→{} within event",
-                                            current_dtmf_duration, event.duration
-                                        );
-                                        metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
-                                        continue;
-                                    }
-                                    current_dtmf_duration = event.duration;
-
-                                    if is_new {
-                                        // Validate minimum duration on first packet.
-                                        // Allow start packets with 0 duration (some PBXes
-                                        // send initial duration=0 then increment).
-                                        if event.end && event.duration < DTMF_MIN_DURATION {
-                                            warn!(
-                                                "Malformed DTMF: end with short duration {}",
-                                                event.duration
-                                            );
-                                            metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
-                                            continue;
-                                        }
-
-                                        current_dtmf_ts = Some(packet.timestamp);
-                                        current_dtmf_duration = event.duration;
-                                        metrics.dtmf_received.fetch_add(1, Ordering::Relaxed);
-                                        // Create persistent tone generator for this event.
-                                        active_dtmf_gen =
-                                            Some(DtmfToneGenerator::new(event.digit, device_rate));
-                                        // Notify application layer of received digit.
-                                        if let Some(ref tx) = config.dtmf_rx_tx {
-                                            let _ = tx.send(event.digit);
-                                        }
-                                    }
-
-                                    // Write DTMF trace entry (JB path)
-                                    if let Some(ref mut trace) = dtmf_trace {
-                                        use std::io::Write;
-                                        let _ = writeln!(
-                                            trace,
-                                            "{},jb,{:?},{},{},{},{},{},{}",
-                                            dtmf_diag_start.elapsed().as_micros(),
-                                            event.digit,
-                                            event.duration,
-                                            event.duration_to_ms(),
-                                            event.end,
-                                            is_new,
-                                            active_dtmf_gen.is_some(),
-                                            decoded_this_cycle,
-                                        );
-                                    }
-
-                                    // End packet: stop generating tone but keep
-                                    // current_dtmf_ts so retransmitted end packets
-                                    // are still filtered by the is_new check.
-                                    // Don't generate tone for end packets — the last
-                                    // continuation already covered this time slot.
-                                    if event.end {
-                                        active_dtmf_gen = None;
-                                    }
-                                    // Tone is generated in the Empty handler below
-                                    // when no audio packets are available.
                                 }
-                                None => {
-                                    // Invalid event code (>16)
-                                    trace!("Malformed DTMF: invalid event code {}", bytes[0]);
-                                    metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
+
+                                // End packet: stop generating tone but keep
+                                // current_dtmf_ts so retransmitted end packets
+                                // are still filtered by the is_new check.
+                                // Don't generate tone for end packets — the last
+                                // continuation already covered this time slot.
+                                if event.end {
+                                    active_dtmf_gen = None;
                                 }
+                                // Tone is generated in the Empty handler below
+                                // when no audio packets are available.
+                            } else {
+                                // Invalid event code (>16)
+                                trace!("Malformed DTMF: invalid event code {}", bytes[0]);
+                                metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
                             }
                             continue;
                         }
@@ -939,18 +936,16 @@ fn decode_loop(
                                 }
                             }
                             last_output_sample = 0;
-                            producer.push_slice(fill_buf);
                         } else if consecutive_empty >= 10 {
                             // After sustained emptiness, inject comfort noise.
                             cng.update_level(20.0);
                             fill_buf.fill(0);
                             cng.generate(fill_buf);
-                            producer.push_slice(fill_buf);
                         } else {
                             // Push silence to prevent ring buffer underrun.
                             fill_buf.fill(0);
-                            producer.push_slice(fill_buf);
                         }
+                        producer.push_slice(fill_buf);
 
                         break;
                     }
@@ -1122,7 +1117,7 @@ fn decode_loop(
             } else if jb_stats.current_depth_ms <= 50 {
                 // Intermediate: ceil(depth / 20) clamped to [MIN, MAX]
                 #[allow(clippy::cast_possible_truncation)]
-                let frames = ((jb_stats.current_depth_ms + 19) / 20) as usize;
+                let frames = jb_stats.current_depth_ms.div_ceil(20) as usize;
                 frames.clamp(MIN_FILL_FRAMES, MAX_FILL_FRAMES)
             } else {
                 INITIAL_FILL_FRAMES
@@ -1174,9 +1169,8 @@ mod tests {
     fn test_spawn_and_stop() {
         // Create a real playback stream (skip if no audio device available)
         let dm = crate::device::DeviceManager::new();
-        let playback = match PlaybackStream::new(&dm) {
-            Ok(p) => p,
-            Err(_) => return, // skip if no audio device
+        let Ok(playback) = PlaybackStream::new(&dm) else {
+            return; // skip if no audio device
         };
         let (playback_handle, producer, underruns) = playback.take_producer();
         let running = Arc::new(AtomicBool::new(true));

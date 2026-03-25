@@ -803,6 +803,7 @@ impl CallManager {
     /// Accepts an incoming call.
     ///
     /// Sends a 200 OK response with SDP answer and transitions to Connected state.
+    #[allow(clippy::too_many_lines)]
     pub async fn accept_incoming_call(&mut self, call_id: &str) -> AppResult<()> {
         use crate::sip_transport::build_response_from_request;
 
@@ -866,7 +867,7 @@ impl CallManager {
         }
 
         // Generate SDP answer
-        let sdp_answer = self.generate_sdp_offer(&call_id, &media_session, &account)?;
+        let sdp_answer = self.generate_sdp_offer(call_id, &media_session, &account)?;
 
         // Build 200 OK with SDP body
         let mut ok_response = build_response_from_request(
@@ -1104,7 +1105,7 @@ impl CallManager {
     /// Parses `application/dtmf-relay` bodies and emits a `DtmfReceived` event.
     /// Always responds with 200 OK to the sender.
     async fn handle_incoming_info(
-        &mut self,
+        &self,
         request: &SipRequest,
         source: SocketAddr,
     ) -> AppResult<()> {
@@ -2046,6 +2047,7 @@ impl CallManager {
 
     /// Validates that a codec was included in our SDP offer.
     /// Per RFC 3264 Section 6.1, the answer must only contain codecs from the offer.
+    #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
     fn is_codec_offered(&self, codec: CodecPreference, account: &SipAccount) -> bool {
         // Check if we're using TLS/secure transport (determines which codecs we offer)
         let use_srtp = matches!(
@@ -2348,9 +2350,11 @@ impl CallManager {
 
         // Add ICE/DTLS attributes for secure calls
         if use_srtp {
+            use std::fmt::Write as _;
             let creds = session.local_ice_credentials();
             let fingerprint = session.local_dtls_fingerprint();
-            sdp.push_str(&format!(
+            let _ = write!(
+                sdp,
                 "a=ice-ufrag:{ufrag}\r\n\
                  a=ice-pwd:{pwd}\r\n\
                  a=fingerprint:sha-384 {fingerprint}\r\n\
@@ -2359,14 +2363,14 @@ impl CallManager {
                  a=rtcp-mux\r\n",
                 ufrag = creds.ufrag,
                 pwd = creds.pwd,
-            ));
+            );
         }
 
         sdp.push_str("a=sendrecv\r\n");
-        sdp.push_str(&format!(
-            "a=ssrc:{ssrc} cname:{cname}\r\n",
-            cname = account.id,
-        ));
+        {
+            use std::fmt::Write as _;
+            let _ = write!(sdp, "a=ssrc:{ssrc} cname:{cname}\r\n", cname = account.id);
+        }
 
         Ok(sdp)
     }
@@ -2611,14 +2615,14 @@ fn parse_telephone_event_pt(sdp: &str) -> Option<u8> {
         }
 
         // Look for: a=rtpmap:<N> telephone-event/8000
-        if let Some(rest) = line.strip_prefix("a=rtpmap:") {
-            if rest.contains("telephone-event") {
-                // Extract PT number from "101 telephone-event/8000"
-                if let Some(pt_str) = rest.split_whitespace().next() {
-                    if let Ok(pt) = pt_str.parse::<u8>() {
-                        candidate_pt = Some(pt);
-                    }
-                }
+        if let Some(rest) = line.strip_prefix("a=rtpmap:")
+            && rest.contains("telephone-event")
+        {
+            // Extract PT number from "101 telephone-event/8000"
+            if let Some(pt_str) = rest.split_whitespace().next()
+                && let Ok(pt) = pt_str.parse::<u8>()
+            {
+                candidate_pt = Some(pt);
             }
         }
     }
@@ -2648,15 +2652,14 @@ fn parse_redundancy_pt(sdp: &str) -> Option<u8> {
         }
 
         // Look for: a=rtpmap:<N> red/<clock>
-        if let Some(rest) = line.strip_prefix("a=rtpmap:") {
-            // Trim whitespace — remote SDPs may have inconsistent spacing
+        if let Some(rest) = line.strip_prefix("a=rtpmap:")
+            && (rest.trim().contains("red/") || rest.trim().contains("RED/"))
+        {
             let rest = rest.trim();
-            if rest.contains("red/") || rest.contains("RED/") {
-                if let Some(pt_str) = rest.split_whitespace().next() {
-                    if let Ok(pt) = pt_str.parse::<u8>() {
-                        candidate_pt = Some(pt);
-                    }
-                }
+            if let Some(pt_str) = rest.split_whitespace().next()
+                && let Ok(pt) = pt_str.parse::<u8>()
+            {
+                candidate_pt = Some(pt);
             }
         }
     }
@@ -2694,7 +2697,7 @@ fn parse_extmap_attributes(sdp: &str) -> Vec<(u8, String)> {
                     // Extract just the URI (first token of the rest)
                     let uri = uri_part.split_whitespace().next().unwrap_or(uri_part);
                     // Only include extensions we support
-                    if SUPPORTED_URIS.iter().any(|&s| s == uri) {
+                    if SUPPORTED_URIS.contains(&uri) {
                         extensions.push((id, uri.to_string()));
                     }
                 }
@@ -2844,11 +2847,11 @@ fn negotiate_codec_from_sdp_offer(
         }
         if let Some(rtpmap) = line.strip_prefix("a=rtpmap:") {
             let parts: Vec<&str> = rtpmap.split_whitespace().collect();
-            if parts.len() >= 2 {
-                if let Ok(pt) = parts[0].parse::<u8>() {
-                    let codec_name = parts[1].split('/').next().unwrap_or("");
-                    rtpmaps.push((pt, codec_name.to_string()));
-                }
+            if parts.len() >= 2
+                && let Ok(pt) = parts[0].parse::<u8>()
+            {
+                let codec_name = parts[1].split('/').next().unwrap_or("");
+                rtpmaps.push((pt, codec_name.to_string()));
             }
         }
     }
@@ -2881,10 +2884,10 @@ fn negotiate_codec_from_sdp_offer(
                     })
             }
         };
-        if let Some(c) = codec {
-            if !offered_codecs.contains(&c) {
-                offered_codecs.push(c);
-            }
+        if let Some(c) = codec
+            && !offered_codecs.contains(&c)
+        {
+            offered_codecs.push(c);
         }
     }
 
@@ -2981,11 +2984,12 @@ fn session_id() -> u64 {
 /// Returns SDP address type string for a socket address (RFC 8866 Section 5.7).
 ///
 /// Returns `"IP4"` for IPv4 addresses or `"IP6"` for IPv6 addresses.
-fn sdp_addr_type(addr: &SocketAddr) -> &'static str {
+const fn sdp_addr_type(addr: &SocketAddr) -> &'static str {
     if addr.is_ipv4() { "IP4" } else { "IP6" }
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 

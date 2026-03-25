@@ -278,6 +278,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     fn test_encode_decode_g711() {
         let mut pipeline = CodecPipeline::new(CodecPreference::G711Ulaw).unwrap();
 
@@ -296,6 +297,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::similar_names)]
     fn test_from_payload_type() {
         let pcmu = CodecPipeline::from_payload_type(0).unwrap();
         assert_eq!(pcmu.preference(), CodecPreference::G711Ulaw);

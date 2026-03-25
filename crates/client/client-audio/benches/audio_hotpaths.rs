@@ -1,6 +1,14 @@
 //! Criterion benchmarks for audio hot-path functions.
 //!
 //! Run with: `cargo bench -p client-audio`
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::unwrap_used,
+    clippy::missing_docs_in_private_items,
+    missing_docs
+)]
 
 use bytes::Bytes;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};

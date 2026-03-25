@@ -254,6 +254,7 @@ impl Default for EnumResolver {
 mod tests {
     use super::*;
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn test_number_to_domain() {
         let resolver = EnumResolver::default();
@@ -280,6 +281,7 @@ mod tests {
         assert!(resolver.number_to_domain("abc", "e164.arpa").is_err());
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn test_apply_regexp() {
         let resolver = EnumResolver::default();
@@ -348,6 +350,7 @@ mod tests {
         assert!(results[0].is_sip()); // Lower order first
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn test_select_best_sip() {
         let resolver = EnumResolver::default();

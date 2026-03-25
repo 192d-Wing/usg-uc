@@ -239,7 +239,12 @@ impl SignalDetector {
         }
 
         // Calculate energy
-        let energy: i64 = self.samples.iter().map(|&s| (s as i64) * (s as i64)).sum();
+        let energy: i64 = self
+            .samples
+            .iter()
+            .map(|&s| i64::from(s) * i64::from(s))
+            .sum();
+        #[allow(clippy::cast_possible_wrap)]
         let avg_energy = energy / self.samples.len() as i64;
 
         // If energy is too low, no signal
@@ -252,6 +257,7 @@ impl SignalDetector {
         let ced_magnitude = self.goertzel(2100.0);
 
         // Threshold for detection (relative to energy)
+        #[allow(clippy::cast_precision_loss)]
         let threshold = (avg_energy as f64).sqrt() * 0.5;
 
         if cng_magnitude > threshold && cng_magnitude > ced_magnitude {
@@ -268,7 +274,13 @@ impl SignalDetector {
     /// Goertzel algorithm for single frequency detection.
     fn goertzel(&self, target_freq: f64) -> f64 {
         let n = self.samples.len();
-        let k = (target_freq * n as f64 / self.sample_rate as f64).round() as usize;
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let k = (target_freq * n as f64 / f64::from(self.sample_rate)).round() as usize;
+        #[allow(clippy::cast_precision_loss)]
         let w = 2.0 * std::f64::consts::PI * k as f64 / n as f64;
         let coeff = 2.0 * w.cos();
 
@@ -283,7 +295,7 @@ impl SignalDetector {
         }
 
         // Magnitude squared
-        let power = s0 * s0 + s1 * s1 - coeff * s0 * s1;
+        let power = s0.mul_add(s0, s1.mul_add(s1, -(coeff * s0 * s1)));
         power.sqrt()
     }
 

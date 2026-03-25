@@ -697,12 +697,10 @@ impl PathManager {
     ///
     /// Returns true if the path was found and updated.
     pub fn mark_heartbeat_sent(&mut self, path_id: PathId) -> bool {
-        if let Some(path) = self.paths.get_mut(&path_id) {
+        self.paths.get_mut(&path_id).is_some_and(|path| {
             path.on_heartbeat_sent();
             true
-        } else {
-            false
-        }
+        })
     }
 
     /// Returns all active paths.
@@ -755,6 +753,7 @@ impl Default for PathManager {
 // =============================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

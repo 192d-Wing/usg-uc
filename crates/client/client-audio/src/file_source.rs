@@ -233,7 +233,7 @@ mod tests {
     fn test_file_source_new() {
         let source = FileAudioSource::new(8000);
         assert!(!source.is_loaded());
-        assert_eq!(source.duration_secs(), 0.0);
+        assert!(source.duration_secs().abs() < f32::EPSILON);
     }
 
     #[test]
@@ -256,7 +256,7 @@ mod tests {
         assert_eq!(FileAudioSource::normalize_sample(255, 8), 32512);
 
         // 24-bit shift
-        assert_eq!(FileAudioSource::normalize_sample(0x7F0000, 24), 0x7F00);
+        assert_eq!(FileAudioSource::normalize_sample(0x007F_0000, 24), 0x7F00);
     }
 
     #[test]

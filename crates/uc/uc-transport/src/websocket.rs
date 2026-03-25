@@ -105,12 +105,12 @@ impl WebSocketTransport {
             connect_async(url)
                 .await
                 .map_err(|e| TransportError::ConnectFailed {
-                    address: local_addr.clone(),
+                    address: local_addr,
                     reason: format!("WebSocket connect failed: {e}"),
                 })?;
 
         // Extract peer address from URL (simplified)
-        let peer_addr = local_addr.clone(); // Placeholder - should parse from URL
+        let peer_addr = local_addr; // Placeholder - should parse from URL
 
         Ok(Self {
             local_addr,
@@ -142,7 +142,7 @@ impl WebSocketTransport {
         let stream = accept_async(MaybeTlsStream::Plain(tcp_stream))
             .await
             .map_err(|e| TransportError::ConnectFailed {
-                address: peer_addr.clone(),
+                address: peer_addr,
                 reason: format!("WebSocket accept failed: {e}"),
             })?;
 
@@ -190,6 +190,7 @@ impl WebSocketTransport {
                 })?;
             debug!("Sent WebSocket ping");
         }
+        drop(guard);
         Ok(())
     }
 }
@@ -228,7 +229,7 @@ impl Transport for WebSocketTransport {
                 stream.send(message).await.map_err(|e| {
                     self.connected.store(false, Ordering::Relaxed);
                     TransportError::SendFailed {
-                        address: dest.clone(),
+                        address: *dest,
                         reason: format!("WebSocket send failed: {e}"),
                     }
                 })?;
@@ -239,6 +240,7 @@ impl Transport for WebSocketTransport {
                     "Sent WebSocket message"
                 );
             }
+            drop(guard);
 
             Ok(())
         })
@@ -282,7 +284,7 @@ impl Transport for WebSocketTransport {
 
                             return Ok(ReceivedMessage {
                                 data,
-                                source: self.peer_addr.clone(),
+                                source: self.peer_addr,
                                 transport: if self.secure {
                                     TransportType::WebSocketSecure
                                 } else {
@@ -304,6 +306,7 @@ impl Transport for WebSocketTransport {
                     }
                 }
             }
+            drop(guard);
 
             Err(TransportError::NotConnected)
         })
@@ -331,6 +334,7 @@ impl Transport for WebSocketTransport {
                 self.connected.store(false, Ordering::Relaxed);
                 info!(peer = %self.peer_addr, "Closed WebSocket connection");
             }
+            drop(guard);
             Ok(())
         })
     }
@@ -351,6 +355,7 @@ impl std::fmt::Debug for WebSocketTransport {
         f.debug_struct("WebSocketTransport")
             .field("local_addr", &self.local_addr)
             .field("peer_addr", &self.peer_addr)
+            .field("stream", &"<WebSocketStream>")
             .field("secure", &self.secure)
             .field("connected", &self.connected.load(Ordering::Relaxed))
             .finish()
@@ -382,7 +387,7 @@ impl WebSocketListener {
         let listener = tokio::net::TcpListener::bind(addr.to_string())
             .await
             .map_err(|e| TransportError::BindFailed {
-                address: addr.clone(),
+                address: *addr,
                 reason: e.to_string(),
             })?;
 
@@ -393,7 +398,7 @@ impl WebSocketListener {
         );
 
         Ok(Self {
-            local_addr: addr.clone(),
+            local_addr: *addr,
             listener,
             secure,
         })
@@ -415,12 +420,12 @@ impl WebSocketListener {
 
         let peer = SbcSocketAddr::from(peer_addr);
 
-        WebSocketTransport::accept(tcp_stream, self.local_addr.clone(), peer, self.secure).await
+        WebSocketTransport::accept(tcp_stream, self.local_addr, peer, self.secure).await
     }
 
     /// Returns the local address.
     #[must_use]
-    pub fn local_addr(&self) -> &SbcSocketAddr {
+    pub const fn local_addr(&self) -> &SbcSocketAddr {
         &self.local_addr
     }
 }

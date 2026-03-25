@@ -93,7 +93,7 @@ impl VoiceActivityDetector {
     }
 
     /// Creates a VAD with custom configuration.
-    pub fn with_config(cfg: VadConfig) -> Self {
+    pub const fn with_config(cfg: VadConfig) -> Self {
         Self {
             in_speech: false,
             hangover_counter: 0,
@@ -248,7 +248,7 @@ mod tests {
     fn test_silence_detected() {
         let mut vad = VoiceActivityDetector::new();
         // Skip calibration
-        for _ in 0..VadConfig::default().calibration_frames + 1 {
+        for _ in 0..=VadConfig::default().calibration_frames {
             vad.detect(&[0i16; 160]);
         }
         let result = vad.detect(&[0i16; 160]);
@@ -259,7 +259,7 @@ mod tests {
     fn test_speech_detected() {
         let mut vad = VoiceActivityDetector::new();
         // Calibrate with silence
-        for _ in 0..VadConfig::default().calibration_frames + 1 {
+        for _ in 0..=VadConfig::default().calibration_frames {
             vad.detect(&[0i16; 160]);
         }
 
@@ -282,7 +282,7 @@ mod tests {
     fn test_hangover_prevents_cutting() {
         let mut vad = VoiceActivityDetector::new();
         // Calibrate
-        for _ in 0..VadConfig::default().calibration_frames + 1 {
+        for _ in 0..=VadConfig::default().calibration_frames {
             vad.detect(&[0i16; 160]);
         }
 
@@ -311,7 +311,7 @@ mod tests {
         let mut vad = VoiceActivityDetector::new();
         // Calibrate with moderate noise
         let noise: Vec<i16> = vec![100i16; 160];
-        for _ in 0..VadConfig::default().calibration_frames + 1 {
+        for _ in 0..=VadConfig::default().calibration_frames {
             vad.detect(&noise);
         }
 
@@ -366,7 +366,7 @@ mod tests {
     fn test_hysteresis() {
         let mut vad = VoiceActivityDetector::new();
         // Calibrate with silence
-        for _ in 0..VadConfig::default().calibration_frames + 1 {
+        for _ in 0..=VadConfig::default().calibration_frames {
             vad.detect(&[0i16; 160]);
         }
 
@@ -376,13 +376,14 @@ mod tests {
         assert!(vad.in_speech());
 
         // Wait out hangover
-        for _ in 0..VadConfig::default().hangover_frames + 1 {
+        for _ in 0..=VadConfig::default().hangover_frames {
             vad.detect(&[0i16; 160]);
         }
         assert!(!vad.in_speech());
 
         // Marginal energy: above silence threshold but below speech threshold
         // This tests that the higher threshold is needed to re-enter speech
+        #[allow(clippy::cast_possible_truncation)]
         let marginal: Vec<i16> = vec![
             (MIN_ENERGY_THRESHOLD * VadConfig::default().silence_threshold_ratio * 1.1)
                 as i16;

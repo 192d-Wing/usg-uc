@@ -424,6 +424,7 @@ pub fn format_refer_to(uri: &str, replaces: Option<&str>) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -843,7 +844,7 @@ mod tests {
     #[test]
     fn test_refer_handler_debug() {
         let handler = ReferHandler::new("sip:bob@example.com");
-        let debug_str = format!("{:?}", handler);
+        let debug_str = format!("{handler:?}");
         assert!(debug_str.contains("ReferHandler"));
         assert!(debug_str.contains("sip:bob@example.com"));
     }
@@ -851,7 +852,7 @@ mod tests {
     #[test]
     fn test_refer_request_debug() {
         let request = ReferRequest::new("sip:bob@example.com");
-        let debug_str = format!("{:?}", request);
+        let debug_str = format!("{request:?}");
         assert!(debug_str.contains("ReferRequest"));
         assert!(debug_str.contains("sip:bob@example.com"));
     }

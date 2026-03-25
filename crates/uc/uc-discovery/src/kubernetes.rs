@@ -198,7 +198,7 @@ impl KubernetesDiscovery {
         if let Some(subsets) = endpoints.subsets {
             for subset in subsets {
                 // Get the port number
-                let port = match self.resolve_port(&subset.ports) {
+                let port = match self.resolve_port(subset.ports.as_ref()) {
                     Ok(p) => p,
                     Err(e) => {
                         warn!(error = %e, "Failed to resolve port, skipping subset");
@@ -300,7 +300,7 @@ impl KubernetesDiscovery {
     /// Resolves the port number from configuration.
     fn resolve_port(
         &self,
-        ports: &Option<Vec<k8s_openapi::api::core::v1::EndpointPort>>,
+        ports: Option<&Vec<k8s_openapi::api::core::v1::EndpointPort>>,
     ) -> DiscoveryResult<u16> {
         match &self.config.port {
             KubernetesPort::Number(port) => Ok(*port),
@@ -308,21 +308,21 @@ impl KubernetesDiscovery {
                 if let Some(ports) = ports {
                     for port in ports {
                         if port.name.as_deref() == Some(name.as_str()) {
-                            return Ok(u16::try_from(port.port).map_err(|_| {
+                            return u16::try_from(port.port).map_err(|_| {
                                 DiscoveryError::KubernetesError {
                                     reason: format!("Port {} is out of range", port.port),
                                 }
-                            })?);
+                            });
                         }
                     }
 
                     // If named port not found but there's only one port, use it
                     if ports.len() == 1 {
-                        return Ok(u16::try_from(ports[0].port).map_err(|_| {
+                        return u16::try_from(ports[0].port).map_err(|_| {
                             DiscoveryError::KubernetesError {
                                 reason: format!("Port {} is out of range", ports[0].port),
                             }
-                        })?);
+                        });
                     }
                 }
                 Err(DiscoveryError::KubernetesError {
@@ -387,6 +387,7 @@ impl std::fmt::Debug for KubernetesDiscovery {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

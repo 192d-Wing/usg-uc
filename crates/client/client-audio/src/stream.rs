@@ -208,7 +208,7 @@ impl CaptureBackend {
     }
 
     /// Returns the sample rate of the stream.
-    pub fn sample_rate(&self) -> u32 {
+    pub const fn sample_rate(&self) -> u32 {
         match self {
             Self::Cpal(s) => s.sample_rate(),
             #[cfg(target_os = "macos")]

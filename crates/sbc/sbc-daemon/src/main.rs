@@ -35,6 +35,24 @@
 #![allow(clippy::needless_pass_by_ref_mut)]
 // Allow unused_self for methods that are part of trait implementations or future use
 #![allow(clippy::unused_self)]
+// Allow doc_markdown for gRPC service names and protocol identifiers
+#![allow(clippy::doc_markdown)]
+// Allow missing_const_for_fn for methods that may change in future
+#![allow(clippy::missing_const_for_fn)]
+// Allow cast_possible_truncation/wrap for protobuf i32 conversions
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss
+)]
+// Allow complex type for Axum router type
+#![allow(clippy::type_complexity)]
+// Allow too_many_lines for gRPC service implementations
+#![allow(clippy::too_many_lines)]
+// Allow match_same_arms for gRPC status conversions
+#![allow(clippy::match_same_arms)]
+// Allow u64-to-i64 cast for protobuf timestamps
+#![allow(clippy::cast_sign_loss)]
 
 mod api_server;
 mod args;

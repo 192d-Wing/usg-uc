@@ -131,7 +131,7 @@ pub struct IoThreadConfig {
     pub noise_shaper: NoiseShaperConfig,
     /// Enable discontinuous transmission (DTX / silence suppression).
     /// When false, RTP is sent continuously even during silence.
-    /// Disable for providers that don't handle DTX gaps well (e.g., BulkVS).
+    /// Disable for providers that don't handle DTX gaps well (e.g., `BulkVS`).
     pub enable_dtx: bool,
 }
 
@@ -233,7 +233,7 @@ fn io_loop(
 
     // Store codec name in shared stats (constant for the call duration)
     if let Ok(mut s) = stats.lock() {
-        s.codec_name = codec_name.clone();
+        s.codec_name = codec_name;
     }
     let mut capture_rate = config.capture_rate;
     // Number of samples per frame at the capture device rate
@@ -558,7 +558,7 @@ fn io_loop(
         stats_update_counter += 1;
         if stats_update_counter >= 100 {
             stats_update_counter = 0;
-            update_stats(&transmitter, &receiver, &rtcp_session, &stats);
+            update_stats(&transmitter, &receiver, rtcp_session.as_ref(), &stats);
             // Merge I/O-thread-local metrics into shared stats
             if let Ok(mut s) = stats.lock() {
                 s.dtmf_events_sent = dtmf_sent_count;
@@ -572,7 +572,7 @@ fn io_loop(
         // 6. Diagnostic logging every ~2 seconds
         if diag_timer.elapsed() >= Duration::from_secs(2) {
             let tx_stats = transmitter.stats();
-            let aec_erle = aec.as_ref().map_or(0.0, |a| a.erle_db());
+            let aec_erle = aec.as_ref().map_or(0.0, super::aec::AecProcessor::erle_db);
             info!(
                 "IO diag: frames_captured={}, underruns={}, dtx={}, last_read={}/{}, \
                  max_amp={}, tx_pkts={}, rx_pkts={}, jb_depth={}ms, \
@@ -600,7 +600,7 @@ fn io_loop(
     dtmf_sender.flush(&mut transmitter);
 
     // Final stats update on exit
-    update_stats(&transmitter, &receiver, &rtcp_session, &stats);
+    update_stats(&transmitter, &receiver, rtcp_session.as_ref(), &stats);
     capture.stop();
     debug!("I/O thread cleanup complete");
 }
@@ -729,14 +729,14 @@ fn process_moh_frame(
 fn update_stats(
     transmitter: &RtpTransmitter,
     receiver: &RtpReceiver,
-    rtcp_session: &Option<RtcpSession>,
+    rtcp_session: Option<&RtcpSession>,
     stats: &Arc<Mutex<PipelineStats>>,
 ) {
     if let Ok(mut s) = stats.lock() {
         s.tx_stats = transmitter.stats();
         s.rx_stats = receiver.stats();
         s.jitter_stats = receiver.jitter_buffer_stats();
-        s.rtt_ms = rtcp_session.as_ref().and_then(RtcpSession::rtt_ms);
+        s.rtt_ms = rtcp_session.and_then(RtcpSession::rtt_ms);
     }
 }
 

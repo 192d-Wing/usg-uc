@@ -8,7 +8,9 @@
 //! mute/MOH control, and event notifications.
 
 use crate::{AppError, AppResult};
-use client_audio::{AudioPipeline, PipelineConfig, PipelineState, PipelineStats};
+use client_audio::{
+    AudioPipeline, AudioProcessingConfig, PipelineConfig, PipelineState, PipelineStats,
+};
 use client_sip_ua::{MediaSession, MediaSessionState};
 use client_types::DtmfDigit;
 use client_types::audio::CodecPreference;
@@ -75,7 +77,7 @@ pub enum AudioSessionEvent {
     /// Audio session stopped.
     Stopped,
     /// Audio statistics update.
-    StatsUpdate(PipelineStats),
+    StatsUpdate(Box<PipelineStats>),
     /// Error occurred.
     Error(String),
 }
@@ -166,7 +168,7 @@ impl AudioSession {
             dtmf_inter_digit_pause_ms: config.dtmf_inter_digit_pause_ms,
             redundancy_pt: config.redundancy_pt,
             echo_cancellation: true,
-            audio: Default::default(),
+            audio: AudioProcessingConfig::default(),
             extension_ids: config.extension_ids,
         };
 

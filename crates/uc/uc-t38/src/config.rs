@@ -5,6 +5,7 @@ use std::time::Duration;
 
 /// T.38 configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct T38Config {
     /// Enable T.38 support.
     pub enabled: bool,
@@ -63,21 +64,16 @@ impl Default for T38Config {
 }
 
 /// Error correction mode per ITU-T T.38.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCorrectionMode {
     /// No error correction.
     None,
     /// Redundancy-based error correction.
+    #[default]
     Redundancy,
     /// Forward Error Correction.
     Fec,
-}
-
-impl Default for ErrorCorrectionMode {
-    fn default() -> Self {
-        Self::Redundancy
-    }
 }
 
 impl std::fmt::Display for ErrorCorrectionMode {
@@ -91,19 +87,14 @@ impl std::fmt::Display for ErrorCorrectionMode {
 }
 
 /// Rate management method.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RateManagement {
     /// Local TCF (Training Check Frame).
     LocalTcf,
     /// Transferred TCF.
+    #[default]
     TransferredTcf,
-}
-
-impl Default for RateManagement {
-    fn default() -> Self {
-        Self::TransferredTcf
-    }
 }
 
 /// UDPTL transport configuration.

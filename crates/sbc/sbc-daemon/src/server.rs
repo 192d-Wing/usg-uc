@@ -130,25 +130,19 @@ impl Server {
 
         // Create SIP stack configuration
         // If we have a cluster manager with AsyncLocationService, use it
+        let sip_config = SipStackConfig {
+            instance_name: config.general.instance_name.clone(),
+            domain: config.general.instance_name.clone(),
+            registrar_mode: RegistrarMode::B2bua,
+            b2bua_enabled: true,
+        };
         let sip_stack = if let Some(ref cluster_mgr) = cluster {
-            let sip_config = SipStackConfig {
-                instance_name: config.general.instance_name.clone(),
-                domain: config.general.instance_name.clone(),
-                registrar_mode: RegistrarMode::B2bua,
-                b2bua_enabled: true,
-            };
             // Create SIP stack with cluster-backed location service
             Arc::new(SipStack::new_with_location_service(
                 sip_config,
                 Arc::clone(cluster_mgr.location_service()),
             ))
         } else {
-            let sip_config = SipStackConfig {
-                instance_name: config.general.instance_name.clone(),
-                domain: config.general.instance_name.clone(),
-                registrar_mode: RegistrarMode::B2bua,
-                b2bua_enabled: true,
-            };
             Arc::new(SipStack::new(sip_config))
         };
 

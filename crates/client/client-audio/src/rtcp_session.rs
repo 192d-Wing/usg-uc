@@ -196,7 +196,7 @@ impl RtcpSession {
     ///
     /// Each RR block is 24 bytes. We look for one whose LSR matches our
     /// last sent SR (middle 32 bits of our NTP timestamp). RTT is then:
-    ///   RTT = now_ntp_middle32 - LSR - DLSR
+    ///   RTT = `now_ntp_middle32` - LSR - DLSR
     #[allow(clippy::cast_precision_loss)]
     fn extract_rtt_from_rr_blocks(&mut self, data_len: usize, start: usize, count: u8) {
         for i in 0..count as usize {
@@ -517,7 +517,7 @@ mod tests {
         let jb_stats = JitterBufferStats::default();
 
         // Force immediate send by backdating last_send_time
-        session.last_send_time = Instant::now() - Duration::from_secs(10);
+        session.last_send_time = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
         session.maybe_send_report(&tx_stats, &jb_stats);
         // Should not panic; packet sent to non-listening address is fine for UDP
     }
@@ -539,7 +539,7 @@ mod tests {
             ..JitterBufferStats::default()
         };
 
-        session.last_send_time = Instant::now() - Duration::from_secs(10);
+        session.last_send_time = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
         session.maybe_send_report(&tx_stats, &jb_stats);
     }
 
@@ -590,7 +590,7 @@ mod tests {
         session.build_sdes(&mut buf);
 
         // Should be at least 4 (header) + 4 (SSRC) + 2 (type+len) + cname + 1 (end)
-        assert!(buf.len() >= 4 + 4 + 2 + 1);
+        assert!(buf.len() > 4 + 4 + 2);
         // Should be 4-byte aligned
         assert_eq!(buf.len() % 4, 0);
     }
