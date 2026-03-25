@@ -19,7 +19,10 @@ pub struct PostfilterConfig {
 
 impl Default for PostfilterConfig {
     fn default() -> Self {
-        Self { tilt_alpha: 0.3 }
+        // α=0.45 provides ~3 dB more HF attenuation than 0.3, reducing
+        // G.711 quantization noise from remote endpoints that lack
+        // encoder-side noise shaping (most SIP providers).
+        Self { tilt_alpha: 0.45 }
     }
 }
 

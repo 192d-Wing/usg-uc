@@ -87,6 +87,12 @@ const GATE_CLOSE_PEAK: i16 = 500;
 /// 15 frames * 20ms = 300ms — covers inter-word pauses and sentence tails.
 const GAIN_HOLD_FRAMES: u32 = 15;
 
+/// Headroom scale factor applied after resampling to prevent sinc overshoot
+/// from hard-clipping at ±32767. The sinc resampler can overshoot by up to
+/// ~3% on transients; 0.97 provides sufficient headroom while keeping the
+/// signal close to full scale.
+const RESAMPLE_HEADROOM: f32 = 0.97;
+
 /// Exponential ramp speed for gain transitions (per frame).
 /// 0.15 gives a ~130ms time constant (smooth, no audible steps).
 const GAIN_RAMP_SPEED: f32 = 0.15;
@@ -738,6 +744,12 @@ fn decode_loop(
                         // Resample from codec rate to device rate (zero-alloc)
                         let device_pcm = &mut resample_buf[..adjusted_device_samples];
                         resampler.process_adjusted_into(codec_buf, device_pcm);
+
+                        // Apply headroom to prevent sinc overshoot clipping
+                        #[allow(clippy::cast_possible_truncation)]
+                        for s in device_pcm.iter_mut() {
+                            *s = (f32::from(*s) * RESAMPLE_HEADROOM) as i16;
+                        }
 
                         // Track peak amplitude before gain
                         let peak = device_pcm
