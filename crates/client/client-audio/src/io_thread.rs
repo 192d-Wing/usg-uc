@@ -18,7 +18,7 @@ use crate::noise_shaper::{CompandingLaw, NoiseShaper, NoiseShaperConfig};
 use crate::pipeline::{PipelineStats, resample_into};
 use crate::rtcp_session::RtcpSession;
 use crate::rtp_handler::{RtpReceiver, RtpTransmitter};
-use crate::stream::CaptureStream;
+use crate::stream::CaptureBackend;
 use crate::vad::{VadConfig, VadDecision, VoiceActivityDetector};
 use client_types::{CodecPreference, DtmfDigit};
 use std::net::{SocketAddr, UdpSocket};
@@ -152,7 +152,7 @@ pub fn spawn(
     config: IoThreadConfig,
     transmitter: RtpTransmitter,
     receiver: RtpReceiver,
-    capture: CaptureStream,
+    capture: CaptureBackend,
     moh_source: Option<FileAudioSource>,
     muted: Arc<AtomicBool>,
     moh_active: Arc<AtomicBool>,
@@ -209,7 +209,7 @@ fn io_loop(
     config: IoThreadConfig,
     mut transmitter: RtpTransmitter,
     mut receiver: RtpReceiver,
-    mut capture: CaptureStream,
+    mut capture: CaptureBackend,
     mut moh_source: Option<FileAudioSource>,
     muted: Arc<AtomicBool>,
     moh_active: Arc<AtomicBool>,
@@ -302,11 +302,11 @@ fn io_loop(
     let mut stats_update_counter: u32 = 0;
     let mut dtmf_sent_count: u64 = 0;
 
-    // Pending input device switch: CaptureStream creation runs on a
+    // Pending input device switch: CaptureBackend creation runs on a
     // background thread so the I/O loop continues receiving RTP.
-    // Without this, the 200-500ms CaptureStream::new() call blocks RTP
+    // Without this, the 200-500ms CaptureBackend::new() call blocks RTP
     // reception, draining the jitter buffer and causing robotic playback.
-    let mut pending_capture_rx: Option<mpsc::Receiver<Result<CaptureStream, String>>> = None;
+    let mut pending_capture_rx: Option<mpsc::Receiver<Result<CaptureBackend, String>>> = None;
 
     // DTX warmup: always send RTP for the first few seconds of a call.
     // Bluetooth HFP profile negotiation can take 3-8 seconds, during which
@@ -362,7 +362,7 @@ fn io_loop(
                 .name("capture-recovery".to_string())
                 .spawn(move || {
                     let dm = crate::device::DeviceManager::new();
-                    let result = CaptureStream::new(&dm).map_err(|e| e.to_string());
+                    let result = CaptureBackend::new(&dm).map_err(|e| e.to_string());
                     let _ = tx.send(result);
                 })
                 .ok();
@@ -456,7 +456,7 @@ fn io_loop(
                         "I/O thread: switching input device to {:?} (async)",
                         device_name
                     );
-                    // Spawn CaptureStream creation on a background thread so
+                    // Spawn CaptureBackend creation on a background thread so
                     // the I/O loop keeps receiving RTP during the switch.
                     let (tx, rx) = mpsc::channel();
                     thread::Builder::new()
@@ -464,7 +464,7 @@ fn io_loop(
                         .spawn(move || {
                             let mut dm = crate::device::DeviceManager::new();
                             dm.set_input_device(device_name);
-                            let result = CaptureStream::new(&dm).map_err(|e| e.to_string());
+                            let result = CaptureBackend::new(&dm).map_err(|e| e.to_string());
                             let _ = tx.send(result);
                         })
                         .ok();
@@ -610,7 +610,7 @@ fn io_loop(
 fn process_capture_frame(
     codec: &mut CodecPipeline,
     transmitter: &mut RtpTransmitter,
-    capture: &mut CaptureStream,
+    capture: &mut CaptureBackend,
     audio_processor: &mut AudioProcessor,
     vad: &mut VoiceActivityDetector,
     noise_shaper: &mut NoiseShaper,

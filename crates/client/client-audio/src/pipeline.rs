@@ -534,7 +534,7 @@ impl AudioPipeline {
         }
 
         // Start capture stream
-        let capture = crate::stream::CaptureStream::new(&self.device_manager)?;
+        let capture = crate::stream::CaptureBackend::new(&self.device_manager)?;
         let capture_rate = capture.sample_rate();
 
         // Start playback stream and split off the producer
@@ -586,12 +586,17 @@ impl AudioPipeline {
         self.moh_active.store(false, Ordering::Relaxed);
         self.running.store(true, Ordering::Relaxed);
 
-        // Create AEC reference buffer (shared between decode and I/O threads)
-        let aec_ref = if config.echo_cancellation {
+        // Create AEC reference buffer (shared between decode and I/O threads).
+        // Skip software AEC when VPIO is active — the OS handles echo cancellation.
+        let using_vpio = capture.is_vpio();
+        let aec_ref = if config.echo_cancellation && !using_vpio {
             let aec = AecReference::new(clock_rate, 300); // 300ms buffer
             info!("AEC enabled: created reference buffer at {}Hz", clock_rate);
             Some(aec)
         } else {
+            if using_vpio {
+                info!("Software AEC disabled (VPIO hardware AEC active)");
+            }
             None
         };
 

@@ -143,6 +143,107 @@ impl CaptureStream {
     }
 }
 
+/// Capture backend that can use either CPAL or macOS VPIO.
+///
+/// On macOS with built-in mic, VPIO provides hardware echo cancellation.
+/// On all other platforms/devices, CPAL is used.
+pub enum CaptureBackend {
+    /// Standard CPAL capture stream.
+    Cpal(CaptureStream),
+    /// macOS Voice Processing I/O (hardware AEC).
+    #[cfg(target_os = "macos")]
+    Vpio(crate::vpio::VpioCaptureStream),
+}
+
+impl CaptureBackend {
+    /// Creates the appropriate capture backend.
+    ///
+    /// On macOS with built-in mic, uses VPIO for hardware AEC.
+    /// Falls back to CPAL if VPIO fails or for non-built-in devices.
+    pub fn new(device_manager: &crate::device::DeviceManager) -> AudioResult<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            let device_name = device_manager.input_device_name();
+            if crate::vpio::should_use_vpio(device_name) {
+                match crate::vpio::VpioCaptureStream::new() {
+                    Ok(vpio) => {
+                        info!("Using VPIO capture (hardware AEC)");
+                        return Ok(Self::Vpio(vpio));
+                    }
+                    Err(e) => {
+                        info!("VPIO unavailable ({e}), falling back to CPAL");
+                    }
+                }
+            }
+        }
+
+        Ok(Self::Cpal(CaptureStream::new(device_manager)?))
+    }
+
+    /// Reads captured audio samples into the provided buffer.
+    pub fn read(&mut self, buffer: &mut [Sample]) -> usize {
+        match self {
+            Self::Cpal(s) => s.read(buffer),
+            #[cfg(target_os = "macos")]
+            Self::Vpio(s) => s.read(buffer),
+        }
+    }
+
+    /// Returns the number of samples available to read.
+    pub fn available(&self) -> usize {
+        match self {
+            Self::Cpal(s) => s.available(),
+            #[cfg(target_os = "macos")]
+            Self::Vpio(s) => s.available(),
+        }
+    }
+
+    /// Returns whether the stream is running.
+    pub fn is_running(&self) -> bool {
+        match self {
+            Self::Cpal(s) => s.is_running(),
+            #[cfg(target_os = "macos")]
+            Self::Vpio(s) => s.is_running(),
+        }
+    }
+
+    /// Returns the sample rate of the stream.
+    pub fn sample_rate(&self) -> u32 {
+        match self {
+            Self::Cpal(s) => s.sample_rate(),
+            #[cfg(target_os = "macos")]
+            Self::Vpio(s) => s.sample_rate(),
+        }
+    }
+
+    /// Returns `true` if the device errored.
+    pub fn has_error(&self) -> bool {
+        match self {
+            Self::Cpal(s) => s.has_error(),
+            #[cfg(target_os = "macos")]
+            Self::Vpio(s) => s.has_error(),
+        }
+    }
+
+    /// Stops the capture stream.
+    pub fn stop(&self) {
+        match self {
+            Self::Cpal(s) => s.stop(),
+            #[cfg(target_os = "macos")]
+            Self::Vpio(s) => s.stop(),
+        }
+    }
+
+    /// Returns `true` if using VPIO (hardware AEC active).
+    pub const fn is_vpio(&self) -> bool {
+        match self {
+            Self::Cpal(_) => false,
+            #[cfg(target_os = "macos")]
+            Self::Vpio(_) => true,
+        }
+    }
+}
+
 /// Build input stream for i16 samples.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn build_input_stream_i16(

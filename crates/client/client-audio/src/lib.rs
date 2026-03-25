@@ -90,6 +90,8 @@ pub mod sinc_resampler;
 pub mod stream;
 pub(crate) mod thread_priority;
 pub mod vad;
+#[cfg(target_os = "macos")]
+pub mod vpio;
 
 pub use aec::{AecProcessor, AecReference};
 pub use audio_processing::AudioProcessor;
