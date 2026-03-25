@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn test_high_freq_attenuated() {
         // An alternating signal (+1000, -1000) is at Nyquist frequency
-        // and should be strongly attenuated by 2-stage tilt
+        // and should be attenuated by the tilt filter
         let mut pf = Postfilter::new();
         let mut alt: Vec<i16> = (0..160)
             .map(|i| if i % 2 == 0 { 1000 } else { -1000 })
@@ -188,11 +188,11 @@ mod tests {
 
         let filtered_energy: f64 = alt.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
 
-        // 2-stage Nyquist gain = ((1-α)/(1+α))^2 = (0.55/1.45)^2 ≈ 0.144
-        // Energy ≈ 0.021x. Allow margin for transient.
+        // 1-stage Nyquist gain = (1-α)/(1+α) = 0.55/1.45 ≈ 0.379
+        // Energy ≈ 0.144x. Allow margin for transient.
         assert!(
-            filtered_energy < original_energy * 0.1,
-            "Nyquist should be strongly attenuated with 2 stages: ratio={}",
+            filtered_energy < original_energy * 0.3,
+            "Nyquist should be attenuated: ratio={}",
             filtered_energy / original_energy
         );
     }

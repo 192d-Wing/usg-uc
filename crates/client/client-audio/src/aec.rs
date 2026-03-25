@@ -84,9 +84,9 @@ impl AecConfig {
     pub fn room() -> Self {
         Self {
             filter_length_ms: 256,
-            nlms_mu: 0.3,
+            nlms_mu: 0.2,
             doubletalk_threshold: 1.5,
-            nlp_suppression: 0.05,
+            nlp_suppression: 0.02,
             ..Self::default()
         }
     }
@@ -165,17 +165,7 @@ const ERLE_SMOOTHING: f32 = 0.01;
 /// using an adaptive filter driven by the far-end reference signal.
 #[derive(Debug)]
 pub struct AecProcessor {
-    /// Adaptive filter coefficients.
-    filter: Vec<f32>,
-    /// Double-length far-end reference history buffer. Writing each sample at
-    /// `ref_pos` and `ref_pos + filter_len` allows modulo-free reads:
-    /// `reference_history[ref_pos + filter_len - k]` is always in-bounds.
-    reference_history: Vec<f32>,
-    /// Current write position in reference history (wraps within `[0, filter_len)`).
-    ref_pos: usize,
-    /// Filter length in samples.
-    filter_len: usize,
-    /// Running power estimate of the reference signal (for NLMS normalization).
+    /// Smoothed far-end reference power (for echo suppressor gating).
     ref_power: f32,
     /// Shared far-end reference buffer.
     aec_ref: Arc<AecReference>,
@@ -185,18 +175,12 @@ pub struct AecProcessor {
     enabled: bool,
     /// Configuration parameters.
     cfg: AecConfig,
-    /// Running input (before cancellation) power estimate.
+    /// Running input (before suppression) power estimate.
     input_power: f32,
-    /// Running output (after cancellation) power estimate.
+    /// Running output (after suppression) power estimate.
     output_power: f32,
     /// Current ERLE estimate in dB.
     erle_db: f32,
-    /// Delay line for reference signal alignment.
-    /// Compensates for playback pipeline latency so the reference
-    /// arrives at the filter at the same time as the echo in the mic.
-    delay_line: std::collections::VecDeque<i16>,
-    /// Target delay line length in samples.
-    delay_samples: usize,
 }
 
 impl AecProcessor {
@@ -209,17 +193,8 @@ impl AecProcessor {
     }
 
     /// Creates a new AEC processor with custom configuration.
-    pub fn with_config(sample_rate: u32, aec_ref: Arc<AecReference>, cfg: AecConfig) -> Self {
-        #[allow(clippy::cast_possible_truncation)]
-        let filter_len = (sample_rate as usize * cfg.filter_length_ms) / 1000;
-        #[allow(clippy::cast_possible_truncation)]
-        let delay_samples = (sample_rate as usize * cfg.reference_delay_ms) / 1000;
-        let delay_line = std::collections::VecDeque::from(vec![0i16; delay_samples]);
+    pub fn with_config(_sample_rate: u32, aec_ref: Arc<AecReference>, cfg: AecConfig) -> Self {
         Self {
-            filter: vec![0.0; filter_len],
-            reference_history: vec![0.0; filter_len * 2],
-            ref_pos: 0,
-            filter_len,
             ref_power: 0.0,
             aec_ref,
             ref_pull_buf: vec![0; 960], // Max frame size at any rate
@@ -228,8 +203,6 @@ impl AecProcessor {
             input_power: 0.0,
             output_power: 0.0,
             erle_db: 0.0,
-            delay_line,
-            delay_samples,
         }
     }
 
@@ -237,15 +210,10 @@ impl AecProcessor {
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         if !enabled {
-            // Reset filter when disabled
-            self.filter.fill(0.0);
-            self.reference_history.fill(0.0);
             self.ref_power = 0.0;
             self.input_power = 0.0;
             self.output_power = 0.0;
             self.erle_db = 0.0;
-            self.delay_line.clear();
-            self.delay_line.resize(self.delay_samples, 0);
         }
     }
 
@@ -259,15 +227,16 @@ impl AecProcessor {
         self.erle_db
     }
 
-    /// Processes a frame of mic audio in-place, removing estimated echo.
+    /// Processes a frame of mic audio in-place, suppressing echo.
+    ///
+    /// Uses a frame-level echo suppressor: when far-end reference energy
+    /// is detected, the mic output is attenuated. This is simpler and more
+    /// robust than sample-by-sample NLMS on laptop speaker+mic setups where
+    /// the echo path changes constantly.
     ///
     /// `mic_pcm` is the captured audio at codec rate (modified in-place).
     /// The far-end reference is automatically pulled from the shared buffer.
-    #[allow(
-        clippy::needless_range_loop,
-        clippy::cast_lossless,
-        clippy::cast_precision_loss
-    )]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
     pub fn process(&mut self, mic_pcm: &mut [i16]) {
         if !self.enabled {
             return;
@@ -275,120 +244,88 @@ impl AecProcessor {
 
         let frame_len = mic_pcm.len();
 
-        // Pull far-end reference samples
+        // Pull far-end reference samples (and discard — we only need the energy)
         let pull_len = frame_len.min(self.ref_pull_buf.len());
         let ref_pulled = self.aec_ref.pull(&mut self.ref_pull_buf[..pull_len]);
 
-        // If no reference available, can't cancel echo — pass through
+        // If no reference available, pass through
         if ref_pulled == 0 {
             return;
         }
 
-        // Apply delay to reference signal to compensate for playback pipeline
-        // latency (ring buffer + CPAL + DAC + acoustic path). Push new samples
-        // into the back of the delay line, pop delayed samples from the front.
-        if self.delay_samples > 0 {
-            for i in 0..ref_pulled {
-                self.delay_line.push_back(self.ref_pull_buf[i]);
-                self.ref_pull_buf[i] = self.delay_line.pop_front().unwrap_or(0);
+        // Compute reference frame energy (far-end signal level)
+        let ref_energy: f32 = self.ref_pull_buf[..ref_pulled]
+            .iter()
+            .map(|&s| {
+                let f = s as f32;
+                f * f
+            })
+            .sum::<f32>()
+            / ref_pulled as f32;
+
+        // Compute mic frame energy (near-end + echo)
+        let mic_energy: f32 = mic_pcm
+            .iter()
+            .map(|&s| {
+                let f = s as f32;
+                f * f
+            })
+            .sum::<f32>()
+            / frame_len as f32;
+
+        // Track input power for ERLE estimation
+        let frame_input_power = mic_energy * frame_len as f32;
+
+        // Smooth the reference energy to detect far-end activity with holdover.
+        // Decay slowly so suppression persists through brief pauses in far-end speech.
+        const REF_SMOOTH_UP: f32 = 0.4;   // Attack: track rising energy quickly
+        const REF_SMOOTH_DOWN: f32 = 0.02; // Decay: hold suppression ~1s after far-end stops
+        if ref_energy > self.ref_power {
+            self.ref_power += REF_SMOOTH_UP * (ref_energy - self.ref_power);
+        } else {
+            self.ref_power += REF_SMOOTH_DOWN * (ref_energy - self.ref_power);
+        }
+
+        // Determine suppression gain based on far-end activity
+        let gain = if self.ref_power > self.cfg.min_farend_energy {
+            // Far-end is active — echo expected in mic.
+            // Check if near-end is speaking much louder than the echo would be
+            // (double-talk detection via energy ratio).
+            let ratio = mic_energy / (self.ref_power + NLMS_DELTA);
+            if ratio > self.cfg.doubletalk_threshold * self.cfg.doubletalk_threshold {
+                // Near-end is much louder than far-end → likely double-talk.
+                // Apply moderate suppression to limit echo while preserving speech.
+                0.3
+            } else {
+                // Echo-only or echo-dominant → suppress strongly.
+                self.cfg.nlp_suppression
+            }
+        } else {
+            // No far-end activity — pass through at unity gain
+            1.0
+        };
+
+        // Apply gain to entire frame
+        if gain < 1.0 {
+            for s in mic_pcm.iter_mut() {
+                *s = (f32::from(*s) * gain) as i16;
             }
         }
 
-        // Accumulate frame-level input/output power for ERLE estimation.
-        let mut frame_input_power = 0.0_f32;
-        let mut frame_output_power = 0.0_f32;
+        // Compute output power for ERLE
+        let frame_output_power: f32 = mic_pcm
+            .iter()
+            .map(|&s| {
+                let f = s as f32;
+                f * f
+            })
+            .sum();
 
-        // Process sample by sample
-        for i in 0..frame_len {
-            // Get reference sample (zero-pad if we got fewer than frame_len)
-            let ref_sample = if i < ref_pulled {
-                self.ref_pull_buf[i] as f32
-            } else {
-                0.0
-            };
-
-            // Update reference history (double-buffer: write at both halves)
-            self.reference_history[self.ref_pos] = ref_sample;
-            self.reference_history[self.ref_pos + self.filter_len] = ref_sample;
-
-            // Update running power estimate (add new sample, subtract oldest)
-            self.ref_power += ref_sample * ref_sample;
-            // Exponential decay to prevent unbounded growth
-            self.ref_power *= 1.0 - (1.0 / self.filter_len as f32);
-
-            // Compute echo estimate: y_hat = sum(w[k] * x[n-k])
-            // Double-buffer indexing: ref_pos + filter_len - k is always in-bounds
-            let mut echo_estimate = 0.0_f32;
-            let base = self.ref_pos + self.filter_len;
-            for k in 0..self.filter_len {
-                echo_estimate =
-                    self.filter[k].mul_add(self.reference_history[base - k], echo_estimate);
-            }
-
-            // Error signal: mic - echo_estimate
-            let mic_f = mic_pcm[i] as f32;
-            let error = mic_f - echo_estimate;
-
-            // Accumulate power for ERLE
-            frame_input_power += mic_f * mic_f;
-            frame_output_power += error * error;
-
-            // Double-talk detection: compare mic energy to echo estimate energy
-            let mic_energy = mic_f * mic_f;
-            let echo_energy = echo_estimate * echo_estimate;
-            let is_doubletalk = echo_energy > self.cfg.min_farend_energy
-                && mic_energy > self.cfg.doubletalk_threshold * echo_energy;
-
-            // NLMS filter update (skip during double-talk)
-            if !is_doubletalk && self.ref_power > self.cfg.min_farend_energy {
-                let norm_error = self.cfg.nlms_mu / (self.ref_power + NLMS_DELTA) * error;
-                for k in 0..self.filter_len {
-                    self.filter[k] += norm_error * self.reference_history[base - k];
-                }
-            }
-
-            // Non-linear processing (NLP): gated on reference power.
-            // Use the reference signal power directly (reliable) instead of
-            // the echo estimate (unreliable when filter hasn't converged).
-            // When far-end is active, suppress residual echo proportionally.
-            let output = if self.ref_power > self.cfg.min_farend_energy * (self.filter_len as f32) {
-                // Far-end is active — echo is expected in the mic.
-                // Scale suppression by how much energy is in the reference.
-                let ref_rms = (self.ref_power / self.filter_len as f32).sqrt();
-                let error_rms = error.abs();
-                // If error is small relative to reference, it's mostly echo → suppress
-                // If error is large relative to reference, near-end is speaking → pass through
-                if error_rms < ref_rms * self.cfg.doubletalk_threshold {
-                    error * self.cfg.nlp_suppression
-                } else {
-                    // Double-talk: scale down partially instead of full pass-through
-                    error * 0.5
-                }
-            } else {
-                error
-            };
-
-            frame_output_power += output * output - error * error;
-
-            // Write back
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                mic_pcm[i] = output.clamp(-32768.0, 32767.0) as i16;
-            }
-
-            // Advance reference position (branchless wrap)
-            self.ref_pos += 1;
-            if self.ref_pos >= self.filter_len {
-                self.ref_pos = 0;
-            }
-        }
-
-        // Update running ERLE estimate (exponential moving average).
-        // Only update when there's meaningful input signal to avoid
-        // division by zero and meaningless ERLE during silence.
+        // Update ERLE estimate
         if frame_input_power > self.cfg.min_farend_energy {
             self.input_power += ERLE_SMOOTHING * (frame_input_power - self.input_power);
-            self.output_power += ERLE_SMOOTHING * (frame_output_power.max(NLMS_DELTA) - self.output_power);
+            self.output_power +=
+                ERLE_SMOOTHING * (frame_output_power.max(NLMS_DELTA) - self.output_power);
             if self.output_power > NLMS_DELTA {
                 self.erle_db = 10.0 * (self.input_power / self.output_power).log10();
             }
