@@ -12,6 +12,7 @@ use crate::settings::SettingsManager;
 use crate::sip_transport::{CertVerificationMode, SipTransport, TransportEvent};
 use crate::{AppError, AppResult};
 use client_sip_ua::{RegistrationAgent, RegistrationEvent};
+use client_types::audio::CodecPreference;
 use client_types::{
     CallInfo, CallQualityMetrics, CallState, DtmfDigit, RegistrationState, SipAccount,
 };
@@ -209,6 +210,20 @@ impl ClientApp {
         let (call_event_tx, call_event_rx) = mpsc::channel(32);
         let mut call_manager = CallManager::new(local_sip_addr, local_media_addr, call_event_tx);
         call_manager.set_contact_manager(contact_manager.clone());
+
+        // Restore saved device preferences from settings
+        let audio = &settings_manager.settings().audio;
+        if audio.input_device.is_some() || audio.output_device.is_some() {
+            info!(
+                input = ?audio.input_device,
+                output = ?audio.output_device,
+                "Restoring saved audio device preferences"
+            );
+        }
+        call_manager.set_preferred_devices(
+            audio.input_device.clone(),
+            audio.output_device.clone(),
+        );
 
         // Create SIP transport
         let (transport_event_tx, transport_event_rx) = mpsc::channel(32);
@@ -554,6 +569,18 @@ impl ClientApp {
         self.call_manager.toggle_hold().await
     }
 
+    /// Changes the codec for an active call via SIP re-INVITE.
+    ///
+    /// The call must be in Connected state. The audio session will be
+    /// automatically restarted with the new codec when the remote accepts.
+    pub async fn change_codec(
+        &mut self,
+        call_id: &str,
+        codec: CodecPreference,
+    ) -> AppResult<()> {
+        self.call_manager.change_codec(call_id, codec).await
+    }
+
     /// Switches focus to a different call.
     ///
     /// The current focused call will be put on hold if it's connected,
@@ -606,6 +633,8 @@ impl ClientApp {
             stats.capture_underruns,
             stats.playback_underruns,
             stats.rx_stats.srtp_errors,
+            stats.rtt_ms,
+            stats.codec_name.clone(),
         ))
     }
 
@@ -978,25 +1007,18 @@ impl ClientApp {
     pub async fn poll_events(&mut self) -> AppResult<()> {
         trace!("poll_events called");
 
-        // Collect registration events first, then process them
-        // (avoids borrow checker issues with async methods)
-        let reg_events: Vec<_> = std::iter::from_fn(|| self.reg_event_rx.try_recv().ok()).collect();
-        if !reg_events.is_empty() {
-            debug!(count = reg_events.len(), "Processing registration events");
-        }
-        for event in reg_events {
+        // Process registration events inline (NLL allows the temporary
+        // borrow on reg_event_rx to expire before handle borrows &mut self).
+        while let Ok(event) = self.reg_event_rx.try_recv() {
             self.handle_registration_event(event).await?;
         }
 
-        // Collect transport events first, then process them
-        let transport_events: Vec<_> = self
-            .transport_event_rx
-            .as_mut()
-            .map_or_else(Vec::new, |rx| {
-                std::iter::from_fn(|| rx.try_recv().ok()).collect()
-            });
-        for event in transport_events {
-            self.handle_transport_event(event).await?;
+        // Process transport events inline (take receiver to release borrow on self)
+        if let Some(mut rx) = self.transport_event_rx.take() {
+            while let Ok(event) = rx.try_recv() {
+                self.handle_transport_event(event).await?;
+            }
+            self.transport_event_rx = Some(rx);
         }
 
         // Poll call events and send requests via transport
@@ -1008,16 +1030,8 @@ impl ClientApp {
             self.handle_call_agent_event(event).await?;
         }
 
-        // Collect call manager events (state changes, responses to send, etc.)
-        let call_mgr_events: Vec<_> =
-            std::iter::from_fn(|| self.call_event_rx.try_recv().ok()).collect();
-        if !call_mgr_events.is_empty() {
-            info!(
-                count = call_mgr_events.len(),
-                "Processing call manager events"
-            );
-        }
-        for event in call_mgr_events {
+        // Process call manager events inline (state changes, responses to send)
+        while let Ok(event) = self.call_event_rx.try_recv() {
             self.handle_call_event(event).await?;
         }
 

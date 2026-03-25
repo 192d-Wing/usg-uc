@@ -277,89 +277,97 @@ impl fmt::Display for HeaderName {
     }
 }
 
+/// Static lookup table mapping lowercase header names to `HeaderName` variants.
+/// Used by `FromStr` to avoid heap allocation during case-insensitive matching.
+const HEADER_NAME_TABLE: &[(&str, HeaderName)] = &[
+    ("via", HeaderName::Via),
+    ("route", HeaderName::Route),
+    ("record-route", HeaderName::RecordRoute),
+    ("max-forwards", HeaderName::MaxForwards),
+    ("path", HeaderName::Path),
+    ("call-id", HeaderName::CallId),
+    ("cseq", HeaderName::CSeq),
+    ("from", HeaderName::From),
+    ("to", HeaderName::To),
+    ("content-type", HeaderName::ContentType),
+    ("content-length", HeaderName::ContentLength),
+    ("content-encoding", HeaderName::ContentEncoding),
+    ("content-disposition", HeaderName::ContentDisposition),
+    ("content-language", HeaderName::ContentLanguage),
+    ("contact", HeaderName::Contact),
+    ("expires", HeaderName::Expires),
+    ("min-expires", HeaderName::MinExpires),
+    ("www-authenticate", HeaderName::WwwAuthenticate),
+    ("authorization", HeaderName::Authorization),
+    ("proxy-authenticate", HeaderName::ProxyAuthenticate),
+    ("proxy-authorization", HeaderName::ProxyAuthorization),
+    ("allow", HeaderName::Allow),
+    ("supported", HeaderName::Supported),
+    ("require", HeaderName::Require),
+    ("proxy-require", HeaderName::ProxyRequire),
+    ("unsupported", HeaderName::Unsupported),
+    ("accept", HeaderName::Accept),
+    ("accept-encoding", HeaderName::AcceptEncoding),
+    ("accept-language", HeaderName::AcceptLanguage),
+    ("alert-info", HeaderName::AlertInfo),
+    ("call-info", HeaderName::CallInfo),
+    ("date", HeaderName::Date),
+    ("error-info", HeaderName::ErrorInfo),
+    ("in-reply-to", HeaderName::InReplyTo),
+    ("mime-version", HeaderName::MimeVersion),
+    ("organization", HeaderName::Organization),
+    ("priority", HeaderName::Priority),
+    ("reply-to", HeaderName::ReplyTo),
+    ("retry-after", HeaderName::RetryAfter),
+    ("server", HeaderName::Server),
+    ("subject", HeaderName::Subject),
+    ("timestamp", HeaderName::Timestamp),
+    ("user-agent", HeaderName::UserAgent),
+    ("warning", HeaderName::Warning),
+    ("event", HeaderName::Event),
+    ("subscription-state", HeaderName::SubscriptionState),
+    ("allow-events", HeaderName::AllowEvents),
+    ("session-expires", HeaderName::SessionExpires),
+    ("min-se", HeaderName::MinSe),
+    ("identity", HeaderName::Identity),
+    ("p-asserted-identity", HeaderName::PAssertedIdentity),
+    ("p-preferred-identity", HeaderName::PPreferredIdentity),
+    ("reason", HeaderName::Reason),
+    ("refer-to", HeaderName::ReferTo),
+    ("referred-by", HeaderName::ReferredBy),
+    ("replaces", HeaderName::Replaces),
+];
+
 impl FromStr for HeaderName {
     type Err = SipError;
 
     fn from_str(s: &str) -> SipResult<Self> {
         // Handle compact forms (RFC 3261 Section 7.3.3)
         if s.len() == 1 {
-            match s.chars().next() {
-                Some('v' | 'V') => return Ok(Self::Via),
-                Some('f' | 'F') => return Ok(Self::From),
-                Some('t' | 'T') => return Ok(Self::To),
-                Some('i' | 'I') => return Ok(Self::CallId),
-                Some('m' | 'M') => return Ok(Self::Contact),
-                Some('c' | 'C') => return Ok(Self::ContentType),
-                Some('l' | 'L') => return Ok(Self::ContentLength),
-                Some('k' | 'K') => return Ok(Self::Supported),
-                Some('s' | 'S') => return Ok(Self::Subject),
-                Some('r' | 'R') => return Ok(Self::ReferTo),
-                Some('u' | 'U') => return Ok(Self::AllowEvents),
-                Some('o' | 'O') => return Ok(Self::Event),
+            match s.as_bytes()[0] {
+                b'v' | b'V' => return Ok(Self::Via),
+                b'f' | b'F' => return Ok(Self::From),
+                b't' | b'T' => return Ok(Self::To),
+                b'i' | b'I' => return Ok(Self::CallId),
+                b'm' | b'M' => return Ok(Self::Contact),
+                b'c' | b'C' => return Ok(Self::ContentType),
+                b'l' | b'L' => return Ok(Self::ContentLength),
+                b'k' | b'K' => return Ok(Self::Supported),
+                b's' | b'S' => return Ok(Self::Subject),
+                b'r' | b'R' => return Ok(Self::ReferTo),
+                b'u' | b'U' => return Ok(Self::AllowEvents),
+                b'o' | b'O' => return Ok(Self::Event),
                 _ => {}
             }
         }
 
-        // Case-insensitive comparison
-        match s.to_lowercase().as_str() {
-            "via" => Ok(Self::Via),
-            "route" => Ok(Self::Route),
-            "record-route" => Ok(Self::RecordRoute),
-            "max-forwards" => Ok(Self::MaxForwards),
-            "path" => Ok(Self::Path),
-            "call-id" => Ok(Self::CallId),
-            "cseq" => Ok(Self::CSeq),
-            "from" => Ok(Self::From),
-            "to" => Ok(Self::To),
-            "content-type" => Ok(Self::ContentType),
-            "content-length" => Ok(Self::ContentLength),
-            "content-encoding" => Ok(Self::ContentEncoding),
-            "content-disposition" => Ok(Self::ContentDisposition),
-            "content-language" => Ok(Self::ContentLanguage),
-            "contact" => Ok(Self::Contact),
-            "expires" => Ok(Self::Expires),
-            "min-expires" => Ok(Self::MinExpires),
-            "www-authenticate" => Ok(Self::WwwAuthenticate),
-            "authorization" => Ok(Self::Authorization),
-            "proxy-authenticate" => Ok(Self::ProxyAuthenticate),
-            "proxy-authorization" => Ok(Self::ProxyAuthorization),
-            "allow" => Ok(Self::Allow),
-            "supported" => Ok(Self::Supported),
-            "require" => Ok(Self::Require),
-            "proxy-require" => Ok(Self::ProxyRequire),
-            "unsupported" => Ok(Self::Unsupported),
-            "accept" => Ok(Self::Accept),
-            "accept-encoding" => Ok(Self::AcceptEncoding),
-            "accept-language" => Ok(Self::AcceptLanguage),
-            "alert-info" => Ok(Self::AlertInfo),
-            "call-info" => Ok(Self::CallInfo),
-            "date" => Ok(Self::Date),
-            "error-info" => Ok(Self::ErrorInfo),
-            "in-reply-to" => Ok(Self::InReplyTo),
-            "mime-version" => Ok(Self::MimeVersion),
-            "organization" => Ok(Self::Organization),
-            "priority" => Ok(Self::Priority),
-            "reply-to" => Ok(Self::ReplyTo),
-            "retry-after" => Ok(Self::RetryAfter),
-            "server" => Ok(Self::Server),
-            "subject" => Ok(Self::Subject),
-            "timestamp" => Ok(Self::Timestamp),
-            "user-agent" => Ok(Self::UserAgent),
-            "warning" => Ok(Self::Warning),
-            "event" => Ok(Self::Event),
-            "subscription-state" => Ok(Self::SubscriptionState),
-            "allow-events" => Ok(Self::AllowEvents),
-            "session-expires" => Ok(Self::SessionExpires),
-            "min-se" => Ok(Self::MinSe),
-            "identity" => Ok(Self::Identity),
-            "p-asserted-identity" => Ok(Self::PAssertedIdentity),
-            "p-preferred-identity" => Ok(Self::PPreferredIdentity),
-            "reason" => Ok(Self::Reason),
-            "refer-to" => Ok(Self::ReferTo),
-            "referred-by" => Ok(Self::ReferredBy),
-            "replaces" => Ok(Self::Replaces),
-            _ => Ok(Self::Custom(s.to_string())),
+        // Case-insensitive lookup via static table (zero allocation)
+        for &(name, ref variant) in HEADER_NAME_TABLE {
+            if s.eq_ignore_ascii_case(name) {
+                return Ok(variant.clone());
+            }
         }
+        Ok(Self::Custom(s.to_string()))
     }
 }
 
@@ -450,9 +458,11 @@ impl Headers {
     }
 
     /// Gets all headers with the given name.
-    #[must_use]
-    pub fn get_all(&self, name: &HeaderName) -> Vec<&Header> {
-        self.headers.iter().filter(|h| &h.name == name).collect()
+    ///
+    /// Returns an iterator to avoid allocating a `Vec` on every call.
+    pub fn get_all(&self, name: &HeaderName) -> impl Iterator<Item = &Header> {
+        let name = name.clone();
+        self.headers.iter().filter(move |h| h.name == name)
     }
 
     /// Gets the first header value with the given name.
@@ -528,7 +538,6 @@ impl Headers {
     #[must_use]
     pub fn via_all_parsed(&self) -> Vec<ViaHeader> {
         self.get_all(&HeaderName::Via)
-            .iter()
             .filter_map(|h| h.value.parse().ok())
             .collect()
     }
@@ -591,7 +600,6 @@ impl Headers {
     #[must_use]
     pub fn route_values(&self) -> Vec<String> {
         self.get_all(&HeaderName::Route)
-            .iter()
             .map(|h| h.value.clone())
             .collect()
     }
@@ -600,7 +608,6 @@ impl Headers {
     #[must_use]
     pub fn record_route_values(&self) -> Vec<String> {
         self.get_all(&HeaderName::RecordRoute)
-            .iter()
             .map(|h| h.value.clone())
             .collect()
     }
@@ -662,7 +669,6 @@ impl Headers {
     #[must_use]
     pub fn path_values(&self) -> Vec<String> {
         self.get_all(&HeaderName::Path)
-            .iter()
             .map(|h| h.value.clone())
             .collect()
     }
@@ -864,8 +870,7 @@ mod tests {
         headers.add(Header::new(HeaderName::Via, "first"));
         headers.add(Header::new(HeaderName::Via, "second"));
 
-        let via_headers = headers.get_all(&HeaderName::Via);
-        assert_eq!(via_headers.len(), 2);
+        assert_eq!(headers.get_all(&HeaderName::Via).count(), 2);
     }
 
     #[test]

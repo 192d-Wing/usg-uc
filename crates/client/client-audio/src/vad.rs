@@ -21,39 +21,38 @@
 /// Minimum energy threshold (prevents triggering on near-zero input).
 const MIN_ENERGY_THRESHOLD: f32 = 50.0;
 
-/// Ratio above noise floor for speech detection.
-/// A frame is classified as speech if its energy exceeds
-/// `noise_floor * SPEECH_THRESHOLD_RATIO`.
-/// 2.5 is tuned for Bluetooth HFP capture which has higher
-/// background noise than wired microphones.
-const SPEECH_THRESHOLD_RATIO: f32 = 2.5;
+/// Configuration for Voice Activity Detection.
+#[derive(Debug, Clone)]
+pub struct VadConfig {
+    /// Ratio above noise floor for speech detection.
+    pub speech_threshold_ratio: f32,
+    /// Ratio for returning to silence (hysteresis).
+    pub silence_threshold_ratio: f32,
+    /// Zero-crossing rate threshold (0.0-1.0). High ZCR + marginal energy = noise.
+    pub zcr_noise_threshold: f32,
+    /// Frames to hold speech state after energy drops (at 20ms/frame).
+    pub hangover_frames: u32,
+    /// Smoothing factor for noise floor adaptation during silence.
+    pub noise_floor_adapt_rate: f32,
+    /// Maximum noise floor (prevents runaway in noisy environments).
+    pub max_noise_floor: f32,
+    /// Number of initial frames for noise floor calibration.
+    pub calibration_frames: u32,
+}
 
-/// Ratio for returning to silence (lower than speech threshold
-/// for hysteresis, avoiding rapid toggling).
-const SILENCE_THRESHOLD_RATIO: f32 = 2.0;
-
-/// Zero-crossing rate threshold (normalized to 0.0-1.0).
-/// Speech typically has ZCR < 0.3, unvoiced noise is > 0.5.
-/// Frames with very high ZCR and marginal energy are likely noise.
-const ZCR_NOISE_THRESHOLD: f32 = 0.5;
-
-/// Number of frames to hold speech state after energy drops.
-/// Prevents cutting off word endings and inter-word pauses.
-/// 25 frames at 20ms = 500ms hold time. Longer hold avoids
-/// mid-sentence gaps that the remote side hears as breaks.
-const HANGOVER_FRAMES: u32 = 25;
-
-/// Smoothing factor for noise floor adaptation (slow, during silence).
-/// Higher = faster adaptation. 0.02 → ~1 second time constant at 50 fps.
-const NOISE_FLOOR_ADAPT_RATE: f32 = 0.02;
-
-/// Maximum noise floor (prevents runaway adaptation in noisy environments).
-/// Approximately -30 dBFS.
-const MAX_NOISE_FLOOR: f32 = 1000.0;
-
-/// Number of initial frames to skip for noise floor calibration.
-/// Avoids speech in the first second from contaminating the estimate.
-const CALIBRATION_FRAMES: u32 = 25;
+impl Default for VadConfig {
+    fn default() -> Self {
+        Self {
+            speech_threshold_ratio: 2.5,
+            silence_threshold_ratio: 2.0,
+            zcr_noise_threshold: 0.5,
+            hangover_frames: 25,
+            noise_floor_adapt_rate: 0.02,
+            max_noise_floor: 1000.0,
+            calibration_frames: 25,
+        }
+    }
+}
 
 /// Voice Activity Detection result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +76,8 @@ pub struct VoiceActivityDetector {
     frame_count: u32,
     /// Whether initial calibration is complete.
     calibrated: bool,
+    /// Configuration parameters.
+    cfg: VadConfig,
 }
 
 impl Default for VoiceActivityDetector {
@@ -87,13 +88,19 @@ impl Default for VoiceActivityDetector {
 
 impl VoiceActivityDetector {
     /// Creates a new VAD with default settings.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
+        Self::with_config(VadConfig::default())
+    }
+
+    /// Creates a VAD with custom configuration.
+    pub fn with_config(cfg: VadConfig) -> Self {
         Self {
             in_speech: false,
             hangover_counter: 0,
             noise_floor: MIN_ENERGY_THRESHOLD,
             frame_count: 0,
             calibrated: false,
+            cfg,
         }
     }
 
@@ -106,14 +113,13 @@ impl VoiceActivityDetector {
             return VadDecision::Silence;
         }
 
-        let energy = compute_rms(pcm);
-        let zcr = compute_zcr(pcm);
+        let (energy, zcr) = compute_rms_and_zcr(pcm);
 
         self.frame_count = self.frame_count.saturating_add(1);
 
         // Initial calibration: assume first N frames are background noise
         if !self.calibrated {
-            if self.frame_count <= CALIBRATION_FRAMES {
+            if self.frame_count <= self.cfg.calibration_frames {
                 // Use first frames to estimate noise floor
                 #[allow(clippy::cast_precision_loss)]
                 let alpha = 1.0 / self.frame_count as f32;
@@ -126,19 +132,19 @@ impl VoiceActivityDetector {
 
         // Determine thresholds based on current state (hysteresis)
         let threshold = if self.in_speech {
-            (self.noise_floor * SILENCE_THRESHOLD_RATIO).max(MIN_ENERGY_THRESHOLD)
+            (self.noise_floor * self.cfg.silence_threshold_ratio).max(MIN_ENERGY_THRESHOLD)
         } else {
-            (self.noise_floor * SPEECH_THRESHOLD_RATIO).max(MIN_ENERGY_THRESHOLD)
+            (self.noise_floor * self.cfg.speech_threshold_ratio).max(MIN_ENERGY_THRESHOLD)
         };
 
         // High ZCR with marginal energy → likely unvoiced noise, not speech
-        let is_likely_noise = zcr > ZCR_NOISE_THRESHOLD && energy < threshold * 1.5;
+        let is_likely_noise = zcr > self.cfg.zcr_noise_threshold && energy < threshold * 1.5;
 
         let is_speech = energy > threshold && !is_likely_noise;
 
         if is_speech {
             self.in_speech = true;
-            self.hangover_counter = HANGOVER_FRAMES;
+            self.hangover_counter = self.cfg.hangover_frames;
         } else if self.hangover_counter > 0 {
             // In hangover period — keep speech state
             self.hangover_counter -= 1;
@@ -169,31 +175,52 @@ impl VoiceActivityDetector {
     /// Adapts the noise floor estimate during silence periods.
     fn adapt_noise_floor(&mut self, energy: f32) {
         // Only adapt if energy is reasonable (not a burst of noise)
-        if energy < self.noise_floor * SPEECH_THRESHOLD_RATIO {
-            self.noise_floor += (energy - self.noise_floor) * NOISE_FLOOR_ADAPT_RATE;
+        if energy < self.noise_floor * self.cfg.speech_threshold_ratio {
+            self.noise_floor += (energy - self.noise_floor) * self.cfg.noise_floor_adapt_rate;
             self.noise_floor = self
                 .noise_floor
-                .clamp(MIN_ENERGY_THRESHOLD, MAX_NOISE_FLOOR);
+                .clamp(MIN_ENERGY_THRESHOLD, self.cfg.max_noise_floor);
         }
     }
 }
 
-/// Computes the RMS (Root Mean Square) energy of a PCM buffer.
-#[allow(clippy::cast_precision_loss)]
-fn compute_rms(pcm: &[i16]) -> f32 {
+/// Computes RMS energy and zero-crossing rate in a single pass over the PCM buffer.
+///
+/// Returns `(rms, zcr)` where:
+/// - `rms` is the Root Mean Square energy (f32)
+/// - `zcr` is the zero-crossing rate in 0.0..1.0
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn compute_rms_and_zcr(pcm: &[i16]) -> (f32, f32) {
     if pcm.is_empty() {
-        return 0.0;
+        return (0.0, 0.0);
     }
-    let sum_sq: f64 = pcm.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
-    #[allow(clippy::cast_possible_truncation)]
+
+    let mut sum_sq: f64 = f64::from(pcm[0]) * f64::from(pcm[0]);
+    let mut crossings: u32 = 0;
+    let mut prev = pcm[0];
+
+    for &s in &pcm[1..] {
+        sum_sq += f64::from(s) * f64::from(s);
+        if (prev >= 0) != (s >= 0) {
+            crossings += 1;
+        }
+        prev = s;
+    }
+
     let rms = (sum_sq / pcm.len() as f64).sqrt() as f32;
-    rms
+    let zcr = if pcm.len() > 1 {
+        crossings as f32 / (pcm.len() - 1) as f32
+    } else {
+        0.0
+    };
+    (rms, zcr)
 }
 
-/// Computes the zero-crossing rate of a PCM buffer.
+/// Computes the zero-crossing rate of a PCM buffer (standalone, used in tests).
 ///
 /// Returns a value in 0.0..1.0 where 0.0 means no zero crossings
 /// and 1.0 means every consecutive pair crosses zero.
+#[cfg(test)]
 #[allow(clippy::cast_precision_loss)]
 fn compute_zcr(pcm: &[i16]) -> f32 {
     if pcm.len() < 2 {
@@ -221,7 +248,7 @@ mod tests {
     fn test_silence_detected() {
         let mut vad = VoiceActivityDetector::new();
         // Skip calibration
-        for _ in 0..CALIBRATION_FRAMES + 1 {
+        for _ in 0..VadConfig::default().calibration_frames + 1 {
             vad.detect(&[0i16; 160]);
         }
         let result = vad.detect(&[0i16; 160]);
@@ -232,7 +259,7 @@ mod tests {
     fn test_speech_detected() {
         let mut vad = VoiceActivityDetector::new();
         // Calibrate with silence
-        for _ in 0..CALIBRATION_FRAMES + 1 {
+        for _ in 0..VadConfig::default().calibration_frames + 1 {
             vad.detect(&[0i16; 160]);
         }
 
@@ -255,7 +282,7 @@ mod tests {
     fn test_hangover_prevents_cutting() {
         let mut vad = VoiceActivityDetector::new();
         // Calibrate
-        for _ in 0..CALIBRATION_FRAMES + 1 {
+        for _ in 0..VadConfig::default().calibration_frames + 1 {
             vad.detect(&[0i16; 160]);
         }
 
@@ -265,7 +292,7 @@ mod tests {
         assert!(vad.in_speech());
 
         // First few silence frames should still be "speech" (hangover)
-        for i in 0..HANGOVER_FRAMES {
+        for i in 0..VadConfig::default().hangover_frames {
             let result = vad.detect(&[1i16; 160]);
             assert_eq!(
                 result,
@@ -284,7 +311,7 @@ mod tests {
         let mut vad = VoiceActivityDetector::new();
         // Calibrate with moderate noise
         let noise: Vec<i16> = vec![100i16; 160];
-        for _ in 0..CALIBRATION_FRAMES + 1 {
+        for _ in 0..VadConfig::default().calibration_frames + 1 {
             vad.detect(&noise);
         }
 
@@ -339,7 +366,7 @@ mod tests {
     fn test_hysteresis() {
         let mut vad = VoiceActivityDetector::new();
         // Calibrate with silence
-        for _ in 0..CALIBRATION_FRAMES + 1 {
+        for _ in 0..VadConfig::default().calibration_frames + 1 {
             vad.detect(&[0i16; 160]);
         }
 
@@ -349,7 +376,7 @@ mod tests {
         assert!(vad.in_speech());
 
         // Wait out hangover
-        for _ in 0..HANGOVER_FRAMES + 1 {
+        for _ in 0..VadConfig::default().hangover_frames + 1 {
             vad.detect(&[0i16; 160]);
         }
         assert!(!vad.in_speech());
@@ -357,7 +384,7 @@ mod tests {
         // Marginal energy: above silence threshold but below speech threshold
         // This tests that the higher threshold is needed to re-enter speech
         let marginal: Vec<i16> =
-            vec![(MIN_ENERGY_THRESHOLD * SILENCE_THRESHOLD_RATIO * 1.1) as i16; 160];
+            vec![(MIN_ENERGY_THRESHOLD * VadConfig::default().silence_threshold_ratio * 1.1) as i16; 160];
         let result = vad.detect(&marginal);
         // Should still be silence because we need SPEECH_THRESHOLD_RATIO to enter speech
         assert_eq!(result, VadDecision::Silence);

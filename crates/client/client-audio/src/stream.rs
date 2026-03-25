@@ -37,6 +37,8 @@ pub struct CaptureStream {
     is_running: Arc<AtomicBool>,
     /// Sample rate of the stream.
     sample_rate: u32,
+    /// Set to `true` by the CPAL error callback when the device disconnects or errors.
+    device_error: Arc<AtomicBool>,
 }
 
 impl CaptureStream {
@@ -62,6 +64,8 @@ impl CaptureStream {
 
         let is_running = Arc::new(AtomicBool::new(true));
         let is_running_clone = is_running.clone();
+        let device_error = Arc::new(AtomicBool::new(false));
+        let device_error_clone = device_error.clone();
 
         // Get the sample format
         let supported_config = device
@@ -69,12 +73,20 @@ impl CaptureStream {
             .map_err(|e| AudioError::StreamError(format!("Failed to get config: {e}")))?;
 
         let stream = match supported_config.sample_format() {
-            SampleFormat::I16 => {
-                build_input_stream_i16(&device, &config, producer, is_running_clone)?
-            }
-            SampleFormat::F32 => {
-                build_input_stream_f32(&device, &config, producer, is_running_clone)?
-            }
+            SampleFormat::I16 => build_input_stream_i16(
+                &device,
+                &config,
+                producer,
+                is_running_clone,
+                device_error_clone,
+            )?,
+            SampleFormat::F32 => build_input_stream_f32(
+                &device,
+                &config,
+                producer,
+                is_running_clone,
+                device_error_clone,
+            )?,
             format => {
                 return Err(AudioError::StreamError(format!(
                     "Unsupported sample format: {format:?}"
@@ -93,6 +105,7 @@ impl CaptureStream {
             consumer,
             is_running,
             sample_rate,
+            device_error,
         })
     }
 
@@ -118,10 +131,116 @@ impl CaptureStream {
         self.sample_rate
     }
 
+    /// Returns `true` if the CPAL error callback has fired (device disconnect/error).
+    pub fn has_error(&self) -> bool {
+        self.device_error.load(Ordering::Relaxed)
+    }
+
     /// Stops the capture stream.
     pub fn stop(&self) {
         self.is_running.store(false, Ordering::Relaxed);
         debug!("Capture stream stopped");
+    }
+}
+
+/// Capture backend that can use either CPAL or macOS VPIO.
+///
+/// On macOS with built-in mic, VPIO provides hardware echo cancellation.
+/// On all other platforms/devices, CPAL is used.
+pub enum CaptureBackend {
+    /// Standard CPAL capture stream.
+    Cpal(CaptureStream),
+    /// macOS Voice Processing I/O (hardware AEC).
+    #[cfg(target_os = "macos")]
+    Vpio(crate::vpio::VpioCaptureStream),
+}
+
+impl CaptureBackend {
+    /// Creates the appropriate capture backend.
+    ///
+    /// On macOS with built-in mic, uses VPIO for hardware AEC.
+    /// Falls back to CPAL if VPIO fails or for non-built-in devices.
+    pub fn new(device_manager: &crate::device::DeviceManager) -> AudioResult<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            let device_name = device_manager.input_device_name();
+            if crate::vpio::should_use_vpio(device_name) {
+                match crate::vpio::VpioCaptureStream::new() {
+                    Ok(vpio) => {
+                        info!("Using VPIO capture (hardware AEC)");
+                        return Ok(Self::Vpio(vpio));
+                    }
+                    Err(e) => {
+                        info!("VPIO unavailable ({e}), falling back to CPAL");
+                    }
+                }
+            }
+        }
+
+        Ok(Self::Cpal(CaptureStream::new(device_manager)?))
+    }
+
+    /// Reads captured audio samples into the provided buffer.
+    pub fn read(&mut self, buffer: &mut [Sample]) -> usize {
+        match self {
+            Self::Cpal(s) => s.read(buffer),
+            #[cfg(target_os = "macos")]
+            Self::Vpio(s) => s.read(buffer),
+        }
+    }
+
+    /// Returns the number of samples available to read.
+    pub fn available(&self) -> usize {
+        match self {
+            Self::Cpal(s) => s.available(),
+            #[cfg(target_os = "macos")]
+            Self::Vpio(s) => s.available(),
+        }
+    }
+
+    /// Returns whether the stream is running.
+    pub fn is_running(&self) -> bool {
+        match self {
+            Self::Cpal(s) => s.is_running(),
+            #[cfg(target_os = "macos")]
+            Self::Vpio(s) => s.is_running(),
+        }
+    }
+
+    /// Returns the sample rate of the stream.
+    pub fn sample_rate(&self) -> u32 {
+        match self {
+            Self::Cpal(s) => s.sample_rate(),
+            #[cfg(target_os = "macos")]
+            Self::Vpio(s) => s.sample_rate(),
+        }
+    }
+
+    /// Returns `true` if the device errored.
+    pub fn has_error(&self) -> bool {
+        match self {
+            Self::Cpal(s) => s.has_error(),
+            #[cfg(target_os = "macos")]
+            Self::Vpio(s) => s.has_error(),
+        }
+    }
+
+    /// Stops the capture stream.
+    pub fn stop(&self) {
+        match self {
+            Self::Cpal(s) => s.stop(),
+            #[cfg(target_os = "macos")]
+            Self::Vpio(s) => s.stop(),
+        }
+    }
+
+    /// Returns `true` if using VPIO (hardware AEC active).
+    pub const fn is_vpio(&self) -> bool {
+        match self {
+            Self::Cpal(_) => false,
+            #[cfg(target_os = "macos")]
+            Self::Vpio(_) => true,
+        }
     }
 }
 
@@ -132,6 +251,7 @@ fn build_input_stream_i16(
     config: &cpal::StreamConfig,
     mut producer: ringbuf::HeapProd<Sample>,
     is_running: Arc<AtomicBool>,
+    device_error: Arc<AtomicBool>,
 ) -> AudioResult<Stream> {
     let channels = usize::from(config.channels);
 
@@ -147,16 +267,20 @@ fn build_input_stream_i16(
                 if channels == 1 {
                     let _ = producer.push_slice(data);
                 } else {
-                    // Mix down to mono
-                    for chunk in data.chunks(channels) {
+                    // Mix down to mono into stack buffer, then batch push
+                    let mono_count = data.len() / channels;
+                    let mut mono_buf = [0i16; 1920]; // max 40ms @ 48kHz
+                    let count = mono_count.min(mono_buf.len());
+                    for (i, chunk) in data.chunks(channels).take(count).enumerate() {
                         let sum: i32 = chunk.iter().map(|&s| i32::from(s)).sum();
-                        let mono = (sum / channels as i32) as i16;
-                        let _ = producer.try_push(mono);
+                        mono_buf[i] = (sum / channels as i32) as i16;
                     }
+                    let _ = producer.push_slice(&mono_buf[..count]);
                 }
             },
             move |err| {
-                error!("Capture stream error: {err}");
+                error!("Capture stream error (device may have disconnected): {err}");
+                device_error.store(true, Ordering::Relaxed);
             },
             None,
         )
@@ -172,6 +296,7 @@ fn build_input_stream_f32(
     config: &cpal::StreamConfig,
     mut producer: ringbuf::HeapProd<Sample>,
     is_running: Arc<AtomicBool>,
+    device_error: Arc<AtomicBool>,
 ) -> AudioResult<Stream> {
     let channels = usize::from(config.channels);
 
@@ -197,7 +322,8 @@ fn build_input_stream_f32(
                 }
             },
             move |err| {
-                error!("Capture stream error: {err}");
+                error!("Capture stream error (device may have disconnected): {err}");
+                device_error.store(true, Ordering::Relaxed);
             },
             None,
         )
@@ -218,6 +344,8 @@ pub struct PlaybackStream {
     sample_rate: u32,
     /// Counter for CPAL callback underruns (callbacks where ring buffer was empty).
     underrun_count: Arc<AtomicU64>,
+    /// Set to `true` by the CPAL error callback when the device disconnects or errors.
+    device_error: Arc<AtomicBool>,
 }
 
 impl PlaybackStream {
@@ -245,6 +373,8 @@ impl PlaybackStream {
         let is_running_clone = is_running.clone();
         let underrun_count = Arc::new(AtomicU64::new(0));
         let underrun_clone = underrun_count.clone();
+        let device_error = Arc::new(AtomicBool::new(false));
+        let device_error_clone = device_error.clone();
 
         // Get the sample format
         let supported_config = device
@@ -258,6 +388,7 @@ impl PlaybackStream {
                 consumer,
                 is_running_clone,
                 underrun_clone,
+                device_error_clone,
             )?,
             SampleFormat::F32 => build_output_stream_f32(
                 &device,
@@ -265,6 +396,7 @@ impl PlaybackStream {
                 consumer,
                 is_running_clone,
                 underrun_clone,
+                device_error_clone,
             )?,
             format => {
                 return Err(AudioError::StreamError(format!(
@@ -285,6 +417,7 @@ impl PlaybackStream {
             is_running,
             sample_rate,
             underrun_count,
+            device_error,
         })
     }
 
@@ -315,6 +448,11 @@ impl PlaybackStream {
         self.sample_rate
     }
 
+    /// Returns `true` if the CPAL error callback has fired (device disconnect/error).
+    pub fn has_error(&self) -> bool {
+        self.device_error.load(Ordering::Relaxed)
+    }
+
     /// Stops the playback stream.
     pub fn stop(&self) {
         self.is_running.store(false, Ordering::Relaxed);
@@ -339,6 +477,7 @@ impl PlaybackStream {
             _stream: self._stream,
             is_running: self.is_running,
             sample_rate: self.sample_rate,
+            device_error: self.device_error,
         };
         (handle, self.producer, self.underrun_count)
     }
@@ -355,6 +494,8 @@ pub struct PlaybackStreamHandle {
     is_running: Arc<AtomicBool>,
     /// Sample rate of the stream.
     sample_rate: u32,
+    /// Set to `true` by the CPAL error callback when the device disconnects or errors.
+    device_error: Arc<AtomicBool>,
 }
 
 impl PlaybackStreamHandle {
@@ -366,6 +507,11 @@ impl PlaybackStreamHandle {
     /// Returns whether the stream is running.
     pub fn is_running(&self) -> bool {
         self.is_running.load(Ordering::Relaxed)
+    }
+
+    /// Returns `true` if the CPAL error callback has fired (device disconnect/error).
+    pub fn has_error(&self) -> bool {
+        self.device_error.load(Ordering::Relaxed)
     }
 
     /// Stops the playback stream.
@@ -383,6 +529,7 @@ fn build_output_stream_i16(
     mut consumer: ringbuf::HeapCons<Sample>,
     is_running: Arc<AtomicBool>,
     underrun_count: Arc<AtomicU64>,
+    device_error: Arc<AtomicBool>,
 ) -> AudioResult<Stream> {
     let channels = usize::from(config.channels);
     let mut last_sample: i16 = 0;
@@ -432,7 +579,8 @@ fn build_output_stream_i16(
                 }
             },
             move |err| {
-                error!("Playback stream error: {err}");
+                error!("Playback stream error (device may have disconnected): {err}");
+                device_error.store(true, Ordering::Relaxed);
             },
             None,
         )
@@ -448,6 +596,7 @@ fn build_output_stream_f32(
     mut consumer: ringbuf::HeapCons<Sample>,
     is_running: Arc<AtomicBool>,
     underrun_count: Arc<AtomicU64>,
+    device_error: Arc<AtomicBool>,
 ) -> AudioResult<Stream> {
     let channels = usize::from(config.channels);
     let mut last_sample: f32 = 0.0;
@@ -492,7 +641,8 @@ fn build_output_stream_f32(
                 }
             },
             move |err| {
-                error!("Playback stream error: {err}");
+                error!("Playback stream error (device may have disconnected): {err}");
+                device_error.store(true, Ordering::Relaxed);
             },
             None,
         )

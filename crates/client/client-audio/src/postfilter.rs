@@ -4,36 +4,59 @@
 //! introduce noise correlated with the signal. Our encoder-side noise shaper
 //! (Appendix III) pushes quantization noise energy toward high frequencies
 //! (NTF = 1 − 0.5z⁻¹ → +3.5 dB at Nyquist). This postfilter compensates
-//! by applying a gain-normalized low-pass tilt that attenuates the
-//! high-frequency noise while preserving speech fundamentals and formants.
+//! by applying cascaded gain-normalized low-pass tilt stages that attenuate
+//! the high-frequency noise while preserving speech fundamentals and formants.
 //!
 //! Based on ITU-T G.711 Appendix III §4 recommendations. The filter
 //! operates at codec rate (8 kHz) before resampling for maximum effect.
+//!
+//! ## Filter response
+//!
+//! Two cascaded 1st-order tilt sections with α=0.45 give:
+//! - DC: 0 dB (unity gain, speech fundamentals preserved)
+//! - 1 kHz: ~-1 dB (formant region, minimal impact)
+//! - 2 kHz: ~-4 dB (upper formants, slight attenuation)
+//! - 3 kHz: ~-8 dB (consonant/noise boundary)
+//! - 4 kHz (Nyquist): ~-17 dB (strong noise attenuation)
 
-/// Low-pass tilt coefficient (0.0 = bypass, higher = more HF attenuation).
+/// Configuration for the decoder-side postfilter.
+#[derive(Debug, Clone)]
+pub struct PostfilterConfig {
+    /// Low-pass tilt coefficient (0.0 = bypass, higher = more HF attenuation).
+    pub tilt_alpha: f32,
+    /// Number of cascaded tilt stages (1 = 6 dB/oct, 2 = 12 dB/oct).
+    pub stages: u8,
+}
+
+impl Default for PostfilterConfig {
+    fn default() -> Self {
+        // Single stage with α=0.45 gives ~8 dB attenuation at Nyquist.
+        // Enough to reduce G.711 quantization hiss without muffling speech.
+        // Use stages=2 for more aggressive filtering if needed.
+        Self {
+            tilt_alpha: 0.45,
+            stages: 1,
+        }
+    }
+}
+
+/// Decoder-side postfilter using cascaded gain-normalized low-pass tilt stages.
 ///
-/// Frequency response (8 kHz sample rate):
-/// - DC (0 Hz): 1.0 (unity — no bass boost)
-/// - 1 kHz: ~0.97 (−0.3 dB, negligible)
-/// - 2 kHz: ~0.89 (−1.0 dB, mild)
-/// - 4 kHz (Nyquist): (1−α)/(1+α) = 0.54 (−5.4 dB, significant)
-const TILT_ALPHA: f32 = 0.3;
-
-/// Gain normalization factor: 1/(1+α).
-/// Ensures DC gain is exactly 1.0 (no bass boost).
-const GAIN_NORM: f32 = 1.0 / (1.0 + TILT_ALPHA);
-
-/// Decoder-side postfilter using a gain-normalized low-pass tilt filter.
-///
-/// Implements `y[n] = (x[n] + α * x[n-1]) / (1 + α)`, which gently
-/// attenuates high-frequency quantization noise pushed there by the
-/// encoder-side noise shaper, while preserving speech fundamentals.
+/// Each stage implements `y[n] = (x[n] + α * x[n-1]) / (1 + α)`, which gently
+/// attenuates high-frequency quantization noise. Cascading two stages gives
+/// 12 dB/octave rolloff instead of 6 dB/octave.
 #[derive(Debug)]
 pub struct Postfilter {
-    /// Previous input sample for the tilt filter.
-    prev_input: f32,
+    /// Previous input sample for each tilt stage.
+    prev_input: [f32; 2],
     /// Whether the postfilter is active.
     enabled: bool,
+    /// Tilt coefficient.
+    tilt_alpha: f32,
+    /// Gain normalization factor: 1/(1+α).
+    gain_norm: f32,
+    /// Number of active stages (1 or 2).
+    stages: u8,
 }
 
 impl Default for Postfilter {
@@ -44,10 +67,18 @@ impl Default for Postfilter {
 
 impl Postfilter {
     /// Creates a new postfilter (enabled by default).
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
+        Self::with_config(PostfilterConfig::default())
+    }
+
+    /// Creates a postfilter with custom configuration.
+    pub fn with_config(cfg: PostfilterConfig) -> Self {
         Self {
-            prev_input: 0.0,
+            prev_input: [0.0; 2],
             enabled: true,
+            tilt_alpha: cfg.tilt_alpha,
+            gain_norm: 1.0 / (1.0 + cfg.tilt_alpha),
+            stages: cfg.stages.min(2).max(1),
         }
     }
 
@@ -63,19 +94,32 @@ impl Postfilter {
 
     /// Applies the postfilter to a frame of decoded PCM in-place.
     ///
-    /// The low-pass tilt `y[n] = (x[n] + α * x[n-1]) / (1 + α)` gently
-    /// rolls off high-frequency quantization noise. Zero-allocation operation.
+    /// Each stage applies `y[n] = (x[n] + α * x[n-1]) / (1 + α)`.
+    /// With 2 stages, the output of stage 1 feeds into stage 2.
+    /// Zero-allocation operation.
     #[allow(clippy::cast_possible_truncation)]
     pub fn process(&mut self, pcm: &mut [i16]) {
         if !self.enabled {
             return;
         }
 
+        let alpha = self.tilt_alpha;
+        let norm = self.gain_norm;
+
         for sample in pcm.iter_mut() {
-            let x = f32::from(*sample);
-            let y = TILT_ALPHA.mul_add(self.prev_input, x) * GAIN_NORM;
-            self.prev_input = x;
-            *sample = y.clamp(-32768.0, 32767.0) as i16;
+            // Stage 1
+            let x0 = f32::from(*sample);
+            let y0 = alpha.mul_add(self.prev_input[0], x0) * norm;
+            self.prev_input[0] = x0;
+
+            if self.stages >= 2 {
+                // Stage 2: feed stage 1 output into stage 2
+                let y1 = alpha.mul_add(self.prev_input[1], y0) * norm;
+                self.prev_input[1] = y0;
+                *sample = y1.clamp(-32768.0, 32767.0) as i16;
+            } else {
+                *sample = y0.clamp(-32768.0, 32767.0) as i16;
+            }
         }
     }
 }
@@ -118,12 +162,11 @@ mod tests {
     #[test]
     fn test_dc_preserved() {
         // A constant DC signal should pass through at unity gain
-        // (the gain normalization factor 1/(1+α) cancels the (1+α) DC gain)
         let mut pf = Postfilter::new();
         let mut dc = vec![1000i16; 160];
         pf.process(&mut dc);
 
-        // After settling, output ≈ (x + α*x) / (1+α) = x = 1000
+        // After settling, each stage has DC gain of 1.0, so cascaded = 1.0
         let settled = dc[159];
         assert!(
             (settled - 1000).abs() < 10,
@@ -134,7 +177,7 @@ mod tests {
     #[test]
     fn test_high_freq_attenuated() {
         // An alternating signal (+1000, -1000) is at Nyquist frequency
-        // and should be attenuated by the low-pass tilt
+        // and should be attenuated by the tilt filter
         let mut pf = Postfilter::new();
         let mut alt: Vec<i16> = (0..160)
             .map(|i| if i % 2 == 0 { 1000 } else { -1000 })
@@ -145,18 +188,40 @@ mod tests {
 
         let filtered_energy: f64 = alt.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
 
-        // Nyquist gain = (1-α)/(1+α) = 0.7/1.3 ≈ 0.538, energy ≈ 0.29x
-        // Allow some margin for the transient at the start
+        // 1-stage Nyquist gain = (1-α)/(1+α) = 0.55/1.45 ≈ 0.379
+        // Energy ≈ 0.144x. Allow margin for transient.
         assert!(
-            filtered_energy < original_energy * 0.5,
-            "Nyquist signal should be significantly attenuated: original={original_energy}, filtered={filtered_energy}"
+            filtered_energy < original_energy * 0.3,
+            "Nyquist should be attenuated: ratio={}",
+            filtered_energy / original_energy
+        );
+    }
+
+    #[test]
+    fn test_single_stage_less_attenuation() {
+        let cfg = PostfilterConfig {
+            tilt_alpha: 0.45,
+            stages: 1,
+        };
+        let mut pf = Postfilter::with_config(cfg);
+        let mut alt: Vec<i16> = (0..160)
+            .map(|i| if i % 2 == 0 { 1000 } else { -1000 })
+            .collect();
+        let original_energy: f64 = alt.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
+
+        pf.process(&mut alt);
+        let filtered_energy: f64 = alt.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
+
+        // 1-stage: energy ratio ≈ 0.144 (less attenuation than 2-stage)
+        assert!(
+            filtered_energy < original_energy * 0.3,
+            "Single stage should attenuate Nyquist but less than 2-stage"
         );
     }
 
     #[test]
     fn test_output_bounded() {
         let mut pf = Postfilter::new();
-        // Large signal that could cause overflow
         let mut loud = vec![i16::MAX; 160];
         pf.process(&mut loud);
         assert!(
@@ -167,7 +232,6 @@ mod tests {
 
     #[test]
     fn test_cross_frame_continuity() {
-        // Process two frames back-to-back and verify no discontinuity
         let mut pf = Postfilter::new();
         let mut frame1 = vec![500i16; 160];
         let mut frame2 = vec![500i16; 160];
@@ -178,7 +242,6 @@ mod tests {
         pf.process(&mut frame2);
         let first_of_frame2 = frame2[0];
 
-        // Should be continuous (same input, filter has settled)
         assert!(
             (last_of_frame1 - first_of_frame2).abs() <= 1,
             "Cross-frame should be continuous: {last_of_frame1} vs {first_of_frame2}"

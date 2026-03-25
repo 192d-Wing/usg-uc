@@ -420,7 +420,7 @@ fn parse_headers_and_body(rest: &str) -> SipResult<(Headers, Option<Bytes>)> {
     // Parse body
     let body = body_section
         .filter(|b| !b.is_empty())
-        .map(|b| Bytes::from(b.to_string()));
+        .map(|b| Bytes::copy_from_slice(b.as_bytes()));
 
     // Validate Content-Length if present
     if let Some(expected) = headers.content_length() {

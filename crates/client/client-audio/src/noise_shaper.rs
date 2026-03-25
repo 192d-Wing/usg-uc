@@ -29,19 +29,27 @@
 
 use uc_codecs::{G711Alaw, G711Ulaw};
 
-/// Noise shaping filter coefficient.
-/// 0.5 gives NTF(z) = 1 - 0.5·z⁻¹:
-///   DC: |NTF| = 0.5 → -6.0 dB noise reduction
-///   Nyquist: |NTF| = 1.5 → +3.5 dB noise increase
-///
-/// Conservative choice; values up to 0.8 are possible but risk
-/// audible high-frequency noise on quiet passages.
-const NOISE_SHAPING_ALPHA: f32 = 0.5;
+/// Configuration for the encoder-side noise shaper.
+#[derive(Debug, Clone)]
+pub struct NoiseShaperConfig {
+    /// Noise shaping filter coefficient (0.0-0.8).
+    /// Higher values push more noise to high frequencies but risk audible HF noise.
+    pub alpha: f32,
+    /// Maximum absolute error feedback value. Prevents runaway divergence.
+    pub error_clamp: f32,
+}
 
-/// Maximum absolute value of accumulated error feedback.
-/// Prevents runaway if repeated clipping causes the error loop to diverge.
-/// Set to half the i16 range to leave headroom for the original signal.
-const ERROR_CLAMP: f32 = 16384.0;
+impl Default for NoiseShaperConfig {
+    fn default() -> Self {
+        Self {
+            // Reduced from 0.5 to 0.25: remote endpoints without a matching
+            // decoder postfilter hear the shaped HF noise as static. Lower
+            // alpha keeps noise shaping benefits while reducing HF artifacts.
+            alpha: 0.25,
+            error_clamp: 16384.0,
+        }
+    }
+}
 
 /// G.711 companding law for the noise shaper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,32 +73,37 @@ pub struct NoiseShaper {
     prev_error: f32,
     /// Whether the noise shaper is active.
     enabled: bool,
+    /// Configuration parameters.
+    cfg: NoiseShaperConfig,
 }
 
 impl NoiseShaper {
     /// Creates a new noise shaper for the given companding law.
-    pub const fn new(law: CompandingLaw) -> Self {
+    pub fn new(law: CompandingLaw) -> Self {
+        Self::with_config(law, NoiseShaperConfig::default())
+    }
+
+    /// Creates a noise shaper with custom configuration.
+    pub fn with_config(law: CompandingLaw, cfg: NoiseShaperConfig) -> Self {
         Self {
             law,
             prev_error: 0.0,
             enabled: true,
+            cfg,
         }
     }
 
     /// Creates a noise shaper that is enabled for G.711 codecs and disabled otherwise.
     ///
     /// Pass `None` for non-G.711 codecs; the shaper will be a no-op.
-    pub const fn new_optional(law: Option<CompandingLaw>) -> Self {
+    pub fn new_optional(law: Option<CompandingLaw>) -> Self {
         match law {
-            Some(law) => Self {
-                law,
-                prev_error: 0.0,
-                enabled: true,
-            },
+            Some(law) => Self::new(law),
             None => Self {
                 law: CompandingLaw::MuLaw,
                 prev_error: 0.0,
                 enabled: false,
+                cfg: NoiseShaperConfig::default(),
             },
         }
     }
@@ -125,7 +138,7 @@ impl NoiseShaper {
             let x = f32::from(*sample);
 
             // Add filtered error feedback: shaped = x + α * e[n-1]
-            let shaped = NOISE_SHAPING_ALPHA.mul_add(self.prev_error, x);
+            let shaped = self.cfg.alpha.mul_add(self.prev_error, x);
 
             // Clamp to i16 range before encoding
             let clamped = shaped.clamp(-32768.0, 32767.0) as i16;
@@ -146,7 +159,7 @@ impl NoiseShaper {
             let error = shaped - f32::from(decoded);
 
             // Clamp error to prevent runaway feedback
-            self.prev_error = error.clamp(-ERROR_CLAMP, ERROR_CLAMP);
+            self.prev_error = error.clamp(-self.cfg.error_clamp, self.cfg.error_clamp);
 
             // Output the shaped sample (codec will encode this identically)
             *sample = clamped;
@@ -223,7 +236,7 @@ mod tests {
 
         // Error should stay within bounds
         assert!(
-            ns.prev_error.abs() <= ERROR_CLAMP,
+            ns.prev_error.abs() <= NoiseShaperConfig::default().error_clamp,
             "Error should be clamped: got {}",
             ns.prev_error
         );

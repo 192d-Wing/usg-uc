@@ -41,7 +41,9 @@ pub mod offer_answer;
 pub mod session;
 pub mod srtp;
 
-pub use attribute::{Attribute, AttributeName, Direction};
+pub use attribute::{
+    Attribute, AttributeName, Direction, Extmap, ExtmapDirection, NegotiatedExtensions,
+};
 pub use error::{SdpError, SdpResult};
 pub use media::{MediaDescription, MediaType, TransportProtocol};
 pub use offer_answer::{

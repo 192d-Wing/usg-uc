@@ -28,8 +28,17 @@ ringbuf.workspace = true
 # WAV file loading for Music on Hold
 hound = "3.5"
 
+# macOS Voice Processing I/O (hardware AEC)
+[target.'cfg(target_os = "macos")'.dependencies]
+coreaudio-rs = "0.13"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+criterion.workspace = true
+
+[[bench]]
+name = "audio_hotpaths"
+harness = false
 
 [lints]
 workspace = true

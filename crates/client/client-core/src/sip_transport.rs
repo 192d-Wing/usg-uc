@@ -202,18 +202,17 @@ pub fn start_udp_receive_thread(
         loop {
             match socket.recv_from(&mut buf) {
                 Ok((n, source)) => {
-                    info!(source = %source, size = n, "UDP receive thread: received packet");
-                    let data = buf[..n].to_vec();
+                    debug!(source = %source, size = n, "UDP receive thread: received packet");
 
-                    match SipMessage::parse(&data) {
+                    match SipMessage::parse(&buf[..n]) {
                         Ok(message) => {
-                            info!(source = %source, "UDP receive thread: parsed SIP message");
+                            debug!(source = %source, "UDP receive thread: parsed SIP message");
                             let event = match message {
                                 SipMessage::Request(request) => {
                                     TransportEvent::RequestReceived { request, source }
                                 }
                                 SipMessage::Response(response) => {
-                                    info!(status = %response.status, "UDP receive thread: SIP response");
+                                    debug!(status = %response.status, "UDP receive thread: SIP response");
                                     TransportEvent::ResponseReceived { response, source }
                                 }
                             };
@@ -226,7 +225,7 @@ pub fn start_udp_receive_thread(
                         }
                         Err(e) => {
                             warn!(error = %e, source = %source, "UDP receive thread: parse error");
-                            if let Ok(raw) = std::str::from_utf8(&data) {
+                            if let Ok(raw) = std::str::from_utf8(&buf[..n]) {
                                 debug!(raw_message = %raw, "UDP receive thread: raw message");
                             }
                         }
@@ -282,19 +281,18 @@ pub async fn run_udp_receive_loop(socket: Arc<UdpSocket>, event_tx: mpsc::Sender
             // from a blocking thread context
             match socket_clone.try_recv_from(&mut buf) {
                 Ok((n, source)) => {
-                    info!(source = %source, size = n, "Received UDP packet (blocking thread)");
-                    let data = buf[..n].to_vec();
+                    debug!(source = %source, size = n, "Received UDP packet (blocking thread)");
 
-                    match SipMessage::parse(&data) {
+                    match SipMessage::parse(&buf[..n]) {
                         Ok(message) => {
-                            info!(source = %source, "Parsed SIP message via UDP");
+                            debug!(source = %source, "Parsed SIP message via UDP");
                             let event = match message {
                                 SipMessage::Request(request) => {
                                     debug!(method = %request.method, "Received SIP request via UDP");
                                     TransportEvent::RequestReceived { request, source }
                                 }
                                 SipMessage::Response(response) => {
-                                    info!(status = %response.status, "Received SIP response via UDP");
+                                    debug!(status = %response.status, "Received SIP response via UDP");
                                     TransportEvent::ResponseReceived { response, source }
                                 }
                             };
@@ -306,7 +304,7 @@ pub async fn run_udp_receive_loop(socket: Arc<UdpSocket>, event_tx: mpsc::Sender
                         }
                         Err(e) => {
                             warn!(error = %e, source = %source, "Failed to parse UDP SIP message");
-                            if let Ok(raw) = std::str::from_utf8(&data) {
+                            if let Ok(raw) = std::str::from_utf8(&buf[..n]) {
                                 debug!(raw_message = %raw, "Raw UDP message");
                             }
                         }
@@ -320,7 +318,7 @@ pub async fn run_udp_receive_loop(socket: Arc<UdpSocket>, event_tx: mpsc::Sender
                     std::thread::sleep(std::time::Duration::from_millis(10));
                     let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if count.is_multiple_of(500) {
-                        info!(poll_count = count, "UDP receive (blocking) still polling");
+                        debug!(poll_count = count, "UDP receive (blocking) still polling");
                     }
                 }
                 Err(e) => {
@@ -1680,7 +1678,7 @@ mod tests {
         let response = build_response_from_request(&request, StatusCode::RINGING, Some("xyz"));
 
         // Count Via headers - should have 2
-        let via_headers = response.headers.get_all(&HeaderName::Via);
+        let via_headers: Vec<_> = response.headers.get_all(&HeaderName::Via).collect();
         assert_eq!(via_headers.len(), 2);
 
         // Verify order preserved (proxy first, then client)

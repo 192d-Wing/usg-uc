@@ -39,6 +39,10 @@ pub struct AudioSessionConfig {
     pub dtmf_volume: u8,
     /// Inter-digit pause in milliseconds (default 100).
     pub dtmf_inter_digit_pause_ms: u32,
+    /// RFC 2198 redundancy payload type from SDP (`None` = disabled).
+    pub redundancy_pt: Option<u8>,
+    /// Negotiated RTP header extensions (id, URI) from SDP `a=extmap`.
+    pub extension_ids: Vec<(u8, String)>,
 }
 
 impl Default for AudioSessionConfig {
@@ -47,13 +51,15 @@ impl Default for AudioSessionConfig {
             local_port: 0,
             remote_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
             codec: CodecPreference::G711Ulaw,
-            jitter_buffer_ms: 60,
+            jitter_buffer_ms: 40,
             srtp_key: None,
             srtp_salt: None,
             moh_file_path: None,
             dtmf_payload_type: None,
             dtmf_volume: 10,
             dtmf_inter_digit_pause_ms: 100,
+            redundancy_pt: None,
+            extension_ids: Vec::new(),
         }
     }
 }
@@ -119,13 +125,15 @@ impl AudioSession {
             local_port: 0,
             remote_addr,
             codec,
-            jitter_buffer_ms: 60,
+            jitter_buffer_ms: 40,
             srtp_key: None,
             srtp_salt: None,
             moh_file_path: None,
             dtmf_payload_type: None,
             dtmf_volume: 10,
             dtmf_inter_digit_pause_ms: 100,
+            redundancy_pt: None,
+            extension_ids: Vec::new(),
         };
 
         self.start(config).await
@@ -156,6 +164,10 @@ impl AudioSession {
             dtmf_payload_type: config.dtmf_payload_type,
             dtmf_volume: config.dtmf_volume,
             dtmf_inter_digit_pause_ms: config.dtmf_inter_digit_pause_ms,
+            redundancy_pt: config.redundancy_pt,
+            echo_cancellation: true,
+            audio: Default::default(),
+            extension_ids: config.extension_ids,
         };
 
         // Start pipeline (sync — pipeline spawns its own threads)
@@ -418,7 +430,7 @@ mod tests {
     fn test_audio_session_config_default() {
         let config = AudioSessionConfig::default();
         assert_eq!(config.local_port, 0);
-        assert_eq!(config.jitter_buffer_ms, 60);
+        assert_eq!(config.jitter_buffer_ms, 40);
         assert_eq!(config.codec, CodecPreference::G711Ulaw);
     }
 

@@ -169,39 +169,38 @@ impl FromStr for ViaHeader {
         // Power of 10 Rule 5: Assert precondition
         debug_assert!(!s.is_empty(), "empty Via header string");
 
-        // Split into protocol part and rest
-        // Loop bound: splitn(2, ..) produces at most 2 elements
-        let parts: Vec<&str> = s.splitn(2, ' ').collect();
-        if parts.len() != 2 {
-            return Err(SipError::InvalidHeader {
-                name: "Via".to_string(),
-                reason: "missing sent-by".to_string(),
-            });
-        }
-
-        // Parse SIP/2.0/transport
-        // Loop bound: split('/') bounded by parts[0].len()
-        let proto_parts: Vec<&str> = parts[0].split('/').collect();
-        if proto_parts.len() != 3 {
-            return Err(SipError::InvalidHeader {
-                name: "Via".to_string(),
-                reason: "invalid protocol format".to_string(),
-            });
-        }
-
-        // Power of 10 Rule 5: Assert protocol parts
-        debug_assert_eq!(proto_parts.len(), 3, "protocol must have 3 parts");
-
-        let protocol = proto_parts[0].to_string();
-        let version = proto_parts[1].to_string();
-        let transport = proto_parts[2].to_uppercase();
-
-        // Parse sent-by and params
-        let rest_parts: Vec<&str> = parts[1].split(';').collect();
-        let sent_by = rest_parts.first().ok_or_else(|| SipError::InvalidHeader {
+        // Split into protocol part and rest (no Vec allocation)
+        let (proto_part, rest) = s.split_once(' ').ok_or_else(|| SipError::InvalidHeader {
             name: "Via".to_string(),
             reason: "missing sent-by".to_string(),
         })?;
+
+        // Parse SIP/2.0/transport via chained split_once (no Vec allocation)
+        let (protocol_str, remainder) =
+            proto_part
+                .split_once('/')
+                .ok_or_else(|| SipError::InvalidHeader {
+                    name: "Via".to_string(),
+                    reason: "invalid protocol format".to_string(),
+                })?;
+        let (version_str, transport_str) =
+            remainder
+                .split_once('/')
+                .ok_or_else(|| SipError::InvalidHeader {
+                    name: "Via".to_string(),
+                    reason: "invalid protocol format".to_string(),
+                })?;
+
+        let protocol = protocol_str.to_string();
+        let version = version_str.to_string();
+        let transport = transport_str.to_uppercase();
+
+        // Split sent-by from params (no Vec allocation)
+        let (sent_by, params_str) = if let Some((sb, ps)) = rest.split_once(';') {
+            (sb, Some(ps))
+        } else {
+            (rest, None)
+        };
 
         // Parse host:port
         let (host, port) = if let Some((h, p)) = sent_by.rsplit_once(':') {
@@ -222,22 +221,28 @@ impl FromStr for ViaHeader {
         let mut maddr = None;
         let mut params = HashMap::new();
 
-        for param in rest_parts.iter().skip(1) {
-            let (name, value) = if let Some((n, v)) = param.split_once('=') {
-                (n.trim().to_lowercase(), Some(v.trim().to_string()))
+        for param in params_str.into_iter().flat_map(|ps| ps.split(';')) {
+            // Split name=value without allocating; only allocate for the
+            // matched field or for unknown params that go into the HashMap.
+            let (raw_name, raw_value) = if let Some((n, v)) = param.split_once('=') {
+                (n.trim(), Some(v.trim()))
             } else {
-                (param.trim().to_lowercase(), None)
+                (param.trim(), None::<&str>)
             };
 
-            match name.as_str() {
-                "branch" => branch = value,
-                "received" => received = value,
-                "rport" => rport = value.and_then(|v| v.parse().ok()),
-                "ttl" => ttl = value.and_then(|v| v.parse().ok()),
-                "maddr" => maddr = value,
-                _ => {
-                    params.insert(name, value);
-                }
+            if raw_name.eq_ignore_ascii_case("branch") {
+                branch = raw_value.map(String::from);
+            } else if raw_name.eq_ignore_ascii_case("received") {
+                received = raw_value.map(String::from);
+            } else if raw_name.eq_ignore_ascii_case("rport") {
+                rport = raw_value.and_then(|v| v.parse().ok());
+            } else if raw_name.eq_ignore_ascii_case("ttl") {
+                ttl = raw_value.and_then(|v| v.parse().ok());
+            } else if raw_name.eq_ignore_ascii_case("maddr") {
+                maddr = raw_value.map(String::from);
+            } else {
+                // Only allocate for unknown params
+                params.insert(raw_name.to_lowercase(), raw_value.map(String::from));
             }
         }
 
@@ -340,25 +345,26 @@ impl fmt::Display for NameAddr {
 
 /// Parses a quoted display name from a name-addr string.
 fn parse_quoted_display_name(s: &str) -> SipResult<(String, &str)> {
-    let mut end = 1;
-    let chars: Vec<char> = s.chars().collect();
-    while end < chars.len() {
-        if chars[end] == '"' && (end == 0 || chars[end - 1] != '\\') {
+    // Scan for the closing quote using byte offsets. The delimiters ('"' and
+    // '\\') are ASCII so byte-level scanning is safe for UTF-8 strings.
+    let bytes = s.as_bytes();
+    let mut pos = 1;
+    while pos < bytes.len() {
+        if bytes[pos] == b'"' && (pos == 0 || bytes[pos - 1] != b'\\') {
             break;
         }
-        end += 1;
+        pos += 1;
     }
 
-    if end >= chars.len() {
+    if pos >= bytes.len() {
         return Err(SipError::InvalidHeader {
             name: "From/To".to_string(),
             reason: "unclosed display name quote".to_string(),
         });
     }
 
-    let name: String = chars[1..end].iter().collect();
-    let name = name.replace("\\\"", "\"");
-    Ok((name, &s[end + 1..]))
+    let name = s[1..pos].replace("\\\"", "\"");
+    Ok((name, &s[pos + 1..]))
 }
 
 /// Extracts display name and remaining string from a name-addr.
@@ -399,16 +405,17 @@ fn parse_nameaddr_params(params_str: &str) -> (Option<String>, HashMap<String, O
     let mut params = HashMap::new();
 
     for param in params_str.split(';').filter(|p| !p.is_empty()) {
-        let (name, value) = if let Some((n, v)) = param.split_once('=') {
-            (n.trim().to_lowercase(), Some(v.trim().to_string()))
+        let (raw_name, raw_value) = if let Some((n, v)) = param.split_once('=') {
+            (n.trim(), Some(v.trim()))
         } else {
-            (param.trim().to_lowercase(), None)
+            (param.trim(), None::<&str>)
         };
 
-        if name == "tag" {
-            tag = value;
+        if raw_name.eq_ignore_ascii_case("tag") {
+            tag = raw_value.map(String::from);
         } else {
-            params.insert(name, value);
+            // Only allocate for unknown params
+            params.insert(raw_name.to_lowercase(), raw_value.map(String::from));
         }
     }
 
@@ -474,19 +481,18 @@ impl FromStr for CSeqHeader {
         // Power of 10 Rule 5: Assert precondition
         debug_assert!(!s.is_empty(), "empty CSeq header string");
 
-        // Loop bound: split_whitespace bounded by s.len()
-        let parts: Vec<&str> = s.split_whitespace().collect();
-        if parts.len() != 2 {
-            return Err(SipError::InvalidHeader {
-                name: "CSeq".to_string(),
-                reason: "expected 'sequence method'".to_string(),
-            });
-        }
+        // Split into sequence and method (no Vec allocation)
+        let (seq_str, method_str) =
+            s.trim()
+                .split_once(char::is_whitespace)
+                .ok_or_else(|| SipError::InvalidHeader {
+                    name: "CSeq".to_string(),
+                    reason: "expected 'sequence method'".to_string(),
+                })?;
 
-        // Power of 10 Rule 5: Assert parts count
-        debug_assert_eq!(parts.len(), 2, "CSeq must have exactly 2 parts");
+        let method_str = method_str.trim_start();
 
-        let sequence: u32 = parts[0].parse().map_err(|_| SipError::InvalidHeader {
+        let sequence: u32 = seq_str.parse().map_err(|_| SipError::InvalidHeader {
             name: "CSeq".to_string(),
             reason: "invalid sequence number".to_string(),
         })?;
@@ -498,7 +504,7 @@ impl FromStr for CSeqHeader {
         );
 
         // Method parsing is infallible - unknown methods become Extension variants
-        let method: Method = parts[1]
+        let method: Method = method_str
             .parse()
             .unwrap_or_else(|e: std::convert::Infallible| match e {});
 

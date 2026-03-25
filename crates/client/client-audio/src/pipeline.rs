@@ -9,14 +9,21 @@
 //! The CPAL playback callback runs on a real-time OS thread and reads
 //! from the ring buffer lock-free. No tokio in the audio path.
 
+use crate::aec::{AecConfig, AecReference};
+use crate::audio_processing::{AgcConfig, NoiseGateConfig};
 use crate::codec::CodecPipeline;
+use crate::comfort_noise::ComfortNoiseConfig;
 use crate::decode_thread::{self, DecodeThreadConfig, DecodeThreadHandle};
 use crate::device::DeviceManager;
+use crate::drift_compensator::DriftConfig;
 use crate::file_source::FileAudioSource;
 use crate::io_thread::{self, IoThreadConfig, IoThreadHandle};
-use crate::jitter_buffer::SharedJitterBuffer;
+use crate::jitter_buffer::{JitterBufferConfig, SharedJitterBuffer};
+use crate::noise_shaper::NoiseShaperConfig;
+use crate::postfilter::PostfilterConfig;
 use crate::rtp_handler::{RtpReceiver, RtpStats, RtpTransmitter, generate_ssrc};
 use crate::stream::PlaybackStream;
+use crate::vad::VadConfig;
 use crate::{AudioError, AudioResult};
 use client_types::DtmfDigit;
 use client_types::audio::CodecPreference;
@@ -37,6 +44,143 @@ pub enum PipelineState {
     Running,
     /// Pipeline is stopping.
     Stopping,
+}
+
+/// Bundled configuration for all audio processing components.
+///
+/// Each sub-config has a `Default` impl matching the original hardcoded constants,
+/// so `AudioProcessingConfig::default()` produces identical behavior to before.
+/// Use named constructors like `low_latency()` or `bluetooth()` for presets.
+#[derive(Debug, Clone)]
+pub struct AudioProcessingConfig {
+    /// Automatic gain control settings.
+    pub agc: AgcConfig,
+    /// Noise gate settings.
+    pub noise_gate: NoiseGateConfig,
+    /// Voice activity detection settings.
+    pub vad: VadConfig,
+    /// Acoustic echo cancellation settings.
+    pub aec: AecConfig,
+    /// Encoder-side noise shaper settings (G.711 only).
+    pub noise_shaper: NoiseShaperConfig,
+    /// Decoder-side postfilter settings.
+    pub postfilter: PostfilterConfig,
+    /// Comfort noise generation settings.
+    pub comfort_noise: ComfortNoiseConfig,
+    /// Clock drift compensation settings.
+    pub drift: DriftConfig,
+    /// Jitter buffer adaptive algorithm settings.
+    pub jitter_buffer: JitterBufferConfig,
+}
+
+impl Default for AudioProcessingConfig {
+    fn default() -> Self {
+        Self {
+            agc: AgcConfig::default(),
+            noise_gate: NoiseGateConfig::default(),
+            vad: VadConfig::default(),
+            aec: AecConfig::default(),
+            noise_shaper: NoiseShaperConfig::default(),
+            postfilter: PostfilterConfig::default(),
+            comfort_noise: ComfortNoiseConfig::default(),
+            drift: DriftConfig::default(),
+            jitter_buffer: JitterBufferConfig::default(),
+        }
+    }
+}
+
+impl AudioProcessingConfig {
+    /// Preset for low-latency scenarios (e.g., headset, low-jitter network).
+    pub fn low_latency() -> Self {
+        Self {
+            drift: DriftConfig {
+                dead_zone_ms: 2.0,
+                ..DriftConfig::default()
+            },
+            jitter_buffer: JitterBufferConfig {
+                jitter_margin_ms: 10.0,
+                adapt_smoothing: 0.25,
+                ..JitterBufferConfig::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    /// Preset for Bluetooth HFP headsets (noisier input, higher thresholds).
+    pub fn bluetooth() -> Self {
+        Self {
+            agc: AgcConfig {
+                max_gain: 6.0,
+                ..AgcConfig::default()
+            },
+            noise_gate: NoiseGateConfig {
+                threshold: 200.0,
+                ..NoiseGateConfig::default()
+            },
+            vad: VadConfig {
+                speech_threshold_ratio: 3.0,
+                hangover_frames: 30,
+                ..VadConfig::default()
+            },
+            aec: AecConfig {
+                filter_length_ms: 64,
+                ..AecConfig::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    /// Preset for USB headsets (close-talking mic, short echo path).
+    pub fn usb_headset() -> Self {
+        Self {
+            agc: AgcConfig {
+                max_gain: 3.0,
+                ..AgcConfig::default()
+            },
+            noise_gate: NoiseGateConfig {
+                threshold: 100.0,
+                ..NoiseGateConfig::default()
+            },
+            aec: AecConfig {
+                filter_length_ms: 64,
+                ..AecConfig::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    /// Preset for conference speakerphones (long echo path, room noise).
+    pub fn speakerphone() -> Self {
+        Self {
+            noise_gate: NoiseGateConfig {
+                threshold: 250.0,
+                ..NoiseGateConfig::default()
+            },
+            vad: VadConfig {
+                speech_threshold_ratio: 3.5,
+                hangover_frames: 35,
+                ..VadConfig::default()
+            },
+            aec: AecConfig {
+                filter_length_ms: 256,
+                ..AecConfig::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    /// Returns the appropriate preset for a detected device category.
+    pub fn for_device_category(category: client_types::audio::DeviceCategory) -> Self {
+        use client_types::audio::DeviceCategory;
+        match category {
+            DeviceCategory::Bluetooth => Self::bluetooth(),
+            DeviceCategory::UsbHeadset => Self::usb_headset(),
+            DeviceCategory::Speakerphone => Self::speakerphone(),
+            DeviceCategory::BuiltInSpeaker
+            | DeviceCategory::BuiltInMic
+            | DeviceCategory::Unknown => Self::default(),
+        }
+    }
 }
 
 /// Configuration for the audio pipeline.
@@ -64,6 +208,18 @@ pub struct PipelineConfig {
     pub dtmf_volume: u8,
     /// Inter-digit pause in milliseconds (default 100).
     pub dtmf_inter_digit_pause_ms: u32,
+    /// RFC 2198 redundancy payload type from SDP (`None` = disabled).
+    pub redundancy_pt: Option<u8>,
+    /// Whether acoustic echo cancellation is enabled.
+    pub echo_cancellation: bool,
+    /// Audio processing component configuration.
+    pub audio: AudioProcessingConfig,
+    /// Negotiated RTP header extensions (id, URI) from SDP `a=extmap`.
+    ///
+    /// When non-empty, the RTP transmitter includes a one-byte extension
+    /// header in outgoing packets, and the receiver can interpret extension
+    /// elements in incoming packets.
+    pub extension_ids: Vec<(u8, String)>,
 }
 
 impl Default for PipelineConfig {
@@ -72,7 +228,7 @@ impl Default for PipelineConfig {
             codec: CodecPreference::G711Ulaw,
             local_port: 0, // Auto-assign
             remote_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
-            jitter_buffer_ms: 60,
+            jitter_buffer_ms: 40,
             srtp_master_key: None,
             srtp_master_salt: None,
             muted: false,
@@ -80,6 +236,10 @@ impl Default for PipelineConfig {
             dtmf_payload_type: None,
             dtmf_volume: 10,
             dtmf_inter_digit_pause_ms: 100,
+            redundancy_pt: None,
+            echo_cancellation: true,
+            audio: AudioProcessingConfig::default(),
+            extension_ids: Vec::new(),
         }
     }
 }
@@ -97,6 +257,93 @@ pub struct PipelineStats {
     pub capture_underruns: u64,
     /// Playback underruns (buffer empty).
     pub playback_underruns: u64,
+    /// Round-trip time in milliseconds (from RTCP).
+    pub rtt_ms: Option<f32>,
+    /// Active codec name.
+    pub codec_name: String,
+    /// Frames recovered via FEC (Opus inband FEC).
+    pub fec_recovered_frames: u64,
+    /// Frames generated by PLC (WSOLA concealment).
+    pub plc_generated_frames: u64,
+    /// Frames recovered via RFC 2198 redundancy.
+    pub redundancy_recovered_frames: u64,
+    /// DTMF events received from remote.
+    pub dtmf_events_received: u64,
+    /// DTMF events sent to remote.
+    pub dtmf_events_sent: u64,
+    /// Malformed DTMF packets (invalid event code, duration, or impossible jumps).
+    pub dtmf_malformed: u64,
+    /// Current AGC gain (linear, 1.0 = unity).
+    pub agc_current_gain: f32,
+    /// AEC ERLE estimate in dB (Echo Return Loss Enhancement).
+    pub aec_erle_db: f32,
+}
+
+/// Estimated call quality report derived from pipeline statistics.
+///
+/// Uses the E-model (ITU-T G.107 simplified) to estimate Mean Opinion Score (MOS).
+#[derive(Debug, Clone, Copy)]
+pub struct CallQualityReport {
+    /// Estimated MOS (1.0-4.5). Higher is better.
+    pub mos: f32,
+    /// Packet loss percentage (0.0-100.0).
+    pub loss_pct: f32,
+    /// Average jitter in milliseconds.
+    pub jitter_ms: f32,
+    /// Round-trip time in milliseconds.
+    pub rtt_ms: f32,
+}
+
+impl CallQualityReport {
+    /// Computes a quality report from pipeline statistics.
+    ///
+    /// Uses a simplified E-model: `R = 93.2 - Id - Ie`, where:
+    /// - `Id` accounts for delay (RTT/2 as one-way)
+    /// - `Ie` accounts for equipment impairment (loss + codec)
+    ///
+    /// R is then converted to MOS via the standard formula.
+    pub fn from_stats(stats: &PipelineStats) -> Self {
+        let total_expected = stats.jitter_stats.packets_played
+            + stats.jitter_stats.packets_lost;
+        #[allow(clippy::cast_precision_loss)]
+        let loss_pct = if total_expected > 0 {
+            (stats.jitter_stats.packets_lost as f64 / total_expected as f64 * 100.0) as f32
+        } else {
+            0.0
+        };
+
+        let jitter_ms = stats.jitter_stats.average_jitter_ms;
+        let rtt_ms = stats.rtt_ms.unwrap_or(0.0);
+
+        // Simplified E-model (ITU-T G.107/G.113)
+        let one_way_delay = rtt_ms / 2.0;
+        let id = if one_way_delay > 177.3 {
+            0.024 * one_way_delay + 0.11 * (one_way_delay - 177.3)
+        } else {
+            0.024 * one_way_delay
+        };
+        // Equipment impairment (G.113 Appendix I for G.711):
+        // Ie=0 (codec impairment), Bpl=25.1 (packet loss robustness)
+        // Ie_eff = Ie + (95 - Ie) * Ppl / (Ppl + Bpl)
+        let ie_eff = 95.0 * loss_pct / (loss_pct + 25.1);
+        let r = (93.2 - id - ie_eff).clamp(0.0, 100.0);
+
+        // R to MOS conversion (ITU-T G.107)
+        let mos = if r < 6.5 {
+            1.0
+        } else if r > 100.0 {
+            4.5
+        } else {
+            1.0 + 0.035 * r + r * (r - 60.0) * (100.0 - r) * 7e-6
+        };
+
+        Self {
+            mos,
+            loss_pct,
+            jitter_ms,
+            rtt_ms,
+        }
+    }
 }
 
 /// Audio pipeline coordinating the full audio path.
@@ -124,10 +371,15 @@ pub struct AudioPipeline {
     has_moh_audio: bool,
     /// Playback underrun counter shared with CPAL callback.
     playback_underruns: Option<Arc<AtomicU64>>,
+    /// Decode thread metrics (FEC, PLC, DTMF counters).
+    decode_metrics: Option<Arc<decode_thread::DecodeMetrics>>,
     /// Local RTP port (set after start).
     local_port: Option<u16>,
     /// SSRC being used for transmission.
     ssrc: Option<u32>,
+    /// Receiver for DTMF digits detected by the decode thread.
+    /// Wrapped in Mutex for Sync (needed by async Tauri command handlers).
+    dtmf_rx: Option<Mutex<std::sync::mpsc::Receiver<DtmfDigit>>>,
 }
 
 impl AudioPipeline {
@@ -144,8 +396,10 @@ impl AudioPipeline {
             moh_active: Arc::new(AtomicBool::new(false)),
             has_moh_audio: false,
             playback_underruns: None,
+            decode_metrics: None,
             local_port: None,
             ssrc: None,
+            dtmf_rx: None,
         }
     }
 
@@ -205,8 +459,12 @@ impl AudioPipeline {
         let socket = Arc::new(socket);
 
         // Create shared jitter buffer (used by I/O thread and decode thread)
-        let jitter_buffer =
-            SharedJitterBuffer::new(clock_rate, samples_per_frame, config.jitter_buffer_ms);
+        let jitter_buffer = SharedJitterBuffer::with_config(
+            clock_rate,
+            samples_per_frame,
+            config.jitter_buffer_ms,
+            config.audio.jitter_buffer.clone(),
+        );
 
         // Create transmitter
         let ssrc = generate_ssrc();
@@ -223,8 +481,34 @@ impl AudioPipeline {
             transmitter.set_dtmf_payload_type(pt);
         }
 
+        // Enable RFC 2198 redundancy if negotiated in SDP
+        if let Some(pt) = config.redundancy_pt {
+            transmitter.enable_redundancy(pt);
+        }
+
+        // Create shared DTMF queue for JB bypass
+        let dtmf_queue = crate::rtp_handler::SharedDtmfQueue::new();
+
         // Create receiver
         let mut receiver = RtpReceiver::new(socket, jitter_buffer.clone());
+
+        // Enable RFC 2198 redundancy reception if negotiated in SDP
+        if let Some(pt) = config.redundancy_pt {
+            receiver.set_redundancy_pt(pt);
+        }
+
+        // Set local SSRC on receiver for collision detection (RFC 3550 §8.2)
+        receiver.set_local_ssrc(ssrc);
+
+        // Enable DTMF JB bypass (telephone-event packets routed to dedicated queue)
+        let dtmf_pt = config.dtmf_payload_type.unwrap_or(crate::rtp_handler::DTMF_PAYLOAD_TYPE);
+        receiver.set_dtmf_bypass(dtmf_pt, dtmf_queue.clone());
+
+        // Set negotiated RTP header extensions on both transmitter and receiver
+        if !config.extension_ids.is_empty() {
+            transmitter.set_extension_map(config.extension_ids.clone());
+            receiver.set_extension_map(config.extension_ids.clone());
+        }
 
         // Set up SRTP if keys are provided
         if let (Some(key), Some(salt)) = (&config.srtp_master_key, &config.srtp_master_salt) {
@@ -250,7 +534,7 @@ impl AudioPipeline {
         }
 
         // Start capture stream
-        let capture = crate::stream::CaptureStream::new(&self.device_manager)?;
+        let capture = crate::stream::CaptureBackend::new(&self.device_manager)?;
         let capture_rate = capture.sample_rate();
 
         // Start playback stream and split off the producer
@@ -302,11 +586,36 @@ impl AudioPipeline {
         self.moh_active.store(false, Ordering::Relaxed);
         self.running.store(true, Ordering::Relaxed);
 
+        // Create AEC reference buffer (shared between decode and I/O threads).
+        // Skip software AEC when VPIO is active — the OS handles echo cancellation.
+        let using_vpio = capture.is_vpio();
+        let aec_ref = if config.echo_cancellation && !using_vpio {
+            let aec = AecReference::new(clock_rate, 300); // 300ms buffer
+            info!("AEC enabled: created reference buffer at {}Hz", clock_rate);
+            Some(aec)
+        } else {
+            if using_vpio {
+                info!("Software AEC disabled (VPIO hardware AEC active)");
+            }
+            None
+        };
+
+        // Create DTMF receive notification channel
+        let (dtmf_rx_tx, dtmf_rx_rx) = std::sync::mpsc::channel();
+
         // Spawn decode thread
         let decode_config = DecodeThreadConfig {
             codec: config.codec,
             device_rate,
+            dtmf_payload_type: config.dtmf_payload_type.unwrap_or(crate::rtp_handler::DTMF_PAYLOAD_TYPE),
+            aec_ref: aec_ref.clone(),
+            drift: config.audio.drift.clone(),
+            postfilter: config.audio.postfilter.clone(),
+            comfort_noise: config.audio.comfort_noise.clone(),
+            dtmf_rx_tx: Some(dtmf_rx_tx),
+            dtmf_queue: Some(dtmf_queue.clone()),
         };
+        let decode_metrics = decode_thread::DecodeMetrics::new();
         let decode_handle = decode_thread::spawn(
             decode_config,
             producer,
@@ -314,6 +623,7 @@ impl AudioPipeline {
             jitter_buffer,
             self.running.clone(),
             underrun_counter.clone(),
+            decode_metrics.clone(),
         );
 
         // Create RTCP socket (bound to any available port)
@@ -344,6 +654,13 @@ impl AudioPipeline {
             local_ssrc: ssrc,
             dtmf_volume: config.dtmf_volume,
             dtmf_inter_digit_pause_ms: config.dtmf_inter_digit_pause_ms,
+            aec_ref,
+            agc: config.audio.agc,
+            noise_gate: config.audio.noise_gate,
+            vad: config.audio.vad,
+            aec: config.audio.aec,
+            noise_shaper: config.audio.noise_shaper,
+            enable_dtx: false, // Disabled: most SIP providers don't handle DTX gaps well
         };
         // Give the I/O thread a sender to the decode thread so it can
         // trigger a playback stream refresh after input device switches
@@ -366,9 +683,11 @@ impl AudioPipeline {
         self.decode_thread = Some(decode_handle);
         self.io_thread = Some(io_handle);
         self.playback_underruns = Some(underrun_counter);
+        self.decode_metrics = Some(decode_metrics);
         self.has_moh_audio = has_moh;
         self.local_port = Some(local_port);
         self.ssrc = Some(ssrc);
+        self.dtmf_rx = Some(Mutex::new(dtmf_rx_rx));
 
         self.state = PipelineState::Running;
         info!("Audio pipeline started on port {}", local_port);
@@ -403,6 +722,7 @@ impl AudioPipeline {
 
         self.has_moh_audio = false;
         self.playback_underruns = None;
+        self.decode_metrics = None;
         self.local_port = None;
         self.ssrc = None;
 
@@ -451,6 +771,18 @@ impl AudioPipeline {
         debug!("MOH active: {}", active);
     }
 
+    /// Drains all received DTMF digits from the decode thread.
+    ///
+    /// Returns an iterator of `DtmfDigit` values. Call this periodically
+    /// (e.g., from a timer or event loop) to process incoming DTMF events.
+    pub fn drain_received_dtmf(&self) -> Vec<DtmfDigit> {
+        self.dtmf_rx
+            .as_ref()
+            .and_then(|m| m.lock().ok())
+            .map(|rx| rx.try_iter().collect())
+            .unwrap_or_default()
+    }
+
     /// Returns whether Music on Hold is currently active.
     pub fn is_moh_active(&self) -> bool {
         self.moh_active.load(Ordering::Relaxed)
@@ -480,6 +812,13 @@ impl AudioPipeline {
         // Merge in the CPAL callback underrun count
         if let Some(ref counter) = self.playback_underruns {
             stats.playback_underruns = counter.load(Ordering::Relaxed);
+        }
+        // Merge decode-thread metrics
+        if let Some(ref m) = self.decode_metrics {
+            stats.fec_recovered_frames = m.fec_recovered.load(Ordering::Relaxed);
+            stats.plc_generated_frames = m.plc_generated.load(Ordering::Relaxed);
+            stats.dtmf_events_received = m.dtmf_received.load(Ordering::Relaxed);
+            stats.dtmf_malformed = m.dtmf_malformed.load(Ordering::Relaxed);
         }
         stats
     }
@@ -653,7 +992,7 @@ mod tests {
     fn test_pipeline_config_default() {
         let config = PipelineConfig::default();
         assert_eq!(config.codec, CodecPreference::G711Ulaw);
-        assert_eq!(config.jitter_buffer_ms, 60);
+        assert_eq!(config.jitter_buffer_ms, 40);
         assert!(!config.muted);
     }
 
@@ -681,5 +1020,65 @@ mod tests {
         let stats = PipelineStats::default();
         assert_eq!(stats.capture_underruns, 0);
         assert_eq!(stats.playback_underruns, 0);
+        assert_eq!(stats.fec_recovered_frames, 0);
+        assert_eq!(stats.plc_generated_frames, 0);
+        assert_eq!(stats.dtmf_events_received, 0);
+        assert_eq!(stats.dtmf_events_sent, 0);
+    }
+
+    #[test]
+    fn test_call_quality_report_perfect() {
+        // No loss, no jitter, no RTT → near-perfect MOS
+        let stats = PipelineStats {
+            jitter_stats: crate::jitter_buffer::JitterBufferStats {
+                packets_played: 1000,
+                packets_lost: 0,
+                average_jitter_ms: 0.0,
+                ..Default::default()
+            },
+            rtt_ms: Some(20.0),
+            ..Default::default()
+        };
+        let report = CallQualityReport::from_stats(&stats);
+        assert!(
+            report.mos > 4.0,
+            "Perfect conditions should give MOS > 4.0, got {}",
+            report.mos
+        );
+        assert!(report.loss_pct < 0.01);
+    }
+
+    #[test]
+    fn test_call_quality_report_lossy() {
+        // 10% loss → degraded MOS
+        let stats = PipelineStats {
+            jitter_stats: crate::jitter_buffer::JitterBufferStats {
+                packets_played: 900,
+                packets_lost: 100,
+                average_jitter_ms: 30.0,
+                ..Default::default()
+            },
+            rtt_ms: Some(100.0),
+            ..Default::default()
+        };
+        let report = CallQualityReport::from_stats(&stats);
+        assert!(
+            report.mos < 3.5,
+            "10% loss should degrade MOS below 3.5, got {}",
+            report.mos
+        );
+        assert!((report.loss_pct - 10.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_audio_processing_config_presets() {
+        let default = AudioProcessingConfig::default();
+        let low_lat = AudioProcessingConfig::low_latency();
+        let bt = AudioProcessingConfig::bluetooth();
+
+        // Low-latency should have tighter dead zone
+        assert!(low_lat.drift.dead_zone_ms < default.drift.dead_zone_ms);
+        // Bluetooth should have higher noise gate threshold
+        assert!(bt.noise_gate.threshold > default.noise_gate.threshold);
     }
 }

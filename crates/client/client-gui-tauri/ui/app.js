@@ -239,6 +239,7 @@ const listen = (...args) => getTauriApi().listen(...args);
 let currentTab = 'dialer';
 let contacts = [];
 let callActive = false;
+let currentCallId = null;
 let callDurationInterval = null;
 let callStartTime = null;
 let isMuted = false;
@@ -593,9 +594,27 @@ async function initializeEventListeners() {
 function handleCallStateChange(payload) {
     const { call_id, state, remote_uri, remote_display_name } = payload;
 
+    if (state === 'Dialing' || state === 'dialing' || state === 'EarlyMedia' || state === 'early_media') {
+        // Track the active call so we ignore stale events from prior calls
+        currentCallId = call_id;
+        // Play ringback tone during dialing/early media (BulkVS sends 183
+        // instead of 180, so we start ringback on either state)
+        if (!ringbackTone.isPlaying) {
+            ringbackTone.start();
+        }
+    }
+
+    // Ignore state changes for a different call than the one we're tracking
+    if (currentCallId && call_id !== currentCallId) {
+        console.log(`Ignoring stale event for call ${call_id} (current: ${currentCallId})`);
+        return;
+    }
+
     if (state === 'Ringing' || state === 'ringing') {
         // Play ringback tone while waiting for answer
-        ringbackTone.start();
+        if (!ringbackTone.isPlaying) {
+            ringbackTone.start();
+        }
     } else if (state === 'Connected' || state === 'connected') {
         // Stop ringback tone when call is answered
         ringbackTone.stop();
@@ -607,6 +626,7 @@ function handleCallStateChange(payload) {
     } else if (state === 'Terminated' || state === 'terminated') {
         // Stop ringback tone when call ends
         ringbackTone.stop();
+        currentCallId = null;
         endCall();
     } else if (state === 'OnHold' || state === 'on_hold') {
         isOnHold = true;
@@ -1299,6 +1319,8 @@ async function makeCall(target) {
         console.log('Invoking make_call with:', sipUri);
         const result = await invoke('make_call', { target: sipUri });
         console.log('Call initiated:', result);
+        currentCallId = result; // Track call ID to ignore stale events from prior calls
+        ringbackTone.start(); // Start ringback immediately (user gesture context)
         startCall(target);
     } catch (error) {
         console.error('Failed to make call:', error);
@@ -1383,6 +1405,7 @@ function updateCallDuration() {
 function endCall() {
     callActive = false;
     callStartTime = null;
+    currentCallId = null;
     isMuted = false;
     isOnHold = false;
     incomingCallId = null;

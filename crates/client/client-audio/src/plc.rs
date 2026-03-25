@@ -37,6 +37,10 @@ pub struct PacketLossConcealer {
     consecutive_losses: u32,
     /// Frame size in samples (e.g., 160 for G.711 at 8 kHz).
     frame_size: usize,
+    /// Reusable f32 scratch buffer for LPC synthesis output.
+    synth_scratch: Vec<f32>,
+    /// Reusable i16 scratch buffer for concealment result.
+    result_scratch: Vec<i16>,
 }
 
 impl PacketLossConcealer {
@@ -47,6 +51,8 @@ impl PacketLossConcealer {
             filter_state: vec![0.0; LPC_ORDER],
             consecutive_losses: 0,
             frame_size,
+            synth_scratch: vec![0.0; frame_size],
+            result_scratch: vec![0i16; frame_size],
         }
     }
 
@@ -69,38 +75,45 @@ impl PacketLossConcealer {
     /// Generates a concealment frame to replace a lost packet.
     ///
     /// Returns a buffer of `frame_size` samples.
-    pub fn conceal(&mut self) -> Vec<i16> {
+    pub fn conceal(&mut self) -> &[i16] {
         self.consecutive_losses += 1;
 
         if self.consecutive_losses > MAX_CONCEAL_FRAMES {
             // Too many consecutive losses — output silence to avoid
             // extended robotic artifacts.
             self.filter_state.fill(0.0);
-            return vec![0i16; self.frame_size];
+            self.result_scratch[..self.frame_size].fill(0);
+            return &self.result_scratch[..self.frame_size];
         }
 
         // Compute LPC coefficients from history
         let coeffs = levinson_durbin(&self.history);
 
         // Synthesize replacement frame using LPC all-pole filter
-        let mut output = vec![0.0f32; self.frame_size];
-        synthesize(&coeffs, &mut self.filter_state, &mut output);
+        self.synth_scratch[..self.frame_size].fill(0.0);
+        synthesize(
+            &coeffs,
+            &mut self.filter_state,
+            &mut self.synth_scratch[..self.frame_size],
+        );
 
         // Apply progressive attenuation: energy decays with each
         // consecutive loss so long bursts fade naturally.
         let attenuation = attenuation_factor(self.consecutive_losses);
 
-        let mut result = vec![0i16; self.frame_size];
         #[allow(clippy::cast_possible_truncation)]
-        for (i, &s) in output.iter().enumerate() {
-            result[i] = (s * attenuation).clamp(-32768.0, 32767.0) as i16;
+        for i in 0..self.frame_size {
+            self.result_scratch[i] =
+                (self.synth_scratch[i] * attenuation).clamp(-32768.0, 32767.0) as i16;
         }
 
+        let result = &self.result_scratch[..self.frame_size];
+
         // Update filter state for potential next concealment frame
-        update_filter_state(&mut self.filter_state, &result);
+        update_filter_state(&mut self.filter_state, result);
 
         // Update history so consecutive concealments chain smoothly
-        self.history.copy_from_slice(&result);
+        self.history.copy_from_slice(result);
 
         result
     }

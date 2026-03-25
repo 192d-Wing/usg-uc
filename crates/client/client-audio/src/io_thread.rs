@@ -7,18 +7,19 @@
 //! it receives RTP packets from the socket and pushes them into the
 //! shared jitter buffer for the decode thread.
 
-use crate::audio_processing::AudioProcessor;
+use crate::aec::{AecConfig, AecProcessor, AecReference};
+use crate::audio_processing::{AgcConfig, AudioProcessor, NoiseGateConfig};
 use crate::codec::CodecPipeline;
 use crate::comfort_noise::encode_cn_payload;
 use crate::decode_thread::DecodeCommand;
 use crate::dtmf_sender::DtmfSender;
 use crate::file_source::FileAudioSource;
+use crate::noise_shaper::{CompandingLaw, NoiseShaper, NoiseShaperConfig};
 use crate::pipeline::{PipelineStats, resample_into};
 use crate::rtcp_session::RtcpSession;
 use crate::rtp_handler::{RtpReceiver, RtpTransmitter};
-use crate::stream::CaptureStream;
-use crate::noise_shaper::{CompandingLaw, NoiseShaper};
-use crate::vad::{VadDecision, VoiceActivityDetector};
+use crate::stream::CaptureBackend;
+use crate::vad::{VadConfig, VadDecision, VoiceActivityDetector};
 use client_types::{CodecPreference, DtmfDigit};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -115,6 +116,23 @@ pub struct IoThreadConfig {
     pub dtmf_volume: u8,
     /// Inter-digit pause in milliseconds (default 100).
     pub dtmf_inter_digit_pause_ms: u32,
+    /// AEC far-end reference buffer (shared with decode thread).
+    /// When present, an `AecProcessor` is created to cancel echo on captured audio.
+    pub aec_ref: Option<Arc<AecReference>>,
+    /// AGC configuration.
+    pub agc: AgcConfig,
+    /// Noise gate configuration.
+    pub noise_gate: NoiseGateConfig,
+    /// VAD configuration.
+    pub vad: VadConfig,
+    /// AEC configuration.
+    pub aec: AecConfig,
+    /// Noise shaper configuration.
+    pub noise_shaper: NoiseShaperConfig,
+    /// Enable discontinuous transmission (DTX / silence suppression).
+    /// When false, RTP is sent continuously even during silence.
+    /// Disable for providers that don't handle DTX gaps well (e.g., BulkVS).
+    pub enable_dtx: bool,
 }
 
 /// Spawns the I/O thread.
@@ -134,7 +152,7 @@ pub fn spawn(
     config: IoThreadConfig,
     transmitter: RtpTransmitter,
     receiver: RtpReceiver,
-    capture: CaptureStream,
+    capture: CaptureBackend,
     moh_source: Option<FileAudioSource>,
     muted: Arc<AtomicBool>,
     moh_active: Arc<AtomicBool>,
@@ -191,7 +209,7 @@ fn io_loop(
     config: IoThreadConfig,
     mut transmitter: RtpTransmitter,
     mut receiver: RtpReceiver,
-    mut capture: CaptureStream,
+    mut capture: CaptureBackend,
     mut moh_source: Option<FileAudioSource>,
     muted: Arc<AtomicBool>,
     moh_active: Arc<AtomicBool>,
@@ -210,7 +228,13 @@ fn io_loop(
     };
 
     let codec_clock_rate = codec.clock_rate();
+    let codec_name = codec.name().to_string();
     let codec_samples = codec.samples_per_frame();
+
+    // Store codec name in shared stats (constant for the call duration)
+    if let Ok(mut s) = stats.lock() {
+        s.codec_name = codec_name.clone();
+    }
     let mut capture_rate = config.capture_rate;
     // Number of samples per frame at the capture device rate
     #[allow(clippy::cast_possible_truncation)]
@@ -229,9 +253,9 @@ fn io_loop(
     );
 
     // Audio processing (AGC + noise gate) for capture path
-    let mut audio_processor = AudioProcessor::new();
+    let mut audio_processor = AudioProcessor::with_config(config.agc, config.noise_gate);
     // Voice activity detection for discontinuous transmission
-    let mut vad = VoiceActivityDetector::new();
+    let mut vad = VoiceActivityDetector::with_config(config.vad);
 
     // Encoder-side noise shaping (G.711 Appendix III)
     let noise_shaper_law = match config.codec {
@@ -239,7 +263,10 @@ fn io_loop(
         CodecPreference::G711Alaw => Some(CompandingLaw::ALaw),
         _ => None,
     };
-    let mut noise_shaper = NoiseShaper::new_optional(noise_shaper_law);
+    let mut noise_shaper = match noise_shaper_law {
+        Some(law) => NoiseShaper::with_config(law, config.noise_shaper),
+        None => NoiseShaper::new_optional(None),
+    };
 
     // RTCP session (optional — created if RTCP socket is provided)
     let mut rtcp_session =
@@ -248,11 +275,23 @@ fn io_loop(
             .zip(config.rtcp_remote_addr)
             .map(|(socket, remote_addr)| {
                 let cname = format!("usg-uc-{}", config.local_ssrc);
-                RtcpSession::new(socket, remote_addr, config.local_ssrc, cname)
+                RtcpSession::new(socket, remote_addr, config.local_ssrc, codec_clock_rate, cname)
             });
 
-    // Non-blocking DTMF sender state machine
-    let mut dtmf_sender = DtmfSender::new(config.dtmf_volume, u64::from(config.dtmf_inter_digit_pause_ms));
+    // Acoustic echo cancellation (AEC) processor
+    let aec_cfg = config.aec;
+    let mut aec = config.aec_ref.map(|aec_ref| {
+        info!("AEC enabled: creating NLMS processor at {codec_clock_rate}Hz");
+        AecProcessor::with_config(codec_clock_rate, aec_ref, aec_cfg)
+    });
+
+    // Non-blocking DTMF sender state machine (dual-send: RFC 4733 + in-band)
+    let mut dtmf_sender = DtmfSender::new(
+        config.dtmf_volume,
+        u64::from(config.dtmf_inter_digit_pause_ms),
+        codec_clock_rate,
+        codec_samples,
+    );
 
     // Pre-allocated scratch buffers — reused every frame to avoid heap allocs.
     let mut capture_pcm = vec![0i16; capture_device_samples];
@@ -261,12 +300,13 @@ fn io_loop(
 
     let mut last_capture = Instant::now();
     let mut stats_update_counter: u32 = 0;
+    let mut dtmf_sent_count: u64 = 0;
 
-    // Pending input device switch: CaptureStream creation runs on a
+    // Pending input device switch: CaptureBackend creation runs on a
     // background thread so the I/O loop continues receiving RTP.
-    // Without this, the 200-500ms CaptureStream::new() call blocks RTP
+    // Without this, the 200-500ms CaptureBackend::new() call blocks RTP
     // reception, draining the jitter buffer and causing robotic playback.
-    let mut pending_capture_rx: Option<mpsc::Receiver<Result<CaptureStream, String>>> = None;
+    let mut pending_capture_rx: Option<mpsc::Receiver<Result<CaptureBackend, String>>> = None;
 
     // DTX warmup: always send RTP for the first few seconds of a call.
     // Bluetooth HFP profile negotiation can take 3-8 seconds, during which
@@ -298,6 +338,37 @@ fn io_loop(
             }
         }
 
+        // SSRC collision handling (RFC 3550 §8.2): if the receiver
+        // detected that the remote's SSRC matches our local SSRC,
+        // regenerate ours so both sides have unique identifiers.
+        if receiver.ssrc_collision_detected() {
+            let new_ssrc = crate::rtp_handler::generate_ssrc();
+            transmitter.change_ssrc(new_ssrc);
+            receiver.set_local_ssrc(new_ssrc);
+            receiver.clear_ssrc_collision();
+            if let Some(ref mut rtcp) = rtcp_session {
+                rtcp.set_local_ssrc(new_ssrc);
+            }
+            warn!("SSRC collision resolved: new local SSRC={:#010x}", new_ssrc);
+        }
+
+        // 1b. Auto-recover from capture device disappearance (USB/Bluetooth disconnect).
+        //     If the CPAL error callback fired, initiate an async switch to the default
+        //     device. Skip if a switch is already in progress.
+        if capture.has_error() && pending_capture_rx.is_none() {
+            warn!("I/O thread: capture device error detected, switching to default input");
+            let (tx, rx) = mpsc::channel();
+            thread::Builder::new()
+                .name("capture-recovery".to_string())
+                .spawn(move || {
+                    let dm = crate::device::DeviceManager::new();
+                    let result = CaptureBackend::new(&dm).map_err(|e| e.to_string());
+                    let _ = tx.send(result);
+                })
+                .ok();
+            pending_capture_rx = Some(rx);
+        }
+
         // 2. Capture and send audio at frame intervals.
         //    Uses additive timing to maintain exact cadence (e.g., every 20ms)
         //    regardless of processing time or recv_timeout jitter.
@@ -322,9 +393,15 @@ fn io_loop(
             if current_moh {
                 // Music on Hold mode
                 process_moh_frame(&mut codec, &mut transmitter, &mut moh_source, &mut moh_pcm);
-            } else if !muted.load(Ordering::Relaxed) && !dtmf_sender.is_inband_active() {
+            } else if dtmf_sender.is_sending_tone() {
+                // Suppress mic capture during active DTMF tone/packets, but
+                // NOT during inter-digit pause — normal mic audio resumes
+                // between digits (matches pjproject behavior).
+                trace!("Mic suppressed: DTMF tone active");
+            } else if !muted.load(Ordering::Relaxed) {
                 // Normal capture mode
-                let in_warmup = dtx_warmup_start.elapsed() < dtx_warmup_duration;
+                let in_warmup = !config.enable_dtx
+                    || dtx_warmup_start.elapsed() < dtx_warmup_duration;
                 let (samples_read, max_amp, dtx, noise_floor) = process_capture_frame(
                     &mut codec,
                     &mut transmitter,
@@ -332,6 +409,7 @@ fn io_loop(
                     &mut audio_processor,
                     &mut vad,
                     &mut noise_shaper,
+                    &mut aec,
                     &mut capture_pcm,
                     &mut codec_pcm_buf,
                     &stats,
@@ -367,7 +445,9 @@ fn io_loop(
         if let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 IoCommand::Dtmf(dtmf_cmd) => {
-                    if !dtmf_sender.enqueue(dtmf_cmd) {
+                    if dtmf_sender.enqueue(dtmf_cmd) {
+                        dtmf_sent_count += 1;
+                    } else {
                         warn!("DTMF digit dropped (queue full)");
                     }
                 }
@@ -376,7 +456,7 @@ fn io_loop(
                         "I/O thread: switching input device to {:?} (async)",
                         device_name
                     );
-                    // Spawn CaptureStream creation on a background thread so
+                    // Spawn CaptureBackend creation on a background thread so
                     // the I/O loop keeps receiving RTP during the switch.
                     let (tx, rx) = mpsc::channel();
                     thread::Builder::new()
@@ -384,7 +464,7 @@ fn io_loop(
                         .spawn(move || {
                             let mut dm = crate::device::DeviceManager::new();
                             dm.set_input_device(device_name);
-                            let result = CaptureStream::new(&dm).map_err(|e| e.to_string());
+                            let result = CaptureBackend::new(&dm).map_err(|e| e.to_string());
                             let _ = tx.send(result);
                         })
                         .ok();
@@ -451,32 +531,46 @@ fn io_loop(
             }
         }
 
-        // 4. RTCP: send periodic Sender/Receiver Reports
+        // 4. RTCP: receive incoming SR and send periodic SR/RR reports
         if let Some(ref mut rtcp) = rtcp_session {
+            // Receive incoming RTCP (non-blocking, parses SR for DLSR/RTT)
+            rtcp.try_receive();
             // Propagate remote SSRC learned from received RTP packets
             if let Some(remote_ssrc) = receiver.remote_ssrc() {
                 rtcp.set_remote_ssrc(remote_ssrc);
             }
+            // Feed RTCP RTT measurement to jitter buffer for adaptive depth
+            if let Some(rtt) = rtcp.rtt_ms() {
+                receiver.set_rtt_hint_ms(rtt);
+            }
             let tx = transmitter.stats();
-            let rx = receiver.stats();
             let jb = receiver.jitter_buffer_stats();
-            rtcp.maybe_send_report(&tx, &rx, &jb);
+            rtcp.maybe_send_report(&tx, &jb);
         }
 
         // 5. Periodically update shared stats
         stats_update_counter += 1;
         if stats_update_counter >= 100 {
             stats_update_counter = 0;
-            update_stats(&transmitter, &receiver, &stats);
+            update_stats(&transmitter, &receiver, &rtcp_session, &stats);
+            // Merge I/O-thread-local metrics into shared stats
+            if let Ok(mut s) = stats.lock() {
+                s.dtmf_events_sent = dtmf_sent_count;
+                s.agc_current_gain = audio_processor.current_gain();
+                if let Some(ref aec_proc) = aec {
+                    s.aec_erle_db = aec_proc.erle_db();
+                }
+            }
         }
 
         // 6. Diagnostic logging every ~2 seconds
         if diag_timer.elapsed() >= Duration::from_secs(2) {
             let tx_stats = transmitter.stats();
+            let aec_erle = aec.as_ref().map_or(0.0, |a| a.erle_db());
             info!(
                 "IO diag: frames_captured={}, underruns={}, dtx={}, last_read={}/{}, \
                  max_amp={}, tx_pkts={}, rx_pkts={}, jb_depth={}ms, \
-                 muted={}, moh={}",
+                 muted={}, moh={}, aec_erle={:.1}dB",
                 diag_frames_captured,
                 diag_capture_underruns,
                 diag_dtx_frames,
@@ -488,6 +582,7 @@ fn io_loop(
                 receiver.jitter_buffer_stats().current_depth_ms,
                 muted.load(Ordering::Relaxed),
                 moh_active.load(Ordering::Relaxed),
+                aec_erle,
             );
             diag_max_amplitude = 0;
             diag_dtx_frames = 0;
@@ -495,8 +590,11 @@ fn io_loop(
         }
     }
 
+    // Flush any in-progress DTMF (forced end-bit) before teardown
+    dtmf_sender.flush(&mut transmitter);
+
     // Final stats update on exit
-    update_stats(&transmitter, &receiver, &stats);
+    update_stats(&transmitter, &receiver, &rtcp_session, &stats);
     capture.stop();
     debug!("I/O thread cleanup complete");
 }
@@ -512,10 +610,11 @@ fn io_loop(
 fn process_capture_frame(
     codec: &mut CodecPipeline,
     transmitter: &mut RtpTransmitter,
-    capture: &mut CaptureStream,
+    capture: &mut CaptureBackend,
     audio_processor: &mut AudioProcessor,
     vad: &mut VoiceActivityDetector,
     noise_shaper: &mut NoiseShaper,
+    aec: &mut Option<AecProcessor>,
     device_pcm: &mut [i16],
     codec_pcm_buf: &mut [i16],
     stats: &Arc<Mutex<PipelineStats>>,
@@ -562,6 +661,12 @@ fn process_capture_frame(
         resample_into(device_pcm, codec_pcm_buf, 0);
         codec_pcm_buf
     };
+
+    // AEC: remove echo from captured audio at codec rate.
+    // The reference signal (decoded far-end) is pushed by the decode thread.
+    if let Some(aec_proc) = aec {
+        aec_proc.process(codec_pcm);
+    }
 
     // Noise shaping (G.711 only — reshapes quantization noise before encoding)
     noise_shaper.process(codec_pcm);
@@ -618,12 +723,14 @@ fn process_moh_frame(
 fn update_stats(
     transmitter: &RtpTransmitter,
     receiver: &RtpReceiver,
+    rtcp_session: &Option<RtcpSession>,
     stats: &Arc<Mutex<PipelineStats>>,
 ) {
     if let Ok(mut s) = stats.lock() {
         s.tx_stats = transmitter.stats();
         s.rx_stats = receiver.stats();
         s.jitter_stats = receiver.jitter_buffer_stats();
+        s.rtt_ms = rtcp_session.as_ref().and_then(RtcpSession::rtt_ms);
     }
 }
 

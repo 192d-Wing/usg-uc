@@ -22,6 +22,14 @@
 
 use std::f64::consts::PI;
 
+#[cfg(target_arch = "aarch64")]
+use core::arch::aarch64::{vaddvq_f32, vfmaq_f32, vld1q_f32, vmulq_f32};
+#[cfg(target_arch = "x86_64")]
+use core::arch::x86_64::{
+    _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_loadu_ps, _mm_movehl_ps, _mm_mul_ps,
+    _mm_shuffle_ps,
+};
+
 /// Number of filter taps per polyphase sub-filter.
 /// 16 taps with 6 phases = 96 total taps, achieving ~50 dB stopband
 /// attenuation. Cost: 16 multiply-adds per output sample (negligible).
@@ -42,14 +50,23 @@ const FRAC_HALF_TAPS: usize = 8;
 /// Maintains internal state (input history) for seamless cross-frame
 /// filtering. Create one instance per audio session and call
 /// [`process`](SincResampler::process) for each frame.
+///
+/// Uses a double-length circular buffer for history: each new sample is
+/// written at two positions, so `history[pos..pos+16]` is always a
+/// contiguous view. This replaces the previous `copy_within` shift
+/// (60 bytes/sample → 8 bytes/sample).
 pub struct SincResampler {
     /// Upsampling ratio (e.g., 6 for 8kHz to 48kHz).
     ratio: usize,
     /// Polyphase sub-filter coefficients: `phases[p][k]` is the k-th tap
     /// of the p-th polyphase sub-filter.
     phases: Vec<[f32; TAPS_PER_PHASE]>,
-    /// Input sample history buffer (newest at index 0).
-    history: [f32; TAPS_PER_PHASE],
+    /// Double-length circular history buffer. Reading at `pos` gives a
+    /// contiguous `TAPS_PER_PHASE`-element view (newest at offset 0).
+    history: [f32; TAPS_PER_PHASE * 2],
+    /// Current write position; decrements on each new sample, wraps to
+    /// `TAPS_PER_PHASE - 1` when it underflows.
+    pos: usize,
 }
 
 impl SincResampler {
@@ -60,8 +77,35 @@ impl SincResampler {
         Self {
             ratio,
             phases,
-            history: [0.0; TAPS_PER_PHASE],
+            history: [0.0; TAPS_PER_PHASE * 2],
+            pos: 0,
         }
+    }
+
+    /// Returns a reference to the current history view (contiguous 16-element slice).
+    ///
+    /// # Safety
+    /// `self.pos` is always in `[0, TAPS_PER_PHASE)`, so `pos..pos+TAPS_PER_PHASE`
+    /// is always within the 32-element double buffer.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    fn history_view(&self) -> &[f32; TAPS_PER_PHASE] {
+        // SAFETY: pos is maintained in [0, TAPS_PER_PHASE) by wrapping logic,
+        // so pos + TAPS_PER_PHASE <= 2 * TAPS_PER_PHASE = history.len().
+        // The array is contiguous f32 with proper alignment.
+        unsafe { &*(self.history.as_ptr().add(self.pos).cast::<[f32; TAPS_PER_PHASE]>()) }
+    }
+
+    /// Inserts a new sample into the circular history buffer.
+    #[inline(always)]
+    fn push_sample(&mut self, sample: f32) {
+        self.pos = if self.pos == 0 {
+            TAPS_PER_PHASE - 1
+        } else {
+            self.pos - 1
+        };
+        self.history[self.pos] = sample;
+        self.history[self.pos + TAPS_PER_PHASE] = sample;
     }
 
     /// Resamples the input, producing exactly `input.len() * ratio` output samples.
@@ -73,16 +117,12 @@ impl SincResampler {
         let mut output = Vec::with_capacity(output_len);
 
         for &sample in input {
-            // Shift history right by 1 and insert new sample at [0]
-            self.history.copy_within(0..TAPS_PER_PHASE - 1, 1);
-            self.history[0] = f32::from(sample);
+            self.push_sample(f32::from(sample));
+            let hist = self.history_view();
 
-            // Compute each polyphase output
+            // Compute each polyphase output (SIMD-accelerated dot product)
             for phase in &self.phases {
-                let mut sum = 0.0f32;
-                for (k, &coeff) in phase.iter().enumerate() {
-                    sum = self.history[k].mul_add(coeff, sum);
-                }
+                let sum = dot_product_16(hist, phase);
                 output.push(sum.round().clamp(-32768.0, 32767.0) as i16);
             }
         }
@@ -119,29 +159,26 @@ impl SincResampler {
     #[allow(clippy::cast_possible_truncation)]
     pub fn process_into(&mut self, input: &[i16], output: &mut [i16]) {
         let output_len = output.len();
-        let mut pos = 0;
+        let mut out_pos = 0;
 
         for &sample in input {
-            self.history.copy_within(0..TAPS_PER_PHASE - 1, 1);
-            self.history[0] = f32::from(sample);
+            self.push_sample(f32::from(sample));
+            let hist = self.history_view();
 
             for phase in &self.phases {
-                if pos >= output_len {
+                if out_pos >= output_len {
                     return;
                 }
-                let mut sum = 0.0f32;
-                for (k, &coeff) in phase.iter().enumerate() {
-                    sum = self.history[k].mul_add(coeff, sum);
-                }
-                output[pos] = sum.round().clamp(-32768.0, 32767.0) as i16;
-                pos += 1;
+                let sum = dot_product_16(hist, phase);
+                output[out_pos] = sum.round().clamp(-32768.0, 32767.0) as i16;
+                out_pos += 1;
             }
         }
 
         // If output is longer than nominal, extend with last sample
-        if pos < output_len {
-            let last = if pos > 0 { output[pos - 1] } else { 0 };
-            output[pos..].fill(last);
+        if out_pos < output_len {
+            let last = if out_pos > 0 { output[out_pos - 1] } else { 0 };
+            output[out_pos..].fill(last);
         }
     }
 
@@ -171,32 +208,153 @@ pub struct FractionalSincResampler {
     ratio: f64,
     /// Input-domain advance per output sample (1/ratio).
     step: f64,
-    /// Input sample history buffer (newest at index 0, oldest at end).
-    /// Size = 2 * `FRAC_HALF_TAPS` + 1, giving `FRAC_HALF_TAPS` taps on
-    /// each side of the kernel center for full symmetric support.
+    /// Double-length circular history buffer. `history[pos..pos+FRAC_HIST_SIZE]`
+    /// is always a contiguous view (newest at offset 0).
     history: Vec<f32>,
+    /// Current write position; decrements on each new sample.
+    hist_pos: usize,
     /// Fractional position within the current input sample interval.
     /// Range: [0, 1). When phase < 1.0, output samples are produced.
     phase: f64,
-    /// Pre-computed 1/I0(beta) for Kaiser window evaluation.
-    inv_bessel: f64,
+    /// Pre-computed Kaiser window LUT (replaces per-tap `bessel_i0()` calls).
+    kaiser_lut: KaiserLut,
+    /// Pre-computed sinc LUT (replaces per-tap `sin()` + division).
+    sinc_lut: SincLut,
 }
 
 /// History buffer size for fractional resampler: enough for a symmetric
 /// kernel with `FRAC_HALF_TAPS` taps on each side, plus the center.
 const FRAC_HIST_SIZE: usize = 2 * FRAC_HALF_TAPS + 1;
 
+/// Number of intervals in the Kaiser window lookup table.
+/// 1024 intervals gives linear interpolation error < 10⁻⁶ — inaudible.
+const KAISER_LUT_INTERVALS: usize = 1024;
+
+/// Number of intervals in the sinc function lookup table.
+/// 2048 intervals over [0, `FRAC_HALF_TAPS`] gives step ≈ 0.004,
+/// with interpolation error < 3×10⁻⁵ at the steepest point (x≈0).
+const SINC_LUT_INTERVALS: usize = 2048;
+
+/// Pre-computed Kaiser window lookup table.
+///
+/// Maps normalized distance `|x/half| ∈ [0, 1]` to
+/// `I₀(β·√(1-u²)) / I₀(β)` via linear interpolation.
+/// Eliminates per-tap `bessel_i0()` calls (~25 iterations each).
+struct KaiserLut {
+    table: Vec<f64>,
+}
+
+impl KaiserLut {
+    /// Builds a Kaiser window LUT for the given beta parameter.
+    #[allow(clippy::cast_precision_loss)]
+    fn new(beta: f64) -> Self {
+        let inv_i0_beta = 1.0 / bessel_i0(beta);
+        let size = KAISER_LUT_INTERVALS + 1;
+        let mut table = Vec::with_capacity(size);
+        for i in 0..size {
+            let u = i as f64 / KAISER_LUT_INTERVALS as f64;
+            let arg = (1.0 - u * u).max(0.0).sqrt();
+            table.push(bessel_i0(beta * arg) * inv_i0_beta);
+        }
+        Self { table }
+    }
+
+    /// Evaluates the Kaiser window at normalized position `u_abs = |x/half|`.
+    ///
+    /// Returns 0.0 for `u_abs >= 1.0` (outside the window).
+    #[inline]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
+    fn evaluate(&self, u_abs: f64) -> f64 {
+        if u_abs >= 1.0 {
+            return 0.0;
+        }
+        let pos = u_abs * KAISER_LUT_INTERVALS as f64;
+        let idx = pos as usize;
+        let frac = pos - idx as f64;
+        self.table[idx].mul_add(1.0 - frac, self.table[idx + 1] * frac)
+    }
+}
+
+/// Pre-computed sinc function lookup table.
+///
+/// Maps `|x| ∈ [0, FRAC_HALF_TAPS]` to `sin(πx)/(πx)` via linear
+/// interpolation. Eliminates per-tap `sin()` + division.
+struct SincLut {
+    table: Vec<f64>,
+    /// Reciprocal of the step size for fast index computation.
+    inv_step: f64,
+}
+
+impl SincLut {
+    /// Builds a sinc LUT covering `[0, max_x]`.
+    #[allow(clippy::cast_precision_loss)]
+    fn new(max_x: f64) -> Self {
+        let size = SINC_LUT_INTERVALS + 1;
+        let step = max_x / SINC_LUT_INTERVALS as f64;
+        let mut table = Vec::with_capacity(size);
+        for i in 0..size {
+            let x = i as f64 * step;
+            table.push(if x < 1e-10 {
+                1.0
+            } else {
+                (PI * x).sin() / (PI * x)
+            });
+        }
+        Self {
+            table,
+            inv_step: 1.0 / step,
+        }
+    }
+
+    /// Evaluates `sinc(|x|) = sin(π|x|)/(π|x|)`.
+    ///
+    /// Returns 0.0 for values beyond the table range.
+    #[inline]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn evaluate(&self, x_abs: f64) -> f64 {
+        let pos = x_abs * self.inv_step;
+        let idx = pos as usize;
+        if idx >= SINC_LUT_INTERVALS {
+            return 0.0;
+        }
+        let frac = pos - idx as f64;
+        self.table[idx].mul_add(1.0 - frac, self.table[idx + 1] * frac)
+    }
+}
+
 impl FractionalSincResampler {
     /// Creates a new fractional sinc resampler for the given rate pair.
+    ///
+    /// Pre-computes Kaiser window and sinc LUTs (~25 KB total) to avoid
+    /// per-sample transcendental function evaluation in the inner loop.
+    #[allow(clippy::cast_precision_loss)]
     pub fn new(input_rate: u32, output_rate: u32) -> Self {
         let ratio = f64::from(output_rate) / f64::from(input_rate);
         Self {
             ratio,
             step: 1.0 / ratio,
-            history: vec![0.0; FRAC_HIST_SIZE],
+            history: vec![0.0; FRAC_HIST_SIZE * 2],
+            hist_pos: 0,
             phase: 0.0,
-            inv_bessel: 1.0 / bessel_i0(KAISER_BETA),
+            kaiser_lut: KaiserLut::new(KAISER_BETA),
+            sinc_lut: SincLut::new(FRAC_HALF_TAPS as f64),
         }
+    }
+
+    /// Inserts a new sample into the fractional resampler's circular history.
+    #[inline]
+    fn push_sample(&mut self, sample: f32) {
+        self.hist_pos = if self.hist_pos == 0 {
+            FRAC_HIST_SIZE - 1
+        } else {
+            self.hist_pos - 1
+        };
+        self.history[self.hist_pos] = sample;
+        self.history[self.hist_pos + FRAC_HIST_SIZE] = sample;
     }
 
     /// Resamples the input, producing approximately `input.len() * ratio` output samples.
@@ -235,21 +393,17 @@ impl FractionalSincResampler {
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     fn process_inner(&mut self, input: &[i16], output_len: usize) -> Vec<i16> {
         let half = FRAC_HALF_TAPS as f64;
+        let inv_half = 1.0 / half;
         let mut output = Vec::with_capacity(output_len);
 
         for &sample in input {
-            // Shift history right by 1 and insert new sample at [0]
-            // (newest at index 0, oldest at index FRAC_HIST_SIZE-1)
-            self.history.copy_within(0..FRAC_HIST_SIZE - 1, 1);
-            self.history[0] = f32::from(sample);
+            self.push_sample(f32::from(sample));
 
             // Produce output samples while within current input interval
             while self.phase < 1.0 && output.len() < output_len {
                 // Kernel center in history coordinates.
                 // phase=0 → center at FRAC_HALF_TAPS (8 taps of "future" history ahead)
                 // phase→1 → center at FRAC_HALF_TAPS-1 (approaching next input sample)
-                // This ensures the output advances forward in time as phase increases,
-                // with FRAC_HALF_TAPS taps on each side for full kernel support.
                 let center_pos = half - self.phase;
 
                 let mut sum = 0.0f64;
@@ -257,21 +411,16 @@ impl FractionalSincResampler {
 
                 for k in 0..FRAC_HIST_SIZE {
                     let x = k as f64 - center_pos;
-                    if x.abs() > half {
+                    let x_abs = x.abs();
+                    if x_abs > half {
                         continue;
                     }
 
-                    let sinc_val = if x.abs() < 1e-10 {
-                        1.0
-                    } else {
-                        (PI * x).sin() / (PI * x)
-                    };
-
-                    let arg = (x / half).mul_add(-(x / half), 1.0).max(0.0).sqrt();
-                    let win = bessel_i0(KAISER_BETA * arg) * self.inv_bessel;
+                    let sinc_val = self.sinc_lut.evaluate(x_abs);
+                    let win = self.kaiser_lut.evaluate(x_abs * inv_half);
 
                     let coeff = sinc_val * win;
-                    sum += f64::from(self.history[k]) * coeff;
+                    sum += f64::from(self.history[self.hist_pos + k]) * coeff;
                     coeff_sum += coeff;
                 }
 
@@ -303,12 +452,12 @@ impl FractionalSincResampler {
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     fn process_inner_into(&mut self, input: &[i16], output: &mut [i16]) {
         let half = FRAC_HALF_TAPS as f64;
+        let inv_half = 1.0 / half;
         let output_len = output.len();
         let mut out_pos = 0;
 
         for &sample in input {
-            self.history.copy_within(0..FRAC_HIST_SIZE - 1, 1);
-            self.history[0] = f32::from(sample);
+            self.push_sample(f32::from(sample));
 
             while self.phase < 1.0 && out_pos < output_len {
                 let center_pos = half - self.phase;
@@ -318,21 +467,16 @@ impl FractionalSincResampler {
 
                 for k in 0..FRAC_HIST_SIZE {
                     let x = k as f64 - center_pos;
-                    if x.abs() > half {
+                    let x_abs = x.abs();
+                    if x_abs > half {
                         continue;
                     }
 
-                    let sinc_val = if x.abs() < 1e-10 {
-                        1.0
-                    } else {
-                        (PI * x).sin() / (PI * x)
-                    };
-
-                    let arg = (x / half).mul_add(-(x / half), 1.0).max(0.0).sqrt();
-                    let win = bessel_i0(KAISER_BETA * arg) * self.inv_bessel;
+                    let sinc_val = self.sinc_lut.evaluate(x_abs);
+                    let win = self.kaiser_lut.evaluate(x_abs * inv_half);
 
                     let coeff = sinc_val * win;
-                    sum += f64::from(self.history[k]) * coeff;
+                    sum += f64::from(self.history[self.hist_pos + k]) * coeff;
                     coeff_sum += coeff;
                 }
 
@@ -534,9 +678,167 @@ fn bessel_i0(x: f64) -> f64 {
     sum
 }
 
+// ─── SIMD-accelerated dot product ─────────────────────────────────────
+
+/// Computes the dot product of `history[0..16]` and `coeffs[0..16]`.
+///
+/// Dispatches to NEON (aarch64), SSE2 (x86_64), or scalar fallback.
+#[inline(always)]
+fn dot_product_16(history: &[f32; TAPS_PER_PHASE], coeffs: &[f32; TAPS_PER_PHASE]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        dot_product_16_neon(history, coeffs)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        dot_product_16_sse2(history, coeffs)
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        dot_product_16_scalar(history, coeffs)
+    }
+}
+
+/// NEON-accelerated 16-element f32 dot product.
+///
+/// NEON is mandatory on all aarch64 targets (ARMv8-A baseline).
+/// Uses `vfmaq_f32` fused multiply-add and `vaddvq_f32` horizontal sum.
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_code)]
+#[inline(always)]
+fn dot_product_16_neon(history: &[f32; TAPS_PER_PHASE], coeffs: &[f32; TAPS_PER_PHASE]) -> f32 {
+    // SAFETY: NEON is always available on aarch64. vld1q_f32 supports
+    // unaligned loads. Arrays are exactly 16 elements so all loads are in-bounds.
+    unsafe {
+        let h0 = vld1q_f32(history.as_ptr());
+        let h1 = vld1q_f32(history.as_ptr().add(4));
+        let h2 = vld1q_f32(history.as_ptr().add(8));
+        let h3 = vld1q_f32(history.as_ptr().add(12));
+
+        let c0 = vld1q_f32(coeffs.as_ptr());
+        let c1 = vld1q_f32(coeffs.as_ptr().add(4));
+        let c2 = vld1q_f32(coeffs.as_ptr().add(8));
+        let c3 = vld1q_f32(coeffs.as_ptr().add(12));
+
+        let mut acc = vmulq_f32(h0, c0);
+        acc = vfmaq_f32(acc, h1, c1);
+        acc = vfmaq_f32(acc, h2, c2);
+        acc = vfmaq_f32(acc, h3, c3);
+
+        vaddvq_f32(acc)
+    }
+}
+
+/// SSE2-accelerated 16-element f32 dot product.
+///
+/// SSE2 is mandatory on all x86_64 targets (AMD64 baseline).
+/// Uses `_mm_mul_ps` + `_mm_add_ps` (no FMA requirement).
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)]
+#[inline(always)]
+fn dot_product_16_sse2(history: &[f32; TAPS_PER_PHASE], coeffs: &[f32; TAPS_PER_PHASE]) -> f32 {
+    // SAFETY: SSE2 is always available on x86_64. _mm_loadu_ps supports
+    // unaligned loads. Arrays are exactly 16 elements so all loads are in-bounds.
+    unsafe {
+        let h0 = _mm_loadu_ps(history.as_ptr());
+        let h1 = _mm_loadu_ps(history.as_ptr().add(4));
+        let h2 = _mm_loadu_ps(history.as_ptr().add(8));
+        let h3 = _mm_loadu_ps(history.as_ptr().add(12));
+
+        let c0 = _mm_loadu_ps(coeffs.as_ptr());
+        let c1 = _mm_loadu_ps(coeffs.as_ptr().add(4));
+        let c2 = _mm_loadu_ps(coeffs.as_ptr().add(8));
+        let c3 = _mm_loadu_ps(coeffs.as_ptr().add(12));
+
+        let mut acc = _mm_mul_ps(h0, c0);
+        acc = _mm_add_ps(acc, _mm_mul_ps(h1, c1));
+        acc = _mm_add_ps(acc, _mm_mul_ps(h2, c2));
+        acc = _mm_add_ps(acc, _mm_mul_ps(h3, c3));
+
+        // Horizontal sum: [a, b, c, d] → a+b+c+d
+        let hi = _mm_movehl_ps(acc, acc); // [c, d, c, d]
+        let sum01 = _mm_add_ps(acc, hi); // [a+c, b+d, ?, ?]
+        let shuf = _mm_shuffle_ps(sum01, sum01, 1); // [b+d, ?, ?, ?]
+        let total = _mm_add_ss(sum01, shuf); // [a+b+c+d, ?, ?, ?]
+
+        _mm_cvtss_f32(total)
+    }
+}
+
+/// Scalar fallback using 4-lane accumulation order for consistency with SIMD paths.
+#[cfg(any(
+    not(any(target_arch = "aarch64", target_arch = "x86_64")),
+    test
+))]
+fn dot_product_16_scalar(history: &[f32; TAPS_PER_PHASE], coeffs: &[f32; TAPS_PER_PHASE]) -> f32 {
+    let mut acc0 = history[0] * coeffs[0];
+    let mut acc1 = history[1] * coeffs[1];
+    let mut acc2 = history[2] * coeffs[2];
+    let mut acc3 = history[3] * coeffs[3];
+
+    acc0 = history[4].mul_add(coeffs[4], acc0);
+    acc1 = history[5].mul_add(coeffs[5], acc1);
+    acc2 = history[6].mul_add(coeffs[6], acc2);
+    acc3 = history[7].mul_add(coeffs[7], acc3);
+
+    acc0 = history[8].mul_add(coeffs[8], acc0);
+    acc1 = history[9].mul_add(coeffs[9], acc1);
+    acc2 = history[10].mul_add(coeffs[10], acc2);
+    acc3 = history[11].mul_add(coeffs[11], acc3);
+
+    acc0 = history[12].mul_add(coeffs[12], acc0);
+    acc1 = history[13].mul_add(coeffs[13], acc1);
+    acc2 = history[14].mul_add(coeffs[14], acc2);
+    acc3 = history[15].mul_add(coeffs[15], acc3);
+
+    (acc0 + acc2) + (acc1 + acc3)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── SIMD dot product tests ───────────────────────────────────
+
+    #[test]
+    fn test_dot_product_16_known_values() {
+        let history = [1.0f32; TAPS_PER_PHASE];
+        let coeffs = [2.0f32; TAPS_PER_PHASE];
+        let result = dot_product_16(&history, &coeffs);
+        assert!(
+            (result - 32.0).abs() < 1e-5,
+            "1.0 * 2.0 * 16 = 32.0, got {result}"
+        );
+    }
+
+    #[test]
+    fn test_dot_product_16_matches_scalar() {
+        let mut history = [0.0f32; TAPS_PER_PHASE];
+        let mut coeffs = [0.0f32; TAPS_PER_PHASE];
+        #[allow(clippy::cast_precision_loss)]
+        for i in 0..TAPS_PER_PHASE {
+            history[i] = (i as f32 * 1234.5) - 8000.0;
+            coeffs[i] = (i as f32 * 0.0625) - 0.5;
+        }
+
+        let simd_result = dot_product_16(&history, &coeffs);
+        let scalar_result = dot_product_16_scalar(&history, &coeffs);
+
+        assert!(
+            (simd_result - scalar_result).abs() < 1.0,
+            "SIMD={simd_result}, scalar={scalar_result}"
+        );
+    }
+
+    #[test]
+    fn test_dot_product_16_zeros() {
+        let history = [0.0f32; TAPS_PER_PHASE];
+        let coeffs = [1.0f32; TAPS_PER_PHASE];
+        let result = dot_product_16(&history, &coeffs);
+        assert!(result.abs() < 1e-10, "Zero input should produce zero: {result}");
+    }
 
     // ─── Integer polyphase tests ───────────────────────────────────
 

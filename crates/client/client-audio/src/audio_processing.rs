@@ -10,37 +10,53 @@
 //! Microphone → [Noise Gate] → [AGC] → Encoder
 //! ```
 
-/// Target RMS level in linear scale (approximately -18 dBFS).
-/// This is a comfortable speech level for `VoIP`.
-const AGC_TARGET_RMS: f32 = 4096.0;
+/// Configuration for the AGC (Automatic Gain Control).
+#[derive(Debug, Clone)]
+pub struct AgcConfig {
+    /// Target RMS level in linear scale (approximately -18 dBFS).
+    pub target_rms: f32,
+    /// Maximum gain (12 dB = 4x). Prevents boosting background noise.
+    pub max_gain: f32,
+    /// Minimum gain (-6 dB = 0.5x). Prevents clipping on loud input.
+    pub min_gain: f32,
+    /// Attack coefficient: how quickly gain decreases (0.0-1.0, higher = faster).
+    pub attack: f32,
+    /// Release coefficient: how quickly gain increases (0.0-1.0, higher = faster).
+    pub release: f32,
+}
 
-/// Maximum gain the AGC will apply (12 dB = 4x).
-/// Prevents boosting background noise excessively.
-const AGC_MAX_GAIN: f32 = 4.0;
+impl Default for AgcConfig {
+    fn default() -> Self {
+        Self {
+            target_rms: 4096.0,
+            max_gain: 4.0,
+            min_gain: 0.5,
+            attack: 0.3,
+            release: 0.05,
+        }
+    }
+}
 
-/// Minimum gain (prevents clipping on loud input, -6 dB = 0.5x).
-const AGC_MIN_GAIN: f32 = 0.5;
+/// Configuration for the noise gate.
+#[derive(Debug, Clone)]
+pub struct NoiseGateConfig {
+    /// RMS threshold below which frames are gated. ~-50 dBFS.
+    pub threshold: f32,
+    /// Frames the gate stays open after speech stops (5 frames × 20ms = 100ms).
+    pub hold_frames: u32,
+    /// Fade-out length in samples when closing. Prevents clicks.
+    pub fade_samples: usize,
+}
 
-/// AGC attack time constant: how quickly gain decreases when signal
-/// is too loud. Faster attack prevents clipping. Expressed as a
-/// smoothing factor per frame (0.0-1.0, higher = faster).
-const AGC_ATTACK: f32 = 0.3;
-
-/// AGC release time constant: how quickly gain increases when signal
-/// is too quiet. Slower release sounds more natural.
-const AGC_RELEASE: f32 = 0.05;
-
-/// Noise gate threshold (RMS). Frames below this are considered
-/// silence/noise and are zeroed. ~-50 dBFS.
-const NOISE_GATE_THRESHOLD: f32 = 100.0;
-
-/// Number of frames the gate stays open after speech stops.
-/// Prevents cutting off word tails (5 frames × 20ms = 100ms hold).
-const NOISE_GATE_HOLD_FRAMES: u32 = 5;
-
-/// Noise gate fade-out length in samples when closing.
-/// Prevents clicks from abrupt silence transitions.
-const NOISE_GATE_FADE_SAMPLES: usize = 80;
+impl Default for NoiseGateConfig {
+    fn default() -> Self {
+        Self {
+            threshold: 100.0,
+            hold_frames: 5,
+            fade_samples: 80,
+        }
+    }
+}
 
 /// Audio processing pipeline for the capture path.
 #[derive(Debug)]
@@ -55,6 +71,10 @@ pub struct AudioProcessor {
     gate_open: bool,
     /// Frames remaining in gate hold period.
     gate_hold_counter: u32,
+    /// AGC configuration.
+    agc: AgcConfig,
+    /// Noise gate configuration.
+    gate: NoiseGateConfig,
 }
 
 impl Default for AudioProcessor {
@@ -65,13 +85,20 @@ impl Default for AudioProcessor {
 
 impl AudioProcessor {
     /// Creates a new audio processor with both AGC and noise gate enabled.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
+        Self::with_config(AgcConfig::default(), NoiseGateConfig::default())
+    }
+
+    /// Creates an audio processor with custom configuration.
+    pub fn with_config(agc: AgcConfig, gate: NoiseGateConfig) -> Self {
         Self {
             agc_enabled: true,
             noise_gate_enabled: true,
             current_gain: 1.0,
             gate_open: false,
             gate_hold_counter: 0,
+            agc,
+            gate,
         }
     }
 
@@ -141,21 +168,22 @@ impl AudioProcessor {
 
     /// Applies the noise gate to a frame.
     fn apply_noise_gate(&mut self, pcm: &mut [i16], rms: f32) {
-        if rms > NOISE_GATE_THRESHOLD {
+        if rms > self.gate.threshold {
             // Signal above threshold → open gate
             self.gate_open = true;
-            self.gate_hold_counter = NOISE_GATE_HOLD_FRAMES;
+            self.gate_hold_counter = self.gate.hold_frames;
         } else if self.gate_hold_counter > 0 {
             // In hold period → keep gate open
             self.gate_hold_counter -= 1;
         } else if self.gate_open {
             // Hold period expired → close gate with fade-out
             self.gate_open = false;
-            let fade_len = NOISE_GATE_FADE_SAMPLES.min(pcm.len());
+            let fade_len = self.gate.fade_samples.min(pcm.len());
             #[allow(clippy::cast_precision_loss)]
+            let inv_fade_len = 1.0 / fade_len as f32;
             for (i, sample) in pcm.iter_mut().enumerate() {
                 if i < fade_len {
-                    let t = 1.0 - (i as f32 / fade_len as f32);
+                    let t = 1.0 - (i as f32 * inv_fade_len);
                     *sample = apply_gain(*sample, t);
                 } else {
                     *sample = 0;
@@ -173,22 +201,22 @@ impl AudioProcessor {
     /// Applies automatic gain control to a frame.
     fn apply_agc(&mut self, pcm: &mut [i16], rms: f32) {
         // Don't adjust on very quiet frames (noise floor)
-        if rms < NOISE_GATE_THRESHOLD * 2.0 {
+        if rms < self.gate.threshold * 2.0 {
             return;
         }
 
         // Compute desired gain to reach target RMS
-        let desired_gain = (AGC_TARGET_RMS / rms).clamp(AGC_MIN_GAIN, AGC_MAX_GAIN);
+        let desired_gain = (self.agc.target_rms / rms).clamp(self.agc.min_gain, self.agc.max_gain);
 
         // Smooth the gain transition (attack/release)
         let alpha = if desired_gain < self.current_gain {
-            AGC_ATTACK // Reducing gain (loud signal) → fast
+            self.agc.attack // Reducing gain (loud signal) → fast
         } else {
-            AGC_RELEASE // Increasing gain (quiet signal) → slow
+            self.agc.release // Increasing gain (quiet signal) → slow
         };
 
         self.current_gain += (desired_gain - self.current_gain) * alpha;
-        self.current_gain = self.current_gain.clamp(AGC_MIN_GAIN, AGC_MAX_GAIN);
+        self.current_gain = self.current_gain.clamp(self.agc.min_gain, self.agc.max_gain);
 
         // Apply gain to all samples
         for sample in pcm.iter_mut() {
@@ -303,15 +331,17 @@ mod tests {
     #[test]
     fn test_agc_gain_clamped() {
         let proc = AudioProcessor::new();
+        let cfg = AgcConfig::default();
         // Initial gain should be within bounds
-        assert!(proc.current_gain() >= AGC_MIN_GAIN);
-        assert!(proc.current_gain() <= AGC_MAX_GAIN);
+        assert!(proc.current_gain() >= cfg.min_gain);
+        assert!(proc.current_gain() <= cfg.max_gain);
     }
 
     #[test]
     fn test_noise_gate_hold() {
         let mut proc = AudioProcessor::new();
         proc.set_agc_enabled(false); // Isolate gate behavior
+        let hold_frames = proc.gate.hold_frames;
 
         // First: open the gate with a loud frame
         let mut loud = vec![5000i16; 160];
@@ -319,11 +349,11 @@ mod tests {
         assert!(proc.gate_open);
 
         // Then: send quiet frames — gate should hold open for HOLD_FRAMES
-        for i in 0..NOISE_GATE_HOLD_FRAMES {
+        for i in 0..hold_frames {
             let mut quiet = vec![1i16; 160];
             proc.process(&mut quiet);
             assert!(
-                proc.gate_open || i == NOISE_GATE_HOLD_FRAMES - 1,
+                proc.gate_open || i == hold_frames - 1,
                 "Gate should hold open at frame {i}"
             );
         }

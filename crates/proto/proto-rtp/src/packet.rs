@@ -50,7 +50,7 @@ fn parse_extension_header(
 
     if data.len() < header_size + 4 {
         return Err(RtpError::InvalidExtension {
-            reason: "extension header too short".to_string(),
+            reason: "extension header too short",
         });
     }
 
@@ -60,7 +60,7 @@ fn parse_extension_header(
 
     if data.len() < header_size + 4 + length {
         return Err(RtpError::InvalidExtension {
-            reason: "extension data too short".to_string(),
+            reason: "extension data too short",
         });
     }
 
@@ -144,6 +144,24 @@ impl RtpHeader {
         self
     }
 
+    /// Sets the extension header. Automatically sets the extension flag.
+    #[must_use]
+    pub fn with_extension(mut self, ext: ExtensionHeader) -> Self {
+        self.extension = true;
+        self.extension_header = Some(ext);
+        self
+    }
+
+    /// Convenience: builds a one-byte extension header from elements and sets it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any element ID is outside 1-14 or data length > 16.
+    pub fn with_one_byte_extensions(self, elements: &[ExtensionElement]) -> RtpResult<Self> {
+        let ext = ExtensionHeader::build_one_byte(elements)?;
+        Ok(self.with_extension(ext))
+    }
+
     /// Returns the header size in bytes.
     #[must_use]
     pub fn size(&self) -> usize {
@@ -152,6 +170,48 @@ impl RtpHeader {
             size += 4 + ext.data.len();
         }
         size
+    }
+
+    /// Serializes the header directly into `buf`, returning the number of
+    /// bytes written.
+    ///
+    /// # Panics
+    /// Panics if `buf` is shorter than [`Self::size()`].
+    #[must_use]
+    pub fn write_into(&self, buf: &mut [u8]) -> usize {
+        let size = self.size();
+        debug_assert!(buf.len() >= size, "buffer too small for RTP header");
+
+        // First byte: V=2, P, X, CC
+        buf[0] = (RTP_VERSION << 6)
+            | (if self.padding { 0x20 } else { 0 })
+            | (if self.extension { 0x10 } else { 0 })
+            | ((self.csrc.len() as u8) & 0x0F);
+
+        // Second byte: M, PT
+        buf[1] = (if self.marker { 0x80 } else { 0 }) | (self.payload_type & 0x7F);
+
+        buf[2..4].copy_from_slice(&self.sequence_number.to_be_bytes());
+        buf[4..8].copy_from_slice(&self.timestamp.to_be_bytes());
+        buf[8..12].copy_from_slice(&self.ssrc.to_be_bytes());
+
+        let mut pos = 12;
+        for &csrc in &self.csrc {
+            buf[pos..pos + 4].copy_from_slice(&csrc.to_be_bytes());
+            pos += 4;
+        }
+
+        if let Some(ref ext) = self.extension_header {
+            buf[pos..pos + 2].copy_from_slice(&ext.profile.to_be_bytes());
+            #[allow(clippy::cast_possible_truncation)]
+            let ext_len = (ext.data.len() / 4) as u16;
+            buf[pos + 2..pos + 4].copy_from_slice(&ext_len.to_be_bytes());
+            pos += 4;
+            buf[pos..pos + ext.data.len()].copy_from_slice(&ext.data);
+            pos += ext.data.len();
+        }
+
+        pos
     }
 
     /// Parses an RTP header from bytes.
@@ -249,6 +309,197 @@ pub struct ExtensionHeader {
     pub data: Bytes,
 }
 
+/// RFC 5285 one-byte header profile identifier (`0xBEDE`).
+pub const EXTENSION_PROFILE_ONE_BYTE: u16 = 0xBEDE;
+
+/// RFC 5285 two-byte header profile mask (upper 12 bits).
+pub const EXTENSION_PROFILE_TWO_BYTE_MASK: u16 = 0xFFF0;
+
+/// RFC 5285 two-byte header profile value (upper 12 bits = `0x100`).
+pub const EXTENSION_PROFILE_TWO_BYTE: u16 = 0x1000;
+
+/// RFC 5285 extension header format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionFormat {
+    /// One-byte header (profile = `0xBEDE`).
+    OneByte,
+    /// Two-byte header (profile = `0x100X`).
+    TwoByte {
+        /// Application-specific bits (lower 4 bits of profile).
+        appbits: u8,
+    },
+}
+
+/// A single extension element per RFC 5285.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionElement {
+    /// Extension ID (1-14 for one-byte, 1-255 for two-byte).
+    pub id: u8,
+    /// Extension data payload.
+    pub data: Bytes,
+}
+
+impl ExtensionHeader {
+    /// Returns the RFC 5285 format, or `None` if the profile is not RFC 5285.
+    #[must_use]
+    pub fn rfc5285_format(&self) -> Option<ExtensionFormat> {
+        if self.profile == EXTENSION_PROFILE_ONE_BYTE {
+            Some(ExtensionFormat::OneByte)
+        } else if self.profile & EXTENSION_PROFILE_TWO_BYTE_MASK == EXTENSION_PROFILE_TWO_BYTE {
+            Some(ExtensionFormat::TwoByte {
+                appbits: (self.profile & 0x0F) as u8,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Parses individual extension elements from the data according to RFC 5285.
+    ///
+    /// Returns `None` if the profile is not a recognized RFC 5285 profile.
+    #[must_use]
+    pub fn parse_elements(&self) -> Option<Vec<ExtensionElement>> {
+        match self.rfc5285_format()? {
+            ExtensionFormat::OneByte => Some(self.parse_one_byte_elements()),
+            ExtensionFormat::TwoByte { .. } => Some(self.parse_two_byte_elements()),
+        }
+    }
+
+    /// Gets a single element by extension ID.
+    #[must_use]
+    pub fn get_element(&self, id: u8) -> Option<ExtensionElement> {
+        self.parse_elements()?
+            .into_iter()
+            .find(|e| e.id == id)
+    }
+
+    /// Builds an `ExtensionHeader` in one-byte format from a slice of elements.
+    ///
+    /// Pads the data to a 4-byte boundary as required by RTP.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any element ID is outside 1-14 or data length > 16.
+    pub fn build_one_byte(elements: &[ExtensionElement]) -> RtpResult<Self> {
+        let mut buf = Vec::new();
+        for elem in elements {
+            if elem.id == 0 || elem.id > 14 {
+                return Err(RtpError::InvalidExtension {
+                    reason: "one-byte element ID must be 1-14",
+                });
+            }
+            if elem.data.is_empty() || elem.data.len() > 16 {
+                return Err(RtpError::InvalidExtension {
+                    reason: "one-byte element data must be 1-16 bytes",
+                });
+            }
+            buf.push((elem.id << 4) | ((elem.data.len() - 1) as u8));
+            buf.extend_from_slice(&elem.data);
+        }
+        while buf.len() % 4 != 0 {
+            buf.push(0);
+        }
+        Ok(Self {
+            profile: EXTENSION_PROFILE_ONE_BYTE,
+            data: Bytes::from(buf),
+        })
+    }
+
+    /// Builds an `ExtensionHeader` in two-byte format from a slice of elements.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any element ID is 0.
+    pub fn build_two_byte(elements: &[ExtensionElement], appbits: u8) -> RtpResult<Self> {
+        let mut buf = Vec::new();
+        for elem in elements {
+            if elem.id == 0 {
+                return Err(RtpError::InvalidExtension {
+                    reason: "two-byte element ID must be 1-255",
+                });
+            }
+            buf.push(elem.id);
+            buf.push(elem.data.len() as u8);
+            buf.extend_from_slice(&elem.data);
+        }
+        while buf.len() % 4 != 0 {
+            buf.push(0);
+        }
+        Ok(Self {
+            profile: EXTENSION_PROFILE_TWO_BYTE | u16::from(appbits & 0x0F),
+            data: Bytes::from(buf),
+        })
+    }
+
+    /// Parses one-byte extension elements (profile `0xBEDE`).
+    fn parse_one_byte_elements(&self) -> Vec<ExtensionElement> {
+        let mut elements = Vec::with_capacity(4);
+        let data = &self.data[..];
+        let mut pos = 0;
+
+        while pos < data.len() {
+            let byte = data[pos];
+            let id = byte >> 4;
+            let len = (byte & 0x0F) as usize + 1;
+
+            if id == 0 {
+                pos += 1;
+                continue;
+            }
+            if id == 15 {
+                break;
+            }
+
+            pos += 1;
+            if pos + len > data.len() {
+                break;
+            }
+
+            elements.push(ExtensionElement {
+                id,
+                data: Bytes::copy_from_slice(&data[pos..pos + len]),
+            });
+            pos += len;
+        }
+
+        elements
+    }
+
+    /// Parses two-byte extension elements (profile `0x100X`).
+    fn parse_two_byte_elements(&self) -> Vec<ExtensionElement> {
+        let mut elements = Vec::with_capacity(8);
+        let data = &self.data[..];
+        let mut pos = 0;
+
+        while pos < data.len() {
+            let id = data[pos];
+            if id == 0 {
+                pos += 1;
+                continue;
+            }
+
+            pos += 1;
+            if pos >= data.len() {
+                break;
+            }
+
+            let len = data[pos] as usize;
+            pos += 1;
+            if pos + len > data.len() {
+                break;
+            }
+
+            elements.push(ExtensionElement {
+                id,
+                data: Bytes::copy_from_slice(&data[pos..pos + len]),
+            });
+            pos += len;
+        }
+
+        elements
+    }
+}
+
 /// Complete RTP packet (header + payload).
 #[derive(Debug, Clone)]
 pub struct RtpPacket {
@@ -289,15 +540,13 @@ impl RtpPacket {
         if header.padding {
             if data.is_empty() {
                 return Err(RtpError::InvalidPadding {
-                    reason: "padding flag set but no padding length".to_string(),
+                    reason: "padding flag set but no padding length",
                 });
             }
 
             padding_size = data[data.len() - 1] as usize;
             if padding_size == 0 || padding_size > data.len() - header_size {
-                return Err(RtpError::InvalidPadding {
-                    reason: format!("invalid padding size: {padding_size}"),
-                });
+                return Err(RtpError::InvalidPaddingSize { padding_size });
             }
 
             payload_end -= padding_size;
@@ -319,7 +568,7 @@ impl RtpPacket {
             BytesMut::with_capacity(self.header.size() + self.payload.len() + self.padding_size);
 
         buf.put(self.header.to_bytes());
-        buf.put(self.payload.clone());
+        buf.put_slice(&self.payload);
 
         if self.padding_size > 0 {
             buf.put_bytes(0, self.padding_size - 1);
@@ -424,5 +673,196 @@ mod tests {
         assert!(display.contains("PT=0"));
         assert!(display.contains("seq=1234"));
         assert!(display.contains("0x12345678"));
+    }
+
+    #[test]
+    fn test_header_write_into_matches_to_bytes() {
+        let header = RtpHeader::new(96, 1000, 160000, 0xDEADBEEF)
+            .with_marker(true)
+            .with_csrc(0x11111111);
+
+        let expected = header.to_bytes();
+
+        let mut buf = [0u8; 128];
+        let written = header.write_into(&mut buf);
+
+        assert_eq!(written, expected.len());
+        assert_eq!(&buf[..written], &expected[..]);
+    }
+
+    #[test]
+    fn test_header_write_into_minimal() {
+        let header = RtpHeader::new(0, 100, 1600, 0xABCDEF01);
+
+        let expected = header.to_bytes();
+
+        let mut buf = [0u8; 12];
+        let written = header.write_into(&mut buf);
+
+        assert_eq!(written, 12);
+        assert_eq!(&buf[..], &expected[..]);
+    }
+
+    // ─── RFC 5285 extension tests ─────────────────────────────────
+
+    #[test]
+    fn test_one_byte_build_and_parse_roundtrip() {
+        let elements = vec![
+            ExtensionElement {
+                id: 1,
+                data: Bytes::from_static(&[0x80]),
+            },
+            ExtensionElement {
+                id: 3,
+                data: Bytes::from_static(&[0xAA, 0xBB]),
+            },
+        ];
+
+        let ext = ExtensionHeader::build_one_byte(&elements).unwrap();
+        assert_eq!(ext.profile, EXTENSION_PROFILE_ONE_BYTE);
+        assert_eq!(ext.data.len() % 4, 0);
+
+        let parsed = ext.parse_elements().unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, 1);
+        assert_eq!(parsed[0].data, Bytes::from_static(&[0x80]));
+        assert_eq!(parsed[1].id, 3);
+        assert_eq!(parsed[1].data, Bytes::from_static(&[0xAA, 0xBB]));
+    }
+
+    #[test]
+    fn test_two_byte_build_and_parse_roundtrip() {
+        let elements = vec![
+            ExtensionElement {
+                id: 1,
+                data: Bytes::from_static(&[0x80]),
+            },
+            ExtensionElement {
+                id: 200,
+                data: Bytes::from_static(&[0xCC, 0xDD, 0xEE]),
+            },
+        ];
+
+        let ext = ExtensionHeader::build_two_byte(&elements, 0).unwrap();
+        assert_eq!(ext.profile & EXTENSION_PROFILE_TWO_BYTE_MASK, EXTENSION_PROFILE_TWO_BYTE);
+        assert_eq!(ext.data.len() % 4, 0);
+
+        let parsed = ext.parse_elements().unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, 1);
+        assert_eq!(parsed[0].data, Bytes::from_static(&[0x80]));
+        assert_eq!(parsed[1].id, 200);
+        assert_eq!(parsed[1].data, Bytes::from_static(&[0xCC, 0xDD, 0xEE]));
+    }
+
+    #[test]
+    fn test_one_byte_invalid_id_zero() {
+        let elements = vec![ExtensionElement {
+            id: 0,
+            data: Bytes::from_static(&[0x01]),
+        }];
+        assert!(ExtensionHeader::build_one_byte(&elements).is_err());
+    }
+
+    #[test]
+    fn test_one_byte_invalid_id_15() {
+        let elements = vec![ExtensionElement {
+            id: 15,
+            data: Bytes::from_static(&[0x01]),
+        }];
+        assert!(ExtensionHeader::build_one_byte(&elements).is_err());
+    }
+
+    #[test]
+    fn test_one_byte_invalid_empty_data() {
+        let elements = vec![ExtensionElement {
+            id: 1,
+            data: Bytes::new(),
+        }];
+        assert!(ExtensionHeader::build_one_byte(&elements).is_err());
+    }
+
+    #[test]
+    fn test_rfc5285_format_detection() {
+        let one_byte = ExtensionHeader {
+            profile: 0xBEDE,
+            data: Bytes::new(),
+        };
+        assert_eq!(one_byte.rfc5285_format(), Some(ExtensionFormat::OneByte));
+
+        let two_byte = ExtensionHeader {
+            profile: 0x1005,
+            data: Bytes::new(),
+        };
+        assert_eq!(
+            two_byte.rfc5285_format(),
+            Some(ExtensionFormat::TwoByte { appbits: 5 })
+        );
+
+        let unknown = ExtensionHeader {
+            profile: 0x4321,
+            data: Bytes::new(),
+        };
+        assert_eq!(unknown.rfc5285_format(), None);
+    }
+
+    #[test]
+    fn test_get_element_by_id() {
+        let elements = vec![
+            ExtensionElement {
+                id: 1,
+                data: Bytes::from_static(&[0xAA]),
+            },
+            ExtensionElement {
+                id: 5,
+                data: Bytes::from_static(&[0xBB]),
+            },
+        ];
+        let ext = ExtensionHeader::build_one_byte(&elements).unwrap();
+
+        assert_eq!(ext.get_element(5).unwrap().data, Bytes::from_static(&[0xBB]));
+        assert!(ext.get_element(9).is_none());
+    }
+
+    #[test]
+    fn test_with_extension_builder() {
+        let ext = ExtensionHeader::build_one_byte(&[ExtensionElement {
+            id: 1,
+            data: Bytes::from_static(&[0x80]),
+        }])
+        .unwrap();
+
+        let header = RtpHeader::new(0, 100, 1600, 0xABCDEF01).with_extension(ext);
+        assert!(header.extension);
+        assert!(header.extension_header.is_some());
+
+        // Roundtrip through serialize/parse
+        let bytes = header.to_bytes();
+        let (parsed, _) = RtpHeader::parse(&bytes).unwrap();
+        assert!(parsed.extension);
+        let parsed_ext = parsed.extension_header.unwrap();
+        let elements = parsed_ext.parse_elements().unwrap();
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].id, 1);
+        assert_eq!(elements[0].data, Bytes::from_static(&[0x80]));
+    }
+
+    #[test]
+    fn test_with_one_byte_extensions_convenience() {
+        let header = RtpHeader::new(0, 100, 1600, 0xABCDEF01)
+            .with_one_byte_extensions(&[
+                ExtensionElement {
+                    id: 1,
+                    data: Bytes::from_static(&[0x80]),
+                },
+                ExtensionElement {
+                    id: 2,
+                    data: Bytes::from_static(&[0xAA, 0xBB]),
+                },
+            ])
+            .unwrap();
+
+        assert!(header.extension);
+        assert!(header.size() > 12);
     }
 }

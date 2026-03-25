@@ -2,11 +2,10 @@
 
 use crate::error::{SrtpError, SrtpResult};
 use crate::key::{SessionKeys, SrtpKeyMaterial};
-use crate::{DEFAULT_REPLAY_WINDOW_SIZE, MAX_PACKET_INDEX, SrtpProfile};
-use std::collections::HashSet;
-use std::sync::Arc;
+use crate::{MAX_PACKET_INDEX, SrtpProfile};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use uc_crypto::aead::CachedAeadKey;
 
 /// SRTP direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,9 +19,16 @@ pub enum SrtpDirection {
 /// SRTP cryptographic context.
 ///
 /// Manages encryption state, packet indices, and replay protection.
+///
+/// AES key schedules are expanded once at construction and cached in
+/// `CachedAeadKey` instances, avoiding ~100ns of key expansion per packet.
 pub struct SrtpContext {
-    /// Session keys.
+    /// Session keys (raw bytes, kept for accessors).
     keys: SessionKeys,
+    /// Pre-expanded RTP AES-256-GCM key (cached key schedule).
+    cached_rtp_key: CachedAeadKey,
+    /// Pre-expanded RTCP AES-256-GCM key (cached key schedule).
+    cached_rtcp_key: CachedAeadKey,
     /// SRTP profile.
     profile: SrtpProfile,
     /// Direction.
@@ -37,8 +43,8 @@ pub struct SrtpContext {
     rtp_index: AtomicU64,
     /// RTCP packet index.
     rtcp_index: AtomicU64,
-    /// Replay protection window.
-    replay_window: Arc<Mutex<ReplayWindow>>,
+    /// Replay protection window (bitmap-based, no heap allocation).
+    replay_window: Mutex<ReplayWindow>,
 }
 
 impl SrtpContext {
@@ -47,6 +53,7 @@ impl SrtpContext {
     /// ## Errors
     ///
     /// Returns an error if key derivation fails.
+    #[allow(clippy::similar_names)]
     pub fn new(
         material: &SrtpKeyMaterial,
         direction: SrtpDirection,
@@ -54,8 +61,14 @@ impl SrtpContext {
     ) -> SrtpResult<Self> {
         let keys = SessionKeys::derive(material)?;
 
+        // Pre-expand AES key schedules once (avoids ~100ns per packet).
+        let cached_rtp_key = Self::build_cached_key(&keys.rtp_key)?;
+        let cached_rtcp_key = Self::build_cached_key(&keys.rtcp_key)?;
+
         Ok(Self {
             keys,
+            cached_rtp_key,
+            cached_rtcp_key,
             profile: material.profile(),
             direction,
             ssrc,
@@ -63,7 +76,21 @@ impl SrtpContext {
             rtp_highest_seq: AtomicU64::new(0),
             rtp_index: AtomicU64::new(0),
             rtcp_index: AtomicU64::new(0),
-            replay_window: Arc::new(Mutex::new(ReplayWindow::new(DEFAULT_REPLAY_WINDOW_SIZE))),
+            replay_window: Mutex::new(ReplayWindow::new()),
+        })
+    }
+
+    /// Builds a `CachedAeadKey` from raw key bytes.
+    fn build_cached_key(key_bytes: &[u8]) -> SrtpResult<CachedAeadKey> {
+        if key_bytes.len() != 32 {
+            return Err(SrtpError::InvalidKey {
+                reason: format!("key length {} is not 32 bytes", key_bytes.len()),
+            });
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(key_bytes);
+        CachedAeadKey::new(&arr).map_err(|_| SrtpError::InvalidKey {
+            reason: "failed to create cached AES-256-GCM key".to_string(),
         })
     }
 
@@ -95,6 +122,18 @@ impl SrtpContext {
     #[must_use]
     pub fn rtp_salt(&self) -> &[u8] {
         &self.keys.rtp_salt
+    }
+
+    /// Returns the cached RTP AEAD key (pre-expanded key schedule).
+    #[must_use]
+    pub fn cached_rtp_key(&self) -> &CachedAeadKey {
+        &self.cached_rtp_key
+    }
+
+    /// Returns the cached RTCP AEAD key (pre-expanded key schedule).
+    #[must_use]
+    pub fn cached_rtcp_key(&self) -> &CachedAeadKey {
+        &self.cached_rtcp_key
     }
 
     /// Returns the RTCP encryption key.
@@ -236,57 +275,65 @@ impl std::fmt::Debug for SrtpContext {
     }
 }
 
-/// Replay protection window.
+/// Bitmap-based replay protection window.
+///
+/// Uses a 64-bit bitmap to track which of the last 64 packet indices have
+/// been received. Bit 0 corresponds to `highest`, bit 1 to `highest - 1`,
+/// etc. This replaces the previous `HashSet<u64>` approach, eliminating
+/// heap allocation, hashing, and `retain()` iteration on window shifts.
 struct ReplayWindow {
-    /// Window size.
-    size: u64,
     /// Highest valid index seen.
     highest: u64,
-    /// Bitmap of received indices (relative to window).
-    received: HashSet<u64>,
+    /// Bitmap: bit `(highest - index)` is set for each received index.
+    bitmap: u64,
+    /// Whether any packet has been received yet.
+    initialized: bool,
 }
 
+/// Fixed replay window size (64 bits = 64-entry window).
+const REPLAY_WINDOW_SIZE: u64 = 64;
+
 impl ReplayWindow {
-    fn new(size: u64) -> Self {
+    fn new() -> Self {
         Self {
-            size,
             highest: 0,
-            received: HashSet::new(),
+            bitmap: 0,
+            initialized: false,
         }
     }
 
     fn check_and_update(&mut self, index: u64) -> SrtpResult<()> {
-        if self.highest == 0 && self.received.is_empty() {
-            // First packet
+        if !self.initialized {
             self.highest = index;
-            self.received.insert(index);
+            self.bitmap = 1; // bit 0 = highest
+            self.initialized = true;
             return Ok(());
         }
 
         if index > self.highest {
-            // New highest - shift window
+            // New highest — shift bitmap to make room
             let shift = index - self.highest;
-            if shift >= self.size {
-                // Complete window shift
-                self.received.clear();
+            if shift >= REPLAY_WINDOW_SIZE {
+                self.bitmap = 0;
             } else {
-                // Partial shift - remove old entries
-                let cutoff = index.saturating_sub(self.size);
-                self.received.retain(|&i| i > cutoff);
+                self.bitmap <<= shift;
             }
+            self.bitmap |= 1; // Mark new highest as received
             self.highest = index;
-            self.received.insert(index);
             Ok(())
-        } else if index + self.size < self.highest {
-            // Too old - outside window
-            Err(SrtpError::ReplayDetected { index })
-        } else if self.received.contains(&index) {
-            // Already received
-            Err(SrtpError::ReplayDetected { index })
         } else {
-            // Within window and not seen
-            self.received.insert(index);
-            Ok(())
+            let delta = self.highest - index;
+            if delta >= REPLAY_WINDOW_SIZE {
+                // Too old — outside the window
+                Err(SrtpError::ReplayDetected { index })
+            } else if self.bitmap & (1 << delta) != 0 {
+                // Already received
+                Err(SrtpError::ReplayDetected { index })
+            } else {
+                // Within window and not seen — mark as received
+                self.bitmap |= 1 << delta;
+                Ok(())
+            }
         }
     }
 }
@@ -330,7 +377,7 @@ mod tests {
 
     #[test]
     fn test_replay_window() {
-        let mut window = ReplayWindow::new(64);
+        let mut window = ReplayWindow::new();
 
         // First packet should succeed
         assert!(window.check_and_update(100).is_ok());
@@ -346,5 +393,54 @@ mod tests {
 
         // Very old packet should fail
         assert!(window.check_and_update(0).is_err());
+    }
+
+    #[test]
+    fn test_replay_window_boundary() {
+        let mut window = ReplayWindow::new();
+
+        // Insert packet at index 100
+        assert!(window.check_and_update(100).is_ok());
+
+        // Index 37 = 100 - 63 = exactly at window boundary (valid)
+        assert!(window.check_and_update(37).is_ok());
+
+        // Index 36 = 100 - 64 = just outside window (too old)
+        assert!(window.check_and_update(36).is_err());
+
+        // Large jump: new highest at 200
+        assert!(window.check_and_update(200).is_ok());
+
+        // Old packet 100 is now 100 positions behind — outside 64-bit window
+        assert!(window.check_and_update(100).is_err());
+
+        // Packet 137 = 200 - 63 = exactly at new window boundary (valid)
+        assert!(window.check_and_update(137).is_ok());
+
+        // Duplicate of 137 should fail
+        assert!(window.check_and_update(137).is_err());
+    }
+
+    #[test]
+    fn test_replay_window_complete_shift() {
+        let mut window = ReplayWindow::new();
+
+        // Fill some history
+        for i in 0..10 {
+            assert!(window.check_and_update(i).is_ok());
+        }
+
+        // Jump beyond the window — all old state should be cleared
+        assert!(window.check_and_update(1000).is_ok());
+
+        // Duplicate of 1000 should fail
+        assert!(window.check_and_update(1000).is_err());
+
+        // Old indices 0-9 are far outside the window
+        assert!(window.check_and_update(5).is_err());
+
+        // Index within the new window (but never seen) should succeed
+        assert!(window.check_and_update(999).is_ok());
+        assert!(window.check_and_update(937).is_ok()); // 1000 - 63
     }
 }

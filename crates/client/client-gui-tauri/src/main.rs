@@ -404,6 +404,42 @@ async fn transfer_call(target: String, state: State<'_, TauriAppState>) -> Resul
     Ok(())
 }
 
+/// Change the codec for an active call via re-INVITE.
+#[tauri::command]
+async fn change_codec(
+    call_id: String,
+    codec: String,
+    state: State<'_, TauriAppState>,
+) -> Result<(), String> {
+    info!("Changing codec for call {call_id} to {codec}");
+
+    let codec_pref = match codec.to_lowercase().as_str() {
+        "opus" => client_types::audio::CodecPreference::Opus,
+        "g722" | "g.722" => client_types::audio::CodecPreference::G722,
+        "pcmu" | "g711u" | "g.711u" | "ulaw" => client_types::audio::CodecPreference::G711Ulaw,
+        "pcma" | "g711a" | "g.711a" | "alaw" => client_types::audio::CodecPreference::G711Alaw,
+        _ => return Err(format!("Unknown codec: {codec}")),
+    };
+
+    let mut client_guard = state.client.lock().await;
+    let client = client_guard
+        .as_mut()
+        .ok_or_else(|| "Client not initialized".to_string())?;
+
+    client
+        .change_codec(&call_id, codec_pref)
+        .await
+        .map_err(|e| format!("Failed to change codec: {e}"))?;
+
+    // Poll events to send re-INVITE request
+    if let Err(e) = client.poll_events().await {
+        warn!(error = %e, "Error polling events after change_codec");
+    }
+
+    drop(client_guard);
+    Ok(())
+}
+
 /// Send a DTMF digit.
 #[tauri::command]
 async fn send_dtmf(digit: String, state: State<'_, TauriAppState>) -> Result<(), String> {
@@ -982,10 +1018,16 @@ async fn set_input_device(
     let mut client_guard = state.client.lock().await;
     if let Some(client) = client_guard.as_mut() {
         client
-            .switch_input_device(device_name)
+            .switch_input_device(device_name.clone())
             .map_err(|e| format!("Failed to switch input device: {e}"))?;
     }
     drop(client_guard);
+
+    // Persist to settings so the choice is remembered across restarts
+    let mut manager = state.settings_manager.write().await;
+    manager.settings_mut().audio.input_device = device_name;
+    let _ = manager.save();
+    drop(manager);
 
     Ok(())
 }
@@ -1001,10 +1043,16 @@ async fn set_output_device(
     let mut client_guard = state.client.lock().await;
     if let Some(client) = client_guard.as_mut() {
         client
-            .switch_output_device(device_name)
+            .switch_output_device(device_name.clone())
             .map_err(|e| format!("Failed to switch output device: {e}"))?;
     }
     drop(client_guard);
+
+    // Persist to settings so the choice is remembered across restarts
+    let mut manager = state.settings_manager.write().await;
+    manager.settings_mut().audio.output_device = device_name;
+    let _ = manager.save();
+    drop(manager);
 
     Ok(())
 }
@@ -1585,6 +1633,7 @@ fn main() {
             toggle_mute,
             toggle_hold,
             transfer_call,
+            change_codec,
             send_dtmf,
             get_contacts,
             add_contact,

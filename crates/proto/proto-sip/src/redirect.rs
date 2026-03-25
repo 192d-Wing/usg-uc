@@ -438,7 +438,6 @@ pub trait RedirectHeaders {
 impl RedirectHeaders for crate::header::Headers {
     fn redirect_contacts(&self) -> Vec<String> {
         self.get_all(&HeaderName::Contact)
-            .iter()
             .map(|h| h.value.clone())
             .collect()
     }

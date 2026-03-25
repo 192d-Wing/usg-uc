@@ -43,20 +43,18 @@ impl Origin {
     /// # Errors
     /// Returns an error if the operation fails.
     pub fn parse(s: &str) -> SdpResult<Self> {
-        let parts: Vec<&str> = s.split_whitespace().collect();
-        if parts.len() != 6 {
-            return Err(SdpError::ParseError {
-                reason: format!("origin requires 6 parts, got {}", parts.len()),
-            });
-        }
+        let mut parts = s.split_whitespace();
+        let missing = |field: &str| SdpError::ParseError {
+            reason: format!("origin missing {field}"),
+        };
 
         Ok(Self {
-            username: parts[0].to_string(),
-            session_id: parts[1].to_string(),
-            session_version: parts[2].to_string(),
-            net_type: parts[3].to_string(),
-            addr_type: parts[4].to_string(),
-            unicast_address: parts[5].to_string(),
+            username: parts.next().ok_or_else(|| missing("username"))?.to_string(),
+            session_id: parts.next().ok_or_else(|| missing("session_id"))?.to_string(),
+            session_version: parts.next().ok_or_else(|| missing("session_version"))?.to_string(),
+            net_type: parts.next().ok_or_else(|| missing("net_type"))?.to_string(),
+            addr_type: parts.next().ok_or_else(|| missing("addr_type"))?.to_string(),
+            unicast_address: parts.next().ok_or_else(|| missing("unicast_address"))?.to_string(),
         })
     }
 

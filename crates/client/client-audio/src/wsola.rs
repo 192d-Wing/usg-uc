@@ -71,6 +71,8 @@ pub struct WsolaPlc {
     consecutive_losses: u32,
     /// Whether the previous frame was lost (for recovery cross-fade).
     prev_lost: bool,
+    /// Pre-allocated output buffer, reused across `conceal()` calls.
+    output: Vec<i16>,
 }
 
 impl WsolaPlc {
@@ -102,6 +104,7 @@ impl WsolaPlc {
             min_pitch_dist,
             consecutive_losses: 0,
             prev_lost: false,
+            output: vec![0i16; frame_size],
         }
     }
 
@@ -130,15 +133,16 @@ impl WsolaPlc {
 
     /// Generates a concealment frame to replace a lost packet.
     ///
-    /// Returns a buffer of `frame_size` samples.
+    /// Returns a slice of `frame_size` samples from a pre-allocated buffer.
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-    pub fn conceal(&mut self) -> Vec<i16> {
+    pub fn conceal(&mut self) -> &[i16] {
         self.consecutive_losses += 1;
         self.prev_lost = true;
 
         // If we've been expanding too long, output silence
         if self.fade_out_pos >= self.max_expand_cnt {
-            return vec![0i16; self.frame_size];
+            self.output.iter_mut().for_each(|s| *s = 0);
+            return &self.output;
         }
 
         // Expand: synthesize new samples via pitch matching
@@ -148,21 +152,22 @@ impl WsolaPlc {
         // (it's after the history + min_extra region)
         let read_start = self.hist_size + self.min_extra;
         let read_end = (read_start + self.frame_size).min(self.cur_cnt);
-        let mut output = vec![0i16; self.frame_size];
+        self.output.iter_mut().for_each(|s| *s = 0);
         let available = read_end.saturating_sub(read_start);
         if available > 0 {
-            output[..available].copy_from_slice(&self.buf[read_start..read_end]);
+            self.output[..available].copy_from_slice(&self.buf[read_start..read_end]);
         }
 
         // Apply linear fade-out for extended losses
         let fade_start = self.fade_out_pos;
         self.fade_out_pos += self.frame_size;
-        for (i, sample) in output.iter_mut().enumerate() {
+        let inv_max = 1.0 / self.max_expand_cnt as f32;
+        for (i, sample) in self.output.iter_mut().enumerate() {
             let pos = fade_start + i;
             if pos >= self.max_expand_cnt {
                 *sample = 0;
             } else {
-                let gain = 1.0 - (pos as f32 / self.max_expand_cnt as f32);
+                let gain = (pos as f32).mul_add(-inv_max, 1.0);
                 *sample = (f32::from(*sample) * gain) as i16;
             }
         }
@@ -170,7 +175,7 @@ impl WsolaPlc {
         // Shift buffer for next iteration
         self.shift_buf();
 
-        output
+        &self.output
     }
 
     /// Cross-fades from the concealment tail into a recovered real frame.
@@ -319,13 +324,13 @@ impl WsolaPlc {
             return;
         }
 
-        // Copy the last frame to a temp buffer, then append
-        let frame: Vec<i16> = self.buf[start..end].to_vec();
+        // Copy the last frame forward using copy_within (no heap allocation).
+        let frame_len = end - start;
         let write_start = end;
-        let write_end = (write_start + frame.len()).min(self.buf_size);
+        let write_end = (write_start + frame_len).min(self.buf_size);
         let copy_len = write_end - write_start;
         if copy_len > 0 {
-            self.buf[write_start..write_end].copy_from_slice(&frame[..copy_len]);
+            self.buf.copy_within(start..start + copy_len, write_start);
             self.cur_cnt = write_end;
         }
     }

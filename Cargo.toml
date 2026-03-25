@@ -218,6 +218,7 @@ windows = { version = "0.62", features = [
 ] }
 uuid = { version = "1.20", features = ["v4"] }
 tempfile = "3.24"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [workspace.lints.rust]
 # Use deny instead of forbid to allow platform-specific unsafe code with explicit #[allow(unsafe_code)]
@@ -234,3 +235,21 @@ nursery = { level = "deny", priority = -1 }
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[profile.release.package.client-audio]
+opt-level = 3
+
+[profile.release.package.proto-rtp]
+opt-level = 3
+
+[profile.release.package.proto-srtp]
+opt-level = 3
+
+[profile.release.package.uc-codecs]
+opt-level = 3

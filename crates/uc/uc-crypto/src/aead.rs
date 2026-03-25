@@ -144,6 +144,155 @@ impl std::fmt::Debug for Aes256GcmKey {
     }
 }
 
+/// AES-256-GCM key with a pre-expanded key schedule for repeated use.
+///
+/// Unlike [`Aes256GcmKey`], which creates a new `UnboundKey` (AES key schedule)
+/// on every `seal`/`open` call, this type expands the key schedule once at
+/// construction and reuses it across all subsequent operations. This saves
+/// ~100ns per packet on the SRTP hot path.
+///
+/// Uses `LessSafeKey` from aws-lc-rs, which requires the caller to manage
+/// nonce uniqueness (appropriate for SRTP where nonces are derived from
+/// packet index + SSRC).
+pub struct CachedAeadKey {
+    inner: aead::LessSafeKey,
+}
+
+impl CachedAeadKey {
+    /// Creates a new cached AEAD key from raw key bytes.
+    ///
+    /// The AES key schedule is expanded once here and reused for all
+    /// subsequent `seal`/`open` calls.
+    ///
+    /// # Errors
+    /// Returns an error if the key bytes are invalid.
+    pub fn new(key_bytes: &[u8; KEY_LEN]) -> CryptoResult<Self> {
+        let unbound_key = aead::UnboundKey::new(&AES_256_GCM, key_bytes)
+            .map_err(|_| CryptoError::InvalidKeyMaterial)?;
+        Ok(Self {
+            inner: aead::LessSafeKey::new(unbound_key),
+        })
+    }
+
+    /// Encrypts plaintext with additional authenticated data.
+    ///
+    /// Returns the ciphertext with the authentication tag appended.
+    ///
+    /// # Errors
+    /// Returns an error if encryption fails.
+    pub fn seal(
+        &self,
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> CryptoResult<Vec<u8>> {
+        let nonce = Nonce::assume_unique_for_key(*nonce);
+        let mut in_out = plaintext.to_vec();
+        in_out.reserve(TAG_LEN);
+
+        self.inner
+            .seal_in_place_append_tag(nonce, Aad::from(aad), &mut in_out)
+            .map_err(|_| CryptoError::SealFailed)?;
+
+        Ok(in_out)
+    }
+
+    /// Decrypts ciphertext with additional authenticated data.
+    ///
+    /// The ciphertext must include the authentication tag at the end.
+    ///
+    /// # Errors
+    /// Returns an error if decryption or authentication fails.
+    pub fn open(
+        &self,
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        ciphertext: &[u8],
+    ) -> CryptoResult<Vec<u8>> {
+        if ciphertext.len() < TAG_LEN {
+            return Err(CryptoError::OpenFailed);
+        }
+
+        let nonce = Nonce::assume_unique_for_key(*nonce);
+        let mut in_out = ciphertext.to_vec();
+        let plaintext_len = self
+            .inner
+            .open_in_place(nonce, Aad::from(aad), &mut in_out)
+            .map_err(|_| CryptoError::OpenFailed)?
+            .len();
+
+        // Truncate in-place instead of copying: open_in_place returns
+        // a subslice of in_out (ciphertext minus the 16-byte auth tag).
+        in_out.truncate(plaintext_len);
+        Ok(in_out)
+    }
+
+    /// Encrypts plaintext into a caller-provided buffer, avoiding allocation.
+    ///
+    /// The buffer is cleared, filled with plaintext, and sealed in-place.
+    /// On return it contains `ciphertext || auth_tag`.
+    ///
+    /// # Errors
+    /// Returns an error if encryption fails.
+    pub fn seal_into(
+        &self,
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        plaintext: &[u8],
+        buf: &mut Vec<u8>,
+    ) -> CryptoResult<()> {
+        buf.clear();
+        buf.extend_from_slice(plaintext);
+        buf.reserve(TAG_LEN);
+
+        let nonce = Nonce::assume_unique_for_key(*nonce);
+        self.inner
+            .seal_in_place_append_tag(nonce, Aad::from(aad), buf)
+            .map_err(|_| CryptoError::SealFailed)?;
+        Ok(())
+    }
+
+    /// Decrypts ciphertext into a caller-provided buffer, avoiding allocation.
+    ///
+    /// The buffer is cleared and filled with ciphertext, then decrypted
+    /// in-place. On return it contains the plaintext (tag stripped).
+    ///
+    /// # Errors
+    /// Returns an error if decryption or authentication fails.
+    pub fn open_into(
+        &self,
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        ciphertext: &[u8],
+        buf: &mut Vec<u8>,
+    ) -> CryptoResult<()> {
+        if ciphertext.len() < TAG_LEN {
+            return Err(CryptoError::OpenFailed);
+        }
+
+        buf.clear();
+        buf.extend_from_slice(ciphertext);
+
+        let nonce = Nonce::assume_unique_for_key(*nonce);
+        let plaintext_len = self
+            .inner
+            .open_in_place(nonce, Aad::from(aad), buf)
+            .map_err(|_| CryptoError::OpenFailed)?
+            .len();
+
+        buf.truncate(plaintext_len);
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for CachedAeadKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedAeadKey")
+            .field("algorithm", &"AES-256-GCM")
+            .finish()
+    }
+}
+
 /// A nonce sequence that provides a single nonce value.
 ///
 /// Used for one-shot seal/open operations.

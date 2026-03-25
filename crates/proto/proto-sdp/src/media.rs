@@ -176,17 +176,30 @@ impl ConnectionData {
     /// # Errors
     /// Returns an error if the operation fails.
     pub fn parse(s: &str) -> SdpResult<Self> {
-        let parts: Vec<&str> = s.split_whitespace().collect();
-        if parts.len() != 3 {
-            return Err(SdpError::InvalidConnection {
-                reason: format!("expected 3 parts, got {}", parts.len()),
-            });
-        }
+        let mut parts = s.split_whitespace();
+        let net_type = parts
+            .next()
+            .ok_or_else(|| SdpError::InvalidConnection {
+                reason: "missing net_type".to_string(),
+            })?
+            .to_string();
+        let addr_type = parts
+            .next()
+            .ok_or_else(|| SdpError::InvalidConnection {
+                reason: "missing addr_type".to_string(),
+            })?
+            .to_string();
+        let address = parts
+            .next()
+            .ok_or_else(|| SdpError::InvalidConnection {
+                reason: "missing address".to_string(),
+            })?
+            .to_string();
 
         Ok(Self {
-            net_type: parts[0].to_string(),
-            addr_type: parts[1].to_string(),
-            address: parts[2].to_string(),
+            net_type,
+            addr_type,
+            address,
         })
     }
 

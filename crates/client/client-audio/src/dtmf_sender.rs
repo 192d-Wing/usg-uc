@@ -17,7 +17,8 @@ use tracing::{debug, info, trace, warn};
 const MAX_DIGIT_QUEUE: usize = 32;
 
 /// Default inter-digit pause in milliseconds.
-const INTER_DIGIT_PAUSE_MS: u64 = 100;
+/// pjproject uses 0ms by default (PJMEDIA_DTMF_DIGIT_PAUSE_LEN = 0).
+const INTER_DIGIT_PAUSE_MS: u64 = 0;
 
 /// Number of end-of-event packets sent for reliability (RFC 4733).
 const END_PACKET_REPEATS: u32 = 3;
@@ -42,6 +43,10 @@ enum DtmfPhase {
 ///
 /// Polled once per I/O loop iteration. Manages the lifecycle of one DTMF
 /// digit at a time with a bounded queue for rapid-fire sequences.
+///
+/// In RFC 4733 mode, sends both telephone-event packets AND in-band audio
+/// tones simultaneously (dual-send). This ensures DTMF is received even if
+/// the remote gateway doesn't properly process telephone-event packets.
 pub struct DtmfSender {
     /// Current phase.
     phase: DtmfPhase,
@@ -53,6 +58,12 @@ pub struct DtmfSender {
     volume: u8,
     /// Inter-digit pause in milliseconds.
     inter_digit_pause_ms: u64,
+    /// Codec clock rate (e.g., 8000 for G.711, 16000 for G.722).
+    codec_clock_rate: u32,
+    /// Codec samples per frame (e.g., 160 for G.711, 320 for G.722).
+    codec_samples_per_frame: usize,
+    /// Pre-allocated buffer for tone generation (avoids per-packet allocation).
+    tone_buffer: Vec<i16>,
 }
 
 /// State for the digit currently being transmitted.
@@ -69,7 +80,7 @@ struct ActiveDigit {
     packets_sent: u32,
     /// Number of end packets sent so far.
     end_packets_sent: u32,
-    /// In-band tone generator (for in-band mode only).
+    /// Tone generator (always present — used for in-band and dual-send).
     tone_gen: Option<DtmfToneGenerator>,
     /// Whether the initial marker-bit packet has been sent.
     marker_sent: bool,
@@ -77,20 +88,28 @@ struct ActiveDigit {
 
 impl Default for DtmfSender {
     fn default() -> Self {
-        Self::new(DtmfEvent::DEFAULT_VOLUME, INTER_DIGIT_PAUSE_MS)
+        Self::new(DtmfEvent::DEFAULT_VOLUME, INTER_DIGIT_PAUSE_MS, 8000, 160)
     }
 }
 
 impl DtmfSender {
     /// Creates a new idle sender with the given DTMF configuration.
     #[must_use]
-    pub const fn new(volume: u8, inter_digit_pause_ms: u64) -> Self {
+    pub const fn new(
+        volume: u8,
+        inter_digit_pause_ms: u64,
+        codec_clock_rate: u32,
+        codec_samples_per_frame: usize,
+    ) -> Self {
         Self {
             phase: DtmfPhase::Idle,
             queue: VecDeque::new(),
             current: None,
             volume,
             inter_digit_pause_ms,
+            codec_clock_rate,
+            codec_samples_per_frame,
+            tone_buffer: Vec::new(),
         }
     }
 
@@ -122,6 +141,15 @@ impl DtmfSender {
         self.phase != DtmfPhase::Idle
     }
 
+    /// Returns `true` if DTMF tone/packets are being actively sent.
+    ///
+    /// Unlike [`is_active()`](Self::is_active), this returns `false` during
+    /// the inter-digit pause, allowing normal mic audio to resume between
+    /// digits (matches pjproject behavior).
+    pub fn is_sending_tone(&self) -> bool {
+        matches!(self.phase, DtmfPhase::Sending | DtmfPhase::EndPackets)
+    }
+
     /// Returns `true` if an in-band DTMF tone is currently being sent.
     ///
     /// When true, the caller should suppress normal mic capture sends
@@ -136,9 +164,10 @@ impl DtmfSender {
 
     /// Polls the state machine. Call once per I/O loop iteration.
     ///
-    /// For RFC 4733 mode, sends telephone-event packets via the transmitter.
-    /// For in-band mode, returns an encoded audio frame that the caller should
-    /// send via `transmitter.send()` instead of normal mic audio.
+    /// Returns an encoded audio frame (in-band DTMF tone) that the caller
+    /// should send via `transmitter.send()`. For RFC 4733 mode, returns
+    /// `None` (only telephone-event packets are sent, no inband audio),
+    /// matching pjproject's approach.
     pub fn poll(
         &mut self,
         transmitter: &mut RtpTransmitter,
@@ -169,18 +198,26 @@ impl DtmfSender {
     }
 
     /// Begins transmission of a single digit.
+    ///
+    /// For RFC 4733: sends only telephone-event packets (no inband audio).
+    /// For pure inband: creates a tone generator and sends encoded audio.
     fn start_digit(&mut self, cmd: DtmfCommand) {
-        let method = if cmd.use_rfc2833 { "RFC4733" } else { "in-band" };
+        let method = if cmd.use_rfc2833 {
+            "RFC4733"
+        } else {
+            "in-band"
+        };
         debug!(
             "DTMF starting digit '{}' for {}ms ({})",
             cmd.digit, cmd.duration_ms, method
         );
 
         let total_duration_ts = DtmfEvent::duration_from_ms(cmd.duration_ms);
+        // Only create tone generator for inband-only mode
         let tone_gen = if cmd.use_rfc2833 {
             None
         } else {
-            Some(DtmfToneGenerator::new(cmd.digit, 8000))
+            Some(DtmfToneGenerator::new(cmd.digit, self.codec_clock_rate))
         };
 
         let now = Instant::now();
@@ -198,6 +235,9 @@ impl DtmfSender {
     }
 
     /// Polls during the Sending phase.
+    ///
+    /// For RFC 4733: sends only the telephone-event packet (no inband audio),
+    /// matching pjproject. For pure in-band: returns tone frame only.
     fn poll_sending(
         &mut self,
         transmitter: &mut RtpTransmitter,
@@ -209,14 +249,18 @@ impl DtmfSender {
         if !digit.marker_sent || digit.last_packet_time.elapsed() >= PACKET_INTERVAL {
             if digit.cmd.use_rfc2833 {
                 self.send_rfc4733_packet(transmitter);
-            } else {
-                return self.send_inband_packet(codec);
+                return None; // RFC 4733 only — no inband audio
             }
+            return self.send_inband_packet(codec);
         }
         None
     }
 
     /// Sends one RFC 4733 telephone-event packet.
+    ///
+    /// Duration progression matches pjproject: each packet advances by one
+    /// frame period (160 samples = 20ms). The marker packet carries
+    /// duration=160, not 0. Capped at the target event duration.
     fn send_rfc4733_packet(&mut self, transmitter: &mut RtpTransmitter) {
         let Some(digit) = self.current.as_mut() else {
             return;
@@ -224,21 +268,21 @@ impl DtmfSender {
 
         let is_marker = !digit.marker_sent;
 
-        // Compute cumulative duration in timestamp units
-        let elapsed_ts = if is_marker {
-            0u16
-        } else {
-            DtmfEvent::duration_from_ms((digit.packets_sent + 1) * 20)
-        };
+        // Compute cumulative duration: (packets_sent + 1) * frame_period.
+        // Marker (packets_sent=0) → 160, next → 320, 480, 640, 800 …
+        let elapsed_ts = DtmfEvent::duration_from_ms((digit.packets_sent + 1) * 20);
 
-        // Check if we've reached the target duration
-        if !is_marker && elapsed_ts >= digit.total_duration_ts {
-            // Transition to end packets
+        // If we've already sent a packet at the target duration, transition
+        // to end packets (like pjproject's `cur_ts >= dtmf_duration` check).
+        if !is_marker && elapsed_ts > digit.total_duration_ts {
             self.phase = DtmfPhase::EndPackets;
             return;
         }
 
-        let mut event = DtmfEvent::new(digit.cmd.digit, elapsed_ts);
+        // Cap at target (pjproject: `if (cur_ts > duration) cur_ts = duration`)
+        let capped_ts = elapsed_ts.min(digit.total_duration_ts);
+
+        let mut event = DtmfEvent::new(digit.cmd.digit, capped_ts);
         event.volume = self.volume;
         if let Err(e) = transmitter.send_dtmf(&event, is_marker) {
             if is_marker {
@@ -257,9 +301,6 @@ impl DtmfSender {
     fn send_inband_packet(&mut self, codec: &mut CodecPipeline) -> Option<Vec<u8>> {
         let digit = self.current.as_mut()?;
 
-        let codec_sample_rate = 8000u32;
-        let samples_per_packet = (codec_sample_rate * 20 / 1000) as usize; // 160 samples
-
         // Check if we've sent enough packets
         let total_packets = digit.cmd.duration_ms / 20;
         if digit.packets_sent >= total_packets {
@@ -268,26 +309,42 @@ impl DtmfSender {
             return None;
         }
 
-        let tone_gen = digit.tone_gen.as_mut()?;
-        let mut tone_samples = vec![0i16; samples_per_packet];
-        tone_gen.generate_samples(&mut tone_samples);
+        let result = self.generate_tone_frame(codec);
 
-        let result = match codec.encode(&tone_samples) {
-            Ok(encoded) => Some(encoded.to_vec()),
-            Err(e) => {
-                warn!("In-band DTMF encode error: {e}");
-                None
-            }
-        };
-
+        let digit = self.current.as_mut()?;
         digit.packets_sent += 1;
         digit.last_packet_time = Instant::now();
-        digit.marker_sent = true; // first packet sent
+        digit.marker_sent = true;
 
         result
     }
 
-    /// Polls during the `EndPackets` phase. Sends one end packet per call.
+    /// Generates one frame of in-band DTMF tone audio, encoded via the codec.
+    ///
+    /// Uses the pre-allocated `tone_buffer` and the codec's actual sample rate
+    /// and frame size (works for G.711, G.722, Opus, etc.).
+    fn generate_tone_frame(&mut self, codec: &mut CodecPipeline) -> Option<Vec<u8>> {
+        let digit = self.current.as_mut()?;
+        let tone_gen = digit.tone_gen.as_mut()?;
+
+        let samples = self.codec_samples_per_frame;
+        self.tone_buffer.resize(samples, 0);
+        tone_gen.generate_samples(&mut self.tone_buffer[..samples]);
+
+        match codec.encode(&self.tone_buffer[..samples]) {
+            Ok(encoded) => Some(encoded.to_vec()),
+            Err(e) => {
+                warn!("DTMF tone encode error: {e}");
+                None
+            }
+        }
+    }
+
+    /// Polls during the `EndPackets` phase.
+    ///
+    /// End packets are paced at 20ms intervals (codec frame rate) matching
+    /// pjproject, rather than burst-sent. The caller generates inband tone
+    /// frames alongside end packets to keep the audio RTP stream continuous.
     fn poll_end_packets(&mut self, transmitter: &mut RtpTransmitter) {
         let Some(digit) = self.current.as_mut() else {
             self.transition_to_pause();
@@ -295,8 +352,23 @@ impl DtmfSender {
         };
 
         if digit.end_packets_sent >= END_PACKET_REPEATS {
-            debug!("DTMF digit '{}' sent successfully", digit.cmd.digit);
+            // Advance audio timestamp past the DTMF event so the next
+            // audio packet resumes at the correct position. Without this,
+            // the timestamp would be stale (no send() calls during DTMF).
+            if digit.cmd.use_rfc2833 {
+                #[allow(clippy::cast_possible_truncation)]
+                let total_frames =
+                    digit.packets_sent + END_PACKET_REPEATS;
+                let advance =
+                    total_frames * self.codec_samples_per_frame as u32;
+                transmitter.advance_dtmf_timestamp(advance);
+            }
             self.transition_to_pause();
+            return;
+        }
+
+        // Pace end packets at 20ms intervals (codec frame rate), like pjproject.
+        if digit.end_packets_sent > 0 && digit.last_packet_time.elapsed() < PACKET_INTERVAL {
             return;
         }
 
@@ -307,6 +379,7 @@ impl DtmfSender {
         }
 
         digit.end_packets_sent += 1;
+        digit.last_packet_time = Instant::now();
     }
 
     /// Polls during the `InterDigitPause` phase.
@@ -320,6 +393,32 @@ impl DtmfSender {
             self.current = None;
             self.try_start_next();
         }
+    }
+
+    /// Sends a forced end packet if DTMF is mid-send, then clears all state.
+    ///
+    /// Called during stream teardown so the remote knows the event is over
+    /// (matches pjproject's `stream_destroy` behavior).
+    pub fn flush(&mut self, transmitter: &mut RtpTransmitter) {
+        if let Some(ref digit) = self.current {
+            if digit.cmd.use_rfc2833
+                && matches!(self.phase, DtmfPhase::Sending | DtmfPhase::EndPackets)
+            {
+                let duration = if self.phase == DtmfPhase::Sending {
+                    DtmfEvent::duration_from_ms((digit.packets_sent + 1) * 20)
+                        .min(digit.total_duration_ts)
+                } else {
+                    digit.total_duration_ts
+                };
+                let mut event = DtmfEvent::with_end(digit.cmd.digit, duration);
+                event.volume = self.volume;
+                let _ = transmitter.send_dtmf(&event, false);
+                info!("DTMF flush: sent forced end for '{}'", digit.cmd.digit);
+            }
+        }
+        self.phase = DtmfPhase::Idle;
+        self.current = None;
+        self.queue.clear();
     }
 
     /// Transitions to the inter-digit pause (or idle if queue is empty).
@@ -367,13 +466,16 @@ mod tests {
         let ok = sender.enqueue(make_cmd(DtmfDigit::Five, 100, true));
         assert!(ok);
         assert!(sender.is_active());
-        assert!(!sender.is_inband_active()); // RFC4733, not in-band
+        // RFC4733 dual-send: is_active=true, but is_inband_active=false
+        // because use_rfc2833=true (inband is sent alongside, not standalone)
+        assert!(!sender.is_inband_active());
     }
 
     #[test]
     fn test_enqueue_inband_detects_active() {
         let mut sender = DtmfSender::default();
         sender.enqueue(make_cmd(DtmfDigit::Five, 100, false));
+        // Pure inband: is_inband_active because use_rfc2833 = false
         assert!(sender.is_inband_active());
     }
 
