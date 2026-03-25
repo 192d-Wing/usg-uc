@@ -52,10 +52,10 @@ impl Default for AecConfig {
     fn default() -> Self {
         Self {
             filter_length_ms: 128,
-            nlms_mu: 0.5,
-            doubletalk_threshold: 2.0,
+            nlms_mu: 0.3,              // Slower convergence but stable during double-talk
+            doubletalk_threshold: 1.5,  // Stop adapting sooner (was 2.0)
             min_farend_energy: 100.0,
-            nlp_suppression: 0.05,
+            nlp_suppression: 0.03,     // Stronger suppression (was 0.05)
             nlp_threshold: 0.15,
             // ~50ms compensates for: ring buffer target fill (40ms at 48kHz)
             // + CPAL output buffer (~10ms) + DAC latency (~2ms).
@@ -347,22 +347,22 @@ impl AecProcessor {
                 }
             }
 
-            // Non-linear processing (NLP): gated on ERLE.
-            // When ERLE is high (>10 dB), the adaptive filter is doing its job
-            // and NLP can use the configured threshold. When ERLE is low (<6 dB),
-            // the filter hasn't converged — apply NLP more aggressively.
-            let output = if echo_energy > self.cfg.min_farend_energy {
-                let echo_ratio = echo_estimate.abs() / (error.abs() + 1.0);
-                let effective_threshold = if self.erle_db < 6.0 {
-                    // Aggressive NLP: lower threshold to suppress more residual echo
-                    self.cfg.nlp_threshold * 0.5
-                } else {
-                    self.cfg.nlp_threshold
-                };
-                if echo_ratio > effective_threshold {
+            // Non-linear processing (NLP): gated on reference power.
+            // Use the reference signal power directly (reliable) instead of
+            // the echo estimate (unreliable when filter hasn't converged).
+            // When far-end is active, suppress residual echo proportionally.
+            let output = if self.ref_power > self.cfg.min_farend_energy * (self.filter_len as f32) {
+                // Far-end is active — echo is expected in the mic.
+                // Scale suppression by how much energy is in the reference.
+                let ref_rms = (self.ref_power / self.filter_len as f32).sqrt();
+                let error_rms = error.abs();
+                // If error is small relative to reference, it's mostly echo → suppress
+                // If error is large relative to reference, near-end is speaking → pass through
+                if error_rms < ref_rms * self.cfg.doubletalk_threshold {
                     error * self.cfg.nlp_suppression
                 } else {
-                    error
+                    // Double-talk: scale down partially instead of full pass-through
+                    error * 0.5
                 }
             } else {
                 error
