@@ -30,13 +30,12 @@ pub struct PostfilterConfig {
 
 impl Default for PostfilterConfig {
     fn default() -> Self {
-        // Two cascaded stages with α=0.45 give ~17 dB attenuation at Nyquist
-        // while preserving speech fundamentals. This effectively suppresses
-        // G.711 quantization noise from remote endpoints that lack
-        // encoder-side noise shaping (most SIP providers).
+        // Single stage with α=0.45 gives ~8 dB attenuation at Nyquist.
+        // Enough to reduce G.711 quantization hiss without muffling speech.
+        // Use stages=2 for more aggressive filtering if needed.
         Self {
             tilt_alpha: 0.45,
-            stages: 2,
+            stages: 1,
         }
     }
 }
