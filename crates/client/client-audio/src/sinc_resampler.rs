@@ -742,10 +742,10 @@ fn dot_product_16_neon(history: &[f32; TAPS_PER_PHASE], coeffs: &[f32; TAPS_PER_
 
 /// SSE2-accelerated 16-element f32 dot product.
 ///
-/// SSE2 is mandatory on all x86_64 targets (AMD64 baseline).
+/// `SSE2` is mandatory on all `x86_64` targets (AMD64 baseline).
 /// Uses `_mm_mul_ps` + `_mm_add_ps` (no FMA requirement).
 #[cfg(target_arch = "x86_64")]
-#[allow(unsafe_code)]
+#[allow(unsafe_code, clippy::inline_always)]
 #[inline(always)]
 fn dot_product_16_sse2(history: &[f32; TAPS_PER_PHASE], coeffs: &[f32; TAPS_PER_PHASE]) -> f32 {
     // SAFETY: SSE2 is always available on x86_64. _mm_loadu_ps supports
