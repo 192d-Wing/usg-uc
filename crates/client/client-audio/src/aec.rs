@@ -289,15 +289,17 @@ impl AecProcessor {
         // Determine suppression gain based on far-end activity
         let gain = if self.ref_power > self.cfg.min_farend_energy {
             // Far-end is active — echo expected in mic.
-            // Check if near-end is speaking much louder than the echo would be
-            // (double-talk detection via energy ratio).
+            // On laptop speaker+mic, acoustic coupling is strong (echo is
+            // 0.3-0.8x the reference level). Only allow double-talk pass-through
+            // when mic energy massively exceeds reference (user shouting over
+            // the speaker). Otherwise suppress to eliminate echo.
             let ratio = mic_energy / (self.ref_power + NLMS_DELTA);
-            if ratio > self.cfg.doubletalk_threshold * self.cfg.doubletalk_threshold {
-                // Near-end is much louder than far-end → likely double-talk.
-                // Apply moderate suppression to limit echo while preserving speech.
-                0.3
+            if ratio > 10.0 {
+                // Mic is 10x louder than reference → near-end is clearly dominant.
+                // Apply moderate suppression to still limit echo leakage.
+                0.15
             } else {
-                // Echo-only or echo-dominant → suppress strongly.
+                // Echo-only or mixed — suppress strongly.
                 self.cfg.nlp_suppression
             }
         } else {
