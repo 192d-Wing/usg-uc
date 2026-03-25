@@ -597,6 +597,11 @@ function handleCallStateChange(payload) {
     if (state === 'Dialing' || state === 'dialing' || state === 'EarlyMedia' || state === 'early_media') {
         // Track the active call so we ignore stale events from prior calls
         currentCallId = call_id;
+        // Play ringback tone during dialing/early media (BulkVS sends 183
+        // instead of 180, so we start ringback on either state)
+        if (!ringbackTone.isPlaying) {
+            ringbackTone.start();
+        }
     }
 
     // Ignore state changes for a different call than the one we're tracking
@@ -607,7 +612,9 @@ function handleCallStateChange(payload) {
 
     if (state === 'Ringing' || state === 'ringing') {
         // Play ringback tone while waiting for answer
-        ringbackTone.start();
+        if (!ringbackTone.isPlaying) {
+            ringbackTone.start();
+        }
     } else if (state === 'Connected' || state === 'connected') {
         // Stop ringback tone when call is answered
         ringbackTone.stop();
