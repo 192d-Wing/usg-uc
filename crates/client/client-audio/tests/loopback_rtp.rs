@@ -9,11 +9,11 @@ use client_audio::{
     CodecPipeline, JitterBufferResult, RtpReceiver, RtpTransmitter, SharedJitterBuffer,
     generate_ssrc,
 };
-#[cfg(feature = "opus-ffi")]
-use uc_codecs::FfiOpusCodec;
 use client_types::audio::CodecPreference;
 use std::net::UdpSocket;
 use std::sync::Arc;
+#[cfg(feature = "opus-ffi")]
+use uc_codecs::FfiOpusCodec;
 
 const SAMPLE_RATE: u32 = 8000;
 const FRAME_SAMPLES: usize = 160; // 20ms at 8kHz
@@ -100,11 +100,9 @@ fn loopback_codec(codec: CodecPreference, payload_type: u8) {
 
     // --- Setup RTP ---
     let ssrc = generate_ssrc();
-    let mut transmitter =
-        RtpTransmitter::new(tx_socket, rx_addr, ssrc, payload_type, ts_increment);
+    let mut transmitter = RtpTransmitter::new(tx_socket, rx_addr, ssrc, payload_type, ts_increment);
 
-    let jitter_buffer =
-        SharedJitterBuffer::new(clock_rate, samples_per_frame as u32, 60);
+    let jitter_buffer = SharedJitterBuffer::new(clock_rate, samples_per_frame as u32, 60);
     let mut receiver = RtpReceiver::new(rx_socket, jitter_buffer.clone());
 
     // --- Generate test signal ---
@@ -165,7 +163,9 @@ fn loopback_codec(codec: CodecPreference, payload_type: u8) {
                 output_signal.extend_from_slice(decoded);
                 decoded_frames += 1;
             }
-            JitterBufferResult::Lost { .. } | JitterBufferResult::Empty | JitterBufferResult::NotReady => {
+            JitterBufferResult::Lost { .. }
+            | JitterBufferResult::Empty
+            | JitterBufferResult::NotReady => {
                 // Gap, empty, or not ready — skip
             }
         }
@@ -200,11 +200,12 @@ fn loopback_codec(codec: CodecPreference, payload_type: u8) {
         let mut best_corr = 0.0_f64;
         for offset in 0..4 {
             let input_start = offset * samples_per_frame;
-            let cmp_len =
-                (compare_len - samples_per_frame).min(input_signal.len() - input_start);
+            let cmp_len = (compare_len - samples_per_frame).min(input_signal.len() - input_start);
             if cmp_len > samples_per_frame && cmp_len <= output_signal.len() {
-                let corr =
-                    cross_correlation(&input_signal[input_start..input_start + cmp_len], &output_signal[..cmp_len]);
+                let corr = cross_correlation(
+                    &input_signal[input_start..input_start + cmp_len],
+                    &output_signal[..cmp_len],
+                );
                 if corr > best_corr {
                     best_corr = corr;
                 }
@@ -394,7 +395,9 @@ fn loopback_out_of_order_packets() {
                 assert_eq!(pcm.len(), FRAME_SAMPLES);
                 decoded += 1;
             }
-            JitterBufferResult::Lost { .. } | JitterBufferResult::Empty | JitterBufferResult::NotReady => {}
+            JitterBufferResult::Lost { .. }
+            | JitterBufferResult::Empty
+            | JitterBufferResult::NotReady => {}
         }
         if decoded >= num_frames {
             break;
@@ -714,7 +717,10 @@ fn pipeline_jitter_simulation() {
     // Encode all frames
     let mut encoded: Vec<Vec<u8>> = Vec::new();
     for f in 0..num_frames {
-        let enc = encoder.encode(&input[f * spf..(f + 1) * spf]).unwrap().to_vec();
+        let enc = encoder
+            .encode(&input[f * spf..(f + 1) * spf])
+            .unwrap()
+            .to_vec();
         encoded.push(enc);
     }
 
@@ -851,7 +857,9 @@ fn opus_fec_recovery_via_jitter_buffer() {
     let mut encoded_packets: Vec<Vec<u8>> = Vec::new();
     for f in 0..num_frames {
         let mut enc = vec![0u8; 1275];
-        let len = codec.encode(&input[f * spf..(f + 1) * spf], &mut enc).unwrap();
+        let len = codec
+            .encode(&input[f * spf..(f + 1) * spf], &mut enc)
+            .unwrap();
         encoded_packets.push(enc[..len].to_vec());
     }
 
@@ -965,7 +973,9 @@ fn loopback_opus_lossless() {
     let mut output = Vec::with_capacity(spf * num_frames);
     for f in 0..num_frames {
         let mut enc = vec![0u8; 1275];
-        let enc_len = codec.encode(&input[f * spf..(f + 1) * spf], &mut enc).unwrap();
+        let enc_len = codec
+            .encode(&input[f * spf..(f + 1) * spf], &mut enc)
+            .unwrap();
 
         let mut dec = vec![0i16; spf];
         let dec_len = codec.decode(&enc[..enc_len], &mut dec).unwrap();

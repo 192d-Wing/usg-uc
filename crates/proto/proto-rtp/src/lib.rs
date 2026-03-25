@@ -44,8 +44,8 @@ pub mod translator;
 
 pub use error::{RtpError, RtpResult};
 pub use packet::{
-    ExtensionElement, ExtensionFormat, ExtensionHeader, RtpHeader, RtpPacket,
     EXTENSION_PROFILE_ONE_BYTE, EXTENSION_PROFILE_TWO_BYTE, EXTENSION_PROFILE_TWO_BYTE_MASK,
+    ExtensionElement, ExtensionFormat, ExtensionHeader, RtpHeader, RtpPacket,
 };
 pub use rtcp::{ReceptionReport, RtcpHeader, RtcpPacket, RtcpType, SenderInfo};
 pub use scheduler::{

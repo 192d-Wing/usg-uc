@@ -846,8 +846,7 @@ impl CallManager {
             }
             // Parse DTMF telephone-event PT from remote offer
             let dtmf_pt = parse_telephone_event_pt(remote_sdp);
-            self.telephone_event_pt
-                .insert(call_id.to_string(), dtmf_pt);
+            self.telephone_event_pt.insert(call_id.to_string(), dtmf_pt);
             if let Some(pt) = dtmf_pt {
                 info!(call_id = %call_id, pt = pt, "Remote offer supports telephone-event PT={pt}");
             }
@@ -1262,11 +1261,7 @@ impl CallManager {
             .ok_or_else(|| AppError::Sip("No active call".to_string()))?;
 
         // Check if remote party supports RFC 4733 telephone-event
-        let dtmf_pt = self
-            .telephone_event_pt
-            .get(&call_id)
-            .copied()
-            .flatten();
+        let dtmf_pt = self.telephone_event_pt.get(&call_id).copied().flatten();
         let use_rfc2833 = dtmf_pt.is_some();
 
         if use_rfc2833 {
@@ -1418,11 +1413,7 @@ impl CallManager {
     /// Sets the preferred devices without switching any active session.
     ///
     /// Used at startup to restore saved preferences from settings.
-    pub fn set_preferred_devices(
-        &mut self,
-        input: Option<String>,
-        output: Option<String>,
-    ) {
+    pub fn set_preferred_devices(&mut self, input: Option<String>, output: Option<String>) {
         self.selected_input_device = input;
         self.selected_output_device = output;
     }
@@ -1709,17 +1700,9 @@ impl CallManager {
 
         // Configure audio
         // Get negotiated DTMF payload type for this call
-        let dtmf_payload_type = self
-            .telephone_event_pt
-            .get(call_id)
-            .copied()
-            .flatten();
+        let dtmf_payload_type = self.telephone_event_pt.get(call_id).copied().flatten();
 
-        let redundancy_pt = self
-            .redundancy_pt
-            .get(call_id)
-            .copied()
-            .flatten();
+        let redundancy_pt = self.redundancy_pt.get(call_id).copied().flatten();
 
         let extension_ids = self
             .negotiated_extension_ids
@@ -1806,10 +1789,9 @@ impl CallManager {
                     // Start media session establishment (ICE + DTLS) — only
                     // for TLS transport. Plain RTP calls (UDP/TCP) don't use
                     // ICE and establish() would always fail with "No ICE candidates".
-                    let use_ice = self
-                        .account
-                        .as_ref()
-                        .is_some_and(|a| matches!(a.transport, client_types::TransportPreference::TlsOnly));
+                    let use_ice = self.account.as_ref().is_some_and(|a| {
+                        matches!(a.transport, client_types::TransportPreference::TlsOnly)
+                    });
                     if use_ice {
                         if let Some(session) = self.media_sessions.get_mut(call_id) {
                             info!(call_id = %call_id, "Found media session, attempting to establish");
@@ -1946,8 +1928,7 @@ impl CallManager {
 
         // Check if telephone-event was negotiated for DTMF support
         let dtmf_pt = parse_telephone_event_pt(sdp);
-        self.telephone_event_pt
-            .insert(call_id.to_string(), dtmf_pt);
+        self.telephone_event_pt.insert(call_id.to_string(), dtmf_pt);
 
         if let Some(pt) = dtmf_pt {
             info!(call_id = %call_id, pt = pt, "Remote supports RFC 2833/4733 telephone-event PT={pt}");
@@ -2881,20 +2862,23 @@ fn negotiate_codec_from_sdp_offer(
             9 => Some(CodecPreference::G722),
             _ => {
                 // Look up dynamic PT in rtpmaps
-                rtpmaps.iter().find(|(rpt, _)| rpt == pt).and_then(|(_, name)| {
-                    let lower = name.to_lowercase();
-                    if lower == "pcmu" {
-                        Some(CodecPreference::G711Ulaw)
-                    } else if lower == "pcma" {
-                        Some(CodecPreference::G711Alaw)
-                    } else if lower == "g722" {
-                        Some(CodecPreference::G722)
-                    } else if lower == "opus" {
-                        Some(CodecPreference::Opus)
-                    } else {
-                        None
-                    }
-                })
+                rtpmaps
+                    .iter()
+                    .find(|(rpt, _)| rpt == pt)
+                    .and_then(|(_, name)| {
+                        let lower = name.to_lowercase();
+                        if lower == "pcmu" {
+                            Some(CodecPreference::G711Ulaw)
+                        } else if lower == "pcma" {
+                            Some(CodecPreference::G711Alaw)
+                        } else if lower == "g722" {
+                            Some(CodecPreference::G722)
+                        } else if lower == "opus" {
+                            Some(CodecPreference::Opus)
+                        } else {
+                            None
+                        }
+                    })
             }
         };
         if let Some(c) = codec {
@@ -3547,7 +3531,10 @@ a=rtpmap:96 speex/16000\r\n";
         let sdp_g711 = "\
 m=audio 5000 RTP/AVP 0\r\n\
 a=rtpmap:0 PCMU/8000\r\n";
-        assert_eq!(parse_codec_from_sdp(sdp_g711), Some(CodecPreference::G711Ulaw));
+        assert_eq!(
+            parse_codec_from_sdp(sdp_g711),
+            Some(CodecPreference::G711Ulaw)
+        );
 
         let sdp_g722 = "\
 m=audio 5000 RTP/AVP 9\r\n\
@@ -3557,7 +3544,10 @@ a=rtpmap:9 G722/8000\r\n";
         let sdp_alaw = "\
 m=audio 5000 RTP/AVP 8\r\n\
 a=rtpmap:8 PCMA/8000\r\n";
-        assert_eq!(parse_codec_from_sdp(sdp_alaw), Some(CodecPreference::G711Alaw));
+        assert_eq!(
+            parse_codec_from_sdp(sdp_alaw),
+            Some(CodecPreference::G711Alaw)
+        );
 
         // Codecs are distinct — change detection works
         assert_ne!(
@@ -3583,10 +3573,7 @@ a=sendrecv\r\n";
         let exts = parse_extmap_attributes(sdp);
         assert_eq!(exts.len(), 1);
         assert_eq!(exts[0].0, 1);
-        assert_eq!(
-            exts[0].1,
-            "urn:ietf:params:rtp-hdrext:ssrc-audio-level"
-        );
+        assert_eq!(exts[0].1, "urn:ietf:params:rtp-hdrext:ssrc-audio-level");
     }
 
     #[test]

@@ -255,7 +255,9 @@ impl WsolaPlc {
                     let w = self.hanning[i];
                     let blended = left.mul_add(1.0 - w, right * w);
                     #[allow(clippy::cast_possible_truncation)]
-                    { self.buf[buf_idx] = blended.clamp(-32768.0, 32767.0) as i16; }
+                    {
+                        self.buf[buf_idx] = blended.clamp(-32768.0, 32767.0) as i16;
+                    }
                 }
             }
         }
@@ -305,7 +307,11 @@ impl WsolaPlc {
             }
 
             // Normalize by candidate energy to prevent bias toward loud segments
-            let norm_corr = if energy > 1.0 { corr / energy.sqrt() } else { 0.0 };
+            let norm_corr = if energy > 1.0 {
+                corr / energy.sqrt()
+            } else {
+                0.0
+            };
 
             if norm_corr > best_corr {
                 best_corr = norm_corr;
@@ -342,7 +348,12 @@ impl WsolaPlc {
         let buf_end = self.cur_cnt.min(self.buf_size);
         let buf_start = buf_end.saturating_sub(fade_len);
 
-        for (i, (&real_sample, &w)) in real_frame.iter().zip(&self.hanning).take(fade_len).enumerate() {
+        for (i, (&real_sample, &w)) in real_frame
+            .iter()
+            .zip(&self.hanning)
+            .take(fade_len)
+            .enumerate()
+        {
             let buf_idx = buf_start + i;
             if buf_idx < self.buf_size {
                 let synthetic = f32::from(self.buf[buf_idx]);
@@ -520,7 +531,11 @@ mod tests {
         let win = create_hanning_window(40);
         assert_eq!(win.len(), 40);
         // First sample should be near 0
-        assert!(win[0] < 0.05, "First sample should be near 0, got {}", win[0]);
+        assert!(
+            win[0] < 0.05,
+            "First sample should be near 0, got {}",
+            win[0]
+        );
         // Last sample should be near 1
         assert!(
             win[39] > 0.95,
@@ -547,9 +562,8 @@ mod tests {
         let signal: Vec<i16> = (0..160)
             .map(|i| {
                 #[allow(clippy::cast_possible_truncation)]
-                let s =
-                    (f64::sin(2.0 * std::f64::consts::PI * freq * f64::from(i) / 8000.0) * 10000.0)
-                        as i16;
+                let s = (f64::sin(2.0 * std::f64::consts::PI * freq * f64::from(i) / 8000.0)
+                    * 10000.0) as i16;
                 s
             })
             .collect();

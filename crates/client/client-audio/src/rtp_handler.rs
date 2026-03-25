@@ -295,7 +295,10 @@ impl RtpTransmitter {
                 debug!("Cached extension header: {} bytes total", self.header_size);
             }
             Err(e) => {
-                warn!("Failed to build extension header: {}, extensions disabled", e);
+                warn!(
+                    "Failed to build extension header: {}, extensions disabled",
+                    e
+                );
                 self.cached_ext_header = None;
                 self.header_size = RTP_HEADER_SIZE;
             }
@@ -423,7 +426,9 @@ impl RtpTransmitter {
             Ok(sent) => {
                 trace!("Sent RTP packet: seq={}, ts={}, size={}", seq, ts, sent);
                 self.stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                self.stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                self.stats
+                    .bytes_sent
+                    .fetch_add(sent as u64, Ordering::Relaxed);
                 self.last_send_time = Instant::now();
                 Ok(())
             }
@@ -482,7 +487,9 @@ impl RtpTransmitter {
             Ok(sent) => {
                 debug!("Sent CN packet: seq={}, ts={}, size={}", seq, ts, sent);
                 self.stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                self.stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                self.stats
+                    .bytes_sent
+                    .fetch_add(sent as u64, Ordering::Relaxed);
                 self.last_send_time = Instant::now();
                 Ok(())
             }
@@ -516,8 +523,7 @@ impl RtpTransmitter {
             // the remote jitter buffer as too-late.
             let elapsed = self.last_send_time.elapsed();
             let elapsed_samples = (elapsed.as_millis() as u32) * 8; // 8 samples/ms at 8kHz
-            let catch_up =
-                (elapsed_samples / self.timestamp_increment) * self.timestamp_increment;
+            let catch_up = (elapsed_samples / self.timestamp_increment) * self.timestamp_increment;
             if catch_up > 0 {
                 self.timestamp.fetch_add(catch_up, Ordering::Relaxed);
                 debug!(
@@ -569,7 +575,9 @@ impl RtpTransmitter {
                     event.digit, seq, ts, event.end, marker
                 );
                 self.stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                self.stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                self.stats
+                    .bytes_sent
+                    .fetch_add(sent as u64, Ordering::Relaxed);
                 self.last_send_time = Instant::now();
                 Ok(())
             }
@@ -824,15 +832,12 @@ impl RtpReceiver {
                     ),
                     Err(e) => {
                         self.stats.srtp_errors.fetch_add(1, Ordering::Relaxed);
-                        return Err(AudioError::SrtpError(format!(
-                            "SRTP unprotect failed: {e}"
-                        )));
+                        return Err(AudioError::SrtpError(format!("SRTP unprotect failed: {e}")));
                     }
                 }
             } else {
                 // Inline minimal parse — no RtpHeader/RtpPacket constructed.
-                let (pt, seq, ts, ssrc, payload_start, payload_end) =
-                    parse_rtp_fields(data)?;
+                let (pt, seq, ts, ssrc, payload_start, payload_end) = parse_rtp_fields(data)?;
                 (
                     pt,
                     seq,
@@ -892,9 +897,7 @@ impl RtpReceiver {
 
         // RFC 2198 redundancy: extract primary + redundant payloads.
         if self.redundancy_pt == Some(pt) {
-            if let Some((primary_pt, primary_data, redundant)) =
-                parse_rfc2198(&payload, ts)
-            {
+            if let Some((primary_pt, primary_data, redundant)) = parse_rfc2198(&payload, ts) {
                 // Push redundant blocks first (they represent older packets).
                 for (red_pt, ts_offset, red_data) in &redundant {
                     let red_ts = ts.wrapping_sub(*ts_offset);
@@ -908,12 +911,8 @@ impl RtpReceiver {
                     self.jitter_buffer.push(red_pkt);
                 }
                 // Push primary payload
-                let buffered = BufferedPacket::new(
-                    seq,
-                    ts,
-                    primary_pt,
-                    Bytes::copy_from_slice(primary_data),
-                );
+                let buffered =
+                    BufferedPacket::new(seq, ts, primary_pt, Bytes::copy_from_slice(primary_data));
                 self.jitter_buffer.push(buffered);
             } else {
                 warn!("Failed to parse RFC 2198 payload, dropping packet");
@@ -1063,10 +1062,9 @@ pub fn parse_rfc2198(
             if offset + 4 > data.len() || num_redundant >= MAX_REDUNDANT_BLOCKS {
                 return None;
             }
-            let ts_offset = (u32::from(data[offset + 1]) << 6)
-                | (u32::from(data[offset + 2]) >> 2);
-            let block_len = (usize::from(data[offset + 2] & 0x03) << 8)
-                | usize::from(data[offset + 3]);
+            let ts_offset = (u32::from(data[offset + 1]) << 6) | (u32::from(data[offset + 2]) >> 2);
+            let block_len =
+                (usize::from(data[offset + 2] & 0x03) << 8) | usize::from(data[offset + 3]);
             redundant_headers[num_redundant] = (block_pt, ts_offset, block_len);
             num_redundant += 1;
             offset += 4;
@@ -1129,8 +1127,7 @@ pub fn parse_rtp_fields(data: &[u8]) -> AudioResult<(u8, u16, u32, u32, usize, u
             return Err(AudioError::RtpError("extension header too short".into()));
         }
         #[allow(clippy::cast_possible_truncation)]
-        let ext_len =
-            u16::from_be_bytes([data[header_end + 2], data[header_end + 3]]) as usize * 4;
+        let ext_len = u16::from_be_bytes([data[header_end + 2], data[header_end + 3]]) as usize * 4;
         header_end += 4 + ext_len;
     }
 
@@ -1142,7 +1139,14 @@ pub fn parse_rtp_fields(data: &[u8]) -> AudioResult<(u8, u16, u32, u32, usize, u
         }
     }
 
-    Ok((payload_type, sequence_number, timestamp, ssrc, header_end, payload_end))
+    Ok((
+        payload_type,
+        sequence_number,
+        timestamp,
+        ssrc,
+        header_end,
+        payload_end,
+    ))
 }
 
 #[cfg(test)]
@@ -1212,8 +1216,7 @@ mod tests {
         packet.extend_from_slice(&header_bytes);
         packet.extend_from_slice(&payload);
 
-        let (pt, seq, ts, ssrc, payload_start, payload_end) =
-            parse_rtp_fields(&packet).unwrap();
+        let (pt, seq, ts, ssrc, payload_start, payload_end) = parse_rtp_fields(&packet).unwrap();
         assert_eq!(pt, 0);
         assert_eq!(seq, 100);
         assert_eq!(ts, 1600);
@@ -1327,12 +1330,14 @@ mod tests {
 
         let (len2, _) = socket.recv_from(&mut buf).unwrap();
         let (pt2, _, ts2, _, ps2, pe2) = parse_rtp_fields(&buf[..len2]).unwrap();
-        assert_eq!(pt2, REDUNDANCY_PAYLOAD_TYPE, "second packet should use redundancy PT");
+        assert_eq!(
+            pt2, REDUNDANCY_PAYLOAD_TYPE,
+            "second packet should use redundancy PT"
+        );
 
         // Parse the RFC 2198 body
         let rfc2198_body = &buf[ps2..pe2];
-        let (primary_pt, primary_data, redundant) =
-            parse_rfc2198(rfc2198_body, ts2).unwrap();
+        let (primary_pt, primary_data, redundant) = parse_rfc2198(rfc2198_body, ts2).unwrap();
         assert_eq!(primary_pt, 0);
         assert_eq!(primary_data.len(), 160);
         assert!(primary_data.iter().all(|&b| b == 0x22));
@@ -1378,7 +1383,7 @@ mod tests {
         // Simulate receiving a packet with our own SSRC — collision!
         let mut pkt = vec![0u8; RTP_HEADER_SIZE + 160];
         pkt[0] = 0x80; // V=2
-        pkt[1] = 0;    // PT=0
+        pkt[1] = 0; // PT=0
         pkt[2..4].copy_from_slice(&1u16.to_be_bytes());
         pkt[4..8].copy_from_slice(&160u32.to_be_bytes());
         pkt[8..12].copy_from_slice(&local_ssrc.to_be_bytes());

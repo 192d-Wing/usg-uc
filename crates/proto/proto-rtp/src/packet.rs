@@ -368,9 +368,7 @@ impl ExtensionHeader {
     /// Gets a single element by extension ID.
     #[must_use]
     pub fn get_element(&self, id: u8) -> Option<ExtensionElement> {
-        self.parse_elements()?
-            .into_iter()
-            .find(|e| e.id == id)
+        self.parse_elements()?.into_iter().find(|e| e.id == id)
     }
 
     /// Builds an `ExtensionHeader` in one-byte format from a slice of elements.
@@ -744,7 +742,10 @@ mod tests {
         ];
 
         let ext = ExtensionHeader::build_two_byte(&elements, 0).unwrap();
-        assert_eq!(ext.profile & EXTENSION_PROFILE_TWO_BYTE_MASK, EXTENSION_PROFILE_TWO_BYTE);
+        assert_eq!(
+            ext.profile & EXTENSION_PROFILE_TWO_BYTE_MASK,
+            EXTENSION_PROFILE_TWO_BYTE
+        );
         assert_eq!(ext.data.len() % 4, 0);
 
         let parsed = ext.parse_elements().unwrap();
@@ -820,7 +821,10 @@ mod tests {
         ];
         let ext = ExtensionHeader::build_one_byte(&elements).unwrap();
 
-        assert_eq!(ext.get_element(5).unwrap().data, Bytes::from_static(&[0xBB]));
+        assert_eq!(
+            ext.get_element(5).unwrap().data,
+            Bytes::from_static(&[0xBB])
+        );
         assert!(ext.get_element(9).is_none());
     }
 

@@ -365,11 +365,7 @@ mod tests {
             }
         }
 
-        if count > 0 {
-            power / count as f64
-        } else {
-            0.0
-        }
+        if count > 0 { power / count as f64 } else { 0.0 }
     }
 
     #[test]

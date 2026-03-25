@@ -26,8 +26,7 @@ use std::f64::consts::PI;
 use core::arch::aarch64::{vaddvq_f32, vfmaq_f32, vld1q_f32, vmulq_f32};
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{
-    _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_loadu_ps, _mm_movehl_ps, _mm_mul_ps,
-    _mm_shuffle_ps,
+    _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_loadu_ps, _mm_movehl_ps, _mm_mul_ps, _mm_shuffle_ps,
 };
 
 /// Number of filter taps per polyphase sub-filter.
@@ -93,7 +92,13 @@ impl SincResampler {
         // SAFETY: pos is maintained in [0, TAPS_PER_PHASE) by wrapping logic,
         // so pos + TAPS_PER_PHASE <= 2 * TAPS_PER_PHASE = history.len().
         // The array is contiguous f32 with proper alignment.
-        unsafe { &*(self.history.as_ptr().add(self.pos).cast::<[f32; TAPS_PER_PHASE]>()) }
+        unsafe {
+            &*(self
+                .history
+                .as_ptr()
+                .add(self.pos)
+                .cast::<[f32; TAPS_PER_PHASE]>())
+        }
     }
 
     /// Inserts a new sample into the circular history buffer.
@@ -768,10 +773,7 @@ fn dot_product_16_sse2(history: &[f32; TAPS_PER_PHASE], coeffs: &[f32; TAPS_PER_
 }
 
 /// Scalar fallback using 4-lane accumulation order for consistency with SIMD paths.
-#[cfg(any(
-    not(any(target_arch = "aarch64", target_arch = "x86_64")),
-    test
-))]
+#[cfg(any(not(any(target_arch = "aarch64", target_arch = "x86_64")), test))]
 fn dot_product_16_scalar(history: &[f32; TAPS_PER_PHASE], coeffs: &[f32; TAPS_PER_PHASE]) -> f32 {
     let mut acc0 = history[0] * coeffs[0];
     let mut acc1 = history[1] * coeffs[1];
@@ -837,7 +839,10 @@ mod tests {
         let history = [0.0f32; TAPS_PER_PHASE];
         let coeffs = [1.0f32; TAPS_PER_PHASE];
         let result = dot_product_16(&history, &coeffs);
-        assert!(result.abs() < 1e-10, "Zero input should produce zero: {result}");
+        assert!(
+            result.abs() < 1e-10,
+            "Zero input should produce zero: {result}"
+        );
     }
 
     // ─── Integer polyphase tests ───────────────────────────────────

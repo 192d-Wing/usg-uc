@@ -216,7 +216,9 @@ impl AudioProcessor {
         };
 
         self.current_gain += (desired_gain - self.current_gain) * alpha;
-        self.current_gain = self.current_gain.clamp(self.agc.min_gain, self.agc.max_gain);
+        self.current_gain = self
+            .current_gain
+            .clamp(self.agc.min_gain, self.agc.max_gain);
 
         // Apply gain to all samples
         for sample in pcm.iter_mut() {

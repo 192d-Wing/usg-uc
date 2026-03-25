@@ -307,10 +307,12 @@ impl Extmap {
     ///
     /// Returns an error if the value cannot be parsed.
     pub fn parse(value: &str) -> SdpResult<Self> {
-        let (id_part, rest) = value.split_once(' ').ok_or_else(|| SdpError::InvalidAttribute {
-            name: "extmap".to_string(),
-            reason: "missing URI".to_string(),
-        })?;
+        let (id_part, rest) = value
+            .split_once(' ')
+            .ok_or_else(|| SdpError::InvalidAttribute {
+                name: "extmap".to_string(),
+                reason: "missing URI".to_string(),
+            })?;
         let rest = rest.trim();
 
         // Parse ID and optional direction
@@ -495,8 +497,7 @@ mod tests {
 
     #[test]
     fn test_extmap_parse_with_direction() {
-        let ext =
-            Extmap::parse("2/sendonly urn:ietf:params:rtp-hdrext:toffset").unwrap();
+        let ext = Extmap::parse("2/sendonly urn:ietf:params:rtp-hdrext:toffset").unwrap();
         assert_eq!(ext.id, 2);
         assert_eq!(ext.direction, Some(ExtmapDirection::Sendonly));
         assert_eq!(ext.uri, "urn:ietf:params:rtp-hdrext:toffset");
@@ -542,20 +543,24 @@ mod tests {
 
     #[test]
     fn test_extmap_is_one_byte_compatible() {
-        assert!(Extmap {
-            id: 14,
-            direction: None,
-            uri: String::new(),
-            extension_attributes: None,
-        }
-        .is_one_byte_compatible());
-        assert!(!Extmap {
-            id: 15,
-            direction: None,
-            uri: String::new(),
-            extension_attributes: None,
-        }
-        .is_one_byte_compatible());
+        assert!(
+            Extmap {
+                id: 14,
+                direction: None,
+                uri: String::new(),
+                extension_attributes: None,
+            }
+            .is_one_byte_compatible()
+        );
+        assert!(
+            !Extmap {
+                id: 15,
+                direction: None,
+                uri: String::new(),
+                extension_attributes: None,
+            }
+            .is_one_byte_compatible()
+        );
     }
 
     #[test]

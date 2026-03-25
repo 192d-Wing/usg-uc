@@ -475,7 +475,10 @@ impl JitterBuffer {
         // Smooth transition toward new target
         #[allow(clippy::cast_precision_loss)]
         let current = self.target_depth_ms as f32;
-        let new_target = current.mul_add(1.0 - self.cfg.adapt_smoothing, clamped * self.cfg.adapt_smoothing);
+        let new_target = current.mul_add(
+            1.0 - self.cfg.adapt_smoothing,
+            clamped * self.cfg.adapt_smoothing,
+        );
         let new_depth = (new_target.round() as u32).clamp(MIN_DEPTH_MS, MAX_DEPTH_MS);
 
         if new_depth != self.target_depth_ms {
@@ -628,10 +631,7 @@ impl SharedJitterBuffer {
                 target_depth_ms,
                 cfg,
             ))),
-            wake: std::sync::Arc::new((
-                std::sync::Mutex::new(()),
-                std::sync::Condvar::new(),
-            )),
+            wake: std::sync::Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
         }
     }
 
@@ -683,10 +683,7 @@ impl SharedJitterBuffer {
 
     /// Returns the current statistics (Copy — no heap allocation).
     pub fn stats(&self) -> JitterBufferStats {
-        self.inner
-            .lock()
-            .map(|jb| *jb.stats())
-            .unwrap_or_default()
+        self.inner.lock().map(|jb| *jb.stats()).unwrap_or_default()
     }
 
     /// Returns the buffered duration in milliseconds.

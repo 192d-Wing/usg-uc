@@ -303,8 +303,7 @@ impl CallQualityReport {
     ///
     /// R is then converted to MOS via the standard formula.
     pub fn from_stats(stats: &PipelineStats) -> Self {
-        let total_expected = stats.jitter_stats.packets_played
-            + stats.jitter_stats.packets_lost;
+        let total_expected = stats.jitter_stats.packets_played + stats.jitter_stats.packets_lost;
         #[allow(clippy::cast_precision_loss)]
         let loss_pct = if total_expected > 0 {
             (stats.jitter_stats.packets_lost as f64 / total_expected as f64 * 100.0) as f32
@@ -501,7 +500,9 @@ impl AudioPipeline {
         receiver.set_local_ssrc(ssrc);
 
         // Enable DTMF JB bypass (telephone-event packets routed to dedicated queue)
-        let dtmf_pt = config.dtmf_payload_type.unwrap_or(crate::rtp_handler::DTMF_PAYLOAD_TYPE);
+        let dtmf_pt = config
+            .dtmf_payload_type
+            .unwrap_or(crate::rtp_handler::DTMF_PAYLOAD_TYPE);
         receiver.set_dtmf_bypass(dtmf_pt, dtmf_queue.clone());
 
         // Set negotiated RTP header extensions on both transmitter and receiver
@@ -607,7 +608,9 @@ impl AudioPipeline {
         let decode_config = DecodeThreadConfig {
             codec: config.codec,
             device_rate,
-            dtmf_payload_type: config.dtmf_payload_type.unwrap_or(crate::rtp_handler::DTMF_PAYLOAD_TYPE),
+            dtmf_payload_type: config
+                .dtmf_payload_type
+                .unwrap_or(crate::rtp_handler::DTMF_PAYLOAD_TYPE),
             aec_ref: aec_ref.clone(),
             drift: config.audio.drift.clone(),
             postfilter: config.audio.postfilter.clone(),

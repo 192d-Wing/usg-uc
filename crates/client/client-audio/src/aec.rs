@@ -52,10 +52,10 @@ impl Default for AecConfig {
     fn default() -> Self {
         Self {
             filter_length_ms: 128,
-            nlms_mu: 0.3,              // Slower convergence but stable during double-talk
-            doubletalk_threshold: 1.5,  // Stop adapting sooner (was 2.0)
+            nlms_mu: 0.3, // Slower convergence but stable during double-talk
+            doubletalk_threshold: 1.5, // Stop adapting sooner (was 2.0)
             min_farend_energy: 100.0,
-            nlp_suppression: 0.03,     // Stronger suppression (was 0.05)
+            nlp_suppression: 0.03, // Stronger suppression (was 0.05)
             nlp_threshold: 0.15,
             // ~50ms compensates for: ring buffer target fill (40ms at 48kHz)
             // + CPAL output buffer (~10ms) + DAC latency (~2ms).
@@ -141,9 +141,7 @@ impl AecReference {
 
     /// Returns the number of samples available to read.
     pub fn available(&self) -> usize {
-        self.consumer
-            .lock()
-            .map_or(0, |cons| cons.occupied_len())
+        self.consumer.lock().map_or(0, |cons| cons.occupied_len())
     }
 }
 
@@ -377,7 +375,9 @@ mod tests {
         processor.set_enabled(false);
 
         // Push reference signal
-        let ref_signal: Vec<i16> = (0..160).map(|i| (1000.0 * (i as f32 * 0.1).sin()) as i16).collect();
+        let ref_signal: Vec<i16> = (0..160)
+            .map(|i| (1000.0 * (i as f32 * 0.1).sin()) as i16)
+            .collect();
         aec_ref.push(&ref_signal);
 
         // Mic should pass through when disabled
@@ -399,7 +399,9 @@ mod tests {
         // Generate far-end signal (440 Hz tone)
         let total_samples = num_frames * frame_size;
         let farend: Vec<i16> = (0..total_samples)
-            .map(|i| (8000.0 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 8000.0).sin()) as i16)
+            .map(|i| {
+                (8000.0 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 8000.0).sin()) as i16
+            })
             .collect();
 
         // Mic signal = echo (attenuated far-end, slight delay)
@@ -410,7 +412,9 @@ mod tests {
             .map(|i| {
                 if i >= echo_delay {
                     #[allow(clippy::cast_possible_truncation)]
-                    { (farend[i - echo_delay] as f32 * echo_gain) as i16 }
+                    {
+                        (farend[i - echo_delay] as f32 * echo_gain) as i16
+                    }
                 } else {
                     0
                 }
@@ -468,7 +472,9 @@ mod tests {
         // Generate far-end tone and echo
         let total_samples = num_frames * frame_size;
         let farend: Vec<i16> = (0..total_samples)
-            .map(|i| (8000.0 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 8000.0).sin()) as i16)
+            .map(|i| {
+                (8000.0 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 8000.0).sin()) as i16
+            })
             .collect();
         let echo_delay = 40;
         let echo_gain = 0.5_f32;
@@ -476,8 +482,12 @@ mod tests {
             .map(|i| {
                 if i >= echo_delay {
                     #[allow(clippy::cast_possible_truncation)]
-                    { (farend[i - echo_delay] as f32 * echo_gain) as i16 }
-                } else { 0 }
+                    {
+                        (farend[i - echo_delay] as f32 * echo_gain) as i16
+                    }
+                } else {
+                    0
+                }
             })
             .collect();
 
@@ -525,7 +535,9 @@ mod tests {
 
         // Near-end speech (880 Hz tone)
         let speech: Vec<i16> = (0..frame_size * num_frames)
-            .map(|i| (6000.0 * (2.0 * std::f32::consts::PI * 880.0 * i as f32 / 8000.0).sin()) as i16)
+            .map(|i| {
+                (6000.0 * (2.0 * std::f32::consts::PI * 880.0 * i as f32 / 8000.0).sin()) as i16
+            })
             .collect();
 
         let mut output_energy = 0.0_f64;

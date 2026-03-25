@@ -111,8 +111,7 @@ impl DriftCompensator {
         }
 
         // --- Active phase: EMA smooth and correct ---
-        self.smoothed_depth +=
-            self.cfg.smoothing_alpha * (current_depth_ms - self.smoothed_depth);
+        self.smoothed_depth += self.cfg.smoothing_alpha * (current_depth_ms - self.smoothed_depth);
 
         let error = self.smoothed_depth - self.target_depth;
 

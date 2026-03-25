@@ -11,10 +11,10 @@ use crate::stream::Sample;
 use crate::{AudioError, AudioResult};
 use coreaudio::audio_unit::render_callback::{self, data};
 use coreaudio::audio_unit::{AudioUnit, Element, IOType, Scope};
-use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::HeapRb;
-use std::sync::atomic::{AtomicBool, Ordering};
+use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info};
 
 /// CoreAudio property: enable/disable I/O on a bus.
@@ -78,10 +78,14 @@ impl VpioCaptureStream {
         let desired_rate: f64 = 48_000.0;
         // kAudioUnitProperty_SampleRate = 2
         let rate_id: u32 = 2;
-        if let Err(e) = audio_unit.set_property(rate_id, Scope::Output, Element::Input, Some(&desired_rate)) {
+        if let Err(e) =
+            audio_unit.set_property(rate_id, Scope::Output, Element::Input, Some(&desired_rate))
+        {
             info!("VPIO rejected 48kHz on input scope: {e}, will use device default");
         }
-        if let Err(e) = audio_unit.set_property(rate_id, Scope::Input, Element::Output, Some(&desired_rate)) {
+        if let Err(e) =
+            audio_unit.set_property(rate_id, Scope::Input, Element::Output, Some(&desired_rate))
+        {
             info!("VPIO rejected 48kHz on output scope: {e}, will use device default");
         }
 

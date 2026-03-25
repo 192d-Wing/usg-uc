@@ -118,11 +118,7 @@ impl RtcpSession {
     ///
     /// Call this from the I/O thread on every iteration. It internally
     /// tracks the 5-second interval.
-    pub fn maybe_send_report(
-        &mut self,
-        tx_stats: &RtpStats,
-        jb_stats: &JitterBufferStats,
-    ) {
+    pub fn maybe_send_report(&mut self, tx_stats: &RtpStats, jb_stats: &JitterBufferStats) {
         if self.last_send_time.elapsed() < RTCP_INTERVAL {
             return;
         }
@@ -180,9 +176,7 @@ impl RtcpSession {
                     self.received_sender_report(ntp_sec, ntp_frac);
                     trace!(
                         "Received RTCP SR: ntp={}.{}, lsr={:#010x}",
-                        ntp_sec,
-                        ntp_frac,
-                        self.last_received_sr_ntp
+                        ntp_sec, ntp_frac, self.last_received_sr_ntp
                     );
 
                     // Parse RR blocks within the SR (start at byte 28, each 24 bytes)
@@ -248,7 +242,10 @@ impl RtcpSession {
 
             // Sanity check: RTT should be positive and < 10 seconds
             if rtt > 0.0 && rtt < 10_000.0 {
-                debug!("RTCP RTT measured: {:.1}ms (LSR={:#010x}, DLSR={:#010x})", rtt, lsr, dlsr);
+                debug!(
+                    "RTCP RTT measured: {:.1}ms (LSR={:#010x}, DLSR={:#010x})",
+                    rtt, lsr, dlsr
+                );
                 self.rtt_ms = Some(rtt);
             }
         }
@@ -260,11 +257,7 @@ impl RtcpSession {
     }
 
     /// Sends a compound RTCP packet (SR + SDES or RR + SDES).
-    fn send_compound_report(
-        &mut self,
-        tx_stats: &RtpStats,
-        jb_stats: &JitterBufferStats,
-    ) {
+    fn send_compound_report(&mut self, tx_stats: &RtpStats, jb_stats: &JitterBufferStats) {
         let mut compound = BytesMut::with_capacity(256);
 
         if tx_stats.packets_sent > 0 {
@@ -348,11 +341,7 @@ impl RtcpSession {
     }
 
     /// Builds a Receiver Report packet into the compound buffer.
-    fn build_receiver_report(
-        &mut self,
-        buf: &mut BytesMut,
-        jb_stats: &JitterBufferStats,
-    ) {
+    fn build_receiver_report(&mut self, buf: &mut BytesMut, jb_stats: &JitterBufferStats) {
         let has_rr = self.remote_ssrc.is_some() && jb_stats.packets_received > 0;
         let rc = u8::from(has_rr);
 
@@ -378,10 +367,7 @@ impl RtcpSession {
     /// Uses jitter buffer stats for loss/jitter (the authoritative source
     /// for actual stream loss), and `self.clock_rate` for correct jitter
     /// timestamp conversion.
-    fn build_reception_report_block(
-        &mut self,
-        jb_stats: &JitterBufferStats,
-    ) -> bytes::Bytes {
+    fn build_reception_report_block(&mut self, jb_stats: &JitterBufferStats) -> bytes::Bytes {
         let remote_ssrc = self.remote_ssrc.unwrap_or(0);
 
         // Fraction lost: packets lost in this interval / packets expected in this interval.
@@ -416,8 +402,7 @@ impl RtcpSession {
             clippy::cast_sign_loss,
             clippy::cast_precision_loss
         )]
-        let jitter =
-            (jb_stats.average_jitter_ms * (self.clock_rate as f32 / 1000.0)) as u32;
+        let jitter = (jb_stats.average_jitter_ms * (self.clock_rate as f32 / 1000.0)) as u32;
 
         // DLSR (delay since last SR in 1/65536 seconds)
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -639,8 +624,7 @@ mod tests {
         let remote: SocketAddr = "127.0.0.1:5001".parse().unwrap();
 
         // 48kHz clock rate (e.g., Opus)
-        let mut session =
-            RtcpSession::new(socket, remote, 12345, 48000, "test@host".to_string());
+        let mut session = RtcpSession::new(socket, remote, 12345, 48000, "test@host".to_string());
         session.set_remote_ssrc(67890);
 
         let jb_stats = JitterBufferStats {

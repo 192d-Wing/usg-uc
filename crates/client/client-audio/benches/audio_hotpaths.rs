@@ -6,7 +6,7 @@ use bytes::Bytes;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use client_audio::jitter_buffer::{BufferedPacket, SharedJitterBuffer};
-use client_audio::rtp_handler::{parse_rfc2198, parse_rtp_fields, RTP_HEADER_SIZE};
+use client_audio::rtp_handler::{RTP_HEADER_SIZE, parse_rfc2198, parse_rtp_fields};
 use client_audio::sinc_resampler::Resampler;
 use uc_codecs::AudioCodec;
 use uc_codecs::g711::G711Ulaw;
@@ -105,12 +105,8 @@ fn bench_jitter_buffer_push_pop(c: &mut Criterion) {
             let jb = SharedJitterBuffer::new(8000, 160, 60);
             // Fill to target depth (3 packets at 20ms each for 60ms)
             for i in 0..3u16 {
-                let pkt = BufferedPacket::new(
-                    i,
-                    u32::from(i) * 160,
-                    0,
-                    Bytes::from_static(&[0u8; 160]),
-                );
+                let pkt =
+                    BufferedPacket::new(i, u32::from(i) * 160, 0, Bytes::from_static(&[0u8; 160]));
                 jb.push(pkt);
             }
             // Pop all

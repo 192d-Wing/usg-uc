@@ -12,11 +12,11 @@ use crate::comfort_noise::{ComfortNoiseConfig, ComfortNoiseGenerator, decode_cn_
 use crate::drift_compensator::{DriftCompensator, DriftConfig};
 use crate::dtmf_tones::DtmfToneGenerator;
 use crate::jitter_buffer::{JitterBufferResult, SharedJitterBuffer};
-use crate::rtp_handler::SharedDtmfQueue;
 use crate::postfilter::{Postfilter, PostfilterConfig};
+use crate::rtp_handler::SharedDtmfQueue;
 use crate::sinc_resampler::Resampler;
-use crate::wsola::WsolaPlc;
 use crate::stream::{PlaybackStream, PlaybackStreamHandle, Sample};
+use crate::wsola::WsolaPlc;
 use client_types::{CodecPreference, DtmfDigit, DtmfEvent};
 
 /// Write a slice of i16 samples to a file as little-endian bytes in batched writes.
@@ -360,9 +360,7 @@ fn decode_loop(
     );
 
     // DTMF diagnostics mode (set DUMP_DTMF=1)
-    let dtmf_diag = std::env::var(DUMP_DTMF_ENV)
-        .ok()
-        .is_some_and(|v| v == "1");
+    let dtmf_diag = std::env::var(DUMP_DTMF_ENV).ok().is_some_and(|v| v == "1");
 
     // Optional audio dump file for debugging (set DUMP_DECODED_AUDIO=1 or DUMP_DTMF=1)
     let mut audio_dump: Option<std::io::BufWriter<std::fs::File>> = std::env::var(DUMP_ENV_VAR)
@@ -507,8 +505,11 @@ fn decode_loop(
                             metrics.dtmf_received.fetch_add(1, Ordering::Relaxed);
                             info!(
                                 "DTMF bypass: NEW event digit={:?} ts={} seq={} end={} dur={}",
-                                event.digit, packet.timestamp, packet.sequence,
-                                event.end, event.duration
+                                event.digit,
+                                packet.timestamp,
+                                packet.sequence,
+                                event.end,
+                                event.duration
                             );
                             active_dtmf_gen =
                                 Some(DtmfToneGenerator::new(event.digit, device_rate));
@@ -523,15 +524,21 @@ fn decode_loop(
                                 trace,
                                 "{},bypass,{:?},{},{},{},{},{},{}",
                                 dtmf_diag_start.elapsed().as_micros(),
-                                event.digit, event.duration, event.duration_to_ms(),
-                                event.end, is_new, active_dtmf_gen.is_some(),
+                                event.digit,
+                                event.duration,
+                                event.duration_to_ms(),
+                                event.end,
+                                is_new,
+                                active_dtmf_gen.is_some(),
                                 decoded_this_cycle,
                             );
                         }
                         if event.end {
                             info!(
                                 "DTMF bypass: END digit={:?} ts={} dur={}ms",
-                                event.digit, packet.timestamp, event.duration_to_ms()
+                                event.digit,
+                                packet.timestamp,
+                                event.duration_to_ms()
                             );
                             active_dtmf_gen = None;
                         }
@@ -580,7 +587,10 @@ fn decode_loop(
                         if packet.payload_type == dtmf_pt {
                             if packet.payload.len() < 4 {
                                 // RFC 4733 requires exactly 4 bytes
-                                trace!("Malformed DTMF: payload too short ({}B)", packet.payload.len());
+                                trace!(
+                                    "Malformed DTMF: payload too short ({}B)",
+                                    packet.payload.len()
+                                );
                                 metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
@@ -659,8 +669,12 @@ fn decode_loop(
                                             trace,
                                             "{},jb,{:?},{},{},{},{},{},{}",
                                             dtmf_diag_start.elapsed().as_micros(),
-                                            event.digit, event.duration, event.duration_to_ms(),
-                                            event.end, is_new, active_dtmf_gen.is_some(),
+                                            event.digit,
+                                            event.duration,
+                                            event.duration_to_ms(),
+                                            event.end,
+                                            is_new,
+                                            active_dtmf_gen.is_some(),
                                             decoded_this_cycle,
                                         );
                                     }
@@ -873,12 +887,18 @@ fn decode_loop(
                             }
                             if let Some(ref mut trace) = dtmf_trace {
                                 use std::io::Write;
-                                let peak = tone_buf.iter().map(|s| s.saturating_abs()).max().unwrap_or(0);
+                                let peak = tone_buf
+                                    .iter()
+                                    .map(|s| s.saturating_abs())
+                                    .max()
+                                    .unwrap_or(0);
                                 let _ = writeln!(
                                     trace,
                                     "{},tone_frame,,{},{},false,false,true,{}",
                                     dtmf_diag_start.elapsed().as_micros(),
-                                    device_samples, peak, decoded_this_cycle,
+                                    device_samples,
+                                    peak,
+                                    decoded_this_cycle,
                                 );
                             }
                             diag_dtmf_tone_frames += 1;
@@ -936,7 +956,6 @@ fn decode_loop(
                     }
                 }
             }
-
 
             // When DTMF tone is active and JB has accumulated excess packets,
             // drain them in a tight loop. We decode to keep the codec state
@@ -1064,8 +1083,8 @@ fn decode_loop(
                         device_rate = new_rate;
                         #[allow(clippy::cast_possible_truncation)]
                         {
-                            device_samples = (codec_samples as u32 * device_rate
-                                / codec_clock_rate) as usize;
+                            device_samples =
+                                (codec_samples as u32 * device_rate / codec_clock_rate) as usize;
                         }
                         target_fill = device_samples * target_fill_frames;
                         scratch.resize(device_samples + 16, 0);
@@ -1176,7 +1195,15 @@ mod tests {
         };
 
         let metrics = DecodeMetrics::new();
-        let mut handle = spawn(config, producer, playback_handle, jb, running, underruns, metrics);
+        let mut handle = spawn(
+            config,
+            producer,
+            playback_handle,
+            jb,
+            running,
+            underruns,
+            metrics,
+        );
 
         // Let it run briefly
         thread::sleep(Duration::from_millis(50));
@@ -1215,12 +1242,18 @@ mod tests {
         // Valid event codes 0-16
         for code in 0..=16 {
             let bytes = [code, 0x80, 0x03, 0x20]; // end=true, duration=800 (100ms)
-            assert!(DtmfEvent::decode(&bytes).is_some(), "Code {code} should be valid");
+            assert!(
+                DtmfEvent::decode(&bytes).is_some(),
+                "Code {code} should be valid"
+            );
         }
         // Invalid event code 17+
         for code in 17..=255 {
             let bytes = [code, 0x80, 0x03, 0x20];
-            assert!(DtmfEvent::decode(&bytes).is_none(), "Code {code} should be invalid");
+            assert!(
+                DtmfEvent::decode(&bytes).is_none(),
+                "Code {code} should be invalid"
+            );
         }
     }
 

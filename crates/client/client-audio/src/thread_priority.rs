@@ -28,16 +28,10 @@ pub(crate) fn set_realtime_priority(thread_name: &str) -> bool {
         // relative_priority=0 means "default within the class".
         let ret = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
         if ret == 0 {
-            debug!(
-                "Set {} thread to QOS_CLASS_USER_INTERACTIVE",
-                thread_name
-            );
+            debug!("Set {} thread to QOS_CLASS_USER_INTERACTIVE", thread_name);
             true
         } else {
-            warn!(
-                "Failed to set {} thread QoS (errno={})",
-                thread_name, ret
-            );
+            warn!("Failed to set {} thread QoS (errno={})", thread_name, ret);
             false
         }
     }

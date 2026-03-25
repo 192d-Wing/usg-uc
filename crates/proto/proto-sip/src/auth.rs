@@ -720,7 +720,9 @@ pub fn compute_response(
             reason: "cnonce required when qop is set".to_string(),
         })?;
         let qop_str = qop.as_str();
-        let mut s = String::with_capacity(ha1.len() + nonce.len() + 8 + cnonce.len() + qop_str.len() + ha2.len() + 5);
+        let mut s = String::with_capacity(
+            ha1.len() + nonce.len() + 8 + cnonce.len() + qop_str.len() + ha2.len() + 5,
+        );
         use std::fmt::Write;
         let _ = write!(s, "{ha1}:{nonce}:{nc:08x}:{cnonce}:{qop_str}:{ha2}");
         s

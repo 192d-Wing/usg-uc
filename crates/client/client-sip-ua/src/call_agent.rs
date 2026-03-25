@@ -186,7 +186,9 @@ impl CallAgent {
         display_name: String,
         caller_id: Option<String>,
         transport: &str,
-        #[cfg(feature = "digest-auth")] digest_credentials: Option<client_types::DigestAuthCredentials>,
+        #[cfg(feature = "digest-auth")] digest_credentials: Option<
+            client_types::DigestAuthCredentials,
+        >,
     ) {
         // If caller_id is provided, replace the user part of the AOR
         self.aor = if let Some(cid) = caller_id {
@@ -1134,9 +1136,10 @@ impl CallAgent {
                     )
                     .await?;
 
-                    let session = self.calls.get_mut(call_id).ok_or_else(|| {
-                        SipUaError::InvalidState("Call not found".to_string())
-                    })?;
+                    let session = self
+                        .calls
+                        .get_mut(call_id)
+                        .ok_or_else(|| SipUaError::InvalidState("Call not found".to_string()))?;
 
                     // Only retry once — BulkVS flow is: INVITE → 401 → auth'd INVITE → 200 OK.
                     // A second genuine 401 (different nonce) means credentials are wrong.

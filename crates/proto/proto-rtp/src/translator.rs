@@ -185,12 +185,9 @@ impl RtpTranslator {
             self.sources.insert(ssrc, SourceState::new(ssrc));
         }
 
-        let state = self
-            .sources
-            .get_mut(&ssrc)
-            .ok_or(RtpError::InvalidRtcp {
-                reason: "source state not found",
-            })?;
+        let state = self.sources.get_mut(&ssrc).ok_or(RtpError::InvalidRtcp {
+            reason: "source state not found",
+        })?;
 
         // Update sequence tracking
         let is_valid = state.sequence_tracker.update(packet.header.sequence_number);

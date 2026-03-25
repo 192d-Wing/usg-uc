@@ -220,10 +220,7 @@ impl ClientApp {
                 "Restoring saved audio device preferences"
             );
         }
-        call_manager.set_preferred_devices(
-            audio.input_device.clone(),
-            audio.output_device.clone(),
-        );
+        call_manager.set_preferred_devices(audio.input_device.clone(), audio.output_device.clone());
 
         // Create SIP transport
         let (transport_event_tx, transport_event_rx) = mpsc::channel(32);
@@ -573,11 +570,7 @@ impl ClientApp {
     ///
     /// The call must be in Connected state. The audio session will be
     /// automatically restarted with the new codec when the remote accepts.
-    pub async fn change_codec(
-        &mut self,
-        call_id: &str,
-        codec: CodecPreference,
-    ) -> AppResult<()> {
+    pub async fn change_codec(&mut self, call_id: &str, codec: CodecPreference) -> AppResult<()> {
         self.call_manager.change_codec(call_id, codec).await
     }
 

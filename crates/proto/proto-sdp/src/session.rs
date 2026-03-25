@@ -50,11 +50,23 @@ impl Origin {
 
         Ok(Self {
             username: parts.next().ok_or_else(|| missing("username"))?.to_string(),
-            session_id: parts.next().ok_or_else(|| missing("session_id"))?.to_string(),
-            session_version: parts.next().ok_or_else(|| missing("session_version"))?.to_string(),
+            session_id: parts
+                .next()
+                .ok_or_else(|| missing("session_id"))?
+                .to_string(),
+            session_version: parts
+                .next()
+                .ok_or_else(|| missing("session_version"))?
+                .to_string(),
             net_type: parts.next().ok_or_else(|| missing("net_type"))?.to_string(),
-            addr_type: parts.next().ok_or_else(|| missing("addr_type"))?.to_string(),
-            unicast_address: parts.next().ok_or_else(|| missing("unicast_address"))?.to_string(),
+            addr_type: parts
+                .next()
+                .ok_or_else(|| missing("addr_type"))?
+                .to_string(),
+            unicast_address: parts
+                .next()
+                .ok_or_else(|| missing("unicast_address"))?
+                .to_string(),
         })
     }
 

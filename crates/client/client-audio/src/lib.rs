@@ -82,7 +82,6 @@ pub mod noise_shaper;
 pub mod pipeline;
 pub mod plc;
 pub mod postfilter;
-pub mod wsola;
 pub mod ringtone;
 pub mod rtcp_session;
 pub mod rtp_handler;
@@ -92,6 +91,7 @@ pub(crate) mod thread_priority;
 pub mod vad;
 #[cfg(target_os = "macos")]
 pub mod vpio;
+pub mod wsola;
 
 pub use aec::{AecProcessor, AecReference};
 pub use audio_processing::AudioProcessor;

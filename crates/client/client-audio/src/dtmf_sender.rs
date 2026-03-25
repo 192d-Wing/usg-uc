@@ -116,10 +116,17 @@ impl DtmfSender {
     /// Enqueues a DTMF digit. Returns `false` if the queue is full.
     pub fn enqueue(&mut self, cmd: DtmfCommand) -> bool {
         if self.queue.len() >= MAX_DIGIT_QUEUE {
-            warn!("DTMF queue full ({MAX_DIGIT_QUEUE}), dropping digit '{}'", cmd.digit);
+            warn!(
+                "DTMF queue full ({MAX_DIGIT_QUEUE}), dropping digit '{}'",
+                cmd.digit
+            );
             return false;
         }
-        let method = if cmd.use_rfc2833 { "RFC4733" } else { "in-band" };
+        let method = if cmd.use_rfc2833 {
+            "RFC4733"
+        } else {
+            "in-band"
+        };
         info!(
             "DTMF enqueued digit '{}' for {}ms ({}) [queue depth: {}]",
             cmd.digit,
@@ -156,10 +163,7 @@ impl DtmfSender {
     /// to avoid sending both mic audio and DTMF tones simultaneously.
     pub fn is_inband_active(&self) -> bool {
         self.phase == DtmfPhase::Sending
-            && self
-                .current
-                .as_ref()
-                .is_some_and(|d| !d.cmd.use_rfc2833)
+            && self.current.as_ref().is_some_and(|d| !d.cmd.use_rfc2833)
     }
 
     /// Polls the state machine. Call once per I/O loop iteration.
@@ -357,10 +361,8 @@ impl DtmfSender {
             // the timestamp would be stale (no send() calls during DTMF).
             if digit.cmd.use_rfc2833 {
                 #[allow(clippy::cast_possible_truncation)]
-                let total_frames =
-                    digit.packets_sent + END_PACKET_REPEATS;
-                let advance =
-                    total_frames * self.codec_samples_per_frame as u32;
+                let total_frames = digit.packets_sent + END_PACKET_REPEATS;
+                let advance = total_frames * self.codec_samples_per_frame as u32;
                 transmitter.advance_dtmf_timestamp(advance);
             }
             self.transition_to_pause();
@@ -499,7 +501,10 @@ mod tests {
         // At this point queue.len() = MAX_DIGIT_QUEUE - 1 = 31 (because first was popped to active)
         // So we need one more to fill to 32.
         let ok = sender.enqueue(make_cmd(DtmfDigit::Zero, 100, true));
-        assert!(ok, "should still fit (queue has 31 after first popped to active)");
+        assert!(
+            ok,
+            "should still fit (queue has 31 after first popped to active)"
+        );
         // Now queue has 32 — next should fail
         let ok = sender.enqueue(make_cmd(DtmfDigit::Zero, 100, true));
         assert!(!ok, "should reject when queue is full");

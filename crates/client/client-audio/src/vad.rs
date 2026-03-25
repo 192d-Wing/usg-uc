@@ -383,8 +383,11 @@ mod tests {
 
         // Marginal energy: above silence threshold but below speech threshold
         // This tests that the higher threshold is needed to re-enter speech
-        let marginal: Vec<i16> =
-            vec![(MIN_ENERGY_THRESHOLD * VadConfig::default().silence_threshold_ratio * 1.1) as i16; 160];
+        let marginal: Vec<i16> = vec![
+            (MIN_ENERGY_THRESHOLD * VadConfig::default().silence_threshold_ratio * 1.1)
+                as i16;
+            160
+        ];
         let result = vad.detect(&marginal);
         // Should still be silence because we need SPEECH_THRESHOLD_RATIO to enter speech
         assert_eq!(result, VadDecision::Silence);

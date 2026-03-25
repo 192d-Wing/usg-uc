@@ -590,7 +590,9 @@ mod tests {
         let mut packets = Vec::new();
         for f in 0..10 {
             let mut enc = vec![0u8; 1275];
-            let len = codec.encode(&input[f * spf..(f + 1) * spf], &mut enc).unwrap();
+            let len = codec
+                .encode(&input[f * spf..(f + 1) * spf], &mut enc)
+                .unwrap();
             packets.push(enc[..len].to_vec());
         }
 
