@@ -73,7 +73,19 @@ impl VpioCaptureStream {
             )
             .map_err(|e| AudioError::StreamError(format!("Failed to enable VPIO input: {e}")))?;
 
-        // Re-initialize with input enabled
+        // Request 48kHz to match playback rate (avoids capture/playback rate mismatch).
+        // Set on both input and output scopes. If VPIO rejects it, we'll use whatever it gives us.
+        let desired_rate: f64 = 48_000.0;
+        // kAudioUnitProperty_SampleRate = 2
+        let rate_id: u32 = 2;
+        if let Err(e) = audio_unit.set_property(rate_id, Scope::Output, Element::Input, Some(&desired_rate)) {
+            info!("VPIO rejected 48kHz on input scope: {e}, will use device default");
+        }
+        if let Err(e) = audio_unit.set_property(rate_id, Scope::Input, Element::Output, Some(&desired_rate)) {
+            info!("VPIO rejected 48kHz on output scope: {e}, will use device default");
+        }
+
+        // Re-initialize with input enabled and sample rate set
         audio_unit
             .initialize()
             .map_err(|e| AudioError::StreamError(format!("Failed to initialize VPIO: {e}")))?;
