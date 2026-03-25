@@ -276,36 +276,26 @@ impl AecProcessor {
         // Track input power for ERLE estimation
         let frame_input_power = mic_energy * frame_len as f32;
 
-        // Smooth the reference energy to detect far-end activity with holdover.
-        // Decay slowly so suppression persists through brief pauses in far-end speech.
-        const REF_SMOOTH_UP: f32 = 0.4;   // Attack: track rising energy quickly
-        const REF_SMOOTH_DOWN: f32 = 0.02; // Decay: hold suppression ~1s after far-end stops
-        if ref_energy > self.ref_power {
-            self.ref_power += REF_SMOOTH_UP * (ref_energy - self.ref_power);
-        } else {
-            self.ref_power += REF_SMOOTH_DOWN * (ref_energy - self.ref_power);
-        }
+        // Use instantaneous reference energy (no smoothing). This makes the
+        // suppressor respond frame-by-frame: suppress only when the remote is
+        // actually talking THIS frame. No holdover = no suppression of our
+        // voice during pauses in the remote's speech.
+        //
+        // The threshold must be well above background noise in decoded G.711
+        // (~200-500 rms² for silence). Use 5000 to only trigger on actual speech.
+        const FAR_END_SPEECH_THRESHOLD: f32 = 5000.0;
 
-        // Determine suppression gain based on far-end activity
-        let gain = if self.ref_power > self.cfg.min_farend_energy {
-            // Far-end is active — echo expected in mic.
-            // On laptop speaker+mic, acoustic coupling is strong (echo is
-            // 0.3-0.8x the reference level). Only allow double-talk pass-through
-            // when mic energy massively exceeds reference (user shouting over
-            // the speaker). Otherwise suppress to eliminate echo.
-            let ratio = mic_energy / (self.ref_power + NLMS_DELTA);
-            if ratio > 10.0 {
-                // Mic is 10x louder than reference → near-end is clearly dominant.
-                // Apply moderate suppression to still limit echo leakage.
-                0.15
-            } else {
-                // Echo-only or mixed — suppress strongly.
-                self.cfg.nlp_suppression
-            }
+        // Determine suppression gain based on far-end activity THIS frame
+        let gain = if ref_energy > FAR_END_SPEECH_THRESHOLD {
+            // Far-end is speaking this frame — suppress echo.
+            self.cfg.nlp_suppression
         } else {
-            // No far-end activity — pass through at unity gain
+            // Far-end is silent — pass through at unity gain.
             1.0
         };
+
+        // Track smoothed ref_power for ERLE reporting only (not used for gating)
+        self.ref_power = ref_energy;
 
         // Apply gain to entire frame
         if gain < 1.0 {
