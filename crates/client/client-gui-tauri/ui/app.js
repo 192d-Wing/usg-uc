@@ -1320,6 +1320,7 @@ async function makeCall(target) {
         const result = await invoke('make_call', { target: sipUri });
         console.log('Call initiated:', result);
         currentCallId = result; // Track call ID to ignore stale events from prior calls
+        ringbackTone.start(); // Start ringback immediately (user gesture context)
         startCall(target);
     } catch (error) {
         console.error('Failed to make call:', error);
