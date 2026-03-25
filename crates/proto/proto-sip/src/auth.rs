@@ -671,12 +671,12 @@ pub fn compute_ha2(
         let body = entity_body.unwrap_or(&[]);
         let body_hash = hasher.hash(body);
         let mut s = String::with_capacity(method.len() + uri.len() + body_hash.len() + 2);
-    
+
         let _ = write!(s, "{method}:{uri}:{body_hash}");
         s
     } else {
         let mut s = String::with_capacity(method.len() + uri.len() + 1);
-    
+
         let _ = write!(s, "{method}:{uri}");
         s
     };
@@ -724,12 +724,12 @@ pub fn compute_response(
         let mut s = String::with_capacity(
             ha1.len() + nonce.len() + 8 + cnonce.len() + qop_str.len() + ha2.len() + 5,
         );
-    
+
         let _ = write!(s, "{ha1}:{nonce}:{nc:08x}:{cnonce}:{qop_str}:{ha2}");
         s
     } else {
         let mut s = String::with_capacity(ha1.len() + nonce.len() + ha2.len() + 2);
-    
+
         let _ = write!(s, "{ha1}:{nonce}:{ha2}");
         s
     };
