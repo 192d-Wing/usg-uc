@@ -1415,6 +1415,18 @@ impl CallManager {
             .or_else(|| self.selected_output_device.clone())
     }
 
+    /// Sets the preferred devices without switching any active session.
+    ///
+    /// Used at startup to restore saved preferences from settings.
+    pub fn set_preferred_devices(
+        &mut self,
+        input: Option<String>,
+        output: Option<String>,
+    ) {
+        self.selected_input_device = input;
+        self.selected_output_device = output;
+    }
+
     /// Puts the focused call on hold.
     ///
     /// Sends a re-INVITE with `a=sendonly` direction to put media on hold.

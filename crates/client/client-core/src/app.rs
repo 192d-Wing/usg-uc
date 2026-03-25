@@ -211,6 +211,20 @@ impl ClientApp {
         let mut call_manager = CallManager::new(local_sip_addr, local_media_addr, call_event_tx);
         call_manager.set_contact_manager(contact_manager.clone());
 
+        // Restore saved device preferences from settings
+        let audio = &settings_manager.settings().audio;
+        if audio.input_device.is_some() || audio.output_device.is_some() {
+            info!(
+                input = ?audio.input_device,
+                output = ?audio.output_device,
+                "Restoring saved audio device preferences"
+            );
+        }
+        call_manager.set_preferred_devices(
+            audio.input_device.clone(),
+            audio.output_device.clone(),
+        );
+
         // Create SIP transport
         let (transport_event_tx, transport_event_rx) = mpsc::channel(32);
         let sip_transport = SipTransport::new(transport_event_tx)

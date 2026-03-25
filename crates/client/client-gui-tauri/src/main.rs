@@ -1018,10 +1018,16 @@ async fn set_input_device(
     let mut client_guard = state.client.lock().await;
     if let Some(client) = client_guard.as_mut() {
         client
-            .switch_input_device(device_name)
+            .switch_input_device(device_name.clone())
             .map_err(|e| format!("Failed to switch input device: {e}"))?;
     }
     drop(client_guard);
+
+    // Persist to settings so the choice is remembered across restarts
+    let mut manager = state.settings_manager.write().await;
+    manager.settings_mut().audio.input_device = device_name;
+    let _ = manager.save();
+    drop(manager);
 
     Ok(())
 }
@@ -1037,10 +1043,16 @@ async fn set_output_device(
     let mut client_guard = state.client.lock().await;
     if let Some(client) = client_guard.as_mut() {
         client
-            .switch_output_device(device_name)
+            .switch_output_device(device_name.clone())
             .map_err(|e| format!("Failed to switch output device: {e}"))?;
     }
     drop(client_guard);
+
+    // Persist to settings so the choice is remembered across restarts
+    let mut manager = state.settings_manager.write().await;
+    manager.settings_mut().audio.output_device = device_name;
+    let _ = manager.save();
+    drop(manager);
 
     Ok(())
 }
