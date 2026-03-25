@@ -51,9 +51,16 @@ impl VpioCaptureStream {
     pub fn new() -> AudioResult<Self> {
         info!("Creating VPIO capture stream (hardware AEC)");
 
-        // Create VoiceProcessingIO audio unit
+        // Create VoiceProcessingIO audio unit.
+        // AudioUnit::new() auto-initializes, but we need to set properties
+        // BEFORE initialization. So: create → uninitialize → configure → reinitialize.
         let mut audio_unit = AudioUnit::new(IOType::VoiceProcessingIO)
             .map_err(|e| AudioError::StreamError(format!("Failed to create VPIO unit: {e}")))?;
+
+        // Uninitialize so we can configure I/O before re-initialization
+        audio_unit
+            .uninitialize()
+            .map_err(|e| AudioError::StreamError(format!("Failed to uninitialize VPIO: {e}")))?;
 
         // Enable input on bus 1 (mic → app)
         let enable_input: u32 = 1;
@@ -65,6 +72,11 @@ impl VpioCaptureStream {
                 Some(&enable_input),
             )
             .map_err(|e| AudioError::StreamError(format!("Failed to enable VPIO input: {e}")))?;
+
+        // Re-initialize with input enabled
+        audio_unit
+            .initialize()
+            .map_err(|e| AudioError::StreamError(format!("Failed to initialize VPIO: {e}")))?;
 
         // Get the actual input stream format (VPIO decides the format)
         let stream_format = audio_unit
