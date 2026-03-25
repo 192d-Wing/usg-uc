@@ -433,6 +433,7 @@ impl CertificateStore {
 
     /// Lists certificates on Linux from PKCS#11 only.
     #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
     fn list_certificates_stub(&self) -> CertStoreResult<Vec<CertificateInfo>> {
         warn!("Certificate store using stub data - not on Windows or macOS");
         Ok(Self::create_stub_certificates())

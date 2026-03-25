@@ -595,7 +595,7 @@ impl JitterBuffer {
 /// The inner `BTreeMap` typically holds <10 packets, so the mutex is held
 /// for less than 1 microsecond per operation.
 ///
-/// Includes a [`Condvar`] so the decode thread can sleep efficiently and
+/// Includes a [`std::sync::Condvar`] so the decode thread can sleep efficiently and
 /// wake immediately when the I/O thread pushes a new packet, instead of
 /// polling on a fixed timer.
 #[derive(Clone)]

@@ -245,7 +245,7 @@ pub fn start_udp_receive_thread(
 /// This function spawns a dedicated thread to receive UDP messages using blocking I/O,
 /// which works around issues with Tauri's async runtime and tokio's UDP socket.
 ///
-/// NOTE: This function takes ownership of the Arc<UdpSocket> and converts it to a
+/// NOTE: This function takes ownership of the `Arc<UdpSocket>` and converts it to a
 /// `std::net::UdpSocket` for blocking receive. The socket should not be used for
 /// send after calling this function - use a separate socket or call this before
 /// the socket is stored for sending.
