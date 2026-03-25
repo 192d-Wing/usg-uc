@@ -566,10 +566,11 @@ fn io_loop(
         // 6. Diagnostic logging every ~2 seconds
         if diag_timer.elapsed() >= Duration::from_secs(2) {
             let tx_stats = transmitter.stats();
+            let aec_erle = aec.as_ref().map_or(0.0, |a| a.erle_db());
             info!(
                 "IO diag: frames_captured={}, underruns={}, dtx={}, last_read={}/{}, \
                  max_amp={}, tx_pkts={}, rx_pkts={}, jb_depth={}ms, \
-                 muted={}, moh={}",
+                 muted={}, moh={}, aec_erle={:.1}dB",
                 diag_frames_captured,
                 diag_capture_underruns,
                 diag_dtx_frames,
@@ -581,6 +582,7 @@ fn io_loop(
                 receiver.jitter_buffer_stats().current_depth_ms,
                 muted.load(Ordering::Relaxed),
                 moh_active.load(Ordering::Relaxed),
+                aec_erle,
             );
             diag_max_amplitude = 0;
             diag_dtx_frames = 0;

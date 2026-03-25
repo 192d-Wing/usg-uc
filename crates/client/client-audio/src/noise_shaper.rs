@@ -42,7 +42,10 @@ pub struct NoiseShaperConfig {
 impl Default for NoiseShaperConfig {
     fn default() -> Self {
         Self {
-            alpha: 0.5,
+            // Reduced from 0.5 to 0.25: remote endpoints without a matching
+            // decoder postfilter hear the shaped HF noise as static. Lower
+            // alpha keeps noise shaping benefits while reducing HF artifacts.
+            alpha: 0.25,
             error_clamp: 16384.0,
         }
     }

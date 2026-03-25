@@ -50,8 +50,8 @@ impl Default for AecConfig {
             nlms_mu: 0.5,
             doubletalk_threshold: 2.0,
             min_farend_energy: 100.0,
-            nlp_suppression: 0.1,
-            nlp_threshold: 0.3,
+            nlp_suppression: 0.05, // Stronger residual echo suppression (was 0.1)
+            nlp_threshold: 0.15,   // Lower threshold so NLP engages more readily (was 0.3)
         }
     }
 }
