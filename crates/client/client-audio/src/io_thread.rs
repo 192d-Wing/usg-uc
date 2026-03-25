@@ -129,6 +129,10 @@ pub struct IoThreadConfig {
     pub aec: AecConfig,
     /// Noise shaper configuration.
     pub noise_shaper: NoiseShaperConfig,
+    /// Enable discontinuous transmission (DTX / silence suppression).
+    /// When false, RTP is sent continuously even during silence.
+    /// Disable for providers that don't handle DTX gaps well (e.g., BulkVS).
+    pub enable_dtx: bool,
 }
 
 /// Spawns the I/O thread.
@@ -396,7 +400,8 @@ fn io_loop(
                 trace!("Mic suppressed: DTMF tone active");
             } else if !muted.load(Ordering::Relaxed) {
                 // Normal capture mode
-                let in_warmup = dtx_warmup_start.elapsed() < dtx_warmup_duration;
+                let in_warmup = !config.enable_dtx
+                    || dtx_warmup_start.elapsed() < dtx_warmup_duration;
                 let (samples_read, max_amp, dtx, noise_floor) = process_capture_frame(
                     &mut codec,
                     &mut transmitter,

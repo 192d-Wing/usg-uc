@@ -655,6 +655,7 @@ impl AudioPipeline {
             vad: config.audio.vad,
             aec: config.audio.aec,
             noise_shaper: config.audio.noise_shaper,
+            enable_dtx: false, // Disabled: most SIP providers don't handle DTX gaps well
         };
         // Give the I/O thread a sender to the decode thread so it can
         // trigger a playback stream refresh after input device switches
