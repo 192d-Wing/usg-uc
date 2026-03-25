@@ -621,7 +621,9 @@ pub fn compute_ha1(
     nonce: Option<&str>,
     cnonce: Option<&str>,
 ) -> SipResult<String> {
-    let a1 = format!("{username}:{realm}:{password}");
+    let mut a1 = String::with_capacity(username.len() + realm.len() + password.len() + 2);
+    use std::fmt::Write;
+    let _ = write!(a1, "{username}:{realm}:{password}");
     let ha1_base = hasher.hash(a1.as_bytes());
 
     if algorithm.is_session() {
@@ -633,7 +635,8 @@ pub fn compute_ha1(
             name: "Authorization".to_string(),
             reason: "cnonce required for session algorithm".to_string(),
         })?;
-        let a1_sess = format!("{ha1_base}:{nonce}:{cnonce}");
+        let mut a1_sess = String::with_capacity(ha1_base.len() + nonce.len() + cnonce.len() + 2);
+        let _ = write!(a1_sess, "{ha1_base}:{nonce}:{cnonce}");
         Ok(hasher.hash(a1_sess.as_bytes()))
     } else {
         Ok(ha1_base)
@@ -666,9 +669,15 @@ pub fn compute_ha2(
     let a2 = if qop == Some(Qop::AuthInt) {
         let body = entity_body.unwrap_or(&[]);
         let body_hash = hasher.hash(body);
-        format!("{method}:{uri}:{body_hash}")
+        let mut s = String::with_capacity(method.len() + uri.len() + body_hash.len() + 2);
+        use std::fmt::Write;
+        let _ = write!(s, "{method}:{uri}:{body_hash}");
+        s
     } else {
-        format!("{method}:{uri}")
+        let mut s = String::with_capacity(method.len() + uri.len() + 1);
+        use std::fmt::Write;
+        let _ = write!(s, "{method}:{uri}");
+        s
     };
 
     Ok(hasher.hash(a2.as_bytes()))
@@ -710,9 +719,16 @@ pub fn compute_response(
             name: "Authorization".to_string(),
             reason: "cnonce required when qop is set".to_string(),
         })?;
-        format!("{ha1}:{nonce}:{nc:08x}:{cnonce}:{}:{ha2}", qop.as_str())
+        let qop_str = qop.as_str();
+        let mut s = String::with_capacity(ha1.len() + nonce.len() + 8 + cnonce.len() + qop_str.len() + ha2.len() + 5);
+        use std::fmt::Write;
+        let _ = write!(s, "{ha1}:{nonce}:{nc:08x}:{cnonce}:{qop_str}:{ha2}");
+        s
     } else {
-        format!("{ha1}:{nonce}:{ha2}")
+        let mut s = String::with_capacity(ha1.len() + nonce.len() + ha2.len() + 2);
+        use std::fmt::Write;
+        let _ = write!(s, "{ha1}:{nonce}:{ha2}");
+        s
     };
 
     Ok(hasher.hash(response_str.as_bytes()))

@@ -993,25 +993,18 @@ impl ClientApp {
     pub async fn poll_events(&mut self) -> AppResult<()> {
         trace!("poll_events called");
 
-        // Collect registration events first, then process them
-        // (avoids borrow checker issues with async methods)
-        let reg_events: Vec<_> = std::iter::from_fn(|| self.reg_event_rx.try_recv().ok()).collect();
-        if !reg_events.is_empty() {
-            debug!(count = reg_events.len(), "Processing registration events");
-        }
-        for event in reg_events {
+        // Process registration events inline (NLL allows the temporary
+        // borrow on reg_event_rx to expire before handle borrows &mut self).
+        while let Ok(event) = self.reg_event_rx.try_recv() {
             self.handle_registration_event(event).await?;
         }
 
-        // Collect transport events first, then process them
-        let transport_events: Vec<_> = self
-            .transport_event_rx
-            .as_mut()
-            .map_or_else(Vec::new, |rx| {
-                std::iter::from_fn(|| rx.try_recv().ok()).collect()
-            });
-        for event in transport_events {
-            self.handle_transport_event(event).await?;
+        // Process transport events inline (take receiver to release borrow on self)
+        if let Some(mut rx) = self.transport_event_rx.take() {
+            while let Ok(event) = rx.try_recv() {
+                self.handle_transport_event(event).await?;
+            }
+            self.transport_event_rx = Some(rx);
         }
 
         // Poll call events and send requests via transport
@@ -1023,16 +1016,8 @@ impl ClientApp {
             self.handle_call_agent_event(event).await?;
         }
 
-        // Collect call manager events (state changes, responses to send, etc.)
-        let call_mgr_events: Vec<_> =
-            std::iter::from_fn(|| self.call_event_rx.try_recv().ok()).collect();
-        if !call_mgr_events.is_empty() {
-            info!(
-                count = call_mgr_events.len(),
-                "Processing call manager events"
-            );
-        }
-        for event in call_mgr_events {
+        // Process call manager events inline (state changes, responses to send)
+        while let Ok(event) = self.call_event_rx.try_recv() {
             self.handle_call_event(event).await?;
         }
 

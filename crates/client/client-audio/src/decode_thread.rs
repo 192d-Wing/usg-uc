@@ -18,6 +18,25 @@ use crate::sinc_resampler::Resampler;
 use crate::wsola::WsolaPlc;
 use crate::stream::{PlaybackStream, PlaybackStreamHandle, Sample};
 use client_types::{CodecPreference, DtmfDigit, DtmfEvent};
+
+/// Write a slice of i16 samples to a file as little-endian bytes in batched writes.
+///
+/// Uses a stack buffer to convert samples to LE bytes, then writes in chunks
+/// to reduce syscall count from N (per-sample) to ~N/512.
+#[inline]
+fn dump_samples(dump: &mut impl std::io::Write, samples: &[i16]) {
+    // Stack buffer: 1024 bytes = 512 samples per write_all call.
+    let mut buf = [0u8; 1024];
+    for chunk in samples.chunks(512) {
+        let byte_len = chunk.len() * 2;
+        for (i, &s) in chunk.iter().enumerate() {
+            let bytes = s.to_le_bytes();
+            buf[i * 2] = bytes[0];
+            buf[i * 2 + 1] = bytes[1];
+        }
+        let _ = dump.write_all(&buf[..byte_len]);
+    }
+}
 use ringbuf::traits::{Observer, Producer};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -696,16 +715,10 @@ fn decode_loop(
                             tone_gen.generate_samples(tone_buf);
 
                             if let Some(ref mut dump) = dtmf_tone_dump {
-                                use std::io::Write;
-                                for &s in &*tone_buf {
-                                    let _ = dump.write_all(&s.to_le_bytes());
-                                }
+                                dump_samples(dump, tone_buf);
                             }
                             if let Some(ref mut dump) = audio_dump {
-                                use std::io::Write;
-                                for &s in &*tone_buf {
-                                    let _ = dump.write_all(&s.to_le_bytes());
-                                }
+                                dump_samples(dump, tone_buf);
                             }
                             diag_dtmf_tone_frames += 1;
                             producer.push_slice(tone_buf);
@@ -776,10 +789,7 @@ fn decode_loop(
 
                         // Write to audio dump file if enabled
                         if let Some(ref mut dump) = audio_dump {
-                            use std::io::Write;
-                            for &s in &*device_pcm {
-                                let _ = dump.write_all(&s.to_le_bytes());
-                            }
+                            dump_samples(dump, device_pcm);
                         }
 
                         let written = producer.push_slice(device_pcm);
@@ -843,17 +853,11 @@ fn decode_loop(
 
                             // Dump tone PCM for analysis
                             if let Some(ref mut dump) = dtmf_tone_dump {
-                                use std::io::Write;
-                                for &s in &*tone_buf {
-                                    let _ = dump.write_all(&s.to_le_bytes());
-                                }
+                                dump_samples(dump, tone_buf);
                             }
                             // Also write to main audio dump
                             if let Some(ref mut dump) = audio_dump {
-                                use std::io::Write;
-                                for &s in &*tone_buf {
-                                    let _ = dump.write_all(&s.to_le_bytes());
-                                }
+                                dump_samples(dump, tone_buf);
                             }
                             if let Some(ref mut trace) = dtmf_trace {
                                 use std::io::Write;

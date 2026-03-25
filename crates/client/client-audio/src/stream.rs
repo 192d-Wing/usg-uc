@@ -166,12 +166,15 @@ fn build_input_stream_i16(
                 if channels == 1 {
                     let _ = producer.push_slice(data);
                 } else {
-                    // Mix down to mono
-                    for chunk in data.chunks(channels) {
+                    // Mix down to mono into stack buffer, then batch push
+                    let mono_count = data.len() / channels;
+                    let mut mono_buf = [0i16; 1920]; // max 40ms @ 48kHz
+                    let count = mono_count.min(mono_buf.len());
+                    for (i, chunk) in data.chunks(channels).take(count).enumerate() {
                         let sum: i32 = chunk.iter().map(|&s| i32::from(s)).sum();
-                        let mono = (sum / channels as i32) as i16;
-                        let _ = producer.try_push(mono);
+                        mono_buf[i] = (sum / channels as i32) as i16;
                     }
+                    let _ = producer.push_slice(&mono_buf[..count]);
                 }
             },
             move |err| {

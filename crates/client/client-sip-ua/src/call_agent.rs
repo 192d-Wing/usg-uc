@@ -248,39 +248,10 @@ impl CallAgent {
         );
 
         let sip_call_id = generate_call_id(&effective_local_addr.ip().to_string());
-
-        // Create call session
         let from_tag = generate_tag();
         let branch = generate_branch();
 
-        let mut session = CallSession {
-            id: call_id.clone(),
-            sip_call_id: sip_call_id.clone(),
-            state: CallState::Idle,
-            dialog: None,
-            invite_transaction: None,
-            non_invite_transaction: None,
-            from_tag: from_tag.clone(),
-            to_tag: None,
-            cseq: 1,
-            remote_uri: remote_uri.to_string(),
-            remote_display_name: None,
-            is_outbound: true,
-            local_sdp: Some(sdp_offer.to_string()),
-            remote_sdp: None,
-            start_time: Utc::now(),
-            connected_at: None,
-            last_branch: Some(branch.clone()),
-            failure_reason: None,
-            refer_request: None,
-            transfer_target: None,
-            #[cfg(feature = "digest-auth")]
-            nonce_count: 0,
-            #[cfg(feature = "digest-auth")]
-            last_challenge: None,
-        };
-
-        // Build request before storing session
+        // Build request first (borrows strings), then move them into session
         let request = Self::build_invite_request_static(
             remote_uri,
             &self.aor,
@@ -297,8 +268,33 @@ impl CallAgent {
         // Create INVITE transaction
         let tx_key = TransactionKey::client(&branch, "INVITE");
         let transaction = ClientInviteTransaction::new(tx_key, TransportType::Reliable);
-        session.invite_transaction = Some(transaction);
-        session.state = CallState::Dialing;
+
+        let session = CallSession {
+            id: call_id.clone(),
+            sip_call_id,
+            state: CallState::Dialing,
+            dialog: None,
+            invite_transaction: Some(transaction),
+            non_invite_transaction: None,
+            from_tag,
+            to_tag: None,
+            cseq: 1,
+            remote_uri: remote_uri.to_string(),
+            remote_display_name: None,
+            is_outbound: true,
+            local_sdp: Some(sdp_offer.to_string()),
+            remote_sdp: None,
+            start_time: Utc::now(),
+            connected_at: None,
+            last_branch: Some(branch),
+            failure_reason: None,
+            refer_request: None,
+            transfer_target: None,
+            #[cfg(feature = "digest-auth")]
+            nonce_count: 0,
+            #[cfg(feature = "digest-auth")]
+            last_challenge: None,
+        };
 
         self.calls.insert(call_id.clone(), session);
 
