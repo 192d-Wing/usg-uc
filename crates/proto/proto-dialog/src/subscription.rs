@@ -623,7 +623,7 @@ pub fn format_allow_events(events: &[String]) -> String {
 /// IANA-registered SIP event packages per RFC 6665 §7.2.
 ///
 /// This list contains event packages registered with IANA as of 2024.
-/// See: https://www.iana.org/assignments/sip-events/sip-events.xhtml
+/// See: <https://www.iana.org/assignments/sip-events/sip-events.xhtml>
 pub const IANA_REGISTERED_EVENT_PACKAGES: &[&str] = &[
     // RFC 3265/6665 - SIP-Specific Event Notification
     "presence",
