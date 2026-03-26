@@ -77,7 +77,10 @@ pub use outbound::{
     DEFAULT_KEEPALIVE_TIMEOUT, Flow, FlowAction, FlowId, FlowState, FlowToken, FlowTransport,
     OutboundFlowManager,
 };
-pub use registrar::{Registrar, RegistrarConfig, RegistrarMode};
+pub use registrar::{
+    AuthenticatedRegistrar, ContactInfo, RegisterRequest, RegisterResponse, Registrar,
+    RegistrarConfig, RegistrarMode,
+};
 
 // RFC 3261 §22 Digest Authentication
 pub use authentication::{
