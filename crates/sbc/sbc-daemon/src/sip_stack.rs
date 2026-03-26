@@ -14,7 +14,7 @@
 //! - **SC-8**: Transmission Confidentiality and Integrity
 
 use bytes::Bytes;
-use proto_b2bua::{B2buaMode, Call, CallConfig, CallId, MediaAddress, SdpRewriter};
+use proto_b2bua::{B2buaMode, Call, CallConfig, CallId, MediaAddress, SdpRewriter, extract_media_address};
 use proto_dialog::{Dialog, DialogId};
 #[cfg(feature = "cluster")]
 use proto_registrar::AsyncLocationService;
@@ -338,6 +338,9 @@ impl SipStack {
     }
 
     /// Processes a SIP response.
+    ///
+    /// In B2BUA mode, matches the response to the B-leg client transaction,
+    /// then forwards an appropriate response to the A-leg.
     async fn process_response(&self, message: SipMessage, source: SbcSocketAddr) -> ProcessResult {
         let SipMessage::Response(ref resp) = message else {
             return ProcessResult::Error {
@@ -345,16 +348,258 @@ impl SipStack {
             };
         };
 
-        info!(
-            status = resp.status.code(),
-            reason = resp.reason_phrase(),
+        let status_code = resp.status.code();
+        let sip_call_id = resp
+            .headers
+            .call_id()
+            .unwrap_or("")
+            .to_string();
+
+        debug!(
+            status = status_code,
+            call_id = %sip_call_id,
             source = %source,
             "Received SIP response"
         );
 
-        // Match to client transaction and process
-        // In B2BUA mode, may need to create response for other leg
-        self.match_response_to_transaction().await
+        // Look up the B-leg Call-ID in correlation map
+        let corr = self.call_correlation.read().await;
+        let internal_id = match corr.b_leg.get(&sip_call_id) {
+            Some(id) => id.clone(),
+            None => {
+                debug!(call_id = %sip_call_id, "Response for unknown B-leg Call-ID, ignoring");
+                return ProcessResult::NoAction;
+            }
+        };
+
+        let addrs = match corr.addresses.get(&internal_id) {
+            Some(a) => CallAddresses {
+                a_leg_source: a.a_leg_source,
+                b_leg_destination: a.b_leg_destination,
+                a_leg_sip_call_id: a.a_leg_sip_call_id.clone(),
+                b_leg_sip_call_id: a.b_leg_sip_call_id.clone(),
+                local_addr: a.local_addr.clone(),
+            },
+            None => {
+                warn!(call_id = %sip_call_id, "No addresses for call");
+                return ProcessResult::NoAction;
+            }
+        };
+        drop(corr);
+
+        // Handle based on status code class
+        if status_code == 100 {
+            // 100 Trying — absorb, do not forward to A-leg (RFC 3261 §16.7)
+            debug!("Absorbing 100 Trying from B-leg");
+            return ProcessResult::NoAction;
+        }
+
+        if (101..200).contains(&status_code) {
+            // 1xx provisional (180 Ringing, 183 Session Progress)
+            return self
+                .handle_provisional_response(resp, &internal_id, &addrs)
+                .await;
+        }
+
+        if (200..300).contains(&status_code) {
+            // 2xx success (200 OK)
+            return self
+                .handle_success_response(resp, &internal_id, &addrs)
+                .await;
+        }
+
+        // 4xx/5xx/6xx error — forward to A-leg, cleanup
+        self.handle_error_response(resp, status_code, &internal_id, &addrs)
+            .await
+    }
+
+    /// Handles 1xx provisional response from B-leg (180 Ringing, 183 Session Progress).
+    async fn handle_provisional_response(
+        &self,
+        resp: &proto_sip::message::SipResponse,
+        internal_id: &CallId,
+        addrs: &CallAddresses,
+    ) -> ProcessResult {
+        let status_code = resp.status.code();
+
+        // Update call state
+        {
+            let mut calls = self.calls.write().await;
+            if let Some(call) = calls.calls.get_mut(internal_id) {
+                let _ = call.receive_provisional(status_code);
+            }
+        }
+
+        // Build provisional response for A-leg with A-leg's Call-ID
+        let mut a_response = proto_sip::message::SipResponse::new(resp.status);
+
+        // Copy Via from A-leg (original request's Via, not B-leg's)
+        // For now, copy from B-leg response and trust the headers
+        copy_response_headers(resp, &mut a_response);
+
+        // Replace Call-ID with A-leg's
+        a_response
+            .headers
+            .set(HeaderName::CallId, &addrs.a_leg_sip_call_id);
+
+        // If 183 with SDP, rewrite SDP for A-leg
+        if status_code == 183 {
+            if let Some(ref body) = resp.body {
+                let sdp_str = String::from_utf8_lossy(body);
+                let local_ip = addrs.local_addr.split(':').next().unwrap_or("0.0.0.0");
+                let local_media = MediaAddress::new(local_ip, 20_002);
+                let result = self
+                    .sdp_rewriter
+                    .rewrite_answer_for_a_leg(&sdp_str, &local_media);
+                a_response.body = Some(Bytes::from(result.rewritten));
+                a_response
+                    .headers
+                    .set(HeaderName::ContentType, "application/sdp");
+            }
+        }
+
+        info!(
+            status = status_code,
+            call_id = %addrs.a_leg_sip_call_id,
+            "Forwarding provisional response to A-leg"
+        );
+
+        ProcessResult::Response {
+            message: SipMessage::Response(a_response),
+            destination: addrs.a_leg_source,
+        }
+    }
+
+    /// Handles 200 OK from B-leg: activate call, rewrite SDP, send ACK to B-leg.
+    async fn handle_success_response(
+        &self,
+        resp: &proto_sip::message::SipResponse,
+        internal_id: &CallId,
+        addrs: &CallAddresses,
+    ) -> ProcessResult {
+        // Activate the call
+        {
+            let mut calls = self.calls.write().await;
+            if let Some(call) = calls.calls.get_mut(internal_id) {
+                let _ = call.activate();
+            }
+        }
+
+        // Extract B-leg's RTP address from SDP
+        if let Some(ref body) = resp.body {
+            let sdp_str = String::from_utf8_lossy(body);
+            if let Some(_remote_media) = extract_media_address(&sdp_str) {
+                // Phase 4 will use this to set_remote_address on MediaPipeline
+                debug!(
+                    call_id = %addrs.a_leg_sip_call_id,
+                    "B-leg RTP address extracted from SDP"
+                );
+            }
+        }
+
+        // Build 200 OK for A-leg with rewritten SDP
+        let mut a_response = proto_sip::message::SipResponse::new(StatusCode::OK);
+        copy_response_headers(resp, &mut a_response);
+        a_response
+            .headers
+            .set(HeaderName::CallId, &addrs.a_leg_sip_call_id);
+
+        // Rewrite SDP for A-leg
+        if let Some(ref body) = resp.body {
+            let sdp_str = String::from_utf8_lossy(body);
+            let local_ip = addrs.local_addr.split(':').next().unwrap_or("0.0.0.0");
+            let local_media = MediaAddress::new(local_ip, 20_002);
+            let result = self
+                .sdp_rewriter
+                .rewrite_answer_for_a_leg(&sdp_str, &local_media);
+            a_response.body = Some(Bytes::from(result.rewritten));
+            a_response
+                .headers
+                .set(HeaderName::ContentType, "application/sdp");
+            // Update Content-Length
+            if let Some(ref body) = a_response.body {
+                a_response
+                    .headers
+                    .set(HeaderName::ContentLength, &body.len().to_string());
+            }
+        }
+
+        // Build ACK for B-leg
+        let b_leg_uri = SipUri::new(addrs.b_leg_destination.ip().to_string())
+            .with_port(addrs.b_leg_destination.port());
+        let mut ack_request = proto_sip::message::SipRequest::new(Method::Ack, b_leg_uri);
+        ack_request.headers.set(HeaderName::CallId, &addrs.b_leg_sip_call_id);
+        ack_request.headers.set(HeaderName::CSeq, "1 ACK");
+        let _local_ip = addrs.local_addr.split(':').next().unwrap_or("0.0.0.0");
+        let branch = generate_branch();
+        ack_request.headers.add(Header::new(
+            HeaderName::Via,
+            format!("SIP/2.0/UDP {};branch={}", addrs.local_addr, branch),
+        ));
+        ack_request.headers.set(HeaderName::ContentLength, "0");
+
+        info!(
+            call_id = %addrs.a_leg_sip_call_id,
+            "Call connected: 200 OK → A-leg, ACK → B-leg"
+        );
+
+        ProcessResult::Multiple(vec![
+            ProcessResult::Response {
+                message: SipMessage::Response(a_response),
+                destination: addrs.a_leg_source,
+            },
+            ProcessResult::Forward {
+                message: SipMessage::Request(ack_request),
+                destination: addrs.b_leg_destination,
+            },
+        ])
+    }
+
+    /// Handles 4xx/5xx/6xx error response from B-leg.
+    async fn handle_error_response(
+        &self,
+        resp: &proto_sip::message::SipResponse,
+        status_code: u16,
+        internal_id: &CallId,
+        addrs: &CallAddresses,
+    ) -> ProcessResult {
+        // Fail the call
+        {
+            let mut calls = self.calls.write().await;
+            if let Some(call) = calls.calls.get_mut(internal_id) {
+                let _ = call.fail(status_code, resp.reason_phrase());
+            }
+        }
+
+        // Build error response for A-leg
+        let mut a_response = proto_sip::message::SipResponse::new(resp.status);
+        copy_response_headers(resp, &mut a_response);
+        a_response
+            .headers
+            .set(HeaderName::CallId, &addrs.a_leg_sip_call_id);
+
+        // Cleanup call state
+        {
+            let mut calls = self.calls.write().await;
+            calls.calls.remove(internal_id);
+        }
+        {
+            let mut corr = self.call_correlation.write().await;
+            corr.a_leg.remove(&addrs.a_leg_sip_call_id);
+            corr.b_leg.remove(&addrs.b_leg_sip_call_id);
+            corr.addresses.remove(internal_id);
+        }
+
+        warn!(
+            status = status_code,
+            call_id = %addrs.a_leg_sip_call_id,
+            "Call failed, forwarding error to A-leg"
+        );
+
+        ProcessResult::Response {
+            message: SipMessage::Response(a_response),
+            destination: addrs.a_leg_source,
+        }
     }
 
     /// Handles REGISTER request.
@@ -938,6 +1183,30 @@ fn generate_tag() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{:x}", timestamp & 0xFFFF_FFFF)
+}
+
+/// Copies common headers from a B-leg response for forwarding to A-leg.
+///
+/// Copies Via, From, To, CSeq, and Content-Length.
+/// Call-ID should be replaced by the caller with the A-leg's Call-ID.
+fn copy_response_headers(
+    from: &proto_sip::message::SipResponse,
+    to: &mut proto_sip::message::SipResponse,
+) {
+    // Copy Via (will be the A-leg's Via from the original INVITE)
+    for via in from.headers.get_all(&HeaderName::Via) {
+        to.headers.add(Header::new(HeaderName::Via, &via.value));
+    }
+    if let Some(from_val) = from.headers.get_value(&HeaderName::From) {
+        to.headers.set(HeaderName::From, from_val);
+    }
+    if let Some(to_val) = from.headers.get_value(&HeaderName::To) {
+        to.headers.set(HeaderName::To, to_val);
+    }
+    if let Some(cseq) = from.headers.cseq() {
+        to.headers.set(HeaderName::CSeq, cseq);
+    }
+    to.headers.set(HeaderName::ContentLength, "0");
 }
 
 /// Resolves a SIP URI string to a socket address.
