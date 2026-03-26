@@ -14,7 +14,7 @@
 //! - **SC-8**: Transmission Confidentiality and Integrity
 
 use bytes::Bytes;
-use proto_b2bua::{Call, CallId};
+use proto_b2bua::{B2buaMode, Call, CallConfig, CallId, MediaAddress, SdpRewriter};
 use proto_dialog::{Dialog, DialogId};
 #[cfg(feature = "cluster")]
 use proto_registrar::AsyncLocationService;
@@ -22,16 +22,18 @@ use proto_registrar::{
     AuthenticatedRegistrar, ContactInfo, LocationService, RegisterRequest, RegistrarConfig,
     RegistrarMode,
 };
+use proto_sip::builder::{RequestBuilder, generate_branch, generate_call_id};
+use proto_sip::uri::SipUri;
 use proto_sip::{Header, HeaderName, Method, SipMessage, StatusCode};
 use proto_transaction::{
     ClientInviteTransaction, ClientNonInviteTransaction, ServerInviteTransaction,
-    ServerNonInviteTransaction, TransactionKey,
+    ServerNonInviteTransaction, TransactionKey, TransportType,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uc_types::address::SbcSocketAddr;
 
 /// SIP stack for processing SIP messages.
@@ -49,6 +51,10 @@ pub struct SipStack {
     /// Async location service for routing (storage-backed, when cluster enabled).
     #[cfg(feature = "cluster")]
     async_location_service: Option<Arc<AsyncLocationService>>,
+    /// Call correlation: maps A-leg/B-leg SIP Call-IDs to internal CallIds.
+    call_correlation: RwLock<CallCorrelation>,
+    /// SDP rewriter for media anchoring.
+    sdp_rewriter: SdpRewriter,
     /// Stack configuration.
     config: SipStackConfig,
     /// Registration statistics.
@@ -141,6 +147,31 @@ struct CallStore {
     calls: HashMap<CallId, Call>,
 }
 
+/// Correlates A-leg and B-leg SIP Call-IDs with internal B2BUA CallIds.
+#[derive(Default)]
+struct CallCorrelation {
+    /// Maps A-leg SIP Call-ID → internal CallId.
+    a_leg: HashMap<String, CallId>,
+    /// Maps B-leg SIP Call-ID → internal CallId.
+    b_leg: HashMap<String, CallId>,
+    /// Maps internal CallId → call addressing info.
+    addresses: HashMap<CallId, CallAddresses>,
+}
+
+/// Addressing info for both legs of a B2BUA call.
+struct CallAddresses {
+    /// A-leg source address (where to send responses).
+    a_leg_source: SbcSocketAddr,
+    /// B-leg destination address (where to forward requests).
+    b_leg_destination: SbcSocketAddr,
+    /// A-leg SIP Call-ID.
+    a_leg_sip_call_id: String,
+    /// B-leg SIP Call-ID.
+    b_leg_sip_call_id: String,
+    /// SBC's local SIP address for Via/Contact headers.
+    local_addr: String,
+}
+
 /// Result of processing a SIP message.
 #[derive(Debug)]
 pub enum ProcessResult {
@@ -196,6 +227,8 @@ impl SipStack {
             location_service,
             #[cfg(feature = "cluster")]
             async_location_service: None,
+            call_correlation: RwLock::new(CallCorrelation::default()),
+            sdp_rewriter: SdpRewriter::new(B2buaMode::MediaRelay),
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
             config,
@@ -232,6 +265,8 @@ impl SipStack {
             registrar: RwLock::new(registrar),
             location_service,
             async_location_service: Some(async_location_service),
+            call_correlation: RwLock::new(CallCorrelation::default()),
+            sdp_rewriter: SdpRewriter::new(B2buaMode::MediaRelay),
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
             config,
@@ -492,6 +527,14 @@ impl SipStack {
     }
 
     /// Handles INVITE request.
+    ///
+    /// B2BUA call flow:
+    /// 1. Send 100 Trying to A-leg
+    /// 2. Look up destination in LocationService (registered users) or resolve directly
+    /// 3. Create B2BUA Call with A-leg/B-leg config
+    /// 4. Rewrite SDP with SBC's address for media anchoring
+    /// 5. Build B-leg INVITE with new headers
+    /// 6. Return Multiple(100 Trying + Forward B-leg INVITE)
     async fn handle_invite(&self, message: SipMessage, source: SbcSocketAddr) -> ProcessResult {
         let SipMessage::Request(ref req) = message else {
             return ProcessResult::Error {
@@ -499,32 +542,208 @@ impl SipStack {
             };
         };
 
-        let call_id = req.headers.call_id().map(String::from);
-        debug!(
-            uri = %req.uri,
-            call_id = call_id.as_deref().unwrap_or("none"),
-            "Processing INVITE"
-        );
+        let a_leg_call_id = req
+            .headers
+            .call_id()
+            .unwrap_or("unknown")
+            .to_string();
 
-        // Create 100 Trying response
+        debug!(uri = %req.uri, call_id = %a_leg_call_id, "Processing INVITE");
+
+        // 1. Build 100 Trying for A-leg
         let trying = create_response_from_request(req, StatusCode::TRYING);
 
+        // 2. Extract destination from Request-URI
+        let dest_user = req.uri.user.as_deref().unwrap_or("").to_string();
+        let dest_host = req.uri.host.clone();
+        let dest_aor = format!("sip:{}@{}", dest_user, dest_host);
+
+        // 3. Look up destination: first check location service, then try direct
+        let b_leg_destination = {
+            let loc = self.location_service.read().await;
+            let bindings = loc.lookup(&dest_aor);
+            if let Some(binding) = bindings.first() {
+                // Registered user — resolve contact URI to address
+                let contact = binding.contact_uri().to_string();
+                resolve_sip_uri_to_addr(&contact)
+            } else {
+                // Not registered — try resolving Request-URI directly
+                resolve_sip_uri_to_addr(&req.uri.to_string())
+            }
+        };
+
+        let b_leg_destination = match b_leg_destination {
+            Some(addr) => addr,
+            None => {
+                warn!(dest = %dest_aor, "Cannot resolve destination");
+                let not_found =
+                    create_response_from_request(req, StatusCode::NOT_FOUND);
+                return ProcessResult::Response {
+                    message: SipMessage::Response(not_found),
+                    destination: source,
+                };
+            }
+        };
+
+        // 4. Create B2BUA call
+        let internal_call_id = CallId::generate();
+        let a_leg_from = req
+            .headers
+            .get_value(&HeaderName::From)
+            .map(|f| extract_uri_from_header(&f))
+            .unwrap_or_default();
+
+        let call_config = CallConfig::new(
+            format!("sip:{}@{}", self.config.instance_name, self.config.domain),
+            a_leg_from,
+            format!("sip:{}@{}", self.config.instance_name, self.config.domain),
+            dest_aor.clone(),
+        )
+        .with_call_id(internal_call_id.clone());
+
+        let mut call = Call::new(call_config);
+        if let Err(e) = call.receive() {
+            error!(error = %e, "Failed to transition call to Received");
+        }
+        if let Err(e) = call.start_routing() {
+            error!(error = %e, "Failed to transition call to Routing");
+        }
+
+        // 5. Determine SBC's local address for SDP rewriting
+        let local_ip = source.ip().to_string(); // Use the address we received on
+        let local_sip_addr = format!("{}:{}", local_ip, source.port());
+
+        // 6. Rewrite SDP for B-leg (replace A-leg's address with SBC's)
+        let b_leg_sdp = if let Some(ref body) = req.body {
+            let sdp_str = String::from_utf8_lossy(body);
+            // For now, use a placeholder port — Phase 4 will allocate real RTP ports
+            let local_media = MediaAddress::new(&local_ip, 20_000);
+            let result = self
+                .sdp_rewriter
+                .rewrite_offer_for_b_leg(&sdp_str, &local_media);
+            Some(result.rewritten)
+        } else {
+            None
+        };
+
+        // 7. Build B-leg INVITE
+        let b_leg_sip_call_id = generate_call_id(&self.config.domain);
+        let b_leg_branch = generate_branch();
+
+        let mut b_leg_uri = SipUri::new(&dest_host).with_user(&dest_user);
+        if let Some(port) = req.uri.port {
+            b_leg_uri.port = Some(port);
+        }
+
+        let mut builder = RequestBuilder::invite(b_leg_uri)
+            .via_auto("UDP", &local_ip, Some(source.port()))
+            .from_auto(
+                SipUri::new(&self.config.domain).with_user(&self.config.instance_name),
+                None,
+            )
+            .to_uri(
+                SipUri::new(&dest_host).with_user(&dest_user),
+                None,
+            )
+            .call_id(&b_leg_sip_call_id)
+            .cseq(1)
+            .max_forwards(70)
+            .contact_uri(
+                SipUri::new(&local_ip).with_port(source.port()),
+            );
+
+        if let Some(ref sdp) = b_leg_sdp {
+            builder = builder.body_sdp(sdp.as_bytes().to_vec());
+        }
+
+        let b_leg_request = match builder.build_with_defaults() {
+            Ok(req) => req,
+            Err(e) => {
+                error!(error = %e, "Failed to build B-leg INVITE");
+                let server_err = create_response_from_request(
+                    req,
+                    StatusCode::SERVER_INTERNAL_ERROR,
+                );
+                return ProcessResult::Response {
+                    message: SipMessage::Response(server_err),
+                    destination: source,
+                };
+            }
+        };
+
+        // 8. Store call state and correlation
+        {
+            let mut calls = self.calls.write().await;
+            calls.calls.insert(internal_call_id.clone(), call);
+        }
+        {
+            let mut corr = self.call_correlation.write().await;
+            corr.a_leg.insert(a_leg_call_id.clone(), internal_call_id.clone());
+            corr.b_leg.insert(b_leg_sip_call_id.clone(), internal_call_id.clone());
+            corr.addresses.insert(
+                internal_call_id.clone(),
+                CallAddresses {
+                    a_leg_source: source,
+                    b_leg_destination,
+                    a_leg_sip_call_id: a_leg_call_id.clone(),
+                    b_leg_sip_call_id: b_leg_sip_call_id.clone(),
+                    local_addr: local_sip_addr,
+                },
+            );
+        }
+
+        // 9. Create transactions
+        {
+            let a_branch = req
+                .headers
+                .get_value(&HeaderName::Via)
+                .and_then(|v| extract_param(&v, "branch").map(String::from))
+                .unwrap_or_else(generate_branch);
+
+            let mut txns = self.transactions.write().await;
+            let server_key = TransactionKey::server(&a_branch, "INVITE");
+            txns.server_invite.insert(
+                server_key,
+                ServerInviteState {
+                    transaction: ServerInviteTransaction::new(
+                        TransactionKey::server(&a_branch, "INVITE"),
+                        TransportType::Unreliable,
+                    ),
+                    source,
+                },
+            );
+
+            let client_key = TransactionKey::client(&b_leg_branch, "INVITE");
+            txns.client_invite.insert(
+                client_key,
+                ClientInviteState {
+                    transaction: ClientInviteTransaction::new(
+                        TransactionKey::client(&b_leg_branch, "INVITE"),
+                        TransportType::Unreliable,
+                    ),
+                    destination: b_leg_destination,
+                },
+            );
+        }
+
         info!(
-            uri = %req.uri,
-            call_id = call_id.as_deref().unwrap_or("none"),
-            "Call initiated, sent 100 Trying"
+            call_id = %a_leg_call_id,
+            b_leg_call_id = %b_leg_sip_call_id,
+            destination = %b_leg_destination,
+            "INVITE routed: A-leg → SBC → B-leg"
         );
 
-        // In a full implementation, would:
-        // 1. Create server transaction
-        // 2. Look up destination via location service or routing
-        // 3. Create B2BUA call legs
-        // 4. Forward INVITE to B-leg
-
-        ProcessResult::Response {
-            message: SipMessage::Response(trying),
-            destination: source,
-        }
+        // 10. Return 100 Trying to A-leg + forward INVITE to B-leg
+        ProcessResult::Multiple(vec![
+            ProcessResult::Response {
+                message: SipMessage::Response(trying),
+                destination: source,
+            },
+            ProcessResult::Forward {
+                message: SipMessage::Request(b_leg_request),
+                destination: b_leg_destination,
+            },
+        ])
     }
 
     /// Handles ACK request.
@@ -719,6 +938,59 @@ fn generate_tag() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{:x}", timestamp & 0xFFFF_FFFF)
+}
+
+/// Resolves a SIP URI string to a socket address.
+///
+/// Parses the host and port from URIs like `sip:user@host:port` or `sip:host`.
+/// Defaults to port 5060 if not specified.
+fn resolve_sip_uri_to_addr(uri: &str) -> Option<SbcSocketAddr> {
+    // Strip sip: or sips: prefix
+    let without_scheme = uri
+        .strip_prefix("sip:")
+        .or_else(|| uri.strip_prefix("sips:"))
+        .unwrap_or(uri);
+
+    // Strip user@ if present
+    let host_part = if let Some(at_pos) = without_scheme.find('@') {
+        &without_scheme[at_pos + 1..]
+    } else {
+        without_scheme
+    };
+
+    // Strip parameters (;transport=udp etc.)
+    let host_part = host_part.split(';').next().unwrap_or(host_part);
+
+    // Parse host:port
+    let (host, port) = if let Some(colon_pos) = host_part.rfind(':') {
+        let port_str = &host_part[colon_pos + 1..];
+        if let Ok(port) = port_str.parse::<u16>() {
+            (&host_part[..colon_pos], port)
+        } else {
+            (host_part, 5060)
+        }
+    } else {
+        (host_part, 5060)
+    };
+
+    // Parse IP address
+    if let Ok(ipv4) = host.parse::<std::net::Ipv4Addr>() {
+        return Some(SbcSocketAddr::new_v4(ipv4, port));
+    }
+    if let Ok(ipv6) = host.parse::<std::net::Ipv6Addr>() {
+        return Some(SbcSocketAddr::new_v6(ipv6, port));
+    }
+
+    // For hostnames, try DNS resolution (synchronous for now)
+    use std::net::ToSocketAddrs;
+    let addr_str = format!("{host}:{port}");
+    if let Ok(mut addrs) = addr_str.to_socket_addrs() {
+        if let Some(addr) = addrs.next() {
+            return Some(SbcSocketAddr::from(addr));
+        }
+    }
+
+    None
 }
 
 /// Extracts a SIP URI from a From/To header value.
@@ -962,14 +1234,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_invite() {
+    async fn test_invite_unresolvable_destination() {
         let config = SipStackConfig::default();
         let stack = SipStack::new(config);
 
-        let invite = b"INVITE sip:bob@sbc.local SIP/2.0\r\n\
+        // INVITE to unresolvable host → should get 404
+        let invite = b"INVITE sip:bob@nonexistent.invalid SIP/2.0\r\n\
             Via: SIP/2.0/UDP client.example.com:5060;branch=z9hG4bK776\r\n\
             From: <sip:alice@example.com>;tag=1234\r\n\
-            To: <sip:bob@sbc.local>\r\n\
+            To: <sip:bob@nonexistent.invalid>\r\n\
             Call-ID: call123@example.com\r\n\
             CSeq: 1 INVITE\r\n\
             Contact: <sip:alice@client.example.com:5060>\r\n\
@@ -983,13 +1256,92 @@ mod tests {
 
         match result {
             ProcessResult::Response { message, .. } => {
-                assert!(message.is_response());
                 if let SipMessage::Response(resp) = message {
-                    // Should get 100 Trying
-                    assert_eq!(resp.status, StatusCode::TRYING);
+                    assert_eq!(resp.status.code(), 404, "Unresolvable destination should return 404");
                 }
             }
-            _ => panic!("Expected response"),
+            _ => panic!("Expected 404 response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_invite_to_registered_user() {
+        let config = SipStackConfig::default();
+        let stack = SipStack::new(config);
+
+        // First, register bob at 127.0.0.1:5060
+        let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK776\r\n\
+            From: <sip:bob@sbc.local>;tag=reg1\r\n\
+            To: <sip:bob@sbc.local>\r\n\
+            Call-ID: reg-bob@example.com\r\n\
+            CSeq: 1 REGISTER\r\n\
+            Contact: <sip:bob@127.0.0.1:5060>\r\n\
+            Expires: 3600\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+
+        let source = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
+        let result = stack
+            .process_message(&Bytes::from_static(register), source)
+            .await;
+        // Verify registration succeeded
+        if let ProcessResult::Response { message, .. } = &result {
+            if let SipMessage::Response(resp) = message {
+                assert_eq!(resp.status, StatusCode::OK, "Registration should succeed");
+            }
+        }
+
+        // Now INVITE bob — should route via location service
+        let invite = b"INVITE sip:bob@sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 192.168.1.100:5060;branch=z9hG4bK999\r\n\
+            From: <sip:alice@example.com>;tag=inv1\r\n\
+            To: <sip:bob@sbc.local>\r\n\
+            Call-ID: call-bob@example.com\r\n\
+            CSeq: 1 INVITE\r\n\
+            Contact: <sip:alice@192.168.1.100:5060>\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+
+        let alice_source = SbcSocketAddr::new_v4(
+            std::net::Ipv4Addr::new(192, 168, 1, 100),
+            5060,
+        );
+        let result = stack
+            .process_message(&Bytes::from_static(invite), alice_source)
+            .await;
+
+        // Should get Multiple(100 Trying + Forward INVITE)
+        match result {
+            ProcessResult::Multiple(results) => {
+                assert_eq!(results.len(), 2, "Should have 2 results: Trying + Forward");
+
+                // First: 100 Trying to A-leg
+                if let ProcessResult::Response { message, destination } = &results[0] {
+                    if let SipMessage::Response(resp) = message {
+                        assert_eq!(resp.status, StatusCode::TRYING);
+                    }
+                    assert_eq!(*destination, alice_source);
+                } else {
+                    panic!("First result should be Response (100 Trying)");
+                }
+
+                // Second: Forward INVITE to B-leg (bob at 127.0.0.1:5060)
+                if let ProcessResult::Forward { message, destination } = &results[1] {
+                    assert!(message.is_request(), "Forward should be a request");
+                    assert_eq!(
+                        destination.ip(),
+                        std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
+                        "B-leg should go to bob's registered address"
+                    );
+                } else {
+                    panic!("Second result should be Forward (B-leg INVITE)");
+                }
+
+                // Verify call state was created
+                assert_eq!(stack.call_count().await, 1);
+            }
+            other => panic!("Expected Multiple, got: {other:?}"),
         }
     }
 

@@ -43,6 +43,7 @@ proto-turn.workspace = true
 proto-ice.workspace = true
 uc-api.workspace = true
 uc-dos-protection.workspace = true
+uc-routing.workspace = true
 
 # Clustering dependencies (optional)
 uc-cluster = { workspace = true, optional = true }
