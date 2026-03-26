@@ -268,7 +268,7 @@ impl LongTermCredentialValidator {
     /// The nonce encodes the creation timestamp and a signature:
     /// `{timestamp}:{signature}`
     ///
-    /// Where signature = HMAC-SHA256(secret, timestamp)[:16] (hex)
+    /// Where signature = `HMAC-SHA256(secret, timestamp)` truncated to 16 bytes (hex)
     pub fn generate_nonce(&self) -> String {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)

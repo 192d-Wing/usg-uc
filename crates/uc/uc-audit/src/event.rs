@@ -45,7 +45,7 @@ pub enum AuditEventType {
 ///
 /// Each event contains:
 /// - Type of event
-/// - When the event occurred (added by [`AuditRecord`])
+/// - When the event occurred (added by [`AuditRecord`](crate::record::AuditRecord))
 /// - Where the event occurred (source)
 /// - Source of the event (identity)
 /// - Outcome of the event (success/failure)
