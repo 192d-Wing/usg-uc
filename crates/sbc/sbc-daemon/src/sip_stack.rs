@@ -33,6 +33,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use proto_sip::manipulation::{
+    HeaderManipulator, ManipulationAction, ManipulationContext, ManipulationDirection,
+    ManipulationPolicy, ManipulationRule,
+};
+use proto_sip::{TopologyHider, TopologyHidingConfig as SipTopologyConfig, TopologyHidingMode};
 use tracing::{debug, error, info, warn};
 use uc_routing::{
     DestinationType, DialPattern, DialPlan, DialPlanEntry, Direction, NumberTransform, Router,
@@ -63,6 +68,10 @@ pub struct SipStack {
     media_pipeline: Option<Arc<crate::media_pipeline::MediaPipeline>>,
     /// Call router for dial plan matching and trunk selection.
     router: Option<RwLock<Router>>,
+    /// SIP header manipulator for per-trunk/global header rules.
+    header_manipulator: Option<HeaderManipulator>,
+    /// Topology hider for Via/Contact/Call-ID anonymization.
+    topology_hider: Option<RwLock<TopologyHider>>,
     /// Stack configuration.
     config: SipStackConfig,
     /// Registration statistics.
@@ -242,6 +251,8 @@ impl SipStack {
             sdp_rewriter: SdpRewriter::new(B2buaMode::MediaRelay),
             media_pipeline: None,
             router: None,
+            header_manipulator: None,
+            topology_hider: None,
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
             config,
@@ -282,6 +293,8 @@ impl SipStack {
             sdp_rewriter: SdpRewriter::new(B2buaMode::MediaRelay),
             media_pipeline: None,
             router: None,
+            header_manipulator: None,
+            topology_hider: None,
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
             config,
@@ -425,6 +438,89 @@ impl SipStack {
         );
 
         self.router = Some(RwLock::new(router));
+    }
+
+    /// Initializes the header manipulator from config.
+    pub fn init_manipulator_from_config(
+        &mut self,
+        config: &sbc_config::HeaderManipulationConfig,
+    ) {
+        let mut manipulator = HeaderManipulator::new();
+
+        for rule_config in &config.global_rules {
+            let direction = match rule_config.direction.as_str() {
+                "inbound" => Some(ManipulationDirection::Inbound),
+                "outbound" => Some(ManipulationDirection::Outbound),
+                _ => None, // "both" or default
+            };
+
+            let action = parse_manipulation_action(&rule_config.action, &rule_config.header, &rule_config.value);
+
+            let mut policy = ManipulationPolicy::new(&rule_config.name);
+            if let Some(dir) = direction {
+                policy = policy.with_direction(dir);
+            }
+            policy.add_rule(ManipulationRule::new(
+                &rule_config.name,
+                proto_sip::manipulation::ManipulationCondition::Always,
+                action,
+            ));
+            manipulator.add_global_policy(policy);
+        }
+
+        for rule_config in &config.trunk_rules {
+            let action = parse_manipulation_action(&rule_config.action, &rule_config.header, &rule_config.value);
+            let mut policy = ManipulationPolicy::new(&rule_config.name);
+            policy.add_rule(ManipulationRule::new(
+                &rule_config.name,
+                proto_sip::manipulation::ManipulationCondition::Always,
+                action,
+            ));
+            manipulator.add_trunk_policy(&rule_config.trunk_id, policy);
+        }
+
+        let global_count = config.global_rules.len();
+        let trunk_count = config.trunk_rules.len();
+
+        info!(
+            global_rules = global_count,
+            trunk_rules = trunk_count,
+            "Header manipulator initialized"
+        );
+
+        self.header_manipulator = Some(manipulator);
+    }
+
+    /// Initializes the topology hider from config.
+    pub fn init_topology_hider_from_config(
+        &mut self,
+        config: &sbc_config::TopologyHidingConfig,
+    ) {
+        if !config.enabled {
+            return;
+        }
+
+        let mode = match config.mode.as_str() {
+            "signaling_only" => TopologyHidingMode::Basic,
+            "full" => TopologyHidingMode::Aggressive,
+            _ => return, // "none"
+        };
+
+        let topo_config = SipTopologyConfig::new(&config.external_host)
+            .with_port(config.external_port)
+            .with_mode(mode)
+            .with_call_id_obfuscation(config.obfuscate_call_id);
+
+        let hider = TopologyHider::new(topo_config);
+
+        info!(
+            mode = %config.mode,
+            external_host = %config.external_host,
+            obfuscate_call_id = config.obfuscate_call_id,
+            "Topology hider initialized"
+        );
+
+        self.topology_hider = Some(RwLock::new(hider));
     }
 
     /// Returns whether the stack has a storage-backed location service.
@@ -1066,7 +1162,7 @@ impl SipStack {
             builder = builder.body_sdp(sdp.as_bytes().to_vec());
         }
 
-        let b_leg_request = match builder.build_with_defaults() {
+        let mut b_leg_request = match builder.build_with_defaults() {
             Ok(req) => req,
             Err(e) => {
                 error!(error = %e, "Failed to build B-leg INVITE");
@@ -1080,6 +1176,20 @@ impl SipStack {
                 };
             }
         };
+
+        // 7b. Apply header manipulation to B-leg INVITE
+        if let Some(ref manipulator) = self.header_manipulator {
+            let context = ManipulationContext::for_request("INVITE", ManipulationDirection::Outbound);
+            if let Ok(count) = manipulator.apply(&mut b_leg_request.headers, &context) {
+                if count > 0 {
+                    debug!(rules_applied = count, "Header manipulation applied to B-leg INVITE");
+                }
+            }
+        }
+
+        // 7c. Apply topology hiding to B-leg INVITE
+        // (strip internal Via headers, anonymize Contact)
+        // TopologyHider modifies headers in-place — will be fully wired in Phase 4
 
         // 8. Store call state and correlation
         {
@@ -1660,6 +1770,39 @@ fn copy_response_headers(
         to.headers.set(HeaderName::CSeq, cseq);
     }
     to.headers.set(HeaderName::ContentLength, "0");
+}
+
+/// Parses a manipulation action from config strings.
+fn parse_manipulation_action(action: &str, header: &str, value: &str) -> ManipulationAction {
+    let header_name: HeaderName = header.parse().unwrap_or(HeaderName::Custom(header.to_string()));
+    match action {
+        "add" => ManipulationAction::Add {
+            name: header_name,
+            value: value.to_string(),
+        },
+        "set" => ManipulationAction::Set {
+            name: header_name,
+            value: value.to_string(),
+        },
+        "remove" => ManipulationAction::Remove { name: header_name },
+        "replace" => ManipulationAction::Replace {
+            name: header_name,
+            pattern: String::new(),
+            replacement: value.to_string(),
+        },
+        "prepend" => ManipulationAction::Prepend {
+            name: header_name,
+            prefix: value.to_string(),
+        },
+        "append" => ManipulationAction::Append {
+            name: header_name,
+            suffix: value.to_string(),
+        },
+        _ => ManipulationAction::Set {
+            name: header_name,
+            value: value.to_string(),
+        },
+    }
 }
 
 /// Resolves a SIP URI string to a socket address.
