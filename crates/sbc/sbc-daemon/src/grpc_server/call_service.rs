@@ -48,15 +48,34 @@ impl CallService for CallServiceImpl {
             "gRPC ListCalls"
         );
 
-        // Get active calls count from stats
-        let active = self.state.stats.calls_active.load(Ordering::Relaxed);
-        let total = self.state.stats.calls_total.load(Ordering::Relaxed);
+        // Get live call data from SIP stack if available
+        let (calls_proto, active, total) = if let Some(ref stack) = self.state.sip_stack {
+            let summaries = stack.list_calls().await;
+            let active = summaries.len() as u64;
+            let total = self.state.stats.calls_total.load(Ordering::Relaxed);
 
-        // TODO: Implement actual call listing from dialog manager
-        // For now, return stats-based response
+            let calls: Vec<_> = summaries
+                .iter()
+                .map(|s| sbc_grpc_api::sbc::CallInfo {
+                    call_id: s.call_id.clone(),
+                    state: match s.state.as_str() {
+                        "Active" => 2,   // CONFIRMED
+                        "Routing" | "Proceeding" => 1, // EARLY
+                        _ => 0,          // INITIAL
+                    },
+                    ..Default::default()
+                })
+                .collect();
+            (calls, active, total)
+        } else {
+            let active = self.state.stats.calls_active.load(Ordering::Relaxed);
+            let total = self.state.stats.calls_total.load(Ordering::Relaxed);
+            (vec![], active, total)
+        };
+
         #[allow(clippy::cast_possible_wrap)]
         let response = ListCallsResponse {
-            calls: vec![], // Would be populated from dialog manager
+            calls: calls_proto,
             total: total as i64,
             active: active as i64,
         };

@@ -1353,6 +1353,97 @@ impl SipStack {
     pub async fn call_count(&self) -> usize {
         self.calls.read().await.calls.len()
     }
+
+    /// Lists all active calls with summary info (for gRPC ListCalls).
+    pub async fn list_calls(&self) -> Vec<CallSummary> {
+        let calls = self.calls.read().await;
+        let corr = self.call_correlation.read().await;
+
+        calls
+            .calls
+            .iter()
+            .map(|(id, call)| {
+                let addrs = corr.addresses.get(id);
+                CallSummary {
+                    call_id: id.to_string(),
+                    state: format!("{:?}", call.state()),
+                    a_leg_call_id: addrs.map(|a| a.a_leg_sip_call_id.clone()).unwrap_or_default(),
+                    b_leg_call_id: addrs.map(|a| a.b_leg_sip_call_id.clone()).unwrap_or_default(),
+                    a_leg_source: addrs.map(|a| a.a_leg_source.to_string()).unwrap_or_default(),
+                    b_leg_destination: addrs.map(|a| a.b_leg_destination.to_string()).unwrap_or_default(),
+                }
+            })
+            .collect()
+    }
+
+    /// Lists all registrations from the location service (for gRPC ListRegistrations).
+    pub async fn list_registrations(&self) -> Vec<RegistrationSummary> {
+        let loc = self.location_service.read().await;
+        loc.aors()
+            .map(|aor| {
+                let bindings = loc.lookup(aor);
+                RegistrationSummary {
+                    aor: aor.to_string(),
+                    contact_count: bindings.len(),
+                    contacts: bindings
+                        .iter()
+                        .map(|b| b.contact_uri().to_string())
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
+    /// Returns the number of registered AORs.
+    pub async fn registration_aor_count(&self) -> usize {
+        let loc = self.location_service.read().await;
+        loc.aor_count()
+    }
+
+    /// Returns the total number of contact bindings.
+    pub async fn registration_binding_count(&self) -> usize {
+        let loc = self.location_service.read().await;
+        loc.total_bindings()
+    }
+
+    /// Deletes a registration binding (for gRPC DeleteRegistration).
+    pub async fn delete_registration(
+        &self,
+        aor: &str,
+        contact_uri: &str,
+    ) -> Result<(), String> {
+        let mut loc = self.location_service.write().await;
+        loc.remove_binding(aor, contact_uri)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Summary of an active call (for gRPC API).
+#[derive(Debug, Clone)]
+pub struct CallSummary {
+    /// Internal call ID.
+    pub call_id: String,
+    /// Call state.
+    pub state: String,
+    /// A-leg SIP Call-ID.
+    pub a_leg_call_id: String,
+    /// B-leg SIP Call-ID.
+    pub b_leg_call_id: String,
+    /// A-leg source address.
+    pub a_leg_source: String,
+    /// B-leg destination address.
+    pub b_leg_destination: String,
+}
+
+/// Summary of a registration (for gRPC API).
+#[derive(Debug, Clone)]
+pub struct RegistrationSummary {
+    /// Address of Record.
+    pub aor: String,
+    /// Number of contacts.
+    pub contact_count: usize,
+    /// Contact URIs.
+    pub contacts: Vec<String>,
 }
 
 /// Creates a response from a request, copying required headers.

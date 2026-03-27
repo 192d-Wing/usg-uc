@@ -56,10 +56,35 @@ impl RegistrationService for RegistrationServiceImpl {
             .load(Ordering::Relaxed);
         let total = self.state.stats.registrations_total.load(Ordering::Relaxed);
 
-        // TODO: Implement actual registration listing from registrar
+        // Get live data from SIP stack if available
+        let (regs_proto, active, total) = if let Some(ref stack) = self.state.sip_stack {
+            let summaries = stack.list_registrations().await;
+            let active = summaries.len() as u64;
+            let total = self.state.stats.registrations_total.load(Ordering::Relaxed);
+
+            let regs: Vec<_> = summaries
+                .iter()
+                .map(|s| sbc_grpc_api::sbc::RegistrationInfo {
+                    aor: s.aor.clone(),
+                    contacts: s
+                        .contacts
+                        .iter()
+                        .map(|c| sbc_grpc_api::sbc::ContactInfo {
+                            uri: c.clone(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                })
+                .collect();
+            (regs, active, total)
+        } else {
+            (vec![], active, total)
+        };
+
         #[allow(clippy::cast_possible_wrap)]
         let response = ListRegistrationsResponse {
-            registrations: vec![], // Would be populated from registrar
+            registrations: regs_proto,
             total: total as i64,
             active: active as i64,
         };
@@ -93,11 +118,21 @@ impl RegistrationService for RegistrationServiceImpl {
             "gRPC DeleteRegistration"
         );
 
-        // TODO: Implement actual registration deletion via registrar
-        // This would send a NOTIFY with expires=0 or update the registration store
-        Err(Status::unimplemented(
-            "DeleteRegistration not yet implemented",
-        ))
+        if let Some(ref stack) = self.state.sip_stack {
+            match stack.delete_registration(&req.aor, &req.contact_uri).await {
+                Ok(()) => {
+                    info!(aor = %req.aor, contact = %req.contact_uri, "Registration deleted");
+                    Ok(Response::new(DeleteRegistrationResponse {
+                        success: true,
+                        message: "Registration deleted".to_string(),
+                        contacts_removed: 1,
+                    }))
+                }
+                Err(e) => Err(Status::not_found(e)),
+            }
+        } else {
+            Err(Status::unavailable("SIP stack not available"))
+        }
     }
 
     async fn get_registration_stats(
@@ -108,14 +143,26 @@ impl RegistrationService for RegistrationServiceImpl {
         info!(realm = %req.realm, "gRPC GetRegistrationStats");
 
         let stats = &self.state.stats;
+        let (unique_aors, total_contacts) = if let Some(ref stack) = self.state.sip_stack {
+            (
+                stack.registration_aor_count().await as i64,
+                stack.registration_binding_count().await as i64,
+            )
+        } else {
+            (0, 0)
+        };
         #[allow(clippy::cast_possible_wrap)]
         let response = GetRegistrationStatsResponse {
             registrations_total: stats.registrations_total.load(Ordering::Relaxed) as i64,
             registrations_active: stats.registrations_active.load(Ordering::Relaxed) as i64,
-            unique_aors: 0,    // TODO: Track unique AORs
-            total_contacts: 0, // TODO: Track total contacts
-            expiring_soon: 0,  // TODO: Track expiring registrations
-            avg_contacts_per_aor: 0.0,
+            unique_aors,
+            total_contacts,
+            expiring_soon: 0,
+            avg_contacts_per_aor: if unique_aors > 0 {
+                total_contacts as f64 / unique_aors as f64
+            } else {
+                0.0
+            },
             registrations_per_minute: 0.0,
             reregistrations_per_minute: 0.0,
             auth_failures_per_minute: 0.0,

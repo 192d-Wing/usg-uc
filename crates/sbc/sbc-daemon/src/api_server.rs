@@ -104,6 +104,8 @@ pub struct AppState {
     pub start_time: Instant,
     /// Ready state.
     pub ready: AtomicU64,
+    /// SIP stack for call/registration queries.
+    pub sip_stack: Option<Arc<crate::sip_stack::SipStack>>,
     /// TLS acceptor for certificate hot-reload (if TLS is enabled).
     pub tls_acceptor: Option<Arc<ReloadableTlsAcceptor>>,
     /// Cluster health check function (when cluster feature is enabled).
@@ -127,6 +129,7 @@ impl AppState {
             version: env!("CARGO_PKG_VERSION").to_string(),
             start_time: Instant::now(),
             ready: AtomicU64::new(1), // Start as ready
+            sip_stack: None,
             tls_acceptor: None,
             #[cfg(feature = "cluster")]
             cluster_health_fn: None,
@@ -145,6 +148,7 @@ impl AppState {
             version: env!("CARGO_PKG_VERSION").to_string(),
             start_time: Instant::now(),
             ready: AtomicU64::new(1),
+            sip_stack: None,
             tls_acceptor: Some(tls_acceptor),
             #[cfg(feature = "cluster")]
             cluster_health_fn: None,
