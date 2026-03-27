@@ -41,7 +41,10 @@ pub mod error;
 pub mod router;
 pub mod trunk;
 
-pub use dialplan::{DialPlan, DialPlanEntry, NumberTransform};
+pub use dialplan::{
+    DestinationType, DialPlan, DialPlanEntry, DialPlanResult, DialPattern, Direction,
+    NumberTransform,
+};
 pub use error::{RoutingError, RoutingResult};
 pub use router::{Router, RoutingDecision};
 pub use trunk::{Trunk, TrunkGroup, TrunkState};

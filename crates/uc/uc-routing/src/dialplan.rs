@@ -168,6 +168,40 @@ impl DialPattern {
     }
 }
 
+/// Call direction for dial plan matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Direction {
+    /// Inbound: trunk → SBC → target (registered user or downstream trunk).
+    Inbound,
+    /// Outbound: registered user → SBC → trunk.
+    #[default]
+    Outbound,
+    /// Both: matches in either direction.
+    Both,
+}
+
+impl std::fmt::Display for Direction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inbound => write!(f, "inbound"),
+            Self::Outbound => write!(f, "outbound"),
+            Self::Both => write!(f, "both"),
+        }
+    }
+}
+
+/// Destination type for a dial plan entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DestinationType {
+    /// Route to a trunk group (default).
+    #[default]
+    TrunkGroup,
+    /// Route to a registered user via LocationService.
+    RegisteredUser,
+    /// Route to a static SIP URI.
+    StaticUri,
+}
+
 /// Dial plan entry.
 #[derive(Debug, Clone)]
 pub struct DialPlanEntry {
@@ -175,11 +209,11 @@ pub struct DialPlanEntry {
     id: String,
     /// Entry name.
     name: String,
-    /// Pattern to match.
+    /// Pattern to match (user part of Request-URI).
     pattern: DialPattern,
     /// Number transformation.
     transform: NumberTransform,
-    /// Trunk group to route to.
+    /// Trunk group to route to (for `DestinationType::TrunkGroup`).
     trunk_group: String,
     /// Priority (lower = higher priority).
     priority: u32,
@@ -187,6 +221,18 @@ pub struct DialPlanEntry {
     enabled: bool,
     /// Tags for categorization.
     tags: Vec<String>,
+    /// Call direction filter.
+    direction: Direction,
+    /// Domain pattern to match (host part of Request-URI).
+    /// Suffix match: `"uc.mil"` matches `"sip.uc.mil"` and `"uc.mil"`.
+    /// Wildcard: `"*.mil"` matches any `.mil` domain.
+    domain_pattern: Option<String>,
+    /// Source trunk ID filter (only match if call came from this trunk).
+    source_trunk: Option<String>,
+    /// Where to route the call.
+    destination_type: DestinationType,
+    /// Static destination URI (for `DestinationType::StaticUri`).
+    static_destination: Option<String>,
 }
 
 impl DialPlanEntry {
@@ -205,6 +251,11 @@ impl DialPlanEntry {
             priority: DEFAULT_PRIORITY,
             enabled: true,
             tags: Vec::new(),
+            direction: Direction::default(),
+            domain_pattern: None,
+            source_trunk: None,
+            destination_type: DestinationType::default(),
+            static_destination: None,
         }
     }
 
@@ -240,6 +291,42 @@ impl DialPlanEntry {
     #[must_use]
     pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
         self.tags.push(tag.into());
+        self
+    }
+
+    /// Sets the call direction filter.
+    #[must_use]
+    pub fn with_direction(mut self, direction: Direction) -> Self {
+        self.direction = direction;
+        self
+    }
+
+    /// Sets the domain pattern to match against the Request-URI host.
+    #[must_use]
+    pub fn with_domain_pattern(mut self, pattern: impl Into<String>) -> Self {
+        self.domain_pattern = Some(pattern.into());
+        self
+    }
+
+    /// Sets the source trunk filter.
+    #[must_use]
+    pub fn with_source_trunk(mut self, trunk_id: impl Into<String>) -> Self {
+        self.source_trunk = Some(trunk_id.into());
+        self
+    }
+
+    /// Sets the destination type.
+    #[must_use]
+    pub fn with_destination_type(mut self, dest_type: DestinationType) -> Self {
+        self.destination_type = dest_type;
+        self
+    }
+
+    /// Sets the static destination URI.
+    #[must_use]
+    pub fn with_static_destination(mut self, uri: impl Into<String>) -> Self {
+        self.destination_type = DestinationType::StaticUri;
+        self.static_destination = Some(uri.into());
         self
     }
 
@@ -283,15 +370,96 @@ impl DialPlanEntry {
         &self.tags
     }
 
-    /// Checks if this entry matches a number.
+    /// Returns the direction filter.
+    pub fn direction(&self) -> Direction {
+        self.direction
+    }
+
+    /// Returns the domain pattern.
+    pub fn domain_pattern(&self) -> Option<&str> {
+        self.domain_pattern.as_deref()
+    }
+
+    /// Returns the source trunk filter.
+    pub fn source_trunk(&self) -> Option<&str> {
+        self.source_trunk.as_deref()
+    }
+
+    /// Returns the destination type.
+    pub fn destination_type(&self) -> DestinationType {
+        self.destination_type
+    }
+
+    /// Returns the static destination URI.
+    pub fn static_destination(&self) -> Option<&str> {
+        self.static_destination.as_deref()
+    }
+
+    /// Checks if this entry matches a number (user part only, legacy).
     pub fn matches(&self, number: &str) -> bool {
         self.enabled && self.pattern.matches(number)
+    }
+
+    /// Checks if this entry matches with full URI context.
+    pub fn matches_extended(
+        &self,
+        user: &str,
+        domain: &str,
+        direction: Direction,
+        source_trunk: Option<&str>,
+    ) -> bool {
+        if !self.enabled {
+            return false;
+        }
+
+        // Direction filter
+        if self.direction != Direction::Both && self.direction != direction {
+            return false;
+        }
+
+        // Source trunk filter
+        if let Some(ref required_trunk) = self.source_trunk {
+            match source_trunk {
+                Some(actual) if actual == required_trunk => {}
+                _ => return false,
+            }
+        }
+
+        // Domain pattern filter
+        if let Some(ref domain_pat) = self.domain_pattern {
+            if !match_domain(domain_pat, domain) {
+                return false;
+            }
+        }
+
+        // User/number pattern match
+        self.pattern.matches(user)
     }
 
     /// Transforms a number according to this entry.
     pub fn transform_number(&self, number: &str) -> String {
         self.transform.apply(number)
     }
+}
+
+/// Matches a domain pattern against a domain.
+///
+/// - `"uc.mil"` matches `"uc.mil"` and `"sip.uc.mil"` (suffix match)
+/// - `"*.mil"` matches any `.mil` domain
+/// - `""` or empty matches everything
+fn match_domain(pattern: &str, domain: &str) -> bool {
+    if pattern.is_empty() {
+        return true;
+    }
+
+    // Wildcard prefix: "*.mil" matches "anything.mil"
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        return domain.ends_with(suffix)
+            || domain == suffix;
+    }
+
+    // Exact or suffix match: "uc.mil" matches "uc.mil" and "sip.uc.mil"
+    domain == pattern || domain.ends_with(&format!(".{pattern}"))
 }
 
 /// Dial plan result.
@@ -305,6 +473,10 @@ pub struct DialPlanResult {
     pub transformed_number: String,
     /// Trunk group to use.
     pub trunk_group: String,
+    /// Destination type.
+    pub destination_type: DestinationType,
+    /// Static destination URI (if `DestinationType::StaticUri`).
+    pub static_destination: Option<String>,
 }
 
 /// A complete dial plan.
@@ -377,7 +549,7 @@ impl DialPlan {
         self.entries.len()
     }
 
-    /// Matches a number against the dial plan.
+    /// Matches a number against the dial plan (legacy, user-part only).
     pub fn match_number(&self, number: &str) -> Option<DialPlanResult> {
         for id in &self.sorted_ids {
             if let Some(entry) = self.entries.get(id)
@@ -388,6 +560,33 @@ impl DialPlan {
                     original_number: number.to_string(),
                     transformed_number: entry.transform_number(number),
                     trunk_group: entry.trunk_group().to_string(),
+                    destination_type: entry.destination_type(),
+                    static_destination: entry.static_destination().map(String::from),
+                });
+            }
+        }
+        None
+    }
+
+    /// Matches with full URI context (user, domain, direction, source trunk).
+    pub fn match_extended(
+        &self,
+        user: &str,
+        domain: &str,
+        direction: Direction,
+        source_trunk: Option<&str>,
+    ) -> Option<DialPlanResult> {
+        for id in &self.sorted_ids {
+            if let Some(entry) = self.entries.get(id)
+                && entry.matches_extended(user, domain, direction, source_trunk)
+            {
+                return Some(DialPlanResult {
+                    entry_id: entry.id().to_string(),
+                    original_number: user.to_string(),
+                    transformed_number: entry.transform_number(user),
+                    trunk_group: entry.trunk_group().to_string(),
+                    destination_type: entry.destination_type(),
+                    static_destination: entry.static_destination().map(String::from),
                 });
             }
         }
@@ -587,6 +786,158 @@ mod tests {
         let result = result.unwrap();
         assert_eq!(result.original_number, "+15551234567");
         assert_eq!(result.transformed_number, "15551234567");
+    }
+
+    #[test]
+    fn test_direction_filtering() {
+        let mut plan = DialPlan::new("test", "Test");
+
+        plan.add_entry(
+            DialPlanEntry::new("outbound-us", DialPattern::prefix("+1"), "us-trunk")
+                .with_direction(Direction::Outbound)
+                .with_priority(10),
+        );
+        plan.add_entry(
+            DialPlanEntry::new("inbound-did", DialPattern::prefix("+1555"), "internal")
+                .with_direction(Direction::Inbound)
+                .with_destination_type(DestinationType::RegisteredUser)
+                .with_priority(5),
+        );
+
+        // Outbound call should match outbound entry
+        let result = plan.match_extended("+15551234567", "sbc.local", Direction::Outbound, None);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().entry_id, "outbound-us");
+
+        // Inbound call should match inbound entry (higher priority)
+        let result = plan.match_extended("+15551234567", "sbc.local", Direction::Inbound, None);
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert_eq!(r.entry_id, "inbound-did");
+        assert_eq!(r.destination_type, DestinationType::RegisteredUser);
+    }
+
+    #[test]
+    fn test_domain_pattern_matching() {
+        let mut plan = DialPlan::new("test", "Test");
+
+        plan.add_entry(
+            DialPlanEntry::new("mil-calls", DialPattern::Any, "mil-trunk")
+                .with_domain_pattern("uc.mil")
+                .with_direction(Direction::Inbound)
+                .with_priority(1),
+        );
+
+        // Match: domain is uc.mil
+        let result = plan.match_extended("bob", "uc.mil", Direction::Inbound, None);
+        assert!(result.is_some());
+
+        // Match: subdomain of uc.mil
+        let result = plan.match_extended("bob", "sip.uc.mil", Direction::Inbound, None);
+        assert!(result.is_some());
+
+        // No match: different domain
+        let result = plan.match_extended("bob", "example.com", Direction::Inbound, None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_wildcard_domain_matching() {
+        let mut plan = DialPlan::new("test", "Test");
+
+        plan.add_entry(
+            DialPlanEntry::new("all-mil", DialPattern::Any, "mil-trunk")
+                .with_domain_pattern("*.mil")
+                .with_direction(Direction::Both)
+                .with_priority(1),
+        );
+
+        assert!(plan.match_extended("bob", "army.mil", Direction::Inbound, None).is_some());
+        assert!(plan.match_extended("bob", "navy.mil", Direction::Outbound, None).is_some());
+        assert!(plan.match_extended("bob", "example.com", Direction::Inbound, None).is_none());
+    }
+
+    #[test]
+    fn test_source_trunk_filtering() {
+        let mut plan = DialPlan::new("test", "Test");
+
+        plan.add_entry(
+            DialPlanEntry::new("from-bulkvs", DialPattern::Any, "downstream")
+                .with_direction(Direction::Inbound)
+                .with_source_trunk("bulkvs-1")
+                .with_priority(1),
+        );
+
+        // Match: correct source trunk
+        let result = plan.match_extended("12345", "sbc.local", Direction::Inbound, Some("bulkvs-1"));
+        assert!(result.is_some());
+
+        // No match: wrong source trunk
+        let result = plan.match_extended("12345", "sbc.local", Direction::Inbound, Some("other-trunk"));
+        assert!(result.is_none());
+
+        // No match: no source trunk
+        let result = plan.match_extended("12345", "sbc.local", Direction::Inbound, None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_static_destination() {
+        let mut plan = DialPlan::new("test", "Test");
+
+        plan.add_entry(
+            DialPlanEntry::new("voicemail", DialPattern::exact("*86"), "")
+                .with_static_destination("sip:voicemail@vm.uc.mil:5060")
+                .with_direction(Direction::Both)
+                .with_priority(1),
+        );
+
+        let result = plan.match_extended("*86", "sbc.local", Direction::Outbound, None);
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert_eq!(r.destination_type, DestinationType::StaticUri);
+        assert_eq!(r.static_destination.as_deref(), Some("sip:voicemail@vm.uc.mil:5060"));
+    }
+
+    #[test]
+    fn test_combined_filters() {
+        let mut plan = DialPlan::new("test", "Test");
+
+        // Inbound from BulkVS to @uc.mil with +1 prefix → strip and route to downstream
+        plan.add_entry(
+            DialPlanEntry::new("bulkvs-to-cm", DialPattern::prefix("+1"), "downstream-cm")
+                .with_direction(Direction::Inbound)
+                .with_source_trunk("bulkvs-1")
+                .with_domain_pattern("uc.mil")
+                .with_transform(NumberTransform::strip_prefix(2))
+                .with_priority(1),
+        );
+
+        let result = plan.match_extended("+15551234567", "sip.uc.mil", Direction::Inbound, Some("bulkvs-1"));
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert_eq!(r.trunk_group, "downstream-cm");
+        assert_eq!(r.transformed_number, "5551234567");
+
+        // Same number but outbound direction — should NOT match
+        let result = plan.match_extended("+15551234567", "sip.uc.mil", Direction::Outbound, None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_match_domain_helper() {
+        // Exact match
+        assert!(match_domain("uc.mil", "uc.mil"));
+        // Suffix match
+        assert!(match_domain("uc.mil", "sip.uc.mil"));
+        // Wildcard
+        assert!(match_domain("*.mil", "army.mil"));
+        assert!(match_domain("*.mil", "uc.mil"));
+        // No match
+        assert!(!match_domain("uc.mil", "example.com"));
+        assert!(!match_domain("*.mil", "example.com"));
+        // Empty pattern matches everything
+        assert!(match_domain("", "anything.com"));
     }
 
     #[test]
