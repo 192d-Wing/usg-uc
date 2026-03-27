@@ -1016,6 +1016,12 @@ impl SipStack {
     }
 
     /// Handles BYE request.
+    ///
+    /// B2BUA BYE flow:
+    /// 1. Look up Call-ID → find internal call (could be A-leg or B-leg)
+    /// 2. Send 200 OK to BYE sender
+    /// 3. Build BYE for the other leg
+    /// 4. Stop media relay and clean up call state
     async fn handle_bye(&self, message: SipMessage, source: SbcSocketAddr) -> ProcessResult {
         let SipMessage::Request(ref req) = message else {
             return ProcessResult::Error {
@@ -1023,27 +1029,124 @@ impl SipStack {
             };
         };
 
-        let call_id = req.headers.call_id().map(String::from);
-        debug!(
-            call_id = call_id.as_deref().unwrap_or("none"),
-            "Processing BYE"
-        );
+        let sip_call_id = req
+            .headers
+            .call_id()
+            .unwrap_or("")
+            .to_string();
 
-        // Create 200 OK response
-        let response = create_response_from_request(req, StatusCode::OK);
+        debug!(call_id = %sip_call_id, "Processing BYE");
+
+        // Look up the call — could be from A-leg or B-leg
+        let corr = self.call_correlation.read().await;
+        let (internal_id, is_from_a_leg) =
+            if let Some(id) = corr.a_leg.get(&sip_call_id) {
+                (id.clone(), true)
+            } else if let Some(id) = corr.b_leg.get(&sip_call_id) {
+                (id.clone(), false)
+            } else {
+                // Unknown call — just respond 200 OK
+                debug!(call_id = %sip_call_id, "BYE for unknown call");
+                let response = create_response_from_request(req, StatusCode::OK);
+                return ProcessResult::Response {
+                    message: SipMessage::Response(response),
+                    destination: source,
+                };
+            };
+
+        let addrs = match corr.addresses.get(&internal_id) {
+            Some(a) => CallAddresses {
+                a_leg_source: a.a_leg_source,
+                b_leg_destination: a.b_leg_destination,
+                a_leg_sip_call_id: a.a_leg_sip_call_id.clone(),
+                b_leg_sip_call_id: a.b_leg_sip_call_id.clone(),
+                local_addr: a.local_addr.clone(),
+            },
+            None => {
+                let response = create_response_from_request(req, StatusCode::OK);
+                return ProcessResult::Response {
+                    message: SipMessage::Response(response),
+                    destination: source,
+                };
+            }
+        };
+        drop(corr);
+
+        // Terminate the call
+        {
+            let mut calls = self.calls.write().await;
+            if let Some(call) = calls.calls.get_mut(&internal_id) {
+                let _ = call.start_termination();
+            }
+        }
+
+        // Stop media relay
+        if let Some(ref pipeline) = self.media_pipeline {
+            let call_id_str = internal_id.to_string();
+            let _ = pipeline.stop_relay(&call_id_str).await;
+            let _ = pipeline.remove_session(&call_id_str).await;
+        }
+
+        // Build 200 OK for BYE sender
+        let ok_response = create_response_from_request(req, StatusCode::OK);
+
+        // Build BYE for the other leg
+        let (other_call_id, other_dest) = if is_from_a_leg {
+            (&addrs.b_leg_sip_call_id, addrs.b_leg_destination)
+        } else {
+            (&addrs.a_leg_sip_call_id, addrs.a_leg_source)
+        };
+
+        let other_uri = SipUri::new(other_dest.ip().to_string())
+            .with_port(other_dest.port());
+        let mut bye_request = proto_sip::message::SipRequest::new(Method::Bye, other_uri);
+        bye_request.headers.set(HeaderName::CallId, other_call_id);
+        bye_request.headers.set(HeaderName::CSeq, "2 BYE");
+        let branch = generate_branch();
+        bye_request.headers.add(Header::new(
+            HeaderName::Via,
+            format!("SIP/2.0/UDP {};branch={}", addrs.local_addr, branch),
+        ));
+        bye_request.headers.set(HeaderName::ContentLength, "0");
+
+        // Clean up call state
+        {
+            let mut calls = self.calls.write().await;
+            calls.calls.remove(&internal_id);
+        }
+        {
+            let mut corr = self.call_correlation.write().await;
+            corr.a_leg.remove(&addrs.a_leg_sip_call_id);
+            corr.b_leg.remove(&addrs.b_leg_sip_call_id);
+            corr.addresses.remove(&internal_id);
+        }
 
         info!(
-            call_id = call_id.as_deref().unwrap_or("none"),
-            "Call terminated"
+            call_id = %sip_call_id,
+            from_a_leg = is_from_a_leg,
+            "Call terminated via BYE"
         );
 
-        ProcessResult::Response {
-            message: SipMessage::Response(response),
-            destination: source,
-        }
+        ProcessResult::Multiple(vec![
+            ProcessResult::Response {
+                message: SipMessage::Response(ok_response),
+                destination: source,
+            },
+            ProcessResult::Forward {
+                message: SipMessage::Request(bye_request),
+                destination: other_dest,
+            },
+        ])
     }
 
     /// Handles CANCEL request.
+    ///
+    /// B2BUA CANCEL flow:
+    /// 1. Match CANCEL to pending A-leg INVITE
+    /// 2. Send 200 OK for CANCEL to sender
+    /// 3. Send 487 Request Terminated for the original INVITE
+    /// 4. Send CANCEL to B-leg (if pending)
+    /// 5. Clean up call state
     async fn handle_cancel(&self, message: SipMessage, source: SbcSocketAddr) -> ProcessResult {
         let SipMessage::Request(ref req) = message else {
             return ProcessResult::Error {
@@ -1051,17 +1154,128 @@ impl SipStack {
             };
         };
 
-        debug!(uri = %req.uri, "Processing CANCEL");
+        let sip_call_id = req
+            .headers
+            .call_id()
+            .unwrap_or("")
+            .to_string();
 
-        // Create 200 OK for the CANCEL
-        let response = create_response_from_request(req, StatusCode::OK);
+        debug!(call_id = %sip_call_id, "Processing CANCEL");
 
-        // Would also need to send 487 Request Terminated for the INVITE
+        // Look up the call via A-leg Call-ID
+        let corr = self.call_correlation.read().await;
+        let internal_id = match corr.a_leg.get(&sip_call_id) {
+            Some(id) => id.clone(),
+            None => {
+                // Unknown call — just respond 200 OK for the CANCEL
+                let response = create_response_from_request(req, StatusCode::OK);
+                return ProcessResult::Response {
+                    message: SipMessage::Response(response),
+                    destination: source,
+                };
+            }
+        };
 
-        ProcessResult::Response {
-            message: SipMessage::Response(response),
-            destination: source,
+        let addrs = match corr.addresses.get(&internal_id) {
+            Some(a) => CallAddresses {
+                a_leg_source: a.a_leg_source,
+                b_leg_destination: a.b_leg_destination,
+                a_leg_sip_call_id: a.a_leg_sip_call_id.clone(),
+                b_leg_sip_call_id: a.b_leg_sip_call_id.clone(),
+                local_addr: a.local_addr.clone(),
+            },
+            None => {
+                let response = create_response_from_request(req, StatusCode::OK);
+                return ProcessResult::Response {
+                    message: SipMessage::Response(response),
+                    destination: source,
+                };
+            }
+        };
+        drop(corr);
+
+        // Fail the call
+        {
+            let mut calls = self.calls.write().await;
+            if let Some(call) = calls.calls.get_mut(&internal_id) {
+                let _ = call.fail(487, "Request Terminated");
+            }
         }
+
+        // Stop media if started
+        if let Some(ref pipeline) = self.media_pipeline {
+            let call_id_str = internal_id.to_string();
+            let _ = pipeline.stop_relay(&call_id_str).await;
+            let _ = pipeline.remove_session(&call_id_str).await;
+        }
+
+        // 200 OK for CANCEL
+        let cancel_ok = create_response_from_request(req, StatusCode::OK);
+
+        // 487 Request Terminated for the original INVITE
+        let mut terminated = proto_sip::message::SipResponse::new(
+            StatusCode::new(487).unwrap_or(StatusCode::SERVER_INTERNAL_ERROR),
+        );
+        // Copy headers from CANCEL (same Via/From/To/Call-ID as original INVITE)
+        if let Some(via) = req.headers.get_value(&HeaderName::Via) {
+            terminated.headers.add(Header::new(HeaderName::Via, via));
+        }
+        if let Some(from) = req.headers.get_value(&HeaderName::From) {
+            terminated.headers.set(HeaderName::From, from);
+        }
+        if let Some(to) = req.headers.get_value(&HeaderName::To) {
+            let to_with_tag = if to.contains("tag=") {
+                to.to_string()
+            } else {
+                format!("{};tag={}", to, generate_tag())
+            };
+            terminated.headers.set(HeaderName::To, to_with_tag);
+        }
+        terminated.headers.set(HeaderName::CallId, &sip_call_id);
+        terminated.headers.set(HeaderName::CSeq, "1 INVITE");
+        terminated.headers.set(HeaderName::ContentLength, "0");
+
+        // CANCEL to B-leg
+        let b_uri = SipUri::new(addrs.b_leg_destination.ip().to_string())
+            .with_port(addrs.b_leg_destination.port());
+        let mut b_cancel = proto_sip::message::SipRequest::new(Method::Cancel, b_uri);
+        b_cancel.headers.set(HeaderName::CallId, &addrs.b_leg_sip_call_id);
+        b_cancel.headers.set(HeaderName::CSeq, "1 CANCEL");
+        let branch = generate_branch();
+        b_cancel.headers.add(Header::new(
+            HeaderName::Via,
+            format!("SIP/2.0/UDP {};branch={}", addrs.local_addr, branch),
+        ));
+        b_cancel.headers.set(HeaderName::ContentLength, "0");
+
+        // Clean up
+        {
+            let mut calls = self.calls.write().await;
+            calls.calls.remove(&internal_id);
+        }
+        {
+            let mut corr = self.call_correlation.write().await;
+            corr.a_leg.remove(&addrs.a_leg_sip_call_id);
+            corr.b_leg.remove(&addrs.b_leg_sip_call_id);
+            corr.addresses.remove(&internal_id);
+        }
+
+        info!(call_id = %sip_call_id, "Call cancelled");
+
+        ProcessResult::Multiple(vec![
+            ProcessResult::Response {
+                message: SipMessage::Response(cancel_ok),
+                destination: source,
+            },
+            ProcessResult::Response {
+                message: SipMessage::Response(terminated),
+                destination: source,
+            },
+            ProcessResult::Forward {
+                message: SipMessage::Request(b_cancel),
+                destination: addrs.b_leg_destination,
+            },
+        ])
     }
 
     /// Handles OPTIONS request (keepalive/capability query).
