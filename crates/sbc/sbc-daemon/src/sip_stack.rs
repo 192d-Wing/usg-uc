@@ -192,7 +192,7 @@ pub enum ProcessResult {
         destination: SbcSocketAddr,
     },
     /// Multiple actions (e.g., 100 Trying + forward INVITE, or BYE + 200 OK).
-    Multiple(Vec<ProcessResult>),
+    Multiple(Vec<Self>),
     /// No action required (e.g., ACK for 2xx).
     NoAction,
     /// Error processing message.
@@ -373,26 +373,22 @@ impl SipStack {
 
         // Look up the B-leg Call-ID in correlation map
         let corr = self.call_correlation.read().await;
-        let internal_id = match corr.b_leg.get(&sip_call_id) {
-            Some(id) => id.clone(),
-            None => {
-                debug!(call_id = %sip_call_id, "Response for unknown B-leg Call-ID, ignoring");
-                return ProcessResult::NoAction;
-            }
+        let Some(id) = corr.b_leg.get(&sip_call_id) else {
+            debug!(call_id = %sip_call_id, "Response for unknown B-leg Call-ID, ignoring");
+            return ProcessResult::NoAction;
         };
+        let internal_id = id.clone();
 
-        let addrs = match corr.addresses.get(&internal_id) {
-            Some(a) => CallAddresses {
-                a_leg_source: a.a_leg_source,
-                b_leg_destination: a.b_leg_destination,
-                a_leg_sip_call_id: a.a_leg_sip_call_id.clone(),
-                b_leg_sip_call_id: a.b_leg_sip_call_id.clone(),
-                local_addr: a.local_addr.clone(),
-            },
-            None => {
-                warn!(call_id = %sip_call_id, "No addresses for call");
-                return ProcessResult::NoAction;
-            }
+        let Some(a) = corr.addresses.get(&internal_id) else {
+            warn!(call_id = %sip_call_id, "No addresses for call");
+            return ProcessResult::NoAction;
+        };
+        let addrs = CallAddresses {
+            a_leg_source: a.a_leg_source,
+            b_leg_destination: a.b_leg_destination,
+            a_leg_sip_call_id: a.a_leg_sip_call_id.clone(),
+            b_leg_sip_call_id: a.b_leg_sip_call_id.clone(),
+            local_addr: a.local_addr.clone(),
         };
         drop(corr);
 
@@ -452,8 +448,8 @@ impl SipStack {
             .set(HeaderName::CallId, &addrs.a_leg_sip_call_id);
 
         // If 183 with SDP, rewrite SDP for A-leg
-        if status_code == 183 {
-            if let Some(ref body) = resp.body {
+        if status_code == 183
+            && let Some(ref body) = resp.body {
                 let sdp_str = String::from_utf8_lossy(body);
                 let local_ip = addrs.local_addr.split(':').next().unwrap_or("0.0.0.0");
                 let local_media = MediaAddress::new(local_ip, 20_002);
@@ -465,7 +461,6 @@ impl SipStack {
                     .headers
                     .set(HeaderName::ContentType, "application/sdp");
             }
-        }
 
         info!(
             status = status_code,
@@ -529,7 +524,7 @@ impl SipStack {
             if let Some(ref body) = a_response.body {
                 a_response
                     .headers
-                    .set(HeaderName::ContentLength, &body.len().to_string());
+                    .set(HeaderName::ContentLength, body.len().to_string());
             }
         }
 
@@ -576,7 +571,7 @@ impl SipStack {
         {
             let mut calls = self.calls.write().await;
             if let Some(call) = calls.calls.get_mut(internal_id) {
-                let _ = call.fail(status_code, resp.reason_phrase());
+                call.fail(status_code, resp.reason_phrase());
             }
         }
 
@@ -629,7 +624,7 @@ impl SipStack {
 
         // Parse AOR from To header
         let aor = match req.headers.get_value(&HeaderName::To) {
-            Some(to) => extract_uri_from_header(&to),
+            Some(to) => extract_uri_from_header(to),
             None => {
                 return ProcessResult::Response {
                     message: SipMessage::Response(create_response_from_request(
@@ -810,33 +805,30 @@ impl SipStack {
         // 2. Extract destination from Request-URI
         let dest_user = req.uri.user.as_deref().unwrap_or("").to_string();
         let dest_host = req.uri.host.clone();
-        let dest_aor = format!("sip:{}@{}", dest_user, dest_host);
+        let dest_aor = format!("sip:{dest_user}@{dest_host}");
 
         // 3. Look up destination: first check location service, then try direct
         let b_leg_destination = {
             let loc = self.location_service.read().await;
             let bindings = loc.lookup(&dest_aor);
-            if let Some(binding) = bindings.first() {
-                // Registered user — resolve contact URI to address
-                let contact = binding.contact_uri().to_string();
-                resolve_sip_uri_to_addr(&contact)
-            } else {
-                // Not registered — try resolving Request-URI directly
-                resolve_sip_uri_to_addr(&req.uri.to_string())
-            }
+            bindings.first().map_or_else(
+                || resolve_sip_uri_to_addr(&req.uri.to_string()),
+                |binding| {
+                    // Registered user — resolve contact URI to address
+                    let contact = binding.contact_uri().to_string();
+                    resolve_sip_uri_to_addr(&contact)
+                },
+            )
         };
 
-        let b_leg_destination = match b_leg_destination {
-            Some(addr) => addr,
-            None => {
-                warn!(dest = %dest_aor, "Cannot resolve destination");
-                let not_found =
-                    create_response_from_request(req, StatusCode::NOT_FOUND);
-                return ProcessResult::Response {
-                    message: SipMessage::Response(not_found),
-                    destination: source,
-                };
-            }
+        let Some(b_leg_destination) = b_leg_destination else {
+            warn!(dest = %dest_aor, "Cannot resolve destination");
+            let not_found =
+                create_response_from_request(req, StatusCode::NOT_FOUND);
+            return ProcessResult::Response {
+                message: SipMessage::Response(not_found),
+                destination: source,
+            };
         };
 
         // 4. Create B2BUA call
@@ -844,7 +836,7 @@ impl SipStack {
         let a_leg_from = req
             .headers
             .get_value(&HeaderName::From)
-            .map(|f| extract_uri_from_header(&f))
+            .map(extract_uri_from_header)
             .unwrap_or_default();
 
         let call_config = CallConfig::new(
@@ -868,17 +860,15 @@ impl SipStack {
         let local_sip_addr = format!("{}:{}", local_ip, source.port());
 
         // 6. Rewrite SDP for B-leg (replace A-leg's address with SBC's)
-        let b_leg_sdp = if let Some(ref body) = req.body {
+        let b_leg_sdp = req.body.as_ref().map(|body| {
             let sdp_str = String::from_utf8_lossy(body);
-            // For now, use a placeholder port — Phase 4 will allocate real RTP ports
+            // For now, use a placeholder port -- Phase 4 will allocate real RTP ports
             let local_media = MediaAddress::new(&local_ip, 20_000);
             let result = self
                 .sdp_rewriter
                 .rewrite_offer_for_b_leg(&sdp_str, &local_media);
-            Some(result.rewritten)
-        } else {
-            None
-        };
+            result.rewritten
+        });
 
         // 7. Build B-leg INVITE
         let b_leg_sip_call_id = generate_call_id(&self.config.domain);
@@ -951,7 +941,7 @@ impl SipStack {
             let a_branch = req
                 .headers
                 .get_value(&HeaderName::Via)
-                .and_then(|v| extract_param(&v, "branch").map(String::from))
+                .and_then(|v| extract_param(v, "branch").map(String::from))
                 .unwrap_or_else(generate_branch);
 
             let mut txns = self.transactions.write().await;
@@ -1054,21 +1044,19 @@ impl SipStack {
                 };
             };
 
-        let addrs = match corr.addresses.get(&internal_id) {
-            Some(a) => CallAddresses {
-                a_leg_source: a.a_leg_source,
-                b_leg_destination: a.b_leg_destination,
-                a_leg_sip_call_id: a.a_leg_sip_call_id.clone(),
-                b_leg_sip_call_id: a.b_leg_sip_call_id.clone(),
-                local_addr: a.local_addr.clone(),
-            },
-            None => {
-                let response = create_response_from_request(req, StatusCode::OK);
-                return ProcessResult::Response {
-                    message: SipMessage::Response(response),
-                    destination: source,
-                };
-            }
+        let Some(a) = corr.addresses.get(&internal_id) else {
+            let response = create_response_from_request(req, StatusCode::OK);
+            return ProcessResult::Response {
+                message: SipMessage::Response(response),
+                destination: source,
+            };
+        };
+        let addrs = CallAddresses {
+            a_leg_source: a.a_leg_source,
+            b_leg_destination: a.b_leg_destination,
+            a_leg_sip_call_id: a.a_leg_sip_call_id.clone(),
+            b_leg_sip_call_id: a.b_leg_sip_call_id.clone(),
+            local_addr: a.local_addr.clone(),
         };
         drop(corr);
 
@@ -1164,33 +1152,29 @@ impl SipStack {
 
         // Look up the call via A-leg Call-ID
         let corr = self.call_correlation.read().await;
-        let internal_id = match corr.a_leg.get(&sip_call_id) {
-            Some(id) => id.clone(),
-            None => {
-                // Unknown call — just respond 200 OK for the CANCEL
-                let response = create_response_from_request(req, StatusCode::OK);
-                return ProcessResult::Response {
-                    message: SipMessage::Response(response),
-                    destination: source,
-                };
-            }
+        let Some(id) = corr.a_leg.get(&sip_call_id) else {
+            // Unknown call -- just respond 200 OK for the CANCEL
+            let response = create_response_from_request(req, StatusCode::OK);
+            return ProcessResult::Response {
+                message: SipMessage::Response(response),
+                destination: source,
+            };
         };
+        let internal_id = id.clone();
 
-        let addrs = match corr.addresses.get(&internal_id) {
-            Some(a) => CallAddresses {
-                a_leg_source: a.a_leg_source,
-                b_leg_destination: a.b_leg_destination,
-                a_leg_sip_call_id: a.a_leg_sip_call_id.clone(),
-                b_leg_sip_call_id: a.b_leg_sip_call_id.clone(),
-                local_addr: a.local_addr.clone(),
-            },
-            None => {
-                let response = create_response_from_request(req, StatusCode::OK);
-                return ProcessResult::Response {
-                    message: SipMessage::Response(response),
-                    destination: source,
-                };
-            }
+        let Some(a) = corr.addresses.get(&internal_id) else {
+            let response = create_response_from_request(req, StatusCode::OK);
+            return ProcessResult::Response {
+                message: SipMessage::Response(response),
+                destination: source,
+            };
+        };
+        let addrs = CallAddresses {
+            a_leg_source: a.a_leg_source,
+            b_leg_destination: a.b_leg_destination,
+            a_leg_sip_call_id: a.a_leg_sip_call_id.clone(),
+            b_leg_sip_call_id: a.b_leg_sip_call_id.clone(),
+            local_addr: a.local_addr.clone(),
         };
         drop(corr);
 
@@ -1198,7 +1182,7 @@ impl SipStack {
         {
             let mut calls = self.calls.write().await;
             if let Some(call) = calls.calls.get_mut(&internal_id) {
-                let _ = call.fail(487, "Request Terminated");
+                call.fail(487, "Request Terminated");
             }
         }
 
@@ -1528,6 +1512,8 @@ fn copy_response_headers(
 /// Parses the host and port from URIs like `sip:user@host:port` or `sip:host`.
 /// Defaults to port 5060 if not specified.
 fn resolve_sip_uri_to_addr(uri: &str) -> Option<SbcSocketAddr> {
+    use std::net::ToSocketAddrs;
+
     // Strip sip: or sips: prefix
     let without_scheme = uri
         .strip_prefix("sip:")
@@ -1535,26 +1521,16 @@ fn resolve_sip_uri_to_addr(uri: &str) -> Option<SbcSocketAddr> {
         .unwrap_or(uri);
 
     // Strip user@ if present
-    let host_part = if let Some(at_pos) = without_scheme.find('@') {
-        &without_scheme[at_pos + 1..]
-    } else {
-        without_scheme
-    };
+    let host_part = without_scheme.find('@').map_or(without_scheme, |at_pos| &without_scheme[at_pos + 1..]);
 
     // Strip parameters (;transport=udp etc.)
     let host_part = host_part.split(';').next().unwrap_or(host_part);
 
     // Parse host:port
-    let (host, port) = if let Some(colon_pos) = host_part.rfind(':') {
+    let (host, port) = host_part.rfind(':').map_or((host_part, 5060), |colon_pos| {
         let port_str = &host_part[colon_pos + 1..];
-        if let Ok(port) = port_str.parse::<u16>() {
-            (&host_part[..colon_pos], port)
-        } else {
-            (host_part, 5060)
-        }
-    } else {
-        (host_part, 5060)
-    };
+        port_str.parse::<u16>().map_or((host_part, 5060), |port| (&host_part[..colon_pos], port))
+    });
 
     // Parse IP address
     if let Ok(ipv4) = host.parse::<std::net::Ipv4Addr>() {
@@ -1565,13 +1541,11 @@ fn resolve_sip_uri_to_addr(uri: &str) -> Option<SbcSocketAddr> {
     }
 
     // For hostnames, try DNS resolution (synchronous for now)
-    use std::net::ToSocketAddrs;
     let addr_str = format!("{host}:{port}");
-    if let Ok(mut addrs) = addr_str.to_socket_addrs() {
-        if let Some(addr) = addrs.next() {
+    if let Ok(mut addrs) = addr_str.to_socket_addrs()
+        && let Some(addr) = addrs.next() {
             return Some(SbcSocketAddr::from(addr));
         }
-    }
 
     None
 }
@@ -1583,11 +1557,10 @@ fn resolve_sip_uri_to_addr(uri: &str) -> Option<SbcSocketAddr> {
 /// - `"Alice" <sip:alice@example.com>;tag=1234`
 /// - `sip:alice@example.com`
 fn extract_uri_from_header(header_value: &str) -> String {
-    if let Some(start) = header_value.find('<') {
-        if let Some(end) = header_value.find('>') {
+    if let Some(start) = header_value.find('<')
+        && let Some(end) = header_value.find('>') {
             return header_value[start + 1..end].to_string();
         }
-    }
     // No angle brackets — take the value before any parameters
     header_value
         .split(';')
@@ -1935,8 +1908,279 @@ mod tests {
 
         assert!(!tag1.is_empty());
         assert!(!tag2.is_empty());
-        // Tags should be formatted as hex
         assert!(tag1.chars().all(|c| c.is_ascii_hexdigit()));
         assert!(tag2.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn test_bye_from_a_leg() {
+        let config = SipStackConfig::default();
+        let stack = SipStack::new(config);
+
+        // Register bob
+        let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK001\r\n\
+            From: <sip:bob@sbc.local>;tag=r1\r\n\
+            To: <sip:bob@sbc.local>\r\n\
+            Call-ID: reg-bob@test\r\n\
+            CSeq: 1 REGISTER\r\n\
+            Contact: <sip:bob@127.0.0.1:5060>\r\n\
+            Expires: 3600\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
+        stack.process_message(&Bytes::from_static(register), src).await;
+
+        // INVITE bob from alice
+        let invite = b"INVITE sip:bob@sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK002\r\n\
+            From: <sip:alice@example.com>;tag=i1\r\n\
+            To: <sip:bob@sbc.local>\r\n\
+            Call-ID: call-bye-test@test\r\n\
+            CSeq: 1 INVITE\r\n\
+            Contact: <sip:alice@192.168.1.1:5060>\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+        let alice = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 168, 1, 1), 5060);
+        stack.process_message(&Bytes::from_static(invite), alice).await;
+        assert_eq!(stack.call_count().await, 1);
+
+        // BYE from alice (A-leg)
+        let bye = b"BYE sip:bob@sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK003\r\n\
+            From: <sip:alice@example.com>;tag=i1\r\n\
+            To: <sip:bob@sbc.local>\r\n\
+            Call-ID: call-bye-test@test\r\n\
+            CSeq: 2 BYE\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+        let result = stack.process_message(&Bytes::from_static(bye), alice).await;
+
+        // Should get Multiple(200 OK to alice + BYE to bob)
+        match result {
+            ProcessResult::Multiple(results) => {
+                assert_eq!(results.len(), 2);
+                // First: 200 OK
+                if let ProcessResult::Response { message, .. } = &results[0] {
+                    if let SipMessage::Response(resp) = message {
+                        assert_eq!(resp.status, StatusCode::OK);
+                    }
+                }
+                // Second: BYE to bob
+                if let ProcessResult::Forward { message, .. } = &results[1] {
+                    assert!(message.is_request());
+                }
+            }
+            _ => panic!("Expected Multiple for BYE"),
+        }
+
+        // Call should be cleaned up
+        assert_eq!(stack.call_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_pending_invite() {
+        let config = SipStackConfig::default();
+        let stack = SipStack::new(config);
+
+        // Register bob
+        let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK010\r\n\
+            From: <sip:bob@sbc.local>;tag=r2\r\n\
+            To: <sip:bob@sbc.local>\r\n\
+            Call-ID: reg-bob-cancel@test\r\n\
+            CSeq: 1 REGISTER\r\n\
+            Contact: <sip:bob@127.0.0.1:5060>\r\n\
+            Expires: 3600\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
+        stack.process_message(&Bytes::from_static(register), src).await;
+
+        // INVITE bob
+        let invite = b"INVITE sip:bob@sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK011\r\n\
+            From: <sip:alice@example.com>;tag=c1\r\n\
+            To: <sip:bob@sbc.local>\r\n\
+            Call-ID: call-cancel-test@test\r\n\
+            CSeq: 1 INVITE\r\n\
+            Contact: <sip:alice@192.168.1.1:5060>\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+        let alice = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 168, 1, 1), 5060);
+        stack.process_message(&Bytes::from_static(invite), alice).await;
+        assert_eq!(stack.call_count().await, 1);
+
+        // CANCEL from alice before bob answers
+        let cancel = b"CANCEL sip:bob@sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK011\r\n\
+            From: <sip:alice@example.com>;tag=c1\r\n\
+            To: <sip:bob@sbc.local>\r\n\
+            Call-ID: call-cancel-test@test\r\n\
+            CSeq: 1 CANCEL\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+        let result = stack.process_message(&Bytes::from_static(cancel), alice).await;
+
+        // Should get Multiple(200 OK for CANCEL + 487 for INVITE + CANCEL to bob)
+        match result {
+            ProcessResult::Multiple(results) => {
+                assert_eq!(results.len(), 3, "CANCEL should produce 3 results");
+                // First: 200 OK for CANCEL
+                if let ProcessResult::Response { message, .. } = &results[0] {
+                    if let SipMessage::Response(resp) = message {
+                        assert_eq!(resp.status, StatusCode::OK);
+                    }
+                }
+                // Second: 487 Request Terminated for INVITE
+                if let ProcessResult::Response { message, .. } = &results[1] {
+                    if let SipMessage::Response(resp) = message {
+                        assert_eq!(resp.status.code(), 487);
+                    }
+                }
+                // Third: CANCEL to bob
+                if let ProcessResult::Forward { message, .. } = &results[2] {
+                    assert!(message.is_request());
+                }
+            }
+            _ => panic!("Expected Multiple for CANCEL"),
+        }
+
+        // Call should be cleaned up
+        assert_eq!(stack.call_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_calls_and_registrations() {
+        let config = SipStackConfig::default();
+        let stack = SipStack::new(config);
+
+        // Initially empty
+        assert!(stack.list_calls().await.is_empty());
+        assert!(stack.list_registrations().await.is_empty());
+        assert_eq!(stack.registration_aor_count().await, 0);
+        assert_eq!(stack.registration_binding_count().await, 0);
+
+        // Register alice
+        let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK020\r\n\
+            From: <sip:alice@sbc.local>;tag=q1\r\n\
+            To: <sip:alice@sbc.local>\r\n\
+            Call-ID: reg-query@test\r\n\
+            CSeq: 1 REGISTER\r\n\
+            Contact: <sip:alice@127.0.0.1:5060>\r\n\
+            Expires: 3600\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
+        stack.process_message(&Bytes::from_static(register), src).await;
+
+        // Verify registration query
+        let regs = stack.list_registrations().await;
+        assert_eq!(regs.len(), 1);
+        assert_eq!(regs[0].aor, "sip:alice@sbc.local");
+        assert_eq!(regs[0].contact_count, 1);
+        assert_eq!(stack.registration_aor_count().await, 1);
+        assert_eq!(stack.registration_binding_count().await, 1);
+
+        // Delete registration
+        stack
+            .delete_registration("sip:alice@sbc.local", "sip:alice@127.0.0.1:5060")
+            .await
+            .unwrap();
+        assert_eq!(stack.registration_aor_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_bye_unknown_call() {
+        let config = SipStackConfig::default();
+        let stack = SipStack::new(config);
+
+        // BYE for unknown call — should just get 200 OK
+        let bye = b"BYE sip:bob@sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK030\r\n\
+            From: <sip:alice@example.com>;tag=u1\r\n\
+            To: <sip:bob@sbc.local>\r\n\
+            Call-ID: unknown-call@test\r\n\
+            CSeq: 2 BYE\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+        let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 168, 1, 1), 5060);
+        let result = stack.process_message(&Bytes::from_static(bye), src).await;
+
+        match result {
+            ProcessResult::Response { message, .. } => {
+                if let SipMessage::Response(resp) = message {
+                    assert_eq!(resp.status, StatusCode::OK, "Unknown BYE should get 200 OK");
+                }
+            }
+            _ => panic!("Expected Response for unknown BYE"),
+        }
+    }
+
+    #[test]
+    fn test_extract_uri_from_header() {
+        assert_eq!(
+            extract_uri_from_header("<sip:alice@example.com>"),
+            "sip:alice@example.com"
+        );
+        assert_eq!(
+            extract_uri_from_header("\"Alice\" <sip:alice@example.com>;tag=1234"),
+            "sip:alice@example.com"
+        );
+        assert_eq!(
+            extract_uri_from_header("sip:alice@example.com;tag=1234"),
+            "sip:alice@example.com"
+        );
+    }
+
+    #[test]
+    fn test_resolve_sip_uri_to_addr() {
+        // IP address
+        let addr = resolve_sip_uri_to_addr("sip:alice@192.168.1.100:5060");
+        assert!(addr.is_some());
+        let addr = addr.unwrap();
+        assert_eq!(addr.port(), 5060);
+
+        // IP without port (default 5060)
+        let addr = resolve_sip_uri_to_addr("sip:alice@10.0.0.1");
+        assert!(addr.is_some());
+        assert_eq!(addr.unwrap().port(), 5060);
+
+        // Bare IP
+        let addr = resolve_sip_uri_to_addr("sip:127.0.0.1:9999");
+        assert!(addr.is_some());
+        assert_eq!(addr.unwrap().port(), 9999);
+    }
+
+    #[test]
+    fn test_parse_contacts_from_request() {
+        let mut req = proto_sip::message::SipRequest::new(
+            Method::Register,
+            SipUri::new("sbc.local"),
+        );
+        req.headers.add(Header::new(
+            HeaderName::Contact,
+            "<sip:alice@192.168.1.100:5060>;expires=3600;q=0.8",
+        ));
+
+        let contacts = parse_contacts_from_request(&req);
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].uri, "sip:alice@192.168.1.100:5060");
+        assert_eq!(contacts[0].expires, Some(3600));
+        assert!((contacts[0].q_value.unwrap() - 0.8).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_parse_wildcard_contact() {
+        let mut req = proto_sip::message::SipRequest::new(
+            Method::Register,
+            SipUri::new("sbc.local"),
+        );
+        req.headers.add(Header::new(HeaderName::Contact, "*"));
+
+        let contacts = parse_contacts_from_request(&req);
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].uri, "*");
     }
 }

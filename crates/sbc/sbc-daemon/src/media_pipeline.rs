@@ -81,7 +81,7 @@ impl RtpPortAllocator {
     /// Creates a new port allocator.
     pub fn new(min_port: u16, max_port: u16) -> Self {
         // Ensure min_port is even for RTP convention
-        let min_port = if min_port % 2 == 0 { min_port } else { min_port + 1 };
+        let min_port = if min_port.is_multiple_of(2) { min_port } else { min_port + 1 };
         Self {
             next_port: AtomicU16::new(min_port),
             min_port,
@@ -100,7 +100,7 @@ impl RtpPortAllocator {
             // Wrap around
             let port = self.min_port + ((port - self.min_port) % (self.max_port - self.min_port));
             // Ensure even
-            let port = if port % 2 == 0 { port } else { port + 1 };
+            let port = if port.is_multiple_of(2) { port } else { port + 1 };
 
             if port + 1 >= self.max_port {
                 continue;
@@ -286,11 +286,11 @@ impl Transcoder {
 
         // Resample if clock rates differ
         let resampled;
-        let pcm_out = if in_rate != out_rate {
+        let pcm_out = if in_rate == out_rate {
+            &pcm[..pcm_samples]
+        } else {
             resampled = resample_linear(&pcm[..pcm_samples], in_rate, out_rate);
             &resampled
-        } else {
-            &pcm[..pcm_samples]
         };
 
         // Encode to output codec
@@ -330,12 +330,12 @@ impl Transcoder {
                 } else {
                     self.g722_dec_b.as_mut()
                 };
-                match decoder {
-                    Some(dec) => Ok(dec.decode(payload, output)),
-                    None => Err(MediaPipelineError::DecryptionFailed(
+                decoder.map_or_else(
+                    || Err(MediaPipelineError::DecryptionFailed(
                         "G.722 decoder not initialized".into(),
                     )),
-                }
+                    |dec| Ok(dec.decode(payload, output)),
+                )
             }
             _ => Err(MediaPipelineError::DecryptionFailed(format!(
                 "Unsupported codec for transcoding: {codec_name}"
@@ -372,12 +372,12 @@ impl Transcoder {
                 } else {
                     self.g722_enc_b.as_mut()
                 };
-                match encoder {
-                    Some(enc) => Ok(enc.encode(pcm, output)),
-                    None => Err(MediaPipelineError::EncryptionFailed(
+                encoder.map_or_else(
+                    || Err(MediaPipelineError::EncryptionFailed(
                         "G.722 encoder not initialized".into(),
                     )),
-                }
+                    |enc| Ok(enc.encode(pcm, output)),
+                )
             }
             _ => Err(MediaPipelineError::EncryptionFailed(format!(
                 "Unsupported codec for transcoding: {codec_name}"
@@ -393,7 +393,7 @@ fn resample_linear(input: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
         return input.to_vec();
     }
 
-    let ratio = to_rate as f64 / from_rate as f64;
+    let ratio = f64::from(to_rate) / f64::from(from_rate);
     let out_len = (input.len() as f64 * ratio) as usize;
     let mut output = Vec::with_capacity(out_len);
 
@@ -405,7 +405,7 @@ fn resample_linear(input: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
         let sample = if idx + 1 < input.len() {
             let s0 = f64::from(input[idx]);
             let s1 = f64::from(input[idx + 1]);
-            (s0 + frac * (s1 - s0)) as i16
+            frac.mul_add(s1 - s0, s0) as i16
         } else {
             input[input.len() - 1]
         };
@@ -890,10 +890,10 @@ impl MediaPipeline {
 
         let a_remote = ctx
             .a_leg_remote
-            .ok_or(MediaPipelineError::BindFailed("A-leg remote not set".into()))?;
+            .ok_or_else(|| MediaPipelineError::BindFailed("A-leg remote not set".into()))?;
         let b_remote = ctx
             .b_leg_remote
-            .ok_or(MediaPipelineError::BindFailed("B-leg remote not set".into()))?;
+            .ok_or_else(|| MediaPipelineError::BindFailed("B-leg remote not set".into()))?;
 
         // Bind UDP sockets
         let a_bind = format!("0.0.0.0:{}", ctx.a_leg_local_port);
