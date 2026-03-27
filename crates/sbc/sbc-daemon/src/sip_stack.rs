@@ -802,7 +802,66 @@ impl SipStack {
         internal_id: &CallId,
         addrs: &CallAddresses,
     ) -> ProcessResult {
-        // Fail the call
+        // Check for failover trunks before giving up
+        if !addrs.failover_trunks.is_empty() {
+            if let Some(ref router_lock) = self.router {
+                let mut remaining = addrs.failover_trunks.clone();
+                let next_trunk_id = remaining.remove(0);
+
+                // Look up trunk URI from router
+                let router = router_lock.read().await;
+                let trunk_addr = router
+                    .get_trunk_group(
+                        // Find the group containing this trunk
+                        &addrs.failover_trunks.first().map_or("default", |_| "default"),
+                    )
+                    .and_then(|_| resolve_sip_uri_to_addr(&format!("sip:{next_trunk_id}")));
+                drop(router);
+
+                if let Some(new_dest) = trunk_addr {
+                    // Build new B-leg INVITE for failover trunk
+                    let new_call_id = generate_call_id(&self.config.domain);
+                    let _new_branch = generate_branch();
+                    let local_ip = addrs.local_addr.split(':').next().unwrap_or("0.0.0.0");
+
+                    let new_uri = SipUri::new(new_dest.ip().to_string())
+                        .with_port(new_dest.port());
+                    let builder = RequestBuilder::invite(new_uri)
+                        .via_auto("UDP", local_ip, Some(new_dest.port()))
+                        .call_id(&new_call_id)
+                        .cseq(1)
+                        .max_forwards(70);
+
+                    if let Ok(new_request) = builder.build_with_defaults() {
+                        // Update correlation with new B-leg
+                        {
+                            let mut corr = self.call_correlation.write().await;
+                            corr.b_leg.remove(&addrs.b_leg_sip_call_id);
+                            corr.b_leg.insert(new_call_id.clone(), internal_id.clone());
+                            if let Some(addr_entry) = corr.addresses.get_mut(internal_id) {
+                                addr_entry.b_leg_destination = new_dest;
+                                addr_entry.b_leg_sip_call_id = new_call_id.clone();
+                                addr_entry.failover_trunks = remaining;
+                            }
+                        }
+
+                        info!(
+                            failed_trunk = %addrs.b_leg_sip_call_id,
+                            next_trunk = %next_trunk_id,
+                            call_id = %addrs.a_leg_sip_call_id,
+                            "Trunk failover: retrying with next trunk"
+                        );
+
+                        return ProcessResult::Forward {
+                            message: SipMessage::Request(new_request),
+                            destination: new_dest,
+                        };
+                    }
+                }
+            }
+        }
+
+        // No failover available — fail the call
         {
             let mut calls = self.calls.write().await;
             if let Some(call) = calls.calls.get_mut(internal_id) {
