@@ -543,7 +543,7 @@ impl Default for GrpcConfig {
 // ── Routing Configuration ──────────────────────────────────────────
 
 /// Call routing configuration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RoutingConfig {
     /// Enable dial plan-based routing.
@@ -565,7 +565,7 @@ impl Default for RoutingConfig {
 }
 
 /// Dial plan configuration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DialPlanConfig {
     /// Unique dial plan ID.
     pub id: String,
@@ -581,7 +581,7 @@ pub struct DialPlanConfig {
 }
 
 /// A single dial plan entry.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DialPlanEntryConfig {
     /// Call direction: "inbound", "outbound", or "both".
@@ -599,16 +599,16 @@ pub struct DialPlanEntryConfig {
     /// Trunk group to route to.
     #[serde(default)]
     pub trunk_group: String,
-    /// Destination type: "trunk_group" (default), "registered_user", "static_uri".
+    /// Destination type: "`trunk_group`" (default), "`registered_user`", "`static_uri`".
     #[serde(default = "default_trunk_group_type")]
     pub destination_type: String,
-    /// Static destination URI (when destination_type = "static_uri").
+    /// Static destination URI (when `destination_type` = "`static_uri`").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub static_destination: Option<String>,
-    /// Number transform type: "none", "strip_prefix", "add_prefix", "replace_prefix".
+    /// Number transform type: "none", "`strip_prefix`", "`add_prefix`", "`replace_prefix`".
     #[serde(default = "default_none_str")]
     pub transform_type: String,
-    /// Transform value (meaning depends on transform_type).
+    /// Transform value (meaning depends on `transform_type`).
     #[serde(default)]
     pub transform_value: String,
     /// Priority (lower = higher priority).
@@ -635,15 +635,15 @@ impl Default for DialPlanEntryConfig {
 }
 
 /// Trunk group configuration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrunkGroupConfig {
     /// Unique trunk group ID.
     pub id: String,
     /// Display name.
     #[serde(default)]
     pub name: String,
-    /// Selection strategy: "priority", "round_robin", "weighted_random",
-    /// "least_connections", "best_success_rate".
+    /// Selection strategy: "priority", "`round_robin`", "`weighted_random`",
+    /// "`least_connections`", "`best_success_rate`".
     #[serde(default = "default_priority_str")]
     pub strategy: String,
     /// Trunks in this group.
@@ -652,7 +652,7 @@ pub struct TrunkGroupConfig {
 }
 
 /// Individual trunk configuration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TrunkConfigSchema {
     /// Unique trunk ID.
@@ -694,7 +694,7 @@ impl Default for TrunkConfigSchema {
 // ── Header Manipulation Configuration ─────────────────────────────
 
 /// SIP header manipulation configuration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct HeaderManipulationConfig {
     /// Global manipulation rules (applied to all calls).
@@ -705,17 +705,8 @@ pub struct HeaderManipulationConfig {
     pub trunk_rules: Vec<TrunkManipulationRuleConfig>,
 }
 
-impl Default for HeaderManipulationConfig {
-    fn default() -> Self {
-        Self {
-            global_rules: Vec::new(),
-            trunk_rules: Vec::new(),
-        }
-    }
-}
-
 /// A header manipulation rule.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManipulationRuleConfig {
     /// Rule name.
     pub name: String,
@@ -732,7 +723,7 @@ pub struct ManipulationRuleConfig {
 }
 
 /// Per-trunk manipulation rule.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrunkManipulationRuleConfig {
     /// Trunk ID this rule applies to.
     pub trunk_id: String,
@@ -752,12 +743,12 @@ pub struct TrunkManipulationRuleConfig {
 /// Topology hiding configuration.
 ///
 /// ## NIST 800-53 Rev5: SC-7 (Boundary Protection)
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TopologyHidingConfig {
     /// Whether topology hiding is enabled.
     pub enabled: bool,
-    /// Hiding mode: "none", "signaling_only", "full".
+    /// Hiding mode: "none", "`signaling_only`", "full".
     pub mode: String,
     /// External hostname to present.
     pub external_host: String,
@@ -781,11 +772,11 @@ impl Default for TopologyHidingConfig {
 
 // ── Config helper functions ───────────────────────────────────────
 
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
-fn default_priority() -> u32 {
+const fn default_priority() -> u32 {
     100
 }
 

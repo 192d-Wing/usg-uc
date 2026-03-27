@@ -803,60 +803,56 @@ impl SipStack {
         addrs: &CallAddresses,
     ) -> ProcessResult {
         // Check for failover trunks before giving up
-        if !addrs.failover_trunks.is_empty() {
-            if let Some(ref router_lock) = self.router {
-                let mut remaining = addrs.failover_trunks.clone();
-                let next_trunk_id = remaining.remove(0);
+        if !addrs.failover_trunks.is_empty()
+            && let Some(ref router_lock) = self.router
+        {
+            let mut remaining = addrs.failover_trunks.clone();
+            let next_trunk_id = remaining.remove(0);
 
-                // Look up trunk URI from router
-                let router = router_lock.read().await;
-                let trunk_addr = router
-                    .get_trunk_group(
-                        // Find the group containing this trunk
-                        &addrs.failover_trunks.first().map_or("default", |_| "default"),
-                    )
-                    .and_then(|_| resolve_sip_uri_to_addr(&format!("sip:{next_trunk_id}")));
-                drop(router);
+            // Look up trunk URI from router
+            let router = router_lock.read().await;
+            let trunk_addr = router
+                .get_trunk_group(
+                    addrs.failover_trunks.first().map_or("default", |_| "default"),
+                )
+                .and_then(|_| resolve_sip_uri_to_addr(&format!("sip:{next_trunk_id}")));
+            drop(router);
 
-                if let Some(new_dest) = trunk_addr {
-                    // Build new B-leg INVITE for failover trunk
-                    let new_call_id = generate_call_id(&self.config.domain);
-                    let _new_branch = generate_branch();
-                    let local_ip = addrs.local_addr.split(':').next().unwrap_or("0.0.0.0");
+            if let Some(new_dest) = trunk_addr {
+                let new_call_id = generate_call_id(&self.config.domain);
+                let local_ip = addrs.local_addr.split(':').next().unwrap_or("0.0.0.0");
 
-                    let new_uri = SipUri::new(new_dest.ip().to_string())
-                        .with_port(new_dest.port());
-                    let builder = RequestBuilder::invite(new_uri)
-                        .via_auto("UDP", local_ip, Some(new_dest.port()))
-                        .call_id(&new_call_id)
-                        .cseq(1)
-                        .max_forwards(70);
+                let new_uri = SipUri::new(new_dest.ip().to_string())
+                    .with_port(new_dest.port());
+                let builder = RequestBuilder::invite(new_uri)
+                    .via_auto("UDP", local_ip, Some(new_dest.port()))
+                    .call_id(&new_call_id)
+                    .cseq(1)
+                    .max_forwards(70);
 
-                    if let Ok(new_request) = builder.build_with_defaults() {
-                        // Update correlation with new B-leg
-                        {
-                            let mut corr = self.call_correlation.write().await;
-                            corr.b_leg.remove(&addrs.b_leg_sip_call_id);
-                            corr.b_leg.insert(new_call_id.clone(), internal_id.clone());
-                            if let Some(addr_entry) = corr.addresses.get_mut(internal_id) {
-                                addr_entry.b_leg_destination = new_dest;
-                                addr_entry.b_leg_sip_call_id = new_call_id.clone();
-                                addr_entry.failover_trunks = remaining;
-                            }
+                if let Ok(new_request) = builder.build_with_defaults() {
+                    {
+                        let mut corr = self.call_correlation.write().await;
+                        corr.b_leg.remove(&addrs.b_leg_sip_call_id);
+                        corr.b_leg.insert(new_call_id.clone(), internal_id.clone());
+                        if let Some(addr_entry) = corr.addresses.get_mut(internal_id) {
+                            addr_entry.b_leg_destination = new_dest;
+                            addr_entry.b_leg_sip_call_id.clone_from(&new_call_id);
+                            addr_entry.failover_trunks = remaining;
                         }
-
-                        info!(
-                            failed_trunk = %addrs.b_leg_sip_call_id,
-                            next_trunk = %next_trunk_id,
-                            call_id = %addrs.a_leg_sip_call_id,
-                            "Trunk failover: retrying with next trunk"
-                        );
-
-                        return ProcessResult::Forward {
-                            message: SipMessage::Request(new_request),
-                            destination: new_dest,
-                        };
                     }
+
+                    info!(
+                        failed_trunk = %addrs.b_leg_sip_call_id,
+                        next_trunk = %next_trunk_id,
+                        call_id = %addrs.a_leg_sip_call_id,
+                        "Trunk failover: retrying with next trunk"
+                    );
+
+                    return ProcessResult::Forward {
+                        message: SipMessage::Request(new_request),
+                        destination: new_dest,
+                    };
                 }
             }
         }
@@ -1239,10 +1235,10 @@ impl SipStack {
         // 7b. Apply header manipulation to B-leg INVITE
         if let Some(ref manipulator) = self.header_manipulator {
             let context = ManipulationContext::for_request("INVITE", ManipulationDirection::Outbound);
-            if let Ok(count) = manipulator.apply(&mut b_leg_request.headers, &context) {
-                if count > 0 {
-                    debug!(rules_applied = count, "Header manipulation applied to B-leg INVITE");
-                }
+            if let Ok(count) = manipulator.apply(&mut b_leg_request.headers, &context)
+                && count > 0
+            {
+                debug!(rules_applied = count, "Header manipulation applied to B-leg INVITE");
             }
         }
 
@@ -1833,7 +1829,7 @@ fn copy_response_headers(
 
 /// Parses a manipulation action from config strings.
 fn parse_manipulation_action(action: &str, header: &str, value: &str) -> ManipulationAction {
-    let header_name: HeaderName = header.parse().unwrap_or(HeaderName::Custom(header.to_string()));
+    let header_name: HeaderName = header.parse().unwrap_or_else(|_| HeaderName::Custom(header.to_string()));
     match action {
         "add" => ManipulationAction::Add {
             name: header_name,
@@ -2539,5 +2535,136 @@ mod tests {
         let contacts = parse_contacts_from_request(&req);
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].uri, "*");
+    }
+
+    #[tokio::test]
+    async fn test_router_initialization() {
+        let mut config = SipStackConfig::default();
+        config.domain = "sbc.test".to_string();
+        let mut stack = SipStack::new(config);
+
+        let routing = sbc_config::RoutingConfig {
+            use_dial_plan: true,
+            max_failover_attempts: 2,
+            default_trunk_group: "default".to_string(),
+        };
+
+        let dial_plans = vec![sbc_config::DialPlanConfig {
+            id: "test-plan".to_string(),
+            name: "Test Plan".to_string(),
+            active: true,
+            entries: vec![
+                sbc_config::DialPlanEntryConfig {
+                    direction: "outbound".to_string(),
+                    pattern_type: "prefix".to_string(),
+                    pattern_value: "+1".to_string(),
+                    trunk_group: "us-trunks".to_string(),
+                    transform_type: "strip_prefix".to_string(),
+                    transform_value: "2".to_string(),
+                    priority: 10,
+                    ..Default::default()
+                },
+                sbc_config::DialPlanEntryConfig {
+                    direction: "both".to_string(),
+                    pattern_type: "exact".to_string(),
+                    pattern_value: "911".to_string(),
+                    trunk_group: "emergency".to_string(),
+                    priority: 1,
+                    ..Default::default()
+                },
+            ],
+        }];
+
+        let trunk_groups = vec![
+            sbc_config::TrunkGroupConfig {
+                id: "us-trunks".to_string(),
+                name: "US".to_string(),
+                strategy: "priority".to_string(),
+                trunks: vec![sbc_config::TrunkConfigSchema {
+                    id: "trunk-1".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: 5060,
+                    protocol: "udp".to_string(),
+                    ..Default::default()
+                }],
+            },
+            sbc_config::TrunkGroupConfig {
+                id: "emergency".to_string(),
+                name: "E911".to_string(),
+                strategy: "priority".to_string(),
+                trunks: vec![sbc_config::TrunkConfigSchema {
+                    id: "e911-1".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: 5061,
+                    protocol: "udp".to_string(),
+                    ..Default::default()
+                }],
+            },
+        ];
+
+        stack.init_router_from_config(&routing, &dial_plans, &trunk_groups);
+
+        // Router should be set
+        assert!(stack.router.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_manipulator_initialization() {
+        let mut config = SipStackConfig::default();
+        config.domain = "sbc.test".to_string();
+        let mut stack = SipStack::new(config);
+
+        let manip_config = sbc_config::HeaderManipulationConfig {
+            global_rules: vec![sbc_config::ManipulationRuleConfig {
+                name: "strip-internal".to_string(),
+                direction: "outbound".to_string(),
+                action: "remove".to_string(),
+                header: "X-Internal-ID".to_string(),
+                value: String::new(),
+            }],
+            trunk_rules: vec![sbc_config::TrunkManipulationRuleConfig {
+                trunk_id: "trunk-1".to_string(),
+                name: "set-ua".to_string(),
+                action: "set".to_string(),
+                header: "User-Agent".to_string(),
+                value: "USG-SBC/1.0".to_string(),
+            }],
+        };
+
+        stack.init_manipulator_from_config(&manip_config);
+        assert!(stack.header_manipulator.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_topology_hider_initialization() {
+        let mut config = SipStackConfig::default();
+        config.domain = "sbc.test".to_string();
+        let mut stack = SipStack::new(config);
+
+        let topo_config = sbc_config::TopologyHidingConfig {
+            enabled: true,
+            mode: "full".to_string(),
+            external_host: "sbc.uc.mil".to_string(),
+            external_port: 5060,
+            obfuscate_call_id: true,
+        };
+
+        stack.init_topology_hider_from_config(&topo_config);
+        assert!(stack.topology_hider.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_topology_hider_disabled() {
+        let mut config = SipStackConfig::default();
+        config.domain = "sbc.test".to_string();
+        let mut stack = SipStack::new(config);
+
+        let topo_config = sbc_config::TopologyHidingConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        stack.init_topology_hider_from_config(&topo_config);
+        assert!(stack.topology_hider.is_none(), "Disabled topology hider should be None");
     }
 }

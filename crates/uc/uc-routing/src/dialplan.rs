@@ -426,10 +426,10 @@ impl DialPlanEntry {
         }
 
         // Domain pattern filter
-        if let Some(ref domain_pat) = self.domain_pattern {
-            if !match_domain(domain_pat, domain) {
-                return false;
-            }
+        if let Some(ref domain_pat) = self.domain_pattern
+            && !match_domain(domain_pat, domain)
+        {
+            return false;
         }
 
         // User/number pattern match
