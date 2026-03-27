@@ -46,8 +46,8 @@ pub use dialplan::{
     NumberTransform,
 };
 pub use error::{RoutingError, RoutingResult};
-pub use router::{Router, RoutingDecision};
-pub use trunk::{Trunk, TrunkGroup, TrunkState};
+pub use router::{Router, RouterConfig, RoutingDecision};
+pub use trunk::{SelectionStrategy, Trunk, TrunkConfig, TrunkGroup, TrunkProtocol, TrunkState};
 
 /// Default routing priority.
 pub const DEFAULT_PRIORITY: u32 = 100;

@@ -34,6 +34,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
+use uc_routing::{
+    DestinationType, DialPattern, DialPlan, DialPlanEntry, Direction, NumberTransform, Router,
+    RouterConfig, SelectionStrategy, Trunk, TrunkConfig, TrunkGroup, TrunkProtocol,
+};
 use uc_types::address::SbcSocketAddr;
 
 /// SIP stack for processing SIP messages.
@@ -57,6 +61,8 @@ pub struct SipStack {
     sdp_rewriter: SdpRewriter,
     /// Media pipeline for RTP relay (optional, set after construction).
     media_pipeline: Option<Arc<crate::media_pipeline::MediaPipeline>>,
+    /// Call router for dial plan matching and trunk selection.
+    router: Option<RwLock<Router>>,
     /// Stack configuration.
     config: SipStackConfig,
     /// Registration statistics.
@@ -161,6 +167,7 @@ struct CallCorrelation {
 }
 
 /// Addressing info for both legs of a B2BUA call.
+#[derive(Clone)]
 struct CallAddresses {
     /// A-leg source address (where to send responses).
     a_leg_source: SbcSocketAddr,
@@ -172,6 +179,8 @@ struct CallAddresses {
     b_leg_sip_call_id: String,
     /// SBC's local SIP address for Via/Contact headers.
     local_addr: String,
+    /// Failover trunk IDs for retry on B-leg failure.
+    failover_trunks: Vec<String>,
 }
 
 /// Result of processing a SIP message.
@@ -232,6 +241,7 @@ impl SipStack {
             call_correlation: RwLock::new(CallCorrelation::default()),
             sdp_rewriter: SdpRewriter::new(B2buaMode::MediaRelay),
             media_pipeline: None,
+            router: None,
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
             config,
@@ -271,6 +281,7 @@ impl SipStack {
             call_correlation: RwLock::new(CallCorrelation::default()),
             sdp_rewriter: SdpRewriter::new(B2buaMode::MediaRelay),
             media_pipeline: None,
+            router: None,
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
             config,
@@ -280,6 +291,140 @@ impl SipStack {
     /// Sets the media pipeline for RTP relay.
     pub fn set_media_pipeline(&mut self, pipeline: Arc<crate::media_pipeline::MediaPipeline>) {
         self.media_pipeline = Some(pipeline);
+    }
+
+    /// Initializes the call router from SBC config sections.
+    ///
+    /// Builds dial plans and trunk groups from the config, then creates
+    /// a Router instance for call routing.
+    pub fn init_router_from_config(
+        &mut self,
+        routing_config: &sbc_config::RoutingConfig,
+        dial_plan_configs: &[sbc_config::DialPlanConfig],
+        trunk_group_configs: &[sbc_config::TrunkGroupConfig],
+    ) {
+        let router_config = RouterConfig {
+            use_dial_plan: routing_config.use_dial_plan,
+            max_failover_attempts: routing_config.max_failover_attempts as usize,
+            default_trunk_group: Some(routing_config.default_trunk_group.clone()),
+        };
+
+        let mut router = Router::new(router_config);
+
+        // Load trunk groups first (dial plan entries reference them)
+        for tg_config in trunk_group_configs {
+            let strategy = match tg_config.strategy.as_str() {
+                "round_robin" => SelectionStrategy::RoundRobin,
+                "weighted_random" => SelectionStrategy::WeightedRandom,
+                "least_connections" => SelectionStrategy::LeastConnections,
+                "best_success_rate" => SelectionStrategy::BestSuccessRate,
+                _ => SelectionStrategy::Priority,
+            };
+
+            let mut group = TrunkGroup::new(&tg_config.id, &tg_config.name)
+                .with_strategy(strategy);
+
+            for t_config in &tg_config.trunks {
+                let protocol = match t_config.protocol.as_str() {
+                    "tcp" => TrunkProtocol::Tcp,
+                    "tls" => TrunkProtocol::Tls,
+                    _ => TrunkProtocol::Udp,
+                };
+
+                let trunk_config = TrunkConfig::new(&t_config.id, &t_config.host)
+                    .with_port(t_config.port)
+                    .with_protocol(protocol)
+                    .with_priority(t_config.priority)
+                    .with_weight(t_config.weight)
+                    .with_max_calls(t_config.max_calls);
+
+                group.add_trunk(Trunk::new(trunk_config));
+            }
+
+            router.add_trunk_group(group);
+        }
+
+        // Load dial plans
+        for dp_config in dial_plan_configs {
+            if !dp_config.active {
+                continue;
+            }
+
+            let mut plan = DialPlan::new(&dp_config.id, &dp_config.name);
+
+            for (idx, entry_config) in dp_config.entries.iter().enumerate() {
+                let pattern = match entry_config.pattern_type.as_str() {
+                    "exact" => DialPattern::exact(&entry_config.pattern_value),
+                    "wildcard" => DialPattern::wildcard(&entry_config.pattern_value),
+                    "any" => DialPattern::Any,
+                    _ => DialPattern::prefix(&entry_config.pattern_value),
+                };
+
+                let direction = match entry_config.direction.as_str() {
+                    "inbound" => Direction::Inbound,
+                    "both" => Direction::Both,
+                    _ => Direction::Outbound,
+                };
+
+                let dest_type = match entry_config.destination_type.as_str() {
+                    "registered_user" => DestinationType::RegisteredUser,
+                    "static_uri" => DestinationType::StaticUri,
+                    _ => DestinationType::TrunkGroup,
+                };
+
+                let transform = match entry_config.transform_type.as_str() {
+                    "strip_prefix" => {
+                        let count = entry_config.transform_value.parse().unwrap_or(0);
+                        NumberTransform::strip_prefix(count)
+                    }
+                    "add_prefix" => {
+                        NumberTransform::add_prefix(&entry_config.transform_value)
+                    }
+                    "replace_prefix" => {
+                        let parts: Vec<&str> = entry_config.transform_value.splitn(2, '|').collect();
+                        if parts.len() == 2 {
+                            NumberTransform::replace_prefix(parts[0], parts[1])
+                        } else {
+                            NumberTransform::None
+                        }
+                    }
+                    _ => NumberTransform::None,
+                };
+
+                let entry_id = format!("{}-{idx}", dp_config.id);
+                let mut entry = DialPlanEntry::new(entry_id, pattern, &entry_config.trunk_group)
+                    .with_transform(transform)
+                    .with_priority(entry_config.priority)
+                    .with_direction(direction)
+                    .with_destination_type(dest_type);
+
+                if let Some(ref domain) = entry_config.domain_pattern {
+                    entry = entry.with_domain_pattern(domain);
+                }
+                if let Some(ref trunk) = entry_config.source_trunk {
+                    entry = entry.with_source_trunk(trunk);
+                }
+                if let Some(ref dest) = entry_config.static_destination {
+                    entry = entry.with_static_destination(dest);
+                }
+
+                plan.add_entry(entry);
+            }
+
+            router.add_dial_plan(plan);
+        }
+
+        let plan_count = dial_plan_configs.iter().filter(|p| p.active).count();
+        let trunk_count: usize = trunk_group_configs.iter().map(|g| g.trunks.len()).sum();
+
+        info!(
+            dial_plans = plan_count,
+            trunk_groups = trunk_group_configs.len(),
+            trunks = trunk_count,
+            "Router initialized from config"
+        );
+
+        self.router = Some(RwLock::new(router));
     }
 
     /// Returns whether the stack has a storage-backed location service.
@@ -383,13 +528,7 @@ impl SipStack {
             warn!(call_id = %sip_call_id, "No addresses for call");
             return ProcessResult::NoAction;
         };
-        let addrs = CallAddresses {
-            a_leg_source: a.a_leg_source,
-            b_leg_destination: a.b_leg_destination,
-            a_leg_sip_call_id: a.a_leg_sip_call_id.clone(),
-            b_leg_sip_call_id: a.b_leg_sip_call_id.clone(),
-            local_addr: a.local_addr.clone(),
-        };
+        let addrs = a.clone();
         drop(corr);
 
         // Handle based on status code class
@@ -807,18 +946,45 @@ impl SipStack {
         let dest_host = req.uri.host.clone();
         let dest_aor = format!("sip:{dest_user}@{dest_host}");
 
-        // 3. Look up destination: first check location service, then try direct
+        // 3. Look up destination:
+        //    a) Check LocationService for registered users
+        //    b) If not registered, try Router (dial plan + trunk selection)
+        //    c) If no router, fall back to direct URI resolution
+        let mut failover_trunks: Vec<String> = Vec::new();
         let b_leg_destination = {
             let loc = self.location_service.read().await;
             let bindings = loc.lookup(&dest_aor);
-            bindings.first().map_or_else(
-                || resolve_sip_uri_to_addr(&req.uri.to_string()),
-                |binding| {
-                    // Registered user — resolve contact URI to address
-                    let contact = binding.contact_uri().to_string();
-                    resolve_sip_uri_to_addr(&contact)
-                },
-            )
+            if let Some(binding) = bindings.first() {
+                // Registered user — resolve contact URI to address
+                let contact = binding.contact_uri().to_string();
+                resolve_sip_uri_to_addr(&contact)
+            } else {
+                drop(loc);
+                // Not registered — try router if configured
+                if let Some(ref router_lock) = self.router {
+                    let mut router = router_lock.write().await;
+                    match router.route(&dest_user) {
+                        Ok(decision) => {
+                            failover_trunks = decision.failover_trunks;
+                            info!(
+                                trunk = %decision.trunk_id,
+                                trunk_uri = %decision.trunk_uri,
+                                destination = %decision.destination,
+                                failover_count = failover_trunks.len(),
+                                "Routed via dial plan"
+                            );
+                            resolve_sip_uri_to_addr(&decision.trunk_uri)
+                        }
+                        Err(e) => {
+                            warn!(dest = %dest_aor, error = %e, "Router failed, trying direct resolution");
+                            resolve_sip_uri_to_addr(&req.uri.to_string())
+                        }
+                    }
+                } else {
+                    // No router — direct resolution
+                    resolve_sip_uri_to_addr(&req.uri.to_string())
+                }
+            }
         };
 
         let Some(b_leg_destination) = b_leg_destination else {
@@ -932,6 +1098,7 @@ impl SipStack {
                     a_leg_sip_call_id: a_leg_call_id.clone(),
                     b_leg_sip_call_id: b_leg_sip_call_id.clone(),
                     local_addr: local_sip_addr,
+                    failover_trunks,
                 },
             );
         }
@@ -1051,13 +1218,7 @@ impl SipStack {
                 destination: source,
             };
         };
-        let addrs = CallAddresses {
-            a_leg_source: a.a_leg_source,
-            b_leg_destination: a.b_leg_destination,
-            a_leg_sip_call_id: a.a_leg_sip_call_id.clone(),
-            b_leg_sip_call_id: a.b_leg_sip_call_id.clone(),
-            local_addr: a.local_addr.clone(),
-        };
+        let addrs = a.clone();
         drop(corr);
 
         // Terminate the call
@@ -1169,13 +1330,7 @@ impl SipStack {
                 destination: source,
             };
         };
-        let addrs = CallAddresses {
-            a_leg_source: a.a_leg_source,
-            b_leg_destination: a.b_leg_destination,
-            a_leg_sip_call_id: a.a_leg_sip_call_id.clone(),
-            b_leg_sip_call_id: a.b_leg_sip_call_id.clone(),
-            local_addr: a.local_addr.clone(),
-        };
+        let addrs = a.clone();
         drop(corr);
 
         // Fail the call

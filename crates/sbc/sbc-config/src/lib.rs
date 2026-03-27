@@ -66,7 +66,11 @@ pub mod schema;
 pub mod validate;
 
 pub use error::{ConfigError, ConfigResult};
-pub use schema::SbcConfig;
+pub use schema::{
+    DialPlanConfig, DialPlanEntryConfig, HeaderManipulationConfig, ManipulationRuleConfig,
+    RoutingConfig, SbcConfig, TopologyHidingConfig, TrunkConfigSchema, TrunkGroupConfig,
+    TrunkManipulationRuleConfig,
+};
 #[cfg(feature = "telemetry")]
 pub use schema::TelemetryConfig;
 
