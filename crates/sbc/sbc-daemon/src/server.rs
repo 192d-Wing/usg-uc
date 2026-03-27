@@ -66,7 +66,9 @@ impl Server {
         health.register(Box::new(uc_health::check::MemoryCheck::new()));
 
         let sip_config = Self::build_sip_config(&config);
-        let sip_stack = Arc::new(SipStack::new(sip_config));
+        let mut sip_stack = SipStack::new(sip_config);
+        Self::init_sip_stack_from_config(&mut sip_stack, &config);
+        let sip_stack = Arc::new(sip_stack);
         let rate_limiter = Self::build_rate_limiter(&config);
 
         Self {
@@ -100,14 +102,16 @@ impl Server {
         health.register(Box::new(uc_health::check::MemoryCheck::new()));
 
         let sip_config = Self::build_sip_config(&config);
-        let sip_stack = if let Some(ref cluster_mgr) = cluster {
-            Arc::new(SipStack::new_with_location_service(
+        let mut sip_stack = if let Some(ref cluster_mgr) = cluster {
+            SipStack::new_with_location_service(
                 sip_config,
                 Arc::clone(cluster_mgr.location_service()),
-            ))
+            )
         } else {
-            Arc::new(SipStack::new(sip_config))
+            SipStack::new(sip_config)
         };
+        Self::init_sip_stack_from_config(&mut sip_stack, &config);
+        let sip_stack = Arc::new(sip_stack);
 
         let rate_limiter = Self::build_rate_limiter(&config);
 
@@ -153,6 +157,28 @@ impl Server {
         );
 
         Arc::new(Mutex::new(RateLimiter::new(rate_limit_config)))
+    }
+
+    /// Initializes SipStack routing, manipulation, and topology hiding from config.
+    fn init_sip_stack_from_config(sip_stack: &mut SipStack, config: &SbcConfig) {
+        // Initialize router from config (if routing section present)
+        if let Some(ref routing) = config.routing {
+            sip_stack.init_router_from_config(routing, &config.dial_plans, &config.trunk_groups);
+        } else if !config.dial_plans.is_empty() || !config.trunk_groups.is_empty() {
+            // Dial plans or trunk groups defined but no [routing] section — use defaults
+            let default_routing = sbc_config::RoutingConfig::default();
+            sip_stack.init_router_from_config(&default_routing, &config.dial_plans, &config.trunk_groups);
+        }
+
+        // Initialize header manipulation (if configured)
+        if let Some(ref manip) = config.header_manipulation {
+            sip_stack.init_manipulator_from_config(manip);
+        }
+
+        // Initialize topology hiding (if configured)
+        if let Some(ref topo) = config.topology_hiding {
+            sip_stack.init_topology_hider_from_config(topo);
+        }
     }
 
     /// Returns the cluster manager if available.
