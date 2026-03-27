@@ -99,6 +99,30 @@ pub struct SbcConfig {
     /// ## NIST 800-53 Rev5: SC-8 (Transmission Confidentiality)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grpc: Option<GrpcConfig>,
+
+    /// Call routing configuration.
+    ///
+    /// ## NIST 800-53 Rev5: AC-4 (Information Flow Enforcement)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingConfig>,
+
+    /// Dial plan definitions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dial_plans: Vec<DialPlanConfig>,
+
+    /// Trunk group definitions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trunk_groups: Vec<TrunkGroupConfig>,
+
+    /// SIP header manipulation rules.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header_manipulation: Option<HeaderManipulationConfig>,
+
+    /// Topology hiding settings.
+    ///
+    /// ## NIST 800-53 Rev5: SC-7 (Boundary Protection)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology_hiding: Option<TopologyHidingConfig>,
 }
 
 /// General SBC settings.
@@ -516,6 +540,271 @@ impl Default for GrpcConfig {
     }
 }
 
+// ── Routing Configuration ──────────────────────────────────────────
+
+/// Call routing configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoutingConfig {
+    /// Enable dial plan-based routing.
+    pub use_dial_plan: bool,
+    /// Maximum failover attempts per call.
+    pub max_failover_attempts: u32,
+    /// Default trunk group for unmatched calls.
+    pub default_trunk_group: String,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            use_dial_plan: true,
+            max_failover_attempts: 3,
+            default_trunk_group: "default".to_string(),
+        }
+    }
+}
+
+/// Dial plan configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DialPlanConfig {
+    /// Unique dial plan ID.
+    pub id: String,
+    /// Display name.
+    #[serde(default)]
+    pub name: String,
+    /// Whether this dial plan is active.
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Dial plan entries.
+    #[serde(default)]
+    pub entries: Vec<DialPlanEntryConfig>,
+}
+
+/// A single dial plan entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DialPlanEntryConfig {
+    /// Call direction: "inbound", "outbound", or "both".
+    pub direction: String,
+    /// Pattern type: "exact", "prefix", "wildcard", "any".
+    pub pattern_type: String,
+    /// Pattern value (the string to match against).
+    pub pattern_value: String,
+    /// Domain pattern to match (e.g., "uc.mil", "*.mil").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain_pattern: Option<String>,
+    /// Source trunk filter (only match calls from this trunk ID).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_trunk: Option<String>,
+    /// Trunk group to route to.
+    #[serde(default)]
+    pub trunk_group: String,
+    /// Destination type: "trunk_group" (default), "registered_user", "static_uri".
+    #[serde(default = "default_trunk_group_type")]
+    pub destination_type: String,
+    /// Static destination URI (when destination_type = "static_uri").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub static_destination: Option<String>,
+    /// Number transform type: "none", "strip_prefix", "add_prefix", "replace_prefix".
+    #[serde(default = "default_none_str")]
+    pub transform_type: String,
+    /// Transform value (meaning depends on transform_type).
+    #[serde(default)]
+    pub transform_value: String,
+    /// Priority (lower = higher priority).
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+}
+
+impl Default for DialPlanEntryConfig {
+    fn default() -> Self {
+        Self {
+            direction: "outbound".to_string(),
+            pattern_type: "prefix".to_string(),
+            pattern_value: String::new(),
+            domain_pattern: None,
+            source_trunk: None,
+            trunk_group: String::new(),
+            destination_type: "trunk_group".to_string(),
+            static_destination: None,
+            transform_type: "none".to_string(),
+            transform_value: String::new(),
+            priority: 100,
+        }
+    }
+}
+
+/// Trunk group configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrunkGroupConfig {
+    /// Unique trunk group ID.
+    pub id: String,
+    /// Display name.
+    #[serde(default)]
+    pub name: String,
+    /// Selection strategy: "priority", "round_robin", "weighted_random",
+    /// "least_connections", "best_success_rate".
+    #[serde(default = "default_priority_str")]
+    pub strategy: String,
+    /// Trunks in this group.
+    #[serde(default)]
+    pub trunks: Vec<TrunkConfigSchema>,
+}
+
+/// Individual trunk configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrunkConfigSchema {
+    /// Unique trunk ID.
+    pub id: String,
+    /// SIP host (IP or hostname).
+    pub host: String,
+    /// SIP port.
+    pub port: u16,
+    /// Transport protocol: "udp", "tcp", "tls".
+    pub protocol: String,
+    /// Selection priority (lower = preferred).
+    pub priority: u32,
+    /// Weight for weighted selection.
+    pub weight: u32,
+    /// Maximum concurrent calls.
+    pub max_calls: u32,
+    /// Cooldown period after failures (seconds).
+    pub cooldown_secs: u32,
+    /// Maximum consecutive failures before cooldown.
+    pub max_failures: u32,
+}
+
+impl Default for TrunkConfigSchema {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            host: String::new(),
+            port: 5060,
+            protocol: "udp".to_string(),
+            priority: 1,
+            weight: 100,
+            max_calls: 100,
+            cooldown_secs: 30,
+            max_failures: 5,
+        }
+    }
+}
+
+// ── Header Manipulation Configuration ─────────────────────────────
+
+/// SIP header manipulation configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HeaderManipulationConfig {
+    /// Global manipulation rules (applied to all calls).
+    #[serde(default)]
+    pub global_rules: Vec<ManipulationRuleConfig>,
+    /// Per-trunk manipulation rules.
+    #[serde(default)]
+    pub trunk_rules: Vec<TrunkManipulationRuleConfig>,
+}
+
+impl Default for HeaderManipulationConfig {
+    fn default() -> Self {
+        Self {
+            global_rules: Vec::new(),
+            trunk_rules: Vec::new(),
+        }
+    }
+}
+
+/// A header manipulation rule.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManipulationRuleConfig {
+    /// Rule name.
+    pub name: String,
+    /// Direction: "inbound", "outbound", "both".
+    #[serde(default = "default_both_str")]
+    pub direction: String,
+    /// Action: "add", "set", "remove", "replace", "prepend", "append".
+    pub action: String,
+    /// Header name to act on.
+    pub header: String,
+    /// Value (for add/set/replace/prepend/append).
+    #[serde(default)]
+    pub value: String,
+}
+
+/// Per-trunk manipulation rule.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrunkManipulationRuleConfig {
+    /// Trunk ID this rule applies to.
+    pub trunk_id: String,
+    /// Rule name.
+    pub name: String,
+    /// Action.
+    pub action: String,
+    /// Header name.
+    pub header: String,
+    /// Value.
+    #[serde(default)]
+    pub value: String,
+}
+
+// ── Topology Hiding Configuration ─────────────────────────────────
+
+/// Topology hiding configuration.
+///
+/// ## NIST 800-53 Rev5: SC-7 (Boundary Protection)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TopologyHidingConfig {
+    /// Whether topology hiding is enabled.
+    pub enabled: bool,
+    /// Hiding mode: "none", "signaling_only", "full".
+    pub mode: String,
+    /// External hostname to present.
+    pub external_host: String,
+    /// External port to present.
+    pub external_port: u16,
+    /// Whether to obfuscate SIP Call-ID headers.
+    pub obfuscate_call_id: bool,
+}
+
+impl Default for TopologyHidingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: "none".to_string(),
+            external_host: String::new(),
+            external_port: 5060,
+            obfuscate_call_id: false,
+        }
+    }
+}
+
+// ── Config helper functions ───────────────────────────────────────
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_priority() -> u32 {
+    100
+}
+
+fn default_none_str() -> String {
+    "none".to_string()
+}
+
+fn default_trunk_group_type() -> String {
+    "trunk_group".to_string()
+}
+
+fn default_priority_str() -> String {
+    "priority".to_string()
+}
+
+fn default_both_str() -> String {
+    "both".to_string()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -559,5 +848,154 @@ mod tests {
         assert!(monitoring.metrics_bind.is_none());
         assert!(!monitoring.per_call_metrics);
         assert_eq!(monitoring.scrape_interval_secs, 15);
+    }
+
+    #[test]
+    fn test_routing_config_parse() {
+        let toml_str = r#"
+            [general]
+            instance_name = "sbc-routing-test"
+
+            [routing]
+            use_dial_plan = true
+            max_failover_attempts = 3
+            default_trunk_group = "us-domestic"
+
+            [[dial_plans]]
+            id = "main"
+            name = "Main Plan"
+            active = true
+
+                [[dial_plans.entries]]
+                direction = "outbound"
+                pattern_type = "prefix"
+                pattern_value = "+1"
+                trunk_group = "us-domestic"
+                transform_type = "strip_prefix"
+                transform_value = "2"
+                priority = 10
+
+                [[dial_plans.entries]]
+                direction = "inbound"
+                pattern_type = "prefix"
+                pattern_value = "+1555"
+                destination_type = "registered_user"
+                transform_type = "strip_prefix"
+                transform_value = "5"
+                priority = 5
+                domain_pattern = "uc.mil"
+                source_trunk = "bulkvs-1"
+
+                [[dial_plans.entries]]
+                direction = "both"
+                pattern_type = "exact"
+                pattern_value = "911"
+                trunk_group = "emergency"
+                priority = 1
+
+            [[trunk_groups]]
+            id = "us-domestic"
+            name = "US Domestic"
+            strategy = "least_connections"
+
+                [[trunk_groups.trunks]]
+                id = "bulkvs-1"
+                host = "sip.bulkvs.com"
+                port = 5060
+                protocol = "udp"
+                priority = 1
+                max_calls = 200
+
+                [[trunk_groups.trunks]]
+                id = "bulkvs-2"
+                host = "sip2.bulkvs.com"
+                port = 5060
+                protocol = "udp"
+                priority = 2
+
+            [[trunk_groups]]
+            id = "emergency"
+            name = "E911"
+            strategy = "priority"
+
+                [[trunk_groups.trunks]]
+                id = "e911-1"
+                host = "e911.example.com"
+                port = 5060
+
+            [header_manipulation]
+                [[header_manipulation.global_rules]]
+                name = "strip-internal"
+                direction = "outbound"
+                action = "remove"
+                header = "X-Internal-ID"
+
+                [[header_manipulation.trunk_rules]]
+                trunk_id = "bulkvs-1"
+                name = "set-ua"
+                action = "set"
+                header = "User-Agent"
+                value = "USG-SBC/1.0"
+
+            [topology_hiding]
+            enabled = true
+            mode = "full"
+            external_host = "sbc.uc.mil"
+            external_port = 5060
+            obfuscate_call_id = true
+        "#;
+
+        let config: SbcConfig = toml::from_str(toml_str).expect("parse routing config");
+
+        // Routing
+        let routing = config.routing.unwrap();
+        assert!(routing.use_dial_plan);
+        assert_eq!(routing.max_failover_attempts, 3);
+        assert_eq!(routing.default_trunk_group, "us-domestic");
+
+        // Dial plans
+        assert_eq!(config.dial_plans.len(), 1);
+        let plan = &config.dial_plans[0];
+        assert_eq!(plan.id, "main");
+        assert!(plan.active);
+        assert_eq!(plan.entries.len(), 3);
+
+        // Outbound entry
+        assert_eq!(plan.entries[0].direction, "outbound");
+        assert_eq!(plan.entries[0].pattern_type, "prefix");
+        assert_eq!(plan.entries[0].pattern_value, "+1");
+        assert_eq!(plan.entries[0].transform_type, "strip_prefix");
+
+        // Inbound entry with domain + source trunk
+        assert_eq!(plan.entries[1].direction, "inbound");
+        assert_eq!(plan.entries[1].destination_type, "registered_user");
+        assert_eq!(plan.entries[1].domain_pattern.as_deref(), Some("uc.mil"));
+        assert_eq!(plan.entries[1].source_trunk.as_deref(), Some("bulkvs-1"));
+
+        // Emergency
+        assert_eq!(plan.entries[2].direction, "both");
+        assert_eq!(plan.entries[2].pattern_type, "exact");
+        assert_eq!(plan.entries[2].priority, 1);
+
+        // Trunk groups
+        assert_eq!(config.trunk_groups.len(), 2);
+        assert_eq!(config.trunk_groups[0].id, "us-domestic");
+        assert_eq!(config.trunk_groups[0].strategy, "least_connections");
+        assert_eq!(config.trunk_groups[0].trunks.len(), 2);
+        assert_eq!(config.trunk_groups[0].trunks[0].host, "sip.bulkvs.com");
+
+        // Header manipulation
+        let manip = config.header_manipulation.unwrap();
+        assert_eq!(manip.global_rules.len(), 1);
+        assert_eq!(manip.global_rules[0].action, "remove");
+        assert_eq!(manip.trunk_rules.len(), 1);
+        assert_eq!(manip.trunk_rules[0].trunk_id, "bulkvs-1");
+
+        // Topology hiding
+        let topo = config.topology_hiding.unwrap();
+        assert!(topo.enabled);
+        assert_eq!(topo.mode, "full");
+        assert_eq!(topo.external_host, "sbc.uc.mil");
+        assert!(topo.obfuscate_call_id);
     }
 }
