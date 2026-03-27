@@ -55,6 +55,8 @@ pub struct SipStack {
     call_correlation: RwLock<CallCorrelation>,
     /// SDP rewriter for media anchoring.
     sdp_rewriter: SdpRewriter,
+    /// Media pipeline for RTP relay (optional, set after construction).
+    media_pipeline: Option<Arc<crate::media_pipeline::MediaPipeline>>,
     /// Stack configuration.
     config: SipStackConfig,
     /// Registration statistics.
@@ -229,6 +231,7 @@ impl SipStack {
             async_location_service: None,
             call_correlation: RwLock::new(CallCorrelation::default()),
             sdp_rewriter: SdpRewriter::new(B2buaMode::MediaRelay),
+            media_pipeline: None,
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
             config,
@@ -267,10 +270,16 @@ impl SipStack {
             async_location_service: Some(async_location_service),
             call_correlation: RwLock::new(CallCorrelation::default()),
             sdp_rewriter: SdpRewriter::new(B2buaMode::MediaRelay),
+            media_pipeline: None,
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
             config,
         }
+    }
+
+    /// Sets the media pipeline for RTP relay.
+    pub fn set_media_pipeline(&mut self, pipeline: Arc<crate::media_pipeline::MediaPipeline>) {
+        self.media_pipeline = Some(pipeline);
     }
 
     /// Returns whether the stack has a storage-backed location service.

@@ -19,7 +19,11 @@ use proto_srtp::{
     SrtpContext, SrtpDirection, SrtpKeyMaterial, SrtpProfile, SrtpProtect, SrtpUnprotect,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
+use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
 use uc_codecs::{CodecCapability, CodecRegistry};
 use uc_media_engine::session::SessionState;
@@ -37,6 +41,10 @@ pub struct MediaPipelineConfig {
     pub rtcp_mux: bool,
     /// Local codecs in preference order.
     pub local_codecs: Vec<CodecCapability>,
+    /// Minimum RTP port for allocation.
+    pub rtp_port_min: u16,
+    /// Maximum RTP port for allocation.
+    pub rtp_port_max: u16,
 }
 
 impl Default for MediaPipelineConfig {
@@ -51,7 +59,68 @@ impl Default for MediaPipelineConfig {
                 CodecCapability::pcmu(),
                 CodecCapability::pcma(),
             ],
+            rtp_port_min: 16_384,
+            rtp_port_max: 32_768,
         }
+    }
+}
+
+/// Allocates RTP port pairs (even=RTP, odd=RTCP) from a configured range.
+pub struct RtpPortAllocator {
+    /// Next port to try.
+    next_port: AtomicU16,
+    /// Minimum port in range.
+    min_port: u16,
+    /// Maximum port in range.
+    max_port: u16,
+    /// Currently allocated ports.
+    allocated: RwLock<std::collections::HashSet<u16>>,
+}
+
+impl RtpPortAllocator {
+    /// Creates a new port allocator.
+    pub fn new(min_port: u16, max_port: u16) -> Self {
+        // Ensure min_port is even for RTP convention
+        let min_port = if min_port % 2 == 0 { min_port } else { min_port + 1 };
+        Self {
+            next_port: AtomicU16::new(min_port),
+            min_port,
+            max_port,
+            allocated: RwLock::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Allocates an even-numbered RTP port. Returns (rtp_port, rtcp_port).
+    pub async fn allocate_pair(&self) -> Result<(u16, u16), MediaPipelineError> {
+        let mut allocated = self.allocated.write().await;
+        let range_size = (self.max_port - self.min_port) / 2;
+
+        for _ in 0..range_size {
+            let port = self.next_port.fetch_add(2, Ordering::Relaxed);
+            // Wrap around
+            let port = self.min_port + ((port - self.min_port) % (self.max_port - self.min_port));
+            // Ensure even
+            let port = if port % 2 == 0 { port } else { port + 1 };
+
+            if port + 1 >= self.max_port {
+                continue;
+            }
+
+            if !allocated.contains(&port) {
+                allocated.insert(port);
+                allocated.insert(port + 1);
+                return Ok((port, port + 1));
+            }
+        }
+
+        Err(MediaPipelineError::PortExhausted)
+    }
+
+    /// Releases a port pair back to the pool.
+    pub async fn release_pair(&self, rtp_port: u16) {
+        let mut allocated = self.allocated.write().await;
+        allocated.remove(&rtp_port);
+        allocated.remove(&(rtp_port + 1));
     }
 }
 
@@ -67,6 +136,8 @@ pub struct MediaPipeline {
     dtls_connections: RwLock<HashMap<String, DtlsConnectionContext>>,
     /// RTP sequence trackers by SSRC.
     sequence_trackers: RwLock<HashMap<u32, SequenceTracker>>,
+    /// Port allocator for RTP/RTCP ports.
+    port_allocator: RtpPortAllocator,
 }
 
 /// Context for an active media session.
@@ -89,6 +160,23 @@ struct MediaSessionContext {
     a_leg_ssrc: u32,
     /// B-leg SSRC.
     b_leg_ssrc: u32,
+    /// A-leg local RTP port.
+    a_leg_local_port: u16,
+    /// B-leg local RTP port.
+    b_leg_local_port: u16,
+    /// Relay task handles (aborted on stop).
+    relay_handles: Vec<JoinHandle<()>>,
+    /// Shutdown sender for relay tasks.
+    relay_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+}
+
+/// Allocated port info returned from `create_session`.
+#[derive(Debug, Clone)]
+pub struct AllocatedPorts {
+    /// A-leg RTP port.
+    pub a_leg_rtp_port: u16,
+    /// B-leg RTP port.
+    pub b_leg_rtp_port: u16,
 }
 
 /// Context for a DTLS connection.
@@ -137,35 +225,42 @@ impl MediaPipeline {
             "Media pipeline created"
         );
 
+        let port_allocator = RtpPortAllocator::new(config.rtp_port_min, config.rtp_port_max);
+
         Self {
             config,
             codec_registry,
             sessions: RwLock::new(HashMap::new()),
             dtls_connections: RwLock::new(HashMap::new()),
             sequence_trackers: RwLock::new(HashMap::new()),
+            port_allocator,
         }
     }
 
-    /// Creates a new media session for a call.
+    /// Creates a new media session for a call, allocating RTP port pairs.
+    ///
+    /// Returns the allocated ports so the SIP stack can use them in SDP.
     pub async fn create_session(
         &self,
         call_id: &str,
         mode: Option<MediaMode>,
-    ) -> Result<(), MediaPipelineError> {
+    ) -> Result<AllocatedPorts, MediaPipelineError> {
         let mode = mode.unwrap_or(self.config.default_mode);
 
         let mut config = MediaSessionConfig::new(call_id)
             .with_mode(mode)
             .with_srtp(self.config.srtp_required);
 
-        // Add local codecs
         for codec in &self.config.local_codecs {
             config = config.with_codec(codec.clone());
         }
 
         let session = MediaSession::new(config);
 
-        // Generate SSRCs for the session
+        // Allocate port pairs for A-leg and B-leg
+        let (a_rtp, _a_rtcp) = self.port_allocator.allocate_pair().await?;
+        let (b_rtp, _b_rtcp) = self.port_allocator.allocate_pair().await?;
+
         let a_leg_ssrc = generate_ssrc();
         let b_leg_ssrc = generate_ssrc();
 
@@ -179,13 +274,27 @@ impl MediaPipeline {
             b_leg_remote: None,
             a_leg_ssrc,
             b_leg_ssrc,
+            a_leg_local_port: a_rtp,
+            b_leg_local_port: b_rtp,
+            relay_handles: Vec::new(),
+            relay_shutdown: None,
         };
 
         let mut sessions = self.sessions.write().await;
         sessions.insert(call_id.to_string(), context);
 
-        info!(call_id = %call_id, mode = ?mode, "Media session created");
-        Ok(())
+        info!(
+            call_id = %call_id,
+            mode = ?mode,
+            a_leg_port = a_rtp,
+            b_leg_port = b_rtp,
+            "Media session created with ports"
+        );
+
+        Ok(AllocatedPorts {
+            a_leg_rtp_port: a_rtp,
+            b_leg_rtp_port: b_rtp,
+        })
     }
 
     /// Negotiates codecs with remote offer.
@@ -494,6 +603,144 @@ impl MediaPipeline {
         Ok(())
     }
 
+    /// Starts RTP relay for a call. Binds UDP sockets and spawns relay tasks.
+    ///
+    /// Must be called after both `set_remote_address` calls (A-leg and B-leg).
+    pub async fn start_relay(&self, call_id: &str) -> Result<(), MediaPipelineError> {
+        let mut sessions = self.sessions.write().await;
+        let ctx = sessions
+            .get_mut(call_id)
+            .ok_or(MediaPipelineError::SessionNotFound)?;
+
+        let a_remote = ctx
+            .a_leg_remote
+            .ok_or(MediaPipelineError::BindFailed("A-leg remote not set".into()))?;
+        let b_remote = ctx
+            .b_leg_remote
+            .ok_or(MediaPipelineError::BindFailed("B-leg remote not set".into()))?;
+
+        // Bind UDP sockets
+        let a_bind = format!("0.0.0.0:{}", ctx.a_leg_local_port);
+        let b_bind = format!("0.0.0.0:{}", ctx.b_leg_local_port);
+
+        let a_socket = Arc::new(
+            UdpSocket::bind(&a_bind)
+                .await
+                .map_err(|e| MediaPipelineError::BindFailed(format!("{a_bind}: {e}")))?,
+        );
+        let b_socket = Arc::new(
+            UdpSocket::bind(&b_bind)
+                .await
+                .map_err(|e| MediaPipelineError::BindFailed(format!("{b_bind}: {e}")))?,
+        );
+
+        // Shutdown channel
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        // Spawn A→B relay task
+        let a_sock = Arc::clone(&a_socket);
+        let b_sock = Arc::clone(&b_socket);
+        let b_addr: std::net::SocketAddr = b_remote.into();
+        let call_id_ab = call_id.to_string();
+        let mut shutdown_ab = shutdown_rx.clone();
+
+        let handle_ab = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            loop {
+                tokio::select! {
+                    result = a_sock.recv_from(&mut buf) => {
+                        match result {
+                            Ok((n, _src)) => {
+                                if let Err(e) = b_sock.send_to(&buf[..n], b_addr).await {
+                                    debug!(error = %e, call_id = %call_id_ab, "A→B relay send error");
+                                }
+                            }
+                            Err(e) => {
+                                debug!(error = %e, call_id = %call_id_ab, "A→B relay recv error");
+                                break;
+                            }
+                        }
+                    }
+                    _ = shutdown_ab.changed() => {
+                        debug!(call_id = %call_id_ab, "A→B relay shutdown");
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Spawn B→A relay task
+        let a_sock = Arc::clone(&a_socket);
+        let b_sock = Arc::clone(&b_socket);
+        let a_addr: std::net::SocketAddr = a_remote.into();
+        let call_id_ba = call_id.to_string();
+        let mut shutdown_ba = shutdown_rx;
+
+        let handle_ba = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            loop {
+                tokio::select! {
+                    result = b_sock.recv_from(&mut buf) => {
+                        match result {
+                            Ok((n, _src)) => {
+                                if let Err(e) = a_sock.send_to(&buf[..n], a_addr).await {
+                                    debug!(error = %e, call_id = %call_id_ba, "B→A relay send error");
+                                }
+                            }
+                            Err(e) => {
+                                debug!(error = %e, call_id = %call_id_ba, "B→A relay recv error");
+                                break;
+                            }
+                        }
+                    }
+                    _ = shutdown_ba.changed() => {
+                        debug!(call_id = %call_id_ba, "B→A relay shutdown");
+                        break;
+                    }
+                }
+            }
+        });
+
+        ctx.relay_handles = vec![handle_ab, handle_ba];
+        ctx.relay_shutdown = Some(shutdown_tx);
+
+        info!(
+            call_id = %call_id,
+            a_leg_port = ctx.a_leg_local_port,
+            b_leg_port = ctx.b_leg_local_port,
+            a_remote = %a_remote,
+            b_remote = %b_remote,
+            "RTP relay started"
+        );
+
+        Ok(())
+    }
+
+    /// Stops the RTP relay for a call and releases ports.
+    pub async fn stop_relay(&self, call_id: &str) -> Result<(), MediaPipelineError> {
+        let mut sessions = self.sessions.write().await;
+        let ctx = sessions
+            .get_mut(call_id)
+            .ok_or(MediaPipelineError::SessionNotFound)?;
+
+        // Signal shutdown
+        if let Some(tx) = ctx.relay_shutdown.take() {
+            let _ = tx.send(true);
+        }
+
+        // Abort relay tasks
+        for handle in ctx.relay_handles.drain(..) {
+            handle.abort();
+        }
+
+        // Release ports
+        self.port_allocator.release_pair(ctx.a_leg_local_port).await;
+        self.port_allocator.release_pair(ctx.b_leg_local_port).await;
+
+        info!(call_id = %call_id, "RTP relay stopped");
+        Ok(())
+    }
+
     /// Removes a media session.
     pub async fn remove_session(&self, call_id: &str) -> Result<(), MediaPipelineError> {
         let mut sessions = self.sessions.write().await;
@@ -570,6 +817,10 @@ pub enum MediaPipelineError {
     EncryptionFailed(String),
     /// Decryption failed.
     DecryptionFailed(String),
+    /// RTP port range exhausted.
+    PortExhausted,
+    /// Failed to bind UDP socket.
+    BindFailed(String),
 }
 
 impl std::fmt::Display for MediaPipelineError {
@@ -583,6 +834,8 @@ impl std::fmt::Display for MediaPipelineError {
             Self::SrtpContextCreationFailed(e) => write!(f, "SRTP context creation failed: {e}"),
             Self::EncryptionFailed(e) => write!(f, "Encryption failed: {e}"),
             Self::DecryptionFailed(e) => write!(f, "Decryption failed: {e}"),
+            Self::PortExhausted => write!(f, "RTP port range exhausted"),
+            Self::BindFailed(e) => write!(f, "Failed to bind UDP socket: {e}"),
         }
     }
 }
