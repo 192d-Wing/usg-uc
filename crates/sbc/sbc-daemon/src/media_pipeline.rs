@@ -168,6 +168,12 @@ struct MediaSessionContext {
     relay_handles: Vec<JoinHandle<()>>,
     /// Shutdown sender for relay tasks.
     relay_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    /// Transcoder for codec conversion (if A-leg and B-leg use different codecs).
+    transcoder: Option<Transcoder>,
+    /// A-leg negotiated codec.
+    a_leg_codec: Option<NegotiatedCodec>,
+    /// B-leg negotiated codec.
+    b_leg_codec: Option<NegotiatedCodec>,
 }
 
 /// Allocated port info returned from `create_session`.
@@ -177,6 +183,237 @@ pub struct AllocatedPorts {
     pub a_leg_rtp_port: u16,
     /// B-leg RTP port.
     pub b_leg_rtp_port: u16,
+}
+
+/// Negotiated codec info for one leg.
+#[derive(Debug, Clone)]
+pub struct NegotiatedCodec {
+    /// Codec name (PCMU, PCMA, G722, opus).
+    pub name: String,
+    /// RTP payload type.
+    pub payload_type: u8,
+    /// Clock rate in Hz.
+    pub clock_rate: u32,
+}
+
+/// Transcoder for converting between different codecs in the relay path.
+///
+/// When A-leg and B-leg negotiate different codecs, the transcoder
+/// decodes incoming RTP payload to PCM and re-encodes for the outgoing leg.
+struct Transcoder {
+    /// A-leg codec info.
+    a_codec: NegotiatedCodec,
+    /// B-leg codec info.
+    b_codec: NegotiatedCodec,
+    /// G.722 encoder for A-leg direction (if needed).
+    g722_enc_a: Option<uc_codecs::g722_adpcm::G722Encoder>,
+    /// G.722 decoder for A-leg direction (if needed).
+    g722_dec_a: Option<uc_codecs::g722_adpcm::G722Decoder>,
+    /// G.722 encoder for B-leg direction (if needed).
+    g722_enc_b: Option<uc_codecs::g722_adpcm::G722Encoder>,
+    /// G.722 decoder for B-leg direction (if needed).
+    g722_dec_b: Option<uc_codecs::g722_adpcm::G722Decoder>,
+}
+
+impl Transcoder {
+    /// Creates a transcoder for the given codec pair.
+    fn new(a_codec: NegotiatedCodec, b_codec: NegotiatedCodec) -> Self {
+        let g722_enc_a = if b_codec.name == "G722" {
+            Some(uc_codecs::g722_adpcm::G722Encoder::new())
+        } else {
+            None
+        };
+        let g722_dec_a = if a_codec.name == "G722" {
+            Some(uc_codecs::g722_adpcm::G722Decoder::new())
+        } else {
+            None
+        };
+        let g722_enc_b = if a_codec.name == "G722" {
+            Some(uc_codecs::g722_adpcm::G722Encoder::new())
+        } else {
+            None
+        };
+        let g722_dec_b = if b_codec.name == "G722" {
+            Some(uc_codecs::g722_adpcm::G722Decoder::new())
+        } else {
+            None
+        };
+
+        Self {
+            a_codec,
+            b_codec,
+            g722_enc_a,
+            g722_dec_a,
+            g722_enc_b,
+            g722_dec_b,
+        }
+    }
+
+    /// Transcodes RTP payload from one codec to another.
+    ///
+    /// `is_a_leg`: true = packet from A-leg (decode with a_codec, encode with b_codec)
+    ///             false = packet from B-leg (decode with b_codec, encode with a_codec)
+    ///
+    /// Returns (transcoded_payload, outbound_payload_type).
+    #[allow(clippy::cast_possible_truncation)]
+    fn transcode(
+        &mut self,
+        payload: &[u8],
+        is_a_leg: bool,
+    ) -> Result<(Vec<u8>, u8), MediaPipelineError> {
+        // Clone codec info to avoid borrow conflicts with &mut self
+        let (in_name, in_rate, out_name, out_rate, out_pt) = if is_a_leg {
+            (
+                self.a_codec.name.clone(),
+                self.a_codec.clock_rate,
+                self.b_codec.name.clone(),
+                self.b_codec.clock_rate,
+                self.b_codec.payload_type,
+            )
+        } else {
+            (
+                self.b_codec.name.clone(),
+                self.b_codec.clock_rate,
+                self.a_codec.name.clone(),
+                self.a_codec.clock_rate,
+                self.a_codec.payload_type,
+            )
+        };
+
+        // Decode to PCM
+        let mut pcm = vec![0i16; payload.len() * 6];
+        let pcm_samples = self.decode_payload(payload, &mut pcm, &in_name, is_a_leg)?;
+
+        // Resample if clock rates differ
+        let resampled;
+        let pcm_out = if in_rate != out_rate {
+            resampled = resample_linear(&pcm[..pcm_samples], in_rate, out_rate);
+            &resampled
+        } else {
+            &pcm[..pcm_samples]
+        };
+
+        // Encode to output codec
+        let mut output = vec![0u8; pcm_out.len() * 2];
+        let encoded_len = self.encode_payload(pcm_out, &mut output, &out_name, !is_a_leg)?;
+
+        output.truncate(encoded_len);
+        Ok((output, out_pt))
+    }
+
+    /// Decodes payload bytes to PCM samples.
+    fn decode_payload(
+        &mut self,
+        payload: &[u8],
+        output: &mut [i16],
+        codec_name: &str,
+        is_a_leg: bool,
+    ) -> Result<usize, MediaPipelineError> {
+        match codec_name {
+            "PCMU" => {
+                let n = payload.len().min(output.len());
+                for i in 0..n {
+                    output[i] = uc_codecs::G711Ulaw::decode_sample(payload[i]);
+                }
+                Ok(n)
+            }
+            "PCMA" => {
+                let n = payload.len().min(output.len());
+                for i in 0..n {
+                    output[i] = uc_codecs::G711Alaw::decode_sample(payload[i]);
+                }
+                Ok(n)
+            }
+            "G722" => {
+                let decoder = if is_a_leg {
+                    self.g722_dec_a.as_mut()
+                } else {
+                    self.g722_dec_b.as_mut()
+                };
+                match decoder {
+                    Some(dec) => Ok(dec.decode(payload, output)),
+                    None => Err(MediaPipelineError::DecryptionFailed(
+                        "G.722 decoder not initialized".into(),
+                    )),
+                }
+            }
+            _ => Err(MediaPipelineError::DecryptionFailed(format!(
+                "Unsupported codec for transcoding: {codec_name}"
+            ))),
+        }
+    }
+
+    /// Encodes PCM samples to codec payload.
+    fn encode_payload(
+        &mut self,
+        pcm: &[i16],
+        output: &mut [u8],
+        codec_name: &str,
+        is_a_leg: bool,
+    ) -> Result<usize, MediaPipelineError> {
+        match codec_name {
+            "PCMU" => {
+                let n = pcm.len().min(output.len());
+                for i in 0..n {
+                    output[i] = uc_codecs::G711Ulaw::encode_sample(pcm[i]);
+                }
+                Ok(n)
+            }
+            "PCMA" => {
+                let n = pcm.len().min(output.len());
+                for i in 0..n {
+                    output[i] = uc_codecs::G711Alaw::encode_sample(pcm[i]);
+                }
+                Ok(n)
+            }
+            "G722" => {
+                let encoder = if is_a_leg {
+                    self.g722_enc_a.as_mut()
+                } else {
+                    self.g722_enc_b.as_mut()
+                };
+                match encoder {
+                    Some(enc) => Ok(enc.encode(pcm, output)),
+                    None => Err(MediaPipelineError::EncryptionFailed(
+                        "G.722 encoder not initialized".into(),
+                    )),
+                }
+            }
+            _ => Err(MediaPipelineError::EncryptionFailed(format!(
+                "Unsupported codec for transcoding: {codec_name}"
+            ))),
+        }
+    }
+}
+
+/// Linear interpolation resampler for integer sample rate ratios.
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss)]
+fn resample_linear(input: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
+    if from_rate == to_rate || input.is_empty() {
+        return input.to_vec();
+    }
+
+    let ratio = to_rate as f64 / from_rate as f64;
+    let out_len = (input.len() as f64 * ratio) as usize;
+    let mut output = Vec::with_capacity(out_len);
+
+    for i in 0..out_len {
+        let src_pos = i as f64 / ratio;
+        let idx = src_pos as usize;
+        let frac = src_pos - idx as f64;
+
+        let sample = if idx + 1 < input.len() {
+            let s0 = f64::from(input[idx]);
+            let s1 = f64::from(input[idx + 1]);
+            (s0 + frac * (s1 - s0)) as i16
+        } else {
+            input[input.len() - 1]
+        };
+
+        output.push(sample);
+    }
+
+    output
 }
 
 /// Context for a DTLS connection.
@@ -278,6 +515,9 @@ impl MediaPipeline {
             b_leg_local_port: b_rtp,
             relay_handles: Vec::new(),
             relay_shutdown: None,
+            transcoder: None,
+            a_leg_codec: None,
+            b_leg_codec: None,
         };
 
         let mut sessions = self.sessions.write().await;
@@ -599,6 +839,42 @@ impl MediaPipeline {
             address = %address,
             "Remote address set"
         );
+
+        Ok(())
+    }
+
+    /// Sets the negotiated codecs for a call. Creates a transcoder if they differ.
+    pub async fn set_negotiated_codecs(
+        &self,
+        call_id: &str,
+        a_codec: NegotiatedCodec,
+        b_codec: NegotiatedCodec,
+    ) -> Result<(), MediaPipelineError> {
+        let mut sessions = self.sessions.write().await;
+        let ctx = sessions
+            .get_mut(call_id)
+            .ok_or(MediaPipelineError::SessionNotFound)?;
+
+        let needs_transcoding = a_codec.name != b_codec.name;
+
+        if needs_transcoding {
+            info!(
+                call_id = %call_id,
+                a_codec = %a_codec.name,
+                b_codec = %b_codec.name,
+                "Transcoding enabled"
+            );
+            ctx.transcoder = Some(Transcoder::new(a_codec.clone(), b_codec.clone()));
+        } else {
+            debug!(
+                call_id = %call_id,
+                codec = %a_codec.name,
+                "Same codec on both legs, no transcoding needed"
+            );
+        }
+
+        ctx.a_leg_codec = Some(a_codec);
+        ctx.b_leg_codec = Some(b_codec);
 
         Ok(())
     }
@@ -956,6 +1232,95 @@ mod tests {
         assert_eq!(stats.call_id, "test-call");
         assert!(matches!(stats.mode, MediaMode::Relay));
         assert!(stats.srtp_enabled);
+    }
+
+    #[test]
+    fn test_transcoder_pcmu_to_pcma() {
+        let a_codec = NegotiatedCodec {
+            name: "PCMU".to_string(),
+            payload_type: 0,
+            clock_rate: 8000,
+        };
+        let b_codec = NegotiatedCodec {
+            name: "PCMA".to_string(),
+            payload_type: 8,
+            clock_rate: 8000,
+        };
+
+        let mut transcoder = Transcoder::new(a_codec, b_codec);
+
+        // Create a PCMU payload (160 bytes = 20ms @ 8kHz)
+        let pcmu_payload: Vec<u8> = (0..160).map(|i| (i % 256) as u8).collect();
+
+        // Transcode A→B (PCMU → PCMA)
+        let (output, pt) = transcoder.transcode(&pcmu_payload, true).unwrap();
+        assert_eq!(pt, 8, "Output should be PCMA payload type");
+        assert_eq!(output.len(), 160, "Same frame size for G.711");
+
+        // Transcode B→A (PCMA → PCMU)
+        let (output2, pt2) = transcoder.transcode(&output, false).unwrap();
+        assert_eq!(pt2, 0, "Output should be PCMU payload type");
+        assert_eq!(output2.len(), 160);
+    }
+
+    #[test]
+    fn test_resample_linear() {
+        // 8kHz to 16kHz (2x upsample)
+        let input: Vec<i16> = vec![0, 1000, 2000, 3000, 4000];
+        let output = resample_linear(&input, 8000, 16_000);
+        assert_eq!(output.len(), 10);
+        assert_eq!(output[0], 0);
+        // Interpolated values should be between samples
+        assert!(output[1] > 0 && output[1] < 1000);
+    }
+
+    #[tokio::test]
+    async fn test_set_negotiated_codecs_same() {
+        let pipeline = MediaPipeline::new(MediaPipelineConfig::default());
+        pipeline.create_session("test-call", None).await.unwrap();
+
+        let codec = NegotiatedCodec {
+            name: "PCMU".to_string(),
+            payload_type: 0,
+            clock_rate: 8000,
+        };
+
+        pipeline
+            .set_negotiated_codecs("test-call", codec.clone(), codec)
+            .await
+            .unwrap();
+
+        // No transcoder should be created for same codec
+        let sessions = pipeline.sessions.read().await;
+        let ctx = sessions.get("test-call").unwrap();
+        assert!(ctx.transcoder.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_set_negotiated_codecs_different() {
+        let pipeline = MediaPipeline::new(MediaPipelineConfig::default());
+        pipeline.create_session("test-call", None).await.unwrap();
+
+        let a_codec = NegotiatedCodec {
+            name: "PCMU".to_string(),
+            payload_type: 0,
+            clock_rate: 8000,
+        };
+        let b_codec = NegotiatedCodec {
+            name: "PCMA".to_string(),
+            payload_type: 8,
+            clock_rate: 8000,
+        };
+
+        pipeline
+            .set_negotiated_codecs("test-call", a_codec, b_codec)
+            .await
+            .unwrap();
+
+        // Transcoder should be created
+        let sessions = pipeline.sessions.read().await;
+        let ctx = sessions.get("test-call").unwrap();
+        assert!(ctx.transcoder.is_some());
     }
 
     #[test]
