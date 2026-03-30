@@ -1534,6 +1534,23 @@ impl CallAgent {
             .map(|(_, session)| session.id.clone())
     }
 
+    /// Returns the SIP Call-ID for a given application call ID.
+    pub fn get_sip_call_id(&self, call_id: &str) -> Option<String> {
+        self.calls.get(call_id).map(|s| s.sip_call_id.clone())
+    }
+
+    /// Returns the local From-tag for a given application call ID.
+    pub fn get_local_tag(&self, call_id: &str) -> Option<String> {
+        self.calls.get(call_id).map(|s| s.from_tag.clone())
+    }
+
+    /// Returns true if the call has a pending outbound INVITE transaction.
+    pub fn has_pending_invite_transaction(&self, call_id: &str) -> bool {
+        self.calls
+            .get(call_id)
+            .is_some_and(|s| s.invite_transaction.is_some())
+    }
+
     /// Sends a CANCEL request for a pending INVITE.
     async fn send_cancel(&mut self, call_id: &str) -> SipUaResult<()> {
         let (remote_uri, sip_call_id, cseq, from_tag, to_tag, branch) = {

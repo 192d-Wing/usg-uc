@@ -47,6 +47,14 @@ pub struct IncomingCallInfo {
     pub local_tag: String,
 }
 
+/// SIP dialog identifiers for an active call, used for re-INVITE detection.
+struct ActiveCallDialog {
+    sip_call_id: String,
+    local_tag: String,
+    #[allow(dead_code)]
+    remote_addr: SocketAddr,
+}
+
 /// Call manager coordinates calls between SIP UA and media sessions.
 pub struct CallManager {
     /// SIP call agent.
@@ -101,6 +109,8 @@ pub struct CallManager {
     negotiated_extension_ids: HashMap<String, Vec<(u8, String)>>,
     /// Effective local media address per call (what was advertised in SDP).
     effective_media_addrs: HashMap<String, SocketAddr>,
+    /// SIP dialog identifiers for active calls (for re-INVITE detection).
+    active_call_dialogs: HashMap<String, ActiveCallDialog>,
     /// SDP session ID per call (RFC 8866 - must remain constant for session).
     sdp_session_ids: HashMap<String, u64>,
     /// SDP session version per call (RFC 8866 - increments on modifications).
@@ -252,6 +262,7 @@ impl CallManager {
             redundancy_pt: HashMap::new(),
             negotiated_extension_ids: HashMap::new(),
             effective_media_addrs: HashMap::new(),
+            active_call_dialogs: HashMap::new(),
             sdp_session_ids: HashMap::new(),
             sdp_session_versions: HashMap::new(),
             selected_input_device: None,
@@ -442,6 +453,22 @@ impl CallManager {
         self.sdp_session_versions
             .insert(call_id.clone(), sdp_session_version);
 
+        // Track SIP dialog identifiers for re-INVITE detection.
+        // remote_addr is unknown until a response arrives; use unspecified placeholder.
+        if let (Some(sip_call_id), Some(local_tag)) = (
+            self.call_agent.get_sip_call_id(&call_id),
+            self.call_agent.get_local_tag(&call_id),
+        ) {
+            self.active_call_dialogs.insert(
+                call_id.clone(),
+                ActiveCallDialog {
+                    sip_call_id,
+                    local_tag,
+                    remote_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+                },
+            );
+        }
+
         // Store media session and track the call
         self.media_sessions.insert(call_id.clone(), media_session);
         self.active_calls.push(call_id.clone());
@@ -515,8 +542,9 @@ impl CallManager {
             let _ = session.close().await;
         }
 
-        // Clean up negotiated codec
+        // Clean up negotiated codec and dialog tracking
         self.negotiated_codecs.remove(call_id);
+        self.active_call_dialogs.remove(call_id);
 
         // Record in call history
         if let Some(info) = call_info {
@@ -641,8 +669,32 @@ impl CallManager {
 
         match method {
             "INVITE" => {
-                // Incoming call
-                self.handle_incoming_invite_from(request, source).await?;
+                // Check if this is a mid-dialog re-INVITE by matching Call-ID + To-tag
+                let sip_call_id = request
+                    .headers
+                    .get_value(&HeaderName::CallId)
+                    .map(std::string::ToString::to_string);
+                let to_tag = request.headers.to_tag();
+
+                let reinvite_match = sip_call_id
+                    .as_ref()
+                    .and_then(|id| self.find_active_call_by_sip_call_id(id))
+                    .and_then(|(call_id, dialog)| {
+                        // A re-INVITE has a To-tag matching our local_tag for the dialog.
+                        // Initial INVITEs have no To-tag.
+                        if to_tag.as_ref().is_some_and(|t| t == &dialog.local_tag) {
+                            Some((call_id, dialog.local_tag.clone()))
+                        } else {
+                            None
+                        }
+                    });
+
+                if let Some((call_id, local_tag)) = reinvite_match {
+                    self.handle_incoming_reinvite(request, source, &call_id, &local_tag)
+                        .await?;
+                } else {
+                    self.handle_incoming_invite_from(request, source).await?;
+                }
             }
             "BYE" => {
                 // Remote party hanging up
@@ -679,6 +731,227 @@ impl CallManager {
             .iter()
             .find(|(_, info)| info.sip_call_id == sip_call_id)
             .map(|(_, info)| info.call_id.clone())
+    }
+
+    /// Finds an active call by its SIP Call-ID in the dialog tracking map.
+    ///
+    /// Returns `(app_call_id, dialog)` if found.
+    fn find_active_call_by_sip_call_id(
+        &self,
+        sip_call_id: &str,
+    ) -> Option<(String, &ActiveCallDialog)> {
+        self.active_call_dialogs
+            .iter()
+            .find(|(_, d)| d.sip_call_id == sip_call_id)
+            .map(|(id, d)| (id.clone(), d))
+    }
+
+    /// Handles an incoming mid-dialog re-INVITE (e.g. session timer refresh, hold).
+    ///
+    /// Unlike an initial INVITE, a re-INVITE targets an existing dialog identified
+    /// by matching SIP Call-ID + To-tag. We respond 200 OK with SDP answer rather
+    /// than ringing the phone.
+    #[allow(clippy::too_many_lines)]
+    async fn handle_incoming_reinvite(
+        &mut self,
+        request: &SipRequest,
+        source: SocketAddr,
+        call_id: &str,
+        local_tag: &str,
+    ) -> AppResult<()> {
+        use crate::sip_transport::build_response_from_request;
+
+        info!(
+            call_id = %call_id,
+            source = %source,
+            "Received incoming re-INVITE for active call"
+        );
+
+        // Glare check: if we have a pending outbound INVITE transaction on this
+        // call (e.g. our own hold/resume re-INVITE), respond 491 Request Pending.
+        if self.call_agent.has_pending_invite_transaction(call_id) {
+            warn!(call_id = %call_id, "Glare detected — pending INVITE transaction, responding 491");
+            let response = build_response_from_request(
+                request,
+                StatusCode::REQUEST_PENDING,
+                Some(local_tag),
+            );
+            let _ = self
+                .app_event_tx
+                .send(CallManagerEvent::SendResponse {
+                    response,
+                    destination: source,
+                })
+                .await;
+            return Ok(());
+        }
+
+        // Parse remote SDP from body
+        let remote_sdp = request
+            .body
+            .as_ref()
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .unwrap_or("");
+
+        // Parse media direction from remote SDP
+        let remote_direction = parse_media_direction(remote_sdp);
+
+        // Track whether we need to restart audio (codec or remote addr changed)
+        let mut audio_restart_needed = false;
+
+        // Re-negotiate codec if SDP is present
+        if !remote_sdp.is_empty() {
+            if let Some(codec) = negotiate_codec_from_sdp_offer(remote_sdp, self.preferred_codec) {
+                let previous_codec = self.negotiated_codecs.get(call_id).copied();
+                info!(call_id = %call_id, codec = ?codec, "Re-negotiated codec from re-INVITE SDP");
+                self.negotiated_codecs.insert(call_id.to_string(), codec);
+
+                // Flag audio restart if codec actually changed
+                if let Some(prev) = previous_codec
+                    && prev != codec
+                    && self.audio_sessions.contains_key(call_id)
+                {
+                    info!(
+                        call_id = %call_id,
+                        from = ?prev,
+                        to = ?codec,
+                        "Codec changed in re-INVITE"
+                    );
+                    audio_restart_needed = true;
+                }
+            }
+
+            // Update DTMF and redundancy PTs
+            let dtmf_pt = parse_telephone_event_pt(remote_sdp);
+            self.telephone_event_pt.insert(call_id.to_string(), dtmf_pt);
+            let red_pt = parse_redundancy_pt(remote_sdp);
+            self.redundancy_pt.insert(call_id.to_string(), red_pt);
+            let ext_ids = parse_extmap_attributes(remote_sdp);
+            self.negotiated_extension_ids
+                .insert(call_id.to_string(), ext_ids);
+
+            // Update remote media address if changed
+            if let Some(new_remote_addr) = parse_remote_media_addr_from_sdp(remote_sdp)
+                && let Some(session) = self.media_sessions.get_mut(call_id)
+            {
+                let old_addr = session.remote_addr();
+                if old_addr != Some(new_remote_addr) {
+                    info!(
+                        call_id = %call_id,
+                        old = ?old_addr,
+                        new = %new_remote_addr,
+                        "Remote media address changed in re-INVITE"
+                    );
+                    session.set_remote_addr(new_remote_addr);
+                    // Must restart audio to pick up the new destination
+                    if self.audio_sessions.contains_key(call_id) {
+                        audio_restart_needed = true;
+                    }
+                }
+            }
+        }
+
+        // Restart audio session if codec or remote address changed
+        if audio_restart_needed {
+            info!(call_id = %call_id, "Restarting audio session for re-INVITE parameter change");
+            let _ = self.stop_audio_session(call_id).await;
+            if let Some(addr) = self
+                .media_sessions
+                .get(call_id)
+                .and_then(MediaSession::remote_addr)
+            {
+                let _ = self.start_audio_session(call_id, addr).await;
+            }
+        }
+
+        // Compute reciprocal direction for our SDP answer
+        let our_direction = match remote_direction {
+            "sendonly" => "recvonly",
+            "recvonly" => "sendonly",
+            "inactive" => "inactive",
+            _ => "sendrecv",
+        };
+
+        // Log hold/resume events
+        match remote_direction {
+            "sendonly" | "inactive" => {
+                info!(call_id = %call_id, direction = %remote_direction, "Remote party placed call on hold");
+            }
+            "sendrecv" => {
+                debug!(call_id = %call_id, "Re-INVITE with sendrecv (session refresh or resume)");
+            }
+            _ => {}
+        }
+
+        // Generate SDP answer with reciprocal direction
+        let sdp_answer = self.generate_sdp_with_direction(call_id, our_direction)?;
+
+        let account = self
+            .account
+            .as_ref()
+            .ok_or_else(|| AppError::Sip("No account configured".to_string()))?;
+
+        // Build 200 OK with SDP body
+        let mut ok_response =
+            build_response_from_request(request, StatusCode::OK, Some(local_tag));
+
+        // Add Contact header
+        let username =
+            extract_username_from_sip_uri(&account.sip_uri).unwrap_or_else(|| account.id.clone());
+        ok_response.add_header(proto_sip::header::Header::new(
+            proto_sip::header::HeaderName::Contact,
+            format!("<sip:{username}@{ip}>", ip = self.local_media_addr.ip()),
+        ));
+
+        // Echo Session-Expires from request (RFC 4028 §7.2) so the session
+        // timer is properly refreshed. Without this, the B2BUA (BulkVS) may
+        // consider the refresh failed and stall media for up to Timer C (3 min).
+        if let Some(se) = request
+            .headers
+            .get_value(&HeaderName::SessionExpires)
+        {
+            let se_value = se.to_string();
+            info!(call_id = %call_id, session_expires = %se_value, "Echoing Session-Expires in 200 OK");
+            ok_response.add_header(proto_sip::header::Header::new(
+                HeaderName::SessionExpires,
+                se_value,
+            ));
+            // Indicate timer extension support
+            ok_response.add_header(proto_sip::header::Header::new(
+                HeaderName::Supported,
+                "timer",
+            ));
+        }
+        // Echo Min-SE if present (RFC 4028 §5)
+        if let Some(min_se) = request.headers.get_value(&HeaderName::MinSe) {
+            ok_response.add_header(proto_sip::header::Header::new(
+                HeaderName::MinSe,
+                min_se.to_string(),
+            ));
+        }
+
+        // Add Content-Type and body
+        ok_response.add_header(proto_sip::header::Header::new(
+            proto_sip::header::HeaderName::ContentType,
+            "application/sdp",
+        ));
+        ok_response.add_header(proto_sip::header::Header::new(
+            proto_sip::header::HeaderName::ContentLength,
+            sdp_answer.len().to_string(),
+        ));
+        ok_response = ok_response.with_body(sdp_answer);
+
+        // Send 200 OK
+        let _ = self
+            .app_event_tx
+            .send(CallManagerEvent::SendResponse {
+                response: ok_response,
+                destination: source,
+            })
+            .await;
+
+        info!(call_id = %call_id, "Sent 200 OK for re-INVITE");
+        Ok(())
     }
 
     /// Handles an incoming INVITE request.
@@ -866,8 +1139,21 @@ impl CallManager {
                 .insert(call_id.to_string(), ext_ids);
         }
 
-        // Generate SDP answer
-        let sdp_answer = self.generate_sdp_offer(call_id, &media_session, &account)?;
+        // Discover and store the effective media address for this inbound call
+        let effective_media_addr = self.get_effective_media_addr()?;
+        self.effective_media_addrs
+            .insert(call_id.to_string(), effective_media_addr);
+
+        // Generate SDP answer using the stored address
+        let sdp_session_id = self.get_or_create_sdp_session_id(call_id);
+        let sdp_session_version = self.get_sdp_session_version(call_id);
+        let sdp_answer = self.generate_sdp_offer_with_addr(
+            &media_session,
+            &account,
+            effective_media_addr,
+            sdp_session_id,
+            sdp_session_version,
+        );
 
         // Build 200 OK with SDP body
         let mut ok_response = build_response_from_request(
@@ -921,6 +1207,16 @@ impl CallManager {
             .insert(call_id.to_string(), media_session);
         self.active_calls.push(call_id.to_string());
         self.focused_call_id = Some(call_id.to_string());
+
+        // Track SIP dialog identifiers for re-INVITE detection
+        self.active_call_dialogs.insert(
+            call_id.to_string(),
+            ActiveCallDialog {
+                sip_call_id: incoming.sip_call_id,
+                local_tag: incoming.local_tag,
+                remote_addr: incoming.source_addr,
+            },
+        );
 
         // Notify application of state change
         let info = CallInfo {
@@ -1041,7 +1337,10 @@ impl CallManager {
             error!(error = %e, "Failed to queue 200 OK response for BYE");
         }
 
-        if let Some(call_id) = self.find_call_by_sip_id(&sip_call_id) {
+        if let Some(call_id) = self
+            .find_call_by_sip_id(&sip_call_id)
+            .or_else(|| self.find_active_call_by_sip_call_id(&sip_call_id).map(|(id, _)| id))
+        {
             info!(call_id = %call_id, sip_call_id = %sip_call_id, "Remote party sent BYE, terminating call");
             // Mark the call as terminated - the remote party hung up
             self.handle_state_changed(&call_id, CallState::Terminated, None)
@@ -1079,7 +1378,10 @@ impl CallManager {
             })
             .await;
 
-        if let Some(call_id) = self.find_call_by_sip_id(&sip_call_id) {
+        if let Some(call_id) = self
+            .find_call_by_sip_id(&sip_call_id)
+            .or_else(|| self.find_active_call_by_sip_call_id(&sip_call_id).map(|(id, _)| id))
+        {
             info!(call_id = %call_id, sip_call_id = %sip_call_id, "Remote party sent CANCEL, terminating call");
             // Mark the call as terminated - the remote party cancelled
             self.handle_state_changed(&call_id, CallState::Terminated, None)
@@ -1842,9 +2144,10 @@ impl CallManager {
                     let _ = session.close().await;
                 }
 
-                // Clean up negotiated codec and effective media address
+                // Clean up negotiated codec, effective media address, and dialog tracking
                 self.negotiated_codecs.remove(call_id);
                 self.effective_media_addrs.remove(call_id);
+                self.active_call_dialogs.remove(call_id);
 
                 // Record in call history
                 let end_reason = call_info
@@ -2101,6 +2404,7 @@ impl CallManager {
             .insert(call_id.to_string(), version + 1);
     }
 
+    #[allow(dead_code)]
     fn generate_sdp_offer(
         &mut self,
         call_id: &str,
@@ -2395,8 +2699,13 @@ impl CallManager {
 
         let ssrc = session.local_ssrc();
 
-        // Discover actual local IP if configured with 0.0.0.0
-        let effective_media_addr = self.get_effective_media_addr()?;
+        // Prefer the stored media address (from initial SDP) so re-INVITEs
+        // and hold/resume advertise the same port as the active RTP session.
+        let effective_media_addr = self
+            .effective_media_addrs
+            .get(call_id)
+            .copied()
+            .map_or_else(|| self.get_effective_media_addr(), Ok)?;
 
         // Check if we're using TLS/secure transport
         let use_srtp = matches!(
@@ -2953,6 +3262,24 @@ fn parse_remote_media_addr_from_sdp(sdp: &str) -> Option<SocketAddr> {
         (Some(ip), Some(port)) if port > 0 => Some(SocketAddr::new(ip, port)),
         _ => None,
     }
+}
+
+/// Extracts the media direction attribute from SDP.
+///
+/// Looks for `a=sendrecv`, `a=sendonly`, `a=recvonly`, or `a=inactive`.
+/// Defaults to `"sendrecv"` per RFC 3264 Section 5 if no direction attribute is present.
+fn parse_media_direction(sdp: &str) -> &'static str {
+    for line in sdp.lines() {
+        let trimmed = line.trim();
+        match trimmed {
+            "a=sendonly" => return "sendonly",
+            "a=recvonly" => return "recvonly",
+            "a=sendrecv" => return "sendrecv",
+            "a=inactive" => return "inactive",
+            _ => {}
+        }
+    }
+    "sendrecv"
 }
 
 /// Generates a unique session ID for SDP per RFC 8866 Section 5.2.
