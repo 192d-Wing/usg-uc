@@ -44,6 +44,9 @@ proto-ice.workspace = true
 uc-api.workspace = true
 uc-dos-protection.workspace = true
 uc-routing.workspace = true
+uc-user-mgmt.workspace = true
+uc-phone-mgmt.workspace = true
+uuid = { version = "1", features = ["v4"] }
 
 # Clustering dependencies (optional)
 uc-cluster = { workspace = true, optional = true }

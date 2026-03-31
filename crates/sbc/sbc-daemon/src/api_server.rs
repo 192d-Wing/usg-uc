@@ -106,6 +106,12 @@ pub struct AppState {
     pub ready: AtomicU64,
     /// SIP stack for call/registration queries.
     pub sip_stack: Option<Arc<crate::sip_stack::SipStack>>,
+    /// User store for user management.
+    pub user_store: Option<Arc<uc_user_mgmt::sqlite::SqliteUserStore>>,
+    /// Phone provisioning server.
+    pub provisioning: Option<Arc<uc_phone_mgmt::provisioning::ProvisioningServer>>,
+    /// CUCM router for CSS/partition-based routing.
+    pub cucm_router: Option<Arc<tokio::sync::RwLock<uc_routing::CucmRouter>>>,
     /// TLS acceptor for certificate hot-reload (if TLS is enabled).
     pub tls_acceptor: Option<Arc<ReloadableTlsAcceptor>>,
     /// Cluster health check function (when cluster feature is enabled).
@@ -130,6 +136,9 @@ impl AppState {
             start_time: Instant::now(),
             ready: AtomicU64::new(1), // Start as ready
             sip_stack: None,
+            user_store: None,
+            provisioning: None,
+            cucm_router: None,
             tls_acceptor: None,
             #[cfg(feature = "cluster")]
             cluster_health_fn: None,
@@ -149,6 +158,9 @@ impl AppState {
             start_time: Instant::now(),
             ready: AtomicU64::new(1),
             sip_stack: None,
+            user_store: None,
+            provisioning: None,
+            cucm_router: None,
             tls_acceptor: Some(tls_acceptor),
             #[cfg(feature = "cluster")]
             cluster_health_fn: None,
@@ -329,7 +341,36 @@ impl ApiServer {
             .route("/trunkgroups/{group_id}", get(get_trunk_group))
             .route("/trunkgroups/{group_id}", delete(delete_trunk_group))
             .route("/trunkgroups/{group_id}/trunks", post(add_trunk))
-            .route("/trunkgroups/{group_id}/trunks/{trunk_id}", delete(delete_trunk));
+            .route("/trunkgroups/{group_id}/trunks/{trunk_id}", delete(delete_trunk))
+            // User management
+            .route("/users", get(list_users))
+            .route("/users", post(create_user))
+            .route("/users/{id}", get(get_user))
+            .route("/users/{id}", delete(delete_user))
+            // Phone management
+            .route("/phones", get(list_phones))
+            .route("/phones", post(create_phone))
+            .route("/phones/{id}", get(get_phone))
+            .route("/phones/{id}", delete(delete_phone))
+            // CUCM routing
+            .route("/partitions", get(list_partitions))
+            .route("/partitions", post(create_partition))
+            .route("/partitions/{id}", delete(delete_partition))
+            .route("/css", get(list_css))
+            .route("/css", post(create_css))
+            .route("/css/{id}", delete(delete_css))
+            .route("/routepatterns", get(list_route_patterns))
+            .route("/routepatterns", post(create_route_pattern))
+            .route("/routepatterns/{id}", delete(delete_route_pattern))
+            .route("/routelists", get(list_route_lists))
+            .route("/routelists", post(create_route_list))
+            .route("/routelists/{id}", delete(delete_route_list));
+
+        // Provisioning routes (outside API prefix)
+        // Use a catch-all under /provision/ since Axum doesn't allow {param}.ext
+        let provision_routes = Router::new()
+            .route("/provision/{*path}", get(serve_phone_config))
+            .with_state(Arc::clone(&self.state));
 
         Router::new()
             // Health probes (no prefix)
@@ -337,6 +378,8 @@ impl ApiServer {
             .route("/readyz", get(readiness_probe))
             // API v1 routes
             .nest(&format!("/api/{}", self.config.api_version), api_routes)
+            // Phone provisioning routes
+            .merge(provision_routes)
             // Dashboard static files (Angular app)
             .fallback(serve_dashboard)
             // Add state
@@ -923,6 +966,334 @@ async fn delete_trunk(
         "group_id": group_id,
         "trunk_id": trunk_id
     }))
+}
+
+// ============================================================================
+// User Management Routes
+use uc_user_mgmt::store::UserStore; // Import trait for method dispatch
+// ============================================================================
+
+async fn list_users(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(ref store) = state.user_store {
+        let filter = uc_user_mgmt::model::UserFilter::default();
+        match store.list_users(&filter).await {
+            Ok(users) => Json(serde_json::json!({ "users": users, "total": users.len() })),
+            Err(e) => Json(serde_json::json!({ "users": [], "error": e.to_string() })),
+        }
+    } else {
+        Json(serde_json::json!({ "users": [], "total": 0 }))
+    }
+}
+
+async fn create_user(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Some(ref store) = state.user_store {
+        let user = uc_user_mgmt::model::User {
+            id: uuid::Uuid::new_v4().to_string(),
+            username: body.get("username").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            display_name: body.get("display_name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            email: body.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            sip_uri: body.get("sip_uri").and_then(|v| v.as_str()).unwrap_or_else(|| {
+                body.get("username").and_then(|v| v.as_str()).unwrap_or("")
+            }).to_string(),
+            auth_type: uc_user_mgmt::model::AuthType::Digest,
+            digest_ha1: None,
+            certificate_dn: body.get("certificate_dn").and_then(|v| v.as_str()).map(String::from),
+            certificate_san: None,
+            calling_search_space: body.get("calling_search_space").and_then(|v| v.as_str()).map(String::from),
+            device_ids: Vec::new(),
+            partition: None,
+            enabled: true,
+            created_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
+            updated_at: 0,
+            last_login: None,
+            metadata: std::collections::HashMap::new(),
+        };
+        match store.create_user(user.clone()).await {
+            Ok(created) => (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "user": created }))),
+            Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "success": false, "error": e.to_string() }))),
+        }
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "success": false, "error": "User store not configured" })))
+    }
+}
+
+async fn get_user(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Some(ref store) = state.user_store {
+        match store.get_user(&id).await {
+            Ok(user) => Json(serde_json::json!(user)),
+            Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
+        }
+    } else {
+        Json(serde_json::json!({ "error": "User store not configured" }))
+    }
+}
+
+async fn delete_user(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Some(ref store) = state.user_store {
+        match store.delete_user(&id).await {
+            Ok(()) => Json(serde_json::json!({ "success": true })),
+            Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+        }
+    } else {
+        Json(serde_json::json!({ "success": false, "error": "User store not configured" }))
+    }
+}
+
+// ============================================================================
+// Phone Management Routes
+// ============================================================================
+
+async fn list_phones(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(serde_json::json!({ "phones": [], "total": 0 }))
+}
+
+async fn create_phone(
+    State(_state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "phone": body })))
+}
+
+async fn get_phone(
+    State(_state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    Json(serde_json::json!({ "error": format!("Phone {id} not found") }))
+}
+
+async fn delete_phone(
+    State(_state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    Json(serde_json::json!({ "success": true, "id": id }))
+}
+
+// ============================================================================
+// Phone Provisioning Routes
+// ============================================================================
+
+async fn serve_phone_config(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    // Extract MAC from path like "001122334455.cfg" or "001122334455-edge.cfg"
+    let filename = path.split('/').last().unwrap_or(&path);
+    let mac_clean = filename.split('.').next().unwrap_or(filename)
+        .split('-').next().unwrap_or(filename)
+        .replace(':', "");
+
+    if let Some(ref prov) = state.provisioning {
+        // Look up phone by MAC and generate config
+        let phone = uc_phone_mgmt::model::Phone::new(
+            &mac_clean,
+            uc_phone_mgmt::model::PhoneModel::Generic("auto".to_string()),
+            &format!("Phone-{mac_clean}"),
+        );
+        match prov.generate_config(&phone) {
+            Ok(config) => Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/xml")
+                .body(config)
+                .unwrap_or_default(),
+            Err(_) => Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body("Phone not found".to_string())
+                .unwrap_or_default(),
+        }
+    } else {
+        Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body("Provisioning not configured".to_string())
+            .unwrap_or_default()
+    }
+}
+
+// ============================================================================
+// CUCM Routing Routes (Partitions, CSS, Route Patterns, Route Lists)
+// ============================================================================
+
+async fn list_partitions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(ref router) = state.cucm_router {
+        let r = router.read().await;
+        let partitions: Vec<_> = r.list_partitions().iter().map(|p| {
+            serde_json::json!({ "id": p.id(), "name": p.name(), "description": p.description() })
+        }).collect();
+        Json(serde_json::json!({ "partitions": partitions }))
+    } else {
+        Json(serde_json::json!({ "partitions": [] }))
+    }
+}
+
+async fn create_partition(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Some(ref router) = state.cucm_router {
+        let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
+        let desc = body.get("description").and_then(|v| v.as_str()).map(String::from);
+        let mut partition = uc_routing::Partition::new(&id, &name);
+        if let Some(d) = desc {
+            partition = partition.with_description(d);
+        }
+        router.write().await.add_partition(partition);
+        (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "id": id })))
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "success": false })))
+    }
+}
+
+async fn delete_partition(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Some(ref router) = state.cucm_router {
+        router.write().await.remove_partition(&id);
+        Json(serde_json::json!({ "success": true, "id": id }))
+    } else {
+        Json(serde_json::json!({ "success": false }))
+    }
+}
+
+async fn list_css(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(ref router) = state.cucm_router {
+        let r = router.read().await;
+        let css_list: Vec<_> = r.list_css().iter().map(|c| {
+            serde_json::json!({
+                "id": c.id(), "name": c.name(),
+                "partitions": c.partitions(), "partition_count": c.partition_count()
+            })
+        }).collect();
+        Json(serde_json::json!({ "calling_search_spaces": css_list }))
+    } else {
+        Json(serde_json::json!({ "calling_search_spaces": [] }))
+    }
+}
+
+async fn create_css(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Some(ref router) = state.cucm_router {
+        let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
+        let partitions: Vec<String> = body.get("partitions")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let mut css = uc_routing::CallingSearchSpace::new(&id, &name);
+        for p in &partitions {
+            css.add_partition(p);
+        }
+        router.write().await.add_css(css);
+        (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "id": id })))
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "success": false })))
+    }
+}
+
+async fn delete_css(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Some(ref router) = state.cucm_router {
+        router.write().await.remove_css(&id);
+        Json(serde_json::json!({ "success": true, "id": id }))
+    } else {
+        Json(serde_json::json!({ "success": false }))
+    }
+}
+
+async fn list_route_patterns(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(ref router) = state.cucm_router {
+        let r = router.read().await;
+        let patterns: Vec<_> = r.list_route_patterns().iter().map(|p| {
+            serde_json::json!({
+                "id": p.id(), "partition_id": p.partition_id(),
+                "priority": p.priority(), "blocked": p.is_blocked()
+            })
+        }).collect();
+        Json(serde_json::json!({ "route_patterns": patterns }))
+    } else {
+        Json(serde_json::json!({ "route_patterns": [] }))
+    }
+}
+
+async fn create_route_pattern(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Some(ref router) = state.cucm_router {
+        let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let partition = body.get("partition_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let pattern_value = body.get("pattern").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let pattern = uc_routing::DialPattern::prefix(&pattern_value);
+        let rp = uc_routing::RoutePattern::new(&id, pattern, &partition);
+        router.write().await.add_route_pattern(rp);
+        (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "id": id })))
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "success": false })))
+    }
+}
+
+async fn delete_route_pattern(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Some(ref router) = state.cucm_router {
+        router.write().await.remove_route_pattern(&id);
+        Json(serde_json::json!({ "success": true, "id": id }))
+    } else {
+        Json(serde_json::json!({ "success": false }))
+    }
+}
+
+async fn list_route_lists(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(ref router) = state.cucm_router {
+        let r = router.read().await;
+        let lists: Vec<_> = r.list_route_lists().iter().map(|l| {
+            serde_json::json!({ "id": l.id(), "name": l.name(), "member_count": l.member_count() })
+        }).collect();
+        Json(serde_json::json!({ "route_lists": lists }))
+    } else {
+        Json(serde_json::json!({ "route_lists": [] }))
+    }
+}
+
+async fn create_route_list(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Some(ref router) = state.cucm_router {
+        let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
+        let rl = uc_routing::RouteList::new(&id, &name);
+        router.write().await.add_route_list(rl);
+        (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "id": id })))
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "success": false })))
+    }
+}
+
+async fn delete_route_list(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Some(ref router) = state.cucm_router {
+        router.write().await.remove_route_list(&id);
+        Json(serde_json::json!({ "success": true, "id": id }))
+    } else {
+        Json(serde_json::json!({ "success": false }))
+    }
 }
 
 // ============================================================================

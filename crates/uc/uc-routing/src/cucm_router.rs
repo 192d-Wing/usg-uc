@@ -139,6 +139,11 @@ impl CucmRouter {
 
     // ---- Route List CRUD ----
 
+    /// Lists all route lists.
+    pub fn list_route_lists(&self) -> Vec<&RouteList> {
+        self.route_lists.values().collect()
+    }
+
     /// Adds a route list.
     pub fn add_route_list(&mut self, list: RouteList) {
         self.route_lists.insert(list.id().to_string(), list);
