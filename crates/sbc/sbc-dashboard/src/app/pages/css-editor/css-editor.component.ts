@@ -48,6 +48,10 @@ import { CssDialogComponent } from './css-dialog.component';
               </div>
             </mat-card-content>
             <mat-card-actions align="end">
+              <button mat-icon-button (click)="editCss(css)"
+                      matTooltip="Edit CSS">
+                <mat-icon>edit</mat-icon>
+              </button>
               <button mat-icon-button color="warn" (click)="deleteCss(css.id)"
                       matTooltip="Delete CSS">
                 <mat-icon>delete</mat-icon>
@@ -141,6 +145,18 @@ export class CssEditorComponent implements OnInit {
     ref.afterClosed().subscribe((result: any) => {
       if (result) {
         this.api.createCss(result).subscribe({
+          next: () => this.loadCss(),
+          error: () => {},
+        });
+      }
+    });
+  }
+
+  editCss(css: any): void {
+    const ref = this.dialog.open(CssDialogComponent, { data: css });
+    ref.afterClosed().subscribe((result: any) => {
+      if (result) {
+        this.api.updateCss(css.id, result).subscribe({
           next: () => this.loadCss(),
           error: () => {},
         });

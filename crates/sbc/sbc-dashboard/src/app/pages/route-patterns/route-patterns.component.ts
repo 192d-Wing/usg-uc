@@ -64,6 +64,10 @@ import { RoutePatternDialogComponent } from './route-pattern-dialog.component';
             <ng-container matColumnDef="actions">
               <th mat-header-cell *matHeaderCellDef>Actions</th>
               <td mat-cell *matCellDef="let row">
+                <button mat-icon-button (click)="editPattern(row)"
+                        matTooltip="Edit Route Pattern">
+                  <mat-icon>edit</mat-icon>
+                </button>
                 <button mat-icon-button color="warn" (click)="deletePattern(row.id)"
                         matTooltip="Delete Route Pattern">
                   <mat-icon>delete</mat-icon>
@@ -129,6 +133,18 @@ export class RoutePatternsComponent implements OnInit {
     ref.afterClosed().subscribe((result: any) => {
       if (result) {
         this.api.createRoutePattern(result).subscribe({
+          next: () => this.loadPatterns(),
+          error: () => {},
+        });
+      }
+    });
+  }
+
+  editPattern(row: any): void {
+    const ref = this.dialog.open(RoutePatternDialogComponent, { data: row });
+    ref.afterClosed().subscribe((result: any) => {
+      if (result) {
+        this.api.updateRoutePattern(result.id, result).subscribe({
           next: () => this.loadPatterns(),
           error: () => {},
         });

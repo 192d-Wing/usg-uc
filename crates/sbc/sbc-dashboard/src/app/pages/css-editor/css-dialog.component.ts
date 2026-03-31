@@ -1,6 +1,6 @@
 import { Component, inject, OnInit, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
-import { MatDialogModule, MatDialogRef } from '@angular/material/dialog';
+import { MAT_DIALOG_DATA, MatDialogModule, MatDialogRef } from '@angular/material/dialog';
 import { MatFormFieldModule } from '@angular/material/form-field';
 import { MatInputModule } from '@angular/material/input';
 import { MatSelectModule } from '@angular/material/select';
@@ -15,18 +15,18 @@ import { ApiService } from '../../services/api.service';
     MatInputModule, MatSelectModule, MatButtonModule,
   ],
   template: `
-    <h2 mat-dialog-title>Add Calling Search Space</h2>
+    <h2 mat-dialog-title>{{ isEdit ? 'Edit' : 'Add' }} Calling Search Space</h2>
     <mat-dialog-content>
       <mat-form-field appearance="outline" class="full-width">
         <mat-label>Name</mat-label>
-        <input matInput [(ngModel)]="css.name" required />
+        <input matInput [(ngModel)]="css.name" required [readonly]="isEdit" />
       </mat-form-field>
 
       <mat-form-field appearance="outline" class="full-width">
         <mat-label>Partitions</mat-label>
         <mat-select [(ngModel)]="css.partitions" multiple>
           @for (p of availablePartitions(); track p.id) {
-            <mat-option [value]="p.name">{{ p.name }}</mat-option>
+            <mat-option [value]="p.id">{{ p.name || p.id }}</mat-option>
           }
         </mat-select>
       </mat-form-field>
@@ -35,7 +35,7 @@ import { ApiService } from '../../services/api.service';
       <button mat-button mat-dialog-close>Cancel</button>
       <button mat-raised-button color="primary" [disabled]="!css.name"
               (click)="dialogRef.close(css)">
-        Add
+        {{ isEdit ? 'Save' : 'Add' }}
       </button>
     </mat-dialog-actions>
   `,
@@ -46,7 +46,9 @@ import { ApiService } from '../../services/api.service';
 })
 export class CssDialogComponent implements OnInit {
   private readonly api = inject(ApiService);
+  readonly data: any = inject(MAT_DIALOG_DATA, { optional: true });
 
+  isEdit = false;
   css: any = { name: '', partitions: [] };
   readonly availablePartitions = signal<any[]>([]);
 
@@ -55,7 +57,14 @@ export class CssDialogComponent implements OnInit {
   ngOnInit(): void {
     this.api.getPartitions().subscribe({
       next: (partitions) => this.availablePartitions.set(partitions),
-      error: () => {},
     });
+
+    if (this.data) {
+      this.isEdit = true;
+      this.css = {
+        name: this.data.name || this.data.id,
+        partitions: [...(this.data.partitions || [])],
+      };
+    }
   }
 }

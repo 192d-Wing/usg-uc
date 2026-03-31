@@ -375,10 +375,10 @@ impl ApiServer {
             .route("/partitions/{id}", delete(delete_partition))
             .route("/css", get(list_css))
             .route("/css", post(create_css))
-            .route("/css/{id}", delete(delete_css))
+            .route("/css/{id}", delete(delete_css).put(update_css))
             .route("/routepatterns", get(list_route_patterns))
             .route("/routepatterns", post(create_route_pattern))
-            .route("/routepatterns/{id}", delete(delete_route_pattern))
+            .route("/routepatterns/{id}", delete(delete_route_pattern).put(update_route_pattern))
             .route("/routelists", get(list_route_lists))
             .route("/routelists", post(create_route_list))
             .route("/routelists/{id}", delete(delete_route_list));
@@ -1276,6 +1276,31 @@ async fn delete_css(
     }
 }
 
+/// Update a CSS (replace partitions).
+async fn update_css(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Some(ref router) = state.cucm_router {
+        // Remove old, add new
+        router.write().await.remove_css(&id);
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
+        let partitions: Vec<String> = body.get("partitions")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let mut css = uc_routing::CallingSearchSpace::new(&id, &name);
+        for p in &partitions {
+            css.add_partition(p);
+        }
+        router.write().await.add_css(css);
+        Json(serde_json::json!({ "success": true, "id": id }))
+    } else {
+        Json(serde_json::json!({ "success": false }))
+    }
+}
+
 async fn list_route_patterns(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if let Some(ref router) = state.cucm_router {
         let r = router.read().await;
@@ -1314,6 +1339,37 @@ async fn delete_route_pattern(
 ) -> impl IntoResponse {
     if let Some(ref router) = state.cucm_router {
         router.write().await.remove_route_pattern(&id);
+        Json(serde_json::json!({ "success": true, "id": id }))
+    } else {
+        Json(serde_json::json!({ "success": false }))
+    }
+}
+
+/// Update a route pattern (delete + recreate).
+async fn update_route_pattern(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Some(ref router) = state.cucm_router {
+        router.write().await.remove_route_pattern(&id);
+        let partition = body.get("partition_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let pattern_value = body.get("pattern").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let pattern = uc_routing::DialPattern::prefix(&pattern_value);
+        let mut rp = uc_routing::RoutePattern::new(&id, pattern, &partition);
+        if let Some(rl) = body.get("route_list_id").and_then(|v| v.as_str()) {
+            rp = rp.with_route_list(rl);
+        }
+        if let Some(rg) = body.get("route_group_id").and_then(|v| v.as_str()) {
+            rp = rp.with_route_group(rg);
+        }
+        if body.get("blocked").and_then(|v| v.as_bool()).unwrap_or(false) {
+            rp = rp.with_block(true);
+        }
+        if let Some(p) = body.get("priority").and_then(|v| v.as_u64()) {
+            rp = rp.with_priority(p as u32);
+        }
+        router.write().await.add_route_pattern(rp);
         Json(serde_json::json!({ "success": true, "id": id }))
     } else {
         Json(serde_json::json!({ "success": false }))

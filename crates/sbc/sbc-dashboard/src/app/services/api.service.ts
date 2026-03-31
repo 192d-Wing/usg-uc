@@ -191,6 +191,9 @@ export class ApiService {
   deleteCss(id: string): Observable<any> {
     return this.http.delete(`${this.baseUrl}/css/${encodeURIComponent(id)}`);
   }
+  updateCss(id: string, css: any): Observable<any> {
+    return this.http.put(`${this.baseUrl}/css/${encodeURIComponent(id)}`, css);
+  }
 
   // Route Patterns
   getRoutePatterns(): Observable<any[]> {
@@ -198,6 +201,9 @@ export class ApiService {
   }
   createRoutePattern(rp: any): Observable<any> {
     return this.http.post(`${this.baseUrl}/routepatterns`, rp);
+  }
+  updateRoutePattern(id: string, rp: any): Observable<any> {
+    return this.http.put(`${this.baseUrl}/routepatterns/${encodeURIComponent(id)}`, rp);
   }
   deleteRoutePattern(id: string): Observable<any> {
     return this.http.delete(`${this.baseUrl}/routepatterns/${encodeURIComponent(id)}`);
