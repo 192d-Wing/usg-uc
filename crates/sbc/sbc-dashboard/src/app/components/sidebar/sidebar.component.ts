@@ -12,22 +12,8 @@ import { MatIconModule } from '@angular/material/icon';
         <mat-icon>home</mat-icon>
         <span>Dashboard</span>
       </a>
-      <a class="usa-sidenav__item" routerLink="/registrations" routerLinkActive="usa-current">
-        <mat-icon>person</mat-icon>
-        <span>Registrations</span>
-      </a>
-      <a class="usa-sidenav__item" routerLink="/directory" routerLinkActive="usa-current">
-        <mat-icon>dialpad</mat-icon>
-        <span>Directory Numbers</span>
-      </a>
-      <a class="usa-sidenav__item" routerLink="/dialplans" routerLinkActive="usa-current">
-        <mat-icon>rule</mat-icon>
-        <span>Dial Plans</span>
-      </a>
-      <a class="usa-sidenav__item" routerLink="/trunkgroups" routerLinkActive="usa-current">
-        <mat-icon>dns</mat-icon>
-        <span>Trunk Groups</span>
-      </a>
+
+      <div class="nav-section-label">User & Device Management</div>
       <a class="usa-sidenav__item" routerLink="/users" routerLinkActive="usa-current">
         <mat-icon>people</mat-icon>
         <span>Users</span>
@@ -36,6 +22,16 @@ import { MatIconModule } from '@angular/material/icon';
         <mat-icon>phone_android</mat-icon>
         <span>Phones</span>
       </a>
+      <a class="usa-sidenav__item" routerLink="/registrations" routerLinkActive="usa-current">
+        <mat-icon>how_to_reg</mat-icon>
+        <span>Registrations</span>
+      </a>
+      <a class="usa-sidenav__item" routerLink="/directory" routerLinkActive="usa-current">
+        <mat-icon>dialpad</mat-icon>
+        <span>Directory Numbers</span>
+      </a>
+
+      <div class="nav-section-label">Call Routing</div>
       <a class="usa-sidenav__item" routerLink="/partitions" routerLinkActive="usa-current">
         <mat-icon>folder</mat-icon>
         <span>Partitions</span>
@@ -52,6 +48,12 @@ import { MatIconModule } from '@angular/material/icon';
         <mat-icon>format_list_numbered</mat-icon>
         <span>Route Lists</span>
       </a>
+      <a class="usa-sidenav__item" routerLink="/trunkgroups" routerLinkActive="usa-current">
+        <mat-icon>dns</mat-icon>
+        <span>Route Groups</span>
+      </a>
+
+      <div class="nav-section-label">Monitoring</div>
       <a class="usa-sidenav__item" routerLink="/cdrs" routerLinkActive="usa-current">
         <mat-icon>history</mat-icon>
         <span>CDR Records</span>
@@ -125,6 +127,16 @@ import { MatIconModule } from '@angular/material/icon';
     .usa-sidenav__item.usa-current mat-icon {
       color: var(--uswds-primary-light);
       opacity: 1;
+    }
+
+    .nav-section-label {
+      padding: 16px 16px 4px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: rgba(255, 255, 255, 0.25);
+      user-select: none;
     }
   `],
 })
