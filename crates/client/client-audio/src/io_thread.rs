@@ -404,7 +404,22 @@ fn io_loop(
                 // NOT during inter-digit pause — normal mic audio resumes
                 // between digits (matches pjproject behavior).
                 trace!("Mic suppressed: DTMF tone active");
-            } else if !muted.load(Ordering::Relaxed) {
+            } else if muted.load(Ordering::Relaxed) {
+                // Muted: send silence RTP to keep media path alive.
+                // Without this, far-end SBCs detect "no media" and BYE the call.
+                codec_pcm_buf.fill(0);
+                match codec.encode(&codec_pcm_buf) {
+                    Ok(encoded) => {
+                        if let Err(e) = transmitter.send(encoded) {
+                            trace!("RTP send error (muted silence): {e}");
+                        }
+                    }
+                    Err(e) => {
+                        trace!("Encode error (muted silence): {e}");
+                    }
+                }
+                diag_frames_captured += 1;
+            } else {
                 // Normal capture mode
                 let in_warmup =
                     !config.enable_dtx || dtx_warmup_start.elapsed() < dtx_warmup_duration;

@@ -38,7 +38,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio_rustls::{TlsConnector, client::TlsStream};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Certificate verification mode for TLS connections.
 #[derive(Debug, Clone, Default)]
@@ -207,6 +207,7 @@ pub fn start_udp_receive_thread(
                     match SipMessage::parse(&buf[..n]) {
                         Ok(message) => {
                             debug!(source = %source, "UDP receive thread: parsed SIP message");
+                            trace!(source = %source, "\n{message}");
                             let event = match message {
                                 SipMessage::Request(request) => {
                                     TransportEvent::RequestReceived { request, source }
@@ -286,6 +287,7 @@ pub async fn run_udp_receive_loop(socket: Arc<UdpSocket>, event_tx: mpsc::Sender
                     match SipMessage::parse(&buf[..n]) {
                         Ok(message) => {
                             debug!(source = %source, "Parsed SIP message via UDP");
+                            trace!(source = %source, "\n{message}");
                             let event = match message {
                                 SipMessage::Request(request) => {
                                     debug!(method = %request.method, "Received SIP request via UDP");
@@ -449,7 +451,10 @@ impl TlsConnection {
 
         // Parse the SIP message
         match SipMessage::parse(&message_bytes) {
-            Ok(message) => Ok(Some(message)),
+            Ok(msg) => {
+                trace!(peer = %self.peer_addr, "\n{msg}");
+                Ok(Some(msg))
+            }
             Err(e) => {
                 warn!(error = %e, "Failed to parse SIP message");
                 Err(AppError::Sip(format!("Failed to parse SIP message: {e}")))
@@ -721,6 +726,7 @@ impl SipTransport {
             size = message_bytes.len(),
             "Sending SIP message"
         );
+        trace!(destination = %destination, "\n{message_bytes}");
 
         conn.send(message_bytes.as_bytes()).await?;
         drop(connections);
@@ -761,6 +767,7 @@ impl SipTransport {
             status = response.status.code(),
             "Sending SIP response"
         );
+        trace!(destination = %destination, "\n{message_bytes}");
 
         conn.send(message_bytes.as_bytes()).await?;
         drop(connections);
@@ -856,6 +863,7 @@ impl SipTransport {
             size = message_bytes.len(),
             "Sending SIP message via UDP"
         );
+        trace!(destination = %destination, "\n{message_bytes}");
 
         socket
             .send_to(message_bytes.as_bytes(), destination)
@@ -900,6 +908,7 @@ impl SipTransport {
             status = response.status.code(),
             "Sending SIP response via UDP"
         );
+        trace!(destination = %destination, "\n{message_bytes}");
 
         socket
             .send_to(message_bytes.as_bytes(), destination)

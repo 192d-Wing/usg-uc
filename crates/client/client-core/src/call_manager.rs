@@ -895,12 +895,13 @@ impl CallManager {
         let mut ok_response =
             build_response_from_request(request, StatusCode::OK, Some(local_tag));
 
-        // Add Contact header
+        // Add Contact header with routable IP (not 0.0.0.0)
+        let effective_addr = self.get_effective_media_addr()?;
         let username =
             extract_username_from_sip_uri(&account.sip_uri).unwrap_or_else(|| account.id.clone());
         ok_response.add_header(proto_sip::header::Header::new(
             proto_sip::header::HeaderName::Contact,
-            format!("<sip:{username}@{ip}>", ip = self.local_media_addr.ip()),
+            format!("<sip:{username}@{ip}>", ip = effective_addr.ip()),
         ));
 
         // Echo Session-Expires from request (RFC 4028 §7.2) so the session
@@ -930,15 +931,16 @@ impl CallManager {
             ));
         }
 
-        // Add Content-Type and body
+        // Add Content-Type and body (use set() to replace the Content-Length: 0
+        // that build_response_from_request() added)
         ok_response.add_header(proto_sip::header::Header::new(
             proto_sip::header::HeaderName::ContentType,
             "application/sdp",
         ));
-        ok_response.add_header(proto_sip::header::Header::new(
+        ok_response.headers.set(
             proto_sip::header::HeaderName::ContentLength,
             sdp_answer.len().to_string(),
-        ));
+        );
         ok_response = ok_response.with_body(sdp_answer);
 
         // Send 200 OK
@@ -1162,25 +1164,26 @@ impl CallManager {
             Some(&incoming.local_tag),
         );
 
-        // Add Contact header - extract user from SIP URI
+        // Add Contact header with routable IP (not 0.0.0.0)
+        let effective_addr = self.get_effective_media_addr()?;
         let username =
             extract_username_from_sip_uri(&account.sip_uri).unwrap_or_else(|| account.id.clone());
         ok_response.add_header(proto_sip::header::Header::new(
             proto_sip::header::HeaderName::Contact,
-            format!("<sip:{username}@{ip}>", ip = self.local_media_addr.ip()),
+            format!("<sip:{username}@{ip}>", ip = effective_addr.ip()),
         ));
 
-        // Add Content-Type and body
+        // Add Content-Type and body (use set() to replace the Content-Length: 0
+        // that build_response_from_request() added)
         ok_response.add_header(proto_sip::header::Header::new(
             proto_sip::header::HeaderName::ContentType,
             "application/sdp",
         ));
 
-        // Update Content-Length
-        ok_response.add_header(proto_sip::header::Header::new(
+        ok_response.headers.set(
             proto_sip::header::HeaderName::ContentLength,
             sdp_answer.len().to_string(),
-        ));
+        );
 
         ok_response = ok_response.with_body(sdp_answer);
 
