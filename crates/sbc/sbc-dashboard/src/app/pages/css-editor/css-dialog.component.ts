@@ -41,7 +41,7 @@ import { ApiService } from '../../services/api.service';
   `,
   styles: [`
     .full-width { width: 100%; }
-    mat-dialog-content { display: flex; flex-direction: column; gap: 4px; min-width: 400px; }
+    mat-dialog-content { display: flex; flex-direction: column; gap: 4px; min-width: 400px; padding-top: 8px !important; }
   `],
 })
 export class CssDialogComponent implements OnInit {
