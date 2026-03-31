@@ -68,6 +68,8 @@ pub struct SipStack {
     media_pipeline: Option<Arc<crate::media_pipeline::MediaPipeline>>,
     /// Call router for dial plan matching and trunk selection.
     router: Option<RwLock<Router>>,
+    /// CUCM-compatible router for CSS/Partition-based routing.
+    cucm_router: Option<Arc<RwLock<uc_routing::CucmRouter>>>,
     /// SIP header manipulator for per-trunk/global header rules.
     header_manipulator: Option<HeaderManipulator>,
     /// Topology hider for Via/Contact/Call-ID anonymization.
@@ -251,6 +253,7 @@ impl SipStack {
             sdp_rewriter: SdpRewriter::new(B2buaMode::MediaRelay),
             media_pipeline: None,
             router: None,
+            cucm_router: None,
             header_manipulator: None,
             topology_hider: None,
             registrations_active: AtomicU64::new(0),
@@ -293,6 +296,7 @@ impl SipStack {
             sdp_rewriter: SdpRewriter::new(B2buaMode::MediaRelay),
             media_pipeline: None,
             router: None,
+            cucm_router: None,
             header_manipulator: None,
             topology_hider: None,
             registrations_active: AtomicU64::new(0),
@@ -304,6 +308,11 @@ impl SipStack {
     /// Sets the media pipeline for RTP relay.
     pub fn set_media_pipeline(&mut self, pipeline: Arc<crate::media_pipeline::MediaPipeline>) {
         self.media_pipeline = Some(pipeline);
+    }
+
+    /// Sets the CUCM router for CSS/Partition-based call routing.
+    pub fn set_cucm_router(&mut self, router: Arc<RwLock<uc_routing::CucmRouter>>) {
+        self.cucm_router = Some(router);
     }
 
     /// Initializes the call router from SBC config sections.
@@ -1111,30 +1120,57 @@ impl SipStack {
                 resolve_sip_uri_to_addr(&contact)
             } else {
                 drop(loc);
-                // Not registered — try router if configured
-                if let Some(ref router_lock) = self.router {
-                    let mut router = router_lock.write().await;
-                    match router.route(&dest_user) {
-                        Ok(decision) => {
-                            failover_trunks = decision.failover_trunks;
+                // Not registered — try CUCM router (CSS-based), then dial plan, then direct
+                let mut routed = None;
+
+                // 1. Try CUCM router if configured
+                if routed.is_none() {
+                    if let Some(ref cucm) = self.cucm_router {
+                        let cucm_r = cucm.read().await;
+                        let css_id: Option<&str> = None; // TODO: get from caller's user/device
+                        if let Some(result) = cucm_r.route(&dest_user, css_id) {
                             info!(
-                                trunk = %decision.trunk_id,
-                                trunk_uri = %decision.trunk_uri,
-                                destination = %decision.destination,
-                                failover_count = failover_trunks.len(),
-                                "Routed via dial plan"
+                                pattern = %result.pattern_id,
+                                partition = %result.partition_id,
+                                destination = %result.transformed_number,
+                                "Routed via CUCM CSS/Partition"
                             );
-                            resolve_sip_uri_to_addr(&decision.trunk_uri)
-                        }
-                        Err(e) => {
-                            warn!(dest = %dest_aor, error = %e, "Router failed, trying direct resolution");
-                            resolve_sip_uri_to_addr(&req.uri.to_string())
+                            if let Some(rg_id) = result.route_group_ids.first() {
+                                routed = resolve_sip_uri_to_addr(&format!("sip:{rg_id}"));
+                            }
                         }
                     }
-                } else {
-                    // No router — direct resolution
-                    resolve_sip_uri_to_addr(&req.uri.to_string())
                 }
+
+                // 2. Try dial plan router if configured
+                if routed.is_none() {
+                    if let Some(ref router_lock) = self.router {
+                        let mut router = router_lock.write().await;
+                        match router.route(&dest_user) {
+                            Ok(decision) => {
+                                failover_trunks = decision.failover_trunks;
+                                info!(
+                                    trunk = %decision.trunk_id,
+                                    trunk_uri = %decision.trunk_uri,
+                                    destination = %decision.destination,
+                                    failover_count = failover_trunks.len(),
+                                    "Routed via dial plan"
+                                );
+                                routed = resolve_sip_uri_to_addr(&decision.trunk_uri);
+                            }
+                            Err(e) => {
+                                warn!(dest = %dest_aor, error = %e, "Dial plan routing failed");
+                            }
+                        }
+                    }
+                }
+
+                // 3. Fall back to direct URI resolution
+                if routed.is_none() {
+                    routed = resolve_sip_uri_to_addr(&req.uri.to_string());
+                }
+
+                routed
             }
         };
 
