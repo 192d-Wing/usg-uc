@@ -549,6 +549,14 @@ impl DialPlan {
         self.entries.len()
     }
 
+    /// Returns all entries in priority order.
+    pub fn all_entries(&self) -> Vec<&DialPlanEntry> {
+        self.sorted_ids
+            .iter()
+            .filter_map(|id| self.entries.get(id))
+            .collect()
+    }
+
     /// Matches a number against the dial plan (legacy, user-part only).
     pub fn match_number(&self, number: &str) -> Option<DialPlanResult> {
         for id in &self.sorted_ids {

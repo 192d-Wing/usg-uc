@@ -1739,7 +1739,7 @@ impl SipStack {
     }
 
     /// Lists dial plan entries for a given plan.
-    pub async fn list_dial_plan_entries(&self, plan_id: &str) -> Vec<DialPlanEntrySummary> {
+    pub async fn list_dial_plan_entries(&self, plan_id: &str) -> Vec<DialPlanEntryDetail> {
         let Some(ref router_lock) = self.router else {
             return Vec::new();
         };
@@ -1747,13 +1747,43 @@ impl SipStack {
         let Some(plan) = router.get_dial_plan(plan_id) else {
             return Vec::new();
         };
-        // We can't iterate entries directly from the public API,
-        // so we return what we can from the plan
-        vec![DialPlanEntrySummary {
-            id: format!("{plan_id}-info"),
-            plan_id: plan_id.to_string(),
-            entry_count: plan.entry_count(),
-        }]
+        plan.all_entries()
+            .iter()
+            .map(|e| DialPlanEntryDetail {
+                id: e.id().to_string(),
+                direction: format!("{}", e.direction()),
+                pattern_type: match e.pattern() {
+                    DialPattern::Exact(_) => "exact".to_string(),
+                    DialPattern::Prefix(_) => "prefix".to_string(),
+                    DialPattern::Wildcard(_) => "wildcard".to_string(),
+                    DialPattern::Regex(_) => "regex".to_string(),
+                    DialPattern::Any => "any".to_string(),
+                },
+                pattern_value: match e.pattern() {
+                    DialPattern::Exact(v) | DialPattern::Prefix(v) | DialPattern::Wildcard(v) | DialPattern::Regex(v) => v.clone(),
+                    DialPattern::Any => "*".to_string(),
+                },
+                domain_pattern: e.domain_pattern().map(String::from),
+                source_trunk: e.source_trunk().map(String::from),
+                trunk_group: e.trunk_group().to_string(),
+                destination_type: match e.destination_type() {
+                    DestinationType::TrunkGroup => "trunk_group",
+                    DestinationType::RegisteredUser => "registered_user",
+                    DestinationType::StaticUri => "static_uri",
+                }.to_string(),
+                static_destination: e.static_destination().map(String::from),
+                transform_type: match e.transform() {
+                    NumberTransform::None => "none",
+                    NumberTransform::StripPrefix { .. } => "strip_prefix",
+                    NumberTransform::AddPrefix { .. } => "add_prefix",
+                    NumberTransform::ReplacePrefix { .. } => "replace_prefix",
+                    NumberTransform::Replace { .. } => "replace",
+                    NumberTransform::Chain(_) => "chain",
+                }.to_string(),
+                priority: e.priority(),
+                enabled: e.is_enabled(),
+            })
+            .collect()
     }
 
     /// Lists trunk group summaries from the router.
@@ -1798,15 +1828,33 @@ pub struct DialPlanSummary {
     pub active: bool,
 }
 
-/// Summary of dial plan entries.
+/// Detail of a dial plan entry (for API).
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct DialPlanEntrySummary {
+pub struct DialPlanEntryDetail {
     /// Entry ID.
     pub id: String,
-    /// Parent plan ID.
-    pub plan_id: String,
-    /// Number of entries in the plan.
-    pub entry_count: usize,
+    /// Direction (inbound/outbound/both).
+    pub direction: String,
+    /// Pattern type description.
+    pub pattern_type: String,
+    /// Pattern value.
+    pub pattern_value: String,
+    /// Domain pattern.
+    pub domain_pattern: Option<String>,
+    /// Source trunk filter.
+    pub source_trunk: Option<String>,
+    /// Trunk group.
+    pub trunk_group: String,
+    /// Destination type.
+    pub destination_type: String,
+    /// Static destination URI.
+    pub static_destination: Option<String>,
+    /// Transform description.
+    pub transform_type: String,
+    /// Priority.
+    pub priority: u32,
+    /// Whether enabled.
+    pub enabled: bool,
 }
 
 /// Summary of a trunk group.
