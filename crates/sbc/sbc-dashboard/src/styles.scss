@@ -61,33 +61,82 @@ html, body {
   color: var(--uswds-text);
 }
 
-// .mil banner dark theme
-.usa-banner__header--dark {
-  background-color: var(--uswds-bg-darker);
-  color: var(--uswds-text-secondary);
-
-  .usa-banner__header-text,
-  .usa-banner__header-action,
-  .usa-banner__button-text {
-    color: var(--uswds-text-secondary);
-  }
-
-  .usa-banner__button {
-    color: var(--uswds-text-secondary);
-
-    &::after {
-      mask-image: url('/assets/uswds/img/usa-icons/expand_more.svg');
-      background-color: var(--uswds-text-secondary);
-    }
-  }
+// --- Official .mil Government Banner ---
+.gov-banner {
+  background-color: #1a1a1a;
+  border-bottom: 1px solid var(--uswds-border);
+  font-family: 'Public Sans', sans-serif;
+  font-size: 12px;
 }
 
-.usa-banner__content {
-  background-color: #252525;
-  color: var(--uswds-text);
+.gov-banner__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 16px;
+  max-width: 1400px;
+  margin: 0 auto;
+}
 
-  p { color: var(--uswds-text); }
-  strong { color: var(--uswds-text); }
+.gov-banner__flag {
+  font-size: 14px;
+  line-height: 1;
+}
+
+.gov-banner__text {
+  color: var(--uswds-text-secondary);
+  font-size: 12px;
+}
+
+.gov-banner__toggle {
+  background: none;
+  border: none;
+  color: var(--uswds-primary-light);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 4px;
+  font-family: 'Public Sans', sans-serif;
+  text-decoration: underline;
+
+  &:hover { color: #fff; }
+}
+
+.gov-banner__caret {
+  font-size: 10px;
+  margin-left: 4px;
+}
+
+.gov-banner__content {
+  background: #222;
+  border-top: 1px solid var(--uswds-border);
+  padding: 16px;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+.gov-banner__guidance {
+  display: flex;
+  gap: 32px;
+  flex-wrap: wrap;
+}
+
+.gov-banner__guidance-item {
+  flex: 1;
+  min-width: 280px;
+
+  strong {
+    color: var(--uswds-text);
+    font-size: 13px;
+    display: block;
+    margin-bottom: 4px;
+  }
+
+  p {
+    color: var(--uswds-text-secondary);
+    font-size: 12px;
+    margin: 0;
+    line-height: 1.5;
+  }
 }
 
 .usa-header--dark {
