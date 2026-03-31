@@ -16,13 +16,15 @@ import { MatButtonModule } from '@angular/material/button';
     <h2 mat-dialog-title>Add Partition</h2>
     <mat-dialog-content>
       <mat-form-field appearance="outline" class="full-width">
-        <mat-label>ID</mat-label>
-        <input matInput [(ngModel)]="partition.id" required placeholder="pt-internal" />
+        <mat-label>Name</mat-label>
+        <input matInput [(ngModel)]="partition.name" required placeholder="Internal"
+               (input)="autoId()" />
       </mat-form-field>
 
       <mat-form-field appearance="outline" class="full-width">
-        <mat-label>Name</mat-label>
-        <input matInput [(ngModel)]="partition.name" required placeholder="Internal" />
+        <mat-label>ID</mat-label>
+        <input matInput [(ngModel)]="partition.id" required placeholder="pt-internal" />
+        <mat-hint>Auto-generated from name</mat-hint>
       </mat-form-field>
 
       <mat-form-field appearance="outline" class="full-width">
@@ -47,4 +49,8 @@ export class PartitionDialogComponent {
   partition: any = { id: '', name: '', description: '' };
 
   constructor(public dialogRef: MatDialogRef<PartitionDialogComponent>) {}
+
+  autoId(): void {
+    this.partition.id = 'pt-' + this.partition.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+  }
 }
