@@ -61,82 +61,56 @@ html, body {
   color: var(--uswds-text);
 }
 
-// --- Official .mil Government Banner ---
-.gov-banner {
+// --- USWDS .mil Banner Dark Theme ---
+.usa-banner {
   background-color: #1a1a1a;
-  border-bottom: 1px solid var(--uswds-border);
-  font-family: 'Public Sans', sans-serif;
-  font-size: 12px;
 }
 
-.gov-banner__header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 16px;
-  max-width: 1400px;
-  margin: 0 auto;
-}
-
-.gov-banner__flag {
-  font-size: 14px;
-  line-height: 1;
-}
-
-.gov-banner__text {
+.usa-banner__header {
+  background-color: #1a1a1a;
   color: var(--uswds-text-secondary);
-  font-size: 12px;
-}
+  min-height: auto;
+  padding-top: 4px;
+  padding-bottom: 4px;
 
-.gov-banner__toggle {
-  background: none;
-  border: none;
-  color: var(--uswds-primary-light);
-  font-size: 12px;
-  cursor: pointer;
-  padding: 2px 4px;
-  font-family: 'Public Sans', sans-serif;
-  text-decoration: underline;
-
-  &:hover { color: #fff; }
-}
-
-.gov-banner__caret {
-  font-size: 10px;
-  margin-left: 4px;
-}
-
-.gov-banner__content {
-  background: #222;
-  border-top: 1px solid var(--uswds-border);
-  padding: 16px;
-  max-width: 1400px;
-  margin: 0 auto;
-}
-
-.gov-banner__guidance {
-  display: flex;
-  gap: 32px;
-  flex-wrap: wrap;
-}
-
-.gov-banner__guidance-item {
-  flex: 1;
-  min-width: 280px;
-
-  strong {
-    color: var(--uswds-text);
-    font-size: 13px;
-    display: block;
-    margin-bottom: 4px;
+  .usa-banner__header-text {
+    color: var(--uswds-text-secondary);
   }
+
+  .usa-banner__header-action {
+    color: var(--uswds-primary-light);
+  }
+}
+
+.usa-banner__button {
+  color: var(--uswds-primary-light) !important;
+
+  &::after {
+    background-color: var(--uswds-primary-light) !important;
+  }
+
+  .usa-banner__button-text {
+    color: var(--uswds-primary-light);
+  }
+}
+
+.usa-banner__content {
+  background-color: #222 !important;
+  color: var(--uswds-text);
+  border-top: 1px solid var(--uswds-border);
 
   p {
     color: var(--uswds-text-secondary);
-    font-size: 12px;
-    margin: 0;
-    line-height: 1.5;
+
+    strong {
+      color: var(--uswds-text);
+    }
   }
+}
+
+.usa-banner__lock-image {
+  height: 1em;
+  vertical-align: middle;
 }
 
 .usa-header--dark {
