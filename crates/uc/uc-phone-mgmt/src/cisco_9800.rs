@@ -83,6 +83,140 @@ pub fn generate_9800_config(phone: &Phone, sbc_host: &str) -> String {
     }
     xml.push('\n');
 
+    // Speed dials
+    if !phone.speed_dials.is_empty() {
+        xml.push_str("  <speedDials>\n");
+        for sd in &phone.speed_dials {
+            xml.push_str(&format!(
+                "    <speedDial index=\"{}\" label=\"{}\" number=\"{}\" />\n",
+                sd.index, sd.label, sd.number
+            ));
+        }
+        xml.push_str("  </speedDials>\n\n");
+    }
+
+    // BLF entries
+    if !phone.blf_entries.is_empty() {
+        xml.push_str("  <blfEntries>\n");
+        for blf in &phone.blf_entries {
+            xml.push_str(&format!(
+                "    <blf index=\"{}\" label=\"{}\" address=\"{}\" />\n",
+                blf.index, blf.label, blf.address
+            ));
+        }
+        xml.push_str("  </blfEntries>\n\n");
+    }
+
+    // Features
+    if phone.features.auto_answer
+        || phone.features.dnd
+        || phone.features.intercom
+        || phone.features.call_recording
+    {
+        xml.push_str("  <features>\n");
+        if phone.features.auto_answer {
+            xml.push_str("    <autoAnswer>true</autoAnswer>\n");
+        }
+        if phone.features.dnd {
+            xml.push_str("    <dnd>true</dnd>\n");
+        }
+        if phone.features.intercom {
+            xml.push_str("    <intercom>true</intercom>\n");
+        }
+        if phone.features.call_recording {
+            xml.push_str("    <callRecording>true</callRecording>\n");
+        }
+        xml.push_str("  </features>\n\n");
+    }
+
+    // Network
+    if phone.network.vlan_id.is_some()
+        || phone.network.dot1x_enabled
+        || phone.network.qos_dscp.is_some()
+    {
+        xml.push_str("  <network>\n");
+        if let Some(vlan) = phone.network.vlan_id {
+            xml.push_str(&format!("    <vlan>{vlan}</vlan>\n"));
+        }
+        if let Some(dscp) = phone.network.qos_dscp {
+            xml.push_str(&format!("    <qosDscp>{dscp}</qosDscp>\n"));
+        }
+        if phone.network.dot1x_enabled {
+            xml.push_str("    <dot1x>true</dot1x>\n");
+        }
+        xml.push_str("  </network>\n\n");
+    }
+
+    // Time
+    if phone.display.timezone.is_some() || phone.display.ntp_server.is_some() {
+        xml.push_str("  <time>\n");
+        if let Some(tz) = &phone.display.timezone {
+            xml.push_str(&format!("    <timezone>{tz}</timezone>\n"));
+        }
+        if let Some(ntp) = &phone.display.ntp_server {
+            xml.push_str(&format!("    <ntpServer>{ntp}</ntpServer>\n"));
+        }
+        xml.push_str(&format!(
+            "    <format24hr>{}</format24hr>\n",
+            phone.display.time_24hr
+        ));
+        xml.push_str("  </time>\n\n");
+    }
+
+    // Display
+    if phone.display.brightness.is_some()
+        || phone.display.language.is_some()
+        || phone.display.ringtone.is_some()
+    {
+        xml.push_str("  <display>\n");
+        if let Some(brightness) = phone.display.brightness {
+            xml.push_str(&format!("    <brightness>{brightness}</brightness>\n"));
+        }
+        if let Some(lang) = &phone.display.language {
+            xml.push_str(&format!("    <language>{lang}</language>\n"));
+        }
+        if let Some(ringtone) = &phone.display.ringtone {
+            xml.push_str(&format!("    <ringtone>{ringtone}</ringtone>\n"));
+        }
+        xml.push_str("  </display>\n\n");
+    }
+
+    // Directory (LDAP)
+    if phone.directory.enabled {
+        xml.push_str("  <directory>\n");
+        if let Some(server) = &phone.directory.ldap_server {
+            xml.push_str(&format!("    <ldapServer>{server}</ldapServer>\n"));
+        }
+        if let Some(port) = phone.directory.ldap_port {
+            xml.push_str(&format!("    <ldapPort>{port}</ldapPort>\n"));
+        }
+        if let Some(base_dn) = &phone.directory.ldap_base_dn {
+            xml.push_str(&format!("    <ldapBaseDN>{base_dn}</ldapBaseDN>\n"));
+        }
+        if let Some(bind_dn) = &phone.directory.ldap_bind_dn {
+            xml.push_str(&format!("    <ldapBindDN>{bind_dn}</ldapBindDN>\n"));
+        }
+        if phone.directory.ldap_tls {
+            xml.push_str("    <ldapTLS>true</ldapTLS>\n");
+        }
+        xml.push_str("  </directory>\n\n");
+    }
+
+    // Emergency
+    if phone.emergency.emergency_number.is_some() {
+        xml.push_str("  <emergency>\n");
+        if let Some(num) = &phone.emergency.emergency_number {
+            xml.push_str(&format!("    <number>{num}</number>\n"));
+        }
+        if let Some(loc) = &phone.emergency.location_id {
+            xml.push_str(&format!("    <locationId>{loc}</locationId>\n"));
+        }
+        if let Some(elin) = &phone.emergency.elin {
+            xml.push_str(&format!("    <elin>{elin}</elin>\n"));
+        }
+        xml.push_str("  </emergency>\n\n");
+    }
+
     // SIP settings
     let transport = phone
         .lines
@@ -113,6 +247,9 @@ pub fn generate_9800_config(phone: &Phone, sbc_host: &str) -> String {
     xml.push_str("  <usbHeadset>\n");
     xml.push_str("    <enabled>true</enabled>\n");
     xml.push_str("    <wideband>true</wideband>\n");
+    if phone.audio.noise_reduction {
+        xml.push_str("    <noiseReduction>true</noiseReduction>\n");
+    }
     xml.push_str("  </usbHeadset>\n\n");
 
     // Enhanced presence settings
@@ -140,7 +277,7 @@ pub fn generate_9800_config(phone: &Phone, sbc_host: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::model::{Phone, PhoneLine, PhoneModel};
+    use crate::model::{BlfEntry, Phone, PhoneLine, PhoneModel, SpeedDial};
 
     fn test_phone() -> Phone {
         let mut phone = Phone::new("aa:bb:cc:dd:ee:ff", PhoneModel::Cisco9861, "Test 9800");
@@ -209,5 +346,109 @@ mod tests {
         let phone = test_phone();
         let config = generate_9800_config(&phone, "sbc.example.com");
         assert!(config.contains("<transport>TLS</transport>"));
+    }
+
+    #[test]
+    fn test_generate_9800_config_speed_dials() {
+        let mut phone = test_phone();
+        phone.speed_dials.push(SpeedDial {
+            index: 1,
+            label: "IT Support".to_string(),
+            number: "9000".to_string(),
+        });
+        let config = generate_9800_config(&phone, "sbc.example.com");
+        assert!(config.contains("<speedDials>"));
+        assert!(config.contains("label=\"IT Support\""));
+        assert!(config.contains("number=\"9000\""));
+    }
+
+    #[test]
+    fn test_generate_9800_config_blf() {
+        let mut phone = test_phone();
+        phone.blf_entries.push(BlfEntry {
+            index: 1,
+            label: "Helpdesk".to_string(),
+            address: "5001@sbc.example.com".to_string(),
+        });
+        let config = generate_9800_config(&phone, "sbc.example.com");
+        assert!(config.contains("<blfEntries>"));
+        assert!(config.contains("label=\"Helpdesk\""));
+    }
+
+    #[test]
+    fn test_generate_9800_config_features() {
+        let mut phone = test_phone();
+        phone.features.auto_answer = true;
+        phone.features.dnd = true;
+        let config = generate_9800_config(&phone, "sbc.example.com");
+        assert!(config.contains("<features>"));
+        assert!(config.contains("<autoAnswer>true</autoAnswer>"));
+        assert!(config.contains("<dnd>true</dnd>"));
+    }
+
+    #[test]
+    fn test_generate_9800_config_network() {
+        let mut phone = test_phone();
+        phone.network.vlan_id = Some(400);
+        phone.network.qos_dscp = Some(46);
+        phone.network.dot1x_enabled = true;
+        let config = generate_9800_config(&phone, "sbc.example.com");
+        assert!(config.contains("<network>"));
+        assert!(config.contains("<vlan>400</vlan>"));
+        assert!(config.contains("<qosDscp>46</qosDscp>"));
+        assert!(config.contains("<dot1x>true</dot1x>"));
+    }
+
+    #[test]
+    fn test_generate_9800_config_time() {
+        let mut phone = test_phone();
+        phone.display.timezone = Some("US/Pacific".to_string());
+        phone.display.ntp_server = Some("ntp.example.com".to_string());
+        let config = generate_9800_config(&phone, "sbc.example.com");
+        assert!(config.contains("<time>"));
+        assert!(config.contains("<timezone>US/Pacific</timezone>"));
+        assert!(config.contains("<ntpServer>ntp.example.com</ntpServer>"));
+    }
+
+    #[test]
+    fn test_generate_9800_config_display() {
+        let mut phone = test_phone();
+        phone.display.brightness = Some(80);
+        phone.display.language = Some("en".to_string());
+        let config = generate_9800_config(&phone, "sbc.example.com");
+        assert!(config.contains("<display>"));
+        assert!(config.contains("<brightness>80</brightness>"));
+        assert!(config.contains("<language>en</language>"));
+    }
+
+    #[test]
+    fn test_generate_9800_config_directory() {
+        let mut phone = test_phone();
+        phone.directory.enabled = true;
+        phone.directory.ldap_server = Some("ldap.example.com".to_string());
+        phone.directory.ldap_base_dn = Some("dc=corp,dc=com".to_string());
+        let config = generate_9800_config(&phone, "sbc.example.com");
+        assert!(config.contains("<directory>"));
+        assert!(config.contains("<ldapServer>ldap.example.com</ldapServer>"));
+        assert!(config.contains("<ldapBaseDN>dc=corp,dc=com</ldapBaseDN>"));
+    }
+
+    #[test]
+    fn test_generate_9800_config_emergency() {
+        let mut phone = test_phone();
+        phone.emergency.emergency_number = Some("911".to_string());
+        phone.emergency.location_id = Some("LOC-001".to_string());
+        let config = generate_9800_config(&phone, "sbc.example.com");
+        assert!(config.contains("<emergency>"));
+        assert!(config.contains("<number>911</number>"));
+        assert!(config.contains("<locationId>LOC-001</locationId>"));
+    }
+
+    #[test]
+    fn test_generate_9800_config_noise_reduction() {
+        let mut phone = test_phone();
+        phone.audio.noise_reduction = true;
+        let config = generate_9800_config(&phone, "sbc.example.com");
+        assert!(config.contains("<noiseReduction>true</noiseReduction>"));
     }
 }

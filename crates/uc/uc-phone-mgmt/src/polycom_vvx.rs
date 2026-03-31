@@ -92,6 +92,84 @@ pub fn generate_vvx_config(phone: &Phone, sbc_host: &str) -> String {
         xml.push_str("  </callForwardConfig>\n\n");
     }
 
+    // Speed dials
+    if !phone.speed_dials.is_empty() {
+        for sd in &phone.speed_dials {
+            xml.push_str(&format!(
+                "  <sd sd.{}.label=\"{}\" sd.{}.number=\"{}\" />\n",
+                sd.index, sd.label, sd.index, sd.number
+            ));
+        }
+        xml.push('\n');
+    }
+
+    // BLF / attendant console
+    if !phone.blf_entries.is_empty() {
+        for blf in &phone.blf_entries {
+            xml.push_str(&format!(
+                "  <attendant attendant.{}.address=\"{}\" attendant.{}.label=\"{}\" />\n",
+                blf.index, blf.address, blf.index, blf.label
+            ));
+        }
+        xml.push('\n');
+    }
+
+    // Auto-answer
+    if phone.features.auto_answer {
+        xml.push_str("  <call call.autoAnswer=\"1\" />\n\n");
+    }
+
+    // Do Not Disturb
+    if phone.features.dnd {
+        xml.push_str("  <feature.enhancedFeatureKeys.dnd.enabled=\"1\" />\n\n");
+    }
+
+    // Network / VLAN
+    if let Some(vlan) = phone.network.vlan_id {
+        xml.push_str(&format!(
+            "  <device.net.vlanId=\"{vlan}\" />\n\n"
+        ));
+    }
+
+    // NTP / Time
+    if phone.display.ntp_server.is_some() || !phone.display.time_24hr {
+        xml.push_str("  <tcpIpApp.sntp");
+        if let Some(ntp) = &phone.display.ntp_server {
+            xml.push_str(&format!(" tcpIpApp.sntp.address=\"{ntp}\""));
+        }
+        xml.push_str(&format!(
+            " lcl.datetime.time.24HourClock=\"{}\"",
+            if phone.display.time_24hr { "1" } else { "0" }
+        ));
+        xml.push_str(" />\n\n");
+    }
+
+    // Display language
+    if let Some(lang) = &phone.display.language {
+        xml.push_str(&format!("  <lcl.ml.lang=\"{lang}\" />\n\n"));
+    }
+
+    // Corporate directory (LDAP)
+    if phone.directory.enabled {
+        if let (Some(server), Some(base_dn)) =
+            (&phone.directory.ldap_server, &phone.directory.ldap_base_dn)
+        {
+            xml.push_str(&format!(
+                "  <dir.corp.address=\"{server}\" dir.corp.baseDN=\"{base_dn}\"",
+            ));
+            if let Some(port) = phone.directory.ldap_port {
+                xml.push_str(&format!(" dir.corp.port=\"{port}\""));
+            }
+            if let Some(bind_dn) = &phone.directory.ldap_bind_dn {
+                xml.push_str(&format!(" dir.corp.user=\"{bind_dn}\""));
+            }
+            if let Some(pw) = &phone.directory.ldap_password {
+                xml.push_str(&format!(" dir.corp.password=\"{pw}\""));
+            }
+            xml.push_str(" />\n\n");
+        }
+    }
+
     // Codec preferences
     xml.push_str("  <codecPref>\n");
     xml.push_str(
@@ -113,7 +191,7 @@ pub fn generate_vvx_config(phone: &Phone, sbc_host: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::model::{CallForward, Phone, PhoneLine, PhoneModel};
+    use crate::model::{BlfEntry, CallForward, Phone, PhoneLine, PhoneModel, SpeedDial};
 
     fn test_phone() -> Phone {
         let mut phone = Phone::new("aa:bb:cc:dd:ee:ff", PhoneModel::PolycomVVX450, "Test VVX");
@@ -168,6 +246,67 @@ mod tests {
         let config = generate_vvx_config(&phone, "sbc.example.com");
         assert!(config.contains("divert.1.busy.contact=\"1099\""));
         assert!(config.contains("divert.1.noanswer.contact=\"1099\""));
+    }
+
+    #[test]
+    fn test_generate_vvx_config_speed_dials() {
+        let mut phone = test_phone();
+        phone.speed_dials.push(SpeedDial {
+            index: 1,
+            label: "Front Desk".to_string(),
+            number: "1000".to_string(),
+        });
+        let config = generate_vvx_config(&phone, "sbc.example.com");
+        assert!(config.contains("sd.1.label=\"Front Desk\""));
+        assert!(config.contains("sd.1.number=\"1000\""));
+    }
+
+    #[test]
+    fn test_generate_vvx_config_blf() {
+        let mut phone = test_phone();
+        phone.blf_entries.push(BlfEntry {
+            index: 1,
+            label: "Boss".to_string(),
+            address: "1002@sbc.example.com".to_string(),
+        });
+        let config = generate_vvx_config(&phone, "sbc.example.com");
+        assert!(config.contains("attendant.1.address=\"1002@sbc.example.com\""));
+        assert!(config.contains("attendant.1.label=\"Boss\""));
+    }
+
+    #[test]
+    fn test_generate_vvx_config_auto_answer() {
+        let mut phone = test_phone();
+        phone.features.auto_answer = true;
+        let config = generate_vvx_config(&phone, "sbc.example.com");
+        assert!(config.contains("call.autoAnswer=\"1\""));
+    }
+
+    #[test]
+    fn test_generate_vvx_config_dnd() {
+        let mut phone = test_phone();
+        phone.features.dnd = true;
+        let config = generate_vvx_config(&phone, "sbc.example.com");
+        assert!(config.contains("feature.enhancedFeatureKeys.dnd.enabled=\"1\""));
+    }
+
+    #[test]
+    fn test_generate_vvx_config_vlan() {
+        let mut phone = test_phone();
+        phone.network.vlan_id = Some(100);
+        let config = generate_vvx_config(&phone, "sbc.example.com");
+        assert!(config.contains("device.net.vlanId=\"100\""));
+    }
+
+    #[test]
+    fn test_generate_vvx_config_ldap() {
+        let mut phone = test_phone();
+        phone.directory.enabled = true;
+        phone.directory.ldap_server = Some("ldap.example.com".to_string());
+        phone.directory.ldap_base_dn = Some("dc=example,dc=com".to_string());
+        let config = generate_vvx_config(&phone, "sbc.example.com");
+        assert!(config.contains("dir.corp.address=\"ldap.example.com\""));
+        assert!(config.contains("dir.corp.baseDN=\"dc=example,dc=com\""));
     }
 
     #[test]

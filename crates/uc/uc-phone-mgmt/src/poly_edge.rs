@@ -76,6 +76,159 @@ pub fn generate_edge_config(phone: &Phone, sbc_host: &str) -> String {
 
     xml.push_str("  </sip>\n\n");
 
+    // Speed dials
+    if !phone.speed_dials.is_empty() {
+        xml.push_str("  <speedDial>\n");
+        for sd in &phone.speed_dials {
+            xml.push_str(&format!(
+                "    <entry index=\"{}\" label=\"{}\" number=\"{}\" />\n",
+                sd.index, sd.label, sd.number
+            ));
+        }
+        xml.push_str("  </speedDial>\n\n");
+    }
+
+    // BLF entries
+    if !phone.blf_entries.is_empty() {
+        xml.push_str("  <blf>\n");
+        for blf in &phone.blf_entries {
+            xml.push_str(&format!(
+                "    <entry index=\"{}\" label=\"{}\" address=\"{}\" />\n",
+                blf.index, blf.label, blf.address
+            ));
+        }
+        xml.push_str("  </blf>\n\n");
+    }
+
+    // Features
+    if phone.features.auto_answer
+        || phone.features.dnd
+        || phone.features.intercom
+        || phone.paging.enabled
+    {
+        xml.push_str("  <features>\n");
+        if phone.features.auto_answer {
+            xml.push_str("    <autoAnswer>true</autoAnswer>\n");
+        }
+        if phone.features.dnd {
+            xml.push_str("    <dnd>true</dnd>\n");
+        }
+        if phone.features.intercom {
+            xml.push_str("    <intercom>true</intercom>\n");
+        }
+        if phone.paging.enabled {
+            xml.push_str("    <paging>true</paging>\n");
+        }
+        xml.push_str("  </features>\n\n");
+    }
+
+    // Network
+    if phone.network.vlan_id.is_some()
+        || phone.network.cdp_enabled
+        || phone.network.lldp_enabled
+        || phone.network.dot1x_enabled
+    {
+        xml.push_str("  <network>\n");
+        if let Some(vlan) = phone.network.vlan_id {
+            xml.push_str(&format!("    <vlan>{vlan}</vlan>\n"));
+        }
+        if phone.network.cdp_enabled {
+            xml.push_str("    <cdp>true</cdp>\n");
+        }
+        if phone.network.lldp_enabled {
+            xml.push_str("    <lldp>true</lldp>\n");
+        }
+        if phone.network.dot1x_enabled {
+            xml.push_str("    <dot1x>true</dot1x>\n");
+        }
+        xml.push_str("  </network>\n\n");
+    }
+
+    // Time
+    if phone.display.timezone.is_some()
+        || phone.display.ntp_server.is_some()
+    {
+        xml.push_str("  <time>\n");
+        if let Some(tz) = &phone.display.timezone {
+            xml.push_str(&format!("    <timezone>{tz}</timezone>\n"));
+        }
+        if let Some(ntp) = &phone.display.ntp_server {
+            xml.push_str(&format!("    <ntpServer>{ntp}</ntpServer>\n"));
+        }
+        xml.push_str(&format!(
+            "    <format24hr>{}</format24hr>\n",
+            phone.display.time_24hr
+        ));
+        xml.push_str("  </time>\n\n");
+    }
+
+    // Display
+    if phone.display.brightness.is_some()
+        || phone.display.language.is_some()
+        || phone.display.ringtone.is_some()
+    {
+        xml.push_str("  <display>\n");
+        if let Some(brightness) = phone.display.brightness {
+            xml.push_str(&format!("    <brightness>{brightness}</brightness>\n"));
+        }
+        if let Some(lang) = &phone.display.language {
+            xml.push_str(&format!("    <language>{lang}</language>\n"));
+        }
+        if let Some(ringtone) = &phone.display.ringtone {
+            xml.push_str(&format!("    <ringtone>{ringtone}</ringtone>\n"));
+        }
+        xml.push_str("  </display>\n\n");
+    }
+
+    // Audio
+    if phone.audio.noise_reduction || phone.audio.headset_mode != crate::model::HeadsetMode::Wired {
+        xml.push_str("  <audio>\n");
+        xml.push_str(&format!(
+            "    <headset>{:?}</headset>\n",
+            phone.audio.headset_mode
+        ));
+        if phone.audio.noise_reduction {
+            xml.push_str("    <noiseReduction>true</noiseReduction>\n");
+        }
+        xml.push_str("  </audio>\n\n");
+    }
+
+    // Directory (LDAP)
+    if phone.directory.enabled {
+        xml.push_str("  <directory>\n");
+        if let Some(server) = &phone.directory.ldap_server {
+            xml.push_str(&format!("    <ldapServer>{server}</ldapServer>\n"));
+        }
+        if let Some(port) = phone.directory.ldap_port {
+            xml.push_str(&format!("    <ldapPort>{port}</ldapPort>\n"));
+        }
+        if let Some(base_dn) = &phone.directory.ldap_base_dn {
+            xml.push_str(&format!("    <ldapBaseDN>{base_dn}</ldapBaseDN>\n"));
+        }
+        if let Some(bind_dn) = &phone.directory.ldap_bind_dn {
+            xml.push_str(&format!("    <ldapBindDN>{bind_dn}</ldapBindDN>\n"));
+        }
+        if phone.directory.ldap_tls {
+            xml.push_str("    <ldapTLS>true</ldapTLS>\n");
+        }
+        xml.push_str("  </directory>\n\n");
+    }
+
+    // Emergency
+    if phone.emergency.emergency_number.is_some() {
+        xml.push_str("  <emergency>\n");
+        if let Some(num) = &phone.emergency.emergency_number {
+            xml.push_str(&format!("    <number>{num}</number>\n"));
+        }
+        if let Some(loc) = &phone.emergency.location_id {
+            xml.push_str(&format!("    <locationId>{loc}</locationId>\n"));
+        }
+        if let Some(elin) = &phone.emergency.elin {
+            xml.push_str(&format!("    <elin>{elin}</elin>\n"));
+        }
+        xml.push_str("  </emergency>\n\n");
+    }
+
     // Provisioning section
     xml.push_str("  <provisioning>\n");
     xml.push_str(&format!(
@@ -99,7 +252,7 @@ pub fn generate_edge_config(phone: &Phone, sbc_host: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::model::{Phone, PhoneLine, PhoneModel};
+    use crate::model::{BlfEntry, Phone, PhoneLine, PhoneModel, SpeedDial};
 
     fn test_phone() -> Phone {
         let mut phone = Phone::new("11:22:33:44:55:66", PhoneModel::PolyEdgeE450, "Test Edge");
@@ -148,5 +301,86 @@ mod tests {
         assert!(config.contains("<authUser>2001</authUser>"));
         assert!(config.contains("<displayName>Jane Smith</displayName>"));
         assert!(config.contains("<voicemail>*97</voicemail>"));
+    }
+
+    #[test]
+    fn test_generate_edge_config_speed_dials() {
+        let mut phone = test_phone();
+        phone.speed_dials.push(SpeedDial {
+            index: 1,
+            label: "Reception".to_string(),
+            number: "1000".to_string(),
+        });
+        let config = generate_edge_config(&phone, "sbc.example.com");
+        assert!(config.contains("<speedDial>"));
+        assert!(config.contains("label=\"Reception\""));
+        assert!(config.contains("number=\"1000\""));
+    }
+
+    #[test]
+    fn test_generate_edge_config_blf() {
+        let mut phone = test_phone();
+        phone.blf_entries.push(BlfEntry {
+            index: 1,
+            label: "Manager".to_string(),
+            address: "1005@sbc.example.com".to_string(),
+        });
+        let config = generate_edge_config(&phone, "sbc.example.com");
+        assert!(config.contains("<blf>"));
+        assert!(config.contains("label=\"Manager\""));
+    }
+
+    #[test]
+    fn test_generate_edge_config_features() {
+        let mut phone = test_phone();
+        phone.features.auto_answer = true;
+        phone.features.dnd = true;
+        let config = generate_edge_config(&phone, "sbc.example.com");
+        assert!(config.contains("<features>"));
+        assert!(config.contains("<autoAnswer>true</autoAnswer>"));
+        assert!(config.contains("<dnd>true</dnd>"));
+    }
+
+    #[test]
+    fn test_generate_edge_config_network() {
+        let mut phone = test_phone();
+        phone.network.vlan_id = Some(200);
+        phone.network.lldp_enabled = true;
+        let config = generate_edge_config(&phone, "sbc.example.com");
+        assert!(config.contains("<network>"));
+        assert!(config.contains("<vlan>200</vlan>"));
+        assert!(config.contains("<lldp>true</lldp>"));
+    }
+
+    #[test]
+    fn test_generate_edge_config_time() {
+        let mut phone = test_phone();
+        phone.display.timezone = Some("America/New_York".to_string());
+        phone.display.ntp_server = Some("pool.ntp.org".to_string());
+        let config = generate_edge_config(&phone, "sbc.example.com");
+        assert!(config.contains("<time>"));
+        assert!(config.contains("<timezone>America/New_York</timezone>"));
+        assert!(config.contains("<ntpServer>pool.ntp.org</ntpServer>"));
+    }
+
+    #[test]
+    fn test_generate_edge_config_directory() {
+        let mut phone = test_phone();
+        phone.directory.enabled = true;
+        phone.directory.ldap_server = Some("ldap.example.com".to_string());
+        phone.directory.ldap_base_dn = Some("dc=example,dc=com".to_string());
+        let config = generate_edge_config(&phone, "sbc.example.com");
+        assert!(config.contains("<directory>"));
+        assert!(config.contains("<ldapServer>ldap.example.com</ldapServer>"));
+        assert!(config.contains("<ldapBaseDN>dc=example,dc=com</ldapBaseDN>"));
+    }
+
+    #[test]
+    fn test_generate_edge_config_emergency() {
+        let mut phone = test_phone();
+        phone.emergency.emergency_number = Some("911".to_string());
+        let config = generate_edge_config(&phone, "sbc.example.com");
+        assert!(config.contains("<emergency>"));
+        assert!(config.contains("<number>911</number>"));
     }
 }

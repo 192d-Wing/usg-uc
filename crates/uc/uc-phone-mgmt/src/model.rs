@@ -40,6 +40,26 @@ pub struct Phone {
     pub last_seen: Option<i64>,
     /// Configuration version counter.
     pub config_version: u32,
+    /// Speed dial entries.
+    pub speed_dials: Vec<SpeedDial>,
+    /// BLF (Busy Lamp Field) entries.
+    pub blf_entries: Vec<BlfEntry>,
+    /// Softkey configuration.
+    pub softkeys: Vec<SoftkeyConfig>,
+    /// Feature flags.
+    pub features: PhoneFeatures,
+    /// Network configuration.
+    pub network: NetworkConfig,
+    /// Display/UI configuration.
+    pub display: DisplayConfig,
+    /// Audio configuration.
+    pub audio: AudioConfig,
+    /// Corporate directory configuration.
+    pub directory: DirectoryConfig,
+    /// Paging/intercom configuration.
+    pub paging: PagingConfig,
+    /// Emergency calling configuration.
+    pub emergency: EmergencyConfig,
 }
 
 impl Phone {
@@ -63,6 +83,16 @@ impl Phone {
             registered_at: None,
             last_seen: None,
             config_version: 1,
+            speed_dials: Vec::new(),
+            blf_entries: Vec::new(),
+            softkeys: Vec::new(),
+            features: PhoneFeatures::default(),
+            network: NetworkConfig::default(),
+            display: DisplayConfig::default(),
+            audio: AudioConfig::default(),
+            directory: DirectoryConfig::default(),
+            paging: PagingConfig::default(),
+            emergency: EmergencyConfig::default(),
         }
     }
 }
@@ -381,6 +411,267 @@ pub enum PhoneStatus {
     Error(String),
 }
 
+/// A speed dial entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeedDial {
+    /// Button/key index (1-based).
+    pub index: u8,
+    /// Display label.
+    pub label: String,
+    /// Number to dial.
+    pub number: String,
+}
+
+/// A BLF (Busy Lamp Field) entry for monitoring another extension.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlfEntry {
+    /// Button/key index (1-based).
+    pub index: u8,
+    /// Display label.
+    pub label: String,
+    /// SIP URI or extension to monitor.
+    pub address: String,
+}
+
+/// Softkey action type.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SoftkeyAction {
+    /// Speed dial.
+    SpeedDial,
+    /// BLF monitor.
+    Blf,
+    /// Park call.
+    Park,
+    /// Transfer call.
+    Transfer,
+    /// Conference.
+    Conference,
+    /// Do Not Disturb toggle.
+    Dnd,
+    /// Intercom.
+    Intercom,
+    /// Custom action.
+    Custom(String),
+}
+
+impl Default for SoftkeyAction {
+    fn default() -> Self {
+        Self::SpeedDial
+    }
+}
+
+/// Softkey configuration for a programmable key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SoftkeyConfig {
+    /// Key index (1-based).
+    pub index: u8,
+    /// Label displayed on the key.
+    pub label: String,
+    /// Action bound to this key.
+    pub action: SoftkeyAction,
+    /// Optional value/target for the action (e.g. number, URI).
+    pub value: Option<String>,
+}
+
+/// Phone feature flags.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhoneFeatures {
+    /// Enable auto-answer (e.g. for paging).
+    pub auto_answer: bool,
+    /// Enable Do Not Disturb.
+    pub dnd: bool,
+    /// Enable intercom calling.
+    pub intercom: bool,
+    /// Enable call recording.
+    pub call_recording: bool,
+    /// Enable hotdesking / extension mobility.
+    pub hotdesking: bool,
+}
+
+impl Default for PhoneFeatures {
+    fn default() -> Self {
+        Self {
+            auto_answer: false,
+            dnd: false,
+            intercom: false,
+            call_recording: false,
+            hotdesking: false,
+        }
+    }
+}
+
+/// Paging and intercom group configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PagingConfig {
+    /// Enable paging support.
+    pub enabled: bool,
+    /// Paging group URIs.
+    pub groups: Vec<String>,
+    /// Multicast paging address (ip:port).
+    pub multicast_address: Option<String>,
+}
+
+impl Default for PagingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            groups: Vec::new(),
+            multicast_address: None,
+        }
+    }
+}
+
+/// Network configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    /// VLAN ID for voice traffic.
+    pub vlan_id: Option<u16>,
+    /// Enable CDP (Cisco Discovery Protocol).
+    pub cdp_enabled: bool,
+    /// Enable LLDP (Link Layer Discovery Protocol).
+    pub lldp_enabled: bool,
+    /// Enable 802.1X authentication.
+    pub dot1x_enabled: bool,
+    /// DSCP value for voice RTP.
+    pub qos_dscp: Option<u8>,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            vlan_id: None,
+            cdp_enabled: false,
+            lldp_enabled: false,
+            dot1x_enabled: false,
+            qos_dscp: None,
+        }
+    }
+}
+
+/// Display and UI configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayConfig {
+    /// Display language (e.g. "en", "es", "fr").
+    pub language: Option<String>,
+    /// Display brightness (0-100).
+    pub brightness: Option<u8>,
+    /// Ringtone name or file.
+    pub ringtone: Option<String>,
+    /// Use 24-hour time format.
+    pub time_24hr: bool,
+    /// Timezone string (e.g. "America/New_York").
+    pub timezone: Option<String>,
+    /// NTP server address.
+    pub ntp_server: Option<String>,
+}
+
+impl Default for DisplayConfig {
+    fn default() -> Self {
+        Self {
+            language: None,
+            brightness: None,
+            ringtone: None,
+            time_24hr: true,
+            timezone: None,
+            ntp_server: None,
+        }
+    }
+}
+
+/// Headset operating mode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum HeadsetMode {
+    /// Standard wired headset.
+    Wired,
+    /// USB headset.
+    Usb,
+    /// Bluetooth headset.
+    Bluetooth,
+    /// DECT wireless headset.
+    Dect,
+}
+
+impl Default for HeadsetMode {
+    fn default() -> Self {
+        Self::Wired
+    }
+}
+
+/// Audio configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioConfig {
+    /// Headset mode.
+    pub headset_mode: HeadsetMode,
+    /// Enable noise reduction / noise cancellation.
+    pub noise_reduction: bool,
+    /// Enable acoustic echo cancellation.
+    pub echo_cancellation: bool,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            headset_mode: HeadsetMode::default(),
+            noise_reduction: false,
+            echo_cancellation: true,
+        }
+    }
+}
+
+/// Corporate directory (LDAP) configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectoryConfig {
+    /// Enable corporate directory lookup.
+    pub enabled: bool,
+    /// LDAP server address.
+    pub ldap_server: Option<String>,
+    /// LDAP server port.
+    pub ldap_port: Option<u16>,
+    /// LDAP base DN.
+    pub ldap_base_dn: Option<String>,
+    /// LDAP bind DN (username).
+    pub ldap_bind_dn: Option<String>,
+    /// LDAP bind password.
+    pub ldap_password: Option<String>,
+    /// Use TLS/SSL for LDAP connection.
+    pub ldap_tls: bool,
+}
+
+impl Default for DirectoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ldap_server: None,
+            ldap_port: None,
+            ldap_base_dn: None,
+            ldap_bind_dn: None,
+            ldap_password: None,
+            ldap_tls: false,
+        }
+    }
+}
+
+/// Emergency calling (E911) configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmergencyConfig {
+    /// Emergency number (e.g. "911").
+    pub emergency_number: Option<String>,
+    /// Location identifier for E911.
+    pub location_id: Option<String>,
+    /// ELIN (Emergency Location Identification Number).
+    pub elin: Option<String>,
+}
+
+impl Default for EmergencyConfig {
+    fn default() -> Self {
+        Self {
+            emergency_number: None,
+            location_id: None,
+            elin: None,
+        }
+    }
+}
+
 /// Filter criteria for listing phones.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhoneFilter {
@@ -453,5 +744,18 @@ mod tests {
         assert_eq!(phone.status, PhoneStatus::Unprovisioned);
         assert_eq!(phone.config_version, 1);
         assert!(phone.lines.is_empty());
+        assert!(phone.speed_dials.is_empty());
+        assert!(phone.blf_entries.is_empty());
+        assert!(phone.softkeys.is_empty());
+        assert!(!phone.features.auto_answer);
+        assert!(!phone.features.dnd);
+        assert!(phone.network.vlan_id.is_none());
+        assert!(phone.display.language.is_none());
+        assert!(phone.display.time_24hr);
+        assert!(!phone.audio.noise_reduction);
+        assert!(phone.audio.echo_cancellation);
+        assert!(!phone.directory.enabled);
+        assert!(!phone.paging.enabled);
+        assert!(phone.emergency.emergency_number.is_none());
     }
 }
