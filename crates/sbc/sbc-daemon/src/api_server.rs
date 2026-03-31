@@ -1318,7 +1318,7 @@ async fn list_route_patterns(State(state): State<Arc<AppState>>) -> impl IntoRes
         let patterns: Vec<_> = r.list_route_patterns().iter().map(|p| {
             let pattern_str = match p.pattern() {
                 uc_routing::DialPattern::Exact(v) => v.clone(),
-                uc_routing::DialPattern::Prefix(v) => format!("{v}..."),
+                uc_routing::DialPattern::Prefix(v) => v.clone(),
                 uc_routing::DialPattern::Wildcard(v) => v.clone(),
                 uc_routing::DialPattern::Regex(v) => v.clone(),
                 uc_routing::DialPattern::Any => "*".to_string(),
