@@ -1,0 +1,93 @@
+# USG SBC Stress Test Environment
+#
+# Usage:
+#   docker compose -f deploy/test/docker-compose.yml build
+#   docker compose -f deploy/test/docker-compose.yml up
+#
+# This spins up:
+#   1. sbc       — the SBC daemon under test
+#   2. sipp-uas  — SIPp UAS (answers calls on port 5080)
+#   3. sipp-uac  — SIPp UAC (generates concurrent INVITE traffic)
+#
+# Monitor:
+#   curl http://localhost:8080/api/v1/system/stats
+#   curl http://localhost:8080/metrics
+
+services:
+  # ── SBC Under Test ─────────────────────────────────────────────
+  sbc:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: sbc-test
+    ports:
+      - "5060:5060/udp"
+      - "8080:8080/tcp"
+      - "16384-16484:16384-16484/udp"
+    volumes:
+      - ./sbc-test.toml:/etc/sbc/config.toml:ro
+    networks:
+      sbc-net:
+        ipv4_address: 172.28.0.10
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/sbc-cli", "health", "--quiet"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # ── SIPp UAS (answers calls) ───────────────────────────────────
+  sipp-uas:
+    image: ctaloi/sipp:latest
+    container_name: sipp-uas
+    command: >
+      -sn uas
+      -p 5080
+      -mi 172.28.0.20
+      -trace_err
+      -trace_stat
+      -fd 1s
+      -bg
+    networks:
+      sbc-net:
+        ipv4_address: 172.28.0.20
+    depends_on:
+      sbc:
+        condition: service_healthy
+
+  # ── SIPp UAC (generates load) ──────────────────────────────────
+  #
+  # Adjust -r (rate), -l (concurrent), -m (total calls) as needed.
+  # Default: 10 calls/sec, 100 concurrent, 1000 total calls
+  sipp-uac:
+    image: ctaloi/sipp:latest
+    container_name: sipp-uac
+    command: >
+      172.28.0.10:5060
+      -sn uac
+      -r 10
+      -rp 1000
+      -l 100
+      -m 1000
+      -mi 172.28.0.30
+      -p 5070
+      -trace_err
+      -trace_stat
+      -fd 1s
+      -d 5000
+      -recv_timeout 10000
+    networks:
+      sbc-net:
+        ipv4_address: 172.28.0.30
+    depends_on:
+      sbc:
+        condition: service_healthy
+      sipp-uas:
+        condition: service_started
+
+networks:
+  sbc-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

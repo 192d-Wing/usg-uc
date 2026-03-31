@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!--
+  SIPp UAC scenario: REGISTER then INVITE through SBC
+
+  Usage:
+    sipp 172.28.0.10:5060 -sf sipp-uac-register-call.xml \
+      -r 10 -l 100 -m 1000 -mi 172.28.0.30 -p 5070
+
+  Flow:
+    1. REGISTER with SBC (establish binding)
+    2. Wait 100ms
+    3. INVITE through SBC to callee
+    4. Expect 100 Trying
+    5. Expect 180 Ringing (optional)
+    6. Expect 200 OK
+    7. ACK
+    8. Pause (call duration)
+    9. BYE
+    10. Expect 200 OK
+-->
+<scenario name="Register then Call">
+
+  <!-- Step 1: REGISTER -->
+  <send retrans="500">
+    <![CDATA[
+      REGISTER sip:[remote_ip] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: "Load Test [call_number]" <sip:user[call_number]@[local_ip]>;tag=[pid]SIPpTag[call_number]
+      To: <sip:user[call_number]@[remote_ip]>
+      Call-ID: reg-[call_id]
+      CSeq: 1 REGISTER
+      Contact: <sip:user[call_number]@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      Expires: 3600
+      Content-Length: 0
+    ]]>
+  </send>
+
+  <!-- Expect 200 OK for REGISTER -->
+  <recv response="200" rtd="true" />
+
+  <pause milliseconds="100" />
+
+  <!-- Step 2: INVITE -->
+  <send retrans="500">
+    <![CDATA[
+      INVITE sip:service@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: "Load Test [call_number]" <sip:user[call_number]@[local_ip]>;tag=[pid]SIPpTag[call_number]
+      To: <sip:service@[remote_ip]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:user[call_number]@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=user[call_number] 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+      s=-
+      c=IN IP[local_ip_type] [local_ip]
+      t=0 0
+      m=audio [auto_media_port] RTP/AVP 0 8
+      a=rtpmap:0 PCMU/8000
+      a=rtpmap:8 PCMA/8000
+      a=sendrecv
+    ]]>
+  </send>
+
+  <!-- Expect 100 Trying -->
+  <recv response="100" optional="true" />
+
+  <!-- Expect 180 Ringing (optional) -->
+  <recv response="180" optional="true" />
+
+  <!-- Expect 200 OK -->
+  <recv response="200" rtd="true" crlf="true">
+    <action>
+      <ereg regexp=".*" search_in="hdr" header="To:" assign_to="remote_to" />
+    </action>
+  </recv>
+
+  <!-- ACK -->
+  <send>
+    <![CDATA[
+      ACK sip:service@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: "Load Test [call_number]" <sip:user[call_number]@[local_ip]>;tag=[pid]SIPpTag[call_number]
+      [remote_to]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Max-Forwards: 70
+      Content-Length: 0
+    ]]>
+  </send>
+
+  <!-- Call hold duration (5 seconds default, override with -d) -->
+  <pause milliseconds="5000" />
+
+  <!-- BYE -->
+  <send retrans="500">
+    <![CDATA[
+      BYE sip:service@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: "Load Test [call_number]" <sip:user[call_number]@[local_ip]>;tag=[pid]SIPpTag[call_number]
+      [remote_to]
+      Call-ID: [call_id]
+      CSeq: 2 BYE
+      Max-Forwards: 70
+      Content-Length: 0
+    ]]>
+  </send>
+
+  <!-- Expect 200 OK for BYE -->
+  <recv response="200" crlf="true" />
+
+  <ResponseTimeRepartition value="10, 20, 30, 40, 50, 100, 150, 200, 500, 1000" />
+  <CallLengthRepartition value="10, 50, 100, 500, 1000, 5000, 10000" />
+
+</scenario>
