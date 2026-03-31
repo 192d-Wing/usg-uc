@@ -1212,8 +1212,11 @@ async fn create_partition(
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     if let Some(ref router) = state.cucm_router {
-        let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let id = body.get("id").and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| name.clone());
         let desc = body.get("description").and_then(|v| v.as_str()).map(String::from);
         let mut partition = uc_routing::Partition::new(&id, &name);
         if let Some(d) = desc {

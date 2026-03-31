@@ -50,7 +50,7 @@ import { PartitionDialogComponent } from './partition-dialog.component';
             <ng-container matColumnDef="actions">
               <th mat-header-cell *matHeaderCellDef>Actions</th>
               <td mat-cell *matCellDef="let row">
-                <button mat-icon-button color="warn" (click)="deletePartition(row.id)"
+                <button mat-icon-button color="warn" (click)="deletePartition(row.id || row.name)"
                         matTooltip="Delete Partition">
                   <mat-icon>delete</mat-icon>
                 </button>
