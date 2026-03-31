@@ -13,6 +13,7 @@ import { WebSocketService } from './services/websocket.service';
 })
 export class AppComponent implements OnInit, OnDestroy {
   private readonly ws = inject(WebSocketService);
+  bannerExpanded = false;
 
   ngOnInit(): void {
     this.ws.connect();

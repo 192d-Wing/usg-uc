@@ -61,6 +61,35 @@ html, body {
   color: var(--uswds-text);
 }
 
+// .mil banner dark theme
+.usa-banner__header--dark {
+  background-color: var(--uswds-bg-darker);
+  color: var(--uswds-text-secondary);
+
+  .usa-banner__header-text,
+  .usa-banner__header-action,
+  .usa-banner__button-text {
+    color: var(--uswds-text-secondary);
+  }
+
+  .usa-banner__button {
+    color: var(--uswds-text-secondary);
+
+    &::after {
+      mask-image: url('/assets/uswds/img/usa-icons/expand_more.svg');
+      background-color: var(--uswds-text-secondary);
+    }
+  }
+}
+
+.usa-banner__content {
+  background-color: #252525;
+  color: var(--uswds-text);
+
+  p { color: var(--uswds-text); }
+  strong { color: var(--uswds-text); }
+}
+
 .usa-header--dark {
   background-color: var(--uswds-bg-darker);
   border-bottom: 1px solid var(--uswds-border);
