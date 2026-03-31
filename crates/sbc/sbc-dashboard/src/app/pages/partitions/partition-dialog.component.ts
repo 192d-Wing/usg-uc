@@ -16,8 +16,13 @@ import { MatButtonModule } from '@angular/material/button';
     <h2 mat-dialog-title>Add Partition</h2>
     <mat-dialog-content>
       <mat-form-field appearance="outline" class="full-width">
+        <mat-label>ID</mat-label>
+        <input matInput [(ngModel)]="partition.id" required placeholder="pt-internal" />
+      </mat-form-field>
+
+      <mat-form-field appearance="outline" class="full-width">
         <mat-label>Name</mat-label>
-        <input matInput [(ngModel)]="partition.name" required />
+        <input matInput [(ngModel)]="partition.name" required placeholder="Internal" />
       </mat-form-field>
 
       <mat-form-field appearance="outline" class="full-width">
@@ -27,7 +32,7 @@ import { MatButtonModule } from '@angular/material/button';
     </mat-dialog-content>
     <mat-dialog-actions align="end">
       <button mat-button mat-dialog-close>Cancel</button>
-      <button mat-raised-button color="primary" [disabled]="!partition.name"
+      <button mat-raised-button color="primary" [disabled]="!partition.id || !partition.name"
               (click)="dialogRef.close(partition)">
         Add
       </button>
@@ -39,7 +44,7 @@ import { MatButtonModule } from '@angular/material/button';
   `],
 })
 export class PartitionDialogComponent {
-  partition: any = { name: '', description: '' };
+  partition: any = { id: '', name: '', description: '' };
 
   constructor(public dialogRef: MatDialogRef<PartitionDialogComponent>) {}
 }
