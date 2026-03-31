@@ -16,11 +16,13 @@
 # =============================================================================
 FROM rust:1.85-bookworm AS builder
 
-# Install build dependencies
+# Install build dependencies (Go required for aws-lc-fips-sys)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     pkg-config \
     libssl-dev \
+    golang \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 # Create app directory
