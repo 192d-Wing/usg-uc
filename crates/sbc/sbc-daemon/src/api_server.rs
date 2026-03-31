@@ -34,7 +34,7 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
@@ -307,12 +307,26 @@ impl ApiServer {
             // Registration routes
             .route("/registrations", get(get_registrations));
 
+        let api_routes = api_routes
+            // Registration management
+            .route("/registrations/{aor}", delete(delete_registration))
+            // Directory number management
+            .route("/directory", get(get_directory_numbers))
+            .route("/directory", post(add_directory_number))
+            .route("/directory/{did}", delete(delete_directory_number))
+            // CDR routes
+            .route("/cdrs", get(get_cdrs))
+            // Call ladder
+            .route("/calls/{call_id}/ladder", get(get_call_ladder));
+
         Router::new()
             // Health probes (no prefix)
             .route("/healthz", get(liveness_probe))
             .route("/readyz", get(readiness_probe))
             // API v1 routes
             .nest(&format!("/api/{}", self.config.api_version), api_routes)
+            // Dashboard static files (Angular app)
+            .fallback(serve_dashboard)
             // Add state
             .with_state(Arc::clone(&self.state))
             // Add tracing
@@ -592,15 +606,33 @@ async fn get_version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 /// List active calls.
 async fn get_calls(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    // For now, return empty list
-    // In production, would query B2BUA for active calls
-    let response = CallListResponse {
-        calls: Vec::new(),
-        total: 0,
-        active: state.stats.calls_active.load(Ordering::Relaxed),
-    };
-
-    Json(response)
+    if let Some(ref stack) = state.sip_stack {
+        let summaries = stack.list_calls().await;
+        let active = summaries.len();
+        let calls: Vec<CallInfo> = summaries
+            .iter()
+            .map(|s| CallInfo {
+                call_id: s.call_id.clone(),
+                state: s.state.clone(),
+                from: s.a_leg_call_id.clone(),
+                to: s.b_leg_call_id.clone(),
+                start_time: 0,
+                duration_secs: 0,
+            })
+            .collect();
+        let total = calls.len();
+        Json(CallListResponse {
+            calls,
+            total,
+            active: active as u64,
+        })
+    } else {
+        Json(CallListResponse {
+            calls: Vec::new(),
+            total: 0,
+            active: state.stats.calls_active.load(Ordering::Relaxed),
+        })
+    }
 }
 
 // ============================================================================
@@ -609,16 +641,190 @@ async fn get_calls(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 /// List registrations.
 async fn get_registrations(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    // For now, return empty list
-    // In production, would query registrar for active registrations
-    let response = RegistrationListResponse {
-        registrations: Vec::new(),
-        total: 0,
-        active: state.stats.registrations_active.load(Ordering::Relaxed),
-    };
-
-    Json(response)
+    if let Some(ref stack) = state.sip_stack {
+        let summaries = stack.list_registrations().await;
+        let active = summaries.len();
+        let registrations: Vec<RegistrationInfo> = summaries
+            .iter()
+            .flat_map(|s| {
+                s.contacts.iter().map(move |c| RegistrationInfo {
+                    aor: s.aor.clone(),
+                    contact: c.clone(),
+                    expires: 3600,
+                    registered_at: 0,
+                })
+            })
+            .collect();
+        let total = registrations.len();
+        Json(RegistrationListResponse {
+            registrations,
+            total,
+            active: active as u64,
+        })
+    } else {
+        Json(RegistrationListResponse {
+            registrations: Vec::new(),
+            total: 0,
+            active: state.stats.registrations_active.load(Ordering::Relaxed),
+        })
+    }
 }
+
+/// Delete a registration.
+async fn delete_registration(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(aor): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let contact = params.get("contact").cloned().unwrap_or_default();
+
+    if let Some(ref stack) = state.sip_stack {
+        match stack.delete_registration(&aor, &contact).await {
+            Ok(()) => (StatusCode::OK, Json(serde_json::json!({"success": true}))),
+            Err(e) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"success": false, "error": e})),
+            ),
+        }
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"success": false, "error": "SIP stack not available"})),
+        )
+    }
+}
+
+// ============================================================================
+// Directory Number Routes
+// ============================================================================
+
+/// List directory numbers (from dial plan config).
+async fn get_directory_numbers(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Directory numbers come from the dial plan config
+    // In a full implementation, these would be stored in a database
+    Json(serde_json::json!({
+        "directory_numbers": [],
+        "total": 0
+    }))
+}
+
+/// Add a directory number.
+async fn add_directory_number(
+    State(_state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    // Would add to dial plan in production
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({"success": true, "did": body.get("did")})),
+    )
+}
+
+/// Delete a directory number.
+async fn delete_directory_number(
+    State(_state): State<Arc<AppState>>,
+    axum::extract::Path(did): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    // Would remove from dial plan in production
+    Json(serde_json::json!({"success": true, "did": did}))
+}
+
+// ============================================================================
+// CDR Routes
+// ============================================================================
+
+/// List CDR records.
+async fn get_cdrs(
+    State(_state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let _start = params.get("start");
+    let _end = params.get("end");
+    let _caller = params.get("caller");
+    let _callee = params.get("callee");
+    let _status = params.get("status");
+
+    // CDR storage not yet implemented — return empty
+    Json(serde_json::json!({
+        "cdrs": [],
+        "total": 0,
+        "page": 1,
+        "page_size": 50
+    }))
+}
+
+// ============================================================================
+// Call Ladder Routes
+// ============================================================================
+
+/// Get SIP message ladder for a call.
+async fn get_call_ladder(
+    State(_state): State<Arc<AppState>>,
+    axum::extract::Path(call_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    // Call ladder storage not yet implemented — return empty
+    Json(serde_json::json!({
+        "call_id": call_id,
+        "participants": ["UAC", "SBC", "UAS"],
+        "messages": []
+    }))
+}
+
+// ============================================================================
+// Dashboard Static Files
+// ============================================================================
+
+/// Serve Angular dashboard static files.
+///
+/// Falls back to index.html for client-side routing.
+async fn serve_dashboard(uri: axum::http::Uri) -> impl IntoResponse {
+    let path = uri.path().trim_start_matches('/');
+
+    // Try to find the file in the embedded dashboard
+    // For now, return a placeholder — the Angular dist/ files will be
+    // served once embedded via include_dir or a static file handler
+    if path.is_empty() || !path.contains('.') {
+        // SPA fallback: serve index.html for all non-file routes
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/html")
+            .body(DASHBOARD_INDEX.to_string())
+            .unwrap_or_default()
+    } else {
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(String::new())
+            .unwrap_or_default()
+    }
+}
+
+/// Placeholder dashboard index until Angular build is embedded.
+const DASHBOARD_INDEX: &str = r#"<!doctype html>
+<html>
+<head>
+  <title>USG SBC Dashboard</title>
+  <style>
+    body { font-family: sans-serif; background: #1a1a2e; color: #e0e0e0;
+           display: flex; align-items: center; justify-content: center;
+           height: 100vh; margin: 0; }
+    .msg { text-align: center; }
+    h1 { color: #4fc3f7; }
+    p { color: #999; }
+    a { color: #4fc3f7; }
+  </style>
+</head>
+<body>
+  <div class="msg">
+    <h1>USG SBC Dashboard</h1>
+    <p>Angular dashboard not yet embedded in binary.</p>
+    <p>Run <code>ng serve --proxy-config proxy.conf.json</code> in
+    <code>crates/sbc/sbc-dashboard/</code> for development.</p>
+    <p><a href="/api/v1/system/stats">API Stats</a> |
+    <a href="/api/v1/registrations">Registrations</a> |
+    <a href="/api/v1/calls">Calls</a></p>
+  </div>
+</body>
+</html>"#;
 
 // ============================================================================
 // TLS Routes
