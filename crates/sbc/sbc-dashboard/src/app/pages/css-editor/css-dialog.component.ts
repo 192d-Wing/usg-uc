@@ -95,12 +95,14 @@ export class CssDialogComponent implements OnInit {
   }
 
   moveUp(index: number): void {
-    const arr = this.css.partitions;
+    const arr = [...this.css.partitions];
     [arr[index - 1], arr[index]] = [arr[index], arr[index - 1]];
+    this.css.partitions = arr;
   }
 
   moveDown(index: number): void {
-    const arr = this.css.partitions;
+    const arr = [...this.css.partitions];
     [arr[index], arr[index + 1]] = [arr[index + 1], arr[index]];
+    this.css.partitions = arr;
   }
 }
