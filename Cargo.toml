@@ -52,6 +52,7 @@ members = [
     "crates/uc/uc-state-sync",
     "crates/uc/uc-aaa",
     "crates/uc/uc-user-mgmt",
+    "crates/uc/uc-phone-mgmt",
     "crates/uc/uc-snmp",
     "crates/uc/uc-syslog",
 
@@ -160,6 +161,7 @@ uc-storage = { path = "crates/uc/uc-storage" }
 uc-state-sync = { path = "crates/uc/uc-state-sync" }
 uc-aaa = { path = "crates/uc/uc-aaa" }
 uc-user-mgmt = { path = "crates/uc/uc-user-mgmt" }
+uc-phone-mgmt = { path = "crates/uc/uc-phone-mgmt" }
 uc-snmp = { path = "crates/uc/uc-snmp" }
 uc-syslog = { path = "crates/uc/uc-syslog" }
 uc-webrtc = { path = "crates/uc/uc-webrtc" }

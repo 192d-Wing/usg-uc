@@ -1,0 +1,17 @@
+[package]
+name = "uc-phone-mgmt"
+description = "Phone device management and auto-provisioning for USG SBC"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid = { version = "1", features = ["v4"] }
+
+[lints]
+workspace = true
