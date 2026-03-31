@@ -37,17 +37,17 @@ import { RoutePatternDialogComponent } from './route-pattern-dialog.component';
                 <code class="pattern-code">{{ row.pattern }}</code>
               </td>
             </ng-container>
-            <ng-container matColumnDef="partition">
+            <ng-container matColumnDef="partition_id">
               <th mat-header-cell *matHeaderCellDef>Partition</th>
-              <td mat-cell *matCellDef="let row">{{ row.partition }}</td>
+              <td mat-cell *matCellDef="let row">{{ row.partition_id || '-' }}</td>
             </ng-container>
-            <ng-container matColumnDef="route_target">
-              <th mat-header-cell *matHeaderCellDef>Route List / Group</th>
-              <td mat-cell *matCellDef="let row">{{ row.route_list_id || row.route_group_id || '-' }}</td>
+            <ng-container matColumnDef="route_list_id">
+              <th mat-header-cell *matHeaderCellDef>Route List</th>
+              <td mat-cell *matCellDef="let row">{{ row.route_list_id || '-' }}</td>
             </ng-container>
-            <ng-container matColumnDef="transform">
-              <th mat-header-cell *matHeaderCellDef>Transform</th>
-              <td mat-cell *matCellDef="let row">{{ row.called_party_transform || '-' }}</td>
+            <ng-container matColumnDef="route_group_id">
+              <th mat-header-cell *matHeaderCellDef>Route Group</th>
+              <td mat-cell *matCellDef="let row">{{ row.route_group_id || '-' }}</td>
             </ng-container>
             <ng-container matColumnDef="priority">
               <th mat-header-cell *matHeaderCellDef>Priority</th>
@@ -112,7 +112,7 @@ export class RoutePatternsComponent implements OnInit {
   private readonly dialog = inject(MatDialog);
 
   readonly displayedColumns = [
-    'pattern', 'partition', 'route_target', 'transform', 'priority', 'blocked', 'actions',
+    'pattern', 'partition_id', 'route_list_id', 'route_group_id', 'priority', 'blocked', 'actions',
   ];
 
   readonly patterns = signal<any[]>([]);

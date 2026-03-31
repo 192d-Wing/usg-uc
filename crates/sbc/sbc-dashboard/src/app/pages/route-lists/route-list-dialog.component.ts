@@ -1,6 +1,6 @@
-import { Component } from '@angular/core';
+import { Component, inject, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
-import { MatDialogModule, MatDialogRef } from '@angular/material/dialog';
+import { MAT_DIALOG_DATA, MatDialogModule, MatDialogRef } from '@angular/material/dialog';
 import { MatFormFieldModule } from '@angular/material/form-field';
 import { MatInputModule } from '@angular/material/input';
 import { MatButtonModule } from '@angular/material/button';
@@ -13,11 +13,11 @@ import { MatButtonModule } from '@angular/material/button';
     MatInputModule, MatButtonModule,
   ],
   template: `
-    <h2 mat-dialog-title>Add Route List</h2>
+    <h2 mat-dialog-title>{{ isEdit ? 'Edit' : 'Add' }} Route List</h2>
     <mat-dialog-content>
       <mat-form-field appearance="outline" class="full-width">
         <mat-label>Name</mat-label>
-        <input matInput [(ngModel)]="routeList.name" required />
+        <input matInput [(ngModel)]="routeList.name" required [readonly]="isEdit" />
       </mat-form-field>
 
       <mat-form-field appearance="outline" class="full-width">
@@ -29,7 +29,7 @@ import { MatButtonModule } from '@angular/material/button';
       <button mat-button mat-dialog-close>Cancel</button>
       <button mat-raised-button color="primary" [disabled]="!routeList.name"
               (click)="dialogRef.close(routeList)">
-        Add
+        {{ isEdit ? 'Save' : 'Add' }}
       </button>
     </mat-dialog-actions>
   `,
@@ -38,8 +38,21 @@ import { MatButtonModule } from '@angular/material/button';
     mat-dialog-content { display: flex; flex-direction: column; gap: 4px; min-width: 400px; }
   `],
 })
-export class RouteListDialogComponent {
+export class RouteListDialogComponent implements OnInit {
+  private readonly data: any = inject(MAT_DIALOG_DATA, { optional: true });
+
+  isEdit = false;
   routeList: any = { name: '', description: '' };
 
   constructor(public dialogRef: MatDialogRef<RouteListDialogComponent>) {}
+
+  ngOnInit(): void {
+    if (this.data) {
+      this.isEdit = true;
+      this.routeList = {
+        name: this.data.name || this.data.id,
+        description: this.data.description || '',
+      };
+    }
+  }
 }

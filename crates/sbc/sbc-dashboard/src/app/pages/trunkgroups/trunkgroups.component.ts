@@ -45,6 +45,9 @@ import { TrunkDialogComponent } from './trunk-dialog.component';
             </mat-expansion-panel-header>
 
             <div class="panel-actions">
+              <button mat-raised-button color="primary" (click)="openEditGroupDialog(group)">
+                <mat-icon>edit</mat-icon> Edit Group
+              </button>
               <button mat-raised-button color="primary" (click)="openAddTrunkDialog(group.id)">
                 <mat-icon>add</mat-icon> Add Trunk
               </button>
@@ -219,6 +222,18 @@ export class TrunkgroupsComponent implements OnInit {
     ref.afterClosed().subscribe((result: any) => {
       if (result) {
         this.api.addTrunkGroup(result).subscribe({
+          next: () => this.loadGroups(),
+          error: () => {},
+        });
+      }
+    });
+  }
+
+  openEditGroupDialog(group: any): void {
+    const ref = this.dialog.open(TrunkgroupDialogComponent, { data: group });
+    ref.afterClosed().subscribe((result: any) => {
+      if (result) {
+        this.api.updateTrunkGroup(group.id, result).subscribe({
           next: () => this.loadGroups(),
           error: () => {},
         });

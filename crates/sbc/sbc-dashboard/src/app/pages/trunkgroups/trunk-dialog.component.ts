@@ -64,6 +64,16 @@ import { FormsModule } from '@angular/forms';
         <mat-label>Max Failures</mat-label>
         <input matInput type="number" [(ngModel)]="form.max_failures">
       </mat-form-field>
+
+      <mat-form-field appearance="outline" class="full-width">
+        <mat-label>SIP Username</mat-label>
+        <input matInput [(ngModel)]="form.sip_username">
+      </mat-form-field>
+
+      <mat-form-field appearance="outline" class="full-width">
+        <mat-label>SIP Password</mat-label>
+        <input matInput type="password" [(ngModel)]="form.sip_password">
+      </mat-form-field>
     </mat-dialog-content>
     <mat-dialog-actions align="end">
       <button mat-button mat-dialog-close>Cancel</button>
@@ -88,6 +98,8 @@ export class TrunkDialogComponent {
     max_calls: 100,
     cooldown_seconds: 30,
     max_failures: 5,
+    sip_username: '',
+    sip_password: '',
   };
 
   save(): void {

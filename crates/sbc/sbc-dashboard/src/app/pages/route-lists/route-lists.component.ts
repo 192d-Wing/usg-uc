@@ -43,6 +43,9 @@ import { RouteListDialogComponent } from './route-list-dialog.component';
             </mat-expansion-panel-header>
 
             <div class="panel-actions">
+              <button mat-raised-button color="primary" (click)="openEditDialog(rl)">
+                <mat-icon>edit</mat-icon> Edit Route List
+              </button>
               <button mat-raised-button color="warn" (click)="deleteRouteList(rl.id)">
                 <mat-icon>delete</mat-icon> Delete Route List
               </button>
@@ -129,6 +132,18 @@ export class RouteListsComponent implements OnInit {
     ref.afterClosed().subscribe((result: any) => {
       if (result) {
         this.api.createRouteList(result).subscribe({
+          next: () => this.loadRouteLists(),
+          error: () => {},
+        });
+      }
+    });
+  }
+
+  openEditDialog(rl: any): void {
+    const ref = this.dialog.open(RouteListDialogComponent, { data: rl });
+    ref.afterClosed().subscribe((result: any) => {
+      if (result) {
+        this.api.updateRouteList(rl.id, result).subscribe({
           next: () => this.loadRouteLists(),
           error: () => {},
         });

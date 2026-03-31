@@ -5,6 +5,8 @@ import { MatFormFieldModule } from '@angular/material/form-field';
 import { MatInputModule } from '@angular/material/input';
 import { MatSelectModule } from '@angular/material/select';
 import { MatButtonModule } from '@angular/material/button';
+import { MatIconModule } from '@angular/material/icon';
+import { MatTooltipModule } from '@angular/material/tooltip';
 import { ApiService } from '../../services/api.service';
 
 @Component({
@@ -13,6 +15,7 @@ import { ApiService } from '../../services/api.service';
   imports: [
     FormsModule, MatDialogModule, MatFormFieldModule,
     MatInputModule, MatSelectModule, MatButtonModule,
+    MatIconModule, MatTooltipModule,
   ],
   template: `
     <h2 mat-dialog-title>{{ isEdit ? 'Edit' : 'Add' }} Calling Search Space</h2>
@@ -30,6 +33,24 @@ import { ApiService } from '../../services/api.service';
           }
         </mat-select>
       </mat-form-field>
+
+      @if (css.partitions.length) {
+        <div class="partition-order">
+          <p class="order-label">Evaluation Order:</p>
+          @for (p of css.partitions; track p; let i = $index) {
+            <div class="partition-row">
+              <span class="order-num">{{ i + 1 }}</span>
+              <span class="partition-name">{{ p }}</span>
+              <button mat-icon-button (click)="moveUp(i)" [disabled]="i === 0" matTooltip="Move up">
+                <mat-icon>arrow_upward</mat-icon>
+              </button>
+              <button mat-icon-button (click)="moveDown(i)" [disabled]="i === css.partitions.length - 1" matTooltip="Move down">
+                <mat-icon>arrow_downward</mat-icon>
+              </button>
+            </div>
+          }
+        </div>
+      }
     </mat-dialog-content>
     <mat-dialog-actions align="end">
       <button mat-button mat-dialog-close>Cancel</button>
@@ -42,6 +63,11 @@ import { ApiService } from '../../services/api.service';
   styles: [`
     .full-width { width: 100%; }
     mat-dialog-content { display: flex; flex-direction: column; gap: 4px; min-width: 400px; padding-top: 8px !important; }
+    .partition-order { margin-top: 8px; }
+    .order-label { font-weight: 500; margin: 0 0 8px; font-size: 14px; color: rgba(255,255,255,0.7); }
+    .partition-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+    .order-num { min-width: 24px; text-align: center; font-weight: 600; color: var(--uswds-primary-light); }
+    .partition-name { flex: 1; }
   `],
 })
 export class CssDialogComponent implements OnInit {
@@ -66,5 +92,15 @@ export class CssDialogComponent implements OnInit {
         partitions: [...(this.data.partitions || [])],
       };
     }
+  }
+
+  moveUp(index: number): void {
+    const arr = this.css.partitions;
+    [arr[index - 1], arr[index]] = [arr[index], arr[index - 1]];
+  }
+
+  moveDown(index: number): void {
+    const arr = this.css.partitions;
+    [arr[index], arr[index + 1]] = [arr[index + 1], arr[index]];
   }
 }

@@ -355,7 +355,7 @@ impl ApiServer {
             .route("/trunkgroups", get(get_trunk_groups))
             .route("/trunkgroups", post(add_trunk_group))
             .route("/trunkgroups/{group_id}", get(get_trunk_group))
-            .route("/trunkgroups/{group_id}", delete(delete_trunk_group))
+            .route("/trunkgroups/{group_id}", delete(delete_trunk_group).put(update_trunk_group))
             .route("/trunkgroups/{group_id}/trunks", post(add_trunk))
             .route("/trunkgroups/{group_id}/trunks/{trunk_id}", delete(delete_trunk))
             // User management
@@ -381,7 +381,7 @@ impl ApiServer {
             .route("/routepatterns/{id}", delete(delete_route_pattern).put(update_route_pattern))
             .route("/routelists", get(list_route_lists))
             .route("/routelists", post(create_route_list))
-            .route("/routelists/{id}", delete(delete_route_list));
+            .route("/routelists/{id}", delete(delete_route_list).put(update_route_list));
 
         // Provisioning routes (outside API prefix)
         // Use a catch-all under /provision/ since Axum doesn't allow {param}.ext
@@ -956,6 +956,17 @@ async fn delete_trunk_group(
     Json(serde_json::json!({ "success": true, "group_id": group_id }))
 }
 
+/// Update a trunk group.
+async fn update_trunk_group(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(group_id): axum::extract::Path<String>,
+    Json(mut body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    body["id"] = serde_json::json!(group_id);
+    state.mem_store.write().await.trunk_groups.insert(group_id.clone(), body.clone());
+    Json(serde_json::json!({ "success": true, "trunk_group": body }))
+}
+
 /// Add a trunk to a group.
 async fn add_trunk(
     State(state): State<Arc<AppState>>,
@@ -1305,9 +1316,22 @@ async fn list_route_patterns(State(state): State<Arc<AppState>>) -> impl IntoRes
     if let Some(ref router) = state.cucm_router {
         let r = router.read().await;
         let patterns: Vec<_> = r.list_route_patterns().iter().map(|p| {
+            let pattern_str = match p.pattern() {
+                uc_routing::DialPattern::Exact(v) => v.clone(),
+                uc_routing::DialPattern::Prefix(v) => format!("{v}..."),
+                uc_routing::DialPattern::Wildcard(v) => v.clone(),
+                uc_routing::DialPattern::Regex(v) => v.clone(),
+                uc_routing::DialPattern::Any => "*".to_string(),
+            };
             serde_json::json!({
-                "id": p.id(), "partition_id": p.partition_id(),
-                "priority": p.priority(), "blocked": p.is_blocked()
+                "id": p.id(),
+                "pattern": pattern_str,
+                "partition_id": p.partition_id(),
+                "route_list_id": p.route_list_id(),
+                "route_group_id": p.route_group_id(),
+                "description": p.description(),
+                "priority": p.priority(),
+                "blocked": p.is_blocked()
             })
         }).collect();
         Json(serde_json::json!({ "route_patterns": patterns }))
@@ -1409,6 +1433,23 @@ async fn delete_route_list(
 ) -> impl IntoResponse {
     if let Some(ref router) = state.cucm_router {
         router.write().await.remove_route_list(&id);
+        Json(serde_json::json!({ "success": true, "id": id }))
+    } else {
+        Json(serde_json::json!({ "success": false }))
+    }
+}
+
+/// Update a route list.
+async fn update_route_list(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Some(ref router) = state.cucm_router {
+        router.write().await.remove_route_list(&id);
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
+        let rl = uc_routing::RouteList::new(&id, &name);
+        router.write().await.add_route_list(rl);
         Json(serde_json::json!({ "success": true, "id": id }))
     } else {
         Json(serde_json::json!({ "success": false }))

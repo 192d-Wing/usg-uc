@@ -219,4 +219,10 @@ export class ApiService {
   deleteRouteList(id: string): Observable<any> {
     return this.http.delete(`${this.baseUrl}/routelists/${encodeURIComponent(id)}`);
   }
+  updateRouteList(id: string, rl: any): Observable<any> {
+    return this.http.put(`${this.baseUrl}/routelists/${encodeURIComponent(id)}`, rl);
+  }
+  updateTrunkGroup(id: string, group: any): Observable<any> {
+    return this.http.put(`${this.baseUrl}/trunkgroups/${encodeURIComponent(id)}`, group);
+  }
 }
