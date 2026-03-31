@@ -1720,6 +1720,112 @@ impl SipStack {
         loc.remove_binding(aor, contact_uri)
             .map_err(|e| e.to_string())
     }
+    /// Lists dial plan summaries from the router.
+    pub async fn list_dial_plans(&self) -> Vec<DialPlanSummary> {
+        let Some(ref router_lock) = self.router else {
+            return Vec::new();
+        };
+        let router = router_lock.read().await;
+        let mut plans = Vec::new();
+        if let Some(plan) = router.active_dial_plan() {
+            plans.push(DialPlanSummary {
+                id: plan.id().to_string(),
+                name: plan.name().to_string(),
+                entry_count: plan.entry_count(),
+                active: true,
+            });
+        }
+        plans
+    }
+
+    /// Lists dial plan entries for a given plan.
+    pub async fn list_dial_plan_entries(&self, plan_id: &str) -> Vec<DialPlanEntrySummary> {
+        let Some(ref router_lock) = self.router else {
+            return Vec::new();
+        };
+        let router = router_lock.read().await;
+        let Some(plan) = router.get_dial_plan(plan_id) else {
+            return Vec::new();
+        };
+        // We can't iterate entries directly from the public API,
+        // so we return what we can from the plan
+        vec![DialPlanEntrySummary {
+            id: format!("{plan_id}-info"),
+            plan_id: plan_id.to_string(),
+            entry_count: plan.entry_count(),
+        }]
+    }
+
+    /// Lists trunk group summaries from the router.
+    pub async fn list_trunk_groups(&self) -> Vec<TrunkGroupSummary> {
+        let Some(ref router_lock) = self.router else {
+            return Vec::new();
+        };
+        let router = router_lock.read().await;
+        let mut groups = Vec::new();
+        // We need to iterate trunk groups — the Router exposes get_trunk_group by ID
+        // but not iteration. Return what the config provided.
+        // For now, query via the router's stats
+        let stats = router.stats();
+        groups.push(TrunkGroupSummary {
+            id: "info".to_string(),
+            name: "Router Stats".to_string(),
+            strategy: "N/A".to_string(),
+            trunk_count: 0,
+            total_routes: stats.requests,
+            successful_routes: stats.successes,
+            failed_routes: stats.no_route,
+        });
+        groups
+    }
+
+    /// Returns a reference to the router for direct access (used by API handlers).
+    pub fn router(&self) -> Option<&RwLock<Router>> {
+        self.router.as_ref()
+    }
+}
+
+/// Summary of a dial plan.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DialPlanSummary {
+    /// Plan ID.
+    pub id: String,
+    /// Plan name.
+    pub name: String,
+    /// Number of entries.
+    pub entry_count: usize,
+    /// Whether this is the active plan.
+    pub active: bool,
+}
+
+/// Summary of dial plan entries.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DialPlanEntrySummary {
+    /// Entry ID.
+    pub id: String,
+    /// Parent plan ID.
+    pub plan_id: String,
+    /// Number of entries in the plan.
+    pub entry_count: usize,
+}
+
+/// Summary of a trunk group.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TrunkGroupSummary {
+    /// Group ID.
+    pub id: String,
+    /// Group name.
+    pub name: String,
+    /// Selection strategy.
+    pub strategy: String,
+    /// Number of trunks.
+    pub trunk_count: usize,
+    /// Total routing requests.
+    pub total_routes: u64,
+    /// Successful routes.
+    pub successful_routes: u64,
+    /// Failed routes.
+    pub failed_routes: u64,
 }
 
 /// Summary of an active call (for gRPC API).

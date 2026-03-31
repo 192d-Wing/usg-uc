@@ -279,7 +279,9 @@ impl Runtime {
         let metrics = SbcMetrics::standard();
         let stats = Arc::clone(server.stats());
 
-        let app_state = Arc::new(AppState::new(metrics, stats));
+        let mut app_state = AppState::new(metrics, stats);
+        app_state.sip_stack = Some(Arc::clone(server.sip_stack()));
+        let app_state = Arc::new(app_state);
         let api_server = ApiServer::new(api_config, app_state.clone(), signal.clone());
 
         // Spawn API server task

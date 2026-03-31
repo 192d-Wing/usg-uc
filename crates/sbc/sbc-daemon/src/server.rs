@@ -207,6 +207,11 @@ impl Server {
         &self.stats
     }
 
+    /// Returns the SIP stack.
+    pub fn sip_stack(&self) -> &Arc<SipStack> {
+        &self.sip_stack
+    }
+
     /// Starts the server and binds to transport addresses.
     pub async fn start(&mut self) -> Result<(), ServerError> {
         info!(

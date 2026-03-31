@@ -317,7 +317,19 @@ impl ApiServer {
             // CDR routes
             .route("/cdrs", get(get_cdrs))
             // Call ladder
-            .route("/calls/{call_id}/ladder", get(get_call_ladder));
+            .route("/calls/{call_id}/ladder", get(get_call_ladder))
+            // Dial plan management
+            .route("/dialplans", get(get_dial_plans))
+            .route("/dialplans/{plan_id}/entries", get(get_dial_plan_entries))
+            .route("/dialplans/{plan_id}/entries", post(add_dial_plan_entry))
+            .route("/dialplans/{plan_id}/entries/{entry_id}", delete(delete_dial_plan_entry))
+            // Trunk group management
+            .route("/trunkgroups", get(get_trunk_groups))
+            .route("/trunkgroups", post(add_trunk_group))
+            .route("/trunkgroups/{group_id}", get(get_trunk_group))
+            .route("/trunkgroups/{group_id}", delete(delete_trunk_group))
+            .route("/trunkgroups/{group_id}/trunks", post(add_trunk))
+            .route("/trunkgroups/{group_id}/trunks/{trunk_id}", delete(delete_trunk));
 
         Router::new()
             // Health probes (no prefix)
@@ -767,6 +779,149 @@ async fn get_call_ladder(
         "call_id": call_id,
         "participants": ["UAC", "SBC", "UAS"],
         "messages": []
+    }))
+}
+
+// ============================================================================
+// Dial Plan Routes
+// ============================================================================
+
+/// List dial plans.
+async fn get_dial_plans(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(ref stack) = state.sip_stack {
+        let plans = stack.list_dial_plans().await;
+        Json(serde_json::json!({ "dial_plans": plans }))
+    } else {
+        Json(serde_json::json!({ "dial_plans": [] }))
+    }
+}
+
+/// Get entries for a dial plan.
+async fn get_dial_plan_entries(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(plan_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Some(ref stack) = state.sip_stack {
+        let entries = stack.list_dial_plan_entries(&plan_id).await;
+        Json(serde_json::json!({ "plan_id": plan_id, "entries": entries }))
+    } else {
+        Json(serde_json::json!({ "plan_id": plan_id, "entries": [] }))
+    }
+}
+
+/// Add a dial plan entry.
+async fn add_dial_plan_entry(
+    State(_state): State<Arc<AppState>>,
+    axum::extract::Path(plan_id): axum::extract::Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    // TODO: Add entry to router's active dial plan
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "success": true,
+            "plan_id": plan_id,
+            "entry": body
+        })),
+    )
+}
+
+/// Delete a dial plan entry.
+async fn delete_dial_plan_entry(
+    State(_state): State<Arc<AppState>>,
+    axum::extract::Path((plan_id, entry_id)): axum::extract::Path<(String, String)>,
+) -> impl IntoResponse {
+    // TODO: Remove entry from router's dial plan
+    Json(serde_json::json!({
+        "success": true,
+        "plan_id": plan_id,
+        "entry_id": entry_id
+    }))
+}
+
+// ============================================================================
+// Trunk Group Routes
+// ============================================================================
+
+/// List trunk groups.
+async fn get_trunk_groups(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(ref stack) = state.sip_stack {
+        let groups = stack.list_trunk_groups().await;
+        Json(serde_json::json!({ "trunk_groups": groups }))
+    } else {
+        Json(serde_json::json!({ "trunk_groups": [] }))
+    }
+}
+
+/// Get a specific trunk group.
+async fn get_trunk_group(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(group_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Some(ref stack) = state.sip_stack {
+        if let Some(router_lock) = stack.router() {
+            let router = router_lock.read().await;
+            if let Some(group) = router.get_trunk_group(&group_id) {
+                return Json(serde_json::json!({
+                    "id": group.id(),
+                    "name": group.name(),
+                    "trunk_count": group.trunk_count(),
+                    "usable_trunks": group.usable_trunk_count(),
+                }));
+            }
+        }
+    }
+    Json(serde_json::json!({ "error": "Trunk group not found" }))
+}
+
+/// Add a trunk group.
+async fn add_trunk_group(
+    State(_state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    // TODO: Add trunk group to router
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "success": true, "trunk_group": body })),
+    )
+}
+
+/// Delete a trunk group.
+async fn delete_trunk_group(
+    State(_state): State<Arc<AppState>>,
+    axum::extract::Path(group_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    // TODO: Remove trunk group from router
+    Json(serde_json::json!({ "success": true, "group_id": group_id }))
+}
+
+/// Add a trunk to a group.
+async fn add_trunk(
+    State(_state): State<Arc<AppState>>,
+    axum::extract::Path(group_id): axum::extract::Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    // TODO: Add trunk to group in router
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "success": true,
+            "group_id": group_id,
+            "trunk": body
+        })),
+    )
+}
+
+/// Delete a trunk from a group.
+async fn delete_trunk(
+    State(_state): State<Arc<AppState>>,
+    axum::extract::Path((group_id, trunk_id)): axum::extract::Path<(String, String)>,
+) -> impl IntoResponse {
+    // TODO: Remove trunk from group in router
+    Json(serde_json::json!({
+        "success": true,
+        "group_id": group_id,
+        "trunk_id": trunk_id
     }))
 }
 

@@ -1,6 +1,6 @@
 import { Injectable, inject } from '@angular/core';
 import { HttpClient, HttpParams } from '@angular/common/http';
-import { Observable } from 'rxjs';
+import { Observable, map } from 'rxjs';
 import {
   SystemStats,
   HealthStatus,
@@ -18,15 +18,32 @@ export class ApiService {
   private readonly baseUrl = '/api/v1';
 
   getStats(): Observable<SystemStats> {
-    return this.http.get<SystemStats>(`${this.baseUrl}/stats`);
+    return this.http.get<SystemStats>(`${this.baseUrl}/system/stats`);
   }
 
   getHealth(): Observable<HealthStatus> {
-    return this.http.get<HealthStatus>(`${this.baseUrl}/health`);
+    return this.http.get<HealthStatus>(`${this.baseUrl}/system/health`);
   }
 
   getRegistrations(): Observable<Registration[]> {
-    return this.http.get<Registration[]>(`${this.baseUrl}/registrations`);
+    return this.http.get<any>(`${this.baseUrl}/registrations`).pipe(
+      map(resp => {
+        const regs = resp.registrations ?? resp;
+        // Group flat registrations by AOR
+        const byAor = new Map<string, Registration>();
+        for (const r of regs) {
+          if (!byAor.has(r.aor)) {
+            byAor.set(r.aor, { aor: r.aor, contacts: [] });
+          }
+          byAor.get(r.aor)!.contacts.push({
+            uri: r.contact ?? r.uri ?? '',
+            expires: r.expires,
+            source_address: r.source_address,
+          });
+        }
+        return Array.from(byAor.values());
+      })
+    );
   }
 
   deleteRegistration(aor: string, contactUri: string): Observable<void> {
@@ -38,7 +55,9 @@ export class ApiService {
   }
 
   getDirectoryNumbers(): Observable<DirectoryNumber[]> {
-    return this.http.get<DirectoryNumber[]>(`${this.baseUrl}/directory`);
+    return this.http.get<any>(`${this.baseUrl}/directory`).pipe(
+      map(resp => resp.directory_numbers ?? resp)
+    );
   }
 
   addDirectoryNumber(dn: DirectoryNumber): Observable<DirectoryNumber> {
@@ -77,7 +96,9 @@ export class ApiService {
   }
 
   getActiveCalls(): Observable<CdrRecord[]> {
-    return this.http.get<CdrRecord[]>(`${this.baseUrl}/calls/active`);
+    return this.http.get<any>(`${this.baseUrl}/calls`).pipe(
+      map(resp => resp.calls ?? resp)
+    );
   }
 
   getRecentCallIds(): Observable<string[]> {
