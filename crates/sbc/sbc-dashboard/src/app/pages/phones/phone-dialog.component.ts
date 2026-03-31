@@ -96,7 +96,15 @@ interface ModelGroup {
   `,
   styles: [`
     .full-width { width: 100%; }
-    mat-dialog-content { display: flex; flex-direction: column; gap: 4px; min-width: 400px; }
+    mat-dialog-content {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-width: 400px;
+      max-height: 65vh;
+      overflow-y: auto;
+      padding-top: 8px !important;
+    }
     .section-title { color: rgba(255, 255, 255, 0.7); margin: 8px 0 4px; font-size: 14px; }
   `],
 })
