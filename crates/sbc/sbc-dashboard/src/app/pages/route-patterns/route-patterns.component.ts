@@ -87,46 +87,20 @@ import { RoutePatternDialogComponent } from './route-pattern-dialog.component';
   styles: [`
     .rp-page { padding: 24px; }
 
-    .page-header {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 24px;
-    }
-
-    .page-title {
-      color: #fff;
-      margin: 0;
-      font-size: 24px;
-      font-weight: 500;
-    }
-
-    .spacer { flex: 1; }
-
-    .table-card, .empty-card {
-      background: #16213e;
-      color: #fff;
-      border-radius: 12px;
-    }
-
     .rp-table { width: 100%; }
 
     .pattern-code {
-      padding: 2px 8px;
-      border-radius: 4px;
-      font-family: monospace;
-      background: rgba(124, 77, 255, 0.15);
-      color: #b388ff;
+      padding: 3px 10px;
+      border-radius: 6px;
+      font-family: 'Roboto Mono', monospace;
+      font-size: 13px;
+      background: rgba(102, 126, 234, 0.1);
+      color: #a5b4fc;
+      border: 1px solid rgba(102, 126, 234, 0.15);
     }
 
-    .blocked { color: #e57373; }
-    mat-icon:not(.blocked) { color: rgba(255, 255, 255, 0.3); }
-
-    .empty-msg {
-      text-align: center;
-      color: rgba(255, 255, 255, 0.5);
-      padding: 24px;
-    }
+    .blocked { color: var(--color-error); }
+    mat-icon:not(.blocked) { color: rgba(255, 255, 255, 0.2); }
   `],
 })
 export class RoutePatternsComponent implements OnInit {

@@ -7,10 +7,10 @@
 }
 
 .page-title {
-  color: #fff;
+  color: var(--text-primary);
   margin: 0;
   font-size: 24px;
-  font-weight: 500;
+  font-weight: 600;
 }
 
 .search-row {
@@ -34,13 +34,11 @@
 }
 
 .recent-label {
-  color: rgba(255, 255, 255, 0.5);
+  color: var(--text-secondary);
   font-size: 13px;
 }
 
 .ladder-card {
-  background: #16213e;
-  border-radius: 12px;
   margin-bottom: 16px;
 }
 
@@ -49,9 +47,8 @@
 }
 
 .detail-card {
-  background: #16213e;
-  color: #fff;
-  border-radius: 12px;
+  border-left: 3px solid transparent;
+  border-image: linear-gradient(135deg, #667eea 0%, #764ba2 100%) 1;
 }
 
 .detail-header {
@@ -63,19 +60,23 @@
 
 .detail-method {
   font-size: 16px;
-  font-weight: 600;
-  color: #7c4dff;
+  font-weight: 700;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
 }
 
 .detail-direction {
   font-size: 13px;
-  color: rgba(255, 255, 255, 0.6);
+  color: var(--text-secondary);
   text-transform: uppercase;
+  letter-spacing: 0.05em;
 }
 
 .detail-time {
   font-size: 13px;
-  color: rgba(255, 255, 255, 0.5);
+  color: var(--text-secondary);
   margin-left: auto;
 }
 
@@ -87,14 +88,15 @@
 }
 
 .detail-raw {
-  background: #0a0a1a;
+  background: rgba(0, 0, 0, 0.3);
   color: rgba(255, 255, 255, 0.85);
-  padding: 12px;
-  border-radius: 8px;
+  padding: 16px;
+  border-radius: 12px;
   font-size: 12px;
   font-family: 'Roboto Mono', monospace;
   overflow-x: auto;
   white-space: pre;
   max-height: 400px;
   overflow-y: auto;
+  border: 1px solid rgba(255, 255, 255, 0.06);
 }

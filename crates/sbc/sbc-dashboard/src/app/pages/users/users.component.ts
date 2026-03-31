@@ -90,49 +90,36 @@ import { UserDialogComponent } from './user-dialog.component';
   styles: [`
     .users-page { padding: 24px; }
 
-    .page-header {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 24px;
-    }
-
-    .page-title {
-      color: #fff;
-      margin: 0;
-      font-size: 24px;
-      font-weight: 500;
-    }
-
-    .spacer { flex: 1; }
-
-    .table-card, .empty-card {
-      background: #16213e;
-      color: #fff;
-      border-radius: 12px;
-    }
-
     .users-table { width: 100%; }
 
     .auth-chip {
-      padding: 2px 10px;
-      border-radius: 12px;
+      padding: 3px 10px;
+      border-radius: 8px;
       font-size: 12px;
       font-weight: 600;
+      border: 1px solid transparent;
     }
 
-    .auth-digest { background: rgba(76, 175, 80, 0.2); color: #81c784; }
-    .auth-mtls_pki { background: rgba(33, 150, 243, 0.2); color: #64b5f6; }
-    .auth-both { background: rgba(156, 39, 176, 0.2); color: #ce93d8; }
-
-    .enabled { color: #81c784; }
-    mat-icon:not(.enabled) { color: rgba(255, 255, 255, 0.3); }
-
-    .empty-msg {
-      text-align: center;
-      color: rgba(255, 255, 255, 0.5);
-      padding: 24px;
+    .auth-digest {
+      background: rgba(74, 222, 128, 0.12);
+      color: var(--color-success);
+      border-color: rgba(74, 222, 128, 0.2);
     }
+
+    .auth-mtls_pki {
+      background: rgba(96, 165, 250, 0.12);
+      color: #93bbfd;
+      border-color: rgba(96, 165, 250, 0.2);
+    }
+
+    .auth-both {
+      background: rgba(168, 85, 247, 0.12);
+      color: #c4b5fd;
+      border-color: rgba(168, 85, 247, 0.2);
+    }
+
+    .enabled { color: var(--color-success); }
+    mat-icon:not(.enabled) { color: rgba(255, 255, 255, 0.2); }
   `],
 })
 export class UsersComponent implements OnInit {

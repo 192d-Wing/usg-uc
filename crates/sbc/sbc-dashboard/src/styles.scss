@@ -1,5 +1,24 @@
 @use '@angular/material' as mat;
 
+// --- Design System CSS Custom Properties ---
+:root {
+  --bg-gradient: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
+  --glass-bg: rgba(255, 255, 255, 0.05);
+  --glass-blur: blur(20px);
+  --glass-border: 1px solid rgba(255, 255, 255, 0.08);
+  --glass-radius: 16px;
+  --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+  --accent-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  --color-success: #4ade80;
+  --color-warning: #fbbf24;
+  --color-error: #f87171;
+  --text-primary: rgba(255, 255, 255, 0.95);
+  --text-secondary: rgba(255, 255, 255, 0.5);
+  --hover-highlight: rgba(255, 255, 255, 0.03);
+  --border-subtle: rgba(255, 255, 255, 0.06);
+}
+
+// --- Angular Material Theme ---
 html {
   @include mat.theme((
     color: (
@@ -12,76 +31,268 @@ html {
   ));
 }
 
+// --- Base ---
 html, body {
   height: 100%;
   margin: 0;
   font-family: Roboto, "Helvetica Neue", sans-serif;
-  background: #0a0a1a;
-  color: #fff;
+  background: var(--bg-gradient);
+  background-attachment: fixed;
+  color: var(--text-primary);
 }
 
+// --- Utility Classes ---
+.glass-card {
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: var(--glass-border);
+  border-radius: var(--glass-radius);
+  box-shadow: var(--glass-shadow);
+  transition: transform 250ms ease, box-shadow 250ms ease;
+}
+
+.gradient-text {
+  background: var(--accent-gradient);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.gradient-divider {
+  height: 2px;
+  background: var(--accent-gradient);
+  border: none;
+  border-radius: 1px;
+  opacity: 0.4;
+  margin: 24px 0;
+}
+
+// --- Material Table Overrides ---
 .mat-mdc-table {
   background: transparent !important;
 }
 
 .mat-mdc-header-cell {
-  color: rgba(255, 255, 255, 0.7) !important;
-  border-bottom-color: rgba(255, 255, 255, 0.1) !important;
+  color: var(--text-secondary) !important;
+  border-bottom: 1px solid var(--border-subtle) !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.03em;
 }
 
 .mat-mdc-cell {
-  color: rgba(255, 255, 255, 0.9) !important;
-  border-bottom-color: rgba(255, 255, 255, 0.05) !important;
+  color: var(--text-primary) !important;
+  border-bottom: 1px solid var(--border-subtle) !important;
 }
 
-.mat-mdc-row:hover {
-  background: rgba(255, 255, 255, 0.03) !important;
+.mat-mdc-row {
+  transition: background 200ms ease;
+
+  &:hover {
+    background: var(--hover-highlight) !important;
+  }
 }
 
+// --- Material Form Field Overrides ---
 .mat-mdc-form-field {
-  --mdc-outlined-text-field-label-text-color: rgba(255, 255, 255, 0.6);
-  --mdc-outlined-text-field-input-text-color: #fff;
-  --mdc-outlined-text-field-outline-color: rgba(255, 255, 255, 0.2);
+  --mdc-outlined-text-field-label-text-color: var(--text-secondary);
+  --mdc-outlined-text-field-input-text-color: var(--text-primary);
+  --mdc-outlined-text-field-outline-color: rgba(255, 255, 255, 0.12);
+  --mdc-outlined-text-field-hover-outline-color: rgba(255, 255, 255, 0.25);
+  --mdc-outlined-text-field-focus-outline-color: #667eea;
 }
 
+// --- Material Paginator ---
 .mat-mdc-paginator {
   background: transparent !important;
-  color: rgba(255, 255, 255, 0.7) !important;
+  color: var(--text-secondary) !important;
 }
 
+// --- Material Card (global glass override) ---
 .mat-mdc-card {
-  --mdc-elevated-card-container-color: #16213e;
+  --mdc-elevated-card-container-color: transparent;
+  background: var(--glass-bg) !important;
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: var(--glass-border) !important;
+  border-radius: var(--glass-radius) !important;
+  box-shadow: var(--glass-shadow) !important;
+  color: var(--text-primary);
+  transition: transform 250ms ease, box-shadow 250ms ease;
 }
 
+// --- Material Sidenav ---
 .mat-sidenav-container {
-  background: #0a0a1a;
+  background: transparent;
 }
 
 .mat-sidenav {
-  background: #1a1a2e !important;
+  background: rgba(255, 255, 255, 0.03) !important;
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border-right: 1px solid rgba(255, 255, 255, 0.06) !important;
 }
 
+// --- Material Dialog (glass overlay) ---
 .mat-mdc-dialog-container {
-  --mdc-dialog-container-color: #1a1a2e;
+  --mdc-dialog-container-color: rgba(15, 12, 41, 0.85);
 }
 
+.mat-mdc-dialog-surface {
+  background: rgba(255, 255, 255, 0.06) !important;
+  backdrop-filter: blur(24px) !important;
+  -webkit-backdrop-filter: blur(24px) !important;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  border-radius: var(--glass-radius) !important;
+  box-shadow: 0 16px 64px rgba(0, 0, 0, 0.5) !important;
+}
+
+// --- Material Expansion Panel (glass) ---
+.mat-expansion-panel {
+  background: var(--glass-bg) !important;
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: var(--glass-border) !important;
+  border-radius: var(--glass-radius) !important;
+  box-shadow: var(--glass-shadow) !important;
+  color: var(--text-primary) !important;
+
+  .mat-expansion-panel-header {
+    color: var(--text-primary) !important;
+  }
+
+  .mat-expansion-panel-header-description {
+    color: var(--text-secondary) !important;
+  }
+}
+
+// --- Raised Button (gradient primary) ---
+.mat-mdc-raised-button.mat-primary {
+  background: var(--accent-gradient) !important;
+  color: #fff !important;
+  border: none !important;
+  box-shadow: 0 4px 16px rgba(102, 126, 234, 0.3) !important;
+  transition: box-shadow 250ms ease, transform 250ms ease;
+
+  &:hover {
+    box-shadow: 0 6px 24px rgba(102, 126, 234, 0.5) !important;
+    transform: translateY(-1px);
+  }
+}
+
+// --- Icon Buttons (glass hover) ---
+.mat-mdc-icon-button {
+  transition: background 200ms ease, transform 200ms ease;
+
+  &:hover {
+    background: rgba(255, 255, 255, 0.08) !important;
+  }
+}
+
+// --- Stroked Button (glass hover) ---
+.mat-mdc-outlined-button,
+button[mat-stroked-button] {
+  border-color: rgba(255, 255, 255, 0.15) !important;
+  color: var(--text-secondary) !important;
+  transition: background 200ms ease, border-color 200ms ease, color 200ms ease;
+
+  &:hover {
+    background: rgba(255, 255, 255, 0.06) !important;
+    border-color: rgba(255, 255, 255, 0.25) !important;
+    color: var(--text-primary) !important;
+  }
+}
+
+// --- Status Chip Styles ---
+.status-badge, .status-chip, .type-badge, .auth-chip, .protocol-badge, .state-badge, .active-badge {
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid transparent;
+  transition: all 200ms ease;
+}
+
+.status-connected, .status-registered {
+  background: rgba(74, 222, 128, 0.12) !important;
+  color: var(--color-success) !important;
+  border-color: rgba(74, 222, 128, 0.2) !important;
+}
+
+.status-failed, .status-error {
+  background: rgba(248, 113, 113, 0.12) !important;
+  color: var(--color-error) !important;
+  border-color: rgba(248, 113, 113, 0.2) !important;
+}
+
+.status-cancelled, .status-provisioning {
+  background: rgba(251, 191, 36, 0.12) !important;
+  color: var(--color-warning) !important;
+  border-color: rgba(251, 191, 36, 0.2) !important;
+}
+
+.status-offline {
+  background: rgba(158, 158, 158, 0.12) !important;
+  color: rgba(255, 255, 255, 0.4) !important;
+  border-color: rgba(158, 158, 158, 0.15) !important;
+}
+
+// --- Custom Scrollbar ---
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
 }
 
 ::-webkit-scrollbar-track {
-  background: rgba(255, 255, 255, 0.02);
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.15);
-  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+  transition: background 200ms ease;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.25);
+  background: rgba(255, 255, 255, 0.2);
 }
 
-html, body { height: 100%; }
-body { margin: 0; font-family: Roboto, "Helvetica Neue", sans-serif; }
+// --- Animations ---
+@keyframes pulse-glow {
+  0%, 100% {
+    box-shadow: 0 0 4px currentColor;
+  }
+  50% {
+    box-shadow: 0 0 12px currentColor, 0 0 24px currentColor;
+  }
+}
+
+@keyframes subtle-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+// --- Page-level shared styles ---
+.page-title {
+  color: var(--text-primary);
+  margin: 0;
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.page-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 24px;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.empty-msg {
+  text-align: center;
+  color: var(--text-secondary);
+  padding: 32px;
+  font-size: 14px;
+}

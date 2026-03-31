@@ -67,22 +67,6 @@ import { CssDialogComponent } from './css-dialog.component';
   styles: [`
     .css-page { padding: 24px; }
 
-    .page-header {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 24px;
-    }
-
-    .page-title {
-      color: #fff;
-      margin: 0;
-      font-size: 24px;
-      font-weight: 500;
-    }
-
-    .spacer { flex: 1; }
-
     .css-grid {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
@@ -90,9 +74,11 @@ import { CssDialogComponent } from './css-dialog.component';
     }
 
     .css-card {
-      background: #16213e;
-      color: #fff;
-      border-radius: 12px;
+      transition: transform 250ms ease, box-shadow 250ms ease;
+    }
+
+    .css-card:hover {
+      transform: translateY(-2px);
     }
 
     .partition-chips {
@@ -107,10 +93,11 @@ import { CssDialogComponent } from './css-dialog.component';
       align-items: center;
       gap: 6px;
       padding: 4px 12px;
-      border-radius: 16px;
+      border-radius: 10px;
       font-size: 13px;
-      background: rgba(124, 77, 255, 0.15);
-      color: #b388ff;
+      background: rgba(102, 126, 234, 0.1);
+      color: #a5b4fc;
+      border: 1px solid rgba(102, 126, 234, 0.15);
     }
 
     .chip-order {
@@ -120,26 +107,15 @@ import { CssDialogComponent } from './css-dialog.component';
       width: 18px;
       height: 18px;
       border-radius: 50%;
-      background: rgba(124, 77, 255, 0.3);
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: #fff;
       font-size: 11px;
       font-weight: 600;
     }
 
     .empty-hint {
-      color: rgba(255, 255, 255, 0.3);
+      color: var(--text-secondary);
       font-size: 13px;
-    }
-
-    .empty-card {
-      background: #16213e;
-      color: #fff;
-      border-radius: 12px;
-    }
-
-    .empty-msg {
-      text-align: center;
-      color: rgba(255, 255, 255, 0.5);
-      padding: 24px;
     }
   `],
 })

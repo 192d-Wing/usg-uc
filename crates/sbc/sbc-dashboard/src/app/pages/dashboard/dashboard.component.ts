@@ -109,29 +109,24 @@ import { Subscription, interval } from 'rxjs';
     .dashboard-page { padding: 24px; }
 
     .page-title {
-      color: #fff;
+      color: var(--text-primary);
       margin: 0 0 24px 0;
-      font-size: 24px;
-      font-weight: 500;
+      font-size: 26px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
     }
 
     .stats-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      grid-template-columns: repeat(4, 1fr);
       gap: 16px;
-      margin-bottom: 24px;
+      margin-bottom: 8px;
     }
 
     .panels-grid {
       display: grid;
       grid-template-columns: 1fr 2fr;
       gap: 16px;
-    }
-
-    mat-card {
-      background: #16213e;
-      color: #fff;
-      border-radius: 12px;
     }
 
     mat-card-header {
@@ -149,16 +144,33 @@ import { Subscription, interval } from 'rxjs';
       margin-bottom: 8px;
     }
 
-    .health-dot { width: 12px; height: 12px; border-radius: 50%; }
-    .dot-healthy { background: #4caf50; }
-    .dot-degraded { background: #ff9800; }
-    .dot-unhealthy { background: #f44336; }
-    .health-text { font-size: 18px; font-weight: 500; }
+    .health-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+    }
+
+    .dot-healthy {
+      background: var(--color-success);
+      box-shadow: 0 0 8px var(--color-success);
+    }
+
+    .dot-degraded {
+      background: var(--color-warning);
+      box-shadow: 0 0 8px var(--color-warning);
+    }
+
+    .dot-unhealthy {
+      background: var(--color-error);
+      box-shadow: 0 0 8px var(--color-error);
+    }
+
+    .health-text { font-size: 18px; font-weight: 600; }
 
     .health-meta {
       display: flex;
       gap: 24px;
-      color: rgba(255,255,255,0.5);
+      color: var(--text-secondary);
       font-size: 13px;
     }
 
@@ -166,29 +178,38 @@ import { Subscription, interval } from 'rxjs';
       display: flex;
       align-items: center;
       gap: 8px;
-      padding: 6px 0;
-      border-top: 1px solid rgba(255,255,255,0.05);
+      padding: 8px 0;
+      border-top: 1px solid var(--border-subtle);
       font-size: 14px;
+      transition: background 200ms ease;
     }
 
-    .check-ok { color: #4caf50; }
-    .check-fail { color: #f44336; }
-    .check-status { margin-left: auto; color: rgba(255,255,255,0.5); font-size: 12px; }
+    .health-check-row:hover {
+      background: var(--hover-highlight);
+    }
+
+    .check-ok { color: var(--color-success); }
+    .check-fail { color: var(--color-error); }
+    .check-status { margin-left: auto; color: var(--text-secondary); font-size: 12px; }
 
     .calls-table { width: 100%; }
 
     .no-calls {
       text-align: center;
       padding: 32px;
-      color: rgba(255,255,255,0.4);
+      color: var(--text-secondary);
     }
 
-    .status-connected { background: rgba(76,175,80,0.2); color: #4caf50; }
-    .status-failed { background: rgba(244,67,54,0.2); color: #f44336; }
-    .status-cancelled { background: rgba(255,152,0,0.2); color: #ff9800; }
+    @media (max-width: 1100px) {
+      .stats-grid { grid-template-columns: repeat(2, 1fr); }
+    }
 
     @media (max-width: 900px) {
       .panels-grid { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 600px) {
+      .stats-grid { grid-template-columns: 1fr; }
     }
   `],
 })

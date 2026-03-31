@@ -95,26 +95,6 @@ interface FlatRegistration {
   styles: [`
     .registrations-page { padding: 24px; }
 
-    .page-header {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 24px;
-    }
-
-    .page-title {
-      color: #fff;
-      margin: 0;
-      font-size: 24px;
-      font-weight: 500;
-    }
-
-    .table-card {
-      background: #16213e;
-      color: #fff;
-      border-radius: 12px;
-    }
-
     .search-field {
       width: 100%;
       max-width: 400px;

@@ -124,24 +124,7 @@ import { CdrRecord, CdrFilter } from '../../models/sbc.models';
   styles: [`
     .cdrs-page { padding: 24px; }
 
-    .page-header {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 24px;
-    }
-
-    .page-title {
-      color: #fff;
-      margin: 0;
-      font-size: 24px;
-      font-weight: 500;
-    }
-
     .filter-card {
-      background: #16213e;
-      color: #fff;
-      border-radius: 12px;
       margin-bottom: 16px;
     }
 
@@ -152,29 +135,21 @@ import { CdrRecord, CdrFilter } from '../../models/sbc.models';
       flex-wrap: wrap;
     }
 
-    .table-card {
-      background: #16213e;
-      color: #fff;
-      border-radius: 12px;
-    }
-
     .cdr-table { width: 100%; }
 
     .status-badge {
-      padding: 2px 8px;
-      border-radius: 4px;
+      padding: 3px 10px;
+      border-radius: 6px;
       font-size: 12px;
       text-transform: uppercase;
-      font-weight: 500;
+      font-weight: 600;
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
     }
 
-    .status-connected { background: rgba(76, 175, 80, 0.2); color: #81c784; }
-    .status-failed { background: rgba(244, 67, 54, 0.2); color: #ef9a9a; }
-    .status-cancelled { background: rgba(255, 152, 0, 0.2); color: #ffcc80; }
-
-    .chip-connected { --mdc-chip-label-text-color: #4caf50; }
-    .chip-failed { --mdc-chip-label-text-color: #f44336; }
-    .chip-cancelled { --mdc-chip-label-text-color: #ff9800; }
+    .chip-connected { --mdc-chip-label-text-color: var(--color-success); }
+    .chip-failed { --mdc-chip-label-text-color: var(--color-error); }
+    .chip-cancelled { --mdc-chip-label-text-color: var(--color-warning); }
   `],
 })
 export class CdrsComponent implements OnInit {

@@ -7,39 +7,50 @@ import { MatIconModule } from '@angular/material/icon';
   standalone: true,
   imports: [MatCardModule, MatIconModule],
   template: `
-    <mat-card class="stats-card" [style.border-left-color]="color()">
-      <mat-card-content class="card-content">
-        <div class="card-icon" [style.background]="color() + '20'" [style.color]="color()">
+    <div class="stats-card glass-card">
+      <div class="card-content">
+        <div class="card-icon-wrap">
           <mat-icon>{{ icon() }}</mat-icon>
         </div>
         <div class="card-info">
           <span class="card-label">{{ title() }}</span>
           <span class="card-value">{{ value() }}</span>
         </div>
-      </mat-card-content>
-    </mat-card>
+      </div>
+    </div>
   `,
   styles: [`
     .stats-card {
-      background: #16213e;
-      border-left: 4px solid;
-      border-radius: 12px;
+      padding: 20px;
+      cursor: default;
+    }
+
+    .stats-card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
     }
 
     .card-content {
       display: flex;
       align-items: center;
       gap: 16px;
-      padding: 8px 0;
     }
 
-    .card-icon {
+    .card-icon-wrap {
       display: flex;
       align-items: center;
       justify-content: center;
       width: 48px;
       height: 48px;
-      border-radius: 12px;
+      border-radius: 14px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+      flex-shrink: 0;
+    }
+
+    .card-icon-wrap mat-icon {
+      color: #fff;
+      font-size: 24px;
     }
 
     .card-info {
@@ -49,15 +60,21 @@ import { MatIconModule } from '@angular/material/icon';
 
     .card-label {
       font-size: 13px;
-      color: rgba(255, 255, 255, 0.6);
+      color: rgba(255, 255, 255, 0.5);
       margin-bottom: 4px;
+      letter-spacing: 0.02em;
     }
 
     .card-value {
       font-size: 28px;
-      font-weight: 600;
-      color: #fff;
+      font-weight: 700;
+      color: rgba(255, 255, 255, 0.95);
       line-height: 1;
+      transition: text-shadow 250ms ease;
+    }
+
+    .stats-card:hover .card-value {
+      text-shadow: 0 0 20px rgba(102, 126, 234, 0.3);
     }
   `],
 })

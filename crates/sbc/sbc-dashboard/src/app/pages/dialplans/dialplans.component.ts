@@ -113,26 +113,7 @@ import { DialplanEntryDialogComponent } from './dialplan-entry-dialog.component'
   styles: [`
     .dialplans-page { padding: 24px; }
 
-    .page-header {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 24px;
-    }
-
-    .page-title {
-      color: #fff;
-      margin: 0;
-      font-size: 24px;
-      font-weight: 500;
-    }
-
-    .spacer { flex: 1; }
-
     .plan-card {
-      background: #16213e;
-      color: #fff;
-      border-radius: 12px;
       margin-bottom: 16px;
     }
 
@@ -140,38 +121,50 @@ import { DialplanEntryDialogComponent } from './dialplan-entry-dialog.component'
       display: flex;
       align-items: center;
       padding: 16px;
-      background: #0f3460;
-      border-radius: 12px 12px 0 0;
+      background: linear-gradient(135deg, rgba(102, 126, 234, 0.15) 0%, rgba(118, 75, 162, 0.1) 100%);
+      border-radius: 16px 16px 0 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
     }
 
     .active-badge {
       display: inline-block;
       margin-left: 12px;
-      padding: 2px 8px;
-      border-radius: 4px;
+      padding: 3px 10px;
+      border-radius: 6px;
       font-size: 11px;
       font-weight: 600;
-      background: rgba(76, 175, 80, 0.2);
-      color: #81c784;
+      background: rgba(74, 222, 128, 0.12);
+      color: var(--color-success);
+      border: 1px solid rgba(74, 222, 128, 0.2);
     }
 
     .entries-table { width: 100%; }
 
     .type-badge {
-      padding: 2px 8px;
-      border-radius: 4px;
+      padding: 3px 10px;
+      border-radius: 6px;
       font-size: 12px;
       text-transform: uppercase;
+      font-weight: 600;
+      border: 1px solid transparent;
     }
 
-    .type-trunk_group { background: rgba(124, 77, 255, 0.2); color: #b388ff; }
-    .type-registered_user { background: rgba(76, 175, 80, 0.2); color: #81c784; }
-    .type-static_uri { background: rgba(0, 188, 212, 0.2); color: #4dd0e1; }
+    .type-trunk_group {
+      background: rgba(102, 126, 234, 0.12);
+      color: #a5b4fc;
+      border-color: rgba(102, 126, 234, 0.2);
+    }
 
-    .empty-msg {
-      text-align: center;
-      color: rgba(255, 255, 255, 0.5);
-      padding: 24px;
+    .type-registered_user {
+      background: rgba(74, 222, 128, 0.12);
+      color: var(--color-success);
+      border-color: rgba(74, 222, 128, 0.2);
+    }
+
+    .type-static_uri {
+      background: rgba(0, 188, 212, 0.12);
+      color: #67e8f9;
+      border-color: rgba(0, 188, 212, 0.2);
     }
   `],
 })

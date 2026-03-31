@@ -84,40 +84,34 @@ import { DirectoryDialogComponent, DirectoryDialogData } from './directory-dialo
   styles: [`
     .directory-page { padding: 24px; }
 
-    .page-header {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 24px;
-    }
-
-    .page-title {
-      color: #fff;
-      margin: 0;
-      font-size: 24px;
-      font-weight: 500;
-    }
-
-    .spacer { flex: 1; }
-
-    .table-card {
-      background: #16213e;
-      color: #fff;
-      border-radius: 12px;
-    }
-
     .dir-table { width: 100%; }
 
     .type-badge {
-      padding: 2px 8px;
-      border-radius: 4px;
+      padding: 3px 10px;
+      border-radius: 6px;
       font-size: 12px;
       text-transform: uppercase;
+      font-weight: 600;
+      border: 1px solid transparent;
     }
 
-    .type-trunk_group { background: rgba(124, 77, 255, 0.2); color: #b388ff; }
-    .type-registered_user { background: rgba(76, 175, 80, 0.2); color: #81c784; }
-    .type-static_uri { background: rgba(0, 188, 212, 0.2); color: #4dd0e1; }
+    .type-trunk_group {
+      background: rgba(102, 126, 234, 0.12);
+      color: #a5b4fc;
+      border-color: rgba(102, 126, 234, 0.2);
+    }
+
+    .type-registered_user {
+      background: rgba(74, 222, 128, 0.12);
+      color: var(--color-success);
+      border-color: rgba(74, 222, 128, 0.2);
+    }
+
+    .type-static_uri {
+      background: rgba(0, 188, 212, 0.12);
+      color: #67e8f9;
+      border-color: rgba(0, 188, 212, 0.2);
+    }
   `],
 })
 export class DirectoryComponent implements OnInit {

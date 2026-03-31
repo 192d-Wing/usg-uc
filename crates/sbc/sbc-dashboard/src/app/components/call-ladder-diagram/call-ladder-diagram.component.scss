@@ -15,39 +15,41 @@
 }
 
 .participant-line {
-  stroke: rgba(255, 255, 255, 0.15);
+  stroke: rgba(255, 255, 255, 0.1);
   stroke-width: 1;
   stroke-dasharray: 4, 4;
 }
 
 .arrow-line {
   stroke-width: 2;
+  transition: stroke-width 200ms ease;
 }
 
+// Gradient-inspired arrow colors
 .arrow-req .arrow-line,
 .arrow-line.arrow-req {
-  stroke: #42a5f5;
+  stroke: #667eea;
 }
 
 .arrow-1xx .arrow-line,
 .arrow-line.arrow-1xx {
-  stroke: #9e9e9e;
+  stroke: rgba(255, 255, 255, 0.35);
 }
 
 .arrow-2xx .arrow-line,
 .arrow-line.arrow-2xx {
-  stroke: #66bb6a;
+  stroke: #4ade80;
 }
 
 .arrow-err .arrow-line,
 .arrow-line.arrow-err {
-  stroke: #ef5350;
+  stroke: #f87171;
 }
 
-.arrowhead.arrow-req { fill: #42a5f5; }
-.arrowhead.arrow-1xx { fill: #9e9e9e; }
-.arrowhead.arrow-2xx { fill: #66bb6a; }
-.arrowhead.arrow-err { fill: #ef5350; }
+.arrowhead.arrow-req { fill: #667eea; }
+.arrowhead.arrow-1xx { fill: rgba(255, 255, 255, 0.35); }
+.arrowhead.arrow-2xx { fill: #4ade80; }
+.arrowhead.arrow-err { fill: #f87171; }
 
 .arrow-label {
   font-size: 11px;
@@ -55,15 +57,20 @@
   font-family: 'Roboto Mono', monospace;
 }
 
-.arrow-label.arrow-req { fill: #42a5f5; }
-.arrow-label.arrow-1xx { fill: #bdbdbd; }
-.arrow-label.arrow-2xx { fill: #66bb6a; }
-.arrow-label.arrow-err { fill: #ef5350; }
+.arrow-label.arrow-req { fill: #818cf8; }
+.arrow-label.arrow-1xx { fill: rgba(255, 255, 255, 0.5); }
+.arrow-label.arrow-2xx { fill: #4ade80; }
+.arrow-label.arrow-err { fill: #f87171; }
 
 .arrow-time {
-  fill: rgba(255, 255, 255, 0.35);
+  fill: rgba(255, 255, 255, 0.3);
   font-size: 9px;
   font-family: 'Roboto Mono', monospace;
+}
+
+.message-group {
+  cursor: pointer;
+  transition: opacity 200ms ease;
 }
 
 .message-group:hover .arrow-line {
@@ -72,5 +79,9 @@
 
 .message-group.selected .arrow-line {
   stroke-width: 3;
-  filter: drop-shadow(0 0 4px currentColor);
+  filter: drop-shadow(0 0 6px currentColor);
+}
+
+.message-group.selected {
+  opacity: 1;
 }

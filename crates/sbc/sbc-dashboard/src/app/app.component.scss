@@ -1,16 +1,19 @@
 .app-container {
   height: 100vh;
+  background: transparent;
 }
 
 .app-sidenav {
   width: 240px;
-  border-right: 1px solid rgba(255, 255, 255, 0.08);
+  border-right: none;
 }
 
 .app-content {
-  background: #0a0a1a;
+  background: transparent;
 }
 
 .content {
   min-height: calc(100vh - 56px);
+  padding: 0;
+  max-width: 1600px;
 }

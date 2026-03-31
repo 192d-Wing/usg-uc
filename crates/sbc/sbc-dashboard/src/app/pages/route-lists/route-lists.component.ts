@@ -87,31 +87,13 @@ import { RouteListDialogComponent } from './route-list-dialog.component';
   styles: [`
     .rl-page { padding: 24px; }
 
-    .page-header {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 24px;
-    }
-
-    .page-title {
-      color: #fff;
-      margin: 0;
-      font-size: 24px;
-      font-weight: 500;
-    }
-
-    .spacer { flex: 1; }
-
     .rl-panel {
-      background: #16213e;
-      color: #fff;
-      margin-bottom: 8px;
+      margin-bottom: 12px;
     }
 
     .rl-icon {
       margin-right: 8px;
-      color: #7c4dff;
+      color: #667eea;
     }
 
     .panel-actions {
@@ -121,18 +103,6 @@ import { RouteListDialogComponent } from './route-list-dialog.component';
     }
 
     .rg-table { width: 100%; }
-
-    .empty-card {
-      background: #16213e;
-      color: #fff;
-      border-radius: 12px;
-    }
-
-    .empty-msg {
-      text-align: center;
-      color: rgba(255, 255, 255, 0.5);
-      padding: 24px;
-    }
   `],
 })
 export class RouteListsComponent implements OnInit {

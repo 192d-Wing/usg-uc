@@ -44,16 +44,20 @@ import { SystemStats } from '../../models/sbc.models';
   `,
   styles: [`
     .header-toolbar {
-      background: #16213e;
-      color: #fff;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(255, 255, 255, 0.03);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      color: var(--text-primary);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
       padding: 0 24px;
       height: 56px;
     }
 
     .instance-name {
       font-size: 16px;
-      font-weight: 500;
+      font-weight: 600;
+      color: var(--text-secondary);
+      letter-spacing: 0.02em;
     }
 
     .spacer {
@@ -65,9 +69,17 @@ import { SystemStats } from '../../models/sbc.models';
       align-items: center;
       gap: 8px;
       margin-right: 16px;
-      padding: 4px 12px;
-      border-radius: 16px;
-      background: rgba(255, 255, 255, 0.05);
+      padding: 6px 14px;
+      border-radius: 20px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      transition: background 200ms ease;
+    }
+
+    .health-indicator:hover {
+      background: rgba(255, 255, 255, 0.06);
     }
 
     .health-dot {
@@ -77,13 +89,33 @@ import { SystemStats } from '../../models/sbc.models';
       display: inline-block;
     }
 
-    .health-healthy { background-color: #4caf50; box-shadow: 0 0 6px #4caf50; }
-    .health-degraded { background-color: #ff9800; box-shadow: 0 0 6px #ff9800; }
-    .health-unhealthy { background-color: #f44336; box-shadow: 0 0 6px #f44336; }
+    .health-healthy {
+      background-color: #4ade80;
+      box-shadow: 0 0 6px #4ade80;
+      animation: pulse-glow 2s ease-in-out infinite;
+      color: #4ade80;
+    }
+
+    .health-degraded {
+      background-color: #fbbf24;
+      box-shadow: 0 0 6px #fbbf24;
+      color: #fbbf24;
+    }
+
+    .health-unhealthy {
+      background-color: #f87171;
+      box-shadow: 0 0 6px #f87171;
+      color: #f87171;
+    }
+
+    @keyframes pulse-glow {
+      0%, 100% { box-shadow: 0 0 4px currentColor; }
+      50% { box-shadow: 0 0 12px currentColor, 0 0 20px currentColor; }
+    }
 
     .health-label {
       font-size: 13px;
-      color: rgba(255, 255, 255, 0.8);
+      color: rgba(255, 255, 255, 0.7);
     }
   `],
 })

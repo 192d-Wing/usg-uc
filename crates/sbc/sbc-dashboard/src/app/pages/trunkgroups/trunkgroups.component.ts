@@ -123,31 +123,13 @@ import { TrunkDialogComponent } from './trunk-dialog.component';
   styles: [`
     .trunkgroups-page { padding: 24px; }
 
-    .page-header {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 24px;
-    }
-
-    .page-title {
-      color: #fff;
-      margin: 0;
-      font-size: 24px;
-      font-weight: 500;
-    }
-
-    .spacer { flex: 1; }
-
     .group-panel {
-      background: #16213e;
-      color: #fff;
-      margin-bottom: 8px;
+      margin-bottom: 12px;
     }
 
     .group-icon {
       margin-right: 8px;
-      color: #7c4dff;
+      color: #667eea;
     }
 
     .panel-actions {
@@ -159,34 +141,39 @@ import { TrunkDialogComponent } from './trunk-dialog.component';
     .trunks-table { width: 100%; }
 
     .protocol-badge {
-      padding: 2px 8px;
-      border-radius: 4px;
+      padding: 3px 10px;
+      border-radius: 6px;
       font-size: 12px;
-      background: rgba(124, 77, 255, 0.2);
-      color: #b388ff;
+      font-weight: 600;
+      background: rgba(102, 126, 234, 0.12);
+      color: #a5b4fc;
+      border: 1px solid rgba(102, 126, 234, 0.2);
     }
 
     .state-badge {
-      padding: 2px 8px;
-      border-radius: 4px;
+      padding: 3px 10px;
+      border-radius: 6px;
       font-size: 11px;
       font-weight: 600;
+      border: 1px solid transparent;
     }
 
-    .state-active { background: rgba(76, 175, 80, 0.2); color: #81c784; }
-    .state-failed { background: rgba(244, 67, 54, 0.2); color: #e57373; }
-    .state-cooldown { background: rgba(255, 152, 0, 0.2); color: #ffb74d; }
-
-    .empty-card {
-      background: #16213e;
-      color: #fff;
-      border-radius: 12px;
+    .state-active {
+      background: rgba(74, 222, 128, 0.12);
+      color: var(--color-success);
+      border-color: rgba(74, 222, 128, 0.2);
     }
 
-    .empty-msg {
-      text-align: center;
-      color: rgba(255, 255, 255, 0.5);
-      padding: 24px;
+    .state-failed {
+      background: rgba(248, 113, 113, 0.12);
+      color: var(--color-error);
+      border-color: rgba(248, 113, 113, 0.2);
+    }
+
+    .state-cooldown {
+      background: rgba(251, 191, 36, 0.12);
+      color: var(--color-warning);
+      border-color: rgba(251, 191, 36, 0.2);
     }
   `],
 })

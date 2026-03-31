@@ -91,46 +91,14 @@ import { PhoneDialogComponent } from './phone-dialog.component';
   styles: [`
     .phones-page { padding: 24px; }
 
-    .page-header {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 24px;
-    }
-
-    .page-title {
-      color: #fff;
-      margin: 0;
-      font-size: 24px;
-      font-weight: 500;
-    }
-
-    .spacer { flex: 1; }
-
-    .table-card, .empty-card {
-      background: #16213e;
-      color: #fff;
-      border-radius: 12px;
-    }
-
     .phones-table { width: 100%; }
 
     .status-chip {
-      padding: 2px 10px;
-      border-radius: 12px;
+      padding: 3px 10px;
+      border-radius: 8px;
       font-size: 12px;
       font-weight: 600;
-    }
-
-    .status-registered { background: rgba(76, 175, 80, 0.2); color: #81c784; }
-    .status-provisioning { background: rgba(255, 235, 59, 0.2); color: #fff176; }
-    .status-offline { background: rgba(158, 158, 158, 0.2); color: #bdbdbd; }
-    .status-error { background: rgba(244, 67, 54, 0.2); color: #e57373; }
-
-    .empty-msg {
-      text-align: center;
-      color: rgba(255, 255, 255, 0.5);
-      padding: 24px;
+      border: 1px solid transparent;
     }
   `],
 })

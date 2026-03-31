@@ -73,35 +73,7 @@ import { PartitionDialogComponent } from './partition-dialog.component';
   styles: [`
     .partitions-page { padding: 24px; }
 
-    .page-header {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 24px;
-    }
-
-    .page-title {
-      color: #fff;
-      margin: 0;
-      font-size: 24px;
-      font-weight: 500;
-    }
-
-    .spacer { flex: 1; }
-
-    .table-card, .empty-card {
-      background: #16213e;
-      color: #fff;
-      border-radius: 12px;
-    }
-
     .partitions-table { width: 100%; }
-
-    .empty-msg {
-      text-align: center;
-      color: rgba(255, 255, 255, 0.5);
-      padding: 24px;
-    }
   `],
 })
 export class PartitionsComponent implements OnInit {

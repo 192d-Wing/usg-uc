@@ -9,8 +9,13 @@ import { MatIconModule } from '@angular/material/icon';
   imports: [RouterLink, RouterLinkActive, MatListModule, MatIconModule],
   template: `
     <div class="sidebar-header">
-      <mat-icon class="logo-icon">router</mat-icon>
-      <span class="logo-text">SBC Manager</span>
+      <div class="logo-icon-wrap">
+        <mat-icon class="logo-icon">router</mat-icon>
+      </div>
+      <div class="logo-text-group">
+        <span class="logo-text gradient-text">USG SBC</span>
+        <span class="logo-subtitle">Session Border Controller</span>
+      </div>
     </div>
     <mat-nav-list>
       <a mat-list-item routerLink="/dashboard" routerLinkActive="active-link">
@@ -66,58 +71,132 @@ import { MatIconModule } from '@angular/material/icon';
         <span matListItemTitle>Call Ladder</span>
       </a>
     </mat-nav-list>
+    <div class="sidebar-footer">
+      <span class="version-badge">v0.1.0</span>
+    </div>
   `,
   styles: [`
     :host {
       display: flex;
       flex-direction: column;
       height: 100%;
-      background: #1a1a2e;
+      background: transparent;
     }
 
     .sidebar-header {
       display: flex;
       align-items: center;
-      padding: 20px 16px;
+      padding: 24px 16px 20px;
       gap: 12px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .logo-icon-wrap {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 40px;
+      height: 40px;
+      border-radius: 12px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+      flex-shrink: 0;
     }
 
     .logo-icon {
-      color: #7c4dff;
-      font-size: 28px;
-      width: 28px;
-      height: 28px;
+      color: #fff;
+      font-size: 22px;
+      width: 22px;
+      height: 22px;
+    }
+
+    .logo-text-group {
+      display: flex;
+      flex-direction: column;
     }
 
     .logo-text {
-      color: #fff;
       font-size: 18px;
-      font-weight: 500;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+
+    .logo-subtitle {
+      font-size: 10px;
+      color: rgba(255, 255, 255, 0.35);
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
     }
 
     mat-nav-list {
       padding-top: 8px;
+      flex: 1;
+      overflow-y: auto;
     }
 
     a[mat-list-item] {
-      color: rgba(255, 255, 255, 0.7);
-      margin: 2px 8px;
-      border-radius: 8px;
+      color: rgba(255, 255, 255, 0.55);
+      margin: 1px 8px;
+      border-radius: 10px;
+      border-left: 3px solid transparent;
+      transition: all 250ms ease;
     }
 
     a[mat-list-item]:hover {
-      color: #fff;
-      background: rgba(255, 255, 255, 0.05);
+      color: rgba(255, 255, 255, 0.9);
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    :host ::ng-deep a[mat-list-item] mat-icon {
+      font-size: 22px;
+      width: 22px;
+      height: 22px;
+      opacity: 0.6;
+      transition: opacity 250ms ease;
+    }
+
+    :host ::ng-deep a[mat-list-item]:hover mat-icon {
+      opacity: 0.9;
     }
 
     :host ::ng-deep .active-link {
-      color: #fff !important;
-      background: rgba(124, 77, 255, 0.2) !important;
+      color: rgba(255, 255, 255, 0.95) !important;
+      background: rgba(102, 126, 234, 0.12) !important;
+      border-left-color: transparent !important;
+      position: relative;
+    }
+
+    :host ::ng-deep .active-link::before {
+      content: '';
+      position: absolute;
+      left: 0;
+      top: 20%;
+      bottom: 20%;
+      width: 3px;
+      border-radius: 0 3px 3px 0;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      box-shadow: 0 0 8px rgba(102, 126, 234, 0.5);
     }
 
     :host ::ng-deep .active-link mat-icon {
-      color: #7c4dff;
+      color: #667eea;
+      opacity: 1 !important;
+    }
+
+    .sidebar-footer {
+      padding: 12px 16px;
+      border-top: 1px solid rgba(255, 255, 255, 0.06);
+      display: flex;
+      justify-content: center;
+    }
+
+    .version-badge {
+      font-size: 11px;
+      color: rgba(255, 255, 255, 0.25);
+      padding: 2px 10px;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.04);
+      letter-spacing: 0.05em;
     }
   `],
 })
