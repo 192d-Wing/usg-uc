@@ -5,6 +5,7 @@ import { MatInputModule } from '@angular/material/input';
 import { MatSelectModule } from '@angular/material/select';
 import { MatButtonModule } from '@angular/material/button';
 import { FormsModule } from '@angular/forms';
+import { MatSlideToggleModule } from '@angular/material/slide-toggle';
 
 @Component({
   selector: 'app-trunk-dialog',
@@ -12,6 +13,7 @@ import { FormsModule } from '@angular/forms';
   imports: [
     MatDialogModule, MatFormFieldModule, MatInputModule,
     MatSelectModule, MatButtonModule, FormsModule,
+    MatSlideToggleModule,
   ],
   template: `
     <h2 mat-dialog-title>Add Trunk</h2>
@@ -74,6 +76,21 @@ import { FormsModule } from '@angular/forms';
         <mat-label>SIP Password</mat-label>
         <input matInput type="password" [(ngModel)]="form.sip_password">
       </mat-form-field>
+
+      <div class="toggle-row">
+        <mat-slide-toggle [(ngModel)]="form.options_ping_enabled">
+          SIP OPTIONS Ping
+        </mat-slide-toggle>
+        <span class="toggle-hint">Send periodic OPTIONS to monitor trunk availability</span>
+      </div>
+
+      @if (form.options_ping_enabled) {
+        <mat-form-field appearance="outline" class="full-width">
+          <mat-label>Ping Interval (seconds)</mat-label>
+          <input matInput type="number" [(ngModel)]="form.options_ping_interval" min="5" max="300" />
+          <mat-hint>How often to send OPTIONS (5-300s)</mat-hint>
+        </mat-form-field>
+      }
     </mat-dialog-content>
     <mat-dialog-actions align="end">
       <button mat-button mat-dialog-close>Cancel</button>
@@ -82,7 +99,9 @@ import { FormsModule } from '@angular/forms';
   `,
   styles: [`
     .full-width { width: 100%; }
-    mat-dialog-content { display: flex; flex-direction: column; gap: 4px; min-width: 400px; }
+    mat-dialog-content { display: flex; flex-direction: column; gap: 4px; min-width: 400px; max-height: 65vh; overflow-y: auto; padding-top: 8px !important; }
+    .toggle-row { display: flex; flex-direction: column; gap: 4px; padding: 8px 0; }
+    .toggle-hint { font-size: 12px; color: var(--uswds-text-secondary, rgba(255,255,255,0.5)); }
   `],
 })
 export class TrunkDialogComponent {
@@ -100,6 +119,8 @@ export class TrunkDialogComponent {
     max_failures: 5,
     sip_username: '',
     sip_password: '',
+    options_ping_enabled: false,
+    options_ping_interval: 30,
   };
 
   save(): void {
