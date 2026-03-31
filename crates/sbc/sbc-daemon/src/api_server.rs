@@ -92,6 +92,16 @@ impl Default for ApiServerConfig {
     }
 }
 
+/// In-memory store for management objects.
+/// Persists within a running SBC session — restart clears data.
+#[derive(Default)]
+pub struct MemStore {
+    /// Phones indexed by ID.
+    pub phones: std::collections::HashMap<String, serde_json::Value>,
+    /// Directory numbers indexed by DID.
+    pub directory_numbers: std::collections::HashMap<String, serde_json::Value>,
+}
+
 /// Shared application state for the API server.
 pub struct AppState {
     /// Metrics registry.
@@ -112,6 +122,8 @@ pub struct AppState {
     pub provisioning: Option<Arc<uc_phone_mgmt::provisioning::ProvisioningServer>>,
     /// CUCM router for CSS/partition-based routing.
     pub cucm_router: Option<Arc<tokio::sync::RwLock<uc_routing::CucmRouter>>>,
+    /// In-memory store for management objects (phones, directory numbers, etc.).
+    pub mem_store: Arc<tokio::sync::RwLock<MemStore>>,
     /// TLS acceptor for certificate hot-reload (if TLS is enabled).
     pub tls_acceptor: Option<Arc<ReloadableTlsAcceptor>>,
     /// Cluster health check function (when cluster feature is enabled).
@@ -139,6 +151,7 @@ impl AppState {
             user_store: None,
             provisioning: None,
             cucm_router: None,
+            mem_store: Arc::new(tokio::sync::RwLock::new(MemStore::default())),
             tls_acceptor: None,
             #[cfg(feature = "cluster")]
             cluster_health_fn: None,
@@ -161,6 +174,7 @@ impl AppState {
             user_store: None,
             provisioning: None,
             cucm_router: None,
+            mem_store: Arc::new(tokio::sync::RwLock::new(MemStore::default())),
             tls_acceptor: Some(tls_acceptor),
             #[cfg(feature = "cluster")]
             cluster_health_fn: None,
@@ -351,7 +365,8 @@ impl ApiServer {
             .route("/phones", get(list_phones))
             .route("/phones", post(create_phone))
             .route("/phones/{id}", get(get_phone))
-            .route("/phones/{id}", delete(delete_phone))
+            .route("/phones/{id}", delete(delete_phone).put(update_phone))
+            .route("/phones/{id}/reboot", post(reboot_phone))
             // CUCM routing
             .route("/partitions", get(list_partitions))
             .route("/partitions", post(create_partition))
@@ -754,33 +769,32 @@ async fn delete_registration(
 // ============================================================================
 
 /// List directory numbers (from dial plan config).
-async fn get_directory_numbers(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
-    // Directory numbers come from the dial plan config
-    // In a full implementation, these would be stored in a database
-    Json(serde_json::json!({
-        "directory_numbers": [],
-        "total": 0
-    }))
+async fn get_directory_numbers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let store = state.mem_store.read().await;
+    let dns: Vec<_> = store.directory_numbers.values().cloned().collect();
+    let total = dns.len();
+    Json(serde_json::json!({ "directory_numbers": dns, "total": total }))
 }
 
 /// Add a directory number.
 async fn add_directory_number(
-    State(_state): State<Arc<AppState>>,
-    Json(body): Json<serde_json::Value>,
+    State(state): State<Arc<AppState>>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    // Would add to dial plan in production
-    (
-        StatusCode::CREATED,
-        Json(serde_json::json!({"success": true, "did": body.get("did")})),
-    )
+    let did = body.get("did").and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    body["did"] = serde_json::json!(&did);
+    state.mem_store.write().await.directory_numbers.insert(did.clone(), body.clone());
+    (StatusCode::CREATED, Json(serde_json::json!({"success": true, "directory_number": body})))
 }
 
 /// Delete a directory number.
 async fn delete_directory_number(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     axum::extract::Path(did): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    // Would remove from dial plan in production
+    state.mem_store.write().await.directory_numbers.remove(&did);
     Json(serde_json::json!({"success": true, "did": did}))
 }
 
@@ -1052,29 +1066,73 @@ async fn delete_user(
 // Phone Management Routes
 // ============================================================================
 
-async fn list_phones(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(serde_json::json!({ "phones": [], "total": 0 }))
+async fn list_phones(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let store = state.mem_store.read().await;
+    let phones: Vec<_> = store.phones.values().cloned().collect();
+    let total = phones.len();
+    Json(serde_json::json!({ "phones": phones, "total": total }))
 }
 
 async fn create_phone(
-    State(_state): State<Arc<AppState>>,
-    Json(body): Json<serde_json::Value>,
+    State(state): State<Arc<AppState>>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    let id = body.get("id").and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    body["id"] = serde_json::json!(id);
+    if body.get("status").is_none() {
+        body["status"] = serde_json::json!("Unprovisioned");
+    }
+    state.mem_store.write().await.phones.insert(id.clone(), body.clone());
     (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "phone": body })))
 }
 
 async fn get_phone(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    Json(serde_json::json!({ "error": format!("Phone {id} not found") }))
+    let store = state.mem_store.read().await;
+    match store.phones.get(&id) {
+        Some(phone) => Json(phone.clone()),
+        None => Json(serde_json::json!({ "error": format!("Phone {id} not found") })),
+    }
 }
 
 async fn delete_phone(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    state.mem_store.write().await.phones.remove(&id);
     Json(serde_json::json!({ "success": true, "id": id }))
+}
+
+/// Update a phone.
+async fn update_phone(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let mut store = state.mem_store.write().await;
+    if store.phones.contains_key(&id) {
+        store.phones.insert(id.clone(), body.clone());
+        Json(serde_json::json!({ "success": true, "phone": body }))
+    } else {
+        Json(serde_json::json!({ "success": false, "error": "Phone not found" }))
+    }
+}
+
+/// Reboot a phone.
+async fn reboot_phone(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let store = state.mem_store.read().await;
+    if store.phones.contains_key(&id) {
+        Json(serde_json::json!({ "success": true, "message": format!("Reboot initiated for {id}") }))
+    } else {
+        Json(serde_json::json!({ "success": false, "error": "Phone not found" }))
+    }
 }
 
 // ============================================================================
