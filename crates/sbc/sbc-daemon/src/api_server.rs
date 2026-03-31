@@ -100,6 +100,8 @@ pub struct MemStore {
     pub phones: std::collections::HashMap<String, serde_json::Value>,
     /// Directory numbers indexed by DID.
     pub directory_numbers: std::collections::HashMap<String, serde_json::Value>,
+    /// Trunk groups (route groups) indexed by ID.
+    pub trunk_groups: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Shared application state for the API server.
@@ -900,14 +902,12 @@ async fn delete_dial_plan_entry(
 // Trunk Group Routes
 // ============================================================================
 
-/// List trunk groups.
+/// List trunk groups (route groups).
 async fn get_trunk_groups(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(ref stack) = state.sip_stack {
-        let groups = stack.list_trunk_groups().await;
-        Json(serde_json::json!({ "trunk_groups": groups }))
-    } else {
-        Json(serde_json::json!({ "trunk_groups": [] }))
-    }
+    let store = state.mem_store.read().await;
+    let groups: Vec<_> = store.trunk_groups.values().cloned().collect();
+    let total = groups.len();
+    Json(serde_json::json!({ "trunk_groups": groups, "total": total }))
 }
 
 /// Get a specific trunk group.
@@ -915,71 +915,76 @@ async fn get_trunk_group(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(group_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    if let Some(ref stack) = state.sip_stack {
-        if let Some(router_lock) = stack.router() {
-            let router = router_lock.read().await;
-            if let Some(group) = router.get_trunk_group(&group_id) {
-                return Json(serde_json::json!({
-                    "id": group.id(),
-                    "name": group.name(),
-                    "trunk_count": group.trunk_count(),
-                    "usable_trunks": group.usable_trunk_count(),
-                }));
-            }
-        }
+    let store = state.mem_store.read().await;
+    match store.trunk_groups.get(&group_id) {
+        Some(group) => Json(group.clone()),
+        None => Json(serde_json::json!({ "error": format!("Trunk group {group_id} not found") })),
     }
-    Json(serde_json::json!({ "error": "Trunk group not found" }))
 }
 
 /// Add a trunk group.
 async fn add_trunk_group(
-    State(_state): State<Arc<AppState>>,
-    Json(body): Json<serde_json::Value>,
+    State(state): State<Arc<AppState>>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    // TODO: Add trunk group to router
-    (
-        StatusCode::CREATED,
-        Json(serde_json::json!({ "success": true, "trunk_group": body })),
-    )
+    let id = body.get("id").and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    body["id"] = serde_json::json!(id);
+    if body.get("trunks").is_none() {
+        body["trunks"] = serde_json::json!([]);
+    }
+    state.mem_store.write().await.trunk_groups.insert(id.clone(), body.clone());
+    // Also add to CUCM router if available
+    if let Some(ref cucm) = state.cucm_router {
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(&id);
+        let group = uc_routing::TrunkGroup::new(&id, name);
+        cucm.write().await.add_route_group(group);
+    }
+    (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "trunk_group": body })))
 }
 
 /// Delete a trunk group.
 async fn delete_trunk_group(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     axum::extract::Path(group_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    // TODO: Remove trunk group from router
+    state.mem_store.write().await.trunk_groups.remove(&group_id);
+    if let Some(ref cucm) = state.cucm_router {
+        cucm.write().await.remove_route_group(&group_id);
+    }
     Json(serde_json::json!({ "success": true, "group_id": group_id }))
 }
 
 /// Add a trunk to a group.
 async fn add_trunk(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     axum::extract::Path(group_id): axum::extract::Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    // TODO: Add trunk to group in router
-    (
-        StatusCode::CREATED,
-        Json(serde_json::json!({
-            "success": true,
-            "group_id": group_id,
-            "trunk": body
-        })),
-    )
+    let mut store = state.mem_store.write().await;
+    if let Some(group) = store.trunk_groups.get_mut(&group_id) {
+        if let Some(trunks) = group.get_mut("trunks").and_then(|v| v.as_array_mut()) {
+            trunks.push(body.clone());
+        }
+        (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "trunk": body })))
+    } else {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({ "success": false, "error": "Group not found" })))
+    }
 }
 
 /// Delete a trunk from a group.
 async fn delete_trunk(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     axum::extract::Path((group_id, trunk_id)): axum::extract::Path<(String, String)>,
 ) -> impl IntoResponse {
-    // TODO: Remove trunk from group in router
-    Json(serde_json::json!({
-        "success": true,
-        "group_id": group_id,
-        "trunk_id": trunk_id
-    }))
+    let mut store = state.mem_store.write().await;
+    if let Some(group) = store.trunk_groups.get_mut(&group_id) {
+        if let Some(trunks) = group.get_mut("trunks").and_then(|v| v.as_array_mut()) {
+            trunks.retain(|t| t.get("id").and_then(|v| v.as_str()) != Some(&trunk_id));
+        }
+    }
+    Json(serde_json::json!({ "success": true, "group_id": group_id, "trunk_id": trunk_id }))
 }
 
 // ============================================================================

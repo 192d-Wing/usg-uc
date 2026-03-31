@@ -281,6 +281,23 @@ impl Runtime {
 
         let mut app_state = AppState::new(metrics, stats);
         app_state.sip_stack = Some(Arc::clone(server.sip_stack()));
+
+        // Initialize CUCM router for partition/CSS/route pattern management
+        app_state.cucm_router = Some(Arc::new(tokio::sync::RwLock::new(
+            uc_routing::CucmRouter::new(),
+        )));
+
+        // Initialize SQLite user store for user management
+        match uc_user_mgmt::sqlite::SqliteUserStore::new(":memory:") {
+            Ok(store) => {
+                app_state.user_store = Some(Arc::new(store));
+                info!("User store initialized (in-memory SQLite)");
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to initialize user store");
+            }
+        }
+
         let app_state = Arc::new(app_state);
         let api_server = ApiServer::new(api_config, app_state.clone(), signal.clone());
 
