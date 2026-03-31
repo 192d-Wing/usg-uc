@@ -154,8 +154,20 @@ export class ApiService {
   createPhone(phone: any): Observable<any> {
     return this.http.post(`${this.baseUrl}/phones`, phone);
   }
+  getPhone(id: string): Observable<any> {
+    return this.http.get(`${this.baseUrl}/phones/${encodeURIComponent(id)}`);
+  }
+  updatePhone(id: string, phone: any): Observable<any> {
+    return this.http.put(`${this.baseUrl}/phones/${encodeURIComponent(id)}`, phone);
+  }
   deletePhone(id: string): Observable<any> {
     return this.http.delete(`${this.baseUrl}/phones/${encodeURIComponent(id)}`);
+  }
+  rebootPhone(id: string): Observable<any> {
+    return this.http.post(`${this.baseUrl}/phones/${encodeURIComponent(id)}/reboot`, {});
+  }
+  getPhoneConfig(id: string): Observable<string> {
+    return this.http.get(`${this.baseUrl}/phones/${encodeURIComponent(id)}/config`, { responseType: 'text' }) as Observable<string>;
   }
 
   // Partitions

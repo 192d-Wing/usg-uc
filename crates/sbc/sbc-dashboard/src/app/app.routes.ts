@@ -48,6 +48,11 @@ export const routes: Routes = [
       import('./pages/phones/phones.component').then(m => m.PhonesComponent),
   },
   {
+    path: 'phones/:id',
+    loadComponent: () =>
+      import('./pages/phones/phone-detail.component').then(m => m.PhoneDetailComponent),
+  },
+  {
     path: 'partitions',
     loadComponent: () =>
       import('./pages/partitions/partitions.component').then(m => m.PartitionsComponent),

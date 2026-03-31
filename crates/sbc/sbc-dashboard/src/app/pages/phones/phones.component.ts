@@ -1,4 +1,5 @@
 import { Component, inject, OnInit, signal } from '@angular/core';
+import { Router } from '@angular/router';
 import { MatCardModule } from '@angular/material/card';
 import { MatIconModule } from '@angular/material/icon';
 import { MatButtonModule } from '@angular/material/button';
@@ -68,7 +69,11 @@ import { PhoneDialogComponent } from './phone-dialog.component';
             <ng-container matColumnDef="actions">
               <th mat-header-cell *matHeaderCellDef>Actions</th>
               <td mat-cell *matCellDef="let row">
-                <button mat-icon-button color="warn" (click)="deletePhone(row.id)"
+                <button mat-icon-button (click)="editPhone(row.id); $event.stopPropagation()"
+                        matTooltip="Edit Phone">
+                  <mat-icon>edit</mat-icon>
+                </button>
+                <button mat-icon-button color="warn" (click)="deletePhone(row.id); $event.stopPropagation()"
                         matTooltip="Delete Phone">
                   <mat-icon>delete</mat-icon>
                 </button>
@@ -76,7 +81,8 @@ import { PhoneDialogComponent } from './phone-dialog.component';
             </ng-container>
 
             <tr mat-header-row *matHeaderRowDef="displayedColumns"></tr>
-            <tr mat-row *matRowDef="let row; columns: displayedColumns;"></tr>
+            <tr mat-row *matRowDef="let row; columns: displayedColumns;"
+                (click)="editPhone(row.id)" style="cursor: pointer;"></tr>
           </table>
         </mat-card>
       } @else {
@@ -105,6 +111,7 @@ import { PhoneDialogComponent } from './phone-dialog.component';
 export class PhonesComponent implements OnInit {
   private readonly api = inject(ApiService);
   private readonly dialog = inject(MatDialog);
+  private readonly router = inject(Router);
 
   readonly displayedColumns = [
     'name', 'mac_address', 'model', 'status', 'owner', 'lines', 'firmware', 'actions',
@@ -153,6 +160,10 @@ export class PhonesComponent implements OnInit {
         });
       }
     });
+  }
+
+  editPhone(id: string): void {
+    this.router.navigate(['/phones', id]);
   }
 
   deletePhone(id: string): void {

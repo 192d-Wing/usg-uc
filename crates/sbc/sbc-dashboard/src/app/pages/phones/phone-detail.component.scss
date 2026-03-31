@@ -1,0 +1,367 @@
+.phone-detail-page {
+  padding: 24px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.page-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.page-title {
+  color: var(--text-primary);
+  margin: 0;
+  font-size: 24px;
+  font-weight: 600;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.header-actions {
+  display: flex;
+  gap: 8px;
+}
+
+// --- Tabs ---
+.detail-tabs {
+  ::ng-deep .mat-mdc-tab-header {
+    background: var(--glass-bg);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    border: var(--glass-border);
+    border-radius: 12px 12px 0 0;
+    margin-bottom: -1px;
+  }
+
+  ::ng-deep .mat-mdc-tab-labels {
+    gap: 4px;
+    padding: 0 8px;
+  }
+
+  ::ng-deep .mdc-tab {
+    color: var(--text-secondary) !important;
+    font-size: 13px;
+    min-width: 80px;
+
+    &--active {
+      color: var(--text-primary) !important;
+    }
+  }
+
+  ::ng-deep .mdc-tab-indicator__content--underline {
+    border-color: #667eea !important;
+  }
+}
+
+// --- Glass Card ---
+.glass-card {
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: var(--glass-border);
+  border-radius: var(--glass-radius);
+  box-shadow: var(--glass-shadow);
+  padding: 24px;
+  margin-bottom: 16px;
+}
+
+.card-title {
+  color: var(--text-primary);
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0 0 20px 0;
+}
+
+// --- Form Grid ---
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px 24px;
+
+  .full-width {
+    grid-column: 1 / -1;
+  }
+}
+
+.form-field {
+  width: 100%;
+}
+
+// --- Model Badge ---
+.model-badge {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  background: rgba(102, 126, 234, 0.15);
+  color: #667eea;
+  border: 1px solid rgba(102, 126, 234, 0.25);
+}
+
+// --- Status Chip ---
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.status-online .status-dot {
+  background: var(--color-success);
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+.status-online {
+  background: rgba(74, 222, 128, 0.12);
+  color: var(--color-success);
+  border: 1px solid rgba(74, 222, 128, 0.2);
+}
+
+.status-offline .status-dot {
+  background: rgba(158, 158, 158, 0.6);
+}
+
+.status-offline {
+  background: rgba(158, 158, 158, 0.12);
+  color: rgba(255, 255, 255, 0.4);
+  border: 1px solid rgba(158, 158, 158, 0.15);
+}
+
+.status-registered .status-dot {
+  background: var(--color-success);
+}
+
+.status-registered {
+  background: rgba(74, 222, 128, 0.12);
+  color: var(--color-success);
+  border: 1px solid rgba(74, 222, 128, 0.2);
+}
+
+.status-provisioning .status-dot {
+  background: var(--color-warning);
+}
+
+.status-provisioning {
+  background: rgba(251, 191, 36, 0.12);
+  color: var(--color-warning);
+  border: 1px solid rgba(251, 191, 36, 0.2);
+}
+
+// --- Info Row ---
+.info-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.info-label {
+  color: var(--text-secondary);
+  font-size: 13px;
+  min-width: 100px;
+}
+
+.info-value {
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 500;
+}
+
+// --- Lines Tab ---
+.line-card {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 12px;
+  padding: 20px;
+  margin-bottom: 16px;
+}
+
+.line-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.line-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: var(--accent-gradient);
+  color: #fff;
+  font-weight: 700;
+  font-size: 14px;
+}
+
+.line-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.line-actions {
+  margin-left: auto;
+}
+
+.section-subtitle {
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 16px 0 12px 0;
+}
+
+// --- Speed Dials & BLF Tab ---
+.split-layout {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+}
+
+.table-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+
+// --- Toggle Row ---
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-subtle);
+
+  &:last-child {
+    border-bottom: none;
+  }
+}
+
+.toggle-label {
+  color: var(--text-primary);
+  font-size: 14px;
+}
+
+.toggle-sublabel {
+  color: var(--text-secondary);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+// Toggle color indicators
+::ng-deep .mat-mdc-slide-toggle.mat-mdc-slide-toggle-checked {
+  .mdc-switch__track::after {
+    background: rgba(102, 126, 234, 0.5) !important;
+  }
+  .mdc-switch__handle::after {
+    background: #667eea !important;
+  }
+}
+
+// --- Slider ---
+.slider-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 0;
+}
+
+.slider-label {
+  color: var(--text-primary);
+  font-size: 14px;
+  min-width: 140px;
+}
+
+.slider-value {
+  color: var(--text-secondary);
+  font-size: 13px;
+  min-width: 32px;
+  text-align: right;
+}
+
+::ng-deep .mat-mdc-slider {
+  flex: 1;
+}
+
+// --- Side-by-side cards ---
+.cards-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+}
+
+// --- Paging Section ---
+.paging-section {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+// --- Sub-field (conditionally shown) ---
+.sub-field {
+  margin-left: 24px;
+  margin-top: 8px;
+}
+
+// --- Material table in tabs ---
+.tab-table {
+  width: 100%;
+
+  ::ng-deep .mat-mdc-header-cell {
+    font-size: 12px;
+  }
+}
+
+// --- Responsive ---
+@media (max-width: 900px) {
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .split-layout,
+  .cards-row {
+    grid-template-columns: 1fr;
+  }
+
+  .phone-detail-page {
+    padding: 16px;
+  }
+}
+
+@media (max-width: 600px) {
+  .page-header {
+    flex-wrap: wrap;
+  }
+
+  .header-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+}
+
+@keyframes pulse-glow {
+  0%, 100% {
+    box-shadow: 0 0 4px currentColor;
+  }
+  50% {
+    box-shadow: 0 0 12px currentColor, 0 0 24px currentColor;
+  }
+}
