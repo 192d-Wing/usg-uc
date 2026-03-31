@@ -1,0 +1,100 @@
+.call-ladder-page {
+  padding: 24px;
+}
+
+.page-header {
+  margin-bottom: 24px;
+}
+
+.page-title {
+  color: #fff;
+  margin: 0;
+  font-size: 24px;
+  font-weight: 500;
+}
+
+.search-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.search-field {
+  flex: 1;
+  max-width: 500px;
+}
+
+.recent-calls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.recent-label {
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 13px;
+}
+
+.ladder-card {
+  background: #16213e;
+  border-radius: 12px;
+  margin-bottom: 16px;
+}
+
+.detail-panel {
+  margin-top: 16px;
+}
+
+.detail-card {
+  background: #16213e;
+  color: #fff;
+  border-radius: 12px;
+}
+
+.detail-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 8px;
+}
+
+.detail-method {
+  font-size: 16px;
+  font-weight: 600;
+  color: #7c4dff;
+}
+
+.detail-direction {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.6);
+  text-transform: uppercase;
+}
+
+.detail-time {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.5);
+  margin-left: auto;
+}
+
+.detail-route {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.7);
+  margin-bottom: 12px;
+  font-family: 'Roboto Mono', monospace;
+}
+
+.detail-raw {
+  background: #0a0a1a;
+  color: rgba(255, 255, 255, 0.85);
+  padding: 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-family: 'Roboto Mono', monospace;
+  overflow-x: auto;
+  white-space: pre;
+  max-height: 400px;
+  overflow-y: auto;
+}

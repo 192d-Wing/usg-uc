@@ -1,0 +1,132 @@
+.dashboard-page {
+  padding: 24px;
+}
+
+.page-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 24px;
+}
+
+.page-title {
+  color: #fff;
+  margin: 0;
+  font-size: 24px;
+  font-weight: 500;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.panels-row {
+  display: grid;
+  grid-template-columns: 1fr 2fr;
+  gap: 16px;
+}
+
+.health-card {
+  background: #16213e;
+  color: #fff;
+  border-radius: 12px;
+}
+
+.health-content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.health-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.health-label {
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 14px;
+}
+
+.health-value {
+  color: #fff;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.health-checks {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.check-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.check-ok {
+  background: #4caf50;
+}
+
+.check-fail {
+  background: #f44336;
+}
+
+.check-name {
+  color: rgba(255, 255, 255, 0.8);
+  font-size: 13px;
+}
+
+.calls-card {
+  background: #16213e;
+  color: #fff;
+  border-radius: 12px;
+}
+
+.calls-table {
+  width: 100%;
+}
+
+.status-badge {
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+  text-transform: uppercase;
+}
+
+.status-connected {
+  background: rgba(76, 175, 80, 0.2);
+  color: #81c784;
+}
+
+.status-ringing {
+  background: rgba(33, 150, 243, 0.2);
+  color: #90caf9;
+}
+
+.no-calls {
+  color: rgba(255, 255, 255, 0.4);
+  text-align: center;
+  padding: 32px;
+  font-size: 14px;
+}
+
+@media (max-width: 900px) {
+  .panels-row {
+    grid-template-columns: 1fr;
+  }
+}

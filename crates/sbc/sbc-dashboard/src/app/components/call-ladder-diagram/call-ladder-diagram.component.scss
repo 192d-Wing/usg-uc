@@ -1,0 +1,76 @@
+.ladder-container {
+  overflow-x: auto;
+  padding: 16px;
+}
+
+.ladder-svg {
+  display: block;
+}
+
+.participant-label {
+  fill: rgba(255, 255, 255, 0.9);
+  font-size: 12px;
+  font-weight: 500;
+  font-family: 'Roboto Mono', monospace;
+}
+
+.participant-line {
+  stroke: rgba(255, 255, 255, 0.15);
+  stroke-width: 1;
+  stroke-dasharray: 4, 4;
+}
+
+.arrow-line {
+  stroke-width: 2;
+}
+
+.arrow-req .arrow-line,
+.arrow-line.arrow-req {
+  stroke: #42a5f5;
+}
+
+.arrow-1xx .arrow-line,
+.arrow-line.arrow-1xx {
+  stroke: #9e9e9e;
+}
+
+.arrow-2xx .arrow-line,
+.arrow-line.arrow-2xx {
+  stroke: #66bb6a;
+}
+
+.arrow-err .arrow-line,
+.arrow-line.arrow-err {
+  stroke: #ef5350;
+}
+
+.arrowhead.arrow-req { fill: #42a5f5; }
+.arrowhead.arrow-1xx { fill: #9e9e9e; }
+.arrowhead.arrow-2xx { fill: #66bb6a; }
+.arrowhead.arrow-err { fill: #ef5350; }
+
+.arrow-label {
+  font-size: 11px;
+  font-weight: 500;
+  font-family: 'Roboto Mono', monospace;
+}
+
+.arrow-label.arrow-req { fill: #42a5f5; }
+.arrow-label.arrow-1xx { fill: #bdbdbd; }
+.arrow-label.arrow-2xx { fill: #66bb6a; }
+.arrow-label.arrow-err { fill: #ef5350; }
+
+.arrow-time {
+  fill: rgba(255, 255, 255, 0.35);
+  font-size: 9px;
+  font-family: 'Roboto Mono', monospace;
+}
+
+.message-group:hover .arrow-line {
+  stroke-width: 3;
+}
+
+.message-group.selected .arrow-line {
+  stroke-width: 3;
+  filter: drop-shadow(0 0 4px currentColor);
+}

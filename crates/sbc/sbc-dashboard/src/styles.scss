@@ -1,0 +1,87 @@
+@use '@angular/material' as mat;
+
+html {
+  @include mat.theme((
+    color: (
+      theme-type: dark,
+      primary: mat.$violet-palette,
+      tertiary: mat.$cyan-palette,
+    ),
+    typography: Roboto,
+    density: 0,
+  ));
+}
+
+html, body {
+  height: 100%;
+  margin: 0;
+  font-family: Roboto, "Helvetica Neue", sans-serif;
+  background: #0a0a1a;
+  color: #fff;
+}
+
+.mat-mdc-table {
+  background: transparent !important;
+}
+
+.mat-mdc-header-cell {
+  color: rgba(255, 255, 255, 0.7) !important;
+  border-bottom-color: rgba(255, 255, 255, 0.1) !important;
+}
+
+.mat-mdc-cell {
+  color: rgba(255, 255, 255, 0.9) !important;
+  border-bottom-color: rgba(255, 255, 255, 0.05) !important;
+}
+
+.mat-mdc-row:hover {
+  background: rgba(255, 255, 255, 0.03) !important;
+}
+
+.mat-mdc-form-field {
+  --mdc-outlined-text-field-label-text-color: rgba(255, 255, 255, 0.6);
+  --mdc-outlined-text-field-input-text-color: #fff;
+  --mdc-outlined-text-field-outline-color: rgba(255, 255, 255, 0.2);
+}
+
+.mat-mdc-paginator {
+  background: transparent !important;
+  color: rgba(255, 255, 255, 0.7) !important;
+}
+
+.mat-mdc-card {
+  --mdc-elevated-card-container-color: #16213e;
+}
+
+.mat-sidenav-container {
+  background: #0a0a1a;
+}
+
+.mat-sidenav {
+  background: #1a1a2e !important;
+}
+
+.mat-mdc-dialog-container {
+  --mdc-dialog-container-color: #1a1a2e;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+html, body { height: 100%; }
+body { margin: 0; font-family: Roboto, "Helvetica Neue", sans-serif; }
