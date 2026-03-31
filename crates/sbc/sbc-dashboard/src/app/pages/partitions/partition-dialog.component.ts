@@ -23,7 +23,7 @@ import { MatButtonModule } from '@angular/material/button';
 
       <mat-form-field appearance="outline" class="full-width">
         <mat-label>ID</mat-label>
-        <input matInput [(ngModel)]="partition.id" required placeholder="pt-internal" />
+        <input matInput [(ngModel)]="partition.id" required readonly placeholder="pt-internal" />
         <mat-hint>Auto-generated from name</mat-hint>
       </mat-form-field>
 

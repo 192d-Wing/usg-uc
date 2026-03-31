@@ -17,13 +17,14 @@ import { FormsModule } from '@angular/forms';
     <h2 mat-dialog-title>{{ isEdit ? 'Edit' : 'Add' }} Trunk Group</h2>
     <mat-dialog-content>
       <mat-form-field appearance="outline" class="full-width">
-        <mat-label>Group ID</mat-label>
-        <input matInput [(ngModel)]="form.id">
+        <mat-label>Name</mat-label>
+        <input matInput [(ngModel)]="form.name" required (input)="autoId()" />
       </mat-form-field>
 
       <mat-form-field appearance="outline" class="full-width">
-        <mat-label>Name</mat-label>
-        <input matInput [(ngModel)]="form.name">
+        <mat-label>ID</mat-label>
+        <input matInput [(ngModel)]="form.id" required readonly />
+        @if (!isEdit) { <mat-hint>Auto-generated from name</mat-hint> }
       </mat-form-field>
 
       <mat-form-field appearance="outline" class="full-width">
@@ -66,6 +67,12 @@ export class TrunkgroupDialogComponent implements OnInit {
         name: this.data.name || '',
         strategy: this.data.strategy || 'priority',
       };
+    }
+  }
+
+  autoId(): void {
+    if (!this.isEdit) {
+      this.form.id = 'rg-' + this.form.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
     }
   }
 

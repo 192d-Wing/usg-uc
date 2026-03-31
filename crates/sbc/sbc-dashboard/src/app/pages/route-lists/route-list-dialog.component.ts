@@ -17,8 +17,17 @@ import { MatButtonModule } from '@angular/material/button';
     <mat-dialog-content>
       <mat-form-field appearance="outline" class="full-width">
         <mat-label>Name</mat-label>
-        <input matInput [(ngModel)]="routeList.name" required [readonly]="isEdit" />
+        <input matInput [(ngModel)]="routeList.name" required [readonly]="isEdit"
+               (input)="autoId()" />
       </mat-form-field>
+
+      @if (!isEdit) {
+        <mat-form-field appearance="outline" class="full-width">
+          <mat-label>ID</mat-label>
+          <input matInput [(ngModel)]="routeList.id" required readonly />
+          <mat-hint>Auto-generated from name</mat-hint>
+        </mat-form-field>
+      }
 
       <mat-form-field appearance="outline" class="full-width">
         <mat-label>Description</mat-label>
@@ -42,7 +51,7 @@ export class RouteListDialogComponent implements OnInit {
   private readonly data: any = inject(MAT_DIALOG_DATA, { optional: true });
 
   isEdit = false;
-  routeList: any = { name: '', description: '' };
+  routeList: any = { id: '', name: '', description: '' };
 
   constructor(public dialogRef: MatDialogRef<RouteListDialogComponent>) {}
 
@@ -50,9 +59,16 @@ export class RouteListDialogComponent implements OnInit {
     if (this.data) {
       this.isEdit = true;
       this.routeList = {
+        id: this.data.id || '',
         name: this.data.name || this.data.id,
         description: this.data.description || '',
       };
+    }
+  }
+
+  autoId(): void {
+    if (!this.isEdit) {
+      this.routeList.id = 'rl-' + this.routeList.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
     }
   }
 }

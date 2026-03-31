@@ -22,8 +22,17 @@ import { ApiService } from '../../services/api.service';
     <mat-dialog-content>
       <mat-form-field appearance="outline" class="full-width">
         <mat-label>Name</mat-label>
-        <input matInput [(ngModel)]="css.name" required [readonly]="isEdit" />
+        <input matInput [(ngModel)]="css.name" required [readonly]="isEdit"
+               (input)="autoId()" />
       </mat-form-field>
+
+      @if (!isEdit) {
+        <mat-form-field appearance="outline" class="full-width">
+          <mat-label>ID</mat-label>
+          <input matInput [(ngModel)]="css.id" required readonly />
+          <mat-hint>Auto-generated from name</mat-hint>
+        </mat-form-field>
+      }
 
       <mat-form-field appearance="outline" class="full-width">
         <mat-label>Partitions</mat-label>
@@ -75,7 +84,7 @@ export class CssDialogComponent implements OnInit {
   readonly data: any = inject(MAT_DIALOG_DATA, { optional: true });
 
   isEdit = false;
-  css: any = { name: '', partitions: [] };
+  css: any = { id: '', name: '', partitions: [] };
   readonly availablePartitions = signal<any[]>([]);
 
   constructor(public dialogRef: MatDialogRef<CssDialogComponent>) {}
@@ -91,6 +100,12 @@ export class CssDialogComponent implements OnInit {
         name: this.data.name || this.data.id,
         partitions: [...(this.data.partitions || [])],
       };
+    }
+  }
+
+  autoId(): void {
+    if (!this.isEdit) {
+      this.css.id = 'css-' + this.css.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
     }
   }
 
