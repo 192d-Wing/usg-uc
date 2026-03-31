@@ -104,4 +104,35 @@ export class ApiService {
   getRecentCallIds(): Observable<string[]> {
     return this.http.get<string[]>(`${this.baseUrl}/calls/recent`);
   }
+
+  getDialPlans(): Observable<any[]> {
+    return this.http.get<any>(`${this.baseUrl}/dialplans`).pipe(map(r => r.dial_plans ?? []));
+  }
+  getDialPlanEntries(planId: string): Observable<any> {
+    return this.http.get<any>(`${this.baseUrl}/dialplans/${encodeURIComponent(planId)}/entries`);
+  }
+  addDialPlanEntry(planId: string, entry: any): Observable<any> {
+    return this.http.post<any>(`${this.baseUrl}/dialplans/${encodeURIComponent(planId)}/entries`, entry);
+  }
+  deleteDialPlanEntry(planId: string, entryId: string): Observable<any> {
+    return this.http.delete<any>(`${this.baseUrl}/dialplans/${encodeURIComponent(planId)}/entries/${encodeURIComponent(entryId)}`);
+  }
+  getTrunkGroups(): Observable<any[]> {
+    return this.http.get<any>(`${this.baseUrl}/trunkgroups`).pipe(map(r => r.trunk_groups ?? []));
+  }
+  addTrunkGroup(group: any): Observable<any> {
+    return this.http.post<any>(`${this.baseUrl}/trunkgroups`, group);
+  }
+  deleteTrunkGroup(groupId: string): Observable<any> {
+    return this.http.delete<any>(`${this.baseUrl}/trunkgroups/${encodeURIComponent(groupId)}`);
+  }
+  getTrunkGroup(groupId: string): Observable<any> {
+    return this.http.get<any>(`${this.baseUrl}/trunkgroups/${encodeURIComponent(groupId)}`);
+  }
+  addTrunk(groupId: string, trunk: any): Observable<any> {
+    return this.http.post<any>(`${this.baseUrl}/trunkgroups/${encodeURIComponent(groupId)}/trunks`, trunk);
+  }
+  deleteTrunk(groupId: string, trunkId: string): Observable<any> {
+    return this.http.delete<any>(`${this.baseUrl}/trunkgroups/${encodeURIComponent(groupId)}/trunks/${encodeURIComponent(trunkId)}`);
+  }
 }

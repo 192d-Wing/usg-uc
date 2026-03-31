@@ -27,5 +27,15 @@ export const routes: Routes = [
     loadComponent: () =>
       import('./pages/call-ladder/call-ladder.component').then((m) => m.CallLadderPageComponent),
   },
+  {
+    path: 'dialplans',
+    loadComponent: () =>
+      import('./pages/dialplans/dialplans.component').then(m => m.DialplansComponent),
+  },
+  {
+    path: 'trunkgroups',
+    loadComponent: () =>
+      import('./pages/trunkgroups/trunkgroups.component').then(m => m.TrunkgroupsComponent),
+  },
   { path: '**', redirectTo: 'dashboard' },
 ];

@@ -25,6 +25,14 @@ import { MatIconModule } from '@angular/material/icon';
         <mat-icon matListItemIcon>dialpad</mat-icon>
         <span matListItemTitle>Directory Numbers</span>
       </a>
+      <a mat-list-item routerLink="/dialplans" routerLinkActive="active-link">
+        <mat-icon matListItemIcon>rule</mat-icon>
+        <span matListItemTitle>Dial Plans</span>
+      </a>
+      <a mat-list-item routerLink="/trunkgroups" routerLinkActive="active-link">
+        <mat-icon matListItemIcon>dns</mat-icon>
+        <span matListItemTitle>Trunk Groups</span>
+      </a>
       <a mat-list-item routerLink="/cdrs" routerLinkActive="active-link">
         <mat-icon matListItemIcon>history</mat-icon>
         <span matListItemTitle>CDR Records</span>
