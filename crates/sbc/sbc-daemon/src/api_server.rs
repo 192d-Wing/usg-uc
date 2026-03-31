@@ -124,6 +124,8 @@ pub struct AppState {
     pub provisioning: Option<Arc<uc_phone_mgmt::provisioning::ProvisioningServer>>,
     /// CUCM router for CSS/partition-based routing.
     pub cucm_router: Option<Arc<tokio::sync::RwLock<uc_routing::CucmRouter>>>,
+    /// Trunk health monitor.
+    pub trunk_monitor: Option<Arc<crate::trunk_monitor::TrunkMonitor>>,
     /// In-memory store for management objects (phones, directory numbers, etc.).
     pub mem_store: Arc<tokio::sync::RwLock<MemStore>>,
     /// TLS acceptor for certificate hot-reload (if TLS is enabled).
@@ -154,6 +156,7 @@ impl AppState {
             provisioning: None,
             cucm_router: None,
             mem_store: Arc::new(tokio::sync::RwLock::new(MemStore::default())),
+            trunk_monitor: None,
             tls_acceptor: None,
             #[cfg(feature = "cluster")]
             cluster_health_fn: None,
@@ -177,6 +180,7 @@ impl AppState {
             provisioning: None,
             cucm_router: None,
             mem_store: Arc::new(tokio::sync::RwLock::new(MemStore::default())),
+            trunk_monitor: None,
             tls_acceptor: Some(tls_acceptor),
             #[cfg(feature = "cluster")]
             cluster_health_fn: None,
@@ -358,6 +362,8 @@ impl ApiServer {
             .route("/trunkgroups/{group_id}", delete(delete_trunk_group).put(update_trunk_group))
             .route("/trunkgroups/{group_id}/trunks", post(add_trunk))
             .route("/trunkgroups/{group_id}/trunks/{trunk_id}", delete(delete_trunk))
+            // Trunk health monitoring
+            .route("/trunk-health", get(get_trunk_health))
             // User management
             .route("/users", get(list_users))
             .route("/users", post(create_user))
@@ -996,6 +1002,20 @@ async fn delete_trunk(
         }
     }
     Json(serde_json::json!({ "success": true, "group_id": group_id, "trunk_id": trunk_id }))
+}
+
+// ============================================================================
+// Trunk Health Monitoring
+// ============================================================================
+
+/// Get health status for all monitored trunks.
+async fn get_trunk_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(ref monitor) = state.trunk_monitor {
+        let statuses = monitor.get_all_status().await;
+        Json(serde_json::json!({ "trunk_health": statuses }))
+    } else {
+        Json(serde_json::json!({ "trunk_health": [], "message": "Trunk monitor not configured" }))
+    }
 }
 
 // ============================================================================

@@ -62,6 +62,7 @@ mod cluster;
 mod grpc_server;
 mod ice_agent;
 mod media_pipeline;
+mod trunk_monitor;
 mod runtime;
 mod server;
 mod shutdown;

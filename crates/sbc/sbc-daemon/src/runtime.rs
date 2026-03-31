@@ -257,6 +257,9 @@ impl Runtime {
         let signal = self.shutdown.signal().clone();
         let config = self.config.read().await.clone();
 
+        // Save instance name before config is moved to server
+        let instance_name = config.general.instance_name.clone();
+
         // Extract gRPC config before moving config to server
         #[cfg(feature = "grpc")]
         let grpc_config = config.grpc.clone().unwrap_or_default();
@@ -286,6 +289,13 @@ impl Runtime {
         app_state.cucm_router = Some(Arc::new(tokio::sync::RwLock::new(
             uc_routing::CucmRouter::new(),
         )));
+
+        // Initialize trunk health monitor
+        let trunk_monitor = Arc::new(crate::trunk_monitor::TrunkMonitor::new(
+            &instance_name,
+        ));
+        app_state.trunk_monitor = Some(Arc::clone(&trunk_monitor));
+        info!("Trunk health monitor initialized");
 
         // Initialize SQLite user store for user management
         match uc_user_mgmt::sqlite::SqliteUserStore::new(":memory:") {
