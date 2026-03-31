@@ -5741,6 +5741,7 @@ dependencies = [
  "uc-health",
  "uc-media-engine",
  "uc-metrics",
+ "uc-routing",
  "uc-state-sync",
  "uc-storage",
  "uc-telemetry",
