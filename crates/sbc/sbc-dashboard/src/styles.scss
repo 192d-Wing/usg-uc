@@ -194,6 +194,31 @@ html, body {
   border-right: 1px solid var(--uswds-border) !important;
 }
 
+// --- USWDS Sidenav Reset (strip blocky defaults) ---
+.usa-sidenav {
+  border: none !important;
+  padding: 0 !important;
+
+  a, a:visited {
+    border: none !important;
+    background: transparent !important;
+    color: var(--uswds-text-secondary) !important;
+    text-decoration: none !important;
+
+    &:hover {
+      color: var(--uswds-text) !important;
+      background: rgba(255, 255, 255, 0.04) !important;
+    }
+
+    &.usa-current {
+      color: #fff !important;
+      background: rgba(0, 94, 162, 0.12) !important;
+      border-left: 3px solid var(--uswds-primary) !important;
+      font-weight: 600;
+    }
+  }
+}
+
 // --- Material Dialog (USWDS dark) ---
 .mat-mdc-dialog-container {
   --mdc-dialog-container-color: var(--uswds-bg);

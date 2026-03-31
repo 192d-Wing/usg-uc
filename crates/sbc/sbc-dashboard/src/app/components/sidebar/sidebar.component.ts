@@ -68,49 +68,58 @@ import { MatIconModule } from '@angular/material/icon';
       padding: 8px 0;
     }
 
-    .usa-sidenav {
+    /* Reset USWDS sidenav defaults */
+    .usa-sidenav,
+    :host ::ng-deep .usa-sidenav {
       list-style: none;
       padding: 0;
       margin: 0;
-      border: none;
+      border: none !important;
+      background: transparent;
     }
 
-    .usa-sidenav__item {
+    .usa-sidenav__item,
+    :host ::ng-deep .usa-sidenav a {
       display: flex;
       align-items: center;
       gap: 10px;
-      padding: 10px 16px;
+      padding: 9px 16px;
       color: var(--uswds-text-secondary);
-      text-decoration: none;
-      font-size: 14px;
+      text-decoration: none !important;
+      font-size: 13px;
       font-weight: 400;
-      border-left: 3px solid transparent;
-      transition: all 200ms ease;
+      border: none !important;
+      border-left: 3px solid transparent !important;
+      border-radius: 0;
+      background: transparent !important;
+      transition: all 150ms ease;
       cursor: pointer;
+      line-height: 1.4;
     }
 
     .usa-sidenav__item:hover {
-      color: var(--uswds-text);
-      background: var(--uswds-hover);
+      color: var(--uswds-text) !important;
+      background: rgba(255, 255, 255, 0.04) !important;
+      border-left-color: rgba(255, 255, 255, 0.15) !important;
     }
 
     .usa-sidenav__item mat-icon {
-      font-size: 20px;
-      width: 20px;
-      height: 20px;
-      opacity: 0.6;
-      transition: opacity 200ms ease;
+      font-size: 18px;
+      width: 18px;
+      height: 18px;
+      opacity: 0.5;
+      transition: opacity 150ms ease;
     }
 
     .usa-sidenav__item:hover mat-icon {
-      opacity: 0.9;
+      opacity: 0.85;
     }
 
     .usa-sidenav__item.usa-current {
-      color: var(--uswds-text);
-      background: rgba(0, 94, 162, 0.15);
-      border-left-color: var(--uswds-primary);
-      font-weight: 700;
+      color: #fff !important;
+      background: rgba(0, 94, 162, 0.12) !important;
+      border-left-color: var(--uswds-primary) !important;
+      font-weight: 600;
     }
 
     .usa-sidenav__item.usa-current mat-icon {
