@@ -36,16 +36,26 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![cfg_attr(test, allow(clippy::panic))]
 
+pub mod css;
+pub mod cucm_router;
 pub mod dialplan;
 pub mod error;
+pub mod partition;
+pub mod route_list;
+pub mod route_pattern;
 pub mod router;
 pub mod trunk;
 
+pub use css::CallingSearchSpace;
+pub use cucm_router::{CucmRouter, CucmRoutingResult};
 pub use dialplan::{
     DestinationType, DialPlan, DialPlanEntry, DialPlanResult, DialPattern, Direction,
     NumberTransform,
 };
 pub use error::{RoutingError, RoutingResult};
+pub use partition::Partition;
+pub use route_list::{RouteList, RouteListMember};
+pub use route_pattern::RoutePattern;
 pub use router::{Router, RouterConfig, RoutingDecision};
 pub use trunk::{SelectionStrategy, Trunk, TrunkConfig, TrunkGroup, TrunkProtocol, TrunkState};
 

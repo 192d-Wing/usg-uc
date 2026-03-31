@@ -1,0 +1,31 @@
+[package]
+name = "uc-user-mgmt"
+description = "User management and authentication for USG SBC"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["sqlite"]
+sqlite = ["dep:rusqlite"]
+postgres = ["dep:sqlx"]
+ldap = ["dep:ldap3"]
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+sha2 = "0.10"
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+
+# Optional backends
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"], optional = true }
+ldap3 = { version = "0.11", optional = true }
+
+[lints]
+workspace = true

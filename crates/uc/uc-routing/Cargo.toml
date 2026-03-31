@@ -13,4 +13,5 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
+serde.workspace = true
 uc-types.workspace = true
