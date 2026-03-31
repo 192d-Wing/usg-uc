@@ -33,6 +33,30 @@ import { MatIconModule } from '@angular/material/icon';
         <mat-icon matListItemIcon>dns</mat-icon>
         <span matListItemTitle>Trunk Groups</span>
       </a>
+      <a mat-list-item routerLink="/users" routerLinkActive="active-link">
+        <mat-icon matListItemIcon>people</mat-icon>
+        <span matListItemTitle>Users</span>
+      </a>
+      <a mat-list-item routerLink="/phones" routerLinkActive="active-link">
+        <mat-icon matListItemIcon>phone_android</mat-icon>
+        <span matListItemTitle>Phones</span>
+      </a>
+      <a mat-list-item routerLink="/partitions" routerLinkActive="active-link">
+        <mat-icon matListItemIcon>folder</mat-icon>
+        <span matListItemTitle>Partitions</span>
+      </a>
+      <a mat-list-item routerLink="/css" routerLinkActive="active-link">
+        <mat-icon matListItemIcon>security</mat-icon>
+        <span matListItemTitle>Calling Search Spaces</span>
+      </a>
+      <a mat-list-item routerLink="/routepatterns" routerLinkActive="active-link">
+        <mat-icon matListItemIcon>alt_route</mat-icon>
+        <span matListItemTitle>Route Patterns</span>
+      </a>
+      <a mat-list-item routerLink="/routelists" routerLinkActive="active-link">
+        <mat-icon matListItemIcon>format_list_numbered</mat-icon>
+        <span matListItemTitle>Route Lists</span>
+      </a>
       <a mat-list-item routerLink="/cdrs" routerLinkActive="active-link">
         <mat-icon matListItemIcon>history</mat-icon>
         <span matListItemTitle>CDR Records</span>

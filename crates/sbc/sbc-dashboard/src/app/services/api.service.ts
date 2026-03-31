@@ -135,4 +135,70 @@ export class ApiService {
   deleteTrunk(groupId: string, trunkId: string): Observable<any> {
     return this.http.delete<any>(`${this.baseUrl}/trunkgroups/${encodeURIComponent(groupId)}/trunks/${encodeURIComponent(trunkId)}`);
   }
+
+  // Users
+  getUsers(): Observable<any[]> {
+    return this.http.get<any>(`${this.baseUrl}/users`).pipe(map(r => r.users ?? []));
+  }
+  createUser(user: any): Observable<any> {
+    return this.http.post(`${this.baseUrl}/users`, user);
+  }
+  deleteUser(id: string): Observable<any> {
+    return this.http.delete(`${this.baseUrl}/users/${encodeURIComponent(id)}`);
+  }
+
+  // Phones
+  getPhones(): Observable<any[]> {
+    return this.http.get<any>(`${this.baseUrl}/phones`).pipe(map(r => r.phones ?? []));
+  }
+  createPhone(phone: any): Observable<any> {
+    return this.http.post(`${this.baseUrl}/phones`, phone);
+  }
+  deletePhone(id: string): Observable<any> {
+    return this.http.delete(`${this.baseUrl}/phones/${encodeURIComponent(id)}`);
+  }
+
+  // Partitions
+  getPartitions(): Observable<any[]> {
+    return this.http.get<any>(`${this.baseUrl}/partitions`).pipe(map(r => r.partitions ?? []));
+  }
+  createPartition(p: any): Observable<any> {
+    return this.http.post(`${this.baseUrl}/partitions`, p);
+  }
+  deletePartition(id: string): Observable<any> {
+    return this.http.delete(`${this.baseUrl}/partitions/${encodeURIComponent(id)}`);
+  }
+
+  // Calling Search Spaces
+  getCss(): Observable<any[]> {
+    return this.http.get<any>(`${this.baseUrl}/css`).pipe(map(r => r.calling_search_spaces ?? []));
+  }
+  createCss(css: any): Observable<any> {
+    return this.http.post(`${this.baseUrl}/css`, css);
+  }
+  deleteCss(id: string): Observable<any> {
+    return this.http.delete(`${this.baseUrl}/css/${encodeURIComponent(id)}`);
+  }
+
+  // Route Patterns
+  getRoutePatterns(): Observable<any[]> {
+    return this.http.get<any>(`${this.baseUrl}/routepatterns`).pipe(map(r => r.route_patterns ?? []));
+  }
+  createRoutePattern(rp: any): Observable<any> {
+    return this.http.post(`${this.baseUrl}/routepatterns`, rp);
+  }
+  deleteRoutePattern(id: string): Observable<any> {
+    return this.http.delete(`${this.baseUrl}/routepatterns/${encodeURIComponent(id)}`);
+  }
+
+  // Route Lists
+  getRouteLists(): Observable<any[]> {
+    return this.http.get<any>(`${this.baseUrl}/routelists`).pipe(map(r => r.route_lists ?? []));
+  }
+  createRouteList(rl: any): Observable<any> {
+    return this.http.post(`${this.baseUrl}/routelists`, rl);
+  }
+  deleteRouteList(id: string): Observable<any> {
+    return this.http.delete(`${this.baseUrl}/routelists/${encodeURIComponent(id)}`);
+  }
 }

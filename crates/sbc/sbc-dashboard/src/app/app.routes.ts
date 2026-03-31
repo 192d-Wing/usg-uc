@@ -37,5 +37,35 @@ export const routes: Routes = [
     loadComponent: () =>
       import('./pages/trunkgroups/trunkgroups.component').then(m => m.TrunkgroupsComponent),
   },
+  {
+    path: 'users',
+    loadComponent: () =>
+      import('./pages/users/users.component').then(m => m.UsersComponent),
+  },
+  {
+    path: 'phones',
+    loadComponent: () =>
+      import('./pages/phones/phones.component').then(m => m.PhonesComponent),
+  },
+  {
+    path: 'partitions',
+    loadComponent: () =>
+      import('./pages/partitions/partitions.component').then(m => m.PartitionsComponent),
+  },
+  {
+    path: 'css',
+    loadComponent: () =>
+      import('./pages/css-editor/css-editor.component').then(m => m.CssEditorComponent),
+  },
+  {
+    path: 'routepatterns',
+    loadComponent: () =>
+      import('./pages/route-patterns/route-patterns.component').then(m => m.RoutePatternsComponent),
+  },
+  {
+    path: 'routelists',
+    loadComponent: () =>
+      import('./pages/route-lists/route-lists.component').then(m => m.RouteListsComponent),
+  },
   { path: '**', redirectTo: 'dashboard' },
 ];
