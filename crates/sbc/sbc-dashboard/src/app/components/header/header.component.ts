@@ -22,7 +22,7 @@ import { SystemStats } from '../../models/sbc.models';
     MatTooltipModule,
   ],
   template: `
-    <mat-toolbar class="header-toolbar">
+    <div class="usa-banner-bar">
       <span class="instance-name">SBC Instance</span>
       <span class="spacer"></span>
 
@@ -40,24 +40,25 @@ import { SystemStats } from '../../models/sbc.models';
       <button mat-icon-button matTooltip="Settings">
         <mat-icon>settings</mat-icon>
       </button>
-    </mat-toolbar>
+    </div>
   `,
   styles: [`
-    .header-toolbar {
-      background: rgba(255, 255, 255, 0.03);
-      backdrop-filter: blur(20px);
-      -webkit-backdrop-filter: blur(20px);
-      color: var(--text-primary);
-      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    .usa-banner-bar {
+      display: flex;
+      align-items: center;
+      background: var(--uswds-card-bg);
+      color: var(--uswds-text);
+      border-bottom: 1px solid var(--uswds-border);
       padding: 0 24px;
-      height: 56px;
+      height: 48px;
     }
 
     .instance-name {
-      font-size: 16px;
-      font-weight: 600;
-      color: var(--text-secondary);
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--uswds-text-secondary);
       letter-spacing: 0.02em;
+      text-transform: uppercase;
     }
 
     .spacer {
@@ -69,12 +70,10 @@ import { SystemStats } from '../../models/sbc.models';
       align-items: center;
       gap: 8px;
       margin-right: 16px;
-      padding: 6px 14px;
-      border-radius: 20px;
+      padding: 4px 12px;
+      border-radius: 4px;
       background: rgba(255, 255, 255, 0.04);
-      border: 1px solid rgba(255, 255, 255, 0.06);
-      backdrop-filter: blur(8px);
-      -webkit-backdrop-filter: blur(8px);
+      border: 1px solid var(--uswds-border);
       transition: background 200ms ease;
     }
 
@@ -115,7 +114,7 @@ import { SystemStats } from '../../models/sbc.models';
 
     .health-label {
       font-size: 13px;
-      color: rgba(255, 255, 255, 0.7);
+      color: var(--uswds-text-secondary);
     }
   `],
 })

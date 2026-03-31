@@ -19,7 +19,7 @@ import { UserDialogComponent } from './user-dialog.component';
   template: `
     <div class="users-page">
       <div class="page-header">
-        <h2 class="page-title">Users</h2>
+        <h1 class="usa-heading page-title">Users</h1>
         <span class="spacer"></span>
         <button mat-raised-button color="primary" (click)="openAddDialog()">
           <mat-icon>add</mat-icon> Add User
@@ -101,21 +101,21 @@ import { UserDialogComponent } from './user-dialog.component';
     }
 
     .auth-digest {
-      background: rgba(74, 222, 128, 0.12);
+      background: rgba(74, 222, 128, 0.15);
       color: var(--color-success);
-      border-color: rgba(74, 222, 128, 0.2);
+      border-color: rgba(74, 222, 128, 0.25);
     }
 
     .auth-mtls_pki {
-      background: rgba(96, 165, 250, 0.12);
-      color: #93bbfd;
-      border-color: rgba(96, 165, 250, 0.2);
+      background: rgba(0, 94, 162, 0.15);
+      color: var(--uswds-primary-light);
+      border-color: rgba(0, 94, 162, 0.3);
     }
 
     .auth-both {
-      background: rgba(168, 85, 247, 0.12);
+      background: rgba(168, 85, 247, 0.15);
       color: #c4b5fd;
-      border-color: rgba(168, 85, 247, 0.2);
+      border-color: rgba(168, 85, 247, 0.25);
     }
 
     .enabled { color: var(--color-success); }

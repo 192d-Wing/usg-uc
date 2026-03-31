@@ -18,7 +18,7 @@ import { PartitionDialogComponent } from './partition-dialog.component';
   template: `
     <div class="partitions-page">
       <div class="page-header">
-        <h2 class="page-title">Partitions</h2>
+        <h1 class="usa-heading page-title">Partitions</h1>
         <span class="spacer"></span>
         <button mat-raised-button color="primary" (click)="openAddDialog()">
           <mat-icon>add</mat-icon> Add Partition

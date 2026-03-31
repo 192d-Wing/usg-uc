@@ -1,19 +1,90 @@
-.app-container {
-  height: 100vh;
-  background: transparent;
+.usa-app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  background: var(--uswds-bg);
 }
 
-.app-sidenav {
+// --- USWDS Header Dark ---
+.usa-header.usa-header--dark {
+  background-color: var(--uswds-bg-darker);
+  border-bottom: 1px solid var(--uswds-border);
+  padding: 12px 24px;
+  flex-shrink: 0;
+
+  .usa-navbar {
+    display: flex;
+    align-items: center;
+    max-width: 100%;
+    padding: 0;
+    border-bottom: none;
+  }
+
+  .usa-logo {
+    margin: 0;
+  }
+
+  .usa-logo__text a {
+    color: var(--uswds-text);
+    text-decoration: none;
+    font-size: 18px;
+    font-weight: 700;
+    font-family: 'Public Sans', sans-serif;
+    letter-spacing: -0.01em;
+  }
+}
+
+// --- Layout ---
+.usa-layout {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+// --- Sidebar ---
+.usa-layout-sidebar {
   width: 240px;
-  border-right: none;
+  flex-shrink: 0;
+  background: var(--uswds-sidebar-bg);
+  border-right: 1px solid var(--uswds-border);
+  overflow-y: auto;
+  height: calc(100vh - 49px - 41px); // header + footer
 }
 
-.app-content {
-  background: transparent;
+// --- Main Content ---
+.usa-layout-main {
+  flex: 1;
+  overflow-y: auto;
+  height: calc(100vh - 49px - 41px); // header + footer
+  background: var(--uswds-bg);
+
+  .grid-container {
+    max-width: 1600px;
+    padding: 0;
+  }
 }
 
-.content {
-  min-height: calc(100vh - 56px);
-  padding: 0;
-  max-width: 1600px;
+// --- Footer ---
+.usa-footer.usa-footer--slim {
+  background-color: var(--uswds-bg-darker);
+  border-top: 1px solid var(--uswds-border);
+  padding: 8px 24px;
+  flex-shrink: 0;
+
+  .usa-footer__return-to-top {
+    padding: 0;
+  }
+
+  .usa-footer__info {
+    color: var(--uswds-text-secondary);
+    font-size: 12px;
+    font-weight: 400;
+  }
+}
+
+// --- Responsive ---
+@media (max-width: 768px) {
+  .usa-layout-sidebar {
+    display: none;
+  }
 }

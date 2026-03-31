@@ -20,7 +20,7 @@ import { DirectoryDialogComponent, DirectoryDialogData } from './directory-dialo
   template: `
     <div class="directory-page">
       <div class="page-header">
-        <h2 class="page-title">Directory Numbers</h2>
+        <h1 class="usa-heading page-title">Directory Numbers</h1>
         <span class="spacer"></span>
         <button mat-raised-button color="primary" (click)="openAddDialog()">
           <mat-icon>add</mat-icon> Add Number
@@ -96,21 +96,21 @@ import { DirectoryDialogComponent, DirectoryDialogData } from './directory-dialo
     }
 
     .type-trunk_group {
-      background: rgba(102, 126, 234, 0.12);
-      color: #a5b4fc;
-      border-color: rgba(102, 126, 234, 0.2);
+      background: rgba(0, 94, 162, 0.15);
+      color: var(--uswds-primary-light);
+      border-color: rgba(0, 94, 162, 0.3);
     }
 
     .type-registered_user {
-      background: rgba(74, 222, 128, 0.12);
+      background: rgba(74, 222, 128, 0.15);
       color: var(--color-success);
-      border-color: rgba(74, 222, 128, 0.2);
+      border-color: rgba(74, 222, 128, 0.25);
     }
 
     .type-static_uri {
-      background: rgba(0, 188, 212, 0.12);
+      background: rgba(0, 188, 212, 0.15);
       color: #67e8f9;
-      border-color: rgba(0, 188, 212, 0.2);
+      border-color: rgba(0, 188, 212, 0.25);
     }
   `],
 })

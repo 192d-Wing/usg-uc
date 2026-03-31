@@ -7,27 +7,37 @@ import { MatIconModule } from '@angular/material/icon';
   standalone: true,
   imports: [MatCardModule, MatIconModule],
   template: `
-    <div class="stats-card glass-card">
-      <div class="card-content">
-        <div class="card-icon-wrap">
-          <mat-icon>{{ icon() }}</mat-icon>
-        </div>
-        <div class="card-info">
-          <span class="card-label">{{ title() }}</span>
-          <span class="card-value">{{ value() }}</span>
+    <div class="usa-card usa-card--dark">
+      <div class="usa-card__body">
+        <div class="card-content">
+          <div class="card-icon-wrap">
+            <mat-icon>{{ icon() }}</mat-icon>
+          </div>
+          <div class="card-info">
+            <span class="card-label">{{ title() }}</span>
+            <span class="card-value">{{ value() }}</span>
+          </div>
         </div>
       </div>
     </div>
   `,
   styles: [`
-    .stats-card {
-      padding: 20px;
+    .usa-card.usa-card--dark {
+      background: var(--uswds-card-bg);
+      border: 1px solid var(--uswds-card-border);
+      border-radius: 8px;
+      padding: 0;
+      margin: 0;
       cursor: default;
+      transition: box-shadow 200ms ease;
     }
 
-    .stats-card:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+    .usa-card.usa-card--dark:hover {
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+    }
+
+    .usa-card__body {
+      padding: 20px;
     }
 
     .card-content {
@@ -42,9 +52,8 @@ import { MatIconModule } from '@angular/material/icon';
       justify-content: center;
       width: 48px;
       height: 48px;
-      border-radius: 14px;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+      border-radius: 8px;
+      background: var(--uswds-primary);
       flex-shrink: 0;
     }
 
@@ -59,22 +68,19 @@ import { MatIconModule } from '@angular/material/icon';
     }
 
     .card-label {
-      font-size: 13px;
-      color: rgba(255, 255, 255, 0.5);
+      font-size: 12px;
+      color: var(--uswds-text-secondary);
       margin-bottom: 4px;
-      letter-spacing: 0.02em;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      font-weight: 700;
     }
 
     .card-value {
       font-size: 28px;
       font-weight: 700;
-      color: rgba(255, 255, 255, 0.95);
+      color: var(--uswds-text);
       line-height: 1;
-      transition: text-shadow 250ms ease;
-    }
-
-    .stats-card:hover .card-value {
-      text-shadow: 0 0 20px rgba(102, 126, 234, 0.3);
     }
   `],
 })

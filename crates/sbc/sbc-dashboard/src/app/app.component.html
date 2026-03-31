@@ -1,13 +1,36 @@
-<div class="app-bg-gradient">
-  <mat-sidenav-container class="app-container">
-    <mat-sidenav mode="side" opened class="app-sidenav">
+<div class="usa-app">
+  <!-- USWDS Header -->
+  <header class="usa-header usa-header--dark">
+    <div class="usa-navbar">
+      <div class="usa-logo">
+        <em class="usa-logo__text">
+          <a href="/" title="USG SBC">USG Session Border Controller</a>
+        </em>
+      </div>
+    </div>
+  </header>
+
+  <div class="usa-layout">
+    <!-- USWDS Side Navigation -->
+    <aside class="usa-layout-sidebar">
       <app-sidebar />
-    </mat-sidenav>
-    <mat-sidenav-content class="app-content">
+    </aside>
+
+    <!-- Main Content -->
+    <main class="usa-layout-main">
       <app-header />
-      <main class="content">
+      <div class="grid-container">
         <router-outlet />
-      </main>
-    </mat-sidenav-content>
-  </mat-sidenav-container>
+      </div>
+    </main>
+  </div>
+
+  <!-- USWDS Footer -->
+  <footer class="usa-footer usa-footer--slim">
+    <div class="grid-container">
+      <div class="usa-footer__return-to-top">
+        <span class="usa-footer__info">USG SBC v0.1.0 -- CNSA 2.0 Compliant</span>
+      </div>
+    </div>
+  </footer>
 </div>

@@ -1,21 +1,32 @@
 @use '@angular/material' as mat;
 
-// --- Design System CSS Custom Properties ---
+// --- USWDS Font/Image Paths ---
+$theme-font-path: '/assets/uswds/fonts';
+$theme-image-path: '/assets/uswds/img';
+
+// --- USWDS Dark Theme Tokens ---
 :root {
-  --bg-gradient: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
-  --glass-bg: rgba(255, 255, 255, 0.05);
-  --glass-blur: blur(20px);
-  --glass-border: 1px solid rgba(255, 255, 255, 0.08);
-  --glass-radius: 16px;
-  --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-  --accent-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  --uswds-bg: #1b1b1b;
+  --uswds-bg-darker: #141414;
+  --uswds-card-bg: #2d2d2d;
+  --uswds-card-border: #3d3d3d;
+  --uswds-primary: #005ea2;
+  --uswds-primary-light: #2378c3;
+  --uswds-primary-dark: #004577;
+  --uswds-secondary: #e41d3d;
+  --uswds-text: #f0f0f0;
+  --uswds-text-secondary: #a9aeb1;
+  --uswds-border: #3d3d3d;
+  --uswds-hover: rgba(255, 255, 255, 0.04);
+  --uswds-sidebar-bg: #171717;
+
   --color-success: #4ade80;
   --color-warning: #fbbf24;
   --color-error: #f87171;
-  --text-primary: rgba(255, 255, 255, 0.95);
-  --text-secondary: rgba(255, 255, 255, 0.5);
-  --hover-highlight: rgba(255, 255, 255, 0.03);
-  --border-subtle: rgba(255, 255, 255, 0.06);
+  --text-primary: #f0f0f0;
+  --text-secondary: #a9aeb1;
+  --border-subtle: #3d3d3d;
+  --hover-highlight: rgba(255, 255, 255, 0.04);
 }
 
 // --- Angular Material Theme ---
@@ -23,10 +34,10 @@ html {
   @include mat.theme((
     color: (
       theme-type: dark,
-      primary: mat.$violet-palette,
+      primary: mat.$azure-palette,
       tertiary: mat.$cyan-palette,
     ),
-    typography: Roboto,
+    typography: 'Public Sans',
     density: 0,
   ));
 }
@@ -35,90 +46,90 @@ html {
 html, body {
   height: 100%;
   margin: 0;
-  font-family: Roboto, "Helvetica Neue", sans-serif;
-  background: var(--bg-gradient);
-  background-attachment: fixed;
-  color: var(--text-primary);
+  font-family: 'Public Sans', 'Source Sans Pro', -apple-system, BlinkMacSystemFont, sans-serif;
+  background: var(--uswds-bg);
+  color: var(--uswds-text);
+}
+
+// --- USWDS Dark Overrides ---
+// Override USWDS light defaults for dark theme
+.usa-header,
+.usa-footer,
+.usa-sidenav,
+.usa-card,
+.usa-banner {
+  color: var(--uswds-text);
+}
+
+.usa-header--dark {
+  background-color: var(--uswds-bg-darker);
+  border-bottom: 1px solid var(--uswds-border);
+}
+
+.usa-footer--slim {
+  background-color: var(--uswds-bg-darker);
+  border-top: 1px solid var(--uswds-border);
+  color: var(--uswds-text-secondary);
 }
 
 // --- Utility Classes ---
-.glass-card {
-  background: var(--glass-bg);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
-  border: var(--glass-border);
-  border-radius: var(--glass-radius);
-  box-shadow: var(--glass-shadow);
-  transition: transform 250ms ease, box-shadow 250ms ease;
+.usa-heading {
+  color: var(--uswds-text);
+  font-family: 'Public Sans', sans-serif;
+  font-weight: 700;
+  letter-spacing: -0.01em;
 }
 
-.gradient-text {
-  background: var(--accent-gradient);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-}
-
-.gradient-divider {
-  height: 2px;
-  background: var(--accent-gradient);
-  border: none;
-  border-radius: 1px;
-  opacity: 0.4;
-  margin: 24px 0;
-}
-
-// --- Material Table Overrides ---
+// --- Material Table Overrides (USWDS themed) ---
 .mat-mdc-table {
   background: transparent !important;
 }
 
 .mat-mdc-header-cell {
-  color: var(--text-secondary) !important;
-  border-bottom: 1px solid var(--border-subtle) !important;
-  font-weight: 600 !important;
+  color: var(--uswds-text-secondary) !important;
+  border-bottom: 2px solid var(--uswds-primary) !important;
+  font-weight: 700 !important;
   letter-spacing: 0.03em;
+  text-transform: uppercase;
+  font-size: 12px !important;
 }
 
 .mat-mdc-cell {
-  color: var(--text-primary) !important;
-  border-bottom: 1px solid var(--border-subtle) !important;
+  color: var(--uswds-text) !important;
+  border-bottom: 1px solid var(--uswds-border) !important;
 }
 
 .mat-mdc-row {
   transition: background 200ms ease;
 
   &:hover {
-    background: var(--hover-highlight) !important;
+    background: var(--uswds-hover) !important;
   }
 }
 
 // --- Material Form Field Overrides ---
 .mat-mdc-form-field {
-  --mdc-outlined-text-field-label-text-color: var(--text-secondary);
-  --mdc-outlined-text-field-input-text-color: var(--text-primary);
-  --mdc-outlined-text-field-outline-color: rgba(255, 255, 255, 0.12);
-  --mdc-outlined-text-field-hover-outline-color: rgba(255, 255, 255, 0.25);
-  --mdc-outlined-text-field-focus-outline-color: #667eea;
+  --mdc-outlined-text-field-label-text-color: var(--uswds-text-secondary);
+  --mdc-outlined-text-field-input-text-color: var(--uswds-text);
+  --mdc-outlined-text-field-outline-color: var(--uswds-border);
+  --mdc-outlined-text-field-hover-outline-color: var(--uswds-primary-light);
+  --mdc-outlined-text-field-focus-outline-color: var(--uswds-primary);
 }
 
 // --- Material Paginator ---
 .mat-mdc-paginator {
   background: transparent !important;
-  color: var(--text-secondary) !important;
+  color: var(--uswds-text-secondary) !important;
 }
 
-// --- Material Card (global glass override) ---
+// --- Material Card (USWDS dark card) ---
 .mat-mdc-card {
   --mdc-elevated-card-container-color: transparent;
-  background: var(--glass-bg) !important;
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
-  border: var(--glass-border) !important;
-  border-radius: var(--glass-radius) !important;
-  box-shadow: var(--glass-shadow) !important;
-  color: var(--text-primary);
-  transition: transform 250ms ease, box-shadow 250ms ease;
+  background: var(--uswds-card-bg) !important;
+  border: 1px solid var(--uswds-card-border) !important;
+  border-radius: 8px !important;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3) !important;
+  color: var(--uswds-text);
 }
 
 // --- Material Sidenav ---
@@ -127,24 +138,20 @@ html, body {
 }
 
 .mat-sidenav {
-  background: rgba(255, 255, 255, 0.03) !important;
-  backdrop-filter: blur(24px);
-  -webkit-backdrop-filter: blur(24px);
-  border-right: 1px solid rgba(255, 255, 255, 0.06) !important;
+  background: var(--uswds-sidebar-bg) !important;
+  border-right: 1px solid var(--uswds-border) !important;
 }
 
-// --- Material Dialog (glass overlay) ---
+// --- Material Dialog (USWDS dark) ---
 .mat-mdc-dialog-container {
-  --mdc-dialog-container-color: rgba(15, 12, 41, 0.85);
+  --mdc-dialog-container-color: var(--uswds-bg);
 }
 
 .mat-mdc-dialog-surface {
-  background: rgba(255, 255, 255, 0.06) !important;
-  backdrop-filter: blur(24px) !important;
-  -webkit-backdrop-filter: blur(24px) !important;
-  border: 1px solid rgba(255, 255, 255, 0.1) !important;
-  border-radius: var(--glass-radius) !important;
-  box-shadow: 0 16px 64px rgba(0, 0, 0, 0.5) !important;
+  background: var(--uswds-card-bg) !important;
+  border: 1px solid var(--uswds-card-border) !important;
+  border-radius: 8px !important;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5) !important;
 }
 
 // Prevent floating labels from being clipped + keep buttons visible in tall dialogs
@@ -162,92 +169,102 @@ html, body {
   background: inherit;
 }
 
-// --- Material Expansion Panel (glass) ---
+// --- Material Expansion Panel (USWDS dark) ---
 .mat-expansion-panel {
-  background: var(--glass-bg) !important;
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
-  border: var(--glass-border) !important;
-  border-radius: var(--glass-radius) !important;
-  box-shadow: var(--glass-shadow) !important;
-  color: var(--text-primary) !important;
+  background: var(--uswds-card-bg) !important;
+  border: 1px solid var(--uswds-card-border) !important;
+  border-radius: 8px !important;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3) !important;
+  color: var(--uswds-text) !important;
 
   .mat-expansion-panel-header {
-    color: var(--text-primary) !important;
+    color: var(--uswds-text) !important;
   }
 
   .mat-expansion-panel-header-description {
-    color: var(--text-secondary) !important;
+    color: var(--uswds-text-secondary) !important;
   }
 }
 
-// --- Raised Button (gradient primary) ---
+// --- Raised Button (USWDS primary blue) ---
 .mat-mdc-raised-button.mat-primary {
-  background: var(--accent-gradient) !important;
+  background: var(--uswds-primary) !important;
   color: #fff !important;
   border: none !important;
-  box-shadow: 0 4px 16px rgba(102, 126, 234, 0.3) !important;
-  transition: box-shadow 250ms ease, transform 250ms ease;
+  border-radius: 4px !important;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3) !important;
+  font-weight: 700;
+  letter-spacing: 0.02em;
 
   &:hover {
-    box-shadow: 0 6px 24px rgba(102, 126, 234, 0.5) !important;
-    transform: translateY(-1px);
+    background: var(--uswds-primary-light) !important;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4) !important;
   }
 }
 
-// --- Icon Buttons (glass hover) ---
+// Warn buttons
+.mat-mdc-raised-button.mat-warn {
+  background: var(--uswds-secondary) !important;
+  color: #fff !important;
+  border-radius: 4px !important;
+}
+
+// --- Icon Buttons ---
 .mat-mdc-icon-button {
-  transition: background 200ms ease, transform 200ms ease;
+  transition: background 200ms ease;
 
   &:hover {
     background: rgba(255, 255, 255, 0.08) !important;
   }
 }
 
-// --- Stroked Button (glass hover) ---
+// --- Stroked Button ---
 .mat-mdc-outlined-button,
 button[mat-stroked-button] {
-  border-color: rgba(255, 255, 255, 0.15) !important;
-  color: var(--text-secondary) !important;
+  border-color: var(--uswds-border) !important;
+  color: var(--uswds-text-secondary) !important;
+  border-radius: 4px !important;
   transition: background 200ms ease, border-color 200ms ease, color 200ms ease;
 
   &:hover {
-    background: rgba(255, 255, 255, 0.06) !important;
-    border-color: rgba(255, 255, 255, 0.25) !important;
-    color: var(--text-primary) !important;
+    background: var(--uswds-hover) !important;
+    border-color: var(--uswds-primary-light) !important;
+    color: var(--uswds-text) !important;
   }
 }
 
-// --- Status Chip Styles ---
+// --- Status Badge / Chip Styles (usa-tag inspired) ---
 .status-badge, .status-chip, .type-badge, .auth-chip, .protocol-badge, .state-badge, .active-badge {
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
   border: 1px solid transparent;
-  transition: all 200ms ease;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
 }
 
 .status-connected, .status-registered {
-  background: rgba(74, 222, 128, 0.12) !important;
+  background: rgba(74, 222, 128, 0.15) !important;
   color: var(--color-success) !important;
-  border-color: rgba(74, 222, 128, 0.2) !important;
+  border-color: rgba(74, 222, 128, 0.25) !important;
 }
 
 .status-failed, .status-error {
-  background: rgba(248, 113, 113, 0.12) !important;
+  background: rgba(248, 113, 113, 0.15) !important;
   color: var(--color-error) !important;
-  border-color: rgba(248, 113, 113, 0.2) !important;
+  border-color: rgba(248, 113, 113, 0.25) !important;
 }
 
 .status-cancelled, .status-provisioning {
-  background: rgba(251, 191, 36, 0.12) !important;
+  background: rgba(251, 191, 36, 0.15) !important;
   color: var(--color-warning) !important;
-  border-color: rgba(251, 191, 36, 0.2) !important;
+  border-color: rgba(251, 191, 36, 0.25) !important;
 }
 
 .status-offline {
-  background: rgba(158, 158, 158, 0.12) !important;
+  background: rgba(158, 158, 158, 0.15) !important;
   color: rgba(255, 255, 255, 0.4) !important;
-  border-color: rgba(158, 158, 158, 0.15) !important;
+  border-color: rgba(158, 158, 158, 0.2) !important;
 }
 
 // --- Custom Scrollbar ---
@@ -263,7 +280,6 @@ button[mat-stroked-button] {
 ::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.1);
   border-radius: 3px;
-  transition: background 200ms ease;
 }
 
 ::-webkit-scrollbar-thumb:hover {
@@ -287,11 +303,12 @@ button[mat-stroked-button] {
 
 // --- Page-level shared styles ---
 .page-title {
-  color: var(--text-primary);
+  color: var(--uswds-text);
   margin: 0;
   font-size: 24px;
-  font-weight: 600;
+  font-weight: 700;
   letter-spacing: -0.01em;
+  font-family: 'Public Sans', sans-serif;
 }
 
 .page-header {
@@ -307,7 +324,7 @@ button[mat-stroked-button] {
 
 .empty-msg {
   text-align: center;
-  color: var(--text-secondary);
+  color: var(--uswds-text-secondary);
   padding: 32px;
   font-size: 14px;
 }

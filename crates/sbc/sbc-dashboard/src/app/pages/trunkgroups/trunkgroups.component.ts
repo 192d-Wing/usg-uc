@@ -20,7 +20,7 @@ import { TrunkDialogComponent } from './trunk-dialog.component';
   template: `
     <div class="trunkgroups-page">
       <div class="page-header">
-        <h2 class="page-title">Trunk Groups</h2>
+        <h1 class="usa-heading page-title">Trunk Groups</h1>
         <span class="spacer"></span>
         <button mat-raised-button color="primary" (click)="openAddGroupDialog()">
           <mat-icon>add</mat-icon> Add Trunk Group
@@ -129,7 +129,7 @@ import { TrunkDialogComponent } from './trunk-dialog.component';
 
     .group-icon {
       margin-right: 8px;
-      color: #667eea;
+      color: var(--uswds-primary-light);
     }
 
     .panel-actions {
@@ -142,12 +142,12 @@ import { TrunkDialogComponent } from './trunk-dialog.component';
 
     .protocol-badge {
       padding: 3px 10px;
-      border-radius: 6px;
+      border-radius: 4px;
       font-size: 12px;
-      font-weight: 600;
-      background: rgba(102, 126, 234, 0.12);
-      color: #a5b4fc;
-      border: 1px solid rgba(102, 126, 234, 0.2);
+      font-weight: 700;
+      background: rgba(0, 94, 162, 0.15);
+      color: var(--uswds-primary-light);
+      border: 1px solid rgba(0, 94, 162, 0.3);
     }
 
     .state-badge {

@@ -21,7 +21,7 @@ import { PhoneDialogComponent } from './phone-dialog.component';
   template: `
     <div class="phones-page">
       <div class="page-header">
-        <h2 class="page-title">Phones</h2>
+        <h1 class="usa-heading page-title">Phones</h1>
         <span class="spacer"></span>
         <button mat-raised-button color="primary" (click)="openAddDialog()">
           <mat-icon>add</mat-icon> Add Phone

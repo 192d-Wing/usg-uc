@@ -26,7 +26,7 @@ import { CdrRecord, CdrFilter } from '../../models/sbc.models';
   template: `
     <div class="cdrs-page">
       <div class="page-header">
-        <h2 class="page-title">CDR Records</h2>
+        <h1 class="usa-heading page-title">CDR Records</h1>
         <button mat-icon-button (click)="loadCdrs()" matTooltip="Refresh">
           <mat-icon>refresh</mat-icon>
         </button>

@@ -18,7 +18,7 @@ import { CssDialogComponent } from './css-dialog.component';
   template: `
     <div class="css-page">
       <div class="page-header">
-        <h2 class="page-title">Calling Search Spaces</h2>
+        <h1 class="usa-heading page-title">Calling Search Spaces</h1>
         <span class="spacer"></span>
         <button mat-raised-button color="primary" (click)="openAddDialog()">
           <mat-icon>add</mat-icon> Add CSS
@@ -93,11 +93,11 @@ import { CssDialogComponent } from './css-dialog.component';
       align-items: center;
       gap: 6px;
       padding: 4px 12px;
-      border-radius: 10px;
+      border-radius: 4px;
       font-size: 13px;
-      background: rgba(102, 126, 234, 0.1);
-      color: #a5b4fc;
-      border: 1px solid rgba(102, 126, 234, 0.15);
+      background: rgba(0, 94, 162, 0.12);
+      color: var(--uswds-primary-light);
+      border: 1px solid rgba(0, 94, 162, 0.2);
     }
 
     .chip-order {
@@ -107,10 +107,10 @@ import { CssDialogComponent } from './css-dialog.component';
       width: 18px;
       height: 18px;
       border-radius: 50%;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      background: var(--uswds-primary);
       color: #fff;
       font-size: 11px;
-      font-weight: 600;
+      font-weight: 700;
     }
 
     .empty-hint {

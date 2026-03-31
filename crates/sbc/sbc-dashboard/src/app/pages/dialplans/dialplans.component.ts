@@ -19,7 +19,7 @@ import { DialplanEntryDialogComponent } from './dialplan-entry-dialog.component'
   template: `
     <div class="dialplans-page">
       <div class="page-header">
-        <h2 class="page-title">Dial Plans</h2>
+        <h1 class="usa-heading page-title">Dial Plans</h1>
         <span class="spacer"></span>
         <button mat-icon-button (click)="loadPlans()" matTooltip="Refresh">
           <mat-icon>refresh</mat-icon>
@@ -121,21 +121,22 @@ import { DialplanEntryDialogComponent } from './dialplan-entry-dialog.component'
       display: flex;
       align-items: center;
       padding: 16px;
-      background: linear-gradient(135deg, rgba(102, 126, 234, 0.15) 0%, rgba(118, 75, 162, 0.1) 100%);
-      border-radius: 16px 16px 0 0;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+      background: rgba(0, 94, 162, 0.1);
+      border-radius: 8px 8px 0 0;
+      border-bottom: 1px solid var(--uswds-border);
     }
 
     .active-badge {
       display: inline-block;
       margin-left: 12px;
       padding: 3px 10px;
-      border-radius: 6px;
+      border-radius: 4px;
       font-size: 11px;
-      font-weight: 600;
-      background: rgba(74, 222, 128, 0.12);
+      font-weight: 700;
+      background: rgba(74, 222, 128, 0.15);
       color: var(--color-success);
-      border: 1px solid rgba(74, 222, 128, 0.2);
+      border: 1px solid rgba(74, 222, 128, 0.25);
+      text-transform: uppercase;
     }
 
     .entries-table { width: 100%; }
@@ -150,21 +151,21 @@ import { DialplanEntryDialogComponent } from './dialplan-entry-dialog.component'
     }
 
     .type-trunk_group {
-      background: rgba(102, 126, 234, 0.12);
-      color: #a5b4fc;
-      border-color: rgba(102, 126, 234, 0.2);
+      background: rgba(0, 94, 162, 0.15);
+      color: var(--uswds-primary-light);
+      border-color: rgba(0, 94, 162, 0.3);
     }
 
     .type-registered_user {
-      background: rgba(74, 222, 128, 0.12);
+      background: rgba(74, 222, 128, 0.15);
       color: var(--color-success);
-      border-color: rgba(74, 222, 128, 0.2);
+      border-color: rgba(74, 222, 128, 0.25);
     }
 
     .type-static_uri {
-      background: rgba(0, 188, 212, 0.12);
+      background: rgba(0, 188, 212, 0.15);
       color: #67e8f9;
-      border-color: rgba(0, 188, 212, 0.2);
+      border-color: rgba(0, 188, 212, 0.25);
     }
   `],
 })

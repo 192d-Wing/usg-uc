@@ -28,10 +28,13 @@
               {
                 "glob": "**/*",
                 "input": "public"
-              }
+              },
+              { "glob": "**/*", "input": "node_modules/@uswds/uswds/dist/img", "output": "/assets/uswds/img" },
+              { "glob": "**/*", "input": "node_modules/@uswds/uswds/dist/fonts", "output": "/assets/uswds/fonts" }
             ],
             "styles": [
               "@angular/material/prebuilt-themes/azure-blue.css",
+              "node_modules/@uswds/uswds/dist/css/uswds.min.css",
               "src/styles.scss"
             ],
             "scripts": []
@@ -41,8 +44,8 @@
               "budgets": [
                 {
                   "type": "initial",
-                  "maximumWarning": "750kB",
-                  "maximumError": "1.5MB"
+                  "maximumWarning": "1.5MB",
+                  "maximumError": "3MB"
                 },
                 {
                   "type": "anyComponentStyle",

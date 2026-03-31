@@ -31,7 +31,7 @@ interface FlatRegistration {
   template: `
     <div class="registrations-page">
       <div class="page-header">
-        <h2 class="page-title">Registrations</h2>
+        <h1 class="usa-heading page-title">Registrations</h1>
         <button mat-icon-button (click)="loadRegistrations()" matTooltip="Refresh">
           <mat-icon>refresh</mat-icon>
         </button>

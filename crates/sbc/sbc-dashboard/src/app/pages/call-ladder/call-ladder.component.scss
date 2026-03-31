@@ -6,13 +6,6 @@
   margin-bottom: 24px;
 }
 
-.page-title {
-  color: var(--text-primary);
-  margin: 0;
-  font-size: 24px;
-  font-weight: 600;
-}
-
 .search-row {
   display: flex;
   align-items: center;
@@ -34,7 +27,7 @@
 }
 
 .recent-label {
-  color: var(--text-secondary);
+  color: var(--uswds-text-secondary);
   font-size: 13px;
 }
 
@@ -47,8 +40,7 @@
 }
 
 .detail-card {
-  border-left: 3px solid transparent;
-  border-image: linear-gradient(135deg, #667eea 0%, #764ba2 100%) 1;
+  border-left: 3px solid var(--uswds-primary);
 }
 
 .detail-header {
@@ -61,22 +53,19 @@
 .detail-method {
   font-size: 16px;
   font-weight: 700;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
+  color: var(--uswds-primary-light);
 }
 
 .detail-direction {
   font-size: 13px;
-  color: var(--text-secondary);
+  color: var(--uswds-text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
 
 .detail-time {
   font-size: 13px;
-  color: var(--text-secondary);
+  color: var(--uswds-text-secondary);
   margin-left: auto;
 }
 
@@ -84,19 +73,19 @@
   font-size: 13px;
   color: rgba(255, 255, 255, 0.7);
   margin-bottom: 12px;
-  font-family: 'Roboto Mono', monospace;
+  font-family: 'Source Code Pro', 'Roboto Mono', monospace;
 }
 
 .detail-raw {
   background: rgba(0, 0, 0, 0.3);
   color: rgba(255, 255, 255, 0.85);
   padding: 16px;
-  border-radius: 12px;
+  border-radius: 4px;
   font-size: 12px;
-  font-family: 'Roboto Mono', monospace;
+  font-family: 'Source Code Pro', 'Roboto Mono', monospace;
   overflow-x: auto;
   white-space: pre;
   max-height: 400px;
   overflow-y: auto;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--uswds-border);
 }

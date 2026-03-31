@@ -18,7 +18,7 @@ import { RoutePatternDialogComponent } from './route-pattern-dialog.component';
   template: `
     <div class="rp-page">
       <div class="page-header">
-        <h2 class="page-title">Route Patterns</h2>
+        <h1 class="usa-heading page-title">Route Patterns</h1>
         <span class="spacer"></span>
         <button mat-raised-button color="primary" (click)="openAddDialog()">
           <mat-icon>add</mat-icon> Add Route Pattern
@@ -91,12 +91,12 @@ import { RoutePatternDialogComponent } from './route-pattern-dialog.component';
 
     .pattern-code {
       padding: 3px 10px;
-      border-radius: 6px;
-      font-family: 'Roboto Mono', monospace;
+      border-radius: 4px;
+      font-family: 'Source Code Pro', 'Roboto Mono', monospace;
       font-size: 13px;
-      background: rgba(102, 126, 234, 0.1);
-      color: #a5b4fc;
-      border: 1px solid rgba(102, 126, 234, 0.15);
+      background: rgba(0, 94, 162, 0.12);
+      color: var(--uswds-primary-light);
+      border: 1px solid rgba(0, 94, 162, 0.2);
     }
 
     .blocked { color: var(--color-error); }

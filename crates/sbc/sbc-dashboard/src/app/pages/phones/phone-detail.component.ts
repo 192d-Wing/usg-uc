@@ -35,7 +35,7 @@ import { ApiService } from '../../services/api.service';
         <button mat-icon-button (click)="goBack()" matTooltip="Back to Phones">
           <mat-icon>arrow_back</mat-icon>
         </button>
-        <h2 class="page-title">{{ phone().name || 'Phone Details' }}</h2>
+        <h1 class="usa-heading page-title">{{ phone().name || 'Phone Details' }}</h1>
         <span class="spacer"></span>
         <div class="header-actions">
           <button mat-raised-button color="primary" (click)="savePhone()" matTooltip="Save Changes">

@@ -19,7 +19,7 @@ import { RouteListDialogComponent } from './route-list-dialog.component';
   template: `
     <div class="rl-page">
       <div class="page-header">
-        <h2 class="page-title">Route Lists</h2>
+        <h1 class="usa-heading page-title">Route Lists</h1>
         <span class="spacer"></span>
         <button mat-raised-button color="primary" (click)="openAddDialog()">
           <mat-icon>add</mat-icon> Add Route List
@@ -93,7 +93,7 @@ import { RouteListDialogComponent } from './route-list-dialog.component';
 
     .rl-icon {
       margin-right: 8px;
-      color: #667eea;
+      color: var(--uswds-primary-light);
     }
 
     .panel-actions {

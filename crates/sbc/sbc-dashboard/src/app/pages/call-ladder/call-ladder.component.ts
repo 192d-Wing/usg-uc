@@ -23,7 +23,7 @@ import { CallLadder, SipMessage } from '../../models/sbc.models';
   template: `
     <div class="call-ladder-page">
       <div class="page-header">
-        <h2 class="page-title">Call Ladder</h2>
+        <h1 class="usa-heading page-title">Call Ladder</h1>
       </div>
 
       <div class="search-row">

@@ -21,7 +21,11 @@ import { Subscription, interval } from 'rxjs';
   ],
   template: `
     <div class="dashboard-page">
-      <h2 class="page-title">Dashboard</h2>
+      <div class="grid-row">
+        <div class="grid-col-12">
+          <h1 class="usa-heading page-title">Dashboard</h1>
+        </div>
+      </div>
 
       <div class="stats-grid">
         <app-stats-card title="Active Calls" [value]="stats().calls_active"
@@ -108,19 +112,11 @@ import { Subscription, interval } from 'rxjs';
   styles: [`
     .dashboard-page { padding: 24px; }
 
-    .page-title {
-      color: var(--text-primary);
-      margin: 0 0 24px 0;
-      font-size: 26px;
-      font-weight: 700;
-      letter-spacing: -0.01em;
-    }
-
     .stats-grid {
       display: grid;
       grid-template-columns: repeat(4, 1fr);
       gap: 16px;
-      margin-bottom: 8px;
+      margin-bottom: 16px;
     }
 
     .panels-grid {
@@ -165,12 +161,12 @@ import { Subscription, interval } from 'rxjs';
       box-shadow: 0 0 8px var(--color-error);
     }
 
-    .health-text { font-size: 18px; font-weight: 600; }
+    .health-text { font-size: 18px; font-weight: 700; }
 
     .health-meta {
       display: flex;
       gap: 24px;
-      color: var(--text-secondary);
+      color: var(--uswds-text-secondary);
       font-size: 13px;
     }
 
@@ -179,25 +175,25 @@ import { Subscription, interval } from 'rxjs';
       align-items: center;
       gap: 8px;
       padding: 8px 0;
-      border-top: 1px solid var(--border-subtle);
+      border-top: 1px solid var(--uswds-border);
       font-size: 14px;
       transition: background 200ms ease;
     }
 
     .health-check-row:hover {
-      background: var(--hover-highlight);
+      background: var(--uswds-hover);
     }
 
     .check-ok { color: var(--color-success); }
     .check-fail { color: var(--color-error); }
-    .check-status { margin-left: auto; color: var(--text-secondary); font-size: 12px; }
+    .check-status { margin-left: auto; color: var(--uswds-text-secondary); font-size: 12px; }
 
     .calls-table { width: 100%; }
 
     .no-calls {
       text-align: center;
       padding: 32px;
-      color: var(--text-secondary);
+      color: var(--uswds-text-secondary);
     }
 
     @media (max-width: 1100px) {
