@@ -234,6 +234,9 @@ pub struct TransportConfig {
 
     /// REST API listen address (default: 0.0.0.0:8080).
     pub api_listen: Option<SocketAddr>,
+
+    /// STUN refresh interval in seconds for external IP re-resolution (default: 300).
+    pub stun_refresh_interval_secs: Option<u64>,
 }
 
 impl Default for TransportConfig {
@@ -258,6 +261,7 @@ impl Default for TransportConfig {
             signaling_ip: None,
             media_ip: None,
             api_listen: None,
+            stun_refresh_interval_secs: None,
         }
     }
 }

@@ -260,6 +260,49 @@ impl Runtime {
         // Save instance name before config is moved to server
         let instance_name = config.general.instance_name.clone();
 
+        // Resolve network zones (interface name → IP)
+        let _zone_registry = if !config.zones.is_empty() {
+            match sbc_config::resolve_zones(&config.zones) {
+                Ok(resolved) => {
+                    for z in &resolved {
+                        info!(
+                            zone = %z.name,
+                            signaling_ip = %z.signaling_ip,
+                            media_ip = %z.media_ip,
+                            external_ip = ?z.external_ip,
+                            "Resolved zone"
+                        );
+                    }
+                    let registry = Arc::new(crate::zone::ResolvedZoneRegistry::from_resolved(resolved));
+
+                    // Start external IP monitor for STUN-based zones
+                    let stun_interval = config.transport.stun_refresh_interval_secs.unwrap_or(300);
+                    let monitor = crate::zone::ExternalIpMonitor::new(
+                        Arc::clone(&registry),
+                        stun_interval,
+                    );
+                    monitor.start();
+                    info!("Zone registry initialized with {} zone(s)", registry.zone_names().len());
+                    Some(registry)
+                }
+                Err(e) => {
+                    let available = sbc_config::interface::list_interfaces();
+                    error!(
+                        error = %e,
+                        available_interfaces = ?available,
+                        "Zone resolution failed — SBC cannot start"
+                    );
+                    return Err(RuntimeError::InitFailed {
+                        component: "zones".to_string(),
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        } else {
+            debug!("No zones configured, using default transport binding");
+            None
+        };
+
         // Extract gRPC config before moving config to server
         #[cfg(feature = "grpc")]
         let grpc_config = config.grpc.clone().unwrap_or_default();
