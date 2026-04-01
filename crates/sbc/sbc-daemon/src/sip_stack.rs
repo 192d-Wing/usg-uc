@@ -2917,6 +2917,7 @@ mod tests {
                     protocol: "udp".to_string(),
                     ..Default::default()
                 }],
+                zone: None,
             },
             sbc_config::TrunkGroupConfig {
                 id: "emergency".to_string(),
@@ -2929,6 +2930,7 @@ mod tests {
                     protocol: "udp".to_string(),
                     ..Default::default()
                 }],
+                zone: None,
             },
         ];
 

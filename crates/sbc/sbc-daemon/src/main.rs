@@ -69,6 +69,7 @@ mod runtime;
 mod server;
 mod shutdown;
 mod sip_stack;
+mod zone;
 
 use args::Args;
 use runtime::Runtime;
