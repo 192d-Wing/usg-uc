@@ -126,6 +126,7 @@ validator = { version = "0.20", features = ["derive"] }
 # Networking
 bytes = "1.11.1"
 socket2 = { version = "0.6", features = ["all"] }
+nix = { version = "0.31", features = ["net"] }
 
 # HTTP server
 axum = "0.8"

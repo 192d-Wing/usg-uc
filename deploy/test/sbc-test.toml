@@ -1,4 +1,7 @@
-# SBC test configuration — relaxed security for local stress testing
+# SBC test configuration — dual-interface deployment
+#
+# Signaling: 172.28.1.10 (eth0 — sbc-signaling network)
+# Media:     172.28.2.10 (eth1 — sbc-media network)
 #
 # Usage: docker compose -f deploy/test/docker-compose.yml up
 
@@ -8,7 +11,23 @@ max_calls = 5000
 max_registrations = 10000
 
 [transport]
-udp_listen = ["0.0.0.0:5060"]
+# Bind SIP signaling to the signaling interface
+udp_listen = ["172.28.1.10:5060"]
+tcp_listen = ["172.28.1.10:5060"]
+tls_listen = ["172.28.1.10:5061"]
+
+# Dual-interface: separate IPs for signaling vs media
+signaling_ip = "172.28.1.10"
+media_ip = "172.28.2.10"
+
+# External IP (set if behind NAT, otherwise auto-detected)
+# external_ip = "203.0.113.10"
+
+# REST API on signaling interface
+api_listen = "172.28.1.10:8080"
+
+tcp_timeout_secs = 30
+tcp_idle_timeout_secs = 300
 
 [media]
 default_mode = "Relay"
@@ -56,7 +75,7 @@ strategy = "round_robin"
 
   [[trunk_groups.trunks]]
   id = "loopback-1"
-  host = "host.docker.internal"
+  host = "172.28.1.20"
   port = 5080
   protocol = "udp"
   max_calls = 5000

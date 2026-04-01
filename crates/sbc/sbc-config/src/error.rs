@@ -37,4 +37,18 @@ pub enum ConfigError {
         /// Description of the violation.
         message: String,
     },
+
+    /// Network interface not found.
+    #[error("network interface '{name}' not found")]
+    InterfaceNotFound {
+        /// Interface name that was not found.
+        name: String,
+    },
+
+    /// Network interface has no IPv4 address.
+    #[error("network interface '{name}' has no IPv4 address")]
+    InterfaceNoAddress {
+        /// Interface name.
+        name: String,
+    },
 }

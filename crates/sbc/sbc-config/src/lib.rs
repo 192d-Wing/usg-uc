@@ -62,14 +62,16 @@
 #![deny(clippy::panic)]
 
 pub mod error;
+pub mod interface;
 pub mod schema;
 pub mod validate;
 
 pub use error::{ConfigError, ConfigResult};
+pub use interface::{ResolvedZone, resolve_zones};
 pub use schema::{
     DialPlanConfig, DialPlanEntryConfig, HeaderManipulationConfig, ManipulationRuleConfig,
     RoutingConfig, SbcConfig, TopologyHidingConfig, TrunkConfigSchema, TrunkGroupConfig,
-    TrunkManipulationRuleConfig,
+    TrunkManipulationRuleConfig, ZoneConfig,
 };
 #[cfg(feature = "telemetry")]
 pub use schema::TelemetryConfig;

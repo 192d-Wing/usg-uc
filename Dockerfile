@@ -69,18 +69,14 @@ RUN chown -R sbc:sbc /usr/local/bin/sbc-daemon /usr/local/bin/sbc-cli
 USER sbc
 
 # Expose ports
-# SIP UDP
+# Signaling interface:
 EXPOSE 5060/udp
-# SIP TCP
 EXPOSE 5060/tcp
-# SIP TLS
 EXPOSE 5061/tcp
-# HTTP API
 EXPOSE 8080/tcp
-# HTTPS API
 EXPOSE 8443/tcp
-# RTP range (typically 16384-32768, but exposing a subset)
-EXPOSE 16384-16484/udp
+# Media interface (RTP/SRTP):
+EXPOSE 16384-32768/udp
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

@@ -25,6 +25,17 @@ wss_listen = []
 tcp_timeout_secs = 30
 tcp_idle_timeout_secs = 300
 
+# Dual-interface deployment (optional):
+# Bind SIP signaling and RTP media to separate interfaces
+# signaling_ip = "10.0.1.10"    # SIP signaling interface
+# media_ip = "10.0.2.10"        # RTP media interface
+
+# External/public IP for NAT traversal (auto-detected if unset)
+# external_ip = "203.0.113.10"
+
+# REST API listen address (default: 0.0.0.0:8080)
+# api_listen = "10.0.1.10:8080"
+
 [media]
 default_mode = "Relay"
 # Per-realm overrides: realm_modes = { "external" = "PassThrough" }

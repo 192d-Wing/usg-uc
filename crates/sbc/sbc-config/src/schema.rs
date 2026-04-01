@@ -123,6 +123,37 @@ pub struct SbcConfig {
     /// ## NIST 800-53 Rev5: SC-7 (Boundary Protection)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topology_hiding: Option<TopologyHidingConfig>,
+
+    /// Zone definitions for network interface binding.
+    ///
+    /// Each zone maps named interfaces to signaling and media roles.
+    /// Trunks and internal registrations reference zones by name.
+    ///
+    /// ## NIST 800-53 Rev5: SC-7 (Boundary Protection)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub zones: Vec<ZoneConfig>,
+}
+
+/// Network zone configuration.
+///
+/// Zones bind signaling and media to named network interfaces.
+/// Each trunk group and the internal registration realm references a zone.
+///
+/// ## NIST 800-53 Rev5: SC-7 (Boundary Protection)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZoneConfig {
+    /// Zone name (referenced by trunk groups and internal registrations).
+    pub name: String,
+    /// Signaling interface name (e.g., "eth0"). Resolved to IP at startup.
+    pub signaling_interface: String,
+    /// Media interface name (e.g., "eth1"). Resolved to IP at startup.
+    pub media_interface: String,
+    /// External/public IP for NAT traversal. Supports:
+    /// - Literal IP: `"203.0.113.10"`
+    /// - Interface name: `"eth2"` (resolved at startup)
+    /// - STUN: `"stun"` or `"stun:server:port"` (auto-discovered)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_ip: Option<String>,
 }
 
 /// General SBC settings.
@@ -140,6 +171,11 @@ pub struct GeneralConfig {
 
     /// Maximum concurrent registrations.
     pub max_registrations: u32,
+
+    /// Default zone for internal registrations (phones, softclients).
+    /// Must reference a defined zone name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_internal_zone: Option<String>,
 }
 
 impl Default for GeneralConfig {
@@ -149,11 +185,17 @@ impl Default for GeneralConfig {
             cluster_id: None,
             max_calls: 10000,
             max_registrations: 50000,
+            default_internal_zone: None,
         }
     }
 }
 
 /// Transport layer configuration.
+///
+/// Supports dual-interface deployment where signaling (SIP) and media (RTP)
+/// are bound to separate network interfaces for security isolation.
+///
+/// ## NIST 800-53 Rev5: SC-7 (Boundary Protection)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TransportConfig {
@@ -177,6 +219,21 @@ pub struct TransportConfig {
 
     /// TCP idle timeout in seconds.
     pub tcp_idle_timeout_secs: u64,
+
+    /// External/public IP address for SIP Contact and SDP.
+    /// Used when behind NAT. If unset, auto-detected from outgoing socket.
+    pub external_ip: Option<String>,
+
+    /// Signaling interface IP for SIP traffic.
+    /// When set, SIP transports bind to this address.
+    pub signaling_ip: Option<String>,
+
+    /// Media interface IP for RTP/SRTP traffic.
+    /// When set, RTP ports bind to this address instead of 0.0.0.0.
+    pub media_ip: Option<String>,
+
+    /// REST API listen address (default: 0.0.0.0:8080).
+    pub api_listen: Option<SocketAddr>,
 }
 
 impl Default for TransportConfig {
@@ -197,6 +254,10 @@ impl Default for TransportConfig {
             wss_listen: Vec::new(),
             tcp_timeout_secs: 30,
             tcp_idle_timeout_secs: 300,
+            external_ip: None,
+            signaling_ip: None,
+            media_ip: None,
+            api_listen: None,
         }
     }
 }
@@ -649,6 +710,9 @@ pub struct TrunkGroupConfig {
     /// Trunks in this group.
     #[serde(default)]
     pub trunks: Vec<TrunkConfigSchema>,
+    /// Zone this trunk group is bound to (must match a `[[zones]]` name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
 }
 
 /// Individual trunk configuration.
