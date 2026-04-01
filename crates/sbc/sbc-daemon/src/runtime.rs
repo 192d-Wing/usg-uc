@@ -297,14 +297,77 @@ impl Runtime {
         app_state.trunk_monitor = Some(Arc::clone(&trunk_monitor));
         info!("Trunk health monitor initialized");
 
-        // Initialize SQLite user store for user management
-        match uc_user_mgmt::sqlite::SqliteUserStore::new(":memory:") {
-            Ok(store) => {
-                app_state.user_store = Some(Arc::new(store));
-                info!("User store initialized (in-memory SQLite)");
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to initialize user store");
+        // Initialize trunk registrar
+        let trunk_registrar = Arc::new(crate::trunk_registrar::TrunkRegistrar::new(
+            &instance_name,
+        ));
+        app_state.trunk_registrar = Some(Arc::clone(&trunk_registrar));
+        info!("Trunk registrar initialized");
+
+        // Initialize user store with optional HA1 encryption
+        //
+        // Backend selection:
+        //   - SBC_POSTGRES_URL env → PostgreSQL (for HA deployments)
+        //   - Otherwise → in-memory SQLite (dev/single-node)
+        //
+        // Encryption:
+        //   - SBC_HA1_ENCRYPTION_KEY env (64 hex chars) → AES-256-GCM encryption of HA1
+        //   - Otherwise → plaintext HA1 (backward compatible)
+        {
+            use uc_user_mgmt::dispatch::DynUserStore;
+            use uc_user_mgmt::encrypt::EncryptedUserStore;
+
+            #[cfg(feature = "user-postgres")]
+            let inner_result: std::result::Result<DynUserStore, uc_user_mgmt::error::UserMgmtError> = if let Ok(pg_url) = std::env::var("SBC_POSTGRES_URL") {
+                match uc_user_mgmt::postgres::PostgresUserStore::new(&pg_url).await {
+                    Ok(pg) => {
+                        info!("User store initialized (PostgreSQL)");
+                        Ok(DynUserStore::Postgres(pg))
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                match uc_user_mgmt::sqlite::SqliteUserStore::new(":memory:") {
+                    Ok(s) => {
+                        info!("User store initialized (in-memory SQLite)");
+                        Ok(DynUserStore::Sqlite(s))
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+
+            #[cfg(not(feature = "user-postgres"))]
+            let inner_result: std::result::Result<DynUserStore, uc_user_mgmt::error::UserMgmtError> =
+                match uc_user_mgmt::sqlite::SqliteUserStore::new(":memory:") {
+                    Ok(s) => {
+                        info!("User store initialized (in-memory SQLite)");
+                        Ok(DynUserStore::Sqlite(s))
+                    }
+                    Err(e) => Err(e),
+                };
+
+            match inner_result {
+                Ok(inner) => {
+                    let encryption_key = std::env::var("SBC_HA1_ENCRYPTION_KEY")
+                        .ok()
+                        .map(|k| uc_user_mgmt::encrypt::parse_hex_key(&k));
+
+                    let store = match encryption_key {
+                        Some(Ok(key)) => {
+                            info!("HA1 encryption enabled (AES-256-GCM)");
+                            EncryptedUserStore::new(inner, Some(key))
+                        }
+                        Some(Err(e)) => {
+                            warn!(error = %e, "Invalid HA1 encryption key, starting without encryption");
+                            EncryptedUserStore::new(inner, None)
+                        }
+                        None => EncryptedUserStore::new(inner, None),
+                    };
+                    app_state.user_store = Some(Arc::new(store));
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to initialize user store");
+                }
             }
         }
 

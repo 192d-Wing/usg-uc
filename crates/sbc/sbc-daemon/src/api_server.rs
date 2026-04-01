@@ -118,14 +118,16 @@ pub struct AppState {
     pub ready: AtomicU64,
     /// SIP stack for call/registration queries.
     pub sip_stack: Option<Arc<crate::sip_stack::SipStack>>,
-    /// User store for user management.
-    pub user_store: Option<Arc<uc_user_mgmt::sqlite::SqliteUserStore>>,
+    /// User store for user management (encrypted, backend-agnostic).
+    pub user_store: Option<Arc<uc_user_mgmt::AnyUserStore>>,
     /// Phone provisioning server.
     pub provisioning: Option<Arc<uc_phone_mgmt::provisioning::ProvisioningServer>>,
     /// CUCM router for CSS/partition-based routing.
     pub cucm_router: Option<Arc<tokio::sync::RwLock<uc_routing::CucmRouter>>>,
     /// Trunk health monitor.
     pub trunk_monitor: Option<Arc<crate::trunk_monitor::TrunkMonitor>>,
+    /// Trunk registrar (SBC registers to carriers).
+    pub trunk_registrar: Option<Arc<crate::trunk_registrar::TrunkRegistrar>>,
     /// In-memory store for management objects (phones, directory numbers, etc.).
     pub mem_store: Arc<tokio::sync::RwLock<MemStore>>,
     /// TLS acceptor for certificate hot-reload (if TLS is enabled).
@@ -157,6 +159,7 @@ impl AppState {
             cucm_router: None,
             mem_store: Arc::new(tokio::sync::RwLock::new(MemStore::default())),
             trunk_monitor: None,
+            trunk_registrar: None,
             tls_acceptor: None,
             #[cfg(feature = "cluster")]
             cluster_health_fn: None,
@@ -181,6 +184,7 @@ impl AppState {
             cucm_router: None,
             mem_store: Arc::new(tokio::sync::RwLock::new(MemStore::default())),
             trunk_monitor: None,
+            trunk_registrar: None,
             tls_acceptor: Some(tls_acceptor),
             #[cfg(feature = "cluster")]
             cluster_health_fn: None,
@@ -361,9 +365,12 @@ impl ApiServer {
             .route("/trunkgroups/{group_id}", get(get_trunk_group))
             .route("/trunkgroups/{group_id}", delete(delete_trunk_group).put(update_trunk_group))
             .route("/trunkgroups/{group_id}/trunks", post(add_trunk))
-            .route("/trunkgroups/{group_id}/trunks/{trunk_id}", delete(delete_trunk))
+            .route("/trunkgroups/{group_id}/trunks/{trunk_id}", delete(delete_trunk).put(update_trunk))
             // Trunk health monitoring
             .route("/trunk-health", get(get_trunk_health))
+            // Trunk registration status
+            .route("/trunk-registration", get(get_trunk_registration_status))
+            .route("/trunk-registration/{trunk_id}/register", post(trigger_trunk_register))
             // User management
             .route("/users", get(list_users))
             .route("/users", post(create_user))
@@ -984,9 +991,88 @@ async fn add_trunk(
         if let Some(trunks) = group.get_mut("trunks").and_then(|v| v.as_array_mut()) {
             trunks.push(body.clone());
         }
+        drop(store);
+        start_trunk_services(&state, &body);
         (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "trunk": body })))
     } else {
         (StatusCode::NOT_FOUND, Json(serde_json::json!({ "success": false, "error": "Group not found" })))
+    }
+}
+
+/// Update a trunk within a group.
+async fn update_trunk(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((group_id, trunk_id)): axum::extract::Path<(String, String)>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let mut store = state.mem_store.write().await;
+    if let Some(group) = store.trunk_groups.get_mut(&group_id) {
+        if let Some(trunks) = group.get_mut("trunks").and_then(|v| v.as_array_mut()) {
+            if let Some(trunk) = trunks.iter_mut().find(|t| t.get("id").and_then(|v| v.as_str()) == Some(&trunk_id)) {
+                // Merge updated fields into existing trunk, preserving the id
+                if let Some(obj) = trunk.as_object_mut() {
+                    if let Some(updates) = body.as_object() {
+                        for (k, v) in updates {
+                            if k != "id" {
+                                obj.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                }
+                let updated = trunk.clone();
+                drop(store);
+                start_trunk_services(&state, &updated);
+                return (StatusCode::OK, Json(serde_json::json!({ "success": true, "trunk": updated })));
+            }
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "success": false, "error": "Trunk not found" })));
+        }
+    }
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({ "success": false, "error": "Group not found" })))
+}
+
+/// Start OPTIONS monitoring and/or SIP registration for a trunk if enabled.
+fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
+    let trunk_id = trunk.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+    let host = trunk.get("host").and_then(|v| v.as_str()).unwrap_or_default();
+    let port = trunk.get("port").and_then(|v| v.as_u64()).unwrap_or(5060) as u16;
+
+    if trunk_id.is_empty() || host.is_empty() {
+        return;
+    }
+
+    // Start OPTIONS health monitoring
+    if trunk.get("options_ping_enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if let Some(ref monitor) = state.trunk_monitor {
+            let interval = trunk.get("options_ping_interval").and_then(|v| v.as_u64()).unwrap_or(30) as u32;
+            monitor.monitor_trunk(crate::trunk_monitor::MonitoredTrunk {
+                trunk_id: trunk_id.to_string(),
+                host: host.to_string(),
+                port,
+                interval_secs: interval,
+            });
+            tracing::info!(trunk_id, "Started OPTIONS health monitor via API");
+        }
+    }
+
+    // Start SIP registration
+    if trunk.get("register_enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let username = trunk.get("sip_username").and_then(|v| v.as_str()).unwrap_or_default();
+        let password = trunk.get("sip_password").and_then(|v| v.as_str()).unwrap_or_default();
+        if !username.is_empty() && !password.is_empty() {
+            if let Some(ref registrar) = state.trunk_registrar {
+                let domain = trunk.get("sip_domain").and_then(|v| v.as_str()).unwrap_or(host);
+                registrar.register_trunk(crate::trunk_registrar::TrunkRegConfig {
+                    trunk_id: trunk_id.to_string(),
+                    host: host.to_string(),
+                    port,
+                    username: username.to_string(),
+                    password: password.to_string(),
+                    domain: domain.to_string(),
+                    expires: 3600,
+                });
+                tracing::info!(trunk_id, "Started SIP registration via API");
+            }
+        }
     }
 }
 
@@ -1015,6 +1101,66 @@ async fn get_trunk_health(State(state): State<Arc<AppState>>) -> impl IntoRespon
         Json(serde_json::json!({ "trunk_health": statuses }))
     } else {
         Json(serde_json::json!({ "trunk_health": [], "message": "Trunk monitor not configured" }))
+    }
+}
+
+/// Get trunk registration statuses.
+async fn get_trunk_registration_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(ref registrar) = state.trunk_registrar {
+        let statuses = registrar.get_all_status().await;
+        Json(serde_json::json!({ "trunk_registrations": statuses }))
+    } else {
+        Json(serde_json::json!({ "trunk_registrations": [] }))
+    }
+}
+
+/// Trigger trunk registration for a specific trunk.
+async fn trigger_trunk_register(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(trunk_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    // Look up trunk in MemStore to get credentials
+    let store = state.mem_store.read().await;
+    let mut found_trunk = None;
+    for group in store.trunk_groups.values() {
+        if let Some(trunks) = group.get("trunks").and_then(|v| v.as_array()) {
+            for t in trunks {
+                if t.get("id").and_then(|v| v.as_str()) == Some(&trunk_id) {
+                    found_trunk = Some(t.clone());
+                    break;
+                }
+            }
+        }
+    }
+    drop(store);
+
+    let Some(trunk) = found_trunk else {
+        return Json(serde_json::json!({ "success": false, "error": "Trunk not found" }));
+    };
+
+    let username = trunk.get("sip_username").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let password = trunk.get("sip_password").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let host = trunk.get("host").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let port = trunk.get("port").and_then(|v| v.as_u64()).unwrap_or(5060) as u16;
+
+    if username.is_empty() || host.is_empty() {
+        return Json(serde_json::json!({ "success": false, "error": "Trunk missing SIP credentials or host" }));
+    }
+
+    if let Some(ref registrar) = state.trunk_registrar {
+        let config = crate::trunk_registrar::TrunkRegConfig {
+            trunk_id: trunk_id.clone(),
+            host: host.clone(),
+            port,
+            username,
+            password,
+            domain: host,
+            expires: 3600,
+        };
+        registrar.register_trunk(config);
+        Json(serde_json::json!({ "success": true, "message": format!("Registration started for {trunk_id}") }))
+    } else {
+        Json(serde_json::json!({ "success": false, "error": "Trunk registrar not configured" }))
     }
 }
 

@@ -19,6 +19,7 @@ grpc-reflection = ["grpc", "sbc-grpc-api?/reflection", "dep:tonic-reflection"]
 cluster = ["uc-cluster", "uc-discovery", "uc-storage", "uc-state-sync", "proto-registrar/storage", "sbc-config/cluster", "sbc-grpc-api?/cluster"]
 redis = ["uc-storage/redis"]
 postgres = ["uc-storage/postgres"]
+user-postgres = ["uc-user-mgmt/postgres"]
 full = ["cluster", "redis", "postgres", "grpc", "grpc-reflection"]
 
 [dependencies]
@@ -28,7 +29,7 @@ uc-health.workspace = true
 uc-metrics.workspace = true
 uc-transport.workspace = true
 uc-telemetry.workspace = true
-proto-sip.workspace = true
+proto-sip = { workspace = true, features = ["digest-auth"] }
 proto-transaction.workspace = true
 proto-dialog.workspace = true
 proto-b2bua.workspace = true
@@ -44,9 +45,10 @@ proto-ice.workspace = true
 uc-api.workspace = true
 uc-dos-protection.workspace = true
 uc-routing.workspace = true
-uc-user-mgmt.workspace = true
+uc-user-mgmt = { workspace = true, features = ["encryption"] }
 uc-phone-mgmt.workspace = true
 uuid = { version = "1", features = ["v4"] }
+socket2.workspace = true
 
 # Clustering dependencies (optional)
 uc-cluster = { workspace = true, optional = true }

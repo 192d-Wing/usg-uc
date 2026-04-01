@@ -5793,6 +5793,7 @@ dependencies = [
  "sbc-grpc-api",
  "serde",
  "serde_json",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
@@ -8086,6 +8087,7 @@ dependencies = [
 name = "uc-user-mgmt"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "hex",
  "ldap3",
  "rusqlite",
@@ -8096,6 +8098,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uc-crypto",
  "uuid",
 ]
 

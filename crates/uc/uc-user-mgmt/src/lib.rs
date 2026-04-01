@@ -27,11 +27,13 @@
 //!
 //! | Feature    | Default | Description              |
 //! |------------|---------|--------------------------|
-//! | `sqlite`   | yes     | SQLite storage backend   |
-//! | `postgres` | no      | PostgreSQL backend       |
-//! | `ldap`     | no      | LDAP directory backend   |
+//! | `sqlite`     | yes     | SQLite storage backend          |
+//! | `postgres`   | no      | PostgreSQL backend              |
+//! | `ldap`       | no      | LDAP directory backend          |
+//! | `encryption` | no      | AES-256-GCM HA1 encryption      |
 
 pub mod digest;
+pub mod dispatch;
 pub mod error;
 pub mod model;
 pub mod pki;
@@ -39,3 +41,13 @@ pub mod store;
 
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+
+#[cfg(feature = "postgres")]
+pub mod postgres;
+
+#[cfg(feature = "encryption")]
+pub mod encrypt;
+
+/// Convenience type alias for an encrypted, backend-agnostic user store.
+#[cfg(feature = "encryption")]
+pub type AnyUserStore = encrypt::EncryptedUserStore<dispatch::DynUserStore>;

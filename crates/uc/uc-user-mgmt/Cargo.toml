@@ -11,6 +11,7 @@ default = ["sqlite"]
 sqlite = ["dep:rusqlite"]
 postgres = ["dep:sqlx"]
 ldap = ["dep:ldap3"]
+encryption = ["dep:uc-crypto", "dep:base64"]
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
@@ -26,6 +27,10 @@ uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"], optional = true }
 ldap3 = { version = "0.11", optional = true }
+
+# Optional encryption
+uc-crypto = { workspace = true, optional = true }
+base64 = { version = "0.22", optional = true }
 
 [lints]
 workspace = true
