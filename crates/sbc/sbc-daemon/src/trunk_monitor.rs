@@ -108,6 +108,8 @@ pub struct MonitoredTrunk {
     pub port: u16,
     /// Ping interval in seconds.
     pub interval_secs: u32,
+    /// Zone signaling IP to bind from (if zones configured).
+    pub bind_ip: Option<std::net::IpAddr>,
 }
 
 /// Trunk health monitor that sends periodic SIP OPTIONS.
@@ -173,6 +175,7 @@ impl TrunkMonitor {
                     &trunk.host,
                     trunk.port,
                     &domain,
+                    trunk.bind_ip,
                 )
                 .await;
 
@@ -211,6 +214,7 @@ impl TrunkMonitor {
         host: &str,
         port: u16,
         domain: &str,
+        bind_ip: Option<std::net::IpAddr>,
     ) -> Result<u64, String> {
         // Resolve target address
         let addr_str = format!("{host}:{port}");
@@ -226,8 +230,11 @@ impl TrunkMonitor {
             })
             .map_err(|e| format!("Cannot resolve {addr_str}: {e}"))?;
 
-        // Bind local UDP socket
-        let socket = UdpSocket::bind("0.0.0.0:0")
+        // Bind local UDP socket (to zone IP if configured)
+        let bind_addr = bind_ip
+            .map(|ip| std::net::SocketAddr::new(ip, 0))
+            .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap_or_else(|_| std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)));
+        let socket = UdpSocket::bind(bind_addr)
             .await
             .map_err(|e| format!("Bind failed: {e}"))?;
 

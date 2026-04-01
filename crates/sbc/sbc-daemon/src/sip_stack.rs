@@ -1893,7 +1893,7 @@ impl SipStack {
             0
         };
 
-        let (ann_socket, actual_rtp_port) = match crate::announcement::AnnouncementServer::bind_socket(preferred_port).await {
+        let (ann_socket, actual_rtp_port) = match crate::announcement::AnnouncementServer::bind_socket(preferred_port, None).await {
             Ok(result) => result,
             Err(e) => {
                 warn!(error = %e, "Cannot bind announcement socket");

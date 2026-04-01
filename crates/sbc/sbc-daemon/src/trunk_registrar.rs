@@ -40,6 +40,10 @@ pub struct TrunkRegConfig {
     pub password: String,
     pub domain: String,
     pub expires: u32,
+    /// Zone signaling IP to bind from (if zones configured).
+    pub bind_ip: Option<std::net::IpAddr>,
+    /// External IP for Contact header (if behind NAT).
+    pub external_ip: Option<std::net::IpAddr>,
 }
 
 /// Trunk registrar that maintains registrations to carriers.
@@ -152,16 +156,26 @@ impl TrunkRegistrar {
             })
             .map_err(|e| format!("Cannot resolve {addr_str}: {e}"))?;
 
-        // Discover our outgoing IP toward this carrier, then bind a fresh socket.
-        let local_ip = {
+        // Bind to zone signaling IP if configured, otherwise auto-discover outgoing IP
+        let (socket, local_ip) = if let Some(bind_ip) = config.bind_ip {
+            let sock = UdpSocket::bind(std::net::SocketAddr::new(bind_ip, 0)).await
+                .map_err(|e| format!("Bind to {bind_ip}:0 failed: {e}"))?;
+            (sock, bind_ip.to_string())
+        } else {
             let probe = UdpSocket::bind("0.0.0.0:0").await
                 .map_err(|e| format!("Probe bind failed: {e}"))?;
             probe.connect(target).await
                 .map_err(|e| format!("Probe connect failed: {e}"))?;
-            probe.local_addr().map_err(|e| e.to_string())?.ip().to_string()
+            let ip = probe.local_addr().map_err(|e| e.to_string())?.ip().to_string();
+            drop(probe);
+            let sock = UdpSocket::bind("0.0.0.0:0").await
+                .map_err(|e| format!("Bind failed: {e}"))?;
+            (sock, ip)
         };
-        let socket = UdpSocket::bind("0.0.0.0:0").await
-            .map_err(|e| format!("Bind failed: {e}"))?;
+        // Use external IP for Contact if behind NAT
+        let contact_ip = config.external_ip
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| local_ip.clone());
         let call_id = generate_call_id(local_domain);
 
         // Step 1: Send initial REGISTER (no auth)
@@ -173,7 +187,7 @@ impl TrunkRegistrar {
             .call_id(&call_id)
             .cseq(1)
             .max_forwards(70)
-            .contact_uri(SipUri::new(&local_ip).with_port(5060))
+            .contact_uri(SipUri::new(&contact_ip).with_port(5060))
             .build_with_defaults()
             .map_err(|e| format!("Build REGISTER failed: {e}"))?;
 
@@ -242,7 +256,7 @@ impl TrunkRegistrar {
                 .call_id(&call_id)
                 .cseq(2)
                 .max_forwards(70)
-                .contact_uri(SipUri::new(&local_ip).with_port(5060))
+                .contact_uri(SipUri::new(&contact_ip).with_port(5060))
                 .build_with_defaults()
                 .map_err(|e| format!("Build auth REGISTER failed: {e}"))?;
 

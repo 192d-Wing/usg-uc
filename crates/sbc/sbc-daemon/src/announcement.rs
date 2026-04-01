@@ -50,12 +50,15 @@ impl AnnouncementServer {
     /// announcement audio, then returns when playback is complete.
     /// Binds an announcement socket and returns (socket, actual_port).
     /// Call this before building the SDP so the port is known.
-    pub async fn bind_socket(preferred_port: u16) -> Result<(UdpSocket, u16), String> {
-        // Try binding to the preferred port first, fall back to OS-assigned
+    /// `bind_ip` specifies the zone media IP to bind to (None = 0.0.0.0).
+    pub async fn bind_socket(preferred_port: u16, bind_ip: Option<std::net::IpAddr>) -> Result<(UdpSocket, u16), String> {
+        let ip = bind_ip
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "0.0.0.0".to_string());
         let bind_addr = if preferred_port > 0 {
-            format!("0.0.0.0:{preferred_port}")
+            format!("{ip}:{preferred_port}")
         } else {
-            "0.0.0.0:0".to_string()
+            format!("{ip}:0")
         };
         let socket = UdpSocket::bind(&bind_addr)
             .await

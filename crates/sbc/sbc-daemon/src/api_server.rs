@@ -1049,6 +1049,7 @@ fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
                 host: host.to_string(),
                 port,
                 interval_secs: interval,
+                bind_ip: None,
             });
             tracing::info!(trunk_id, "Started OPTIONS health monitor via API");
         }
@@ -1069,6 +1070,8 @@ fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
                     password: password.to_string(),
                     domain: domain.to_string(),
                     expires: 3600,
+                    bind_ip: None,
+                    external_ip: None,
                 });
                 tracing::info!(trunk_id, "Started SIP registration via API");
             }
@@ -1156,6 +1159,8 @@ async fn trigger_trunk_register(
             password,
             domain: host,
             expires: 3600,
+            bind_ip: None,
+            external_ip: None,
         };
         registrar.register_trunk(config);
         Json(serde_json::json!({ "success": true, "message": format!("Registration started for {trunk_id}") }))

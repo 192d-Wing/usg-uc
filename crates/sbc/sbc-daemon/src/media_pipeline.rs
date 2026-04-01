@@ -164,6 +164,10 @@ struct MediaSessionContext {
     a_leg_local_port: u16,
     /// B-leg local RTP port.
     b_leg_local_port: u16,
+    /// A-leg bind IP (from zone, or 0.0.0.0).
+    a_leg_bind_ip: std::net::IpAddr,
+    /// B-leg bind IP (from zone, or 0.0.0.0).
+    b_leg_bind_ip: std::net::IpAddr,
     /// Relay task handles (aborted on stop).
     relay_handles: Vec<JoinHandle<()>>,
     /// Shutdown sender for relay tasks.
@@ -482,6 +486,17 @@ impl MediaPipeline {
         call_id: &str,
         mode: Option<MediaMode>,
     ) -> Result<AllocatedPorts, MediaPipelineError> {
+        self.create_session_with_zones(call_id, mode, None, None).await
+    }
+
+    /// Creates a new media session with zone-specific bind IPs.
+    pub async fn create_session_with_zones(
+        &self,
+        call_id: &str,
+        mode: Option<MediaMode>,
+        a_leg_media_ip: Option<std::net::IpAddr>,
+        b_leg_media_ip: Option<std::net::IpAddr>,
+    ) -> Result<AllocatedPorts, MediaPipelineError> {
         let mode = mode.unwrap_or(self.config.default_mode);
 
         let mut config = MediaSessionConfig::new(call_id)
@@ -513,6 +528,8 @@ impl MediaPipeline {
             b_leg_ssrc,
             a_leg_local_port: a_rtp,
             b_leg_local_port: b_rtp,
+            a_leg_bind_ip: a_leg_media_ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            b_leg_bind_ip: b_leg_media_ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
             relay_handles: Vec::new(),
             relay_shutdown: None,
             transcoder: None,
@@ -895,9 +912,9 @@ impl MediaPipeline {
             .b_leg_remote
             .ok_or_else(|| MediaPipelineError::BindFailed("B-leg remote not set".into()))?;
 
-        // Bind UDP sockets
-        let a_bind = format!("0.0.0.0:{}", ctx.a_leg_local_port);
-        let b_bind = format!("0.0.0.0:{}", ctx.b_leg_local_port);
+        // Bind UDP sockets to zone-specific media IPs
+        let a_bind = format!("{}:{}", ctx.a_leg_bind_ip, ctx.a_leg_local_port);
+        let b_bind = format!("{}:{}", ctx.b_leg_bind_ip, ctx.b_leg_local_port);
 
         let a_socket = Arc::new(
             UdpSocket::bind(&a_bind)
