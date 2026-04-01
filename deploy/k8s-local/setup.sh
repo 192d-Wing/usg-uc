@@ -45,8 +45,13 @@ if kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
     kind delete cluster --name "$CLUSTER_NAME"
 fi
 
-info "Creating kind cluster '${CLUSTER_NAME}'..."
+info "Creating kind cluster '${CLUSTER_NAME}' (single node)..."
 kind create cluster --name "$CLUSTER_NAME" --config "$SCRIPT_DIR/kind-config.yaml"
+
+# Remove control-plane taint and add SBC label so DaemonSets can schedule
+info "Configuring node for SBC scheduling..."
+kubectl taint nodes --all node-role.kubernetes.io/control-plane- 2>/dev/null || true
+kubectl label nodes --all node-role.kubernetes.io/sbc=true --overwrite
 ok "Cluster created"
 
 # ── Step 2: Build and load SBC image ─────────────────────
@@ -58,7 +63,18 @@ info "Loading image into kind cluster..."
 kind load docker-image "$SBC_IMAGE" --name "$CLUSTER_NAME"
 ok "Image loaded"
 
-# ── Step 3: Install Multus CNI ────────────────────────────
+# ── Step 3: Install CNI plugins + Multus CNI ──────────────
+info "Installing standard CNI plugins (macvlan, bridge, etc.) into kind node..."
+for NODE in $(kind get nodes --name "$CLUSTER_NAME"); do
+    docker exec "$NODE" bash -c '
+        CNI_VERSION="v1.6.2"
+        ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+        mkdir -p /opt/cni/bin
+        curl -sSL "https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-${ARCH}-${CNI_VERSION}.tgz" | tar -xz -C /opt/cni/bin
+    '
+done
+ok "CNI plugins installed"
+
 info "Installing Multus CNI..."
 kubectl apply -f https://raw.githubusercontent.com/k8snetworkplumbingwg/multus-cni/master/deployments/multus-daemonset-thick.yml
 kubectl -n kube-system rollout status daemonset/kube-multus-ds --timeout=120s

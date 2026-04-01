@@ -1,13 +1,6 @@
 # kind cluster configuration for SBC testing
-# Creates a control-plane + worker node setup
+# Single node — labels applied post-creation via setup.sh
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
   - role: control-plane
-  - role: worker
-    labels:
-      node-role.kubernetes.io/sbc: "true"
-networking:
-  disableDefaultCNI: false
-  podSubnet: "10.244.0.0/16"
-  serviceSubnet: "10.96.0.0/12"
