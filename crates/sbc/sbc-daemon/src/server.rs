@@ -45,6 +45,8 @@ pub struct Server {
     sip_stack: Arc<SipStack>,
     /// Rate limiter for `DoS` protection.
     rate_limiter: Arc<Mutex<RateLimiter>>,
+    /// Resolved zone registry (None if no zones configured).
+    zone_registry: Option<Arc<crate::zone::ResolvedZoneRegistry>>,
     /// Cluster manager (when cluster feature is enabled).
     #[cfg(feature = "cluster")]
     cluster: Option<Arc<ClusterManager>>,
@@ -80,8 +82,24 @@ impl Server {
             udp_transports: RwLock::new(Vec::new()),
             sip_stack,
             rate_limiter,
+            zone_registry: None,
             #[cfg(feature = "cluster")]
             cluster: None,
+        }
+    }
+
+    /// Sets the zone registry for interface-based binding.
+    pub fn set_zone_registry(&mut self, registry: Arc<crate::zone::ResolvedZoneRegistry>) {
+        self.zone_registry = Some(registry);
+    }
+
+    /// Determines which zone a transport belongs to based on its local bind address.
+    fn zone_for_transport(&self, transport: &UdpTransport) -> Option<String> {
+        if let Some(ref registry) = self.zone_registry {
+            let local_ip = transport.local_addr().ip();
+            registry.zone_for_signaling_ip(local_ip)
+        } else {
+            None
         }
     }
 
@@ -124,6 +142,7 @@ impl Server {
             udp_transports: RwLock::new(Vec::new()),
             sip_stack,
             rate_limiter,
+            zone_registry: None,
             cluster,
         }
     }
@@ -316,6 +335,9 @@ impl Server {
             let rate_limiter = Arc::clone(&self.rate_limiter);
             let rate_limit_enabled = self.config.rate_limit.enabled;
 
+            // Determine zone for this transport from its local bind address
+            let zone_name = self.zone_for_transport(&transport);
+
             let handle = tokio::spawn(async move {
                 Self::transport_receive_loop(
                     idx,
@@ -325,6 +347,7 @@ impl Server {
                     sip_stack,
                     rate_limiter,
                     rate_limit_enabled,
+                    zone_name,
                 )
                 .await;
             });
@@ -361,8 +384,13 @@ impl Server {
         sip_stack: Arc<SipStack>,
         rate_limiter: Arc<Mutex<RateLimiter>>,
         rate_limit_enabled: bool,
+        zone_name: Option<String>,
     ) {
-        debug!(transport_idx = idx, "Starting transport receive loop");
+        debug!(
+            transport_idx = idx,
+            zone = zone_name.as_deref().unwrap_or("default"),
+            "Starting transport receive loop"
+        );
 
         loop {
             tokio::select! {
