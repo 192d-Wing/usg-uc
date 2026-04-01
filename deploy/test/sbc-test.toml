@@ -1,33 +1,60 @@
-# SBC test configuration — dual-interface deployment
+# SBC test configuration — three-zone deployment on single NIC with IP aliases
 #
-# Signaling: 172.28.1.10 (eth0 — sbc-signaling network)
-# Media:     172.28.2.10 (eth1 — sbc-media network)
+# Zone topology (all on en0 with alias IPs):
+#   signaling — 192.168.44.129 — SIP signaling (trunks, registrations)
+#   media     — 192.168.44.130 — RTP/SRTP media streams
+#   oobm      — 192.168.44.131 — Out-of-Band Management (REST API, gRPC)
 #
-# Usage: docker compose -f deploy/test/docker-compose.yml up
+# Setup aliases before starting:
+#   sudo ifconfig en0 alias 192.168.44.129 255.255.255.0
+#   sudo ifconfig en0 alias 192.168.44.130 255.255.255.0
+#   sudo ifconfig en0 alias 192.168.44.131 255.255.255.0
+#
+# Remove aliases when done:
+#   sudo ifconfig en0 -alias 192.168.44.129
+#   sudo ifconfig en0 -alias 192.168.44.130
+#   sudo ifconfig en0 -alias 192.168.44.131
 
 [general]
 instance_name = "sbc-test"
 max_calls = 5000
 max_registrations = 10000
+default_internal_zone = "signaling"
+
+# ── Zone Definitions ──────────────────────────────────────
+
+[[zones]]
+name = "signaling"
+signaling_interface = "en0"
+media_interface = "en0"
+external_ip = "stun"
+
+[[zones]]
+name = "media"
+signaling_interface = "en0"
+media_interface = "en0"
+
+[[zones]]
+name = "oobm"
+signaling_interface = "en0"
+media_interface = "en0"
+
+# ── Transport ─────────────────────────────────────────────
 
 [transport]
-# Bind SIP signaling to the signaling interface
-udp_listen = ["172.28.1.10:5060"]
-tcp_listen = ["172.28.1.10:5060"]
-tls_listen = ["172.28.1.10:5061"]
+# SIP on signaling alias
+udp_listen = ["192.168.44.129:5060"]
+tcp_listen = ["192.168.44.129:5060"]
+tls_listen = ["192.168.44.129:5061"]
 
-# Dual-interface: separate IPs for signaling vs media
-signaling_ip = "172.28.1.10"
-media_ip = "172.28.2.10"
+# API/UI on OOBM alias only
+api_listen = "192.168.44.131:8080"
 
-# External IP (set if behind NAT, otherwise auto-detected)
-# external_ip = "203.0.113.10"
-
-# REST API on signaling interface
-api_listen = "172.28.1.10:8080"
-
+stun_refresh_interval_secs = 300
 tcp_timeout_secs = 30
 tcp_idle_timeout_secs = 300
+
+# ── Media ─────────────────────────────────────────────────
 
 [media]
 default_mode = "Relay"
@@ -37,6 +64,8 @@ rtp_port_max = 20000
 
 [media.srtp]
 required = false
+
+# ── Rate Limiting ─────────────────────────────────────────
 
 [rate_limit]
 enabled = true
@@ -50,32 +79,17 @@ level = "info"
 format = "text"
 output = "stdout"
 
-# Test routing: route all calls to a loopback UAS
-[routing]
-use_dial_plan = true
-max_failover_attempts = 1
-default_trunk_group = "loopback"
-
-[[dial_plans]]
-id = "stress-test"
-name = "Stress Test Plan"
-active = true
-
-  [[dial_plans.entries]]
-  direction = "both"
-  pattern_type = "any"
-  pattern_value = ""
-  trunk_group = "loopback"
-  priority = 100
+# ── Trunk Groups ──────────────────────────────────────────
 
 [[trunk_groups]]
 id = "loopback"
 name = "Loopback Test Target"
+zone = "signaling"
 strategy = "round_robin"
 
   [[trunk_groups.trunks]]
   id = "loopback-1"
-  host = "172.28.1.20"
+  host = "127.0.0.1"
   port = 5080
   protocol = "udp"
   max_calls = 5000

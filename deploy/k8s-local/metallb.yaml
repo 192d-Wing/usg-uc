@@ -1,0 +1,40 @@
+# MetalLB IP pools — one per SBC zone
+# All pools use LAN-routable addresses from 192.168.44.0/24
+---
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: sbc-signaling-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - 192.168.44.200/32
+---
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: sbc-media-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - 192.168.44.201/32
+---
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: sbc-oobm-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - 192.168.44.202/32
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: sbc-l2-advert
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - sbc-signaling-pool
+    - sbc-media-pool
+    - sbc-oobm-pool

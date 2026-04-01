@@ -1,0 +1,78 @@
+# Three-zone Services — each pinned to a MetalLB pool
+---
+# Signaling Service (inside leg — SIP)
+apiVersion: v1
+kind: Service
+metadata:
+  name: sbc-signaling
+  namespace: sbc-system
+  annotations:
+    metallb.universe.tf/address-pool: sbc-signaling-pool
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: sbc
+  ports:
+    - name: sip-udp
+      port: 5060
+      targetPort: 5060
+      protocol: UDP
+    - name: sip-tcp
+      port: 5060
+      targetPort: 5060
+      protocol: TCP
+    - name: sip-tls
+      port: 5061
+      targetPort: 5061
+      protocol: TCP
+---
+# Media Service (outside leg — RTP)
+# Note: K8s Services can't expose port ranges (16384-32768).
+# RTP flows directly via the Multus net2 macvlan interface,
+# bypassing kube-proxy. This service is a placeholder for
+# monitoring/discovery; actual RTP uses the pod's macvlan IP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: sbc-media
+  namespace: sbc-system
+  annotations:
+    metallb.universe.tf/address-pool: sbc-media-pool
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: sbc
+  ports:
+    - name: rtp-anchor
+      port: 16384
+      targetPort: 16384
+      protocol: UDP
+---
+# OOBM Service (management — REST API, metrics)
+apiVersion: v1
+kind: Service
+metadata:
+  name: sbc-oobm
+  namespace: sbc-system
+  annotations:
+    metallb.universe.tf/address-pool: sbc-oobm-pool
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: sbc
+  ports:
+    - name: api
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+    - name: api-tls
+      port: 8443
+      targetPort: 8443
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+      protocol: TCP

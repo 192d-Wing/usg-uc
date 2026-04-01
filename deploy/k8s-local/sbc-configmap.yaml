@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sbc-config
+  namespace: sbc-system
+data:
+  config.toml: |
+    [general]
+    instance_name = "sbc-k8s"
+    max_calls = 5000
+    max_registrations = 10000
+    default_internal_zone = "inside"
+
+    [[zones]]
+    name = "inside"
+    signaling_interface = "net1"
+    media_interface = "net1"
+
+    [[zones]]
+    name = "outside"
+    signaling_interface = "net2"
+    media_interface = "net2"
+    external_ip = "stun"
+
+    [[zones]]
+    name = "oobm"
+    signaling_interface = "net3"
+    media_interface = "net3"
+
+    [transport]
+    udp_listen = ["0.0.0.0:5060"]
+    tcp_listen = ["0.0.0.0:5060"]
+    tls_listen = ["0.0.0.0:5061"]
+    api_listen = "0.0.0.0:8080"
+    stun_refresh_interval_secs = 300
+
+    [media]
+    default_mode = "Relay"
+    codecs = ["G711Ulaw", "G711Alaw", "G722"]
+    rtp_port_min = 16384
+    rtp_port_max = 20000
+
+    [media.srtp]
+    required = false
+
+    [rate_limit]
+    enabled = true
+    global_rps = 50000
+    per_ip_rps = 10000
+
+    [logging]
+    level = "info"
+    format = "json"
+    output = "stdout"
