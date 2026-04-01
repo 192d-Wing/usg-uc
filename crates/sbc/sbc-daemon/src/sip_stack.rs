@@ -175,6 +175,8 @@ struct CallCorrelation {
     b_leg: HashMap<String, CallId>,
     /// Maps internal CallId → call addressing info.
     addresses: HashMap<CallId, CallAddresses>,
+    /// Call-IDs currently being handled by announcement playback (dedup retransmits).
+    announcement_calls: std::collections::HashSet<String>,
 }
 
 /// Addressing info for both legs of a B2BUA call.
@@ -1098,6 +1100,17 @@ impl SipStack {
 
         debug!(uri = %req.uri, call_id = %a_leg_call_id, "Processing INVITE");
 
+        // Check for INVITE retransmit — if we already know this Call-ID, absorb it
+        {
+            let corr = self.call_correlation.read().await;
+            if corr.a_leg.contains_key(&a_leg_call_id)
+                || corr.announcement_calls.contains(&a_leg_call_id)
+            {
+                debug!(call_id = %a_leg_call_id, "INVITE retransmit, absorbing");
+                return ProcessResult::NoAction;
+            }
+        }
+
         // 1. Build 100 Trying for A-leg
         let trying = create_response_from_request(req, StatusCode::TRYING);
 
@@ -1108,9 +1121,9 @@ impl SipStack {
 
         // 3. Look up destination:
         //    a) Check LocationService for registered users
-        //    b) If not registered, try Router (dial plan + trunk selection)
-        //    c) If no router, fall back to direct URI resolution
-        let mut failover_trunks: Vec<String> = Vec::new();
+        //    b) If not registered, try CUCM router (CSS/Partition)
+        //    c) Fall back to direct URI resolution
+        let failover_trunks: Vec<String> = Vec::new();
         let b_leg_destination = {
             let loc = self.location_service.read().await;
             let bindings = loc.lookup(&dest_aor);
@@ -1123,51 +1136,30 @@ impl SipStack {
                 // Not registered — try CUCM router (CSS-based), then dial plan, then direct
                 let mut routed = None;
 
-                // 1. Try CUCM router if configured
-                if routed.is_none() {
-                    if let Some(ref cucm) = self.cucm_router {
-                        let cucm_r = cucm.read().await;
-                        let css_id: Option<&str> = None; // TODO: get from caller's user/device
-                        if let Some(result) = cucm_r.route(&dest_user, css_id) {
-                            info!(
-                                pattern = %result.pattern_id,
-                                partition = %result.partition_id,
-                                destination = %result.transformed_number,
-                                "Routed via CUCM CSS/Partition"
-                            );
-                            if let Some(rg_id) = result.route_group_ids.first() {
-                                routed = resolve_sip_uri_to_addr(&format!("sip:{rg_id}"));
-                            }
+                // 1. Route via CUCM router (CSS/Partition → Route Pattern → Route List → Route Group)
+                if let Some(ref cucm) = self.cucm_router {
+                    let cucm_r = cucm.read().await;
+                    let css_id: Option<&str> = None; // TODO: get from caller's user/device
+                    if let Some(result) = cucm_r.route(&dest_user, css_id) {
+                        info!(
+                            pattern = %result.pattern_id,
+                            partition = %result.partition_id,
+                            destination = %result.transformed_number,
+                            "Routed via CUCM CSS/Partition"
+                        );
+                        if let Some(rg_id) = result.route_group_ids.first() {
+                            routed = resolve_sip_uri_to_addr(&format!("sip:{rg_id}"));
                         }
                     }
                 }
 
-                // 2. Try dial plan router if configured
                 if routed.is_none() {
-                    if let Some(ref router_lock) = self.router {
-                        let mut router = router_lock.write().await;
-                        match router.route(&dest_user) {
-                            Ok(decision) => {
-                                failover_trunks = decision.failover_trunks;
-                                info!(
-                                    trunk = %decision.trunk_id,
-                                    trunk_uri = %decision.trunk_uri,
-                                    destination = %decision.destination,
-                                    failover_count = failover_trunks.len(),
-                                    "Routed via dial plan"
-                                );
-                                routed = resolve_sip_uri_to_addr(&decision.trunk_uri);
-                            }
-                            Err(e) => {
-                                warn!(dest = %dest_aor, error = %e, "Dial plan routing failed");
-                            }
-                        }
-                    }
-                }
-
-                // 3. Fall back to direct URI resolution
-                if routed.is_none() {
-                    routed = resolve_sip_uri_to_addr(&req.uri.to_string());
+                    warn!(dest = %dest_aor, "No route found — playing announcement");
+                    return self.play_announcement_to_caller(
+                        req,
+                        source,
+                        crate::announcement::AnnouncementType::NumberNotInService,
+                    ).await;
                 }
 
                 routed
@@ -1175,13 +1167,12 @@ impl SipStack {
         };
 
         let Some(b_leg_destination) = b_leg_destination else {
-            warn!(dest = %dest_aor, "Cannot resolve destination");
-            let not_found =
-                create_response_from_request(req, StatusCode::NOT_FOUND);
-            return ProcessResult::Response {
-                message: SipMessage::Response(not_found),
-                destination: source,
-            };
+            warn!(dest = %dest_aor, "Cannot resolve destination — playing announcement");
+            return self.play_announcement_to_caller(
+                req,
+                source,
+                crate::announcement::AnnouncementType::NumberNotInService,
+            ).await;
         };
 
         // 4. Create B2BUA call
@@ -1848,6 +1839,155 @@ impl SipStack {
     /// Returns a reference to the router for direct access (used by API handlers).
     pub fn router(&self) -> Option<&RwLock<Router>> {
         self.router.as_ref()
+    }
+
+    /// Answers a call, plays an announcement via RTP, then sends BYE.
+    ///
+    /// Flow:
+    /// 1. Allocate RTP port
+    /// 2. Send 200 OK with SDP (sendonly PCMU) to caller
+    /// 3. Spawn background task: stream announcement audio, then send BYE
+    async fn play_announcement_to_caller(
+        &self,
+        req: &proto_sip::message::SipRequest,
+        source: SbcSocketAddr,
+        announcement: crate::announcement::AnnouncementType,
+    ) -> ProcessResult {
+        // Bind announcement RTP socket first to discover actual port
+        let preferred_port = if let Some(ref pipeline) = self.media_pipeline {
+            pipeline.port_allocator().allocate_pair().await.map(|(rtp, _)| rtp).unwrap_or(0)
+        } else {
+            0
+        };
+
+        let (ann_socket, actual_rtp_port) = match crate::announcement::AnnouncementServer::bind_socket(preferred_port).await {
+            Ok(result) => result,
+            Err(e) => {
+                warn!(error = %e, "Cannot bind announcement socket");
+                let unavailable = create_response_from_request(req, StatusCode::TEMPORARILY_UNAVAILABLE);
+                return ProcessResult::Response {
+                    message: SipMessage::Response(unavailable),
+                    destination: source,
+                };
+            }
+        };
+
+        // Use IPv4 address for SDP (strip IPv6-mapped prefix)
+        let local_ip = match source.ip() {
+            std::net::IpAddr::V6(v6) => {
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    v4.to_string()
+                } else {
+                    v6.to_string()
+                }
+            }
+            std::net::IpAddr::V4(v4) => v4.to_string(),
+        };
+        let sdp = crate::announcement::build_announcement_sdp(&local_ip, actual_rtp_port);
+
+        // Build 200 OK with SDP
+        let mut ok_response = create_response_from_request(req, StatusCode::OK);
+        ok_response.add_header(Header::new(
+            HeaderName::Contact,
+            format!("<sip:{}@{}:{}>", self.config.instance_name, local_ip, source.port()),
+        ));
+        ok_response.headers.set(HeaderName::ContentType, "application/sdp");
+        let sdp_bytes = sdp.into_bytes();
+        ok_response.headers.set(HeaderName::ContentLength, sdp_bytes.len().to_string());
+        ok_response.body = Some(Bytes::from(sdp_bytes));
+
+        // Extract caller's RTP destination from their SDP offer
+        let caller_rtp_dest = req.body.as_ref().and_then(|body| {
+            let sdp_str = String::from_utf8_lossy(body);
+            crate::announcement::extract_rtp_dest_from_sdp(&sdp_str)
+        });
+
+        // Track this Call-ID to absorb INVITE retransmits
+        let call_id = req.headers.call_id().unwrap_or("unknown").to_string();
+        {
+            let mut corr = self.call_correlation.write().await;
+            corr.announcement_calls.insert(call_id.clone());
+        }
+        let from_tag = req
+            .headers
+            .get_value(&HeaderName::From)
+            .and_then(|v| extract_param(v, "tag").map(String::from));
+        let to_tag = ok_response
+            .headers
+            .get_value(&HeaderName::To)
+            .and_then(|v| extract_param(v, "tag").map(String::from));
+
+        let domain = self.config.domain.clone();
+        let instance = self.config.instance_name.clone();
+        let source_port = source.port();
+
+        // Spawn background task to play announcement then BYE
+        tokio::spawn(async move {
+            // Wait for caller to process the 200 OK and send ACK
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            if let Some(rtp_dest) = caller_rtp_dest {
+                let ssrc = {
+                    use std::time::{SystemTime, UNIX_EPOCH};
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+                    (now.as_nanos() as u32) ^ (now.as_secs() as u32)
+                };
+                if let Err(e) = crate::announcement::AnnouncementServer::play_on_socket(
+                    announcement,
+                    ann_socket,
+                    rtp_dest,
+                    ssrc,
+                ).await {
+                    warn!(error = %e, "Announcement playback failed");
+                }
+            } else {
+                warn!("No RTP destination from caller SDP, skipping audio playback");
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+
+            // Send BYE after announcement
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            let bye_uri = SipUri::new(&local_ip).with_port(source_port);
+            let bye = RequestBuilder::new(Method::Bye, bye_uri)
+                .via_auto("UDP", &local_ip, Some(source_port))
+                .from_auto(
+                    SipUri::new(&domain).with_user(&instance),
+                    to_tag.as_deref(),
+                )
+                .to_uri(
+                    SipUri::new(&local_ip),
+                    from_tag.as_deref(),
+                )
+                .call_id(&call_id)
+                .cseq(2)
+                .max_forwards(70)
+                .build_with_defaults();
+
+            match bye {
+                Ok(bye_req) => {
+                    let bye_bytes = SipMessage::Request(bye_req).to_bytes();
+                    // Use IPv6 dual-stack socket to handle IPv6-mapped IPv4 addresses
+                    let bind_addr = if source.as_std().is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+                    if let Ok(sock) = tokio::net::UdpSocket::bind(bind_addr).await {
+                        if let Err(e) = sock.send_to(&bye_bytes, source.as_std()).await {
+                            warn!(error = %e, "Failed to send BYE after announcement");
+                        } else {
+                            info!(call_id = %call_id, "Sent BYE after announcement");
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to build BYE after announcement");
+                }
+            }
+        });
+
+        // Return 200 OK to answer the call
+        ProcessResult::Response {
+            message: SipMessage::Response(ok_response),
+            destination: source,
+        }
     }
 }
 

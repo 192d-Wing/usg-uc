@@ -132,6 +132,9 @@ export class ApiService {
   addTrunk(groupId: string, trunk: any): Observable<any> {
     return this.http.post<any>(`${this.baseUrl}/trunkgroups/${encodeURIComponent(groupId)}/trunks`, trunk);
   }
+  updateTrunk(groupId: string, trunkId: string, trunk: any): Observable<any> {
+    return this.http.put(`${this.baseUrl}/trunkgroups/${encodeURIComponent(groupId)}/trunks/${encodeURIComponent(trunkId)}`, trunk);
+  }
   deleteTrunk(groupId: string, trunkId: string): Observable<any> {
     return this.http.delete<any>(`${this.baseUrl}/trunkgroups/${encodeURIComponent(groupId)}/trunks/${encodeURIComponent(trunkId)}`);
   }
@@ -224,5 +227,22 @@ export class ApiService {
   }
   updateTrunkGroup(id: string, group: any): Observable<any> {
     return this.http.put(`${this.baseUrl}/trunkgroups/${encodeURIComponent(id)}`, group);
+  }
+
+  // Trunk Registration
+  getTrunkRegistrationStatus(): Observable<any[]> {
+    return this.http.get<any>(`${this.baseUrl}/trunk-registration`).pipe(
+      map(r => r.trunk_registrations ?? r.registrations ?? [])
+    );
+  }
+  triggerTrunkRegister(trunkId: string): Observable<any> {
+    return this.http.post(`${this.baseUrl}/trunk-registration/${encodeURIComponent(trunkId)}/register`, {});
+  }
+
+  // Trunk Health (OPTIONS ping)
+  getTrunkHealth(): Observable<any[]> {
+    return this.http.get<any>(`${this.baseUrl}/trunk-health`).pipe(
+      map(r => r.trunk_health ?? r.trunks ?? [])
+    );
   }
 }

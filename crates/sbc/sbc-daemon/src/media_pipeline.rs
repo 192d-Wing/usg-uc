@@ -1045,6 +1045,11 @@ impl MediaPipeline {
     pub async fn active_session_count(&self) -> usize {
         self.sessions.read().await.len()
     }
+
+    /// Returns a reference to the port allocator.
+    pub fn port_allocator(&self) -> &RtpPortAllocator {
+        &self.port_allocator
+    }
 }
 
 /// Generates a random SSRC.

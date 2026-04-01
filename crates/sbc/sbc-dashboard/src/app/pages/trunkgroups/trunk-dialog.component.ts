@@ -1,5 +1,5 @@
-import { Component, inject } from '@angular/core';
-import { MatDialogRef, MatDialogModule } from '@angular/material/dialog';
+import { Component, inject, OnInit } from '@angular/core';
+import { MatDialogRef, MatDialogModule, MAT_DIALOG_DATA } from '@angular/material/dialog';
 import { MatFormFieldModule } from '@angular/material/form-field';
 import { MatInputModule } from '@angular/material/input';
 import { MatSelectModule } from '@angular/material/select';
@@ -16,11 +16,11 @@ import { MatSlideToggleModule } from '@angular/material/slide-toggle';
     MatSlideToggleModule,
   ],
   template: `
-    <h2 mat-dialog-title>Add Trunk</h2>
+    <h2 mat-dialog-title>{{ isEdit ? 'Edit Trunk' : 'Add Trunk' }}</h2>
     <mat-dialog-content>
       <mat-form-field appearance="outline" class="full-width">
         <mat-label>Trunk ID</mat-label>
-        <input matInput [(ngModel)]="form.id">
+        <input matInput [(ngModel)]="form.id" [disabled]="isEdit">
       </mat-form-field>
 
       <mat-form-field appearance="outline" class="full-width">
@@ -77,6 +77,12 @@ import { MatSlideToggleModule } from '@angular/material/slide-toggle';
         <input matInput type="password" [(ngModel)]="form.sip_password">
       </mat-form-field>
 
+      <mat-form-field appearance="outline" class="full-width">
+        <mat-label>SIP Domain</mat-label>
+        <input matInput [(ngModel)]="form.sip_domain">
+        <mat-hint>Domain for SIP registration (e.g., sip.carrier.com)</mat-hint>
+      </mat-form-field>
+
       <div class="toggle-row">
         <mat-slide-toggle [(ngModel)]="form.options_ping_enabled">
           SIP OPTIONS Ping
@@ -91,6 +97,13 @@ import { MatSlideToggleModule } from '@angular/material/slide-toggle';
           <mat-hint>How often to send OPTIONS (5-300s)</mat-hint>
         </mat-form-field>
       }
+
+      <div class="toggle-row">
+        <mat-slide-toggle [(ngModel)]="form.register_enabled">
+          SIP Registration
+        </mat-slide-toggle>
+        <span class="toggle-hint">Register the SBC as a subscriber to this trunk</span>
+      </div>
     </mat-dialog-content>
     <mat-dialog-actions align="end">
       <button mat-button mat-dialog-close>Cancel</button>
@@ -104,8 +117,11 @@ import { MatSlideToggleModule } from '@angular/material/slide-toggle';
     .toggle-hint { font-size: 12px; color: var(--uswds-text-secondary, rgba(255,255,255,0.5)); }
   `],
 })
-export class TrunkDialogComponent {
+export class TrunkDialogComponent implements OnInit {
   private readonly dialogRef = inject(MatDialogRef<TrunkDialogComponent>);
+  private readonly data: any = inject(MAT_DIALOG_DATA, { optional: true });
+
+  isEdit = false;
 
   form = {
     id: '',
@@ -119,9 +135,34 @@ export class TrunkDialogComponent {
     max_failures: 5,
     sip_username: '',
     sip_password: '',
+    sip_domain: '',
     options_ping_enabled: false,
     options_ping_interval: 30,
+    register_enabled: false,
   };
+
+  ngOnInit(): void {
+    if (this.data) {
+      this.isEdit = true;
+      this.form = {
+        id: this.data.id ?? '',
+        host: this.data.host ?? '',
+        port: this.data.port ?? 5060,
+        protocol: this.data.protocol ?? 'udp',
+        priority: this.data.priority ?? 1,
+        weight: this.data.weight ?? 100,
+        max_calls: this.data.max_calls ?? 100,
+        cooldown_seconds: this.data.cooldown_seconds ?? 30,
+        max_failures: this.data.max_failures ?? 5,
+        sip_username: this.data.sip_username ?? '',
+        sip_password: this.data.sip_password ?? '',
+        sip_domain: this.data.sip_domain ?? '',
+        options_ping_enabled: this.data.options_ping_enabled ?? false,
+        options_ping_interval: this.data.options_ping_interval ?? 30,
+        register_enabled: this.data.register_enabled ?? false,
+      };
+    }
+  }
 
   save(): void {
     this.dialogRef.close(this.form);

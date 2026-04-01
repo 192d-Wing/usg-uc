@@ -68,7 +68,7 @@ pub mod transport;
 pub mod uri;
 
 pub use auth::{
-    DigestAlgorithm, DigestChallenge, DigestCredentials, DigestHasher, Qop,
+    DigestAlgorithm, DigestChallenge, DigestCredentials, DigestHasher, Md5DigestHasher, Qop,
     compute_digest_response, compute_ha1, compute_ha2, compute_response, create_credentials,
     verify_credentials,
 };

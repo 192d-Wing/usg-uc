@@ -242,7 +242,6 @@ impl Server {
 
         for socket_addr in &self.config.transport.udp_listen {
             let addr = SbcSocketAddr::from(*socket_addr);
-
             match UdpTransport::bind(addr).await {
                 Ok(transport) => {
                     info!(

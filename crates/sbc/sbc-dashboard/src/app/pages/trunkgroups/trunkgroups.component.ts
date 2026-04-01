@@ -1,4 +1,4 @@
-import { Component, inject, OnInit, signal } from '@angular/core';
+import { Component, inject, OnInit, OnDestroy, signal } from '@angular/core';
 import { MatCardModule } from '@angular/material/card';
 import { MatIconModule } from '@angular/material/icon';
 import { MatButtonModule } from '@angular/material/button';
@@ -6,6 +6,7 @@ import { MatTooltipModule } from '@angular/material/tooltip';
 import { MatDialog, MatDialogModule } from '@angular/material/dialog';
 import { MatExpansionModule } from '@angular/material/expansion';
 import { MatTableModule } from '@angular/material/table';
+import { MatChipsModule } from '@angular/material/chips';
 import { ApiService } from '../../services/api.service';
 import { TrunkgroupDialogComponent } from './trunkgroup-dialog.component';
 import { TrunkDialogComponent } from './trunk-dialog.component';
@@ -15,7 +16,7 @@ import { TrunkDialogComponent } from './trunk-dialog.component';
   standalone: true,
   imports: [
     MatCardModule, MatIconModule, MatButtonModule, MatTooltipModule,
-    MatDialogModule, MatExpansionModule, MatTableModule,
+    MatDialogModule, MatExpansionModule, MatTableModule, MatChipsModule,
   ],
   template: `
     <div class="trunkgroups-page">
@@ -25,7 +26,7 @@ import { TrunkDialogComponent } from './trunk-dialog.component';
         <button mat-raised-button color="primary" (click)="openAddGroupDialog()">
           <mat-icon>add</mat-icon> Add Trunk Group
         </button>
-        <button mat-icon-button (click)="loadGroups()" matTooltip="Refresh">
+        <button mat-icon-button (click)="loadAll()" matTooltip="Refresh">
           <mat-icon>refresh</mat-icon>
         </button>
       </div>
@@ -88,17 +89,62 @@ import { TrunkDialogComponent } from './trunk-dialog.component';
                   <th mat-header-cell *matHeaderCellDef>Max Calls</th>
                   <td mat-cell *matCellDef="let row">{{ row.max_calls }}</td>
                 </ng-container>
-                <ng-container matColumnDef="state">
-                  <th mat-header-cell *matHeaderCellDef>State</th>
+                <ng-container matColumnDef="registration">
+                  <th mat-header-cell *matHeaderCellDef>Registration</th>
                   <td mat-cell *matCellDef="let row">
-                    <span class="state-badge" [class]="'state-' + (row.state || 'active')">
-                      {{ (row.state || 'active').toUpperCase() }}
-                    </span>
+                    @if (getRegStatus(row.id); as reg) {
+                      <span class="reg-badge" [class]="'reg-' + reg.state.toLowerCase()">
+                        <mat-icon class="reg-icon">{{ getRegIcon(reg.state) }}</mat-icon>
+                        {{ reg.state }}
+                      </span>
+                      @if (reg.last_error) {
+                        <span class="reg-error" [matTooltip]="reg.last_error">
+                          <mat-icon class="error-icon">warning</mat-icon>
+                        </span>
+                      }
+                    } @else if (row.sip_username) {
+                      <button mat-stroked-button class="register-btn" (click)="registerTrunk(row.id)">
+                        <mat-icon>app_registration</mat-icon> Register
+                      </button>
+                    } @else {
+                      <span class="reg-na">N/A</span>
+                    }
+                  </td>
+                </ng-container>
+                <ng-container matColumnDef="health">
+                  <th mat-header-cell *matHeaderCellDef>Health</th>
+                  <td mat-cell *matCellDef="let row">
+                    @if (getHealthStatus(row.id); as h) {
+                      <span class="health-badge" [class]="h.reachable ? 'health-up' : 'health-down'">
+                        <mat-icon class="health-icon">{{ h.reachable ? 'check_circle' : 'cancel' }}</mat-icon>
+                        {{ h.reachable ? 'UP' : 'DOWN' }}
+                      </span>
+                      @if (h.last_response_ms != null) {
+                        <span class="latency">{{ h.last_response_ms }}ms</span>
+                      }
+                      @if (h.uptime_pct != null) {
+                        <span class="uptime">{{ h.uptime_pct.toFixed(1) }}%</span>
+                      }
+                    } @else if (row.options_ping_enabled) {
+                      <span class="health-pending">Pending</span>
+                    } @else {
+                      <span class="reg-na">N/A</span>
+                    }
                   </td>
                 </ng-container>
                 <ng-container matColumnDef="actions">
                   <th mat-header-cell *matHeaderCellDef>Actions</th>
                   <td mat-cell *matCellDef="let row">
+                    <button mat-icon-button (click)="openEditTrunkDialog(group.id, row)"
+                            matTooltip="Edit Trunk" color="primary">
+                      <mat-icon>edit</mat-icon>
+                    </button>
+                    @if (getRegStatus(row.id); as reg) {
+                      <button mat-icon-button (click)="registerTrunk(row.id)"
+                              matTooltip="Re-Register" color="primary">
+                        <mat-icon>refresh</mat-icon>
+                      </button>
+                    }
                     <button mat-icon-button color="warn" (click)="deleteTrunk(group.id, row.id)"
                             matTooltip="Delete Trunk">
                       <mat-icon>delete</mat-icon>
@@ -153,6 +199,99 @@ import { TrunkDialogComponent } from './trunk-dialog.component';
       border: 1px solid rgba(0, 94, 162, 0.3);
     }
 
+    .reg-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 10px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 600;
+      border: 1px solid transparent;
+    }
+
+    .reg-icon, .health-icon, .error-icon {
+      font-size: 16px;
+      width: 16px;
+      height: 16px;
+    }
+
+    .reg-registered {
+      background: rgba(74, 222, 128, 0.12);
+      color: var(--color-success, #4ade80);
+      border-color: rgba(74, 222, 128, 0.2);
+    }
+
+    .reg-failed {
+      background: rgba(248, 113, 113, 0.12);
+      color: var(--color-error, #f87171);
+      border-color: rgba(248, 113, 113, 0.2);
+    }
+
+    .reg-initializing {
+      background: rgba(251, 191, 36, 0.12);
+      color: var(--color-warning, #fbbf24);
+      border-color: rgba(251, 191, 36, 0.2);
+    }
+
+    .reg-error {
+      margin-left: 4px;
+      cursor: help;
+    }
+
+    .error-icon {
+      color: var(--color-warning, #fbbf24);
+    }
+
+    .reg-na {
+      font-size: 12px;
+      color: rgba(255, 255, 255, 0.3);
+    }
+
+    .register-btn {
+      font-size: 12px;
+    }
+
+    .health-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 10px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 600;
+      border: 1px solid transparent;
+    }
+
+    .health-up {
+      background: rgba(74, 222, 128, 0.12);
+      color: var(--color-success, #4ade80);
+      border-color: rgba(74, 222, 128, 0.2);
+    }
+
+    .health-down {
+      background: rgba(248, 113, 113, 0.12);
+      color: var(--color-error, #f87171);
+      border-color: rgba(248, 113, 113, 0.2);
+    }
+
+    .health-pending {
+      font-size: 12px;
+      color: rgba(255, 255, 255, 0.4);
+    }
+
+    .latency {
+      margin-left: 6px;
+      font-size: 11px;
+      color: rgba(255, 255, 255, 0.5);
+    }
+
+    .uptime {
+      margin-left: 4px;
+      font-size: 11px;
+      color: rgba(255, 255, 255, 0.4);
+    }
+
     .state-badge {
       padding: 3px 10px;
       border-radius: 6px;
@@ -180,24 +319,40 @@ import { TrunkDialogComponent } from './trunk-dialog.component';
     }
   `],
 })
-export class TrunkgroupsComponent implements OnInit {
+export class TrunkgroupsComponent implements OnInit, OnDestroy {
   private readonly api = inject(ApiService);
   private readonly dialog = inject(MatDialog);
+  private refreshTimer: ReturnType<typeof setInterval> | null = null;
 
   readonly trunkColumns = [
-    'id', 'host', 'port', 'protocol', 'priority', 'weight', 'max_calls', 'state', 'actions',
+    'id', 'host', 'port', 'protocol', 'priority', 'weight', 'max_calls',
+    'registration', 'health', 'actions',
   ];
 
   readonly groups = signal<any[]>([]);
+  readonly regStatuses = signal<Map<string, any>>(new Map());
+  readonly healthStatuses = signal<Map<string, any>>(new Map());
 
   ngOnInit(): void {
+    this.loadAll();
+    // Auto-refresh registration & health status every 15s
+    this.refreshTimer = setInterval(() => this.loadStatusData(), 15000);
+  }
+
+  ngOnDestroy(): void {
+    if (this.refreshTimer) {
+      clearInterval(this.refreshTimer);
+    }
+  }
+
+  loadAll(): void {
     this.loadGroups();
+    this.loadStatusData();
   }
 
   loadGroups(): void {
     this.api.getTrunkGroups().subscribe({
       next: (groups) => {
-        // For each group, fetch full details including trunks
         for (const g of groups) {
           this.api.getTrunkGroup(g.id).subscribe({
             next: (full) => {
@@ -212,6 +367,57 @@ export class TrunkgroupsComponent implements OnInit {
         if (groups.length === 0) {
           this.groups.set([]);
         }
+      },
+      error: () => {},
+    });
+  }
+
+  loadStatusData(): void {
+    this.api.getTrunkRegistrationStatus().subscribe({
+      next: (regs) => {
+        const map = new Map<string, any>();
+        for (const r of regs) {
+          map.set(r.trunk_id, r);
+        }
+        this.regStatuses.set(map);
+      },
+      error: () => {},
+    });
+
+    this.api.getTrunkHealth().subscribe({
+      next: (trunks) => {
+        const map = new Map<string, any>();
+        for (const t of trunks) {
+          map.set(t.trunk_id, t);
+        }
+        this.healthStatuses.set(map);
+      },
+      error: () => {},
+    });
+  }
+
+  getRegStatus(trunkId: string): any | null {
+    return this.regStatuses().get(trunkId) ?? null;
+  }
+
+  getHealthStatus(trunkId: string): any | null {
+    return this.healthStatuses().get(trunkId) ?? null;
+  }
+
+  getRegIcon(state: string): string {
+    switch (state.toLowerCase()) {
+      case 'registered': return 'check_circle';
+      case 'failed': return 'error';
+      case 'initializing': return 'hourglass_empty';
+      default: return 'help_outline';
+    }
+  }
+
+  registerTrunk(trunkId: string): void {
+    this.api.triggerTrunkRegister(trunkId).subscribe({
+      next: () => {
+        // Refresh status after a short delay to allow registration to complete
+        setTimeout(() => this.loadStatusData(), 2000);
       },
       error: () => {},
     });
@@ -246,6 +452,18 @@ export class TrunkgroupsComponent implements OnInit {
     ref.afterClosed().subscribe((result: any) => {
       if (result) {
         this.api.addTrunk(groupId, result).subscribe({
+          next: () => this.loadGroups(),
+          error: () => {},
+        });
+      }
+    });
+  }
+
+  openEditTrunkDialog(groupId: string, trunk: any): void {
+    const ref = this.dialog.open(TrunkDialogComponent, { data: trunk });
+    ref.afterClosed().subscribe((result: any) => {
+      if (result) {
+        this.api.updateTrunk(groupId, trunk.id, result).subscribe({
           next: () => this.loadGroups(),
           error: () => {},
         });

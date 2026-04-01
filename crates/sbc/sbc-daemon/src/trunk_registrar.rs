@@ -1,0 +1,296 @@
+//! SIP trunk registration client.
+//!
+//! Registers the SBC as a subscriber to SIP trunks/carriers
+//! using digest authentication. Maintains registrations with
+//! periodic re-REGISTER.
+
+use bytes::Bytes;
+use proto_sip::builder::{RequestBuilder, generate_branch, generate_call_id};
+use proto_sip::uri::SipUri;
+use proto_sip::{DigestChallenge, Header, HeaderName, Md5DigestHasher, SipMessage, create_credentials};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::UdpSocket;
+use tokio::sync::RwLock;
+use tracing::{info, warn};
+
+/// Registration state for a trunk.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TrunkRegistrationStatus {
+    pub trunk_id: String,
+    pub registered: bool,
+    pub state: String,
+    pub registrar: String,
+    pub username: String,
+    pub last_registered: Option<i64>,
+    pub last_error: Option<String>,
+    pub expires: u32,
+    pub attempts: u64,
+    pub successes: u64,
+}
+
+/// Configuration for trunk registration.
+#[derive(Debug, Clone)]
+pub struct TrunkRegConfig {
+    pub trunk_id: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub password: String,
+    pub domain: String,
+    pub expires: u32,
+}
+
+/// Trunk registrar that maintains registrations to carriers.
+pub struct TrunkRegistrar {
+    statuses: Arc<RwLock<HashMap<String, TrunkRegistrationStatus>>>,
+    local_domain: String,
+}
+
+impl TrunkRegistrar {
+    pub fn new(local_domain: &str) -> Self {
+        Self {
+            statuses: Arc::new(RwLock::new(HashMap::new())),
+            local_domain: local_domain.to_string(),
+        }
+    }
+
+    pub fn statuses(&self) -> Arc<RwLock<HashMap<String, TrunkRegistrationStatus>>> {
+        Arc::clone(&self.statuses)
+    }
+
+    /// Starts registration for a trunk. Spawns a background task.
+    pub fn register_trunk(&self, config: TrunkRegConfig) -> tokio::task::JoinHandle<()> {
+        let statuses = Arc::clone(&self.statuses);
+        let local_domain = self.local_domain.clone();
+        let trunk_id = config.trunk_id.clone();
+        let registrar = format!("{}:{}", config.host, config.port);
+        let username = config.username.clone();
+
+        // Initialize status
+        {
+            let statuses = Arc::clone(&statuses);
+            tokio::spawn(async move {
+                statuses.write().await.insert(
+                    trunk_id.clone(),
+                    TrunkRegistrationStatus {
+                        trunk_id,
+                        registered: false,
+                        state: "Initializing".to_string(),
+                        registrar,
+                        username,
+                        last_registered: None,
+                        last_error: None,
+                        expires: 3600,
+                        attempts: 0,
+                        successes: 0,
+                    },
+                );
+            });
+        }
+
+        tokio::spawn(async move {
+            info!(
+                trunk_id = %config.trunk_id,
+                host = %config.host,
+                username = %config.username,
+                "Starting trunk registration"
+            );
+
+            loop {
+                let result = Self::do_register(&config, &local_domain).await;
+
+                let mut st = statuses.write().await;
+                if let Some(status) = st.get_mut(&config.trunk_id) {
+                    status.attempts += 1;
+                    match result {
+                        Ok(expires) => {
+                            status.registered = true;
+                            status.state = "Registered".to_string();
+                            status.expires = expires;
+                            status.last_error = None;
+                            status.successes += 1;
+                            status.last_registered = Some(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs() as i64)
+                                    .unwrap_or(0),
+                            );
+                            info!(trunk_id = %config.trunk_id, expires, "Trunk registered");
+                        }
+                        Err(e) => {
+                            status.registered = false;
+                            status.state = "Failed".to_string();
+                            status.last_error = Some(e.clone());
+                            warn!(trunk_id = %config.trunk_id, error = %e, "Trunk registration failed");
+                        }
+                    }
+                }
+                drop(st);
+
+                // Re-register at 80% of expires, min 30s
+                let wait = Duration::from_secs(
+                    (u64::from(config.expires) * 80 / 100).max(30),
+                );
+                tokio::time::sleep(wait).await;
+            }
+        })
+    }
+
+    /// Performs a single REGISTER transaction with digest auth.
+    async fn do_register(config: &TrunkRegConfig, local_domain: &str) -> Result<u32, String> {
+        let addr_str = format!("{}:{}", config.host, config.port);
+        let target: std::net::SocketAddr = addr_str
+            .parse()
+            .or_else(|_| {
+                use std::net::ToSocketAddrs;
+                addr_str.to_socket_addrs()
+                    .map_err(|e| e.to_string())?
+                    .next()
+                    .ok_or_else(|| "DNS resolution failed".to_string())
+            })
+            .map_err(|e| format!("Cannot resolve {addr_str}: {e}"))?;
+
+        // Discover our outgoing IP toward this carrier, then bind a fresh socket.
+        let local_ip = {
+            let probe = UdpSocket::bind("0.0.0.0:0").await
+                .map_err(|e| format!("Probe bind failed: {e}"))?;
+            probe.connect(target).await
+                .map_err(|e| format!("Probe connect failed: {e}"))?;
+            probe.local_addr().map_err(|e| e.to_string())?.ip().to_string()
+        };
+        let socket = UdpSocket::bind("0.0.0.0:0").await
+            .map_err(|e| format!("Bind failed: {e}"))?;
+        let call_id = generate_call_id(local_domain);
+
+        // Step 1: Send initial REGISTER (no auth)
+        let uri = SipUri::new(&config.host);
+        let request = RequestBuilder::register(uri.clone())
+            .via_auto("UDP", &local_ip, Some(5060))
+            .from_auto(SipUri::new(&config.host).with_user(&config.username), None)
+            .to_uri(SipUri::new(&config.host).with_user(&config.username), None)
+            .call_id(&call_id)
+            .cseq(1)
+            .max_forwards(70)
+            .contact_uri(SipUri::new(&local_ip).with_port(5060))
+            .build_with_defaults()
+            .map_err(|e| format!("Build REGISTER failed: {e}"))?;
+
+        let msg_bytes = SipMessage::Request(request).to_bytes();
+        socket.send_to(&msg_bytes, target).await
+            .map_err(|e| format!("Send failed: {e}"))?;
+
+        // Receive response
+        let mut buf = [0u8; 4096];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
+            .await
+            .map_err(|_| "Timeout waiting for response".to_string())?
+            .map_err(|e| format!("Recv failed: {e}"))?;
+
+        let resp = SipMessage::parse(&Bytes::copy_from_slice(&buf[..n]))
+            .map_err(|e| format!("Parse response failed: {e}"))?;
+
+        let SipMessage::Response(ref response) = resp else {
+            return Err("Expected response, got request".to_string());
+        };
+
+        let status_code = response.status.code();
+
+        // If 200 OK, registered without auth
+        if status_code == 200 {
+            return Ok(config.expires);
+        }
+
+        // If 401/407, extract challenge and retry with credentials
+        if status_code == 401 || status_code == 407 {
+            let auth_header = if status_code == 401 {
+                response.headers.get_value(&HeaderName::WwwAuthenticate)
+            } else {
+                response.headers.get_value(&HeaderName::Custom("Proxy-Authenticate".to_string()))
+            };
+
+            let challenge_str = auth_header
+                .ok_or_else(|| format!("{status_code} with no challenge header"))?;
+
+            let challenge: DigestChallenge = challenge_str.parse()
+                .map_err(|e| format!("Parse challenge failed: {e}"))?;
+
+            let hasher = Md5DigestHasher;
+            let cnonce = generate_branch();
+            let digest_uri = format!("sip:{}", config.host);
+
+            let credentials = create_credentials(
+                &hasher,
+                &challenge,
+                &config.username,
+                &config.password,
+                "REGISTER",
+                &digest_uri,
+                Some(&cnonce),
+                Some(1),
+                None,
+            ).map_err(|e| format!("Digest computation failed: {e}"))?;
+
+            let auth_value = credentials.to_string();
+
+            // Build authenticated REGISTER
+            let mut auth_request = RequestBuilder::register(uri)
+                .via_auto("UDP", &local_ip, Some(5060))
+                .from_auto(SipUri::new(&config.host).with_user(&config.username), None)
+                .to_uri(SipUri::new(&config.host).with_user(&config.username), None)
+                .call_id(&call_id)
+                .cseq(2)
+                .max_forwards(70)
+                .contact_uri(SipUri::new(&local_ip).with_port(5060))
+                .build_with_defaults()
+                .map_err(|e| format!("Build auth REGISTER failed: {e}"))?;
+
+            let header_name = if status_code == 401 {
+                HeaderName::Authorization
+            } else {
+                HeaderName::Custom("Proxy-Authorization".to_string())
+            };
+            auth_request.headers.add(Header::new(header_name, &auth_value));
+
+            // Add Expires header
+            auth_request.headers.set(HeaderName::Expires, &config.expires.to_string());
+
+            let auth_bytes = SipMessage::Request(auth_request).to_bytes();
+            socket.send_to(&auth_bytes, target).await
+                .map_err(|e| format!("Send auth REGISTER failed: {e}"))?;
+
+            // Receive final response
+            let (n2, _) = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
+                .await
+                .map_err(|_| "Timeout waiting for auth response".to_string())?
+                .map_err(|e| format!("Recv auth response failed: {e}"))?;
+
+            let resp2 = SipMessage::parse(&Bytes::copy_from_slice(&buf[..n2]))
+                .map_err(|e| format!("Parse auth response failed: {e}"))?;
+
+            let SipMessage::Response(ref response2) = resp2 else {
+                return Err("Expected response to auth REGISTER".to_string());
+            };
+
+            if response2.status.code() == 200 {
+                let expires = response2.headers.get_value(&HeaderName::Expires)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(config.expires);
+                Ok(expires)
+            } else {
+                Err(format!("Auth rejected: {} {}", response2.status.code(), response2.reason_phrase()))
+            }
+        } else {
+            Err(format!("Unexpected: {} {}", status_code, response.reason_phrase()))
+        }
+    }
+
+    pub async fn get_all_status(&self) -> Vec<TrunkRegistrationStatus> {
+        self.statuses.read().await.values().cloned().collect()
+    }
+
+    pub async fn get_status(&self, trunk_id: &str) -> Option<TrunkRegistrationStatus> {
+        self.statuses.read().await.get(trunk_id).cloned()
+    }
+}

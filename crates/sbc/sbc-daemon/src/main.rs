@@ -54,6 +54,7 @@
 // Allow u64-to-i64 cast for protobuf timestamps
 #![allow(clippy::cast_sign_loss)]
 
+mod announcement;
 mod api_server;
 mod args;
 #[cfg(feature = "cluster")]
@@ -63,6 +64,7 @@ mod grpc_server;
 mod ice_agent;
 mod media_pipeline;
 mod trunk_monitor;
+mod trunk_registrar;
 mod runtime;
 mod server;
 mod shutdown;
