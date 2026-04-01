@@ -76,6 +76,8 @@ pub struct SipStack {
     topology_hider: Option<RwLock<TopologyHider>>,
     /// Stack configuration.
     config: SipStackConfig,
+    /// Resolved zone registry for interface-based binding.
+    zone_registry: Option<Arc<crate::zone::ResolvedZoneRegistry>>,
     /// Registration statistics.
     registrations_active: AtomicU64,
     registrations_total: AtomicU64,
@@ -261,6 +263,7 @@ impl SipStack {
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
             config,
+            zone_registry: None,
         }
     }
 
@@ -304,12 +307,40 @@ impl SipStack {
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
             config,
+            zone_registry: None,
         }
     }
 
     /// Sets the media pipeline for RTP relay.
     pub fn set_media_pipeline(&mut self, pipeline: Arc<crate::media_pipeline::MediaPipeline>) {
         self.media_pipeline = Some(pipeline);
+    }
+
+    /// Sets the zone registry for zone-aware SIP processing.
+    pub fn set_zone_registry(&mut self, registry: Arc<crate::zone::ResolvedZoneRegistry>) {
+        self.zone_registry = Some(registry);
+    }
+
+    /// Returns the effective signaling IP for a zone, falling back to source IP.
+    fn zone_signaling_ip(&self, zone: Option<&str>, fallback: std::net::IpAddr) -> String {
+        if let (Some(name), Some(reg)) = (zone, &self.zone_registry) {
+            reg.signaling_ip(name)
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| fallback.to_string())
+        } else {
+            fallback.to_string()
+        }
+    }
+
+    /// Returns the effective media IP for a zone, falling back to source IP.
+    fn zone_media_ip(&self, zone: Option<&str>, fallback: std::net::IpAddr) -> String {
+        if let (Some(name), Some(reg)) = (zone, &self.zone_registry) {
+            reg.media_ip(name)
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| fallback.to_string())
+        } else {
+            fallback.to_string()
+        }
     }
 
     /// Sets the CUCM router for CSS/Partition-based call routing.
@@ -541,7 +572,9 @@ impl SipStack {
     }
 
     /// Processes an incoming SIP message.
-    pub async fn process_message(&self, data: &Bytes, source: SbcSocketAddr) -> ProcessResult {
+    ///
+    /// `receiving_zone` is the zone name this message arrived on (if zones configured).
+    pub async fn process_message(&self, data: &Bytes, source: SbcSocketAddr, _receiving_zone: Option<&str>) -> ProcessResult {
         // Parse the SIP message
         let message = match SipMessage::parse(data) {
             Ok(msg) => msg,
@@ -2358,7 +2391,7 @@ mod tests {
 
         let source = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
         let result = stack
-            .process_message(&Bytes::from_static(options), source)
+            .process_message(&Bytes::from_static(options), source, None)
             .await;
 
         match result {
@@ -2390,7 +2423,7 @@ mod tests {
 
         let source = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
         let result = stack
-            .process_message(&Bytes::from_static(register), source)
+            .process_message(&Bytes::from_static(register), source, None)
             .await;
 
         match result {
@@ -2442,7 +2475,7 @@ mod tests {
 
         let source = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
         let result = stack
-            .process_message(&Bytes::from_static(register), source)
+            .process_message(&Bytes::from_static(register), source, None)
             .await;
 
         match result {
@@ -2477,7 +2510,7 @@ mod tests {
         let config = SipStackConfig::default();
         let stack = SipStack::new(config);
 
-        // INVITE to unresolvable host → should get 404
+        // INVITE to unresolvable host → should get 200 OK (announcement playback)
         let invite = b"INVITE sip:bob@nonexistent.invalid SIP/2.0\r\n\
             Via: SIP/2.0/UDP client.example.com:5060;branch=z9hG4bK776\r\n\
             From: <sip:alice@example.com>;tag=1234\r\n\
@@ -2490,16 +2523,18 @@ mod tests {
 
         let source = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
         let result = stack
-            .process_message(&Bytes::from_static(invite), source)
+            .process_message(&Bytes::from_static(invite), source, None)
             .await;
 
+        // Unresolvable destinations now get a 200 OK with announcement SDP
         match result {
             ProcessResult::Response { message, .. } => {
                 if let SipMessage::Response(resp) = message {
-                    assert_eq!(resp.status.code(), 404, "Unresolvable destination should return 404");
+                    assert_eq!(resp.status.code(), 200, "Unresolvable destination should return 200 OK (announcement)");
+                    assert!(resp.body.is_some(), "Should have SDP body for announcement");
                 }
             }
-            _ => panic!("Expected 404 response"),
+            _ => panic!("Expected 200 OK response with announcement"),
         }
     }
 
@@ -2522,7 +2557,7 @@ mod tests {
 
         let source = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
         let result = stack
-            .process_message(&Bytes::from_static(register), source)
+            .process_message(&Bytes::from_static(register), source, None)
             .await;
         // Verify registration succeeded
         if let ProcessResult::Response { message, .. } = &result {
@@ -2547,7 +2582,7 @@ mod tests {
             5060,
         );
         let result = stack
-            .process_message(&Bytes::from_static(invite), alice_source)
+            .process_message(&Bytes::from_static(invite), alice_source, None)
             .await;
 
         // Should get Multiple(100 Trying + Forward INVITE)
@@ -2612,7 +2647,7 @@ mod tests {
             Content-Length: 0\r\n\
             \r\n";
         let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
-        stack.process_message(&Bytes::from_static(register), src).await;
+        stack.process_message(&Bytes::from_static(register), src, None).await;
 
         // INVITE bob from alice
         let invite = b"INVITE sip:bob@sbc.local SIP/2.0\r\n\
@@ -2625,7 +2660,7 @@ mod tests {
             Content-Length: 0\r\n\
             \r\n";
         let alice = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 168, 1, 1), 5060);
-        stack.process_message(&Bytes::from_static(invite), alice).await;
+        stack.process_message(&Bytes::from_static(invite), alice, None).await;
         assert_eq!(stack.call_count().await, 1);
 
         // BYE from alice (A-leg)
@@ -2637,7 +2672,7 @@ mod tests {
             CSeq: 2 BYE\r\n\
             Content-Length: 0\r\n\
             \r\n";
-        let result = stack.process_message(&Bytes::from_static(bye), alice).await;
+        let result = stack.process_message(&Bytes::from_static(bye), alice, None).await;
 
         // Should get Multiple(200 OK to alice + BYE to bob)
         match result {
@@ -2678,7 +2713,7 @@ mod tests {
             Content-Length: 0\r\n\
             \r\n";
         let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
-        stack.process_message(&Bytes::from_static(register), src).await;
+        stack.process_message(&Bytes::from_static(register), src, None).await;
 
         // INVITE bob
         let invite = b"INVITE sip:bob@sbc.local SIP/2.0\r\n\
@@ -2691,7 +2726,7 @@ mod tests {
             Content-Length: 0\r\n\
             \r\n";
         let alice = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 168, 1, 1), 5060);
-        stack.process_message(&Bytes::from_static(invite), alice).await;
+        stack.process_message(&Bytes::from_static(invite), alice, None).await;
         assert_eq!(stack.call_count().await, 1);
 
         // CANCEL from alice before bob answers
@@ -2703,7 +2738,7 @@ mod tests {
             CSeq: 1 CANCEL\r\n\
             Content-Length: 0\r\n\
             \r\n";
-        let result = stack.process_message(&Bytes::from_static(cancel), alice).await;
+        let result = stack.process_message(&Bytes::from_static(cancel), alice, None).await;
 
         // Should get Multiple(200 OK for CANCEL + 487 for INVITE + CANCEL to bob)
         match result {
@@ -2756,7 +2791,7 @@ mod tests {
             Content-Length: 0\r\n\
             \r\n";
         let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
-        stack.process_message(&Bytes::from_static(register), src).await;
+        stack.process_message(&Bytes::from_static(register), src, None).await;
 
         // Verify registration query
         let regs = stack.list_registrations().await;
@@ -2789,7 +2824,7 @@ mod tests {
             Content-Length: 0\r\n\
             \r\n";
         let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 168, 1, 1), 5060);
-        let result = stack.process_message(&Bytes::from_static(bye), src).await;
+        let result = stack.process_message(&Bytes::from_static(bye), src, None).await;
 
         match result {
             ProcessResult::Response { message, .. } => {

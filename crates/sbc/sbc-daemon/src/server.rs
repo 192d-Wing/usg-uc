@@ -449,7 +449,7 @@ impl Server {
                             );
 
                             // Process through SIP stack
-                            let result = sip_stack.process_message(&msg.data, msg.source).await;
+                            let result = sip_stack.process_message(&msg.data, msg.source, zone_name.as_deref()).await;
 
                             // Handle the processing result
                             Self::handle_result(result, &transport, &stats).await;
