@@ -1052,9 +1052,22 @@ impl SipStack {
                     // Remove existing bindings for this AOR and re-add current ones
                     let _ = loc.remove_all_bindings(&aor);
                     for binding in &reg_response.contacts {
+                        // If Contact has 0.0.0.0, substitute the actual source IP
+                        // so the SBC can route calls back to the phone
+                        let contact = binding.contact_uri();
+                        let fixed_contact = if contact.contains("0.0.0.0") {
+                            let src_ip = match source.ip() {
+                                std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped()
+                                    .map_or_else(|| v6.to_string(), |v4| v4.to_string()),
+                                std::net::IpAddr::V4(v4) => v4.to_string(),
+                            };
+                            contact.replace("0.0.0.0", &src_ip)
+                        } else {
+                            contact.to_string()
+                        };
                         let new_binding = proto_registrar::Binding::new(
                             &aor,
-                            binding.contact_uri(),
+                            &fixed_contact,
                             &call_id,
                             cseq,
                         );
