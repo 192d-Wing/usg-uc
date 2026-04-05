@@ -93,8 +93,11 @@ impl Default for ApiServerConfig {
     }
 }
 
+/// Persistence path for trunk group configuration.
+const TRUNK_GROUPS_PATH: &str = "/var/lib/sbc/trunk_groups.json";
+
 /// In-memory store for management objects.
-/// Persists within a running SBC session — restart clears data.
+/// Trunk groups are persisted to disk on changes.
 #[derive(Default)]
 pub struct MemStore {
     /// Phones indexed by ID.
@@ -103,6 +106,55 @@ pub struct MemStore {
     pub directory_numbers: std::collections::HashMap<String, serde_json::Value>,
     /// Trunk groups (route groups) indexed by ID.
     pub trunk_groups: std::collections::HashMap<String, serde_json::Value>,
+}
+
+impl MemStore {
+    /// Loads persisted trunk groups from disk.
+    pub fn load_trunk_groups() -> std::collections::HashMap<String, serde_json::Value> {
+        let path = std::path::Path::new(TRUNK_GROUPS_PATH);
+        if !path.exists() {
+            return std::collections::HashMap::new();
+        }
+        match std::fs::read_to_string(path) {
+            Ok(data) => {
+                match serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(&data) {
+                    Ok(groups) => {
+                        tracing::info!(count = groups.len(), "Loaded persisted trunk groups from {}", TRUNK_GROUPS_PATH);
+                        groups
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to parse {}, starting fresh", TRUNK_GROUPS_PATH);
+                        std::collections::HashMap::new()
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to read {}", TRUNK_GROUPS_PATH);
+                std::collections::HashMap::new()
+            }
+        }
+    }
+
+    /// Persists trunk groups to disk (atomic write via temp file + rename).
+    pub fn save_trunk_groups(&self) {
+        let data = match serde_json::to_string_pretty(&self.trunk_groups) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to serialize trunk groups");
+                return;
+            }
+        };
+        let tmp_path = format!("{TRUNK_GROUPS_PATH}.tmp");
+        if let Err(e) = std::fs::write(&tmp_path, &data) {
+            tracing::warn!(error = %e, "Failed to write {tmp_path}");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, TRUNK_GROUPS_PATH) {
+            tracing::warn!(error = %e, "Failed to rename {tmp_path} to {TRUNK_GROUPS_PATH}");
+            return;
+        }
+        tracing::debug!(count = self.trunk_groups.len(), "Persisted trunk groups to {TRUNK_GROUPS_PATH}");
+    }
 }
 
 /// Shared application state for the API server.
@@ -888,11 +940,11 @@ async fn get_dial_plan_entries(
 
 /// Add a dial plan entry.
 async fn add_dial_plan_entry(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     axum::extract::Path(plan_id): axum::extract::Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    // TODO: Add entry to router's active dial plan
+    sync_dial_plan_to_router(&state, &plan_id, &[body.clone()]).await;
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
@@ -905,10 +957,16 @@ async fn add_dial_plan_entry(
 
 /// Delete a dial plan entry.
 async fn delete_dial_plan_entry(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     axum::extract::Path((plan_id, entry_id)): axum::extract::Path<(String, String)>,
 ) -> impl IntoResponse {
-    // TODO: Remove entry from router's dial plan
+    // Remove by rebuilding the plan without this entry
+    if let Some(ref sip_stack) = state.sip_stack {
+        if let Some(router_lock) = sip_stack.router() {
+            let mut router = router_lock.write().await;
+            router.remove_dial_plan(&plan_id);
+        }
+    }
     Json(serde_json::json!({
         "success": true,
         "plan_id": plan_id,
@@ -952,13 +1010,18 @@ async fn add_trunk_group(
     if body.get("trunks").is_none() {
         body["trunks"] = serde_json::json!([]);
     }
-    state.mem_store.write().await.trunk_groups.insert(id.clone(), body.clone());
-    // Also add to CUCM router if available
+    let mut store = state.mem_store.write().await;
+    store.trunk_groups.insert(id.clone(), body.clone());
+    store.save_trunk_groups();
+    drop(store);
+    // Sync to CUCM router
     if let Some(ref cucm) = state.cucm_router {
         let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(&id);
         let group = uc_routing::TrunkGroup::new(&id, name);
         cucm.write().await.add_route_group(group);
     }
+    // Sync to SIP stack router
+    sync_trunk_group_to_router(&state, &body).await;
     (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "trunk_group": body })))
 }
 
@@ -967,9 +1030,15 @@ async fn delete_trunk_group(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(group_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    state.mem_store.write().await.trunk_groups.remove(&group_id);
+    let mut store = state.mem_store.write().await;
+    store.trunk_groups.remove(&group_id);
+    store.save_trunk_groups();
+    drop(store);
     if let Some(ref cucm) = state.cucm_router {
         cucm.write().await.remove_route_group(&group_id);
+    }
+    if let Some(ref sip_stack) = state.sip_stack {
+        sip_stack.remove_trunk_group_from_router(&group_id).await;
     }
     Json(serde_json::json!({ "success": true, "group_id": group_id }))
 }
@@ -981,7 +1050,11 @@ async fn update_trunk_group(
     Json(mut body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     body["id"] = serde_json::json!(group_id);
-    state.mem_store.write().await.trunk_groups.insert(group_id.clone(), body.clone());
+    let mut store = state.mem_store.write().await;
+    store.trunk_groups.insert(group_id.clone(), body.clone());
+    store.save_trunk_groups();
+    drop(store);
+    sync_trunk_group_to_router(&state, &body).await;
     Json(serde_json::json!({ "success": true, "trunk_group": body }))
 }
 
@@ -996,8 +1069,13 @@ async fn add_trunk(
         if let Some(trunks) = group.get_mut("trunks").and_then(|v| v.as_array_mut()) {
             trunks.push(body.clone());
         }
+        store.save_trunk_groups();
+        let group_json = store.trunk_groups.get(&group_id).cloned();
         drop(store);
         start_trunk_services(&state, &body);
+        if let Some(gj) = group_json {
+            sync_trunk_group_to_router(&state, &gj).await;
+        }
         (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "trunk": body })))
     } else {
         (StatusCode::NOT_FOUND, Json(serde_json::json!({ "success": false, "error": "Group not found" })))
@@ -1036,7 +1114,7 @@ async fn update_trunk(
 }
 
 /// Start OPTIONS monitoring and/or SIP registration for a trunk if enabled.
-fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
+pub fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
     let trunk_id = trunk.get("id").and_then(|v| v.as_str()).unwrap_or_default();
     let host = trunk.get("host").and_then(|v| v.as_str()).unwrap_or_default();
     let port = trunk.get("port").and_then(|v| v.as_u64()).unwrap_or(5060) as u16;
@@ -1098,6 +1176,65 @@ fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
             }
         }
     }
+}
+
+/// Syncs a trunk group from MemStore JSON to the SipStack router.
+pub async fn sync_trunk_group_to_router(state: &Arc<AppState>, group_json: &serde_json::Value) {
+    let Some(ref sip_stack) = state.sip_stack else { return };
+    let id = group_json.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+    let name = group_json.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+    if id.is_empty() { return; }
+
+    let mut group = uc_routing::TrunkGroup::new(id, name);
+
+    if let Some(trunks) = group_json.get("trunks").and_then(|v| v.as_array()) {
+        for t in trunks {
+            let trunk_id = t.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let host = t.get("host").and_then(|v| v.as_str()).unwrap_or_default();
+            let port = t.get("port").and_then(|v| v.as_u64()).unwrap_or(5060) as u16;
+            if trunk_id.is_empty() || host.is_empty() { continue; }
+
+            let trunk_config = uc_routing::TrunkConfig {
+                id: trunk_id.to_string(),
+                name: trunk_id.to_string(),
+                host: host.to_string(),
+                port,
+                protocol: uc_routing::TrunkProtocol::Udp,
+                priority: t.get("priority").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
+                weight: t.get("weight").and_then(|v| v.as_u64()).unwrap_or(100) as u32,
+                max_calls: t.get("max_calls").and_then(|v| v.as_u64()).unwrap_or(100) as u32,
+                cooldown_secs: t.get("cooldown_seconds").and_then(|v| v.as_u64()).unwrap_or(30) as u64,
+                max_failures: t.get("max_failures").and_then(|v| v.as_u64()).unwrap_or(5) as u32,
+                outbound_enabled: true,
+                inbound_enabled: true,
+            };
+            group.add_trunk(uc_routing::Trunk::new(trunk_config));
+        }
+    }
+
+    sip_stack.add_trunk_group_to_router(group).await;
+    tracing::info!(trunk_group = id, "Synced trunk group to SIP stack router");
+}
+
+/// Syncs a dial plan entry to the SipStack router.
+pub async fn sync_dial_plan_to_router(state: &Arc<AppState>, plan_id: &str, entries: &[serde_json::Value]) {
+    let Some(ref sip_stack) = state.sip_stack else { return };
+
+    let mut plan = uc_routing::DialPlan::new(plan_id, plan_id);
+    for (idx, entry) in entries.iter().enumerate() {
+        let trunk_group = entry.get("trunk_group_id").and_then(|v| v.as_str()).unwrap_or_default();
+        let _pattern_value = entry.get("pattern").and_then(|v| v.as_str()).unwrap_or(".*");
+        let priority = entry.get("priority").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+
+        let pattern = uc_routing::DialPattern::Any;
+        let entry_id = format!("{plan_id}-{idx}");
+        let dp_entry = uc_routing::DialPlanEntry::new(entry_id, pattern, trunk_group)
+            .with_priority(priority);
+        plan.add_entry(dp_entry);
+    }
+
+    sip_stack.add_dial_plan_to_router(plan).await;
+    tracing::info!(plan_id, entries = entries.len(), "Synced dial plan to SIP stack router");
 }
 
 /// Delete a trunk from a group.

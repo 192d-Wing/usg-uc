@@ -81,6 +81,11 @@ spec:
               ip route add default via "$LAN_GATEWAY" table 100
               echo "Policy route: ${LAN_SUBNET} → gw ${LAN_GATEWAY} (table 100)"
               echo "Default route: eth0 → gw ${ETH0_GW} (main table)"
+              # Ensure data directory is writable by the SBC user (UID 1000)
+              chown -R 1000:1000 /var/lib/sbc 2>/dev/null || true
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/sbc
       containers:
         - name: sbc
           image: sbc-daemon:local
@@ -152,6 +157,8 @@ spec:
           configMap:
             name: sbc-config
         - name: data
-          emptyDir: {}
+          hostPath:
+            path: /var/lib/sbc
+            type: DirectoryOrCreate
         - name: logs
           emptyDir: {}

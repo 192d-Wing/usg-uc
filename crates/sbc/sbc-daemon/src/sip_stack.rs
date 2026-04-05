@@ -1901,6 +1901,42 @@ impl SipStack {
         self.router.as_ref()
     }
 
+    /// Ensures a Router exists on the SipStack, creating a default one if needed.
+    pub async fn ensure_router(&mut self) {
+        if self.router.is_none() {
+            let config = RouterConfig {
+                use_dial_plan: true,
+                max_failover_attempts: 3,
+                default_trunk_group: None,
+            };
+            self.router = Some(RwLock::new(Router::new(config)));
+        }
+    }
+
+    /// Adds or replaces a trunk group in the router.
+    pub async fn add_trunk_group_to_router(&self, group: TrunkGroup) {
+        if let Some(ref router_lock) = self.router {
+            let mut router = router_lock.write().await;
+            router.add_trunk_group(group);
+        }
+    }
+
+    /// Removes a trunk group from the router.
+    pub async fn remove_trunk_group_from_router(&self, id: &str) {
+        if let Some(ref router_lock) = self.router {
+            let mut router = router_lock.write().await;
+            router.remove_trunk_group(id);
+        }
+    }
+
+    /// Adds or replaces a dial plan in the router.
+    pub async fn add_dial_plan_to_router(&self, plan: DialPlan) {
+        if let Some(ref router_lock) = self.router {
+            let mut router = router_lock.write().await;
+            router.add_dial_plan(plan);
+        }
+    }
+
     /// Answers a call, plays an announcement via RTP, then sends BYE.
     ///
     /// Flow:

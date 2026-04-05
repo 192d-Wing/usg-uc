@@ -420,7 +420,36 @@ impl Runtime {
             }
         }
 
+        // Load persisted trunk groups and replay them into the router + registrar
+        {
+            let persisted = crate::api_server::MemStore::load_trunk_groups();
+            if !persisted.is_empty() {
+                let mut store = app_state.mem_store.write().await;
+                store.trunk_groups = persisted;
+                drop(store);
+            }
+        }
+
         let app_state = Arc::new(app_state);
+
+        // Replay persisted trunk groups: sync to router and start services
+        {
+            let store = app_state.mem_store.read().await;
+            let groups: Vec<_> = store.trunk_groups.values().cloned().collect();
+            drop(store);
+            for group_json in &groups {
+                crate::api_server::sync_trunk_group_to_router(&app_state, group_json).await;
+                if let Some(trunks) = group_json.get("trunks").and_then(|v| v.as_array()) {
+                    for trunk in trunks {
+                        crate::api_server::start_trunk_services(&app_state, trunk);
+                    }
+                }
+            }
+            if !groups.is_empty() {
+                info!(count = groups.len(), "Replayed persisted trunk groups");
+            }
+        }
+
         let api_server = ApiServer::new(api_config, app_state.clone(), signal.clone());
 
         // Spawn API server task

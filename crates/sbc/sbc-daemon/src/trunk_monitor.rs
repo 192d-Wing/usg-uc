@@ -230,13 +230,27 @@ impl TrunkMonitor {
             })
             .map_err(|e| format!("Cannot resolve {addr_str}: {e}"))?;
 
-        // Bind local UDP socket (to zone IP if configured)
-        let bind_addr = bind_ip
-            .map(|ip| std::net::SocketAddr::new(ip, 0))
-            .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap_or_else(|_| std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)));
-        let socket = UdpSocket::bind(bind_addr)
-            .await
-            .map_err(|e| format!("Bind failed: {e}"))?;
+        // Bind to zone IP on port 5060 (matching the SIP listener) so the
+        // OPTIONS goes out the correct interface and the response comes back.
+        let socket = if let Some(ip) = bind_ip {
+            let bind_addr = std::net::SocketAddr::new(ip, 5060);
+            let sock2 = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            ).map_err(|e| format!("Socket create failed: {e}"))?;
+            sock2.set_reuse_address(true).ok();
+            #[cfg(target_os = "linux")]
+            sock2.set_reuse_port(true).ok();
+            sock2.set_nonblocking(true).map_err(|e| format!("Set nonblocking failed: {e}"))?;
+            sock2.bind(&bind_addr.into()).map_err(|e| format!("Bind to {bind_addr} failed: {e}"))?;
+            UdpSocket::from_std(sock2.into())
+                .map_err(|e| format!("Convert to tokio socket failed: {e}"))?
+        } else {
+            UdpSocket::bind("0.0.0.0:0")
+                .await
+                .map_err(|e| format!("Bind failed: {e}"))?
+        };
 
         // Build OPTIONS request
         let uri = SipUri::new(host).with_port(port);
