@@ -83,6 +83,16 @@ import { MatSlideToggleModule } from '@angular/material/slide-toggle';
         <mat-hint>Domain for SIP registration (e.g., sip.carrier.com)</mat-hint>
       </mat-form-field>
 
+      <mat-form-field appearance="outline" class="full-width">
+        <mat-label>Zone</mat-label>
+        <mat-select [(ngModel)]="form.zone">
+          <mat-option value="outside">Outside (trunks/carriers)</mat-option>
+          <mat-option value="inside">Inside (internal)</mat-option>
+          <mat-option value="oobm">OOBM (management)</mat-option>
+        </mat-select>
+        <mat-hint>Network interface for signaling and media</mat-hint>
+      </mat-form-field>
+
       <div class="toggle-row">
         <mat-slide-toggle [(ngModel)]="form.options_ping_enabled">
           SIP OPTIONS Ping
@@ -104,6 +114,14 @@ import { MatSlideToggleModule } from '@angular/material/slide-toggle';
         </mat-slide-toggle>
         <span class="toggle-hint">Register the SBC as a subscriber to this trunk</span>
       </div>
+
+      @if (form.register_enabled) {
+        <mat-form-field appearance="outline" class="full-width">
+          <mat-label>Registration Interval (seconds)</mat-label>
+          <input matInput type="number" [(ngModel)]="form.register_expires" min="10" max="3600" />
+          <mat-hint>How often to re-register (default 25s for BulkVS)</mat-hint>
+        </mat-form-field>
+      }
     </mat-dialog-content>
     <mat-dialog-actions align="end">
       <button mat-button mat-dialog-close>Cancel</button>
@@ -136,9 +154,11 @@ export class TrunkDialogComponent implements OnInit {
     sip_username: '',
     sip_password: '',
     sip_domain: '',
+    zone: 'outside',
     options_ping_enabled: false,
     options_ping_interval: 30,
     register_enabled: false,
+    register_expires: 25,
   };
 
   ngOnInit(): void {
@@ -157,9 +177,11 @@ export class TrunkDialogComponent implements OnInit {
         sip_username: this.data.sip_username ?? '',
         sip_password: this.data.sip_password ?? '',
         sip_domain: this.data.sip_domain ?? '',
+        zone: this.data.zone ?? 'outside',
         options_ping_enabled: this.data.options_ping_enabled ?? false,
         options_ping_interval: this.data.options_ping_interval ?? 30,
         register_enabled: this.data.register_enabled ?? false,
+        register_expires: this.data.register_expires ?? 25,
       };
     }
   }

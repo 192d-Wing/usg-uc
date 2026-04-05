@@ -119,35 +119,8 @@ for NODE in $(kind get nodes --name "$CLUSTER_NAME"); do
 done
 ok "CNI plugins installed"
 
-info "Starting CNI DHCP daemon on kind node(s)..."
-for NODE in $(kind get nodes --name "$CLUSTER_NAME"); do
-    docker exec "$NODE" sh -c '
-        # Kill any stale DHCP daemon and clean up
-        killall -9 dhcp 2>/dev/null || true
-        sleep 1
-        rm -f /run/cni/dhcp.sock
-        rm -rf /var/lib/cni/dhcp 2>/dev/null || true
-        mkdir -p /run/cni
-
-        /opt/cni/bin/dhcp daemon > /var/log/cni-dhcp.log 2>&1 &
-        DHCP_PID=$!
-
-        # Wait for the socket and verify the process is still alive
-        for i in 1 2 3 4 5 6 7 8 9 10; do
-            [ -S /run/cni/dhcp.sock ] && break
-            sleep 0.5
-        done
-
-        if [ -S /run/cni/dhcp.sock ] && kill -0 $DHCP_PID 2>/dev/null; then
-            echo "DHCP daemon ready (PID $DHCP_PID)"
-        else
-            echo "DHCP daemon failed to start"
-            cat /var/log/cni-dhcp.log 2>/dev/null
-            exit 1
-        fi
-    '
-done
-ok "CNI DHCP daemon started"
+# Static IPs via host-local IPAM — no DHCP daemon needed
+ok "Using static IPs for macvlan interfaces (no DHCP daemon required)"
 
 info "Installing Multus CNI..."
 kubectl apply -f https://raw.githubusercontent.com/k8snetworkplumbingwg/multus-cni/master/deployments/multus-daemonset-thick.yml
@@ -252,34 +225,26 @@ echo "Services:"
 kubectl -n sbc-system get svc
 echo ""
 
-SBC_POD=$(kubectl -n sbc-system get pod -l app.kubernetes.io/name=sbc -o name 2>/dev/null | head -1)
-if [ -n "$SBC_POD" ]; then
-    POD_STATUS=$(kubectl -n sbc-system get "$SBC_POD" -o jsonpath='{.metadata.annotations.k8s\.v1\.cni\.cncf\.io/network-status}' 2>/dev/null)
-    echo "Macvlan IPs (DHCP-assigned):"
-    echo "$POD_STATUS" | python3 -c "
-import sys,json
-for net in json.load(sys.stdin):
-    if net.get('interface','').startswith('net'):
-        ips = ', '.join(net.get('ips', ['pending']))
-        print(f\"  {net['name'].split('/')[-1]:12s} ({net['interface']}): {ips}\")
-" 2>/dev/null || echo "  (waiting for DHCP leases...)"
-    echo ""
-fi
-
-echo "Host access (via Kind extraPortMappings):"
-echo "  SIP (UDP/TCP):  localhost:5060"
-echo "  SIP TLS:        localhost:5061"
-echo "  OOBM API:       http://localhost:8080"
-echo "  Metrics:        http://localhost:9090"
+echo "Zone IPs (static):"
+echo "  inside  (net1):  192.168.0.240  — SIP phones"
+echo "  outside (net2):  192.168.0.241  — SIP trunks, RTP media"
+echo "  oobm    (net3):  192.168.0.242  — Dashboard, API, metrics"
 echo ""
 
-echo "LAN access (macvlan DHCP — from other devices on the LAN):"
-echo "  Use the DHCP IPs shown above for direct pod access."
-echo "  Media (RTP) flows via the outside macvlan interface directly."
+echo "Access:"
+echo "  Dashboard:      http://192.168.0.242:8080"
+echo "  SIP (inside):   192.168.0.240:5060"
+echo "  SIP (outside):  192.168.0.241:5060"
+echo "  API:            http://localhost:8080  (via port mapping)"
+echo ""
+
+echo "Router port forward (for inbound calls from SIP trunks):"
+echo "  UDP 5060        → 192.168.0.241"
+echo "  UDP 16384-20000 → 192.168.0.241"
 echo ""
 
 echo "Quick test:"
-echo "  curl http://localhost:8080/api/v1/system/health"
+echo "  curl http://192.168.0.242:8080/api/v1/system/health"
 echo ""
 
 echo "Logs:"

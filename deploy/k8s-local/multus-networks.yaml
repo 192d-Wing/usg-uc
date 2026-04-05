@@ -1,5 +1,7 @@
 # Multus NetworkAttachmentDefinitions — three additional interfaces per SBC pod
-# Uses macvlan on the kind node's macvlan trunk with DHCP from the LAN
+# Uses macvlan on the Kind node's macvlan trunk with static IPs from the LAN.
+# Addresses are chosen from the upper end of the LAN subnet to avoid
+# conflicts with DHCP leases and other devices.
 ---
 apiVersion: "k8s.cni.cncf.io/v1"
 kind: NetworkAttachmentDefinition
@@ -14,7 +16,11 @@ spec:
       "master": "eth0",
       "mode": "bridge",
       "ipam": {
-        "type": "dhcp"
+        "type": "host-local",
+        "subnet": "192.168.0.0/24",
+        "rangeStart": "192.168.0.240",
+        "rangeEnd": "192.168.0.240",
+        "gateway": "192.168.0.1"
       }
     }
 ---
@@ -31,7 +37,11 @@ spec:
       "master": "eth0",
       "mode": "bridge",
       "ipam": {
-        "type": "dhcp"
+        "type": "host-local",
+        "subnet": "192.168.0.0/24",
+        "rangeStart": "192.168.0.241",
+        "rangeEnd": "192.168.0.241",
+        "gateway": "192.168.0.1"
       }
     }
 ---
@@ -48,6 +58,10 @@ spec:
       "master": "eth0",
       "mode": "bridge",
       "ipam": {
-        "type": "dhcp"
+        "type": "host-local",
+        "subnet": "192.168.0.0/24",
+        "rangeStart": "192.168.0.242",
+        "rangeEnd": "192.168.0.242",
+        "gateway": "192.168.0.1"
       }
     }
