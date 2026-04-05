@@ -1,0 +1,226 @@
+---
+# USG SBC Configuration Playbook
+#
+# Configures the SBC via its REST API:
+#   - Partitions and Calling Search Spaces
+#   - Route patterns for inbound call routing
+#   - Trunk groups with SIP registration
+#   - Directory number (DID) to user mappings
+#   - SIP users with digest authentication
+#
+# Usage:
+#   ansible-playbook -i inventory.yml configure-sbc.yml
+#   ansible-playbook -i inventory.yml configure-sbc.yml -e sbc_api_url=http://localhost:8080/api/v1
+#   ansible-playbook -i inventory.yml configure-sbc.yml --tags trunks
+#   ansible-playbook -i inventory.yml configure-sbc.yml --tags users
+
+- name: Configure USG SBC
+  hosts: sbc
+  gather_facts: false
+
+  vars:
+    sbc_api_url: "http://192.168.0.242:8080/api/v1"
+
+    # ── Partitions ──────────────────────────────────────
+    partitions:
+      - id: pt-inbound
+        name: Inbound Partition
+
+    # ── Calling Search Spaces ───────────────────────────
+    calling_search_spaces:
+      - id: css-bulkvs
+        name: BulkVS Inbound
+        partitions:
+          - pt-inbound
+
+    # ── Route Patterns ──────────────────────────────────
+    route_patterns:
+      - id: rp-main-line
+        pattern: "+12139160002"
+        pattern_type: exact
+        partition_id: pt-inbound
+        description: Main DID to jwillman
+
+    # ── Trunk Groups ────────────────────────────────────
+    trunk_groups:
+      - id: rg-bulkvs
+        name: BulkVS
+        strategy: priority
+        css_id: css-bulkvs
+        trunks:
+          - id: bulkvs
+            host: sip.bulkvs.com
+            port: 5060
+            protocol: udp
+            priority: 1
+            weight: 100
+            max_calls: 100
+            zone: outside
+            register_enabled: true
+            register_expires: 25
+            sip_username: "611956_test"
+            sip_password: "ciscocisco12-"
+            sip_domain: sip.bulkvs.com
+            options_ping_enabled: true
+            options_ping_interval: 30
+
+    # ── Directory Numbers (DID → User) ──────────────────
+    directory_numbers:
+      - did: "+12139160002"
+        user: jwillman
+        description: Main line
+
+    # ── Users ───────────────────────────────────────────
+    users:
+      - username: jwillman
+        password: "changeme"
+        sip_domain: sbc-local
+        display_name: John Willman
+        auth_type: digest
+
+  tasks:
+    # ── Wait for SBC API ────────────────────────────────
+    - name: Wait for SBC API to be ready
+      ansible.builtin.uri:
+        url: "{{ sbc_api_url }}/system/health"
+        method: GET
+        status_code: 200
+      register: health
+      retries: 30
+      delay: 5
+      until: health.status == 200
+      tags: [always]
+
+    - name: Show SBC status
+      ansible.builtin.debug:
+        msg: "SBC {{ health.json.status }} (v{{ health.json.version }}, uptime {{ health.json.uptime_secs }}s)"
+      tags: [always]
+
+    # ── Partitions ──────────────────────────────────────
+    - name: Create partitions
+      ansible.builtin.uri:
+        url: "{{ sbc_api_url }}/partitions"
+        method: POST
+        body_format: json
+        body: "{{ item }}"
+        status_code: [200, 201]
+      loop: "{{ partitions }}"
+      loop_control:
+        label: "{{ item.id }}"
+      tags: [routing, partitions]
+
+    # ── Calling Search Spaces ───────────────────────────
+    - name: Create calling search spaces
+      ansible.builtin.uri:
+        url: "{{ sbc_api_url }}/css"
+        method: POST
+        body_format: json
+        body: "{{ item }}"
+        status_code: [200, 201]
+      loop: "{{ calling_search_spaces }}"
+      loop_control:
+        label: "{{ item.id }}"
+      tags: [routing, css]
+
+    # ── Route Patterns ──────────────────────────────────
+    - name: Create route patterns
+      ansible.builtin.uri:
+        url: "{{ sbc_api_url }}/routepatterns"
+        method: POST
+        body_format: json
+        body: "{{ item }}"
+        status_code: [200, 201]
+      loop: "{{ route_patterns }}"
+      loop_control:
+        label: "{{ item.id }}"
+      tags: [routing, routepatterns]
+
+    # ── Trunk Groups ────────────────────────────────────
+    - name: Create trunk groups
+      ansible.builtin.uri:
+        url: "{{ sbc_api_url }}/trunkgroups"
+        method: POST
+        body_format: json
+        body:
+          id: "{{ item.id }}"
+          name: "{{ item.name }}"
+          strategy: "{{ item.strategy | default('priority') }}"
+          css_id: "{{ item.css_id | default('') }}"
+          trunks: []
+        status_code: [200, 201]
+      loop: "{{ trunk_groups }}"
+      loop_control:
+        label: "{{ item.id }}"
+      tags: [trunks]
+
+    - name: Add trunks to groups
+      ansible.builtin.uri:
+        url: "{{ sbc_api_url }}/trunkgroups/{{ item.0.id }}/trunks"
+        method: POST
+        body_format: json
+        body: "{{ item.1 }}"
+        status_code: [200, 201]
+      loop: "{{ trunk_groups | subelements('trunks', skip_missing=True) }}"
+      loop_control:
+        label: "{{ item.0.id }}/{{ item.1.id }}"
+      tags: [trunks]
+
+    # ── Directory Numbers ───────────────────────────────
+    - name: Create directory number mappings
+      ansible.builtin.uri:
+        url: "{{ sbc_api_url }}/directory"
+        method: POST
+        body_format: json
+        body: "{{ item }}"
+        status_code: [200, 201]
+      loop: "{{ directory_numbers }}"
+      loop_control:
+        label: "{{ item.did }} → {{ item.user }}"
+      tags: [directory, did]
+
+    # ── Users ───────────────────────────────────────────
+    - name: Create SIP users
+      ansible.builtin.uri:
+        url: "{{ sbc_api_url }}/users"
+        method: POST
+        body_format: json
+        body: "{{ item }}"
+        status_code: [200, 201]
+      loop: "{{ users }}"
+      loop_control:
+        label: "{{ item.username }}"
+      tags: [users]
+
+    # ── Verify ──────────────────────────────────────────
+    - name: Verify trunk registration
+      ansible.builtin.uri:
+        url: "{{ sbc_api_url }}/trunk-registration"
+        method: GET
+      register: reg
+      tags: [verify]
+
+    - name: Show registration status
+      ansible.builtin.debug:
+        msg: >-
+          {% for r in reg.json.trunk_registrations %}
+          {{ r.trunk_id }}: {{ r.state }} ({{ r.registrar }})
+          {% endfor %}
+      when: reg.json.trunk_registrations | length > 0
+      tags: [verify]
+
+    - name: Verify trunk health
+      ansible.builtin.uri:
+        url: "{{ sbc_api_url }}/trunk-health"
+        method: GET
+      register: health_status
+      tags: [verify]
+
+    - name: Show health status
+      ansible.builtin.debug:
+        msg: >-
+          {% for h in health_status.json.trunk_health %}
+          {{ h.trunk_id }}: {{ 'UP' if h.reachable else 'DOWN' }}
+          ({{ h.uptime_pct | round(1) }}% uptime)
+          {% endfor %}
+      when: health_status.json.trunk_health | length > 0
+      tags: [verify]

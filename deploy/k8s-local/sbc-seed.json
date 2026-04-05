@@ -1,0 +1,55 @@
+{
+  "partitions": [
+    { "id": "pt-inbound", "name": "Inbound Partition" }
+  ],
+  "calling_search_spaces": [
+    { "id": "css-bulkvs", "name": "BulkVS Inbound", "partitions": ["pt-inbound"] }
+  ],
+  "route_patterns": [
+    {
+      "id": "rp-main-line",
+      "pattern": "+12139160002",
+      "pattern_type": "exact",
+      "partition_id": "pt-inbound",
+      "description": "Main DID to jwillman"
+    }
+  ],
+  "trunk_groups": [
+    {
+      "id": "rg-bulkvs",
+      "name": "BulkVS",
+      "strategy": "priority",
+      "css_id": "css-bulkvs",
+      "trunks": [
+        {
+          "id": "bulkvs",
+          "host": "sip.bulkvs.com",
+          "port": 5060,
+          "protocol": "udp",
+          "priority": 1,
+          "weight": 100,
+          "max_calls": 100,
+          "zone": "outside",
+          "register_enabled": true,
+          "register_expires": 25,
+          "sip_username": "611956_test",
+          "sip_password": "ciscocisco12-",
+          "sip_domain": "sip.bulkvs.com",
+          "options_ping_enabled": true,
+          "options_ping_interval": 30
+        }
+      ]
+    }
+  ],
+  "directory_numbers": [
+    { "did": "+12139160002", "user": "jwillman", "description": "Main line" }
+  ],
+  "users": [
+    {
+      "username": "jwillman",
+      "display_name": "John Willman",
+      "sip_domain": "sbc-local",
+      "auth_type": "digest"
+    }
+  ]
+}

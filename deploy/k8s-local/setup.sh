@@ -172,6 +172,12 @@ kubectl -n sbc-system create configmap sbc-network \
     --from-literal=lan_subnet="$LAN_SUBNET" \
     --from-literal=lan_gateway="$LAN_GATEWAY" \
     --dry-run=client -o yaml | kubectl apply -f -
+if [ -f "$SCRIPT_DIR/sbc-seed.json" ]; then
+    kubectl -n sbc-system create configmap sbc-seed \
+        --from-file=seed.json="$SCRIPT_DIR/sbc-seed.json" \
+        --dry-run=client -o yaml | kubectl apply -f -
+    ok "Seed config applied"
+fi
 ok "ConfigMaps applied"
 
 # ── Step 10: Deploy SBC DaemonSet ────────────────────────

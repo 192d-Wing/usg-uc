@@ -420,23 +420,114 @@ impl Runtime {
             }
         }
 
-        // Load persisted trunk groups and replay them into the router + registrar
+        // Load seed config (from ConfigMap) then persisted trunk groups (from hostPath).
+        // Seed provides baseline config; persisted data overrides/supplements it.
         {
+            let mut store = app_state.mem_store.write().await;
+
+            // Load seed config first (if present)
+            let seed_path = std::env::var("SBC_SEED_CONFIG")
+                .unwrap_or_else(|_| "/etc/sbc/seed.json".to_string());
+            if let Ok(seed_data) = std::fs::read_to_string(&seed_path) {
+                if let Ok(seed) = serde_json::from_str::<serde_json::Value>(&seed_data) {
+                    info!(path = %seed_path, "Loading seed configuration");
+
+                    // Seed trunk groups
+                    if let Some(groups) = seed.get("trunk_groups").and_then(|v| v.as_array()) {
+                        for g in groups {
+                            if let Some(id) = g.get("id").and_then(|v| v.as_str()) {
+                                store.trunk_groups.insert(id.to_string(), g.clone());
+                            }
+                        }
+                        info!(count = groups.len(), "Seeded trunk groups");
+                    }
+
+                    // Seed directory numbers
+                    if let Some(dns) = seed.get("directory_numbers").and_then(|v| v.as_array()) {
+                        for dn in dns {
+                            if let Some(did) = dn.get("did").and_then(|v| v.as_str()) {
+                                store.directory_numbers.insert(did.to_string(), dn.clone());
+                            }
+                        }
+                        info!(count = dns.len(), "Seeded directory numbers");
+                    }
+
+                    // Seed partitions, CSS, route patterns, route lists into CUCM router
+                    if let Some(ref cucm) = app_state.cucm_router {
+                        let mut cucm_w = cucm.write().await;
+                        if let Some(parts) = seed.get("partitions").and_then(|v| v.as_array()) {
+                            for p in parts {
+                                let id = p.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                                let name = p.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+                                cucm_w.add_partition(uc_routing::Partition::new(id, name));
+                            }
+                            info!(count = parts.len(), "Seeded partitions");
+                        }
+                        if let Some(csses) = seed.get("calling_search_spaces").and_then(|v| v.as_array()) {
+                            for c in csses {
+                                let id = c.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                                let name = c.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+                                let parts: Vec<String> = c.get("partitions")
+                                    .and_then(|v| v.as_array())
+                                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                                    .unwrap_or_default();
+                                let mut css = uc_routing::CallingSearchSpace::new(id, name);
+                                for p in &parts {
+                                    css.add_partition(p);
+                                }
+                                cucm_w.add_css(css);
+                            }
+                            info!(count = csses.len(), "Seeded calling search spaces");
+                        }
+                        if let Some(rps) = seed.get("route_patterns").and_then(|v| v.as_array()) {
+                            for rp in rps {
+                                let id = rp.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                                let partition = rp.get("partition_id").and_then(|v| v.as_str()).unwrap_or_default();
+                                let pattern_value = rp.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+                                let pattern_type = rp.get("pattern_type").and_then(|v| v.as_str()).unwrap_or("prefix");
+                                let pattern = match pattern_type {
+                                    "exact" => uc_routing::DialPattern::exact(pattern_value),
+                                    "wildcard" => uc_routing::DialPattern::wildcard(pattern_value),
+                                    "any" => uc_routing::DialPattern::Any,
+                                    _ => uc_routing::DialPattern::prefix(pattern_value),
+                                };
+                                let mut route_pattern = uc_routing::RoutePattern::new(id, pattern, partition);
+                                if let Some(desc) = rp.get("description").and_then(|v| v.as_str()) {
+                                    route_pattern = route_pattern.with_description(desc);
+                                }
+                                if let Some(rg) = rp.get("route_group_id").and_then(|v| v.as_str()) {
+                                    if !rg.is_empty() { route_pattern = route_pattern.with_route_group(rg); }
+                                }
+                                if let Some(rl) = rp.get("route_list_id").and_then(|v| v.as_str()) {
+                                    if !rl.is_empty() { route_pattern = route_pattern.with_route_list(rl); }
+                                }
+                                cucm_w.add_route_pattern(route_pattern);
+                            }
+                            info!(count = rps.len(), "Seeded route patterns");
+                        }
+                    }
+                }
+            }
+
+            // Load persisted trunk groups (overrides seed if same IDs)
             let persisted = crate::api_server::MemStore::load_trunk_groups();
             if !persisted.is_empty() {
-                let mut store = app_state.mem_store.write().await;
-                store.trunk_groups = persisted;
-                drop(store);
+                for (id, group) in persisted {
+                    store.trunk_groups.insert(id, group);
+                }
             }
+            drop(store);
         }
 
         let app_state = Arc::new(app_state);
 
-        // Replay persisted trunk groups: sync to router and start services
+        // Replay trunk groups and DID mappings: sync to router and start services
         {
             let store = app_state.mem_store.read().await;
             let groups: Vec<_> = store.trunk_groups.values().cloned().collect();
+            let dns: Vec<_> = store.directory_numbers.values().cloned().collect();
             drop(store);
+
             for group_json in &groups {
                 crate::api_server::sync_trunk_group_to_router(&app_state, group_json).await;
                 if let Some(trunks) = group_json.get("trunks").and_then(|v| v.as_array()) {
@@ -446,7 +537,21 @@ impl Runtime {
                 }
             }
             if !groups.is_empty() {
-                info!(count = groups.len(), "Replayed persisted trunk groups");
+                info!(count = groups.len(), "Replayed trunk groups");
+            }
+
+            // Sync DID mappings to SIP stack
+            for dn in &dns {
+                let did = dn.get("did").and_then(|v| v.as_str()).unwrap_or_default();
+                let user = dn.get("user").and_then(|v| v.as_str()).unwrap_or_default();
+                if !did.is_empty() && !user.is_empty() {
+                    if let Some(ref sip_stack) = app_state.sip_stack {
+                        sip_stack.add_did_mapping(did, user).await;
+                    }
+                }
+            }
+            if !dns.is_empty() {
+                info!(count = dns.len(), "Replayed DID mappings");
             }
         }
 

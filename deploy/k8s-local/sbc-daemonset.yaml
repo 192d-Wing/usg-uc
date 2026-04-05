@@ -135,7 +135,12 @@ spec:
               memory: 2Gi
           volumeMounts:
             - name: config
-              mountPath: /etc/sbc
+              mountPath: /etc/sbc/config.toml
+              subPath: config.toml
+              readOnly: true
+            - name: seed
+              mountPath: /etc/sbc/seed.json
+              subPath: seed.json
               readOnly: true
             - name: data
               mountPath: /var/lib/sbc
@@ -145,6 +150,10 @@ spec:
         - name: config
           configMap:
             name: sbc-config
+        - name: seed
+          configMap:
+            name: sbc-seed
+            optional: true
         - name: data
           hostPath:
             path: /var/lib/sbc
