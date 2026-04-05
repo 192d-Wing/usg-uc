@@ -1,10 +1,11 @@
-import { Component, inject, OnInit } from '@angular/core';
+import { Component, inject, OnInit, signal } from '@angular/core';
 import { MAT_DIALOG_DATA, MatDialogRef, MatDialogModule } from '@angular/material/dialog';
 import { MatFormFieldModule } from '@angular/material/form-field';
 import { MatInputModule } from '@angular/material/input';
 import { MatSelectModule } from '@angular/material/select';
 import { MatButtonModule } from '@angular/material/button';
 import { FormsModule } from '@angular/forms';
+import { ApiService } from '../../services/api.service';
 
 @Component({
   selector: 'app-trunkgroup-dialog',
@@ -37,6 +38,17 @@ import { FormsModule } from '@angular/forms';
           <mat-option value="best_success_rate">Best Success Rate</mat-option>
         </mat-select>
       </mat-form-field>
+
+      <mat-form-field appearance="outline" class="full-width">
+        <mat-label>Calling Search Space (Inbound)</mat-label>
+        <mat-select [(ngModel)]="form.css_id">
+          <mat-option [value]="''">None</mat-option>
+          @for (css of cssList(); track css.id) {
+            <mat-option [value]="css.id">{{ css.name || css.id }}</mat-option>
+          }
+        </mat-select>
+        <mat-hint>CSS used to route inbound calls from this trunk group</mat-hint>
+      </mat-form-field>
     </mat-dialog-content>
     <mat-dialog-actions align="end">
       <button mat-button mat-dialog-close>Cancel</button>
@@ -51,21 +63,31 @@ import { FormsModule } from '@angular/forms';
 export class TrunkgroupDialogComponent implements OnInit {
   private readonly dialogRef = inject(MatDialogRef<TrunkgroupDialogComponent>);
   private readonly data: any = inject(MAT_DIALOG_DATA, { optional: true });
+  private readonly api = inject(ApiService);
 
   isEdit = false;
+  readonly cssList = signal<any[]>([]);
   form = {
     id: '',
     name: '',
     strategy: 'priority',
+    css_id: '',
   };
 
   ngOnInit(): void {
+    // Load available CSS options
+    this.api.getCss().subscribe({
+      next: (list) => this.cssList.set(list),
+      error: () => {},
+    });
+
     if (this.data) {
       this.isEdit = true;
       this.form = {
         id: this.data.id || '',
         name: this.data.name || '',
         strategy: this.data.strategy || 'priority',
+        css_id: this.data.css_id || '',
       };
     }
   }

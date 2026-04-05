@@ -1213,7 +1213,24 @@ pub async fn sync_trunk_group_to_router(state: &Arc<AppState>, group_json: &serd
     }
 
     sip_stack.add_trunk_group_to_router(group).await;
-    tracing::info!(trunk_group = id, "Synced trunk group to SIP stack router");
+
+    // Register inbound trunk mapping (source IP → trunk group + CSS)
+    let css_id = group_json.get("css_id").and_then(|v| v.as_str());
+    let hosts: Vec<(String, u16)> = group_json.get("trunks")
+        .and_then(|v| v.as_array())
+        .map(|trunks| {
+            trunks.iter().filter_map(|t| {
+                let h = t.get("host").and_then(|v| v.as_str())?;
+                let p = t.get("port").and_then(|v| v.as_u64()).unwrap_or(5060) as u16;
+                Some((h.to_string(), p))
+            }).collect()
+        })
+        .unwrap_or_default();
+    if !hosts.is_empty() {
+        sip_stack.register_inbound_trunk(id, css_id, &hosts).await;
+    }
+
+    tracing::info!(trunk_group = id, css = ?css_id, "Synced trunk group to SIP stack router");
 }
 
 /// Syncs a dial plan entry to the SipStack router.

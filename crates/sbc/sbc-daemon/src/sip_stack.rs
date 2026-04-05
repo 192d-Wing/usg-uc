@@ -78,6 +78,9 @@ pub struct SipStack {
     config: SipStackConfig,
     /// Resolved zone registry for interface-based binding.
     zone_registry: Option<Arc<crate::zone::ResolvedZoneRegistry>>,
+    /// Inbound trunk identification: maps source IP → (trunk_group_id, css_id).
+    /// Used to resolve which CSS to use for routing inbound calls from trunks.
+    inbound_trunk_map: RwLock<std::collections::HashMap<std::net::IpAddr, (String, Option<String>)>>,
     /// Registration statistics.
     registrations_active: AtomicU64,
     registrations_total: AtomicU64,
@@ -264,6 +267,7 @@ impl SipStack {
             registrations_total: AtomicU64::new(0),
             config,
             zone_registry: None,
+            inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -308,6 +312,7 @@ impl SipStack {
             registrations_total: AtomicU64::new(0),
             config,
             zone_registry: None,
+            inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1169,15 +1174,37 @@ impl SipStack {
                 // Not registered — try CUCM router (CSS-based), then dial plan, then direct
                 let mut routed = None;
 
+                // Identify which trunk group this inbound call came from (by source IP)
+                // and get its assigned CSS for routing
+                let source_ip = match source.ip() {
+                    std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped()
+                        .map(std::net::IpAddr::V4)
+                        .unwrap_or(std::net::IpAddr::V6(v6)),
+                    ip => ip,
+                };
+                let inbound_trunk = self.lookup_inbound_trunk(source_ip).await;
+                let css_id_owned = inbound_trunk.as_ref().and_then(|(_, css)| css.clone());
+
+                if let Some((ref tg_id, ref css)) = inbound_trunk {
+                    info!(
+                        trunk_group = %tg_id,
+                        css = ?css,
+                        source = %source_ip,
+                        dest = %dest_user,
+                        "Identified inbound trunk for CSS routing"
+                    );
+                }
+
                 // 1. Route via CUCM router (CSS/Partition → Route Pattern → Route List → Route Group)
                 if let Some(ref cucm) = self.cucm_router {
                     let cucm_r = cucm.read().await;
-                    let css_id: Option<&str> = None; // TODO: get from caller's user/device
-                    if let Some(result) = cucm_r.route(&dest_user, css_id) {
+                    let css_ref = css_id_owned.as_deref();
+                    if let Some(result) = cucm_r.route(&dest_user, css_ref) {
                         info!(
                             pattern = %result.pattern_id,
                             partition = %result.partition_id,
                             destination = %result.transformed_number,
+                            css = ?css_ref,
                             "Routed via CUCM CSS/Partition"
                         );
                         if let Some(rg_id) = result.route_group_ids.first() {
@@ -1927,6 +1954,32 @@ impl SipStack {
             let mut router = router_lock.write().await;
             router.remove_trunk_group(id);
         }
+    }
+
+    /// Registers a trunk group for inbound call identification.
+    /// Maps each trunk's host IP to the trunk group ID and CSS.
+    pub async fn register_inbound_trunk(&self, trunk_group_id: &str, css_id: Option<&str>, hosts: &[(String, u16)]) {
+        let mut map = self.inbound_trunk_map.write().await;
+        for (host, _port) in hosts {
+            // Resolve hostname to IP
+            let addr_str = format!("{host}:0");
+            if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
+                map.insert(addr.ip(), (trunk_group_id.to_string(), css_id.map(String::from)));
+            } else {
+                use std::net::ToSocketAddrs;
+                if let Ok(mut addrs) = addr_str.to_socket_addrs() {
+                    if let Some(addr) = addrs.find(|a| a.is_ipv4()) {
+                        map.insert(addr.ip(), (trunk_group_id.to_string(), css_id.map(String::from)));
+                    }
+                }
+            }
+        }
+        info!(trunk_group = trunk_group_id, css = ?css_id, hosts = hosts.len(), "Registered inbound trunk for CSS routing");
+    }
+
+    /// Looks up which trunk group and CSS an inbound call belongs to by source IP.
+    pub async fn lookup_inbound_trunk(&self, source_ip: std::net::IpAddr) -> Option<(String, Option<String>)> {
+        self.inbound_trunk_map.read().await.get(&source_ip).cloned()
     }
 
     /// Adds or replaces a dial plan in the router.
