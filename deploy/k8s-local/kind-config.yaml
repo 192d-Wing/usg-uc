@@ -1,6 +1,30 @@
 # kind cluster configuration for SBC testing
 # Single node — labels applied post-creation via setup.sh
+#
+# On Linux, the setup script creates a Docker macvlan network on the
+# host's physical NIC and attaches the Kind node, so Multus macvlan
+# interfaces inside pods get real LAN IPs via DHCP.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
   - role: control-plane
+    extraPortMappings:
+      # SIP signaling (UDP + TCP)
+      - containerPort: 30560
+        hostPort: 5060
+        protocol: UDP
+      - containerPort: 30560
+        hostPort: 5060
+        protocol: TCP
+      # SIP TLS
+      - containerPort: 30561
+        hostPort: 5061
+        protocol: TCP
+      # OOBM API
+      - containerPort: 30880
+        hostPort: 8080
+        protocol: TCP
+      # Metrics
+      - containerPort: 30990
+        hostPort: 9090
+        protocol: TCP

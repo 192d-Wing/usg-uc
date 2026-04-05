@@ -108,6 +108,12 @@ impl ResolvedZoneRegistry {
         self.zones.keys().cloned().collect()
     }
 
+    /// Returns the external IP for a zone (synchronous, best-effort via try_read).
+    pub fn external_ip(&self, name: &str) -> Option<IpAddr> {
+        self.zones.get(name)
+            .and_then(|e| e.external_ip.try_read().ok().and_then(|v| *v))
+    }
+
     /// Looks up which zone owns a given signaling IP.
     pub fn zone_for_signaling_ip(&self, ip: IpAddr) -> Option<String> {
         for (name, entry) in &self.zones {
@@ -234,8 +240,8 @@ impl ExternalIpMonitor {
                 stun_server
                     .to_socket_addrs()
                     .map_err(|e| e.to_string())?
-                    .next()
-                    .ok_or_else(|| "DNS resolution failed".to_string())
+                    .find(|a| a.is_ipv4())
+                    .ok_or_else(|| "No IPv4 address found".to_string())
             })
             .map_err(|e| format!("Cannot resolve STUN server {stun_server}: {e}"))?;
 

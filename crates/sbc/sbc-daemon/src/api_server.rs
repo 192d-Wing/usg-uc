@@ -47,6 +47,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio_rustls::TlsAcceptor;
+use include_dir::{include_dir, Dir};
 use tower::Service;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
@@ -128,6 +129,8 @@ pub struct AppState {
     pub trunk_monitor: Option<Arc<crate::trunk_monitor::TrunkMonitor>>,
     /// Trunk registrar (SBC registers to carriers).
     pub trunk_registrar: Option<Arc<crate::trunk_registrar::TrunkRegistrar>>,
+    /// Zone registry for resolving zone IPs (signaling, media, external).
+    pub zone_registry: Option<Arc<crate::zone::ResolvedZoneRegistry>>,
     /// In-memory store for management objects (phones, directory numbers, etc.).
     pub mem_store: Arc<tokio::sync::RwLock<MemStore>>,
     /// TLS acceptor for certificate hot-reload (if TLS is enabled).
@@ -160,6 +163,7 @@ impl AppState {
             mem_store: Arc::new(tokio::sync::RwLock::new(MemStore::default())),
             trunk_monitor: None,
             trunk_registrar: None,
+            zone_registry: None,
             tls_acceptor: None,
             #[cfg(feature = "cluster")]
             cluster_health_fn: None,
@@ -185,6 +189,7 @@ impl AppState {
             mem_store: Arc::new(tokio::sync::RwLock::new(MemStore::default())),
             trunk_monitor: None,
             trunk_registrar: None,
+            zone_registry: None,
             tls_acceptor: Some(tls_acceptor),
             #[cfg(feature = "cluster")]
             cluster_health_fn: None,
@@ -1040,6 +1045,20 @@ fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
         return;
     }
 
+    // Resolve zone IPs for binding and Contact header.
+    // The trunk's "zone" field specifies which interface to bind to.
+    // Falls back to "outside", then "inside".
+    let zone_name = trunk.get("zone").and_then(|v| v.as_str()).unwrap_or("outside");
+    let (bind_ip, external_ip) = if let Some(ref zr) = state.zone_registry {
+        let ip = zr.signaling_ip(zone_name)
+            .or_else(|| zr.signaling_ip("outside"))
+            .or_else(|| zr.signaling_ip("inside"));
+        let ext = zr.external_ip(zone_name);
+        (ip, ext)
+    } else {
+        (None, None)
+    };
+
     // Start OPTIONS health monitoring
     if trunk.get("options_ping_enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
         if let Some(ref monitor) = state.trunk_monitor {
@@ -1049,9 +1068,9 @@ fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
                 host: host.to_string(),
                 port,
                 interval_secs: interval,
-                bind_ip: None,
+                bind_ip,
             });
-            tracing::info!(trunk_id, "Started OPTIONS health monitor via API");
+            tracing::info!(trunk_id, ?bind_ip, "Started OPTIONS health monitor via API");
         }
     }
 
@@ -1062,6 +1081,8 @@ fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
         if !username.is_empty() && !password.is_empty() {
             if let Some(ref registrar) = state.trunk_registrar {
                 let domain = trunk.get("sip_domain").and_then(|v| v.as_str()).unwrap_or(host);
+                let expires = trunk.get("register_expires").and_then(|v| v.as_u64()).unwrap_or(25) as u32;
+                tracing::info!(trunk_id, ?bind_ip, ?external_ip, expires, "Starting trunk registration with zone IPs");
                 registrar.register_trunk(crate::trunk_registrar::TrunkRegConfig {
                     trunk_id: trunk_id.to_string(),
                     host: host.to_string(),
@@ -1069,9 +1090,9 @@ fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
                     username: username.to_string(),
                     password: password.to_string(),
                     domain: domain.to_string(),
-                    expires: 3600,
-                    bind_ip: None,
-                    external_ip: None,
+                    expires,
+                    bind_ip,
+                    external_ip,
                 });
                 tracing::info!(trunk_id, "Started SIP registration via API");
             }
@@ -1634,32 +1655,77 @@ async fn update_route_list(
 // Dashboard Static Files
 // ============================================================================
 
+/// Embedded Angular dashboard built from `crates/sbc/sbc-dashboard/`.
+///
+/// The directory is populated by `ng build` during the Docker image build.
+/// When the directory is empty (dev builds without Node.js), the placeholder
+/// HTML is served instead.
+static DASHBOARD_DIR: Dir<'_> =
+    include_dir!("$CARGO_MANIFEST_DIR/../sbc-dashboard/dist/sbc-dashboard/browser");
+
 /// Serve Angular dashboard static files.
 ///
-/// Falls back to index.html for client-side routing.
+/// Falls back to index.html for client-side routing (SPA).
 async fn serve_dashboard(uri: axum::http::Uri) -> impl IntoResponse {
     let path = uri.path().trim_start_matches('/');
 
-    // Try to find the file in the embedded dashboard
-    // For now, return a placeholder — the Angular dist/ files will be
-    // served once embedded via include_dir or a static file handler
-    if path.is_empty() || !path.contains('.') {
-        // SPA fallback: serve index.html for all non-file routes
-        Response::builder()
+    // If the embedded dist is empty, serve the dev placeholder
+    if DASHBOARD_DIR.entries().is_empty() {
+        return Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/html")
-            .body(DASHBOARD_INDEX.to_string())
-            .unwrap_or_default()
-    } else {
-        Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(String::new())
-            .unwrap_or_default()
+            .body(DASHBOARD_PLACEHOLDER.to_string())
+            .unwrap_or_default();
+    }
+
+    // Try to serve the requested file from the embedded dist
+    if !path.is_empty() && path.contains('.') {
+        if let Some(file) = DASHBOARD_DIR.get_file(path) {
+            let mime = mime_from_path(path);
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", mime)
+                .header("Cache-Control", "public, max-age=31536000, immutable")
+                .body(
+                    String::from_utf8_lossy(file.contents()).into_owned(),
+                )
+                .unwrap_or_default();
+        }
+    }
+
+    // SPA fallback: serve index.html for all non-file routes
+    let index = DASHBOARD_DIR
+        .get_file("index.html")
+        .map(|f| String::from_utf8_lossy(f.contents()).into_owned())
+        .unwrap_or_else(|| DASHBOARD_PLACEHOLDER.to_string());
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/html")
+        .body(index)
+        .unwrap_or_default()
+}
+
+/// Derive Content-Type from file extension.
+fn mime_from_path(path: &str) -> &'static str {
+    match path.rsplit('.').next() {
+        Some("html") => "text/html",
+        Some("js") => "application/javascript",
+        Some("css") => "text/css",
+        Some("json") => "application/json",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        Some("woff2") => "font/woff2",
+        Some("woff") => "font/woff",
+        Some("ttf") => "font/ttf",
+        Some("map") => "application/json",
+        _ => "application/octet-stream",
     }
 }
 
-/// Placeholder dashboard index until Angular build is embedded.
-const DASHBOARD_INDEX: &str = r#"<!doctype html>
+/// Placeholder shown when the Angular dist is not embedded (dev builds).
+const DASHBOARD_PLACEHOLDER: &str = r#"<!doctype html>
 <html>
 <head>
   <title>USG SBC Dashboard</title>

@@ -12,7 +12,18 @@
 # - **SC-28**: Protection of Information at Rest - No secrets in image
 
 # =============================================================================
-# Stage 1: Build
+# Stage 1: Build Angular dashboard
+# =============================================================================
+FROM node:22-bookworm-slim AS dashboard
+
+WORKDIR /app
+COPY crates/sbc/sbc-dashboard/package.json crates/sbc/sbc-dashboard/package-lock.json* ./
+RUN npm ci --prefer-offline
+COPY crates/sbc/sbc-dashboard/ ./
+RUN npx ng build --configuration=production
+
+# =============================================================================
+# Stage 2: Build Rust binaries
 # =============================================================================
 FROM rust:1.85-bookworm AS builder
 
@@ -32,7 +43,10 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
 
-# Build release binary
+# Copy built Angular dashboard into the location include_dir! expects
+COPY --from=dashboard /app/dist/ crates/sbc/sbc-dashboard/dist/
+
+# Build release binary (dashboard is embedded via include_dir!)
 RUN cargo build --release --package sbc-daemon --package sbc-cli
 
 # =============================================================================

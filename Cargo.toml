@@ -128,6 +128,9 @@ bytes = "1.11.1"
 socket2 = { version = "0.6", features = ["all"] }
 nix = { version = "0.31", features = ["net"] }
 
+# Embedded static files
+include_dir = "0.7"
+
 # HTTP server
 axum = "0.8"
 tower = "0.5"

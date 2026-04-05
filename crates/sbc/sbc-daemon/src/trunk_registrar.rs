@@ -133,10 +133,12 @@ impl TrunkRegistrar {
                 }
                 drop(st);
 
-                // Re-register at 80% of expires, min 30s
+                // Re-register at 80% of the configured expires (not the server-granted
+                // value, which may be much larger than what the provider actually requires).
                 let wait = Duration::from_secs(
-                    (u64::from(config.expires) * 80 / 100).max(30),
+                    (u64::from(config.expires) * 80 / 100).max(10),
                 );
+                info!(trunk_id = %config.trunk_id, wait_secs = wait.as_secs(), "Scheduling re-registration");
                 tokio::time::sleep(wait).await;
             }
         })
@@ -156,11 +158,24 @@ impl TrunkRegistrar {
             })
             .map_err(|e| format!("Cannot resolve {addr_str}: {e}"))?;
 
-        // Bind to zone signaling IP if configured, otherwise auto-discover outgoing IP
-        let (socket, local_ip) = if let Some(bind_ip) = config.bind_ip {
-            let sock = UdpSocket::bind(std::net::SocketAddr::new(bind_ip, 0)).await
-                .map_err(|e| format!("Bind to {bind_ip}:0 failed: {e}"))?;
-            (sock, bind_ip.to_string())
+        // Bind to zone signaling IP on port 5060 so the NAT mapping matches
+        // what the provider expects for inbound traffic. Uses SO_REUSEADDR
+        // to share the port with the main SIP listener (which binds to 0.0.0.0:5060).
+        let (socket, local_ip, local_port) = if let Some(bind_ip) = config.bind_ip {
+            let bind_addr = std::net::SocketAddr::new(bind_ip, 5060);
+            let sock2 = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            ).map_err(|e| format!("Socket create failed: {e}"))?;
+            sock2.set_reuse_address(true).ok();
+            #[cfg(target_os = "linux")]
+            sock2.set_reuse_port(true).ok();
+            sock2.set_nonblocking(true).map_err(|e| format!("Set nonblocking failed: {e}"))?;
+            sock2.bind(&bind_addr.into()).map_err(|e| format!("Bind to {bind_addr} failed: {e}"))?;
+            let sock = UdpSocket::from_std(sock2.into())
+                .map_err(|e| format!("Convert to tokio socket failed: {e}"))?;
+            (sock, bind_ip.to_string(), 5060u16)
         } else {
             let probe = UdpSocket::bind("0.0.0.0:0").await
                 .map_err(|e| format!("Probe bind failed: {e}"))?;
@@ -170,28 +185,41 @@ impl TrunkRegistrar {
             drop(probe);
             let sock = UdpSocket::bind("0.0.0.0:0").await
                 .map_err(|e| format!("Bind failed: {e}"))?;
-            (sock, ip)
+            let port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
+            (sock, ip, port)
         };
-        // Use external IP for Contact if behind NAT
+        // Use external IP for Contact if behind NAT.
+        // Contact port must be the SIP listener port (5060), not the
+        // registration socket's ephemeral port, so the provider can
+        // route inbound calls (INVITEs) to the SBC's SIP listener.
         let contact_ip = config.external_ip
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| local_ip.clone());
+        let contact_port: u16 = 5060;
         let call_id = generate_call_id(local_domain);
 
         // Step 1: Send initial REGISTER (no auth)
         let uri = SipUri::new(&config.host);
         let request = RequestBuilder::register(uri.clone())
-            .via_auto("UDP", &local_ip, Some(5060))
+            .via_auto("UDP", &local_ip, Some(local_port))
             .from_auto(SipUri::new(&config.host).with_user(&config.username), None)
             .to_uri(SipUri::new(&config.host).with_user(&config.username), None)
             .call_id(&call_id)
             .cseq(1)
             .max_forwards(70)
-            .contact_uri(SipUri::new(&contact_ip).with_port(5060))
+            .contact_uri(SipUri::new(&contact_ip).with_port(contact_port))
             .build_with_defaults()
             .map_err(|e| format!("Build REGISTER failed: {e}"))?;
 
         let msg_bytes = SipMessage::Request(request).to_bytes();
+        info!(
+            trunk_id = %config.trunk_id,
+            target = %target,
+            local_ip = %local_ip,
+            contact_ip = %contact_ip,
+            "Sending initial REGISTER:\n{}",
+            String::from_utf8_lossy(&msg_bytes),
+        );
         socket.send_to(&msg_bytes, target).await
             .map_err(|e| format!("Send failed: {e}"))?;
 
@@ -201,6 +229,12 @@ impl TrunkRegistrar {
             .await
             .map_err(|_| "Timeout waiting for response".to_string())?
             .map_err(|e| format!("Recv failed: {e}"))?;
+
+        info!(
+            trunk_id = %config.trunk_id,
+            "Received response:\n{}",
+            String::from_utf8_lossy(&buf[..n]),
+        );
 
         let resp = SipMessage::parse(&Bytes::copy_from_slice(&buf[..n]))
             .map_err(|e| format!("Parse response failed: {e}"))?;
@@ -250,13 +284,13 @@ impl TrunkRegistrar {
 
             // Build authenticated REGISTER
             let mut auth_request = RequestBuilder::register(uri)
-                .via_auto("UDP", &local_ip, Some(5060))
+                .via_auto("UDP", &local_ip, Some(local_port))
                 .from_auto(SipUri::new(&config.host).with_user(&config.username), None)
                 .to_uri(SipUri::new(&config.host).with_user(&config.username), None)
                 .call_id(&call_id)
                 .cseq(2)
                 .max_forwards(70)
-                .contact_uri(SipUri::new(&contact_ip).with_port(5060))
+                .contact_uri(SipUri::new(&contact_ip).with_port(contact_port))
                 .build_with_defaults()
                 .map_err(|e| format!("Build auth REGISTER failed: {e}"))?;
 
@@ -271,6 +305,11 @@ impl TrunkRegistrar {
             auth_request.headers.set(HeaderName::Expires, &config.expires.to_string());
 
             let auth_bytes = SipMessage::Request(auth_request).to_bytes();
+            info!(
+                trunk_id = %config.trunk_id,
+                "Sending authenticated REGISTER:\n{}",
+                String::from_utf8_lossy(&auth_bytes),
+            );
             socket.send_to(&auth_bytes, target).await
                 .map_err(|e| format!("Send auth REGISTER failed: {e}"))?;
 
@@ -280,6 +319,12 @@ impl TrunkRegistrar {
                 .map_err(|_| "Timeout waiting for auth response".to_string())?
                 .map_err(|e| format!("Recv auth response failed: {e}"))?;
 
+            info!(
+                trunk_id = %config.trunk_id,
+                "Received auth response:\n{}",
+                String::from_utf8_lossy(&buf[..n2]),
+            );
+
             let resp2 = SipMessage::parse(&Bytes::copy_from_slice(&buf[..n2]))
                 .map_err(|e| format!("Parse auth response failed: {e}"))?;
 
@@ -288,8 +333,17 @@ impl TrunkRegistrar {
             };
 
             if response2.status.code() == 200 {
+                // Check Expires header first, then Contact ;expires= parameter
                 let expires = response2.headers.get_value(&HeaderName::Expires)
                     .and_then(|v| v.parse().ok())
+                    .or_else(|| {
+                        response2.headers.get_value(&HeaderName::Contact)
+                            .and_then(|c| {
+                                c.split(";expires=").nth(1)
+                                    .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+                                    .and_then(|s| s.parse().ok())
+                            })
+                    })
                     .unwrap_or(config.expires);
                 Ok(expires)
             } else {

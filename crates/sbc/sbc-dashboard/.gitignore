@@ -1,1 +1,3 @@
 node_modules/
+dist/
+!dist/sbc-dashboard/browser/.gitkeep

@@ -49,6 +49,7 @@ uc-user-mgmt = { workspace = true, features = ["encryption"] }
 uc-phone-mgmt.workspace = true
 uuid = { version = "1", features = ["v4"] }
 socket2.workspace = true
+include_dir.workspace = true
 
 # Clustering dependencies (optional)
 uc-cluster = { workspace = true, optional = true }

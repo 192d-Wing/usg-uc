@@ -4,6 +4,9 @@ metadata:
   name: sbc-system
   labels:
     app.kubernetes.io/part-of: usg-uc
-    pod-security.kubernetes.io/enforce: restricted
-    pod-security.kubernetes.io/audit: restricted
-    pod-security.kubernetes.io/warn: restricted
+    # Relaxed to 'privileged' for init container NET_ADMIN (policy routing).
+    # Production deployments should use 'restricted' with a network plugin
+    # that handles source-based routing natively.
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: baseline
+    pod-security.kubernetes.io/warn: baseline

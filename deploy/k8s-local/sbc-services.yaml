@@ -1,4 +1,6 @@
-# Three-zone Services — each pinned to a MetalLB pool
+# SBC Services — macvlan interfaces provide direct LAN access;
+# these Services offer in-cluster discoverability and host access
+# via fixed NodePorts mapped through kind extraPortMappings.
 ---
 # Signaling Service (inside leg — SIP)
 apiVersion: v1
@@ -7,24 +9,27 @@ metadata:
   name: sbc-signaling
   namespace: sbc-system
   annotations:
-    metallb.universe.tf/address-pool: sbc-signaling-pool
+    metallb.universe.tf/address-pool: sbc-pool
 spec:
   type: LoadBalancer
-  externalTrafficPolicy: Local
+  externalTrafficPolicy: Cluster
   selector:
     app.kubernetes.io/name: sbc
   ports:
     - name: sip-udp
       port: 5060
       targetPort: 5060
+      nodePort: 30560
       protocol: UDP
     - name: sip-tcp
       port: 5060
       targetPort: 5060
+      nodePort: 30560
       protocol: TCP
     - name: sip-tls
       port: 5061
       targetPort: 5061
+      nodePort: 30561
       protocol: TCP
 ---
 # Media Service (outside leg — RTP)
@@ -38,10 +43,10 @@ metadata:
   name: sbc-media
   namespace: sbc-system
   annotations:
-    metallb.universe.tf/address-pool: sbc-media-pool
+    metallb.universe.tf/address-pool: sbc-pool
 spec:
   type: LoadBalancer
-  externalTrafficPolicy: Local
+  externalTrafficPolicy: Cluster
   selector:
     app.kubernetes.io/name: sbc
   ports:
@@ -57,16 +62,17 @@ metadata:
   name: sbc-oobm
   namespace: sbc-system
   annotations:
-    metallb.universe.tf/address-pool: sbc-oobm-pool
+    metallb.universe.tf/address-pool: sbc-pool
 spec:
   type: LoadBalancer
-  externalTrafficPolicy: Local
+  externalTrafficPolicy: Cluster
   selector:
     app.kubernetes.io/name: sbc
   ports:
     - name: api
       port: 8080
       targetPort: 8080
+      nodePort: 30880
       protocol: TCP
     - name: api-tls
       port: 8443
@@ -75,4 +81,5 @@ spec:
     - name: metrics
       port: 9090
       targetPort: 9090
+      nodePort: 30990
       protocol: TCP

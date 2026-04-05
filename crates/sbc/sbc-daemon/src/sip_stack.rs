@@ -1186,6 +1186,33 @@ impl SipStack {
                     }
                 }
 
+                // 2. Route via dial plan → trunk group → trunk
+                if routed.is_none() {
+                    if let Some(ref router_lock) = self.router {
+                        let mut router = router_lock.write().await;
+                        info!(dest = %dest_user, "Attempting dial plan routing");
+                        match router.route(&dest_user) {
+                            Ok(decision) => {
+                                info!(
+                                    trunk_id = %decision.trunk_id,
+                                    trunk_uri = %decision.trunk_uri,
+                                    destination = %decision.destination,
+                                    "Routed via dial plan"
+                                );
+                                routed = resolve_sip_uri_to_addr(&decision.trunk_uri);
+                                if routed.is_none() {
+                                    warn!(trunk_uri = %decision.trunk_uri, "Could not resolve trunk URI to address");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(dest = %dest_user, error = %e, "Dial plan routing failed");
+                            }
+                        }
+                    } else {
+                        warn!("No router configured on SIP stack");
+                    }
+                }
+
                 if routed.is_none() {
                     warn!(dest = %dest_aor, "No route found — playing announcement");
                     return self.play_announcement_to_caller(
@@ -1893,7 +1920,14 @@ impl SipStack {
             0
         };
 
-        let (ann_socket, actual_rtp_port) = match crate::announcement::AnnouncementServer::bind_socket(preferred_port, None).await {
+        // Bind RTP socket to the outside zone's signaling IP so media
+        // exits via the correct macvlan interface.
+        let rtp_bind_ip = if let Some(ref zr) = self.zone_registry {
+            zr.signaling_ip("outside")
+        } else {
+            None
+        };
+        let (ann_socket, actual_rtp_port) = match crate::announcement::AnnouncementServer::bind_socket(preferred_port, rtp_bind_ip).await {
             Ok(result) => result,
             Err(e) => {
                 warn!(error = %e, "Cannot bind announcement socket");
@@ -1905,24 +1939,27 @@ impl SipStack {
             }
         };
 
-        // Use IPv4 address for SDP (strip IPv6-mapped prefix)
-        let local_ip = match source.ip() {
-            std::net::IpAddr::V6(v6) => {
-                if let Some(v4) = v6.to_ipv4_mapped() {
-                    v4.to_string()
-                } else {
-                    v6.to_string()
-                }
-            }
+        // Use the outside zone's external IP (STUN/public) for the SDP so
+        // the remote party (on the internet) can send RTP to a routable address.
+        // Falls back to the signaling IP if no external IP is configured.
+        let sdp_ip = if let Some(ref zr) = self.zone_registry {
+            zr.external_ip("outside")
+                .or_else(|| zr.signaling_ip("outside"))
+                .map(|ip| ip.to_string())
+        } else {
+            None
+        }.unwrap_or_else(|| match source.ip() {
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or_else(|| v6.to_string(), |v4| v4.to_string()),
             std::net::IpAddr::V4(v4) => v4.to_string(),
-        };
-        let sdp = crate::announcement::build_announcement_sdp(&local_ip, actual_rtp_port);
+        });
+        info!(sdp_ip = %sdp_ip, rtp_port = actual_rtp_port, zone_registry_present = self.zone_registry.is_some(), "SDP media address for announcement");
+        let sdp = crate::announcement::build_announcement_sdp(&sdp_ip, actual_rtp_port);
 
         // Build 200 OK with SDP
         let mut ok_response = create_response_from_request(req, StatusCode::OK);
         ok_response.add_header(Header::new(
             HeaderName::Contact,
-            format!("<sip:{}@{}:{}>", self.config.instance_name, local_ip, source.port()),
+            format!("<sip:{}@{}:{}>", self.config.instance_name, sdp_ip, source.port()),
         ));
         ok_response.headers.set(HeaderName::ContentType, "application/sdp");
         let sdp_bytes = sdp.into_bytes();
@@ -1953,6 +1990,7 @@ impl SipStack {
         let domain = self.config.domain.clone();
         let instance = self.config.instance_name.clone();
         let source_port = source.port();
+        let local_ip = sdp_ip.clone();
 
         // Spawn background task to play announcement then BYE
         tokio::spawn(async move {

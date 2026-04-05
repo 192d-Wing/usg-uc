@@ -90,7 +90,14 @@ impl Server {
 
     /// Sets the zone registry for interface-based binding.
     pub fn set_zone_registry(&mut self, registry: Arc<crate::zone::ResolvedZoneRegistry>) {
-        self.zone_registry = Some(registry);
+        self.zone_registry = Some(Arc::clone(&registry));
+        // Also set on the SIP stack so it can use zone IPs for SDP/Contact headers
+        if let Some(stack) = Arc::get_mut(&mut self.sip_stack) {
+            stack.set_zone_registry(registry);
+            tracing::info!("Zone registry set on SIP stack");
+        } else {
+            tracing::error!("Cannot set zone registry on SIP stack — Arc has multiple references");
+        }
     }
 
     /// Determines which zone a transport belongs to based on its local bind address.

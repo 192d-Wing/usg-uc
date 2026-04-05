@@ -261,7 +261,7 @@ impl Runtime {
         let instance_name = config.general.instance_name.clone();
 
         // Resolve network zones (interface name → IP)
-        let _zone_registry = if !config.zones.is_empty() {
+        let zone_registry = if !config.zones.is_empty() {
             match sbc_config::resolve_zones(&config.zones) {
                 Ok(resolved) => {
                     for z in &resolved {
@@ -313,6 +313,11 @@ impl Runtime {
         #[cfg(not(feature = "cluster"))]
         let mut server = Server::new(config, signal.clone());
 
+        // Set zone registry on server (and its SipStack) before starting
+        if let Some(ref registry) = zone_registry {
+            server.set_zone_registry(Arc::clone(registry));
+        }
+
         server
             .start()
             .await
@@ -345,6 +350,7 @@ impl Runtime {
             &instance_name,
         ));
         app_state.trunk_registrar = Some(Arc::clone(&trunk_registrar));
+        app_state.zone_registry = zone_registry.clone();
         info!("Trunk registrar initialized");
 
         // Initialize user store with optional HA1 encryption

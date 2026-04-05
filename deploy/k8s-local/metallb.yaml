@@ -1,32 +1,16 @@
-# MetalLB IP pools — one per SBC zone
-# All pools use LAN-routable addresses from 192.168.44.0/24
+# MetalLB configuration — general-purpose LAN pool
+# With DHCP macvlan, the SBC pod gets LAN IPs directly on its interfaces.
+# This pool is available for any Services that need a LoadBalancer IP.
+# The address range should be outside the DHCP server's lease range.
 ---
 apiVersion: metallb.io/v1beta1
 kind: IPAddressPool
 metadata:
-  name: sbc-signaling-pool
+  name: sbc-pool
   namespace: metallb-system
 spec:
   addresses:
-    - 192.168.44.200/32
----
-apiVersion: metallb.io/v1beta1
-kind: IPAddressPool
-metadata:
-  name: sbc-media-pool
-  namespace: metallb-system
-spec:
-  addresses:
-    - 192.168.44.201/32
----
-apiVersion: metallb.io/v1beta1
-kind: IPAddressPool
-metadata:
-  name: sbc-oobm-pool
-  namespace: metallb-system
-spec:
-  addresses:
-    - 192.168.44.202/32
+    - 192.168.0.230-192.168.0.239
 ---
 apiVersion: metallb.io/v1beta1
 kind: L2Advertisement
@@ -35,6 +19,4 @@ metadata:
   namespace: metallb-system
 spec:
   ipAddressPools:
-    - sbc-signaling-pool
-    - sbc-media-pool
-    - sbc-oobm-pool
+    - sbc-pool
