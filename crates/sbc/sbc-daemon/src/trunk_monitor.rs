@@ -43,6 +43,9 @@ pub struct TrunkHealthStatus {
     pub total_success: u64,
     /// Uptime percentage (0.0 - 100.0).
     pub uptime_pct: f64,
+    /// Timestamp when the trunk became reachable (Unix epoch seconds).
+    /// Resets on every down→up transition.
+    pub in_service_since: Option<i64>,
 }
 
 impl TrunkHealthStatus {
@@ -58,6 +61,7 @@ impl TrunkHealthStatus {
             total_pings: 0,
             total_success: 0,
             uptime_pct: 0.0,
+            in_service_since: None,
         }
     }
 
@@ -67,6 +71,10 @@ impl TrunkHealthStatus {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
+        // Track down→up transition for service duration timer
+        if !self.reachable {
+            self.in_service_since = Some(now);
+        }
         self.reachable = true;
         self.last_response_ms = Some(response_ms);
         self.last_success = Some(now);
@@ -88,6 +96,7 @@ impl TrunkHealthStatus {
         self.last_failure = Some(now);
         self.consecutive_failures += 1;
         self.consecutive_success = 0;
+        self.in_service_since = None;
         self.total_pings += 1;
         self.uptime_pct = if self.total_pings > 0 {
             (self.total_success as f64 / self.total_pings as f64) * 100.0

@@ -500,25 +500,11 @@ export class TrunkgroupsComponent implements OnInit, OnDestroy {
     });
   }
 
-  /** Computes service uptime duration as HH:MM:SS from the last failure timestamp. */
+  /** Computes service uptime duration as HH:MM:SS from in_service_since timestamp. */
   getServiceDuration(health: any): string {
-    // Use last_failure to determine when the trunk came back up.
-    // If no failure recorded, use the first success or fall back to consecutive_success * interval.
-    const now = this.now();
-    let upSince: number;
+    if (!health.in_service_since) return '0:00';
 
-    if (health.last_failure && health.last_success && health.last_success > health.last_failure) {
-      // Came back up after a failure — uptime starts at last_failure + ping interval
-      upSince = health.last_failure;
-    } else if (health.last_success) {
-      // Never failed — estimate from consecutive successes * ~30s intervals
-      const estimatedStart = health.last_success - (health.consecutive_success * 30);
-      upSince = estimatedStart;
-    } else {
-      return '0:00';
-    }
-
-    const secs = Math.max(0, now - upSince);
+    const secs = Math.max(0, this.now() - health.in_service_since);
     const h = Math.floor(secs / 3600);
     const m = Math.floor((secs % 3600) / 60);
     const s = secs % 60;
