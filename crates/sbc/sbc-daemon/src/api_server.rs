@@ -1697,8 +1697,29 @@ async fn create_route_pattern(
         let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let partition = body.get("partition_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let pattern_value = body.get("pattern").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let pattern = uc_routing::DialPattern::prefix(&pattern_value);
-        let rp = uc_routing::RoutePattern::new(&id, pattern, &partition);
+        let pattern_type = body.get("pattern_type").and_then(|v| v.as_str()).unwrap_or("prefix");
+
+        let pattern = match pattern_type {
+            "exact" => uc_routing::DialPattern::exact(&pattern_value),
+            "wildcard" => uc_routing::DialPattern::wildcard(&pattern_value),
+            "any" => uc_routing::DialPattern::Any,
+            _ => uc_routing::DialPattern::prefix(&pattern_value),
+        };
+
+        let mut rp = uc_routing::RoutePattern::new(&id, pattern, &partition);
+        if let Some(rl) = body.get("route_list_id").and_then(|v| v.as_str()) {
+            if !rl.is_empty() { rp = rp.with_route_list(rl); }
+        }
+        if let Some(rg) = body.get("route_group_id").and_then(|v| v.as_str()) {
+            if !rg.is_empty() { rp = rp.with_route_group(rg); }
+        }
+        if let Some(desc) = body.get("description").and_then(|v| v.as_str()) {
+            rp = rp.with_description(desc);
+        }
+        if let Some(pri) = body.get("priority").and_then(|v| v.as_u64()) {
+            rp = rp.with_priority(pri as u32);
+        }
+
         router.write().await.add_route_pattern(rp);
         (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "id": id })))
     } else {
