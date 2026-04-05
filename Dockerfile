@@ -42,6 +42,7 @@ WORKDIR /app
 # Copy workspace files
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
+COPY audio_files/ audio_files/
 
 # Copy built Angular dashboard into the location include_dir! expects
 COPY --from=dashboard /app/dist/ crates/sbc/sbc-dashboard/dist/

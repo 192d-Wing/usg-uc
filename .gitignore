@@ -34,3 +34,4 @@ standards/
 ref/crates/sbc/sbc-dashboard/node_modules/
 crates/sbc/sbc-dashboard/dist/
 crates/sbc/sbc-dashboard/.angular/
+*.log

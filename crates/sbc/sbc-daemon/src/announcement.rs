@@ -10,6 +10,7 @@
 //! - **SC-7**: Boundary Protection (controlled call termination)
 
 use bytes::Bytes;
+use include_dir::{include_dir, Dir};
 use proto_rtp::RtpHeader;
 use proto_rtp::RtpPacket;
 use std::net::SocketAddr;
@@ -17,6 +18,10 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 use uc_codecs::G711Ulaw;
+
+/// Embedded audio files from the project's audio_files/ directory.
+/// Files should be raw PCM: signed 16-bit little-endian, mono, 8000Hz.
+static AUDIO_FILES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../../audio_files");
 
 /// PCMU payload type per RFC 3551.
 const PCMU_PAYLOAD_TYPE: u8 = 0;
@@ -133,12 +138,39 @@ impl AnnouncementServer {
     }
 }
 
+/// Loads an embedded PCM file as 16-bit signed samples.
+/// Falls back to synthesized tones if the file is not found.
+fn load_pcm_file(filename: &str) -> Option<Vec<i16>> {
+    AUDIO_FILES.get_file(filename).map(|file| {
+        let bytes = file.contents();
+        // Parse as signed 16-bit little-endian samples
+        bytes
+            .chunks_exact(2)
+            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect()
+    })
+}
+
 /// Generates PCM 16-bit signed samples at 8kHz for the given announcement.
 fn generate_announcement(announcement: AnnouncementType) -> Vec<i16> {
     match announcement {
-        AnnouncementType::NumberNotInService => generate_number_not_in_service(),
-        AnnouncementType::AllCircuitsBusy => generate_all_circuits_busy(),
-        AnnouncementType::Silence => vec![0i16; PCMU_CLOCK_RATE as usize * 2], // 2 seconds
+        AnnouncementType::NumberNotInService => {
+            if let Some(samples) = load_pcm_file("Not_in_service.pcm") {
+                info!(samples = samples.len(), duration_ms = samples.len() * 1000 / PCMU_CLOCK_RATE as usize, "Loaded embedded PCM: Not_in_service.pcm");
+                samples
+            } else {
+                warn!("Not_in_service.pcm not found in embedded audio_files, using synthesized tones");
+                generate_number_not_in_service()
+            }
+        }
+        AnnouncementType::AllCircuitsBusy => {
+            if let Some(samples) = load_pcm_file("All_circuits_busy.pcm") {
+                samples
+            } else {
+                generate_all_circuits_busy()
+            }
+        }
+        AnnouncementType::Silence => vec![0i16; PCMU_CLOCK_RATE as usize * 2],
     }
 }
 

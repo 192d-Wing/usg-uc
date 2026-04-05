@@ -1978,19 +1978,16 @@ impl SipStack {
             let mut corr = self.call_correlation.write().await;
             corr.announcement_calls.insert(call_id.clone());
         }
-        let from_tag = req
-            .headers
-            .get_value(&HeaderName::From)
-            .and_then(|v| extract_param(v, "tag").map(String::from));
-        let to_tag = ok_response
-            .headers
-            .get_value(&HeaderName::To)
-            .and_then(|v| extract_param(v, "tag").map(String::from));
+        // Capture full From/To headers for the BYE dialog matching.
+        // In BYE from UAS: From = our To (with our tag), To = caller's From (with their tag)
+        let invite_from = req.headers.get_value(&HeaderName::From).unwrap_or_default().to_string();
+        let ok_to = ok_response.headers.get_value(&HeaderName::To).unwrap_or_default().to_string();
 
-        let domain = self.config.domain.clone();
-        let instance = self.config.instance_name.clone();
         let source_port = source.port();
-        let local_ip = sdp_ip.clone();
+        // local_ip = macvlan IP for binding sockets; sdp_ip = external/public IP for SDP
+        let local_ip = rtp_bind_ip
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| sdp_ip.clone());
 
         // Spawn background task to play announcement then BYE
         tokio::spawn(async move {
@@ -2019,32 +2016,51 @@ impl SipStack {
             // Send BYE after announcement
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-            let bye_uri = SipUri::new(&local_ip).with_port(source_port);
+            // Build BYE using the exact dialog headers from the INVITE/200 exchange.
+            // From UAS perspective: our From = the To from 200 OK, our To = the From from INVITE
+            let caller_ip = source.ip().to_string();
+            let bye_uri = SipUri::new(&caller_ip).with_port(source_port);
             let bye = RequestBuilder::new(Method::Bye, bye_uri)
-                .via_auto("UDP", &local_ip, Some(source_port))
-                .from_auto(
-                    SipUri::new(&domain).with_user(&instance),
-                    to_tag.as_deref(),
-                )
-                .to_uri(
-                    SipUri::new(&local_ip),
-                    from_tag.as_deref(),
-                )
+                .via_auto("UDP", &local_ip, Some(5060))
+                .from_auto(SipUri::new(&local_ip), None)
+                .to_uri(SipUri::new(&caller_ip), None)
                 .call_id(&call_id)
                 .cseq(2)
                 .max_forwards(70)
-                .build_with_defaults();
+                .build_with_defaults()
+                .map(|mut r| {
+                    // Overwrite From/To with exact dialog headers (swapped for UAS BYE)
+                    r.headers.set(HeaderName::From, &ok_to);
+                    r.headers.set(HeaderName::To, &invite_from);
+                    r
+                });
 
             match bye {
                 Ok(bye_req) => {
                     let bye_bytes = SipMessage::Request(bye_req).to_bytes();
-                    // Use IPv6 dual-stack socket to handle IPv6-mapped IPv4 addresses
-                    let bind_addr = if source.as_std().is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
-                    if let Ok(sock) = tokio::net::UdpSocket::bind(bind_addr).await {
-                        if let Err(e) = sock.send_to(&bye_bytes, source.as_std()).await {
-                            warn!(error = %e, "Failed to send BYE after announcement");
-                        } else {
-                            info!(call_id = %call_id, "Sent BYE after announcement");
+                    info!("Sending BYE:\n{}", String::from_utf8_lossy(&bye_bytes));
+                    // Bind to the outside zone IP on port 5060 so the BYE comes
+                    // from the same address the call was established on
+                    let bind_addr: std::net::SocketAddr = format!("{local_ip}:5060").parse()
+                        .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+                    let sock2 = socket2::Socket::new(
+                        socket2::Domain::IPV4,
+                        socket2::Type::DGRAM,
+                        Some(socket2::Protocol::UDP),
+                    );
+                    if let Ok(s) = sock2 {
+                        s.set_reuse_address(true).ok();
+                        #[cfg(target_os = "linux")]
+                        s.set_reuse_port(true).ok();
+                        s.set_nonblocking(true).ok();
+                        if s.bind(&bind_addr.into()).is_ok() {
+                            if let Ok(sock) = tokio::net::UdpSocket::from_std(s.into()) {
+                                if let Err(e) = sock.send_to(&bye_bytes, source.as_std()).await {
+                                    warn!(error = %e, "Failed to send BYE after announcement");
+                                } else {
+                                    info!(call_id = %call_id, destination = %source, "Sent BYE after announcement");
+                                }
+                            }
                         }
                     }
                 }
