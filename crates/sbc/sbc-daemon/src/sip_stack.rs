@@ -1053,8 +1053,13 @@ impl SipStack {
                 let binding_count = reg_response.contacts.len();
                 {
                     let mut loc = self.location_service.write().await;
-                    // Remove existing bindings for this AOR and re-add current ones
-                    let _ = loc.remove_all_bindings(&aor);
+                    // Remove ALL existing bindings for this AOR before re-adding.
+                    // This ensures stale bindings from previous registrations
+                    // (different source ports, reconnects) are cleaned up.
+                    if loc.has_bindings(&aor) {
+                        let removed = loc.remove_all_bindings(&aor).unwrap_or(0);
+                        debug!(aor = %aor, removed, "Cleared existing bindings before re-register");
+                    }
                     for binding in &reg_response.contacts {
                         // If Contact has 0.0.0.0, substitute the actual source IP
                         // so the SBC can route calls back to the phone
