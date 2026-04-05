@@ -1053,35 +1053,29 @@ impl SipStack {
                 let binding_count = reg_response.contacts.len();
                 {
                     let mut loc = self.location_service.write().await;
-                    // Remove ALL existing bindings for this AOR before re-adding.
-                    // This ensures stale bindings from previous registrations
-                    // (different source ports, reconnects) are cleaned up.
-                    if loc.has_bindings(&aor) {
-                        let removed = loc.remove_all_bindings(&aor).unwrap_or(0);
-                        debug!(aor = %aor, removed, "Cleared existing bindings before re-register");
-                    }
-                    for binding in &reg_response.contacts {
-                        // If Contact has 0.0.0.0, substitute the actual source IP
-                        // so the SBC can route calls back to the phone
-                        let contact = binding.contact_uri();
-                        let fixed_contact = if contact.contains("0.0.0.0") {
-                            let src_ip = match source.ip() {
-                                std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped()
-                                    .map_or_else(|| v6.to_string(), |v4| v4.to_string()),
-                                std::net::IpAddr::V4(v4) => v4.to_string(),
-                            };
-                            contact.replace("0.0.0.0", &src_ip)
-                        } else {
-                            contact.to_string()
-                        };
-                        let new_binding = proto_registrar::Binding::new(
-                            &aor,
-                            &fixed_contact,
-                            &call_id,
-                            cseq,
-                        );
-                        let _ = loc.add_binding(new_binding);
-                    }
+                    // Always remove ALL existing bindings for this AOR before
+                    // re-adding. Only keep the latest Contact from this REGISTER.
+                    let _ = loc.remove_all_bindings(&aor);
+
+                    // Only add the contact from the current source address,
+                    // using the actual source IP if Contact has 0.0.0.0
+                    let src_ip = match source.ip() {
+                        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped()
+                            .map_or_else(|| v6.to_string(), |v4| v4.to_string()),
+                        std::net::IpAddr::V4(v4) => v4.to_string(),
+                    };
+                    let src_port = source.port();
+
+                    // Build a single canonical contact from the actual source
+                    let contact_uri = format!("sip:{dest_user}@{src_ip}:{src_port};transport=udp",
+                        dest_user = aor.split(':').nth(1).and_then(|s| s.split('@').next()).unwrap_or("unknown"));
+                    let new_binding = proto_registrar::Binding::new(
+                        &aor,
+                        &contact_uri,
+                        &call_id,
+                        cseq,
+                    );
+                    let _ = loc.add_binding(new_binding);
                 }
 
                 self.registrations_total.fetch_add(1, Ordering::Relaxed);
