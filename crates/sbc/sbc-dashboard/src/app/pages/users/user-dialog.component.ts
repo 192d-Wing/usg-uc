@@ -1,6 +1,6 @@
-import { Component } from '@angular/core';
+import { Component, inject, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
-import { MatDialogModule, MatDialogRef } from '@angular/material/dialog';
+import { MatDialogModule, MatDialogRef, MAT_DIALOG_DATA } from '@angular/material/dialog';
 import { MatFormFieldModule } from '@angular/material/form-field';
 import { MatInputModule } from '@angular/material/input';
 import { MatSelectModule } from '@angular/material/select';
@@ -14,11 +14,23 @@ import { MatButtonModule } from '@angular/material/button';
     MatInputModule, MatSelectModule, MatButtonModule,
   ],
   template: `
-    <h2 mat-dialog-title>Add User</h2>
+    <h2 mat-dialog-title>{{ isEdit ? 'Edit User' : 'Add User' }}</h2>
     <mat-dialog-content>
       <mat-form-field appearance="outline" class="full-width">
         <mat-label>Username</mat-label>
-        <input matInput [(ngModel)]="user.username" required />
+        <input matInput [(ngModel)]="user.username" required [disabled]="isEdit" />
+      </mat-form-field>
+
+      <mat-form-field appearance="outline" class="full-width">
+        <mat-label>{{ isEdit ? 'New Password (leave blank to keep)' : 'Password' }}</mat-label>
+        <input matInput [(ngModel)]="user.password" type="password" />
+        <mat-hint>Used for SIP digest authentication</mat-hint>
+      </mat-form-field>
+
+      <mat-form-field appearance="outline" class="full-width">
+        <mat-label>SIP Domain / Realm</mat-label>
+        <input matInput [(ngModel)]="user.sip_domain" />
+        <mat-hint>Digest realm (e.g., sip.example.com)</mat-hint>
       </mat-form-field>
 
       <mat-form-field appearance="outline" class="full-width">
@@ -61,18 +73,24 @@ import { MatButtonModule } from '@angular/material/button';
       <button mat-button mat-dialog-close>Cancel</button>
       <button mat-raised-button color="primary" [disabled]="!user.username"
               (click)="dialogRef.close(user)">
-        Add
+        {{ isEdit ? 'Save' : 'Add' }}
       </button>
     </mat-dialog-actions>
   `,
   styles: [`
     .full-width { width: 100%; }
-    mat-dialog-content { display: flex; flex-direction: column; gap: 4px; min-width: 400px; }
+    mat-dialog-content { display: flex; flex-direction: column; gap: 4px; min-width: 400px; max-height: 65vh; overflow-y: auto; padding-top: 8px !important; }
   `],
 })
-export class UserDialogComponent {
+export class UserDialogComponent implements OnInit {
+  private readonly data: any = inject(MAT_DIALOG_DATA, { optional: true });
+
+  isEdit = false;
+
   user: any = {
     username: '',
+    password: '',
+    sip_domain: 'sbc-local',
     display_name: '',
     email: '',
     sip_uri: '',
@@ -82,4 +100,23 @@ export class UserDialogComponent {
   };
 
   constructor(public dialogRef: MatDialogRef<UserDialogComponent>) {}
+
+  ngOnInit(): void {
+    if (this.data) {
+      this.isEdit = true;
+      this.user = {
+        ...this.user,
+        username: this.data.username ?? '',
+        display_name: this.data.display_name ?? '',
+        email: this.data.email ?? '',
+        sip_uri: this.data.sip_uri ?? '',
+        auth_type: this.data.auth_type ?? 'digest',
+        certificate_dn: this.data.certificate_dn ?? '',
+        calling_search_space: this.data.calling_search_space ?? '',
+        password: '', // Don't pre-fill password
+        sip_domain: this.data.sip_domain ?? 'sbc-local',
+        id: this.data.id,
+      };
+    }
+  }
 }

@@ -67,6 +67,10 @@ import { UserDialogComponent } from './user-dialog.component';
             <ng-container matColumnDef="actions">
               <th mat-header-cell *matHeaderCellDef>Actions</th>
               <td mat-cell *matCellDef="let row">
+                <button mat-icon-button color="primary" (click)="openEditDialog(row)"
+                        matTooltip="Edit User">
+                  <mat-icon>edit</mat-icon>
+                </button>
                 <button mat-icon-button color="warn" (click)="deleteUser(row.id)"
                         matTooltip="Delete User">
                   <mat-icon>delete</mat-icon>
@@ -148,6 +152,18 @@ export class UsersComponent implements OnInit {
     ref.afterClosed().subscribe((result: any) => {
       if (result) {
         this.api.createUser(result).subscribe({
+          next: () => this.loadUsers(),
+          error: () => {},
+        });
+      }
+    });
+  }
+
+  openEditDialog(user: any): void {
+    const ref = this.dialog.open(UserDialogComponent, { data: user });
+    ref.afterClosed().subscribe((result: any) => {
+      if (result) {
+        this.api.updateUser(result.id, result).subscribe({
           next: () => this.loadUsers(),
           error: () => {},
         });

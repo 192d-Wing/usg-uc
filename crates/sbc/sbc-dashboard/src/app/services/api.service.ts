@@ -146,6 +146,9 @@ export class ApiService {
   createUser(user: any): Observable<any> {
     return this.http.post(`${this.baseUrl}/users`, user);
   }
+  updateUser(id: string, user: any): Observable<any> {
+    return this.http.put(`${this.baseUrl}/users/${encodeURIComponent(id)}`, user);
+  }
   deleteUser(id: string): Observable<any> {
     return this.http.delete(`${this.baseUrl}/users/${encodeURIComponent(id)}`);
   }

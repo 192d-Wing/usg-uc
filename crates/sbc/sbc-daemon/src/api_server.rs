@@ -432,7 +432,7 @@ impl ApiServer {
             .route("/users", get(list_users))
             .route("/users", post(create_user))
             .route("/users/{id}", get(get_user))
-            .route("/users/{id}", delete(delete_user))
+            .route("/users/{id}", delete(delete_user).put(update_user))
             // Phone management
             .route("/phones", get(list_phones))
             .route("/phones", post(create_phone))
@@ -1375,7 +1375,13 @@ async fn create_user(
                 body.get("username").and_then(|v| v.as_str()).unwrap_or("")
             }).to_string(),
             auth_type: uc_user_mgmt::model::AuthType::Digest,
-            digest_ha1: None,
+            digest_ha1: body.get("password").and_then(|v| v.as_str())
+                .filter(|p| !p.is_empty())
+                .map(|password| {
+                    let username = body.get("username").and_then(|v| v.as_str()).unwrap_or("");
+                    let realm = body.get("sip_domain").and_then(|v| v.as_str()).unwrap_or("sbc-local");
+                    uc_user_mgmt::digest::compute_ha1(username, realm, password)
+                }),
             certificate_dn: body.get("certificate_dn").and_then(|v| v.as_str()).map(String::from),
             certificate_san: None,
             calling_search_space: body.get("calling_search_space").and_then(|v| v.as_str()).map(String::from),
@@ -1417,6 +1423,54 @@ async fn delete_user(
     if let Some(ref store) = state.user_store {
         match store.delete_user(&id).await {
             Ok(()) => Json(serde_json::json!({ "success": true })),
+            Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+        }
+    } else {
+        Json(serde_json::json!({ "success": false, "error": "User store not configured" }))
+    }
+}
+
+async fn update_user(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Some(ref store) = state.user_store {
+        // Get existing user
+        let existing = match store.get_user(&id).await {
+            Ok(u) => u,
+            Err(e) => return Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+        };
+        let username = body.get("username").and_then(|v| v.as_str()).unwrap_or(&existing.username);
+        let digest_ha1 = body.get("password").and_then(|v| v.as_str())
+            .filter(|p| !p.is_empty())
+            .map(|password| {
+                let realm = body.get("sip_domain").and_then(|v| v.as_str()).unwrap_or("sbc-local");
+                uc_user_mgmt::digest::compute_ha1(username, realm, password)
+            })
+            .or(existing.digest_ha1);
+
+        let updated = uc_user_mgmt::model::User {
+            id: id.clone(),
+            username: username.to_string(),
+            display_name: body.get("display_name").and_then(|v| v.as_str()).unwrap_or(&existing.display_name).to_string(),
+            email: body.get("email").and_then(|v| v.as_str()).unwrap_or(&existing.email).to_string(),
+            sip_uri: body.get("sip_uri").and_then(|v| v.as_str()).unwrap_or(&existing.sip_uri).to_string(),
+            auth_type: existing.auth_type,
+            digest_ha1,
+            certificate_dn: body.get("certificate_dn").and_then(|v| v.as_str()).map(String::from).or(existing.certificate_dn),
+            certificate_san: existing.certificate_san,
+            calling_search_space: body.get("calling_search_space").and_then(|v| v.as_str()).map(String::from).or(existing.calling_search_space),
+            device_ids: existing.device_ids,
+            partition: existing.partition,
+            enabled: body.get("enabled").and_then(|v| v.as_bool()).unwrap_or(existing.enabled),
+            created_at: existing.created_at,
+            updated_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
+            last_login: existing.last_login,
+            metadata: existing.metadata,
+        };
+        match store.update_user(updated.clone()).await {
+            Ok(u) => Json(serde_json::json!({ "success": true, "user": u })),
             Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
         }
     } else {
