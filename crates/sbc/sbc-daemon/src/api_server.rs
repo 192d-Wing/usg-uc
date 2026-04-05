@@ -858,6 +858,12 @@ async fn add_directory_number(
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     body["did"] = serde_json::json!(&did);
     state.mem_store.write().await.directory_numbers.insert(did.clone(), body.clone());
+    // Sync DID → user mapping to SIP stack for call routing
+    if let Some(user) = body.get("user").and_then(|v| v.as_str()) {
+        if let Some(ref sip_stack) = state.sip_stack {
+            sip_stack.add_did_mapping(&did, user).await;
+        }
+    }
     (StatusCode::CREATED, Json(serde_json::json!({"success": true, "directory_number": body})))
 }
 
@@ -867,6 +873,9 @@ async fn delete_directory_number(
     axum::extract::Path(did): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     state.mem_store.write().await.directory_numbers.remove(&did);
+    if let Some(ref sip_stack) = state.sip_stack {
+        sip_stack.remove_did_mapping(&did).await;
+    }
     Json(serde_json::json!({"success": true, "did": did}))
 }
 

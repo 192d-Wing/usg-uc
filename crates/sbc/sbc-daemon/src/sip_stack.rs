@@ -81,6 +81,8 @@ pub struct SipStack {
     /// Inbound trunk identification: maps source IP → (trunk_group_id, css_id).
     /// Used to resolve which CSS to use for routing inbound calls from trunks.
     inbound_trunk_map: RwLock<std::collections::HashMap<std::net::IpAddr, (String, Option<String>)>>,
+    /// Directory number mapping: DID → username for inbound call routing.
+    did_map: RwLock<std::collections::HashMap<String, String>>,
     /// Registration statistics.
     registrations_active: AtomicU64,
     registrations_total: AtomicU64,
@@ -268,6 +270,7 @@ impl SipStack {
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
+            did_map: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -313,6 +316,7 @@ impl SipStack {
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
+            did_map: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1171,19 +1175,69 @@ impl SipStack {
         let dest_aor = format!("sip:{dest_user}@{dest_host}");
 
         // 3. Look up destination:
-        //    a) Check LocationService for registered users
-        //    b) If not registered, try CUCM router (CSS/Partition)
-        //    c) Fall back to direct URI resolution
+        //    a) Check DID → user mapping, then LocationService
+        //    b) Check LocationService directly for registered users
+        //    c) Try CUCM router (CSS/Partition)
+        //    d) Try dial plan router
+        //    e) Fall back to announcement
         let failover_trunks: Vec<String> = Vec::new();
         let b_leg_destination = {
+            // Check DID → user mapping first (e.g., +12139160002 → jwillman)
+            let mapped_user = self.lookup_did(&dest_user).await;
+
+            // Build AOR candidates for location service lookup
             let loc = self.location_service.read().await;
-            let bindings = loc.lookup(&dest_aor);
-            if let Some(binding) = bindings.first() {
-                // Registered user — resolve contact URI to address
-                let contact = binding.contact_uri().to_string();
+            let mut found_contact = None;
+
+            if let Some(ref user) = mapped_user {
+                info!(did = %dest_user, user = %user, "DID mapped to registered user");
+                // Try the mapped user with the dest host first, then with known zone IPs
+                let candidates = [
+                    format!("sip:{user}@{dest_host}"),
+                ];
+                for aor in &candidates {
+                    let bindings = loc.lookup(aor);
+                    if let Some(binding) = bindings.first() {
+                        let contact = binding.contact_uri().to_string();
+                        info!(aor = %aor, contact = %contact, "Routing to registered user");
+                        found_contact = Some(contact);
+                        break;
+                    }
+                }
+                // If not found with dest_host, try with zone IPs
+                if found_contact.is_none() {
+                    if let Some(ref zr) = self.zone_registry {
+                        for zone_name in &["inside", "outside", "oobm"] {
+                            if let Some(ip) = zr.signaling_ip(zone_name) {
+                                let aor = format!("sip:{user}@{ip}");
+                                let bindings = loc.lookup(&aor);
+                                if let Some(binding) = bindings.first() {
+                                    let contact = binding.contact_uri().to_string();
+                                    info!(aor = %aor, contact = %contact, zone = zone_name, "Routing to registered user via zone lookup");
+                                    found_contact = Some(contact);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if found_contact.is_none() {
+                    warn!(user = %user, "DID mapped but user not registered on any zone");
+                }
+            } else {
+                // Direct AOR lookup (no DID mapping)
+                let bindings = loc.lookup(&dest_aor);
+                if let Some(binding) = bindings.first() {
+                    let contact = binding.contact_uri().to_string();
+                    info!(aor = %dest_aor, contact = %contact, "Routing to registered user");
+                    found_contact = Some(contact);
+                }
+            }
+            drop(loc);
+
+            if let Some(contact) = found_contact {
                 resolve_sip_uri_to_addr(&contact)
             } else {
-                drop(loc);
                 // Not registered — try CUCM router (CSS-based), then dial plan, then direct
                 let mut routed = None;
 
@@ -1993,6 +2047,22 @@ impl SipStack {
     /// Looks up which trunk group and CSS an inbound call belongs to by source IP.
     pub async fn lookup_inbound_trunk(&self, source_ip: std::net::IpAddr) -> Option<(String, Option<String>)> {
         self.inbound_trunk_map.read().await.get(&source_ip).cloned()
+    }
+
+    /// Adds a DID → username mapping for inbound call routing.
+    pub async fn add_did_mapping(&self, did: &str, username: &str) {
+        self.did_map.write().await.insert(did.to_string(), username.to_string());
+        info!(did, username, "Added DID → user mapping");
+    }
+
+    /// Removes a DID mapping.
+    pub async fn remove_did_mapping(&self, did: &str) {
+        self.did_map.write().await.remove(did);
+    }
+
+    /// Looks up a username by DID.
+    pub async fn lookup_did(&self, did: &str) -> Option<String> {
+        self.did_map.read().await.get(did).cloned()
     }
 
     /// Adds or replaces a dial plan in the router.

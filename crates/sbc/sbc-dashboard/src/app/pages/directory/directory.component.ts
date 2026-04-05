@@ -7,8 +7,7 @@ import { MatSlideToggleModule } from '@angular/material/slide-toggle';
 import { MatTooltipModule } from '@angular/material/tooltip';
 import { MatDialog, MatDialogModule } from '@angular/material/dialog';
 import { ApiService } from '../../services/api.service';
-import { DirectoryNumber } from '../../models/sbc.models';
-import { DirectoryDialogComponent, DirectoryDialogData } from './directory-dialog.component';
+import { DirectoryDialogComponent } from './directory-dialog.component';
 
 @Component({
   selector: 'app-directory',
@@ -37,36 +36,17 @@ import { DirectoryDialogComponent, DirectoryDialogData } from './directory-dialo
               <th mat-header-cell *matHeaderCellDef>DID</th>
               <td mat-cell *matCellDef="let row">{{ row.did }}</td>
             </ng-container>
+            <ng-container matColumnDef="user">
+              <th mat-header-cell *matHeaderCellDef>User</th>
+              <td mat-cell *matCellDef="let row">{{ row.user }}</td>
+            </ng-container>
             <ng-container matColumnDef="description">
               <th mat-header-cell *matHeaderCellDef>Description</th>
               <td mat-cell *matCellDef="let row">{{ row.description }}</td>
             </ng-container>
-            <ng-container matColumnDef="destination_type">
-              <th mat-header-cell *matHeaderCellDef>Type</th>
-              <td mat-cell *matCellDef="let row">
-                <span class="type-badge" [class]="'type-' + row.destination_type">
-                  {{ formatType(row.destination_type) }}
-                </span>
-              </td>
-            </ng-container>
-            <ng-container matColumnDef="destination">
-              <th mat-header-cell *matHeaderCellDef>Destination</th>
-              <td mat-cell *matCellDef="let row">{{ row.destination }}</td>
-            </ng-container>
-            <ng-container matColumnDef="enabled">
-              <th mat-header-cell *matHeaderCellDef>Enabled</th>
-              <td mat-cell *matCellDef="let row">
-                <mat-slide-toggle [checked]="row.enabled"
-                                  (change)="toggleEnabled(row)">
-                </mat-slide-toggle>
-              </td>
-            </ng-container>
             <ng-container matColumnDef="actions">
               <th mat-header-cell *matHeaderCellDef>Actions</th>
               <td mat-cell *matCellDef="let row">
-                <button mat-icon-button (click)="openEditDialog(row)" matTooltip="Edit">
-                  <mat-icon>edit</mat-icon>
-                </button>
                 <button mat-icon-button color="warn" (click)="deleteNumber(row)"
                         matTooltip="Delete">
                   <mat-icon>delete</mat-icon>
@@ -118,8 +98,8 @@ export class DirectoryComponent implements OnInit {
   private readonly api = inject(ApiService);
   private readonly dialog = inject(MatDialog);
 
-  readonly displayedColumns = ['did', 'description', 'destination_type', 'destination', 'enabled', 'actions'];
-  readonly numbers = signal<DirectoryNumber[]>([]);
+  readonly displayedColumns = ['did', 'user', 'description', 'actions'];
+  readonly numbers = signal<any[]>([]);
 
   ngOnInit(): void {
     this.loadNumbers();
@@ -133,9 +113,8 @@ export class DirectoryComponent implements OnInit {
   }
 
   openAddDialog(): void {
-    const data: DirectoryDialogData = { mode: 'add' };
-    const ref = this.dialog.open(DirectoryDialogComponent, { data });
-    ref.afterClosed().subscribe((result: DirectoryNumber | undefined) => {
+    const ref = this.dialog.open(DirectoryDialogComponent);
+    ref.afterClosed().subscribe((result: any) => {
       if (result) {
         this.api.addDirectoryNumber(result).subscribe({
           next: () => this.loadNumbers(),
@@ -145,34 +124,11 @@ export class DirectoryComponent implements OnInit {
     });
   }
 
-  openEditDialog(dn: DirectoryNumber): void {
-    const data: DirectoryDialogData = { mode: 'edit', number: dn };
-    const ref = this.dialog.open(DirectoryDialogComponent, { data });
-    ref.afterClosed().subscribe((result: DirectoryNumber | undefined) => {
-      if (result) {
-        this.api.updateDirectoryNumber(dn.did, result).subscribe({
-          next: () => this.loadNumbers(),
-          error: () => {},
-        });
-      }
-    });
-  }
-
-  toggleEnabled(dn: DirectoryNumber): void {
-    this.api.updateDirectoryNumber(dn.did, { enabled: !dn.enabled }).subscribe({
-      next: () => this.loadNumbers(),
-      error: () => {},
-    });
-  }
-
-  deleteNumber(dn: DirectoryNumber): void {
+  deleteNumber(dn: any): void {
     this.api.deleteDirectoryNumber(dn.did).subscribe({
       next: () => this.loadNumbers(),
       error: () => {},
     });
   }
 
-  formatType(type: string): string {
-    return type.replace(/_/g, ' ');
-  }
 }
