@@ -112,18 +112,24 @@ import { TrunkDialogComponent } from './trunk-dialog.component';
                   </td>
                 </ng-container>
                 <ng-container matColumnDef="health">
-                  <th mat-header-cell *matHeaderCellDef>Health</th>
+                  <th mat-header-cell *matHeaderCellDef>Service Status</th>
                   <td mat-cell *matCellDef="let row">
                     @if (getHealthStatus(row.id); as h) {
-                      <span class="health-badge" [class]="h.reachable ? 'health-up' : 'health-down'">
-                        <mat-icon class="health-icon">{{ h.reachable ? 'check_circle' : 'cancel' }}</mat-icon>
-                        {{ h.reachable ? 'UP' : 'DOWN' }}
-                      </span>
-                      @if (h.last_response_ms != null) {
+                      @if (h.reachable) {
+                        <span class="health-badge health-up">
+                          <mat-icon class="health-icon">check_circle</mat-icon>
+                          In Service: {{ getServiceDuration(h) }}
+                        </span>
                         <span class="latency">{{ h.last_response_ms }}ms</span>
-                      }
-                      @if (h.uptime_pct != null) {
                         <span class="uptime">{{ h.uptime_pct.toFixed(1) }}%</span>
+                      } @else {
+                        <span class="health-badge health-down">
+                          <mat-icon class="health-icon">cancel</mat-icon>
+                          Not In Service
+                        </span>
+                        @if (h.last_success) {
+                          <span class="last-seen">Last up: {{ getTimeAgo(h.last_success) }}</span>
+                        }
                       }
                     } @else if (row.options_ping_enabled) {
                       <span class="health-pending">Pending</span>
@@ -292,6 +298,12 @@ import { TrunkDialogComponent } from './trunk-dialog.component';
       color: rgba(255, 255, 255, 0.4);
     }
 
+    .last-seen {
+      margin-left: 6px;
+      font-size: 11px;
+      color: rgba(255, 255, 255, 0.4);
+    }
+
     .state-badge {
       padding: 3px 10px;
       border-radius: 6px;
@@ -332,17 +344,20 @@ export class TrunkgroupsComponent implements OnInit, OnDestroy {
   readonly groups = signal<any[]>([]);
   readonly regStatuses = signal<Map<string, any>>(new Map());
   readonly healthStatuses = signal<Map<string, any>>(new Map());
+  readonly now = signal<number>(Math.floor(Date.now() / 1000));
+  private tickTimer: ReturnType<typeof setInterval> | null = null;
 
   ngOnInit(): void {
     this.loadAll();
     // Auto-refresh registration & health status every 15s
     this.refreshTimer = setInterval(() => this.loadStatusData(), 15000);
+    // Tick every second to update the live service duration timer
+    this.tickTimer = setInterval(() => this.now.set(Math.floor(Date.now() / 1000)), 1000);
   }
 
   ngOnDestroy(): void {
-    if (this.refreshTimer) {
-      clearInterval(this.refreshTimer);
-    }
+    if (this.refreshTimer) clearInterval(this.refreshTimer);
+    if (this.tickTimer) clearInterval(this.tickTimer);
   }
 
   loadAll(): void {
@@ -483,6 +498,42 @@ export class TrunkgroupsComponent implements OnInit, OnDestroy {
       next: () => this.loadGroups(),
       error: () => {},
     });
+  }
+
+  /** Computes service uptime duration as HH:MM:SS from the last failure timestamp. */
+  getServiceDuration(health: any): string {
+    // Use last_failure to determine when the trunk came back up.
+    // If no failure recorded, use the first success or fall back to consecutive_success * interval.
+    const now = this.now();
+    let upSince: number;
+
+    if (health.last_failure && health.last_success && health.last_success > health.last_failure) {
+      // Came back up after a failure — uptime starts at last_failure + ping interval
+      upSince = health.last_failure;
+    } else if (health.last_success) {
+      // Never failed — estimate from consecutive successes * ~30s intervals
+      const estimatedStart = health.last_success - (health.consecutive_success * 30);
+      upSince = estimatedStart;
+    } else {
+      return '0:00';
+    }
+
+    const secs = Math.max(0, now - upSince);
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = secs % 60;
+    if (h > 0) {
+      return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+    }
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  }
+
+  /** Formats a unix timestamp as "X min ago" or "X hr ago". */
+  getTimeAgo(timestamp: number): string {
+    const secs = Math.max(0, this.now() - timestamp);
+    if (secs < 60) return `${secs}s ago`;
+    if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
+    return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m ago`;
   }
 
   formatType(type: string): string {
