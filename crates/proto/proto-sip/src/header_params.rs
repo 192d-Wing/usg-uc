@@ -38,7 +38,10 @@ pub struct ViaHeader {
     /// Received parameter (actual source IP).
     pub received: Option<String>,
     /// Rport parameter (actual source port).
-    pub rport: Option<u16>,
+    /// `Some(Some(port))` = `;rport=PORT` (server response),
+    /// `Some(None)` = `;rport` (client request per RFC 3581),
+    /// `None` = not present.
+    pub rport: Option<Option<u16>>,
     /// TTL parameter (time-to-live for multicast).
     pub ttl: Option<u8>,
     /// Maddr parameter (multicast address).
@@ -77,6 +80,16 @@ impl ViaHeader {
     #[must_use]
     pub fn with_branch(mut self, branch: impl Into<String>) -> Self {
         self.branch = Some(branch.into());
+        self
+    }
+
+    /// Requests rport processing per RFC 3581 (adds empty `;rport` parameter).
+    ///
+    /// Used in outgoing requests to ask the server to include the source port
+    /// in the Via response, enabling NAT traversal.
+    #[must_use]
+    pub fn with_rport(mut self) -> Self {
+        self.rport = Some(None);
         self
     }
 
@@ -132,8 +145,10 @@ impl fmt::Display for ViaHeader {
             write!(f, ";received={received}")?;
         }
 
-        if let Some(rport) = self.rport {
-            write!(f, ";rport={rport}")?;
+        match self.rport {
+            Some(Some(rport)) => write!(f, ";rport={rport}")?,
+            Some(None) => write!(f, ";rport")?,
+            None => {}
         }
 
         if let Some(ttl) = self.ttl {
@@ -235,7 +250,7 @@ impl FromStr for ViaHeader {
             } else if raw_name.eq_ignore_ascii_case("received") {
                 received = raw_value.map(String::from);
             } else if raw_name.eq_ignore_ascii_case("rport") {
-                rport = raw_value.and_then(|v| v.parse().ok());
+                rport = Some(raw_value.and_then(|v| v.parse().ok()));
             } else if raw_name.eq_ignore_ascii_case("ttl") {
                 ttl = raw_value.and_then(|v| v.parse().ok());
             } else if raw_name.eq_ignore_ascii_case("maddr") {

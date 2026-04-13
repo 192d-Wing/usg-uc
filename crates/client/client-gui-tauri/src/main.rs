@@ -19,7 +19,7 @@ use client_types::{CallHistoryEntry, CertificateInfo, Contact, SipAccount, Smart
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{error, info, warn};
 
@@ -1539,8 +1539,35 @@ async fn poll_events(
             let name = event_name(&event);
             let payload = event_payload(&event);
 
+            let payload_str = payload.to_string();
             if let Err(e) = app_handle.emit(name, payload) {
                 warn!("Failed to emit event {name}: {e}");
+            }
+
+            // Also dispatch critical events via eval() as a reliable fallback.
+            // Tauri's event listener registration can silently fail if the
+            // JS event API isn't fully initialized when listeners are set up.
+            let windows = app_handle.webview_windows();
+            if let Some(webview_window) = windows.values().next() {
+                // Direct DOM manipulation for incoming-call via eval().
+                // Uses inline styles because the CSS file styles are not reliably
+                // applied to dynamically-shown modals in WKWebView.
+                let js = if name == "incoming-call" {
+                    format!(
+                        "if(window.showIncomingCallOverlay){{ var p={payload_str}; window.showIncomingCallOverlay(p.call_id, p.remote_display_name, p.remote_uri); }}"
+                    )
+                } else if name == "incoming-call-cancelled" || name == "call-ended" {
+                    format!(
+                        "if(window.hideIncomingCallOverlay) window.hideIncomingCallOverlay(); if(window.__tauriEventFallback) window.__tauriEventFallback('{name}', {payload_str});"
+                    )
+                } else {
+                    format!(
+                        "if (window.__tauriEventFallback) {{ window.__tauriEventFallback('{name}', {payload_str}); }}"
+                    )
+                };
+                if let Err(e) = webview_window.eval(&js) {
+                    warn!("Failed to eval event {name}: {e}");
+                }
             }
         }
     }

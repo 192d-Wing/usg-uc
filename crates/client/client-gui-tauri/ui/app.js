@@ -199,20 +199,35 @@ function safeAlert(message) {
     alert(clean);
 }
 
-// Use Tauri 2.0 invoke API - access lazily to ensure Tauri is loaded
+// Use Tauri 2.0 invoke API
 function getTauriApi() {
-    // Tauri 2.0 uses __TAURI_INTERNALS__ for the core API
     if (window.__TAURI_INTERNALS__) {
         return {
             invoke: window.__TAURI_INTERNALS__.invoke,
-            // For events, Tauri 2.0 uses a different approach
             listen: async (event, handler) => {
-                // Use the Tauri 2.0 event API if available
-                if (window.__TAURI__ && window.__TAURI__.event) {
+                // Try the high-level API first (withGlobalTauri)
+                if (window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.listen) {
                     return window.__TAURI__.event.listen(event, handler);
                 }
-                // Fallback: return noop
-                return () => {};
+                // Use __TAURI_INTERNALS__ directly as a reliable fallback.
+                // This creates a callback via transformCallback and registers
+                // the event listener through the event plugin.
+                console.log(`[listen] Using __TAURI_INTERNALS__ for event: ${event}`);
+                const ti = window.__TAURI_INTERNALS__;
+                const handlerId = ti.transformCallback((evt) => {
+                    handler(evt);
+                });
+                const eventId = await ti.invoke('plugin:event|listen', {
+                    event: event,
+                    target: { kind: 'Any' },
+                    handler: handlerId,
+                });
+                return () => {
+                    ti.invoke('plugin:event|unlisten', {
+                        event: event,
+                        eventId: eventId,
+                    });
+                };
             }
         };
     }
@@ -234,6 +249,37 @@ function getTauriApi() {
 // Lazy getters
 const invoke = (...args) => getTauriApi().invoke(...args);
 const listen = (...args) => getTauriApi().listen(...args);
+
+// Reliable event fallback: Tauri backend calls this via eval() for every event.
+// This ensures events reach the frontend even if plugin:event|listen registration failed.
+window.__tauriEventFallback = function(eventName, payload) {
+    console.log('[__tauriEventFallback] event:', eventName, 'payload:', payload);
+    const event = { payload: payload };
+    switch (eventName) {
+        case 'registration-state-changed':
+            registrationState = (event.payload.state || '').toLowerCase();
+            updateStatus(registrationState === 'registered' ? 'online' : 'offline');
+            break;
+        case 'call-state-changed':
+            handleCallStateChange(event.payload);
+            break;
+        case 'incoming-call':
+            handleIncomingCall(event.payload);
+            break;
+        case 'incoming-call-cancelled':
+            dismissIncomingCallModal();
+            break;
+        case 'call-ended':
+            endCall();
+            break;
+        case 'error':
+            console.error('Error event:', event.payload);
+            break;
+        case 'transfer-progress':
+            handleTransferProgress(event.payload);
+            break;
+    }
+};
 
 // Application State
 let currentTab = 'dialer';
@@ -589,6 +635,13 @@ async function initializeEventListeners() {
         console.log('Transfer progress:', event.payload);
         handleTransferProgress(event.payload);
     });
+
+    // DTMF received
+    await listen('dtmf-received', (event) => {
+        console.log('DTMF received:', event.payload);
+    });
+
+    console.log('Event listeners registered');
 }
 
 function handleCallStateChange(payload) {
@@ -638,7 +691,6 @@ function handleIncomingCall(payload) {
     const { call_id, remote_uri, remote_display_name } = payload;
     incomingCallId = call_id;
 
-    // Sanitize caller info for display
     const callerName = escapeHtml(remote_display_name || 'Unknown').slice(0, 100);
     const callerUri = escapeHtml(remote_uri || '').slice(0, 256);
 
@@ -657,6 +709,9 @@ function dismissIncomingCallModal() {
 
 async function acceptIncomingCall(callId) {
     dismissIncomingCallModal();
+    // Also remove eval-created overlay
+    var overlay = document.getElementById('incomingCallOverlay');
+    if (overlay) overlay.remove();
     if (!rateLimiter.canCall('accept_call')) return;
     try {
         await invoke('accept_call', { callId });
@@ -668,12 +723,85 @@ async function acceptIncomingCall(callId) {
 
 async function rejectIncomingCall(callId) {
     dismissIncomingCallModal();
+    // Also remove eval-created overlay
+    var overlay = document.getElementById('incomingCallOverlay');
+    if (overlay) overlay.remove();
     try {
         await invoke('reject_call', { callId });
     } catch (error) {
         console.error('Failed to reject call:', error);
     }
 }
+
+// Expose to window for eval()-created inline buttons
+window.acceptIncomingCall = acceptIncomingCall;
+window.rejectIncomingCall = rejectIncomingCall;
+
+// Incoming call overlay built entirely with inline styles (WKWebView-safe).
+// Called from Rust eval() fallback since CSS class-based modal is invisible in WKWebView.
+window.showIncomingCallOverlay = function(callId, callerName, callerUri) {
+    var old = document.getElementById('incomingCallOverlay');
+    if (old) old.remove();
+
+    var overlay = document.createElement('div');
+    overlay.id = 'incomingCallOverlay';
+    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.75);z-index:99999;display:flex;align-items:center;justify-content:center;';
+
+    var card = document.createElement('div');
+    card.style.cssText = 'background:#2A292D;padding:32px;border-radius:16px;text-align:center;max-width:340px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.5);';
+
+    var iconWrap = document.createElement('div');
+    iconWrap.style.cssText = 'width:72px;height:72px;border-radius:50%;background:#004A77;display:flex;align-items:center;justify-content:center;margin:0 auto 16px;font-size:36px;color:#A8C7FA;';
+    iconWrap.textContent = '\u{260E}';
+
+    var labelEl = document.createElement('div');
+    labelEl.style.cssText = 'font-size:12px;color:#C4C0C9;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;';
+    labelEl.textContent = 'Incoming Call';
+
+    var nameEl = document.createElement('div');
+    nameEl.style.cssText = 'font-size:22px;color:#E4E1E6;margin-bottom:4px;font-weight:500;';
+    nameEl.textContent = callerName || 'Unknown';
+
+    var uriEl = document.createElement('div');
+    uriEl.style.cssText = 'font-size:14px;color:#C4C0C9;margin-bottom:32px;';
+    uriEl.textContent = callerUri || '';
+
+    var actions = document.createElement('div');
+    actions.style.cssText = 'display:flex;gap:16px;justify-content:center;';
+
+    var declineBtn = document.createElement('button');
+    declineBtn.style.cssText = 'min-width:120px;padding:12px 24px;border:none;border-radius:12px;background:#F2B8B5;color:#601410;font-size:14px;font-weight:500;cursor:pointer;';
+    declineBtn.textContent = 'Decline';
+    declineBtn.onclick = function() {
+        window.rejectIncomingCall(callId);
+    };
+
+    var acceptBtn = document.createElement('button');
+    acceptBtn.style.cssText = 'min-width:120px;padding:12px 24px;border:none;border-radius:12px;background:#A8C7FA;color:#062E6F;font-size:14px;font-weight:500;cursor:pointer;';
+    acceptBtn.textContent = 'Accept';
+    acceptBtn.onclick = function() {
+        window.acceptIncomingCall(callId);
+    };
+
+    actions.appendChild(declineBtn);
+    actions.appendChild(acceptBtn);
+    card.appendChild(iconWrap);
+    card.appendChild(labelEl);
+    card.appendChild(nameEl);
+    card.appendChild(uriEl);
+    card.appendChild(actions);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+
+    incomingRingtone.start();
+    incomingCallId = callId;
+};
+
+window.hideIncomingCallOverlay = function() {
+    var el = document.getElementById('incomingCallOverlay');
+    if (el) el.remove();
+    incomingRingtone.stop();
+};
 
 function handleTransferProgress(payload) {
     const { status_code, is_success, is_final } = payload;

@@ -21,6 +21,23 @@ use tracing::{debug, error, info, warn};
 /// User agent string for SIP messages.
 const USER_AGENT: &str = "USG-SIP-Client/0.1.0 (CNSA 2.0)";
 
+/// Resolves the local IP address that would be used to reach a given destination.
+///
+/// Creates a temporary UDP socket, "connects" it to the destination (no actual traffic),
+/// and reads back the OS-selected source address. This gives us the correct local
+/// interface IP for the registrar, instead of `0.0.0.0`.
+fn resolve_local_ip(destination: &SocketAddr) -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect(destination).ok()?;
+    let local_addr = socket.local_addr().ok()?;
+    let ip = local_addr.ip();
+    if ip.is_unspecified() {
+        None
+    } else {
+        Some(ip)
+    }
+}
+
 /// Registration agent handles REGISTER transactions for accounts.
 pub struct RegistrationAgent {
     /// Active registrations by account ID.
@@ -527,10 +544,30 @@ impl RegistrationAgent {
             client_types::TransportPreference::Udp => "udp",
         };
 
-        // Build Via header
-        let via = ViaHeader::new(transport_str, local_addr.ip().to_string())
+        // Use the resolved local IP for Via/Contact headers instead of 0.0.0.0.
+        // This ensures BulkVS (and other registrars) can route incoming INVITEs
+        // back to the correct address.
+        let effective_ip = if local_addr.ip().is_unspecified() {
+            // Determine our local IP by checking which interface routes to the registrar
+            let registrar_ip = registrar_uri
+                .host
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .map(|ip| {
+                    SocketAddr::new(ip, registrar_uri.port.unwrap_or(5060))
+                });
+            registrar_ip
+                .and_then(|addr| resolve_local_ip(&addr))
+                .unwrap_or(local_addr.ip())
+        } else {
+            local_addr.ip()
+        };
+
+        // Build Via header with rport for NAT traversal (RFC 3581)
+        let via = ViaHeader::new(transport_str, effective_ip.to_string())
             .with_port(local_addr.port())
-            .with_branch(branch);
+            .with_branch(branch)
+            .with_rport();
 
         // Build From header (with tag)
         let from = NameAddr::new(aor_uri.clone())
@@ -540,8 +577,8 @@ impl RegistrationAgent {
         // Build To header (same as From for REGISTER, no tag)
         let to = NameAddr::new(aor_uri.clone()).with_display_name(&account.display_name);
 
-        // Build Contact header - use user from AoR if present
-        let mut contact_uri = SipUri::new(local_addr.ip().to_string())
+        // Build Contact header - use resolved IP for correct incoming call routing
+        let mut contact_uri = SipUri::new(effective_ip.to_string())
             .with_port(local_addr.port())
             .with_param("transport", Some(transport_param.to_string()));
         if let Some(user) = &aor_uri.user {
@@ -598,9 +635,24 @@ impl RegistrationAgent {
             client_types::TransportPreference::Udp => "udp",
         };
 
-        let via = ViaHeader::new(transport_str, local_addr.ip().to_string())
+        // Resolve effective local IP (same as build_register_request)
+        let effective_ip = if local_addr.ip().is_unspecified() {
+            let registrar_ip = registrar_uri
+                .host
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .map(|ip| SocketAddr::new(ip, registrar_uri.port.unwrap_or(5060)));
+            registrar_ip
+                .and_then(|addr| resolve_local_ip(&addr))
+                .unwrap_or(local_addr.ip())
+        } else {
+            local_addr.ip()
+        };
+
+        let via = ViaHeader::new(transport_str, effective_ip.to_string())
             .with_port(local_addr.port())
-            .with_branch(branch);
+            .with_branch(branch)
+            .with_rport();
 
         let from = NameAddr::new(aor_uri.clone())
             .with_display_name(&account.display_name)
@@ -609,7 +661,7 @@ impl RegistrationAgent {
         let to = NameAddr::new(aor_uri.clone()).with_display_name(&account.display_name);
 
         // Contact: * for removing all bindings, or specific contact with expires=0
-        let mut contact_uri = SipUri::new(local_addr.ip().to_string())
+        let mut contact_uri = SipUri::new(effective_ip.to_string())
             .with_port(local_addr.port())
             .with_param("transport", Some(transport_param.to_string()));
         if let Some(user) = &aor_uri.user {

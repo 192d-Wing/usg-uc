@@ -1212,22 +1212,79 @@ impl CallManager {
         self.focused_call_id = Some(call_id.to_string());
 
         // Track SIP dialog identifiers for re-INVITE detection
+        let sip_call_id = incoming.sip_call_id.clone();
+        let local_tag = incoming.local_tag.clone();
+        let remote_tag = incoming.invite_request.headers.from_tag();
+        let remote_uri_str = incoming.remote_uri.clone();
+        let remote_display = incoming.remote_display_name.clone();
+        let source_addr = incoming.source_addr;
+        let remote_sdp_str = incoming
+            .invite_request
+            .body
+            .as_ref()
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .map(String::from);
+
         self.active_call_dialogs.insert(
             call_id.to_string(),
             ActiveCallDialog {
-                sip_call_id: incoming.sip_call_id,
-                local_tag: incoming.local_tag,
-                remote_addr: incoming.source_addr,
+                sip_call_id: sip_call_id.clone(),
+                local_tag: local_tag.clone(),
+                remote_addr: source_addr,
             },
         );
+
+        // Register the inbound call in the call agent so hangup (BYE) works.
+        // For BYE routing, use the Contact header from the INVITE if available,
+        // otherwise fall back to the source address.
+        let bye_target = incoming
+            .invite_request
+            .headers
+            .get_value(&proto_sip::header::HeaderName::Contact)
+            .and_then(|c| {
+                // Extract URI from Contact: <sip:...>
+                let s = c.to_string();
+                let start = s.find('<').map(|i| i + 1).unwrap_or(0);
+                let end = s.find('>').unwrap_or(s.len());
+                Some(s[start..end].to_string())
+            })
+            .unwrap_or_else(|| format!("sip:{}:{}", source_addr.ip(), source_addr.port()));
+
+        self.call_agent.register_inbound_call(
+            call_id,
+            &sip_call_id,
+            &local_tag,
+            remote_tag.as_deref(),
+            &bye_target,
+            remote_display.as_deref(),
+            remote_sdp_str.as_deref(),
+        );
+
+        // Start audio session using remote media address from INVITE SDP
+        if let Some(ref sdp) = remote_sdp_str {
+            if let Some(remote_media_addr) = parse_remote_media_addr_from_sdp(sdp) {
+                info!(
+                    call_id = %call_id,
+                    remote_media = %remote_media_addr,
+                    "Starting audio for accepted incoming call"
+                );
+                if let Err(e) = self.start_audio_session(call_id, remote_media_addr).await {
+                    error!(call_id = %call_id, error = %e, "Failed to start audio for incoming call");
+                }
+            } else {
+                warn!(call_id = %call_id, "No remote media address in incoming SDP");
+            }
+        } else {
+            warn!(call_id = %call_id, "No SDP body in incoming INVITE");
+        }
 
         // Notify application of state change
         let info = CallInfo {
             id: call_id.to_string(),
             state: CallState::Connected,
             direction: CallDirection::Inbound,
-            remote_uri: incoming.remote_uri,
-            remote_display_name: incoming.remote_display_name,
+            remote_uri: remote_uri_str,
+            remote_display_name: remote_display,
             start_time: Utc::now(),
             connect_time: Some(Utc::now()),
             is_muted: false,

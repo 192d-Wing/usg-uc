@@ -216,6 +216,55 @@ impl CallAgent {
         );
     }
 
+    /// Registers an accepted inbound call in the call agent's calls map.
+    ///
+    /// This allows hangup (BYE) and other in-dialog operations to work for
+    /// inbound calls the same way they work for outbound calls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_inbound_call(
+        &mut self,
+        call_id: &str,
+        sip_call_id: &str,
+        local_tag: &str,
+        remote_tag: Option<&str>,
+        remote_uri: &str,
+        remote_display_name: Option<&str>,
+        remote_sdp: Option<&str>,
+    ) {
+        let session = CallSession {
+            id: call_id.to_string(),
+            sip_call_id: sip_call_id.to_string(),
+            state: CallState::Connected,
+            dialog: None,
+            invite_transaction: None,
+            non_invite_transaction: None,
+            from_tag: local_tag.to_string(),
+            to_tag: remote_tag.map(String::from),
+            cseq: 1,
+            remote_uri: remote_uri.to_string(),
+            remote_display_name: remote_display_name.map(String::from),
+            is_outbound: false,
+            local_sdp: None,
+            remote_sdp: remote_sdp.map(String::from),
+            start_time: Utc::now(),
+            connected_at: Some(Instant::now()),
+            last_branch: None,
+            failure_reason: None,
+            refer_request: None,
+            transfer_target: None,
+            #[cfg(feature = "digest-auth")]
+            nonce_count: 0,
+            #[cfg(feature = "digest-auth")]
+            last_challenge: None,
+        };
+        info!(
+            call_id = %call_id,
+            sip_call_id = %sip_call_id,
+            "Registered inbound call in call agent"
+        );
+        self.calls.insert(call_id.to_string(), session);
+    }
+
     /// Makes an outbound call.
     ///
     /// Returns the call ID for tracking.
@@ -1768,7 +1817,8 @@ impl CallAgent {
 
         let via = ViaHeader::new(transport_type, local_addr.ip().to_string())
             .with_port(local_addr.port())
-            .with_branch(branch);
+            .with_branch(branch)
+            .with_rport();
 
         let from = NameAddr::new(aor_uri)
             .with_display_name(display_name)
@@ -1822,7 +1872,8 @@ impl CallAgent {
 
         let via = ViaHeader::new(transport_type, local_addr.ip().to_string())
             .with_port(local_addr.port())
-            .with_branch(branch.to_string());
+            .with_branch(branch.to_string())
+            .with_rport();
 
         let from = NameAddr::new(aor_uri.clone())
             .with_display_name(display_name)
@@ -1881,7 +1932,8 @@ impl CallAgent {
 
         let via = ViaHeader::new(transport_type, local_addr.ip().to_string())
             .with_port(local_addr.port())
-            .with_branch(branch.to_string());
+            .with_branch(branch.to_string())
+            .with_rport();
 
         let from = NameAddr::new(aor_uri)
             .with_display_name(display_name)
@@ -1930,7 +1982,8 @@ impl CallAgent {
 
         let via = ViaHeader::new(transport_type, local_addr.ip().to_string())
             .with_port(local_addr.port())
-            .with_branch(branch);
+            .with_branch(branch)
+            .with_rport();
 
         let from = NameAddr::new(aor_uri)
             .with_display_name(display_name)
@@ -1979,7 +2032,8 @@ impl CallAgent {
 
         let via = ViaHeader::new(transport_type, local_addr.ip().to_string())
             .with_port(local_addr.port())
-            .with_branch(branch);
+            .with_branch(branch)
+            .with_rport();
 
         let from = NameAddr::new(aor_uri)
             .with_display_name(display_name)
@@ -2028,7 +2082,8 @@ impl CallAgent {
 
         let via = ViaHeader::new(transport_type, local_addr.ip().to_string())
             .with_port(local_addr.port())
-            .with_branch(branch.to_string());
+            .with_branch(branch.to_string())
+            .with_rport();
 
         let from = NameAddr::new(aor_uri.clone())
             .with_display_name(display_name)
@@ -2094,7 +2149,8 @@ impl CallAgent {
 
         let via = ViaHeader::new(transport_type, local_addr.ip().to_string())
             .with_port(local_addr.port())
-            .with_branch(branch);
+            .with_branch(branch)
+            .with_rport();
 
         let from = NameAddr::new(aor_uri.clone())
             .with_display_name(display_name)
