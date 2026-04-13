@@ -114,10 +114,11 @@ class IncomingRingtone {
 
             this.isPlaying = true;
 
-            // Play ring pattern: 1 second on, 3 seconds off
+            // Classic phone ring: two short bursts, then pause
+            // Pattern: ring 0.4s, pause 0.2s, ring 0.4s, pause 3s (4s cycle)
             this.playRing();
             this.ringInterval = setInterval(() => {
-                this.playRing();
+                if (this.isPlaying) this.playRing();
             }, 4000);
         } catch (error) {
             console.error('Failed to start incoming ringtone:', error);
@@ -127,27 +128,38 @@ class IncomingRingtone {
     playRing() {
         if (!this.audioContext) return;
 
-        const osc1 = this.audioContext.createOscillator();
-        const osc2 = this.audioContext.createOscillator();
-        const gainNode = this.audioContext.createGain();
+        const ctx = this.audioContext;
+        const now = ctx.currentTime;
 
-        osc1.frequency.value = 440;
-        osc2.frequency.value = 480;
-        osc1.type = 'sine';
-        osc2.type = 'sine';
+        // Use higher frequencies for a distinct phone ring sound
+        // UK/classic style: 400 + 450 Hz dual tone
+        for (let burst = 0; burst < 2; burst++) {
+            const offset = burst * 0.6; // 0.4s ring + 0.2s gap
 
-        osc1.connect(gainNode);
-        osc2.connect(gainNode);
-        gainNode.connect(this.audioContext.destination);
+            const osc1 = ctx.createOscillator();
+            const osc2 = ctx.createOscillator();
+            const gain = ctx.createGain();
 
-        gainNode.gain.value = 0.15;
+            osc1.frequency.value = 400;
+            osc2.frequency.value = 450;
+            osc1.type = 'sine';
+            osc2.type = 'sine';
 
-        const now = this.audioContext.currentTime;
-        osc1.start(now);
-        osc2.start(now);
+            osc1.connect(gain);
+            osc2.connect(gain);
+            gain.connect(ctx.destination);
 
-        osc1.stop(now + 1.0);
-        osc2.stop(now + 1.0);
+            // Envelope: quick fade in/out to avoid clicks
+            gain.gain.setValueAtTime(0, now + offset);
+            gain.gain.linearRampToValueAtTime(0.18, now + offset + 0.02);
+            gain.gain.setValueAtTime(0.18, now + offset + 0.38);
+            gain.gain.linearRampToValueAtTime(0, now + offset + 0.4);
+
+            osc1.start(now + offset);
+            osc2.start(now + offset);
+            osc1.stop(now + offset + 0.4);
+            osc2.stop(now + offset + 0.4);
+        }
     }
 
     stop() {
@@ -739,6 +751,36 @@ window.rejectIncomingCall = rejectIncomingCall;
 
 // Incoming call overlay built entirely with inline styles (WKWebView-safe).
 // Called from Rust eval() fallback since CSS class-based modal is invisible in WKWebView.
+// Extract a display-friendly caller ID from a SIP URI.
+// "sip:+18086368006@76.8.29.198:5060" → "+1 (808) 636-8006"
+// "sip:john@example.com" → "john@example.com"
+function formatCallerUri(uri) {
+    if (!uri) return '';
+    // Strip sip:/sips: scheme
+    var s = uri.replace(/^sips?:/i, '');
+    // Take user part (before @)
+    var atIdx = s.indexOf('@');
+    var user = atIdx >= 0 ? s.substring(0, atIdx) : s;
+    // If it looks like a phone number, format it
+    var digits = user.replace(/[^\d]/g, '');
+    if (digits.length === 11 && digits[0] === '1') {
+        return '+1 (' + digits.substring(1, 4) + ') ' + digits.substring(4, 7) + '-' + digits.substring(7);
+    }
+    if (digits.length === 10) {
+        return '(' + digits.substring(0, 3) + ') ' + digits.substring(3, 6) + '-' + digits.substring(6);
+    }
+    // If user part starts with +, it's an international number
+    if (user[0] === '+' && digits.length > 6) {
+        return user;
+    }
+    // Otherwise return user@host (no port)
+    if (atIdx >= 0) {
+        var host = s.substring(atIdx + 1).replace(/:\d+$/, '');
+        return user + '@' + host;
+    }
+    return user;
+}
+
 window.showIncomingCallOverlay = function(callId, callerName, callerUri) {
     var old = document.getElementById('incomingCallOverlay');
     if (old) old.remove();
@@ -764,7 +806,7 @@ window.showIncomingCallOverlay = function(callId, callerName, callerUri) {
 
     var uriEl = document.createElement('div');
     uriEl.style.cssText = 'font-size:14px;color:#C4C0C9;margin-bottom:32px;';
-    uriEl.textContent = callerUri || '';
+    uriEl.textContent = formatCallerUri(callerUri);
 
     var actions = document.createElement('div');
     actions.style.cssText = 'display:flex;gap:16px;justify-content:center;';
