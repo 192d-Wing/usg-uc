@@ -2422,7 +2422,8 @@ async function loadAudioDevices() {
 function createDeviceMenuItem(displayName, deviceName, isSelected, invokeCmd) {
     const item = document.createElement('button');
     item.className = 'nav-audio-menu-item' + (isSelected ? ' selected' : '');
-    item.innerHTML = `<svg class="check-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg><span>${displayName}</span>`;
+    item.innerHTML = '<svg class="check-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg><span></span>';
+    item.querySelector('span').textContent = displayName;
     item.addEventListener('click', async () => {
         // Update selection UI
         const list = item.parentElement;
@@ -2605,7 +2606,11 @@ async function loadCertificates() {
     } catch (error) {
         console.error('Failed to load certificates:', error);
         certificates = [];
-        certList.innerHTML = `<div class="cert-error">Failed to load certificates: ${error}</div>`;
+        var errDiv = document.createElement('div');
+        errDiv.className = 'cert-error';
+        errDiv.textContent = 'Failed to load certificates: ' + error;
+        certList.innerHTML = '';
+        certList.appendChild(errDiv);
     }
 }
 

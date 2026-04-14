@@ -94,14 +94,14 @@ impl ViaHeader {
     }
 
     /// Generates a valid RFC 3261 branch parameter with magic cookie.
+    ///
+    /// Uses cryptographic randomness to prevent prediction and replay attacks.
     #[must_use]
     pub fn generate_branch() -> String {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        format!("{VIA_BRANCH_MAGIC_COOKIE}{timestamp:x}")
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).expect("getrandom failed");
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        format!("{VIA_BRANCH_MAGIC_COOKIE}{hex}")
     }
 
     /// Returns true if the branch parameter has the RFC 3261 magic cookie.
@@ -319,14 +319,13 @@ impl NameAddr {
     }
 
     /// Generates a random tag for From/To headers.
+    ///
+    /// Uses cryptographic randomness to prevent prediction and call hijacking.
     #[must_use]
     pub fn generate_tag() -> String {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        format!("{:x}", timestamp & 0xFFFF_FFFF_FFFF)
+        let mut bytes = [0u8; 8];
+        getrandom::fill(&mut bytes).expect("getrandom failed");
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 }
 

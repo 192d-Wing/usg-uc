@@ -45,6 +45,8 @@ use tracing::{debug, error, info, trace, warn};
 pub enum CertVerificationMode {
     /// Accept all certificates (DEVELOPMENT ONLY).
     /// Use only for local testing with self-signed certificates.
+    /// Only available in debug builds.
+    #[cfg(debug_assertions)]
     Insecure,
 
     /// Use the operating system's trusted CA store (default).
@@ -64,9 +66,11 @@ pub enum CertVerificationMode {
 /// A certificate verifier that accepts all certificates.
 /// Used for development/testing with self-signed certificates.
 /// WARNING: Do NOT use in production!
+#[cfg(debug_assertions)]
 #[derive(Debug)]
 struct InsecureCertVerifier;
 
+#[cfg(debug_assertions)]
 impl ServerCertVerifier for InsecureCertVerifier {
     fn verify_server_cert(
         &self,
@@ -440,6 +444,14 @@ impl TlsConnection {
             .map_err(|e| AppError::Sip(format!("Invalid UTF-8 in SIP headers: {e}")))?;
 
         let content_length = extract_content_length(headers_str).unwrap_or(0);
+
+        // Reject oversized messages to prevent OOM attacks
+        if content_length > MAX_SIP_MESSAGE_SIZE {
+            return Err(AppError::Sip(format!(
+                "SIP Content-Length {content_length} exceeds maximum {MAX_SIP_MESSAGE_SIZE}"
+            )));
+        }
+
         let total_length = header_end + 4 + content_length;
 
         if self.read_buffer.len() < total_length {
@@ -614,6 +626,7 @@ impl SipTransport {
 
         // Configure server certificate verification
         let builder_with_verifier = match &config.verification_mode {
+            #[cfg(debug_assertions)]
             CertVerificationMode::Insecure => {
                 warn!("INSECURE MODE: Server certificates will not be validated!");
                 warn!("This should only be used for development with self-signed certs");

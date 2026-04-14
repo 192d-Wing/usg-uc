@@ -676,6 +676,21 @@ async fn update_sip_settings(
         client_types::TransportPreference::Udp | client_types::TransportPreference::Tcp => "sip",
     };
 
+    // Validate SIP URI components to prevent header injection
+    fn validate_sip_component(value: &str, field: &str) -> Result<(), String> {
+        if value.contains('\r') || value.contains('\n') || value.contains('\0') {
+            return Err(format!("{field} contains illegal characters (CR/LF/NUL)"));
+        }
+        if value.contains('>') || value.contains('<') {
+            return Err(format!("{field} contains illegal angle brackets"));
+        }
+        Ok(())
+    }
+    validate_sip_component(&settings.username, "Username")?;
+    validate_sip_component(&settings.domain, "Domain")?;
+    validate_sip_component(&settings.registrar, "Registrar")?;
+    validate_sip_component(&settings.display_name, "Display name")?;
+
     // Build SIP URI from username and domain
     let sip_uri = format!("{uri_scheme}:{}@{}", settings.username, settings.domain);
 

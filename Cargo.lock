@@ -5147,6 +5147,7 @@ name = "proto-sip"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "getrandom 0.4.2",
  "md5 0.7.0",
  "thiserror 2.0.18",
 ]

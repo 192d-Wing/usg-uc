@@ -475,6 +475,9 @@ impl AudioPipeline {
         // Create receiver
         let mut receiver = RtpReceiver::new(socket, jitter_buffer.clone());
 
+        // Validate RTP source — only accept packets from the negotiated remote
+        receiver.set_expected_remote(config.remote_addr);
+
         // Enable RFC 2198 redundancy reception if negotiated in SDP
         if let Some(pt) = config.redundancy_pt {
             receiver.set_redundancy_pt(pt);
