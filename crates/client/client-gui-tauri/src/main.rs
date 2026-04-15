@@ -158,9 +158,54 @@ async fn initialize_client(state: State<'_, TauriAppState>) -> Result<(), String
     let mut client = ClientApp::new(local_sip_addr, local_media_addr, event_tx)
         .map_err(|e| format!("Failed to create client: {e}"))?;
 
+    // Resolve registrar DNS to determine if we need IPv4 or IPv6 socket.
+    // Check the configured registrar hostname — if it resolves to AAAA (IPv6),
+    // we bind the UDP socket to [::]:0, otherwise 0.0.0.0:0.
+    // Resolve registrar DNS to determine if we need IPv4 or IPv6 socket.
+    // If the registrar only has AAAA records (no A records), use IPv6.
+    let use_ipv6 = {
+        let settings = state.settings_manager.read().await;
+        let registrar_uri = settings
+            .default_account()
+            .map(|a| a.registrar_uri.clone())
+            .unwrap_or_default();
+        drop(settings);
+
+        if registrar_uri.is_empty() {
+            false
+        } else {
+            // Strip sip:/sips: prefix for DNS lookup
+            let host = registrar_uri
+                .strip_prefix("sips:")
+                .or_else(|| registrar_uri.strip_prefix("sip:"))
+                .unwrap_or(&registrar_uri);
+            match tokio::net::lookup_host(format!("{host}:5060")).await {
+                Ok(addrs) => {
+                    let all_addrs: Vec<_> = addrs.collect();
+                    let has_ipv4 = all_addrs.iter().any(|a| a.is_ipv4());
+                    let has_ipv6 = all_addrs.iter().any(|a| a.is_ipv6());
+                    info!(
+                        registrar = host,
+                        ipv4 = has_ipv4,
+                        ipv6 = has_ipv6,
+                        "Registrar DNS resolved"
+                    );
+                    // Prefer IPv6 when available
+                    has_ipv6
+                }
+                Err(e) => {
+                    info!(error = %e, "Registrar DNS pre-resolve failed, defaulting to IPv4");
+                    false
+                }
+            }
+        }
+    };
+
     // Get UDP socket and event sender for the receive loop BEFORE initialize
     // This ensures the receive loop is running before any registration sends
-    if let Some((udp_socket, transport_event_tx)) = client.get_udp_socket_for_receive().await {
+    if let Some((udp_socket, transport_event_tx)) =
+        client.get_udp_socket_for_receive(use_ipv6).await
+    {
         info!("Spawning UDP receive loop using Tauri async runtime");
         tauri::async_runtime::spawn(async move {
             run_udp_receive_loop(udp_socket, transport_event_tx).await;

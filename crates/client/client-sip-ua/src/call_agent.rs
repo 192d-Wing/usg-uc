@@ -2214,15 +2214,24 @@ impl CallAgent {
         // DNS resolution for hostnames
         debug!(host = %host, "parse_destination: performing DNS resolution");
         let lookup_host = format!("{host}:{port}");
-        let mut addrs = tokio::net::lookup_host(&lookup_host).await.map_err(|e| {
-            error!(host = %host, error = %e, "parse_destination: DNS resolution failed");
-            SipUaError::ConfigError(format!("DNS resolution failed for {host}: {e}"))
-        })?;
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&lookup_host)
+            .await
+            .map_err(|e| {
+                error!(host = %host, error = %e, "parse_destination: DNS resolution failed");
+                SipUaError::ConfigError(format!("DNS resolution failed for {host}: {e}"))
+            })?
+            .collect();
 
-        let result = addrs.next().ok_or_else(|| {
-            error!(host = %host, "parse_destination: no addresses found");
-            SipUaError::ConfigError(format!("No addresses found for {host}"))
-        })?;
+        // Prefer IPv6 (AAAA) over IPv4 (A) to match socket address family
+        let result = addrs
+            .iter()
+            .find(|a| a.is_ipv6())
+            .or_else(|| addrs.first())
+            .copied()
+            .ok_or_else(|| {
+                error!(host = %host, "parse_destination: no addresses found");
+                SipUaError::ConfigError(format!("No addresses found for {host}"))
+            })?;
 
         debug!(
             host = %host,

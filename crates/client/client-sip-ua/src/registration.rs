@@ -27,7 +27,13 @@ const USER_AGENT: &str = "USG-SIP-Client/0.1.0 (CNSA 2.0)";
 /// and reads back the OS-selected source address. This gives us the correct local
 /// interface IP for the registrar, instead of `0.0.0.0`.
 fn resolve_local_ip(destination: &SocketAddr) -> Option<std::net::IpAddr> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    // Bind to the same address family as the destination
+    let bind_addr = if destination.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let socket = std::net::UdpSocket::bind(bind_addr).ok()?;
     socket.connect(destination).ok()?;
     let local_addr = socket.local_addr().ok()?;
     let ip = local_addr.ip();
@@ -755,12 +761,18 @@ impl RegistrationAgent {
             return Ok(SocketAddr::new(ip, port));
         }
 
-        // DNS resolution for hostnames
+        // DNS resolution for hostnames — prefer IPv6 (AAAA) over IPv4 (A).
+        // The UDP socket address family is chosen at startup to match.
         let lookup_host = format!("{host}:{port}");
-        tokio::net::lookup_host(&lookup_host)
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&lookup_host)
             .await
             .map_err(|e| SipUaError::ConfigError(format!("DNS resolution failed for {host}: {e}")))?
-            .next()
+            .collect();
+        addrs
+            .iter()
+            .find(|a| a.is_ipv6())
+            .or_else(|| addrs.first())
+            .copied()
             .ok_or_else(|| SipUaError::ConfigError(format!("No addresses found for {host}")))
     }
 

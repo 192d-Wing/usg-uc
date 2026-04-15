@@ -792,7 +792,13 @@ impl SipTransport {
     ///
     /// If the socket is new, the caller should start a receive loop.
     /// In Tauri context, use `tauri::async_runtime::spawn` for the receive loop.
-    pub async fn get_or_create_udp_socket(&self) -> AppResult<(Arc<UdpSocket>, bool)> {
+    /// # Arguments
+    /// * `use_ipv6` - If true, bind to `[::]:0` for IPv6; otherwise `0.0.0.0:0` for IPv4.
+    ///   Determined by resolving the registrar address first (AAAA → true, A → false).
+    pub async fn get_or_create_udp_socket(
+        &self,
+        use_ipv6: bool,
+    ) -> AppResult<(Arc<UdpSocket>, bool)> {
         let socket_guard = self.udp_socket.read().await;
         if let Some(ref sock) = *socket_guard {
             let result = Ok((sock.clone(), false));
@@ -810,15 +816,22 @@ impl SipTransport {
             return result;
         }
 
-        // Bind to any available port
-        let socket = match UdpSocket::bind("0.0.0.0:0").await {
+        // Bind to the address family that matches the registrar (IPv6 preferred).
+        // macOS does not support dual-stack (sending IPv4 on an IPv6 socket
+        // fails with EINVAL), so we must match the registrar's address family.
+        let (primary, fallback) = if use_ipv6 {
+            ("[::]:0", "0.0.0.0:0")
+        } else {
+            ("0.0.0.0:0", "[::]:0")
+        };
+        let socket = match UdpSocket::bind(primary).await {
             Ok(s) => {
-                info!("UDP socket bound to 0.0.0.0");
+                info!(addr = primary, "UDP socket bound");
                 s
             }
             Err(e) => {
-                warn!(error = %e, "Failed to bind to 0.0.0.0, trying localhost");
-                UdpSocket::bind("127.0.0.1:0")
+                warn!(error = %e, primary = primary, "Failed to bind, trying fallback");
+                UdpSocket::bind(fallback)
                     .await
                     .map_err(|e2| AppError::Sip(format!("Failed to bind UDP socket: {e} / {e2}")))?
             }
@@ -857,7 +870,7 @@ impl SipTransport {
         );
 
         // Get or create UDP socket (caller is responsible for receive loop)
-        let (socket, is_new) = self.get_or_create_udp_socket().await?;
+        let (socket, is_new) = self.get_or_create_udp_socket(destination.is_ipv6()).await?;
 
         // Log socket info for debugging
         if let Ok(local_addr) = socket.local_addr() {
@@ -901,7 +914,7 @@ impl SipTransport {
         );
 
         // Get or create UDP socket
-        let (socket, is_new) = self.get_or_create_udp_socket().await?;
+        let (socket, is_new) = self.get_or_create_udp_socket(destination.is_ipv6()).await?;
 
         // Log socket info for debugging
         if let Ok(local_addr) = socket.local_addr() {
