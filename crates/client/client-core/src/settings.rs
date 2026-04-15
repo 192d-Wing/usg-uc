@@ -650,7 +650,9 @@ impl SettingsManager {
     /// Call this after modifying account credentials to save them to credential storage.
     #[cfg(feature = "digest-auth")]
     pub fn persist_account_passwords(&mut self) -> AppResult<()> {
-        let accounts_to_persist: Vec<(String, String)> = self
+        use zeroize::Zeroize;
+
+        let mut accounts_to_persist: Vec<(String, String)> = self
             .settings
             .accounts
             .iter()
@@ -665,13 +667,18 @@ impl SettingsManager {
             })
             .collect();
 
-        for (account_id, password) in accounts_to_persist {
-            if self.store_digest_password(&account_id, &password)?
-                && let Some(account) = self.settings.accounts.get_mut(&account_id)
+        for (account_id, password) in &accounts_to_persist {
+            if self.store_digest_password(account_id, password)?
+                && let Some(account) = self.settings.accounts.get_mut(account_id)
                 && let Some(ref mut creds) = account.digest_credentials
             {
                 creds.password_persisted = true;
             }
+        }
+
+        // Zeroize plaintext passwords from temporary vector
+        for (_, password) in &mut accounts_to_persist {
+            password.zeroize();
         }
 
         Ok(())

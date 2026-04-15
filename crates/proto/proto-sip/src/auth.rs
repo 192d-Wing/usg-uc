@@ -584,15 +584,14 @@ impl DigestHasher for Md5DigestHasher {
 }
 
 /// Generates a client nonce for digest authentication.
+///
+/// Uses cryptographic randomness to prevent prediction and replay attacks.
 #[cfg(feature = "digest-auth")]
 #[must_use]
 pub fn generate_cnonce() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{now:016x}")
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("getrandom failed");
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Computes HA1 for digest authentication per RFC 2617 Section 3.2.2.1.

@@ -1214,6 +1214,9 @@ impl CertificateStore {
             // P-384: 1.3.132.0.34
             // P-521: 1.3.132.0.35
 
+            if data.is_null() || len == 0 {
+                return String::from("Unknown");
+            }
             let params = std::slice::from_raw_parts(data, len);
 
             // Simple OID detection (actual parsing would need ASN.1 decoder)
@@ -1421,8 +1424,14 @@ impl CertificateStore {
                 CertStoreError::CertificateNotFound(thumbprint.to_string())
             })?;
 
-            // Get the DER-encoded certificate
+            // Get the DER-encoded certificate with bounds validation
             let cert = &*cert_ctx;
+            if cert.pbCertEncoded.is_null() || cert.cbCertEncoded == 0 {
+                let _ = CertCloseStore(Some(store), 0);
+                return Err(CertStoreError::CertificateNotFound(
+                    "Certificate has no encoded data".to_string(),
+                ));
+            }
             let cert_der =
                 std::slice::from_raw_parts(cert.pbCertEncoded, cert.cbCertEncoded as usize)
                     .to_vec();
