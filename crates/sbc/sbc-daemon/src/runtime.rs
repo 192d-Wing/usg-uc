@@ -303,9 +303,12 @@ impl Runtime {
             None
         };
 
-        // Extract gRPC config before moving config to server
+        // Extract gRPC config and API listen address before moving config to
+        // server. The schema parses transport.api_listen but it was previously
+        // ignored — capture it here so the API server honors the TOML setting.
         #[cfg(feature = "grpc")]
         let grpc_config = config.grpc.clone().unwrap_or_default();
+        let api_listen_override = config.transport.api_listen;
 
         // Pass cluster manager to server if available
         #[cfg(feature = "cluster")]
@@ -325,8 +328,11 @@ impl Runtime {
                 reason: e.to_string(),
             })?;
 
-        // Create API server
-        let api_config = ApiServerConfig::default();
+        let api_config = ApiServerConfig {
+            listen_addr: api_listen_override
+                .unwrap_or_else(|| ApiServerConfig::default().listen_addr),
+            ..ApiServerConfig::default()
+        };
         let metrics = SbcMetrics::standard();
         let stats = Arc::clone(server.stats());
 

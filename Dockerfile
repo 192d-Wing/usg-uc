@@ -12,7 +12,8 @@
 # - **SC-28**: Protection of Information at Rest - No secrets in image
 
 # =============================================================================
-# Stage 1: Build Angular dashboard
+# Stage 1: Build dashboard (Vite + React, output to dist/sbc-dashboard/browser
+# to match the path baked into sbc-daemon's include_dir!).
 # =============================================================================
 FROM node:22-bookworm-slim AS dashboard
 
@@ -20,7 +21,7 @@ WORKDIR /app
 COPY crates/sbc/sbc-dashboard/package.json crates/sbc/sbc-dashboard/package-lock.json* ./
 RUN npm ci --prefer-offline
 COPY crates/sbc/sbc-dashboard/ ./
-RUN npx ng build --configuration=production
+RUN npm run build
 
 # =============================================================================
 # Stage 2: Build Rust binaries
@@ -55,10 +56,12 @@ RUN cargo build --release --package sbc-daemon --package sbc-cli
 # =============================================================================
 FROM debian:bookworm-slim AS runtime
 
-# Install runtime dependencies
+# Install runtime dependencies. libcap2-bin provides `setcap` so the
+# non-root daemon can bind to privileged ports (e.g. HTTP :80).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
+    libcap2-bin \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -77,8 +80,11 @@ COPY --from=builder /app/target/release/sbc-cli /usr/local/bin/
 # Copy default configuration
 COPY deploy/config/config.toml /etc/sbc/config.toml
 
-# Set ownership
-RUN chown -R sbc:sbc /usr/local/bin/sbc-daemon /usr/local/bin/sbc-cli
+# Set ownership and grant CAP_NET_BIND_SERVICE as a file capability so the
+# non-root user (UID 1000) can bind to privileged ports without needing
+# ambient capabilities at the pod level.
+RUN chown -R sbc:sbc /usr/local/bin/sbc-daemon /usr/local/bin/sbc-cli \
+    && setcap 'cap_net_bind_service=+ep' /usr/local/bin/sbc-daemon
 
 # Switch to non-root user
 USER sbc

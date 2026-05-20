@@ -1,0 +1,46 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sbc-daemon
+  namespace: sbc-system
+  labels:
+    app.kubernetes.io/name: sbc
+    app.kubernetes.io/component: daemon
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sbc-daemon
+  namespace: sbc-system
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["sbc-config"]
+    verbs: ["get", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["sbc-certs"]
+    verbs: ["get", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sbc-daemon
+  namespace: sbc-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sbc-daemon
+subjects:
+  - kind: ServiceAccount
+    name: sbc-daemon
+    namespace: sbc-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kea-dhcp4
+  namespace: sbc-system
+  labels:
+    app.kubernetes.io/name: kea-dhcp4
