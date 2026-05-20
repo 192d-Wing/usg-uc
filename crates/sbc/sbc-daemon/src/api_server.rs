@@ -1568,35 +1568,81 @@ async fn serve_phone_config(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(path): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    // Extract MAC from path like "001122334455.cfg" or "001122334455-edge.cfg"
-    let filename = path.split('/').last().unwrap_or(&path);
-    let mac_clean = filename.split('.').next().unwrap_or(filename)
-        .split('-').next().unwrap_or(filename)
-        .replace(':', "");
-
-    if let Some(ref prov) = state.provisioning {
-        // Look up phone by MAC and generate config
-        let phone = uc_phone_mgmt::model::Phone::new(
-            &mac_clean,
-            uc_phone_mgmt::model::PhoneModel::Generic("auto".to_string()),
-            &format!("Phone-{mac_clean}"),
-        );
-        match prov.generate_config(&phone) {
-            Ok(config) => Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "text/xml")
-                .body(config)
-                .unwrap_or_default(),
-            Err(_) => Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body("Phone not found".to_string())
-                .unwrap_or_default(),
-        }
-    } else {
-        Response::builder()
+    let Some(ref prov) = state.provisioning else {
+        return Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .body("Provisioning not configured".to_string())
-            .unwrap_or_default()
+            .unwrap_or_default();
+    };
+
+    // Filename forms across vendors:
+    //   <mac>.cfg              (Polycom VVX/Edge)
+    //   <mac>.xml              (Cisco MPP/9800)
+    //   <mac>-edge.cfg         (Polycom Edge variant)
+    //   <UPPERCASE_MAC>.xml    (Teo spec p.19 mandates uppercase)
+    //   TCS7000A.xml           (Teo global file, served separately below)
+    let filename = path.rsplit('/').next().unwrap_or(&path);
+    let stem = filename.split('.').next().unwrap_or(filename);
+    let mac_token = stem.split('-').next().unwrap_or(stem);
+    let mac_key = mac_token.replace([':', '-'], "").to_lowercase();
+
+    // Teo global config file. We don't currently serve a fleet-wide global,
+    // but respond 404 with a clear body so the phone doesn't fall back to its
+    // last cached copy thinking the server is broken.
+    if filename.eq_ignore_ascii_case("TCS7000A.xml") {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body("No global Teo config served; per-MAC files only".to_string())
+            .unwrap_or_default();
+    }
+
+    // Look up the phone record by MAC. Phones must be created via
+    // POST /api/v1/phones before they can fetch a config.
+    let phone_json = {
+        let store = state.mem_store.read().await;
+        store.phones.values().find(|v| {
+            v.get("mac_address")
+                .and_then(|m| m.as_str())
+                .map(|m| m.replace([':', '-'], "").eq_ignore_ascii_case(&mac_key))
+                .unwrap_or(false)
+        }).cloned()
+    };
+
+    let Some(phone_json) = phone_json else {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(format!("No phone record for MAC {mac_key}"))
+            .unwrap_or_default();
+    };
+
+    let phone: uc_phone_mgmt::model::Phone = match serde_json::from_value(phone_json) {
+        Ok(p) => p,
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(format!("Stored phone record is malformed: {e}"))
+                .unwrap_or_default();
+        }
+    };
+
+    match prov.generate_config(&phone) {
+        Ok(config) => {
+            // .cfg is text/plain by convention for Polycom; .xml is application/xml.
+            let ct = if filename.to_ascii_lowercase().ends_with(".xml") {
+                "application/xml"
+            } else {
+                "text/plain"
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", ct)
+                .body(config)
+                .unwrap_or_default()
+        }
+        Err(e) => Response::builder()
+            .status(StatusCode::UNPROCESSABLE_ENTITY)
+            .body(format!("Cannot generate config: {e}"))
+            .unwrap_or_default(),
     }
 }
 

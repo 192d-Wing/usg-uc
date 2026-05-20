@@ -6,6 +6,7 @@ use crate::error::PhoneMgmtError;
 use crate::model::{Phone, PhoneModel};
 use crate::poly_edge;
 use crate::polycom_vvx;
+use crate::teo;
 
 /// Provisioning server that generates phone-specific configurations.
 pub struct ProvisioningServer {
@@ -41,6 +42,7 @@ impl ProvisioningServer {
             "poly_edge" => Ok(poly_edge::generate_edge_config(phone, &self.sbc_host)),
             "cisco_mpp" => Ok(cisco_mpp::generate_mpp_config(phone, &self.sbc_host)),
             "cisco_9800" => Ok(cisco_9800::generate_9800_config(phone, &self.sbc_host)),
+            "teo" => Ok(teo::generate_teo_config(phone, &self.sbc_host)),
             other => Err(PhoneMgmtError::ConfigGenerationFailed(format!(
                 "unsupported model family: {other}"
             ))),
@@ -53,14 +55,17 @@ impl ProvisioningServer {
     /// phone's config.
     #[must_use]
     pub fn config_path(&self, mac: &str, model: &PhoneModel) -> String {
+        // Teo spec p.19 mandates UPPERCASE MAC for the filename. Other vendors
+        // accept either; we keep them lowercase for consistency with their docs.
+        if model.family() == "teo" {
+            return format!("/provision/{}", teo::teo_config_filename(mac));
+        }
         let clean_mac = mac.replace(':', "").to_lowercase();
         let ext = match model.family() {
-            "polycom_vvx" | "polycom_trio" => "cfg",
-            "poly_edge" => "cfg",
             "cisco_mpp" | "cisco_9800" => "xml",
             _ => "cfg",
         };
-        format!("/provisioning/{clean_mac}.{ext}")
+        format!("/provision/{clean_mac}.{ext}")
     }
 }
 
@@ -92,28 +97,45 @@ mod tests {
     fn test_config_path_polycom() {
         let server = ProvisioningServer::new("sbc.example.com", 443);
         let path = server.config_path("aa:bb:cc:dd:ee:ff", &PhoneModel::PolycomVVX450);
-        assert_eq!(path, "/provisioning/aabbccddeeff.cfg");
+        assert_eq!(path, "/provision/aabbccddeeff.cfg");
     }
 
     #[test]
     fn test_config_path_cisco_mpp() {
         let server = ProvisioningServer::new("sbc.example.com", 443);
         let path = server.config_path("11:22:33:44:55:66", &PhoneModel::CiscoMPP8851);
-        assert_eq!(path, "/provisioning/112233445566.xml");
+        assert_eq!(path, "/provision/112233445566.xml");
     }
 
     #[test]
     fn test_config_path_cisco_9800() {
         let server = ProvisioningServer::new("sbc.example.com", 443);
         let path = server.config_path("AA:BB:CC:DD:EE:FF", &PhoneModel::Cisco9861);
-        assert_eq!(path, "/provisioning/aabbccddeeff.xml");
+        assert_eq!(path, "/provision/aabbccddeeff.xml");
     }
 
     #[test]
     fn test_config_path_poly_edge() {
         let server = ProvisioningServer::new("sbc.example.com", 443);
         let path = server.config_path("aa:bb:cc:dd:ee:ff", &PhoneModel::PolyEdgeE450);
-        assert_eq!(path, "/provisioning/aabbccddeeff.cfg");
+        assert_eq!(path, "/provision/aabbccddeeff.cfg");
+    }
+
+    #[test]
+    fn test_config_path_teo_uppercases_mac() {
+        let server = ProvisioningServer::new("sbc.example.mil", 443);
+        // Lowercase, colon-separated input → UPPERCASE filename per Teo spec.
+        let path = server.config_path("00:04:8d:00:00:f5", &PhoneModel::Teo7810);
+        assert_eq!(path, "/provision/00048D0000F5.xml");
+    }
+
+    #[test]
+    fn test_generate_config_teo() {
+        let server = ProvisioningServer::new("sbc.example.mil", 443);
+        let phone = test_phone(PhoneModel::Teo7810);
+        let config = server.generate_config(&phone).unwrap();
+        assert!(config.contains("<TEO_settings schema_vers=\"2.0\">"));
+        assert!(config.contains("<TEO_phone model=\"7810\">"));
     }
 
     #[test]

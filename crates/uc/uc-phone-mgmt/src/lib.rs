@@ -1,7 +1,7 @@
 //! Phone device management and auto-provisioning for USG SBC.
 //!
 //! Supports Polycom VVX, Poly Edge, Cisco MPP (6800/7800/8800),
-//! and Cisco 9800 series phones.
+//! Cisco 9800 series, and Teo / Tone Commander 7810/4104/4101 phones.
 
 #![forbid(unsafe_code)]
 #![deny(warnings)]
@@ -15,3 +15,4 @@ pub mod poly_edge;
 pub mod polycom_vvx;
 pub mod provisioning;
 pub mod store;
+pub mod teo;

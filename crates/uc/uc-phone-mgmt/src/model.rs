@@ -186,6 +186,16 @@ pub enum PhoneModel {
     /// Cisco 9871
     Cisco9871,
 
+    // Teo / Tone Commander
+    /// Teo 7810
+    Teo7810,
+    /// Teo 7810-TSG (TEMPEST/secure variant)
+    Teo7810TSG,
+    /// Teo 4104
+    Teo4104,
+    /// Teo 4101
+    Teo4101,
+
     /// Generic / unknown model.
     Generic(String),
 }
@@ -234,6 +244,8 @@ impl PhoneModel {
             | Self::CiscoMPP8861 => "cisco_mpp",
 
             Self::Cisco9841 | Self::Cisco9851 | Self::Cisco9861 | Self::Cisco9871 => "cisco_9800",
+
+            Self::Teo7810 | Self::Teo7810TSG | Self::Teo4104 | Self::Teo4101 => "teo",
 
             Self::Generic(_) => "generic",
         }
@@ -294,6 +306,12 @@ impl PhoneModel {
             Self::Cisco9861 => 10,
             Self::Cisco9871 => 12,
 
+            // Teo: multifunction keys can each be a LINE.
+            // 7810 has 10 keys (1-10), 4104 has 16, 4101 has 1 primary line only.
+            Self::Teo7810 | Self::Teo7810TSG => 10,
+            Self::Teo4104 => 16,
+            Self::Teo4101 => 1,
+
             Self::Generic(_) => 4,
         }
     }
@@ -344,6 +362,11 @@ impl PhoneModel {
             Self::Cisco9851 => "Cisco 9851",
             Self::Cisco9861 => "Cisco 9861",
             Self::Cisco9871 => "Cisco 9871",
+
+            Self::Teo7810 => "Teo 7810",
+            Self::Teo7810TSG => "Teo 7810-TSG",
+            Self::Teo4104 => "Teo 4104",
+            Self::Teo4101 => "Teo 4101",
 
             Self::Generic(name) => name.as_str(),
         }
