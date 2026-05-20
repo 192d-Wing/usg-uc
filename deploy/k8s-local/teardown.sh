@@ -5,6 +5,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "$SCRIPT_DIR/.env.local" ] && source "$SCRIPT_DIR/.env.local"
+
 CLUSTER_NAME="sbc-local"
 HOST_NIC="${SBC_HOST_NIC:-enp2s0}"
 DOCKER_MACVLAN_NET="sbc-lan"

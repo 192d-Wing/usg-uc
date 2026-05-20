@@ -20,6 +20,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Per-machine overrides (gitignored). Define SBC_HOST_NIC / SBC_LAN_GATEWAY here.
+[ -f "$SCRIPT_DIR/.env.local" ] && source "$SCRIPT_DIR/.env.local"
+
 CLUSTER_NAME="sbc-local"
 SBC_IMAGE="sbc-daemon:local"
 HOST_NIC="${SBC_HOST_NIC:-enp2s0}"       # Physical NIC for macvlan trunk
@@ -161,9 +165,29 @@ else
 fi
 
 # ── Step 8: Apply Multus networks ────────────────────────
-info "Creating Multus NetworkAttachmentDefinitions (master=${MACVLAN_IF})..."
-sed "s/\"master\": \"eth0\"/\"master\": \"${MACVLAN_IF}\"/" "$SCRIPT_DIR/multus-networks.yaml" | kubectl apply -f -
-ok "Networks created (sbc-inside, sbc-outside, sbc-oobm)"
+# Compute zone IPs in the detected LAN subnet. Defaults use the top of the /24
+# (240/241/242) — override in .env.local if those collide with DHCP scope.
+LAN_PREFIX="${LAN_SUBNET%.*}"                      # e.g. 10.0.100  (from 10.0.100.0/24)
+SBC_INSIDE_IP="${SBC_INSIDE_IP:-${LAN_PREFIX}.240}"
+SBC_OUTSIDE_IP="${SBC_OUTSIDE_IP:-${LAN_PREFIX}.241}"
+SBC_OOBM_IP="${SBC_OOBM_IP:-${LAN_PREFIX}.242}"
+
+info "Creating Multus NetworkAttachmentDefinitions"
+info "  master=${MACVLAN_IF}  subnet=${LAN_SUBNET}  gateway=${LAN_GATEWAY}"
+info "  inside=${SBC_INSIDE_IP}  outside=${SBC_OUTSIDE_IP}  oobm=${SBC_OOBM_IP}"
+python3 - "$SCRIPT_DIR/multus-networks.yaml" <<PY | kubectl apply -f -
+import sys, re
+path = sys.argv[1]
+text = open(path).read()
+text = text.replace('"master": "eth0"', '"master": "${MACVLAN_IF}"')
+text = re.sub(r'"subnet":\s*"192\.168\.0\.0/24"', '"subnet": "${LAN_SUBNET}"', text)
+text = re.sub(r'"gateway":\s*"192\.168\.0\.1"', '"gateway": "${LAN_GATEWAY}"', text)
+text = text.replace('192.168.0.240', '${SBC_INSIDE_IP}')
+text = text.replace('192.168.0.241', '${SBC_OUTSIDE_IP}')
+text = text.replace('192.168.0.242', '${SBC_OOBM_IP}')
+sys.stdout.write(text)
+PY
+ok "Networks created (sbc-inside=${SBC_INSIDE_IP}, sbc-outside=${SBC_OUTSIDE_IP}, sbc-oobm=${SBC_OOBM_IP})"
 
 # ── Step 9: Apply SBC ConfigMaps ─────────────────────────
 info "Applying SBC configuration..."
@@ -231,26 +255,27 @@ echo "Services:"
 kubectl -n sbc-system get svc
 echo ""
 
-echo "Zone IPs (static):"
-echo "  inside  (net1):  192.168.0.240  — SIP phones"
-echo "  outside (net2):  192.168.0.241  — SIP trunks, RTP media"
-echo "  oobm    (net3):  192.168.0.242  — Dashboard, API, metrics"
+echo "Zone IPs (static, on LAN ${LAN_SUBNET}):"
+echo "  inside  (net1):  ${SBC_INSIDE_IP}  — SIP phones"
+echo "  outside (net2):  ${SBC_OUTSIDE_IP}  — SIP trunks, RTP media"
+echo "  oobm    (net3):  ${SBC_OOBM_IP}  — Dashboard, API, metrics"
 echo ""
 
 echo "Access:"
-echo "  Dashboard:      http://192.168.0.242:8080"
-echo "  SIP (inside):   192.168.0.240:5060"
-echo "  SIP (outside):  192.168.0.241:5060"
-echo "  API:            http://localhost:8080  (via port mapping)"
+echo "  Dashboard:      http://${SBC_OOBM_IP}:8080"
+echo "  API:            http://${SBC_OOBM_IP}:8080/api/v1/..."
+echo "  Metrics:        http://${SBC_OOBM_IP}:9090/metrics"
+echo "  SIP (inside):   ${SBC_INSIDE_IP}:5060"
+echo "  SIP (outside):  ${SBC_OUTSIDE_IP}:5060"
 echo ""
 
 echo "Router port forward (for inbound calls from SIP trunks):"
-echo "  UDP 5060        → 192.168.0.241"
-echo "  UDP 16384-20000 → 192.168.0.241"
+echo "  UDP 5060        → ${SBC_OUTSIDE_IP}"
+echo "  UDP 16384-20000 → ${SBC_OUTSIDE_IP}"
 echo ""
 
 echo "Quick test:"
-echo "  curl http://192.168.0.242:8080/api/v1/system/health"
+echo "  curl http://${SBC_OOBM_IP}:8080/api/v1/system/health"
 echo ""
 
 echo "Logs:"
