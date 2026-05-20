@@ -10,10 +10,10 @@ import StatusIndicator from '@cloudscape-design/components/status-indicator';
 export function PlaceholderPage({
   title,
   description,
-}: {
+}: Readonly<{
   title: string;
   description?: string;
-}) {
+}>) {
   return (
     <ContentLayout header={<Header variant="h1">{title}</Header>}>
       <Container header={<Header variant="h2">Migration in progress</Header>}>

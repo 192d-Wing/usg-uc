@@ -29,7 +29,7 @@ const items: SideNavigationProps.Item[] = [
   ]},
 ];
 
-export function Sidebar({ activePath }: { activePath: string }) {
+export function Sidebar({ activePath }: Readonly<{ activePath: string }>) {
   const navigate = useNavigate();
   // Cloudscape matches activeHref against item.href. Strip params (e.g.
   // /phones/abc-123 should still highlight /phones).

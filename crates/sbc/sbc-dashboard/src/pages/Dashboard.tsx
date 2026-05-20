@@ -27,7 +27,7 @@ function formatUptime(seconds: number | undefined): string {
   return `${mins}m`;
 }
 
-function Kpi({ label, value }: { label: string; value: string | number }) {
+function Kpi({ label, value }: Readonly<{ label: string; value: string | number }>) {
   return (
     <div>
       <Box variant="awsui-key-label">{label}</Box>
@@ -64,10 +64,10 @@ export function Dashboard() {
       }
     };
     void load();
-    const id = window.setInterval(load, 10_000);
+    const id = globalThis.setInterval(load, 10_000);
     return () => {
       cancelled = true;
-      window.clearInterval(id);
+      globalThis.clearInterval(id);
     };
   }, []);
 
