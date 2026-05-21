@@ -521,6 +521,44 @@ impl Runtime {
                         "PostgresPhoneStore init failed; phone handlers + serve_phone_config will use JSON MemStore fallback");
                 }
             }
+
+            match sbc_config_store::PostgresTrunkGroupStore::new(&pg_url).await {
+                Ok(store) => {
+                    let store_arc = Arc::new(store);
+                    let json_path = std::path::Path::new("/var/lib/sbc/trunk_groups.json");
+                    match sbc_config_store::migrate_trunk_groups_json_to_postgres(
+                        json_path,
+                        &store_arc,
+                    )
+                    .await
+                    {
+                        Ok(0) => debug!("Trunk-groups JSON migration: nothing to do"),
+                        Ok(n) => info!(imported = n, "Migrated trunk_groups.json to Postgres"),
+                        Err(e) => warn!(error = %e, "Trunk-groups JSON migration failed; continuing"),
+                    }
+                    app_state.trunk_group_store = Some(store_arc);
+                    info!("Trunk-group store initialized (PostgreSQL)");
+                }
+                Err(e) => {
+                    warn!(error = %e,
+                        "PostgresTrunkGroupStore init failed; trunk-group handlers will use JSON MemStore fallback");
+                }
+            }
+
+            // Dial plans had no JSON predecessor — they lived only in the
+            // CucmRouter and were lost on every restart. No migration step
+            // needed; just stand up the store and let the post-Arc replay
+            // block re-sync any persisted plans into the router.
+            match sbc_config_store::PostgresDialPlanStore::new(&pg_url).await {
+                Ok(store) => {
+                    app_state.dial_plan_store = Some(Arc::new(store));
+                    info!("Dial-plan store initialized (PostgreSQL)");
+                }
+                Err(e) => {
+                    warn!(error = %e,
+                        "PostgresDialPlanStore init failed; dial-plan writes will be ephemeral");
+                }
+            }
         }
 
         // Load seed config (from ConfigMap) then persisted trunk groups (from hostPath).
@@ -631,9 +669,14 @@ impl Runtime {
             // IDs), phones, directory_numbers. Each entity type is its own
             // file under /var/lib/sbc/ so a corrupt one doesn't take the
             // others down.
-            let persisted_trunks = crate::api_server::MemStore::load_trunk_groups();
-            for (id, g) in persisted_trunks {
-                store.trunk_groups.insert(id, g);
+            // JSON trunk_groups load only runs without Postgres; with the
+            // store configured, the migration above moved trunk_groups.json
+            // into the table and handlers read from Postgres directly.
+            if app_state.trunk_group_store.is_none() {
+                let persisted_trunks = crate::api_server::MemStore::load_trunk_groups();
+                for (id, g) in persisted_trunks {
+                    store.trunk_groups.insert(id, g);
+                }
             }
             // JSON phones load only runs without Postgres. With Postgres,
             // the migration above moved phones.json into the table and
@@ -690,6 +733,63 @@ impl Runtime {
                     }
                 }
                 Err(e) => warn!(error = %e, "Failed to load DIDs from Postgres for replay"),
+            }
+        }
+
+        // Postgres path: replay trunk groups (sync to SIP router + start
+        // per-trunk OPTIONS monitoring/registration). With the store
+        // configured the JSON replay block below short-circuits so we
+        // don't double-register.
+        if let Some(ref ts) = app_state.trunk_group_store {
+            match ts.list().await {
+                Ok(groups) => {
+                    for group_json in &groups {
+                        crate::api_server::sync_trunk_group_to_router(&app_state, group_json).await;
+                        if let Some(trunks) =
+                            group_json.get("trunks").and_then(|v| v.as_array())
+                        {
+                            for trunk in trunks {
+                                crate::api_server::start_trunk_services(&app_state, trunk);
+                            }
+                        }
+                    }
+                    if !groups.is_empty() {
+                        info!(count = groups.len(), "Replayed trunk groups from Postgres");
+                    }
+                }
+                Err(e) => warn!(error = %e, "Failed to load trunk groups from Postgres"),
+            }
+        }
+
+        // Postgres path: replay dial plans into CucmRouter. This is genuinely
+        // new functionality — dial plans were ephemeral pre-PR3 (lived only
+        // in the router, lost on every restart). With the store configured,
+        // plans survive restarts and downtime no longer requires the
+        // operator to re-POST every dial plan.
+        if let Some(ref dps) = app_state.dial_plan_store {
+            match dps.list().await {
+                Ok(plans) => {
+                    let mut count = 0usize;
+                    for doc in &plans {
+                        let plan_id = doc.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                        let entries: Vec<serde_json::Value> = doc
+                            .get("entries")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        if !plan_id.is_empty() && !entries.is_empty() {
+                            crate::api_server::sync_dial_plan_to_router(
+                                &app_state, plan_id, &entries,
+                            )
+                            .await;
+                            count += 1;
+                        }
+                    }
+                    if count > 0 {
+                        info!(count, "Replayed dial plans from Postgres");
+                    }
+                }
+                Err(e) => warn!(error = %e, "Failed to load dial plans from Postgres"),
             }
         }
 

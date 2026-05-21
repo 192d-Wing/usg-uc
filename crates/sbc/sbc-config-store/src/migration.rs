@@ -20,6 +20,7 @@ use crate::directory::PostgresDirectoryNumberStore;
 use crate::error::{ConfigStoreError, ConfigStoreResult};
 use crate::model::DirectoryNumber;
 use crate::phones::PostgresPhoneStore;
+use crate::trunk_groups::PostgresTrunkGroupStore;
 
 /// Migrate `directory_numbers.json` into the Postgres store.
 ///
@@ -142,6 +143,57 @@ pub async fn migrate_phones_json_to_postgres(
         skipped,
         backup = %backup_path.display(),
         "Migrated phones.json into Postgres"
+    );
+    Ok(imported)
+}
+
+/// Migrate `trunk_groups.json` into the Postgres store.
+///
+/// Same shape as the DID and phones migrations. Per-group entries are
+/// stored verbatim as JSONB; no schema validation since the daemon's
+/// `sync_trunk_group_to_router` is what actually parses the body — and
+/// it already tolerates partial bodies for legacy reasons.
+///
+/// # Errors
+/// Returns `ConfigStoreError` for read/parse/upsert/rename failures.
+pub async fn migrate_trunk_groups_json_to_postgres(
+    json_path: &Path,
+    store: &PostgresTrunkGroupStore,
+) -> ConfigStoreResult<usize> {
+    if !json_path.exists() {
+        return Ok(0);
+    }
+    if !store.is_empty().await? {
+        info!(
+            path = %json_path.display(),
+            "trunk_groups table not empty; skipping JSON migration"
+        );
+        return Ok(0);
+    }
+
+    let raw = tokio::fs::read_to_string(json_path).await?;
+    // Legacy shape: HashMap<group_id, body-JSON>.
+    let map: HashMap<String, serde_json::Value> = serde_json::from_str(&raw)?;
+
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+    for (id, value) in map {
+        if let Err(e) = store.upsert(&id, &value).await {
+            warn!(group_id = %id, error = %e, "Skipping trunk group — upsert failed");
+            skipped += 1;
+        } else {
+            imported += 1;
+        }
+    }
+
+    let backup_path = json_path.with_extension("json.migrated.bak");
+    tokio::fs::rename(json_path, &backup_path).await?;
+
+    info!(
+        imported,
+        skipped,
+        backup = %backup_path.display(),
+        "Migrated trunk_groups.json into Postgres"
     );
     Ok(imported)
 }

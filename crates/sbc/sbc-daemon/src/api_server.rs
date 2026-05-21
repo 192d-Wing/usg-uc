@@ -235,6 +235,16 @@ pub struct AppState {
     /// env var. When `Some`, phone CRUD and `serve_phone_config` query
     /// Postgres; the MemStore phones map is bypassed.
     pub phone_store: Option<Arc<sbc_config_store::PostgresPhoneStore>>,
+    /// Postgres-backed trunk-group store. When `Some`, trunk-group and
+    /// nested trunk CRUD persist to Postgres in addition to the existing
+    /// `sip_stack`/`cucm_router` synchronization (which is unchanged —
+    /// persistence and SIP-stack wiring are separate concerns here).
+    pub trunk_group_store: Option<Arc<sbc_config_store::PostgresTrunkGroupStore>>,
+    /// Postgres-backed dial-plan store. Before this PR, dial plans lived
+    /// only in the `CucmRouter` and were lost on every daemon restart.
+    /// When `Some`, dial-plan writes persist and the startup loop replays
+    /// them into the router so SIP routing decisions survive restarts.
+    pub dial_plan_store: Option<Arc<sbc_config_store::PostgresDialPlanStore>>,
     /// TLS acceptor for certificate hot-reload (if TLS is enabled).
     pub tls_acceptor: Option<Arc<ReloadableTlsAcceptor>>,
     /// Cluster health check function (when cluster feature is enabled).
@@ -265,6 +275,8 @@ impl AppState {
             mem_store: Arc::new(tokio::sync::RwLock::new(MemStore::default())),
             directory_store: None,
             phone_store: None,
+            trunk_group_store: None,
+            dial_plan_store: None,
             trunk_monitor: None,
             trunk_registrar: None,
             zone_registry: None,
@@ -293,6 +305,8 @@ impl AppState {
             mem_store: Arc::new(tokio::sync::RwLock::new(MemStore::default())),
             directory_store: None,
             phone_store: None,
+            trunk_group_store: None,
+            dial_plan_store: None,
             trunk_monitor: None,
             trunk_registrar: None,
             zone_registry: None,
@@ -1107,12 +1121,61 @@ async fn get_dial_plan_entries(
 }
 
 /// Add a dial plan entry.
+///
+/// JSON path: legacy one-shot behavior — pushes the single entry into the
+/// router, wiping previously-added entries for this plan. The endpoint
+/// has had this shape since before the Postgres store existed; not
+/// changing it on the JSON path to avoid surprising existing operators.
+///
+/// Postgres path: proper read-append-write. The plan is stored as
+/// `{"entries": [...]}` JSONB; new entries get a generated `id` if the
+/// caller didn't supply one, and the full accumulated entries[] is
+/// re-synced to the router.
 async fn add_dial_plan_entry(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(plan_id): axum::extract::Path<String>,
-    Json(body): Json<serde_json::Value>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    sync_dial_plan_to_router(&state, &plan_id, &[body.clone()]).await;
+    if body.get("id").and_then(|v| v.as_str()).is_none() {
+        body["id"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+    }
+    if let Some(ref store) = state.dial_plan_store {
+        let mut doc = match store.get(&plan_id).await {
+            Ok(v) => v,
+            Err(sbc_config_store::ConfigStoreError::NotFound) => {
+                serde_json::json!({"id": plan_id, "entries": []})
+            }
+            Err(e) => {
+                warn!(plan_id, error = %e, "dial_plan_store get failed");
+                serde_json::json!({"id": plan_id, "entries": []})
+            }
+        };
+        // Make sure the doc carries its id so the startup replay loop
+        // (which only sees the JSONB body) can route it back to its
+        // plan_id without consulting the row's PK column.
+        if let Some(obj) = doc.as_object_mut() {
+            obj.insert("id".to_string(), serde_json::json!(&plan_id));
+            let entries = obj
+                .entry("entries".to_string())
+                .or_insert_with(|| serde_json::json!([]));
+            if let Some(arr) = entries.as_array_mut() {
+                arr.push(body.clone());
+            }
+        }
+        if let Err(e) = store.upsert(&plan_id, &doc).await {
+            warn!(plan_id, error = %e, "dial_plan_store upsert failed");
+        }
+        // Re-sync the full plan so previously-added entries survive.
+        let entries: Vec<serde_json::Value> = doc
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        sync_dial_plan_to_router(&state, &plan_id, &entries).await;
+    } else {
+        // Legacy behavior preserved: single-entry replace.
+        sync_dial_plan_to_router(&state, &plan_id, &[body.clone()]).await;
+    }
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
@@ -1124,12 +1187,56 @@ async fn add_dial_plan_entry(
 }
 
 /// Delete a dial plan entry.
+///
+/// JSON path: legacy behavior — removes the *entire* plan from the
+/// router (the endpoint never tracked individual entries server-side, so
+/// it couldn't remove just one). Preserved to avoid behavior drift.
+///
+/// Postgres path: removes only the named entry from the document; if
+/// the plan becomes empty, the row is deleted and the plan is dropped
+/// from the router. Otherwise the remaining entries are re-synced.
 async fn delete_dial_plan_entry(
     State(state): State<Arc<AppState>>,
     axum::extract::Path((plan_id, entry_id)): axum::extract::Path<(String, String)>,
 ) -> impl IntoResponse {
-    // Remove by rebuilding the plan without this entry
-    if let Some(ref sip_stack) = state.sip_stack {
+    if let Some(ref store) = state.dial_plan_store {
+        match store.get(&plan_id).await {
+            Ok(mut doc) => {
+                let became_empty = if let Some(arr) = doc
+                    .get_mut("entries")
+                    .and_then(|v| v.as_array_mut())
+                {
+                    arr.retain(|e| e.get("id").and_then(|v| v.as_str()) != Some(&entry_id));
+                    arr.is_empty()
+                } else {
+                    true
+                };
+                if became_empty {
+                    if let Err(e) = store.delete(&plan_id).await {
+                        warn!(plan_id, error = %e, "dial_plan_store delete failed");
+                    }
+                    if let Some(ref sip_stack) = state.sip_stack {
+                        if let Some(router_lock) = sip_stack.router() {
+                            let mut router = router_lock.write().await;
+                            router.remove_dial_plan(&plan_id);
+                        }
+                    }
+                } else {
+                    if let Err(e) = store.upsert(&plan_id, &doc).await {
+                        warn!(plan_id, error = %e, "dial_plan_store upsert failed");
+                    }
+                    let entries: Vec<serde_json::Value> = doc
+                        .get("entries")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    sync_dial_plan_to_router(&state, &plan_id, &entries).await;
+                }
+            }
+            Err(sbc_config_store::ConfigStoreError::NotFound) => { /* idempotent */ }
+            Err(e) => warn!(plan_id, error = %e, "dial_plan_store get failed during delete"),
+        }
+    } else if let Some(ref sip_stack) = state.sip_stack {
         if let Some(router_lock) = sip_stack.router() {
             let mut router = router_lock.write().await;
             router.remove_dial_plan(&plan_id);
@@ -1146,8 +1253,58 @@ async fn delete_dial_plan_entry(
 // Trunk Group Routes
 // ============================================================================
 
+/// Fetch a trunk group's full body. Postgres-first, MemStore fallback.
+/// Returned `None` means "no such group" in both backends; `Some(Err)`
+/// means we should surface a 5xx rather than silently behaving as 404.
+async fn lookup_trunk_group(
+    state: &Arc<AppState>,
+    group_id: &str,
+) -> Option<serde_json::Value> {
+    if let Some(ref store) = state.trunk_group_store {
+        return match store.get(group_id).await {
+            Ok(v) => Some(v),
+            Err(sbc_config_store::ConfigStoreError::NotFound) => None,
+            Err(e) => {
+                warn!(group_id, error = %e, "trunk_group_store get failed");
+                None
+            }
+        };
+    }
+    let mem = state.mem_store.read().await;
+    mem.trunk_groups.get(group_id).cloned()
+}
+
+/// Persist a trunk group's full body. Postgres when configured, JSON
+/// MemStore otherwise. Returns whether the write was successful.
+async fn persist_trunk_group(
+    state: &Arc<AppState>,
+    group_id: &str,
+    body: &serde_json::Value,
+) -> bool {
+    if let Some(ref store) = state.trunk_group_store {
+        if let Err(e) = store.upsert(group_id, body).await {
+            warn!(group_id, error = %e, "trunk_group_store upsert failed");
+            return false;
+        }
+        return true;
+    }
+    let mut mem = state.mem_store.write().await;
+    mem.trunk_groups.insert(group_id.to_string(), body.clone());
+    mem.save_trunk_groups();
+    true
+}
+
 /// List trunk groups (route groups).
 async fn get_trunk_groups(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(ref store) = state.trunk_group_store {
+        match store.list().await {
+            Ok(groups) => {
+                let total = groups.len();
+                return Json(serde_json::json!({ "trunk_groups": groups, "total": total }));
+            }
+            Err(e) => warn!(error = %e, "trunk_group_store list failed; falling back to MemStore"),
+        }
+    }
     let store = state.mem_store.read().await;
     let groups: Vec<_> = store.trunk_groups.values().cloned().collect();
     let total = groups.len();
@@ -1159,9 +1316,8 @@ async fn get_trunk_group(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(group_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    let store = state.mem_store.read().await;
-    match store.trunk_groups.get(&group_id) {
-        Some(group) => Json(group.clone()),
+    match lookup_trunk_group(&state, &group_id).await {
+        Some(group) => Json(group),
         None => Json(serde_json::json!({ "error": format!("Trunk group {group_id} not found") })),
     }
 }
@@ -1178,11 +1334,9 @@ async fn add_trunk_group(
     if body.get("trunks").is_none() {
         body["trunks"] = serde_json::json!([]);
     }
-    let mut store = state.mem_store.write().await;
-    store.trunk_groups.insert(id.clone(), body.clone());
-    store.save_trunk_groups();
-    drop(store);
-    // Sync to CUCM router
+    persist_trunk_group(&state, &id, &body).await;
+    // Sync to CUCM router — unchanged from the JSON path; persistence and
+    // in-memory router state are deliberately separate concerns.
     if let Some(ref cucm) = state.cucm_router {
         let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(&id);
         let group = uc_routing::TrunkGroup::new(&id, name);
@@ -1198,10 +1352,17 @@ async fn delete_trunk_group(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(group_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    let mut store = state.mem_store.write().await;
-    store.trunk_groups.remove(&group_id);
-    store.save_trunk_groups();
-    drop(store);
+    if let Some(ref store) = state.trunk_group_store {
+        if let Err(e) = store.delete(&group_id).await {
+            if !matches!(e, sbc_config_store::ConfigStoreError::NotFound) {
+                warn!(group_id, error = %e, "trunk_group_store delete failed");
+            }
+        }
+    } else {
+        let mut mem = state.mem_store.write().await;
+        mem.trunk_groups.remove(&group_id);
+        mem.save_trunk_groups();
+    }
     if let Some(ref cucm) = state.cucm_router {
         cucm.write().await.remove_route_group(&group_id);
     }
@@ -1217,11 +1378,8 @@ async fn update_trunk_group(
     axum::extract::Path(group_id): axum::extract::Path<String>,
     Json(mut body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    body["id"] = serde_json::json!(group_id);
-    let mut store = state.mem_store.write().await;
-    store.trunk_groups.insert(group_id.clone(), body.clone());
-    store.save_trunk_groups();
-    drop(store);
+    body["id"] = serde_json::json!(&group_id);
+    persist_trunk_group(&state, &group_id, &body).await;
     sync_trunk_group_to_router(&state, &body).await;
     Json(serde_json::json!({ "success": true, "trunk_group": body }))
 }
@@ -1232,22 +1390,33 @@ async fn add_trunk(
     axum::extract::Path(group_id): axum::extract::Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let mut store = state.mem_store.write().await;
-    if let Some(group) = store.trunk_groups.get_mut(&group_id) {
-        if let Some(trunks) = group.get_mut("trunks").and_then(|v| v.as_array_mut()) {
-            trunks.push(body.clone());
+    let Some(mut group_json) = lookup_trunk_group(&state, &group_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "success": false, "error": "Group not found" })),
+        );
+    };
+    // Append the new trunk to the group's trunks[] array, creating the
+    // array if the group never had one. Same semantic as the JSON path's
+    // get_mut("trunks").as_array_mut() walk.
+    let trunks_owned = group_json
+        .get_mut("trunks")
+        .and_then(|v| v.as_array_mut());
+    match trunks_owned {
+        Some(arr) => arr.push(body.clone()),
+        None => {
+            if let Some(obj) = group_json.as_object_mut() {
+                obj.insert("trunks".to_string(), serde_json::json!([body.clone()]));
+            }
         }
-        store.save_trunk_groups();
-        let group_json = store.trunk_groups.get(&group_id).cloned();
-        drop(store);
-        start_trunk_services(&state, &body);
-        if let Some(gj) = group_json {
-            sync_trunk_group_to_router(&state, &gj).await;
-        }
-        (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "trunk": body })))
-    } else {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({ "success": false, "error": "Group not found" })))
     }
+    persist_trunk_group(&state, &group_id, &group_json).await;
+    start_trunk_services(&state, &body);
+    sync_trunk_group_to_router(&state, &group_json).await;
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "success": true, "trunk": body })),
+    )
 }
 
 /// Update a trunk within a group.
@@ -1256,29 +1425,49 @@ async fn update_trunk(
     axum::extract::Path((group_id, trunk_id)): axum::extract::Path<(String, String)>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let mut store = state.mem_store.write().await;
-    if let Some(group) = store.trunk_groups.get_mut(&group_id) {
-        if let Some(trunks) = group.get_mut("trunks").and_then(|v| v.as_array_mut()) {
-            if let Some(trunk) = trunks.iter_mut().find(|t| t.get("id").and_then(|v| v.as_str()) == Some(&trunk_id)) {
-                // Merge updated fields into existing trunk, preserving the id
-                if let Some(obj) = trunk.as_object_mut() {
-                    if let Some(updates) = body.as_object() {
-                        for (k, v) in updates {
-                            if k != "id" {
-                                obj.insert(k.clone(), v.clone());
-                            }
-                        }
-                    }
-                }
-                let updated = trunk.clone();
-                drop(store);
-                start_trunk_services(&state, &updated);
-                return (StatusCode::OK, Json(serde_json::json!({ "success": true, "trunk": updated })));
+    let Some(mut group_json) = lookup_trunk_group(&state, &group_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "success": false, "error": "Group not found" })),
+        );
+    };
+    let Some(trunks) = group_json
+        .get_mut("trunks")
+        .and_then(|v| v.as_array_mut())
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "success": false, "error": "Group not found" })),
+        );
+    };
+    let Some(trunk) = trunks
+        .iter_mut()
+        .find(|t| t.get("id").and_then(|v| v.as_str()) == Some(&trunk_id))
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "success": false, "error": "Trunk not found" })),
+        );
+    };
+    // Merge updates into the existing trunk, preserving id.
+    if let (Some(obj), Some(updates)) = (trunk.as_object_mut(), body.as_object()) {
+        for (k, v) in updates {
+            if k != "id" {
+                obj.insert(k.clone(), v.clone());
             }
-            return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "success": false, "error": "Trunk not found" })));
         }
     }
-    (StatusCode::NOT_FOUND, Json(serde_json::json!({ "success": false, "error": "Group not found" })))
+    let updated = trunk.clone();
+    persist_trunk_group(&state, &group_id, &group_json).await;
+    start_trunk_services(&state, &updated);
+    // Re-sync the whole group so the router sees the updated trunk
+    // properties (legacy JSON code skipped this, leaving the router
+    // briefly out of date — fix it on the Postgres path).
+    sync_trunk_group_to_router(&state, &group_json).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "success": true, "trunk": updated })),
+    )
 }
 
 /// Start OPTIONS monitoring and/or SIP registration for a trunk if enabled.
@@ -1427,11 +1616,18 @@ async fn delete_trunk(
     State(state): State<Arc<AppState>>,
     axum::extract::Path((group_id, trunk_id)): axum::extract::Path<(String, String)>,
 ) -> impl IntoResponse {
-    let mut store = state.mem_store.write().await;
-    if let Some(group) = store.trunk_groups.get_mut(&group_id) {
-        if let Some(trunks) = group.get_mut("trunks").and_then(|v| v.as_array_mut()) {
+    if let Some(mut group_json) = lookup_trunk_group(&state, &group_id).await {
+        if let Some(trunks) = group_json
+            .get_mut("trunks")
+            .and_then(|v| v.as_array_mut())
+        {
             trunks.retain(|t| t.get("id").and_then(|v| v.as_str()) != Some(&trunk_id));
         }
+        persist_trunk_group(&state, &group_id, &group_json).await;
+        // Re-sync router to reflect the removal; the legacy JSON path
+        // skipped this too, so a removed trunk would stay live in the
+        // router until the next group-level update. Fix it here.
+        sync_trunk_group_to_router(&state, &group_json).await;
     }
     Json(serde_json::json!({ "success": true, "group_id": group_id, "trunk_id": trunk_id }))
 }
@@ -1465,10 +1661,18 @@ async fn trigger_trunk_register(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(trunk_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    // Look up trunk in MemStore to get credentials
-    let store = state.mem_store.read().await;
+    // Look up the trunk's credentials. Postgres path scans `list()`;
+    // MemStore path scans the in-memory map. Either way it's O(groups *
+    // trunks-per-group) — operator-scale, not on the SIP path, no index
+    // needed.
+    let groups: Vec<serde_json::Value> = if let Some(ref store) = state.trunk_group_store {
+        store.list().await.unwrap_or_default()
+    } else {
+        let mem = state.mem_store.read().await;
+        mem.trunk_groups.values().cloned().collect()
+    };
     let mut found_trunk = None;
-    for group in store.trunk_groups.values() {
+    for group in &groups {
         if let Some(trunks) = group.get("trunks").and_then(|v| v.as_array()) {
             for t in trunks {
                 if t.get("id").and_then(|v| v.as_str()) == Some(&trunk_id) {
@@ -1477,8 +1681,10 @@ async fn trigger_trunk_register(
                 }
             }
         }
+        if found_trunk.is_some() {
+            break;
+        }
     }
-    drop(store);
 
     let Some(trunk) = found_trunk else {
         return Json(serde_json::json!({ "success": false, "error": "Trunk not found" }));

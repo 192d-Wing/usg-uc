@@ -36,12 +36,16 @@ OPERATOR DASHBOARD:
 
 CONFIG STORE:
 {{- if .Values.sbcPostgres.enabled }}
-  Postgres StatefulSet:  {{ include "sbc.fullname" . }}-postgres (PR1: DIDs, PR2: phones)
+  Postgres StatefulSet:  {{ include "sbc.fullname" . }}-postgres
+                         (PR1: DIDs, PR2: phones, PR3: trunk groups + dial plans)
   DSN env (daemon):      SBC_POSTGRES_URL from Secret/{{ include "sbc.fullname" . }}-postgres
-  Existing JSON files at /var/lib/sbc/{directory_numbers,phones}.json will
-  be migrated to Postgres on first daemon startup and renamed to
-  *.migrated.bak. Trunk groups + dial plans are still JSON-on-PVC pending
-  PR3.
+  Existing JSON files at /var/lib/sbc/{directory_numbers,phones,trunk_groups}.json
+  are migrated into Postgres on first daemon startup and renamed to
+  *.migrated.bak. Dial plans had no JSON predecessor — they used to be
+  ephemeral (lost on every daemon restart); they now survive restarts
+  via the dial_plans table.
+  All config entities now in Postgres. PR4 wires the gRPC mutation
+  services; PR5 stands up sbc-api as its own pod.
 {{- else if .Values.sbcPostgres.existingSecret.name }}
   External Postgres via Secret/{{ .Values.sbcPostgres.existingSecret.name }} (key={{ .Values.sbcPostgres.existingSecret.key | default "dsn" }})
 {{- else }}
