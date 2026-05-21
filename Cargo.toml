@@ -71,6 +71,7 @@ members = [
     "crates/sbc/sbc-grpc-api",
     "crates/sbc/sbc-daemon",
     "crates/sbc/sbc-api-server",
+    "crates/sbc/sbc-provision-server",
     "crates/sbc/sbc-cli",
     "crates/sbc/sbc-integration-tests",
 

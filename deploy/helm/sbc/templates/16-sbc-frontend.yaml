@@ -66,13 +66,24 @@ spec:
           env:
             # Consumed by nginx-unprivileged's entrypoint, which runs
             # envsubst on /etc/nginx/templates/*.template -> /etc/nginx/conf.d/.
-            # When sbcApi.enabled the upstream is sbc-api-server (which
-            # owns config-entity CRUD itself and proxies the rest to the
-            # daemon). When disabled, point straight at the daemon's API.
-            # Phone provisioning (/provision/*) is always served by the
-            # daemon — sbc-api proxies it through transparently.
+            # When sbcApi.enabled the API upstream is sbc-api-server
+            # (which owns config-entity CRUD itself and proxies the
+            # rest to the daemon). When disabled, point straight at
+            # the daemon's API.
             - name: SBC_API_UPSTREAM
             {{- if .Values.sbcApi.enabled }}
+              value: "{{ include "sbc.fullname" . }}-sbc-api.{{ .Release.Namespace }}.svc.cluster.local:80"
+            {{- else }}
+              value: "{{ include "sbc.fullname" . }}-api.{{ .Release.Namespace }}.svc.cluster.local:80"
+            {{- end }}
+            # Phone provisioning upstream. sbc-provision-server when
+            # the dedicated pod is enabled; otherwise fall back to the
+            # sbc-api upstream (which proxies /provision/* to the
+            # daemon's legacy code path).
+            - name: SBC_PROVISION_UPSTREAM
+            {{- if .Values.sbcProvision.enabled }}
+              value: "{{ include "sbc.fullname" . }}-provision.{{ .Release.Namespace }}.svc.cluster.local:80"
+            {{- else if .Values.sbcApi.enabled }}
               value: "{{ include "sbc.fullname" . }}-sbc-api.{{ .Release.Namespace }}.svc.cluster.local:80"
             {{- else }}
               value: "{{ include "sbc.fullname" . }}-api.{{ .Release.Namespace }}.svc.cluster.local:80"

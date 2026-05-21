@@ -116,6 +116,22 @@ sbcApi:
     requests: { cpu: "50m",  memory: "64Mi"  }
     limits:   { cpu: "500m", memory: "256Mi" }
 
+# sbc-provision-server — stand-alone phone-provisioning pod (PR6).
+# Owns /provision/<MAC>.{cfg,xml}: reads the phone record from Postgres
+# and renders the vendor config. When enabled, the frontend nginx
+# upstream for /provision/* flips here, so phone provisioning rolls
+# independently of the daemon.
+sbcProvision:
+  enabled: true
+  replicas: 2
+  image:
+    repository: sbc-provision-server
+    tag: local
+    pullPolicy: Never
+  resources:
+    requests: { cpu: "20m",  memory: "32Mi"  }
+    limits:   { cpu: "200m", memory: "128Mi" }
+
 sbcDaemon:
   replicas: 1
   # PVC for /var/lib/sbc — holds the file-backed SQLite (users / HA1s) and
@@ -174,6 +190,15 @@ kea:
       # service.loadBalancerIP.
       dns_servers:
         - "10.50.1.5"
+      # VLAN ID for the phone VLAN. Emitted into TEO option 125 (L2QVLAN
+      # field) so TSG phones know which 802.1q tag to use after first boot.
+      vlan_id: 3001
+      # DHCP option 125 (VIVSO) — TEO TSG vendor-specific payload. Helper
+      # template builds the hex blob from this subnet's gateway / tftp_server
+      # / vlan_id values. Set `enabled: false` for subnets that don't host
+      # TEO TSG phones.
+      teo_option_125:
+        enabled: true
 
 services:
   sip:     { enabled: true }

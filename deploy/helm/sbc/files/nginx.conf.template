@@ -20,8 +20,12 @@ server {
         proxy_read_timeout 60s;
     }
 
+    # Phone provisioning. SBC_PROVISION_UPSTREAM resolves to either the
+    # stand-alone sbc-provision-server pod (when sbcProvision.enabled)
+    # or back to sbc-api / the daemon (which still has the legacy code
+    # path mounted) when the dedicated pod is disabled.
     location /provision/ {
-        proxy_pass         http://${SBC_API_UPSTREAM};
+        proxy_pass         http://${SBC_PROVISION_UPSTREAM};
         proxy_http_version 1.1;
         proxy_set_header   Host              $host;
         proxy_set_header   X-Real-IP         $remote_addr;
@@ -31,18 +35,16 @@ server {
 
     # Phones (TEO especially) hit the root path on first-boot — DHCP option
     # 66 only carries a hostname, so firmware fetches /<MAC>.xml or
-    # /<MAC>.cfg from the root. Match a hex MAC (12 chars, any case, with or
-    # without colon/dash separators) followed by .xml or .cfg and rewrite
-    # to the daemon's canonical /provision/ path. Subsequent refreshes use
-    # the update_server URL embedded in the returned XML and hit
-    # /provision/ directly.
-    # Use `+` (1+ chars) instead of `{12,17}` — nginx-unprivileged's entrypoint
-    # runs envsubst over the template and treats `{...}` as a variable-
-    # reference fragment in some cases, which truncates the regex at the
-    # quantifier and produces `pcre2_compile() failed: missing closing
-    # parenthesis`. `+` matches the same MAC patterns in practice.
+    # /<MAC>.cfg from the root. Rewrite to /provision/<file> so the
+    # canonical endpoint handles it regardless of which upstream owns it.
+    # Use `+` (1+ chars) instead of `{12,17}` — nginx-unprivileged's
+    # entrypoint runs envsubst over the template and treats `{...}` as
+    # a variable-reference fragment in some cases, which truncates the
+    # regex at the quantifier and produces `pcre2_compile() failed:
+    # missing closing parenthesis`. `+` matches the same MAC patterns
+    # in practice.
     location ~ ^/([0-9A-Fa-f:_-]+\.(?:xml|cfg))$ {
-        proxy_pass         http://${SBC_API_UPSTREAM}/provision/$1;
+        proxy_pass         http://${SBC_PROVISION_UPSTREAM}/provision/$1;
         proxy_http_version 1.1;
         proxy_set_header   Host              $host;
         proxy_set_header   X-Real-IP         $remote_addr;
@@ -51,11 +53,13 @@ server {
     }
 
     # TEO global config file (TEO spec p.19) — phones fetch this in some
-    # firmwares before the per-MAC file. Daemon returns a 404 with a clear
-    # body; we proxy through so the daemon's 404 (right Content-Type and
-    # body) wins over nginx's SPA fallback returning index.html.
+    # firmwares before the per-MAC file. sbc-provision-server serves
+    # this at root (/TCS7000A.xml); the legacy daemon path serves it at
+    # /provision/TCS7000A.xml. Try the root path first; the upstream
+    # will 404 cleanly if it doesn't know the path, which is better
+    # than the SPA fallback returning index.html.
     location = /TCS7000A.xml {
-        proxy_pass         http://${SBC_API_UPSTREAM}/provision/TCS7000A.xml;
+        proxy_pass         http://${SBC_PROVISION_UPSTREAM}/TCS7000A.xml;
         proxy_http_version 1.1;
         proxy_set_header   Host              $host;
         proxy_set_header   X-Real-IP         $remote_addr;

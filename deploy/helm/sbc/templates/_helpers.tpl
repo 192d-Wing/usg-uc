@@ -50,6 +50,16 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: api
 {{- end }}
 
+{{/* Selector labels for the sbc-provision-server pod. Phone provisioning
+     rolls and recovers independently of SIP, the API, and the frontend.
+     Phones re-fetch on their own boot cycle so a brief unavailability
+     during a rolling update doesn't disrupt active calls. */}}
+{{- define "sbc.provisionSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "sbc.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: provision
+{{- end }}
+
 {{- define "sbc.serviceAccountName" -}}
 {{ include "sbc.fullname" . }}
 {{- end }}

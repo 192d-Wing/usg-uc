@@ -1,0 +1,33 @@
+[package]
+name = "sbc-provision-server"
+description = "Stand-alone phone-provisioning HTTP pod for the USG SBC. Serves /provision/<MAC>.{cfg,xml} by looking up the phone record in Postgres (via sbc-config-store::PostgresPhoneStore) and rendering the vendor-specific config through uc_phone_mgmt::ProvisioningServer. Lives in its own pod so phone provisioning rolls independently of the SIP-serving daemon."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "sbc-provision-server"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+sbc-config-store = { workspace = true }
+uc-phone-mgmt.workspace = true
+
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+axum.workspace = true
+tower.workspace = true
+tower-http = { workspace = true, features = ["trace"] }
+
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror.workspace = true

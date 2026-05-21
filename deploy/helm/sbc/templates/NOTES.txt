@@ -39,9 +39,16 @@ OPERATOR DASHBOARD:
             └ everything else (calls, registrations, users, partitions,
               CSS, route patterns, /system/stats, trunk-health,
               trunk-registration): reverse-proxied to the daemon.
-  /provision/* → daemon (unchanged)
 {{- else }}
-  /api/* and /provision/* → daemon (single-pod legacy mode)
+  /api/* → daemon (sbcApi disabled — legacy single-pod mode)
+{{- end }}
+{{- if .Values.sbcProvision.enabled }}
+  /provision/<MAC>.{cfg,xml} → sbc-provision-server pod
+            (reads phone record from Postgres, renders via
+             uc_phone_mgmt::ProvisioningServer; rolls independently of
+             the SIP daemon)
+{{- else }}
+  /provision/* → daemon legacy code path (sbcProvision disabled)
 {{- end }}
 
 CONFIG STORE:
