@@ -22,7 +22,9 @@ uc-phone-mgmt.workspace = true
 
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tracing.workspace = true
-tracing-subscriber.workspace = true
+# `json` enables structured JSON log output (we call `.json()` in main.rs).
+# Workspace's tracing-subscriber declaration only has `env-filter`.
+tracing-subscriber = { workspace = true, features = ["json"] }
 
 axum.workspace = true
 tower.workspace = true

@@ -160,7 +160,9 @@ async fn serve_teo_global() -> impl IntoResponse {
     // don't fall back to a cached config thinking the server's broken.
     Response::builder()
         .status(StatusCode::NOT_FOUND)
-        .body("No global Teo config served; per-MAC files only".to_string())
+        .body(axum::body::Body::from(
+            "No global Teo config served; per-MAC files only",
+        ))
         .unwrap_or_default()
 }
 
@@ -189,14 +191,18 @@ async fn serve_phone_config(
         Err(sbc_config_store::ConfigStoreError::NotFound) => {
             return Response::builder()
                 .status(StatusCode::NOT_FOUND)
-                .body(format!("No phone record for MAC {mac_key}"))
+                .body(axum::body::Body::from(format!(
+                    "No phone record for MAC {mac_key}"
+                )))
                 .unwrap_or_default();
         }
         Err(e) => {
             warn!(mac = %mac_key, error = %e, "phone lookup failed");
             return Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(format!("phone store lookup failed: {e}"))
+                .body(axum::body::Body::from(format!(
+                    "phone store lookup failed: {e}"
+                )))
                 .unwrap_or_default();
         }
     };
@@ -211,12 +217,14 @@ async fn serve_phone_config(
             Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", ct)
-                .body(config_text)
+                .body(axum::body::Body::from(config_text))
                 .unwrap_or_default()
         }
         Err(e) => Response::builder()
             .status(StatusCode::UNPROCESSABLE_ENTITY)
-            .body(format!("Cannot generate config: {e}"))
+            .body(axum::body::Body::from(format!(
+                "Cannot generate config: {e}"
+            )))
             .unwrap_or_default(),
     }
 }

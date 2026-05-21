@@ -140,6 +140,10 @@ scrape_interval_secs = 15
 # the SIP router stays in sync without sbc-api going through the
 # daemon's REST endpoint. Distinct port from `[monitoring]` above —
 # both default to 9090 in the Rust schema, which would collide.
+# `enabled` defaults to false in the schema, so it MUST be set true
+# here or the gRPC server never starts and sbc-api's writes silently
+# skip the SIP-router refresh step.
+enabled = true
 listen_addr = {{ .Values.sbcDaemon.config.grpc_listen | quote }}
 enable_reflection = false
 require_mtls = false
