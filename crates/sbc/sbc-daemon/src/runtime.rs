@@ -28,6 +28,61 @@ use tracing::{debug, error, info, warn};
 use uc_metrics::SbcMetrics;
 use uc_telemetry::TelemetryProvider;
 
+/// Retry a Postgres-store constructor with bounded backoff.
+///
+/// The four `Postgres*Store::new(&dsn)` calls during daemon startup
+/// race against the Postgres pod's bring-up: in a fresh `helm install`
+/// the daemon can come up 5–30s before Postgres accepts connections,
+/// causing "Name or service not known" or "Connection refused" on the
+/// first attempt. Without retry the daemon permanently leaves all four
+/// config stores as `None`, falls back to the JSON `MemStore` path, and
+/// stays there until manually restarted — exactly the bug the PR1-6
+/// dev-cluster deploy hit.
+///
+/// Total wait budget: 12 × 5s = 60s. Postgres bring-up empirically
+/// finishes in ~30s on microk8s hostpath storage; 60s leaves headroom
+/// for slower storage backends without making the daemon's failure
+/// mode invisibly slow.
+async fn connect_with_retry<T, F, Fut>(
+    label: &str,
+    mut connect: F,
+) -> Result<T, sbc_config_store::ConfigStoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, sbc_config_store::ConfigStoreError>>,
+{
+    const ATTEMPTS: u32 = 12;
+    const BACKOFF: Duration = Duration::from_secs(5);
+    let mut last_err: Option<sbc_config_store::ConfigStoreError> = None;
+    for attempt in 1..=ATTEMPTS {
+        match connect().await {
+            Ok(v) => {
+                if attempt > 1 {
+                    info!(label, attempt, "Postgres store init succeeded after retry");
+                }
+                return Ok(v);
+            }
+            Err(e) => {
+                if attempt < ATTEMPTS {
+                    warn!(
+                        label,
+                        attempt,
+                        attempts = ATTEMPTS,
+                        backoff_secs = BACKOFF.as_secs(),
+                        error = %e,
+                        "Postgres store init failed; retrying"
+                    );
+                    tokio::time::sleep(BACKOFF).await;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        sbc_config_store::ConfigStoreError::Storage("retry helper saw no attempts".to_string())
+    }))
+}
+
 /// SBC daemon runtime.
 pub struct Runtime {
     /// Command-line arguments.
@@ -475,8 +530,18 @@ impl Runtime {
         // identically to pre-split. Each store opens its own pool today;
         // pool consolidation lands when the connection count starts to
         // matter (planned PR4-ish).
+        //
+        // Each `connect_with_retry` call hides a backoff loop: when
+        // Postgres takes a few seconds to come up (typical pattern in
+        // a fresh `helm install` — Postgres pod scheduling + PVC bind +
+        // initdb + accept-connections is ~30s), the daemon waits it out
+        // instead of permanently falling back to None.
         if let Ok(pg_url) = std::env::var("SBC_POSTGRES_URL") {
-            match sbc_config_store::PostgresDirectoryNumberStore::new(&pg_url).await {
+            match connect_with_retry("directory", || {
+                sbc_config_store::PostgresDirectoryNumberStore::new(&pg_url)
+            })
+            .await
+            {
                 Ok(store) => {
                     let store_arc = Arc::new(store);
                     let json_path = std::path::Path::new("/var/lib/sbc/directory_numbers.json");
@@ -495,11 +560,15 @@ impl Runtime {
                 }
                 Err(e) => {
                     warn!(error = %e,
-                        "PostgresDirectoryNumberStore init failed; DID handlers will use JSON MemStore fallback");
+                        "PostgresDirectoryNumberStore init exhausted retries; DID handlers will use JSON MemStore fallback");
                 }
             }
 
-            match sbc_config_store::PostgresPhoneStore::new(&pg_url).await {
+            match connect_with_retry("phones", || {
+                sbc_config_store::PostgresPhoneStore::new(&pg_url)
+            })
+            .await
+            {
                 Ok(store) => {
                     let store_arc = Arc::new(store);
                     let json_path = std::path::Path::new("/var/lib/sbc/phones.json");
@@ -518,11 +587,15 @@ impl Runtime {
                 }
                 Err(e) => {
                     warn!(error = %e,
-                        "PostgresPhoneStore init failed; phone handlers + serve_phone_config will use JSON MemStore fallback");
+                        "PostgresPhoneStore init exhausted retries; phone handlers + serve_phone_config will use JSON MemStore fallback");
                 }
             }
 
-            match sbc_config_store::PostgresTrunkGroupStore::new(&pg_url).await {
+            match connect_with_retry("trunk_groups", || {
+                sbc_config_store::PostgresTrunkGroupStore::new(&pg_url)
+            })
+            .await
+            {
                 Ok(store) => {
                     let store_arc = Arc::new(store);
                     let json_path = std::path::Path::new("/var/lib/sbc/trunk_groups.json");
@@ -541,7 +614,7 @@ impl Runtime {
                 }
                 Err(e) => {
                     warn!(error = %e,
-                        "PostgresTrunkGroupStore init failed; trunk-group handlers will use JSON MemStore fallback");
+                        "PostgresTrunkGroupStore init exhausted retries; trunk-group handlers will use JSON MemStore fallback");
                 }
             }
 
@@ -549,14 +622,18 @@ impl Runtime {
             // CucmRouter and were lost on every restart. No migration step
             // needed; just stand up the store and let the post-Arc replay
             // block re-sync any persisted plans into the router.
-            match sbc_config_store::PostgresDialPlanStore::new(&pg_url).await {
+            match connect_with_retry("dial_plans", || {
+                sbc_config_store::PostgresDialPlanStore::new(&pg_url)
+            })
+            .await
+            {
                 Ok(store) => {
                     app_state.dial_plan_store = Some(Arc::new(store));
                     info!("Dial-plan store initialized (PostgreSQL)");
                 }
                 Err(e) => {
                     warn!(error = %e,
-                        "PostgresDialPlanStore init failed; dial-plan writes will be ephemeral");
+                        "PostgresDialPlanStore init exhausted retries; dial-plan writes will be ephemeral");
                 }
             }
         }
