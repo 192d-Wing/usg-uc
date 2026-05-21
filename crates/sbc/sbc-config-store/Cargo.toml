@@ -1,0 +1,22 @@
+[package]
+name = "sbc-config-store"
+description = "Persistence layer for SBC management entities (phones, DIDs, trunk groups, dial plans). PR1 ships DirectoryNumber-on-Postgres; subsequent PRs add the other entities behind the same shape."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
+uuid = { version = "1", features = ["v4"] }

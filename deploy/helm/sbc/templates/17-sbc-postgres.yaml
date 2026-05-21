@@ -1,0 +1,125 @@
+{{/*
+sbc-postgres — per-site Postgres for SBC config entities (DIDs in PR1;
+phones, trunks, dial-plans land in follow-up PRs).
+
+Two modes:
+
+  1) sbcPostgres.enabled=true  (dev default)
+     Chart provisions a single-replica StatefulSet + PVC + Secret. The
+     Secret holds the DSN at key `dsn` and is mounted into the daemon
+     Deployment as SBC_POSTGRES_URL.
+
+  2) sbcPostgres.enabled=false + sbcPostgres.existingSecret.name set
+     Operator brings their own Postgres (managed RDS, internal cluster,
+     etc). The chart skips the StatefulSet and just references the named
+     Secret. Key defaults to `dsn` but is overrideable.
+
+Either way, the daemon reads SBC_POSTGRES_URL — single contract.
+
+This is intentionally a tiny StatefulSet rather than a bitnami subchart:
+keeps the chart self-contained and dependency-free, which matters for
+the 184-site air-gapped deploy pattern (see BOOTSTRAP.md).
+*/}}
+{{- if .Values.sbcPostgres.enabled }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "sbc.fullname" . }}-postgres
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+type: Opaque
+stringData:
+  POSTGRES_DB: {{ .Values.sbcPostgres.database | quote }}
+  POSTGRES_USER: {{ .Values.sbcPostgres.username | quote }}
+  POSTGRES_PASSWORD: {{ .Values.sbcPostgres.password | quote }}
+  # Daemon reads this exact key (SBC_POSTGRES_URL semantics).
+  dsn: "postgres://{{ .Values.sbcPostgres.username }}:{{ .Values.sbcPostgres.password }}@{{ include "sbc.fullname" . }}-postgres.{{ .Release.Namespace }}.svc.cluster.local:5432/{{ .Values.sbcPostgres.database }}?sslmode=disable"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sbc.fullname" . }}-postgres
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  type: ClusterIP
+  clusterIP: None              # headless for StatefulSet stable DNS
+  selector:
+    {{- include "sbc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+  ports:
+    - { name: postgres, port: 5432, targetPort: 5432, protocol: TCP }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "sbc.fullname" . }}-postgres
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  serviceName: {{ include "sbc.fullname" . }}-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "sbc.labels" . | nindent 6 }}
+      app.kubernetes.io/component: postgres
+  template:
+    metadata:
+      labels:
+        {{- include "sbc.labels" . | nindent 8 }}
+        app.kubernetes.io/component: postgres
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999          # postgres image default uid
+        runAsGroup: 999
+        fsGroup: 999
+      containers:
+        - name: postgres
+          image: "{{ .Values.sbcPostgres.image.repository }}:{{ .Values.sbcPostgres.image.tag }}"
+          imagePullPolicy: {{ .Values.sbcPostgres.image.pullPolicy }}
+          envFrom:
+            - secretRef:
+                name: {{ include "sbc.fullname" . }}-postgres
+          ports:
+            - { name: postgres, containerPort: 5432, protocol: TCP }
+          # PGDATA points at a subdir so the PVC root can hold the
+          # lost+found dir without breaking initdb.
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "{{ .Values.sbcPostgres.username }}", "-d", "{{ .Values.sbcPostgres.database }}"]
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "{{ .Values.sbcPostgres.username }}", "-d", "{{ .Values.sbcPostgres.database }}"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.sbcPostgres.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: {{ .Values.sbcPostgres.persistence.size }}
+        {{- with .Values.sbcPostgres.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+{{- end }}

@@ -466,6 +466,40 @@ impl Runtime {
             }
         }
 
+        // Initialize the Postgres-backed directory-number store, if a DSN
+        // is provided. We deliberately reuse the same `SBC_POSTGRES_URL`
+        // env var the user store reads (above) so one DSN drives both,
+        // matching the Helm chart's single-secret convention. When unset,
+        // DID handlers fall back to the legacy JSON-on-disk MemStore path
+        // unchanged — existing single-pod deploys behave identically.
+        if let Ok(pg_url) = std::env::var("SBC_POSTGRES_URL") {
+            match sbc_config_store::PostgresDirectoryNumberStore::new(&pg_url).await {
+                Ok(store) => {
+                    let store_arc = Arc::new(store);
+                    // One-shot migration: copy /var/lib/sbc/directory_numbers.json
+                    // into Postgres on first startup with a DSN, then rename
+                    // the JSON file so we don't try again.
+                    let json_path = std::path::Path::new("/var/lib/sbc/directory_numbers.json");
+                    match sbc_config_store::migrate_directory_json_to_postgres(
+                        json_path,
+                        &store_arc,
+                    )
+                    .await
+                    {
+                        Ok(0) => debug!("Directory JSON migration: nothing to do"),
+                        Ok(n) => info!(imported = n, "Migrated directory_numbers.json to Postgres"),
+                        Err(e) => warn!(error = %e, "Directory JSON migration failed; continuing"),
+                    }
+                    app_state.directory_store = Some(store_arc);
+                    info!("Directory store initialized (PostgreSQL)");
+                }
+                Err(e) => {
+                    warn!(error = %e,
+                        "PostgresDirectoryNumberStore init failed; DID handlers will use JSON MemStore fallback");
+                }
+            }
+        }
+
         // Load seed config (from ConfigMap) then persisted trunk groups (from hostPath).
         // Seed provides baseline config; persisted data overrides/supplements it.
         {
@@ -488,11 +522,26 @@ impl Runtime {
                         info!(count = groups.len(), "Seeded trunk groups");
                     }
 
-                    // Seed directory numbers
+                    // Seed directory numbers. With Postgres configured, also
+                    // upsert each seeded DID to the directory store so the
+                    // handlers (which read from Postgres) and the SIP-stack
+                    // replay loop see them. Without this, seeded DIDs on a
+                    // Postgres deploy would be invisible to the dashboard.
                     if let Some(dns) = seed.get("directory_numbers").and_then(|v| v.as_array()) {
                         for dn in dns {
                             if let Some(did) = dn.get("did").and_then(|v| v.as_str()) {
                                 store.directory_numbers.insert(did.to_string(), dn.clone());
+                                if let Some(ref ds) = app_state.directory_store {
+                                    match sbc_config_store::DirectoryNumber::from_json(dn.clone()) {
+                                        Ok(typed) => {
+                                            if let Err(e) = ds.upsert(&typed).await {
+                                                warn!(did = %did, error = %e, "Failed to seed DID into Postgres");
+                                            }
+                                        }
+                                        Err(e) => warn!(did = %did, error = %e,
+                                            "Malformed seed DID, skipping Postgres upsert"),
+                                    }
+                                }
                             }
                         }
                         info!(count = dns.len(), "Seeded directory numbers");
@@ -567,23 +616,53 @@ impl Runtime {
             for (id, p) in persisted_phones {
                 store.phones.insert(id, p);
             }
-            let persisted_dids = crate::api_server::MemStore::load_directory_numbers();
-            // Replay DID→user mappings into the SIP stack so call routing
-            // works without the dashboard having to be hit first.
-            for (did, body) in &persisted_dids {
-                if let Some(user) = body.get("user").and_then(|v| v.as_str()) {
-                    if let Some(ref sip_stack) = app_state.sip_stack {
-                        sip_stack.add_did_mapping(did, user).await;
+            // JSON DID load + replay only runs in legacy (no-Postgres)
+            // mode. With Postgres configured, the migration above moved
+            // any JSON file's contents into the table; we replay from
+            // Postgres after the Arc::new(app_state) cut-over below.
+            if app_state.directory_store.is_none() {
+                let persisted_dids = crate::api_server::MemStore::load_directory_numbers();
+                // Replay DID→user mappings into the SIP stack so call routing
+                // works without the dashboard having to be hit first.
+                for (did, body) in &persisted_dids {
+                    if let Some(user) = body.get("user").and_then(|v| v.as_str()) {
+                        if let Some(ref sip_stack) = app_state.sip_stack {
+                            sip_stack.add_did_mapping(did, user).await;
+                        }
                     }
                 }
-            }
-            for (did, b) in persisted_dids {
-                store.directory_numbers.insert(did, b);
+                for (did, b) in persisted_dids {
+                    store.directory_numbers.insert(did, b);
+                }
             }
             drop(store);
         }
 
         let app_state = Arc::new(app_state);
+
+        // Postgres path: replay DIDs from the directory store. Done here
+        // (after the Arc::new cut-over) for symmetry with the JSON path's
+        // second-pass replay below, and so the sip_stack registrations
+        // happen with the same Arc<AppState> the API server will see.
+        if let Some(ref ds) = app_state.directory_store {
+            match ds.list().await {
+                Ok(dns) => {
+                    let mut count = 0usize;
+                    for dn in &dns {
+                        if let (Some(user), Some(ref sip_stack)) =
+                            (dn.user.as_deref(), app_state.sip_stack.as_ref())
+                        {
+                            sip_stack.add_did_mapping(&dn.did, user).await;
+                            count += 1;
+                        }
+                    }
+                    if count > 0 {
+                        info!(count, "Replayed DID mappings from Postgres");
+                    }
+                }
+                Err(e) => warn!(error = %e, "Failed to load DIDs from Postgres for replay"),
+            }
+        }
 
         // Replay trunk groups and DID mappings: sync to router and start services
         {
@@ -604,18 +683,21 @@ impl Runtime {
                 info!(count = groups.len(), "Replayed trunk groups");
             }
 
-            // Sync DID mappings to SIP stack
-            for dn in &dns {
-                let did = dn.get("did").and_then(|v| v.as_str()).unwrap_or_default();
-                let user = dn.get("user").and_then(|v| v.as_str()).unwrap_or_default();
-                if !did.is_empty() && !user.is_empty() {
-                    if let Some(ref sip_stack) = app_state.sip_stack {
-                        sip_stack.add_did_mapping(did, user).await;
+            // Sync DID mappings to SIP stack — JSON path only (the Postgres
+            // path replayed via directory_store above).
+            if app_state.directory_store.is_none() {
+                for dn in &dns {
+                    let did = dn.get("did").and_then(|v| v.as_str()).unwrap_or_default();
+                    let user = dn.get("user").and_then(|v| v.as_str()).unwrap_or_default();
+                    if !did.is_empty() && !user.is_empty() {
+                        if let Some(ref sip_stack) = app_state.sip_stack {
+                            sip_stack.add_did_mapping(did, user).await;
+                        }
                     }
                 }
-            }
-            if !dns.is_empty() {
-                info!(count = dns.len(), "Replayed DID mappings");
+                if !dns.is_empty() {
+                    info!(count = dns.len(), "Replayed DID mappings");
+                }
             }
         }
 

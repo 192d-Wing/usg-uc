@@ -225,6 +225,11 @@ pub struct AppState {
     pub zone_registry: Option<Arc<crate::zone::ResolvedZoneRegistry>>,
     /// In-memory store for management objects (phones, directory numbers, etc.).
     pub mem_store: Arc<tokio::sync::RwLock<MemStore>>,
+    /// Postgres-backed directory-number store. When `Some`, DID handlers
+    /// read/write Postgres instead of the JSON-on-disk `MemStore` path.
+    /// Set at startup based on `config.storage.postgres`; `None` preserves
+    /// the legacy single-pod JSON behavior.
+    pub directory_store: Option<Arc<sbc_config_store::PostgresDirectoryNumberStore>>,
     /// TLS acceptor for certificate hot-reload (if TLS is enabled).
     pub tls_acceptor: Option<Arc<ReloadableTlsAcceptor>>,
     /// Cluster health check function (when cluster feature is enabled).
@@ -253,6 +258,7 @@ impl AppState {
             provisioning: None,
             cucm_router: None,
             mem_store: Arc::new(tokio::sync::RwLock::new(MemStore::default())),
+            directory_store: None,
             trunk_monitor: None,
             trunk_registrar: None,
             zone_registry: None,
@@ -279,6 +285,7 @@ impl AppState {
             provisioning: None,
             cucm_router: None,
             mem_store: Arc::new(tokio::sync::RwLock::new(MemStore::default())),
+            directory_store: None,
             trunk_monitor: None,
             trunk_registrar: None,
             zone_registry: None,
@@ -892,6 +899,22 @@ async fn delete_registration(
 
 /// List directory numbers (from dial plan config).
 async fn get_directory_numbers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Postgres path (preferred when `[storage.postgres]` is configured).
+    if let Some(ref store) = state.directory_store {
+        match store.list().await {
+            Ok(dns) => {
+                let total = dns.len();
+                let values: Vec<serde_json::Value> = dns
+                    .iter()
+                    .filter_map(|dn| dn.to_json().ok())
+                    .collect();
+                return Json(serde_json::json!({ "directory_numbers": values, "total": total }));
+            }
+            Err(e) => {
+                warn!(error = %e, "directory_store list failed; falling back to JSON store");
+            }
+        }
+    }
     let store = state.mem_store.read().await;
     let dns: Vec<_> = store.directory_numbers.values().cloned().collect();
     let total = dns.len();
@@ -907,10 +930,21 @@ async fn add_directory_number(
         .map(String::from)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     body["did"] = serde_json::json!(&did);
-    {
-        let mut store = state.mem_store.write().await;
-        store.directory_numbers.insert(did.clone(), body.clone());
-        store.save_directory_numbers();
+    if let Some(ref store) = state.directory_store {
+        match sbc_config_store::DirectoryNumber::from_json(body.clone()) {
+            Ok(dn) => {
+                if let Err(e) = store.upsert(&dn).await {
+                    warn!(did = %did, error = %e, "Postgres DID upsert failed");
+                }
+            }
+            Err(e) => {
+                warn!(did = %did, error = %e, "Malformed DID body; not persisted to Postgres");
+            }
+        }
+    } else {
+        let mut mem = state.mem_store.write().await;
+        mem.directory_numbers.insert(did.clone(), body.clone());
+        mem.save_directory_numbers();
     }
     // Sync DID → user mapping to SIP stack for call routing
     if let Some(user) = body.get("user").and_then(|v| v.as_str()) {
@@ -926,10 +960,17 @@ async fn delete_directory_number(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(did): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    {
-        let mut store = state.mem_store.write().await;
-        store.directory_numbers.remove(&did);
-        store.save_directory_numbers();
+    if let Some(ref store) = state.directory_store {
+        if let Err(e) = store.delete(&did).await {
+            // NotFound is a normal idempotent-delete case; only log others.
+            if !matches!(e, sbc_config_store::ConfigStoreError::NotFound) {
+                warn!(did = %did, error = %e, "Postgres DID delete failed");
+            }
+        }
+    } else {
+        let mut mem = state.mem_store.write().await;
+        mem.directory_numbers.remove(&did);
+        mem.save_directory_numbers();
     }
     if let Some(ref sip_stack) = state.sip_stack {
         sip_stack.remove_did_mapping(&did).await;
@@ -945,16 +986,42 @@ async fn update_directory_number(
     Json(mut body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     body["did"] = serde_json::json!(&did);
-    let mut store = state.mem_store.write().await;
-    if !store.directory_numbers.contains_key(&did) {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"success": false, "error": "Directory number not found"})),
-        );
+    if let Some(ref store) = state.directory_store {
+        // PUT semantics on the existing API are upsert-shaped; check
+        // presence first to keep the 404 behavior the dashboard expects.
+        match store.get(&did).await {
+            Ok(_) => {}
+            Err(sbc_config_store::ConfigStoreError::NotFound) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"success": false, "error": "Directory number not found"})),
+                );
+            }
+            Err(e) => {
+                warn!(did = %did, error = %e, "Postgres DID lookup failed during update");
+            }
+        }
+        match sbc_config_store::DirectoryNumber::from_json(body.clone()) {
+            Ok(dn) => {
+                if let Err(e) = store.upsert(&dn).await {
+                    warn!(did = %did, error = %e, "Postgres DID upsert failed");
+                }
+            }
+            Err(e) => {
+                warn!(did = %did, error = %e, "Malformed DID body; not persisted to Postgres");
+            }
+        }
+    } else {
+        let mut mem = state.mem_store.write().await;
+        if !mem.directory_numbers.contains_key(&did) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"success": false, "error": "Directory number not found"})),
+            );
+        }
+        mem.directory_numbers.insert(did.clone(), body.clone());
+        mem.save_directory_numbers();
     }
-    store.directory_numbers.insert(did.clone(), body.clone());
-    store.save_directory_numbers();
-    drop(store);
     if let Some(ref sip_stack) = state.sip_stack {
         sip_stack.remove_did_mapping(&did).await;
         if let Some(user) = body.get("user").and_then(|v| v.as_str()) {

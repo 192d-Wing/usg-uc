@@ -69,6 +69,37 @@ sbcFrontend:
     requests: { cpu: "20m",  memory: "32Mi"  }
     limits:   { cpu: "100m", memory: "128Mi" }
 
+# sbc-postgres — per-site Postgres for SBC config entities. PR1 stores
+# directory_numbers here; phones/trunks/dial-plans follow in subsequent
+# PRs. Daemon reads SBC_POSTGRES_URL from the secret below.
+#
+# Production: set `enabled: false` and point `existingSecret.name` at a
+# Secret you manage that contains a `dsn` key. (Some teams want managed
+# Postgres; this lets them.)
+sbcPostgres:
+  enabled: true
+  image:
+    repository: postgres
+    tag: "16-alpine"
+    pullPolicy: IfNotPresent
+  database: sbc
+  username: sbc
+  # Dev default; override with --set sbcPostgres.password=... or use a
+  # values file in CI. NOT a real password in production — set
+  # `enabled: false` + `existingSecret` for prod.
+  password: sbc-dev-only
+  persistence:
+    size: 2Gi
+    storageClass: ""            # cluster default
+  resources:
+    requests: { cpu: "50m",  memory: "128Mi" }
+    limits:   { cpu: "500m", memory: "512Mi" }
+  # When enabled=false, daemon mounts this Secret's `dsn` key as
+  # SBC_POSTGRES_URL. Set `name` to enable the external-DSN path.
+  existingSecret:
+    name: ""
+    key: dsn
+
 sbcDaemon:
   replicas: 1
   # PVC for /var/lib/sbc — holds the file-backed SQLite (users / HA1s) and

@@ -34,6 +34,21 @@ OPERATOR DASHBOARD:
   proxied to the sbc-daemon ClusterIP Service so dashboard rolls don't
   restart SIP)
 
+CONFIG STORE:
+{{- if .Values.sbcPostgres.enabled }}
+  Postgres StatefulSet:  {{ include "sbc.fullname" . }}-postgres (PR1: DIDs)
+  DSN env (daemon):      SBC_POSTGRES_URL from Secret/{{ include "sbc.fullname" . }}-postgres
+  Existing JSON file at /var/lib/sbc/directory_numbers.json will be
+  migrated to Postgres on first daemon startup and renamed to
+  *.migrated.bak. Phones/trunks/dial_plans are still JSON-on-PVC pending
+  follow-up PRs.
+{{- else if .Values.sbcPostgres.existingSecret.name }}
+  External Postgres via Secret/{{ .Values.sbcPostgres.existingSecret.name }} (key={{ .Values.sbcPostgres.existingSecret.key | default "dsn" }})
+{{- else }}
+  Legacy JSON-on-PVC for all config entities. Enable sbcPostgres to move
+  DIDs into Postgres (required for the sbc-api pod split in PR3).
+{{- end }}
+
 PROVISIONING URL (TEO TSG / Polycom / Cisco MPP — all accept FQDN):
   http://sbc.{{ .Values.site.fqdn_base }}/provision/<mac>.<ext>
 

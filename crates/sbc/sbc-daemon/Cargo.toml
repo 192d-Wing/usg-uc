@@ -25,6 +25,7 @@ full = ["cluster", "redis", "postgres", "grpc", "grpc-reflection"]
 [dependencies]
 uc-types.workspace = true
 sbc-config = { path = "../sbc-config", features = ["telemetry"] }
+sbc-config-store = { workspace = true }
 uc-health.workspace = true
 uc-metrics.workspace = true
 uc-transport.workspace = true

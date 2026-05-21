@@ -70,6 +70,23 @@ spec:
             # Daemon falls back to :memory: if this var is unset.
             - name: SBC_SQLITE_PATH
               value: "/var/lib/sbc/sbc.db"
+            # Postgres DSN. Sourced from either the chart-managed Secret
+            # (sbcPostgres.enabled=true) or an operator-managed Secret
+            # (sbcPostgres.existingSecret.name set). Daemon treats this as
+            # optional: unset → legacy JSON-on-PVC path for config entities.
+            {{- if .Values.sbcPostgres.enabled }}
+            - name: SBC_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sbc.fullname" . }}-postgres
+                  key: dsn
+            {{- else if .Values.sbcPostgres.existingSecret.name }}
+            - name: SBC_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.sbcPostgres.existingSecret.name }}
+                  key: {{ .Values.sbcPostgres.existingSecret.key | default "dsn" }}
+            {{- end }}
           ports:
             - { name: sip-udp,  containerPort: 5060, protocol: UDP }
             - { name: sip-tcp,  containerPort: 5060, protocol: TCP }

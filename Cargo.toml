@@ -67,6 +67,7 @@ members = [
 
     # SBC Application
     "crates/sbc/sbc-config",
+    "crates/sbc/sbc-config-store",
     "crates/sbc/sbc-grpc-api",
     "crates/sbc/sbc-daemon",
     "crates/sbc/sbc-cli",
@@ -189,6 +190,7 @@ proto-stir-shaken = { path = "crates/proto/proto-stir-shaken" }
 
 # Internal crates - SBC Application
 sbc-config = { path = "crates/sbc/sbc-config" }
+sbc-config-store = { path = "crates/sbc/sbc-config-store" }
 sbc-grpc-api = { path = "crates/sbc/sbc-grpc-api" }
 
 # gRPC/Protobuf
