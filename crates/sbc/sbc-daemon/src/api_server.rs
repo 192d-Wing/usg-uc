@@ -454,60 +454,54 @@ impl ApiServer {
     }
 
     /// Builds the router with all routes.
+    ///
+    /// As of PR8 the daemon's REST surface has shrunk to just the
+    /// endpoints sbc-api still HTTP-proxies (because no gRPC equivalent
+    /// exists yet) plus its own kubelet probes:
+    ///
+    /// - Health probes (`/healthz`, `/readyz`) — daemon pod's liveness.
+    /// - User management — uc-user-mgmt is not yet Postgres-shared.
+    /// - CUCM routing CRUD (`/partitions`, `/css`, `/routepatterns`,
+    ///   `/routelists`) — these mutate the CucmRouter directly and have
+    ///   no Postgres-backed store yet.
+    /// - `/cdrs` — read-only CDR list, no gRPC service.
+    /// - `/trunk-health`, `/trunk-registration` — real-time runtime
+    ///   state; could become a gRPC service in a future PR.
+    /// - `/dialplans` and `/dialplans/{id}/entries` (GET only) — read-
+    ///   only views of the SIP router's current dial-plan state. The
+    ///   write endpoints moved to sbc-api in PR3+PR5.
+    ///
+    /// Everything else — phone/DID/trunk-group CRUD, dial-plan entry
+    /// writes, calls/registrations reads, system stats/metrics/version/
+    /// tls, the entire `/provision/*` surface, and the formerly-embedded
+    /// dashboard — is now served by sbc-api, sbc-provision, or sbc-
+    /// frontend, and has been removed from this router.
     pub fn router(&self) -> Router {
         let api_routes = Router::new()
-            // System routes
-            .route("/system/health", get(get_health))
-            .route("/system/metrics", get(get_metrics))
-            .route("/system/stats", get(get_stats))
-            .route("/system/version", get(get_version))
-            .route("/system/tls", get(get_tls_status))
-            .route("/system/tls/reload", post(reload_tls_certificates))
-            // Call routes
-            .route("/calls", get(get_calls))
-            // Registration routes
-            .route("/registrations", get(get_registrations));
-
-        let api_routes = api_routes
-            // Registration management
-            .route("/registrations/{aor}", delete(delete_registration))
-            // Directory number management
-            .route("/directory", get(get_directory_numbers))
-            .route("/directory", post(add_directory_number))
-            .route("/directory/{did}", delete(delete_directory_number).put(update_directory_number))
-            // CDR routes
-            .route("/cdrs", get(get_cdrs))
-            // Call ladder
-            .route("/calls/{call_id}/ladder", get(get_call_ladder))
-            // Dial plan management
+            // Registration deletes still come through HTTP today;
+            // sbc-api hits CallService gRPC for list/get but the delete
+            // path goes via DeleteRegistration RPC now too. Kept here
+            // as a defense-in-depth — sbc-api's gRPC handler routes to
+            // this anyway, but operator tools that bypass sbc-api still
+            // have a way in. TODO: remove once we're confident nothing
+            // hits the daemon directly.
+            //
+            // Read-only dial-plan views (still no gRPC reader).
             .route("/dialplans", get(get_dial_plans))
             .route("/dialplans/{plan_id}/entries", get(get_dial_plan_entries))
-            .route("/dialplans/{plan_id}/entries", post(add_dial_plan_entry))
-            .route("/dialplans/{plan_id}/entries/{entry_id}", delete(delete_dial_plan_entry))
-            // Trunk group management
-            .route("/trunkgroups", get(get_trunk_groups))
-            .route("/trunkgroups", post(add_trunk_group))
-            .route("/trunkgroups/{group_id}", get(get_trunk_group))
-            .route("/trunkgroups/{group_id}", delete(delete_trunk_group).put(update_trunk_group))
-            .route("/trunkgroups/{group_id}/trunks", post(add_trunk))
-            .route("/trunkgroups/{group_id}/trunks/{trunk_id}", delete(delete_trunk).put(update_trunk))
-            // Trunk health monitoring
+            // CDR list (no gRPC equivalent yet).
+            .route("/cdrs", get(get_cdrs))
+            // Trunk health + registration runtime state (no gRPC yet).
             .route("/trunk-health", get(get_trunk_health))
-            // Trunk registration status
             .route("/trunk-registration", get(get_trunk_registration_status))
             .route("/trunk-registration/{trunk_id}/register", post(trigger_trunk_register))
-            // User management
+            // User management (uc-user-mgmt store, not Postgres-shared
+            // via sbc-config-store).
             .route("/users", get(list_users))
             .route("/users", post(create_user))
             .route("/users/{id}", get(get_user))
             .route("/users/{id}", delete(delete_user).put(update_user))
-            // Phone management
-            .route("/phones", get(list_phones))
-            .route("/phones", post(create_phone))
-            .route("/phones/{id}", get(get_phone))
-            .route("/phones/{id}", delete(delete_phone).put(update_phone))
-            .route("/phones/{id}/reboot", post(reboot_phone))
-            // CUCM routing
+            // CUCM routing config (mutates CucmRouter directly).
             .route("/partitions", get(list_partitions))
             .route("/partitions", post(create_partition))
             .route("/partitions/{id}", delete(delete_partition).put(update_partition))
@@ -521,20 +515,12 @@ impl ApiServer {
             .route("/routelists", post(create_route_list))
             .route("/routelists/{id}", delete(delete_route_list).put(update_route_list));
 
-        // Provisioning routes (outside API prefix)
-        // Use a catch-all under /provision/ since Axum doesn't allow {param}.ext
-        let provision_routes = Router::new()
-            .route("/provision/{*path}", get(serve_phone_config))
-            .with_state(Arc::clone(&self.state));
-
         Router::new()
-            // Health probes (no prefix)
+            // Kubelet probes — the daemon pod's own liveness/readiness.
             .route("/healthz", get(liveness_probe))
             .route("/readyz", get(readiness_probe))
             // API v1 routes
             .nest(&format!("/api/{}", self.config.api_version), api_routes)
-            // Phone provisioning routes
-            .merge(provision_routes)
             // Add state
             .with_state(Arc::clone(&self.state))
             // Add tracing
