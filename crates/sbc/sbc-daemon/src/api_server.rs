@@ -413,7 +413,7 @@ impl ApiServer {
             // Directory number management
             .route("/directory", get(get_directory_numbers))
             .route("/directory", post(add_directory_number))
-            .route("/directory/{did}", delete(delete_directory_number))
+            .route("/directory/{did}", delete(delete_directory_number).put(update_directory_number))
             // CDR routes
             .route("/cdrs", get(get_cdrs))
             // Call ladder
@@ -449,7 +449,7 @@ impl ApiServer {
             // CUCM routing
             .route("/partitions", get(list_partitions))
             .route("/partitions", post(create_partition))
-            .route("/partitions/{id}", delete(delete_partition))
+            .route("/partitions/{id}", delete(delete_partition).put(update_partition))
             .route("/css", get(list_css))
             .route("/css", post(create_css))
             .route("/css/{id}", delete(delete_css).put(update_css))
@@ -896,6 +896,32 @@ async fn delete_directory_number(
         sip_stack.remove_did_mapping(&did).await;
     }
     Json(serde_json::json!({"success": true, "did": did}))
+}
+
+/// Update a directory number. Path `did` is the key; any new `did` in the
+/// body is ignored so the URL stays canonical.
+async fn update_directory_number(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(did): axum::extract::Path<String>,
+    Json(mut body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    body["did"] = serde_json::json!(&did);
+    let mut store = state.mem_store.write().await;
+    if !store.directory_numbers.contains_key(&did) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"success": false, "error": "Directory number not found"})),
+        );
+    }
+    store.directory_numbers.insert(did.clone(), body.clone());
+    drop(store);
+    if let Some(ref sip_stack) = state.sip_stack {
+        sip_stack.remove_did_mapping(&did).await;
+        if let Some(user) = body.get("user").and_then(|v| v.as_str()) {
+            sip_stack.add_did_mapping(&did, user).await;
+        }
+    }
+    (StatusCode::OK, Json(serde_json::json!({"success": true, "directory_number": body})))
 }
 
 // ============================================================================
@@ -1712,6 +1738,37 @@ async fn delete_partition(
         Json(serde_json::json!({ "success": true, "id": id }))
     } else {
         Json(serde_json::json!({ "success": false }))
+    }
+}
+
+/// Update a partition's name/description. ID is path-bound and immutable;
+/// `add_partition` is upsert-by-id so the existing entry is replaced.
+async fn update_partition(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Some(ref router) = state.cucm_router {
+        let mut router = router.write().await;
+        if router.get_partition(&id).is_none() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "success": false, "error": "Partition not found" })),
+            );
+        }
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let desc = body.get("description").and_then(|v| v.as_str()).map(String::from);
+        let mut partition = uc_routing::Partition::new(&id, &name);
+        if let Some(d) = desc {
+            partition = partition.with_description(d);
+        }
+        router.add_partition(partition);
+        (StatusCode::OK, Json(serde_json::json!({ "success": true, "id": id })))
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "success": false, "error": "Router not configured" })),
+        )
     }
 }
 

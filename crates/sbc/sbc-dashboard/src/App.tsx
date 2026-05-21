@@ -1,8 +1,11 @@
+import { useState } from 'react';
 import { Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import AppLayout from '@cloudscape-design/components/app-layout';
 import TopNavigation from '@cloudscape-design/components/top-navigation';
+import { Mode } from '@cloudscape-design/global-styles';
 
 import { Sidebar } from './components/Sidebar';
+import { getStoredMode, persistMode } from './theme';
 import { Dashboard } from './pages/Dashboard';
 import { Phones } from './pages/Phones';
 import { PhoneDetail } from './pages/PhoneDetail';
@@ -20,6 +23,13 @@ import { CallLadder } from './pages/CallLadder';
 export function App() {
   const location = useLocation();
   const navigate = useNavigate();
+  const [mode, setMode] = useState<Mode>(getStoredMode());
+
+  const toggleTheme = () => {
+    const next = mode === Mode.Dark ? Mode.Light : Mode.Dark;
+    setMode(next);
+    persistMode(next);
+  };
 
   return (
     <>
@@ -32,6 +42,14 @@ export function App() {
             navigate('/dashboard');
           },
         }}
+        utilities={[
+          {
+            type: 'button',
+            text: mode === Mode.Dark ? 'Light mode' : 'Dark mode',
+            ariaLabel: 'Toggle color theme',
+            onClick: toggleTheme,
+          },
+        ]}
       />
       <AppLayout
         navigation={<Sidebar activePath={location.pathname} />}

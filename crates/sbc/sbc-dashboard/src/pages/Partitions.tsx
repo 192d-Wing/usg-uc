@@ -19,6 +19,14 @@ type Partition = {
   description?: string | null;
 };
 
+type FormState = {
+  id: string;
+  name: string;
+  description: string;
+};
+
+const EMPTY_FORM: FormState = { id: '', name: '', description: '' };
+
 export function Partitions() {
   const [items, setItems] = useState<Partition[]>([]);
   const [loading, setLoading] = useState(true);
@@ -26,13 +34,10 @@ export function Partitions() {
   const [filter, setFilter] = useState('');
   const [selected, setSelected] = useState<Partition[]>([]);
 
-  const [createOpen, setCreateOpen] = useState(false);
-  const [createName, setCreateName] = useState('');
-  const [createId, setCreateId] = useState('');
-  const [createDesc, setCreateDesc] = useState('');
+  const [modalMode, setModalMode] = useState<'create' | 'edit' | null>(null);
+  const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [busy, setBusy] = useState(false);
   const [modalError, setModalError] = useState<string | null>(null);
-
   const [deleteOpen, setDeleteOpen] = useState(false);
 
   const load = async () => {
@@ -40,10 +45,9 @@ export function Partitions() {
     setError(null);
     try {
       const res = await api.get<{ partitions: Partition[] }>('/partitions');
-      setItems(res.partitions ?? []);
-      setSelected((cur) =>
-        cur.filter((s) => (res.partitions ?? []).some((p) => p.id === s.id)),
-      );
+      const next = res.partitions ?? [];
+      setItems(next);
+      setSelected((cur) => cur.filter((s) => next.some((p) => p.id === s.id)));
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e));
     } finally {
@@ -61,28 +65,44 @@ export function Partitions() {
       )
     : items;
 
-  const openCreate = () => {
-    setCreateName('');
-    setCreateId('');
-    setCreateDesc('');
-    setModalError(null);
-    setCreateOpen(true);
-  };
+  const target = selected[0];
 
-  const submitCreate = async () => {
-    if (!createName.trim()) {
+  const openCreate = () => {
+    setForm(EMPTY_FORM);
+    setModalError(null);
+    setModalMode('create');
+  };
+  const openEdit = () => {
+    if (!target) return;
+    setForm({
+      id: target.id,
+      name: target.name ?? '',
+      description: target.description ?? '',
+    });
+    setModalError(null);
+    setModalMode('edit');
+  };
+  const closeModal = () => setModalMode(null);
+
+  const submit = async () => {
+    if (!form.name.trim()) {
       setModalError('Name is required.');
       return;
     }
     setBusy(true);
     setModalError(null);
+    const body: Record<string, unknown> = {
+      name: form.name.trim(),
+      description: form.description.trim() || undefined,
+    };
     try {
-      await api.post('/partitions', {
-        name: createName.trim(),
-        id: createId.trim() || undefined,
-        description: createDesc.trim() || undefined,
-      });
-      setCreateOpen(false);
+      if (modalMode === 'create') {
+        body.id = form.id.trim() || undefined;
+        await api.post('/partitions', body);
+      } else if (target) {
+        await api.put(`/partitions/${encodeURIComponent(target.id)}`, body);
+      }
+      closeModal();
       await load();
     } catch (e) {
       setModalError(e instanceof ApiError ? e.message : String(e));
@@ -91,7 +111,6 @@ export function Partitions() {
     }
   };
 
-  const target = selected[0];
   const openDelete = () => {
     if (!target) return;
     setModalError(null);
@@ -127,6 +146,9 @@ export function Partitions() {
               </Button>
               <Button onClick={openDelete} disabled={!target || busy}>
                 Delete
+              </Button>
+              <Button onClick={openEdit} disabled={!target || busy}>
+                Edit
               </Button>
               <Button variant="primary" onClick={openCreate}>
                 Create partition
@@ -174,25 +196,36 @@ export function Partitions() {
       />
 
       <FormModal
-        visible={createOpen}
-        title="Create partition"
-        submitLabel="Create"
+        visible={modalMode !== null}
+        title={modalMode === 'edit' ? 'Edit partition' : 'Create partition'}
+        submitLabel={modalMode === 'edit' ? 'Save' : 'Create'}
         busy={busy}
         error={modalError}
-        onCancel={() => setCreateOpen(false)}
-        onSubmit={submitCreate}
+        onCancel={closeModal}
+        onSubmit={submit}
       >
         <FormField label="Name" description="Display name for the partition.">
-          <Input value={createName} onChange={({ detail }) => setCreateName(detail.value)} />
+          <Input value={form.name} onChange={({ detail }) => setForm({ ...form, name: detail.value })} />
         </FormField>
         <FormField
-          label="ID (optional)"
-          description="Defaults to the name if blank. Used in API URLs and CSS references."
+          label="ID"
+          description={
+            modalMode === 'edit'
+              ? 'ID is immutable. Delete and recreate to change it.'
+              : 'Defaults to the name if blank. Used in API URLs and CSS references.'
+          }
         >
-          <Input value={createId} onChange={({ detail }) => setCreateId(detail.value)} />
+          <Input
+            value={form.id}
+            onChange={({ detail }) => setForm({ ...form, id: detail.value })}
+            disabled={modalMode === 'edit'}
+          />
         </FormField>
         <FormField label="Description (optional)">
-          <Textarea value={createDesc} onChange={({ detail }) => setCreateDesc(detail.value)} />
+          <Textarea
+            value={form.description}
+            onChange={({ detail }) => setForm({ ...form, description: detail.value })}
+          />
         </FormField>
       </FormModal>
 
