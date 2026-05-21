@@ -1,0 +1,106 @@
+{{- if .Values.sbcApi.enabled }}
+# sbc-api-server — stand-alone REST API pod.
+#
+# Owns config-entity CRUD (phones, DIDs, trunk groups, dial plans)
+# directly out of Postgres and proxies everything else to the daemon's
+# REST endpoint. After a write that needs SIP-router invalidation it
+# calls the daemon's TrunkSync / DialPlanSync / DidMappingSync gRPC
+# services. Lets the dashboard and operator tooling come and go
+# without touching the SIP-serving process.
+#
+# The nginx frontend (16-sbc-frontend.yaml) routes /api/* here when
+# sbcApi.enabled is true; otherwise it falls back to the daemon's API
+# Service.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sbc.fullname" . }}-sbc-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  replicas: {{ .Values.sbcApi.replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "sbc.apiSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sbc.apiSelectorLabels" . | nindent 8 }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: sbc-api
+          image: "{{ .Values.sbcApi.image.repository }}:{{ .Values.sbcApi.image.tag }}"
+          imagePullPolicy: {{ .Values.sbcApi.image.pullPolicy }}
+          env:
+            - name: SBC_API_LISTEN_ADDR
+              value: "0.0.0.0:80"
+            # Daemon endpoints — both ClusterIPs created by
+            # 13-sbc-services.yaml. The daemon's REST stays running
+            # post-cutover so the proxy fallback still has somewhere
+            # to land non-config requests (calls, registrations, etc.).
+            - name: SBC_DAEMON_HTTP_URL
+              value: "http://{{ include "sbc.fullname" . }}-api.{{ .Release.Namespace }}.svc.cluster.local:80"
+            - name: SBC_DAEMON_GRPC_URL
+              value: "http://{{ include "sbc.fullname" . }}-grpc.{{ .Release.Namespace }}.svc.cluster.local:9091"
+            # Postgres DSN — same Secret the daemon reads. sbc-api owns
+            # the write side of the four config-entity tables; the
+            # daemon still reads the same tables for SIP-router replay.
+            {{- if .Values.sbcPostgres.enabled }}
+            - name: SBC_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sbc.fullname" . }}-postgres
+                  key: dsn
+            {{- else if .Values.sbcPostgres.existingSecret.name }}
+            - name: SBC_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.sbcPostgres.existingSecret.name }}
+                  key: {{ .Values.sbcPostgres.existingSecret.key | default "dsn" }}
+            {{- end }}
+          ports:
+            - { name: http, containerPort: 80, protocol: TCP }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.sbcApi.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              add: [NET_BIND_SERVICE]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sbc.fullname" . }}-sbc-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "sbc.apiSelectorLabels" . | nindent 4 }}
+  ports:
+    - { name: http, port: 80, targetPort: http, protocol: TCP }
+{{- end }}

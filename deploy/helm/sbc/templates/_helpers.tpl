@@ -41,6 +41,15 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: frontend
 {{- end }}
 
+{{/* Selector labels for the sbc-api-server pod. Separate component so
+     the API-server Deployment rolls independently of the SIP-serving
+     daemon and the nginx-served frontend. */}}
+{{- define "sbc.apiSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "sbc.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: api
+{{- end }}
+
 {{- define "sbc.serviceAccountName" -}}
 {{ include "sbc.fullname" . }}
 {{- end }}
@@ -114,6 +123,16 @@ require_mtls = false
 metrics_bind = {{ .Values.sbcDaemon.config.metrics_listen | quote }}
 per_call_metrics = false
 scrape_interval_secs = 15
+
+[grpc]
+# gRPC admin API. Used by sbc-api-server (when sbcApi.enabled) to call
+# TrunkSync / DialPlanSync / DidMappingSync after operator writes, so
+# the SIP router stays in sync without sbc-api going through the
+# daemon's REST endpoint. Distinct port from `[monitoring]` above —
+# both default to 9090 in the Rust schema, which would collide.
+listen_addr = {{ .Values.sbcDaemon.config.grpc_listen | quote }}
+enable_reflection = false
+require_mtls = false
 
 # Phone provisioning HTTP server. Without this section the daemon leaves
 # AppState::provisioning = None and /provision/<MAC>.{cfg,xml} returns 503.

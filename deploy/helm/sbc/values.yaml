@@ -100,6 +100,22 @@ sbcPostgres:
     name: ""
     key: dsn
 
+# sbc-api-server — stand-alone REST API pod (PR5). Owns config-entity
+# CRUD directly out of Postgres and proxies everything else to the
+# daemon. When enabled, the frontend nginx upstream flips from the
+# daemon's API ClusterIP to sbc-api's, so operator/dashboard traffic
+# stops sharing a process lifecycle with SIP.
+sbcApi:
+  enabled: true
+  replicas: 2                            # rolling update needs >1
+  image:
+    repository: sbc-api-server
+    tag: local
+    pullPolicy: Never
+  resources:
+    requests: { cpu: "50m",  memory: "64Mi"  }
+    limits:   { cpu: "500m", memory: "256Mi" }
+
 sbcDaemon:
   replicas: 1
   # PVC for /var/lib/sbc — holds the file-backed SQLite (users / HA1s) and
@@ -132,6 +148,10 @@ sbcDaemon:
     srtp_required: true
     api_listen: "0.0.0.0:80"
     metrics_listen: "0.0.0.0:9090"
+    # gRPC admin API — must be distinct from metrics_listen (both default
+    # to 9090 in the Rust schema, which collides). sbc-api dials this
+    # via the *-grpc ClusterIP Service to push SIP-router refresh RPCs.
+    grpc_listen: "0.0.0.0:9091"
 
 kea:
   enabled: true

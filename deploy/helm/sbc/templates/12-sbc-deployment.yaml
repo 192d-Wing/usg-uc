@@ -93,6 +93,9 @@ spec:
             - { name: sip-tls,  containerPort: 5061, protocol: TCP }
             - { name: api,      containerPort: 80,   protocol: TCP }
             - { name: metrics,  containerPort: 9090, protocol: TCP }
+            # gRPC admin API; consumed by sbc-api-server (when enabled)
+            # for TrunkSync / DialPlanSync / DidMappingSync RPCs.
+            - { name: grpc,     containerPort: 9091, protocol: TCP }
           livenessProbe:
             httpGet: { path: /healthz, port: api }
             initialDelaySeconds: 10

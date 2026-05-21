@@ -74,6 +74,24 @@ spec:
   ports:
     - { name: api, port: 80, targetPort: 80, protocol: TCP }
 {{- end }}
+---
+# Daemon gRPC admin endpoint. ClusterIP only — never externally exposed.
+# sbc-api-server reaches the daemon's TrunkSync / DialPlanSync /
+# DidMappingSync services here. Always created (no feature gate) since
+# the gRPC server is enabled in the daemon image.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sbc.fullname" . }}-grpc
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "sbc.selectorLabels" . | nindent 4 }}
+  ports:
+    - { name: grpc, port: 9091, targetPort: 9091, protocol: TCP }
 {{- if .Values.services.metrics.enabled }}
 ---
 apiVersion: v1

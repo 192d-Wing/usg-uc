@@ -30,9 +30,19 @@ PER PHONE VLAN (DHCP relay to Kea's stable LB IP):
 
 OPERATOR DASHBOARD:
   http://sbc.{{ .Values.site.fqdn_base }}/
-  (served by the sbc-frontend nginx pod; /api and /provision are reverse-
-  proxied to the sbc-daemon ClusterIP Service so dashboard rolls don't
-  restart SIP)
+  Served by the sbc-frontend nginx pod.
+{{- if .Values.sbcApi.enabled }}
+  /api/* → sbc-api-server pod
+            ├ phones / DIDs / trunk groups / dial plans: read+write Postgres
+            │   (then daemon TrunkSync / DialPlanSync / DidMappingSync
+            │    gRPC at {{ include "sbc.fullname" . }}-grpc:9091)
+            └ everything else (calls, registrations, users, partitions,
+              CSS, route patterns, /system/stats, trunk-health,
+              trunk-registration): reverse-proxied to the daemon.
+  /provision/* → daemon (unchanged)
+{{- else }}
+  /api/* and /provision/* → daemon (single-pod legacy mode)
+{{- end }}
 
 CONFIG STORE:
 {{- if .Values.sbcPostgres.enabled }}

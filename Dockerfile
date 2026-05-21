@@ -71,7 +71,8 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo chef cook --release --recipe-path recipe.json \
-        --package sbc-daemon --package sbc-cli
+        --package sbc-daemon --package sbc-cli \
+        --features sbc-daemon/grpc
 
 # =============================================================================
 # Stage 2d: Build the workspace binaries with the cooked deps as a baseline.
@@ -89,6 +90,7 @@ COPY audio_files/ audio_files/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo build --release --package sbc-daemon --package sbc-cli \
+        --features sbc-daemon/grpc \
     && cp target/release/sbc-daemon /tmp/sbc-daemon \
     && cp target/release/sbc-cli /tmp/sbc-cli
 
