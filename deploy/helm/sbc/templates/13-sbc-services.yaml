@@ -1,8 +1,11 @@
-# Headless Services for SBC. clusterIP: None makes DNS for the Service name
-# return the pod IPs directly (no DNAT). ExternalDNS picks up the hostname
-# annotation and creates an A record in the configured DNS provider that
-# also points at the pod IPs — so any client resolving the FQDN hits the
-# SBC at its current Cilium-assigned IP.
+# LoadBalancer Services for SIP signaling + REST API. Use a single fixed
+# loadBalancerIP from the site's CiliumLoadBalancerIPPool so the SBC's
+# ingress is reachable at one stable address (FQDN resolves here via the
+# sibling coredns-site chart's k8s_gateway plugin).
+#
+# externalTrafficPolicy: Local keeps the client's source IP intact through
+# kube-proxy's DNAT — important for SIP peer authentication and access
+# logging.
 {{- if .Values.services.sip.enabled }}
 apiVersion: v1
 kind: Service
@@ -15,10 +18,19 @@ metadata:
   annotations:
     external-dns.alpha.kubernetes.io/hostname: "sbc.{{ .Values.site.fqdn_base }}"
     external-dns.alpha.kubernetes.io/ttl: "60"
+    # k8s_gateway plugin (sibling coredns-site chart) — v0.4.0 only honors
+    # this annotation name.
+    coredns.io/hostname: "sbc.{{ .Values.site.fqdn_base }}"
+    # Allow this Service to share its LB IP with other Services in this
+    # site (sbc-api shares the same IP for HTTP, sbc-sip for SIP).
+    # Cilium 1.19 annotation key is `lbipam.cilium.io/sharing-key`.
+    lbipam.cilium.io/sharing-key: "{{ .Values.site.name }}-sbc"
+    lbipam.cilium.io/sharing-cross-namespace: "*"
   {{- end }}
 spec:
-  type: ClusterIP
-  clusterIP: None
+  type: LoadBalancer
+  loadBalancerIP: {{ .Values.site.sbc_lb_ip }}
+  externalTrafficPolicy: Local
   selector:
     {{- include "sbc.selectorLabels" . | nindent 4 }}
   ports:
@@ -28,6 +40,10 @@ spec:
 {{- end }}
 {{- if .Values.services.api.enabled }}
 ---
+# Shares the same loadBalancerIP via the well-known multi-port-on-one-IP
+# pattern. Two Services targeting the same LB IP work because Cilium's LB
+# pool allocator allows multiple Services to claim the same IP as long as
+# the (IP, port) tuples don't collide.
 apiVersion: v1
 kind: Service
 metadata:
@@ -39,10 +55,17 @@ metadata:
   annotations:
     external-dns.alpha.kubernetes.io/hostname: "sbc.{{ .Values.site.fqdn_base }}"
     external-dns.alpha.kubernetes.io/ttl: "60"
+    coredns.io/hostname: "sbc.{{ .Values.site.fqdn_base }}"
+    # Allow this Service to share its LB IP with other Services in this
+    # site (sbc-api shares the same IP for HTTP, sbc-sip for SIP).
+    # Cilium 1.19 annotation key is `lbipam.cilium.io/sharing-key`.
+    lbipam.cilium.io/sharing-key: "{{ .Values.site.name }}-sbc"
+    lbipam.cilium.io/sharing-cross-namespace: "*"
   {{- end }}
 spec:
-  type: ClusterIP
-  clusterIP: None
+  type: LoadBalancer
+  loadBalancerIP: {{ .Values.site.sbc_lb_ip }}
+  externalTrafficPolicy: Local
   selector:
     {{- include "sbc.selectorLabels" . | nindent 4 }}
   ports:

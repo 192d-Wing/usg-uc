@@ -27,6 +27,11 @@ site:
   # Fixed LB IP for Kea. Set the upstream router's `ip helper-address` on
   # each phone VLAN's SVI to this address.
   kea_lb_ip: "10.50.1.13"
+  # Fixed LB IP for SBC SIP/API ingress. k8s_gateway can't dereference
+  # headless Services through Endpoints (it would require a newer plugin
+  # version), so SIP/API Services are LoadBalancer-type with a stable LB
+  # IP. The FQDN `sbc.<fqdn_base>` resolves to this address.
+  sbc_lb_ip: "10.50.1.10"
 
 bgp:
   # Set true on the first chart install per cluster (creates cluster-wide
@@ -88,6 +93,12 @@ kea:
       # FQDN of the SBC's provisioning HTTP endpoint — TEO TSG accepts FQDN
       # here, so we don't need a stable IP for provisioning.
       tftp_server: "sbc.kfk-001.usg.example.com"
+      # DHCP option 6 (domain-name-servers). Point phones at the per-site
+      # CoreDNS so they can resolve `sbc.<site>` and `kea.<site>` FQDNs.
+      # Coordinates with the sibling coredns-site chart's
+      # service.loadBalancerIP.
+      dns_servers:
+        - "10.50.1.5"
 
 services:
   sip:     { enabled: true }

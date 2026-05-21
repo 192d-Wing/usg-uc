@@ -134,6 +134,9 @@ Render kea-dhcp4.conf. Phone subnets keyed by relay agent IP (giaddr).
         "option-data": [
           { "name": "routers",          "data": {{ $sub.gateway | quote }} },
           { "name": "tftp-server-name", "data": {{ $sub.tftp_server | quote }} }
+          {{- with $sub.dns_servers }},
+          { "name": "domain-name-servers", "data": {{ join "," . | quote }} }
+          {{- end }}
         ],
         "relay": { "ip-addresses": [{{ $sub.gateway | quote }}] }
       }
