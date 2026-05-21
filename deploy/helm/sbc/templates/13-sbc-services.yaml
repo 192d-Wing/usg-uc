@@ -1,6 +1,8 @@
-# In-cluster ClusterIP Services for cross-component DNS. External traffic
-# reaches the SBC directly at its BGP-advertised pod IP (no LoadBalancer
-# needed under the single-IP model).
+# Headless Services for SBC. clusterIP: None makes DNS for the Service name
+# return the pod IPs directly (no DNAT). ExternalDNS picks up the hostname
+# annotation and creates an A record in the configured DNS provider that
+# also points at the pod IPs — so any client resolving the FQDN hits the
+# SBC at its current Cilium-assigned IP.
 {{- if .Values.services.sip.enabled }}
 apiVersion: v1
 kind: Service
@@ -9,8 +11,14 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "sbc.labels" . | nindent 4 }}
+  {{- if .Values.externalDns.enabled }}
+  annotations:
+    external-dns.alpha.kubernetes.io/hostname: "sbc.{{ .Values.site.fqdn_base }}"
+    external-dns.alpha.kubernetes.io/ttl: "60"
+  {{- end }}
 spec:
   type: ClusterIP
+  clusterIP: None
   selector:
     {{- include "sbc.selectorLabels" . | nindent 4 }}
   ports:
@@ -27,8 +35,14 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "sbc.labels" . | nindent 4 }}
+  {{- if .Values.externalDns.enabled }}
+  annotations:
+    external-dns.alpha.kubernetes.io/hostname: "sbc.{{ .Values.site.fqdn_base }}"
+    external-dns.alpha.kubernetes.io/ttl: "60"
+  {{- end }}
 spec:
   type: ClusterIP
+  clusterIP: None
   selector:
     {{- include "sbc.selectorLabels" . | nindent 4 }}
   ports:

@@ -2,6 +2,8 @@
 
 This is the step-by-step to bring a fresh microk8s node from "OS just installed" to "SBC pod Ready + reachable via BGP from upstream router". Every step is per-site and idempotent.
 
+The architecture is **FQDN-first**: clients reach the SBC by name (`sbc.<site>.usg.example.com`), and the name resolves to whatever pod IP Cilium currently assigns. The only stable IP per site is **Kea's** — because the DHCP-relay protocol used by upstream routers is L3-only and won't accept an FQDN.
+
 ## Prerequisites per site
 
 | Item | Detail |
@@ -9,7 +11,9 @@ This is the step-by-step to bring a fresh microk8s node from "OS just installed"
 | Hardware | x86_64 host with single NIC, ≥4 vCPU, ≥8 GiB RAM |
 | OS | Ubuntu 24.04+ (snap-capable) |
 | Upstream router | Supports BGP, can peer with k8s node ASN 65001 |
-| Site /28 | Reserved per-site IPv4 CIDR not used elsewhere on the network |
+| Site `/28` LB pool | Per-site reserved /28 for LoadBalancer Service IPs (Kea + future) |
+| DNS infrastructure | A DNS provider ExternalDNS can write to (Route53, CoreDNS-RFC2136, Cloudflare, …) |
+| Site FQDN base | Per-site subdomain you control, e.g. `kfk-001.usg.example.com` |
 | Upstream BGP config | See [§ Upstream router config](#upstream-router-config) |
 
 ## Step 1 — Install microk8s
@@ -86,24 +90,49 @@ sudo microk8s kubectl get pods -A -o wide | grep -v '10\.0\.\|10\.2\.'
 #  no 10.1.x.x left)
 ```
 
-## Step 3 — Per-site Helm values
+## Step 3 — Install ExternalDNS (one-time per cluster)
+
+The chart publishes the SBC's FQDN via standard `external-dns.alpha.kubernetes.io/hostname` annotations on its Services. ExternalDNS itself must be installed cluster-wide once. Pick the provider matching your existing DNS infrastructure (Route53, CoreDNS-RFC2136, Cloudflare, Akamai EdgeDNS, etc.).
+
+Generic ExternalDNS install via the upstream chart:
+
+```bash
+sudo microk8s helm3 repo add external-dns https://kubernetes-sigs.github.io/external-dns/
+sudo microk8s helm3 install external-dns external-dns/external-dns \
+  --namespace kube-system \
+  --set provider=<your-provider> \
+  --set sources={service} \
+  --set txtOwnerId=<unique-cluster-id> \
+  --set domainFilters[0]=<your-domain>     # e.g. usg.example.com
+```
+
+Provider-specific args go in `--set <provider>.*` (see the [ExternalDNS docs](https://kubernetes-sigs.github.io/external-dns/) for your provider).
+
+ExternalDNS watches Services with the `external-dns.alpha.kubernetes.io/hostname` annotation and creates A records pointing at the Service's endpoint IPs. The SBC chart uses **headless** Services for SIP/API so the A records point directly at pod IPs (no DNAT, source IP preserved for SIP peer authentication).
+
+> **Without ExternalDNS** the chart still installs cleanly — the annotations are inert and clients won't be able to resolve the SBC by FQDN. You can also pre-create A records manually for static deployments.
+
+## Step 4 — Per-site Helm values
 
 Create `values-<site-id>.yaml`:
 
 ```yaml
 site:
-  name: <site-id>                  # e.g. kfk-001, lowercase + DNS-safe
-  node: <k8s-node-hostname>        # e.g. k8-01
-  pod_cidr: "10.50.<X>.0/28"       # this site's reserved /28
-  sbc_ip: "10.50.<X>.10"           # informational only under cluster-pool
-  kea_ip: "10.50.<X>.13"           # informational only under cluster-pool
+  name: <site-id>                       # e.g. kfk-001, lowercase + DNS-safe
+  node: <k8s-node-hostname>             # e.g. k8-01
+  fqdn_base: "<site-id>.usg.example.com"  # zone ExternalDNS writes into
+  lb_pool_cidr: "10.50.<X>.0/28"        # site's LoadBalancer IP pool
+  kea_lb_ip: "10.50.<X>.13"             # stable LB IP for DHCP relay target
 
 bgp:
-  install_cluster_config: true     # set false on second-and-later installs
+  install_cluster_config: true          # set false on second-and-later installs
   cluster_asn: 65001
   upstream:
-    ip: "<upstream-router-ip>"     # e.g. 10.0.100.1
+    ip: "<upstream-router-ip>"          # e.g. 10.0.100.1
     asn: 65000
+
+externalDns:
+  enabled: true                         # adds DNS-publish annotations to Services
 
 image:
   repository: sbc-daemon
@@ -115,12 +144,12 @@ kea:
     - subnet:      "<phone-vlan-cidr>"
       pool:        ["<dhcp-start>", "<dhcp-end>"]
       gateway:     "<phone-vlan-gateway>"
-      tftp_server: "<sbc-ip>"      # = site.sbc_ip
+      tftp_server: "sbc.<site-id>.usg.example.com"   # FQDN, not IP
 ```
 
-For 184 sites: render values from a CSV/YAML inventory + a template. Site differences are just IPs/CIDRs/ASNs.
+For 184 sites: render values from a CSV/YAML inventory + a template. Site differences are just `name`, `node`, `fqdn_base`, `lb_pool_cidr`, `kea_lb_ip`, `bgp.upstream.ip`, and the phone subnet block.
 
-## Step 4 — Build & import the SBC image
+## Step 5 — Build & import the SBC image
 
 The image is built locally and imported into microk8s containerd. **Known issue**: Cilium's BPF programs attach to all veths, which breaks podman's normal build-time veth creation — use `--network=host` to skip podman's network namespace.
 
@@ -137,7 +166,7 @@ sudo microk8s ctr image tag --force \
 
 For 184 sites: build once on a build host, push the OCI tarball to each site's microk8s ctr.
 
-## Step 5 — Deploy the chart
+## Step 6 — Deploy the chart
 
 ```bash
 sudo microk8s helm3 install sbc-<site-id> deploy/helm/sbc \
@@ -151,9 +180,16 @@ Verify:
 # SBC + Kea pods Ready
 sudo microk8s kubectl get pods -n sbc-system
 
-# Cilium BGP advertising pod CIDR
+# Kea got its fixed LB IP from the site pool
+sudo microk8s kubectl get svc -n sbc-system | grep kea
+# expect: EXTERNAL-IP == kea_lb_ip from values
+
+# Cilium BGP advertising pod CIDR + Kea's LB /32
 sudo microk8s kubectl exec -n kube-system ds/cilium -c cilium-agent -- \
   cilium bgp routes advertised
+
+# DNS resolution working (if ExternalDNS wired up)
+dig sbc.<site-id>.usg.example.com +short
 ```
 
 ## Upstream router config
@@ -174,18 +210,16 @@ address-family ipv4 unicast
 exit-address-family
 ```
 
-Per phone VLAN (DHCP relay to Kea):
+Per phone VLAN (DHCP relay to Kea's stable LB IP from values.yaml):
 
 ```
 interface Vlan<phone-vlan-id>
-  ip helper-address <kea-pod-ip>
+  ip helper-address <site.kea_lb_ip>      # e.g. 10.50.1.13 — stable across pod restarts
 ```
 
-Discover the Kea pod IP after `helm install`:
+The Kea LB IP comes from your per-site `lb_pool_cidr` and is pinned by Cilium via the LoadBalancer Service. Verify after install:
 ```bash
-sudo microk8s kubectl -n sbc-system get pod \
-  -l app.kubernetes.io/component=kea-dhcp4 \
-  -o jsonpath='{.items[0].status.podIP}'
+sudo microk8s kubectl -n sbc-system get svc | grep kea
 ```
 
 ## Troubleshooting

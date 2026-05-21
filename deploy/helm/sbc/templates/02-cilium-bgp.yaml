@@ -34,10 +34,8 @@ spec:
         matchLabels:
           advertise: bgp
 ---
-# Advertise the cluster's pod CIDR (the /24 carved out for this node from the
-# cluster IPv4 pool) so anywhere in the pod network is reachable from the
-# upstream router. The SBC pod will get an IP from this CIDR and be reachable
-# at that address via the BGP route.
+# Cluster-wide: advertise the cluster pod CIDR so pods are directly
+# reachable upstream by their IPs (FQDN A records point here).
 apiVersion: cilium.io/v2
 kind: CiliumBGPAdvertisement
 metadata:
@@ -48,3 +46,23 @@ spec:
   advertisements:
     - advertisementType: PodCIDR
 {{- end }}
+---
+# Per-site: advertise this site's LoadBalancer IPs (currently just Kea).
+# The /32 is advertised only while the Service is allocated an IP from the
+# pool, so removing the chart removes the advertisement.
+apiVersion: cilium.io/v2
+kind: CiliumBGPAdvertisement
+metadata:
+  name: {{ include "sbc.fullname" . }}-lb-advertisement
+  labels:
+    advertise: bgp
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  advertisements:
+    - advertisementType: Service
+      service:
+        addresses:
+          - LoadBalancerIP
+      selector:
+        matchLabels:
+          sbc.usg/site: {{ .Values.site.name }}

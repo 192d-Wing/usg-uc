@@ -1,12 +1,14 @@
 
 USG SBC site {{ .Values.site.name | quote }} installed on node {{ .Values.site.node | quote }}.
 
-L3 single-IP model:
-  - SBC pod gets one Cilium-assigned IP from the cluster pod CIDR
-  - BGP advertises the cluster's PodCIDR upstream — pod is reachable at its IP
-  - Kea pod gets a separate Cilium IP, used as DHCP relay target
+FQDN-first L3 model:
+  - SBC pod has one Cilium-assigned IP; FQDN published via ExternalDNS:
+      sbc.{{ .Values.site.fqdn_base }}  →  current pod IP
+  - Kea has a fixed LoadBalancer IP for DHCP relay (the one stable IP needed):
+      Kea LB IP:  {{ .Values.site.kea_lb_ip }}
+  - All other clients (trunks/phones/operators) reach the SBC by FQDN.
 
-UPSTREAM ROUTER ({{ .Values.bgp.upstream.ip }}, AS {{ .Values.bgp.upstream.asn }}) MUST BE CONFIGURED WITH:
+UPSTREAM ROUTER ({{ .Values.bgp.upstream.ip }}, AS {{ .Values.bgp.upstream.asn }}) BGP CONFIG:
 
   router bgp {{ .Values.bgp.upstream.asn }}
     bgp router-id <upstream-router-id>
@@ -20,16 +22,22 @@ UPSTREAM ROUTER ({{ .Values.bgp.upstream.ip }}, AS {{ .Values.bgp.upstream.asn }
     neighbor kube-nodes default-originate
   exit-address-family
 
-PER PHONE VLAN (DHCP relay to Kea pod):
+PER PHONE VLAN (DHCP relay to Kea's stable LB IP):
 {{- range .Values.kea.phone_subnets }}
   interface Vlan<id-for-{{ .subnet }}>
-    ip helper-address <kea-pod-ip>      # discover via: kubectl -n {{ $.Release.Namespace }} get pod -l app.kubernetes.io/component=kea-dhcp4 -o jsonpath='{.items[0].status.podIP}'
+    ip helper-address {{ $.Values.site.kea_lb_ip }}
 {{- end }}
 
+PROVISIONING URL (TEO TSG / Polycom / Cisco MPP — all accept FQDN):
+  http://sbc.{{ .Values.site.fqdn_base }}/provision/<mac>.<ext>
+
 Verify on this cluster:
-  microk8s kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }} -o wide
+  microk8s kubectl -n {{ .Release.Namespace }} get pods,svc -l app.kubernetes.io/instance={{ .Release.Name }}
+  microk8s kubectl -n {{ .Release.Namespace }} get ciliumloadbalancerippool {{ include "sbc.fullname" . }}-lb-pool
+  microk8s kubectl exec -n kube-system ds/cilium -c cilium-agent -- cilium bgp routes advertised
+  dig sbc.{{ .Values.site.fqdn_base }} +short        # if ExternalDNS is wired up
 
 Verify on upstream router:
   show ip bgp summary
-  show ip bgp <pod-cidr>
-  ping <sbc-pod-ip>
+  show ip bgp {{ .Values.site.kea_lb_ip }}/32
+  ping {{ .Values.site.kea_lb_ip }}

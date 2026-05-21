@@ -1,43 +1,54 @@
-# USG SBC — per-site L3 deployment (Cilium native, single-IP-per-pod).
+# USG SBC — per-site L3 deployment (Cilium + FQDN-first).
 #
 # Architecture:
-#   - One SBC pod per site, single IP from the site's CiliumPodIPPool (/28)
-#   - Cilium BGP advertises the /28 to the site's upstream router
-#   - Phones / trunks / operators all reach the SBC at one stable site IP
-#   - Zone identity is a logical SIP-classification concept (by remote peer
-#     IP, dial pattern, trunk peer match), not a wire-level binding
-#   - No Multus, no Whereabouts, no secondary CNIs
+#   - SBC pod gets a Cilium-assigned cluster-pool IP (dynamic per restart)
+#   - SBC publishes its FQDN via ExternalDNS (sbc.<site.fqdn_base>) → current pod IP
+#   - Phones/trunks/operators all reach SBC by FQDN, NOT by IP
+#   - Kea (DHCPv4 server) is exposed via a LoadBalancer Service with a fixed
+#     IP from a per-site CiliumLoadBalancerIPPool. This is the one place an
+#     IP is required: upstream router `ip helper-address` config is L3-only
+#     and can't take an FQDN.
+#   - BGP advertises:
+#       * The cluster pod CIDR (so any pod is reachable at its IP)
+#       * The site's LoadBalancer IP pool (so Kea's LB IP is reachable)
 #
 # NIST 800-53 Rev5: CM-2 (baseline), CM-6 (settings), SC-7 (boundary).
 
 site:
-  name: kfk-001
-  node: k8-01
-  # /28 reserved for this site's SBC pods. Advertised via Cilium BGP.
-  pod_cidr: "10.50.1.0/28"
-  # Stable IP the SBC pod binds to. Pinned via ipam.cilium.io/ipv4-address
-  # so trunk peers and DHCP clients see the same address across pod restarts.
-  sbc_ip: "10.50.1.10"
-  # Stable IP for Kea (DHCP relay target on each phone VLAN).
-  kea_ip: "10.50.1.13"
+  name: kfk-001                          # used in resource names
+  node: k8-01                            # k8s node hostname for this site
+  # FQDN base. Resources publish themselves under this domain via ExternalDNS:
+  #   sbc.<fqdn_base>   → SBC SIP/HTTP
+  #   kea.<fqdn_base>   → Kea (informational only; DHCP relay still uses IP)
+  fqdn_base: "kfk-001.usg.example.com"
+  # Per-site LoadBalancer IP pool. Tiny CIDR — only a handful of LB IPs are
+  # needed per site (Kea is the main one). Advertised upstream via BGP.
+  lb_pool_cidr: "10.50.1.0/28"
+  # Fixed LB IP for Kea. Set the upstream router's `ip helper-address` on
+  # each phone VLAN's SVI to this address.
+  kea_lb_ip: "10.50.1.13"
 
 bgp:
-  # Per-site BGPClusterConfig + Advertisement. Set to false on subsequent
-  # site charts deployed to the same cluster (the cluster-wide BGP cluster
-  # config is shared and only needs one install).
+  # Set true on the first chart install per cluster (creates cluster-wide
+  # CiliumBGPClusterConfig). Subsequent sites set false.
   install_cluster_config: false
-  # Cluster's BGP ASN.
   cluster_asn: 65001
   upstream:
     ip: "10.0.100.1"
     asn: 65000
+
+# ExternalDNS integration. The chart adds standard ExternalDNS hostname
+# annotations to Services; ExternalDNS itself is a cluster-wide install
+# (see BOOTSTRAP.md). When disabled, the annotations are still emitted but
+# inert.
+externalDns:
+  enabled: true
 
 image:
   repository: sbc-daemon
   tag: local
   pullPolicy: Never
 
-# SBC daemon
 sbcDaemon:
   replicas: 1
   resources:
@@ -62,7 +73,6 @@ sbcDaemon:
     api_listen: "0.0.0.0:80"
     metrics_listen: "0.0.0.0:9090"
 
-# Kea DHCPv4 (relay mode)
 kea:
   enabled: true
   image:
@@ -75,10 +85,10 @@ kea:
     - subnet:      "10.50.10.0/24"
       pool:        ["10.50.10.50", "10.50.10.250"]
       gateway:     "10.50.10.1"
-      tftp_server: "10.50.1.10"        # = site.sbc_ip
+      # FQDN of the SBC's provisioning HTTP endpoint — TEO TSG accepts FQDN
+      # here, so we don't need a stable IP for provisioning.
+      tftp_server: "sbc.kfk-001.usg.example.com"
 
-# Services for in-cluster DNS access (zone IPs are reached directly via BGP
-# from outside the cluster, so external Services aren't needed)
 services:
   sip:     { enabled: true }
   api:     { enabled: true }

@@ -1,0 +1,16 @@
+# Per-site LoadBalancer IP pool. Cilium pulls IPs from this pool when a
+# Service in this namespace has `loadBalancerIP: <ip-from-pool>` set OR
+# matches the pool's serviceSelector. The matching CiliumBGPAdvertisement
+# in 02-cilium-bgp.yaml advertises any allocated /32s upstream.
+apiVersion: cilium.io/v2
+kind: CiliumLoadBalancerIPPool
+metadata:
+  name: {{ include "sbc.fullname" . }}-lb-pool
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  blocks:
+    - cidr: {{ .Values.site.lb_pool_cidr }}
+  serviceSelector:
+    matchLabels:
+      sbc.usg/site: {{ .Values.site.name }}
