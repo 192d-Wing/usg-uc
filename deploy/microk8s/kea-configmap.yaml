@@ -52,11 +52,19 @@ data:
             "space": "dhcp4"
           }
         ],
-        "option-data": [
-          { "name": "tftp-server-name",    "data": "sbc.xtic.dev.mil" },
-          { "name": "tftp-server-address", "data": "10.0.100.240" },
-          { "name": "boot-file-name",      "data": "provision" },
-          { "name": "v4-firmware-url",     "data": "http://sbc.xtic.dev.mil/provision" }
+        "option-data": [],
+        "hooks-libraries": [
+          {
+            "library": "/usr/local/lib/kea/hooks/libdhcp_flex_option.so",
+            "parameters": {
+              "options": [
+                {
+                  "code": 125,
+                  "add": "0x99CCCA4C32513D313B4C3251564C414E3D333030313B566F6963655072693D323B5369676E616C5072693D333B557064617465537276723D7362632E787469632E6465762E6D696C3B2050726F746F636F6C3D485454503B436F6E66696746696C653D4D41433B53697050726F7879537276723D7362632E787469632E6465762E6D696C3B2053697050726F7879506F72743D353036303B5369705265676973747261723D7362632E787469632E6465762E6D696C3B536970526567506F72743D353036303B20536572766572547970653D54454F5F55434D"
+                }
+              ]
+            }
+          }
         ],
         "subnet4": [
           {
@@ -67,12 +75,8 @@ data:
               { "pool": "10.0.101.100 - 10.0.101.200" }
             ],
             "option-data": [
-              { "name": "routers",              "data": "10.0.101.1" },
-              { "name": "domain-name-servers",  "data": "10.0.101.1" },
-              { "name": "tftp-server-name",     "data": "sbc.xtic.dev.mil" },
-              { "name": "tftp-server-address",  "data": "10.0.100.240" },
-              { "name": "boot-file-name",       "data": "provision" },
-              { "name": "v4-firmware-url",      "data": "http://sbc.xtic.dev.mil/provision" }
+              { "name": "routers",             "data": "10.0.101.1" },
+              { "name": "domain-name-servers", "data": "10.0.101.1" }
             ]
           }
         ],

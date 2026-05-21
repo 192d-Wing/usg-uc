@@ -61,16 +61,29 @@ spec:
           args:
             - |
               set -e
-              # Policy routing for OUTBOUND traffic sourced from macvlan IPs.
-              ip rule add from "$LAN_SUBNET" table 100 || true
-              ip route add default via "$LAN_GATEWAY" table 100 || true
-              # Pin the host IP back via calico/eth0. Without this, replies
-              # to the host (which lives in $LAN_SUBNET) leak out a macvlan
-              # interface because of on-link 10.0.100.0/24 routes, causing
-              # kubelet HTTP probes to time out.
+              # Three macvlan zones share one LAN subnet, so the pod's main
+              # table has three competing on-link routes for 10.0.100.0/24.
+              # The kernel always picks the first (net1) for any LAN
+              # destination, so a SYN-ACK leaving the pod for a connection
+              # accepted on net2/net3 egresses through net1 with the wrong
+              # MAC. Per-source routing tables keep the egress symmetric.
+              for entry in "240:net1:inside" "241:net2:outside" "242:net3:oobm"; do
+                last_octet=$(echo "$entry" | cut -d: -f1)
+                dev=$(echo "$entry" | cut -d: -f2)
+                table="$last_octet"
+                src_ip="10.0.100.${last_octet}"
+                ip route flush table "$table" 2>/dev/null || true
+                ip route add 10.0.100.0/24 dev "$dev" scope link src "$src_ip" table "$table"
+                ip route add default via "$LAN_GATEWAY" dev "$dev" table "$table"
+                ip rule add from "$src_ip" table "$table" priority "$((1000 + last_octet))" || true
+                echo "Pinned src $src_ip -> $dev (table $table)"
+              done
+              # Pin the kubelet host IP back via calico/eth0 so HTTP probes
+              # (originating from the host on $LAN_SUBNET) get symmetric
+              # replies. Without this, replies leak out a macvlan interface.
               CALICO_GW=$(ip -4 route show default | awk '/dev eth0/ {print $3; exit}')
               if [ -n "$HOST_IP" ] && [ -n "$CALICO_GW" ]; then
-                ip route add "$HOST_IP/32" via "$CALICO_GW" dev eth0 || true
+                ip route replace "$HOST_IP/32" via "$CALICO_GW" dev eth0
                 echo "Pinned host IP $HOST_IP via $CALICO_GW dev eth0"
               fi
               chown -R 1000:1000 /var/lib/sbc 2>/dev/null || true
