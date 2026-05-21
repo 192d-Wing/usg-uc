@@ -1,0 +1,100 @@
+# SBC daemon — single replica per site, single pod IP from Cilium's cluster
+# pool. No Multus, no secondary CNIs. The pod's IP is BGP-advertised via the
+# cluster PodCIDR advertisement. The daemon binds 0.0.0.0:5060 (single
+# listener) and classifies zone post-receive by trunk-peer match / dial-plan
+# routing rather than by which local IP a packet hit.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sbc.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.sbcDaemon.replicas }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "sbc.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sbc.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include "sbc.config" . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "sbc.serviceAccountName" . }}
+      nodeName: {{ .Values.site.node }}
+      securityContext:
+        {{- toYaml .Values.sbcDaemon.podSecurityContext | nindent 8 }}
+      # initContainer renders config.toml with the pod's actual IP (downward
+      # API). Without this we'd have to hard-code a placeholder; with it the
+      # daemon binds to and advertises its real IP, so Via/Contact/SDP all
+      # match the source IP that trunk peers see.
+      initContainers:
+        - name: render-config
+          image: busybox:1.36
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              sed "s|__POD_IP__|${POD_IP}|g" /etc/sbc-template/config.toml > /etc/sbc-rendered/config.toml
+              echo "Rendered config.toml with POD_IP=${POD_IP}"
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef: { fieldPath: status.podIP }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: config-template, mountPath: /etc/sbc-template, readOnly: true }
+            - { name: config-rendered, mountPath: /etc/sbc-rendered }
+      containers:
+        - name: sbc
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["-c", "/etc/sbc/config.toml", "-f"]
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef: { fieldPath: status.podIP }
+          ports:
+            - { name: sip-udp,  containerPort: 5060, protocol: UDP }
+            - { name: sip-tcp,  containerPort: 5060, protocol: TCP }
+            - { name: sip-tls,  containerPort: 5061, protocol: TCP }
+            - { name: api,      containerPort: 80,   protocol: TCP }
+            - { name: metrics,  containerPort: 9090, protocol: TCP }
+          livenessProbe:
+            httpGet: { path: /healthz, port: api }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: api }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          startupProbe:
+            httpGet: { path: /healthz, port: api }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 30
+          resources:
+            {{- toYaml .Values.sbcDaemon.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.sbcDaemon.securityContext | nindent 12 }}
+          volumeMounts:
+            - { name: config-rendered, mountPath: /etc/sbc/config.toml, subPath: config.toml, readOnly: true }
+            - { name: data, mountPath: /var/lib/sbc }
+            - { name: logs, mountPath: /var/log/sbc }
+      volumes:
+        - name: config-template
+          configMap:
+            name: {{ include "sbc.fullname" . }}-config
+        - name: config-rendered
+          emptyDir: {}
+        - name: data
+          emptyDir: {}
+        - name: logs
+          emptyDir: {}

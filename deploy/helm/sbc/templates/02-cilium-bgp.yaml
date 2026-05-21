@@ -1,0 +1,50 @@
+{{- if .Values.bgp.install_cluster_config }}
+# Cluster-wide BGP cluster config. Install once on the first site; subsequent
+# sites in the same cluster set bgp.install_cluster_config: false.
+apiVersion: cilium.io/v2
+kind: CiliumBGPClusterConfig
+metadata:
+  name: bgp-cluster-config
+spec:
+  nodeSelector:
+    matchExpressions:
+      - { key: kubernetes.io/os, operator: In, values: [linux] }
+  bgpInstances:
+    - name: instance-{{ .Values.bgp.cluster_asn }}
+      localASN: {{ .Values.bgp.cluster_asn }}
+      peers:
+        - name: upstream
+          peerASN: {{ .Values.bgp.upstream.asn }}
+          peerAddress: {{ .Values.bgp.upstream.ip }}
+          peerConfigRef:
+            name: upstream-peer-config
+---
+apiVersion: cilium.io/v2
+kind: CiliumBGPPeerConfig
+metadata:
+  name: upstream-peer-config
+spec:
+  timers:
+    holdTimeSeconds: 90
+    keepAliveTimeSeconds: 30
+  families:
+    - afi: ipv4
+      safi: unicast
+      advertisements:
+        matchLabels:
+          advertise: bgp
+---
+# Advertise the cluster's pod CIDR (the /24 carved out for this node from the
+# cluster IPv4 pool) so anywhere in the pod network is reachable from the
+# upstream router. The SBC pod will get an IP from this CIDR and be reachable
+# at that address via the BGP route.
+apiVersion: cilium.io/v2
+kind: CiliumBGPAdvertisement
+metadata:
+  name: pod-cidr-advertisement
+  labels:
+    advertise: bgp
+spec:
+  advertisements:
+    - advertisementType: PodCIDR
+{{- end }}

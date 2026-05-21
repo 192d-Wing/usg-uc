@@ -33,7 +33,7 @@ RUN npm run build
 # planner / cacher / builder stages so the apt-install + cargo-install
 # layers cache once.
 # =============================================================================
-FROM rust:1.85-bookworm AS chef
+FROM rust:1-bookworm AS chef
 
 # Install build dependencies (Go required for aws-lc-fips-sys)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -63,8 +63,14 @@ COPY crates/ crates/
 RUN cargo chef prepare --recipe-path recipe.json
 
 # =============================================================================
-# Stage 2c: Cook (= compile) just the dependencies. This layer is reused on
-# every rebuild where Cargo.lock + crate manifests are unchanged.
+# Stage 2c: Cook (= compile) just the dependencies. With recipe.json only and
+# no real workspace source, cargo-chef substitutes empty crate stubs so only
+# crates.io deps get compiled. The resulting /app/target is committed into
+# the image layer (not a cache mount) so the next stage can COPY it.
+#
+# Layer caching: this stage's hash depends only on recipe.json + the base
+# image. As long as Cargo.lock and crate manifests don't change, recipe.json
+# is identical and this layer (≈3GB of pre-built deps) is reused.
 # =============================================================================
 FROM chef AS cacher
 
@@ -72,19 +78,16 @@ COPY --from=planner /app/recipe.json recipe.json
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target \
     cargo chef cook --release --recipe-path recipe.json \
         --package sbc-daemon --package sbc-cli
 
 # =============================================================================
-# Stage 2d: Build the workspace binaries. With cached deps in /app/target,
-# source-only changes recompile only the changed crates.
+# Stage 2d: Build the workspace binaries with the cooked deps as a baseline.
+# Only the workspace crates (sbc-daemon, sbc-cli, uc-*) recompile when their
+# source changes; everything in crates.io stays cached from the cacher layer.
 # =============================================================================
 FROM chef AS builder
 
-# Bring the cooked target tree forward. The cache mount below keeps fingerprints
-# fresh on rebuilds, but the COPY ensures we have a non-cache baseline so the
-# binaries can be extracted in the final stage even when BuildKit cache misses.
 COPY --from=cacher /app/target /app/target
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
@@ -96,7 +99,6 @@ COPY --from=dashboard /app/dist/ crates/sbc/sbc-dashboard/dist/
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target,sharing=locked \
     cargo build --release --package sbc-daemon --package sbc-cli \
     && cp target/release/sbc-daemon /tmp/sbc-daemon \
     && cp target/release/sbc-cli /tmp/sbc-cli

@@ -108,7 +108,7 @@ zeroize = { version = "1.8", features = ["derive"] }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.9"
+toml = "1.1"
 
 # Error handling
 thiserror = "2.0"
@@ -207,15 +207,15 @@ client-gui-windows = { path = "crates/client/client-gui-windows" }
 
 # Audio (for soft client)
 cpal = "0.17"
-ringbuf = "0.4"
+ringbuf = "0.5"
 
 # GUI (for soft client)
-egui = "0.33"
-eframe = { version = "0.33", features = ["wgpu"] }
+egui = "0.34"
+eframe = { version = "0.34", features = ["wgpu"] }
 
 # Windows integration (for soft client)
 directories = "6"
-tray-icon = "0.21.3"
+tray-icon = "0.24"
 image = "0.25"
 rfd = "0.17"
 winrt-notification = "0.5"
@@ -226,7 +226,7 @@ windows = { version = "0.62", features = [
 ] }
 uuid = { version = "1.20", features = ["v4"] }
 tempfile = "3.24"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [workspace.lints.rust]
 # Use deny instead of forbid to allow platform-specific unsafe code with explicit #[allow(unsafe_code)]

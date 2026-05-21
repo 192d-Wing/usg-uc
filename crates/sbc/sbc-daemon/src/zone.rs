@@ -114,14 +114,18 @@ impl ResolvedZoneRegistry {
             .and_then(|e| e.external_ip.try_read().ok().and_then(|v| *v))
     }
 
-    /// Looks up which zone owns a given signaling IP.
+    /// Looks up which zone owns a given signaling IP. Falls back to the first
+    /// configured zone when there is no exact match — this is the L3 single-IP
+    /// case where the pod has one Cilium-assigned IP and every zone shares it.
+    /// Per-call zone is then derived downstream via trunk-peer matching and
+    /// dial-plan routing rather than by which local IP the packet hit.
     pub fn zone_for_signaling_ip(&self, ip: IpAddr) -> Option<String> {
         for (name, entry) in &self.zones {
             if entry.signaling_ip == ip {
                 return Some(name.clone());
             }
         }
-        None
+        self.zones.keys().next().cloned()
     }
 
     /// Updates the external IP for a zone (called from STUN or Via received=).
@@ -347,7 +351,10 @@ mod tests {
             reg.zone_for_signaling_ip("10.0.2.10".parse().unwrap()),
             Some("external".to_string())
         );
-        assert!(reg.zone_for_signaling_ip("99.99.99.99".parse().unwrap()).is_none());
+        // Unmatched IP falls back to the first zone (L3 single-IP case where
+        // the pod's Cilium-assigned IP doesn't equal any configured zone IP).
+        let fallback = reg.zone_for_signaling_ip("99.99.99.99".parse().unwrap());
+        assert!(fallback.is_some(), "unmatched IP should fall back, not return None");
     }
 
     #[test]

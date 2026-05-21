@@ -1,53 +1,35 @@
-Thank you for installing {{ .Chart.Name }}!
 
-Your release is named {{ .Release.Name }}.
+USG SBC site {{ .Values.site.name | quote }} installed on node {{ .Values.site.node | quote }}.
 
-## Getting Started
+L3 single-IP model:
+  - SBC pod gets one Cilium-assigned IP from the cluster pod CIDR
+  - BGP advertises the cluster's PodCIDR upstream — pod is reachable at its IP
+  - Kea pod gets a separate Cilium IP, used as DHCP relay target
 
-1. Get the SIP service external IP:
+UPSTREAM ROUTER ({{ .Values.bgp.upstream.ip }}, AS {{ .Values.bgp.upstream.asn }}) MUST BE CONFIGURED WITH:
 
-   kubectl get svc {{ include "sbc.fullname" . }}-sip -n {{ .Release.Namespace }}
+  router bgp {{ .Values.bgp.upstream.asn }}
+    bgp router-id <upstream-router-id>
+    no bgp ebgp-requires-policy
+    neighbor kube-nodes peer-group
+    neighbor kube-nodes remote-as {{ .Values.bgp.cluster_asn }}
+    neighbor kube-nodes soft-reconfiguration inbound
+    neighbor <node-ip> peer-group kube-nodes
+  address-family ipv4 unicast
+    neighbor kube-nodes activate
+    neighbor kube-nodes default-originate
+  exit-address-family
 
-2. Get the API service endpoint:
-
-   kubectl get svc {{ include "sbc.fullname" . }}-api -n {{ .Release.Namespace }}
-
-3. Check the pod status:
-
-   kubectl get pods -l "app.kubernetes.io/name={{ include "sbc.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -n {{ .Release.Namespace }}
-
-4. View logs:
-
-   kubectl logs -l "app.kubernetes.io/name={{ include "sbc.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -n {{ .Release.Namespace }}
-
-## Configuration
-
-The SBC is configured via values.yaml. Key settings:
-
-- config.general.maxCalls: {{ .Values.config.general.maxCalls }}
-- config.media.defaultMode: {{ .Values.config.media.defaultMode }}
-- config.security.curve: {{ .Values.config.security.curve }}
-
-To update configuration:
-
-   helm upgrade {{ .Release.Name }} . -f values.yaml -n {{ .Release.Namespace }}
-
-## Ports
-
-- SIP UDP: 5060
-- SIP TCP: 5060
-- SIP TLS: 5061
-- HTTP API: {{ .Values.apiService.httpPort }}
-- HTTPS API: {{ .Values.apiService.httpsPort }}
-{{- if .Values.metrics.enabled }}
-- Metrics: {{ .Values.metrics.port }}
+PER PHONE VLAN (DHCP relay to Kea pod):
+{{- range .Values.kea.phone_subnets }}
+  interface Vlan<id-for-{{ .subnet }}>
+    ip helper-address <kea-pod-ip>      # discover via: kubectl -n {{ $.Release.Namespace }} get pod -l app.kubernetes.io/component=kea-dhcp4 -o jsonpath='{.items[0].status.podIP}'
 {{- end }}
 
-## CNSA 2.0 Compliance
+Verify on this cluster:
+  microk8s kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }} -o wide
 
-This SBC is configured for CNSA 2.0 compliance:
-- Elliptic Curve: {{ .Values.config.security.curve }}
-- SRTP Profile: {{ .Values.config.media.srtp.profile }}
-- TLS Version: {{ .Values.config.security.minTlsVersion }}+
-
-For more information, see the documentation.
+Verify on upstream router:
+  show ip bgp summary
+  show ip bgp <pod-cidr>
+  ping <sbc-pod-ip>

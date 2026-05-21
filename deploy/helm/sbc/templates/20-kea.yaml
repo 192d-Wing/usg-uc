@@ -1,0 +1,51 @@
+{{- if .Values.kea.enabled }}
+# Kea DHCPv4 in relay mode. Gets a Cilium-assigned cluster-pool IP; that IP
+# is what each phone VLAN's `ip helper-address` upstream config points at.
+# Kea distinguishes phone VLANs by giaddr (relay agent IP).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sbc.fullname" . }}-kea-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+data:
+  kea-dhcp4.conf: |-
+    {{- include "kea.config" . | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sbc.fullname" . }}-kea
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels:
+      {{- include "sbc.keaSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sbc.keaSelectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include "kea.config" . | sha256sum }}
+    spec:
+      nodeName: {{ .Values.site.node }}
+      containers:
+        - name: kea-dhcp4
+          image: "{{ .Values.kea.image.repository }}:{{ .Values.kea.image.tag }}"
+          args: ["-c", "/etc/kea/kea-dhcp4.conf"]
+          ports:
+            - { name: dhcp, containerPort: 67, protocol: UDP }
+          resources:
+            {{- toYaml .Values.kea.resources | nindent 12 }}
+          volumeMounts:
+            - { name: config, mountPath: /etc/kea/kea-dhcp4.conf, subPath: kea-dhcp4.conf, readOnly: true }
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "sbc.fullname" . }}-kea-config
+{{- end }}

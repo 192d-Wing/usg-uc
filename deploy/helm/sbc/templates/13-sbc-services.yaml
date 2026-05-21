@@ -1,0 +1,52 @@
+# In-cluster ClusterIP Services for cross-component DNS. External traffic
+# reaches the SBC directly at its BGP-advertised pod IP (no LoadBalancer
+# needed under the single-IP model).
+{{- if .Values.services.sip.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sbc.fullname" . }}-sip
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "sbc.selectorLabels" . | nindent 4 }}
+  ports:
+    - { name: sip-udp, port: 5060, targetPort: 5060, protocol: UDP }
+    - { name: sip-tcp, port: 5060, targetPort: 5060, protocol: TCP }
+    - { name: sip-tls, port: 5061, targetPort: 5061, protocol: TCP }
+{{- end }}
+{{- if .Values.services.api.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sbc.fullname" . }}-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "sbc.selectorLabels" . | nindent 4 }}
+  ports:
+    - { name: api, port: 80, targetPort: 80, protocol: TCP }
+{{- end }}
+{{- if .Values.services.metrics.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sbc.fullname" . }}-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "sbc.selectorLabels" . | nindent 4 }}
+  ports:
+    - { name: metrics, port: 9090, targetPort: 9090, protocol: TCP }
+{{- end }}

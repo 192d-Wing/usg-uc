@@ -77,11 +77,21 @@ pub fn resolve_zones(zones: &[ZoneConfig]) -> Result<Vec<ResolvedZone>, ConfigEr
     Ok(resolved)
 }
 
-/// Resolves an interface name to its first non-link-local IPv4 address.
+/// Resolves a zone binding to an IP address.
+///
+/// Accepts either a literal IPv4/IPv6 address (used by L3-routed deployments
+/// where the pod's `cni.projectcalico.org/ipAddrs` annotation already pins the
+/// zone IP onto eth0) or an interface name (used by macvlan/multus deployments
+/// where each zone owns a dedicated interface). Literal IPs are tried first so
+/// numeric-only configs don't fall through to interface lookup.
 fn resolve_interface(
     name: &str,
     iface_map: &HashMap<String, Vec<IpAddr>>,
 ) -> Result<IpAddr, ConfigError> {
+    if let Ok(ip) = name.parse::<IpAddr>() {
+        return Ok(ip);
+    }
+
     let addrs = iface_map
         .get(name)
         .ok_or_else(|| ConfigError::InterfaceNotFound {
@@ -183,6 +193,36 @@ mod tests {
         let zones: Vec<ZoneConfig> = vec![];
         let resolved = resolve_zones(&zones).unwrap();
         assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_interface_literal_ipv4() {
+        let map = enumerate_interfaces().unwrap();
+        let ip = resolve_interface("10.50.1.10", &map).unwrap();
+        assert_eq!(ip, IpAddr::V4(std::net::Ipv4Addr::new(10, 50, 1, 10)));
+    }
+
+    #[test]
+    fn test_resolve_interface_literal_ipv6() {
+        let map = enumerate_interfaces().unwrap();
+        let ip = resolve_interface("::1", &map).unwrap();
+        assert_eq!(ip, IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn test_resolve_zones_l3_literal_ips() {
+        let zones = vec![ZoneConfig {
+            name: "inside".to_string(),
+            signaling_interface: "10.50.1.10".to_string(),
+            media_interface: "10.50.1.10".to_string(),
+            external_ip: None,
+        }];
+        let resolved = resolve_zones(&zones).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].signaling_ip,
+            IpAddr::V4(std::net::Ipv4Addr::new(10, 50, 1, 10))
+        );
     }
 
     #[test]
