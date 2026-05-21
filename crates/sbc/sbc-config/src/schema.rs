@@ -132,6 +132,32 @@ pub struct SbcConfig {
     /// ## NIST 800-53 Rev5: SC-7 (Boundary Protection)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub zones: Vec<ZoneConfig>,
+
+    /// Phone provisioning server configuration.
+    ///
+    /// When set, the daemon serves per-phone XML / cfg files at
+    /// `/provision/{filename}` and embeds the configured host in
+    /// vendor-specific provisioning fields (e.g. TEO `update_server`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provisioning: Option<ProvisioningConfig>,
+}
+
+/// Phone provisioning settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProvisioningConfig {
+    /// Public hostname or IP that phones use to reach the SBC.
+    ///
+    /// Embedded into vendor configs as the next-fetch URL. Should resolve
+    /// (or route) from the phone VLAN to the SBC's inside-zone interface.
+    pub host: String,
+
+    /// Port the daemon exposes provisioning on. Defaults to 80.
+    #[serde(default = "default_provisioning_port")]
+    pub port: u16,
+}
+
+const fn default_provisioning_port() -> u16 {
+    80
 }
 
 /// Network zone configuration.
@@ -235,6 +261,12 @@ pub struct TransportConfig {
     /// REST API listen address (default: 0.0.0.0:8080).
     pub api_listen: Option<SocketAddr>,
 
+    /// REST API HTTPS listen address. When set together with
+    /// `security.tls_cert_path` / `security.tls_key_path`, the API server
+    /// runs HTTP and HTTPS listeners side-by-side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_tls_listen: Option<SocketAddr>,
+
     /// STUN refresh interval in seconds for external IP re-resolution (default: 300).
     pub stun_refresh_interval_secs: Option<u64>,
 }
@@ -261,6 +293,7 @@ impl Default for TransportConfig {
             signaling_ip: None,
             media_ip: None,
             api_listen: None,
+            api_tls_listen: None,
             stun_refresh_interval_secs: None,
         }
     }

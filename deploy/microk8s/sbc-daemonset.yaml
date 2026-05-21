@@ -117,6 +117,9 @@ spec:
             - name: api
               containerPort: 80
               protocol: TCP
+            - name: api-tls
+              containerPort: 443
+              protocol: TCP
             - name: metrics
               containerPort: 9090
               protocol: TCP
@@ -156,6 +159,9 @@ spec:
               mountPath: /etc/sbc/config.toml
               subPath: config.toml
               readOnly: true
+            - name: tls
+              mountPath: /etc/sbc/tls
+              readOnly: true
             - name: data
               mountPath: /var/lib/sbc
             - name: logs
@@ -164,6 +170,9 @@ spec:
         - name: config
           configMap:
             name: sbc-config
+        - name: tls
+          secret:
+            secretName: sbc-tls
         - name: data
           hostPath:
             path: /var/lib/sbc

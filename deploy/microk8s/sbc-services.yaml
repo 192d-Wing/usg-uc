@@ -38,6 +38,10 @@ spec:
       port: 80
       targetPort: 80
       protocol: TCP
+    - name: api-tls
+      port: 443
+      targetPort: 443
+      protocol: TCP
     - name: metrics
       port: 9090
       targetPort: 9090

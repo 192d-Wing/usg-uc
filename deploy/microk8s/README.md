@@ -88,11 +88,15 @@ microk8s kubectl apply -f multus-networks.yaml
 microk8s kubectl apply -f sbc-configmap.yaml
 microk8s kubectl apply -f sbc-services.yaml
 
+# TLS — generate a self-signed cert and load it as the sbc-tls Secret.
+# Required before sbc-daemonset.yaml; the daemon mounts /etc/sbc/tls/.
+sudo bash make-tls-secret.sh
+
 # Kea (independent of SBC image — can deploy alone)
 microk8s kubectl apply -f kea-configmap.yaml
 microk8s kubectl apply -f kea-deployment.yaml
 
-# SBC (requires sbc-daemon:local in containerd)
+# SBC (requires sbc-daemon:local in containerd + sbc-tls Secret)
 microk8s kubectl apply -f sbc-daemonset.yaml
 ```
 

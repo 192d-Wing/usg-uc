@@ -63,11 +63,17 @@ use crate::shutdown::ShutdownSignal;
 pub struct ApiServerConfig {
     /// Listen address for HTTP server.
     pub listen_addr: SocketAddr,
+    /// Optional separate listen address for HTTPS. When set together with
+    /// `tls`, the daemon serves HTTP on `listen_addr` and HTTPS on
+    /// `tls_listen_addr` concurrently. If `None`, behavior depends on `tls`:
+    /// when `tls` is Some the HTTPS listener uses `listen_addr` (legacy
+    /// HTTPS-only mode); when `tls` is None the daemon runs plain HTTP.
+    pub tls_listen_addr: Option<SocketAddr>,
     /// Enable CORS.
     pub enable_cors: bool,
     /// API version prefix.
     pub api_version: String,
-    /// TLS configuration (optional).
+    /// TLS configuration (cert + key paths). Required for HTTPS.
     pub tls: Option<TlsConfig>,
 }
 
@@ -86,6 +92,7 @@ impl Default for ApiServerConfig {
             listen_addr: "0.0.0.0:8080"
                 .parse()
                 .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 8080))),
+            tls_listen_addr: None,
             enable_cors: false,
             api_version: "v1".to_string(),
             tls: None,
@@ -475,18 +482,27 @@ impl ApiServer {
             .layer(TraceLayer::new_for_http())
     }
 
-    /// Runs the API server (HTTP or HTTPS depending on configuration).
+    /// Runs the API server. The combination of `listen_addr`, `tls_listen_addr`,
+    /// and `tls` decides the topology:
+    ///
+    /// - `tls` set + `tls_listen_addr` set → HTTP on `listen_addr`, HTTPS on
+    ///   `tls_listen_addr`, both run concurrently.
+    /// - `tls` set + `tls_listen_addr` None → HTTPS on `listen_addr` (legacy).
+    /// - `tls` None → plain HTTP on `listen_addr`.
     pub async fn run(&self) -> Result<(), ApiServerError> {
-        if let Some(tls_config) = &self.config.tls {
-            self.run_https(tls_config).await
-        } else {
-            self.run_http().await
+        match (&self.config.tls, self.config.tls_listen_addr) {
+            (Some(tls_config), Some(tls_addr)) => {
+                let http_addr = self.config.listen_addr;
+                tokio::try_join!(self.run_http(http_addr), self.run_https(tls_config, tls_addr))
+                    .map(|_| ())
+            }
+            (Some(tls_config), None) => self.run_https(tls_config, self.config.listen_addr).await,
+            (None, _) => self.run_http(self.config.listen_addr).await,
         }
     }
 
-    /// Runs the API server with plain HTTP.
-    async fn run_http(&self) -> Result<(), ApiServerError> {
-        let addr = self.config.listen_addr;
+    /// Runs the API server with plain HTTP on `addr`.
+    async fn run_http(&self, addr: SocketAddr) -> Result<(), ApiServerError> {
         let router = self.router();
 
         info!(address = %addr, tls = false, "Starting API server (HTTP)");
@@ -514,9 +530,12 @@ impl ApiServer {
         Ok(())
     }
 
-    /// Runs the API server with HTTPS (TLS).
-    async fn run_https(&self, tls_config: &TlsConfig) -> Result<(), ApiServerError> {
-        let addr = self.config.listen_addr;
+    /// Runs the API server with HTTPS (TLS) on `addr`.
+    async fn run_https(
+        &self,
+        tls_config: &TlsConfig,
+        addr: SocketAddr,
+    ) -> Result<(), ApiServerError> {
         let router = self.router();
 
         info!(

@@ -32,7 +32,14 @@ data:
     tcp_listen = ["0.0.0.0:5060"]
     tls_listen = ["0.0.0.0:5061"]
     api_listen = "0.0.0.0:80"
+    api_tls_listen = "0.0.0.0:443"
     stun_refresh_interval_secs = 300
+
+    [security]
+    tls_cert_path = "/etc/sbc/tls/tls.crt"
+    tls_key_path = "/etc/sbc/tls/tls.key"
+    min_tls_version = "TLSv1.3"
+    require_mtls = false
 
     [media]
     default_mode = "Relay"
@@ -47,6 +54,10 @@ data:
     enabled = true
     global_rps = 50000
     per_ip_rps = 10000
+
+    [provisioning]
+    host = "sbc.xtic.dev.mil"
+    port = 80
 
     [logging]
     level = "info"

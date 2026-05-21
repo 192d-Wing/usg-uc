@@ -309,6 +309,13 @@ impl Runtime {
         #[cfg(feature = "grpc")]
         let grpc_config = config.grpc.clone().unwrap_or_default();
         let api_listen_override = config.transport.api_listen;
+        let api_tls_listen = config.transport.api_tls_listen;
+        let api_tls_paths: Option<(std::path::PathBuf, std::path::PathBuf)> = config
+            .security
+            .tls_cert_path
+            .clone()
+            .zip(config.security.tls_key_path.clone());
+        let provisioning_config = config.provisioning.clone();
 
         // Pass cluster manager to server if available
         #[cfg(feature = "cluster")]
@@ -328,9 +335,20 @@ impl Runtime {
                 reason: e.to_string(),
             })?;
 
+        let api_tls = api_tls_paths.map(|(cert_path, key_path)| {
+            crate::api_server::TlsConfig { cert_path, key_path }
+        });
+        if api_tls.is_some() {
+            info!(
+                "API HTTPS listener enabled on {:?}",
+                api_tls_listen
+            );
+        }
         let api_config = ApiServerConfig {
             listen_addr: api_listen_override
                 .unwrap_or_else(|| ApiServerConfig::default().listen_addr),
+            tls_listen_addr: api_tls_listen,
+            tls: api_tls,
             ..ApiServerConfig::default()
         };
         let metrics = SbcMetrics::standard();
@@ -338,6 +356,22 @@ impl Runtime {
 
         let mut app_state = AppState::new(metrics, stats);
         app_state.sip_stack = Some(Arc::clone(server.sip_stack()));
+
+        // Initialize phone provisioning server when [provisioning] is set in
+        // config.toml. Without this, /provision/{file} returns 503 because
+        // AppState::new() leaves the field as None.
+        if let Some(prov_cfg) = provisioning_config {
+            app_state.provisioning = Some(Arc::new(
+                uc_phone_mgmt::provisioning::ProvisioningServer::new(
+                    &prov_cfg.host,
+                    prov_cfg.port,
+                ),
+            ));
+            info!(
+                "Phone provisioning server initialized host={} port={}",
+                prov_cfg.host, prov_cfg.port
+            );
+        }
 
         // Initialize CUCM router for partition/CSS/route pattern management
         app_state.cucm_router = Some(Arc::new(tokio::sync::RwLock::new(
