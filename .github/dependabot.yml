@@ -16,3 +16,8 @@ updates:
     # Optional: Raise PRs with a specific label
     labels:
       - "actions updates"
+  # .github/dependabot.yml
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
