@@ -67,7 +67,14 @@ external_ip = "__POD_IP__"
 name = "outside"
 signaling_interface = "__POD_IP__"
 media_interface = "__POD_IP__"
-external_ip = "__POD_IP__"
+# Outside zone faces the public internet (PSTN/SIP trunks). The pod's
+# RFC1918 address is unreachable from carriers, so SDP must advertise the
+# public NAT IP. "stun" tells the daemon to discover it at startup via
+# STUN — carriers like BulkVS need this to route initial RTP packets
+# rather than dropping them at our SDP'd private IP and waiting to latch
+# on outgoing RTP (which causes audible crackle as the jitter buffer
+# recovers).
+external_ip = "stun"
 
 [[zones]]
 name = "oobm"
