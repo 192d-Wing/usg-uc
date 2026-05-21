@@ -34,7 +34,8 @@ spec:
       annotations:
         checksum/config: {{ include "kea.config" . | sha256sum }}
     spec:
-      nodeName: {{ .Values.site.node }}
+      nodeSelector:
+        kubernetes.io/hostname: {{ .Values.site.node }}
       containers:
         - name: kea-dhcp4
           image: "{{ .Values.kea.image.repository }}:{{ .Values.kea.image.tag }}"

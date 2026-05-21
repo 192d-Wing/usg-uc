@@ -56,6 +56,15 @@ image:
 
 sbcDaemon:
   replicas: 1
+  # PVC for /var/lib/sbc — holds the file-backed SQLite (users / HA1s) and
+  # JSON-persisted phones, directory_numbers, trunk_groups. Survives pod
+  # restarts, helm upgrades, and node reboots.
+  persistence:
+    enabled: true
+    size: 1Gi
+    storageClass: ""        # empty = cluster default; on microk8s = "microk8s-hostpath"
+    # accessMode: ReadWriteOnce because the SBC is single-replica per site.
+    accessMode: ReadWriteOnce
   resources:
     requests: { cpu: "500m", memory: "512Mi" }
     limits:   { cpu: "2",    memory: "2Gi"   }

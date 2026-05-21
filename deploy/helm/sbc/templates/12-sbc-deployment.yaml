@@ -25,7 +25,12 @@ spec:
         checksum/config: {{ include "sbc.config" . | sha256sum }}
     spec:
       serviceAccountName: {{ include "sbc.serviceAccountName" . }}
-      nodeName: {{ .Values.site.node }}
+      # Pin to this site's node via the scheduler (not `nodeName`, which
+      # bypasses scheduling entirely — that breaks WaitForFirstConsumer
+      # PVC binding because the volume controller never sees the
+      # scheduled-node signal).
+      nodeSelector:
+        kubernetes.io/hostname: {{ .Values.site.node }}
       securityContext:
         {{- toYaml .Values.sbcDaemon.podSecurityContext | nindent 8 }}
       # initContainer renders config.toml with the pod's actual IP (downward
@@ -61,6 +66,10 @@ spec:
             - name: POD_IP
               valueFrom:
                 fieldRef: { fieldPath: status.podIP }
+            # File-backed SQLite path under the persistent volume mount.
+            # Daemon falls back to :memory: if this var is unset.
+            - name: SBC_SQLITE_PATH
+              value: "/var/lib/sbc/sbc.db"
           ports:
             - { name: sip-udp,  containerPort: 5060, protocol: UDP }
             - { name: sip-tcp,  containerPort: 5060, protocol: TCP }
@@ -95,6 +104,11 @@ spec:
         - name: config-rendered
           emptyDir: {}
         - name: data
+          {{- if .Values.sbcDaemon.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "sbc.fullname" . }}-data
+          {{- else }}
           emptyDir: {}
+          {{- end }}
         - name: logs
           emptyDir: {}

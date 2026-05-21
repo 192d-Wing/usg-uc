@@ -406,6 +406,12 @@ impl Runtime {
             use uc_user_mgmt::dispatch::DynUserStore;
             use uc_user_mgmt::encrypt::EncryptedUserStore;
 
+            // Backend resolution: SBC_POSTGRES_URL → Postgres, else
+            // SBC_SQLITE_PATH → file-backed SQLite (survives pod restart),
+            // else :memory: (dev/single-shot).
+            let sqlite_path = std::env::var("SBC_SQLITE_PATH")
+                .unwrap_or_else(|_| ":memory:".to_string());
+
             #[cfg(feature = "user-postgres")]
             let inner_result: std::result::Result<DynUserStore, uc_user_mgmt::error::UserMgmtError> = if let Ok(pg_url) = std::env::var("SBC_POSTGRES_URL") {
                 match uc_user_mgmt::postgres::PostgresUserStore::new(&pg_url).await {
@@ -416,9 +422,9 @@ impl Runtime {
                     Err(e) => Err(e),
                 }
             } else {
-                match uc_user_mgmt::sqlite::SqliteUserStore::new(":memory:") {
+                match uc_user_mgmt::sqlite::SqliteUserStore::new(&sqlite_path) {
                     Ok(s) => {
-                        info!("User store initialized (in-memory SQLite)");
+                        info!(path = %sqlite_path, "User store initialized (SQLite)");
                         Ok(DynUserStore::Sqlite(s))
                     }
                     Err(e) => Err(e),
@@ -427,9 +433,9 @@ impl Runtime {
 
             #[cfg(not(feature = "user-postgres"))]
             let inner_result: std::result::Result<DynUserStore, uc_user_mgmt::error::UserMgmtError> =
-                match uc_user_mgmt::sqlite::SqliteUserStore::new(":memory:") {
+                match uc_user_mgmt::sqlite::SqliteUserStore::new(&sqlite_path) {
                     Ok(s) => {
-                        info!("User store initialized (in-memory SQLite)");
+                        info!(path = %sqlite_path, "User store initialized (SQLite)");
                         Ok(DynUserStore::Sqlite(s))
                     }
                     Err(e) => Err(e),
@@ -549,12 +555,30 @@ impl Runtime {
                 }
             }
 
-            // Load persisted trunk groups (overrides seed if same IDs)
-            let persisted = crate::api_server::MemStore::load_trunk_groups();
-            if !persisted.is_empty() {
-                for (id, group) in persisted {
-                    store.trunk_groups.insert(id, group);
+            // Load persisted entities — trunk_groups (overrides seed if same
+            // IDs), phones, directory_numbers. Each entity type is its own
+            // file under /var/lib/sbc/ so a corrupt one doesn't take the
+            // others down.
+            let persisted_trunks = crate::api_server::MemStore::load_trunk_groups();
+            for (id, g) in persisted_trunks {
+                store.trunk_groups.insert(id, g);
+            }
+            let persisted_phones = crate::api_server::MemStore::load_phones();
+            for (id, p) in persisted_phones {
+                store.phones.insert(id, p);
+            }
+            let persisted_dids = crate::api_server::MemStore::load_directory_numbers();
+            // Replay DID→user mappings into the SIP stack so call routing
+            // works without the dashboard having to be hit first.
+            for (did, body) in &persisted_dids {
+                if let Some(user) = body.get("user").and_then(|v| v.as_str()) {
+                    if let Some(ref sip_stack) = app_state.sip_stack {
+                        sip_stack.add_did_mapping(did, user).await;
+                    }
                 }
+            }
+            for (did, b) in persisted_dids {
+                store.directory_numbers.insert(did, b);
             }
             drop(store);
         }

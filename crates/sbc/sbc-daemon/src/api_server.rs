@@ -100,11 +100,16 @@ impl Default for ApiServerConfig {
     }
 }
 
-/// Persistence path for trunk group configuration.
+/// Persistence root for management objects. Each entity type is its own
+/// JSON file (trunk_groups.json, phones.json, directory_numbers.json) so a
+/// corrupt one doesn't take the others down. The mountpoint matches the
+/// Helm chart's PVC mount at /var/lib/sbc.
 const TRUNK_GROUPS_PATH: &str = "/var/lib/sbc/trunk_groups.json";
+const PHONES_PATH: &str = "/var/lib/sbc/phones.json";
+const DIRECTORY_PATH: &str = "/var/lib/sbc/directory_numbers.json";
 
-/// In-memory store for management objects.
-/// Trunk groups are persisted to disk on changes.
+/// In-memory store for management objects, with JSON-on-disk persistence
+/// for the slices the dashboard mutates.
 #[derive(Default)]
 pub struct MemStore {
     /// Phones indexed by ID.
@@ -116,51 +121,80 @@ pub struct MemStore {
 }
 
 impl MemStore {
-    /// Loads persisted trunk groups from disk.
-    pub fn load_trunk_groups() -> std::collections::HashMap<String, serde_json::Value> {
-        let path = std::path::Path::new(TRUNK_GROUPS_PATH);
-        if !path.exists() {
+    /// Generic loader for an entity-type JSON file. Missing file is the
+    /// "fresh deployment" case and returns an empty map silently.
+    fn load_map(path: &str, kind: &str) -> std::collections::HashMap<String, serde_json::Value> {
+        let p = std::path::Path::new(path);
+        if !p.exists() {
             return std::collections::HashMap::new();
         }
-        match std::fs::read_to_string(path) {
-            Ok(data) => {
-                match serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(&data) {
-                    Ok(groups) => {
-                        tracing::info!(count = groups.len(), "Loaded persisted trunk groups from {}", TRUNK_GROUPS_PATH);
-                        groups
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Failed to parse {}, starting fresh", TRUNK_GROUPS_PATH);
-                        std::collections::HashMap::new()
-                    }
+        match std::fs::read_to_string(p) {
+            Ok(data) => match serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(&data) {
+                Ok(map) => {
+                    tracing::info!(count = map.len(), kind, path, "Loaded persisted entities");
+                    map
                 }
-            }
+                Err(e) => {
+                    tracing::warn!(error = %e, kind, path, "Failed to parse, starting fresh");
+                    std::collections::HashMap::new()
+                }
+            },
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to read {}", TRUNK_GROUPS_PATH);
+                tracing::warn!(error = %e, kind, path, "Failed to read");
                 std::collections::HashMap::new()
             }
         }
     }
 
-    /// Persists trunk groups to disk (atomic write via temp file + rename).
-    pub fn save_trunk_groups(&self) {
-        let data = match serde_json::to_string_pretty(&self.trunk_groups) {
+    /// Generic atomic-write persister via temp-file + rename.
+    fn save_map(map: &std::collections::HashMap<String, serde_json::Value>, path: &str, kind: &str) {
+        // Ensure parent dir exists (no-op when PVC is mounted; helps in dev).
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let data = match serde_json::to_string_pretty(map) {
             Ok(d) => d,
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to serialize trunk groups");
+                tracing::warn!(error = %e, kind, "Failed to serialize");
                 return;
             }
         };
-        let tmp_path = format!("{TRUNK_GROUPS_PATH}.tmp");
-        if let Err(e) = std::fs::write(&tmp_path, &data) {
-            tracing::warn!(error = %e, "Failed to write {tmp_path}");
+        let tmp = format!("{path}.tmp");
+        if let Err(e) = std::fs::write(&tmp, &data) {
+            tracing::warn!(error = %e, kind, path = tmp, "Failed to write tmp");
             return;
         }
-        if let Err(e) = std::fs::rename(&tmp_path, TRUNK_GROUPS_PATH) {
-            tracing::warn!(error = %e, "Failed to rename {tmp_path} to {TRUNK_GROUPS_PATH}");
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            tracing::warn!(error = %e, kind, src = tmp, dst = path, "Failed to rename into place");
             return;
         }
-        tracing::debug!(count = self.trunk_groups.len(), "Persisted trunk groups to {TRUNK_GROUPS_PATH}");
+        tracing::debug!(count = map.len(), kind, path, "Persisted entities");
+    }
+
+    pub fn load_trunk_groups() -> std::collections::HashMap<String, serde_json::Value> {
+        Self::load_map(TRUNK_GROUPS_PATH, "trunk_groups")
+    }
+    pub fn load_phones() -> std::collections::HashMap<String, serde_json::Value> {
+        Self::load_map(PHONES_PATH, "phones")
+    }
+    pub fn load_directory_numbers() -> std::collections::HashMap<String, serde_json::Value> {
+        Self::load_map(DIRECTORY_PATH, "directory_numbers")
+    }
+    pub fn save_trunk_groups(&self) {
+        Self::save_map(&self.trunk_groups, TRUNK_GROUPS_PATH, "trunk_groups");
+    }
+    pub fn save_phones(&self) {
+        Self::save_map(&self.phones, PHONES_PATH, "phones");
+    }
+    pub fn save_directory_numbers(&self) {
+        Self::save_map(&self.directory_numbers, DIRECTORY_PATH, "directory_numbers");
+    }
+
+    /// Loads all persisted entity types. Called once at startup.
+    pub fn load_all(&mut self) {
+        self.trunk_groups = Self::load_trunk_groups();
+        self.phones = Self::load_phones();
+        self.directory_numbers = Self::load_directory_numbers();
     }
 }
 
@@ -876,7 +910,11 @@ async fn add_directory_number(
         .map(String::from)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     body["did"] = serde_json::json!(&did);
-    state.mem_store.write().await.directory_numbers.insert(did.clone(), body.clone());
+    {
+        let mut store = state.mem_store.write().await;
+        store.directory_numbers.insert(did.clone(), body.clone());
+        store.save_directory_numbers();
+    }
     // Sync DID → user mapping to SIP stack for call routing
     if let Some(user) = body.get("user").and_then(|v| v.as_str()) {
         if let Some(ref sip_stack) = state.sip_stack {
@@ -891,7 +929,11 @@ async fn delete_directory_number(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(did): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    state.mem_store.write().await.directory_numbers.remove(&did);
+    {
+        let mut store = state.mem_store.write().await;
+        store.directory_numbers.remove(&did);
+        store.save_directory_numbers();
+    }
     if let Some(ref sip_stack) = state.sip_stack {
         sip_stack.remove_did_mapping(&did).await;
     }
@@ -914,6 +956,7 @@ async fn update_directory_number(
         );
     }
     store.directory_numbers.insert(did.clone(), body.clone());
+    store.save_directory_numbers();
     drop(store);
     if let Some(ref sip_stack) = state.sip_stack {
         sip_stack.remove_did_mapping(&did).await;
@@ -1554,7 +1597,11 @@ async fn create_phone(
     if body.get("status").is_none() {
         body["status"] = serde_json::json!("Unprovisioned");
     }
-    state.mem_store.write().await.phones.insert(id.clone(), body.clone());
+    {
+        let mut store = state.mem_store.write().await;
+        store.phones.insert(id.clone(), body.clone());
+        store.save_phones();
+    }
     (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "phone": body })))
 }
 
@@ -1573,7 +1620,9 @@ async fn delete_phone(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    state.mem_store.write().await.phones.remove(&id);
+    let mut store = state.mem_store.write().await;
+    store.phones.remove(&id);
+    store.save_phones();
     Json(serde_json::json!({ "success": true, "id": id }))
 }
 
@@ -1586,6 +1635,7 @@ async fn update_phone(
     let mut store = state.mem_store.write().await;
     if store.phones.contains_key(&id) {
         store.phones.insert(id.clone(), body.clone());
+        store.save_phones();
         Json(serde_json::json!({ "success": true, "phone": body }))
     } else {
         Json(serde_json::json!({ "success": false, "error": "Phone not found" }))

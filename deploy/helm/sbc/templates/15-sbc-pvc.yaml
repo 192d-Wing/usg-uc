@@ -1,0 +1,22 @@
+{{- if .Values.sbcDaemon.persistence.enabled }}
+# PersistentVolumeClaim for /var/lib/sbc. Backs the SQLite user store and
+# the JSON-persisted entity files (phones, directory_numbers, trunk_groups).
+# Survives pod restarts, helm upgrades, and (for non-emptyDir storage
+# classes) node reboots.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "sbc.fullname" . }}-data
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.sbcDaemon.persistence.accessMode }}
+  resources:
+    requests:
+      storage: {{ .Values.sbcDaemon.persistence.size }}
+  {{- with .Values.sbcDaemon.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+{{- end }}
