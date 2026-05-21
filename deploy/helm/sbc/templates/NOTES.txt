@@ -28,6 +28,12 @@ PER PHONE VLAN (DHCP relay to Kea's stable LB IP):
     ip helper-address {{ $.Values.site.kea_lb_ip }}
 {{- end }}
 
+OPERATOR DASHBOARD:
+  http://sbc.{{ .Values.site.fqdn_base }}/
+  (served by the sbc-frontend nginx pod; /api and /provision are reverse-
+  proxied to the sbc-daemon ClusterIP Service so dashboard rolls don't
+  restart SIP)
+
 PROVISIONING URL (TEO TSG / Polycom / Cisco MPP — all accept FQDN):
   http://sbc.{{ .Values.site.fqdn_base }}/provision/<mac>.<ext>
 

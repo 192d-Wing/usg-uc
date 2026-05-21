@@ -54,6 +54,21 @@ image:
   tag: local
   pullPolicy: Never
 
+# sbc-frontend — operator dashboard (React SPA + nginx). Runs in its own
+# Deployment so dashboard releases roll independently of the SBC daemon,
+# leaving SIP/RTP untouched. nginx proxies /api/* and /provision/* to the
+# daemon's in-cluster ClusterIP Service.
+sbcFrontend:
+  enabled: true
+  replicas: 2                            # rolling update is meaningful at >1
+  image:
+    repository: sbc-frontend
+    tag: local
+    pullPolicy: Never
+  resources:
+    requests: { cpu: "20m",  memory: "32Mi"  }
+    limits:   { cpu: "100m", memory: "128Mi" }
+
 sbcDaemon:
   replicas: 1
   # PVC for /var/lib/sbc — holds the file-backed SQLite (users / HA1s) and

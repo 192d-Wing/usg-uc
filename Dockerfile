@@ -15,19 +15,11 @@
 # - **CM-7**: Least Functionality - Only required binaries installed
 # - **SC-28**: Protection of Information at Rest - No secrets in image
 
-# =============================================================================
-# Stage 1: Build dashboard (Vite + React, output to dist/sbc-dashboard/browser
-# to match the path baked into sbc-daemon's include_dir!).
-# =============================================================================
-FROM node:22-bookworm-slim AS dashboard
-
-WORKDIR /app
-COPY crates/sbc/sbc-dashboard/package.json crates/sbc/sbc-dashboard/package-lock.json* ./
-RUN --mount=type=cache,target=/root/.npm \
-    npm ci --prefer-offline
-COPY crates/sbc/sbc-dashboard/ ./
-RUN npm run build
-
+# Note: the React dashboard is built into a separate image (crates/sbc/
+# sbc-dashboard/Dockerfile) and runs in its own Deployment behind nginx, so
+# operators can roll dashboard updates without recompiling or restarting the
+# SBC daemon (which would interrupt SIP).
+#
 # =============================================================================
 # Stage 2a: Rust toolchain + build-deps + cargo-chef. Shared base for the
 # planner / cacher / builder stages so the apt-install + cargo-install
@@ -93,9 +85,6 @@ COPY --from=cacher /app/target /app/target
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
 COPY audio_files/ audio_files/
-
-# Copy built dashboard into the location include_dir! expects.
-COPY --from=dashboard /app/dist/ crates/sbc/sbc-dashboard/dist/
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \

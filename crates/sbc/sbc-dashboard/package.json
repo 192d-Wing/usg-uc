@@ -2,7 +2,7 @@
   "name": "sbc-dashboard",
   "version": "0.1.0",
   "private": true,
-  "description": "USG SBC operator dashboard (React + Cloudscape). Built into the SBC daemon via include_dir!.",
+  "description": "USG SBC operator dashboard (React + Cloudscape). Packaged as a standalone nginx image (sbc-frontend) that proxies /api and /provision to the SBC daemon.",
   "type": "module",
   "scripts": {
     "dev": "vite",

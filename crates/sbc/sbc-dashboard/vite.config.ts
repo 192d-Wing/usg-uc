@@ -1,12 +1,10 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
-// outDir matches the path baked into the SBC daemon's include_dir! macro:
-//   crates/sbc/sbc-daemon/src/api_server.rs:
-//     include_dir!("$CARGO_MANIFEST_DIR/../sbc-dashboard/dist/sbc-dashboard/browser")
-//
-// Keeping this path means the Rust embed mechanism works unchanged across
-// the Angular -> React migration.
+// outDir is the bundle root copied into the sbc-frontend nginx image
+// (see ./Dockerfile: COPY --from=build /app/dist/sbc-dashboard/browser).
+// The bundle is no longer embedded into the SBC daemon — the dashboard runs
+// in its own pod so UI releases don't restart SIP.
 export default defineConfig({
   plugins: [react()],
   build: {

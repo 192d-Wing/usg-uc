@@ -1,5 +1,6 @@
 // Minimal fetch wrapper for the SBC's /api/v1 surface. Used by all pages.
-// Same-origin in production (dashboard served by sbc-daemon at :8080); the
+// Same-origin in production (dashboard served by the sbc-frontend nginx pod,
+// which reverse-proxies /api to the SBC daemon's ClusterIP Service); the
 // Vite dev server proxies /api → http://localhost:8080 (see vite.config.ts).
 
 const API_BASE = '/api/v1';

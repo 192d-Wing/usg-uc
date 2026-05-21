@@ -32,6 +32,15 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: kea-dhcp4
 {{- end }}
 
+{{/* Selector labels for the sbc-frontend (nginx) pod. Separate component
+     so the frontend Deployment can be rolled without disturbing the
+     SIP-serving daemon pod. */}}
+{{- define "sbc.frontendSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "sbc.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: frontend
+{{- end }}
+
 {{- define "sbc.serviceAccountName" -}}
 {{ include "sbc.fullname" . }}
 {{- end }}

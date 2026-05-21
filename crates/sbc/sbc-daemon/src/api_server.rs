@@ -47,7 +47,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio_rustls::TlsAcceptor;
-use include_dir::{include_dir, Dir};
 use tower::Service;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
@@ -508,8 +507,6 @@ impl ApiServer {
             .nest(&format!("/api/{}", self.config.api_version), api_routes)
             // Phone provisioning routes
             .merge(provision_routes)
-            // Dashboard static files (Angular app)
-            .fallback(serve_dashboard)
             // Add state
             .with_state(Arc::clone(&self.state))
             // Add tracing
@@ -2060,107 +2057,6 @@ async fn update_route_list(
         Json(serde_json::json!({ "success": false }))
     }
 }
-
-// ============================================================================
-// Dashboard Static Files
-// ============================================================================
-
-/// Embedded Angular dashboard built from `crates/sbc/sbc-dashboard/`.
-///
-/// The directory is populated by `ng build` during the Docker image build.
-/// When the directory is empty (dev builds without Node.js), the placeholder
-/// HTML is served instead.
-static DASHBOARD_DIR: Dir<'_> =
-    include_dir!("$CARGO_MANIFEST_DIR/../sbc-dashboard/dist/sbc-dashboard/browser");
-
-/// Serve Angular dashboard static files.
-///
-/// Falls back to index.html for client-side routing (SPA).
-async fn serve_dashboard(uri: axum::http::Uri) -> impl IntoResponse {
-    let path = uri.path().trim_start_matches('/');
-
-    // If the embedded dist is empty, serve the dev placeholder
-    if DASHBOARD_DIR.entries().is_empty() {
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "text/html")
-            .body(DASHBOARD_PLACEHOLDER.to_string())
-            .unwrap_or_default();
-    }
-
-    // Try to serve the requested file from the embedded dist
-    if !path.is_empty() && path.contains('.') {
-        if let Some(file) = DASHBOARD_DIR.get_file(path) {
-            let mime = mime_from_path(path);
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", mime)
-                .header("Cache-Control", "public, max-age=31536000, immutable")
-                .body(
-                    String::from_utf8_lossy(file.contents()).into_owned(),
-                )
-                .unwrap_or_default();
-        }
-    }
-
-    // SPA fallback: serve index.html for all non-file routes
-    let index = DASHBOARD_DIR
-        .get_file("index.html")
-        .map(|f| String::from_utf8_lossy(f.contents()).into_owned())
-        .unwrap_or_else(|| DASHBOARD_PLACEHOLDER.to_string());
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "text/html")
-        .body(index)
-        .unwrap_or_default()
-}
-
-/// Derive Content-Type from file extension.
-fn mime_from_path(path: &str) -> &'static str {
-    match path.rsplit('.').next() {
-        Some("html") => "text/html",
-        Some("js") => "application/javascript",
-        Some("css") => "text/css",
-        Some("json") => "application/json",
-        Some("svg") => "image/svg+xml",
-        Some("png") => "image/png",
-        Some("ico") => "image/x-icon",
-        Some("woff2") => "font/woff2",
-        Some("woff") => "font/woff",
-        Some("ttf") => "font/ttf",
-        Some("map") => "application/json",
-        _ => "application/octet-stream",
-    }
-}
-
-/// Placeholder shown when the Angular dist is not embedded (dev builds).
-const DASHBOARD_PLACEHOLDER: &str = r#"<!doctype html>
-<html>
-<head>
-  <title>USG SBC Dashboard</title>
-  <style>
-    body { font-family: sans-serif; background: #1a1a2e; color: #e0e0e0;
-           display: flex; align-items: center; justify-content: center;
-           height: 100vh; margin: 0; }
-    .msg { text-align: center; }
-    h1 { color: #4fc3f7; }
-    p { color: #999; }
-    a { color: #4fc3f7; }
-  </style>
-</head>
-<body>
-  <div class="msg">
-    <h1>USG SBC Dashboard</h1>
-    <p>Angular dashboard not yet embedded in binary.</p>
-    <p>Run <code>ng serve --proxy-config proxy.conf.json</code> in
-    <code>crates/sbc/sbc-dashboard/</code> for development.</p>
-    <p><a href="/api/v1/system/stats">API Stats</a> |
-    <a href="/api/v1/registrations">Registrations</a> |
-    <a href="/api/v1/calls">Calls</a></p>
-  </div>
-</body>
-</html>"#;
 
 // ============================================================================
 // TLS Routes
