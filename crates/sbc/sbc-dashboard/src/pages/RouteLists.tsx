@@ -1,13 +1,16 @@
 import { useEffect, useState } from 'react';
 import Button from '@cloudscape-design/components/button';
 import ContentLayout from '@cloudscape-design/components/content-layout';
+import FormField from '@cloudscape-design/components/form-field';
 import Header from '@cloudscape-design/components/header';
+import Input from '@cloudscape-design/components/input';
 import SpaceBetween from '@cloudscape-design/components/space-between';
 import StatusIndicator from '@cloudscape-design/components/status-indicator';
 import Table from '@cloudscape-design/components/table';
 import TextFilter from '@cloudscape-design/components/text-filter';
 
 import { api, ApiError } from '../api';
+import { DeleteConfirmModal, FormModal } from '../components/CrudModal';
 
 type RouteList = {
   id: string;
@@ -20,13 +23,24 @@ export function RouteLists() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState('');
+  const [selected, setSelected] = useState<RouteList[]>([]);
+
+  const [modalMode, setModalMode] = useState<'create' | 'edit' | null>(null);
+  const [formId, setFormId] = useState('');
+  const [formName, setFormName] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [modalError, setModalError] = useState<string | null>(null);
+
+  const [deleteOpen, setDeleteOpen] = useState(false);
 
   const load = async () => {
     setLoading(true);
     setError(null);
     try {
       const res = await api.get<{ route_lists: RouteList[] }>('/routelists');
-      setItems(res.route_lists ?? []);
+      const next = res.route_lists ?? [];
+      setItems(next);
+      setSelected((cur) => cur.filter((s) => next.some((l) => l.id === s.id)));
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e));
     } finally {
@@ -42,6 +56,68 @@ export function RouteLists() {
     ? items.filter((l) => `${l.id} ${l.name ?? ''}`.toLowerCase().includes(filter.toLowerCase()))
     : items;
 
+  const target = selected[0];
+
+  const openCreate = () => {
+    setFormId('');
+    setFormName('');
+    setModalError(null);
+    setModalMode('create');
+  };
+  const openEdit = () => {
+    if (!target) return;
+    setFormId(target.id);
+    setFormName(target.name ?? '');
+    setModalError(null);
+    setModalMode('edit');
+  };
+  const closeModal = () => setModalMode(null);
+
+  const submit = async () => {
+    const id = formId.trim();
+    if (!id) {
+      setModalError('ID is required.');
+      return;
+    }
+    setBusy(true);
+    setModalError(null);
+    const body = { id, name: formName.trim() || id };
+    try {
+      if (modalMode === 'create') {
+        await api.post('/routelists', body);
+      } else {
+        await api.put(`/routelists/${encodeURIComponent(id)}`, body);
+      }
+      closeModal();
+      await load();
+    } catch (e) {
+      setModalError(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const openDelete = () => {
+    if (!target) return;
+    setModalError(null);
+    setDeleteOpen(true);
+  };
+  const confirmDelete = async () => {
+    if (!target) return;
+    setBusy(true);
+    setModalError(null);
+    try {
+      await api.delete(`/routelists/${encodeURIComponent(target.id)}`);
+      setDeleteOpen(false);
+      setSelected([]);
+      await load();
+    } catch (e) {
+      setModalError(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <ContentLayout
       header={
@@ -50,9 +126,20 @@ export function RouteLists() {
           counter={`(${items.length})`}
           description="Ordered route group lists used by route patterns to direct outbound calls."
           actions={
-            <Button onClick={load} iconName="refresh" loading={loading}>
-              Refresh
-            </Button>
+            <SpaceBetween direction="horizontal" size="xs">
+              <Button onClick={load} iconName="refresh" loading={loading}>
+                Refresh
+              </Button>
+              <Button onClick={openDelete} disabled={!target || busy}>
+                Delete
+              </Button>
+              <Button onClick={openEdit} disabled={!target || busy}>
+                Edit
+              </Button>
+              <Button variant="primary" onClick={openCreate}>
+                Create route list
+              </Button>
+            </SpaceBetween>
           }
         >
           Route Lists
@@ -66,6 +153,9 @@ export function RouteLists() {
         variant="full-page"
         stickyHeader
         trackBy="id"
+        selectionType="single"
+        selectedItems={selected}
+        onSelectionChange={({ detail }) => setSelected(detail.selectedItems)}
         columnDefinitions={[
           { id: 'name', header: 'Name', cell: (l) => l.name ?? l.id, isRowHeader: true, sortingField: 'name' },
           { id: 'id', header: 'ID', cell: (l) => l.id },
@@ -85,10 +175,41 @@ export function RouteLists() {
           ) : (
             <SpaceBetween size="xxs" alignItems="center">
               <b>No route lists</b>
-              <span>Create one via POST /api/v1/routelists.</span>
+              <span>Click “Create route list” to add one.</span>
             </SpaceBetween>
           )
         }
+      />
+
+      <FormModal
+        visible={modalMode !== null}
+        title={modalMode === 'edit' ? 'Edit route list' : 'Create route list'}
+        submitLabel={modalMode === 'edit' ? 'Save' : 'Create'}
+        busy={busy}
+        error={modalError}
+        onCancel={closeModal}
+        onSubmit={submit}
+      >
+        <FormField label="ID" description="Stable identifier referenced by route patterns.">
+          <Input
+            value={formId}
+            onChange={({ detail }) => setFormId(detail.value)}
+            disabled={modalMode === 'edit'}
+          />
+        </FormField>
+        <FormField label="Name (optional)" description="Defaults to the ID.">
+          <Input value={formName} onChange={({ detail }) => setFormName(detail.value)} />
+        </FormField>
+      </FormModal>
+
+      <DeleteConfirmModal
+        visible={deleteOpen}
+        resource="route list"
+        name={target?.name ?? target?.id ?? ''}
+        busy={busy}
+        error={modalError}
+        onCancel={() => setDeleteOpen(false)}
+        onConfirm={confirmDelete}
       />
     </ContentLayout>
   );

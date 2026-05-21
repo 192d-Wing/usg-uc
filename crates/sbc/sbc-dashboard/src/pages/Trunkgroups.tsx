@@ -1,19 +1,25 @@
 import { useEffect, useState } from 'react';
 import Button from '@cloudscape-design/components/button';
 import ContentLayout from '@cloudscape-design/components/content-layout';
+import FormField from '@cloudscape-design/components/form-field';
 import Header from '@cloudscape-design/components/header';
+import Input from '@cloudscape-design/components/input';
 import SpaceBetween from '@cloudscape-design/components/space-between';
 import StatusIndicator from '@cloudscape-design/components/status-indicator';
 import Table from '@cloudscape-design/components/table';
+import Textarea from '@cloudscape-design/components/textarea';
 import TextFilter from '@cloudscape-design/components/text-filter';
 
 import { api, ApiError } from '../api';
+import { DeleteConfirmModal, FormModal } from '../components/CrudModal';
+
+type Trunk = { id?: string; host?: string; port?: number; transport?: string };
 
 type TrunkGroup = {
   id?: string;
   name?: string;
   description?: string;
-  trunks?: Array<{ id?: string; host?: string; port?: number; transport?: string }>;
+  trunks?: Trunk[];
 };
 
 export function Trunkgroups() {
@@ -21,21 +27,29 @@ export function Trunkgroups() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState('');
+  const [selected, setSelected] = useState<TrunkGroup[]>([]);
+
+  const [modalMode, setModalMode] = useState<'create' | 'edit' | null>(null);
+  const [formId, setFormId] = useState('');
+  const [formName, setFormName] = useState('');
+  const [formDesc, setFormDesc] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [modalError, setModalError] = useState<string | null>(null);
+  const [deleteOpen, setDeleteOpen] = useState(false);
 
   const load = async () => {
     setLoading(true);
     setError(null);
     try {
-      const res = await api.get<{ trunk_groups: TrunkGroup[] } | { trunkgroups: TrunkGroup[] }>(
-        '/trunkgroups',
-      );
-      // The API returns the field as `trunk_groups` or `trunkgroups` depending
-      // on the daemon version; tolerate both.
+      const res = await api.get<
+        { trunk_groups: TrunkGroup[] } | { trunkgroups: TrunkGroup[] }
+      >('/trunkgroups');
       const list =
         (res as { trunk_groups?: TrunkGroup[] }).trunk_groups ??
         (res as { trunkgroups?: TrunkGroup[] }).trunkgroups ??
         [];
       setItems(list);
+      setSelected((cur) => cur.filter((s) => list.some((g) => groupKey(g) === groupKey(s))));
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e));
     } finally {
@@ -54,17 +68,97 @@ export function Trunkgroups() {
       })
     : items;
 
+  const target = selected[0];
+
+  const openCreate = () => {
+    setFormId('');
+    setFormName('');
+    setFormDesc('');
+    setModalError(null);
+    setModalMode('create');
+  };
+  const openEdit = () => {
+    if (!target) return;
+    setFormId(target.id ?? '');
+    setFormName(target.name ?? '');
+    setFormDesc(target.description ?? '');
+    setModalError(null);
+    setModalMode('edit');
+  };
+  const closeModal = () => setModalMode(null);
+
+  const submit = async () => {
+    if (!formName.trim()) {
+      setModalError('Name is required.');
+      return;
+    }
+    setBusy(true);
+    setModalError(null);
+    const body: Record<string, unknown> = {
+      name: formName.trim(),
+      description: formDesc.trim() || undefined,
+    };
+    if (formId.trim()) body.id = formId.trim();
+    try {
+      if (modalMode === 'create') {
+        await api.post('/trunkgroups', body);
+      } else if (target?.id) {
+        // Preserve existing trunks on update (the backend treats body as the full state).
+        body.trunks = target.trunks ?? [];
+        await api.put(`/trunkgroups/${encodeURIComponent(target.id)}`, body);
+      }
+      closeModal();
+      await load();
+    } catch (e) {
+      setModalError(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const openDelete = () => {
+    if (!target) return;
+    setModalError(null);
+    setDeleteOpen(true);
+  };
+  const confirmDelete = async () => {
+    if (!target?.id) return;
+    setBusy(true);
+    setModalError(null);
+    try {
+      await api.delete(`/trunkgroups/${encodeURIComponent(target.id)}`);
+      setDeleteOpen(false);
+      setSelected([]);
+      await load();
+    } catch (e) {
+      setModalError(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <ContentLayout
       header={
         <Header
           variant="h1"
           counter={`(${items.length})`}
-          description="SIP trunk groups for outbound call routing."
+          description="SIP trunk groups for outbound call routing. Trunks within a group are edited via the API."
           actions={
-            <Button onClick={load} iconName="refresh" loading={loading}>
-              Refresh
-            </Button>
+            <SpaceBetween direction="horizontal" size="xs">
+              <Button onClick={load} iconName="refresh" loading={loading}>
+                Refresh
+              </Button>
+              <Button onClick={openDelete} disabled={!target || busy}>
+                Delete
+              </Button>
+              <Button onClick={openEdit} disabled={!target || busy}>
+                Edit
+              </Button>
+              <Button variant="primary" onClick={openCreate}>
+                Create group
+              </Button>
+            </SpaceBetween>
           }
         >
           Route Groups
@@ -77,7 +171,10 @@ export function Trunkgroups() {
         loadingText="Loading trunk groups…"
         variant="full-page"
         stickyHeader
-        trackBy={(g) => g.id ?? g.name ?? ''}
+        trackBy={groupKey}
+        selectionType="single"
+        selectedItems={selected}
+        onSelectionChange={({ detail }) => setSelected(detail.selectedItems)}
         columnDefinitions={[
           { id: 'name', header: 'Name', cell: (g) => g.name ?? '—', isRowHeader: true, sortingField: 'name' },
           { id: 'description', header: 'Description', cell: (g) => g.description ?? '—' },
@@ -86,7 +183,9 @@ export function Trunkgroups() {
             header: 'Trunks',
             cell: (g) =>
               g.trunks?.length
-                ? g.trunks.map((t) => `${t.host ?? '?'}:${t.port ?? ''}${t.transport ? `/${t.transport}` : ''}`).join(', ')
+                ? g.trunks
+                    .map((t) => `${t.host ?? '?'}:${t.port ?? ''}${t.transport ? `/${t.transport}` : ''}`)
+                    .join(', ')
                 : '0',
           },
           { id: 'id', header: 'ID', cell: (g) => g.id ?? '—' },
@@ -105,11 +204,52 @@ export function Trunkgroups() {
           ) : (
             <SpaceBetween size="xxs" alignItems="center">
               <b>No trunk groups</b>
-              <span>Create one via POST /api/v1/trunkgroups.</span>
+              <span>Click “Create group” to add one.</span>
             </SpaceBetween>
           )
         }
       />
+
+      <FormModal
+        visible={modalMode !== null}
+        title={modalMode === 'edit' ? 'Edit route group' : 'Create route group'}
+        submitLabel={modalMode === 'edit' ? 'Save' : 'Create'}
+        busy={busy}
+        error={modalError}
+        onCancel={closeModal}
+        onSubmit={submit}
+      >
+        <FormField label="Name">
+          <Input value={formName} onChange={({ detail }) => setFormName(detail.value)} />
+        </FormField>
+        <FormField
+          label="ID (optional)"
+          description="A UUID is auto-generated when blank. Cannot be changed after create."
+        >
+          <Input
+            value={formId}
+            onChange={({ detail }) => setFormId(detail.value)}
+            disabled={modalMode === 'edit'}
+          />
+        </FormField>
+        <FormField label="Description (optional)">
+          <Textarea value={formDesc} onChange={({ detail }) => setFormDesc(detail.value)} />
+        </FormField>
+      </FormModal>
+
+      <DeleteConfirmModal
+        visible={deleteOpen}
+        resource="route group"
+        name={target?.name ?? target?.id ?? ''}
+        busy={busy}
+        error={modalError}
+        onCancel={() => setDeleteOpen(false)}
+        onConfirm={confirmDelete}
+      />
     </ContentLayout>
   );
+}
+
+function groupKey(g: TrunkGroup): string {
+  return g.id ?? g.name ?? '';
 }
