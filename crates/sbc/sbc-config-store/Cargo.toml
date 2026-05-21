@@ -20,3 +20,7 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["fs"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 uuid = { version = "1", features = ["v4"] }
+# Phone model lives in uc-phone-mgmt; we reuse the typed struct rather
+# than redefining 30+ fields. Pulling it in keeps PostgresPhoneStore's
+# upsert/get signatures match what handlers already construct.
+uc-phone-mgmt.workspace = true

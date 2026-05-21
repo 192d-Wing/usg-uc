@@ -466,19 +466,19 @@ impl Runtime {
             }
         }
 
-        // Initialize the Postgres-backed directory-number store, if a DSN
-        // is provided. We deliberately reuse the same `SBC_POSTGRES_URL`
-        // env var the user store reads (above) so one DSN drives both,
-        // matching the Helm chart's single-secret convention. When unset,
-        // DID handlers fall back to the legacy JSON-on-disk MemStore path
-        // unchanged — existing single-pod deploys behave identically.
+        // Initialize Postgres-backed config stores when a DSN is
+        // configured. Same `SBC_POSTGRES_URL` env var the user store
+        // reads, so one Secret drives every Postgres consumer; matches
+        // the Helm chart's single-secret convention. When the env var is
+        // unset, every config-entity handler falls back to the legacy
+        // JSON-on-disk MemStore path — single-pod deploys behave
+        // identically to pre-split. Each store opens its own pool today;
+        // pool consolidation lands when the connection count starts to
+        // matter (planned PR4-ish).
         if let Ok(pg_url) = std::env::var("SBC_POSTGRES_URL") {
             match sbc_config_store::PostgresDirectoryNumberStore::new(&pg_url).await {
                 Ok(store) => {
                     let store_arc = Arc::new(store);
-                    // One-shot migration: copy /var/lib/sbc/directory_numbers.json
-                    // into Postgres on first startup with a DSN, then rename
-                    // the JSON file so we don't try again.
                     let json_path = std::path::Path::new("/var/lib/sbc/directory_numbers.json");
                     match sbc_config_store::migrate_directory_json_to_postgres(
                         json_path,
@@ -496,6 +496,29 @@ impl Runtime {
                 Err(e) => {
                     warn!(error = %e,
                         "PostgresDirectoryNumberStore init failed; DID handlers will use JSON MemStore fallback");
+                }
+            }
+
+            match sbc_config_store::PostgresPhoneStore::new(&pg_url).await {
+                Ok(store) => {
+                    let store_arc = Arc::new(store);
+                    let json_path = std::path::Path::new("/var/lib/sbc/phones.json");
+                    match sbc_config_store::migrate_phones_json_to_postgres(
+                        json_path,
+                        &store_arc,
+                    )
+                    .await
+                    {
+                        Ok(0) => debug!("Phones JSON migration: nothing to do"),
+                        Ok(n) => info!(imported = n, "Migrated phones.json to Postgres"),
+                        Err(e) => warn!(error = %e, "Phones JSON migration failed; continuing"),
+                    }
+                    app_state.phone_store = Some(store_arc);
+                    info!("Phone store initialized (PostgreSQL)");
+                }
+                Err(e) => {
+                    warn!(error = %e,
+                        "PostgresPhoneStore init failed; phone handlers + serve_phone_config will use JSON MemStore fallback");
                 }
             }
         }
@@ -612,9 +635,15 @@ impl Runtime {
             for (id, g) in persisted_trunks {
                 store.trunk_groups.insert(id, g);
             }
-            let persisted_phones = crate::api_server::MemStore::load_phones();
-            for (id, p) in persisted_phones {
-                store.phones.insert(id, p);
+            // JSON phones load only runs without Postgres. With Postgres,
+            // the migration above moved phones.json into the table and
+            // handlers read directly from Postgres — keeping a stale
+            // duplicate in MemStore would just risk drift.
+            if app_state.phone_store.is_none() {
+                let persisted_phones = crate::api_server::MemStore::load_phones();
+                for (id, p) in persisted_phones {
+                    store.phones.insert(id, p);
+                }
             }
             // JSON DID load + replay only runs in legacy (no-Postgres)
             // mode. With Postgres configured, the migration above moved

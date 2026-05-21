@@ -21,8 +21,10 @@ pub mod directory;
 pub mod error;
 pub mod migration;
 pub mod model;
+pub mod phones;
 
 pub use directory::PostgresDirectoryNumberStore;
 pub use error::{ConfigStoreError, ConfigStoreResult};
-pub use migration::migrate_directory_json_to_postgres;
+pub use migration::{migrate_directory_json_to_postgres, migrate_phones_json_to_postgres};
 pub use model::DirectoryNumber;
+pub use phones::PostgresPhoneStore;

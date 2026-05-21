@@ -36,12 +36,12 @@ OPERATOR DASHBOARD:
 
 CONFIG STORE:
 {{- if .Values.sbcPostgres.enabled }}
-  Postgres StatefulSet:  {{ include "sbc.fullname" . }}-postgres (PR1: DIDs)
+  Postgres StatefulSet:  {{ include "sbc.fullname" . }}-postgres (PR1: DIDs, PR2: phones)
   DSN env (daemon):      SBC_POSTGRES_URL from Secret/{{ include "sbc.fullname" . }}-postgres
-  Existing JSON file at /var/lib/sbc/directory_numbers.json will be
-  migrated to Postgres on first daemon startup and renamed to
-  *.migrated.bak. Phones/trunks/dial_plans are still JSON-on-PVC pending
-  follow-up PRs.
+  Existing JSON files at /var/lib/sbc/{directory_numbers,phones}.json will
+  be migrated to Postgres on first daemon startup and renamed to
+  *.migrated.bak. Trunk groups + dial plans are still JSON-on-PVC pending
+  PR3.
 {{- else if .Values.sbcPostgres.existingSecret.name }}
   External Postgres via Secret/{{ .Values.sbcPostgres.existingSecret.name }} (key={{ .Values.sbcPostgres.existingSecret.key | default "dsn" }})
 {{- else }}

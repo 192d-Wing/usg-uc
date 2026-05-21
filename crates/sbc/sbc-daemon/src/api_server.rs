@@ -230,6 +230,11 @@ pub struct AppState {
     /// Set at startup based on `config.storage.postgres`; `None` preserves
     /// the legacy single-pod JSON behavior.
     pub directory_store: Option<Arc<sbc_config_store::PostgresDirectoryNumberStore>>,
+    /// Postgres-backed phone store. Same on/off semantics as
+    /// `directory_store`; both keyed off the single `SBC_POSTGRES_URL`
+    /// env var. When `Some`, phone CRUD and `serve_phone_config` query
+    /// Postgres; the MemStore phones map is bypassed.
+    pub phone_store: Option<Arc<sbc_config_store::PostgresPhoneStore>>,
     /// TLS acceptor for certificate hot-reload (if TLS is enabled).
     pub tls_acceptor: Option<Arc<ReloadableTlsAcceptor>>,
     /// Cluster health check function (when cluster feature is enabled).
@@ -259,6 +264,7 @@ impl AppState {
             cucm_router: None,
             mem_store: Arc::new(tokio::sync::RwLock::new(MemStore::default())),
             directory_store: None,
+            phone_store: None,
             trunk_monitor: None,
             trunk_registrar: None,
             zone_registry: None,
@@ -286,6 +292,7 @@ impl AppState {
             cucm_router: None,
             mem_store: Arc::new(tokio::sync::RwLock::new(MemStore::default())),
             directory_store: None,
+            phone_store: None,
             trunk_monitor: None,
             trunk_registrar: None,
             zone_registry: None,
@@ -1644,6 +1651,19 @@ async fn update_user(
 // ============================================================================
 
 async fn list_phones(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(ref store) = state.phone_store {
+        match store.list().await {
+            Ok(phones) => {
+                let total = phones.len();
+                let values: Vec<serde_json::Value> = phones
+                    .iter()
+                    .filter_map(|p| serde_json::to_value(p).ok())
+                    .collect();
+                return Json(serde_json::json!({ "phones": values, "total": total }));
+            }
+            Err(e) => warn!(error = %e, "phone_store list failed; falling back to JSON"),
+        }
+    }
     let store = state.mem_store.read().await;
     let phones: Vec<_> = store.phones.values().cloned().collect();
     let total = phones.len();
@@ -1652,27 +1672,144 @@ async fn list_phones(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 async fn create_phone(
     State(state): State<Arc<AppState>>,
-    Json(mut body): Json<serde_json::Value>,
+    Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let id = body.get("id").and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    body["id"] = serde_json::json!(id);
-    if body.get("status").is_none() {
-        body["status"] = serde_json::json!("Unprovisioned");
+    // Build a real `Phone` via the constructor so every nested struct has its
+    // default (PhoneFeatures, NetworkConfig, …) and then merge whichever
+    // fields the caller actually supplied. Storing a partial body — which
+    // earlier handlers did — broke the provisioning serializer, which
+    // strictly deserializes into Phone and rejects missing fields.
+    let mac = match body.get("mac_address").and_then(|v| v.as_str()) {
+        Some(m) if !m.is_empty() => m.to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"success": false, "error": "mac_address is required"})),
+            );
+        }
+    };
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let model: uc_phone_mgmt::model::PhoneModel = match body.get("model") {
+        Some(v) => match serde_json::from_value(v.clone()) {
+            Ok(m) => m,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(
+                        serde_json::json!({"success": false, "error": format!("invalid model: {e}")}),
+                    ),
+                );
+            }
+        },
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"success": false, "error": "model is required"})),
+            );
+        }
+    };
+
+    let mut phone = uc_phone_mgmt::model::Phone::new(&mac, model, &name);
+    if let Some(id) = body.get("id").and_then(|v| v.as_str()) {
+        if !id.is_empty() {
+            phone.id = id.to_string();
+        }
     }
+
+    // Merge optional / structured fields by re-serializing the constructed
+    // Phone, taking the body's keys for the fields the caller cared about,
+    // and re-parsing as Phone. This validates the resulting record AND
+    // preserves vendor-managed defaults the caller didn't set.
+    let mut phone_value = match serde_json::to_value(&phone) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::json!({"success": false, "error": format!("serialize: {e}")}),
+                ),
+            );
+        }
+    };
+    if let (serde_json::Value::Object(dst), serde_json::Value::Object(src)) =
+        (&mut phone_value, &body)
     {
-        let mut store = state.mem_store.write().await;
-        store.phones.insert(id.clone(), body.clone());
-        store.save_phones();
+        for (k, v) in src {
+            if matches!(k.as_str(), "mac_address" | "model" | "id") {
+                continue; // already handled above
+            }
+            dst.insert(k.clone(), v.clone());
+        }
     }
-    (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "phone": body })))
+    if let Err(e) = serde_json::from_value::<uc_phone_mgmt::model::Phone>(phone_value.clone()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": format!("phone record failed validation: {e}"),
+            })),
+        );
+    }
+
+    let id = phone.id.clone();
+    if let Some(ref store) = state.phone_store {
+        // The phone_value was already validated against Phone above
+        // (line ~1730), so this deserialization should succeed; treat
+        // failure as a 500 to surface drift.
+        match serde_json::from_value::<uc_phone_mgmt::model::Phone>(phone_value.clone()) {
+            Ok(typed) => {
+                if let Err(e) = store.upsert(&typed).await {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "success": false,
+                            "error": format!("phone_store upsert failed: {e}"),
+                        })),
+                    );
+                }
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": format!("validated phone failed re-deserialize: {e}"),
+                    })),
+                );
+            }
+        }
+    } else {
+        let mut mem = state.mem_store.write().await;
+        mem.phones.insert(id, phone_value.clone());
+        mem.save_phones();
+    }
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "success": true, "phone": phone_value })),
+    )
 }
 
 async fn get_phone(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    if let Some(ref store) = state.phone_store {
+        return match store.get(&id).await {
+            Ok(phone) => Json(serde_json::to_value(&phone)
+                .unwrap_or_else(|_| serde_json::json!({"error": "serialize failed"}))),
+            Err(sbc_config_store::ConfigStoreError::NotFound) => {
+                Json(serde_json::json!({ "error": format!("Phone {id} not found") }))
+            }
+            Err(e) => {
+                warn!(phone_id = %id, error = %e, "phone_store get failed");
+                Json(serde_json::json!({ "error": format!("Phone {id} not found") }))
+            }
+        };
+    }
     let store = state.mem_store.read().await;
     match store.phones.get(&id) {
         Some(phone) => Json(phone.clone()),
@@ -1684,18 +1821,52 @@ async fn delete_phone(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    let mut store = state.mem_store.write().await;
-    store.phones.remove(&id);
-    store.save_phones();
+    if let Some(ref store) = state.phone_store {
+        if let Err(e) = store.delete(&id).await {
+            if !matches!(e, sbc_config_store::ConfigStoreError::NotFound) {
+                warn!(phone_id = %id, error = %e, "phone_store delete failed");
+            }
+        }
+    } else {
+        let mut mem = state.mem_store.write().await;
+        mem.phones.remove(&id);
+        mem.save_phones();
+    }
     Json(serde_json::json!({ "success": true, "id": id }))
 }
 
-/// Update a phone.
+/// Update a phone. With the Postgres store active the body must
+/// deserialize cleanly to `uc_phone_mgmt::model::Phone` — previously the
+/// JSON path silently accepted partial bodies, which then broke the
+/// provisioning serializer on the next fetch. Tightening this is
+/// intentional; the dashboard already sends full records.
 async fn update_phone(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    if let Some(ref store) = state.phone_store {
+        match serde_json::from_value::<uc_phone_mgmt::model::Phone>(body.clone()) {
+            Ok(mut typed) => {
+                // Path id wins over any id field in the body, matching
+                // the JSON-path's contract.
+                typed.id = id.clone();
+                if let Err(e) = store.upsert(&typed).await {
+                    return Json(serde_json::json!({
+                        "success": false,
+                        "error": format!("phone_store upsert failed: {e}"),
+                    }));
+                }
+                return Json(serde_json::json!({ "success": true, "phone": body }));
+            }
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("phone record failed validation: {e}"),
+                }));
+            }
+        }
+    }
     let mut store = state.mem_store.write().await;
     if store.phones.contains_key(&id) {
         store.phones.insert(id.clone(), body.clone());
@@ -1711,6 +1882,21 @@ async fn reboot_phone(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    if let Some(ref store) = state.phone_store {
+        return match store.get(&id).await {
+            Ok(_) => Json(serde_json::json!({
+                "success": true,
+                "message": format!("Reboot initiated for {id}"),
+            })),
+            Err(sbc_config_store::ConfigStoreError::NotFound) => {
+                Json(serde_json::json!({ "success": false, "error": "Phone not found" }))
+            }
+            Err(e) => {
+                warn!(phone_id = %id, error = %e, "phone_store get failed during reboot");
+                Json(serde_json::json!({ "success": false, "error": "Phone not found" }))
+            }
+        };
+    }
     let store = state.mem_store.read().await;
     if store.phones.contains_key(&id) {
         Json(serde_json::json!({ "success": true, "message": format!("Reboot initiated for {id}") }))
@@ -1757,30 +1943,48 @@ async fn serve_phone_config(
 
     // Look up the phone record by MAC. Phones must be created via
     // POST /api/v1/phones before they can fetch a config.
-    let phone_json = {
-        let store = state.mem_store.read().await;
-        store.phones.values().find(|v| {
-            v.get("mac_address")
-                .and_then(|m| m.as_str())
-                .map(|m| m.replace([':', '-'], "").eq_ignore_ascii_case(&mac_key))
-                .unwrap_or(false)
-        }).cloned()
-    };
-
-    let Some(phone_json) = phone_json else {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(format!("No phone record for MAC {mac_key}"))
-            .unwrap_or_default();
-    };
-
-    let phone: uc_phone_mgmt::model::Phone = match serde_json::from_value(phone_json) {
-        Ok(p) => p,
-        Err(e) => {
+    // Postgres path: indexed lookup on the normalized MAC column.
+    // JSON path: linear scan of the in-memory map (legacy behavior).
+    let phone: uc_phone_mgmt::model::Phone = if let Some(ref ps) = state.phone_store {
+        match ps.get_by_mac(&mac_key).await {
+            Ok(p) => p,
+            Err(sbc_config_store::ConfigStoreError::NotFound) => {
+                return Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(format!("No phone record for MAC {mac_key}"))
+                    .unwrap_or_default();
+            }
+            Err(e) => {
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(format!("phone_store lookup failed: {e}"))
+                    .unwrap_or_default();
+            }
+        }
+    } else {
+        let phone_json = {
+            let store = state.mem_store.read().await;
+            store.phones.values().find(|v| {
+                v.get("mac_address")
+                    .and_then(|m| m.as_str())
+                    .map(|m| m.replace([':', '-'], "").eq_ignore_ascii_case(&mac_key))
+                    .unwrap_or(false)
+            }).cloned()
+        };
+        let Some(phone_json) = phone_json else {
             return Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(format!("Stored phone record is malformed: {e}"))
+                .status(StatusCode::NOT_FOUND)
+                .body(format!("No phone record for MAC {mac_key}"))
                 .unwrap_or_default();
+        };
+        match serde_json::from_value(phone_json) {
+            Ok(p) => p,
+            Err(e) => {
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(format!("Stored phone record is malformed: {e}"))
+                    .unwrap_or_default();
+            }
         }
     };
 

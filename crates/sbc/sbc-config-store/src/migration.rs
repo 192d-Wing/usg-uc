@@ -14,10 +14,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use tracing::{info, warn};
+use uc_phone_mgmt::model::Phone;
 
 use crate::directory::PostgresDirectoryNumberStore;
 use crate::error::{ConfigStoreError, ConfigStoreResult};
 use crate::model::DirectoryNumber;
+use crate::phones::PostgresPhoneStore;
 
 /// Migrate `directory_numbers.json` into the Postgres store.
 ///
@@ -80,6 +82,66 @@ pub async fn migrate_directory_json_to_postgres(
         skipped,
         backup = %backup_path.display(),
         "Migrated directory_numbers.json into Postgres"
+    );
+    Ok(imported)
+}
+
+/// Migrate `phones.json` into the Postgres store.
+///
+/// Same shape as [`migrate_directory_json_to_postgres`]: noop if the JSON
+/// file is absent or the target table already has rows; otherwise parse
+/// each entry as a typed `Phone`, upsert, and rename the JSON file to
+/// `*.migrated.bak` once done. Malformed rows are skipped with a warning
+/// so a single bad record doesn't block the rest.
+///
+/// # Errors
+/// Returns `ConfigStoreError` for read/parse/upsert/rename failures.
+pub async fn migrate_phones_json_to_postgres(
+    json_path: &Path,
+    store: &PostgresPhoneStore,
+) -> ConfigStoreResult<usize> {
+    if !json_path.exists() {
+        return Ok(0);
+    }
+    if !store.is_empty().await? {
+        info!(
+            path = %json_path.display(),
+            "phones table not empty; skipping JSON migration"
+        );
+        return Ok(0);
+    }
+
+    let raw = tokio::fs::read_to_string(json_path).await?;
+    // Legacy shape: HashMap<phone_id, Phone-serialized-as-Value>.
+    let map: HashMap<String, serde_json::Value> = serde_json::from_str(&raw)?;
+
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+    for (id, value) in map {
+        match serde_json::from_value::<Phone>(value) {
+            Ok(phone) => {
+                if let Err(e) = store.upsert(&phone).await {
+                    warn!(phone_id = %id, error = %e, "Skipping phone — upsert failed");
+                    skipped += 1;
+                } else {
+                    imported += 1;
+                }
+            }
+            Err(e) => {
+                warn!(phone_id = %id, error = %e, "Skipping malformed phone during migration");
+                skipped += 1;
+            }
+        }
+    }
+
+    let backup_path = json_path.with_extension("json.migrated.bak");
+    tokio::fs::rename(json_path, &backup_path).await?;
+
+    info!(
+        imported,
+        skipped,
+        backup = %backup_path.display(),
+        "Migrated phones.json into Postgres"
     );
     Ok(imported)
 }
