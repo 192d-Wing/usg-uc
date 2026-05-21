@@ -9,6 +9,11 @@
 //! - `CallService` - Call monitoring and control
 //! - `RegistrationService` - Registration management
 //! - `SystemService` - System operations
+//! - `TrunkSyncService` - "Trunk group X changed in Postgres; please re-sync"
+//!   notification API used by sbc-api (PR5+). Returns FailedPrecondition
+//!   when SBC_POSTGRES_URL is unset.
+//! - `DialPlanSyncService` - Same shape as TrunkSyncService, for dial plans.
+//! - `DidMappingSyncService` - Same shape, for DID→user mappings.
 //! - `ClusterService` - Cluster management (requires `cluster` feature)
 //! - `Health` - Standard gRPC health checking
 //! - `ServerReflection` - gRPC reflection service (requires `grpc-reflection` feature)
@@ -24,9 +29,12 @@ mod call_service;
 #[cfg(feature = "cluster")]
 mod cluster_service;
 mod config_service;
+mod dial_plan_sync_service;
+mod did_mapping_sync_service;
 mod health_service;
 mod registration_service;
 mod system_service;
+mod trunk_sync_service;
 
 use crate::api_server::AppState;
 #[cfg(feature = "cluster")]
@@ -38,8 +46,11 @@ use sbc_grpc_api::sbc::call_service_server::CallServiceServer;
 #[cfg(feature = "cluster")]
 use sbc_grpc_api::sbc::cluster_service_server::ClusterServiceServer;
 use sbc_grpc_api::sbc::config_service_server::ConfigServiceServer;
+use sbc_grpc_api::sbc::dial_plan_sync_service_server::DialPlanSyncServiceServer;
+use sbc_grpc_api::sbc::did_mapping_sync_service_server::DidMappingSyncServiceServer;
 use sbc_grpc_api::sbc::registration_service_server::RegistrationServiceServer;
 use sbc_grpc_api::sbc::system_service_server::SystemServiceServer;
+use sbc_grpc_api::sbc::trunk_sync_service_server::TrunkSyncServiceServer;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tonic::transport::Server;
@@ -50,9 +61,12 @@ pub use call_service::CallServiceImpl;
 #[cfg(feature = "cluster")]
 pub use cluster_service::ClusterServiceImpl;
 pub use config_service::ConfigServiceImpl;
+pub use dial_plan_sync_service::DialPlanSyncServiceImpl;
+pub use did_mapping_sync_service::DidMappingSyncServiceImpl;
 pub use health_service::HealthServiceImpl;
 pub use registration_service::RegistrationServiceImpl;
 pub use system_service::SystemServiceImpl;
+pub use trunk_sync_service::TrunkSyncServiceImpl;
 
 /// gRPC API server.
 pub struct GrpcServer {
@@ -154,6 +168,14 @@ impl GrpcServer {
         let health_svc = HealthServiceImpl::new(Arc::clone(&self.state));
         let call_svc = CallServiceImpl::new(Arc::clone(&self.state));
         let registration_svc = RegistrationServiceImpl::new(Arc::clone(&self.state));
+        // Sync services used by sbc-api (and other Postgres-aware
+        // writers) to push "I changed entity X" notifications back to
+        // the daemon so it can re-read from Postgres and refresh the
+        // SIP router. Always mounted; each service returns
+        // FailedPrecondition when no Postgres DSN is configured.
+        let trunk_sync_svc = TrunkSyncServiceImpl::new(Arc::clone(&self.state));
+        let dial_plan_sync_svc = DialPlanSyncServiceImpl::new(Arc::clone(&self.state));
+        let did_mapping_sync_svc = DidMappingSyncServiceImpl::new(Arc::clone(&self.state));
 
         // Configure TLS if enabled
         let tls_config = self.configure_tls()?;
@@ -178,7 +200,10 @@ impl GrpcServer {
             .add_service(SystemServiceServer::new(system_svc))
             .add_service(HealthServer::new(health_svc))
             .add_service(CallServiceServer::new(call_svc))
-            .add_service(RegistrationServiceServer::new(registration_svc));
+            .add_service(RegistrationServiceServer::new(registration_svc))
+            .add_service(TrunkSyncServiceServer::new(trunk_sync_svc))
+            .add_service(DialPlanSyncServiceServer::new(dial_plan_sync_svc))
+            .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc));
 
         // Build router with reflection but no cluster
         #[cfg(all(not(feature = "cluster"), feature = "grpc-reflection"))]
@@ -188,7 +213,10 @@ impl GrpcServer {
                 .add_service(SystemServiceServer::new(system_svc))
                 .add_service(HealthServer::new(health_svc))
                 .add_service(CallServiceServer::new(call_svc))
-                .add_service(RegistrationServiceServer::new(registration_svc));
+                .add_service(RegistrationServiceServer::new(registration_svc))
+            .add_service(TrunkSyncServiceServer::new(trunk_sync_svc))
+            .add_service(DialPlanSyncServiceServer::new(dial_plan_sync_svc))
+            .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc));
 
             // Add reflection service if enabled in config
             if self.config.enable_reflection {
@@ -213,7 +241,10 @@ impl GrpcServer {
                 .add_service(SystemServiceServer::new(system_svc))
                 .add_service(HealthServer::new(health_svc))
                 .add_service(CallServiceServer::new(call_svc))
-                .add_service(RegistrationServiceServer::new(registration_svc));
+                .add_service(RegistrationServiceServer::new(registration_svc))
+            .add_service(TrunkSyncServiceServer::new(trunk_sync_svc))
+            .add_service(DialPlanSyncServiceServer::new(dial_plan_sync_svc))
+            .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc));
 
             // Add ClusterService if cluster manager is available
             if let Some(cluster) = &self.cluster {
@@ -234,7 +265,10 @@ impl GrpcServer {
                 .add_service(SystemServiceServer::new(system_svc))
                 .add_service(HealthServer::new(health_svc))
                 .add_service(CallServiceServer::new(call_svc))
-                .add_service(RegistrationServiceServer::new(registration_svc));
+                .add_service(RegistrationServiceServer::new(registration_svc))
+            .add_service(TrunkSyncServiceServer::new(trunk_sync_svc))
+            .add_service(DialPlanSyncServiceServer::new(dial_plan_sync_svc))
+            .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc));
 
             // Add ClusterService if cluster manager is available
             let with_cluster = if let Some(cluster) = &self.cluster {

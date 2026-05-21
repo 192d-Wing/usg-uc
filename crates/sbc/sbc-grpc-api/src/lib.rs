@@ -194,6 +194,33 @@ pub mod prelude {
     pub use super::health::health_client::HealthClient;
     pub use super::health::health_server::{Health, HealthServer};
     pub use super::health::{HealthCheckRequest, HealthCheckResponse};
+
+    // Trunk sync service (sbc-api → daemon "I changed trunk group X, please re-sync")
+    pub use super::sbc::trunk_sync_service_client::TrunkSyncServiceClient;
+    pub use super::sbc::trunk_sync_service_server::{TrunkSyncService, TrunkSyncServiceServer};
+    pub use super::sbc::{
+        RemoveTrunkGroupRequest, RemoveTrunkGroupResponse, SyncTrunkGroupRequest,
+        SyncTrunkGroupResponse,
+    };
+
+    // Dial-plan sync service
+    pub use super::sbc::dial_plan_sync_service_client::DialPlanSyncServiceClient;
+    pub use super::sbc::dial_plan_sync_service_server::{
+        DialPlanSyncService, DialPlanSyncServiceServer,
+    };
+    pub use super::sbc::{
+        RemoveDialPlanRequest, RemoveDialPlanResponse, SyncDialPlanRequest, SyncDialPlanResponse,
+    };
+
+    // DID mapping sync service
+    pub use super::sbc::did_mapping_sync_service_client::DidMappingSyncServiceClient;
+    pub use super::sbc::did_mapping_sync_service_server::{
+        DidMappingSyncService, DidMappingSyncServiceServer,
+    };
+    pub use super::sbc::{
+        RemoveDirectoryNumberRequest, RemoveDirectoryNumberResponse, SyncDirectoryNumberRequest,
+        SyncDirectoryNumberResponse,
+    };
 }
 
 #[cfg(test)]

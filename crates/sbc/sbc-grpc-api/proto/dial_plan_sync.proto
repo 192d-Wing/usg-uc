@@ -1,0 +1,34 @@
+// SBC Dial-Plan Sync Service
+//
+// Same shape as TrunkSyncService: ID-only notification, daemon re-reads
+// the dial plan from Postgres and pushes it into the CucmRouter via the
+// existing sync_dial_plan_to_router helper.
+//
+// NIST 800-53 Rev5: CM-5, AC-3.
+syntax = "proto3";
+
+package sbc.api.v1;
+
+service DialPlanSyncService {
+    rpc SyncDialPlan(SyncDialPlanRequest) returns (SyncDialPlanResponse);
+    rpc RemoveDialPlan(RemoveDialPlanRequest) returns (RemoveDialPlanResponse);
+}
+
+message SyncDialPlanRequest {
+    // Dial plan ID (matches the `id` PK in the dial_plans table).
+    string plan_id = 1;
+}
+
+message SyncDialPlanResponse {
+    bool synced = 1;
+    string message = 2;
+}
+
+message RemoveDialPlanRequest {
+    string plan_id = 1;
+}
+
+message RemoveDialPlanResponse {
+    bool success = 1;
+    string message = 2;
+}

@@ -1,0 +1,44 @@
+// SBC DID-to-User Mapping Sync Service
+//
+// Asks the daemon to refresh the DID→user mapping the SipStack uses for
+// inbound call routing. ID-only RPC; daemon reads the user field from
+// the directory_numbers Postgres row.
+//
+// NIST 800-53 Rev5: CM-5, AC-3.
+syntax = "proto3";
+
+package sbc.api.v1;
+
+service DidMappingSyncService {
+    // SyncDirectoryNumber re-reads the DID from Postgres and pushes its
+    // current user binding into the SIP stack. Used for both create and
+    // update.
+    rpc SyncDirectoryNumber(SyncDirectoryNumberRequest) returns (SyncDirectoryNumberResponse);
+
+    // RemoveDirectoryNumber drops the DID mapping from the SIP stack.
+    // Caller is responsible for having already removed the Postgres row.
+    rpc RemoveDirectoryNumber(RemoveDirectoryNumberRequest) returns (RemoveDirectoryNumberResponse);
+}
+
+message SyncDirectoryNumberRequest {
+    // The DID (Direct Inward Dialing number) — primary key in the
+    // directory_numbers table.
+    string did = 1;
+}
+
+message SyncDirectoryNumberResponse {
+    // True iff the DID was found in Postgres and had a user binding to
+    // push. False can mean either "no such DID" or "DID exists but has
+    // no user assigned yet" — see the message field.
+    bool synced = 1;
+    string message = 2;
+}
+
+message RemoveDirectoryNumberRequest {
+    string did = 1;
+}
+
+message RemoveDirectoryNumberResponse {
+    bool success = 1;
+    string message = 2;
+}

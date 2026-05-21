@@ -1,0 +1,49 @@
+// SBC Trunk-Group Sync Service
+//
+// Notification API used by sbc-api (and any other Postgres-aware writer)
+// to tell the daemon "I changed trunk group X — please re-read from
+// Postgres and push the new config to the SIP router". The daemon owns
+// Postgres reads on its side too, so the RPC carries only the group ID,
+// not the full trunk-group body — that keeps the proto schema small and
+// removes the risk of the proto and the Postgres row drifting apart.
+//
+// NIST 800-53 Rev5: CM-5 (Access Restrictions for Change), AC-3.
+syntax = "proto3";
+
+package sbc.api.v1;
+
+// TrunkSyncService asks the daemon to re-sync a trunk group from its
+// current Postgres state into the live SIP router.
+service TrunkSyncService {
+    // SyncTrunkGroup reloads the named group from Postgres and pushes
+    // it (and its inbound-trunk source-IP mapping) to the SIP router.
+    // Used for both create and update — the daemon doesn't need to
+    // distinguish since sync_trunk_group_to_router is idempotent.
+    rpc SyncTrunkGroup(SyncTrunkGroupRequest) returns (SyncTrunkGroupResponse);
+
+    // RemoveTrunkGroup drops the named group from the SIP router. The
+    // caller is responsible for having already deleted the Postgres row.
+    rpc RemoveTrunkGroup(RemoveTrunkGroupRequest) returns (RemoveTrunkGroupResponse);
+}
+
+message SyncTrunkGroupRequest {
+    // Trunk group ID (matches the `id` PK in the trunk_groups table).
+    string group_id = 1;
+}
+
+message SyncTrunkGroupResponse {
+    // True iff the group was found in Postgres and pushed to the router.
+    // False means the row didn't exist — caller can treat as a no-op.
+    bool synced = 1;
+    // Human-readable note (e.g., "synced 3 trunks", "no such group").
+    string message = 2;
+}
+
+message RemoveTrunkGroupRequest {
+    string group_id = 1;
+}
+
+message RemoveTrunkGroupResponse {
+    bool success = 1;
+    string message = 2;
+}
