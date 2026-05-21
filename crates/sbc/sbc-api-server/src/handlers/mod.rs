@@ -15,10 +15,12 @@ use tower_http::trace::TraceLayer;
 
 use crate::state::AppState;
 
+mod calls;
 mod dial_plans;
 mod directory;
 mod phones;
 mod proxy;
+mod registrations;
 mod system;
 mod trunk_groups;
 
@@ -63,6 +65,23 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/dialplans/{plan_id}/entries/{entry_id}",
             delete(dial_plans::delete_entry),
         )
+        // SIP-state reads — these used to fall through to the HTTP
+        // proxy back to the daemon. PR7 wires them directly to the
+        // daemon's gRPC CallService / RegistrationService / System
+        // Service so the daemon's REST surface can be deleted.
+        .route("/calls", get(calls::list))
+        .route("/calls/{call_id}/ladder", get(calls::ladder))
+        .route("/calls/{call_id}/terminate", post(calls::terminate))
+        .route("/registrations", get(registrations::list))
+        .route("/registrations/{aor}", delete(registrations::delete))
+        // System endpoints. /system/version stays local (sbc-api's
+        // own identity); /system/daemon-version exposes the daemon's
+        // version via gRPC. The rest passthrough to SystemService.
+        .route("/system/daemon-version", get(system::daemon_version))
+        .route("/system/stats", get(system::stats))
+        .route("/system/metrics", get(system::metrics))
+        .route("/system/tls", get(system::tls_status))
+        .route("/system/tls/reload", post(system::tls_reload))
         .with_state(Arc::clone(&state));
 
     // Catch-all for /api/v1/* paths we don't handle locally. Matches

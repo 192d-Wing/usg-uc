@@ -12,7 +12,8 @@ use sbc_config_store::{
     PostgresTrunkGroupStore,
 };
 use sbc_grpc_api::prelude::{
-    DialPlanSyncServiceClient, DidMappingSyncServiceClient, TrunkSyncServiceClient,
+    CallServiceClient, DialPlanSyncServiceClient, DidMappingSyncServiceClient,
+    RegistrationServiceClient, SystemServiceClient, TrunkSyncServiceClient,
 };
 use thiserror::Error;
 use tonic::transport::{Channel, Endpoint};
@@ -43,6 +44,14 @@ pub struct AppState {
     pub trunk_sync: TrunkSyncServiceClient<Channel>,
     pub dial_plan_sync: DialPlanSyncServiceClient<Channel>,
     pub did_sync: DidMappingSyncServiceClient<Channel>,
+    /// gRPC clients for SIP-state reads. These replace the HTTP-proxy
+    /// fallback path for `/calls`, `/registrations`, and `/system/*`
+    /// reads — sbc-api now talks gRPC directly to the daemon instead
+    /// of reverse-proxying HTTP, which lets us delete the daemon's
+    /// REST API entirely.
+    pub calls: CallServiceClient<Channel>,
+    pub registrations: RegistrationServiceClient<Channel>,
+    pub system: SystemServiceClient<Channel>,
 
     /// HTTP client + base URL used by the reverse-proxy fallback for
     /// endpoints sbc-api doesn't own.
@@ -89,7 +98,10 @@ impl AppState {
         let channel = endpoint.connect_lazy();
         let trunk_sync = TrunkSyncServiceClient::new(channel.clone());
         let dial_plan_sync = DialPlanSyncServiceClient::new(channel.clone());
-        let did_sync = DidMappingSyncServiceClient::new(channel);
+        let did_sync = DidMappingSyncServiceClient::new(channel.clone());
+        let calls = CallServiceClient::new(channel.clone());
+        let registrations = RegistrationServiceClient::new(channel.clone());
+        let system = SystemServiceClient::new(channel);
 
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -104,6 +116,9 @@ impl AppState {
             trunk_sync,
             dial_plan_sync,
             did_sync,
+            calls,
+            registrations,
+            system,
             http_client,
             daemon_http_base: cfg.daemon_http_url.trim_end_matches('/').to_string(),
             start_time: std::time::Instant::now(),
