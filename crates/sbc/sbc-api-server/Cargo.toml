@@ -1,0 +1,49 @@
+[package]
+name = "sbc-api-server"
+description = "Stand-alone SBC API server pod. Hosts the operator REST surface for config entities (phones, DIDs, trunk groups, dial plans) directly out of Postgres, and proxies SIP-state reads to the sbc-daemon. Pairs with the daemon's TrunkSync/DialPlanSync/DidMappingSync gRPC services for SIP-router invalidation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "sbc-api-server"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Shared SBC pieces
+sbc-config-store = { workspace = true }
+sbc-grpc-api = { workspace = true }
+uc-phone-mgmt.workspace = true
+
+# Runtime
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# HTTP server
+axum.workspace = true
+tower.workspace = true
+tower-http = { workspace = true, features = ["trace"] }
+hyper.workspace = true
+
+# Serde
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+# gRPC client to the daemon's TrunkSync/DialPlanSync/DidMappingSync.
+tonic = { workspace = true }
+
+# HTTP reverse-proxy fallback. Anything sbc-api doesn't own a handler
+# for (calls, registrations, users, partitions, CSS, system stats, …)
+# gets proxied to the daemon's still-running REST endpoint.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+uuid = { version = "1", features = ["v4"] }
+thiserror.workspace = true
