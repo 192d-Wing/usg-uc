@@ -29,6 +29,40 @@ server {
         proxy_read_timeout 30s;
     }
 
+    # Phones (TEO especially) hit the root path on first-boot — DHCP option
+    # 66 only carries a hostname, so firmware fetches /<MAC>.xml or
+    # /<MAC>.cfg from the root. Match a hex MAC (12 chars, any case, with or
+    # without colon/dash separators) followed by .xml or .cfg and rewrite
+    # to the daemon's canonical /provision/ path. Subsequent refreshes use
+    # the update_server URL embedded in the returned XML and hit
+    # /provision/ directly.
+    # Use `+` (1+ chars) instead of `{12,17}` — nginx-unprivileged's entrypoint
+    # runs envsubst over the template and treats `{...}` as a variable-
+    # reference fragment in some cases, which truncates the regex at the
+    # quantifier and produces `pcre2_compile() failed: missing closing
+    # parenthesis`. `+` matches the same MAC patterns in practice.
+    location ~ ^/([0-9A-Fa-f:_-]+\.(?:xml|cfg))$ {
+        proxy_pass         http://${SBC_API_UPSTREAM}/provision/$1;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_read_timeout 30s;
+    }
+
+    # TEO global config file (TEO spec p.19) — phones fetch this in some
+    # firmwares before the per-MAC file. Daemon returns a 404 with a clear
+    # body; we proxy through so the daemon's 404 (right Content-Type and
+    # body) wins over nginx's SPA fallback returning index.html.
+    location = /TCS7000A.xml {
+        proxy_pass         http://${SBC_API_UPSTREAM}/provision/TCS7000A.xml;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_read_timeout 30s;
+    }
+
     location = /nginx-health {
         access_log off;
         return 200 "ok\n";

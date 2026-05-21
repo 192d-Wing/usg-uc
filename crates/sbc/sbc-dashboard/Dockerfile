@@ -12,7 +12,7 @@
 # =============================================================================
 # Stage 1: Build the SPA bundle.
 # =============================================================================
-FROM node:22-bookworm-slim AS build
+FROM docker.io/library/node:22-bookworm-slim AS build
 
 WORKDIR /app
 COPY package.json package-lock.json* ./
@@ -24,7 +24,7 @@ RUN npm run build
 # =============================================================================
 # Stage 2: Runtime — nginx serving the static bundle and proxying API paths.
 # =============================================================================
-FROM nginxinc/nginx-unprivileged:1.27-alpine AS runtime
+FROM docker.io/nginxinc/nginx-unprivileged:1.27-alpine AS runtime
 
 # Template, not final config — entrypoint envsubst's $SBC_API_UPSTREAM in
 # at container start so the upstream Service name can be set per-deploy

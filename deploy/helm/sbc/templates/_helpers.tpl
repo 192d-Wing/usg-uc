@@ -115,6 +115,14 @@ metrics_bind = {{ .Values.sbcDaemon.config.metrics_listen | quote }}
 per_call_metrics = false
 scrape_interval_secs = 15
 
+# Phone provisioning HTTP server. Without this section the daemon leaves
+# AppState::provisioning = None and /provision/<MAC>.{cfg,xml} returns 503.
+# `host` is the FQDN that gets embedded in vendor configs as the next-fetch
+# URL — phones come back here after first boot for refresh checks.
+[provisioning]
+host = {{ printf "sbc.%s" .Values.site.fqdn_base | quote }}
+port = 80
+
 [rate_limit]
 enabled = true
 global_rps = 10000
