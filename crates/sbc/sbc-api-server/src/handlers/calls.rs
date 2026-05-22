@@ -104,6 +104,9 @@ pub async fn terminate(
     let req = TerminateCallRequest {
         call_id: call_id.clone(),
         reason: "operator_requested".to_string(),
+        // SIP 200 OK as the cause — matches the daemon's default for
+        // "normal" terminations; 603 would be for reject scenarios.
+        cause_code: 200,
     };
     match client.terminate_call(req).await {
         Ok(resp) => {

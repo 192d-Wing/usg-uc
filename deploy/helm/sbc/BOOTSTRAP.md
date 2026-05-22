@@ -56,7 +56,8 @@ sudo microk8s helm3 install cilium cilium/cilium --version 1.19.4 \
   --set bgpControlPlane.enabled=true \
   --set hubble.enabled=true \
   --set hubble.relay.enabled=true \
-  --set hubble.ui.enabled=true
+  --set hubble.ui.enabled=true \
+  --set cni.chainingMode=portmap   # required for hostPort (SBC SIP WAN ingress)
 
 # Wait for cilium agent Ready
 sudo microk8s kubectl rollout status ds/cilium -n kube-system --timeout=180s
