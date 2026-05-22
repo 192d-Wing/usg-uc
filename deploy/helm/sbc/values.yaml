@@ -178,18 +178,18 @@ kea:
     requests: { cpu: "50m",  memory: "64Mi"  }
     limits:   { cpu: "200m", memory: "256Mi" }
   phone_subnets:
-    - subnet:      "10.50.10.0/24"
-      pool:        ["10.50.10.50", "10.50.10.250"]
-      gateway:     "10.50.10.1"
+    - subnet:      "10.0.101.0/24"
+      pool:        ["10.0.101.50", "10.0.101.250"]
+      gateway:     "10.0.101.1"
       # FQDN of the SBC's provisioning HTTP endpoint — TEO TSG accepts FQDN
       # here, so we don't need a stable IP for provisioning.
-      tftp_server: "sbc.kfk-001.usg.example.com"
+      tftp_server: "sbc.xtic.dev.mil"
       # DHCP option 6 (domain-name-servers). Point phones at the per-site
       # CoreDNS so they can resolve `sbc.<site>` and `kea.<site>` FQDNs.
       # Coordinates with the sibling coredns-site chart's
       # service.loadBalancerIP.
       dns_servers:
-        - "10.50.1.5"
+        - "10.0.101.1"
       # VLAN ID for the phone VLAN. Emitted into TEO option 125 (L2QVLAN
       # field) so TSG phones know which 802.1q tag to use after first boot.
       vlan_id: 3001

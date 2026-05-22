@@ -171,9 +171,57 @@ audit_enabled = true
 {{- end }}
 
 {{/*
+Build the TEO TSG DHCP option 125 (VIVSO) hex payload for a phone subnet.
+Format observed in the field (commit 6e01e32):
+
+  | 4 bytes magic header (0x99CCCA4C) | ASCII key=value;key=value;... |
+
+The ASCII payload's exact spacing/casing matters — TSG firmware does
+strict string matching, so quirks from the reference config are
+preserved (notably the space after some semicolons like `; Protocol=` and
+`; SipProxyPort=`).
+
+Argument: a single phone_subnet entry (with .vlan_id and .tftp_server)
+plus the parent `$` context (for site.fqdn_base).
+*/}}
+{{- define "teo.option125Hex" -}}
+{{- $sub := .sub -}}
+{{- $host := $sub.tftp_server -}}
+{{- $vlan := $sub.vlan_id | int -}}
+{{- $payload := printf "L2Q=1;L2QVLAN=%d;VoicePri=2;SignalPri=3;UpdateSrvr=%s;Protocol=HTTP;ConfigFile=MAC;SipProxySrvr=%s;SipProxyPort=5060;SipRegistrar=%s;SipRegPort=5060;ServerType=TEO_UCM" $vlan $host $host $host -}}
+{{- /* Magic header */ -}}
+0x99CCD3
+{{- /* ASCII payload, byte-by-byte to uppercase hex. Sprig's `range` can't
+       iterate a string, so we walk indices with `until (len ...)` and use
+       `index` which returns the byte value at that position. ASCII-only
+       payload, so byte == codepoint. */ -}}
+{{- $len := len $payload -}}
+{{- range $i := until $len -}}{{- printf "%02X" (index $payload $i) -}}{{- end -}}
+{{- end -}}
+
+{{/*
 Render kea-dhcp4.conf. Phone subnets keyed by relay agent IP (giaddr).
+
+Option 125 (VIVSO) is a Kea built-in (`vivso-suboptions`) whose option-data
+path validates the payload as RFC 3925 sub-options even when csv-format is
+false — so Kea rejects the TEO blob ("Option parse failed. Tried to parse
+84 bytes from 247-byte long buffer."). We instead use the flex_option hook
+library to inject raw bytes into option 125 unconditionally for any client
+that lands in this server, which is what the original (pre-Helm) Kea
+configmap did and what TEO TSG firmware expects.
+
+Scoping: flex_option is a server-level hook, not subnet-level. All subnets
+in this chart are phone subnets so unconditional injection is fine; if a
+mixed deployment ever needs per-subnet scoping, add a `client-class`
+expression matching the subnet's giaddr.
 */}}
 {{- define "kea.config" -}}
+{{- $teoSubnets := list -}}
+{{- range $sub := .Values.kea.phone_subnets -}}
+  {{- if and $sub.teo_option_125 $sub.teo_option_125.enabled -}}
+    {{- $teoSubnets = append $teoSubnets $sub -}}
+  {{- end -}}
+{{- end -}}
 {
   "Dhcp4": {
     "interfaces-config": { "interfaces": ["eth0"] },
@@ -181,6 +229,21 @@ Render kea-dhcp4.conf. Phone subnets keyed by relay agent IP (giaddr).
     "valid-lifetime": 3600,
     "renew-timer": 900,
     "rebind-timer": 1800,
+    {{- if $teoSubnets }}
+    "hooks-libraries": [
+      {
+        "library": "/usr/local/lib/kea/hooks/libdhcp_flex_option.so",
+        "parameters": {
+          "options": [
+            {
+              "code": 125,
+              "add": {{ include "teo.option125Hex" (dict "sub" (index $teoSubnets 0)) | quote }}
+            }
+          ]
+        }
+      }
+    ],
+    {{- end }}
     "subnet4": [
       {{- range $i, $sub := .Values.kea.phone_subnets }}
       {{- if $i }},{{ end }}

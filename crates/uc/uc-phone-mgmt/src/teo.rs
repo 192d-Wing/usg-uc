@@ -134,7 +134,7 @@ fn write_line_keys(xml: &mut String, phone: &Phone) {
         let _ = writeln!(
             xml,
             "        <line_id>{}</line_id>",
-            xml_escape(&line.directory_number),
+            xml_escape(&teo_line_id(&line.directory_number)),
         );
         let _ = writeln!(
             xml,
@@ -166,6 +166,17 @@ fn write_line_keys(xml: &mut String, phone: &Phone) {
         xml.push_str("      </key>\n");
     }
     xml.push_str("    </multi_function_key_list>\n");
+}
+
+/// Normalize a directory number for use in TEO `<line_id>`. Strips an E.164
+/// NANP prefix (`+1`) so a stored `+12139160002` renders as `2139160002`,
+/// which is what TEO firmware expects for the on-screen line label. Plain
+/// extensions (`2001`) pass through unchanged.
+fn teo_line_id(dn: &str) -> String {
+    dn.strip_prefix("+1")
+        .or_else(|| dn.strip_prefix('+'))
+        .unwrap_or(dn)
+        .to_string()
 }
 
 fn xml_escape(s: &str) -> String {
@@ -250,6 +261,15 @@ mod tests {
         assert!(xml.contains("<sip_password>s3cret</sip_password>"));
         assert!(xml.contains("<sip_proxy_addr source=\"STATIC\">sbc.example.mil</sip_proxy_addr>"));
         assert!(xml.contains("<sip_proxy_port>5060</sip_proxy_port>"));
+    }
+
+    #[test]
+    fn line_id_strips_e164_nanp_prefix() {
+        let mut phone = phone_with_one_line(PhoneModel::Teo7810TSG);
+        phone.lines[0].directory_number = "+12139160002".into();
+        let xml = generate_teo_config(&phone, "sbc.lab");
+        assert!(xml.contains("<line_id>2139160002</line_id>"));
+        assert!(!xml.contains("+12139160002"));
     }
 
     #[test]
