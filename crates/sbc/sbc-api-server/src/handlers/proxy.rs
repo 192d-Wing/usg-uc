@@ -1,11 +1,13 @@
 //! Reverse-proxy fallback to the sbc-daemon for endpoints sbc-api
 //! doesn't own.
 //!
-//! In PR5 sbc-api owns config entities (phones, DIDs, trunk groups,
-//! dial-plan writes). Everything else — calls, registrations, users,
-//! partitions, CSS, route patterns, trunk-health, trunk-registration,
-//! system stats — still lives on the daemon. The dashboard hits sbc-api
-//! as the single front door, so we proxy what we don't own.
+//! sbc-api owns config entities (phones, DIDs, trunk groups, dial-plan
+//! writes), users (PR10), SIP-state reads (PR7), and trunk runtime
+//! state (PR9). What's left for the proxy: CUCM routing CRUD
+//! (partitions, CSS, route patterns/lists) and the read-only `/cdrs` +
+//! `/dialplans` views, all of which still live on the daemon until
+//! PR11. The dashboard hits sbc-api as the single front door, so we
+//! proxy what we don't own.
 //!
 //! Body forwarding uses reqwest's streaming-buffered shape (bytes in,
 //! bytes out). Headers are mostly stripped — the daemon will set its

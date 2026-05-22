@@ -16,6 +16,7 @@ use sbc_grpc_api::prelude::{
     RegistrationServiceClient, SystemServiceClient, TrunkHealthServiceClient,
     TrunkSyncServiceClient,
 };
+use uc_user_mgmt::postgres::PostgresUserStore;
 use thiserror::Error;
 use tonic::transport::{Channel, Endpoint};
 use tracing::info;
@@ -38,6 +39,10 @@ pub struct AppState {
     pub directory: Arc<PostgresDirectoryNumberStore>,
     pub trunk_groups: Arc<PostgresTrunkGroupStore>,
     pub dial_plans: Arc<PostgresDialPlanStore>,
+    /// Postgres-backed user store. Moves /users CRUD off the daemon as
+    /// of PR10. SIP digest auth still happens in the daemon, but it
+    /// reads through the same `users` table via its own pool.
+    pub users: Arc<PostgresUserStore>,
 
     /// gRPC clients into the daemon's sync services. Cloning a tonic
     /// client is cheap (Arc<Channel> underneath) so handlers take
@@ -90,6 +95,11 @@ impl AppState {
                 .await
                 .map_err(|e| StateError::Postgres(e.to_string()))?,
         );
+        let users = Arc::new(
+            PostgresUserStore::new(&cfg.database_url)
+                .await
+                .map_err(|e| StateError::Postgres(e.to_string()))?,
+        );
 
         info!(grpc = %cfg.daemon_grpc_url, "dialing daemon gRPC");
         // Lazy connect: tonic doesn't actually open the TCP socket
@@ -119,6 +129,7 @@ impl AppState {
             directory,
             trunk_groups,
             dial_plans,
+            users,
             trunk_sync,
             dial_plan_sync,
             did_sync,

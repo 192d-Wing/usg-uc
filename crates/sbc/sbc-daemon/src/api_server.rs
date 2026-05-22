@@ -211,8 +211,6 @@ pub struct AppState {
     pub ready: AtomicU64,
     /// SIP stack for call/registration queries.
     pub sip_stack: Option<Arc<crate::sip_stack::SipStack>>,
-    /// User store for user management (encrypted, backend-agnostic).
-    pub user_store: Option<Arc<uc_user_mgmt::AnyUserStore>>,
     /// Phone provisioning server.
     pub provisioning: Option<Arc<uc_phone_mgmt::provisioning::ProvisioningServer>>,
     /// CUCM router for CSS/partition-based routing.
@@ -269,7 +267,6 @@ impl AppState {
             start_time: Instant::now(),
             ready: AtomicU64::new(1), // Start as ready
             sip_stack: None,
-            user_store: None,
             provisioning: None,
             cucm_router: None,
             mem_store: Arc::new(tokio::sync::RwLock::new(MemStore::default())),
@@ -299,7 +296,6 @@ impl AppState {
             start_time: Instant::now(),
             ready: AtomicU64::new(1),
             sip_stack: None,
-            user_store: None,
             provisioning: None,
             cucm_router: None,
             mem_store: Arc::new(tokio::sync::RwLock::new(MemStore::default())),
@@ -460,7 +456,6 @@ impl ApiServer {
     /// exists yet) plus its own kubelet probes:
     ///
     /// - Health probes (`/healthz`, `/readyz`) — daemon pod's liveness.
-    /// - User management — uc-user-mgmt is not yet Postgres-shared.
     /// - CUCM routing CRUD (`/partitions`, `/css`, `/routepatterns`,
     ///   `/routelists`) — these mutate the CucmRouter directly and have
     ///   no Postgres-backed store yet.
@@ -493,12 +488,8 @@ impl ApiServer {
             .route("/cdrs", get(get_cdrs))
             // (trunk-health and trunk-registration routes moved to
             // sbc-api in PR9; backed by daemon's TrunkHealthService gRPC.)
-            // User management (uc-user-mgmt store, not Postgres-shared
-            // via sbc-config-store).
-            .route("/users", get(list_users))
-            .route("/users", post(create_user))
-            .route("/users/{id}", get(get_user))
-            .route("/users/{id}", delete(delete_user).put(update_user))
+            // (user CRUD moved to sbc-api in PR10; PostgresUserStore is
+            // hit directly from sbc-api instead of via the daemon.)
             // CUCM routing config (mutates CucmRouter directly).
             .route("/partitions", get(list_partitions))
             .route("/partitions", post(create_partition))
@@ -970,140 +961,8 @@ pub async fn sync_dial_plan_to_router(state: &Arc<AppState>, plan_id: &str, entr
 // ============================================================================
 
 // ============================================================================
-// User Management Routes
-use uc_user_mgmt::store::UserStore; // Import trait for method dispatch
-// ============================================================================
-
-async fn list_users(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(ref store) = state.user_store {
-        let filter = uc_user_mgmt::model::UserFilter::default();
-        match store.list_users(&filter).await {
-            Ok(users) => Json(serde_json::json!({ "users": users, "total": users.len() })),
-            Err(e) => Json(serde_json::json!({ "users": [], "error": e.to_string() })),
-        }
-    } else {
-        Json(serde_json::json!({ "users": [], "total": 0 }))
-    }
-}
-
-async fn create_user(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    if let Some(ref store) = state.user_store {
-        let user = uc_user_mgmt::model::User {
-            id: uuid::Uuid::new_v4().to_string(),
-            username: body.get("username").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            display_name: body.get("display_name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            email: body.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            sip_uri: body.get("sip_uri").and_then(|v| v.as_str()).unwrap_or_else(|| {
-                body.get("username").and_then(|v| v.as_str()).unwrap_or("")
-            }).to_string(),
-            auth_type: uc_user_mgmt::model::AuthType::Digest,
-            digest_ha1: body.get("password").and_then(|v| v.as_str())
-                .filter(|p| !p.is_empty())
-                .map(|password| {
-                    let username = body.get("username").and_then(|v| v.as_str()).unwrap_or("");
-                    let realm = body.get("sip_domain").and_then(|v| v.as_str()).unwrap_or("sbc-local");
-                    uc_user_mgmt::digest::compute_ha1(username, realm, password)
-                }),
-            certificate_dn: body.get("certificate_dn").and_then(|v| v.as_str()).map(String::from),
-            certificate_san: None,
-            calling_search_space: body.get("calling_search_space").and_then(|v| v.as_str()).map(String::from),
-            device_ids: Vec::new(),
-            partition: None,
-            enabled: true,
-            created_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
-            updated_at: 0,
-            last_login: None,
-            metadata: std::collections::HashMap::new(),
-        };
-        match store.create_user(user.clone()).await {
-            Ok(created) => (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "user": created }))),
-            Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "success": false, "error": e.to_string() }))),
-        }
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "success": false, "error": "User store not configured" })))
-    }
-}
-
-async fn get_user(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    if let Some(ref store) = state.user_store {
-        match store.get_user(&id).await {
-            Ok(user) => Json(serde_json::json!(user)),
-            Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
-        }
-    } else {
-        Json(serde_json::json!({ "error": "User store not configured" }))
-    }
-}
-
-async fn delete_user(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    if let Some(ref store) = state.user_store {
-        match store.delete_user(&id).await {
-            Ok(()) => Json(serde_json::json!({ "success": true })),
-            Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
-        }
-    } else {
-        Json(serde_json::json!({ "success": false, "error": "User store not configured" }))
-    }
-}
-
-async fn update_user(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    if let Some(ref store) = state.user_store {
-        // Get existing user
-        let existing = match store.get_user(&id).await {
-            Ok(u) => u,
-            Err(e) => return Json(serde_json::json!({ "success": false, "error": e.to_string() })),
-        };
-        let username = body.get("username").and_then(|v| v.as_str()).unwrap_or(&existing.username);
-        let digest_ha1 = body.get("password").and_then(|v| v.as_str())
-            .filter(|p| !p.is_empty())
-            .map(|password| {
-                let realm = body.get("sip_domain").and_then(|v| v.as_str()).unwrap_or("sbc-local");
-                uc_user_mgmt::digest::compute_ha1(username, realm, password)
-            })
-            .or(existing.digest_ha1);
-
-        let updated = uc_user_mgmt::model::User {
-            id: id.clone(),
-            username: username.to_string(),
-            display_name: body.get("display_name").and_then(|v| v.as_str()).unwrap_or(&existing.display_name).to_string(),
-            email: body.get("email").and_then(|v| v.as_str()).unwrap_or(&existing.email).to_string(),
-            sip_uri: body.get("sip_uri").and_then(|v| v.as_str()).unwrap_or(&existing.sip_uri).to_string(),
-            auth_type: existing.auth_type,
-            digest_ha1,
-            certificate_dn: body.get("certificate_dn").and_then(|v| v.as_str()).map(String::from).or(existing.certificate_dn),
-            certificate_san: existing.certificate_san,
-            calling_search_space: body.get("calling_search_space").and_then(|v| v.as_str()).map(String::from).or(existing.calling_search_space),
-            device_ids: existing.device_ids,
-            partition: existing.partition,
-            enabled: body.get("enabled").and_then(|v| v.as_bool()).unwrap_or(existing.enabled),
-            created_at: existing.created_at,
-            updated_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
-            last_login: existing.last_login,
-            metadata: existing.metadata,
-        };
-        match store.update_user(updated.clone()).await {
-            Ok(u) => Json(serde_json::json!({ "success": true, "user": u })),
-            Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
-        }
-    } else {
-        Json(serde_json::json!({ "success": false, "error": "User store not configured" }))
-    }
-}
-
-// ============================================================================
+// (User Management handlers removed in PR10 — sbc-api owns /users CRUD,
+// reading and writing PostgresUserStore directly.)
 // (Phone Management + Phone Provisioning handlers removed in PR8 —
 // sbc-api owns phone CRUD; sbc-provision owns /provision/<MAC>.{cfg,xml}.)
 // ============================================================================

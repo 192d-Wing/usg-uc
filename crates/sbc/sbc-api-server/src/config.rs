@@ -36,9 +36,8 @@ pub struct Config {
     pub daemon_grpc_url: String,
 
     /// Daemon's REST endpoint (`http://host:port`). Used by the
-    /// reverse-proxy fallback for endpoints sbc-api doesn't own (calls,
-    /// registrations, users, partitions, CSS, route patterns, system,
-    /// trunk-health, trunk-registration).
+    /// reverse-proxy fallback for endpoints sbc-api doesn't own
+    /// (partitions, CSS, route patterns/lists, CDRs, dial-plan reads).
     pub daemon_http_url: String,
 }
 

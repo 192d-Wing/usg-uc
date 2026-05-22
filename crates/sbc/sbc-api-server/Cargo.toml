@@ -21,6 +21,13 @@ workspace = true
 sbc-config-store = { workspace = true }
 sbc-grpc-api = { workspace = true }
 uc-phone-mgmt.workspace = true
+# Users move into sbc-api as of PR10. We use the Postgres backend
+# directly (no sqlite/dispatch shim) — sbc-api always runs against
+# the same shared Postgres as the daemon's other config stores.
+# Direct path dep (instead of workspace=true) so we can disable the
+# default `sqlite` feature; cargo doesn't allow overriding inherited
+# default-features.
+uc-user-mgmt = { path = "../../uc/uc-user-mgmt", default-features = false, features = ["postgres"] }
 
 # Runtime
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
@@ -43,7 +50,7 @@ serde_json = { workspace = true }
 tonic = { workspace = true }
 
 # HTTP reverse-proxy fallback. Anything sbc-api doesn't own a handler
-# for (calls, registrations, users, partitions, CSS, system stats, …)
+# for (partitions, CSS, route patterns/lists, CDRs, dial-plan reads)
 # gets proxied to the daemon's still-running REST endpoint.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 

@@ -448,78 +448,12 @@ impl Runtime {
         app_state.zone_registry = zone_registry.clone();
         info!("Trunk registrar initialized");
 
-        // Initialize user store with optional HA1 encryption
-        //
-        // Backend selection:
-        //   - SBC_POSTGRES_URL env → PostgreSQL (for HA deployments)
-        //   - Otherwise → in-memory SQLite (dev/single-node)
-        //
-        // Encryption:
-        //   - SBC_HA1_ENCRYPTION_KEY env (64 hex chars) → AES-256-GCM encryption of HA1
-        //   - Otherwise → plaintext HA1 (backward compatible)
-        {
-            use uc_user_mgmt::dispatch::DynUserStore;
-            use uc_user_mgmt::encrypt::EncryptedUserStore;
-
-            // Backend resolution: SBC_POSTGRES_URL → Postgres, else
-            // SBC_SQLITE_PATH → file-backed SQLite (survives pod restart),
-            // else :memory: (dev/single-shot).
-            let sqlite_path = std::env::var("SBC_SQLITE_PATH")
-                .unwrap_or_else(|_| ":memory:".to_string());
-
-            #[cfg(feature = "user-postgres")]
-            let inner_result: std::result::Result<DynUserStore, uc_user_mgmt::error::UserMgmtError> = if let Ok(pg_url) = std::env::var("SBC_POSTGRES_URL") {
-                match uc_user_mgmt::postgres::PostgresUserStore::new(&pg_url).await {
-                    Ok(pg) => {
-                        info!("User store initialized (PostgreSQL)");
-                        Ok(DynUserStore::Postgres(pg))
-                    }
-                    Err(e) => Err(e),
-                }
-            } else {
-                match uc_user_mgmt::sqlite::SqliteUserStore::new(&sqlite_path) {
-                    Ok(s) => {
-                        info!(path = %sqlite_path, "User store initialized (SQLite)");
-                        Ok(DynUserStore::Sqlite(s))
-                    }
-                    Err(e) => Err(e),
-                }
-            };
-
-            #[cfg(not(feature = "user-postgres"))]
-            let inner_result: std::result::Result<DynUserStore, uc_user_mgmt::error::UserMgmtError> =
-                match uc_user_mgmt::sqlite::SqliteUserStore::new(&sqlite_path) {
-                    Ok(s) => {
-                        info!(path = %sqlite_path, "User store initialized (SQLite)");
-                        Ok(DynUserStore::Sqlite(s))
-                    }
-                    Err(e) => Err(e),
-                };
-
-            match inner_result {
-                Ok(inner) => {
-                    let encryption_key = std::env::var("SBC_HA1_ENCRYPTION_KEY")
-                        .ok()
-                        .map(|k| uc_user_mgmt::encrypt::parse_hex_key(&k));
-
-                    let store = match encryption_key {
-                        Some(Ok(key)) => {
-                            info!("HA1 encryption enabled (AES-256-GCM)");
-                            EncryptedUserStore::new(inner, Some(key))
-                        }
-                        Some(Err(e)) => {
-                            warn!(error = %e, "Invalid HA1 encryption key, starting without encryption");
-                            EncryptedUserStore::new(inner, None)
-                        }
-                        None => EncryptedUserStore::new(inner, None),
-                    };
-                    app_state.user_store = Some(Arc::new(store));
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to initialize user store");
-                }
-            }
-        }
+        // User store init moved to sbc-api as of PR10 — sbc-api owns
+        // /users CRUD via PostgresUserStore. The daemon no longer holds
+        // a UserStore handle here. (SIP digest auth will read the same
+        // Postgres `users` table directly once that wiring lands; until
+        // then, the daemon's auth path still relies on whatever is in
+        // its in-memory state.)
 
         // Initialize Postgres-backed config stores when a DSN is
         // configured. Same `SBC_POSTGRES_URL` env var the user store

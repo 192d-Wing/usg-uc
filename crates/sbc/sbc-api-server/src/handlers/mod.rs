@@ -24,6 +24,7 @@ mod registrations;
 mod system;
 mod trunk_groups;
 mod trunks;
+mod users;
 
 pub fn router(state: Arc<AppState>) -> Router {
     let api_v1 = Router::new()
@@ -75,6 +76,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/calls/{call_id}/terminate", post(calls::terminate))
         .route("/registrations", get(registrations::list))
         .route("/registrations/{aor}", delete(registrations::delete))
+        // Users CRUD — Postgres-backed via uc-user-mgmt as of PR10.
+        // Replaces the daemon's REST /users handlers.
+        .route("/users", get(users::list).post(users::create))
+        .route(
+            "/users/{id}",
+            get(users::get).put(users::update).delete(users::delete),
+        )
         // System endpoints. /system/version stays local (sbc-api's
         // own identity); /system/daemon-version exposes the daemon's
         // version via gRPC. The rest passthrough to SystemService.
