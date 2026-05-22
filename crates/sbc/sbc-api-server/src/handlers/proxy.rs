@@ -2,12 +2,13 @@
 //! doesn't own.
 //!
 //! sbc-api owns config entities (phones, DIDs, trunk groups, dial-plan
-//! writes), users (PR10), SIP-state reads (PR7), and trunk runtime
-//! state (PR9). What's left for the proxy: CUCM routing CRUD
-//! (partitions, CSS, route patterns/lists) and the read-only `/cdrs` +
-//! `/dialplans` views, all of which still live on the daemon until
-//! PR11. The dashboard hits sbc-api as the single front door, so we
-//! proxy what we don't own.
+//! writes), users (PR10), CUCM routing CRUD (PR11), SIP-state reads
+//! (PR7), and trunk runtime state (PR9). What's left for the proxy is
+//! the read-only `/cdrs` and `/dialplans` views, which still live on
+//! the daemon — they're cheap to expose locally there and have no
+//! Postgres or gRPC equivalent yet. The dashboard hits sbc-api as the
+//! single front door, so the catch-all forwards anything it doesn't
+//! own.
 //!
 //! Body forwarding uses reqwest's streaming-buffered shape (bytes in,
 //! bytes out). Headers are mostly stripped — the daemon will set its

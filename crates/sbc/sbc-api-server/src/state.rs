@@ -8,13 +8,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sbc_config_store::{
-    PostgresDialPlanStore, PostgresDirectoryNumberStore, PostgresPhoneStore,
+    PostgresCallingSearchSpaceStore, PostgresDialPlanStore, PostgresDirectoryNumberStore,
+    PostgresPartitionStore, PostgresPhoneStore, PostgresRouteListStore, PostgresRoutePatternStore,
     PostgresTrunkGroupStore,
 };
 use sbc_grpc_api::prelude::{
-    CallServiceClient, DialPlanSyncServiceClient, DidMappingSyncServiceClient,
-    RegistrationServiceClient, SystemServiceClient, TrunkHealthServiceClient,
-    TrunkSyncServiceClient,
+    CallServiceClient, CucmSyncServiceClient, DialPlanSyncServiceClient,
+    DidMappingSyncServiceClient, RegistrationServiceClient, SystemServiceClient,
+    TrunkHealthServiceClient, TrunkSyncServiceClient,
 };
 use uc_user_mgmt::postgres::PostgresUserStore;
 use thiserror::Error;
@@ -43,6 +44,16 @@ pub struct AppState {
     /// of PR10. SIP digest auth still happens in the daemon, but it
     /// reads through the same `users` table via its own pool.
     pub users: Arc<PostgresUserStore>,
+    /// Postgres-backed CUCM-routing stores (PR11). sbc-api owns CRUD;
+    /// after each write it notifies the daemon via `cucm_sync` so the
+    /// live router catches up without a daemon restart.
+    pub partitions: Arc<PostgresPartitionStore>,
+    /// See [`Self::partitions`].
+    pub css: Arc<PostgresCallingSearchSpaceStore>,
+    /// See [`Self::partitions`].
+    pub route_patterns: Arc<PostgresRoutePatternStore>,
+    /// See [`Self::partitions`].
+    pub route_lists: Arc<PostgresRouteListStore>,
 
     /// gRPC clients into the daemon's sync services. Cloning a tonic
     /// client is cheap (Arc<Channel> underneath) so handlers take
@@ -62,6 +73,10 @@ pub struct AppState {
     /// daemon's REST `/trunk-health`, `/trunk-registration`, and
     /// `/trunk-registration/{id}/register` endpoints (PR9).
     pub trunk_health: TrunkHealthServiceClient<Channel>,
+    /// CUCM-routing sync client (PR11) — sbc-api notifies the daemon
+    /// "I changed partition / CSS / route-pattern / route-list X,
+    /// please re-apply from Postgres to the live CucmRouter".
+    pub cucm_sync: CucmSyncServiceClient<Channel>,
 
     /// HTTP client + base URL used by the reverse-proxy fallback for
     /// endpoints sbc-api doesn't own.
@@ -100,6 +115,26 @@ impl AppState {
                 .await
                 .map_err(|e| StateError::Postgres(e.to_string()))?,
         );
+        let partitions = Arc::new(
+            PostgresPartitionStore::new(&cfg.database_url)
+                .await
+                .map_err(|e| StateError::Postgres(e.to_string()))?,
+        );
+        let css = Arc::new(
+            PostgresCallingSearchSpaceStore::new(&cfg.database_url)
+                .await
+                .map_err(|e| StateError::Postgres(e.to_string()))?,
+        );
+        let route_patterns = Arc::new(
+            PostgresRoutePatternStore::new(&cfg.database_url)
+                .await
+                .map_err(|e| StateError::Postgres(e.to_string()))?,
+        );
+        let route_lists = Arc::new(
+            PostgresRouteListStore::new(&cfg.database_url)
+                .await
+                .map_err(|e| StateError::Postgres(e.to_string()))?,
+        );
 
         info!(grpc = %cfg.daemon_grpc_url, "dialing daemon gRPC");
         // Lazy connect: tonic doesn't actually open the TCP socket
@@ -117,7 +152,8 @@ impl AppState {
         let calls = CallServiceClient::new(channel.clone());
         let registrations = RegistrationServiceClient::new(channel.clone());
         let system = SystemServiceClient::new(channel.clone());
-        let trunk_health = TrunkHealthServiceClient::new(channel);
+        let trunk_health = TrunkHealthServiceClient::new(channel.clone());
+        let cucm_sync = CucmSyncServiceClient::new(channel);
 
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -130,6 +166,10 @@ impl AppState {
             trunk_groups,
             dial_plans,
             users,
+            partitions,
+            css,
+            route_patterns,
+            route_lists,
             trunk_sync,
             dial_plan_sync,
             did_sync,
@@ -137,6 +177,7 @@ impl AppState {
             registrations,
             system,
             trunk_health,
+            cucm_sync,
             http_client,
             daemon_http_base: cfg.daemon_http_url.trim_end_matches('/').to_string(),
             start_time: std::time::Instant::now(),

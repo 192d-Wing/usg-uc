@@ -570,6 +570,55 @@ impl Runtime {
                         "PostgresDialPlanStore init exhausted retries; dial-plan writes will be ephemeral");
                 }
             }
+
+            // CUCM routing stores (PR11). Same shape as dial_plans: no
+            // JSON predecessor (these lived in-memory only), so just
+            // stand up the four stores and let the replay block below
+            // re-sync them into the CucmRouter.
+            match connect_with_retry("partitions", || {
+                sbc_config_store::PostgresPartitionStore::new(&pg_url)
+            })
+            .await
+            {
+                Ok(s) => {
+                    app_state.partition_store = Some(Arc::new(s));
+                    info!("Partition store initialized (PostgreSQL)");
+                }
+                Err(e) => warn!(error = %e, "PostgresPartitionStore init exhausted retries"),
+            }
+            match connect_with_retry("calling_search_spaces", || {
+                sbc_config_store::PostgresCallingSearchSpaceStore::new(&pg_url)
+            })
+            .await
+            {
+                Ok(s) => {
+                    app_state.css_store = Some(Arc::new(s));
+                    info!("CSS store initialized (PostgreSQL)");
+                }
+                Err(e) => warn!(error = %e, "PostgresCallingSearchSpaceStore init exhausted retries"),
+            }
+            match connect_with_retry("route_patterns", || {
+                sbc_config_store::PostgresRoutePatternStore::new(&pg_url)
+            })
+            .await
+            {
+                Ok(s) => {
+                    app_state.route_pattern_store = Some(Arc::new(s));
+                    info!("Route-pattern store initialized (PostgreSQL)");
+                }
+                Err(e) => warn!(error = %e, "PostgresRoutePatternStore init exhausted retries"),
+            }
+            match connect_with_retry("route_lists", || {
+                sbc_config_store::PostgresRouteListStore::new(&pg_url)
+            })
+            .await
+            {
+                Ok(s) => {
+                    app_state.route_list_store = Some(Arc::new(s));
+                    info!("Route-list store initialized (PostgreSQL)");
+                }
+                Err(e) => warn!(error = %e, "PostgresRouteListStore init exhausted retries"),
+            }
         }
 
         // Load seed config (from ConfigMap) then persisted trunk groups (from hostPath).
@@ -801,6 +850,65 @@ impl Runtime {
                     }
                 }
                 Err(e) => warn!(error = %e, "Failed to load dial plans from Postgres"),
+            }
+        }
+
+        // Postgres path: replay CUCM routing (partitions → CSS → route
+        // patterns → route lists) into CucmRouter. Order matters because
+        // CSSes reference partitions and route patterns reference both
+        // partitions and route lists/groups; replaying out of order
+        // would temporarily leave dangling references and could mis-
+        // route the first inbound calls after a restart.
+        if let Some(ref s) = app_state.partition_store {
+            match s.list().await {
+                Ok(rows) => {
+                    for body in &rows {
+                        crate::api_server::apply_partition_to_router(&app_state, body).await;
+                    }
+                    if !rows.is_empty() {
+                        info!(count = rows.len(), "Replayed partitions from Postgres");
+                    }
+                }
+                Err(e) => warn!(error = %e, "Failed to load partitions from Postgres"),
+            }
+        }
+        if let Some(ref s) = app_state.css_store {
+            match s.list().await {
+                Ok(rows) => {
+                    for body in &rows {
+                        crate::api_server::apply_css_to_router(&app_state, body).await;
+                    }
+                    if !rows.is_empty() {
+                        info!(count = rows.len(), "Replayed CSSes from Postgres");
+                    }
+                }
+                Err(e) => warn!(error = %e, "Failed to load CSSes from Postgres"),
+            }
+        }
+        if let Some(ref s) = app_state.route_list_store {
+            match s.list().await {
+                Ok(rows) => {
+                    for body in &rows {
+                        crate::api_server::apply_route_list_to_router(&app_state, body).await;
+                    }
+                    if !rows.is_empty() {
+                        info!(count = rows.len(), "Replayed route lists from Postgres");
+                    }
+                }
+                Err(e) => warn!(error = %e, "Failed to load route lists from Postgres"),
+            }
+        }
+        if let Some(ref s) = app_state.route_pattern_store {
+            match s.list().await {
+                Ok(rows) => {
+                    for body in &rows {
+                        crate::api_server::apply_route_pattern_to_router(&app_state, body).await;
+                    }
+                    if !rows.is_empty() {
+                        info!(count = rows.len(), "Replayed route patterns from Postgres");
+                    }
+                }
+                Err(e) => warn!(error = %e, "Failed to load route patterns from Postgres"),
             }
         }
 

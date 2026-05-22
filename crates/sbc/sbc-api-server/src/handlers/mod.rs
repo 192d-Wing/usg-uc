@@ -16,6 +16,7 @@ use tower_http::trace::TraceLayer;
 use crate::state::AppState;
 
 mod calls;
+mod cucm;
 mod dial_plans;
 mod directory;
 mod phones;
@@ -82,6 +83,39 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/users/{id}",
             get(users::get).put(users::update).delete(users::delete),
+        )
+        // CUCM routing CRUD — Postgres-backed as of PR11. Each write
+        // notifies the daemon via CucmSyncService so the live router
+        // catches up without a daemon restart. Replaces the daemon's
+        // REST /partitions, /css, /routepatterns, /routelists handlers.
+        .route(
+            "/partitions",
+            get(cucm::list_partitions).post(cucm::create_partition),
+        )
+        .route(
+            "/partitions/{id}",
+            put(cucm::update_partition).delete(cucm::delete_partition),
+        )
+        .route("/css", get(cucm::list_css).post(cucm::create_css))
+        .route(
+            "/css/{id}",
+            put(cucm::update_css).delete(cucm::delete_css),
+        )
+        .route(
+            "/routepatterns",
+            get(cucm::list_route_patterns).post(cucm::create_route_pattern),
+        )
+        .route(
+            "/routepatterns/{id}",
+            put(cucm::update_route_pattern).delete(cucm::delete_route_pattern),
+        )
+        .route(
+            "/routelists",
+            get(cucm::list_route_lists).post(cucm::create_route_list),
+        )
+        .route(
+            "/routelists/{id}",
+            put(cucm::update_route_list).delete(cucm::delete_route_list),
         )
         // System endpoints. /system/version stays local (sbc-api's
         // own identity); /system/daemon-version exposes the daemon's

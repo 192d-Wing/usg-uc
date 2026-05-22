@@ -1,0 +1,72 @@
+// SBC CUCM-Routing Sync Service
+//
+// Notification API used by sbc-api to tell the daemon "I changed CUCM
+// entity X — please re-read it from Postgres and apply it to the live
+// CucmRouter". Same ID-only pattern as TrunkSyncService and
+// DialPlanSyncService: the daemon owns Postgres reads, so the RPC
+// carries only the affected ID to keep the proto schema small and
+// proto/storage in sync by construction.
+//
+// One service covers all four entity classes (partitions, calling
+// search spaces, route patterns, route lists). Each class has Sync
+// (upsert) and Remove RPCs; the daemon's helpers translate the JSON
+// body into the typed uc_routing builder calls.
+//
+// NIST 800-53 Rev5: CM-5 (Access Restrictions for Change), AC-3.
+syntax = "proto3";
+
+package sbc.api.v1;
+
+service CucmSyncService {
+    // Partitions
+    rpc SyncPartition(SyncPartitionRequest) returns (SyncCucmResponse);
+    rpc RemovePartition(RemovePartitionRequest) returns (SyncCucmResponse);
+
+    // Calling Search Spaces
+    rpc SyncCallingSearchSpace(SyncCallingSearchSpaceRequest) returns (SyncCucmResponse);
+    rpc RemoveCallingSearchSpace(RemoveCallingSearchSpaceRequest) returns (SyncCucmResponse);
+
+    // Route Patterns
+    rpc SyncRoutePattern(SyncRoutePatternRequest) returns (SyncCucmResponse);
+    rpc RemoveRoutePattern(RemoveRoutePatternRequest) returns (SyncCucmResponse);
+
+    // Route Lists
+    rpc SyncRouteList(SyncRouteListRequest) returns (SyncCucmResponse);
+    rpc RemoveRouteList(RemoveRouteListRequest) returns (SyncCucmResponse);
+}
+
+// Shared response type — every Sync/Remove operation returns the same
+// {bool synced, string message} shape, so callers can dispatch on result
+// state without per-RPC marshaling.
+message SyncCucmResponse {
+    bool synced = 1;
+    string message = 2;
+}
+
+message SyncPartitionRequest {
+    string partition_id = 1;
+}
+message RemovePartitionRequest {
+    string partition_id = 1;
+}
+
+message SyncCallingSearchSpaceRequest {
+    string css_id = 1;
+}
+message RemoveCallingSearchSpaceRequest {
+    string css_id = 1;
+}
+
+message SyncRoutePatternRequest {
+    string pattern_id = 1;
+}
+message RemoveRoutePatternRequest {
+    string pattern_id = 1;
+}
+
+message SyncRouteListRequest {
+    string list_id = 1;
+}
+message RemoveRouteListRequest {
+    string list_id = 1;
+}

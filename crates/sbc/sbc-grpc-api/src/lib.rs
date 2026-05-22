@@ -233,6 +233,17 @@ pub mod prelude {
         ListTrunkRegistrationsResponse, RegisterTrunkRequest, RegisterTrunkResponse,
         TrunkHealthInfo, TrunkRegistrationInfo,
     };
+
+    // CUCM routing sync service (PR11) — sbc-api → daemon "I changed
+    // partition/css/route-pattern/route-list X, please re-sync from
+    // Postgres into the live CucmRouter".
+    pub use super::sbc::cucm_sync_service_client::CucmSyncServiceClient;
+    pub use super::sbc::cucm_sync_service_server::{CucmSyncService, CucmSyncServiceServer};
+    pub use super::sbc::{
+        RemoveCallingSearchSpaceRequest, RemovePartitionRequest, RemoveRouteListRequest,
+        RemoveRoutePatternRequest, SyncCallingSearchSpaceRequest, SyncCucmResponse,
+        SyncPartitionRequest, SyncRouteListRequest, SyncRoutePatternRequest,
+    };
 }
 
 #[cfg(test)]

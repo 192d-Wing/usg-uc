@@ -17,6 +17,7 @@
 //!   chosen at runtime when no DSN is configured, so existing single-pod
 //!   deploys keep working unchanged.
 
+pub mod cucm;
 pub mod dial_plans;
 pub mod directory;
 pub mod error;
@@ -25,6 +26,10 @@ pub mod model;
 pub mod phones;
 pub mod trunk_groups;
 
+pub use cucm::{
+    PostgresCallingSearchSpaceStore, PostgresPartitionStore, PostgresRouteListStore,
+    PostgresRoutePatternStore,
+};
 pub use dial_plans::PostgresDialPlanStore;
 pub use directory::PostgresDirectoryNumberStore;
 pub use error::{ConfigStoreError, ConfigStoreResult};

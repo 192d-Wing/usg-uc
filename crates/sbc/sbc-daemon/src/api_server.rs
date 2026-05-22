@@ -34,7 +34,7 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::get,
 };
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
@@ -243,6 +243,19 @@ pub struct AppState {
     /// When `Some`, dial-plan writes persist and the startup loop replays
     /// them into the router so SIP routing decisions survive restarts.
     pub dial_plan_store: Option<Arc<sbc_config_store::PostgresDialPlanStore>>,
+    /// Postgres-backed CUCM-routing stores (PR11). Pre-PR11 these lived
+    /// only in-memory inside `CucmRouter` — a daemon restart wiped them.
+    /// When `Some`, sbc-api owns the writes (and notifies via the gRPC
+    /// `CucmSyncService`) and the daemon's startup loop replays them
+    /// into the router so partition/CSS/route-pattern/route-list state
+    /// survives restarts.
+    pub partition_store: Option<Arc<sbc_config_store::PostgresPartitionStore>>,
+    /// See [`Self::partition_store`].
+    pub css_store: Option<Arc<sbc_config_store::PostgresCallingSearchSpaceStore>>,
+    /// See [`Self::partition_store`].
+    pub route_pattern_store: Option<Arc<sbc_config_store::PostgresRoutePatternStore>>,
+    /// See [`Self::partition_store`].
+    pub route_list_store: Option<Arc<sbc_config_store::PostgresRouteListStore>>,
     /// TLS acceptor for certificate hot-reload (if TLS is enabled).
     pub tls_acceptor: Option<Arc<ReloadableTlsAcceptor>>,
     /// Cluster health check function (when cluster feature is enabled).
@@ -274,6 +287,10 @@ impl AppState {
             phone_store: None,
             trunk_group_store: None,
             dial_plan_store: None,
+            partition_store: None,
+            css_store: None,
+            route_pattern_store: None,
+            route_list_store: None,
             trunk_monitor: None,
             trunk_registrar: None,
             zone_registry: None,
@@ -303,6 +320,10 @@ impl AppState {
             phone_store: None,
             trunk_group_store: None,
             dial_plan_store: None,
+            partition_store: None,
+            css_store: None,
+            route_pattern_store: None,
+            route_list_store: None,
             trunk_monitor: None,
             trunk_registrar: None,
             zone_registry: None,
@@ -456,12 +477,7 @@ impl ApiServer {
     /// exists yet) plus its own kubelet probes:
     ///
     /// - Health probes (`/healthz`, `/readyz`) — daemon pod's liveness.
-    /// - CUCM routing CRUD (`/partitions`, `/css`, `/routepatterns`,
-    ///   `/routelists`) — these mutate the CucmRouter directly and have
-    ///   no Postgres-backed store yet.
     /// - `/cdrs` — read-only CDR list, no gRPC service.
-    /// - `/trunk-health`, `/trunk-registration` — real-time runtime
-    ///   state; could become a gRPC service in a future PR.
     /// - `/dialplans` and `/dialplans/{id}/entries` (GET only) — read-
     ///   only views of the SIP router's current dial-plan state. The
     ///   write endpoints moved to sbc-api in PR3+PR5.
@@ -490,19 +506,11 @@ impl ApiServer {
             // sbc-api in PR9; backed by daemon's TrunkHealthService gRPC.)
             // (user CRUD moved to sbc-api in PR10; PostgresUserStore is
             // hit directly from sbc-api instead of via the daemon.)
-            // CUCM routing config (mutates CucmRouter directly).
-            .route("/partitions", get(list_partitions))
-            .route("/partitions", post(create_partition))
-            .route("/partitions/{id}", delete(delete_partition).put(update_partition))
-            .route("/css", get(list_css))
-            .route("/css", post(create_css))
-            .route("/css/{id}", delete(delete_css).put(update_css))
-            .route("/routepatterns", get(list_route_patterns))
-            .route("/routepatterns", post(create_route_pattern))
-            .route("/routepatterns/{id}", delete(delete_route_pattern).put(update_route_pattern))
-            .route("/routelists", get(list_route_lists))
-            .route("/routelists", post(create_route_list))
-            .route("/routelists/{id}", delete(delete_route_list).put(update_route_list));
+            // (CUCM routing CRUD — partitions, CSS, route patterns,
+            // route lists — moved to sbc-api in PR11; sbc-api owns the
+            // Postgres writes and the daemon's live router catches up
+            // via the new CucmSyncService gRPC.)
+            ;
 
         Router::new()
             // Kubelet probes — the daemon pod's own liveness/readiness.
@@ -955,6 +963,92 @@ pub async fn sync_dial_plan_to_router(state: &Arc<AppState>, plan_id: &str, entr
     tracing::info!(plan_id, entries = entries.len(), "Synced dial plan to SIP stack router");
 }
 
+/// Apply a JSON partition body to the live `CucmRouter`. Used by both
+/// the boot-time replay (when `cucm_router` is `Some`) and the gRPC
+/// `CucmSyncService.SyncPartition` handler. Idempotent: `add_partition`
+/// upserts by ID.
+pub async fn apply_partition_to_router(state: &Arc<AppState>, body: &serde_json::Value) {
+    let Some(ref router) = state.cucm_router else { return };
+    let Some(id) = body.get("id").and_then(|v| v.as_str()) else { return };
+    if id.is_empty() { return; }
+    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+    let mut p = uc_routing::Partition::new(id, name);
+    if let Some(desc) = body.get("description").and_then(|v| v.as_str()) {
+        if !desc.is_empty() { p = p.with_description(desc); }
+    }
+    router.write().await.add_partition(p);
+}
+
+/// Apply a JSON CSS body. `partitions` is an array of partition-ID
+/// strings; ordering is preserved (CUCM CSS lookup is ordered).
+pub async fn apply_css_to_router(state: &Arc<AppState>, body: &serde_json::Value) {
+    let Some(ref router) = state.cucm_router else { return };
+    let Some(id) = body.get("id").and_then(|v| v.as_str()) else { return };
+    if id.is_empty() { return; }
+    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+    let mut css = uc_routing::CallingSearchSpace::new(id, name);
+    if let Some(arr) = body.get("partitions").and_then(|v| v.as_array()) {
+        for pid in arr.iter().filter_map(|v| v.as_str()) {
+            css.add_partition(pid);
+        }
+    }
+    let mut router = router.write().await;
+    // CSS has no upsert-by-id; remove-then-add gives the same shape.
+    router.remove_css(id);
+    router.add_css(css);
+}
+
+/// Apply a JSON route-pattern body. `pattern_type` chooses the
+/// `DialPattern` variant; unknown values fall back to `prefix` to match
+/// the legacy REST handler.
+pub async fn apply_route_pattern_to_router(state: &Arc<AppState>, body: &serde_json::Value) {
+    let Some(ref router) = state.cucm_router else { return };
+    let Some(id) = body.get("id").and_then(|v| v.as_str()) else { return };
+    if id.is_empty() { return; }
+    let partition = body.get("partition_id").and_then(|v| v.as_str()).unwrap_or("");
+    let pattern_value = body.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+    let pattern_type = body.get("pattern_type").and_then(|v| v.as_str()).unwrap_or("prefix");
+    let pattern = match pattern_type {
+        "exact" => uc_routing::DialPattern::exact(pattern_value),
+        "wildcard" => uc_routing::DialPattern::wildcard(pattern_value),
+        "any" => uc_routing::DialPattern::Any,
+        _ => uc_routing::DialPattern::prefix(pattern_value),
+    };
+    let mut rp = uc_routing::RoutePattern::new(id, pattern, partition);
+    if let Some(rl) = body.get("route_list_id").and_then(|v| v.as_str()) {
+        if !rl.is_empty() { rp = rp.with_route_list(rl); }
+    }
+    if let Some(rg) = body.get("route_group_id").and_then(|v| v.as_str()) {
+        if !rg.is_empty() { rp = rp.with_route_group(rg); }
+    }
+    if let Some(desc) = body.get("description").and_then(|v| v.as_str()) {
+        if !desc.is_empty() { rp = rp.with_description(desc); }
+    }
+    if let Some(p) = body.get("priority").and_then(|v| v.as_u64()) {
+        rp = rp.with_priority(p as u32);
+    }
+    if body.get("blocked").and_then(|v| v.as_bool()).unwrap_or(false) {
+        rp = rp.with_block(true);
+    }
+    let mut router = router.write().await;
+    router.remove_route_pattern(id);
+    router.add_route_pattern(rp);
+}
+
+/// Apply a JSON route-list body. Mirrors the legacy REST shape, which
+/// only persisted `id` + `name` — member management remains TODO until
+/// the dashboard grows a UI for it.
+pub async fn apply_route_list_to_router(state: &Arc<AppState>, body: &serde_json::Value) {
+    let Some(ref router) = state.cucm_router else { return };
+    let Some(id) = body.get("id").and_then(|v| v.as_str()) else { return };
+    if id.is_empty() { return; }
+    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+    let rl = uc_routing::RouteList::new(id, name);
+    let mut router = router.write().await;
+    router.remove_route_list(id);
+    router.add_route_list(rl);
+}
+
 // ============================================================================
 // (Trunk health + registration REST handlers removed in PR9 — sbc-api
 // now calls the daemon's TrunkHealthService gRPC.)
@@ -968,324 +1062,11 @@ pub async fn sync_dial_plan_to_router(state: &Arc<AppState>, plan_id: &str, entr
 // ============================================================================
 
 // ============================================================================
-// CUCM Routing Routes (Partitions, CSS, Route Patterns, Route Lists)
+// (CUCM routing handlers removed in PR11 — sbc-api owns Postgres-
+// backed CRUD for partitions, CSS, route patterns, and route lists;
+// it notifies the daemon via CucmSyncService gRPC so the live
+// CucmRouter catches up without a daemon restart.)
 // ============================================================================
-
-async fn list_partitions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(ref router) = state.cucm_router {
-        let r = router.read().await;
-        let partitions: Vec<_> = r.list_partitions().iter().map(|p| {
-            serde_json::json!({ "id": p.id(), "name": p.name(), "description": p.description() })
-        }).collect();
-        Json(serde_json::json!({ "partitions": partitions }))
-    } else {
-        Json(serde_json::json!({ "partitions": [] }))
-    }
-}
-
-async fn create_partition(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    if let Some(ref router) = state.cucm_router {
-        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let id = body.get("id").and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .unwrap_or_else(|| name.clone());
-        let desc = body.get("description").and_then(|v| v.as_str()).map(String::from);
-        let mut partition = uc_routing::Partition::new(&id, &name);
-        if let Some(d) = desc {
-            partition = partition.with_description(d);
-        }
-        router.write().await.add_partition(partition);
-        (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "id": id })))
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "success": false })))
-    }
-}
-
-async fn delete_partition(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    if let Some(ref router) = state.cucm_router {
-        router.write().await.remove_partition(&id);
-        Json(serde_json::json!({ "success": true, "id": id }))
-    } else {
-        Json(serde_json::json!({ "success": false }))
-    }
-}
-
-/// Update a partition's name/description. ID is path-bound and immutable;
-/// `add_partition` is upsert-by-id so the existing entry is replaced.
-async fn update_partition(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    if let Some(ref router) = state.cucm_router {
-        let mut router = router.write().await;
-        if router.get_partition(&id).is_none() {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "success": false, "error": "Partition not found" })),
-            );
-        }
-        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let desc = body.get("description").and_then(|v| v.as_str()).map(String::from);
-        let mut partition = uc_routing::Partition::new(&id, &name);
-        if let Some(d) = desc {
-            partition = partition.with_description(d);
-        }
-        router.add_partition(partition);
-        (StatusCode::OK, Json(serde_json::json!({ "success": true, "id": id })))
-    } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "success": false, "error": "Router not configured" })),
-        )
-    }
-}
-
-async fn list_css(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(ref router) = state.cucm_router {
-        let r = router.read().await;
-        let css_list: Vec<_> = r.list_css().iter().map(|c| {
-            serde_json::json!({
-                "id": c.id(), "name": c.name(),
-                "partitions": c.partitions(), "partition_count": c.partition_count()
-            })
-        }).collect();
-        Json(serde_json::json!({ "calling_search_spaces": css_list }))
-    } else {
-        Json(serde_json::json!({ "calling_search_spaces": [] }))
-    }
-}
-
-async fn create_css(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    if let Some(ref router) = state.cucm_router {
-        let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
-        let partitions: Vec<String> = body.get("partitions")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            .unwrap_or_default();
-        let mut css = uc_routing::CallingSearchSpace::new(&id, &name);
-        for p in &partitions {
-            css.add_partition(p);
-        }
-        router.write().await.add_css(css);
-        (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "id": id })))
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "success": false })))
-    }
-}
-
-async fn delete_css(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    if let Some(ref router) = state.cucm_router {
-        router.write().await.remove_css(&id);
-        Json(serde_json::json!({ "success": true, "id": id }))
-    } else {
-        Json(serde_json::json!({ "success": false }))
-    }
-}
-
-/// Update a CSS (replace partitions).
-async fn update_css(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    if let Some(ref router) = state.cucm_router {
-        // Remove old, add new
-        router.write().await.remove_css(&id);
-        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
-        let partitions: Vec<String> = body.get("partitions")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            .unwrap_or_default();
-        let mut css = uc_routing::CallingSearchSpace::new(&id, &name);
-        for p in &partitions {
-            css.add_partition(p);
-        }
-        router.write().await.add_css(css);
-        Json(serde_json::json!({ "success": true, "id": id }))
-    } else {
-        Json(serde_json::json!({ "success": false }))
-    }
-}
-
-async fn list_route_patterns(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(ref router) = state.cucm_router {
-        let r = router.read().await;
-        let patterns: Vec<_> = r.list_route_patterns().iter().map(|p| {
-            let pattern_str = match p.pattern() {
-                uc_routing::DialPattern::Exact(v) => v.clone(),
-                uc_routing::DialPattern::Prefix(v) => v.clone(),
-                uc_routing::DialPattern::Wildcard(v) => v.clone(),
-                uc_routing::DialPattern::Regex(v) => v.clone(),
-                uc_routing::DialPattern::Any => "*".to_string(),
-            };
-            serde_json::json!({
-                "id": p.id(),
-                "pattern": pattern_str,
-                "partition_id": p.partition_id(),
-                "route_list_id": p.route_list_id(),
-                "route_group_id": p.route_group_id(),
-                "description": p.description(),
-                "priority": p.priority(),
-                "blocked": p.is_blocked()
-            })
-        }).collect();
-        Json(serde_json::json!({ "route_patterns": patterns }))
-    } else {
-        Json(serde_json::json!({ "route_patterns": [] }))
-    }
-}
-
-async fn create_route_pattern(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    if let Some(ref router) = state.cucm_router {
-        let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let partition = body.get("partition_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let pattern_value = body.get("pattern").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let pattern_type = body.get("pattern_type").and_then(|v| v.as_str()).unwrap_or("prefix");
-
-        let pattern = match pattern_type {
-            "exact" => uc_routing::DialPattern::exact(&pattern_value),
-            "wildcard" => uc_routing::DialPattern::wildcard(&pattern_value),
-            "any" => uc_routing::DialPattern::Any,
-            _ => uc_routing::DialPattern::prefix(&pattern_value),
-        };
-
-        let mut rp = uc_routing::RoutePattern::new(&id, pattern, &partition);
-        if let Some(rl) = body.get("route_list_id").and_then(|v| v.as_str()) {
-            if !rl.is_empty() { rp = rp.with_route_list(rl); }
-        }
-        if let Some(rg) = body.get("route_group_id").and_then(|v| v.as_str()) {
-            if !rg.is_empty() { rp = rp.with_route_group(rg); }
-        }
-        if let Some(desc) = body.get("description").and_then(|v| v.as_str()) {
-            rp = rp.with_description(desc);
-        }
-        if let Some(pri) = body.get("priority").and_then(|v| v.as_u64()) {
-            rp = rp.with_priority(pri as u32);
-        }
-
-        router.write().await.add_route_pattern(rp);
-        (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "id": id })))
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "success": false })))
-    }
-}
-
-async fn delete_route_pattern(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    if let Some(ref router) = state.cucm_router {
-        router.write().await.remove_route_pattern(&id);
-        Json(serde_json::json!({ "success": true, "id": id }))
-    } else {
-        Json(serde_json::json!({ "success": false }))
-    }
-}
-
-/// Update a route pattern (delete + recreate).
-async fn update_route_pattern(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    if let Some(ref router) = state.cucm_router {
-        router.write().await.remove_route_pattern(&id);
-        let partition = body.get("partition_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let pattern_value = body.get("pattern").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let pattern = uc_routing::DialPattern::prefix(&pattern_value);
-        let mut rp = uc_routing::RoutePattern::new(&id, pattern, &partition);
-        if let Some(rl) = body.get("route_list_id").and_then(|v| v.as_str()) {
-            rp = rp.with_route_list(rl);
-        }
-        if let Some(rg) = body.get("route_group_id").and_then(|v| v.as_str()) {
-            rp = rp.with_route_group(rg);
-        }
-        if body.get("blocked").and_then(|v| v.as_bool()).unwrap_or(false) {
-            rp = rp.with_block(true);
-        }
-        if let Some(p) = body.get("priority").and_then(|v| v.as_u64()) {
-            rp = rp.with_priority(p as u32);
-        }
-        router.write().await.add_route_pattern(rp);
-        Json(serde_json::json!({ "success": true, "id": id }))
-    } else {
-        Json(serde_json::json!({ "success": false }))
-    }
-}
-
-async fn list_route_lists(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(ref router) = state.cucm_router {
-        let r = router.read().await;
-        let lists: Vec<_> = r.list_route_lists().iter().map(|l| {
-            serde_json::json!({ "id": l.id(), "name": l.name(), "member_count": l.member_count() })
-        }).collect();
-        Json(serde_json::json!({ "route_lists": lists }))
-    } else {
-        Json(serde_json::json!({ "route_lists": [] }))
-    }
-}
-
-async fn create_route_list(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    if let Some(ref router) = state.cucm_router {
-        let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
-        let rl = uc_routing::RouteList::new(&id, &name);
-        router.write().await.add_route_list(rl);
-        (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "id": id })))
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "success": false })))
-    }
-}
-
-async fn delete_route_list(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    if let Some(ref router) = state.cucm_router {
-        router.write().await.remove_route_list(&id);
-        Json(serde_json::json!({ "success": true, "id": id }))
-    } else {
-        Json(serde_json::json!({ "success": false }))
-    }
-}
-
-/// Update a route list.
-async fn update_route_list(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    if let Some(ref router) = state.cucm_router {
-        router.write().await.remove_route_list(&id);
-        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
-        let rl = uc_routing::RouteList::new(&id, &name);
-        router.write().await.add_route_list(rl);
-        Json(serde_json::json!({ "success": true, "id": id }))
-    } else {
-        Json(serde_json::json!({ "success": false }))
-    }
-}
 
 // ============================================================================
 // (TLS handlers removed in PR8 — sbc-api now reaches the daemon's
