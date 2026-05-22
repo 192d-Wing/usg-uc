@@ -34,6 +34,7 @@ mod did_mapping_sync_service;
 mod health_service;
 mod registration_service;
 mod system_service;
+mod trunk_health_service;
 mod trunk_sync_service;
 
 use crate::api_server::AppState;
@@ -50,6 +51,7 @@ use sbc_grpc_api::sbc::dial_plan_sync_service_server::DialPlanSyncServiceServer;
 use sbc_grpc_api::sbc::did_mapping_sync_service_server::DidMappingSyncServiceServer;
 use sbc_grpc_api::sbc::registration_service_server::RegistrationServiceServer;
 use sbc_grpc_api::sbc::system_service_server::SystemServiceServer;
+use sbc_grpc_api::sbc::trunk_health_service_server::TrunkHealthServiceServer;
 use sbc_grpc_api::sbc::trunk_sync_service_server::TrunkSyncServiceServer;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -66,6 +68,7 @@ pub use did_mapping_sync_service::DidMappingSyncServiceImpl;
 pub use health_service::HealthServiceImpl;
 pub use registration_service::RegistrationServiceImpl;
 pub use system_service::SystemServiceImpl;
+pub use trunk_health_service::TrunkHealthServiceImpl;
 pub use trunk_sync_service::TrunkSyncServiceImpl;
 
 /// gRPC API server.
@@ -176,6 +179,7 @@ impl GrpcServer {
         let trunk_sync_svc = TrunkSyncServiceImpl::new(Arc::clone(&self.state));
         let dial_plan_sync_svc = DialPlanSyncServiceImpl::new(Arc::clone(&self.state));
         let did_mapping_sync_svc = DidMappingSyncServiceImpl::new(Arc::clone(&self.state));
+        let trunk_health_svc = TrunkHealthServiceImpl::new(Arc::clone(&self.state));
 
         // Configure TLS if enabled
         let tls_config = self.configure_tls()?;
@@ -203,7 +207,8 @@ impl GrpcServer {
             .add_service(RegistrationServiceServer::new(registration_svc))
             .add_service(TrunkSyncServiceServer::new(trunk_sync_svc))
             .add_service(DialPlanSyncServiceServer::new(dial_plan_sync_svc))
-            .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc));
+            .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc))
+            .add_service(TrunkHealthServiceServer::new(trunk_health_svc));
 
         // Build router with reflection but no cluster
         #[cfg(all(not(feature = "cluster"), feature = "grpc-reflection"))]
@@ -216,7 +221,8 @@ impl GrpcServer {
                 .add_service(RegistrationServiceServer::new(registration_svc))
             .add_service(TrunkSyncServiceServer::new(trunk_sync_svc))
             .add_service(DialPlanSyncServiceServer::new(dial_plan_sync_svc))
-            .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc));
+            .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc))
+            .add_service(TrunkHealthServiceServer::new(trunk_health_svc));
 
             // Add reflection service if enabled in config
             if self.config.enable_reflection {
@@ -244,7 +250,8 @@ impl GrpcServer {
                 .add_service(RegistrationServiceServer::new(registration_svc))
             .add_service(TrunkSyncServiceServer::new(trunk_sync_svc))
             .add_service(DialPlanSyncServiceServer::new(dial_plan_sync_svc))
-            .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc));
+            .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc))
+            .add_service(TrunkHealthServiceServer::new(trunk_health_svc));
 
             // Add ClusterService if cluster manager is available
             if let Some(cluster) = &self.cluster {
@@ -268,7 +275,8 @@ impl GrpcServer {
                 .add_service(RegistrationServiceServer::new(registration_svc))
             .add_service(TrunkSyncServiceServer::new(trunk_sync_svc))
             .add_service(DialPlanSyncServiceServer::new(dial_plan_sync_svc))
-            .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc));
+            .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc))
+            .add_service(TrunkHealthServiceServer::new(trunk_health_svc));
 
             // Add ClusterService if cluster manager is available
             let with_cluster = if let Some(cluster) = &self.cluster {

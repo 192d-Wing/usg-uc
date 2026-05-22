@@ -221,6 +221,18 @@ pub mod prelude {
         RemoveDirectoryNumberRequest, RemoveDirectoryNumberResponse, SyncDirectoryNumberRequest,
         SyncDirectoryNumberResponse,
     };
+
+    // Trunk health + registration service — replaces the daemon's REST
+    // /trunk-health and /trunk-registration[/{id}/register] endpoints.
+    pub use super::sbc::trunk_health_service_client::TrunkHealthServiceClient;
+    pub use super::sbc::trunk_health_service_server::{
+        TrunkHealthService, TrunkHealthServiceServer,
+    };
+    pub use super::sbc::{
+        ListTrunkHealthRequest, ListTrunkHealthResponse, ListTrunkRegistrationsRequest,
+        ListTrunkRegistrationsResponse, RegisterTrunkRequest, RegisterTrunkResponse,
+        TrunkHealthInfo, TrunkRegistrationInfo,
+    };
 }
 
 #[cfg(test)]

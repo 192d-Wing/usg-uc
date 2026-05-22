@@ -491,10 +491,8 @@ impl ApiServer {
             .route("/dialplans/{plan_id}/entries", get(get_dial_plan_entries))
             // CDR list (no gRPC equivalent yet).
             .route("/cdrs", get(get_cdrs))
-            // Trunk health + registration runtime state (no gRPC yet).
-            .route("/trunk-health", get(get_trunk_health))
-            .route("/trunk-registration", get(get_trunk_registration_status))
-            .route("/trunk-registration/{trunk_id}/register", post(trigger_trunk_register))
+            // (trunk-health and trunk-registration routes moved to
+            // sbc-api in PR9; backed by daemon's TrunkHealthService gRPC.)
             // User management (uc-user-mgmt store, not Postgres-shared
             // via sbc-config-store).
             .route("/users", get(list_users))
@@ -967,90 +965,9 @@ pub async fn sync_dial_plan_to_router(state: &Arc<AppState>, plan_id: &str, entr
 }
 
 // ============================================================================
-// Trunk Health Monitoring
+// (Trunk health + registration REST handlers removed in PR9 — sbc-api
+// now calls the daemon's TrunkHealthService gRPC.)
 // ============================================================================
-
-/// Get health status for all monitored trunks.
-async fn get_trunk_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(ref monitor) = state.trunk_monitor {
-        let statuses = monitor.get_all_status().await;
-        Json(serde_json::json!({ "trunk_health": statuses }))
-    } else {
-        Json(serde_json::json!({ "trunk_health": [], "message": "Trunk monitor not configured" }))
-    }
-}
-
-/// Get trunk registration statuses.
-async fn get_trunk_registration_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(ref registrar) = state.trunk_registrar {
-        let statuses = registrar.get_all_status().await;
-        Json(serde_json::json!({ "trunk_registrations": statuses }))
-    } else {
-        Json(serde_json::json!({ "trunk_registrations": [] }))
-    }
-}
-
-/// Trigger trunk registration for a specific trunk.
-async fn trigger_trunk_register(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(trunk_id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    // Look up the trunk's credentials. Postgres path scans `list()`;
-    // MemStore path scans the in-memory map. Either way it's O(groups *
-    // trunks-per-group) — operator-scale, not on the SIP path, no index
-    // needed.
-    let groups: Vec<serde_json::Value> = if let Some(ref store) = state.trunk_group_store {
-        store.list().await.unwrap_or_default()
-    } else {
-        let mem = state.mem_store.read().await;
-        mem.trunk_groups.values().cloned().collect()
-    };
-    let mut found_trunk = None;
-    for group in &groups {
-        if let Some(trunks) = group.get("trunks").and_then(|v| v.as_array()) {
-            for t in trunks {
-                if t.get("id").and_then(|v| v.as_str()) == Some(&trunk_id) {
-                    found_trunk = Some(t.clone());
-                    break;
-                }
-            }
-        }
-        if found_trunk.is_some() {
-            break;
-        }
-    }
-
-    let Some(trunk) = found_trunk else {
-        return Json(serde_json::json!({ "success": false, "error": "Trunk not found" }));
-    };
-
-    let username = trunk.get("sip_username").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let password = trunk.get("sip_password").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let host = trunk.get("host").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let port = trunk.get("port").and_then(|v| v.as_u64()).unwrap_or(5060) as u16;
-
-    if username.is_empty() || host.is_empty() {
-        return Json(serde_json::json!({ "success": false, "error": "Trunk missing SIP credentials or host" }));
-    }
-
-    if let Some(ref registrar) = state.trunk_registrar {
-        let config = crate::trunk_registrar::TrunkRegConfig {
-            trunk_id: trunk_id.clone(),
-            host: host.clone(),
-            port,
-            username,
-            password,
-            domain: host,
-            expires: 3600,
-            bind_ip: None,
-            external_ip: None,
-        };
-        registrar.register_trunk(config);
-        Json(serde_json::json!({ "success": true, "message": format!("Registration started for {trunk_id}") }))
-    } else {
-        Json(serde_json::json!({ "success": false, "error": "Trunk registrar not configured" }))
-    }
-}
 
 // ============================================================================
 // User Management Routes

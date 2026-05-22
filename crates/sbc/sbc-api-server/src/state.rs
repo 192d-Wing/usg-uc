@@ -13,7 +13,8 @@ use sbc_config_store::{
 };
 use sbc_grpc_api::prelude::{
     CallServiceClient, DialPlanSyncServiceClient, DidMappingSyncServiceClient,
-    RegistrationServiceClient, SystemServiceClient, TrunkSyncServiceClient,
+    RegistrationServiceClient, SystemServiceClient, TrunkHealthServiceClient,
+    TrunkSyncServiceClient,
 };
 use thiserror::Error;
 use tonic::transport::{Channel, Endpoint};
@@ -52,6 +53,10 @@ pub struct AppState {
     pub calls: CallServiceClient<Channel>,
     pub registrations: RegistrationServiceClient<Channel>,
     pub system: SystemServiceClient<Channel>,
+    /// Runtime trunk-state reads + RegisterTrunk trigger. Replaces the
+    /// daemon's REST `/trunk-health`, `/trunk-registration`, and
+    /// `/trunk-registration/{id}/register` endpoints (PR9).
+    pub trunk_health: TrunkHealthServiceClient<Channel>,
 
     /// HTTP client + base URL used by the reverse-proxy fallback for
     /// endpoints sbc-api doesn't own.
@@ -101,7 +106,8 @@ impl AppState {
         let did_sync = DidMappingSyncServiceClient::new(channel.clone());
         let calls = CallServiceClient::new(channel.clone());
         let registrations = RegistrationServiceClient::new(channel.clone());
-        let system = SystemServiceClient::new(channel);
+        let system = SystemServiceClient::new(channel.clone());
+        let trunk_health = TrunkHealthServiceClient::new(channel);
 
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -119,6 +125,7 @@ impl AppState {
             calls,
             registrations,
             system,
+            trunk_health,
             http_client,
             daemon_http_base: cfg.daemon_http_url.trim_end_matches('/').to_string(),
             start_time: std::time::Instant::now(),

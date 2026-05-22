@@ -23,6 +23,7 @@ mod proxy;
 mod registrations;
 mod system;
 mod trunk_groups;
+mod trunks;
 
 pub fn router(state: Arc<AppState>) -> Router {
     let api_v1 = Router::new()
@@ -82,6 +83,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/system/metrics", get(system::metrics))
         .route("/system/tls", get(system::tls_status))
         .route("/system/tls/reload", post(system::tls_reload))
+        // Trunk runtime state — replaces HTTP-proxy to daemon REST
+        // with direct TrunkHealthService gRPC (PR9).
+        .route("/trunk-health", get(trunks::list_health))
+        .route("/trunk-registration", get(trunks::list_registrations))
+        .route(
+            "/trunk-registration/{trunk_id}/register",
+            post(trunks::register),
+        )
         .with_state(Arc::clone(&state));
 
     // Catch-all for /api/v1/* paths we don't handle locally. Matches

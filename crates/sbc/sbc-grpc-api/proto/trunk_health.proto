@@ -1,0 +1,78 @@
+// SBC Trunk Health + Registration Service
+//
+// Read-side view of runtime trunk state — OPTIONS-ping health monitor
+// and outbound carrier-registration status — plus a Register trigger
+// for manually kicking a re-registration. sbc-api proxies the matching
+// REST routes here so the daemon's REST endpoints (`/api/v1/trunk-
+// health`, `/api/v1/trunk-registration[/{id}/register]`) can be
+// removed entirely.
+//
+// NIST 800-53 Rev5: AU-2 (event logging — all reads logged), AC-3.
+syntax = "proto3";
+
+package sbc.api.v1;
+
+service TrunkHealthService {
+    // ListTrunkHealth returns the OPTIONS-ping health snapshot for every
+    // monitored trunk.
+    rpc ListTrunkHealth(ListTrunkHealthRequest) returns (ListTrunkHealthResponse);
+
+    // ListTrunkRegistrations returns each trunk's outbound-registration
+    // status (registrar URI, last registered at, attempt/success counts).
+    rpc ListTrunkRegistrations(ListTrunkRegistrationsRequest) returns (ListTrunkRegistrationsResponse);
+
+    // RegisterTrunk kicks a fresh REGISTER attempt for the named trunk.
+    // Daemon resolves credentials from Postgres (or MemStore fallback)
+    // before calling the trunk registrar.
+    rpc RegisterTrunk(RegisterTrunkRequest) returns (RegisterTrunkResponse);
+}
+
+message TrunkHealthInfo {
+    string trunk_id = 1;
+    bool reachable = 2;
+    // Last OPTIONS response time in ms; absent before first reply.
+    int64 last_response_ms = 3;
+    int64 last_success_epoch = 4;
+    int64 last_failure_epoch = 5;
+    uint32 consecutive_success = 6;
+    uint32 consecutive_failures = 7;
+    uint64 total_pings = 8;
+    uint64 total_success = 9;
+    double uptime_pct = 10;
+    int64 in_service_since_epoch = 11;
+}
+
+message ListTrunkHealthRequest {}
+
+message ListTrunkHealthResponse {
+    repeated TrunkHealthInfo trunks = 1;
+}
+
+message TrunkRegistrationInfo {
+    string trunk_id = 1;
+    bool registered = 2;
+    // Free-form lifecycle state: "registered", "expiring", "failed", …
+    string state = 3;
+    string registrar = 4;
+    string username = 5;
+    int64 last_registered_epoch = 6;
+    string last_error = 7;
+    uint32 expires_secs = 8;
+    uint64 attempts = 9;
+    uint64 successes = 10;
+}
+
+message ListTrunkRegistrationsRequest {}
+
+message ListTrunkRegistrationsResponse {
+    repeated TrunkRegistrationInfo trunks = 1;
+}
+
+message RegisterTrunkRequest {
+    string trunk_id = 1;
+}
+
+message RegisterTrunkResponse {
+    bool success = 1;
+    string message = 2;
+}
