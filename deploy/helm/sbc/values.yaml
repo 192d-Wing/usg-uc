@@ -49,8 +49,14 @@ bgp:
 externalDns:
   enabled: true
 
+# Image references use the `localhost/` prefix because kubelet caches
+# image-missing state by the exact reference string; after a kubelet
+# image-GC sweep (triggered by disk pressure), the bare `sbc-daemon:local`
+# reference stays poisoned until kubelite restarts. `localhost/` is the
+# default repo containerd applies on `ctr image import` of an unprefixed
+# tag, so this is also what `microk8s ctr` already stores under.
 image:
-  repository: sbc-daemon
+  repository: localhost/sbc-daemon
   tag: local
   pullPolicy: Never
 
@@ -62,7 +68,7 @@ sbcFrontend:
   enabled: true
   replicas: 2                            # rolling update is meaningful at >1
   image:
-    repository: sbc-frontend
+    repository: localhost/sbc-frontend
     tag: local
     pullPolicy: Never
   resources:
@@ -109,7 +115,7 @@ sbcApi:
   enabled: true
   replicas: 2                            # rolling update needs >1
   image:
-    repository: sbc-api-server
+    repository: localhost/sbc-api-server
     tag: local
     pullPolicy: Never
   resources:
@@ -125,7 +131,7 @@ sbcProvision:
   enabled: true
   replicas: 2
   image:
-    repository: sbc-provision-server
+    repository: localhost/sbc-provision-server
     tag: local
     pullPolicy: Never
   resources:
