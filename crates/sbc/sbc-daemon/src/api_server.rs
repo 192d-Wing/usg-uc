@@ -1035,15 +1035,46 @@ pub async fn apply_route_pattern_to_router(state: &Arc<AppState>, body: &serde_j
     router.add_route_pattern(rp);
 }
 
-/// Apply a JSON route-list body. Mirrors the legacy REST shape, which
-/// only persisted `id` + `name` — member management remains TODO until
-/// the dashboard grows a UI for it.
+/// Apply a JSON route-list body, including its ordered members.
+///
+/// Body shape:
+/// ```json
+/// {
+///   "id": "rl-us",
+///   "name": "US PSTN",
+///   "description": "optional",
+///   "members": [
+///     {"route_group_id": "rg-bulkvs", "priority": 1},
+///     {"route_group_id": "rg-backup", "priority": 2}
+///   ]
+/// }
+/// ```
+///
+/// `priority` is optional and defaults to `members.len()` (i.e., the
+/// array order doubles as the priority when callers don't care).
+/// Per-member digit transforms aren't wired here yet; add them when a
+/// dashboard caller needs them.
 pub async fn apply_route_list_to_router(state: &Arc<AppState>, body: &serde_json::Value) {
     let Some(ref router) = state.cucm_router else { return };
     let Some(id) = body.get("id").and_then(|v| v.as_str()) else { return };
     if id.is_empty() { return; }
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(id);
-    let rl = uc_routing::RouteList::new(id, name);
+    let mut rl = uc_routing::RouteList::new(id, name);
+    if let Some(desc) = body.get("description").and_then(|v| v.as_str()) {
+        if !desc.is_empty() { rl = rl.with_description(desc); }
+    }
+    if let Some(members) = body.get("members").and_then(|v| v.as_array()) {
+        for (idx, m) in members.iter().enumerate() {
+            let Some(rg_id) = m.get("route_group_id").and_then(|v| v.as_str()) else { continue };
+            if rg_id.is_empty() { continue; }
+            let priority = m
+                .get("priority")
+                .and_then(|v| v.as_u64())
+                .map(|p| p as u32)
+                .unwrap_or((idx + 1) as u32);
+            rl.add_member(uc_routing::RouteListMember::new(rg_id, priority));
+        }
+    }
     let mut router = router.write().await;
     router.remove_route_list(id);
     router.add_route_list(rl);
