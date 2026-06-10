@@ -20,7 +20,7 @@ use proto_srtp::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -67,8 +67,10 @@ impl Default for MediaPipelineConfig {
 
 /// Allocates RTP port pairs (even=RTP, odd=RTCP) from a configured range.
 pub struct RtpPortAllocator {
-    /// Next port to try.
-    next_port: AtomicU16,
+    /// Monotonically increasing pair index (modulo the usable pair count).
+    /// u32 so the u16 wraparound of long-running allocation cannot
+    /// underflow/overflow the port arithmetic.
+    next_index: AtomicU32,
     /// Minimum port in range.
     min_port: u16,
     /// Maximum port in range.
@@ -79,37 +81,59 @@ pub struct RtpPortAllocator {
 
 impl RtpPortAllocator {
     /// Creates a new port allocator.
+    ///
+    /// A reversed range is swapped (with a warning) rather than panicking
+    /// in the port arithmetic later.
     pub fn new(min_port: u16, max_port: u16) -> Self {
+        let (min_port, max_port) = if min_port <= max_port {
+            (min_port, max_port)
+        } else {
+            warn!(min_port, max_port, "RTP port range reversed, swapping");
+            (max_port, min_port)
+        };
         // Ensure min_port is even for RTP convention
-        let min_port = if min_port.is_multiple_of(2) { min_port } else { min_port + 1 };
+        let min_port = if min_port.is_multiple_of(2) {
+            min_port
+        } else {
+            min_port.saturating_add(1)
+        };
         Self {
-            next_port: AtomicU16::new(min_port),
+            next_index: AtomicU32::new(0),
             min_port,
             max_port,
             allocated: RwLock::new(std::collections::HashSet::new()),
         }
     }
 
+    /// Number of usable (RTP, RTCP) port pairs in the range.
+    fn pair_count(&self) -> u32 {
+        if self.max_port <= self.min_port {
+            return 0;
+        }
+        // Each pair occupies (even, even+1); both ends inclusive.
+        (u32::from(self.max_port) - u32::from(self.min_port) + 1) / 2
+    }
+
     /// Allocates an even-numbered RTP port. Returns (rtp_port, rtcp_port).
     pub async fn allocate_pair(&self) -> Result<(u16, u16), MediaPipelineError> {
         let mut allocated = self.allocated.write().await;
-        let range_size = (self.max_port - self.min_port) / 2;
+        let pairs = self.pair_count();
+        if pairs == 0 {
+            return Err(MediaPipelineError::PortExhausted);
+        }
 
-        for _ in 0..range_size {
-            let port = self.next_port.fetch_add(2, Ordering::Relaxed);
-            // Wrap around
-            let port = self.min_port + ((port - self.min_port) % (self.max_port - self.min_port));
-            // Ensure even
-            let port = if port.is_multiple_of(2) { port } else { port + 1 };
+        for _ in 0..pairs {
+            let index = self.next_index.fetch_add(1, Ordering::Relaxed) % pairs;
+            // index < pairs guarantees rtp <= max_port - 1, so rtcp fits
+            // without overflow.
+            #[allow(clippy::cast_possible_truncation)]
+            let rtp = self.min_port + (index as u16) * 2;
+            let rtcp = rtp + 1;
 
-            if port + 1 >= self.max_port {
-                continue;
-            }
-
-            if !allocated.contains(&port) {
-                allocated.insert(port);
-                allocated.insert(port + 1);
-                return Ok((port, port + 1));
+            if !allocated.contains(&rtp) {
+                allocated.insert(rtp);
+                allocated.insert(rtcp);
+                return Ok((rtp, rtcp));
             }
         }
 
@@ -789,10 +813,17 @@ impl MediaPipeline {
                 .unprotect_rtp(data)
                 .map_err(|e| MediaPipelineError::DecryptionFailed(e.to_string()))?
         } else {
-            // Parse as unencrypted RTP
+            // Parse as unencrypted RTP. Guard the payload slice: never trust
+            // the parser's header_size against attacker-controlled input.
             let (header, header_size) = RtpHeader::parse(data)
                 .map_err(|e| MediaPipelineError::DecryptionFailed(e.to_string()))?;
-            RtpPacket::new(header, data[header_size..].to_vec())
+            let payload = data.get(header_size..).ok_or_else(|| {
+                MediaPipelineError::DecryptionFailed(format!(
+                    "RTP header size {header_size} exceeds packet length {}",
+                    data.len()
+                ))
+            })?;
+            RtpPacket::new(header, payload.to_vec())
         };
 
         // Track sequence for the packet
@@ -930,69 +961,38 @@ impl MediaPipeline {
         // Shutdown channel
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        // Spawn A→B relay task
-        let a_sock = Arc::clone(&a_socket);
-        let b_sock = Arc::clone(&b_socket);
+        // Per-leg send targets, shared between the two directions so that
+        // symmetric-RTP latching on one leg redirects the opposite
+        // direction's sends (RFC 4961: reply to where media actually
+        // arrives from, not where SDP claimed it would).
+        let a_addr: std::net::SocketAddr = a_remote.into();
         let b_addr: std::net::SocketAddr = b_remote.into();
-        let call_id_ab = call_id.to_string();
-        let mut shutdown_ab = shutdown_rx.clone();
+        let a_target = Arc::new(std::sync::RwLock::new(a_addr));
+        let b_target = Arc::new(std::sync::RwLock::new(b_addr));
 
-        let handle_ab = tokio::spawn(async move {
-            let mut buf = [0u8; 2048];
-            loop {
-                tokio::select! {
-                    result = a_sock.recv_from(&mut buf) => {
-                        match result {
-                            Ok((n, _src)) => {
-                                if let Err(e) = b_sock.send_to(&buf[..n], b_addr).await {
-                                    debug!(error = %e, call_id = %call_id_ab, "A→B relay send error");
-                                }
-                            }
-                            Err(e) => {
-                                debug!(error = %e, call_id = %call_id_ab, "A→B relay recv error");
-                                break;
-                            }
-                        }
-                    }
-                    _ = shutdown_ab.changed() => {
-                        debug!(call_id = %call_id_ab, "A→B relay shutdown");
-                        break;
-                    }
-                }
-            }
-        });
+        // Spawn A→B relay task
+        let handle_ab = tokio::spawn(relay_leg(
+            Arc::clone(&a_socket),
+            Arc::clone(&b_socket),
+            a_addr,
+            Arc::clone(&a_target),
+            Arc::clone(&b_target),
+            call_id.to_string(),
+            "A→B",
+            shutdown_rx.clone(),
+        ));
 
         // Spawn B→A relay task
-        let a_sock = Arc::clone(&a_socket);
-        let b_sock = Arc::clone(&b_socket);
-        let a_addr: std::net::SocketAddr = a_remote.into();
-        let call_id_ba = call_id.to_string();
-        let mut shutdown_ba = shutdown_rx;
-
-        let handle_ba = tokio::spawn(async move {
-            let mut buf = [0u8; 2048];
-            loop {
-                tokio::select! {
-                    result = b_sock.recv_from(&mut buf) => {
-                        match result {
-                            Ok((n, _src)) => {
-                                if let Err(e) = a_sock.send_to(&buf[..n], a_addr).await {
-                                    debug!(error = %e, call_id = %call_id_ba, "B→A relay send error");
-                                }
-                            }
-                            Err(e) => {
-                                debug!(error = %e, call_id = %call_id_ba, "B→A relay recv error");
-                                break;
-                            }
-                        }
-                    }
-                    _ = shutdown_ba.changed() => {
-                        debug!(call_id = %call_id_ba, "B→A relay shutdown");
-                        break;
-                    }
-                }
-            }
-        });
+        let handle_ba = tokio::spawn(relay_leg(
+            Arc::clone(&b_socket),
+            Arc::clone(&a_socket),
+            b_addr,
+            Arc::clone(&b_target),
+            Arc::clone(&a_target),
+            call_id.to_string(),
+            "B→A",
+            shutdown_rx,
+        ));
 
         ctx.relay_handles = vec![handle_ab, handle_ba];
         ctx.relay_shutdown = Some(shutdown_tx);
@@ -1069,14 +1069,101 @@ impl MediaPipeline {
     }
 }
 
+/// One direction of the RTP relay with source validation and symmetric-RTP
+/// latching.
+///
+/// Before latching, only packets whose source IP matches the SDP-negotiated
+/// remote are forwarded (the port may differ behind NAT). The first accepted
+/// packet latches the exact source: subsequent packets must match it, and
+/// the opposite direction's send target is updated so replies go to where
+/// media actually arrives from (RFC 4961 symmetric RTP). Packets from any
+/// other source are dropped and counted — an off-path attacker who learns
+/// the media port can no longer inject into or overwrite the stream.
+///
+/// ## NIST 800-53 Rev5: SC-7 (Boundary Protection), SC-8
+#[allow(clippy::too_many_arguments)]
+async fn relay_leg(
+    recv_sock: Arc<UdpSocket>,
+    send_sock: Arc<UdpSocket>,
+    expected_remote: std::net::SocketAddr,
+    recv_target: Arc<std::sync::RwLock<std::net::SocketAddr>>,
+    forward_target: Arc<std::sync::RwLock<std::net::SocketAddr>>,
+    call_id: String,
+    direction: &'static str,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut buf = [0u8; 2048];
+    let mut latched: Option<std::net::SocketAddr> = None;
+    let mut dropped: u64 = 0;
+
+    loop {
+        tokio::select! {
+            result = recv_sock.recv_from(&mut buf) => {
+                match result {
+                    Ok((n, src)) => {
+                        let acceptable = match latched {
+                            Some(latched_src) => src == latched_src,
+                            None => src.ip() == expected_remote.ip(),
+                        };
+                        if !acceptable {
+                            dropped += 1;
+                            if dropped == 1 || dropped.is_multiple_of(1000) {
+                                warn!(
+                                    call_id = %call_id,
+                                    direction,
+                                    source = %src,
+                                    expected = %expected_remote,
+                                    dropped,
+                                    "Dropping RTP from unexpected source"
+                                );
+                            }
+                            continue;
+                        }
+
+                        if latched.is_none() {
+                            latched = Some(src);
+                            if src != expected_remote {
+                                debug!(
+                                    call_id = %call_id,
+                                    direction,
+                                    sdp_remote = %expected_remote,
+                                    actual = %src,
+                                    "Symmetric RTP latch"
+                                );
+                            }
+                            if let Ok(mut target) = recv_target.write() {
+                                *target = src;
+                            }
+                        }
+
+                        let dest = match forward_target.read() {
+                            Ok(guard) => *guard,
+                            Err(_) => continue,
+                        };
+                        if let Err(e) = send_sock.send_to(&buf[..n], dest).await {
+                            debug!(error = %e, call_id = %call_id, direction, "Relay send error");
+                        }
+                    }
+                    Err(e) => {
+                        debug!(error = %e, call_id = %call_id, direction, "Relay recv error");
+                        break;
+                    }
+                }
+            }
+            _ = shutdown.changed() => {
+                debug!(call_id = %call_id, direction, "Relay shutdown");
+                break;
+            }
+        }
+    }
+}
+
 /// Generates a random SSRC.
-#[allow(clippy::cast_possible_truncation)]
+///
+/// Cryptographically random — a timestamp-derived SSRC is predictable and
+/// collision-prone, aiding RTP injection.
 fn generate_ssrc() -> u32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    (now.as_nanos() as u32) ^ (now.as_secs() as u32)
+    rand::random::<u32>()
 }
 
 /// Session statistics.
@@ -1144,6 +1231,87 @@ impl std::error::Error for MediaPipelineError {}
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// The relay must latch to the first valid source and drop packets from
+    /// any other source (RTP injection defense).
+    #[tokio::test]
+    async fn test_relay_leg_drops_unexpected_sources() {
+        let relay_in = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay_out = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let legit = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let relay_addr = relay_in.local_addr().unwrap();
+        let expected = legit.local_addr().unwrap();
+        let recv_target = Arc::new(std::sync::RwLock::new(expected));
+        let forward_target =
+            Arc::new(std::sync::RwLock::new(receiver.local_addr().unwrap()));
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let _task = tokio::spawn(relay_leg(
+            relay_in,
+            relay_out,
+            expected,
+            recv_target,
+            forward_target,
+            "test-call".to_string(),
+            "A→B",
+            shutdown_rx,
+        ));
+
+        let mut buf = [0u8; 64];
+
+        // First packet from the negotiated source latches and forwards.
+        legit.send_to(b"one", relay_addr).await.unwrap();
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            receiver.recv_from(&mut buf),
+        )
+        .await
+        .expect("legit packet must be forwarded")
+        .unwrap();
+        assert_eq!(&buf[..n], b"one");
+
+        // Attacker (same IP, different port — post-latch) must be dropped:
+        // the next packet the receiver sees is the second legit one.
+        attacker.send_to(b"evil", relay_addr).await.unwrap();
+        legit.send_to(b"two", relay_addr).await.unwrap();
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            receiver.recv_from(&mut buf),
+        )
+        .await
+        .expect("second legit packet must be forwarded")
+        .unwrap();
+        assert_eq!(&buf[..n], b"two", "injected packet must not be relayed");
+    }
+
+    /// Port allocator must survive index wraparound and tiny/reversed ranges.
+    #[tokio::test]
+    async fn test_port_allocator_bounds() {
+        // Reversed range is swapped, not panicked on.
+        let allocator = RtpPortAllocator::new(20010, 20000);
+        let (rtp, rtcp) = allocator.allocate_pair().await.unwrap();
+        assert!(rtp >= 20000 && rtcp <= 20010);
+
+        // Exhausting a tiny range fails cleanly and recovers after release.
+        let allocator = RtpPortAllocator::new(30000, 30003);
+        let (p1, _) = allocator.allocate_pair().await.unwrap();
+        let (p2, _) = allocator.allocate_pair().await.unwrap();
+        assert_ne!(p1, p2);
+        assert!(allocator.allocate_pair().await.is_err());
+        allocator.release_pair(p1).await;
+        assert_eq!(allocator.allocate_pair().await.unwrap().0, p1);
+
+        // Top-of-range allocation never overflows u16.
+        let allocator = RtpPortAllocator::new(65532, 65535);
+        let (rtp, rtcp) = allocator.allocate_pair().await.unwrap();
+        assert_eq!((rtp, rtcp), (65532, 65533));
+        let (rtp, rtcp) = allocator.allocate_pair().await.unwrap();
+        assert_eq!((rtp, rtcp), (65534, 65535));
+        assert!(allocator.allocate_pair().await.is_err());
+    }
 
     #[test]
     fn test_default_config() {
