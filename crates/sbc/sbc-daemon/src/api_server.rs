@@ -31,8 +31,9 @@
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Request, State},
     http::StatusCode,
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
@@ -187,6 +188,10 @@ pub struct AppState {
     pub mem_store: Arc<tokio::sync::RwLock<MemStore>>,
     /// TLS acceptor for certificate hot-reload (if TLS is enabled).
     pub tls_acceptor: Option<Arc<ReloadableTlsAcceptor>>,
+    /// Management-plane authentication state. `AppState::new` starts
+    /// disabled for unit tests; the runtime always installs an enforced
+    /// state before serving.
+    pub auth: Arc<crate::auth::AuthState>,
     /// Cluster health check function (when cluster feature is enabled).
     #[cfg(feature = "cluster")]
     pub cluster_health_fn: Option<
@@ -217,6 +222,7 @@ impl AppState {
             trunk_registrar: None,
             zone_registry: None,
             tls_acceptor: None,
+            auth: Arc::new(crate::auth::AuthState::disabled()),
             #[cfg(feature = "cluster")]
             cluster_health_fn: None,
         }
@@ -243,6 +249,7 @@ impl AppState {
             trunk_registrar: None,
             zone_registry: None,
             tls_acceptor: Some(tls_acceptor),
+            auth: Arc::new(crate::auth::AuthState::disabled()),
             #[cfg(feature = "cluster")]
             cluster_health_fn: None,
         }
@@ -388,6 +395,10 @@ impl ApiServer {
     /// Builds the router with all routes.
     pub fn router(&self) -> Router {
         let api_routes = Router::new()
+            // Authentication (login itself is exempt from the auth layer)
+            .route("/auth/login", post(auth_login))
+            .route("/auth/logout", post(auth_logout))
+            .route("/auth/session", get(auth_session))
             // System routes
             .route("/system/health", get(get_health))
             .route("/system/metrics", get(get_metrics))
@@ -458,6 +469,28 @@ impl ApiServer {
         let provision_routes = Router::new()
             .route("/provision/{*path}", get(serve_phone_config))
             .with_state(Arc::clone(&self.state));
+
+        // Deny-by-default authentication on the API surface. Exemptions:
+        // login itself, and the read-only health/metrics endpoints used by
+        // probes and Prometheus. /healthz, /readyz, the dashboard static
+        // files, and /provision/ live outside the nest (provisioning will
+        // gain per-phone tokens — see REMEDIATION-PLAN.md 0.2.4).
+        // Note: `nest` strips the /api/{version} prefix before the inner
+        // router (and this middleware) sees the request, so these paths are
+        // relative to the nest.
+        let public_paths: std::collections::HashSet<String> = [
+            "/auth/login".to_string(),
+            "/auth/session".to_string(),
+            "/system/health".to_string(),
+            "/system/metrics".to_string(),
+        ]
+        .into();
+        let auth_ctx = Arc::new(AuthLayerCtx {
+            state: Arc::clone(&self.state),
+            public_paths,
+        });
+        let api_routes =
+            api_routes.layer(middleware::from_fn_with_state(auth_ctx, require_auth));
 
         Router::new()
             // Health probes (no prefix)
@@ -653,6 +686,143 @@ impl ApiServer {
             })?;
 
         Ok(TlsAcceptor::from(Arc::new(config)))
+    }
+}
+
+// ============================================================================
+// Authentication
+// ============================================================================
+
+/// State for the authentication middleware: app state plus the exact paths
+/// exempt from authentication.
+struct AuthLayerCtx {
+    state: Arc<AppState>,
+    public_paths: std::collections::HashSet<String>,
+}
+
+/// Deny-by-default authentication middleware for the API router.
+///
+/// Accepts `Authorization: Bearer <token>` (sessions and API keys) or the
+/// `sbc_session` cookie set by [`auth_login`].
+///
+/// ## NIST 800-53 Rev5: AC-3 (Access Enforcement)
+async fn require_auth(
+    State(ctx): State<Arc<AuthLayerCtx>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if ctx.public_paths.contains(req.uri().path()) {
+        return next.run(req).await;
+    }
+
+    let token = crate::auth::extract_token(req.headers());
+    if ctx.state.auth.authorize(token.as_deref()) {
+        return next.run(req).await;
+    }
+
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": "authentication required",
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /api/v1/auth/login` — verifies admin credentials and issues a
+/// session token (JSON body for bearer clients, cookie for the dashboard).
+async fn auth_login(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let username = body
+        .get("username")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let password = body
+        .get("password")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    // argon2 verification is deliberately slow (~100ms); keep it off the
+    // async executor threads.
+    let auth = Arc::clone(&state.auth);
+    let token = tokio::task::spawn_blocking(move || auth.login(&username, &password))
+        .await
+        .ok()
+        .flatten();
+
+    let Some(token) = token else {
+        warn!("Failed admin login attempt");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "invalid credentials" })),
+        )
+            .into_response();
+    };
+
+    // `Secure` only when serving HTTPS — the explicitly-insecure HTTP mode
+    // could not set the cookie otherwise.
+    let secure_attr = if state.tls_acceptor.is_some() {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie = format!(
+        "sbc_session={token}; HttpOnly{secure_attr}; SameSite=Strict; Path=/; Max-Age=43200"
+    );
+
+    let mut response = Json(serde_json::json!({
+        "token": token,
+        "expires_in_secs": 43_200,
+    }))
+    .into_response();
+    if let Ok(value) = cookie.parse() {
+        response
+            .headers_mut()
+            .insert(axum::http::header::SET_COOKIE, value);
+    }
+    response
+}
+
+/// `POST /api/v1/auth/logout` — invalidates the presented session.
+async fn auth_logout(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Some(token) = crate::auth::extract_token(&headers) {
+        state.auth.logout(&token);
+    }
+    let mut response =
+        Json(serde_json::json!({ "success": true })).into_response();
+    if let Ok(value) =
+        "sbc_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0".parse()
+    {
+        response
+            .headers_mut()
+            .insert(axum::http::header::SET_COOKIE, value);
+    }
+    response
+}
+
+/// `GET /api/v1/auth/session` — reports whether the presented credential is
+/// valid (the dashboard uses this to decide whether to show the login view).
+async fn auth_session(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let valid = crate::auth::extract_token(&headers)
+        .is_some_and(|token| state.auth.validate_token(&token));
+    if valid {
+        Json(serde_json::json!({ "authenticated": true })).into_response()
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "authenticated": false })),
+        )
+            .into_response()
     }
 }
 
@@ -2524,5 +2694,118 @@ mod tests {
         assert_eq!(config.listen_addr.port(), 8443);
         assert!(!config.enable_cors);
         assert_eq!(config.api_version, "v1");
+    }
+
+    /// With enforced auth, every API route except the public set requires a
+    /// credential; login issues a token that unlocks them.
+    #[tokio::test]
+    async fn test_auth_enforced_end_to_end() {
+        let dir = std::env::temp_dir().join(format!(
+            "sbc-api-auth-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let metrics = SbcMetrics::standard();
+        let stats = Arc::new(ServerStats::default());
+        let mut state = AppState::new(metrics, stats);
+        let admin =
+            crate::auth::AdminAuth::load_or_bootstrap_for_test(&dir, "test-password");
+        state.auth = Arc::new(crate::auth::AuthState::enforced(admin));
+        let server = ApiServer::new(
+            ApiServerConfig::default(),
+            Arc::new(state),
+            ShutdownSignal::new(),
+        );
+        let router = server.router();
+
+        // Protected route without credentials → 401
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/calls")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Public health endpoint stays reachable
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/system/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Wrong password → 401
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"admin","password":"wrong"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Correct login → token
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"admin","password":"test-password"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("login must set a session cookie")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(cookie.starts_with("sbc_session="));
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let token = json["token"].as_str().expect("token in body").to_string();
+
+        // Bearer token unlocks protected routes
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/calls")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

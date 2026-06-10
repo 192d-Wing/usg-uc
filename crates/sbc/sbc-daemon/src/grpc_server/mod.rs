@@ -162,7 +162,7 @@ impl GrpcServer {
         // runtime fills in the API/bootstrap certificate when none is
         // configured, so reaching the plaintext branch requires the explicit
         // grpc.allow_insecure opt-in.
-        let mut server = if let Some(tls) = tls_config {
+        let server = if let Some(tls) = tls_config {
             info!("gRPC server TLS enabled");
             Server::builder()
                 .tls_config(tls)
@@ -182,6 +182,34 @@ impl GrpcServer {
                     .to_string(),
             });
         };
+
+        // Authentication: every RPC requires a bearer credential (session
+        // token or API key) unless mTLS already authenticates the client at
+        // the transport layer.
+        //
+        // ## NIST 800-53 Rev5: AC-3 (Access Enforcement), IA-2
+        let auth = Arc::clone(&self.state.auth);
+        let require_mtls = self.config.require_mtls;
+        let check_auth = move |req: tonic::Request<()>| -> Result<tonic::Request<()>, tonic::Status> {
+            if require_mtls {
+                return Ok(req);
+            }
+            let token = req
+                .metadata()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("Bearer "))
+                .map(str::trim);
+            if auth.authorize(token) {
+                Ok(req)
+            } else {
+                Err(tonic::Status::unauthenticated(
+                    "missing or invalid bearer token",
+                ))
+            }
+        };
+        let mut server =
+            server.layer(tonic::service::interceptor::InterceptorLayer::new(check_auth));
 
         // Build router with core services (no cluster, no reflection)
         #[cfg(all(not(feature = "cluster"), not(feature = "grpc-reflection")))]

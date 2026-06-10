@@ -414,6 +414,17 @@ impl Runtime {
         let mut app_state = AppState::new(metrics, stats);
         app_state.sip_stack = Some(Arc::clone(server.sip_stack()));
 
+        // Management-plane authentication is always enforced in the daemon.
+        // First start bootstraps admin credentials (random password logged
+        // once, or SBC_ADMIN_PASSWORD).
+        let admin_auth =
+            crate::auth::AdminAuth::load_or_bootstrap(&crate::auth::default_state_dir())
+                .map_err(|e| RuntimeError::InitFailed {
+                    component: "admin-auth".to_string(),
+                    reason: e,
+                })?;
+        app_state.auth = Arc::new(crate::auth::AuthState::enforced(admin_auth));
+
         // Wire the reloadable TLS acceptor so certificate hot-reload
         // (POST /api/v1/system/tls/reload) works for the HTTPS listener.
         if let Some(tls) = &api_tls {
