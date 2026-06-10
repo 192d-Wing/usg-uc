@@ -43,8 +43,11 @@ pub struct Server {
     udp_transports: RwLock<Vec<Arc<UdpTransport>>>,
     /// SIP stack for message processing.
     sip_stack: Arc<SipStack>,
-    /// Rate limiter for `DoS` protection.
+    /// Per-source rate limiter for `DoS` protection.
     rate_limiter: Arc<Mutex<RateLimiter>>,
+    /// Global (all-sources) rate limiter — backstop against distributed
+    /// floods that stay under the per-IP limit.
+    global_limiter: Arc<Mutex<RateLimiter>>,
     /// Resolved zone registry (None if no zones configured).
     zone_registry: Option<Arc<crate::zone::ResolvedZoneRegistry>>,
     /// Cluster manager (when cluster feature is enabled).
@@ -72,6 +75,7 @@ impl Server {
         Self::init_sip_stack_from_config(&mut sip_stack, &config);
         let sip_stack = Arc::new(sip_stack);
         let rate_limiter = Self::build_rate_limiter(&config);
+        let global_limiter = Self::build_global_limiter(&config);
 
         Self {
             config,
@@ -82,6 +86,7 @@ impl Server {
             udp_transports: RwLock::new(Vec::new()),
             sip_stack,
             rate_limiter,
+            global_limiter,
             zone_registry: None,
             #[cfg(feature = "cluster")]
             cluster: None,
@@ -139,6 +144,7 @@ impl Server {
         let sip_stack = Arc::new(sip_stack);
 
         let rate_limiter = Self::build_rate_limiter(&config);
+        let global_limiter = Self::build_global_limiter(&config);
 
         Self {
             config,
@@ -149,6 +155,7 @@ impl Server {
             udp_transports: RwLock::new(Vec::new()),
             sip_stack,
             rate_limiter,
+            global_limiter,
             zone_registry: None,
             cluster,
         }
@@ -159,11 +166,12 @@ impl Server {
         SipStackConfig {
             instance_name: config.general.instance_name.clone(),
             domain: config.general.instance_name.clone(),
+            max_calls: config.general.max_calls,
             ..SipStackConfig::default()
         }
     }
 
-    /// Builds rate limiter from config.
+    /// Builds the per-source rate limiter from config.
     fn build_rate_limiter(config: &SbcConfig) -> Arc<Mutex<RateLimiter>> {
         #[allow(
             clippy::cast_possible_truncation,
@@ -178,9 +186,25 @@ impl Server {
         info!(
             enabled = config.rate_limit.enabled,
             per_ip_rps = config.rate_limit.per_ip_rps,
+            global_rps = config.rate_limit.global_rps,
             burst_multiplier = config.rate_limit.burst_multiplier,
             "Rate limiting configured"
         );
+
+        Arc::new(Mutex::new(RateLimiter::new(rate_limit_config)))
+    }
+
+    /// Builds the global (all-sources) rate limiter from config.
+    fn build_global_limiter(config: &SbcConfig) -> Arc<Mutex<RateLimiter>> {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let burst_size = (f64::from(config.rate_limit.global_rps)
+            * f64::from(config.rate_limit.burst_multiplier)) as u32;
+        let rate_limit_config =
+            RateLimiterConfig::new(config.rate_limit.global_rps, burst_size).with_per_ip(false);
 
         Arc::new(Mutex::new(RateLimiter::new(rate_limit_config)))
     }
@@ -340,6 +364,7 @@ impl Server {
             let stats = Arc::clone(&self.stats);
             let sip_stack = Arc::clone(&self.sip_stack);
             let rate_limiter = Arc::clone(&self.rate_limiter);
+            let global_limiter = Arc::clone(&self.global_limiter);
             let rate_limit_enabled = self.config.rate_limit.enabled;
 
             // Determine zone for this transport from its local bind address
@@ -353,6 +378,7 @@ impl Server {
                     stats,
                     sip_stack,
                     rate_limiter,
+                    global_limiter,
                     rate_limit_enabled,
                     zone_name,
                 )
@@ -390,6 +416,7 @@ impl Server {
         stats: Arc<ServerStats>,
         sip_stack: Arc<SipStack>,
         rate_limiter: Arc<Mutex<RateLimiter>>,
+        global_limiter: Arc<Mutex<RateLimiter>>,
         rate_limit_enabled: bool,
         zone_name: Option<String>,
     ) {
@@ -409,8 +436,26 @@ impl Server {
                             // Extract source IP for rate limiting
                             let source_ip = msg.source.ip();
 
-                            // Check rate limit
+                            // Check rate limits: global backstop first
+                            // (one bucket, catches distributed floods that
+                            // stay under the per-IP limit), then per-source.
                             if rate_limit_enabled {
+                                let global_action = {
+                                    let mut limiter = global_limiter.lock().await;
+                                    limiter.check(source_ip)
+                                };
+                                if matches!(
+                                    global_action,
+                                    RateLimitAction::Reject | RateLimitAction::Block { .. }
+                                ) {
+                                    stats.rate_limited.fetch_add(1, Ordering::Relaxed);
+                                    debug!(
+                                        source = %source_ip,
+                                        "Global rate limit exceeded, rejecting message"
+                                    );
+                                    continue;
+                                }
+
                                 let action = {
                                     let mut limiter = rate_limiter.lock().await;
                                     limiter.check(source_ip)

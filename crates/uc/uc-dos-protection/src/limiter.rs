@@ -108,6 +108,14 @@ struct TokenBucket {
     window_start: Instant,
 }
 
+/// Cap on per-IP token buckets before idle eviction kicks in. Bounds memory
+/// against spoofed-source floods.
+const MAX_TRACKED_SOURCES: usize = 65_536;
+
+/// A bucket idle this long is evicted under memory pressure (a quiet
+/// returning source simply starts with a full bucket again).
+const BUCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 impl TokenBucket {
     /// Creates a new token bucket.
     fn new(burst: u32) -> Self {
@@ -118,6 +126,11 @@ impl TokenBucket {
             request_count: 0,
             window_start: now,
         }
+    }
+
+    /// Whether this bucket has seen no traffic for `idle`.
+    fn is_idle(&self, idle: Duration) -> bool {
+        self.last_update.elapsed() >= idle
     }
 
     /// Updates the token bucket and tries to consume a token.
@@ -255,8 +268,17 @@ impl RateLimiter {
             }
         }
 
-        // Get or create bucket
+        // Get or create bucket. Spoofed UDP source addresses can otherwise
+        // grow the per-IP map without bound: once over the cap, evict idle
+        // buckets before inserting a new one (full buckets carry no state
+        // worth keeping — a returning quiet source just starts full again).
         let (allowed, rate) = if self.config.per_ip {
+            if self.buckets.len() >= MAX_TRACKED_SOURCES
+                && !self.buckets.contains_key(&source)
+            {
+                self.buckets
+                    .retain(|_, bucket| !bucket.is_idle(BUCKET_IDLE_TIMEOUT));
+            }
             let bucket = self
                 .buckets
                 .entry(source)

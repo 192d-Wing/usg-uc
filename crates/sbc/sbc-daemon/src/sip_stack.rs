@@ -83,6 +83,11 @@ pub struct SipStack {
     inbound_trunk_map: RwLock<std::collections::HashMap<std::net::IpAddr, (String, Option<String>)>>,
     /// Directory number mapping: DID → username for inbound call routing.
     did_map: RwLock<std::collections::HashMap<String, String>>,
+    /// Call-IDs currently being played an announcement (dedup retransmits).
+    /// Arc so the spawned playback task can remove its entry when done —
+    /// previously entries were never removed (unbounded growth from
+    /// unroutable INVITEs).
+    announcement_calls: Arc<tokio::sync::RwLock<std::collections::HashSet<String>>>,
     /// Registration statistics.
     registrations_active: AtomicU64,
     registrations_total: AtomicU64,
@@ -105,6 +110,9 @@ pub struct SipStackConfig {
     pub require_auth: bool,
     /// Static credentials: username → password (for standalone deployment).
     pub auth_credentials: HashMap<String, String>,
+    /// Maximum concurrent calls — INVITEs beyond this are rejected with
+    /// 503 (admission control, `general.max_calls`).
+    pub max_calls: u32,
 }
 
 impl Default for SipStackConfig {
@@ -117,6 +125,7 @@ impl Default for SipStackConfig {
             auth_realm: "sbc.local".to_string(),
             require_auth: false,
             auth_credentials: HashMap::new(),
+            max_calls: 1000,
         }
     }
 }
@@ -139,24 +148,57 @@ struct TransactionStore {
 struct ServerInviteState {
     transaction: ServerInviteTransaction,
     source: SbcSocketAddr,
+    created_at: std::time::Instant,
 }
 
 /// State for server non-INVITE transaction.
 struct ServerNonInviteState {
     transaction: ServerNonInviteTransaction,
     source: SbcSocketAddr,
+    created_at: std::time::Instant,
 }
 
 /// State for client INVITE transaction.
 struct ClientInviteState {
     transaction: ClientInviteTransaction,
     destination: SbcSocketAddr,
+    created_at: std::time::Instant,
 }
 
 /// State for client non-INVITE transaction.
 struct ClientNonInviteState {
     transaction: ClientNonInviteTransaction,
     destination: SbcSocketAddr,
+    created_at: std::time::Instant,
+}
+
+impl TransactionStore {
+    /// Sweep threshold: once any map exceeds this, expired entries are
+    /// purged on the next insert. Bounds memory against INVITE floods —
+    /// transaction entries were never removed otherwise.
+    const SWEEP_THRESHOLD: usize = 1024;
+
+    /// RFC 3261 Timer-derived transaction lifetime (64*T1 = 32s, doubled
+    /// for safety margin).
+    const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(64);
+
+    /// Removes transactions older than [`Self::MAX_AGE`] once any map has
+    /// grown past [`Self::SWEEP_THRESHOLD`]. Amortized O(1) per insert.
+    fn sweep_if_needed(&mut self) {
+        let over = self.server_invite.len().max(self.client_invite.len())
+            .max(self.server_non_invite.len())
+            .max(self.client_non_invite.len())
+            > Self::SWEEP_THRESHOLD;
+        if !over {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let young = |created: std::time::Instant| now.duration_since(created) < Self::MAX_AGE;
+        self.server_invite.retain(|_, s| young(s.created_at));
+        self.server_non_invite.retain(|_, s| young(s.created_at));
+        self.client_invite.retain(|_, s| young(s.created_at));
+        self.client_non_invite.retain(|_, s| young(s.created_at));
+    }
 }
 
 /// Store for active dialogs.
@@ -182,8 +224,6 @@ struct CallCorrelation {
     b_leg: HashMap<String, CallId>,
     /// Maps internal CallId → call addressing info.
     addresses: HashMap<CallId, CallAddresses>,
-    /// Call-IDs currently being handled by announcement playback (dedup retransmits).
-    announcement_calls: std::collections::HashSet<String>,
 }
 
 /// Addressing info for both legs of a B2BUA call.
@@ -271,6 +311,9 @@ impl SipStack {
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
             did_map: RwLock::new(std::collections::HashMap::new()),
+            announcement_calls: Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashSet::new(),
+            )),
         }
     }
 
@@ -317,6 +360,9 @@ impl SipStack {
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
             did_map: RwLock::new(std::collections::HashMap::new()),
+            announcement_calls: Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashSet::new(),
+            )),
         }
     }
 
@@ -1157,11 +1203,39 @@ impl SipStack {
         // Check for INVITE retransmit — if we already know this Call-ID, absorb it
         {
             let corr = self.call_correlation.read().await;
-            if corr.a_leg.contains_key(&a_leg_call_id)
-                || corr.announcement_calls.contains(&a_leg_call_id)
-            {
+            if corr.a_leg.contains_key(&a_leg_call_id) {
                 debug!(call_id = %a_leg_call_id, "INVITE retransmit, absorbing");
                 return ProcessResult::NoAction;
+            }
+        }
+        if self
+            .announcement_calls
+            .read()
+            .await
+            .contains(&a_leg_call_id)
+        {
+            debug!(call_id = %a_leg_call_id, "INVITE retransmit (announcement), absorbing");
+            return ProcessResult::NoAction;
+        }
+
+        // Admission control: reject new calls beyond the configured ceiling
+        // (general.max_calls) instead of allocating unbounded state.
+        //
+        // ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+        {
+            let calls = self.calls.read().await;
+            if calls.calls.len() >= self.config.max_calls as usize {
+                warn!(
+                    call_id = %a_leg_call_id,
+                    max_calls = self.config.max_calls,
+                    "Maximum concurrent calls reached, rejecting INVITE"
+                );
+                let unavailable =
+                    create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
+                return ProcessResult::Response {
+                    message: SipMessage::Response(unavailable),
+                    destination: source,
+                };
             }
         }
 
@@ -1457,6 +1531,8 @@ impl SipStack {
                 .unwrap_or_else(generate_branch);
 
             let mut txns = self.transactions.write().await;
+            txns.sweep_if_needed();
+            let now = std::time::Instant::now();
             let server_key = TransactionKey::server(&a_branch, "INVITE");
             txns.server_invite.insert(
                 server_key,
@@ -1466,6 +1542,7 @@ impl SipStack {
                         TransportType::Unreliable,
                     ),
                     source,
+                    created_at: now,
                 },
             );
 
@@ -1478,6 +1555,7 @@ impl SipStack {
                         TransportType::Unreliable,
                     ),
                     destination: b_leg_destination,
+                    created_at: now,
                 },
             );
         }
@@ -2145,10 +2223,8 @@ impl SipStack {
 
         // Track this Call-ID to absorb INVITE retransmits
         let call_id = req.headers.call_id().unwrap_or("unknown").to_string();
-        {
-            let mut corr = self.call_correlation.write().await;
-            corr.announcement_calls.insert(call_id.clone());
-        }
+        let announcement_calls = Arc::clone(&self.announcement_calls);
+        announcement_calls.write().await.insert(call_id.clone());
         // Capture full From/To headers for the BYE dialog matching.
         // In BYE from UAS: From = our To (with our tag), To = caller's From (with their tag)
         let invite_from = req.headers.get_value(&HeaderName::From).unwrap_or_default().to_string();
@@ -2239,6 +2315,10 @@ impl SipStack {
                     warn!(error = %e, "Failed to build BYE after announcement");
                 }
             }
+
+            // Playback finished — drop the retransmit-dedup entry so the
+            // set stays bounded (it previously grew forever).
+            announcement_calls.write().await.remove(&call_id);
         });
 
         // Return 200 OK to answer the call

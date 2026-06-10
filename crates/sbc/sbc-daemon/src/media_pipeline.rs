@@ -159,7 +159,7 @@ pub struct MediaPipeline {
     /// DTLS connections by local address.
     dtls_connections: RwLock<HashMap<String, DtlsConnectionContext>>,
     /// RTP sequence trackers by SSRC.
-    sequence_trackers: RwLock<HashMap<u32, SequenceTracker>>,
+    sequence_trackers: RwLock<HashMap<u32, TrackedSequence>>,
     /// Port allocator for RTP/RTCP ports.
     port_allocator: RtpPortAllocator,
 }
@@ -826,13 +826,31 @@ impl MediaPipeline {
             RtpPacket::new(header, payload.to_vec())
         };
 
-        // Track sequence for the packet
+        // Track sequence for the packet. The map is keyed by the
+        // attacker-controlled SSRC, so it is bounded: idle entries are
+        // evicted once the soft cap is reached, and brand-new SSRCs are
+        // rejected at the hard cap (random-SSRC floods previously grew
+        // this map without limit).
         let mut trackers = self.sequence_trackers.write().await;
+        let now = std::time::Instant::now();
+        if trackers.len() >= SSRC_TRACKER_SOFT_CAP
+            && !trackers.contains_key(&packet.header.ssrc)
+        {
+            trackers.retain(|_, t| {
+                now.duration_since(t.last_seen) < SSRC_TRACKER_IDLE_TIMEOUT
+            });
+            if trackers.len() >= SSRC_TRACKER_HARD_CAP {
+                return Err(MediaPipelineError::DecryptionFailed(
+                    "SSRC tracker capacity exceeded".to_string(),
+                ));
+            }
+        }
         let tracker = trackers
             .entry(packet.header.ssrc)
-            .or_insert_with(SequenceTracker::new);
+            .or_insert_with(TrackedSequence::new);
+        tracker.last_seen = now;
 
-        let is_valid = tracker.update(packet.header.sequence_number);
+        let is_valid = tracker.inner.update(packet.header.sequence_number);
         if !is_valid {
             warn!(
                 ssrc = packet.header.ssrc,
@@ -1066,6 +1084,28 @@ impl MediaPipeline {
     /// Returns a reference to the port allocator.
     pub fn port_allocator(&self) -> &RtpPortAllocator {
         &self.port_allocator
+    }
+}
+
+/// Soft cap on tracked SSRCs: eviction of idle entries starts here.
+const SSRC_TRACKER_SOFT_CAP: usize = 4096;
+/// Hard cap on tracked SSRCs: new SSRCs are rejected beyond this.
+const SSRC_TRACKER_HARD_CAP: usize = 8192;
+/// Idle eviction window for SSRC trackers.
+const SSRC_TRACKER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A sequence tracker with a last-activity timestamp for idle eviction.
+struct TrackedSequence {
+    inner: SequenceTracker,
+    last_seen: std::time::Instant,
+}
+
+impl TrackedSequence {
+    fn new() -> Self {
+        Self {
+            inner: SequenceTracker::new(),
+            last_seen: std::time::Instant::now(),
+        }
     }
 }
 
