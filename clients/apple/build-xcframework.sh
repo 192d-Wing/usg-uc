@@ -58,41 +58,28 @@ mv "$BINDINGS_DIR/client_ffiFFI.modulemap" "$HEADERS_DIR/module.modulemap"
 mkdir -p "$PKG_DIR/Sources/UsgSipClient"
 mv "$BINDINGS_DIR/client_ffi.swift" "$PKG_DIR/Sources/UsgSipClient/ClientFFI.swift"
 
-echo "==> Bundling native libraries"
-# A cargo staticlib contains only Rust objects; native libraries compiled by
-# build scripts must be carried separately:
-#  - aws-lc-sys (non-FIPS, used by rustls) emits a static archive -> merge it
-#    into the slice with libtool so the xcframework is self-contained
-#  - aws-lc-fips-sys emits a DYLIB (the FIPS module boundary requires a shared
-#    library) -> staged under Frameworks/native/<target>/ and linked+rpath'd
-#    by Package.swift
-MERGED_DIR="$(mktemp -d)"
+echo "==> Staging the FIPS crypto module"
+# A cargo staticlib contains only Rust objects. The one native library the
+# core needs is the aws-lc FIPS module, which is a DYLIB by design (the FIPS
+# boundary requires a shared library): staged under Frameworks/native/<target>/
+# and linked + rpath'd by Package.swift. The macOS demo loads it from there;
+# the iOS app must embed it in its bundle.
 for target in "${TARGETS[@]}"; do
-    build_dir="$TARGET_DIR/$target/$PROFILE/build"
-    mkdir -p "$MERGED_DIR/$target" "$PKG_DIR/Frameworks/native/$target"
-
-    static_extras=()
-    while IFS= read -r lib; do
-        static_extras+=("$lib")
-    done < <(find "$build_dir" -path "*/out/*" -name "libaws_lc_*_crypto.a" 2>/dev/null)
-
-    libtool -static -o "$MERGED_DIR/$target/libclient_ffi.a" \
-        "$TARGET_DIR/$target/$PROFILE/libclient_ffi.a" \
-        ${static_extras[@]+"${static_extras[@]}"}
-
-    find "$build_dir" -path "*/artifacts/*" -name "libaws_lc_fips_*_crypto.dylib" \
+    mkdir -p "$PKG_DIR/Frameworks/native/$target"
+    find "$TARGET_DIR/$target/$PROFILE/build" -path "*/artifacts/*" \
+        -name "libaws_lc_fips_*_crypto.dylib" \
         -exec cp {} "$PKG_DIR/Frameworks/native/$target/" \; 2>/dev/null
 done
 
 echo "==> Assembling ClientFFI.xcframework"
 XCF_ARGS=()
 for target in "${TARGETS[@]}"; do
-    XCF_ARGS+=(-library "$MERGED_DIR/$target/libclient_ffi.a" -headers "$HEADERS_DIR")
+    XCF_ARGS+=(-library "$TARGET_DIR/$target/$PROFILE/libclient_ffi.a" -headers "$HEADERS_DIR")
 done
 rm -rf "$PKG_DIR/Frameworks/ClientFFI.xcframework"
 mkdir -p "$PKG_DIR/Frameworks"
 xcodebuild -create-xcframework "${XCF_ARGS[@]}" \
     -output "$PKG_DIR/Frameworks/ClientFFI.xcframework"
 
-rm -rf "$BINDINGS_DIR" "$MERGED_DIR"
+rm -rf "$BINDINGS_DIR"
 echo "==> Done: $PKG_DIR/Frameworks/ClientFFI.xcframework"

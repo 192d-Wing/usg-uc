@@ -104,8 +104,14 @@ tokio = { version = "1.49", features = ["full"] }
 
 # Cryptography (CNSA 2.0 compliant)
 aws-lc-rs = { version = "1.15", default-features = false }
+# `fips` routes rustls + webpki through aws-lc-fips-sys (the same FIPS module
+# uc-crypto uses) and turns on rustls' FIPS posture (provider self-check,
+# TLS 1.2 extended-master-secret enforcement). The non-FIPS aws-lc-sys still
+# *compiles* (rustls' aws-lc-rs feature hard-enables it) but nothing
+# references it, so binaries contain exactly one crypto module: FIPS.
 rustls = { version = "0.23", default-features = false, features = [
     "aws-lc-rs",
+    "fips",
     "tls12",
 ] }
 zeroize = { version = "1.8", features = ["derive"] }
