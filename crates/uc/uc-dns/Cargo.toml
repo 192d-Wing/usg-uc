@@ -27,7 +27,7 @@ tokio = { version = "1", features = ["sync", "time"] }
 tracing = "0.1"
 
 # DNS resolver (optional - for actual resolution)
-hickory-resolver = { version = "0.25", optional = true }
+hickory-resolver = { version = "0.26", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

@@ -8,18 +8,15 @@ use crate::config::TransportPref;
 use crate::error::{DnsError, DnsResult};
 use crate::naptr::NaptrRecord;
 use crate::srv::SrvRecord;
-use hickory_resolver::Resolver;
+use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::proto::rr::RecordType;
 use hickory_resolver::proto::rr::rdata::NAPTR;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, trace, warn};
-
-/// Type alias for the tokio-based resolver.
-type TokioResolver = Resolver<TokioConnectionProvider>;
 
 /// DNS resolver using hickory-resolver for actual DNS queries.
 pub struct HickoryDnsResolver {
@@ -38,11 +35,14 @@ impl HickoryDnsResolver {
     ///
     /// Returns an error if the resolver cannot be created.
     pub fn new(cache: Arc<DnsCache>) -> DnsResult<Self> {
-        let resolver = Resolver::builder_with_config(
+        let resolver = TokioResolver::builder_with_config(
             ResolverConfig::default(),
-            TokioConnectionProvider::default(),
+            TokioRuntimeProvider::default(),
         )
-        .build();
+        .build()
+        .map_err(|e| DnsError::ResolverInit {
+            reason: e.to_string(),
+        })?;
 
         Ok(Self {
             resolver,
@@ -61,9 +61,13 @@ impl HickoryDnsResolver {
         opts: ResolverOpts,
         cache: Arc<DnsCache>,
     ) -> DnsResult<Self> {
-        let resolver = Resolver::builder_with_config(config, TokioConnectionProvider::default())
-            .with_options(opts)
-            .build();
+        let resolver =
+            TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
+                .with_options(opts)
+                .build()
+                .map_err(|e| DnsError::ResolverInit {
+                    reason: e.to_string(),
+                })?;
 
         Ok(Self {
             resolver,
@@ -119,10 +123,10 @@ impl HickoryDnsResolver {
         // Get TTL from response (use first record's TTL)
         let ttl = response
             .as_lookup()
-            .record_iter()
-            .next()
+            .answers()
+            .first()
             .map_or(self.default_ttl, |r| {
-                Duration::from_secs(u64::from(r.ttl()))
+                Duration::from_secs(u64::from(r.ttl))
             });
 
         // Cache the result
@@ -148,44 +152,47 @@ impl HickoryDnsResolver {
 
         debug!(name = %name, "Looking up SRV records");
 
-        let response = self.resolver.srv_lookup(name).await.map_err(|e| {
-            // NXDOMAIN is not an error for SRV - just means no records
-            if e.is_no_records_found() {
-                return DnsError::NoRecords {
+        let response = self
+            .resolver
+            .lookup(name, RecordType::SRV)
+            .await
+            .map_err(|e| {
+                // NXDOMAIN is not an error for SRV - just means no records
+                if e.is_no_records_found() {
+                    return DnsError::NoRecords {
+                        domain: name.to_string(),
+                    };
+                }
+                DnsError::ResolutionFailed {
                     domain: name.to_string(),
-                };
-            }
-            DnsError::ResolutionFailed {
-                domain: name.to_string(),
-                reason: e.to_string(),
-            }
-        })?;
+                    reason: e.to_string(),
+                }
+            })?;
 
         let mut records = Vec::new();
         let mut min_ttl = self.default_ttl;
 
         // Get TTL from the lookup records
-        let record_ttl = response
-            .as_lookup()
-            .record_iter()
-            .next()
-            .map_or(self.default_ttl, |r| {
-                Duration::from_secs(u64::from(r.ttl()))
-            });
+        let record_ttl = response.answers().first().map_or(self.default_ttl, |r| {
+            Duration::from_secs(u64::from(r.ttl))
+        });
         if record_ttl < min_ttl {
             min_ttl = record_ttl;
         }
 
-        for srv in response.iter() {
-            let target = srv.target().to_utf8();
+        for record in response.answers() {
+            let hickory_resolver::proto::rr::RData::SRV(srv) = &record.data else {
+                continue;
+            };
+            let target = srv.target.to_utf8();
             let target = target.trim_end_matches('.');
 
             #[allow(clippy::cast_possible_truncation)]
             records.push(SrvRecord::new(
                 name,
-                srv.priority(),
-                srv.weight(),
-                srv.port(),
+                srv.priority,
+                srv.weight,
+                srv.port,
                 target,
                 min_ttl.as_secs() as u32,
             ));
@@ -241,26 +248,26 @@ impl HickoryDnsResolver {
         let mut records = Vec::new();
         let mut min_ttl = self.default_ttl;
 
-        for record in response.record_iter() {
-            let ttl = Duration::from_secs(u64::from(record.ttl()));
+        for record in response.answers() {
+            let ttl = Duration::from_secs(u64::from(record.ttl));
             if ttl < min_ttl {
                 min_ttl = ttl;
             }
 
             // Try to extract NAPTR data from the record
-            if let Some(naptr) = record.data().as_naptr() {
+            if let hickory_resolver::proto::rr::RData::NAPTR(naptr) = &record.data {
                 let naptr: &NAPTR = naptr;
-                let replacement = naptr.replacement().to_utf8();
+                let replacement = naptr.replacement.to_utf8();
                 let replacement = replacement.trim_end_matches('.');
 
                 #[allow(clippy::cast_possible_truncation)]
                 records.push(NaptrRecord::new(
                     name,
-                    naptr.order(),
-                    naptr.preference(),
-                    std::str::from_utf8(naptr.flags()).unwrap_or(""),
-                    std::str::from_utf8(naptr.services()).unwrap_or(""),
-                    std::str::from_utf8(naptr.regexp()).unwrap_or(""),
+                    naptr.order,
+                    naptr.preference,
+                    std::str::from_utf8(&naptr.flags).unwrap_or(""),
+                    std::str::from_utf8(&naptr.services).unwrap_or(""),
+                    std::str::from_utf8(&naptr.regexp).unwrap_or(""),
                     replacement,
                     ttl.as_secs() as u32,
                 ));

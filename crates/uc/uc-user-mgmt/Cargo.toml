@@ -24,7 +24,7 @@ hex = "0.4"
 uuid = { version = "1", features = ["v4"] }
 
 # Optional backends
-rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"], optional = true }
 ldap3 = { version = "0.11", optional = true }
 
