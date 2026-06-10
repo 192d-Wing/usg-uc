@@ -70,11 +70,11 @@ impl TrunkRegistrar {
 
     /// Stops registration for a trunk and removes its status entry.
     pub async fn stop_trunk(&self, trunk_id: &str) {
-        if let Ok(mut tasks) = self.tasks.lock() {
-            if let Some(handle) = tasks.remove(trunk_id) {
-                handle.abort();
-                info!(trunk_id, "Stopped trunk registration loop");
-            }
+        if let Ok(mut tasks) = self.tasks.lock()
+            && let Some(handle) = tasks.remove(trunk_id)
+        {
+            handle.abort();
+            info!(trunk_id, "Stopped trunk registration loop");
         }
         self.statuses.write().await.remove(trunk_id);
     }
@@ -148,8 +148,7 @@ impl TrunkRegistrar {
                             status.last_registered = Some(
                                 std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs() as i64)
-                                    .unwrap_or(0),
+                                    .map_or(0, |d| d.as_secs() as i64),
                             );
                             info!(trunk_id = %config.trunk_id, expires, "Trunk registered");
                         }
@@ -186,11 +185,11 @@ impl TrunkRegistrar {
             }
         });
 
-        if let Ok(mut tasks) = self.tasks.lock() {
-            if let Some(previous) = tasks.insert(registry_id.clone(), handle) {
-                previous.abort();
-                info!(trunk_id = %registry_id, "Replaced existing registration loop");
-            }
+        if let Ok(mut tasks) = self.tasks.lock()
+            && let Some(previous) = tasks.insert(registry_id.clone(), handle)
+        {
+            previous.abort();
+            info!(trunk_id = %registry_id, "Replaced existing registration loop");
         }
     }
 
@@ -280,7 +279,7 @@ impl TrunkRegistrar {
             let sock = UdpSocket::bind("0.0.0.0:0")
                 .await
                 .map_err(|e| format!("Bind failed: {e}"))?;
-            let port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
+            let port = sock.local_addr().map_or(0, |a| a.port());
             (sock, ip, port)
         };
         // Use external IP for Contact if behind NAT.
@@ -289,8 +288,7 @@ impl TrunkRegistrar {
         // route inbound calls (INVITEs) to the SBC's SIP listener.
         let contact_ip = config
             .external_ip
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|| local_ip.clone());
+            .map_or_else(|| local_ip.clone(), |ip| ip.to_string());
         let contact_port: u16 = 5060;
         let call_id = generate_call_id(local_domain);
 
@@ -411,7 +409,7 @@ impl TrunkRegistrar {
             // Add Expires header
             auth_request
                 .headers
-                .set(HeaderName::Expires, &config.expires.to_string());
+                .set(HeaderName::Expires, config.expires.to_string());
 
             let auth_bytes = SipMessage::Request(auth_request).to_bytes();
             // Never log the full authenticated REGISTER: the Authorization

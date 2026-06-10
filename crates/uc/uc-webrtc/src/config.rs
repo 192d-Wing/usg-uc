@@ -150,7 +150,7 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             max_sessions: 1000,
-            idle_timeout: Duration::from_secs(300),
+            idle_timeout: Duration::from_mins(5),
             recording_enabled: false,
         }
     }

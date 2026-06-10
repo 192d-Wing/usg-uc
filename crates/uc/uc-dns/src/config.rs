@@ -48,9 +48,9 @@ impl Default for DnsConfig {
             retries: 2,
             cache_enabled: true,
             cache_max_entries: 10000,
-            cache_min_ttl: Duration::from_secs(60),
-            cache_max_ttl: Duration::from_secs(86400), // 24 hours
-            cache_negative_ttl: Duration::from_secs(300), // 5 minutes
+            cache_min_ttl: Duration::from_mins(1),
+            cache_max_ttl: Duration::from_hours(24), // 24 hours
+            cache_negative_ttl: Duration::from_mins(5), // 5 minutes
             enum_config: EnumConfig::default(),
             sip_config: SipResolverConfig::default(),
         }

@@ -316,7 +316,10 @@ impl Runtime {
         let instance_name = config.general.instance_name.clone();
 
         // Resolve network zones (interface name → IP)
-        let zone_registry = if !config.zones.is_empty() {
+        let zone_registry = if config.zones.is_empty() {
+            debug!("No zones configured, using default transport binding");
+            None
+        } else {
             match sbc_config::resolve_zones(&config.zones) {
                 Ok(resolved) => {
                     for z in &resolved {
@@ -355,9 +358,6 @@ impl Runtime {
                     });
                 }
             }
-        } else {
-            debug!("No zones configured, using default transport binding");
-            None
         };
 
         // Extract gRPC config and API listen address before moving config to
@@ -530,7 +530,7 @@ impl Runtime {
                         Ok(0) => debug!("Trunk-groups JSON migration: nothing to do"),
                         Ok(n) => info!(imported = n, "Migrated trunk_groups.json to Postgres"),
                         Err(e) => {
-                            warn!(error = %e, "Trunk-groups JSON migration failed; continuing")
+                            warn!(error = %e, "Trunk-groups JSON migration failed; continuing");
                         }
                     }
                     app_state.trunk_group_store = Some(store_arc);
@@ -586,7 +586,7 @@ impl Runtime {
                     info!("CSS store initialized (PostgreSQL)");
                 }
                 Err(e) => {
-                    warn!(error = %e, "PostgresCallingSearchSpaceStore init exhausted retries")
+                    warn!(error = %e, "PostgresCallingSearchSpaceStore init exhausted retries");
                 }
             }
             match connect_with_retry("route_patterns", || {
@@ -621,118 +621,117 @@ impl Runtime {
             // Load seed config first (if present)
             let seed_path = std::env::var("SBC_SEED_CONFIG")
                 .unwrap_or_else(|_| "/etc/sbc/seed.json".to_string());
-            if let Ok(seed_data) = std::fs::read_to_string(&seed_path) {
-                if let Ok(seed) = serde_json::from_str::<serde_json::Value>(&seed_data) {
-                    info!(path = %seed_path, "Loading seed configuration");
+            if let Ok(seed_data) = std::fs::read_to_string(&seed_path)
+                && let Ok(seed) = serde_json::from_str::<serde_json::Value>(&seed_data)
+            {
+                info!(path = %seed_path, "Loading seed configuration");
 
-                    // Seed trunk groups
-                    if let Some(groups) = seed.get("trunk_groups").and_then(|v| v.as_array()) {
-                        for g in groups {
-                            if let Some(id) = g.get("id").and_then(|v| v.as_str()) {
-                                store.trunk_groups.insert(id.to_string(), g.clone());
-                            }
+                // Seed trunk groups
+                if let Some(groups) = seed.get("trunk_groups").and_then(|v| v.as_array()) {
+                    for g in groups {
+                        if let Some(id) = g.get("id").and_then(|v| v.as_str()) {
+                            store.trunk_groups.insert(id.to_string(), g.clone());
                         }
-                        info!(count = groups.len(), "Seeded trunk groups");
                     }
+                    info!(count = groups.len(), "Seeded trunk groups");
+                }
 
-                    // Seed directory numbers. With Postgres configured, also
-                    // upsert each seeded DID to the directory store so the
-                    // handlers (which read from Postgres) and the SIP-stack
-                    // replay loop see them. Without this, seeded DIDs on a
-                    // Postgres deploy would be invisible to the dashboard.
-                    if let Some(dns) = seed.get("directory_numbers").and_then(|v| v.as_array()) {
-                        for dn in dns {
-                            if let Some(did) = dn.get("did").and_then(|v| v.as_str()) {
-                                store.directory_numbers.insert(did.to_string(), dn.clone());
-                                if let Some(ref ds) = app_state.directory_store {
-                                    match sbc_config_store::DirectoryNumber::from_json(dn.clone()) {
-                                        Ok(typed) => {
-                                            if let Err(e) = ds.upsert(&typed).await {
-                                                warn!(did = %did, error = %e, "Failed to seed DID into Postgres");
-                                            }
+                // Seed directory numbers. With Postgres configured, also
+                // upsert each seeded DID to the directory store so the
+                // handlers (which read from Postgres) and the SIP-stack
+                // replay loop see them. Without this, seeded DIDs on a
+                // Postgres deploy would be invisible to the dashboard.
+                if let Some(dns) = seed.get("directory_numbers").and_then(|v| v.as_array()) {
+                    for dn in dns {
+                        if let Some(did) = dn.get("did").and_then(|v| v.as_str()) {
+                            store.directory_numbers.insert(did.to_string(), dn.clone());
+                            if let Some(ref ds) = app_state.directory_store {
+                                match sbc_config_store::DirectoryNumber::from_json(dn.clone()) {
+                                    Ok(typed) => {
+                                        if let Err(e) = ds.upsert(&typed).await {
+                                            warn!(did = %did, error = %e, "Failed to seed DID into Postgres");
                                         }
-                                        Err(e) => warn!(did = %did, error = %e,
+                                    }
+                                    Err(e) => warn!(did = %did, error = %e,
                                             "Malformed seed DID, skipping Postgres upsert"),
-                                    }
                                 }
                             }
                         }
-                        info!(count = dns.len(), "Seeded directory numbers");
                     }
+                    info!(count = dns.len(), "Seeded directory numbers");
+                }
 
-                    // Seed partitions, CSS, route patterns, route lists into CUCM router
-                    if let Some(ref cucm) = app_state.cucm_router {
-                        let mut cucm_w = cucm.write().await;
-                        if let Some(parts) = seed.get("partitions").and_then(|v| v.as_array()) {
-                            for p in parts {
-                                let id = p.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-                                let name = p.get("name").and_then(|v| v.as_str()).unwrap_or(id);
-                                cucm_w.add_partition(uc_routing::Partition::new(id, name));
-                            }
-                            info!(count = parts.len(), "Seeded partitions");
+                // Seed partitions, CSS, route patterns, route lists into CUCM router
+                if let Some(ref cucm) = app_state.cucm_router {
+                    let mut cucm_w = cucm.write().await;
+                    if let Some(parts) = seed.get("partitions").and_then(|v| v.as_array()) {
+                        for p in parts {
+                            let id = p.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                            let name = p.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+                            cucm_w.add_partition(uc_routing::Partition::new(id, name));
                         }
-                        if let Some(csses) =
-                            seed.get("calling_search_spaces").and_then(|v| v.as_array())
-                        {
-                            for c in csses {
-                                let id = c.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-                                let name = c.get("name").and_then(|v| v.as_str()).unwrap_or(id);
-                                let parts: Vec<String> = c
-                                    .get("partitions")
-                                    .and_then(|v| v.as_array())
-                                    .map(|a| {
-                                        a.iter()
-                                            .filter_map(|v| v.as_str().map(String::from))
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                let mut css = uc_routing::CallingSearchSpace::new(id, name);
-                                for p in &parts {
-                                    css.add_partition(p);
-                                }
-                                cucm_w.add_css(css);
+                        info!(count = parts.len(), "Seeded partitions");
+                    }
+                    if let Some(csses) =
+                        seed.get("calling_search_spaces").and_then(|v| v.as_array())
+                    {
+                        for c in csses {
+                            let id = c.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                            let name = c.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+                            let parts: Vec<String> = c
+                                .get("partitions")
+                                .and_then(|v| v.as_array())
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|v| v.as_str().map(String::from))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let mut css = uc_routing::CallingSearchSpace::new(id, name);
+                            for p in &parts {
+                                css.add_partition(p);
                             }
-                            info!(count = csses.len(), "Seeded calling search spaces");
+                            cucm_w.add_css(css);
                         }
-                        if let Some(rps) = seed.get("route_patterns").and_then(|v| v.as_array()) {
-                            for rp in rps {
-                                let id = rp.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-                                let partition = rp
-                                    .get("partition_id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default();
-                                let pattern_value =
-                                    rp.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-                                let pattern_type = rp
-                                    .get("pattern_type")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("prefix");
-                                let pattern = match pattern_type {
-                                    "exact" => uc_routing::DialPattern::exact(pattern_value),
-                                    "wildcard" => uc_routing::DialPattern::wildcard(pattern_value),
-                                    "any" => uc_routing::DialPattern::Any,
-                                    _ => uc_routing::DialPattern::prefix(pattern_value),
-                                };
-                                let mut route_pattern =
-                                    uc_routing::RoutePattern::new(id, pattern, partition);
-                                if let Some(desc) = rp.get("description").and_then(|v| v.as_str()) {
-                                    route_pattern = route_pattern.with_description(desc);
-                                }
-                                if let Some(rg) = rp.get("route_group_id").and_then(|v| v.as_str())
-                                {
-                                    if !rg.is_empty() {
-                                        route_pattern = route_pattern.with_route_group(rg);
-                                    }
-                                }
-                                if let Some(rl) = rp.get("route_list_id").and_then(|v| v.as_str()) {
-                                    if !rl.is_empty() {
-                                        route_pattern = route_pattern.with_route_list(rl);
-                                    }
-                                }
-                                cucm_w.add_route_pattern(route_pattern);
+                        info!(count = csses.len(), "Seeded calling search spaces");
+                    }
+                    if let Some(rps) = seed.get("route_patterns").and_then(|v| v.as_array()) {
+                        for rp in rps {
+                            let id = rp.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                            let partition = rp
+                                .get("partition_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            let pattern_value =
+                                rp.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+                            let pattern_type = rp
+                                .get("pattern_type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("prefix");
+                            let pattern = match pattern_type {
+                                "exact" => uc_routing::DialPattern::exact(pattern_value),
+                                "wildcard" => uc_routing::DialPattern::wildcard(pattern_value),
+                                "any" => uc_routing::DialPattern::Any,
+                                _ => uc_routing::DialPattern::prefix(pattern_value),
+                            };
+                            let mut route_pattern =
+                                uc_routing::RoutePattern::new(id, pattern, partition);
+                            if let Some(desc) = rp.get("description").and_then(|v| v.as_str()) {
+                                route_pattern = route_pattern.with_description(desc);
                             }
-                            info!(count = rps.len(), "Seeded route patterns");
+                            if let Some(rg) = rp.get("route_group_id").and_then(|v| v.as_str())
+                                && !rg.is_empty()
+                            {
+                                route_pattern = route_pattern.with_route_group(rg);
+                            }
+                            if let Some(rl) = rp.get("route_list_id").and_then(|v| v.as_str())
+                                && !rl.is_empty()
+                            {
+                                route_pattern = route_pattern.with_route_list(rl);
+                            }
+                            cucm_w.add_route_pattern(route_pattern);
                         }
+                        info!(count = rps.len(), "Seeded route patterns");
                     }
                 }
             }
@@ -769,10 +768,10 @@ impl Runtime {
                 // Replay DID→user mappings into the SIP stack so call routing
                 // works without the dashboard having to be hit first.
                 for (did, body) in &persisted_dids {
-                    if let Some(user) = body.get("user").and_then(|v| v.as_str()) {
-                        if let Some(ref sip_stack) = app_state.sip_stack {
-                            sip_stack.add_did_mapping(did, user).await;
-                        }
+                    if let Some(user) = body.get("user").and_then(|v| v.as_str())
+                        && let Some(ref sip_stack) = app_state.sip_stack
+                    {
+                        sip_stack.add_did_mapping(did, user).await;
                     }
                 }
                 for (did, b) in persisted_dids {
@@ -793,7 +792,7 @@ impl Runtime {
                 Ok(dns) => {
                     let mut count = 0usize;
                     for dn in &dns {
-                        if let (Some(user), Some(ref sip_stack)) =
+                        if let (Some(user), Some(sip_stack)) =
                             (dn.user.as_deref(), app_state.sip_stack.as_ref())
                         {
                             sip_stack.add_did_mapping(&dn.did, user).await;
@@ -947,10 +946,11 @@ impl Runtime {
                 for dn in &dns {
                     let did = dn.get("did").and_then(|v| v.as_str()).unwrap_or_default();
                     let user = dn.get("user").and_then(|v| v.as_str()).unwrap_or_default();
-                    if !did.is_empty() && !user.is_empty() {
-                        if let Some(ref sip_stack) = app_state.sip_stack {
-                            sip_stack.add_did_mapping(did, user).await;
-                        }
+                    if !did.is_empty()
+                        && !user.is_empty()
+                        && let Some(ref sip_stack) = app_state.sip_stack
+                    {
+                        sip_stack.add_did_mapping(did, user).await;
                     }
                 }
                 if !dns.is_empty() {

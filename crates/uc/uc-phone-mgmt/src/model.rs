@@ -203,7 +203,7 @@ pub enum PhoneModel {
 impl PhoneModel {
     /// Return the model family identifier string.
     #[must_use]
-    pub fn family(&self) -> &str {
+    pub const fn family(&self) -> &str {
         match self {
             Self::PolycomVVX150
             | Self::PolycomVVX250
@@ -251,7 +251,7 @@ impl PhoneModel {
 
     /// Return the maximum number of line appearances supported.
     #[must_use]
-    pub fn max_lines(&self) -> u8 {
+    pub const fn max_lines(&self) -> u8 {
         match self {
             // VVX entry-level
             Self::PolycomVVX150 => 2,
@@ -316,7 +316,7 @@ impl PhoneModel {
 
     /// Return a human-readable display name for the model.
     #[must_use]
-    pub fn display_name(&self) -> &str {
+    pub const fn display_name(&self) -> &str {
         match self {
             Self::PolycomVVX150 => "Polycom VVX 150",
             Self::PolycomVVX250 => "Polycom VVX 250",
@@ -455,9 +455,10 @@ pub struct BlfEntry {
 }
 
 /// Softkey action type.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum SoftkeyAction {
     /// Speed dial.
+    #[default]
     SpeedDial,
     /// BLF monitor.
     Blf,
@@ -475,12 +476,6 @@ pub enum SoftkeyAction {
     Custom(String),
 }
 
-impl Default for SoftkeyAction {
-    fn default() -> Self {
-        Self::SpeedDial
-    }
-}
-
 /// Softkey configuration for a programmable key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SoftkeyConfig {
@@ -495,7 +490,7 @@ pub struct SoftkeyConfig {
 }
 
 /// Phone feature flags.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PhoneFeatures {
     /// Enable auto-answer (e.g. for paging).
     pub auto_answer: bool,
@@ -509,20 +504,8 @@ pub struct PhoneFeatures {
     pub hotdesking: bool,
 }
 
-impl Default for PhoneFeatures {
-    fn default() -> Self {
-        Self {
-            auto_answer: false,
-            dnd: false,
-            intercom: false,
-            call_recording: false,
-            hotdesking: false,
-        }
-    }
-}
-
 /// Paging and intercom group configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PagingConfig {
     /// Enable paging support.
     pub enabled: bool,
@@ -532,18 +515,8 @@ pub struct PagingConfig {
     pub multicast_address: Option<String>,
 }
 
-impl Default for PagingConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            groups: Vec::new(),
-            multicast_address: None,
-        }
-    }
-}
-
 /// Network configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NetworkConfig {
     /// VLAN ID for voice traffic.
     pub vlan_id: Option<u16>,
@@ -557,18 +530,6 @@ pub struct NetworkConfig {
     pub qos_dscp: Option<u8>,
 }
 
-impl Default for NetworkConfig {
-    fn default() -> Self {
-        Self {
-            vlan_id: None,
-            cdp_enabled: false,
-            lldp_enabled: false,
-            dot1x_enabled: false,
-            qos_dscp: None,
-        }
-    }
-}
-
 /// Display and UI configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DisplayConfig {
@@ -580,7 +541,7 @@ pub struct DisplayConfig {
     pub ringtone: Option<String>,
     /// Use 24-hour time format.
     pub time_24hr: bool,
-    /// Timezone string (e.g. "America/New_York").
+    /// Timezone string (e.g. "`America/New_York`").
     pub timezone: Option<String>,
     /// NTP server address.
     pub ntp_server: Option<String>,
@@ -600,9 +561,10 @@ impl Default for DisplayConfig {
 }
 
 /// Headset operating mode.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum HeadsetMode {
     /// Standard wired headset.
+    #[default]
     Wired,
     /// USB headset.
     Usb,
@@ -610,12 +572,6 @@ pub enum HeadsetMode {
     Bluetooth,
     /// DECT wireless headset.
     Dect,
-}
-
-impl Default for HeadsetMode {
-    fn default() -> Self {
-        Self::Wired
-    }
 }
 
 /// Audio configuration.
@@ -640,7 +596,7 @@ impl Default for AudioConfig {
 }
 
 /// Corporate directory (LDAP) configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DirectoryConfig {
     /// Enable corporate directory lookup.
     pub enabled: bool,
@@ -658,22 +614,8 @@ pub struct DirectoryConfig {
     pub ldap_tls: bool,
 }
 
-impl Default for DirectoryConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            ldap_server: None,
-            ldap_port: None,
-            ldap_base_dn: None,
-            ldap_bind_dn: None,
-            ldap_password: None,
-            ldap_tls: false,
-        }
-    }
-}
-
 /// Emergency calling (E911) configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EmergencyConfig {
     /// Emergency number (e.g. "911").
     pub emergency_number: Option<String>,
@@ -683,20 +625,10 @@ pub struct EmergencyConfig {
     pub elin: Option<String>,
 }
 
-impl Default for EmergencyConfig {
-    fn default() -> Self {
-        Self {
-            emergency_number: None,
-            location_id: None,
-            elin: None,
-        }
-    }
-}
-
 /// Filter criteria for listing phones.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhoneFilter {
-    /// Filter by model family (e.g. "polycom_vvx").
+    /// Filter by model family (e.g. "`polycom_vvx`").
     pub model_family: Option<String>,
     /// Filter by status.
     pub status: Option<PhoneStatus>,

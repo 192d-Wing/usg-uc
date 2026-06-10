@@ -229,7 +229,7 @@ async fn serve_teo_global() -> impl IntoResponse {
 /// Serve a per-MAC phone provisioning config.
 ///
 /// Logic is a faithful port of the daemon's old `serve_phone_config`
-/// (api_server.rs in commits up to 0852812): extract MAC from filename,
+/// (`api_server.rs` in commits up to 0852812): extract MAC from filename,
 /// normalize, look up phone by normalized MAC, render via vendor
 /// generator, return with the right Content-Type per extension.
 async fn serve_phone_config(State(state): State<AppState>, Path(path): Path<String>) -> Response {

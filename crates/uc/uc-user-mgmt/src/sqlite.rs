@@ -293,8 +293,10 @@ impl UserStore for SqliteUserStore {
             // param_idx not needed after this point
         }
 
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-            param_values.iter().map(|p| p.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = param_values
+            .iter()
+            .map(std::convert::AsRef::as_ref)
+            .collect();
 
         let mut stmt = conn
             .prepare(&sql)

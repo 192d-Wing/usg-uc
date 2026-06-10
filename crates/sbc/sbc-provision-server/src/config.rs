@@ -30,7 +30,7 @@ pub struct Config {
     pub provision_port: u16,
 
     /// Source networks allowed to fetch provisioning configs (defense in
-    /// depth behind the Cilium NetworkPolicy). Parsed from
+    /// depth behind the Cilium `NetworkPolicy`). Parsed from
     /// `SBC_PROVISION_ALLOWED_CIDRS` (comma-separated CIDRs). Empty =
     /// unrestricted at the app layer. The client IP is read from
     /// `X-Forwarded-For` (set by the frontend nginx).

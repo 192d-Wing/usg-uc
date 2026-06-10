@@ -10,7 +10,6 @@
 //! Password-based digest authentication is NOT supported.
 
 #![forbid(unsafe_code)]
-#![deny(warnings)]
 #![deny(missing_docs)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]

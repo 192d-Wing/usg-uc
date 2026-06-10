@@ -1,5 +1,5 @@
 //! Directory-number (DID) CRUD. Writes go to Postgres and then trigger
-//! a DidMappingSync gRPC call to the daemon so the SIP stack's DID→user
+//! a `DidMappingSync` gRPC call to the daemon so the SIP stack's DID→user
 //! routing map stays current.
 
 use std::sync::Arc;
@@ -35,8 +35,7 @@ pub async fn create(
     let did = body
         .get("did")
         .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        .map_or_else(|| uuid::Uuid::new_v4().to_string(), String::from);
     body["did"] = serde_json::json!(&did);
 
     let dn = match sbc_config_store::DirectoryNumber::from_json(body.clone()) {
@@ -120,10 +119,10 @@ pub async fn delete(
     State(state): State<Arc<AppState>>,
     Path(did): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = state.directory.delete(&did).await {
-        if !matches!(e, sbc_config_store::ConfigStoreError::NotFound) {
-            warn!(did, error = %e, "directory delete failed");
-        }
+    if let Err(e) = state.directory.delete(&did).await
+        && !matches!(e, sbc_config_store::ConfigStoreError::NotFound)
+    {
+        warn!(did, error = %e, "directory delete failed");
     }
     notify_did_remove(&state, &did).await;
     Json(serde_json::json!({"success": true, "did": did}))

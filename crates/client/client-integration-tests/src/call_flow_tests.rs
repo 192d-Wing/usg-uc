@@ -519,10 +519,11 @@ mod incoming_call_tests {
                         saw_200_ok = true;
                     }
                 }
-                CallManagerEvent::CallStateChanged { state, .. } => {
-                    if state == CallState::Connected {
-                        saw_connected_event = true;
-                    }
+                CallManagerEvent::CallStateChanged {
+                    state: CallState::Connected,
+                    ..
+                } => {
+                    saw_connected_event = true;
                 }
                 _ => {}
             }

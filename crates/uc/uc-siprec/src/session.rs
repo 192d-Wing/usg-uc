@@ -543,8 +543,7 @@ impl RecordingSession {
     pub fn duration_secs(&self) -> u64 {
         let end = self.terminated_at.unwrap_or_else(SystemTime::now);
         end.duration_since(self.created_at)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_secs())
     }
 
     /// Generates XML metadata for the recording.

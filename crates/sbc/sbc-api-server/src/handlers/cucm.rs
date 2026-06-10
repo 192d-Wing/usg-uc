@@ -53,8 +53,7 @@ pub async fn create_partition(
         .get("id")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .map(String::from)
-        .unwrap_or_else(|| name.clone());
+        .map_or_else(|| name.clone(), String::from);
     if id.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -107,10 +106,10 @@ pub async fn delete_partition(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = state.partitions.delete(&id).await {
-        if !matches!(e, sbc_config_store::ConfigStoreError::NotFound) {
-            warn!(id, error = %e, "delete partition failed");
-        }
+    if let Err(e) = state.partitions.delete(&id).await
+        && !matches!(e, sbc_config_store::ConfigStoreError::NotFound)
+    {
+        warn!(id, error = %e, "delete partition failed");
     }
     let mut client = state.cucm_sync.clone();
     if let Err(e) = client
@@ -203,10 +202,10 @@ pub async fn delete_css(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = state.css.delete(&id).await {
-        if !matches!(e, sbc_config_store::ConfigStoreError::NotFound) {
-            warn!(id, error = %e, "delete css failed");
-        }
+    if let Err(e) = state.css.delete(&id).await
+        && !matches!(e, sbc_config_store::ConfigStoreError::NotFound)
+    {
+        warn!(id, error = %e, "delete css failed");
     }
     let mut client = state.cucm_sync.clone();
     if let Err(e) = client
@@ -294,10 +293,10 @@ pub async fn delete_route_pattern(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = state.route_patterns.delete(&id).await {
-        if !matches!(e, sbc_config_store::ConfigStoreError::NotFound) {
-            warn!(id, error = %e, "delete route_pattern failed");
-        }
+    if let Err(e) = state.route_patterns.delete(&id).await
+        && !matches!(e, sbc_config_store::ConfigStoreError::NotFound)
+    {
+        warn!(id, error = %e, "delete route_pattern failed");
     }
     let mut client = state.cucm_sync.clone();
     if let Err(e) = client
@@ -387,10 +386,10 @@ pub async fn delete_route_list(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = state.route_lists.delete(&id).await {
-        if !matches!(e, sbc_config_store::ConfigStoreError::NotFound) {
-            warn!(id, error = %e, "delete route_list failed");
-        }
+    if let Err(e) = state.route_lists.delete(&id).await
+        && !matches!(e, sbc_config_store::ConfigStoreError::NotFound)
+    {
+        warn!(id, error = %e, "delete route_list failed");
     }
     let mut client = state.cucm_sync.clone();
     if let Err(e) = client

@@ -2,7 +2,7 @@
 //!
 //! Dial plans were genuinely ephemeral before this PR: the daemon held
 //! them in `CucmRouter` only, and a restart lost every plan unless the
-//! operator re-POSTed them or had them in the ConfigMap seed. With a
+//! operator re-POSTed them or had them in the `ConfigMap` seed. With a
 //! Postgres store wired in, dial plans persist across daemon restarts
 //! and (once `sbc-api` lands in PR5) become writeable from a separate
 //! pod without going through the daemon.
@@ -52,7 +52,7 @@ impl PostgresDialPlanStore {
 
     /// Expose the underlying pool for cross-store reuse.
     #[must_use]
-    pub fn pool(&self) -> &PgPool {
+    pub const fn pool(&self) -> &PgPool {
         &self.pool
     }
 

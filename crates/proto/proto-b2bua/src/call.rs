@@ -28,8 +28,7 @@ impl CallId {
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos() as u64);
         let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
         Self(format!("call-{timestamp:x}-{counter:x}"))
     }

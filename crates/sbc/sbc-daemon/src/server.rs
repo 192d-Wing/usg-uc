@@ -444,6 +444,10 @@ impl Server {
     }
 
     /// Receive loop for a single transport.
+    // Spawned-task entrypoint: each argument is a distinct shared handle the
+    // loop needs for its lifetime; bundling them into a struct would only move
+    // the same fields behind one name without improving clarity.
+    #[allow(clippy::too_many_arguments)]
     async fn transport_receive_loop(
         idx: usize,
         transport: Arc<UdpTransport>,

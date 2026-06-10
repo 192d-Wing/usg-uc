@@ -60,9 +60,7 @@ impl AnnouncementServer {
         preferred_port: u16,
         bind_ip: Option<std::net::IpAddr>,
     ) -> Result<(UdpSocket, u16), String> {
-        let ip = bind_ip
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|| "0.0.0.0".to_string());
+        let ip = bind_ip.map_or_else(|| "0.0.0.0".to_string(), |ip| ip.to_string());
         let bind_addr = if preferred_port > 0 {
             format!("{ip}:{preferred_port}")
         } else {
@@ -187,7 +185,7 @@ fn generate_announcement(announcement: AnnouncementType) -> Vec<i16> {
 /// SIT tone sequence (intercept): 985.2 Hz, 1428.5 Hz, 1776.7 Hz
 /// Each tone: 276ms + 276ms + 380ms
 fn generate_number_not_in_service() -> Vec<i16> {
-    let sample_rate = PCMU_CLOCK_RATE as f64;
+    let sample_rate = f64::from(PCMU_CLOCK_RATE);
     let mut samples = Vec::new();
 
     // === SIT Tones (Special Information Tones) ===
@@ -493,7 +491,7 @@ fn generate_number_not_in_service() -> Vec<i16> {
 
 /// Generates "all circuits busy" announcement with SIT tones.
 fn generate_all_circuits_busy() -> Vec<i16> {
-    let sample_rate = PCMU_CLOCK_RATE as f64;
+    let sample_rate = f64::from(PCMU_CLOCK_RATE);
     let mut samples = Vec::new();
 
     // Reorder busy SIT: 985.2 Hz, 1428.5 Hz, 1776.7 Hz (same tones, shorter)

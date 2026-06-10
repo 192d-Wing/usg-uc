@@ -313,8 +313,7 @@ impl GruuService {
         // Generate a random-looking identifier that encodes the instance
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos());
 
         let random_part = simple_hash(&format!("{instance_id}{timestamp}"));
 

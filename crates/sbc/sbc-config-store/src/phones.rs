@@ -53,13 +53,13 @@ impl PostgresPhoneStore {
 
     /// Expose the underlying pool for cross-store reuse.
     #[must_use]
-    pub fn pool(&self) -> &PgPool {
+    pub const fn pool(&self) -> &PgPool {
         &self.pool
     }
 
     /// Normalize a MAC for indexed lookup: strip `:` and `-`, lowercase.
     /// Matches the comparison used today in `serve_phone_config`
-    /// (api_server.rs); store + lookup must agree.
+    /// (`api_server.rs`); store + lookup must agree.
     #[must_use]
     pub fn normalize_mac(mac: &str) -> String {
         mac.replace([':', '-'], "").to_lowercase()

@@ -201,8 +201,7 @@ impl<T: Clone> LWWRegister<T> {
         use std::time::{SystemTime, UNIX_EPOCH};
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_micros() as u64)
     }
 }
 

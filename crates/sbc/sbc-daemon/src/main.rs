@@ -22,7 +22,6 @@
 //! - **SC-5**: `DoS` Protection - Rate limiting enabled
 
 #![forbid(unsafe_code)]
-#![deny(warnings)]
 // Allow dead code for methods that will be used in future integration
 #![allow(dead_code)]
 // Allow significant_drop_tightening for async RwLock guards that are legitimately held

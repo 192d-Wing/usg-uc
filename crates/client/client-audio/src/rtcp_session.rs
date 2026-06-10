@@ -382,11 +382,9 @@ impl RtcpSession {
         let expected_this_interval = received_this_interval + lost_this_interval;
 
         #[allow(clippy::cast_possible_truncation)]
-        let fraction_lost = if expected_this_interval > 0 {
-            ((lost_this_interval * 256) / expected_this_interval) as u8
-        } else {
-            0
-        };
+        let fraction_lost = (lost_this_interval * 256)
+            .checked_div(expected_this_interval)
+            .unwrap_or(0) as u8;
 
         // Cumulative lost (total)
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]

@@ -24,7 +24,6 @@
 //! - **RFC 5764**: DTLS Extension for SRTP Key Establishment
 
 #![forbid(unsafe_code)]
-#![deny(warnings)]
 #![deny(missing_docs)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]

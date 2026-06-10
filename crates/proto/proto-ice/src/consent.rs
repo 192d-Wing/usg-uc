@@ -444,8 +444,7 @@ impl ConsentKeepaliveManager {
             // Fallback
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_nanos() as u64);
             transaction_id[..8].copy_from_slice(&now.to_be_bytes());
         }
 
@@ -463,8 +462,7 @@ impl ConsentKeepaliveManager {
         if uc_crypto::random::fill_random(&mut transaction_id).is_err() {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_nanos() as u64);
             transaction_id[..8].copy_from_slice(&now.to_be_bytes());
         }
 

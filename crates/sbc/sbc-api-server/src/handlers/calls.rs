@@ -67,7 +67,7 @@ pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 /// Per-call detail. The daemon's old REST surface returned a "ladder"
 /// view at `/calls/{id}/ladder` that was a hard-coded placeholder
 /// (`participants: ["UAC","SBC","UAS"], messages: []`) — see the
-/// pre-cleanup daemon api_server.rs `get_call_ladder` handler. We
+/// pre-cleanup daemon `api_server.rs` `get_call_ladder` handler. We
 /// match that shape from a real `GetCall` response so future ladder
 /// detail can attach to a fielded structure rather than be re-stubbed.
 pub async fn ladder(

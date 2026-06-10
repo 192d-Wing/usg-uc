@@ -64,7 +64,6 @@
 //! - **SC-24**: Fail in Known State (ClusterService)
 
 #![forbid(unsafe_code)]
-#![deny(warnings)]
 #![deny(missing_docs)]
 // Allow clippy warnings in generated code
 #![allow(clippy::derive_partial_eq_without_eq)]

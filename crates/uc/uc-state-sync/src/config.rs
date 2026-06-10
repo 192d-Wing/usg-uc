@@ -135,7 +135,7 @@ mod tests {
     fn test_durations() {
         let config = StateSyncConfig::default();
         assert_eq!(config.replication_interval(), Duration::from_millis(100));
-        assert_eq!(config.snapshot_interval(), Duration::from_secs(300));
+        assert_eq!(config.snapshot_interval(), Duration::from_mins(5));
         assert_eq!(config.max_lag(), Duration::from_secs(5));
     }
 

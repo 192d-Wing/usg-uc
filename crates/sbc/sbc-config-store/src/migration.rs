@@ -1,4 +1,4 @@
-//! One-shot JSON → Postgres migration for directory_numbers.
+//! One-shot JSON → Postgres migration for `directory_numbers`.
 //!
 //! Called by the daemon at startup when Postgres is configured. Backfills
 //! the legacy `/var/lib/sbc/directory_numbers.json` file if (and only if)
@@ -58,10 +58,10 @@ pub async fn migrate_directory_json_to_postgres(
     for (key, mut value) in map {
         // Ensure the value carries its `did` (legacy code persisted it
         // both as the map key and inside the object; tolerate either).
-        if value.get("did").is_none() {
-            if let Some(obj) = value.as_object_mut() {
-                obj.insert("did".to_string(), serde_json::Value::String(key.clone()));
-            }
+        if value.get("did").is_none()
+            && let Some(obj) = value.as_object_mut()
+        {
+            obj.insert("did".to_string(), serde_json::Value::String(key.clone()));
         }
         match DirectoryNumber::from_json(value) {
             Ok(dn) => {
