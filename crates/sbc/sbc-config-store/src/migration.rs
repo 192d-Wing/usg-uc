@@ -17,7 +17,7 @@ use tracing::{info, warn};
 use uc_phone_mgmt::model::Phone;
 
 use crate::directory::PostgresDirectoryNumberStore;
-use crate::error::{ConfigStoreError, ConfigStoreResult};
+use crate::error::ConfigStoreResult;
 use crate::model::DirectoryNumber;
 use crate::phones::PostgresPhoneStore;
 use crate::trunk_groups::PostgresTrunkGroupStore;
