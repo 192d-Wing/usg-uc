@@ -145,7 +145,7 @@ metadata:
   labels:
     {{- include "sbc.labels" . | nindent 4 }}
     app.kubernetes.io/component: frontend
-  {{- if .Values.externalDns.enabled }}
+  {{- if and .Values.externalDns.enabled (not .Values.gateway.enabled) }}
   annotations:
     external-dns.alpha.kubernetes.io/hostname: "sbc.{{ .Values.site.fqdn_base }}"
     external-dns.alpha.kubernetes.io/ttl: "60"
@@ -159,7 +159,11 @@ metadata:
     lbipam.cilium.io/sharing-key: "{{ .Values.site.name }}-sbc"
   {{- end }}
 spec:
-  type: LoadBalancer
+  # When the Gateway is enabled it owns the LB IP and terminates TLS; the
+  # frontend then sits behind it as a ClusterIP backend (the :80 port would
+  # otherwise collide with the Gateway's HTTP-redirect listener on the
+  # shared IP).
+  type: {{ if .Values.gateway.enabled }}ClusterIP{{ else }}LoadBalancer{{ end }}
   # Cluster (not Local) policy: the dashboard tolerates SNAT'd client IPs
   # (it doesn't peer-auth on source IP like SIP does), and Cluster policy
   # lets the LB target frontend pods on any node — important because the

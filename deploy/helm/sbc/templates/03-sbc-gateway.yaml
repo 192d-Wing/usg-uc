@@ -1,0 +1,113 @@
+{{- if .Values.gateway.enabled }}
+{{- /*
+TLS termination for the management/provisioning HTTP surface via the
+Gateway API (Cilium) + cert-manager.
+
+The Gateway owns the SBC LoadBalancer IP, terminates HTTPS:443 with a
+cert-manager-issued certificate, redirects HTTP:80 -> HTTPS, and routes
+everything to the frontend nginx (which fans out to sbc-api /
+sbc-provision / dashboard). When this is enabled, 16-sbc-frontend.yaml
+flips the frontend Service to ClusterIP.
+
+SIP (5060) is NOT in scope here — it keeps its own LoadBalancer; the
+Gateway API is HTTP(S) only.
+*/ -}}
+{{- $host := .Values.gateway.hostname | default (printf "sbc.%s" .Values.site.fqdn_base) -}}
+{{- $tlsSecret := .Values.gateway.tlsSecretName | default (printf "%s-tls" (include "sbc.fullname" .)) -}}
+{{- $issuer := required "gateway.clusterIssuer is required when gateway.enabled=true" .Values.gateway.clusterIssuer -}}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "sbc.fullname" . }}-tls
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  secretName: {{ $tlsSecret }}
+  dnsNames:
+    - {{ $host | quote }}
+  issuerRef:
+    name: {{ $issuer | quote }}
+    kind: {{ .Values.gateway.issuerKind | default "ClusterIssuer" }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: {{ include "sbc.fullname" . }}-gateway
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+  {{- if .Values.externalDns.enabled }}
+  annotations:
+    external-dns.alpha.kubernetes.io/hostname: {{ $host | quote }}
+    external-dns.alpha.kubernetes.io/ttl: "60"
+    coredns.io/hostname: {{ $host | quote }}
+  {{- end }}
+spec:
+  gatewayClassName: {{ .Values.gateway.className }}
+  # Pin the Gateway to the site's SBC LoadBalancer IP (Cilium honors
+  # Gateway addresses via LB IPAM).
+  addresses:
+    - type: IPAddress
+      value: {{ .Values.site.sbc_lb_ip | quote }}
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      hostname: {{ $host | quote }}
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: {{ $host | quote }}
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: {{ $tlsSecret }}
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+# HTTP -> HTTPS redirect.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "sbc.fullname" . }}-redirect
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ include "sbc.fullname" . }}-gateway
+      sectionName: http
+  hostnames:
+    - {{ $host | quote }}
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301
+---
+# HTTPS -> frontend nginx (which routes /api, /provision, dashboard).
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "sbc.fullname" . }}-route
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ include "sbc.fullname" . }}-gateway
+      sectionName: https
+  hostnames:
+    - {{ $host | quote }}
+  rules:
+    - backendRefs:
+        - name: {{ include "sbc.fullname" . }}-frontend
+          port: 80
+{{- end }}

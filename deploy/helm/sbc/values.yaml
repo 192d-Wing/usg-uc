@@ -82,6 +82,22 @@ sbcFrontend:
 # Production: set `enabled: false` and point `existingSecret.name` at a
 # Secret you manage that contains a `dsn` key. (Some teams want managed
 # Postgres; this lets them.)
+# TLS termination at the edge via Gateway API (Cilium) + cert-manager.
+# Opt-in: when enabled the Gateway owns the SBC LoadBalancer IP, terminates
+# HTTPS, redirects HTTP->HTTPS, and routes to the frontend nginx (which the
+# chart flips to ClusterIP). SIP keeps its own LoadBalancer (Gateway API is
+# HTTP-only). Requires the Gateway API CRDs and cert-manager installed.
+gateway:
+  enabled: false
+  className: cilium
+  # cert-manager issuer that signs the edge certificate (required when
+  # enabled). Kind defaults to ClusterIssuer.
+  clusterIssuer: ""
+  issuerKind: ClusterIssuer
+  # Defaults to sbc.<site.fqdn_base> / <release>-tls if left empty.
+  hostname: ""
+  tlsSecretName: ""
+
 # Management-plane authentication (sbc-api / sbc-provision). These pods
 # are fail-closed: they refuse to start without an admin credential. The
 # 00-sbc-auth-secret.yaml template generates and preserves a shared HMAC
