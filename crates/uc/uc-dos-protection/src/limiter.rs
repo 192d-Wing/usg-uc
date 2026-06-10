@@ -114,7 +114,7 @@ const MAX_TRACKED_SOURCES: usize = 65_536;
 
 /// A bucket idle this long is evicted under memory pressure (a quiet
 /// returning source simply starts with a full bucket again).
-const BUCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const BUCKET_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Minimum spacing between idle-bucket sweeps, so a flood of new sources at
 /// capacity cannot trigger an O(n) scan on every packet.

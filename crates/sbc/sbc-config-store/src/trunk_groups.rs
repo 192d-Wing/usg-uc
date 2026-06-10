@@ -1,6 +1,6 @@
 //! Postgres-backed store for trunk groups.
 //!
-//! Unlike DIDs (typed model) and phones (reuse uc_phone_mgmt::Phone), the
+//! Unlike DIDs (typed model) and phones (reuse `uc_phone_mgmt::Phone`), the
 //! trunk-group body is currently passed through as `serde_json::Value`
 //! end-to-end. `sync_trunk_group_to_router` in the daemon pulls per-trunk
 //! config (priority, weight, cooldown, options-ping, register creds,
@@ -52,7 +52,7 @@ impl PostgresTrunkGroupStore {
 
     /// Expose the underlying pool for cross-store reuse.
     #[must_use]
-    pub fn pool(&self) -> &PgPool {
+    pub const fn pool(&self) -> &PgPool {
         &self.pool
     }
 

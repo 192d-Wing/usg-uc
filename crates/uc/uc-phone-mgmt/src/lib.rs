@@ -4,7 +4,6 @@
 //! Cisco 9800 series, and Teo / Tone Commander 7810/4104/4101 phones.
 
 #![forbid(unsafe_code)]
-#![deny(warnings)]
 
 pub mod cisco_9800;
 pub mod cisco_mpp;

@@ -278,22 +278,21 @@ impl CucmRouter {
         transformed: &mut String,
         transforms_applied: &mut Vec<String>,
     ) -> Vec<String> {
-        if let Some(rl_id) = matched.route_list_id() {
-            if let Some(rl) = self.route_lists.get(rl_id) {
-                let ordered = rl.ordered_members();
-                // Apply first member's transform if present (primary path)
-                if let Some(first) = ordered.first()
-                    && let Some(t) = first.transform()
-                {
-                    *transformed = t.apply(transformed);
-                    transforms_applied
-                        .push(format!("route_list_member({})", first.route_group_id()));
-                }
-                return ordered
-                    .iter()
-                    .map(|m| m.route_group_id().to_string())
-                    .collect();
+        if let Some(rl_id) = matched.route_list_id()
+            && let Some(rl) = self.route_lists.get(rl_id)
+        {
+            let ordered = rl.ordered_members();
+            // Apply first member's transform if present (primary path)
+            if let Some(first) = ordered.first()
+                && let Some(t) = first.transform()
+            {
+                *transformed = t.apply(transformed);
+                transforms_applied.push(format!("route_list_member({})", first.route_group_id()));
             }
+            return ordered
+                .iter()
+                .map(|m| m.route_group_id().to_string())
+                .collect();
         }
 
         if let Some(rg_id) = matched.route_group_id() {

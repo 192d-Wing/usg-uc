@@ -71,13 +71,13 @@ pub struct AppState {
     pub calls: CallServiceClient<Channel>,
     pub registrations: RegistrationServiceClient<Channel>,
     pub system: SystemServiceClient<Channel>,
-    /// Runtime trunk-state reads + RegisterTrunk trigger. Replaces the
+    /// Runtime trunk-state reads + `RegisterTrunk` trigger. Replaces the
     /// daemon's REST `/trunk-health`, `/trunk-registration`, and
     /// `/trunk-registration/{id}/register` endpoints (PR9).
     pub trunk_health: TrunkHealthServiceClient<Channel>,
     /// CUCM-routing sync client (PR11) — sbc-api notifies the daemon
     /// "I changed partition / CSS / route-pattern / route-list X,
-    /// please re-apply from Postgres to the live CucmRouter".
+    /// please re-apply from Postgres to the live `CucmRouter`".
     pub cucm_sync: CucmSyncServiceClient<Channel>,
 
     /// HTTP client + base URL used by the reverse-proxy fallback for
@@ -205,16 +205,16 @@ fn scrub_dsn(dsn: &str) -> String {
     // Naive: replace `user:pass@host` with `user:***@host`. Doesn't
     // handle every DSN form (e.g., URL-encoded creds) but catches the
     // typical postgres://user:pass@host/db shape we emit from Helm.
-    if let Some(at) = dsn.find('@') {
-        if let Some(scheme_end) = dsn.find("://") {
-            let after_scheme = scheme_end + 3;
-            if let Some(colon) = dsn[after_scheme..at].find(':') {
-                let mut out = String::with_capacity(dsn.len());
-                out.push_str(&dsn[..after_scheme + colon + 1]);
-                out.push_str("***");
-                out.push_str(&dsn[at..]);
-                return out;
-            }
+    if let Some(at) = dsn.find('@')
+        && let Some(scheme_end) = dsn.find("://")
+    {
+        let after_scheme = scheme_end + 3;
+        if let Some(colon) = dsn[after_scheme..at].find(':') {
+            let mut out = String::with_capacity(dsn.len());
+            out.push_str(&dsn[..=(after_scheme + colon)]);
+            out.push_str("***");
+            out.push_str(&dsn[at..]);
+            return out;
         }
     }
     dsn.to_string()

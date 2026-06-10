@@ -88,10 +88,10 @@ pub fn restore_passwords(body: &mut Value, existing: Option<&Value>) {
 /// Drops a `sip_password` equal to the marker from a single (new) trunk —
 /// there is no stored secret to restore for a brand-new trunk.
 pub fn drop_marker_password(trunk: &mut Value) {
-    if trunk.get("sip_password").and_then(|v| v.as_str()) == Some(REDACTED) {
-        if let Some(obj) = trunk.as_object_mut() {
-            obj.remove("sip_password");
-        }
+    if trunk.get("sip_password").and_then(|v| v.as_str()) == Some(REDACTED)
+        && let Some(obj) = trunk.as_object_mut()
+    {
+        obj.remove("sip_password");
     }
 }
 

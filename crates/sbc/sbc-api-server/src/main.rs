@@ -3,8 +3,8 @@
 //! Owns the config-entity surface (phones, DIDs, trunk groups, dial
 //! plans) directly out of Postgres, and reverse-proxies everything else
 //! to the sbc-daemon's REST endpoint. After a write that needs SIP-
-//! router invalidation, sbc-api calls the daemon's TrunkSync /
-//! DialPlanSync / DidMappingSync gRPC services to push the change.
+//! router invalidation, sbc-api calls the daemon's `TrunkSync` /
+//! `DialPlanSync` / `DidMappingSync` gRPC services to push the change.
 //!
 //! Runs independently of the daemon so dashboard/config releases roll
 //! without touching the SIP-serving process. The daemon is on the

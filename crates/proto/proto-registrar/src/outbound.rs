@@ -40,7 +40,7 @@ pub const DEFAULT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MIN_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Maximum keepalive interval (should be less than typical NAT timeout).
-pub const MAX_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
+pub const MAX_KEEPALIVE_INTERVAL: Duration = Duration::from_mins(2);
 
 /// Flow transport type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -589,8 +589,7 @@ impl OutboundFlowManager {
                         // Generate a simple transaction ID
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_nanos())
-                            .unwrap_or(0);
+                            .map_or(0, |d| d.as_nanos());
                         transaction_id[..8].copy_from_slice(&now.to_le_bytes()[..8]);
 
                         FlowAction::SendStunKeepalive {

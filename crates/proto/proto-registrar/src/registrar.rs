@@ -388,8 +388,7 @@ impl RegisterResponse {
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
 
         // RFC 1123 date format (simplified)
         // In production, use a proper date formatting library

@@ -1234,14 +1234,16 @@ impl CallManager {
             .invite_request
             .headers
             .get_value(&proto_sip::header::HeaderName::Contact)
-            .and_then(|c| {
-                // Extract URI from Contact: <sip:...>
-                let s = c.to_string();
-                let start = s.find('<').map(|i| i + 1).unwrap_or(0);
-                let end = s.find('>').unwrap_or(s.len());
-                Some(s[start..end].to_string())
-            })
-            .unwrap_or_else(|| format!("sip:{}:{}", source_addr.ip(), source_addr.port()));
+            .map_or_else(
+                || format!("sip:{}:{}", source_addr.ip(), source_addr.port()),
+                |c| {
+                    // Extract URI from Contact: <sip:...>
+                    let s = c.to_string();
+                    let start = s.find('<').map_or(0, |i| i + 1);
+                    let end = s.find('>').unwrap_or(s.len());
+                    s[start..end].to_string()
+                },
+            );
 
         self.call_agent.register_inbound_call(
             call_id,

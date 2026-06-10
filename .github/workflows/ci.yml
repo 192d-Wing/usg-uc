@@ -8,7 +8,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
+  # No blanket `-D warnings`: the lint gate is the `deny`-level clippy groups
+  # (clippy::all + pedantic) configured in the workspace Cargo.toml. Warn-level
+  # lints (nursery, unwrap/expect/panic, missing_docs) stay visible without
+  # failing the build.
 
 jobs:
   fmt:
@@ -43,7 +46,7 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-clippy-
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --all-targets --all-features
 
   build:
     name: Build

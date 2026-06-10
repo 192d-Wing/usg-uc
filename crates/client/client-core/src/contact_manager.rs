@@ -151,7 +151,7 @@ impl ContactManager {
     /// Gets contacts sorted alphabetically by display name.
     pub fn contacts_sorted(&self) -> Vec<&Contact> {
         let mut contacts: Vec<_> = self.store.contacts.values().collect();
-        contacts.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        contacts.sort_by_key(|a| a.name.to_lowercase());
         contacts
     }
 
@@ -282,8 +282,7 @@ fn generate_contact_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     format!("contact-{timestamp:x}")
 }
 

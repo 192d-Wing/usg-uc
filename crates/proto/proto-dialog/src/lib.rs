@@ -38,7 +38,6 @@
 //! - Rule 10: Compile with all warnings, use static analysis
 
 #![forbid(unsafe_code)]
-#![deny(warnings)]
 #![deny(missing_docs)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]

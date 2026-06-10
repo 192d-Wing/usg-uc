@@ -234,9 +234,9 @@ impl Default for DnsCache {
     fn default() -> Self {
         Self::new(
             10000,
-            Duration::from_secs(60),
-            Duration::from_secs(86400),
-            Duration::from_secs(300),
+            Duration::from_mins(1),
+            Duration::from_hours(24),
+            Duration::from_mins(5),
         )
     }
 }

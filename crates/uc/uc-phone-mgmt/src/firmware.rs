@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 /// Metadata about an available firmware image.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FirmwareInfo {
-    /// Model family this firmware applies to (e.g. "polycom_vvx").
+    /// Model family this firmware applies to (e.g. "`polycom_vvx`").
     pub model_family: String,
     /// Firmware version string.
     pub version: String,
@@ -49,12 +49,11 @@ impl FirmwareManager {
         let mut results = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                if let Ok(contents) = std::fs::read_to_string(&path) {
-                    if let Ok(info) = serde_json::from_str::<FirmwareInfo>(&contents) {
-                        results.push(info);
-                    }
-                }
+            if path.extension().and_then(|e| e.to_str()) == Some("json")
+                && let Ok(contents) = std::fs::read_to_string(&path)
+                && let Ok(info) = serde_json::from_str::<FirmwareInfo>(&contents)
+            {
+                results.push(info);
             }
         }
         results

@@ -80,8 +80,7 @@ impl ReloadableTlsAcceptor {
 
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
 
         info!(
             cert_path = %cert_path.display(),
@@ -112,8 +111,7 @@ impl ReloadableTlsAcceptor {
 
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
 
         Self {
             acceptor: ArcSwap::from_pointee(acceptor),
@@ -152,8 +150,7 @@ impl ReloadableTlsAcceptor {
         self.reload_count.fetch_add(1, Ordering::Relaxed);
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         self.last_reload.store(now, Ordering::Relaxed);
 
         info!(
@@ -282,12 +279,7 @@ mod tests {
             .arg(&key_path)
             .output();
 
-        if key_result.is_err()
-            || !key_result
-                .as_ref()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        {
+        if key_result.is_err() || !key_result.as_ref().is_ok_and(|o| o.status.success()) {
             return None;
         }
 
@@ -300,12 +292,7 @@ mod tests {
             .args(["-days", "1", "-subj", "/CN=test"])
             .output();
 
-        if cert_result.is_err()
-            || !cert_result
-                .as_ref()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        {
+        if cert_result.is_err() || !cert_result.as_ref().is_ok_and(|o| o.status.success()) {
             return None;
         }
 

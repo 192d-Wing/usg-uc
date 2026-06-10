@@ -93,20 +93,20 @@ async fn proxy(
     if !query.is_empty() {
         req = req.query(&query);
     }
-    if let Some(ua) = headers.get(axum::http::header::USER_AGENT) {
-        if let Ok(v) = ua.to_str() {
-            req = req.header(reqwest::header::USER_AGENT, v);
-        }
+    if let Some(ua) = headers.get(axum::http::header::USER_AGENT)
+        && let Ok(v) = ua.to_str()
+    {
+        req = req.header(reqwest::header::USER_AGENT, v);
     }
-    if let Some(rid) = headers.get("x-request-id") {
-        if let Ok(v) = rid.to_str() {
-            req = req.header("x-request-id", v);
-        }
+    if let Some(rid) = headers.get("x-request-id")
+        && let Ok(v) = rid.to_str()
+    {
+        req = req.header("x-request-id", v);
     }
-    if let Some(ct) = headers.get(axum::http::header::CONTENT_TYPE) {
-        if let Ok(v) = ct.to_str() {
-            req = req.header(reqwest::header::CONTENT_TYPE, v);
-        }
+    if let Some(ct) = headers.get(axum::http::header::CONTENT_TYPE)
+        && let Ok(v) = ct.to_str()
+    {
+        req = req.header(reqwest::header::CONTENT_TYPE, v);
     }
     if !body.is_empty() {
         req = req.body(body);

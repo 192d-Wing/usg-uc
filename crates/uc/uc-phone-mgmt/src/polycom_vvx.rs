@@ -140,24 +140,23 @@ pub fn generate_vvx_config(phone: &Phone, sbc_host: &str) -> String {
     }
 
     // Corporate directory (LDAP)
-    if phone.directory.enabled {
-        if let (Some(server), Some(base_dn)) =
+    if phone.directory.enabled
+        && let (Some(server), Some(base_dn)) =
             (&phone.directory.ldap_server, &phone.directory.ldap_base_dn)
-        {
-            xml.push_str(&format!(
-                "  <dir.corp.address=\"{server}\" dir.corp.baseDN=\"{base_dn}\"",
-            ));
-            if let Some(port) = phone.directory.ldap_port {
-                xml.push_str(&format!(" dir.corp.port=\"{port}\""));
-            }
-            if let Some(bind_dn) = &phone.directory.ldap_bind_dn {
-                xml.push_str(&format!(" dir.corp.user=\"{bind_dn}\""));
-            }
-            if let Some(pw) = &phone.directory.ldap_password {
-                xml.push_str(&format!(" dir.corp.password=\"{pw}\""));
-            }
-            xml.push_str(" />\n\n");
+    {
+        xml.push_str(&format!(
+            "  <dir.corp.address=\"{server}\" dir.corp.baseDN=\"{base_dn}\"",
+        ));
+        if let Some(port) = phone.directory.ldap_port {
+            xml.push_str(&format!(" dir.corp.port=\"{port}\""));
         }
+        if let Some(bind_dn) = &phone.directory.ldap_bind_dn {
+            xml.push_str(&format!(" dir.corp.user=\"{bind_dn}\""));
+        }
+        if let Some(pw) = &phone.directory.ldap_password {
+            xml.push_str(&format!(" dir.corp.password=\"{pw}\""));
+        }
+        xml.push_str(" />\n\n");
     }
 
     // Codec preferences

@@ -51,7 +51,7 @@ impl PostgresDirectoryNumberStore {
     /// Expose the underlying pool so future stores in this crate (phones,
     /// trunks, dial-plans) can share it.
     #[must_use]
-    pub fn pool(&self) -> &PgPool {
+    pub const fn pool(&self) -> &PgPool {
         &self.pool
     }
 

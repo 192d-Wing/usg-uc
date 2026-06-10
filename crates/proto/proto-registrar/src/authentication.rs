@@ -615,8 +615,7 @@ fn generate_random_nonce() -> String {
     // Combine timestamp with random data for uniqueness
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
 
     // Use simple random generation without external crates
     // In production, use a proper CSPRNG

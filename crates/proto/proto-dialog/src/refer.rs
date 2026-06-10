@@ -142,7 +142,7 @@ impl ReferRequest {
             sent_at: Instant::now(),
             subscription_state: ReferSubscriptionState::Pending,
             current_status: None,
-            expires: Duration::from_secs(180), // Default 3 minutes
+            expires: Duration::from_mins(3), // Default 3 minutes
             no_refer_sub: false,
         }
     }
@@ -269,7 +269,7 @@ impl ReferHandler {
             received_at: Instant::now(),
             subscription_state: ReferSubscriptionState::Pending,
             current_status: ReferStatus::Trying,
-            expires: Duration::from_secs(180),
+            expires: Duration::from_mins(3),
             notify_cseq: 1,
         }
     }
@@ -628,9 +628,8 @@ mod tests {
 
     #[test]
     fn test_refer_request_with_expires() {
-        let request =
-            ReferRequest::new("sip:bob@example.com").with_expires(Duration::from_secs(300));
-        assert_eq!(request.expires(), Duration::from_secs(300));
+        let request = ReferRequest::new("sip:bob@example.com").with_expires(Duration::from_mins(5));
+        assert_eq!(request.expires(), Duration::from_mins(5));
     }
 
     #[test]
@@ -652,7 +651,7 @@ mod tests {
             ReferSubscriptionState::Pending
         );
         assert!(request.current_status().is_none());
-        assert_eq!(request.expires(), Duration::from_secs(180));
+        assert_eq!(request.expires(), Duration::from_mins(3));
         assert!(!request.no_refer_sub());
     }
 
@@ -736,7 +735,7 @@ mod tests {
     fn test_refer_request_clone() {
         let request = ReferRequest::new("sip:bob@example.com")
             .with_referred_by("sip:alice@example.com")
-            .with_expires(Duration::from_secs(60));
+            .with_expires(Duration::from_mins(1));
 
         let cloned = request.clone();
         assert_eq!(cloned.refer_to(), request.refer_to());
@@ -753,8 +752,7 @@ mod tests {
 
     #[test]
     fn test_refer_handler_with_expires() {
-        let handler =
-            ReferHandler::new("sip:bob@example.com").with_expires(Duration::from_secs(60));
+        let handler = ReferHandler::new("sip:bob@example.com").with_expires(Duration::from_mins(1));
         // Can't directly check expires, but we can verify it was set
         // by checking subscription_state_header when active
         let mut handler = handler;

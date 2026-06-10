@@ -26,7 +26,7 @@ pub struct ResolvedZone {
     /// External/public IP for NAT traversal.
     /// `None` means use `signaling_ip` directly.
     pub external_ip: Option<IpAddr>,
-    /// Raw external_ip config value (for STUN re-resolution).
+    /// Raw `external_ip` config value (for STUN re-resolution).
     pub external_ip_source: Option<String>,
 }
 
@@ -122,13 +122,13 @@ fn enumerate_interfaces() -> Result<HashMap<String, Vec<IpAddr>>, ConfigError> {
     })?;
 
     for ifaddr in ifaddrs {
-        if let Some(addr) = ifaddr.address {
-            if let Some(sockaddr) = addr.as_sockaddr_in() {
-                let ip = IpAddr::V4(std::net::Ipv4Addr::from(sockaddr.ip()));
-                map.entry(ifaddr.interface_name.clone())
-                    .or_default()
-                    .push(ip);
-            }
+        if let Some(addr) = ifaddr.address
+            && let Some(sockaddr) = addr.as_sockaddr_in()
+        {
+            let ip = IpAddr::V4(sockaddr.ip());
+            map.entry(ifaddr.interface_name.clone())
+                .or_default()
+                .push(ip);
         }
     }
 
@@ -137,6 +137,7 @@ fn enumerate_interfaces() -> Result<HashMap<String, Vec<IpAddr>>, ConfigError> {
 
 /// Returns a list of all available interface names on the system.
 /// Useful for error messages and diagnostics.
+#[must_use]
 pub fn list_interfaces() -> Vec<String> {
     enumerate_interfaces()
         .map(|m| {
@@ -148,7 +149,7 @@ pub fn list_interfaces() -> Vec<String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 

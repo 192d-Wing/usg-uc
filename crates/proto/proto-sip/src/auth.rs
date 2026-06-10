@@ -588,6 +588,9 @@ impl DigestHasher for Md5DigestHasher {
 /// Uses cryptographic randomness to prevent prediction and replay attacks.
 #[cfg(feature = "digest-auth")]
 #[must_use]
+// A failing CSPRNG is unrecoverable and must not yield a predictable
+// cnonce; `expect` is the correct response and the API is infallible.
+#[allow(clippy::expect_used)]
 pub fn generate_cnonce() -> String {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("getrandom failed");

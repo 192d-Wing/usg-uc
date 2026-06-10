@@ -74,7 +74,7 @@ impl ResolvedZoneRegistry {
     /// Returns the addresses for a zone, or `None` if not found.
     pub async fn get(&self, name: &str) -> Option<ZoneAddresses> {
         let entry = self.zones.get(name)?;
-        let external_ip = entry.external_ip.read().await.clone();
+        let external_ip = *entry.external_ip.read().await;
         Some(ZoneAddresses {
             name: name.to_string(),
             signaling_ip: entry.signaling_ip,
@@ -100,7 +100,7 @@ impl ResolvedZoneRegistry {
             seen.entry(entry.signaling_ip)
                 .or_insert_with(|| name.clone());
         }
-        seen.into_iter().map(|(ip, name)| (ip, name)).collect()
+        seen.into_iter().collect()
     }
 
     /// Returns all zone names.

@@ -68,8 +68,7 @@ impl TrunkHealthStatus {
     fn record_success(&mut self, response_ms: u64) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs() as i64);
 
         // Track down→up transition for service duration timer
         if !self.reachable {
@@ -88,8 +87,7 @@ impl TrunkHealthStatus {
     fn record_failure(&mut self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs() as i64);
 
         self.reachable = false;
         self.last_response_ms = None;
@@ -146,11 +144,11 @@ impl TrunkMonitor {
 
     /// Stops monitoring a trunk and removes its health entry.
     pub async fn stop_trunk(&self, trunk_id: &str) {
-        if let Ok(mut tasks) = self.tasks.lock() {
-            if let Some(handle) = tasks.remove(trunk_id) {
-                handle.abort();
-                info!(trunk_id, "Stopped OPTIONS health monitor");
-            }
+        if let Ok(mut tasks) = self.tasks.lock()
+            && let Some(handle) = tasks.remove(trunk_id)
+        {
+            handle.abort();
+            info!(trunk_id, "Stopped OPTIONS health monitor");
         }
         self.health.write().await.remove(trunk_id);
     }
@@ -237,11 +235,11 @@ impl TrunkMonitor {
             }
         });
 
-        if let Ok(mut tasks) = self.tasks.lock() {
-            if let Some(previous) = tasks.insert(registry_id.clone(), handle) {
-                previous.abort();
-                info!(trunk_id = %registry_id, "Replaced existing OPTIONS monitor task");
-            }
+        if let Ok(mut tasks) = self.tasks.lock()
+            && let Some(previous) = tasks.insert(registry_id.clone(), handle)
+        {
+            previous.abort();
+            info!(trunk_id = %registry_id, "Replaced existing OPTIONS monitor task");
         }
     }
 
@@ -299,13 +297,12 @@ impl TrunkMonitor {
         let call_id = generate_call_id(domain);
         let local_addr = socket
             .local_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "0.0.0.0:0".to_string());
+            .map_or_else(|_| "0.0.0.0:0".to_string(), |a| a.to_string());
 
         let request = RequestBuilder::options(uri)
             .via_auto(
                 "UDP",
-                &local_addr.split(':').next().unwrap_or("0.0.0.0"),
+                local_addr.split(':').next().unwrap_or("0.0.0.0"),
                 None,
             )
             .from_auto(SipUri::new(domain).with_user("sbc-monitor"), None)

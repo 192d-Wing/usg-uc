@@ -158,8 +158,7 @@ impl IceCredentials {
 
         let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0) as u64;
+            .map_or(0, |d| d.as_nanos()) as u64;
 
         let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
             .chars()
@@ -211,8 +210,7 @@ impl IceAgent {
 
         let tie_breaker = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos() as u64);
 
         Self {
             role,

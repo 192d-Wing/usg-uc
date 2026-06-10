@@ -97,6 +97,9 @@ impl ViaHeader {
     ///
     /// Uses cryptographic randomness to prevent prediction and replay attacks.
     #[must_use]
+    // A failing CSPRNG is unrecoverable and must not yield a predictable
+    // branch; `expect` is the correct response and the API is infallible.
+    #[allow(clippy::expect_used)]
     pub fn generate_branch() -> String {
         let mut bytes = [0u8; 16];
         getrandom::fill(&mut bytes).expect("getrandom failed");
@@ -322,6 +325,9 @@ impl NameAddr {
     ///
     /// Uses cryptographic randomness to prevent prediction and call hijacking.
     #[must_use]
+    // A failing CSPRNG is unrecoverable and must not yield a predictable
+    // tag; `expect` is the correct response and the API is infallible.
+    #[allow(clippy::expect_used)]
     pub fn generate_tag() -> String {
         let mut bytes = [0u8; 8];
         getrandom::fill(&mut bytes).expect("getrandom failed");

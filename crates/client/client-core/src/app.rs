@@ -385,12 +385,13 @@ impl ClientApp {
     /// Returns `None` if the transport is not initialized.
     pub async fn get_udp_socket_for_receive(
         &mut self,
+        use_ipv6: bool,
     ) -> Option<(
         std::sync::Arc<tokio::net::UdpSocket>,
         tokio::sync::mpsc::Sender<TransportEvent>,
     )> {
         if let Some(ref transport) = self.sip_transport {
-            match transport.get_or_create_udp_socket().await {
+            match transport.get_or_create_udp_socket(use_ipv6).await {
                 Ok((socket, _is_new)) => {
                     // Update the registration agent's local address with the actual bound address
                     // This ensures Via/Contact headers have the correct port
@@ -654,20 +655,16 @@ impl ClientApp {
 
                 // Update app state based on registration
                 match state {
-                    RegistrationState::Registered => {
-                        if self.state == AppState::Registering {
-                            self.state = AppState::Registered;
-                        }
+                    RegistrationState::Registered if self.state == AppState::Registering => {
+                        self.state = AppState::Registered;
                     }
-                    RegistrationState::Failed | RegistrationState::CertificateInvalid => {
-                        if self.state == AppState::Registering {
-                            self.state = AppState::Ready;
-                        }
+                    RegistrationState::Failed | RegistrationState::CertificateInvalid
+                        if self.state == AppState::Registering =>
+                    {
+                        self.state = AppState::Ready;
                     }
-                    RegistrationState::Unregistered => {
-                        if self.state == AppState::Registered {
-                            self.state = AppState::Ready;
-                        }
+                    RegistrationState::Unregistered if self.state == AppState::Registered => {
+                        self.state = AppState::Ready;
                     }
                     _ => {}
                 }
@@ -755,10 +752,8 @@ impl ClientApp {
 
                 // Update app state
                 match state {
-                    CallState::Terminated => {
-                        if self.state == AppState::InCall {
-                            self.state = AppState::Registered;
-                        }
+                    CallState::Terminated if self.state == AppState::InCall => {
+                        self.state = AppState::Registered;
                     }
                     _ if state.is_active() => {
                         self.state = AppState::InCall;

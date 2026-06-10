@@ -267,7 +267,7 @@ struct Permission {
 
 impl Permission {
     /// Permission lifetime (5 minutes per RFC 5766).
-    const LIFETIME: Duration = Duration::from_secs(300);
+    const LIFETIME: Duration = Duration::from_mins(5);
 
     fn new() -> Self {
         Self {
@@ -295,7 +295,7 @@ struct ChannelBinding {
 
 impl ChannelBinding {
     /// Channel binding lifetime (10 minutes per RFC 5766).
-    const LIFETIME: Duration = Duration::from_secs(600);
+    const LIFETIME: Duration = Duration::from_mins(10);
 
     fn new(peer_addr: SocketAddr) -> Self {
         Self {

@@ -668,7 +668,7 @@ impl SharedJitterBuffer {
 
     /// Returns the number of packets currently buffered.
     pub fn len(&self) -> usize {
-        self.inner.lock().map(|jb| jb.len()).unwrap_or(0)
+        self.inner.lock().map_or(0, |jb| jb.len())
     }
 
     /// Returns whether the buffer is empty.
@@ -678,7 +678,7 @@ impl SharedJitterBuffer {
 
     /// Returns whether the buffer is primed and ready for playout.
     pub fn is_ready(&self) -> bool {
-        self.inner.lock().map(|jb| jb.is_ready()).unwrap_or(false)
+        self.inner.lock().is_ok_and(|jb| jb.is_ready())
     }
 
     /// Returns the current statistics (Copy — no heap allocation).
@@ -688,10 +688,7 @@ impl SharedJitterBuffer {
 
     /// Returns the buffered duration in milliseconds.
     pub fn buffered_duration_ms(&self) -> u32 {
-        self.inner
-            .lock()
-            .map(|jb| jb.buffered_duration_ms())
-            .unwrap_or(0)
+        self.inner.lock().map_or(0, |jb| jb.buffered_duration_ms())
     }
 
     /// Resets the jitter buffer state.

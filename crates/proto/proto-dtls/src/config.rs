@@ -327,7 +327,7 @@ mod tests {
 
     #[test]
     fn test_with_handshake_timeout() {
-        let timeout = Duration::from_secs(60);
+        let timeout = Duration::from_mins(1);
         let config = DtlsConfig::default().with_handshake_timeout(timeout);
         assert_eq!(config.handshake_timeout, timeout);
     }

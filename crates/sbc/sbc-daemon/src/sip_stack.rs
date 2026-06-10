@@ -416,8 +416,7 @@ impl SipStack {
     fn zone_signaling_ip(&self, zone: Option<&str>, fallback: std::net::IpAddr) -> String {
         if let (Some(name), Some(reg)) = (zone, &self.zone_registry) {
             reg.signaling_ip(name)
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|| fallback.to_string())
+                .map_or_else(|| fallback.to_string(), |ip| ip.to_string())
         } else {
             fallback.to_string()
         }
@@ -427,8 +426,7 @@ impl SipStack {
     fn zone_media_ip(&self, zone: Option<&str>, fallback: std::net::IpAddr) -> String {
         if let (Some(name), Some(reg)) = (zone, &self.zone_registry) {
             reg.media_ip(name)
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|| fallback.to_string())
+                .map_or_else(|| fallback.to_string(), |ip| ip.to_string())
         } else {
             fallback.to_string()
         }
@@ -791,18 +789,17 @@ impl SipStack {
 
         // Learn the remote (callee) tag from the first tagged response —
         // it completes the dialog identity used by in-dialog BYE/ACK.
-        if addrs.dialog_to_tag.is_none() {
-            if let Some(tag) = resp
+        if addrs.dialog_to_tag.is_none()
+            && let Some(tag) = resp
                 .headers
                 .get_value(&HeaderName::To)
                 .and_then(|to| extract_param(to, "tag"))
                 .map(String::from)
-            {
-                addrs.dialog_to_tag = Some(tag.clone());
-                let mut corr = self.call_correlation.write().await;
-                if let Some(entry) = corr.addresses.get_mut(&internal_id) {
-                    entry.dialog_to_tag = Some(tag);
-                }
+        {
+            addrs.dialog_to_tag = Some(tag.clone());
+            let mut corr = self.call_correlation.write().await;
+            if let Some(entry) = corr.addresses.get_mut(&internal_id) {
+                entry.dialog_to_tag = Some(tag);
             }
         }
 
@@ -1449,18 +1446,18 @@ impl SipStack {
                     }
                 }
                 // If not found with dest_host, try with zone IPs
-                if found_contact.is_none() {
-                    if let Some(ref zr) = self.zone_registry {
-                        for zone_name in &["inside", "outside", "oobm"] {
-                            if let Some(ip) = zr.signaling_ip(zone_name) {
-                                let aor = format!("sip:{user}@{ip}");
-                                let bindings = loc.lookup(&aor);
-                                if let Some(binding) = bindings.first() {
-                                    let contact = binding.contact_uri().to_string();
-                                    info!(aor = %aor, contact = %contact, zone = zone_name, "Routing to registered user via zone lookup");
-                                    found_contact = Some(contact);
-                                    break;
-                                }
+                if found_contact.is_none()
+                    && let Some(ref zr) = self.zone_registry
+                {
+                    for zone_name in &["inside", "outside", "oobm"] {
+                        if let Some(ip) = zr.signaling_ip(zone_name) {
+                            let aor = format!("sip:{user}@{ip}");
+                            let bindings = loc.lookup(&aor);
+                            if let Some(binding) = bindings.first() {
+                                let contact = binding.contact_uri().to_string();
+                                info!(aor = %aor, contact = %contact, zone = zone_name, "Routing to registered user via zone lookup");
+                                found_contact = Some(contact);
+                                break;
                             }
                         }
                     }
@@ -1490,8 +1487,7 @@ impl SipStack {
                 let source_ip = match source.ip() {
                     std::net::IpAddr::V6(v6) => v6
                         .to_ipv4_mapped()
-                        .map(std::net::IpAddr::V4)
-                        .unwrap_or(std::net::IpAddr::V6(v6)),
+                        .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
                     ip => ip,
                 };
                 let inbound_trunk = self.lookup_inbound_trunk(source_ip).await;
@@ -2369,13 +2365,13 @@ impl SipStack {
                 );
             } else {
                 use std::net::ToSocketAddrs;
-                if let Ok(mut addrs) = addr_str.to_socket_addrs() {
-                    if let Some(addr) = addrs.find(|a| a.is_ipv4()) {
-                        map.insert(
-                            addr.ip(),
-                            (trunk_group_id.to_string(), css_id.map(String::from)),
-                        );
-                    }
+                if let Ok(mut addrs) = addr_str.to_socket_addrs()
+                    && let Some(addr) = addrs.find(std::net::SocketAddr::is_ipv4)
+                {
+                    map.insert(
+                        addr.ip(),
+                        (trunk_group_id.to_string(), css_id.map(String::from)),
+                    );
                 }
             }
         }
@@ -2435,8 +2431,7 @@ impl SipStack {
                 .port_allocator()
                 .allocate_pair()
                 .await
-                .map(|(rtp, _)| rtp)
-                .unwrap_or(0)
+                .map_or(0, |(rtp, _)| rtp)
         } else {
             0
         };
@@ -2528,9 +2523,7 @@ impl SipStack {
 
         let source_port = source.port();
         // local_ip = macvlan IP for binding sockets; sdp_ip = external/public IP for SDP
-        let local_ip = rtp_bind_ip
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|| sdp_ip.clone());
+        let local_ip = rtp_bind_ip.map_or_else(|| sdp_ip.clone(), |ip| ip.to_string());
 
         // Spawn background task to play announcement then BYE
         tokio::spawn(async move {
@@ -2601,13 +2594,13 @@ impl SipStack {
                         #[cfg(target_os = "linux")]
                         s.set_reuse_port(true).ok();
                         s.set_nonblocking(true).ok();
-                        if s.bind(&bind_addr.into()).is_ok() {
-                            if let Ok(sock) = tokio::net::UdpSocket::from_std(s.into()) {
-                                if let Err(e) = sock.send_to(&bye_bytes, source.as_std()).await {
-                                    warn!(error = %e, "Failed to send BYE after announcement");
-                                } else {
-                                    info!(call_id = %call_id, destination = %source, "Sent BYE after announcement");
-                                }
+                        if s.bind(&bind_addr.into()).is_ok()
+                            && let Ok(sock) = tokio::net::UdpSocket::from_std(s.into())
+                        {
+                            if let Err(e) = sock.send_to(&bye_bytes, source.as_std()).await {
+                                warn!(error = %e, "Failed to send BYE after announcement");
+                            } else {
+                                info!(call_id = %call_id, destination = %source, "Sent BYE after announcement");
                             }
                         }
                     }
@@ -3129,9 +3122,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_with_auth() {
-        let mut config = SipStackConfig::default();
-        config.require_auth = true;
-        config.auth_realm = "example.com".to_string();
+        let mut config = SipStackConfig {
+            require_auth: true,
+            auth_realm: "example.com".to_string(),
+            ..Default::default()
+        };
         config
             .auth_credentials
             .insert("alice".to_string(), "password123".to_string());
@@ -3241,10 +3236,10 @@ mod tests {
             .process_message(&Bytes::from_static(register), source, None)
             .await;
         // Verify registration succeeded
-        if let ProcessResult::Response { message, .. } = &result {
-            if let SipMessage::Response(resp) = message {
-                assert_eq!(resp.status, StatusCode::OK, "Registration should succeed");
-            }
+        if let ProcessResult::Response { message, .. } = &result
+            && let SipMessage::Response(resp) = message
+        {
+            assert_eq!(resp.status, StatusCode::OK, "Registration should succeed");
         }
 
         // Now INVITE bob — should route via location service
@@ -3371,10 +3366,10 @@ mod tests {
             ProcessResult::Multiple(results) => {
                 assert_eq!(results.len(), 2);
                 // First: 200 OK
-                if let ProcessResult::Response { message, .. } = &results[0] {
-                    if let SipMessage::Response(resp) = message {
-                        assert_eq!(resp.status, StatusCode::OK);
-                    }
+                if let ProcessResult::Response { message, .. } = &results[0]
+                    && let SipMessage::Response(resp) = message
+                {
+                    assert_eq!(resp.status, StatusCode::OK);
                 }
                 // Second: BYE to bob
                 if let ProcessResult::Forward { message, .. } = &results[1] {
@@ -3443,16 +3438,16 @@ mod tests {
             ProcessResult::Multiple(results) => {
                 assert_eq!(results.len(), 3, "CANCEL should produce 3 results");
                 // First: 200 OK for CANCEL
-                if let ProcessResult::Response { message, .. } = &results[0] {
-                    if let SipMessage::Response(resp) = message {
-                        assert_eq!(resp.status, StatusCode::OK);
-                    }
+                if let ProcessResult::Response { message, .. } = &results[0]
+                    && let SipMessage::Response(resp) = message
+                {
+                    assert_eq!(resp.status, StatusCode::OK);
                 }
                 // Second: 487 Request Terminated for INVITE
-                if let ProcessResult::Response { message, .. } = &results[1] {
-                    if let SipMessage::Response(resp) = message {
-                        assert_eq!(resp.status.code(), 487);
-                    }
+                if let ProcessResult::Response { message, .. } = &results[1]
+                    && let SipMessage::Response(resp) = message
+                {
+                    assert_eq!(resp.status.code(), 487);
                 }
                 // Third: CANCEL to bob
                 if let ProcessResult::Forward { message, .. } = &results[2] {
@@ -3606,8 +3601,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_router_initialization() {
-        let mut config = SipStackConfig::default();
-        config.domain = "sbc.test".to_string();
+        let config = SipStackConfig {
+            domain: "sbc.test".to_string(),
+            ..Default::default()
+        };
         let mut stack = SipStack::new(config);
 
         let routing = sbc_config::RoutingConfig {
@@ -3679,8 +3676,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_manipulator_initialization() {
-        let mut config = SipStackConfig::default();
-        config.domain = "sbc.test".to_string();
+        let config = SipStackConfig {
+            domain: "sbc.test".to_string(),
+            ..Default::default()
+        };
         let mut stack = SipStack::new(config);
 
         let manip_config = sbc_config::HeaderManipulationConfig {
@@ -3706,8 +3705,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_topology_hider_initialization() {
-        let mut config = SipStackConfig::default();
-        config.domain = "sbc.test".to_string();
+        let config = SipStackConfig {
+            domain: "sbc.test".to_string(),
+            ..Default::default()
+        };
         let mut stack = SipStack::new(config);
 
         let topo_config = sbc_config::TopologyHidingConfig {
@@ -3724,8 +3725,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_topology_hider_disabled() {
-        let mut config = SipStackConfig::default();
-        config.domain = "sbc.test".to_string();
+        let config = SipStackConfig {
+            domain: "sbc.test".to_string(),
+            ..Default::default()
+        };
         let mut stack = SipStack::new(config);
 
         let topo_config = sbc_config::TopologyHidingConfig {

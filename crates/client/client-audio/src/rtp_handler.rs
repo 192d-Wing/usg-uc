@@ -978,14 +978,11 @@ fn entropy_seed() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     // Source 1: High-resolution timestamp (nanoseconds)
-    let time_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| {
-            #[allow(clippy::cast_possible_truncation)]
-            let nanos = d.as_nanos() as u64;
-            nanos
-        })
-        .unwrap_or(0);
+    let time_nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
+        #[allow(clippy::cast_possible_truncation)]
+        let nanos = d.as_nanos() as u64;
+        nanos
+    });
 
     // Source 2: Thread ID (different per thread)
     let thread_id = {

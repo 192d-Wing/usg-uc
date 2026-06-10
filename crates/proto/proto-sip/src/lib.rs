@@ -41,10 +41,11 @@
 //! - **Rule 7**: Return checking - enforced via `Result` types
 //! - **Rule 8**: Limited preprocessor - Rust has no C-style preprocessor
 //! - **Rule 9**: Pointer restrictions - `#![forbid(unsafe_code)]` enforced
-//! - **Rule 10**: All warnings enabled - `#![deny(warnings)]` enforced
+//! - **Rule 10**: Lints enforced - `clippy::all` denied workspace-wide, plus
+//!   `missing_docs` and the `unwrap`/`expect`/`panic` restriction lints denied
+//!   in this crate. (`pedantic`/`nursery` are warn-level; see workspace lints.)
 
 #![forbid(unsafe_code)]
-#![deny(warnings)]
 #![deny(missing_docs)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]

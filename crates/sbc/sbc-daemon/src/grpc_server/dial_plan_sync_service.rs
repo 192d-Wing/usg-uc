@@ -85,11 +85,11 @@ impl DialPlanSyncService for DialPlanSyncServiceImpl {
         let plan_id = req.plan_id;
         info!(plan_id, "gRPC RemoveDialPlan");
 
-        if let Some(ref sip_stack) = self.state.sip_stack {
-            if let Some(router_lock) = sip_stack.router() {
-                let mut router = router_lock.write().await;
-                router.remove_dial_plan(&plan_id);
-            }
+        if let Some(ref sip_stack) = self.state.sip_stack
+            && let Some(router_lock) = sip_stack.router()
+        {
+            let mut router = router_lock.write().await;
+            router.remove_dial_plan(&plan_id);
         }
         Ok(Response::new(RemoveDialPlanResponse {
             success: true,

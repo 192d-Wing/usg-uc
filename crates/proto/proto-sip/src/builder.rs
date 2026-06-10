@@ -31,8 +31,7 @@ pub fn generate_call_id(host: &str) -> String {
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
 
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
 

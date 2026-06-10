@@ -111,7 +111,7 @@ impl RtpPortAllocator {
             return 0;
         }
         // Each pair occupies (even, even+1); both ends inclusive.
-        (u32::from(self.max_port) - u32::from(self.min_port) + 1) / 2
+        (u32::from(self.max_port) - u32::from(self.min_port)).div_ceil(2)
     }
 
     /// Allocates an even-numbered RTP port. Returns (rtp_port, rtcp_port).
@@ -1099,7 +1099,7 @@ const SSRC_TRACKER_SOFT_CAP: usize = 4096;
 /// Hard cap on tracked SSRCs: new SSRCs are rejected beyond this.
 const SSRC_TRACKER_HARD_CAP: usize = 8192;
 /// Idle eviction window for SSRC trackers.
-const SSRC_TRACKER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const SSRC_TRACKER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// A sequence tracker with a last-activity timestamp for idle eviction.
 struct TrackedSequence {

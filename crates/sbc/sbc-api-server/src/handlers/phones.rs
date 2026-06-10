@@ -73,10 +73,10 @@ pub async fn create(
     };
 
     let mut phone = uc_phone_mgmt::model::Phone::new(&mac, model, &name);
-    if let Some(id) = body.get("id").and_then(|v| v.as_str()) {
-        if !id.is_empty() {
-            phone.id = id.to_string();
-        }
+    if let Some(id) = body.get("id").and_then(|v| v.as_str())
+        && !id.is_empty()
+    {
+        phone.id = id.to_string();
     }
 
     // Merge the caller's extra fields by serializing the seeded Phone,
@@ -173,10 +173,10 @@ pub async fn delete(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = state.phones.delete(&id).await {
-        if !matches!(e, sbc_config_store::ConfigStoreError::NotFound) {
-            warn!(id, error = %e, "delete phone failed");
-        }
+    if let Err(e) = state.phones.delete(&id).await
+        && !matches!(e, sbc_config_store::ConfigStoreError::NotFound)
+    {
+        warn!(id, error = %e, "delete phone failed");
     }
     Json(serde_json::json!({"success": true, "id": id}))
 }

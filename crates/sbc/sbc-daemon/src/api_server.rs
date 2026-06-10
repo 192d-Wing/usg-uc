@@ -832,7 +832,10 @@ pub fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
         .get("host")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let port = trunk.get("port").and_then(|v| v.as_u64()).unwrap_or(5060) as u16;
+    let port = trunk
+        .get("port")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(5060) as u16;
 
     if trunk_id.is_empty() || host.is_empty() {
         return;
@@ -859,29 +862,28 @@ pub fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
     // Start OPTIONS health monitoring
     if trunk
         .get("options_ping_enabled")
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
+        && let Some(ref monitor) = state.trunk_monitor
     {
-        if let Some(ref monitor) = state.trunk_monitor {
-            let interval = trunk
-                .get("options_ping_interval")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(30) as u32;
-            monitor.monitor_trunk(crate::trunk_monitor::MonitoredTrunk {
-                trunk_id: trunk_id.to_string(),
-                host: host.to_string(),
-                port,
-                interval_secs: interval,
-                bind_ip,
-            });
-            tracing::info!(trunk_id, ?bind_ip, "Started OPTIONS health monitor via API");
-        }
+        let interval = trunk
+            .get("options_ping_interval")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(30) as u32;
+        monitor.monitor_trunk(crate::trunk_monitor::MonitoredTrunk {
+            trunk_id: trunk_id.to_string(),
+            host: host.to_string(),
+            port,
+            interval_secs: interval,
+            bind_ip,
+        });
+        tracing::info!(trunk_id, ?bind_ip, "Started OPTIONS health monitor via API");
     }
 
     // Start SIP registration
     if trunk
         .get("register_enabled")
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
     {
         let username = trunk
@@ -892,36 +894,37 @@ pub fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
             .get("sip_password")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        if !username.is_empty() && !password.is_empty() {
-            if let Some(ref registrar) = state.trunk_registrar {
-                let domain = trunk
-                    .get("sip_domain")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(host);
-                let expires = trunk
-                    .get("register_expires")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(25) as u32;
-                tracing::info!(
-                    trunk_id,
-                    ?bind_ip,
-                    ?external_ip,
-                    expires,
-                    "Starting trunk registration with zone IPs"
-                );
-                registrar.register_trunk(crate::trunk_registrar::TrunkRegConfig {
-                    trunk_id: trunk_id.to_string(),
-                    host: host.to_string(),
-                    port,
-                    username: username.to_string(),
-                    password: password.to_string(),
-                    domain: domain.to_string(),
-                    expires,
-                    bind_ip,
-                    external_ip,
-                });
-                tracing::info!(trunk_id, "Started SIP registration via API");
-            }
+        if !username.is_empty()
+            && !password.is_empty()
+            && let Some(ref registrar) = state.trunk_registrar
+        {
+            let domain = trunk
+                .get("sip_domain")
+                .and_then(|v| v.as_str())
+                .unwrap_or(host);
+            let expires = trunk
+                .get("register_expires")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(25) as u32;
+            tracing::info!(
+                trunk_id,
+                ?bind_ip,
+                ?external_ip,
+                expires,
+                "Starting trunk registration with zone IPs"
+            );
+            registrar.register_trunk(crate::trunk_registrar::TrunkRegConfig {
+                trunk_id: trunk_id.to_string(),
+                host: host.to_string(),
+                port,
+                username: username.to_string(),
+                password: password.to_string(),
+                domain: domain.to_string(),
+                expires,
+                bind_ip,
+                external_ip,
+            });
+            tracing::info!(trunk_id, "Started SIP registration via API");
         }
     }
 }
@@ -949,7 +952,10 @@ pub async fn sync_trunk_group_to_router(state: &Arc<AppState>, group_json: &serd
         for t in trunks {
             let trunk_id = t.get("id").and_then(|v| v.as_str()).unwrap_or_default();
             let host = t.get("host").and_then(|v| v.as_str()).unwrap_or_default();
-            let port = t.get("port").and_then(|v| v.as_u64()).unwrap_or(5060) as u16;
+            let port = t
+                .get("port")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(5060) as u16;
             if trunk_id.is_empty() || host.is_empty() {
                 continue;
             }
@@ -960,14 +966,26 @@ pub async fn sync_trunk_group_to_router(state: &Arc<AppState>, group_json: &serd
                 host: host.to_string(),
                 port,
                 protocol: uc_routing::TrunkProtocol::Udp,
-                priority: t.get("priority").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
-                weight: t.get("weight").and_then(|v| v.as_u64()).unwrap_or(100) as u32,
-                max_calls: t.get("max_calls").and_then(|v| v.as_u64()).unwrap_or(100) as u32,
+                priority: t
+                    .get("priority")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(1) as u32,
+                weight: t
+                    .get("weight")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(100) as u32,
+                max_calls: t
+                    .get("max_calls")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(100) as u32,
                 cooldown_secs: t
                     .get("cooldown_seconds")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(30) as u64,
-                max_failures: t.get("max_failures").and_then(|v| v.as_u64()).unwrap_or(5) as u32,
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(30),
+                max_failures: t
+                    .get("max_failures")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(5) as u32,
                 outbound_enabled: true,
                 inbound_enabled: true,
             };
@@ -987,7 +1005,10 @@ pub async fn sync_trunk_group_to_router(state: &Arc<AppState>, group_json: &serd
                 .iter()
                 .filter_map(|t| {
                     let h = t.get("host").and_then(|v| v.as_str())?;
-                    let p = t.get("port").and_then(|v| v.as_u64()).unwrap_or(5060) as u16;
+                    let p = t
+                        .get("port")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(5060) as u16;
                     Some((h.to_string(), p))
                 })
                 .collect()
@@ -1020,7 +1041,10 @@ pub async fn sync_dial_plan_to_router(
             .get("pattern")
             .and_then(|v| v.as_str())
             .unwrap_or(".*");
-        let priority = entry.get("priority").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+        let priority = entry
+            .get("priority")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1) as u32;
 
         let pattern = uc_routing::DialPattern::Any;
         let entry_id = format!("{plan_id}-{idx}");
@@ -1053,10 +1077,10 @@ pub async fn apply_partition_to_router(state: &Arc<AppState>, body: &serde_json:
     }
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(id);
     let mut p = uc_routing::Partition::new(id, name);
-    if let Some(desc) = body.get("description").and_then(|v| v.as_str()) {
-        if !desc.is_empty() {
-            p = p.with_description(desc);
-        }
+    if let Some(desc) = body.get("description").and_then(|v| v.as_str())
+        && !desc.is_empty()
+    {
+        p = p.with_description(desc);
     }
     router.write().await.add_partition(p);
 }
@@ -1115,27 +1139,27 @@ pub async fn apply_route_pattern_to_router(state: &Arc<AppState>, body: &serde_j
         _ => uc_routing::DialPattern::prefix(pattern_value),
     };
     let mut rp = uc_routing::RoutePattern::new(id, pattern, partition);
-    if let Some(rl) = body.get("route_list_id").and_then(|v| v.as_str()) {
-        if !rl.is_empty() {
-            rp = rp.with_route_list(rl);
-        }
+    if let Some(rl) = body.get("route_list_id").and_then(|v| v.as_str())
+        && !rl.is_empty()
+    {
+        rp = rp.with_route_list(rl);
     }
-    if let Some(rg) = body.get("route_group_id").and_then(|v| v.as_str()) {
-        if !rg.is_empty() {
-            rp = rp.with_route_group(rg);
-        }
+    if let Some(rg) = body.get("route_group_id").and_then(|v| v.as_str())
+        && !rg.is_empty()
+    {
+        rp = rp.with_route_group(rg);
     }
-    if let Some(desc) = body.get("description").and_then(|v| v.as_str()) {
-        if !desc.is_empty() {
-            rp = rp.with_description(desc);
-        }
+    if let Some(desc) = body.get("description").and_then(|v| v.as_str())
+        && !desc.is_empty()
+    {
+        rp = rp.with_description(desc);
     }
-    if let Some(p) = body.get("priority").and_then(|v| v.as_u64()) {
+    if let Some(p) = body.get("priority").and_then(serde_json::Value::as_u64) {
         rp = rp.with_priority(p as u32);
     }
     if body
         .get("blocked")
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
     {
         rp = rp.with_block(true);
@@ -1176,10 +1200,10 @@ pub async fn apply_route_list_to_router(state: &Arc<AppState>, body: &serde_json
     }
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(id);
     let mut rl = uc_routing::RouteList::new(id, name);
-    if let Some(desc) = body.get("description").and_then(|v| v.as_str()) {
-        if !desc.is_empty() {
-            rl = rl.with_description(desc);
-        }
+    if let Some(desc) = body.get("description").and_then(|v| v.as_str())
+        && !desc.is_empty()
+    {
+        rl = rl.with_description(desc);
     }
     if let Some(members) = body.get("members").and_then(|v| v.as_array()) {
         for (idx, m) in members.iter().enumerate() {
@@ -1191,9 +1215,8 @@ pub async fn apply_route_list_to_router(state: &Arc<AppState>, body: &serde_json
             }
             let priority = m
                 .get("priority")
-                .and_then(|v| v.as_u64())
-                .map(|p| p as u32)
-                .unwrap_or((idx + 1) as u32);
+                .and_then(serde_json::Value::as_u64)
+                .map_or((idx + 1) as u32, |p| p as u32);
             rl.add_member(uc_routing::RouteListMember::new(rg_id, priority));
         }
     }

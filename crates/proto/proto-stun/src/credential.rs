@@ -32,7 +32,7 @@ use crate::message::StunMessage;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Default nonce validity duration (10 minutes per RFC 5389 recommendation).
-pub const DEFAULT_NONCE_LIFETIME: Duration = Duration::from_secs(600);
+pub const DEFAULT_NONCE_LIFETIME: Duration = Duration::from_mins(10);
 
 /// Minimum nonce validity (should be at least one transaction round-trip).
 pub const MIN_NONCE_LIFETIME: Duration = Duration::from_secs(30);

@@ -57,7 +57,7 @@ impl CucmJsonStore {
 
     /// Expose the underlying pool for cross-store reuse.
     #[must_use]
-    pub fn pool(&self) -> &PgPool {
+    pub const fn pool(&self) -> &PgPool {
         &self.pool
     }
 
@@ -173,7 +173,7 @@ macro_rules! cucm_store {
 
             /// Expose the underlying pool.
             #[must_use]
-            pub fn pool(&self) -> &PgPool {
+            pub const fn pool(&self) -> &PgPool {
                 self.0.pool()
             }
 

@@ -1,5 +1,5 @@
 //! Trunk-group + nested trunk CRUD. Writes go to Postgres, then a
-//! TrunkSync gRPC call to the daemon refreshes the SIP router. Lookup
+//! `TrunkSync` gRPC call to the daemon refreshes the SIP router. Lookup
 //! helpers mirror the daemon's `lookup_trunk_group` / `persist_trunk_
 //! group` pattern from PR3 so the branching logic shows up exactly
 //! twice instead of once per handler.
@@ -86,8 +86,7 @@ pub async fn add_group(
     let id = body
         .get("id")
         .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        .map_or_else(|| uuid::Uuid::new_v4().to_string(), String::from);
     body["id"] = serde_json::json!(&id);
     if body.get("trunks").is_none() {
         body["trunks"] = serde_json::json!([]);
@@ -134,10 +133,10 @@ pub async fn delete_group(
     State(state): State<Arc<AppState>>,
     Path(group_id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = state.trunk_groups.delete(&group_id).await {
-        if !matches!(e, sbc_config_store::ConfigStoreError::NotFound) {
-            warn!(group_id, error = %e, "trunk group delete failed");
-        }
+    if let Err(e) = state.trunk_groups.delete(&group_id).await
+        && !matches!(e, sbc_config_store::ConfigStoreError::NotFound)
+    {
+        warn!(group_id, error = %e, "trunk group delete failed");
     }
     notify_remove(&state, &group_id).await;
     Json(serde_json::json!({"success": true, "group_id": group_id}))

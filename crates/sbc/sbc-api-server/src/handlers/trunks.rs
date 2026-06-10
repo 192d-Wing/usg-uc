@@ -4,8 +4,8 @@
 //! be removed.
 //!
 //! Response shapes match what the daemon used to emit:
-//!   GET /trunk-health           → {"trunk_health":[…]}
-//!   GET /trunk-registration     → {"trunk_registrations":[…]}
+//!   GET /trunk-health           → {"`trunk_health"`:[…]}
+//!   GET /trunk-registration     → {"`trunk_registrations"`:[…]}
 //!   POST /trunk-registration/{id}/register → {"success":bool, "message":…}
 
 use std::sync::Arc;
