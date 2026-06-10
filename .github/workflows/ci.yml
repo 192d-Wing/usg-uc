@@ -104,12 +104,17 @@ jobs:
       - name: Configure Android NDK toolchain
         if: contains(matrix.target, 'android')
         run: |
-          TOOLCHAIN="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          PREBUILT="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64"
           {
-            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/aarch64-linux-android26-clang"
-            echo "CC_aarch64_linux_android=$TOOLCHAIN/aarch64-linux-android26-clang"
-            echo "CXX_aarch64_linux_android=$TOOLCHAIN/aarch64-linux-android26-clang++"
-            echo "AR_aarch64_linux_android=$TOOLCHAIN/llvm-ar"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$PREBUILT/bin/aarch64-linux-android26-clang"
+            echo "CC_aarch64_linux_android=$PREBUILT/bin/aarch64-linux-android26-clang"
+            echo "CXX_aarch64_linux_android=$PREBUILT/bin/aarch64-linux-android26-clang++"
+            echo "AR_aarch64_linux_android=$PREBUILT/bin/llvm-ar"
+            # aws-lc-(fips-)sys generates bindings with the host libclang,
+            # which needs the Android sysroot spelled out or it fails on
+            # missing libc headers (stdlib.h).
+            echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android=--sysroot=$PREBUILT/sysroot --target=aarch64-linux-android26"
+            echo "ANDROID_NDK_ROOT=$ANDROID_NDK_LATEST_HOME"
           } >> "$GITHUB_ENV"
       - run: cargo check -p client-ffi --target ${{ matrix.target }}
 
