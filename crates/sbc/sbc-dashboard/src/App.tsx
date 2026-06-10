@@ -3,6 +3,8 @@ import AppLayout from '@cloudscape-design/components/app-layout';
 import TopNavigation from '@cloudscape-design/components/top-navigation';
 
 import { Sidebar } from './components/Sidebar';
+import { AuthGate } from './components/AuthGate';
+import { api, UNAUTHORIZED_EVENT } from './api';
 import { Dashboard } from './pages/Dashboard';
 import { Phones } from './pages/Phones';
 import { PhoneDetail } from './pages/PhoneDetail';
@@ -21,8 +23,19 @@ export function App() {
   const location = useLocation();
   const navigate = useNavigate();
 
+  const signOut = () => {
+    api
+      .post('/auth/logout', {})
+      .catch(() => {
+        // Session may already be gone; show the login view either way.
+      })
+      .finally(() => {
+        globalThis.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+      });
+  };
+
   return (
-    <>
+    <AuthGate>
       <TopNavigation
         identity={{
           href: '/',
@@ -32,6 +45,13 @@ export function App() {
             navigate('/dashboard');
           },
         }}
+        utilities={[
+          {
+            type: 'button',
+            text: 'Sign out',
+            onClick: signOut,
+          },
+        ]}
       />
       <AppLayout
         navigation={<Sidebar activePath={location.pathname} />}
@@ -57,6 +77,6 @@ export function App() {
           </Routes>
         }
       />
-    </>
+    </AuthGate>
   );
 }
