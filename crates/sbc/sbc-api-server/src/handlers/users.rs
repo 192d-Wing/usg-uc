@@ -16,10 +16,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use tracing::warn;
 use uc_user_mgmt::digest::compute_ha1;
 use uc_user_mgmt::model::{AuthType, User, UserFilter};
@@ -62,9 +62,7 @@ pub async fn create(
     let username = body_str(&body, "username").unwrap_or("").to_string();
     let display_name = body_str(&body, "display_name").unwrap_or("").to_string();
     let email = body_str(&body, "email").unwrap_or("").to_string();
-    let sip_uri = body_str(&body, "sip_uri")
-        .unwrap_or(&username)
-        .to_string();
+    let sip_uri = body_str(&body, "sip_uri").unwrap_or(&username).to_string();
     let digest_ha1 = body_str(&body, "password")
         .filter(|p| !p.is_empty())
         .map(|password| {
@@ -106,10 +104,7 @@ pub async fn create(
     }
 }
 
-pub async fn get(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+pub async fn get(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> impl IntoResponse {
     match state.users.get_user(&id).await {
         Ok(user) => Json(serde_json::json!(user)),
         Err(e) => Json(serde_json::json!({"error": e.to_string()})),

@@ -9,10 +9,10 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use sbc_grpc_api::prelude::{DeleteRegistrationRequest, ListRegistrationsRequest};
 use std::collections::HashMap;
 use tracing::warn;

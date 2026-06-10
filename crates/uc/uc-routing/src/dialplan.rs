@@ -454,8 +454,7 @@ fn match_domain(pattern: &str, domain: &str) -> bool {
 
     // Wildcard prefix: "*.mil" matches "anything.mil"
     if let Some(suffix) = pattern.strip_prefix("*.") {
-        return domain.ends_with(suffix)
-            || domain == suffix;
+        return domain.ends_with(suffix) || domain == suffix;
     }
 
     // Exact or suffix match: "uc.mil" matches "uc.mil" and "sip.uc.mil"
@@ -860,9 +859,18 @@ mod tests {
                 .with_priority(1),
         );
 
-        assert!(plan.match_extended("bob", "army.mil", Direction::Inbound, None).is_some());
-        assert!(plan.match_extended("bob", "navy.mil", Direction::Outbound, None).is_some());
-        assert!(plan.match_extended("bob", "example.com", Direction::Inbound, None).is_none());
+        assert!(
+            plan.match_extended("bob", "army.mil", Direction::Inbound, None)
+                .is_some()
+        );
+        assert!(
+            plan.match_extended("bob", "navy.mil", Direction::Outbound, None)
+                .is_some()
+        );
+        assert!(
+            plan.match_extended("bob", "example.com", Direction::Inbound, None)
+                .is_none()
+        );
     }
 
     #[test]
@@ -877,11 +885,17 @@ mod tests {
         );
 
         // Match: correct source trunk
-        let result = plan.match_extended("12345", "sbc.local", Direction::Inbound, Some("bulkvs-1"));
+        let result =
+            plan.match_extended("12345", "sbc.local", Direction::Inbound, Some("bulkvs-1"));
         assert!(result.is_some());
 
         // No match: wrong source trunk
-        let result = plan.match_extended("12345", "sbc.local", Direction::Inbound, Some("other-trunk"));
+        let result = plan.match_extended(
+            "12345",
+            "sbc.local",
+            Direction::Inbound,
+            Some("other-trunk"),
+        );
         assert!(result.is_none());
 
         // No match: no source trunk
@@ -904,7 +918,10 @@ mod tests {
         assert!(result.is_some());
         let r = result.unwrap();
         assert_eq!(r.destination_type, DestinationType::StaticUri);
-        assert_eq!(r.static_destination.as_deref(), Some("sip:voicemail@vm.uc.mil:5060"));
+        assert_eq!(
+            r.static_destination.as_deref(),
+            Some("sip:voicemail@vm.uc.mil:5060")
+        );
     }
 
     #[test]
@@ -921,7 +938,12 @@ mod tests {
                 .with_priority(1),
         );
 
-        let result = plan.match_extended("+15551234567", "sip.uc.mil", Direction::Inbound, Some("bulkvs-1"));
+        let result = plan.match_extended(
+            "+15551234567",
+            "sip.uc.mil",
+            Direction::Inbound,
+            Some("bulkvs-1"),
+        );
         assert!(result.is_some());
         let r = result.unwrap();
         assert_eq!(r.trunk_group, "downstream-cm");

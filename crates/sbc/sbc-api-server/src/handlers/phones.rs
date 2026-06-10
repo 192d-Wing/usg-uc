@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use tracing::warn;
 
 use crate::state::AppState;
@@ -128,10 +128,7 @@ pub async fn create(
     )
 }
 
-pub async fn get(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+pub async fn get(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> impl IntoResponse {
     match state.phones.get(&id).await {
         Ok(phone) => Json(
             serde_json::to_value(&phone)

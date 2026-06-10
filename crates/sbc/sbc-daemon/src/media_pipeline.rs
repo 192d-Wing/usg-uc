@@ -359,9 +359,11 @@ impl Transcoder {
                     self.g722_dec_b.as_mut()
                 };
                 decoder.map_or_else(
-                    || Err(MediaPipelineError::DecryptionFailed(
-                        "G.722 decoder not initialized".into(),
-                    )),
+                    || {
+                        Err(MediaPipelineError::DecryptionFailed(
+                            "G.722 decoder not initialized".into(),
+                        ))
+                    },
                     |dec| Ok(dec.decode(payload, output)),
                 )
             }
@@ -401,9 +403,11 @@ impl Transcoder {
                     self.g722_enc_b.as_mut()
                 };
                 encoder.map_or_else(
-                    || Err(MediaPipelineError::EncryptionFailed(
-                        "G.722 encoder not initialized".into(),
-                    )),
+                    || {
+                        Err(MediaPipelineError::EncryptionFailed(
+                            "G.722 encoder not initialized".into(),
+                        ))
+                    },
                     |enc| Ok(enc.encode(pcm, output)),
                 )
             }
@@ -415,7 +419,11 @@ impl Transcoder {
 }
 
 /// Linear interpolation resampler for integer sample rate ratios.
-#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 fn resample_linear(input: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
     if from_rate == to_rate || input.is_empty() {
         return input.to_vec();
@@ -510,7 +518,8 @@ impl MediaPipeline {
         call_id: &str,
         mode: Option<MediaMode>,
     ) -> Result<AllocatedPorts, MediaPipelineError> {
-        self.create_session_with_zones(call_id, mode, None, None).await
+        self.create_session_with_zones(call_id, mode, None, None)
+            .await
     }
 
     /// Creates a new media session with zone-specific bind IPs.
@@ -552,8 +561,10 @@ impl MediaPipeline {
             b_leg_ssrc,
             a_leg_local_port: a_rtp,
             b_leg_local_port: b_rtp,
-            a_leg_bind_ip: a_leg_media_ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
-            b_leg_bind_ip: b_leg_media_ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            a_leg_bind_ip: a_leg_media_ip
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            b_leg_bind_ip: b_leg_media_ip
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
             relay_handles: Vec::new(),
             relay_shutdown: None,
             transcoder: None,
@@ -833,12 +844,8 @@ impl MediaPipeline {
         // this map without limit).
         let mut trackers = self.sequence_trackers.write().await;
         let now = std::time::Instant::now();
-        if trackers.len() >= SSRC_TRACKER_SOFT_CAP
-            && !trackers.contains_key(&packet.header.ssrc)
-        {
-            trackers.retain(|_, t| {
-                now.duration_since(t.last_seen) < SSRC_TRACKER_IDLE_TIMEOUT
-            });
+        if trackers.len() >= SSRC_TRACKER_SOFT_CAP && !trackers.contains_key(&packet.header.ssrc) {
+            trackers.retain(|_, t| now.duration_since(t.last_seen) < SSRC_TRACKER_IDLE_TIMEOUT);
             if trackers.len() >= SSRC_TRACKER_HARD_CAP {
                 return Err(MediaPipelineError::DecryptionFailed(
                     "SSRC tracker capacity exceeded".to_string(),
@@ -1285,8 +1292,7 @@ mod tests {
         let relay_addr = relay_in.local_addr().unwrap();
         let expected = legit.local_addr().unwrap();
         let recv_target = Arc::new(std::sync::RwLock::new(expected));
-        let forward_target =
-            Arc::new(std::sync::RwLock::new(receiver.local_addr().unwrap()));
+        let forward_target = Arc::new(std::sync::RwLock::new(receiver.local_addr().unwrap()));
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         let _task = tokio::spawn(relay_leg(

@@ -45,7 +45,10 @@ async fn main() -> ExitCode {
         .json()
         .init();
 
-    info!(version = env!("CARGO_PKG_VERSION"), "sbc-provision-server starting");
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "sbc-provision-server starting"
+    );
 
     let cfg = match Config::from_env() {
         Ok(c) => c,
@@ -80,7 +83,9 @@ async fn main() -> ExitCode {
     // phone subnet, so they bypass the check.
     let allowed = Arc::new(cfg.allowed_cidrs.clone());
     if allowed.is_empty() {
-        info!("SBC_PROVISION_ALLOWED_CIDRS unset — app-layer source restriction disabled (NetworkPolicy only)");
+        info!(
+            "SBC_PROVISION_ALLOWED_CIDRS unset — app-layer source restriction disabled (NetworkPolicy only)"
+        );
     } else {
         info!(cidrs = ?allowed, "provisioning restricted to source networks");
     }
@@ -96,7 +101,10 @@ async fn main() -> ExitCode {
         // specific body; same thing here so phones don't fall through
         // to nginx's SPA fallback.
         .route("/TCS7000A.xml", get(serve_teo_global))
-        .layer(axum::middleware::from_fn_with_state(allowed, restrict_source))
+        .layer(axum::middleware::from_fn_with_state(
+            allowed,
+            restrict_source,
+        ))
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 
@@ -115,7 +123,7 @@ async fn main() -> ExitCode {
         };
         #[cfg(unix)]
         let term = async {
-            use tokio::signal::unix::{signal, SignalKind};
+            use tokio::signal::unix::{SignalKind, signal};
             if let Ok(mut s) = signal(SignalKind::terminate()) {
                 s.recv().await;
             }
@@ -172,7 +180,10 @@ async fn restrict_source(
         return next.run(req).await;
     }
 
-    warn!(?client_ip, "provisioning request from disallowed source network");
+    warn!(
+        ?client_ip,
+        "provisioning request from disallowed source network"
+    );
     (
         StatusCode::FORBIDDEN,
         Json(serde_json::json!({"error": "source network not permitted"})),
@@ -186,10 +197,7 @@ async fn liveness() -> impl IntoResponse {
 
 async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
     match state.phones.is_empty().await {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "ready"})),
-        ),
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"status": "ready"}))),
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"status": "not_ready", "error": e.to_string()})),
@@ -224,10 +232,7 @@ async fn serve_teo_global() -> impl IntoResponse {
 /// (api_server.rs in commits up to 0852812): extract MAC from filename,
 /// normalize, look up phone by normalized MAC, render via vendor
 /// generator, return with the right Content-Type per extension.
-async fn serve_phone_config(
-    State(state): State<AppState>,
-    Path(path): Path<String>,
-) -> Response {
+async fn serve_phone_config(State(state): State<AppState>, Path(path): Path<String>) -> Response {
     // Filename forms across vendors:
     //   <mac>.cfg           Polycom VVX/Edge
     //   <mac>.xml           Cisco MPP/9800

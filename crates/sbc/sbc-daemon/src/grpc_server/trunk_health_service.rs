@@ -108,13 +108,12 @@ impl TrunkHealthService for TrunkHealthServiceImpl {
 
         // Look up the trunk's credentials. Same fall-through logic the
         // REST handler used: Postgres first, MemStore fallback.
-        let groups: Vec<serde_json::Value> =
-            if let Some(ref store) = self.state.trunk_group_store {
-                store.list().await.unwrap_or_default()
-            } else {
-                let mem = self.state.mem_store.read().await;
-                mem.trunk_groups.values().cloned().collect()
-            };
+        let groups: Vec<serde_json::Value> = if let Some(ref store) = self.state.trunk_group_store {
+            store.list().await.unwrap_or_default()
+        } else {
+            let mem = self.state.mem_store.read().await;
+            mem.trunk_groups.values().cloned().collect()
+        };
         let mut found_trunk = None;
         for group in &groups {
             if let Some(trunks) = group.get("trunks").and_then(|v| v.as_array()) {
@@ -151,10 +150,7 @@ impl TrunkHealthService for TrunkHealthServiceImpl {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let port = trunk
-            .get("port")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(5060) as u16;
+        let port = trunk.get("port").and_then(|v| v.as_u64()).unwrap_or(5060) as u16;
 
         if username.is_empty() || host.is_empty() {
             return Ok(Response::new(RegisterTrunkResponse {

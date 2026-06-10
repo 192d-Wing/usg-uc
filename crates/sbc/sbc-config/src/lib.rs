@@ -68,13 +68,13 @@ pub mod validate;
 
 pub use error::{ConfigError, ConfigResult};
 pub use interface::{ResolvedZone, resolve_zones};
+#[cfg(feature = "telemetry")]
+pub use schema::TelemetryConfig;
 pub use schema::{
     DialPlanConfig, DialPlanEntryConfig, HeaderManipulationConfig, ManipulationRuleConfig,
     RoutingConfig, SbcConfig, TopologyHidingConfig, TrunkConfigSchema, TrunkGroupConfig,
     TrunkManipulationRuleConfig, ZoneConfig,
 };
-#[cfg(feature = "telemetry")]
-pub use schema::TelemetryConfig;
 
 use std::path::Path;
 

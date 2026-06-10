@@ -30,7 +30,10 @@ pub fn trunk(trunk: &mut Value) {
             .and_then(|v| v.as_str())
             .is_some_and(|p| !p.is_empty())
     {
-        obj.insert("sip_password".to_string(), Value::String(REDACTED.to_string()));
+        obj.insert(
+            "sip_password".to_string(),
+            Value::String(REDACTED.to_string()),
+        );
     }
 }
 

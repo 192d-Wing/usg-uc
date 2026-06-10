@@ -1,7 +1,7 @@
 //! Route Pattern — a pattern that belongs to a partition and matches dialed digits.
 
-use crate::dialplan::{DialPattern, NumberTransform};
 use crate::DEFAULT_PRIORITY;
+use crate::dialplan::{DialPattern, NumberTransform};
 
 /// A Route Pattern belongs to a partition and matches dialed digits.
 ///
@@ -201,8 +201,7 @@ mod tests {
 
     #[test]
     fn test_route_pattern_blocked() {
-        let rp = RoutePattern::new("rp-900", DialPattern::prefix("1900"), "pt-ld")
-            .with_block(true);
+        let rp = RoutePattern::new("rp-900", DialPattern::prefix("1900"), "pt-ld").with_block(true);
         assert!(rp.is_blocked());
     }
 

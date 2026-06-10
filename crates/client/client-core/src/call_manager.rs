@@ -771,11 +771,8 @@ impl CallManager {
         // call (e.g. our own hold/resume re-INVITE), respond 491 Request Pending.
         if self.call_agent.has_pending_invite_transaction(call_id) {
             warn!(call_id = %call_id, "Glare detected — pending INVITE transaction, responding 491");
-            let response = build_response_from_request(
-                request,
-                StatusCode::REQUEST_PENDING,
-                Some(local_tag),
-            );
+            let response =
+                build_response_from_request(request, StatusCode::REQUEST_PENDING, Some(local_tag));
             let _ = self
                 .app_event_tx
                 .send(CallManagerEvent::SendResponse {
@@ -892,8 +889,7 @@ impl CallManager {
             .ok_or_else(|| AppError::Sip("No account configured".to_string()))?;
 
         // Build 200 OK with SDP body
-        let mut ok_response =
-            build_response_from_request(request, StatusCode::OK, Some(local_tag));
+        let mut ok_response = build_response_from_request(request, StatusCode::OK, Some(local_tag));
 
         // Add Contact header with routable IP (not 0.0.0.0)
         let effective_addr = self.get_effective_media_addr()?;
@@ -907,10 +903,7 @@ impl CallManager {
         // Echo Session-Expires from request (RFC 4028 §7.2) so the session
         // timer is properly refreshed. Without this, the B2BUA (BulkVS) may
         // consider the refresh failed and stall media for up to Timer C (3 min).
-        if let Some(se) = request
-            .headers
-            .get_value(&HeaderName::SessionExpires)
-        {
+        if let Some(se) = request.headers.get_value(&HeaderName::SessionExpires) {
             let se_value = se.to_string();
             info!(call_id = %call_id, session_expires = %se_value, "Echoing Session-Expires in 200 OK");
             ok_response.add_header(proto_sip::header::Header::new(
@@ -1397,10 +1390,10 @@ impl CallManager {
             error!(error = %e, "Failed to queue 200 OK response for BYE");
         }
 
-        if let Some(call_id) = self
-            .find_call_by_sip_id(&sip_call_id)
-            .or_else(|| self.find_active_call_by_sip_call_id(&sip_call_id).map(|(id, _)| id))
-        {
+        if let Some(call_id) = self.find_call_by_sip_id(&sip_call_id).or_else(|| {
+            self.find_active_call_by_sip_call_id(&sip_call_id)
+                .map(|(id, _)| id)
+        }) {
             info!(call_id = %call_id, sip_call_id = %sip_call_id, "Remote party sent BYE, terminating call");
             // Mark the call as terminated - the remote party hung up
             self.handle_state_changed(&call_id, CallState::Terminated, None)
@@ -1438,10 +1431,10 @@ impl CallManager {
             })
             .await;
 
-        if let Some(call_id) = self
-            .find_call_by_sip_id(&sip_call_id)
-            .or_else(|| self.find_active_call_by_sip_call_id(&sip_call_id).map(|(id, _)| id))
-        {
+        if let Some(call_id) = self.find_call_by_sip_id(&sip_call_id).or_else(|| {
+            self.find_active_call_by_sip_call_id(&sip_call_id)
+                .map(|(id, _)| id)
+        }) {
             info!(call_id = %call_id, sip_call_id = %sip_call_id, "Remote party sent CANCEL, terminating call");
             // Mark the call as terminated - the remote party cancelled
             self.handle_state_changed(&call_id, CallState::Terminated, None)

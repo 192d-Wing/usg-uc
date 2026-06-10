@@ -110,7 +110,8 @@ impl ResolvedZoneRegistry {
 
     /// Returns the external IP for a zone (synchronous, best-effort via try_read).
     pub fn external_ip(&self, name: &str) -> Option<IpAddr> {
-        self.zones.get(name)
+        self.zones
+            .get(name)
             .and_then(|e| e.external_ip.try_read().ok().and_then(|v| *v))
     }
 
@@ -245,9 +246,7 @@ impl ExternalIpMonitor {
                 .await
                 .map_err(|e| format!("Cannot resolve STUN server {stun_server}: {e}"))?
                 .find(SocketAddr::is_ipv4)
-                .ok_or_else(|| {
-                    format!("No IPv4 address found for STUN server {stun_server}")
-                })?,
+                .ok_or_else(|| format!("No IPv4 address found for STUN server {stun_server}"))?,
         };
 
         let socket = UdpSocket::bind(SocketAddr::new(bind_ip, 0))
@@ -355,7 +354,10 @@ mod tests {
         // Unmatched IP falls back to the first zone (L3 single-IP case where
         // the pod's Cilium-assigned IP doesn't equal any configured zone IP).
         let fallback = reg.zone_for_signaling_ip("99.99.99.99".parse().unwrap());
-        assert!(fallback.is_some(), "unmatched IP should fall back, not return None");
+        assert!(
+            fallback.is_some(),
+            "unmatched IP should fall back, not return None"
+        );
     }
 
     #[test]

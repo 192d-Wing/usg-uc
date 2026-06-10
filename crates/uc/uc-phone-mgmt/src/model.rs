@@ -212,9 +212,7 @@ impl PhoneModel {
             | Self::PolycomVVX501
             | Self::PolycomVVX601 => "polycom_vvx",
 
-            Self::PolycomTrio8300 | Self::PolycomTrio8500 | Self::PolycomTrio8800 => {
-                "polycom_trio"
-            }
+            Self::PolycomTrio8300 | Self::PolycomTrio8500 | Self::PolycomTrio8800 => "polycom_trio",
 
             Self::PolyEdgeE100
             | Self::PolyEdgeE220

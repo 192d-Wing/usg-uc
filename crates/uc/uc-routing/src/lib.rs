@@ -49,7 +49,7 @@ pub mod trunk;
 pub use css::CallingSearchSpace;
 pub use cucm_router::{CucmRouter, CucmRoutingResult};
 pub use dialplan::{
-    DestinationType, DialPlan, DialPlanEntry, DialPlanResult, DialPattern, Direction,
+    DestinationType, DialPattern, DialPlan, DialPlanEntry, DialPlanResult, Direction,
     NumberTransform,
 };
 pub use error::{RoutingError, RoutingResult};

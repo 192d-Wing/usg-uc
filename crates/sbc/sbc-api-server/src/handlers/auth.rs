@@ -8,10 +8,10 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
-use axum::http::{header, StatusCode};
-use axum::response::{IntoResponse, Response};
 use axum::Json;
+use axum::extract::State;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use tracing::warn;
 
@@ -27,10 +27,7 @@ pub struct LoginRequest {
 ///
 /// Returns the token in the body (for `Authorization: Bearer` clients) and
 /// as an `HttpOnly; Secure; SameSite=Strict` cookie (for the dashboard).
-pub async fn login(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<LoginRequest>,
-) -> Response {
+pub async fn login(State(state): State<Arc<AppState>>, Json(body): Json<LoginRequest>) -> Response {
     // argon2 verification is deliberately slow; keep it off the async
     // executor threads.
     let auth = Arc::clone(&state.auth);
@@ -83,8 +80,7 @@ pub async fn session(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let valid = uc_auth::extract_credential(&headers)
-        .is_some_and(|c| state.auth.authorize(&c));
+    let valid = uc_auth::extract_credential(&headers).is_some_and(|c| state.auth.authorize(&c));
     if valid {
         Json(serde_json::json!({ "authenticated": true })).into_response()
     } else {

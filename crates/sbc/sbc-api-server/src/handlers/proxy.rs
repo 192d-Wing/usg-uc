@@ -32,7 +32,15 @@ pub async fn proxy_get(
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    proxy(state, reqwest::Method::GET, &path, &query, &headers, Bytes::new()).await
+    proxy(
+        state,
+        reqwest::Method::GET,
+        &path,
+        &query,
+        &headers,
+        Bytes::new(),
+    )
+    .await
 }
 
 pub async fn proxy_post(
@@ -61,7 +69,15 @@ pub async fn proxy_delete(
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    proxy(state, reqwest::Method::DELETE, &path, &query, &headers, Bytes::new()).await
+    proxy(
+        state,
+        reqwest::Method::DELETE,
+        &path,
+        &query,
+        &headers,
+        Bytes::new(),
+    )
+    .await
 }
 
 async fn proxy(
@@ -112,9 +128,7 @@ async fn proxy(
                     }
                     builder
                         .body(axum::body::Body::from(bytes))
-                        .unwrap_or_else(|_| {
-                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                        })
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
                 }
                 Err(e) => {
                     warn!(url, error = %e, "proxy body read failed");

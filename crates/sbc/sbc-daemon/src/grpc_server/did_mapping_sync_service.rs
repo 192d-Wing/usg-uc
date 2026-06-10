@@ -77,12 +77,12 @@ impl DidMappingSyncService for DidMappingSyncServiceImpl {
                     }))
                 }
             }
-            Err(sbc_config_store::ConfigStoreError::NotFound) => Ok(Response::new(
-                SyncDirectoryNumberResponse {
+            Err(sbc_config_store::ConfigStoreError::NotFound) => {
+                Ok(Response::new(SyncDirectoryNumberResponse {
                     synced: false,
                     message: format!("no such DID: {did}"),
-                },
-            )),
+                }))
+            }
             Err(e) => {
                 warn!(did, error = %e, "directory_store get failed");
                 Err(Status::internal(format!("storage error: {e}")))

@@ -17,9 +17,7 @@ pub fn generate_edge_config(phone: &Phone, sbc_host: &str) -> String {
     // SIP section
     xml.push_str("  <sip>\n");
     if let Some(line) = phone.lines.first() {
-        xml.push_str(&format!(
-            "    <server>{sbc_host}</server>\n"
-        ));
+        xml.push_str(&format!("    <server>{sbc_host}</server>\n"));
         xml.push_str(&format!("    <port>{}</port>\n", line.sip_port));
         xml.push_str(&format!(
             "    <transport>{}</transport>\n",
@@ -47,10 +45,7 @@ pub fn generate_edge_config(phone: &Phone, sbc_host: &str) -> String {
             "      <authPassword>{}</authPassword>\n",
             line.sip_password
         ));
-        xml.push_str(&format!(
-            "      <label>{}</label>\n",
-            line.display_name
-        ));
+        xml.push_str(&format!("      <label>{}</label>\n", line.display_name));
         if let Some(vm) = &line.voicemail_uri {
             xml.push_str(&format!("      <voicemail>{vm}</voicemail>\n"));
         }
@@ -145,9 +140,7 @@ pub fn generate_edge_config(phone: &Phone, sbc_host: &str) -> String {
     }
 
     // Time
-    if phone.display.timezone.is_some()
-        || phone.display.ntp_server.is_some()
-    {
+    if phone.display.timezone.is_some() || phone.display.ntp_server.is_some() {
         xml.push_str("  <time>\n");
         if let Some(tz) = &phone.display.timezone {
             xml.push_str(&format!("    <timezone>{tz}</timezone>\n"));

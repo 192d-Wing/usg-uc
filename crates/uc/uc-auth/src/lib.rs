@@ -24,8 +24,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -212,7 +212,9 @@ impl Authenticator {
             if p.is_empty() {
                 return Err(AuthError::NoAdminCredentials);
             }
-            info!("Hashing SBC_ADMIN_PASSWORD at startup; prefer SBC_ADMIN_PASSWORD_HASH in production");
+            info!(
+                "Hashing SBC_ADMIN_PASSWORD at startup; prefer SBC_ADMIN_PASSWORD_HASH in production"
+            );
             hash_password(&p)?
         } else {
             return Err(AuthError::NoAdminCredentials);
@@ -247,10 +249,12 @@ impl Authenticator {
             .unwrap_or_default();
 
         let token_ttl_secs = match std::env::var("SBC_AUTH_TOKEN_TTL_SECS") {
-            Ok(v) => v.parse().map_err(|e: std::num::ParseIntError| AuthError::Invalid {
-                var: "SBC_AUTH_TOKEN_TTL_SECS",
-                reason: e.to_string(),
-            })?,
+            Ok(v) => v
+                .parse()
+                .map_err(|e: std::num::ParseIntError| AuthError::Invalid {
+                    var: "SBC_AUTH_TOKEN_TTL_SECS",
+                    reason: e.to_string(),
+                })?,
             Err(_) => DEFAULT_TOKEN_TTL_SECS,
         };
 
@@ -363,8 +367,7 @@ pub async fn require_auth(
     if layer.public_paths.contains(req.uri().path()) {
         return next.run(req).await;
     }
-    let ok = extract_credential(req.headers())
-        .is_some_and(|c| layer.authenticator.authorize(&c));
+    let ok = extract_credential(req.headers()).is_some_and(|c| layer.authenticator.authorize(&c));
     if ok {
         return next.run(req).await;
     }
@@ -396,7 +399,11 @@ mod tests {
 
     fn test_auth() -> Authenticator {
         let hash = hash_password("correct horse").expect("hash");
-        Authenticator::new("admin", &hash, b"shared-signing-key-32-bytes-long!".to_vec())
+        Authenticator::new(
+            "admin",
+            &hash,
+            b"shared-signing-key-32-bytes-long!".to_vec(),
+        )
     }
 
     #[test]
@@ -418,14 +425,25 @@ mod tests {
         let a = Authenticator::new("admin", &hash, key.clone());
         let b = Authenticator::new("admin", &hash, key);
         let token = a.login("admin", "pw").expect("login");
-        assert!(b.authorize(&token), "replica B must accept replica A's token");
+        assert!(
+            b.authorize(&token),
+            "replica B must accept replica A's token"
+        );
     }
 
     #[test]
     fn token_rejected_with_different_key() {
         let hash = hash_password("pw").expect("hash");
-        let a = Authenticator::new("admin", &hash, b"key-aaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec());
-        let b = Authenticator::new("admin", &hash, b"key-bbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_vec());
+        let a = Authenticator::new(
+            "admin",
+            &hash,
+            b"key-aaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec(),
+        );
+        let b = Authenticator::new(
+            "admin",
+            &hash,
+            b"key-bbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_vec(),
+        );
         let token = a.login("admin", "pw").expect("login");
         assert!(!b.authorize(&token));
     }
@@ -440,11 +458,17 @@ mod tests {
     #[test]
     fn extract_credential_bearer_and_cookie() {
         let mut h = axum::http::HeaderMap::new();
-        h.insert(axum::http::header::AUTHORIZATION, "Bearer abc".parse().unwrap());
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer abc".parse().unwrap(),
+        );
         assert_eq!(extract_credential(&h).as_deref(), Some("abc"));
 
         let mut h = axum::http::HeaderMap::new();
-        h.insert(axum::http::header::COOKIE, "x=1; sbc_session=tok".parse().unwrap());
+        h.insert(
+            axum::http::header::COOKIE,
+            "x=1; sbc_session=tok".parse().unwrap(),
+        );
         assert_eq!(extract_credential(&h).as_deref(), Some("tok"));
     }
 }

@@ -4,10 +4,10 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use sbc_grpc_api::prelude::{RemoveDirectoryNumberRequest, SyncDirectoryNumberRequest};
 use tracing::warn;
 
@@ -131,7 +131,9 @@ pub async fn delete(
 
 async fn notify_did_sync(state: &Arc<AppState>, did: &str) {
     let mut client = state.did_sync.clone();
-    let req = SyncDirectoryNumberRequest { did: did.to_string() };
+    let req = SyncDirectoryNumberRequest {
+        did: did.to_string(),
+    };
     if let Err(e) = client.sync_directory_number(req).await {
         warn!(did, error = %e, "daemon DID sync RPC failed");
     }
@@ -139,7 +141,9 @@ async fn notify_did_sync(state: &Arc<AppState>, did: &str) {
 
 async fn notify_did_remove(state: &Arc<AppState>, did: &str) {
     let mut client = state.did_sync.clone();
-    let req = RemoveDirectoryNumberRequest { did: did.to_string() };
+    let req = RemoveDirectoryNumberRequest {
+        did: did.to_string(),
+    };
     if let Err(e) = client.remove_directory_number(req).await {
         warn!(did, error = %e, "daemon DID remove RPC failed");
     }

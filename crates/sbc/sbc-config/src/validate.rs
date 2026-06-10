@@ -388,11 +388,7 @@ fn validate_trunks(group: &crate::schema::TrunkGroupConfig) -> ConfigResult<()> 
 }
 
 fn validate_routing(config: &SbcConfig) -> ConfigResult<()> {
-    let group_ids: HashSet<&str> = config
-        .trunk_groups
-        .iter()
-        .map(|g| g.id.as_str())
-        .collect();
+    let group_ids: HashSet<&str> = config.trunk_groups.iter().map(|g| g.id.as_str()).collect();
     // Cross-check trunk group references only when trunk groups are
     // configured; with none, references may be resolved elsewhere.
     let have_groups = !config.trunk_groups.is_empty();
@@ -694,7 +690,10 @@ mod tests {
     fn assert_rejected(config: &SbcConfig, needle: &str) {
         let err = validate_config(config).expect_err("config should be rejected");
         let msg = err.to_string();
-        assert!(msg.contains(needle), "error '{msg}' should mention '{needle}'");
+        assert!(
+            msg.contains(needle),
+            "error '{msg}' should mention '{needle}'"
+        );
     }
 
     #[test]
@@ -879,14 +878,24 @@ mod tests {
         let mut config = SbcConfig::default();
 
         // IPv6 literal and IPv4/hostname forms are accepted.
-        for host in ["[2001:db8::1]", "2001:db8::1", "192.0.2.10", "sip-1.example.com"] {
+        for host in [
+            "[2001:db8::1]",
+            "2001:db8::1",
+            "192.0.2.10",
+            "sip-1.example.com",
+        ] {
             let mut group = trunk_group("tg1");
             group.trunks[0].host = host.to_string();
             config.trunk_groups = vec![group];
             assert!(validate_config(&config).is_ok(), "host {host}");
         }
 
-        for host in ["evil\r\nhost", "host with space", "host;param", "host_under"] {
+        for host in [
+            "evil\r\nhost",
+            "host with space",
+            "host;param",
+            "host_under",
+        ] {
             let mut group = trunk_group("tg1");
             group.trunks[0].host = host.to_string();
             config.trunk_groups = vec![group];
@@ -1170,7 +1179,6 @@ mod tests {
     }
 
     // ── STIR/SHAKEN ────────────────────────────────────────────────
-
 }
 
 /// Tests that the shipped deploy configurations still validate.

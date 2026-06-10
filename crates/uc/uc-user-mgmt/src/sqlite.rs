@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use tracing::debug;
 
 use crate::error::UserMgmtError;
@@ -27,8 +27,8 @@ impl SqliteUserStore {
     /// Returns `UserMgmtError::StorageError` if the database cannot be opened
     /// or the schema migration fails.
     pub fn new(path: &str) -> Result<Self> {
-        let conn = Connection::open(path)
-            .map_err(|e| UserMgmtError::StorageError(e.to_string()))?;
+        let conn =
+            Connection::open(path).map_err(|e| UserMgmtError::StorageError(e.to_string()))?;
         let store = Self {
             conn: Mutex::new(conn),
         };
@@ -42,8 +42,8 @@ impl SqliteUserStore {
     ///
     /// Returns `UserMgmtError::StorageError` if table creation fails.
     pub fn in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()
-            .map_err(|e| UserMgmtError::StorageError(e.to_string()))?;
+        let conn =
+            Connection::open_in_memory().map_err(|e| UserMgmtError::StorageError(e.to_string()))?;
         let store = Self {
             conn: Mutex::new(conn),
         };
@@ -82,9 +82,7 @@ impl SqliteUserStore {
         Ok(())
     }
 
-    fn row_to_user(
-        row: &rusqlite::Row<'_>,
-    ) -> std::result::Result<User, rusqlite::Error> {
+    fn row_to_user(row: &rusqlite::Row<'_>) -> std::result::Result<User, rusqlite::Error> {
         let auth_type_str: String = row.get(5)?;
         let auth_type = match auth_type_str.as_str() {
             "Digest" => AuthType::Digest,
@@ -94,8 +92,7 @@ impl SqliteUserStore {
         };
 
         let device_ids_json: String = row.get(10)?;
-        let device_ids: Vec<String> =
-            serde_json::from_str(&device_ids_json).unwrap_or_default();
+        let device_ids: Vec<String> = serde_json::from_str(&device_ids_json).unwrap_or_default();
 
         let metadata_json: String = row.get(16)?;
         let metadata: HashMap<String, String> =
@@ -255,8 +252,7 @@ impl UserStore for SqliteUserStore {
 
         if let Some(ref username) = filter.username_contains {
             sql.push_str(&format!(" AND username LIKE ?{param_idx}"));
-            param_values
-                .push(Box::new(format!("%{username}%")));
+            param_values.push(Box::new(format!("%{username}%")));
             param_idx += 1;
         }
 
@@ -310,9 +306,7 @@ impl UserStore for SqliteUserStore {
 
         let mut users = Vec::new();
         for row in rows {
-            users.push(
-                row.map_err(|e| UserMgmtError::StorageError(e.to_string()))?,
-            );
+            users.push(row.map_err(|e| UserMgmtError::StorageError(e.to_string()))?);
         }
         Ok(users)
     }
@@ -386,11 +380,7 @@ impl UserStore for SqliteUserStore {
         Ok(())
     }
 
-    async fn authenticate_digest(
-        &self,
-        username: &str,
-        _realm: &str,
-    ) -> Result<Option<String>> {
+    async fn authenticate_digest(&self, username: &str, _realm: &str) -> Result<Option<String>> {
         let conn = self
             .conn
             .lock()
@@ -410,11 +400,7 @@ impl UserStore for SqliteUserStore {
         }
     }
 
-    async fn authenticate_certificate(
-        &self,
-        dn: &str,
-        san: &str,
-    ) -> Result<Option<User>> {
+    async fn authenticate_certificate(&self, dn: &str, san: &str) -> Result<Option<User>> {
         let conn = self
             .conn
             .lock()

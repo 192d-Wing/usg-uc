@@ -10,10 +10,10 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use sbc_grpc_api::prelude::{
     ListTrunkHealthRequest, ListTrunkRegistrationsRequest, RegisterTrunkRequest,
 };

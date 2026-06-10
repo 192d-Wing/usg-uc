@@ -9,8 +9,8 @@
 //! lookup. `serve_phone_config` is the hot path — it hits this table once
 //! per phone boot — so the MAC lookup must be index-backed.
 
-use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
+use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use tracing::debug;
 
 use uc_phone_mgmt::model::Phone;

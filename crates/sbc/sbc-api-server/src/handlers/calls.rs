@@ -10,10 +10,10 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use sbc_grpc_api::prelude::{GetCallRequest, ListCallsRequest, TerminateCallRequest};
 use tonic::Code;
 use tracing::warn;
@@ -75,7 +75,9 @@ pub async fn ladder(
     Path(call_id): Path<String>,
 ) -> impl IntoResponse {
     let mut client = state.calls.clone();
-    let req = GetCallRequest { call_id: call_id.clone() };
+    let req = GetCallRequest {
+        call_id: call_id.clone(),
+    };
     match client.get_call(req).await {
         Ok(_resp) => Json(serde_json::json!({
             "call_id": call_id,

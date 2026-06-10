@@ -17,10 +17,10 @@ use sbc_grpc_api::prelude::{
     DidMappingSyncServiceClient, RegistrationServiceClient, SystemServiceClient,
     TrunkHealthServiceClient, TrunkSyncServiceClient,
 };
-use uc_user_mgmt::postgres::PostgresUserStore;
 use thiserror::Error;
 use tonic::transport::{Channel, Endpoint};
 use tracing::info;
+use uc_user_mgmt::postgres::PostgresUserStore;
 
 use crate::config::Config;
 

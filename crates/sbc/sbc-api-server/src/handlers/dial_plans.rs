@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use sbc_grpc_api::prelude::{RemoveDialPlanRequest, SyncDialPlanRequest};
 use tracing::warn;
 
@@ -61,15 +61,13 @@ pub async fn delete_entry(
 ) -> impl IntoResponse {
     match state.dial_plans.get(&plan_id).await {
         Ok(mut doc) => {
-            let became_empty = if let Some(arr) = doc
-                .get_mut("entries")
-                .and_then(|v| v.as_array_mut())
-            {
-                arr.retain(|e| e.get("id").and_then(|v| v.as_str()) != Some(&entry_id));
-                arr.is_empty()
-            } else {
-                true
-            };
+            let became_empty =
+                if let Some(arr) = doc.get_mut("entries").and_then(|v| v.as_array_mut()) {
+                    arr.retain(|e| e.get("id").and_then(|v| v.as_str()) != Some(&entry_id));
+                    arr.is_empty()
+                } else {
+                    true
+                };
             if became_empty {
                 if let Err(e) = state.dial_plans.delete(&plan_id).await {
                     warn!(plan_id, error = %e, "dial plan delete failed");
@@ -94,7 +92,9 @@ pub async fn delete_entry(
 
 async fn notify_dial_plan_sync(state: &Arc<AppState>, plan_id: &str) {
     let mut client = state.dial_plan_sync.clone();
-    let req = SyncDialPlanRequest { plan_id: plan_id.to_string() };
+    let req = SyncDialPlanRequest {
+        plan_id: plan_id.to_string(),
+    };
     if let Err(e) = client.sync_dial_plan(req).await {
         warn!(plan_id, error = %e, "daemon dial-plan sync RPC failed");
     }
@@ -102,7 +102,9 @@ async fn notify_dial_plan_sync(state: &Arc<AppState>, plan_id: &str) {
 
 async fn notify_dial_plan_remove(state: &Arc<AppState>, plan_id: &str) {
     let mut client = state.dial_plan_sync.clone();
-    let req = RemoveDialPlanRequest { plan_id: plan_id.to_string() };
+    let req = RemoveDialPlanRequest {
+        plan_id: plan_id.to_string(),
+    };
     if let Err(e) = client.remove_dial_plan(req).await {
         warn!(plan_id, error = %e, "daemon dial-plan remove RPC failed");
     }

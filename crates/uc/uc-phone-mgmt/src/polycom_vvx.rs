@@ -44,10 +44,7 @@ pub fn generate_vvx_config(phone: &Phone, sbc_host: &str) -> String {
     }
 
     // Voicemail configuration
-    let has_voicemail = phone
-        .lines
-        .iter()
-        .any(|l| l.voicemail_uri.is_some());
+    let has_voicemail = phone.lines.iter().any(|l| l.voicemail_uri.is_some());
     if has_voicemail {
         xml.push_str("  <voiceMailConfig>\n");
         for line in &phone.lines {
@@ -62,10 +59,7 @@ pub fn generate_vvx_config(phone: &Phone, sbc_host: &str) -> String {
     }
 
     // Call forward configuration
-    let has_cf = phone
-        .lines
-        .iter()
-        .any(|l| l.call_forward.is_some());
+    let has_cf = phone.lines.iter().any(|l| l.call_forward.is_some());
     if has_cf {
         xml.push_str("  <callForwardConfig>\n");
         for line in &phone.lines {
@@ -77,9 +71,7 @@ pub fn generate_vvx_config(phone: &Phone, sbc_host: &str) -> String {
                     ));
                 }
                 if let Some(busy) = &cf.busy {
-                    xml.push_str(&format!(
-                        "    <divert.{i}.busy.contact=\"{busy}\" />\n"
-                    ));
+                    xml.push_str(&format!("    <divert.{i}.busy.contact=\"{busy}\" />\n"));
                 }
                 if let Some(na) = &cf.no_answer {
                     xml.push_str(&format!(
@@ -126,9 +118,7 @@ pub fn generate_vvx_config(phone: &Phone, sbc_host: &str) -> String {
 
     // Network / VLAN
     if let Some(vlan) = phone.network.vlan_id {
-        xml.push_str(&format!(
-            "  <device.net.vlanId=\"{vlan}\" />\n\n"
-        ));
+        xml.push_str(&format!("  <device.net.vlanId=\"{vlan}\" />\n\n"));
     }
 
     // NTP / Time

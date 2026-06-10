@@ -14,7 +14,9 @@
 //! - **SC-8**: Transmission Confidentiality and Integrity
 
 use bytes::Bytes;
-use proto_b2bua::{B2buaMode, Call, CallConfig, CallId, MediaAddress, SdpRewriter, extract_media_address};
+use proto_b2bua::{
+    B2buaMode, Call, CallConfig, CallId, MediaAddress, SdpRewriter, extract_media_address,
+};
 use proto_dialog::{Dialog, DialogId};
 #[cfg(feature = "cluster")]
 use proto_registrar::AsyncLocationService;
@@ -23,21 +25,21 @@ use proto_registrar::{
     RegistrarMode,
 };
 use proto_sip::builder::{RequestBuilder, generate_branch, generate_call_id};
+use proto_sip::manipulation::{
+    HeaderManipulator, ManipulationAction, ManipulationContext, ManipulationDirection,
+    ManipulationPolicy, ManipulationRule,
+};
 use proto_sip::uri::SipUri;
 use proto_sip::{Header, HeaderName, Method, SipMessage, StatusCode};
+use proto_sip::{TopologyHider, TopologyHidingConfig as SipTopologyConfig, TopologyHidingMode};
 use proto_transaction::{
     ClientInviteTransaction, ClientNonInviteTransaction, ServerInviteTransaction,
     ServerNonInviteTransaction, TransactionKey, TransportType,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
-use proto_sip::manipulation::{
-    HeaderManipulator, ManipulationAction, ManipulationContext, ManipulationDirection,
-    ManipulationPolicy, ManipulationRule,
-};
-use proto_sip::{TopologyHider, TopologyHidingConfig as SipTopologyConfig, TopologyHidingMode};
 use tracing::{debug, error, info, warn};
 use uc_routing::{
     DestinationType, DialPattern, DialPlan, DialPlanEntry, Direction, NumberTransform, Router,
@@ -80,7 +82,8 @@ pub struct SipStack {
     zone_registry: Option<Arc<crate::zone::ResolvedZoneRegistry>>,
     /// Inbound trunk identification: maps source IP → (trunk_group_id, css_id).
     /// Used to resolve which CSS to use for routing inbound calls from trunks.
-    inbound_trunk_map: RwLock<std::collections::HashMap<std::net::IpAddr, (String, Option<String>)>>,
+    inbound_trunk_map:
+        RwLock<std::collections::HashMap<std::net::IpAddr, (String, Option<String>)>>,
     /// Directory number mapping: DID → username for inbound call routing.
     did_map: RwLock<std::collections::HashMap<String, String>>,
     /// Call-IDs currently being played an announcement (dedup retransmits).
@@ -187,7 +190,10 @@ impl TransactionStore {
     /// Removes transactions older than [`Self::MAX_AGE`] once any map has
     /// grown past [`Self::SWEEP_THRESHOLD`]. Amortized O(1) per insert.
     fn sweep_if_needed(&mut self) {
-        let over = self.server_invite.len().max(self.client_invite.len())
+        let over = self
+            .server_invite
+            .len()
+            .max(self.client_invite.len())
             .max(self.server_non_invite.len())
             .max(self.client_non_invite.len())
             > Self::SWEEP_THRESHOLD;
@@ -306,10 +312,8 @@ impl SipStack {
 
         // Build authenticated registrar with password lookup from config
         let credentials = config.auth_credentials.clone();
-        let registrar =
-            AuthenticatedRegistrar::new(registrar_config).with_password_lookup(move |user, _| {
-                credentials.get(user).cloned()
-            });
+        let registrar = AuthenticatedRegistrar::new(registrar_config)
+            .with_password_lookup(move |user, _| credentials.get(user).cloned());
 
         Self {
             transactions: RwLock::new(TransactionStore::default()),
@@ -333,9 +337,9 @@ impl SipStack {
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
             did_map: RwLock::new(std::collections::HashMap::new()),
-            announcement_calls: Arc::new(tokio::sync::RwLock::new(
-                std::collections::HashSet::new(),
-            )),
+            announcement_calls: Arc::new(
+                tokio::sync::RwLock::new(std::collections::HashSet::new()),
+            ),
         }
     }
 
@@ -355,10 +359,8 @@ impl SipStack {
         };
 
         let credentials = config.auth_credentials.clone();
-        let registrar =
-            AuthenticatedRegistrar::new(registrar_config).with_password_lookup(move |user, _| {
-                credentials.get(user).cloned()
-            });
+        let registrar = AuthenticatedRegistrar::new(registrar_config)
+            .with_password_lookup(move |user, _| credentials.get(user).cloned());
 
         info!("SIP stack initialized with storage-backed location service");
 
@@ -383,9 +385,9 @@ impl SipStack {
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
             did_map: RwLock::new(std::collections::HashMap::new()),
-            announcement_calls: Arc::new(tokio::sync::RwLock::new(
-                std::collections::HashSet::new(),
-            )),
+            announcement_calls: Arc::new(
+                tokio::sync::RwLock::new(std::collections::HashSet::new()),
+            ),
         }
     }
 
@@ -465,8 +467,7 @@ impl SipStack {
                 _ => SelectionStrategy::Priority,
             };
 
-            let mut group = TrunkGroup::new(&tg_config.id, &tg_config.name)
-                .with_strategy(strategy);
+            let mut group = TrunkGroup::new(&tg_config.id, &tg_config.name).with_strategy(strategy);
 
             for t_config in &tg_config.trunks {
                 let protocol = match t_config.protocol.as_str() {
@@ -521,11 +522,10 @@ impl SipStack {
                         let count = entry_config.transform_value.parse().unwrap_or(0);
                         NumberTransform::strip_prefix(count)
                     }
-                    "add_prefix" => {
-                        NumberTransform::add_prefix(&entry_config.transform_value)
-                    }
+                    "add_prefix" => NumberTransform::add_prefix(&entry_config.transform_value),
                     "replace_prefix" => {
-                        let parts: Vec<&str> = entry_config.transform_value.splitn(2, '|').collect();
+                        let parts: Vec<&str> =
+                            entry_config.transform_value.splitn(2, '|').collect();
                         if parts.len() == 2 {
                             NumberTransform::replace_prefix(parts[0], parts[1])
                         } else {
@@ -572,10 +572,7 @@ impl SipStack {
     }
 
     /// Initializes the header manipulator from config.
-    pub fn init_manipulator_from_config(
-        &mut self,
-        config: &sbc_config::HeaderManipulationConfig,
-    ) {
+    pub fn init_manipulator_from_config(&mut self, config: &sbc_config::HeaderManipulationConfig) {
         let mut manipulator = HeaderManipulator::new();
 
         for rule_config in &config.global_rules {
@@ -585,7 +582,11 @@ impl SipStack {
                 _ => None, // "both" or default
             };
 
-            let action = parse_manipulation_action(&rule_config.action, &rule_config.header, &rule_config.value);
+            let action = parse_manipulation_action(
+                &rule_config.action,
+                &rule_config.header,
+                &rule_config.value,
+            );
 
             let mut policy = ManipulationPolicy::new(&rule_config.name);
             if let Some(dir) = direction {
@@ -600,7 +601,11 @@ impl SipStack {
         }
 
         for rule_config in &config.trunk_rules {
-            let action = parse_manipulation_action(&rule_config.action, &rule_config.header, &rule_config.value);
+            let action = parse_manipulation_action(
+                &rule_config.action,
+                &rule_config.header,
+                &rule_config.value,
+            );
             let mut policy = ManipulationPolicy::new(&rule_config.name);
             policy.add_rule(ManipulationRule::new(
                 &rule_config.name,
@@ -623,10 +628,7 @@ impl SipStack {
     }
 
     /// Initializes the topology hider from config.
-    pub fn init_topology_hider_from_config(
-        &mut self,
-        config: &sbc_config::TopologyHidingConfig,
-    ) {
+    pub fn init_topology_hider_from_config(&mut self, config: &sbc_config::TopologyHidingConfig) {
         if !config.enabled {
             return;
         }
@@ -663,7 +665,12 @@ impl SipStack {
     /// Processes an incoming SIP message.
     ///
     /// `receiving_zone` is the zone name this message arrived on (if zones configured).
-    pub async fn process_message(&self, data: &Bytes, source: SbcSocketAddr, _receiving_zone: Option<&str>) -> ProcessResult {
+    pub async fn process_message(
+        &self,
+        data: &Bytes,
+        source: SbcSocketAddr,
+        _receiving_zone: Option<&str>,
+    ) -> ProcessResult {
         // Parse the SIP message
         let message = match SipMessage::parse(data) {
             Ok(msg) => msg,
@@ -732,11 +739,7 @@ impl SipStack {
         };
 
         let status_code = resp.status.code();
-        let sip_call_id = resp
-            .headers
-            .call_id()
-            .unwrap_or("")
-            .to_string();
+        let sip_call_id = resp.headers.call_id().unwrap_or("").to_string();
 
         debug!(
             status = status_code,
@@ -852,25 +855,26 @@ impl SipStack {
 
         // If 183 with SDP, rewrite SDP for A-leg (early media / ringback)
         if status_code == 183
-            && let Some(ref body) = resp.body {
-                let sdp_str = String::from_utf8_lossy(body);
-                let local_ip = addrs.local_addr.split(':').next().unwrap_or("0.0.0.0");
-                let local_media = MediaAddress::new(local_ip, 20_002);
-                let result = self
-                    .sdp_rewriter
-                    .rewrite_answer_for_a_leg(&sdp_str, &local_media);
-                let rewritten = Bytes::from(result.rewritten);
-                // build_a_leg_response set Content-Length: 0; correct it to
-                // the attached body length or the A-leg UA truncates the SDP
-                // and the caller gets no early media.
-                a_response
-                    .headers
-                    .set(HeaderName::ContentLength, rewritten.len().to_string());
-                a_response.body = Some(rewritten);
-                a_response
-                    .headers
-                    .set(HeaderName::ContentType, "application/sdp");
-            }
+            && let Some(ref body) = resp.body
+        {
+            let sdp_str = String::from_utf8_lossy(body);
+            let local_ip = addrs.local_addr.split(':').next().unwrap_or("0.0.0.0");
+            let local_media = MediaAddress::new(local_ip, 20_002);
+            let result = self
+                .sdp_rewriter
+                .rewrite_answer_for_a_leg(&sdp_str, &local_media);
+            let rewritten = Bytes::from(result.rewritten);
+            // build_a_leg_response set Content-Length: 0; correct it to
+            // the attached body length or the A-leg UA truncates the SDP
+            // and the caller gets no early media.
+            a_response
+                .headers
+                .set(HeaderName::ContentLength, rewritten.len().to_string());
+            a_response.body = Some(rewritten);
+            a_response
+                .headers
+                .set(HeaderName::ContentType, "application/sdp");
+        }
 
         info!(
             status = status_code,
@@ -943,17 +947,17 @@ impl SipStack {
         let b_leg_uri = SipUri::new(addrs.b_leg_destination.ip().to_string())
             .with_port(addrs.b_leg_destination.port());
         let mut ack_request = proto_sip::message::SipRequest::new(Method::Ack, b_leg_uri);
-        ack_request.headers.set(HeaderName::CallId, &addrs.b_leg_sip_call_id);
+        ack_request
+            .headers
+            .set(HeaderName::CallId, &addrs.b_leg_sip_call_id);
         ack_request.headers.set(HeaderName::CSeq, "1 ACK");
         ack_request.headers.set(HeaderName::From, &addrs.b_leg_from);
         ack_request.headers.set(
             HeaderName::To,
-            resp.headers
-                .get_value(&HeaderName::To)
-                .map_or_else(
-                    || with_tag(&addrs.b_leg_to, addrs.dialog_to_tag.as_deref()),
-                    String::from,
-                ),
+            resp.headers.get_value(&HeaderName::To).map_or_else(
+                || with_tag(&addrs.b_leg_to, addrs.dialog_to_tag.as_deref()),
+                String::from,
+            ),
         );
         ack_request.headers.set(HeaderName::MaxForwards, "70");
         let branch = generate_branch();
@@ -999,7 +1003,10 @@ impl SipStack {
             let router = router_lock.read().await;
             let trunk_addr = router
                 .get_trunk_group(
-                    addrs.failover_trunks.first().map_or("default", |_| "default"),
+                    addrs
+                        .failover_trunks
+                        .first()
+                        .map_or("default", |_| "default"),
                 )
                 .and_then(|_| resolve_sip_uri_to_addr(&format!("sip:{next_trunk_id}")));
             drop(router);
@@ -1008,8 +1015,7 @@ impl SipStack {
                 let new_call_id = generate_call_id(&self.config.domain);
                 let local_ip = addrs.local_addr.split(':').next().unwrap_or("0.0.0.0");
 
-                let new_uri = SipUri::new(new_dest.ip().to_string())
-                    .with_port(new_dest.port());
+                let new_uri = SipUri::new(new_dest.ip().to_string()).with_port(new_dest.port());
                 let builder = RequestBuilder::invite(new_uri)
                     .via_auto("UDP", local_ip, Some(new_dest.port()))
                     .call_id(&new_call_id)
@@ -1155,11 +1161,7 @@ impl SipStack {
             .and_then(|v| v.parse().ok());
 
         // Parse Call-ID and CSeq
-        let call_id = req
-            .headers
-            .call_id()
-            .unwrap_or("unknown")
-            .to_string();
+        let call_id = req.headers.call_id().unwrap_or("unknown").to_string();
         let cseq: u32 = req
             .headers
             .cseq()
@@ -1172,7 +1174,10 @@ impl SipStack {
             .with_call_id(&call_id)
             .with_cseq(cseq);
         let register_req = if let Some(exp) = expires {
-            RegisterRequest { expires: Some(exp), ..register_req }
+            RegisterRequest {
+                expires: Some(exp),
+                ..register_req
+            }
         } else {
             register_req
         };
@@ -1205,7 +1210,8 @@ impl SipStack {
         };
 
         // Build SIP response from RegisterResponse
-        let status = StatusCode::new(reg_response.status_code).unwrap_or(StatusCode::SERVER_INTERNAL_ERROR);
+        let status =
+            StatusCode::new(reg_response.status_code).unwrap_or(StatusCode::SERVER_INTERNAL_ERROR);
         let mut response = create_response_from_request(req, status);
 
         match reg_response.status_code {
@@ -1234,7 +1240,8 @@ impl SipStack {
                     let mut loc = self.location_service.write().await;
                     let _ = loc.remove_all_bindings(&aor);
                     let src_ip = match source.ip() {
-                        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped()
+                        std::net::IpAddr::V6(v6) => v6
+                            .to_ipv4_mapped()
                             .map_or_else(|| v6.to_string(), |v4| v4.to_string()),
                         std::net::IpAddr::V4(v4) => v4.to_string(),
                     };
@@ -1283,10 +1290,8 @@ impl SipStack {
             401 => {
                 // Add WWW-Authenticate challenge header
                 if let Some(ref www_auth) = reg_response.www_authenticate {
-                    response.add_header(Header::new(
-                        HeaderName::WwwAuthenticate,
-                        www_auth.as_str(),
-                    ));
+                    response
+                        .add_header(Header::new(HeaderName::WwwAuthenticate, www_auth.as_str()));
                 }
                 debug!(aor = %aor, "Registration challenged (401)");
             }
@@ -1332,11 +1337,7 @@ impl SipStack {
             };
         };
 
-        let a_leg_call_id = req
-            .headers
-            .call_id()
-            .unwrap_or("unknown")
-            .to_string();
+        let a_leg_call_id = req.headers.call_id().unwrap_or("unknown").to_string();
 
         debug!(uri = %req.uri, call_id = %a_leg_call_id, "Processing INVITE");
 
@@ -1437,9 +1438,7 @@ impl SipStack {
             if let Some(ref user) = mapped_user {
                 info!(did = %dest_user, user = %user, "DID mapped to registered user");
                 // Try the mapped user with the dest host first, then with known zone IPs
-                let candidates = [
-                    format!("sip:{user}@{dest_host}"),
-                ];
+                let candidates = [format!("sip:{user}@{dest_host}")];
                 for aor in &candidates {
                     let bindings = loc.lookup(aor);
                     if let Some(binding) = bindings.first() {
@@ -1489,7 +1488,8 @@ impl SipStack {
                 // Identify which trunk group this inbound call came from (by source IP)
                 // and get its assigned CSS for routing
                 let source_ip = match source.ip() {
-                    std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped()
+                    std::net::IpAddr::V6(v6) => v6
+                        .to_ipv4_mapped()
                         .map(std::net::IpAddr::V4)
                         .unwrap_or(std::net::IpAddr::V6(v6)),
                     ip => ip,
@@ -1554,11 +1554,13 @@ impl SipStack {
 
                 if routed.is_none() {
                     warn!(dest = %dest_aor, "No route found — playing announcement");
-                    return self.play_announcement_to_caller(
-                        req,
-                        source,
-                        crate::announcement::AnnouncementType::NumberNotInService,
-                    ).await;
+                    return self
+                        .play_announcement_to_caller(
+                            req,
+                            source,
+                            crate::announcement::AnnouncementType::NumberNotInService,
+                        )
+                        .await;
                 }
 
                 routed
@@ -1567,11 +1569,13 @@ impl SipStack {
 
         let Some(b_leg_destination) = b_leg_destination else {
             warn!(dest = %dest_aor, "Cannot resolve destination — playing announcement");
-            return self.play_announcement_to_caller(
-                req,
-                source,
-                crate::announcement::AnnouncementType::NumberNotInService,
-            ).await;
+            return self
+                .play_announcement_to_caller(
+                    req,
+                    source,
+                    crate::announcement::AnnouncementType::NumberNotInService,
+                )
+                .await;
         };
 
         // 4. Create B2BUA call
@@ -1628,16 +1632,11 @@ impl SipStack {
                 SipUri::new(&self.config.domain).with_user(&self.config.instance_name),
                 None,
             )
-            .to_uri(
-                SipUri::new(&dest_host).with_user(&dest_user),
-                None,
-            )
+            .to_uri(SipUri::new(&dest_host).with_user(&dest_user), None)
             .call_id(&b_leg_sip_call_id)
             .cseq(1)
             .max_forwards(b_leg_max_forwards)
-            .contact_uri(
-                SipUri::new(&local_ip).with_port(source.port()),
-            );
+            .contact_uri(SipUri::new(&local_ip).with_port(source.port()));
 
         if let Some(ref sdp) = b_leg_sdp {
             builder = builder.body_sdp(sdp.as_bytes().to_vec());
@@ -1647,10 +1646,8 @@ impl SipStack {
             Ok(req) => req,
             Err(e) => {
                 error!(error = %e, "Failed to build B-leg INVITE");
-                let server_err = create_response_from_request(
-                    req,
-                    StatusCode::SERVER_INTERNAL_ERROR,
-                );
+                let server_err =
+                    create_response_from_request(req, StatusCode::SERVER_INTERNAL_ERROR);
                 return ProcessResult::Response {
                     message: SipMessage::Response(server_err),
                     destination: source,
@@ -1660,11 +1657,15 @@ impl SipStack {
 
         // 7b. Apply header manipulation to B-leg INVITE
         if let Some(ref manipulator) = self.header_manipulator {
-            let context = ManipulationContext::for_request("INVITE", ManipulationDirection::Outbound);
+            let context =
+                ManipulationContext::for_request("INVITE", ManipulationDirection::Outbound);
             if let Ok(count) = manipulator.apply(&mut b_leg_request.headers, &context)
                 && count > 0
             {
-                debug!(rules_applied = count, "Header manipulation applied to B-leg INVITE");
+                debug!(
+                    rules_applied = count,
+                    "Header manipulation applied to B-leg INVITE"
+                );
             }
         }
 
@@ -1679,8 +1680,10 @@ impl SipStack {
         }
         {
             let mut corr = self.call_correlation.write().await;
-            corr.a_leg.insert(a_leg_call_id.clone(), internal_call_id.clone());
-            corr.b_leg.insert(b_leg_sip_call_id.clone(), internal_call_id.clone());
+            corr.a_leg
+                .insert(a_leg_call_id.clone(), internal_call_id.clone());
+            corr.b_leg
+                .insert(b_leg_sip_call_id.clone(), internal_call_id.clone());
             // Dialog state for in-dialog requests and forwarded responses:
             // both legs' From/To/Via/CSeq must be carried exactly, not
             // reconstructed (a BYE without dialog tags is unmatchable).
@@ -1826,30 +1829,25 @@ impl SipStack {
             };
         };
 
-        let sip_call_id = req
-            .headers
-            .call_id()
-            .unwrap_or("")
-            .to_string();
+        let sip_call_id = req.headers.call_id().unwrap_or("").to_string();
 
         debug!(call_id = %sip_call_id, "Processing BYE");
 
         // Look up the call — could be from A-leg or B-leg
         let corr = self.call_correlation.read().await;
-        let (internal_id, is_from_a_leg) =
-            if let Some(id) = corr.a_leg.get(&sip_call_id) {
-                (id.clone(), true)
-            } else if let Some(id) = corr.b_leg.get(&sip_call_id) {
-                (id.clone(), false)
-            } else {
-                // Unknown call — just respond 200 OK
-                debug!(call_id = %sip_call_id, "BYE for unknown call");
-                let response = create_response_from_request(req, StatusCode::OK);
-                return ProcessResult::Response {
-                    message: SipMessage::Response(response),
-                    destination: source,
-                };
+        let (internal_id, is_from_a_leg) = if let Some(id) = corr.a_leg.get(&sip_call_id) {
+            (id.clone(), true)
+        } else if let Some(id) = corr.b_leg.get(&sip_call_id) {
+            (id.clone(), false)
+        } else {
+            // Unknown call — just respond 200 OK
+            debug!(call_id = %sip_call_id, "BYE for unknown call");
+            let response = create_response_from_request(req, StatusCode::OK);
+            return ProcessResult::Response {
+                message: SipMessage::Response(response),
+                destination: source,
             };
+        };
 
         let Some(a) = corr.addresses.get(&internal_id) else {
             let response = create_response_from_request(req, StatusCode::OK);
@@ -1888,8 +1886,7 @@ impl SipStack {
             (&addrs.a_leg_sip_call_id, addrs.a_leg_source)
         };
 
-        let other_uri = SipUri::new(other_dest.ip().to_string())
-            .with_port(other_dest.port());
+        let other_uri = SipUri::new(other_dest.ip().to_string()).with_port(other_dest.port());
         let mut bye_request = proto_sip::message::SipRequest::new(Method::Bye, other_uri);
         bye_request.headers.set(HeaderName::CallId, other_call_id);
         if is_from_a_leg {
@@ -1965,11 +1962,7 @@ impl SipStack {
             };
         };
 
-        let sip_call_id = req
-            .headers
-            .call_id()
-            .unwrap_or("")
-            .to_string();
+        let sip_call_id = req.headers.call_id().unwrap_or("").to_string();
 
         debug!(call_id = %sip_call_id, "Processing CANCEL");
 
@@ -2042,7 +2035,9 @@ impl SipStack {
         let b_uri = SipUri::new(addrs.b_leg_destination.ip().to_string())
             .with_port(addrs.b_leg_destination.port());
         let mut b_cancel = proto_sip::message::SipRequest::new(Method::Cancel, b_uri);
-        b_cancel.headers.set(HeaderName::CallId, &addrs.b_leg_sip_call_id);
+        b_cancel
+            .headers
+            .set(HeaderName::CallId, &addrs.b_leg_sip_call_id);
         b_cancel.headers.set(HeaderName::CSeq, "1 CANCEL");
         b_cancel.headers.set(HeaderName::From, &addrs.b_leg_from);
         b_cancel.headers.set(HeaderName::To, &addrs.b_leg_to);
@@ -2175,10 +2170,18 @@ impl SipStack {
                 CallSummary {
                     call_id: id.to_string(),
                     state: format!("{:?}", call.state()),
-                    a_leg_call_id: addrs.map(|a| a.a_leg_sip_call_id.clone()).unwrap_or_default(),
-                    b_leg_call_id: addrs.map(|a| a.b_leg_sip_call_id.clone()).unwrap_or_default(),
-                    a_leg_source: addrs.map(|a| a.a_leg_source.to_string()).unwrap_or_default(),
-                    b_leg_destination: addrs.map(|a| a.b_leg_destination.to_string()).unwrap_or_default(),
+                    a_leg_call_id: addrs
+                        .map(|a| a.a_leg_sip_call_id.clone())
+                        .unwrap_or_default(),
+                    b_leg_call_id: addrs
+                        .map(|a| a.b_leg_sip_call_id.clone())
+                        .unwrap_or_default(),
+                    a_leg_source: addrs
+                        .map(|a| a.a_leg_source.to_string())
+                        .unwrap_or_default(),
+                    b_leg_destination: addrs
+                        .map(|a| a.b_leg_destination.to_string())
+                        .unwrap_or_default(),
                 }
             })
             .collect()
@@ -2215,11 +2218,7 @@ impl SipStack {
     }
 
     /// Deletes a registration binding (for gRPC DeleteRegistration).
-    pub async fn delete_registration(
-        &self,
-        aor: &str,
-        contact_uri: &str,
-    ) -> Result<(), String> {
+    pub async fn delete_registration(&self, aor: &str, contact_uri: &str) -> Result<(), String> {
         let mut loc = self.location_service.write().await;
         loc.remove_binding(aor, contact_uri)
             .map_err(|e| e.to_string())
@@ -2264,7 +2263,10 @@ impl SipStack {
                     DialPattern::Any => "any".to_string(),
                 },
                 pattern_value: match e.pattern() {
-                    DialPattern::Exact(v) | DialPattern::Prefix(v) | DialPattern::Wildcard(v) | DialPattern::Regex(v) => v.clone(),
+                    DialPattern::Exact(v)
+                    | DialPattern::Prefix(v)
+                    | DialPattern::Wildcard(v)
+                    | DialPattern::Regex(v) => v.clone(),
                     DialPattern::Any => "*".to_string(),
                 },
                 domain_pattern: e.domain_pattern().map(String::from),
@@ -2274,7 +2276,8 @@ impl SipStack {
                     DestinationType::TrunkGroup => "trunk_group",
                     DestinationType::RegisteredUser => "registered_user",
                     DestinationType::StaticUri => "static_uri",
-                }.to_string(),
+                }
+                .to_string(),
                 static_destination: e.static_destination().map(String::from),
                 transform_type: match e.transform() {
                     NumberTransform::None => "none",
@@ -2283,7 +2286,8 @@ impl SipStack {
                     NumberTransform::ReplacePrefix { .. } => "replace_prefix",
                     NumberTransform::Replace { .. } => "replace",
                     NumberTransform::Chain(_) => "chain",
-                }.to_string(),
+                }
+                .to_string(),
                 priority: e.priority(),
                 enabled: e.is_enabled(),
             })
@@ -2348,18 +2352,29 @@ impl SipStack {
 
     /// Registers a trunk group for inbound call identification.
     /// Maps each trunk's host IP to the trunk group ID and CSS.
-    pub async fn register_inbound_trunk(&self, trunk_group_id: &str, css_id: Option<&str>, hosts: &[(String, u16)]) {
+    pub async fn register_inbound_trunk(
+        &self,
+        trunk_group_id: &str,
+        css_id: Option<&str>,
+        hosts: &[(String, u16)],
+    ) {
         let mut map = self.inbound_trunk_map.write().await;
         for (host, _port) in hosts {
             // Resolve hostname to IP
             let addr_str = format!("{host}:0");
             if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
-                map.insert(addr.ip(), (trunk_group_id.to_string(), css_id.map(String::from)));
+                map.insert(
+                    addr.ip(),
+                    (trunk_group_id.to_string(), css_id.map(String::from)),
+                );
             } else {
                 use std::net::ToSocketAddrs;
                 if let Ok(mut addrs) = addr_str.to_socket_addrs() {
                     if let Some(addr) = addrs.find(|a| a.is_ipv4()) {
-                        map.insert(addr.ip(), (trunk_group_id.to_string(), css_id.map(String::from)));
+                        map.insert(
+                            addr.ip(),
+                            (trunk_group_id.to_string(), css_id.map(String::from)),
+                        );
                     }
                 }
             }
@@ -2368,13 +2383,19 @@ impl SipStack {
     }
 
     /// Looks up which trunk group and CSS an inbound call belongs to by source IP.
-    pub async fn lookup_inbound_trunk(&self, source_ip: std::net::IpAddr) -> Option<(String, Option<String>)> {
+    pub async fn lookup_inbound_trunk(
+        &self,
+        source_ip: std::net::IpAddr,
+    ) -> Option<(String, Option<String>)> {
         self.inbound_trunk_map.read().await.get(&source_ip).cloned()
     }
 
     /// Adds a DID → username mapping for inbound call routing.
     pub async fn add_did_mapping(&self, did: &str, username: &str) {
-        self.did_map.write().await.insert(did.to_string(), username.to_string());
+        self.did_map
+            .write()
+            .await
+            .insert(did.to_string(), username.to_string());
         info!(did, username, "Added DID → user mapping");
     }
 
@@ -2410,7 +2431,12 @@ impl SipStack {
     ) -> ProcessResult {
         // Bind announcement RTP socket first to discover actual port
         let preferred_port = if let Some(ref pipeline) = self.media_pipeline {
-            pipeline.port_allocator().allocate_pair().await.map(|(rtp, _)| rtp).unwrap_or(0)
+            pipeline
+                .port_allocator()
+                .allocate_pair()
+                .await
+                .map(|(rtp, _)| rtp)
+                .unwrap_or(0)
         } else {
             0
         };
@@ -2422,17 +2448,21 @@ impl SipStack {
         } else {
             None
         };
-        let (ann_socket, actual_rtp_port) = match crate::announcement::AnnouncementServer::bind_socket(preferred_port, rtp_bind_ip).await {
-            Ok(result) => result,
-            Err(e) => {
-                warn!(error = %e, "Cannot bind announcement socket");
-                let unavailable = create_response_from_request(req, StatusCode::TEMPORARILY_UNAVAILABLE);
-                return ProcessResult::Response {
-                    message: SipMessage::Response(unavailable),
-                    destination: source,
-                };
-            }
-        };
+        let (ann_socket, actual_rtp_port) =
+            match crate::announcement::AnnouncementServer::bind_socket(preferred_port, rtp_bind_ip)
+                .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    warn!(error = %e, "Cannot bind announcement socket");
+                    let unavailable =
+                        create_response_from_request(req, StatusCode::TEMPORARILY_UNAVAILABLE);
+                    return ProcessResult::Response {
+                        message: SipMessage::Response(unavailable),
+                        destination: source,
+                    };
+                }
+            };
 
         // Use the outside zone's external IP (STUN/public) for the SDP so
         // the remote party (on the internet) can send RTP to a routable address.
@@ -2443,8 +2473,11 @@ impl SipStack {
                 .map(|ip| ip.to_string())
         } else {
             None
-        }.unwrap_or_else(|| match source.ip() {
-            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or_else(|| v6.to_string(), |v4| v4.to_string()),
+        }
+        .unwrap_or_else(|| match source.ip() {
+            std::net::IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map_or_else(|| v6.to_string(), |v4| v4.to_string()),
             std::net::IpAddr::V4(v4) => v4.to_string(),
         });
         info!(sdp_ip = %sdp_ip, rtp_port = actual_rtp_port, zone_registry_present = self.zone_registry.is_some(), "SDP media address for announcement");
@@ -2454,11 +2487,20 @@ impl SipStack {
         let mut ok_response = create_response_from_request(req, StatusCode::OK);
         ok_response.add_header(Header::new(
             HeaderName::Contact,
-            format!("<sip:{}@{}:{}>", self.config.instance_name, sdp_ip, source.port()),
+            format!(
+                "<sip:{}@{}:{}>",
+                self.config.instance_name,
+                sdp_ip,
+                source.port()
+            ),
         ));
-        ok_response.headers.set(HeaderName::ContentType, "application/sdp");
+        ok_response
+            .headers
+            .set(HeaderName::ContentType, "application/sdp");
         let sdp_bytes = sdp.into_bytes();
-        ok_response.headers.set(HeaderName::ContentLength, sdp_bytes.len().to_string());
+        ok_response
+            .headers
+            .set(HeaderName::ContentLength, sdp_bytes.len().to_string());
         ok_response.body = Some(Bytes::from(sdp_bytes));
 
         // Extract caller's RTP destination from their SDP offer
@@ -2473,8 +2515,16 @@ impl SipStack {
         announcement_calls.write().await.insert(call_id.clone());
         // Capture full From/To headers for the BYE dialog matching.
         // In BYE from UAS: From = our To (with our tag), To = caller's From (with their tag)
-        let invite_from = req.headers.get_value(&HeaderName::From).unwrap_or_default().to_string();
-        let ok_to = ok_response.headers.get_value(&HeaderName::To).unwrap_or_default().to_string();
+        let invite_from = req
+            .headers
+            .get_value(&HeaderName::From)
+            .unwrap_or_default()
+            .to_string();
+        let ok_to = ok_response
+            .headers
+            .get_value(&HeaderName::To)
+            .unwrap_or_default()
+            .to_string();
 
         let source_port = source.port();
         // local_ip = macvlan IP for binding sockets; sdp_ip = external/public IP for SDP
@@ -2490,7 +2540,9 @@ impl SipStack {
             if let Some(rtp_dest) = caller_rtp_dest {
                 let ssrc = {
                     use std::time::{SystemTime, UNIX_EPOCH};
-                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default();
                     (now.as_nanos() as u32) ^ (now.as_secs() as u32)
                 };
                 if let Err(e) = crate::announcement::AnnouncementServer::play_on_socket(
@@ -2498,7 +2550,9 @@ impl SipStack {
                     ann_socket,
                     rtp_dest,
                     ssrc,
-                ).await {
+                )
+                .await
+                {
                     warn!(error = %e, "Announcement playback failed");
                 }
             } else {
@@ -2534,7 +2588,8 @@ impl SipStack {
                     info!("Sending BYE:\n{}", String::from_utf8_lossy(&bye_bytes));
                     // Bind to the outside zone IP on port 5060 so the BYE comes
                     // from the same address the call was established on
-                    let bind_addr: std::net::SocketAddr = format!("{local_ip}:5060").parse()
+                    let bind_addr: std::net::SocketAddr = format!("{local_ip}:5060")
+                        .parse()
                         .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
                     let sock2 = socket2::Socket::new(
                         socket2::Domain::IPV4,
@@ -2753,7 +2808,9 @@ fn build_a_leg_response(
 
 /// Parses a manipulation action from config strings.
 fn parse_manipulation_action(action: &str, header: &str, value: &str) -> ManipulationAction {
-    let header_name: HeaderName = header.parse().unwrap_or_else(|_| HeaderName::Custom(header.to_string()));
+    let header_name: HeaderName = header
+        .parse()
+        .unwrap_or_else(|_| HeaderName::Custom(header.to_string()));
     match action {
         "add" => ManipulationAction::Add {
             name: header_name,
@@ -2798,7 +2855,9 @@ fn resolve_sip_uri_to_addr(uri: &str) -> Option<SbcSocketAddr> {
         .unwrap_or(uri);
 
     // Strip user@ if present
-    let host_part = without_scheme.find('@').map_or(without_scheme, |at_pos| &without_scheme[at_pos + 1..]);
+    let host_part = without_scheme
+        .find('@')
+        .map_or(without_scheme, |at_pos| &without_scheme[at_pos + 1..]);
 
     // Strip parameters (;transport=udp etc.)
     let host_part = host_part.split(';').next().unwrap_or(host_part);
@@ -2806,7 +2865,9 @@ fn resolve_sip_uri_to_addr(uri: &str) -> Option<SbcSocketAddr> {
     // Parse host:port
     let (host, port) = host_part.rfind(':').map_or((host_part, 5060), |colon_pos| {
         let port_str = &host_part[colon_pos + 1..];
-        port_str.parse::<u16>().map_or((host_part, 5060), |port| (&host_part[..colon_pos], port))
+        port_str
+            .parse::<u16>()
+            .map_or((host_part, 5060), |port| (&host_part[..colon_pos], port))
     });
 
     // Parse IP address
@@ -2820,9 +2881,10 @@ fn resolve_sip_uri_to_addr(uri: &str) -> Option<SbcSocketAddr> {
     // For hostnames, try DNS resolution (synchronous for now)
     let addr_str = format!("{host}:{port}");
     if let Ok(mut addrs) = addr_str.to_socket_addrs()
-        && let Some(addr) = addrs.next() {
-            return Some(SbcSocketAddr::from(addr));
-        }
+        && let Some(addr) = addrs.next()
+    {
+        return Some(SbcSocketAddr::from(addr));
+    }
 
     None
 }
@@ -2835,9 +2897,10 @@ fn resolve_sip_uri_to_addr(uri: &str) -> Option<SbcSocketAddr> {
 /// - `sip:alice@example.com`
 fn extract_uri_from_header(header_value: &str) -> String {
     if let Some(start) = header_value.find('<')
-        && let Some(end) = header_value.find('>') {
-            return header_value[start + 1..end].to_string();
-        }
+        && let Some(end) = header_value.find('>')
+    {
+        return header_value[start + 1..end].to_string();
+    }
     // No angle brackets — take the value before any parameters
     header_value
         .split(';')
@@ -2968,10 +3031,7 @@ mod tests {
 
     #[test]
     fn test_with_tag() {
-        assert_eq!(
-            with_tag("<sip:a@b>", Some("xyz")),
-            "<sip:a@b>;tag=xyz"
-        );
+        assert_eq!(with_tag("<sip:a@b>", Some("xyz")), "<sip:a@b>;tag=xyz");
         // Existing tag is preserved, not duplicated
         assert_eq!(
             with_tag("<sip:a@b>;tag=abc", Some("xyz")),
@@ -3008,7 +3068,11 @@ mod tests {
                 let SipMessage::Response(resp) = message else {
                     panic!("Expected response message");
                 };
-                assert_eq!(resp.status.code(), 483, "must reject with 483 Too Many Hops");
+                assert_eq!(
+                    resp.status.code(),
+                    483,
+                    "must reject with 483 Too Many Hops"
+                );
             }
             other => panic!("Expected 483 response, got {other:?}"),
         }
@@ -3143,7 +3207,11 @@ mod tests {
         match result {
             ProcessResult::Response { message, .. } => {
                 if let SipMessage::Response(resp) = message {
-                    assert_eq!(resp.status.code(), 200, "Unresolvable destination should return 200 OK (announcement)");
+                    assert_eq!(
+                        resp.status.code(),
+                        200,
+                        "Unresolvable destination should return 200 OK (announcement)"
+                    );
                     assert!(resp.body.is_some(), "Should have SDP body for announcement");
                 }
             }
@@ -3190,10 +3258,7 @@ mod tests {
             Content-Length: 0\r\n\
             \r\n";
 
-        let alice_source = SbcSocketAddr::new_v4(
-            std::net::Ipv4Addr::new(192, 168, 1, 100),
-            5060,
-        );
+        let alice_source = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 168, 1, 100), 5060);
         let result = stack
             .process_message(&Bytes::from_static(invite), alice_source, None)
             .await;
@@ -3204,7 +3269,11 @@ mod tests {
                 assert_eq!(results.len(), 2, "Should have 2 results: Trying + Forward");
 
                 // First: 100 Trying to A-leg
-                if let ProcessResult::Response { message, destination } = &results[0] {
+                if let ProcessResult::Response {
+                    message,
+                    destination,
+                } = &results[0]
+                {
                     if let SipMessage::Response(resp) = message {
                         assert_eq!(resp.status, StatusCode::TRYING);
                     }
@@ -3214,7 +3283,11 @@ mod tests {
                 }
 
                 // Second: Forward INVITE to B-leg (bob at 127.0.0.1:5060)
-                if let ProcessResult::Forward { message, destination } = &results[1] {
+                if let ProcessResult::Forward {
+                    message,
+                    destination,
+                } = &results[1]
+                {
                     assert!(message.is_request(), "Forward should be a request");
                     assert_eq!(
                         destination.ip(),
@@ -3260,7 +3333,9 @@ mod tests {
             Content-Length: 0\r\n\
             \r\n";
         let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
-        stack.process_message(&Bytes::from_static(register), src, None).await;
+        stack
+            .process_message(&Bytes::from_static(register), src, None)
+            .await;
 
         // INVITE bob from alice
         let invite = b"INVITE sip:bob@sbc.local SIP/2.0\r\n\
@@ -3273,7 +3348,9 @@ mod tests {
             Content-Length: 0\r\n\
             \r\n";
         let alice = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 168, 1, 1), 5060);
-        stack.process_message(&Bytes::from_static(invite), alice, None).await;
+        stack
+            .process_message(&Bytes::from_static(invite), alice, None)
+            .await;
         assert_eq!(stack.call_count().await, 1);
 
         // BYE from alice (A-leg)
@@ -3285,7 +3362,9 @@ mod tests {
             CSeq: 2 BYE\r\n\
             Content-Length: 0\r\n\
             \r\n";
-        let result = stack.process_message(&Bytes::from_static(bye), alice, None).await;
+        let result = stack
+            .process_message(&Bytes::from_static(bye), alice, None)
+            .await;
 
         // Should get Multiple(200 OK to alice + BYE to bob)
         match result {
@@ -3326,7 +3405,9 @@ mod tests {
             Content-Length: 0\r\n\
             \r\n";
         let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
-        stack.process_message(&Bytes::from_static(register), src, None).await;
+        stack
+            .process_message(&Bytes::from_static(register), src, None)
+            .await;
 
         // INVITE bob
         let invite = b"INVITE sip:bob@sbc.local SIP/2.0\r\n\
@@ -3339,7 +3420,9 @@ mod tests {
             Content-Length: 0\r\n\
             \r\n";
         let alice = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 168, 1, 1), 5060);
-        stack.process_message(&Bytes::from_static(invite), alice, None).await;
+        stack
+            .process_message(&Bytes::from_static(invite), alice, None)
+            .await;
         assert_eq!(stack.call_count().await, 1);
 
         // CANCEL from alice before bob answers
@@ -3351,7 +3434,9 @@ mod tests {
             CSeq: 1 CANCEL\r\n\
             Content-Length: 0\r\n\
             \r\n";
-        let result = stack.process_message(&Bytes::from_static(cancel), alice, None).await;
+        let result = stack
+            .process_message(&Bytes::from_static(cancel), alice, None)
+            .await;
 
         // Should get Multiple(200 OK for CANCEL + 487 for INVITE + CANCEL to bob)
         match result {
@@ -3404,7 +3489,9 @@ mod tests {
             Content-Length: 0\r\n\
             \r\n";
         let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
-        stack.process_message(&Bytes::from_static(register), src, None).await;
+        stack
+            .process_message(&Bytes::from_static(register), src, None)
+            .await;
 
         // Verify registration query
         let regs = stack.list_registrations().await;
@@ -3441,7 +3528,9 @@ mod tests {
             Content-Length: 0\r\n\
             \r\n";
         let src = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 168, 1, 1), 5060);
-        let result = stack.process_message(&Bytes::from_static(bye), src, None).await;
+        let result = stack
+            .process_message(&Bytes::from_static(bye), src, None)
+            .await;
 
         match result {
             ProcessResult::Response { message, .. } => {
@@ -3490,10 +3579,8 @@ mod tests {
 
     #[test]
     fn test_parse_contacts_from_request() {
-        let mut req = proto_sip::message::SipRequest::new(
-            Method::Register,
-            SipUri::new("sbc.local"),
-        );
+        let mut req =
+            proto_sip::message::SipRequest::new(Method::Register, SipUri::new("sbc.local"));
         req.headers.add(Header::new(
             HeaderName::Contact,
             "<sip:alice@192.168.1.100:5060>;expires=3600;q=0.8",
@@ -3508,10 +3595,8 @@ mod tests {
 
     #[test]
     fn test_parse_wildcard_contact() {
-        let mut req = proto_sip::message::SipRequest::new(
-            Method::Register,
-            SipUri::new("sbc.local"),
-        );
+        let mut req =
+            proto_sip::message::SipRequest::new(Method::Register, SipUri::new("sbc.local"));
         req.headers.add(Header::new(HeaderName::Contact, "*"));
 
         let contacts = parse_contacts_from_request(&req);
@@ -3649,6 +3734,9 @@ mod tests {
         };
 
         stack.init_topology_hider_from_config(&topo_config);
-        assert!(stack.topology_hider.is_none(), "Disabled topology hider should be None");
+        assert!(
+            stack.topology_hider.is_none(),
+            "Disabled topology hider should be None"
+        );
     }
 }

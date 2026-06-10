@@ -37,11 +37,7 @@ fn resolve_local_ip(destination: &SocketAddr) -> Option<std::net::IpAddr> {
     socket.connect(destination).ok()?;
     let local_addr = socket.local_addr().ok()?;
     let ip = local_addr.ip();
-    if ip.is_unspecified() {
-        None
-    } else {
-        Some(ip)
-    }
+    if ip.is_unspecified() { None } else { Some(ip) }
 }
 
 /// Registration agent handles REGISTER transactions for accounts.
@@ -559,9 +555,7 @@ impl RegistrationAgent {
                 .host
                 .parse::<std::net::IpAddr>()
                 .ok()
-                .map(|ip| {
-                    SocketAddr::new(ip, registrar_uri.port.unwrap_or(5060))
-                });
+                .map(|ip| SocketAddr::new(ip, registrar_uri.port.unwrap_or(5060)));
             registrar_ip
                 .and_then(|addr| resolve_local_ip(&addr))
                 .unwrap_or(local_addr.ip())

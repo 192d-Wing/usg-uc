@@ -59,9 +59,9 @@ impl CallService for CallServiceImpl {
                 .map(|s| sbc_grpc_api::sbc::CallInfo {
                     call_id: s.call_id.clone(),
                     state: match s.state.as_str() {
-                        "Active" => 2,   // CONFIRMED
+                        "Active" => 2,                 // CONFIRMED
                         "Routing" | "Proceeding" => 1, // EARLY
-                        _ => 0,          // INITIAL
+                        _ => 0,                        // INITIAL
                     },
                     ..Default::default()
                 })

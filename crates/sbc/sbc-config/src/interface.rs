@@ -179,11 +179,7 @@ mod tests {
     #[test]
     fn test_resolve_loopback() {
         let map = enumerate_interfaces().unwrap();
-        let lo_name = if map.contains_key("lo0") {
-            "lo0"
-        } else {
-            "lo"
-        };
+        let lo_name = if map.contains_key("lo0") { "lo0" } else { "lo" };
         let ip = resolve_interface(lo_name, &map).unwrap();
         assert_eq!(ip, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     }
@@ -228,11 +224,7 @@ mod tests {
     #[test]
     fn test_resolve_zone_with_stun_external() {
         let map = enumerate_interfaces().unwrap();
-        let lo_name = if map.contains_key("lo0") {
-            "lo0"
-        } else {
-            "lo"
-        };
+        let lo_name = if map.contains_key("lo0") { "lo0" } else { "lo" };
 
         let zones = vec![ZoneConfig {
             name: "test".to_string(),
@@ -246,9 +238,6 @@ mod tests {
         assert_eq!(resolved[0].name, "test");
         // STUN should defer — external_ip is None, source is preserved
         assert!(resolved[0].external_ip.is_none());
-        assert_eq!(
-            resolved[0].external_ip_source,
-            Some("stun".to_string())
-        );
+        assert_eq!(resolved[0].external_ip_source, Some("stun".to_string()));
     }
 }

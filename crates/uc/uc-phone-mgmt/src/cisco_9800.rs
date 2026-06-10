@@ -15,10 +15,7 @@ pub fn generate_9800_config(phone: &Phone, sbc_host: &str) -> String {
     );
 
     // Device info
-    xml.push_str(&format!(
-        "  <deviceName>{}</deviceName>\n",
-        phone.name
-    ));
+    xml.push_str(&format!("  <deviceName>{}</deviceName>\n", phone.name));
     xml.push_str(&format!(
         "  <macAddress>{}</macAddress>\n",
         phone.mac_address
@@ -32,29 +29,15 @@ pub fn generate_9800_config(phone: &Phone, sbc_host: &str) -> String {
     for line in &phone.lines {
         let i = line.index;
         xml.push_str(&format!("  <line index=\"{i}\">\n"));
-        xml.push_str(&format!(
-            "    <proxy>{sbc_host}</proxy>\n"
-        ));
-        xml.push_str(&format!(
-            "    <port>{}</port>\n",
-            line.sip_port
-        ));
-        xml.push_str(&format!(
-            "    <userId>{}</userId>\n",
-            line.sip_username
-        ));
-        xml.push_str(&format!(
-            "    <password>{}</password>\n",
-            line.sip_password
-        ));
+        xml.push_str(&format!("    <proxy>{sbc_host}</proxy>\n"));
+        xml.push_str(&format!("    <port>{}</port>\n", line.sip_port));
+        xml.push_str(&format!("    <userId>{}</userId>\n", line.sip_username));
+        xml.push_str(&format!("    <password>{}</password>\n", line.sip_password));
         xml.push_str(&format!(
             "    <displayName>{}</displayName>\n",
             line.display_name
         ));
-        xml.push_str(&format!(
-            "    <authId>{}</authId>\n",
-            line.sip_username
-        ));
+        xml.push_str(&format!("    <authId>{}</authId>\n", line.sip_username));
         xml.push_str("    <enabled>true</enabled>\n");
 
         if let Some(vm) = &line.voicemail_uri {
@@ -228,9 +211,7 @@ pub fn generate_9800_config(phone: &Phone, sbc_host: &str) -> String {
         });
 
     xml.push_str("  <sipSettings>\n");
-    xml.push_str(&format!(
-        "    <transport>{transport}</transport>\n"
-    ));
+    xml.push_str(&format!("    <transport>{transport}</transport>\n"));
     xml.push_str("    <preferredCodec>G722</preferredCodec>\n");
     xml.push_str("    <secondPreferredCodec>G711u</secondPreferredCodec>\n");
     xml.push_str("    <thirdPreferredCodec>G711a</thirdPreferredCodec>\n");
@@ -255,9 +236,7 @@ pub fn generate_9800_config(phone: &Phone, sbc_host: &str) -> String {
     // Enhanced presence settings
     xml.push_str("  <presence>\n");
     xml.push_str("    <enabled>true</enabled>\n");
-    xml.push_str(&format!(
-        "    <server>{sbc_host}</server>\n"
-    ));
+    xml.push_str(&format!("    <server>{sbc_host}</server>\n"));
     xml.push_str("    <protocol>SIP</protocol>\n");
     xml.push_str("  </presence>\n\n");
 

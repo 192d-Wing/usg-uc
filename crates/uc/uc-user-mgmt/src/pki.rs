@@ -67,10 +67,7 @@ impl PkiValidator {
     ///
     /// Returns `UserMgmtError::CertificateValidationFailed` if the certificate
     /// cannot be parsed.
-    pub fn extract_identity(
-        &self,
-        cert_der: &[u8],
-    ) -> Result<PkiIdentity, UserMgmtError> {
+    pub fn extract_identity(&self, cert_der: &[u8]) -> Result<PkiIdentity, UserMgmtError> {
         // Convert DER bytes to a lossy string for basic DN extraction.
         // This is a placeholder until full ASN.1 parsing is implemented.
         let cert_text = String::from_utf8_lossy(cert_der);
@@ -79,17 +76,15 @@ impl PkiValidator {
             .map(|cn| format!("CN={cn}"))
             .unwrap_or_default();
 
-        let subject_cn =
-            extract_field(&cert_text, "CN=").unwrap_or_default();
+        let subject_cn = extract_field(&cert_text, "CN=").unwrap_or_default();
 
         // DoD EDIPI is typically the last 10 digits of the CN
         let edipi = extract_edipi(&subject_cn);
 
-        let email = extract_field(&cert_text, "E=")
-            .or_else(|| extract_field(&cert_text, "emailAddress="));
+        let email =
+            extract_field(&cert_text, "E=").or_else(|| extract_field(&cert_text, "emailAddress="));
 
-        let issuer_cn =
-            extract_field(&cert_text, "CN=").unwrap_or_default();
+        let issuer_cn = extract_field(&cert_text, "CN=").unwrap_or_default();
 
         Ok(PkiIdentity {
             subject_dn,
@@ -98,9 +93,7 @@ impl PkiValidator {
             upn: None,
             edipi,
             issuer_cn,
-            serial_number: hex::encode(
-                &cert_der[..std::cmp::min(cert_der.len(), 20)],
-            ),
+            serial_number: hex::encode(&cert_der[..std::cmp::min(cert_der.len(), 20)]),
             not_after: 0, // Requires ASN.1 parsing for actual value
         })
     }

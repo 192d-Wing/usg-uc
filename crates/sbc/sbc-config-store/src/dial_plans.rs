@@ -13,8 +13,8 @@
 //! Adding columns would just mean another schema migration each time
 //! we taught the dashboard a new dial-plan toggle.
 
-use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
+use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use tracing::debug;
 
 use crate::error::{ConfigStoreError, ConfigStoreResult};

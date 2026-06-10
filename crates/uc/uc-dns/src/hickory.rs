@@ -61,13 +61,12 @@ impl HickoryDnsResolver {
         opts: ResolverOpts,
         cache: Arc<DnsCache>,
     ) -> DnsResult<Self> {
-        let resolver =
-            TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
-                .with_options(opts)
-                .build()
-                .map_err(|e| DnsError::ResolverInit {
-                    reason: e.to_string(),
-                })?;
+        let resolver = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
+            .with_options(opts)
+            .build()
+            .map_err(|e| DnsError::ResolverInit {
+                reason: e.to_string(),
+            })?;
 
         Ok(Self {
             resolver,
@@ -125,9 +124,7 @@ impl HickoryDnsResolver {
             .as_lookup()
             .answers()
             .first()
-            .map_or(self.default_ttl, |r| {
-                Duration::from_secs(u64::from(r.ttl))
-            });
+            .map_or(self.default_ttl, |r| Duration::from_secs(u64::from(r.ttl)));
 
         // Cache the result
         self.cache
@@ -173,9 +170,10 @@ impl HickoryDnsResolver {
         let mut min_ttl = self.default_ttl;
 
         // Get TTL from the lookup records
-        let record_ttl = response.answers().first().map_or(self.default_ttl, |r| {
-            Duration::from_secs(u64::from(r.ttl))
-        });
+        let record_ttl = response
+            .answers()
+            .first()
+            .map_or(self.default_ttl, |r| Duration::from_secs(u64::from(r.ttl)));
         if record_ttl < min_ttl {
             min_ttl = record_ttl;
         }

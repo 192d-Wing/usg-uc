@@ -68,7 +68,8 @@ impl CucmRouter {
 
     /// Adds a partition.
     pub fn add_partition(&mut self, partition: Partition) {
-        self.partitions.insert(partition.id().to_string(), partition);
+        self.partitions
+            .insert(partition.id().to_string(), partition);
     }
 
     /// Removes a partition by ID.
@@ -175,11 +176,7 @@ impl CucmRouter {
     /// 3. For each partition, find enabled, non-blocked patterns that match.
     /// 4. Among matches, prefer the longest prefix, then lowest priority value.
     /// 5. Resolve route list or route group, apply transforms.
-    pub fn route(
-        &self,
-        dialed_digits: &str,
-        css_id: Option<&str>,
-    ) -> Option<CucmRoutingResult> {
+    pub fn route(&self, dialed_digits: &str, css_id: Option<&str>) -> Option<CucmRoutingResult> {
         // 1. Resolve CSS
         let css_key = css_id.or(self.default_css.as_deref())?;
         let css = self.css_list.get(css_key)?;
@@ -234,7 +231,8 @@ impl CucmRouter {
         }
 
         // 5. Resolve route groups
-        let route_group_ids = self.resolve_route_groups(matched, &mut transformed, &mut transforms_applied);
+        let route_group_ids =
+            self.resolve_route_groups(matched, &mut transformed, &mut transforms_applied);
 
         Some(CucmRoutingResult {
             pattern_id: matched.id().to_string(),
@@ -254,9 +252,7 @@ impl CucmRouter {
         self.route_patterns
             .iter()
             .filter(|rp| {
-                rp.partition_id() == partition_id
-                    && !rp.is_blocked()
-                    && rp.matches(digits)
+                rp.partition_id() == partition_id && !rp.is_blocked() && rp.matches(digits)
             })
             .collect()
     }
@@ -290,7 +286,8 @@ impl CucmRouter {
                     && let Some(t) = first.transform()
                 {
                     *transformed = t.apply(transformed);
-                    transforms_applied.push(format!("route_list_member({})", first.route_group_id()));
+                    transforms_applied
+                        .push(format!("route_list_member({})", first.route_group_id()));
                 }
                 return ordered
                     .iter()
@@ -508,18 +505,10 @@ mod tests {
     #[test]
     fn test_route_pattern_crud() {
         let mut router = CucmRouter::new();
-        router.add_route_pattern(RoutePattern::new(
-            "rp-1",
-            DialPattern::exact("100"),
-            "pt-1",
-        ));
+        router.add_route_pattern(RoutePattern::new("rp-1", DialPattern::exact("100"), "pt-1"));
         assert_eq!(router.list_route_patterns().len(), 1);
 
-        router.add_route_pattern(RoutePattern::new(
-            "rp-2",
-            DialPattern::exact("200"),
-            "pt-2",
-        ));
+        router.add_route_pattern(RoutePattern::new("rp-2", DialPattern::exact("200"), "pt-2"));
         assert_eq!(router.list_route_patterns_by_partition("pt-1").len(), 1);
 
         let removed = router.remove_route_pattern("rp-1");

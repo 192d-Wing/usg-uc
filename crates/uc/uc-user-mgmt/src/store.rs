@@ -11,16 +11,10 @@ pub type Result<T> = std::result::Result<T, UserMgmtError>;
 /// Implementations must be `Send + Sync` for use across async tasks.
 pub trait UserStore: Send + Sync {
     /// Create a new user account.
-    fn create_user(
-        &self,
-        user: User,
-    ) -> impl std::future::Future<Output = Result<User>> + Send;
+    fn create_user(&self, user: User) -> impl std::future::Future<Output = Result<User>> + Send;
 
     /// Retrieve a user by their unique ID.
-    fn get_user(
-        &self,
-        id: &str,
-    ) -> impl std::future::Future<Output = Result<User>> + Send;
+    fn get_user(&self, id: &str) -> impl std::future::Future<Output = Result<User>> + Send;
 
     /// Retrieve a user by their username.
     fn get_user_by_username(
@@ -41,16 +35,10 @@ pub trait UserStore: Send + Sync {
     ) -> impl std::future::Future<Output = Result<Vec<User>>> + Send;
 
     /// Update an existing user account.
-    fn update_user(
-        &self,
-        user: User,
-    ) -> impl std::future::Future<Output = Result<User>> + Send;
+    fn update_user(&self, user: User) -> impl std::future::Future<Output = Result<User>> + Send;
 
     /// Delete a user account by ID.
-    fn delete_user(
-        &self,
-        id: &str,
-    ) -> impl std::future::Future<Output = Result<()>> + Send;
+    fn delete_user(&self, id: &str) -> impl std::future::Future<Output = Result<()>> + Send;
 
     /// Look up the HA1 digest hash for SIP digest authentication.
     ///
@@ -72,7 +60,5 @@ pub trait UserStore: Send + Sync {
     ) -> impl std::future::Future<Output = Result<Option<User>>> + Send;
 
     /// Return the total number of users in the store.
-    fn count_users(
-        &self,
-    ) -> impl std::future::Future<Output = Result<usize>> + Send;
+    fn count_users(&self) -> impl std::future::Future<Output = Result<usize>> + Send;
 }

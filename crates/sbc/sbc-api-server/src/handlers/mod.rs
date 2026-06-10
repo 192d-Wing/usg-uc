@@ -9,8 +9,8 @@
 
 use std::sync::Arc;
 
-use axum::routing::{delete, get, post, put};
 use axum::Router;
+use axum::routing::{delete, get, post, put};
 use tower_http::trace::TraceLayer;
 
 use crate::state::AppState;
@@ -59,17 +59,17 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .put(trunk_groups::update_group)
                 .delete(trunk_groups::delete_group),
         )
-        .route("/trunkgroups/{group_id}/trunks", post(trunk_groups::add_trunk))
+        .route(
+            "/trunkgroups/{group_id}/trunks",
+            post(trunk_groups::add_trunk),
+        )
         .route(
             "/trunkgroups/{group_id}/trunks/{trunk_id}",
             put(trunk_groups::update_trunk).delete(trunk_groups::delete_trunk),
         )
         // Dial plan writes (reads stay on the daemon — they read SIP-
         // stack state, not Postgres).
-        .route(
-            "/dialplans/{plan_id}/entries",
-            post(dial_plans::add_entry),
-        )
+        .route("/dialplans/{plan_id}/entries", post(dial_plans::add_entry))
         .route(
             "/dialplans/{plan_id}/entries/{entry_id}",
             delete(dial_plans::delete_entry),
@@ -103,10 +103,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             put(cucm::update_partition).delete(cucm::delete_partition),
         )
         .route("/css", get(cucm::list_css).post(cucm::create_css))
-        .route(
-            "/css/{id}",
-            put(cucm::update_css).delete(cucm::delete_css),
-        )
+        .route("/css/{id}", put(cucm::update_css).delete(cucm::delete_css))
         .route(
             "/routepatterns",
             get(cucm::list_route_patterns).post(cucm::create_route_pattern),
@@ -145,10 +142,13 @@ pub fn router(state: Arc<AppState>) -> Router {
     // *path so it captures arbitrary depth (e.g., /api/v1/system/stats,
     // /api/v1/users/123, /api/v1/registrations).
     let api_proxy = Router::new()
-        .route("/api/v1/{*path}", get(proxy::proxy_get)
-            .post(proxy::proxy_post)
-            .put(proxy::proxy_put)
-            .delete(proxy::proxy_delete))
+        .route(
+            "/api/v1/{*path}",
+            get(proxy::proxy_get)
+                .post(proxy::proxy_post)
+                .put(proxy::proxy_put)
+                .delete(proxy::proxy_delete),
+        )
         .with_state(Arc::clone(&state));
 
     // Deny-by-default authentication applied at the OUTER router so it

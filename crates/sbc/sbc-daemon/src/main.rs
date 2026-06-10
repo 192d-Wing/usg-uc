@@ -63,12 +63,12 @@ mod cluster;
 mod grpc_server;
 mod ice_agent;
 mod media_pipeline;
-mod trunk_monitor;
-mod trunk_registrar;
 mod runtime;
 mod server;
 mod shutdown;
 mod sip_stack;
+mod trunk_monitor;
+mod trunk_registrar;
 mod zone;
 
 use args::Args;

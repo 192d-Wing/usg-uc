@@ -13,10 +13,7 @@ pub enum ConfigError {
     #[error("missing required env var: {0}")]
     Missing(&'static str),
     #[error("invalid {var}: {reason}")]
-    Invalid {
-        var: &'static str,
-        reason: String,
-    },
+    Invalid { var: &'static str, reason: String },
 }
 
 #[derive(Debug, Clone)]
@@ -51,8 +48,8 @@ impl Config {
                 reason: e.to_string(),
             })?;
 
-        let database_url =
-            std::env::var("SBC_POSTGRES_URL").map_err(|_| ConfigError::Missing("SBC_POSTGRES_URL"))?;
+        let database_url = std::env::var("SBC_POSTGRES_URL")
+            .map_err(|_| ConfigError::Missing("SBC_POSTGRES_URL"))?;
 
         let daemon_grpc_url = std::env::var("SBC_DAEMON_GRPC_URL")
             .map_err(|_| ConfigError::Missing("SBC_DAEMON_GRPC_URL"))?;

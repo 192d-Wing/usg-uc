@@ -13,8 +13,8 @@
 //! types, so the store stays a pass-through and the daemon's
 //! `sync_*_to_router` helpers do the typed conversion when applying.
 
-use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
+use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use tracing::debug;
 
 use crate::error::{ConfigStoreError, ConfigStoreResult};
@@ -89,7 +89,11 @@ impl CucmJsonStore {
                  updated_at = NOW()",
             self.table
         );
-        sqlx::query(&sql).bind(id).bind(data).execute(&self.pool).await?;
+        sqlx::query(&sql)
+            .bind(id)
+            .bind(data)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -213,6 +217,9 @@ macro_rules! cucm_store {
 }
 
 cucm_store!(PostgresPartitionStore, "cucm_partitions");
-cucm_store!(PostgresCallingSearchSpaceStore, "cucm_calling_search_spaces");
+cucm_store!(
+    PostgresCallingSearchSpaceStore,
+    "cucm_calling_search_spaces"
+);
 cucm_store!(PostgresRoutePatternStore, "cucm_route_patterns");
 cucm_store!(PostgresRouteListStore, "cucm_route_lists");

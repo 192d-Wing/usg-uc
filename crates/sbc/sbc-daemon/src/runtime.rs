@@ -328,16 +328,18 @@ impl Runtime {
                             "Resolved zone"
                         );
                     }
-                    let registry = Arc::new(crate::zone::ResolvedZoneRegistry::from_resolved(resolved));
+                    let registry =
+                        Arc::new(crate::zone::ResolvedZoneRegistry::from_resolved(resolved));
 
                     // Start external IP monitor for STUN-based zones
                     let stun_interval = config.transport.stun_refresh_interval_secs.unwrap_or(300);
-                    let monitor = crate::zone::ExternalIpMonitor::new(
-                        Arc::clone(&registry),
-                        stun_interval,
-                    );
+                    let monitor =
+                        crate::zone::ExternalIpMonitor::new(Arc::clone(&registry), stun_interval);
                     monitor.start();
-                    info!("Zone registry initialized with {} zone(s)", registry.zone_names().len());
+                    info!(
+                        "Zone registry initialized with {} zone(s)",
+                        registry.zone_names().len()
+                    );
                     Some(registry)
                 }
                 Err(e) => {
@@ -390,14 +392,12 @@ impl Runtime {
                 reason: e.to_string(),
             })?;
 
-        let api_tls = api_tls_paths.map(|(cert_path, key_path)| {
-            crate::api_server::TlsConfig { cert_path, key_path }
+        let api_tls = api_tls_paths.map(|(cert_path, key_path)| crate::api_server::TlsConfig {
+            cert_path,
+            key_path,
         });
         if api_tls.is_some() {
-            info!(
-                "API HTTPS listener enabled on {:?}",
-                api_tls_listen
-            );
+            info!("API HTTPS listener enabled on {:?}", api_tls_listen);
         }
         let api_config = ApiServerConfig {
             listen_addr: api_listen_override
@@ -417,10 +417,7 @@ impl Runtime {
         // AppState::new() leaves the field as None.
         if let Some(prov_cfg) = provisioning_config {
             app_state.provisioning = Some(Arc::new(
-                uc_phone_mgmt::provisioning::ProvisioningServer::new(
-                    &prov_cfg.host,
-                    prov_cfg.port,
-                ),
+                uc_phone_mgmt::provisioning::ProvisioningServer::new(&prov_cfg.host, prov_cfg.port),
             ));
             info!(
                 "Phone provisioning server initialized host={} port={}",
@@ -434,16 +431,12 @@ impl Runtime {
         )));
 
         // Initialize trunk health monitor
-        let trunk_monitor = Arc::new(crate::trunk_monitor::TrunkMonitor::new(
-            &instance_name,
-        ));
+        let trunk_monitor = Arc::new(crate::trunk_monitor::TrunkMonitor::new(&instance_name));
         app_state.trunk_monitor = Some(Arc::clone(&trunk_monitor));
         info!("Trunk health monitor initialized");
 
         // Initialize trunk registrar
-        let trunk_registrar = Arc::new(crate::trunk_registrar::TrunkRegistrar::new(
-            &instance_name,
-        ));
+        let trunk_registrar = Arc::new(crate::trunk_registrar::TrunkRegistrar::new(&instance_name));
         app_state.trunk_registrar = Some(Arc::clone(&trunk_registrar));
         app_state.zone_registry = zone_registry.clone();
         info!("Trunk registrar initialized");
@@ -480,8 +473,7 @@ impl Runtime {
                     let store_arc = Arc::new(store);
                     let json_path = std::path::Path::new("/var/lib/sbc/directory_numbers.json");
                     match sbc_config_store::migrate_directory_json_to_postgres(
-                        json_path,
-                        &store_arc,
+                        json_path, &store_arc,
                     )
                     .await
                     {
@@ -506,11 +498,8 @@ impl Runtime {
                 Ok(store) => {
                     let store_arc = Arc::new(store);
                     let json_path = std::path::Path::new("/var/lib/sbc/phones.json");
-                    match sbc_config_store::migrate_phones_json_to_postgres(
-                        json_path,
-                        &store_arc,
-                    )
-                    .await
+                    match sbc_config_store::migrate_phones_json_to_postgres(json_path, &store_arc)
+                        .await
                     {
                         Ok(0) => debug!("Phones JSON migration: nothing to do"),
                         Ok(n) => info!(imported = n, "Migrated phones.json to Postgres"),
@@ -534,14 +523,15 @@ impl Runtime {
                     let store_arc = Arc::new(store);
                     let json_path = std::path::Path::new("/var/lib/sbc/trunk_groups.json");
                     match sbc_config_store::migrate_trunk_groups_json_to_postgres(
-                        json_path,
-                        &store_arc,
+                        json_path, &store_arc,
                     )
                     .await
                     {
                         Ok(0) => debug!("Trunk-groups JSON migration: nothing to do"),
                         Ok(n) => info!(imported = n, "Migrated trunk_groups.json to Postgres"),
-                        Err(e) => warn!(error = %e, "Trunk-groups JSON migration failed; continuing"),
+                        Err(e) => {
+                            warn!(error = %e, "Trunk-groups JSON migration failed; continuing")
+                        }
                     }
                     app_state.trunk_group_store = Some(store_arc);
                     info!("Trunk-group store initialized (PostgreSQL)");
@@ -595,7 +585,9 @@ impl Runtime {
                     app_state.css_store = Some(Arc::new(s));
                     info!("CSS store initialized (PostgreSQL)");
                 }
-                Err(e) => warn!(error = %e, "PostgresCallingSearchSpaceStore init exhausted retries"),
+                Err(e) => {
+                    warn!(error = %e, "PostgresCallingSearchSpaceStore init exhausted retries")
+                }
             }
             match connect_with_retry("route_patterns", || {
                 sbc_config_store::PostgresRoutePatternStore::new(&pg_url)
@@ -679,13 +671,20 @@ impl Runtime {
                             }
                             info!(count = parts.len(), "Seeded partitions");
                         }
-                        if let Some(csses) = seed.get("calling_search_spaces").and_then(|v| v.as_array()) {
+                        if let Some(csses) =
+                            seed.get("calling_search_spaces").and_then(|v| v.as_array())
+                        {
                             for c in csses {
                                 let id = c.get("id").and_then(|v| v.as_str()).unwrap_or_default();
                                 let name = c.get("name").and_then(|v| v.as_str()).unwrap_or(id);
-                                let parts: Vec<String> = c.get("partitions")
+                                let parts: Vec<String> = c
+                                    .get("partitions")
                                     .and_then(|v| v.as_array())
-                                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|v| v.as_str().map(String::from))
+                                            .collect()
+                                    })
                                     .unwrap_or_default();
                                 let mut css = uc_routing::CallingSearchSpace::new(id, name);
                                 for p in &parts {
@@ -698,24 +697,37 @@ impl Runtime {
                         if let Some(rps) = seed.get("route_patterns").and_then(|v| v.as_array()) {
                             for rp in rps {
                                 let id = rp.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-                                let partition = rp.get("partition_id").and_then(|v| v.as_str()).unwrap_or_default();
-                                let pattern_value = rp.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-                                let pattern_type = rp.get("pattern_type").and_then(|v| v.as_str()).unwrap_or("prefix");
+                                let partition = rp
+                                    .get("partition_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default();
+                                let pattern_value =
+                                    rp.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+                                let pattern_type = rp
+                                    .get("pattern_type")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("prefix");
                                 let pattern = match pattern_type {
                                     "exact" => uc_routing::DialPattern::exact(pattern_value),
                                     "wildcard" => uc_routing::DialPattern::wildcard(pattern_value),
                                     "any" => uc_routing::DialPattern::Any,
                                     _ => uc_routing::DialPattern::prefix(pattern_value),
                                 };
-                                let mut route_pattern = uc_routing::RoutePattern::new(id, pattern, partition);
+                                let mut route_pattern =
+                                    uc_routing::RoutePattern::new(id, pattern, partition);
                                 if let Some(desc) = rp.get("description").and_then(|v| v.as_str()) {
                                     route_pattern = route_pattern.with_description(desc);
                                 }
-                                if let Some(rg) = rp.get("route_group_id").and_then(|v| v.as_str()) {
-                                    if !rg.is_empty() { route_pattern = route_pattern.with_route_group(rg); }
+                                if let Some(rg) = rp.get("route_group_id").and_then(|v| v.as_str())
+                                {
+                                    if !rg.is_empty() {
+                                        route_pattern = route_pattern.with_route_group(rg);
+                                    }
                                 }
                                 if let Some(rl) = rp.get("route_list_id").and_then(|v| v.as_str()) {
-                                    if !rl.is_empty() { route_pattern = route_pattern.with_route_list(rl); }
+                                    if !rl.is_empty() {
+                                        route_pattern = route_pattern.with_route_list(rl);
+                                    }
                                 }
                                 cucm_w.add_route_pattern(route_pattern);
                             }
@@ -805,9 +817,7 @@ impl Runtime {
                 Ok(groups) => {
                     for group_json in &groups {
                         crate::api_server::sync_trunk_group_to_router(&app_state, group_json).await;
-                        if let Some(trunks) =
-                            group_json.get("trunks").and_then(|v| v.as_array())
-                        {
+                        if let Some(trunks) = group_json.get("trunks").and_then(|v| v.as_array()) {
                             for trunk in trunks {
                                 crate::api_server::start_trunk_services(&app_state, trunk);
                             }

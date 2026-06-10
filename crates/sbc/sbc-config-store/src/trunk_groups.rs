@@ -13,8 +13,8 @@
 //! existing `sync_trunk_group_to_router` keeps reading from the same
 //! `serde_json::Value` shape it already understands.
 
-use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
+use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use tracing::debug;
 
 use crate::error::{ConfigStoreError, ConfigStoreResult};

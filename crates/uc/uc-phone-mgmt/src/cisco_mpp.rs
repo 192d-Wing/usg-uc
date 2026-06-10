@@ -17,12 +17,8 @@ pub fn generate_mpp_config(phone: &Phone, sbc_host: &str) -> String {
     // Per-line configuration
     for line in &phone.lines {
         let i = line.index;
-        xml.push_str(&format!(
-            "  <!-- Line {i} -->\n"
-        ));
-        xml.push_str(&format!(
-            "  <Line{i}_Proxy>{sbc_host}</Line{i}_Proxy>\n"
-        ));
+        xml.push_str(&format!("  <!-- Line {i} -->\n"));
+        xml.push_str(&format!("  <Line{i}_Proxy>{sbc_host}</Line{i}_Proxy>\n"));
         xml.push_str(&format!(
             "  <Line{i}_Port>{}</Line{i}_Port>\n",
             line.sip_port
@@ -43,9 +39,7 @@ pub fn generate_mpp_config(phone: &Phone, sbc_host: &str) -> String {
             "  <Line{i}_Auth_ID>{}</Line{i}_Auth_ID>\n",
             line.sip_username
         ));
-        xml.push_str(&format!(
-            "  <Line{i}_Enabled>Yes</Line{i}_Enabled>\n"
-        ));
+        xml.push_str(&format!("  <Line{i}_Enabled>Yes</Line{i}_Enabled>\n"));
 
         if let Some(vm) = &line.voicemail_uri {
             xml.push_str(&format!(
@@ -55,9 +49,7 @@ pub fn generate_mpp_config(phone: &Phone, sbc_host: &str) -> String {
 
         if let Some(cf) = &line.call_forward {
             if let Some(all) = &cf.all {
-                xml.push_str(&format!(
-                    "  <Line{i}_Cfwd_All>{all}</Line{i}_Cfwd_All>\n"
-                ));
+                xml.push_str(&format!("  <Line{i}_Cfwd_All>{all}</Line{i}_Cfwd_All>\n"));
             }
             if let Some(busy) = &cf.busy {
                 xml.push_str(&format!(
@@ -120,10 +112,7 @@ pub fn generate_mpp_config(phone: &Phone, sbc_host: &str) -> String {
     }
 
     // Network settings
-    if phone.network.vlan_id.is_some()
-        || phone.network.cdp_enabled
-        || phone.network.lldp_enabled
-    {
+    if phone.network.vlan_id.is_some() || phone.network.cdp_enabled || phone.network.lldp_enabled {
         xml.push_str("  <!-- Network -->\n");
         if let Some(vlan) = phone.network.vlan_id {
             xml.push_str(&format!("  <VLAN_ID_>{vlan}</VLAN_ID_>\n"));
@@ -166,23 +155,17 @@ pub fn generate_mpp_config(phone: &Phone, sbc_host: &str) -> String {
             ));
         }
         if let Some(bind_dn) = &phone.directory.ldap_bind_dn {
-            xml.push_str(&format!(
-                "  <LDAP_Bind_DN>{bind_dn}</LDAP_Bind_DN>\n"
-            ));
+            xml.push_str(&format!("  <LDAP_Bind_DN>{bind_dn}</LDAP_Bind_DN>\n"));
         }
         if let Some(pw) = &phone.directory.ldap_password {
-            xml.push_str(&format!(
-                "  <LDAP_Password>{pw}</LDAP_Password>\n"
-            ));
+            xml.push_str(&format!("  <LDAP_Password>{pw}</LDAP_Password>\n"));
         }
         xml.push('\n');
     }
 
     // Emergency
     if let Some(num) = &phone.emergency.emergency_number {
-        xml.push_str(&format!(
-            "  <Emergency_Number>{num}</Emergency_Number>\n\n"
-        ));
+        xml.push_str(&format!("  <Emergency_Number>{num}</Emergency_Number>\n\n"));
     }
 
     // SIP section
@@ -196,9 +179,7 @@ pub fn generate_mpp_config(phone: &Phone, sbc_host: &str) -> String {
         });
 
     xml.push_str("  <!-- SIP Settings -->\n");
-    xml.push_str(&format!(
-        "  <SIP_Transport>{transport}</SIP_Transport>\n"
-    ));
+    xml.push_str(&format!("  <SIP_Transport>{transport}</SIP_Transport>\n"));
     xml.push_str("  <SIP_Preferred_Codec>G722</SIP_Preferred_Codec>\n");
     xml.push_str("  <SIP_Second_Preferred_Codec>G711u</SIP_Second_Preferred_Codec>\n");
     xml.push_str("  <SIP_Third_Preferred_Codec>G711a</SIP_Third_Preferred_Codec>\n\n");

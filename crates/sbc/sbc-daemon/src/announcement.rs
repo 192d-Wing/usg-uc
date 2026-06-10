@@ -10,7 +10,7 @@
 //! - **SC-7**: Boundary Protection (controlled call termination)
 
 use bytes::Bytes;
-use include_dir::{include_dir, Dir};
+use include_dir::{Dir, include_dir};
 use proto_rtp::RtpHeader;
 use proto_rtp::RtpPacket;
 use std::net::SocketAddr;
@@ -56,7 +56,10 @@ impl AnnouncementServer {
     /// Binds an announcement socket and returns (socket, actual_port).
     /// Call this before building the SDP so the port is known.
     /// `bind_ip` specifies the zone media IP to bind to (None = 0.0.0.0).
-    pub async fn bind_socket(preferred_port: u16, bind_ip: Option<std::net::IpAddr>) -> Result<(UdpSocket, u16), String> {
+    pub async fn bind_socket(
+        preferred_port: u16,
+        bind_ip: Option<std::net::IpAddr>,
+    ) -> Result<(UdpSocket, u16), String> {
         let ip = bind_ip
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "0.0.0.0".to_string());
@@ -109,10 +112,7 @@ impl AnnouncementServer {
 
         for chunk in samples.chunks(SAMPLES_PER_PACKET) {
             // Encode PCM samples to PCMU
-            let payload: Vec<u8> = chunk
-                .iter()
-                .map(|&s| G711Ulaw::encode_sample(s))
-                .collect();
+            let payload: Vec<u8> = chunk.iter().map(|&s| G711Ulaw::encode_sample(s)).collect();
 
             let header = RtpHeader::new(PCMU_PAYLOAD_TYPE, seq, timestamp, ssrc);
             let packet = RtpPacket::new(header, Bytes::from(payload));
@@ -156,10 +156,16 @@ fn generate_announcement(announcement: AnnouncementType) -> Vec<i16> {
     match announcement {
         AnnouncementType::NumberNotInService => {
             if let Some(samples) = load_pcm_file("Not_in_service.pcm") {
-                info!(samples = samples.len(), duration_ms = samples.len() * 1000 / PCMU_CLOCK_RATE as usize, "Loaded embedded PCM: Not_in_service.pcm");
+                info!(
+                    samples = samples.len(),
+                    duration_ms = samples.len() * 1000 / PCMU_CLOCK_RATE as usize,
+                    "Loaded embedded PCM: Not_in_service.pcm"
+                );
                 samples
             } else {
-                warn!("Not_in_service.pcm not found in embedded audio_files, using synthesized tones");
+                warn!(
+                    "Not_in_service.pcm not found in embedded audio_files, using synthesized tones"
+                );
                 generate_number_not_in_service()
             }
         }
@@ -187,9 +193,9 @@ fn generate_number_not_in_service() -> Vec<i16> {
     // === SIT Tones (Special Information Tones) ===
     // Intercept pattern: indicates number is not in service
     let sit_tones = [
-        (985.2, 0.276),   // First tone
-        (1428.5, 0.276),  // Second tone
-        (1776.7, 0.380),  // Third tone
+        (985.2, 0.276),  // First tone
+        (1428.5, 0.276), // Second tone
+        (1776.7, 0.380), // Third tone
     ];
 
     for &(freq, duration) in &sit_tones {
@@ -215,52 +221,227 @@ fn generate_number_not_in_service() -> Vec<i16> {
     // Word-level timing: short bursts of complex tones with pauses
     let speech_segments = [
         // "We're" - high front vowel
-        SpeechSegment { f1: 270.0, f2: 2300.0, duration: 0.18, amplitude: 0.6 },
-        SpeechSegment { f1: 0.0,   f2: 0.0,    duration: 0.06, amplitude: 0.0 }, // pause
+        SpeechSegment {
+            f1: 270.0,
+            f2: 2300.0,
+            duration: 0.18,
+            amplitude: 0.6,
+        },
+        SpeechSegment {
+            f1: 0.0,
+            f2: 0.0,
+            duration: 0.06,
+            amplitude: 0.0,
+        }, // pause
         // "sorry"
-        SpeechSegment { f1: 700.0, f2: 1200.0, duration: 0.15, amplitude: 0.5 },
-        SpeechSegment { f1: 270.0, f2: 2300.0, duration: 0.15, amplitude: 0.5 },
-        SpeechSegment { f1: 0.0,   f2: 0.0,    duration: 0.15, amplitude: 0.0 }, // pause
+        SpeechSegment {
+            f1: 700.0,
+            f2: 1200.0,
+            duration: 0.15,
+            amplitude: 0.5,
+        },
+        SpeechSegment {
+            f1: 270.0,
+            f2: 2300.0,
+            duration: 0.15,
+            amplitude: 0.5,
+        },
+        SpeechSegment {
+            f1: 0.0,
+            f2: 0.0,
+            duration: 0.15,
+            amplitude: 0.0,
+        }, // pause
         // "the"
-        SpeechSegment { f1: 500.0, f2: 1500.0, duration: 0.08, amplitude: 0.4 },
+        SpeechSegment {
+            f1: 500.0,
+            f2: 1500.0,
+            duration: 0.08,
+            amplitude: 0.4,
+        },
         // "number"
-        SpeechSegment { f1: 500.0, f2: 1800.0, duration: 0.15, amplitude: 0.5 },
-        SpeechSegment { f1: 300.0, f2: 1700.0, duration: 0.12, amplitude: 0.4 },
-        SpeechSegment { f1: 0.0,   f2: 0.0,    duration: 0.06, amplitude: 0.0 },
+        SpeechSegment {
+            f1: 500.0,
+            f2: 1800.0,
+            duration: 0.15,
+            amplitude: 0.5,
+        },
+        SpeechSegment {
+            f1: 300.0,
+            f2: 1700.0,
+            duration: 0.12,
+            amplitude: 0.4,
+        },
+        SpeechSegment {
+            f1: 0.0,
+            f2: 0.0,
+            duration: 0.06,
+            amplitude: 0.0,
+        },
         // "you have"
-        SpeechSegment { f1: 300.0, f2: 2300.0, duration: 0.10, amplitude: 0.4 },
-        SpeechSegment { f1: 700.0, f2: 1100.0, duration: 0.12, amplitude: 0.5 },
-        SpeechSegment { f1: 0.0,   f2: 0.0,    duration: 0.06, amplitude: 0.0 },
+        SpeechSegment {
+            f1: 300.0,
+            f2: 2300.0,
+            duration: 0.10,
+            amplitude: 0.4,
+        },
+        SpeechSegment {
+            f1: 700.0,
+            f2: 1100.0,
+            duration: 0.12,
+            amplitude: 0.5,
+        },
+        SpeechSegment {
+            f1: 0.0,
+            f2: 0.0,
+            duration: 0.06,
+            amplitude: 0.0,
+        },
         // "dialed"
-        SpeechSegment { f1: 400.0, f2: 2100.0, duration: 0.15, amplitude: 0.5 },
-        SpeechSegment { f1: 500.0, f2: 1800.0, duration: 0.12, amplitude: 0.4 },
-        SpeechSegment { f1: 0.0,   f2: 0.0,    duration: 0.15, amplitude: 0.0 }, // longer pause
+        SpeechSegment {
+            f1: 400.0,
+            f2: 2100.0,
+            duration: 0.15,
+            amplitude: 0.5,
+        },
+        SpeechSegment {
+            f1: 500.0,
+            f2: 1800.0,
+            duration: 0.12,
+            amplitude: 0.4,
+        },
+        SpeechSegment {
+            f1: 0.0,
+            f2: 0.0,
+            duration: 0.15,
+            amplitude: 0.0,
+        }, // longer pause
         // "is not"
-        SpeechSegment { f1: 400.0, f2: 2000.0, duration: 0.08, amplitude: 0.4 },
-        SpeechSegment { f1: 600.0, f2: 1200.0, duration: 0.12, amplitude: 0.5 },
-        SpeechSegment { f1: 0.0,   f2: 0.0,    duration: 0.06, amplitude: 0.0 },
+        SpeechSegment {
+            f1: 400.0,
+            f2: 2000.0,
+            duration: 0.08,
+            amplitude: 0.4,
+        },
+        SpeechSegment {
+            f1: 600.0,
+            f2: 1200.0,
+            duration: 0.12,
+            amplitude: 0.5,
+        },
+        SpeechSegment {
+            f1: 0.0,
+            f2: 0.0,
+            duration: 0.06,
+            amplitude: 0.0,
+        },
         // "in service"
-        SpeechSegment { f1: 400.0, f2: 2200.0, duration: 0.08, amplitude: 0.4 },
-        SpeechSegment { f1: 300.0, f2: 1600.0, duration: 0.18, amplitude: 0.5 },
-        SpeechSegment { f1: 400.0, f2: 2000.0, duration: 0.12, amplitude: 0.4 },
-        SpeechSegment { f1: 0.0,   f2: 0.0,    duration: 0.25, amplitude: 0.0 }, // sentence pause
+        SpeechSegment {
+            f1: 400.0,
+            f2: 2200.0,
+            duration: 0.08,
+            amplitude: 0.4,
+        },
+        SpeechSegment {
+            f1: 300.0,
+            f2: 1600.0,
+            duration: 0.18,
+            amplitude: 0.5,
+        },
+        SpeechSegment {
+            f1: 400.0,
+            f2: 2000.0,
+            duration: 0.12,
+            amplitude: 0.4,
+        },
+        SpeechSegment {
+            f1: 0.0,
+            f2: 0.0,
+            duration: 0.25,
+            amplitude: 0.0,
+        }, // sentence pause
         // "Please check"
-        SpeechSegment { f1: 270.0, f2: 2300.0, duration: 0.15, amplitude: 0.5 },
-        SpeechSegment { f1: 500.0, f2: 1900.0, duration: 0.12, amplitude: 0.4 },
-        SpeechSegment { f1: 0.0,   f2: 0.0,    duration: 0.06, amplitude: 0.0 },
+        SpeechSegment {
+            f1: 270.0,
+            f2: 2300.0,
+            duration: 0.15,
+            amplitude: 0.5,
+        },
+        SpeechSegment {
+            f1: 500.0,
+            f2: 1900.0,
+            duration: 0.12,
+            amplitude: 0.4,
+        },
+        SpeechSegment {
+            f1: 0.0,
+            f2: 0.0,
+            duration: 0.06,
+            amplitude: 0.0,
+        },
         // "the number"
-        SpeechSegment { f1: 500.0, f2: 1500.0, duration: 0.08, amplitude: 0.4 },
-        SpeechSegment { f1: 500.0, f2: 1800.0, duration: 0.15, amplitude: 0.5 },
-        SpeechSegment { f1: 300.0, f2: 1700.0, duration: 0.12, amplitude: 0.4 },
-        SpeechSegment { f1: 0.0,   f2: 0.0,    duration: 0.06, amplitude: 0.0 },
+        SpeechSegment {
+            f1: 500.0,
+            f2: 1500.0,
+            duration: 0.08,
+            amplitude: 0.4,
+        },
+        SpeechSegment {
+            f1: 500.0,
+            f2: 1800.0,
+            duration: 0.15,
+            amplitude: 0.5,
+        },
+        SpeechSegment {
+            f1: 300.0,
+            f2: 1700.0,
+            duration: 0.12,
+            amplitude: 0.4,
+        },
+        SpeechSegment {
+            f1: 0.0,
+            f2: 0.0,
+            duration: 0.06,
+            amplitude: 0.0,
+        },
         // "and dial"
-        SpeechSegment { f1: 700.0, f2: 1100.0, duration: 0.10, amplitude: 0.4 },
-        SpeechSegment { f1: 400.0, f2: 2100.0, duration: 0.15, amplitude: 0.5 },
-        SpeechSegment { f1: 500.0, f2: 1800.0, duration: 0.12, amplitude: 0.4 },
-        SpeechSegment { f1: 0.0,   f2: 0.0,    duration: 0.06, amplitude: 0.0 },
+        SpeechSegment {
+            f1: 700.0,
+            f2: 1100.0,
+            duration: 0.10,
+            amplitude: 0.4,
+        },
+        SpeechSegment {
+            f1: 400.0,
+            f2: 2100.0,
+            duration: 0.15,
+            amplitude: 0.5,
+        },
+        SpeechSegment {
+            f1: 500.0,
+            f2: 1800.0,
+            duration: 0.12,
+            amplitude: 0.4,
+        },
+        SpeechSegment {
+            f1: 0.0,
+            f2: 0.0,
+            duration: 0.06,
+            amplitude: 0.0,
+        },
         // "again"
-        SpeechSegment { f1: 500.0, f2: 1700.0, duration: 0.12, amplitude: 0.4 },
-        SpeechSegment { f1: 270.0, f2: 2300.0, duration: 0.18, amplitude: 0.5 },
+        SpeechSegment {
+            f1: 500.0,
+            f2: 1700.0,
+            duration: 0.12,
+            amplitude: 0.4,
+        },
+        SpeechSegment {
+            f1: 270.0,
+            f2: 2300.0,
+            duration: 0.18,
+            amplitude: 0.5,
+        },
     ];
 
     for seg in &speech_segments {
@@ -316,11 +497,7 @@ fn generate_all_circuits_busy() -> Vec<i16> {
     let mut samples = Vec::new();
 
     // Reorder busy SIT: 985.2 Hz, 1428.5 Hz, 1776.7 Hz (same tones, shorter)
-    let sit_tones = [
-        (985.2, 0.276),
-        (1428.5, 0.276),
-        (1776.7, 0.380),
-    ];
+    let sit_tones = [(985.2, 0.276), (1428.5, 0.276), (1776.7, 0.380)];
 
     for &(freq, duration) in &sit_tones {
         let num_samples = (sample_rate * duration) as usize;

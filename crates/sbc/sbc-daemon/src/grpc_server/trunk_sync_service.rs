@@ -29,7 +29,8 @@ pub struct TrunkSyncServiceImpl {
 
 impl std::fmt::Debug for TrunkSyncServiceImpl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TrunkSyncServiceImpl").finish_non_exhaustive()
+        f.debug_struct("TrunkSyncServiceImpl")
+            .finish_non_exhaustive()
     }
 }
 
@@ -64,12 +65,12 @@ impl TrunkSyncService for TrunkSyncServiceImpl {
                     message: "synced to SIP router".to_string(),
                 }))
             }
-            Err(sbc_config_store::ConfigStoreError::NotFound) => Ok(Response::new(
-                SyncTrunkGroupResponse {
+            Err(sbc_config_store::ConfigStoreError::NotFound) => {
+                Ok(Response::new(SyncTrunkGroupResponse {
                     synced: false,
                     message: format!("no such trunk group: {group_id}"),
-                },
-            )),
+                }))
+            }
             Err(e) => {
                 warn!(group_id, error = %e, "trunk_group_store get failed");
                 Err(Status::internal(format!("storage error: {e}")))

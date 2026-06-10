@@ -15,10 +15,10 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use sbc_grpc_api::prelude::{
     RemoveCallingSearchSpaceRequest, RemovePartitionRequest, RemoveRouteListRequest,
     RemoveRoutePatternRequest, SyncCallingSearchSpaceRequest, SyncPartitionRequest,
@@ -210,9 +210,7 @@ pub async fn delete_css(
     }
     let mut client = state.cucm_sync.clone();
     if let Err(e) = client
-        .remove_calling_search_space(RemoveCallingSearchSpaceRequest {
-            css_id: id.clone(),
-        })
+        .remove_calling_search_space(RemoveCallingSearchSpaceRequest { css_id: id.clone() })
         .await
     {
         warn!(id, error = %e, "CucmSyncService.RemoveCallingSearchSpace failed");

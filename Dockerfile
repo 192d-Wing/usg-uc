@@ -25,7 +25,7 @@
 # planner / cacher / builder stages so the apt-install + cargo-install
 # layers cache once.
 # =============================================================================
-FROM rust:1-bookworm AS chef
+FROM rust:1-trixie AS chef
 
 # Install build dependencies (Go required for aws-lc-fips-sys)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -72,8 +72,8 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo chef cook --release --recipe-path recipe.json \
-        --package sbc-daemon --package sbc-cli \
-        --features sbc-daemon/grpc
+    --package sbc-daemon --package sbc-cli \
+    --features sbc-daemon/grpc
 
 # =============================================================================
 # Stage 2d: Build the workspace binaries with the cooked deps as a baseline.
@@ -91,14 +91,14 @@ COPY audio_files/ audio_files/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo build --release --package sbc-daemon --package sbc-cli \
-        --features sbc-daemon/grpc \
+    --features sbc-daemon/grpc \
     && cp target/release/sbc-daemon /tmp/sbc-daemon \
     && cp target/release/sbc-cli /tmp/sbc-cli
 
 # =============================================================================
 # Stage 3: Runtime
 # =============================================================================
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 
 # Install runtime dependencies. libcap2-bin provides `setcap` so the
 # non-root daemon can bind to privileged ports (e.g. HTTP :80).

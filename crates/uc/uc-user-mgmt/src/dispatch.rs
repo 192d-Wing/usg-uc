@@ -61,19 +61,11 @@ impl UserStore for DynUserStore {
         dispatch!(self, delete_user, id)
     }
 
-    async fn authenticate_digest(
-        &self,
-        username: &str,
-        realm: &str,
-    ) -> Result<Option<String>> {
+    async fn authenticate_digest(&self, username: &str, realm: &str) -> Result<Option<String>> {
         dispatch!(self, authenticate_digest, username, realm)
     }
 
-    async fn authenticate_certificate(
-        &self,
-        dn: &str,
-        san: &str,
-    ) -> Result<Option<User>> {
+    async fn authenticate_certificate(&self, dn: &str, san: &str) -> Result<Option<User>> {
         dispatch!(self, authenticate_certificate, dn, san)
     }
 

@@ -217,7 +217,11 @@ impl Server {
         } else if !config.dial_plans.is_empty() || !config.trunk_groups.is_empty() {
             // Dial plans or trunk groups defined but no [routing] section — use defaults
             let default_routing = sbc_config::RoutingConfig::default();
-            sip_stack.init_router_from_config(&default_routing, &config.dial_plans, &config.trunk_groups);
+            sip_stack.init_router_from_config(
+                &default_routing,
+                &config.dial_plans,
+                &config.trunk_groups,
+            );
         }
 
         // Initialize header manipulation (if configured)
@@ -412,8 +416,7 @@ impl Server {
         // aborted immediately, so "draining" could never complete and
         // active calls were killed on SIGTERM.
         self.sip_stack.set_draining();
-        let drain_deadline =
-            tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+        let drain_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
         loop {
             let active = self.sip_stack.active_call_count().await;
             if active == 0 {
@@ -421,7 +424,10 @@ impl Server {
                 break;
             }
             if tokio::time::Instant::now() >= drain_deadline {
-                warn!(active, "Drain timeout reached, terminating with active calls");
+                warn!(
+                    active,
+                    "Drain timeout reached, terminating with active calls"
+                );
                 break;
             }
             debug!(active, "Waiting for calls to drain");
@@ -576,11 +582,7 @@ impl Server {
     }
 
     /// Handles a single `ProcessResult`, sending responses/forwards via the transport.
-    async fn handle_result(
-        result: ProcessResult,
-        transport: &UdpTransport,
-        stats: &ServerStats,
-    ) {
+    async fn handle_result(result: ProcessResult, transport: &UdpTransport, stats: &ServerStats) {
         match result {
             ProcessResult::Response {
                 message,

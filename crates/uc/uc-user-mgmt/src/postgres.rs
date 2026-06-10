@@ -75,12 +75,10 @@ impl PostgresUserStore {
         .await
         .map_err(|e| UserMgmtError::StorageError(e.to_string()))?;
 
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_users_username ON users (username)",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| UserMgmtError::StorageError(e.to_string()))?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_users_username ON users (username)")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| UserMgmtError::StorageError(e.to_string()))?;
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_users_certificate_dn ON users (certificate_dn)",
@@ -103,8 +101,7 @@ impl PostgresUserStore {
         };
 
         let device_ids_json: serde_json::Value = row.try_get("device_ids")?;
-        let device_ids: Vec<String> =
-            serde_json::from_value(device_ids_json).unwrap_or_default();
+        let device_ids: Vec<String> = serde_json::from_value(device_ids_json).unwrap_or_default();
 
         let metadata_json: serde_json::Value = row.try_get("metadata")?;
         let metadata: HashMap<String, String> =
@@ -301,8 +298,7 @@ impl UserStore for PostgresUserStore {
         let mut users = Vec::with_capacity(rows.len());
         for row in &rows {
             users.push(
-                Self::row_to_user(row)
-                    .map_err(|e| UserMgmtError::StorageError(e.to_string()))?,
+                Self::row_to_user(row).map_err(|e| UserMgmtError::StorageError(e.to_string()))?,
             );
         }
         Ok(users)
@@ -368,11 +364,7 @@ impl UserStore for PostgresUserStore {
         Ok(())
     }
 
-    async fn authenticate_digest(
-        &self,
-        username: &str,
-        _realm: &str,
-    ) -> Result<Option<String>> {
+    async fn authenticate_digest(&self, username: &str, _realm: &str) -> Result<Option<String>> {
         let row = sqlx::query(
             "SELECT digest_ha1 FROM users WHERE username = $1 AND enabled = TRUE
              AND auth_type IN ('Digest', 'Both')",
@@ -393,11 +385,7 @@ impl UserStore for PostgresUserStore {
         }
     }
 
-    async fn authenticate_certificate(
-        &self,
-        dn: &str,
-        san: &str,
-    ) -> Result<Option<User>> {
+    async fn authenticate_certificate(&self, dn: &str, san: &str) -> Result<Option<User>> {
         let row = sqlx::query(
             "SELECT id, username, display_name, email, sip_uri, auth_type,
              digest_ha1, certificate_dn, certificate_san, calling_search_space,

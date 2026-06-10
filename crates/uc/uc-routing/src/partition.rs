@@ -63,8 +63,7 @@ mod tests {
 
     #[test]
     fn test_partition_create() {
-        let p = Partition::new("pt-internal", "Internal")
-            .with_description("Internal extensions");
+        let p = Partition::new("pt-internal", "Internal").with_description("Internal extensions");
         assert_eq!(p.id(), "pt-internal");
         assert_eq!(p.name(), "Internal");
         assert_eq!(p.description(), Some("Internal extensions"));

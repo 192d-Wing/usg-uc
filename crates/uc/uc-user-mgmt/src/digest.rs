@@ -58,9 +58,7 @@ mod tests {
 
         // Compute the correct response
         let ha2 = hex::encode(Sha256::digest(format!("{method}:{uri}").as_bytes()));
-        let expected = hex::encode(Sha256::digest(
-            format!("{ha1}:{nonce}:{ha2}").as_bytes(),
-        ));
+        let expected = hex::encode(Sha256::digest(format!("{ha1}:{nonce}:{ha2}").as_bytes()));
 
         assert!(verify_digest_response(&ha1, nonce, method, uri, &expected));
         assert!(!verify_digest_response(&ha1, nonce, method, uri, "wrong"));

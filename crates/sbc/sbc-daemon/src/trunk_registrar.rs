@@ -7,7 +7,9 @@
 use bytes::Bytes;
 use proto_sip::builder::{RequestBuilder, generate_branch, generate_call_id};
 use proto_sip::uri::SipUri;
-use proto_sip::{DigestChallenge, Header, HeaderName, Md5DigestHasher, SipMessage, create_credentials};
+use proto_sip::{
+    DigestChallenge, Header, HeaderName, Md5DigestHasher, SipMessage, create_credentials,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -247,23 +249,36 @@ impl TrunkRegistrar {
                 socket2::Domain::IPV4,
                 socket2::Type::DGRAM,
                 Some(socket2::Protocol::UDP),
-            ).map_err(|e| format!("Socket create failed: {e}"))?;
+            )
+            .map_err(|e| format!("Socket create failed: {e}"))?;
             sock2.set_reuse_address(true).ok();
             #[cfg(target_os = "linux")]
             sock2.set_reuse_port(true).ok();
-            sock2.set_nonblocking(true).map_err(|e| format!("Set nonblocking failed: {e}"))?;
-            sock2.bind(&bind_addr.into()).map_err(|e| format!("Bind to {bind_addr} failed: {e}"))?;
+            sock2
+                .set_nonblocking(true)
+                .map_err(|e| format!("Set nonblocking failed: {e}"))?;
+            sock2
+                .bind(&bind_addr.into())
+                .map_err(|e| format!("Bind to {bind_addr} failed: {e}"))?;
             let sock = UdpSocket::from_std(sock2.into())
                 .map_err(|e| format!("Convert to tokio socket failed: {e}"))?;
             (sock, bind_ip.to_string(), 5060u16)
         } else {
-            let probe = UdpSocket::bind("0.0.0.0:0").await
+            let probe = UdpSocket::bind("0.0.0.0:0")
+                .await
                 .map_err(|e| format!("Probe bind failed: {e}"))?;
-            probe.connect(target).await
+            probe
+                .connect(target)
+                .await
                 .map_err(|e| format!("Probe connect failed: {e}"))?;
-            let ip = probe.local_addr().map_err(|e| e.to_string())?.ip().to_string();
+            let ip = probe
+                .local_addr()
+                .map_err(|e| e.to_string())?
+                .ip()
+                .to_string();
             drop(probe);
-            let sock = UdpSocket::bind("0.0.0.0:0").await
+            let sock = UdpSocket::bind("0.0.0.0:0")
+                .await
                 .map_err(|e| format!("Bind failed: {e}"))?;
             let port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
             (sock, ip, port)
@@ -272,7 +287,8 @@ impl TrunkRegistrar {
         // Contact port must be the SIP listener port (5060), not the
         // registration socket's ephemeral port, so the provider can
         // route inbound calls (INVITEs) to the SBC's SIP listener.
-        let contact_ip = config.external_ip
+        let contact_ip = config
+            .external_ip
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| local_ip.clone());
         let contact_port: u16 = 5060;
@@ -304,7 +320,9 @@ impl TrunkRegistrar {
             "REGISTER message:\n{}",
             String::from_utf8_lossy(&msg_bytes),
         );
-        socket.send_to(&msg_bytes, target).await
+        socket
+            .send_to(&msg_bytes, target)
+            .await
             .map_err(|e| format!("Send failed: {e}"))?;
 
         // Receive a MATCHING response (same source IP, our Call-ID). The
@@ -338,13 +356,16 @@ impl TrunkRegistrar {
             let auth_header = if status_code == 401 {
                 response.headers.get_value(&HeaderName::WwwAuthenticate)
             } else {
-                response.headers.get_value(&HeaderName::Custom("Proxy-Authenticate".to_string()))
+                response
+                    .headers
+                    .get_value(&HeaderName::Custom("Proxy-Authenticate".to_string()))
             };
 
-            let challenge_str = auth_header
-                .ok_or_else(|| format!("{status_code} with no challenge header"))?;
+            let challenge_str =
+                auth_header.ok_or_else(|| format!("{status_code} with no challenge header"))?;
 
-            let challenge: DigestChallenge = challenge_str.parse()
+            let challenge: DigestChallenge = challenge_str
+                .parse()
                 .map_err(|e| format!("Parse challenge failed: {e}"))?;
 
             let hasher = Md5DigestHasher;
@@ -361,7 +382,8 @@ impl TrunkRegistrar {
                 Some(&cnonce),
                 Some(1),
                 None,
-            ).map_err(|e| format!("Digest computation failed: {e}"))?;
+            )
+            .map_err(|e| format!("Digest computation failed: {e}"))?;
 
             let auth_value = credentials.to_string();
 
@@ -382,10 +404,14 @@ impl TrunkRegistrar {
             } else {
                 HeaderName::Custom("Proxy-Authorization".to_string())
             };
-            auth_request.headers.add(Header::new(header_name, &auth_value));
+            auth_request
+                .headers
+                .add(Header::new(header_name, &auth_value));
 
             // Add Expires header
-            auth_request.headers.set(HeaderName::Expires, &config.expires.to_string());
+            auth_request
+                .headers
+                .set(HeaderName::Expires, &config.expires.to_string());
 
             let auth_bytes = SipMessage::Request(auth_request).to_bytes();
             // Never log the full authenticated REGISTER: the Authorization
@@ -394,7 +420,9 @@ impl TrunkRegistrar {
                 trunk_id = %config.trunk_id,
                 "Sending authenticated REGISTER"
             );
-            socket.send_to(&auth_bytes, target).await
+            socket
+                .send_to(&auth_bytes, target)
+                .await
                 .map_err(|e| format!("Send auth REGISTER failed: {e}"))?;
 
             // Receive final response (matched by source + Call-ID)
@@ -415,12 +443,17 @@ impl TrunkRegistrar {
 
             if response2.status.code() == 200 {
                 // Check Expires header first, then Contact ;expires= parameter
-                let expires = response2.headers.get_value(&HeaderName::Expires)
+                let expires = response2
+                    .headers
+                    .get_value(&HeaderName::Expires)
                     .and_then(|v| v.parse().ok())
                     .or_else(|| {
-                        response2.headers.get_value(&HeaderName::Contact)
+                        response2
+                            .headers
+                            .get_value(&HeaderName::Contact)
                             .and_then(|c| {
-                                c.split(";expires=").nth(1)
+                                c.split(";expires=")
+                                    .nth(1)
                                     .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
                                     .and_then(|s| s.parse().ok())
                             })
@@ -428,10 +461,18 @@ impl TrunkRegistrar {
                     .unwrap_or(config.expires);
                 Ok(expires)
             } else {
-                Err(format!("Auth rejected: {} {}", response2.status.code(), response2.reason_phrase()))
+                Err(format!(
+                    "Auth rejected: {} {}",
+                    response2.status.code(),
+                    response2.reason_phrase()
+                ))
             }
         } else {
-            Err(format!("Unexpected: {} {}", status_code, response.reason_phrase()))
+            Err(format!(
+                "Unexpected: {} {}",
+                status_code,
+                response.reason_phrase()
+            ))
         }
     }
 

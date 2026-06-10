@@ -22,8 +22,8 @@ use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use crate::api_server::{
-    apply_css_to_router, apply_partition_to_router, apply_route_list_to_router,
-    apply_route_pattern_to_router, AppState,
+    AppState, apply_css_to_router, apply_partition_to_router, apply_route_list_to_router,
+    apply_route_pattern_to_router,
 };
 
 pub struct CucmSyncServiceImpl {
@@ -32,7 +32,8 @@ pub struct CucmSyncServiceImpl {
 
 impl std::fmt::Debug for CucmSyncServiceImpl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CucmSyncServiceImpl").finish_non_exhaustive()
+        f.debug_struct("CucmSyncServiceImpl")
+            .finish_non_exhaustive()
     }
 }
 
@@ -43,9 +44,7 @@ impl CucmSyncServiceImpl {
 }
 
 fn precondition(svc: &str) -> Status {
-    Status::failed_precondition(format!(
-        "{svc} requires Postgres (SBC_POSTGRES_URL unset)"
-    ))
+    Status::failed_precondition(format!("{svc} requires Postgres (SBC_POSTGRES_URL unset)"))
 }
 
 #[tonic::async_trait]
@@ -69,12 +68,12 @@ impl CucmSyncService for CucmSyncServiceImpl {
                     message: "partition applied to CucmRouter".to_string(),
                 }))
             }
-            Err(sbc_config_store::ConfigStoreError::NotFound) => Ok(Response::new(
-                SyncCucmResponse {
+            Err(sbc_config_store::ConfigStoreError::NotFound) => {
+                Ok(Response::new(SyncCucmResponse {
                     synced: false,
                     message: format!("no such partition: {id}"),
-                },
-            )),
+                }))
+            }
             Err(e) => {
                 warn!(partition_id = %id, error = %e, "partition_store get failed");
                 Err(Status::internal(format!("storage error: {e}")))
@@ -116,12 +115,12 @@ impl CucmSyncService for CucmSyncServiceImpl {
                     message: "CSS applied to CucmRouter".to_string(),
                 }))
             }
-            Err(sbc_config_store::ConfigStoreError::NotFound) => Ok(Response::new(
-                SyncCucmResponse {
+            Err(sbc_config_store::ConfigStoreError::NotFound) => {
+                Ok(Response::new(SyncCucmResponse {
                     synced: false,
                     message: format!("no such CSS: {id}"),
-                },
-            )),
+                }))
+            }
             Err(e) => {
                 warn!(css_id = %id, error = %e, "css_store get failed");
                 Err(Status::internal(format!("storage error: {e}")))
@@ -163,12 +162,12 @@ impl CucmSyncService for CucmSyncServiceImpl {
                     message: "route pattern applied to CucmRouter".to_string(),
                 }))
             }
-            Err(sbc_config_store::ConfigStoreError::NotFound) => Ok(Response::new(
-                SyncCucmResponse {
+            Err(sbc_config_store::ConfigStoreError::NotFound) => {
+                Ok(Response::new(SyncCucmResponse {
                     synced: false,
                     message: format!("no such route pattern: {id}"),
-                },
-            )),
+                }))
+            }
             Err(e) => {
                 warn!(pattern_id = %id, error = %e, "route_pattern_store get failed");
                 Err(Status::internal(format!("storage error: {e}")))
@@ -210,12 +209,12 @@ impl CucmSyncService for CucmSyncServiceImpl {
                     message: "route list applied to CucmRouter".to_string(),
                 }))
             }
-            Err(sbc_config_store::ConfigStoreError::NotFound) => Ok(Response::new(
-                SyncCucmResponse {
+            Err(sbc_config_store::ConfigStoreError::NotFound) => {
+                Ok(Response::new(SyncCucmResponse {
                     synced: false,
                     message: format!("no such route list: {id}"),
-                },
-            )),
+                }))
+            }
             Err(e) => {
                 warn!(list_id = %id, error = %e, "route_list_store get failed");
                 Err(Status::internal(format!("storage error: {e}")))

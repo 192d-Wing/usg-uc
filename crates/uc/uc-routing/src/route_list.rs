@@ -105,8 +105,7 @@ impl RouteList {
     /// Returns `true` if a member was removed.
     pub fn remove_member(&mut self, route_group_id: &str) -> bool {
         let before = self.members.len();
-        self.members
-            .retain(|m| m.route_group_id != route_group_id);
+        self.members.retain(|m| m.route_group_id != route_group_id);
         self.members.len() < before
     }
 
@@ -129,8 +128,7 @@ mod tests {
 
     #[test]
     fn test_route_list_create() {
-        let rl = RouteList::new("rl-us", "US Route List")
-            .with_description("Routes to US carriers");
+        let rl = RouteList::new("rl-us", "US Route List").with_description("Routes to US carriers");
         assert_eq!(rl.id(), "rl-us");
         assert_eq!(rl.name(), "US Route List");
         assert_eq!(rl.description(), Some("Routes to US carriers"));
@@ -171,8 +169,8 @@ mod tests {
 
     #[test]
     fn test_route_list_member_transform() {
-        let member = RouteListMember::new("tg-intl", 10)
-            .with_transform(NumberTransform::add_prefix("011"));
+        let member =
+            RouteListMember::new("tg-intl", 10).with_transform(NumberTransform::add_prefix("011"));
         assert!(member.transform().is_some());
     }
 }

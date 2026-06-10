@@ -5,8 +5,8 @@
 //! caught up with yet. Indices are intentionally minimal — DID volume per
 //! site is in the thousands, not millions; pg can table-scan happily.
 
-use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
+use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use tracing::debug;
 
 use crate::error::{ConfigStoreError, ConfigStoreResult};

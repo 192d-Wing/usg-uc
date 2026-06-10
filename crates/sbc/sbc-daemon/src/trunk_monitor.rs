@@ -9,9 +9,9 @@
 //! - **SC-7**: Boundary Protection (trunk availability monitoring)
 //! - **SI-4**: System Monitoring
 
+use proto_sip::SipMessage;
 use proto_sip::builder::{RequestBuilder, generate_branch, generate_call_id};
 use proto_sip::uri::SipUri;
-use proto_sip::SipMessage;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -274,12 +274,17 @@ impl TrunkMonitor {
                 socket2::Domain::IPV4,
                 socket2::Type::DGRAM,
                 Some(socket2::Protocol::UDP),
-            ).map_err(|e| format!("Socket create failed: {e}"))?;
+            )
+            .map_err(|e| format!("Socket create failed: {e}"))?;
             sock2.set_reuse_address(true).ok();
             #[cfg(target_os = "linux")]
             sock2.set_reuse_port(true).ok();
-            sock2.set_nonblocking(true).map_err(|e| format!("Set nonblocking failed: {e}"))?;
-            sock2.bind(&bind_addr.into()).map_err(|e| format!("Bind to {bind_addr} failed: {e}"))?;
+            sock2
+                .set_nonblocking(true)
+                .map_err(|e| format!("Set nonblocking failed: {e}"))?;
+            sock2
+                .bind(&bind_addr.into())
+                .map_err(|e| format!("Bind to {bind_addr} failed: {e}"))?;
             UdpSocket::from_std(sock2.into())
                 .map_err(|e| format!("Convert to tokio socket failed: {e}"))?
         } else {
@@ -298,7 +303,11 @@ impl TrunkMonitor {
             .unwrap_or_else(|_| "0.0.0.0:0".to_string());
 
         let request = RequestBuilder::options(uri)
-            .via_auto("UDP", &local_addr.split(':').next().unwrap_or("0.0.0.0"), None)
+            .via_auto(
+                "UDP",
+                &local_addr.split(':').next().unwrap_or("0.0.0.0"),
+                None,
+            )
             .from_auto(SipUri::new(domain).with_user("sbc-monitor"), None)
             .to_uri(SipUri::new(host), None)
             .call_id(&call_id)

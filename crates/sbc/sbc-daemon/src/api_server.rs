@@ -29,13 +29,7 @@
 //! - **SC-12**: Cryptographic Key Establishment and Management (certificate rotation)
 //! - **SC-13**: Cryptographic Protection (CNSA 2.0 compliant TLS)
 
-use axum::{
-    Json, Router,
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::get,
-};
+use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use hyper_util::service::TowerToHyperService;
@@ -128,7 +122,10 @@ impl MemStore {
             return std::collections::HashMap::new();
         }
         match std::fs::read_to_string(p) {
-            Ok(data) => match serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(&data) {
+            Ok(data) => match serde_json::from_str::<
+                std::collections::HashMap<String, serde_json::Value>,
+            >(&data)
+            {
                 Ok(map) => {
                     tracing::info!(count = map.len(), kind, path, "Loaded persisted entities");
                     map
@@ -146,7 +143,11 @@ impl MemStore {
     }
 
     /// Generic atomic-write persister via temp-file + rename.
-    fn save_map(map: &std::collections::HashMap<String, serde_json::Value>, path: &str, kind: &str) {
+    fn save_map(
+        map: &std::collections::HashMap<String, serde_json::Value>,
+        path: &str,
+        kind: &str,
+    ) {
         // Ensure parent dir exists (no-op when PVC is mounted; helps in dev).
         if let Some(parent) = std::path::Path::new(path).parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -535,8 +536,11 @@ impl ApiServer {
         match (&self.config.tls, self.config.tls_listen_addr) {
             (Some(tls_config), Some(tls_addr)) => {
                 let http_addr = self.config.listen_addr;
-                tokio::try_join!(self.run_http(http_addr), self.run_https(tls_config, tls_addr))
-                    .map(|_| ())
+                tokio::try_join!(
+                    self.run_http(http_addr),
+                    self.run_https(tls_config, tls_addr)
+                )
+                .map(|_| ())
             }
             (Some(tls_config), None) => self.run_https(tls_config, self.config.listen_addr).await,
             (None, _) => self.run_http(self.config.listen_addr).await,
@@ -757,7 +761,6 @@ async fn readiness_probe(State(state): State<Arc<AppState>>) -> impl IntoRespons
 // the gRPC sync services still call into them.
 // ============================================================================
 
-
 // ============================================================================
 // CDR Routes
 // ============================================================================
@@ -825,7 +828,10 @@ async fn get_dial_plan_entries(
 /// sbc-api / removed in PR8.
 pub fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
     let trunk_id = trunk.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-    let host = trunk.get("host").and_then(|v| v.as_str()).unwrap_or_default();
+    let host = trunk
+        .get("host")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     let port = trunk.get("port").and_then(|v| v.as_u64()).unwrap_or(5060) as u16;
 
     if trunk_id.is_empty() || host.is_empty() {
@@ -835,9 +841,13 @@ pub fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
     // Resolve zone IPs for binding and Contact header.
     // The trunk's "zone" field specifies which interface to bind to.
     // Falls back to "outside", then "inside".
-    let zone_name = trunk.get("zone").and_then(|v| v.as_str()).unwrap_or("outside");
+    let zone_name = trunk
+        .get("zone")
+        .and_then(|v| v.as_str())
+        .unwrap_or("outside");
     let (bind_ip, external_ip) = if let Some(ref zr) = state.zone_registry {
-        let ip = zr.signaling_ip(zone_name)
+        let ip = zr
+            .signaling_ip(zone_name)
             .or_else(|| zr.signaling_ip("outside"))
             .or_else(|| zr.signaling_ip("inside"));
         let ext = zr.external_ip(zone_name);
@@ -847,9 +857,16 @@ pub fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
     };
 
     // Start OPTIONS health monitoring
-    if trunk.get("options_ping_enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if trunk
+        .get("options_ping_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         if let Some(ref monitor) = state.trunk_monitor {
-            let interval = trunk.get("options_ping_interval").and_then(|v| v.as_u64()).unwrap_or(30) as u32;
+            let interval = trunk
+                .get("options_ping_interval")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(30) as u32;
             monitor.monitor_trunk(crate::trunk_monitor::MonitoredTrunk {
                 trunk_id: trunk_id.to_string(),
                 host: host.to_string(),
@@ -862,14 +879,36 @@ pub fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
     }
 
     // Start SIP registration
-    if trunk.get("register_enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
-        let username = trunk.get("sip_username").and_then(|v| v.as_str()).unwrap_or_default();
-        let password = trunk.get("sip_password").and_then(|v| v.as_str()).unwrap_or_default();
+    if trunk
+        .get("register_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let username = trunk
+            .get("sip_username")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let password = trunk
+            .get("sip_password")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         if !username.is_empty() && !password.is_empty() {
             if let Some(ref registrar) = state.trunk_registrar {
-                let domain = trunk.get("sip_domain").and_then(|v| v.as_str()).unwrap_or(host);
-                let expires = trunk.get("register_expires").and_then(|v| v.as_u64()).unwrap_or(25) as u32;
-                tracing::info!(trunk_id, ?bind_ip, ?external_ip, expires, "Starting trunk registration with zone IPs");
+                let domain = trunk
+                    .get("sip_domain")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(host);
+                let expires = trunk
+                    .get("register_expires")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(25) as u32;
+                tracing::info!(
+                    trunk_id,
+                    ?bind_ip,
+                    ?external_ip,
+                    expires,
+                    "Starting trunk registration with zone IPs"
+                );
                 registrar.register_trunk(crate::trunk_registrar::TrunkRegConfig {
                     trunk_id: trunk_id.to_string(),
                     host: host.to_string(),
@@ -889,10 +928,20 @@ pub fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
 
 /// Syncs a trunk group from MemStore JSON to the SipStack router.
 pub async fn sync_trunk_group_to_router(state: &Arc<AppState>, group_json: &serde_json::Value) {
-    let Some(ref sip_stack) = state.sip_stack else { return };
-    let id = group_json.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-    let name = group_json.get("name").and_then(|v| v.as_str()).unwrap_or(id);
-    if id.is_empty() { return; }
+    let Some(ref sip_stack) = state.sip_stack else {
+        return;
+    };
+    let id = group_json
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let name = group_json
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(id);
+    if id.is_empty() {
+        return;
+    }
 
     let mut group = uc_routing::TrunkGroup::new(id, name);
 
@@ -901,7 +950,9 @@ pub async fn sync_trunk_group_to_router(state: &Arc<AppState>, group_json: &serd
             let trunk_id = t.get("id").and_then(|v| v.as_str()).unwrap_or_default();
             let host = t.get("host").and_then(|v| v.as_str()).unwrap_or_default();
             let port = t.get("port").and_then(|v| v.as_u64()).unwrap_or(5060) as u16;
-            if trunk_id.is_empty() || host.is_empty() { continue; }
+            if trunk_id.is_empty() || host.is_empty() {
+                continue;
+            }
 
             let trunk_config = uc_routing::TrunkConfig {
                 id: trunk_id.to_string(),
@@ -912,7 +963,10 @@ pub async fn sync_trunk_group_to_router(state: &Arc<AppState>, group_json: &serd
                 priority: t.get("priority").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
                 weight: t.get("weight").and_then(|v| v.as_u64()).unwrap_or(100) as u32,
                 max_calls: t.get("max_calls").and_then(|v| v.as_u64()).unwrap_or(100) as u32,
-                cooldown_secs: t.get("cooldown_seconds").and_then(|v| v.as_u64()).unwrap_or(30) as u64,
+                cooldown_secs: t
+                    .get("cooldown_seconds")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(30) as u64,
                 max_failures: t.get("max_failures").and_then(|v| v.as_u64()).unwrap_or(5) as u32,
                 outbound_enabled: true,
                 inbound_enabled: true,
@@ -925,14 +979,18 @@ pub async fn sync_trunk_group_to_router(state: &Arc<AppState>, group_json: &serd
 
     // Register inbound trunk mapping (source IP → trunk group + CSS)
     let css_id = group_json.get("css_id").and_then(|v| v.as_str());
-    let hosts: Vec<(String, u16)> = group_json.get("trunks")
+    let hosts: Vec<(String, u16)> = group_json
+        .get("trunks")
         .and_then(|v| v.as_array())
         .map(|trunks| {
-            trunks.iter().filter_map(|t| {
-                let h = t.get("host").and_then(|v| v.as_str())?;
-                let p = t.get("port").and_then(|v| v.as_u64()).unwrap_or(5060) as u16;
-                Some((h.to_string(), p))
-            }).collect()
+            trunks
+                .iter()
+                .filter_map(|t| {
+                    let h = t.get("host").and_then(|v| v.as_str())?;
+                    let p = t.get("port").and_then(|v| v.as_u64()).unwrap_or(5060) as u16;
+                    Some((h.to_string(), p))
+                })
+                .collect()
         })
         .unwrap_or_default();
     if !hosts.is_empty() {
@@ -943,24 +1001,40 @@ pub async fn sync_trunk_group_to_router(state: &Arc<AppState>, group_json: &serd
 }
 
 /// Syncs a dial plan entry to the SipStack router.
-pub async fn sync_dial_plan_to_router(state: &Arc<AppState>, plan_id: &str, entries: &[serde_json::Value]) {
-    let Some(ref sip_stack) = state.sip_stack else { return };
+pub async fn sync_dial_plan_to_router(
+    state: &Arc<AppState>,
+    plan_id: &str,
+    entries: &[serde_json::Value],
+) {
+    let Some(ref sip_stack) = state.sip_stack else {
+        return;
+    };
 
     let mut plan = uc_routing::DialPlan::new(plan_id, plan_id);
     for (idx, entry) in entries.iter().enumerate() {
-        let trunk_group = entry.get("trunk_group_id").and_then(|v| v.as_str()).unwrap_or_default();
-        let _pattern_value = entry.get("pattern").and_then(|v| v.as_str()).unwrap_or(".*");
+        let trunk_group = entry
+            .get("trunk_group_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let _pattern_value = entry
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".*");
         let priority = entry.get("priority").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
 
         let pattern = uc_routing::DialPattern::Any;
         let entry_id = format!("{plan_id}-{idx}");
-        let dp_entry = uc_routing::DialPlanEntry::new(entry_id, pattern, trunk_group)
-            .with_priority(priority);
+        let dp_entry =
+            uc_routing::DialPlanEntry::new(entry_id, pattern, trunk_group).with_priority(priority);
         plan.add_entry(dp_entry);
     }
 
     sip_stack.add_dial_plan_to_router(plan).await;
-    tracing::info!(plan_id, entries = entries.len(), "Synced dial plan to SIP stack router");
+    tracing::info!(
+        plan_id,
+        entries = entries.len(),
+        "Synced dial plan to SIP stack router"
+    );
 }
 
 /// Apply a JSON partition body to the live `CucmRouter`. Used by both
@@ -968,13 +1042,21 @@ pub async fn sync_dial_plan_to_router(state: &Arc<AppState>, plan_id: &str, entr
 /// `CucmSyncService.SyncPartition` handler. Idempotent: `add_partition`
 /// upserts by ID.
 pub async fn apply_partition_to_router(state: &Arc<AppState>, body: &serde_json::Value) {
-    let Some(ref router) = state.cucm_router else { return };
-    let Some(id) = body.get("id").and_then(|v| v.as_str()) else { return };
-    if id.is_empty() { return; }
+    let Some(ref router) = state.cucm_router else {
+        return;
+    };
+    let Some(id) = body.get("id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    if id.is_empty() {
+        return;
+    }
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(id);
     let mut p = uc_routing::Partition::new(id, name);
     if let Some(desc) = body.get("description").and_then(|v| v.as_str()) {
-        if !desc.is_empty() { p = p.with_description(desc); }
+        if !desc.is_empty() {
+            p = p.with_description(desc);
+        }
     }
     router.write().await.add_partition(p);
 }
@@ -982,9 +1064,15 @@ pub async fn apply_partition_to_router(state: &Arc<AppState>, body: &serde_json:
 /// Apply a JSON CSS body. `partitions` is an array of partition-ID
 /// strings; ordering is preserved (CUCM CSS lookup is ordered).
 pub async fn apply_css_to_router(state: &Arc<AppState>, body: &serde_json::Value) {
-    let Some(ref router) = state.cucm_router else { return };
-    let Some(id) = body.get("id").and_then(|v| v.as_str()) else { return };
-    if id.is_empty() { return; }
+    let Some(ref router) = state.cucm_router else {
+        return;
+    };
+    let Some(id) = body.get("id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    if id.is_empty() {
+        return;
+    }
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(id);
     let mut css = uc_routing::CallingSearchSpace::new(id, name);
     if let Some(arr) = body.get("partitions").and_then(|v| v.as_array()) {
@@ -1002,12 +1090,24 @@ pub async fn apply_css_to_router(state: &Arc<AppState>, body: &serde_json::Value
 /// `DialPattern` variant; unknown values fall back to `prefix` to match
 /// the legacy REST handler.
 pub async fn apply_route_pattern_to_router(state: &Arc<AppState>, body: &serde_json::Value) {
-    let Some(ref router) = state.cucm_router else { return };
-    let Some(id) = body.get("id").and_then(|v| v.as_str()) else { return };
-    if id.is_empty() { return; }
-    let partition = body.get("partition_id").and_then(|v| v.as_str()).unwrap_or("");
+    let Some(ref router) = state.cucm_router else {
+        return;
+    };
+    let Some(id) = body.get("id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    if id.is_empty() {
+        return;
+    }
+    let partition = body
+        .get("partition_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let pattern_value = body.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-    let pattern_type = body.get("pattern_type").and_then(|v| v.as_str()).unwrap_or("prefix");
+    let pattern_type = body
+        .get("pattern_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("prefix");
     let pattern = match pattern_type {
         "exact" => uc_routing::DialPattern::exact(pattern_value),
         "wildcard" => uc_routing::DialPattern::wildcard(pattern_value),
@@ -1016,18 +1116,28 @@ pub async fn apply_route_pattern_to_router(state: &Arc<AppState>, body: &serde_j
     };
     let mut rp = uc_routing::RoutePattern::new(id, pattern, partition);
     if let Some(rl) = body.get("route_list_id").and_then(|v| v.as_str()) {
-        if !rl.is_empty() { rp = rp.with_route_list(rl); }
+        if !rl.is_empty() {
+            rp = rp.with_route_list(rl);
+        }
     }
     if let Some(rg) = body.get("route_group_id").and_then(|v| v.as_str()) {
-        if !rg.is_empty() { rp = rp.with_route_group(rg); }
+        if !rg.is_empty() {
+            rp = rp.with_route_group(rg);
+        }
     }
     if let Some(desc) = body.get("description").and_then(|v| v.as_str()) {
-        if !desc.is_empty() { rp = rp.with_description(desc); }
+        if !desc.is_empty() {
+            rp = rp.with_description(desc);
+        }
     }
     if let Some(p) = body.get("priority").and_then(|v| v.as_u64()) {
         rp = rp.with_priority(p as u32);
     }
-    if body.get("blocked").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if body
+        .get("blocked")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         rp = rp.with_block(true);
     }
     let mut router = router.write().await;
@@ -1055,18 +1165,30 @@ pub async fn apply_route_pattern_to_router(state: &Arc<AppState>, body: &serde_j
 /// Per-member digit transforms aren't wired here yet; add them when a
 /// dashboard caller needs them.
 pub async fn apply_route_list_to_router(state: &Arc<AppState>, body: &serde_json::Value) {
-    let Some(ref router) = state.cucm_router else { return };
-    let Some(id) = body.get("id").and_then(|v| v.as_str()) else { return };
-    if id.is_empty() { return; }
+    let Some(ref router) = state.cucm_router else {
+        return;
+    };
+    let Some(id) = body.get("id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    if id.is_empty() {
+        return;
+    }
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(id);
     let mut rl = uc_routing::RouteList::new(id, name);
     if let Some(desc) = body.get("description").and_then(|v| v.as_str()) {
-        if !desc.is_empty() { rl = rl.with_description(desc); }
+        if !desc.is_empty() {
+            rl = rl.with_description(desc);
+        }
     }
     if let Some(members) = body.get("members").and_then(|v| v.as_array()) {
         for (idx, m) in members.iter().enumerate() {
-            let Some(rg_id) = m.get("route_group_id").and_then(|v| v.as_str()) else { continue };
-            if rg_id.is_empty() { continue; }
+            let Some(rg_id) = m.get("route_group_id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if rg_id.is_empty() {
+                continue;
+            }
             let priority = m
                 .get("priority")
                 .and_then(|v| v.as_u64())

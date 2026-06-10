@@ -275,8 +275,11 @@ mod tests {
     #[test]
     fn update_server_points_at_sbc_for_refresh() {
         let xml = generate_teo_config(&phone_with_one_line(PhoneModel::Teo7810), "sbc.lab");
-        assert!(xml
-            .contains("<update_server source=\"STATIC\">http://sbc.lab/provision</update_server>"));
+        assert!(
+            xml.contains(
+                "<update_server source=\"STATIC\">http://sbc.lab/provision</update_server>"
+            )
+        );
         assert!(xml.contains("<config_file_name_base>MAC</config_file_name_base>"));
     }
 

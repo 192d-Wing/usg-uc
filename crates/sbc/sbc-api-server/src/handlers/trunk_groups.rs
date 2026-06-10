@@ -6,10 +6,10 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use sbc_grpc_api::prelude::{RemoveTrunkGroupRequest, SyncTrunkGroupRequest};
 use tracing::warn;
 
@@ -37,7 +37,9 @@ async fn persist(state: &Arc<AppState>, id: &str, body: &serde_json::Value) -> b
 
 async fn notify_sync(state: &Arc<AppState>, id: &str) {
     let mut client = state.trunk_sync.clone();
-    let req = SyncTrunkGroupRequest { group_id: id.to_string() };
+    let req = SyncTrunkGroupRequest {
+        group_id: id.to_string(),
+    };
     if let Err(e) = client.sync_trunk_group(req).await {
         warn!(group_id = id, error = %e, "daemon trunk-group sync RPC failed");
     }
@@ -45,7 +47,9 @@ async fn notify_sync(state: &Arc<AppState>, id: &str) {
 
 async fn notify_remove(state: &Arc<AppState>, id: &str) {
     let mut client = state.trunk_sync.clone();
-    let req = RemoveTrunkGroupRequest { group_id: id.to_string() };
+    let req = RemoveTrunkGroupRequest {
+        group_id: id.to_string(),
+    };
     if let Err(e) = client.remove_trunk_group(req).await {
         warn!(group_id = id, error = %e, "daemon trunk-group remove RPC failed");
     }
@@ -180,10 +184,7 @@ pub async fn update_trunk(
             Json(serde_json::json!({"success": false, "error": "Group not found"})),
         );
     };
-    let Some(trunks) = group_json
-        .get_mut("trunks")
-        .and_then(|v| v.as_array_mut())
-    else {
+    let Some(trunks) = group_json.get_mut("trunks").and_then(|v| v.as_array_mut()) else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"success": false, "error": "Group not found"})),
@@ -225,10 +226,7 @@ pub async fn delete_trunk(
     Path((group_id, trunk_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     if let Some(mut group_json) = lookup(&state, &group_id).await {
-        if let Some(trunks) = group_json
-            .get_mut("trunks")
-            .and_then(|v| v.as_array_mut())
-        {
+        if let Some(trunks) = group_json.get_mut("trunks").and_then(|v| v.as_array_mut()) {
             trunks.retain(|t| t.get("id").and_then(|v| v.as_str()) != Some(&trunk_id));
         }
         persist(&state, &group_id, &group_json).await;

@@ -30,7 +30,10 @@ async fn main() -> ExitCode {
         .json()
         .init();
 
-    info!(version = env!("CARGO_PKG_VERSION"), "sbc-api-server starting");
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "sbc-api-server starting"
+    );
 
     let cfg = match config::Config::from_env() {
         Ok(c) => c,
@@ -67,7 +70,7 @@ async fn main() -> ExitCode {
         };
         #[cfg(unix)]
         let term = async {
-            use tokio::signal::unix::{signal, SignalKind};
+            use tokio::signal::unix::{SignalKind, signal};
             if let Ok(mut s) = signal(SignalKind::terminate()) {
                 s.recv().await;
             }

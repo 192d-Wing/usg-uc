@@ -66,11 +66,7 @@ impl FirmwareManager {
     #[must_use]
     pub fn get_firmware_path(&self, model_family: &str, version: &str) -> Option<PathBuf> {
         let path = self.firmware_dir.join(model_family).join(version);
-        if path.exists() {
-            Some(path)
-        } else {
-            None
-        }
+        if path.exists() { Some(path) } else { None }
     }
 
     /// Determine if a firmware upgrade is needed by comparing version strings.

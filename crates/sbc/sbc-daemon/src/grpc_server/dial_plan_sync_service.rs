@@ -64,12 +64,12 @@ impl DialPlanSyncService for DialPlanSyncServiceImpl {
                     message: format!("synced {entry_count} entries to SIP router"),
                 }))
             }
-            Err(sbc_config_store::ConfigStoreError::NotFound) => Ok(Response::new(
-                SyncDialPlanResponse {
+            Err(sbc_config_store::ConfigStoreError::NotFound) => {
+                Ok(Response::new(SyncDialPlanResponse {
                     synced: false,
                     message: format!("no such dial plan: {plan_id}"),
-                },
-            )),
+                }))
+            }
             Err(e) => {
                 warn!(plan_id, error = %e, "dial_plan_store get failed");
                 Err(Status::internal(format!("storage error: {e}")))

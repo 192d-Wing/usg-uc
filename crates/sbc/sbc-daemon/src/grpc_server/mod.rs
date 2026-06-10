@@ -226,11 +226,11 @@ impl GrpcServer {
                 .add_service(HealthServer::new(health_svc))
                 .add_service(CallServiceServer::new(call_svc))
                 .add_service(RegistrationServiceServer::new(registration_svc))
-            .add_service(TrunkSyncServiceServer::new(trunk_sync_svc))
-            .add_service(DialPlanSyncServiceServer::new(dial_plan_sync_svc))
-            .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc))
-            .add_service(TrunkHealthServiceServer::new(trunk_health_svc))
-            .add_service(CucmSyncServiceServer::new(cucm_sync_svc));
+                .add_service(TrunkSyncServiceServer::new(trunk_sync_svc))
+                .add_service(DialPlanSyncServiceServer::new(dial_plan_sync_svc))
+                .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc))
+                .add_service(TrunkHealthServiceServer::new(trunk_health_svc))
+                .add_service(CucmSyncServiceServer::new(cucm_sync_svc));
 
             // Add reflection service if enabled in config
             if self.config.enable_reflection {
@@ -256,11 +256,11 @@ impl GrpcServer {
                 .add_service(HealthServer::new(health_svc))
                 .add_service(CallServiceServer::new(call_svc))
                 .add_service(RegistrationServiceServer::new(registration_svc))
-            .add_service(TrunkSyncServiceServer::new(trunk_sync_svc))
-            .add_service(DialPlanSyncServiceServer::new(dial_plan_sync_svc))
-            .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc))
-            .add_service(TrunkHealthServiceServer::new(trunk_health_svc))
-            .add_service(CucmSyncServiceServer::new(cucm_sync_svc));
+                .add_service(TrunkSyncServiceServer::new(trunk_sync_svc))
+                .add_service(DialPlanSyncServiceServer::new(dial_plan_sync_svc))
+                .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc))
+                .add_service(TrunkHealthServiceServer::new(trunk_health_svc))
+                .add_service(CucmSyncServiceServer::new(cucm_sync_svc));
 
             // Add ClusterService if cluster manager is available
             if let Some(cluster) = &self.cluster {
@@ -282,11 +282,11 @@ impl GrpcServer {
                 .add_service(HealthServer::new(health_svc))
                 .add_service(CallServiceServer::new(call_svc))
                 .add_service(RegistrationServiceServer::new(registration_svc))
-            .add_service(TrunkSyncServiceServer::new(trunk_sync_svc))
-            .add_service(DialPlanSyncServiceServer::new(dial_plan_sync_svc))
-            .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc))
-            .add_service(TrunkHealthServiceServer::new(trunk_health_svc))
-            .add_service(CucmSyncServiceServer::new(cucm_sync_svc));
+                .add_service(TrunkSyncServiceServer::new(trunk_sync_svc))
+                .add_service(DialPlanSyncServiceServer::new(dial_plan_sync_svc))
+                .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc))
+                .add_service(TrunkHealthServiceServer::new(trunk_health_svc))
+                .add_service(CucmSyncServiceServer::new(cucm_sync_svc));
 
             // Add ClusterService if cluster manager is available
             let with_cluster = if let Some(cluster) = &self.cluster {

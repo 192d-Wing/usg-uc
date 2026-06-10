@@ -181,10 +181,7 @@ impl<S: UserStore> UserStore for EncryptedUserStore<S> {
         Ok(user)
     }
 
-    async fn list_users(
-        &self,
-        filter: &crate::model::UserFilter,
-    ) -> store::Result<Vec<User>> {
+    async fn list_users(&self, filter: &crate::model::UserFilter) -> store::Result<Vec<User>> {
         let mut users = self.inner.list_users(filter).await?;
         for user in &mut users {
             self.decrypt_user_ha1(user)?;
@@ -215,11 +212,7 @@ impl<S: UserStore> UserStore for EncryptedUserStore<S> {
         }
     }
 
-    async fn authenticate_certificate(
-        &self,
-        dn: &str,
-        san: &str,
-    ) -> store::Result<Option<User>> {
+    async fn authenticate_certificate(&self, dn: &str, san: &str) -> store::Result<Option<User>> {
         let user = self.inner.authenticate_certificate(dn, san).await?;
         match user {
             Some(mut u) => {
@@ -258,7 +251,9 @@ mod tests {
         assert!(!is_plaintext_ha1(&bad));
 
         // Base64-encoded encrypted value (longer than 64)
-        assert!(!is_plaintext_ha1("dGhpcyBpcyBhIGJhc2U2NCBlbmNvZGVkIHN0cmluZyB0aGF0IGlzIGxvbmdlciB0aGFuIDY0IGNoYXJz"));
+        assert!(!is_plaintext_ha1(
+            "dGhpcyBpcyBhIGJhc2U2NCBlbmNvZGVkIHN0cmluZyB0aGF0IGlzIGxvbmdlciB0aGFuIDY0IGNoYXJz"
+        ));
     }
 
     #[test]
@@ -306,8 +301,7 @@ mod tests {
         };
 
         // Plaintext HA1 should pass through even when key is set
-        let plaintext_ha1 =
-            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let plaintext_ha1 = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
         let result = store.decrypt_ha1(plaintext_ha1).unwrap();
         assert_eq!(result, plaintext_ha1);
     }
@@ -328,10 +322,7 @@ mod tests {
         async fn get_user_by_certificate_dn(&self, _: &str) -> store::Result<User> {
             unimplemented!()
         }
-        async fn list_users(
-            &self,
-            _: &crate::model::UserFilter,
-        ) -> store::Result<Vec<User>> {
+        async fn list_users(&self, _: &crate::model::UserFilter) -> store::Result<Vec<User>> {
             unimplemented!()
         }
         async fn update_user(&self, _: User) -> store::Result<User> {
@@ -340,18 +331,10 @@ mod tests {
         async fn delete_user(&self, _: &str) -> store::Result<()> {
             unimplemented!()
         }
-        async fn authenticate_digest(
-            &self,
-            _: &str,
-            _: &str,
-        ) -> store::Result<Option<String>> {
+        async fn authenticate_digest(&self, _: &str, _: &str) -> store::Result<Option<String>> {
             unimplemented!()
         }
-        async fn authenticate_certificate(
-            &self,
-            _: &str,
-            _: &str,
-        ) -> store::Result<Option<User>> {
+        async fn authenticate_certificate(&self, _: &str, _: &str) -> store::Result<Option<User>> {
             unimplemented!()
         }
         async fn count_users(&self) -> store::Result<usize> {
