@@ -6,7 +6,7 @@
 //! arrive on a runtime thread; there is no foreign-side polling.
 
 use crate::types::{AppEvent, AudioDevice, CallInfo, ClientError, RegistrationState};
-use client_core::{ClientApp, StoragePaths, run_udp_receive_loop};
+use client_core::{ClientApp, StoragePaths, run_udp_receive_loop_async};
 use client_types::DtmfDigit;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -172,9 +172,11 @@ impl SipClient {
         let mut tasks = self.tasks.lock().map_err(|_| lock_err())?;
 
         if let Some((socket, transport_event_tx)) = udp {
+            // Must be the async (abortable) loop: the blocking-pool variant
+            // cannot be aborted and would wedge runtime shutdown.
             tasks.push(
                 self.runtime
-                    .spawn(run_udp_receive_loop(socket, transport_event_tx)),
+                    .spawn(run_udp_receive_loop_async(socket, transport_event_tx)),
             );
         }
 

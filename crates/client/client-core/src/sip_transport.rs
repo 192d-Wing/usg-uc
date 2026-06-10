@@ -336,6 +336,60 @@ pub async fn run_udp_receive_loop(socket: Arc<UdpSocket>, event_tx: mpsc::Sender
     });
 }
 
+/// Parses a received UDP datagram into a transport event, logging failures.
+fn parse_udp_datagram(buf: &[u8], source: SocketAddr) -> Option<TransportEvent> {
+    match SipMessage::parse(buf) {
+        Ok(SipMessage::Request(request)) => {
+            debug!(method = %request.method, source = %source, "Received SIP request via UDP");
+            Some(TransportEvent::RequestReceived { request, source })
+        }
+        Ok(SipMessage::Response(response)) => {
+            debug!(status = %response.status, source = %source, "Received SIP response via UDP");
+            Some(TransportEvent::ResponseReceived { response, source })
+        }
+        Err(e) => {
+            warn!(error = %e, source = %source, "Failed to parse UDP SIP message");
+            if let Ok(raw) = std::str::from_utf8(buf) {
+                debug!(raw_message = %raw, "Raw UDP message");
+            }
+            None
+        }
+    }
+}
+
+/// Runs an async UDP receive loop dispatching SIP messages to the event channel.
+///
+/// Unlike [`run_udp_receive_loop`] — a blocking-pool spin loop kept as a
+/// workaround for Tauri's async runtime — this awaits the socket directly and
+/// is therefore cancellable via `JoinHandle::abort()`. The FFI layer requires
+/// that: blocking-pool tasks cannot be aborted, so they wedge the owned
+/// runtime's shutdown (`Runtime::drop` waits on the blocking pool).
+pub async fn run_udp_receive_loop_async(
+    socket: Arc<UdpSocket>,
+    event_tx: mpsc::Sender<TransportEvent>,
+) {
+    if let Ok(addr) = socket.local_addr() {
+        info!(local_addr = %addr, "Starting async UDP receive loop");
+    }
+    let mut buf = vec![0u8; MAX_SIP_MESSAGE_SIZE];
+    loop {
+        match socket.recv_from(&mut buf).await {
+            Ok((n, source)) => {
+                if let Some(event) = parse_udp_datagram(&buf[..n], source)
+                    && event_tx.send(event).await.is_err()
+                {
+                    info!("UDP receive loop: event channel closed, stopping");
+                    return;
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "UDP receive loop: recv error");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
 /// Events from the transport layer.
 #[derive(Debug, Clone)]
 pub enum TransportEvent {
