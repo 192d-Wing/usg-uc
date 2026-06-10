@@ -75,6 +75,44 @@ jobs:
           shared-key: ci
       - run: cargo test --all-targets --all-features
 
+  # Locks in portability of the shared client core for the native-client
+  # migration (docs/CLIENT-NATIVE-MIGRATION-PLAN.md, Phase 0): the FFI crate
+  # and everything below it must keep compiling for mobile targets.
+  client-cross:
+    name: Client cross-target (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-ios
+            os: macos-latest
+          - target: aarch64-apple-ios-sim
+            os: macos-latest
+          - target: aarch64-linux-android
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cross-${{ matrix.target }}
+      - name: Configure Android NDK toolchain
+        if: contains(matrix.target, 'android')
+        run: |
+          TOOLCHAIN="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          {
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/aarch64-linux-android26-clang"
+            echo "CC_aarch64_linux_android=$TOOLCHAIN/aarch64-linux-android26-clang"
+            echo "CXX_aarch64_linux_android=$TOOLCHAIN/aarch64-linux-android26-clang++"
+            echo "AR_aarch64_linux_android=$TOOLCHAIN/llvm-ar"
+          } >> "$GITHUB_ENV"
+      - run: cargo check -p client-ffi --target ${{ matrix.target }}
+
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
