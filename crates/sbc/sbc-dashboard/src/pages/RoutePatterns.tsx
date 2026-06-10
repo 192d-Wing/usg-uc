@@ -1,4 +1,3 @@
-import { useEffect, useState } from 'react';
 import Box from '@cloudscape-design/components/box';
 import Button from '@cloudscape-design/components/button';
 import ContentLayout from '@cloudscape-design/components/content-layout';
@@ -8,7 +7,7 @@ import StatusIndicator from '@cloudscape-design/components/status-indicator';
 import Table from '@cloudscape-design/components/table';
 import TextFilter from '@cloudscape-design/components/text-filter';
 
-import { api, ApiError } from '../api';
+import { useApiList } from '../hooks/useApiList';
 
 type RoutePattern = {
   id: string;
@@ -59,36 +58,15 @@ function renderBlockedCell(p: RoutePattern) {
   return <BlockedIndicator blocked={p.blocked} />;
 }
 
+function routePatternSearchText(p: RoutePattern): string {
+  return `${p.pattern} ${p.partition_id ?? ''} ${p.route_list_id ?? ''} ${p.route_group_id ?? ''} ${p.description ?? ''}`;
+}
+
 export function RoutePatterns() {
-  const [items, setItems] = useState<RoutePattern[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState('');
-
-  const load = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await api.get<{ route_patterns: RoutePattern[] }>('/routepatterns');
-      setItems(res.route_patterns ?? []);
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    void load();
-  }, []);
-
-  const filtered = filter
-    ? items.filter((p) => {
-        const hay =
-          `${p.pattern} ${p.partition_id ?? ''} ${p.route_list_id ?? ''} ${p.route_group_id ?? ''} ${p.description ?? ''}`.toLowerCase();
-        return hay.includes(filter.toLowerCase());
-      })
-    : items;
+  const { items, filteredItems, loading, error, filterText, setFilterText, reload } =
+    useApiList<RoutePattern>('/routepatterns', (r) => r.route_patterns ?? [], {
+      searchText: routePatternSearchText,
+    });
 
   return (
     <ContentLayout
@@ -98,7 +76,7 @@ export function RoutePatterns() {
           counter={`(${items.length})`}
           description="Dial patterns mapped to a route list or group. See docs/route-patterns.md for syntax."
           actions={
-            <Button onClick={load} iconName="refresh" loading={loading}>
+            <Button onClick={reload} iconName="refresh" loading={loading}>
               Refresh
             </Button>
           }
@@ -108,7 +86,7 @@ export function RoutePatterns() {
       }
     >
       <Table
-        items={filtered}
+        items={filteredItems}
         loading={loading}
         loadingText="Loading route patterns…"
         variant="full-page"
@@ -120,20 +98,19 @@ export function RoutePatterns() {
             header: 'Pattern',
             cell: (p) => p.pattern,
             isRowHeader: true,
-            sortingField: 'pattern',
           },
           { id: 'partition', header: 'Partition', cell: (p) => p.partition_id ?? '—' },
           { id: 'target', header: 'Target', cell: renderTargetCell },
-          { id: 'priority', header: 'Priority', cell: (p) => p.priority ?? 0, sortingField: 'priority' },
+          { id: 'priority', header: 'Priority', cell: (p) => p.priority ?? 0 },
           { id: 'status', header: 'Status', cell: renderBlockedCell },
           { id: 'description', header: 'Description', cell: (p) => p.description ?? '—' },
         ]}
         filter={
           <TextFilter
             filteringPlaceholder="Find by pattern / partition / target"
-            filteringText={filter}
-            onChange={({ detail }) => setFilter(detail.filteringText)}
-            countText={`${filtered.length} matches`}
+            filteringText={filterText}
+            onChange={({ detail }) => setFilterText(detail.filteringText)}
+            countText={`${filteredItems.length} matches`}
           />
         }
         empty={

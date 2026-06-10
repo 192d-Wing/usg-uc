@@ -1,4 +1,3 @@
-import { useEffect, useState } from 'react';
 import Button from '@cloudscape-design/components/button';
 import ContentLayout from '@cloudscape-design/components/content-layout';
 import Header from '@cloudscape-design/components/header';
@@ -7,7 +6,7 @@ import StatusIndicator from '@cloudscape-design/components/status-indicator';
 import Table from '@cloudscape-design/components/table';
 import TextFilter from '@cloudscape-design/components/text-filter';
 
-import { api, ApiError } from '../api';
+import { useApiList } from '../hooks/useApiList';
 
 type TrunkGroup = {
   id?: string;
@@ -16,43 +15,17 @@ type TrunkGroup = {
   trunks?: Array<{ id?: string; host?: string; port?: number; transport?: string }>;
 };
 
+function trunkGroupSearchText(g: TrunkGroup): string {
+  return `${g.name ?? ''} ${g.description ?? ''} ${g.id ?? ''}`;
+}
+
 export function Trunkgroups() {
-  const [items, setItems] = useState<TrunkGroup[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState('');
-
-  const load = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await api.get<{ trunk_groups: TrunkGroup[] } | { trunkgroups: TrunkGroup[] }>(
-        '/trunkgroups',
-      );
-      // The API returns the field as `trunk_groups` or `trunkgroups` depending
-      // on the daemon version; tolerate both.
-      const list =
-        (res as { trunk_groups?: TrunkGroup[] }).trunk_groups ??
-        (res as { trunkgroups?: TrunkGroup[] }).trunkgroups ??
-        [];
-      setItems(list);
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    void load();
-  }, []);
-
-  const filtered = filter
-    ? items.filter((g) => {
-        const hay = `${g.name ?? ''} ${g.description ?? ''} ${g.id ?? ''}`.toLowerCase();
-        return hay.includes(filter.toLowerCase());
-      })
-    : items;
+  // The API returns the field as `trunk_groups` or `trunkgroups` depending
+  // on the daemon version; tolerate both.
+  const { items, filteredItems, loading, error, filterText, setFilterText, reload } =
+    useApiList<TrunkGroup>('/trunkgroups', (r) => r.trunk_groups ?? r.trunkgroups ?? [], {
+      searchText: trunkGroupSearchText,
+    });
 
   return (
     <ContentLayout
@@ -62,7 +35,7 @@ export function Trunkgroups() {
           counter={`(${items.length})`}
           description="SIP trunk groups for outbound call routing."
           actions={
-            <Button onClick={load} iconName="refresh" loading={loading}>
+            <Button onClick={reload} iconName="refresh" loading={loading}>
               Refresh
             </Button>
           }
@@ -72,14 +45,14 @@ export function Trunkgroups() {
       }
     >
       <Table
-        items={filtered}
+        items={filteredItems}
         loading={loading}
         loadingText="Loading trunk groups…"
         variant="full-page"
         stickyHeader
         trackBy={(g) => g.id ?? g.name ?? ''}
         columnDefinitions={[
-          { id: 'name', header: 'Name', cell: (g) => g.name ?? '—', isRowHeader: true, sortingField: 'name' },
+          { id: 'name', header: 'Name', cell: (g) => g.name ?? '—', isRowHeader: true },
           { id: 'description', header: 'Description', cell: (g) => g.description ?? '—' },
           {
             id: 'trunks',
@@ -94,9 +67,9 @@ export function Trunkgroups() {
         filter={
           <TextFilter
             filteringPlaceholder="Find trunk group"
-            filteringText={filter}
-            onChange={({ detail }) => setFilter(detail.filteringText)}
-            countText={`${filtered.length} matches`}
+            filteringText={filterText}
+            onChange={({ detail }) => setFilterText(detail.filteringText)}
+            countText={`${filteredItems.length} matches`}
           />
         }
         empty={

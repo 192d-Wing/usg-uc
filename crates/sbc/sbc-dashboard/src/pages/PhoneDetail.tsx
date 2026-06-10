@@ -6,7 +6,9 @@ import BreadcrumbGroup from '@cloudscape-design/components/breadcrumb-group';
 import ColumnLayout from '@cloudscape-design/components/column-layout';
 import ContentLayout from '@cloudscape-design/components/content-layout';
 import Container from '@cloudscape-design/components/container';
+import Flashbar, { type FlashbarProps } from '@cloudscape-design/components/flashbar';
 import Header from '@cloudscape-design/components/header';
+import Modal from '@cloudscape-design/components/modal';
 import SpaceBetween from '@cloudscape-design/components/space-between';
 import StatusIndicator from '@cloudscape-design/components/status-indicator';
 import Table from '@cloudscape-design/components/table';
@@ -44,12 +46,15 @@ export function PhoneDetail() {
   const [phone, setPhone] = useState<Phone | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [confirmReboot, setConfirmReboot] = useState(false);
+  const [rebooting, setRebooting] = useState(false);
+  const [flashItems, setFlashItems] = useState<FlashbarProps.MessageDefinition[]>([]);
 
   useEffect(() => {
     if (!id) return;
     let cancelled = false;
     api
-      .get<Phone>(`/phones/${id}`)
+      .get<Phone>(`/phones/${encodeURIComponent(id)}`)
       .then((p) => {
         if (cancelled) return;
         // Tolerate the {error: ...} response shape from the existing API.
@@ -65,6 +70,37 @@ export function PhoneDetail() {
       cancelled = true;
     };
   }, [id]);
+
+  const reboot = async () => {
+    if (!id) return;
+    setRebooting(true);
+    try {
+      await api.post(`/phones/${encodeURIComponent(id)}/reboot`, {});
+      setFlashItems([
+        {
+          id: 'reboot-ok',
+          type: 'success',
+          content: `Reboot request sent to ${phone?.name ?? id}.`,
+          dismissible: true,
+          onDismiss: () => setFlashItems([]),
+        },
+      ]);
+    } catch (e) {
+      setFlashItems([
+        {
+          id: 'reboot-err',
+          type: 'error',
+          header: 'Reboot failed',
+          content: e instanceof ApiError ? e.message : String(e),
+          dismissible: true,
+          onDismiss: () => setFlashItems([]),
+        },
+      ]);
+    } finally {
+      setRebooting(false);
+      setConfirmReboot(false);
+    }
+  };
 
   return (
     <ContentLayout
@@ -85,9 +121,9 @@ export function PhoneDetail() {
             description={phone?.mac_address}
             actions={
               <Button
-                onClick={() =>
-                  id && api.post(`/phones/${id}/reboot`, {}).catch((e) => setError(String(e)))
-                }
+                onClick={() => setConfirmReboot(true)}
+                loading={rebooting}
+                disabled={!id || loading}
               >
                 Reboot phone
               </Button>
@@ -98,7 +134,28 @@ export function PhoneDetail() {
         </SpaceBetween>
       }
     >
+      <Modal
+        visible={confirmReboot}
+        onDismiss={() => setConfirmReboot(false)}
+        header="Reboot phone"
+        footer={
+          <Box float="right">
+            <SpaceBetween direction="horizontal" size="xs">
+              <Button variant="link" onClick={() => setConfirmReboot(false)} disabled={rebooting}>
+                Cancel
+              </Button>
+              <Button variant="primary" onClick={() => void reboot()} loading={rebooting}>
+                Reboot
+              </Button>
+            </SpaceBetween>
+          </Box>
+        }
+      >
+        Reboot {phone?.name ?? id}? Any active calls on this phone will be dropped.
+      </Modal>
+
       <SpaceBetween size="l">
+        {flashItems.length ? <Flashbar items={flashItems} /> : null}
         {error ? <StatusIndicator type="error">{error}</StatusIndicator> : null}
         {loading ? <StatusIndicator type="loading">Loading…</StatusIndicator> : null}
 

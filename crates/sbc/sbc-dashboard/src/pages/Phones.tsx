@@ -1,4 +1,3 @@
-import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import Button from '@cloudscape-design/components/button';
 import ContentLayout from '@cloudscape-design/components/content-layout';
@@ -9,7 +8,7 @@ import StatusIndicator from '@cloudscape-design/components/status-indicator';
 import Table from '@cloudscape-design/components/table';
 import TextFilter from '@cloudscape-design/components/text-filter';
 
-import { api, ApiError } from '../api';
+import { useApiList } from '../hooks/useApiList';
 
 type Phone = {
   id: string;
@@ -41,47 +40,25 @@ function statusIndicator(status: Phone['status']) {
   return <StatusIndicator type="pending">{text}</StatusIndicator>;
 }
 
+function phoneSearchText(p: Phone): string {
+  return `${p.mac_address} ${p.name} ${p.ip_address ?? ''} ${modelLabel(p.model)}`;
+}
+
 export function Phones() {
   const navigate = useNavigate();
-  const [phones, setPhones] = useState<Phone[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState('');
-
-  const load = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await api.get<{ phones: Phone[] }>('/phones');
-      setPhones(res.phones ?? []);
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    void load();
-  }, []);
-
-  const filtered = filter
-    ? phones.filter((p) => {
-        const hay = `${p.mac_address} ${p.name} ${p.ip_address ?? ''} ${modelLabel(p.model)}`.toLowerCase();
-        return hay.includes(filter.toLowerCase());
-      })
-    : phones;
+  const { items, filteredItems, loading, error, filterText, setFilterText, reload } =
+    useApiList<Phone>('/phones', (r) => r.phones ?? [], { searchText: phoneSearchText });
 
   return (
     <ContentLayout
       header={
         <Header
           variant="h1"
-          counter={`(${phones.length})`}
+          counter={`(${items.length})`}
           description="Provisioned phone devices. Click a row to view details."
           actions={
             <SpaceBetween direction="horizontal" size="xs">
-              <Button onClick={load} iconName="refresh" loading={loading}>
+              <Button onClick={reload} iconName="refresh" loading={loading}>
                 Refresh
               </Button>
             </SpaceBetween>
@@ -92,7 +69,7 @@ export function Phones() {
       }
     >
       <Table
-        items={filtered}
+        items={filteredItems}
         loading={loading}
         loadingText="Loading phones…"
         variant="full-page"
@@ -108,9 +85,8 @@ export function Phones() {
               </Link>
             ),
             isRowHeader: true,
-            sortingField: 'mac_address',
           },
-          { id: 'name', header: 'Name', cell: (p) => p.name, sortingField: 'name' },
+          { id: 'name', header: 'Name', cell: (p) => p.name },
           { id: 'model', header: 'Model', cell: (p) => modelLabel(p.model) },
           { id: 'ip', header: 'IP', cell: (p) => p.ip_address ?? '—' },
           {
@@ -123,9 +99,9 @@ export function Phones() {
         filter={
           <TextFilter
             filteringPlaceholder="Find phone"
-            filteringText={filter}
-            onChange={({ detail }) => setFilter(detail.filteringText)}
-            countText={`${filtered.length} matches`}
+            filteringText={filterText}
+            onChange={({ detail }) => setFilterText(detail.filteringText)}
+            countText={`${filteredItems.length} matches`}
           />
         }
         empty={

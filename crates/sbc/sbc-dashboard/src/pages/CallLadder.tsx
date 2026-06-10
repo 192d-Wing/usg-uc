@@ -30,6 +30,14 @@ type Ladder = {
   messages: Message[];
 };
 
+// Messages carry no unique id and retransmissions can repeat every field, so
+// key rows by their position in the ladder to avoid trackBy collisions.
+type MessageRow = Message & { rowKey: string };
+
+function messageRows(messages: Message[] | undefined): MessageRow[] {
+  return (messages ?? []).map((m, i) => ({ ...m, rowKey: `msg-${i}` }));
+}
+
 export function CallLadder() {
   const [callId, setCallId] = useState('');
   const [ladder, setLadder] = useState<Ladder | null>(null);
@@ -109,8 +117,8 @@ export function CallLadder() {
               }
             >
               <Table
-                items={ladder.messages ?? []}
-                trackBy={(m) => `${m.timestamp ?? ''}|${m.method ?? ''}|${m.from ?? ''}|${m.to ?? ''}`}
+                items={messageRows(ladder.messages)}
+                trackBy="rowKey"
                 columnDefinitions={[
                   { id: 'ts', header: 'Time', cell: (m) => String(m.timestamp ?? '—') },
                   { id: 'dir', header: 'Direction', cell: (m) => m.direction ?? '—' },

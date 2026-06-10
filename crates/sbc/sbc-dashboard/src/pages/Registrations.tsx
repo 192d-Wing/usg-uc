@@ -1,4 +1,3 @@
-import { useEffect, useState } from 'react';
 import Button from '@cloudscape-design/components/button';
 import ContentLayout from '@cloudscape-design/components/content-layout';
 import Header from '@cloudscape-design/components/header';
@@ -7,7 +6,7 @@ import StatusIndicator from '@cloudscape-design/components/status-indicator';
 import Table from '@cloudscape-design/components/table';
 import TextFilter from '@cloudscape-design/components/text-filter';
 
-import { api, ApiError } from '../api';
+import { useApiList } from '../hooks/useApiList';
 
 type Registration = {
   aor: string;
@@ -16,34 +15,16 @@ type Registration = {
   registered_at?: number;
 };
 
+function registrationSearchText(r: Registration): string {
+  return `${r.aor} ${r.contact}`;
+}
+
 export function Registrations() {
-  const [items, setItems] = useState<Registration[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState('');
-
-  const load = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await api.get<{ registrations: Registration[] }>('/registrations');
-      setItems(res.registrations ?? []);
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    void load();
-    const id = globalThis.setInterval(load, 15_000);
-    return () => globalThis.clearInterval(id);
-  }, []);
-
-  const filtered = filter
-    ? items.filter((r) => `${r.aor} ${r.contact}`.toLowerCase().includes(filter.toLowerCase()))
-    : items;
+  const { items, filteredItems, loading, error, filterText, setFilterText, reload } =
+    useApiList<Registration>('/registrations', (r) => r.registrations ?? [], {
+      pollMs: 15_000,
+      searchText: registrationSearchText,
+    });
 
   return (
     <ContentLayout
@@ -53,7 +34,7 @@ export function Registrations() {
           counter={`(${items.length})`}
           description="Live SIP registration bindings. Auto-refreshes every 15s."
           actions={
-            <Button onClick={load} iconName="refresh" loading={loading}>
+            <Button onClick={reload} iconName="refresh" loading={loading}>
               Refresh
             </Button>
           }
@@ -63,28 +44,27 @@ export function Registrations() {
       }
     >
       <Table
-        items={filtered}
+        items={filteredItems}
         loading={loading}
         loadingText="Loading registrations…"
         variant="full-page"
         stickyHeader
         trackBy={(r) => `${r.aor}|${r.contact}`}
         columnDefinitions={[
-          { id: 'aor', header: 'Address of Record', cell: (r) => r.aor, isRowHeader: true, sortingField: 'aor' },
+          { id: 'aor', header: 'Address of Record', cell: (r) => r.aor, isRowHeader: true },
           { id: 'contact', header: 'Contact', cell: (r) => r.contact },
           {
             id: 'expires',
             header: 'Expires (s)',
             cell: (r) => r.expires ?? '—',
-            sortingField: 'expires',
           },
         ]}
         filter={
           <TextFilter
             filteringPlaceholder="Find by AOR or contact"
-            filteringText={filter}
-            onChange={({ detail }) => setFilter(detail.filteringText)}
-            countText={`${filtered.length} matches`}
+            filteringText={filterText}
+            onChange={({ detail }) => setFilterText(detail.filteringText)}
+            countText={`${filteredItems.length} matches`}
           />
         }
         empty={

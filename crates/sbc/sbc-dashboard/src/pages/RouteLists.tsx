@@ -1,4 +1,3 @@
-import { useEffect, useState } from 'react';
 import Button from '@cloudscape-design/components/button';
 import ContentLayout from '@cloudscape-design/components/content-layout';
 import Header from '@cloudscape-design/components/header';
@@ -7,7 +6,7 @@ import StatusIndicator from '@cloudscape-design/components/status-indicator';
 import Table from '@cloudscape-design/components/table';
 import TextFilter from '@cloudscape-design/components/text-filter';
 
-import { api, ApiError } from '../api';
+import { useApiList } from '../hooks/useApiList';
 
 type RouteList = {
   id: string;
@@ -15,32 +14,15 @@ type RouteList = {
   member_count?: number;
 };
 
+function routeListSearchText(l: RouteList): string {
+  return `${l.id} ${l.name ?? ''}`;
+}
+
 export function RouteLists() {
-  const [items, setItems] = useState<RouteList[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState('');
-
-  const load = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await api.get<{ route_lists: RouteList[] }>('/routelists');
-      setItems(res.route_lists ?? []);
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    void load();
-  }, []);
-
-  const filtered = filter
-    ? items.filter((l) => `${l.id} ${l.name ?? ''}`.toLowerCase().includes(filter.toLowerCase()))
-    : items;
+  const { items, filteredItems, loading, error, filterText, setFilterText, reload } =
+    useApiList<RouteList>('/routelists', (r) => r.route_lists ?? [], {
+      searchText: routeListSearchText,
+    });
 
   return (
     <ContentLayout
@@ -50,7 +32,7 @@ export function RouteLists() {
           counter={`(${items.length})`}
           description="Ordered route group lists used by route patterns to direct outbound calls."
           actions={
-            <Button onClick={load} iconName="refresh" loading={loading}>
+            <Button onClick={reload} iconName="refresh" loading={loading}>
               Refresh
             </Button>
           }
@@ -60,23 +42,23 @@ export function RouteLists() {
       }
     >
       <Table
-        items={filtered}
+        items={filteredItems}
         loading={loading}
         loadingText="Loading route lists…"
         variant="full-page"
         stickyHeader
         trackBy="id"
         columnDefinitions={[
-          { id: 'name', header: 'Name', cell: (l) => l.name ?? l.id, isRowHeader: true, sortingField: 'name' },
+          { id: 'name', header: 'Name', cell: (l) => l.name ?? l.id, isRowHeader: true },
           { id: 'id', header: 'ID', cell: (l) => l.id },
-          { id: 'members', header: 'Members', cell: (l) => l.member_count ?? 0, sortingField: 'member_count' },
+          { id: 'members', header: 'Members', cell: (l) => l.member_count ?? 0 },
         ]}
         filter={
           <TextFilter
             filteringPlaceholder="Find route list"
-            filteringText={filter}
-            onChange={({ detail }) => setFilter(detail.filteringText)}
-            countText={`${filtered.length} matches`}
+            filteringText={filterText}
+            onChange={({ detail }) => setFilterText(detail.filteringText)}
+            countText={`${filteredItems.length} matches`}
           />
         }
         empty={

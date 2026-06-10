@@ -1,4 +1,3 @@
-import { useEffect, useState } from 'react';
 import Badge from '@cloudscape-design/components/badge';
 import Box from '@cloudscape-design/components/box';
 import Button from '@cloudscape-design/components/button';
@@ -9,7 +8,7 @@ import StatusIndicator from '@cloudscape-design/components/status-indicator';
 import Table from '@cloudscape-design/components/table';
 import TextFilter from '@cloudscape-design/components/text-filter';
 
-import { api, ApiError } from '../api';
+import { useApiList } from '../hooks/useApiList';
 
 type Css = {
   id: string;
@@ -35,35 +34,13 @@ function renderPartitionsCell(c: Css) {
   return <PartitionBadges cssId={c.id} partitions={c.partitions} />;
 }
 
+function cssSearchText(c: Css): string {
+  return `${c.id} ${c.name ?? ''} ${(c.partitions ?? []).join(' ')}`;
+}
+
 export function CallingSearchSpaces() {
-  const [items, setItems] = useState<Css[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState('');
-
-  const load = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await api.get<{ calling_search_spaces: Css[] }>('/css');
-      setItems(res.calling_search_spaces ?? []);
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    void load();
-  }, []);
-
-  const filtered = filter
-    ? items.filter((c) => {
-        const hay = `${c.id} ${c.name ?? ''} ${(c.partitions ?? []).join(' ')}`.toLowerCase();
-        return hay.includes(filter.toLowerCase());
-      })
-    : items;
+  const { items, filteredItems, loading, error, filterText, setFilterText, reload } =
+    useApiList<Css>('/css', (r) => r.calling_search_spaces ?? [], { searchText: cssSearchText });
 
   return (
     <ContentLayout
@@ -73,7 +50,7 @@ export function CallingSearchSpaces() {
           counter={`(${items.length})`}
           description="Ordered partition lists that determine which numbers a caller can reach. First match wins."
           actions={
-            <Button onClick={load} iconName="refresh" loading={loading}>
+            <Button onClick={reload} iconName="refresh" loading={loading}>
               Refresh
             </Button>
           }
@@ -83,14 +60,14 @@ export function CallingSearchSpaces() {
       }
     >
       <Table
-        items={filtered}
+        items={filteredItems}
         loading={loading}
         loadingText="Loading calling search spaces…"
         variant="full-page"
         stickyHeader
         trackBy="id"
         columnDefinitions={[
-          { id: 'name', header: 'Name', cell: (c) => c.name ?? c.id, isRowHeader: true, sortingField: 'name' },
+          { id: 'name', header: 'Name', cell: (c) => c.name ?? c.id, isRowHeader: true },
           { id: 'id', header: 'ID', cell: (c) => c.id },
           {
             id: 'partitions',
@@ -101,15 +78,14 @@ export function CallingSearchSpaces() {
             id: 'count',
             header: 'Count',
             cell: (c) => c.partition_count ?? c.partitions?.length ?? 0,
-            sortingField: 'partition_count',
           },
         ]}
         filter={
           <TextFilter
             filteringPlaceholder="Find CSS by name / partition"
-            filteringText={filter}
-            onChange={({ detail }) => setFilter(detail.filteringText)}
-            countText={`${filtered.length} matches`}
+            filteringText={filterText}
+            onChange={({ detail }) => setFilterText(detail.filteringText)}
+            countText={`${filteredItems.length} matches`}
           />
         }
         empty={

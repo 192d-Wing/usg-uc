@@ -1,4 +1,3 @@
-import { useEffect, useState } from 'react';
 import Button from '@cloudscape-design/components/button';
 import ContentLayout from '@cloudscape-design/components/content-layout';
 import Header from '@cloudscape-design/components/header';
@@ -7,7 +6,7 @@ import StatusIndicator from '@cloudscape-design/components/status-indicator';
 import Table from '@cloudscape-design/components/table';
 import TextFilter from '@cloudscape-design/components/text-filter';
 
-import { api, ApiError } from '../api';
+import { useApiList } from '../hooks/useApiList';
 
 type Partition = {
   id: string;
@@ -15,34 +14,15 @@ type Partition = {
   description?: string | null;
 };
 
+function partitionSearchText(p: Partition): string {
+  return `${p.id} ${p.name ?? ''} ${p.description ?? ''}`;
+}
+
 export function Partitions() {
-  const [items, setItems] = useState<Partition[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState('');
-
-  const load = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await api.get<{ partitions: Partition[] }>('/partitions');
-      setItems(res.partitions ?? []);
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    void load();
-  }, []);
-
-  const filtered = filter
-    ? items.filter((p) =>
-        `${p.id} ${p.name ?? ''} ${p.description ?? ''}`.toLowerCase().includes(filter.toLowerCase()),
-      )
-    : items;
+  const { items, filteredItems, loading, error, filterText, setFilterText, reload } =
+    useApiList<Partition>('/partitions', (r) => r.partitions ?? [], {
+      searchText: partitionSearchText,
+    });
 
   return (
     <ContentLayout
@@ -52,7 +32,7 @@ export function Partitions() {
           counter={`(${items.length})`}
           description="Route partitions — groupings used by Calling Search Spaces to scope what numbers a caller can reach."
           actions={
-            <Button onClick={load} iconName="refresh" loading={loading}>
+            <Button onClick={reload} iconName="refresh" loading={loading}>
               Refresh
             </Button>
           }
@@ -62,23 +42,23 @@ export function Partitions() {
       }
     >
       <Table
-        items={filtered}
+        items={filteredItems}
         loading={loading}
         loadingText="Loading partitions…"
         variant="full-page"
         stickyHeader
         trackBy="id"
         columnDefinitions={[
-          { id: 'name', header: 'Name', cell: (p) => p.name ?? p.id, isRowHeader: true, sortingField: 'name' },
+          { id: 'name', header: 'Name', cell: (p) => p.name ?? p.id, isRowHeader: true },
           { id: 'id', header: 'ID', cell: (p) => p.id },
           { id: 'description', header: 'Description', cell: (p) => p.description ?? '—' },
         ]}
         filter={
           <TextFilter
             filteringPlaceholder="Find partition"
-            filteringText={filter}
-            onChange={({ detail }) => setFilter(detail.filteringText)}
-            countText={`${filtered.length} matches`}
+            filteringText={filterText}
+            onChange={({ detail }) => setFilterText(detail.filteringText)}
+            countText={`${filteredItems.length} matches`}
           />
         }
         empty={

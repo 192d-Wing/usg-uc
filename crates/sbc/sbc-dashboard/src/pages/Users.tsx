@@ -1,4 +1,3 @@
-import { useEffect, useState } from 'react';
 import Button from '@cloudscape-design/components/button';
 import ContentLayout from '@cloudscape-design/components/content-layout';
 import Header from '@cloudscape-design/components/header';
@@ -7,7 +6,7 @@ import StatusIndicator from '@cloudscape-design/components/status-indicator';
 import Table from '@cloudscape-design/components/table';
 import TextFilter from '@cloudscape-design/components/text-filter';
 
-import { api, ApiError } from '../api';
+import { useApiList } from '../hooks/useApiList';
 
 type User = {
   id?: string;
@@ -19,35 +18,13 @@ type User = {
   enabled?: boolean;
 };
 
+function userSearchText(u: User): string {
+  return `${u.username ?? ''} ${u.display_name ?? ''} ${u.email ?? ''} ${u.sip_uri ?? ''}`;
+}
+
 export function Users() {
-  const [items, setItems] = useState<User[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState('');
-
-  const load = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await api.get<{ users?: User[]; total?: number }>('/users');
-      setItems(res.users ?? []);
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    void load();
-  }, []);
-
-  const filtered = filter
-    ? items.filter((u) => {
-        const hay = `${u.username ?? ''} ${u.display_name ?? ''} ${u.email ?? ''} ${u.sip_uri ?? ''}`.toLowerCase();
-        return hay.includes(filter.toLowerCase());
-      })
-    : items;
+  const { items, filteredItems, loading, error, filterText, setFilterText, reload } =
+    useApiList<User>('/users', (r) => r.users ?? [], { searchText: userSearchText });
 
   return (
     <ContentLayout
@@ -57,7 +34,7 @@ export function Users() {
           counter={`(${items.length})`}
           description="Registered SIP users and their authentication settings."
           actions={
-            <Button onClick={load} iconName="refresh" loading={loading}>
+            <Button onClick={reload} iconName="refresh" loading={loading}>
               Refresh
             </Button>
           }
@@ -67,7 +44,7 @@ export function Users() {
       }
     >
       <Table
-        items={filtered}
+        items={filteredItems}
         loading={loading}
         loadingText="Loading users…"
         variant="full-page"
@@ -79,7 +56,6 @@ export function Users() {
             header: 'Username',
             cell: (u) => u.username ?? '—',
             isRowHeader: true,
-            sortingField: 'username',
           },
           { id: 'display', header: 'Display name', cell: (u) => u.display_name ?? '—' },
           { id: 'sip', header: 'SIP URI', cell: (u) => u.sip_uri ?? '—' },
@@ -99,9 +75,9 @@ export function Users() {
         filter={
           <TextFilter
             filteringPlaceholder="Find user"
-            filteringText={filter}
-            onChange={({ detail }) => setFilter(detail.filteringText)}
-            countText={`${filtered.length} matches`}
+            filteringText={filterText}
+            onChange={({ detail }) => setFilterText(detail.filteringText)}
+            countText={`${filteredItems.length} matches`}
           />
         }
         empty={

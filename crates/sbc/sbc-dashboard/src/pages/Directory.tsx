@@ -1,4 +1,3 @@
-import { useEffect, useState } from 'react';
 import Button from '@cloudscape-design/components/button';
 import ContentLayout from '@cloudscape-design/components/content-layout';
 import Header from '@cloudscape-design/components/header';
@@ -7,7 +6,7 @@ import StatusIndicator from '@cloudscape-design/components/status-indicator';
 import Table from '@cloudscape-design/components/table';
 import TextFilter from '@cloudscape-design/components/text-filter';
 
-import { api, ApiError } from '../api';
+import { useApiList } from '../hooks/useApiList';
 
 type DirectoryNumber = {
   did: string;
@@ -16,36 +15,15 @@ type DirectoryNumber = {
   description?: string;
 };
 
+function directorySearchText(d: DirectoryNumber): string {
+  return `${d.did} ${d.user ?? ''} ${d.partition ?? ''} ${d.description ?? ''}`;
+}
+
 export function Directory() {
-  const [items, setItems] = useState<DirectoryNumber[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState('');
-
-  const load = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await api.get<{ directory_numbers: DirectoryNumber[] }>('/directory');
-      setItems(res.directory_numbers ?? []);
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    void load();
-  }, []);
-
-  const filtered = filter
-    ? items.filter((d) =>
-        `${d.did} ${d.user ?? ''} ${d.partition ?? ''} ${d.description ?? ''}`
-          .toLowerCase()
-          .includes(filter.toLowerCase()),
-      )
-    : items;
+  const { items, filteredItems, loading, error, filterText, setFilterText, reload } =
+    useApiList<DirectoryNumber>('/directory', (r) => r.directory_numbers ?? [], {
+      searchText: directorySearchText,
+    });
 
   return (
     <ContentLayout
@@ -55,7 +33,7 @@ export function Directory() {
           counter={`(${items.length})`}
           description="Provisioned directory numbers and their owning users."
           actions={
-            <Button onClick={load} iconName="refresh" loading={loading}>
+            <Button onClick={reload} iconName="refresh" loading={loading}>
               Refresh
             </Button>
           }
@@ -65,14 +43,14 @@ export function Directory() {
       }
     >
       <Table
-        items={filtered}
+        items={filteredItems}
         loading={loading}
         loadingText="Loading directory numbers…"
         variant="full-page"
         stickyHeader
         trackBy="did"
         columnDefinitions={[
-          { id: 'did', header: 'Number', cell: (d) => d.did, isRowHeader: true, sortingField: 'did' },
+          { id: 'did', header: 'Number', cell: (d) => d.did, isRowHeader: true },
           { id: 'user', header: 'User', cell: (d) => d.user ?? '—' },
           { id: 'partition', header: 'Partition', cell: (d) => d.partition ?? '—' },
           { id: 'description', header: 'Description', cell: (d) => d.description ?? '—' },
@@ -80,9 +58,9 @@ export function Directory() {
         filter={
           <TextFilter
             filteringPlaceholder="Find by number / user / partition"
-            filteringText={filter}
-            onChange={({ detail }) => setFilter(detail.filteringText)}
-            countText={`${filtered.length} matches`}
+            filteringText={filterText}
+            onChange={({ detail }) => setFilterText(detail.filteringText)}
+            countText={`${filteredItems.length} matches`}
           />
         }
         empty={
