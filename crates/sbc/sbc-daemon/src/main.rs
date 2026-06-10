@@ -69,6 +69,7 @@ mod runtime;
 mod server;
 mod shutdown;
 mod sip_stack;
+mod tls_bootstrap;
 mod zone;
 
 use args::Args;

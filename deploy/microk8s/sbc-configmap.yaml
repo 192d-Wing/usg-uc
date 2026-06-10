@@ -31,8 +31,16 @@ data:
     udp_listen = ["0.0.0.0:5060"]
     tcp_listen = ["0.0.0.0:5060"]
     tls_listen = ["0.0.0.0:5061"]
-    api_listen = "0.0.0.0:80"
     stun_refresh_interval_secs = 300
+
+    [api]
+    listen_addr = "0.0.0.0:80"
+    # Explicit plain-HTTP opt-in: TEO phones fetch /provision/ configs over
+    # HTTP on the inside zone and cannot validate a self-signed certificate.
+    # Management traffic on this listener is cleartext. Move to an
+    # operator-provided certificate (tls_cert_path/tls_key_path) once one is
+    # issued for 10.0.100.240, and keep HTTP only for the provisioning path.
+    insecure_http = "any"
 
     [media]
     default_mode = "Relay"

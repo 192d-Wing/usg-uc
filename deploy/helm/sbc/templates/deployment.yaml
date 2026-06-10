@@ -48,9 +48,6 @@ spec:
             - name: sip-tls
               containerPort: 5061
               protocol: TCP
-            - name: http-api
-              containerPort: {{ .Values.apiService.httpPort }}
-              protocol: TCP
             - name: https-api
               containerPort: {{ .Values.apiService.httpsPort }}
               protocol: TCP
@@ -75,7 +72,8 @@ spec:
           livenessProbe:
             httpGet:
               path: /health/live
-              port: http-api
+              port: https-api
+              scheme: HTTPS
             initialDelaySeconds: 10
             periodSeconds: 30
             timeoutSeconds: 5
@@ -83,7 +81,8 @@ spec:
           readinessProbe:
             httpGet:
               path: /health/ready
-              port: http-api
+              port: https-api
+              scheme: HTTPS
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5
@@ -91,7 +90,8 @@ spec:
           startupProbe:
             httpGet:
               path: /health/live
-              port: http-api
+              port: https-api
+              scheme: HTTPS
             initialDelaySeconds: 5
             periodSeconds: 5
             timeoutSeconds: 5

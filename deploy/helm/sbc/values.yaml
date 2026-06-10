@@ -66,9 +66,7 @@ sipService:
 apiService:
   # -- Service type
   type: ClusterIP
-  # -- HTTP port
-  httpPort: 8080
-  # -- HTTPS port
+  # -- HTTPS port (TLS by default; plain HTTP requires api.insecure_http opt-in)
   httpsPort: 8443
 
 # Metrics configuration

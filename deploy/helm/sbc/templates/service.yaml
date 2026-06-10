@@ -46,10 +46,6 @@ spec:
   selector:
     {{- include "sbc.selectorLabels" . | nindent 4 }}
   ports:
-    - name: http
-      port: {{ .Values.apiService.httpPort }}
-      targetPort: http-api
-      protocol: TCP
     - name: https
       port: {{ .Values.apiService.httpsPort }}
       targetPort: https-api

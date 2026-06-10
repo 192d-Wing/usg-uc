@@ -26,7 +26,7 @@ impl Default for Args {
             help: false,
             version: false,
             format: OutputFormat::Text,
-            api_url: "http://localhost:8080".to_string(),
+            api_url: "https://localhost:8443".to_string(),
             verbose: 0,
         }
     }
@@ -208,7 +208,7 @@ OPTIONS:
     -v, --verbose       Increase verbosity
     --json              Output in JSON format
     --table             Output in table format
-    --api-url <URL>     API endpoint URL (default: http://localhost:8080)
+    --api-url <URL>     API endpoint URL (default: https://localhost:8443)
 
 EXAMPLES:
     sbc-cli status

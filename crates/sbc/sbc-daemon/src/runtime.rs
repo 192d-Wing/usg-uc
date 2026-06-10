@@ -303,12 +303,87 @@ impl Runtime {
             None
         };
 
-        // Extract gRPC config and API listen address before moving config to
-        // server. The schema parses transport.api_listen but it was previously
-        // ignored — capture it here so the API server honors the TOML setting.
+        // Extract gRPC and API config before moving config to server.
+        // transport.api_listen is honored as a deprecated override of
+        // api.listen_addr.
         #[cfg(feature = "grpc")]
-        let grpc_config = config.grpc.clone().unwrap_or_default();
-        let api_listen_override = config.transport.api_listen;
+        let mut grpc_config = config.grpc.clone().unwrap_or_default();
+        let api_schema = config.api.clone();
+        let api_listen_addr = if let Some(addr) = config.transport.api_listen {
+            warn!(
+                "transport.api_listen is deprecated; use [api] listen_addr instead"
+            );
+            addr
+        } else {
+            api_schema.listen_addr
+        };
+
+        // Resolve the API server's TLS configuration. HTTPS is the default:
+        // operator certificates win; otherwise generate/reuse a self-signed
+        // bootstrap certificate. Plain HTTP requires the explicit
+        // api.insecure_http opt-in (validated against the bind address).
+        let api_tls: Option<crate::api_server::TlsConfig> =
+            match (&api_schema.tls_cert_path, &api_schema.tls_key_path) {
+                (Some(cert), Some(key)) => Some(crate::api_server::TlsConfig {
+                    cert_path: cert.clone(),
+                    key_path: key.clone(),
+                }),
+                _ => {
+                    let insecure_ok = match api_schema.insecure_http {
+                        sbc_config::InsecureHttpMode::Off => false,
+                        sbc_config::InsecureHttpMode::Loopback => {
+                            api_listen_addr.ip().is_loopback()
+                        }
+                        sbc_config::InsecureHttpMode::Any => true,
+                    };
+                    if insecure_ok {
+                        warn!(
+                            address = %api_listen_addr,
+                            "API server configured for PLAIN HTTP (api.insecure_http); \
+                             management traffic and credentials transit in cleartext"
+                        );
+                        None
+                    } else {
+                        let boot = crate::tls_bootstrap::ensure_bootstrap_cert(
+                            &crate::tls_bootstrap::default_tls_dir(),
+                        )
+                        .map_err(|e| RuntimeError::InitFailed {
+                            component: "tls-bootstrap".to_string(),
+                            reason: e.to_string(),
+                        })?;
+                        Some(crate::api_server::TlsConfig {
+                            cert_path: boot.cert_path,
+                            key_path: boot.key_path,
+                        })
+                    }
+                }
+            };
+
+        // gRPC inherits the API certificate (or the bootstrap certificate)
+        // when no gRPC-specific certificate is configured, unless the
+        // operator explicitly allowed insecure operation.
+        #[cfg(feature = "grpc")]
+        if grpc_config.enabled
+            && grpc_config.tls_cert_path.is_none()
+            && !grpc_config.allow_insecure
+        {
+            let (cert_path, key_path) = match &api_tls {
+                Some(tls) => (tls.cert_path.clone(), tls.key_path.clone()),
+                None => {
+                    let boot = crate::tls_bootstrap::ensure_bootstrap_cert(
+                        &crate::tls_bootstrap::default_tls_dir(),
+                    )
+                    .map_err(|e| RuntimeError::InitFailed {
+                        component: "tls-bootstrap".to_string(),
+                        reason: e.to_string(),
+                    })?;
+                    (boot.cert_path, boot.key_path)
+                }
+            };
+            info!("gRPC server using API TLS certificate (no grpc.tls_cert_path configured)");
+            grpc_config.tls_cert_path = Some(cert_path);
+            grpc_config.tls_key_path = Some(key_path);
+        }
 
         // Pass cluster manager to server if available
         #[cfg(feature = "cluster")]
@@ -329,8 +404,8 @@ impl Runtime {
             })?;
 
         let api_config = ApiServerConfig {
-            listen_addr: api_listen_override
-                .unwrap_or_else(|| ApiServerConfig::default().listen_addr),
+            listen_addr: api_listen_addr,
+            tls: api_tls.clone(),
             ..ApiServerConfig::default()
         };
         let metrics = SbcMetrics::standard();
@@ -338,6 +413,18 @@ impl Runtime {
 
         let mut app_state = AppState::new(metrics, stats);
         app_state.sip_stack = Some(Arc::clone(server.sip_stack()));
+
+        // Wire the reloadable TLS acceptor so certificate hot-reload
+        // (POST /api/v1/system/tls/reload) works for the HTTPS listener.
+        if let Some(tls) = &api_tls {
+            let acceptor = ApiServer::create_reloadable_tls_acceptor(tls).map_err(|e| {
+                RuntimeError::InitFailed {
+                    component: "api-tls".to_string(),
+                    reason: e.to_string(),
+                }
+            })?;
+            app_state.tls_acceptor = Some(Arc::new(acceptor));
+        }
 
         // Initialize CUCM router for partition/CSS/route pattern management
         app_state.cucm_router = Some(Arc::new(tokio::sync::RwLock::new(

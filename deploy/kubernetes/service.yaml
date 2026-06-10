@@ -84,10 +84,6 @@ spec:
     app.kubernetes.io/name: sbc
     app.kubernetes.io/component: daemon
   ports:
-    - name: http
-      port: 8080
-      targetPort: http-api
-      protocol: TCP
     - name: https
       port: 8443
       targetPort: https-api

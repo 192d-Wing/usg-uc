@@ -62,6 +62,11 @@ pub struct SbcConfig {
     /// Logging settings.
     pub logging: LoggingConfig,
 
+    /// REST API / dashboard server settings.
+    ///
+    /// ## NIST 800-53 Rev5: SC-8 (Transmission Confidentiality)
+    pub api: ApiConfig,
+
     /// Cluster settings for high availability.
     ///
     /// ## NIST 800-53 Rev5: SC-24 (Fail in Known State)
@@ -232,7 +237,10 @@ pub struct TransportConfig {
     /// When set, RTP ports bind to this address instead of 0.0.0.0.
     pub media_ip: Option<String>,
 
-    /// REST API listen address (default: 0.0.0.0:8080).
+    /// REST API listen address.
+    ///
+    /// Deprecated: use `[api] listen_addr` instead. When set, this overrides
+    /// `api.listen_addr` for backward compatibility.
     pub api_listen: Option<SocketAddr>,
 
     /// STUN refresh interval in seconds for external IP re-resolution (default: 300).
@@ -262,6 +270,66 @@ impl Default for TransportConfig {
             media_ip: None,
             api_listen: None,
             stun_refresh_interval_secs: None,
+        }
+    }
+}
+
+/// REST API / dashboard server configuration.
+///
+/// HTTPS is the default. When no certificate is configured, a self-signed
+/// P-384 bootstrap certificate is generated on first start and persisted
+/// (see `sbc-daemon` TLS bootstrap). Plain HTTP requires an explicit
+/// `insecure_http` opt-in.
+///
+/// ## NIST 800-53 Rev5 Controls
+///
+/// - **SC-8**: Transmission Confidentiality (TLS by default)
+/// - **SC-13**: Cryptographic Protection
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ApiConfig {
+    /// Listen address for the REST API and dashboard (default: `0.0.0.0:8443`, HTTPS).
+    pub listen_addr: SocketAddr,
+
+    /// Path to TLS certificate (PEM format). When unset, a self-signed
+    /// bootstrap certificate is generated and reused across restarts.
+    pub tls_cert_path: Option<PathBuf>,
+
+    /// Path to TLS private key (PEM format).
+    pub tls_key_path: Option<PathBuf>,
+
+    /// Plain-HTTP opt-out of TLS. `off` (default): always serve HTTPS.
+    /// `loopback`: allow HTTP only when `listen_addr` is a loopback address
+    /// (e.g. behind a local reverse proxy). `any`: allow HTTP on any
+    /// interface — NOT recommended; management traffic and credentials
+    /// transit in cleartext.
+    pub insecure_http: InsecureHttpMode,
+}
+
+/// Plain-HTTP opt-in modes for the REST API server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum InsecureHttpMode {
+    /// Always serve HTTPS (default).
+    #[default]
+    Off,
+    /// Allow plain HTTP only on loopback binds.
+    Loopback,
+    /// Allow plain HTTP on any interface (insecure).
+    Any,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        // Use unwrap for hardcoded valid address in Default impl
+        #[allow(clippy::unwrap_used)]
+        let listen_addr = "0.0.0.0:8443".parse().unwrap();
+
+        Self {
+            listen_addr,
+            tls_cert_path: None,
+            tls_key_path: None,
+            insecure_http: InsecureHttpMode::Off,
         }
     }
 }
@@ -575,6 +643,13 @@ pub struct GrpcConfig {
     /// Require mutual TLS (client certificate authentication).
     pub require_mtls: bool,
 
+    /// Allow the gRPC server to run without TLS (insecure).
+    ///
+    /// When `false` (default) and no certificate is configured, the daemon
+    /// falls back to the API server's certificate or the self-signed
+    /// bootstrap certificate instead of serving plaintext.
+    pub allow_insecure: bool,
+
     /// Maximum concurrent gRPC connections.
     pub max_connections: u32,
 
@@ -598,6 +673,7 @@ impl Default for GrpcConfig {
             tls_key_path: None,
             tls_ca_path: None,
             require_mtls: false,
+            allow_insecure: false,
             max_connections: 1000,
             request_timeout_secs: 30,
             enable_reflection: true,

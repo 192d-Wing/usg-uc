@@ -25,6 +25,68 @@ pub fn validate_config(config: &SbcConfig) -> ConfigResult<()> {
     validate_security(&config.security)?;
     validate_stir_shaken(&config.stir_shaken)?;
     validate_rate_limit(&config.rate_limit)?;
+    validate_api(&config.api)?;
+    if let Some(grpc) = &config.grpc {
+        validate_grpc(grpc)?;
+    }
+
+    Ok(())
+}
+
+fn validate_api(config: &crate::schema::ApiConfig) -> ConfigResult<()> {
+    match (&config.tls_cert_path, &config.tls_key_path) {
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(ConfigError::Validation {
+                message: "api.tls_cert_path and api.tls_key_path must be set together"
+                    .to_string(),
+            });
+        }
+        _ => {}
+    }
+
+    if config.insecure_http == crate::schema::InsecureHttpMode::Loopback
+        && !config.listen_addr.ip().is_loopback()
+    {
+        return Err(ConfigError::Validation {
+            message: format!(
+                "api.insecure_http = \"loopback\" requires a loopback listen_addr, got {}; \
+                 use insecure_http = \"any\" to serve plain HTTP on other interfaces \
+                 (not recommended)",
+                config.listen_addr
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_grpc(config: &crate::schema::GrpcConfig) -> ConfigResult<()> {
+    if !config.enabled {
+        return Ok(());
+    }
+
+    match (&config.tls_cert_path, &config.tls_key_path) {
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(ConfigError::Validation {
+                message: "grpc.tls_cert_path and grpc.tls_key_path must be set together"
+                    .to_string(),
+            });
+        }
+        _ => {}
+    }
+
+    if config.allow_insecure && config.tls_cert_path.is_some() {
+        return Err(ConfigError::Validation {
+            message: "grpc.allow_insecure conflicts with grpc.tls_cert_path; remove one"
+                .to_string(),
+        });
+    }
+
+    if config.require_mtls && config.tls_ca_path.is_none() {
+        return Err(ConfigError::Validation {
+            message: "grpc.require_mtls requires grpc.tls_ca_path".to_string(),
+        });
+    }
 
     Ok(())
 }
@@ -224,6 +286,49 @@ mod tests {
     fn test_invalid_tls_version() {
         let mut config = SbcConfig::default();
         config.security.min_tls_version = "1.0".to_string();
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_api_cert_without_key() {
+        let mut config = SbcConfig::default();
+        config.api.tls_cert_path = Some("/etc/sbc/api.crt".into());
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_api_insecure_loopback_rejects_wildcard_bind() {
+        let mut config = SbcConfig::default();
+        config.api.insecure_http = crate::schema::InsecureHttpMode::Loopback;
+        // Default listen_addr is 0.0.0.0:8443 (non-loopback)
+        assert!(validate_config(&config).is_err());
+
+        config.api.listen_addr = "127.0.0.1:8080".parse().unwrap();
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_grpc_insecure_conflicts_with_cert() {
+        let mut config = SbcConfig::default();
+        let mut grpc = crate::schema::GrpcConfig {
+            enabled: true,
+            allow_insecure: true,
+            ..Default::default()
+        };
+        grpc.tls_cert_path = Some("/etc/sbc/grpc.crt".into());
+        grpc.tls_key_path = Some("/etc/sbc/grpc.key".into());
+        config.grpc = Some(grpc);
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_grpc_mtls_requires_ca() {
+        let mut config = SbcConfig::default();
+        config.grpc = Some(crate::schema::GrpcConfig {
+            enabled: true,
+            require_mtls: true,
+            ..Default::default()
+        });
         assert!(validate_config(&config).is_err());
     }
 }

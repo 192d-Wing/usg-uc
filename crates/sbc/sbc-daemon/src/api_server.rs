@@ -83,9 +83,9 @@ pub struct TlsConfig {
 impl Default for ApiServerConfig {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:8080"
+            listen_addr: "0.0.0.0:8443"
                 .parse()
-                .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 8080))),
+                .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 8443))),
             enable_cors: false,
             api_version: "v1".to_string(),
             tls: None,
@@ -2521,7 +2521,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = ApiServerConfig::default();
-        assert_eq!(config.listen_addr.port(), 8080);
+        assert_eq!(config.listen_addr.port(), 8443);
         assert!(!config.enable_cors);
         assert_eq!(config.api_version, "v1");
     }

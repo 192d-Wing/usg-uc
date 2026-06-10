@@ -158,7 +158,10 @@ impl GrpcServer {
         // Configure TLS if enabled
         let tls_config = self.configure_tls()?;
 
-        // Build the server with or without TLS
+        // Build the server with or without TLS. TLS is the default: the
+        // runtime fills in the API/bootstrap certificate when none is
+        // configured, so reaching the plaintext branch requires the explicit
+        // grpc.allow_insecure opt-in.
         let mut server = if let Some(tls) = tls_config {
             info!("gRPC server TLS enabled");
             Server::builder()
@@ -166,9 +169,18 @@ impl GrpcServer {
                 .map_err(|e| GrpcServerError::TlsError {
                     reason: e.to_string(),
                 })?
-        } else {
-            warn!("gRPC server running WITHOUT TLS - not recommended for production");
+        } else if self.config.allow_insecure {
+            warn!(
+                "gRPC server running WITHOUT TLS (grpc.allow_insecure); \
+                 management traffic transits in cleartext"
+            );
             Server::builder()
+        } else {
+            return Err(GrpcServerError::TlsError {
+                reason: "no TLS certificate configured and grpc.allow_insecure is false; \
+                         refusing to serve plaintext gRPC"
+                    .to_string(),
+            });
         };
 
         // Build router with core services (no cluster, no reflection)

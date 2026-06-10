@@ -31,8 +31,12 @@ data:
     udp_listen = ["0.0.0.0:5060"]
     tcp_listen = ["0.0.0.0:5060"]
     tls_listen = ["0.0.0.0:5061"]
-    api_listen = "0.0.0.0:8080"
     stun_refresh_interval_secs = 300
+
+    [api]
+    # HTTPS with a self-signed bootstrap certificate (generated on first
+    # start under /var/lib/sbc/tls). Probes use scheme: HTTPS.
+    listen_addr = "0.0.0.0:8443"
 
     [media]
     default_mode = "Relay"

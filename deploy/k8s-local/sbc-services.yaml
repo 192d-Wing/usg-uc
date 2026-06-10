@@ -70,13 +70,10 @@ spec:
     app.kubernetes.io/name: sbc
   ports:
     - name: api
-      port: 8080
-      targetPort: 8080
-      nodePort: 30880
-      protocol: TCP
-    - name: api-tls
+      # HTTPS (TLS by default; bootstrap certificate on first start)
       port: 8443
       targetPort: 8443
+      nodePort: 30880
       protocol: TCP
     - name: metrics
       port: 9090

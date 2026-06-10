@@ -56,7 +56,7 @@ spec:
         - podSelector: {}
       ports:
         - protocol: TCP
-          port: {{ .Values.apiService.httpPort }}
+          port: {{ .Values.apiService.httpsPort }}
         - protocol: TCP
           port: {{ .Values.apiService.httpsPort }}
 

@@ -33,8 +33,18 @@ tcp_idle_timeout_secs = 300
 # External/public IP for NAT traversal (auto-detected if unset)
 # external_ip = "203.0.113.10"
 
-# REST API listen address (default: 0.0.0.0:8080)
-# api_listen = "10.0.1.10:8080"
+# REST API listen address: deprecated, use [api] listen_addr below.
+
+# REST API / dashboard. HTTPS by default: a self-signed P-384 bootstrap
+# certificate is generated under /var/lib/sbc/tls on first start unless
+# tls_cert_path/tls_key_path point at operator-provided PEM files.
+# Plain HTTP requires the explicit insecure_http opt-in
+# ("loopback" = loopback binds only, "any" = any interface; not recommended).
+[api]
+listen_addr = "0.0.0.0:8443"
+# tls_cert_path = "/etc/sbc/api.crt"
+# tls_key_path = "/etc/sbc/api.key"
+# insecure_http = "off"
 
 [media]
 default_mode = "Relay"

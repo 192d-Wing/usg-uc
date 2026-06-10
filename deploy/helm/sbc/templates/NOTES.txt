@@ -37,7 +37,7 @@ To update configuration:
 - SIP UDP: 5060
 - SIP TCP: 5060
 - SIP TLS: 5061
-- HTTP API: {{ .Values.apiService.httpPort }}
+- HTTPS API: {{ .Values.apiService.httpsPort }}
 - HTTPS API: {{ .Values.apiService.httpsPort }}
 {{- if .Values.metrics.enabled }}
 - Metrics: {{ .Values.metrics.port }}
