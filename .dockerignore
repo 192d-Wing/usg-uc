@@ -1,0 +1,21 @@
+# Build artifacts — never needed in any image build context.
+target/
+**/target/
+**/node_modules/
+crates/sbc/sbc-dashboard/dist/
+
+# VCS / CI / docs
+.git/
+.github/
+**/*.md
+
+# Local dev / test scratch
+deploy/test/
+*.log
+.DS_Store
+
+# Secrets / state that must never enter an image
+**/*.key
+**/*.pem
+**/admin_credentials.json
+**/trunk_groups.json

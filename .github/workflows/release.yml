@@ -1,0 +1,170 @@
+name: Release
+
+# Builds the SBC pod images (sbc-daemon, sbc-api-server, sbc-provision-server,
+# sbc-dashboard) for linux/amd64 + linux/arm64 and publishes a multi-arch
+# manifest per image.
+#
+# Each architecture builds on a NATIVE runner (no QEMU) — important for the
+# heavy Rust + aws-lc-fips compile — pushing by digest; a per-image merge job
+# then assembles the manifest list.
+#
+# Base images are pulled with Iron Bank (registry1.dso.mil) credentials when
+# present (org secrets REPO1_USER / REPO1) so a Platform One environment can
+# point the Dockerfiles' base ARGs at hardened images without a workflow
+# change. Output goes to GHCR by default — override env.REGISTRY for a Harbor
+# / Platform One project registry.
+#
+# Triggers:
+#   - a semver tag (v1.2.3) cuts released images tagged with the version
+#     (and `latest` on the default branch);
+#   - workflow_dispatch builds on-demand images tagged with the short SHA.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      push:
+        description: 'Push images to the registry (false = build only)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io/192d-wing
+  IRONBANK_REGISTRY: registry1.dso.mil
+  # Mirror the Iron Bank robot user into env so steps can gate on its
+  # presence (the `secrets` context isn't allowed in `if:` conditions).
+  IRONBANK_USER: ${{ secrets.REPO1_USER }}
+
+jobs:
+  build:
+    name: ${{ matrix.image }} (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          # The Rust images use cargo-chef and copy the whole workspace, so
+          # their context is the repo root. The dashboard image copies only
+          # its own package.json / src, so its context is its crate dir.
+          - { name: sbc-daemon, dockerfile: Dockerfile, context: . }
+          - { name: sbc-api-server, dockerfile: crates/sbc/sbc-api-server/Dockerfile, context: . }
+          - { name: sbc-provision-server, dockerfile: crates/sbc/sbc-provision-server/Dockerfile, context: . }
+          - { name: sbc-dashboard, dockerfile: crates/sbc/sbc-dashboard/Dockerfile, context: crates/sbc/sbc-dashboard }
+        platform:
+          - { arch: linux/amd64, runner: ubuntu-24.04 }
+          - { arch: linux/arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Normalize platform name
+        run: echo "PLATFORM_PAIR=${arch//\//-}" >> "$GITHUB_ENV"
+        env:
+          arch: ${{ matrix.platform.arch }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Iron Bank base-image source (when the Dockerfile base ARGs point there).
+      # Skipped silently if the org secrets aren't configured.
+      - name: Log in to Iron Bank
+        if: ${{ env.IRONBANK_USER != '' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.IRONBANK_REGISTRY }}
+          username: ${{ secrets.REPO1_USER }}
+          password: ${{ secrets.REPO1 }}
+
+      - name: Log in to GHCR
+        if: ${{ github.event_name == 'push' || inputs.push }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata (labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ matrix.image.name }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.image.context }}
+          file: ${{ matrix.image.dockerfile }}
+          platforms: ${{ matrix.platform.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.image.name }}-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}-${{ env.PLATFORM_PAIR }}
+          provenance: false
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=${{ github.event_name == 'push' || inputs.push }}
+
+      - name: Export digest
+        if: ${{ github.event_name == 'push' || inputs.push }}
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: ${{ github.event_name == 'push' || inputs.push }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.image.name }}-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge ${{ matrix.image }}
+    runs-on: ubuntu-24.04
+    needs: build
+    if: ${{ github.event_name == 'push' || inputs.push }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [sbc-daemon, sbc-api-server, sbc-provision-server, sbc-dashboard]
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-${{ matrix.image }}-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata (tags)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ matrix.image }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=,enable=${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ matrix.image }}@sha256:%s ' *)
+
+      - name: Inspect
+        run: docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ matrix.image }}:${{ steps.meta.outputs.version }}
