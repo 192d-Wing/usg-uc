@@ -150,6 +150,17 @@ impl MemStore {
             tracing::warn!(error = %e, "Failed to write {tmp_path}");
             return;
         }
+        // Trunk groups contain carrier SIP credentials — owner-only access.
+        // Set on the temp file so the final path never exists world-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) =
+                std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
+            {
+                tracing::warn!(error = %e, "Failed to set permissions on {tmp_path}");
+            }
+        }
         if let Err(e) = std::fs::rename(&tmp_path, TRUNK_GROUPS_PATH) {
             tracing::warn!(error = %e, "Failed to rename {tmp_path} to {TRUNK_GROUPS_PATH}");
             return;
@@ -279,12 +290,20 @@ impl AppState {
     }
 
     /// Returns TLS certificate reload statistics.
+    ///
+    /// Only file names are exposed, not absolute paths — deployment layout
+    /// is not disclosed through the API.
     pub fn tls_stats(&self) -> Option<TlsReloadStats> {
+        fn file_name(path: &std::path::Path) -> String {
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        }
         self.tls_acceptor.as_ref().map(|acceptor| TlsReloadStats {
             reload_count: acceptor.reload_count(),
             last_reload_timestamp: acceptor.last_reload_timestamp(),
-            cert_path: acceptor.cert_path().display().to_string(),
-            key_path: acceptor.key_path().display().to_string(),
+            cert_path: file_name(acceptor.cert_path()),
+            key_path: file_name(acceptor.key_path()),
         })
     }
 
@@ -1157,10 +1176,93 @@ async fn delete_dial_plan_entry(
 // Trunk Group Routes
 // ============================================================================
 
+/// Marker returned in place of trunk SIP passwords. Clients that echo a
+/// trunk group back (GET → edit → PUT) send this marker, which the write
+/// handlers replace with the stored secret.
+const REDACTED_PASSWORD: &str = "***REDACTED***";
+
+/// Replaces every trunk `sip_password` in a group with the redaction marker.
+///
+/// Trunk credentials are write-only through the API: they are persisted and
+/// used for registration but never returned.
+///
+/// ## NIST 800-53 Rev5: IA-5 (Authenticator Management)
+fn redact_trunk_group(group: &mut serde_json::Value) {
+    if let Some(trunks) = group.get_mut("trunks").and_then(|v| v.as_array_mut()) {
+        for trunk in trunks {
+            redact_trunk(trunk);
+        }
+    }
+}
+
+/// Replaces a single trunk's `sip_password` with the redaction marker.
+fn redact_trunk(trunk: &mut serde_json::Value) {
+    if let Some(obj) = trunk.as_object_mut() {
+        if obj
+            .get("sip_password")
+            .and_then(|v| v.as_str())
+            .is_some_and(|p| !p.is_empty())
+        {
+            obj.insert(
+                "sip_password".to_string(),
+                serde_json::json!(REDACTED_PASSWORD),
+            );
+        }
+    }
+}
+
+/// Restores stored passwords for trunks whose incoming `sip_password` is the
+/// redaction marker (round-tripped from a redacted GET).
+fn restore_redacted_passwords(body: &mut serde_json::Value, existing: Option<&serde_json::Value>) {
+    let Some(trunks) = body.get_mut("trunks").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    for trunk in trunks {
+        let is_marker = trunk
+            .get("sip_password")
+            .and_then(|v| v.as_str())
+            .is_some_and(|p| p == REDACTED_PASSWORD);
+        if !is_marker {
+            continue;
+        }
+        let trunk_id = trunk.get("id").and_then(|v| v.as_str()).map(String::from);
+        let stored = existing
+            .and_then(|g| g.get("trunks"))
+            .and_then(|v| v.as_array())
+            .and_then(|trunks| {
+                trunks.iter().find(|t| {
+                    t.get("id").and_then(|v| v.as_str()).map(String::from) == trunk_id
+                })
+            })
+            .and_then(|t| t.get("sip_password"))
+            .cloned();
+        if let Some(obj) = trunk.as_object_mut() {
+            match stored {
+                Some(password) => {
+                    obj.insert("sip_password".to_string(), password);
+                }
+                None => {
+                    // Marker with no stored secret: drop it rather than
+                    // persisting the literal marker as a password.
+                    obj.remove("sip_password");
+                }
+            }
+        }
+    }
+}
+
 /// List trunk groups (route groups).
 async fn get_trunk_groups(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let store = state.mem_store.read().await;
-    let groups: Vec<_> = store.trunk_groups.values().cloned().collect();
+    let groups: Vec<_> = store
+        .trunk_groups
+        .values()
+        .cloned()
+        .map(|mut g| {
+            redact_trunk_group(&mut g);
+            g
+        })
+        .collect();
     let total = groups.len();
     Json(serde_json::json!({ "trunk_groups": groups, "total": total }))
 }
@@ -1172,7 +1274,11 @@ async fn get_trunk_group(
 ) -> impl IntoResponse {
     let store = state.mem_store.read().await;
     match store.trunk_groups.get(&group_id) {
-        Some(group) => Json(group.clone()),
+        Some(group) => {
+            let mut group = group.clone();
+            redact_trunk_group(&mut group);
+            Json(group)
+        }
         None => Json(serde_json::json!({ "error": format!("Trunk group {group_id} not found") })),
     }
 }
@@ -1190,6 +1296,7 @@ async fn add_trunk_group(
         body["trunks"] = serde_json::json!([]);
     }
     let mut store = state.mem_store.write().await;
+    restore_redacted_passwords(&mut body, store.trunk_groups.get(&id));
     store.trunk_groups.insert(id.clone(), body.clone());
     store.save_trunk_groups();
     drop(store);
@@ -1201,6 +1308,7 @@ async fn add_trunk_group(
     }
     // Sync to SIP stack router
     sync_trunk_group_to_router(&state, &body).await;
+    redact_trunk_group(&mut body);
     (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "trunk_group": body })))
 }
 
@@ -1230,10 +1338,12 @@ async fn update_trunk_group(
 ) -> impl IntoResponse {
     body["id"] = serde_json::json!(group_id);
     let mut store = state.mem_store.write().await;
+    restore_redacted_passwords(&mut body, store.trunk_groups.get(&group_id));
     store.trunk_groups.insert(group_id.clone(), body.clone());
     store.save_trunk_groups();
     drop(store);
     sync_trunk_group_to_router(&state, &body).await;
+    redact_trunk_group(&mut body);
     Json(serde_json::json!({ "success": true, "trunk_group": body }))
 }
 
@@ -1241,8 +1351,15 @@ async fn update_trunk_group(
 async fn add_trunk(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(group_id): axum::extract::Path<String>,
-    Json(body): Json<serde_json::Value>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // A round-tripped redaction marker on a new trunk has no stored secret
+    // to restore — drop it rather than persisting the literal marker.
+    if body.get("sip_password").and_then(|v| v.as_str()) == Some(REDACTED_PASSWORD) {
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("sip_password");
+        }
+    }
     let mut store = state.mem_store.write().await;
     if let Some(group) = store.trunk_groups.get_mut(&group_id) {
         if let Some(trunks) = group.get_mut("trunks").and_then(|v| v.as_array_mut()) {
@@ -1255,7 +1372,9 @@ async fn add_trunk(
         if let Some(gj) = group_json {
             sync_trunk_group_to_router(&state, &gj).await;
         }
-        (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "trunk": body })))
+        let mut response_trunk = body;
+        redact_trunk(&mut response_trunk);
+        (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "trunk": response_trunk })))
     } else {
         (StatusCode::NOT_FOUND, Json(serde_json::json!({ "success": false, "error": "Group not found" })))
     }
@@ -1271,20 +1390,31 @@ async fn update_trunk(
     if let Some(group) = store.trunk_groups.get_mut(&group_id) {
         if let Some(trunks) = group.get_mut("trunks").and_then(|v| v.as_array_mut()) {
             if let Some(trunk) = trunks.iter_mut().find(|t| t.get("id").and_then(|v| v.as_str()) == Some(&trunk_id)) {
-                // Merge updated fields into existing trunk, preserving the id
+                // Merge updated fields into existing trunk, preserving the
+                // id and ignoring a round-tripped password redaction marker
+                // (keeps the stored secret).
                 if let Some(obj) = trunk.as_object_mut() {
                     if let Some(updates) = body.as_object() {
                         for (k, v) in updates {
-                            if k != "id" {
-                                obj.insert(k.clone(), v.clone());
+                            if k == "id" {
+                                continue;
                             }
+                            if k == "sip_password"
+                                && v.as_str() == Some(REDACTED_PASSWORD)
+                            {
+                                continue;
+                            }
+                            obj.insert(k.clone(), v.clone());
                         }
                     }
                 }
                 let updated = trunk.clone();
+                store.save_trunk_groups();
                 drop(store);
                 start_trunk_services(&state, &updated);
-                return (StatusCode::OK, Json(serde_json::json!({ "success": true, "trunk": updated })));
+                let mut response_trunk = updated;
+                redact_trunk(&mut response_trunk);
+                return (StatusCode::OK, Json(serde_json::json!({ "success": true, "trunk": response_trunk })));
             }
             return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "success": false, "error": "Trunk not found" })));
         }
@@ -2694,6 +2824,88 @@ mod tests {
         assert_eq!(config.listen_addr.port(), 8443);
         assert!(!config.enable_cors);
         assert_eq!(config.api_version, "v1");
+    }
+
+    /// Trunk SIP passwords are write-only: redacted in every response, and a
+    /// round-tripped redaction marker preserves the stored secret.
+    #[tokio::test]
+    async fn test_trunk_password_redaction_roundtrip() {
+        let state = test_state();
+        let server = ApiServer::new(
+            ApiServerConfig::default(),
+            Arc::clone(&state),
+            ShutdownSignal::new(),
+        );
+        let router = server.router();
+
+        // Create a trunk group with a secret
+        let create = serde_json::json!({
+            "id": "tg1",
+            "name": "carrier",
+            "trunks": [{ "id": "t1", "host": "sip.example.com", "sip_password": "s3cret" }],
+        });
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/trunkgroups")
+                    .header("content-type", "application/json")
+                    .body(Body::from(create.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["trunk_group"]["trunks"][0]["sip_password"],
+            "***REDACTED***",
+            "create response must not echo the password"
+        );
+
+        // GET must be redacted too
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/trunkgroups/tg1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let fetched: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(fetched["trunks"][0]["sip_password"], "***REDACTED***");
+
+        // PUT the redacted document back (GET → edit → PUT round-trip)
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/trunkgroups/tg1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(fetched.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The stored secret must survive the round-trip
+        let store = state.mem_store.read().await;
+        let stored = store.trunk_groups.get("tg1").expect("group stored");
+        assert_eq!(
+            stored["trunks"][0]["sip_password"], "s3cret",
+            "round-tripped redaction marker must preserve the stored secret"
+        );
     }
 
     /// With enforced auth, every API route except the public set requires a

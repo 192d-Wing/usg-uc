@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
 
 /// Registration state for a trunk.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -217,7 +217,11 @@ impl TrunkRegistrar {
             target = %target,
             local_ip = %local_ip,
             contact_ip = %contact_ip,
-            "Sending initial REGISTER:\n{}",
+            "Sending initial REGISTER"
+        );
+        trace!(
+            trunk_id = %config.trunk_id,
+            "REGISTER message:\n{}",
             String::from_utf8_lossy(&msg_bytes),
         );
         socket.send_to(&msg_bytes, target).await
@@ -230,7 +234,7 @@ impl TrunkRegistrar {
             .map_err(|_| "Timeout waiting for response".to_string())?
             .map_err(|e| format!("Recv failed: {e}"))?;
 
-        info!(
+        trace!(
             trunk_id = %config.trunk_id,
             "Received response:\n{}",
             String::from_utf8_lossy(&buf[..n]),
@@ -305,10 +309,11 @@ impl TrunkRegistrar {
             auth_request.headers.set(HeaderName::Expires, &config.expires.to_string());
 
             let auth_bytes = SipMessage::Request(auth_request).to_bytes();
+            // Never log the full authenticated REGISTER: the Authorization
+            // header's digest response is offline-bruteforceable.
             info!(
                 trunk_id = %config.trunk_id,
-                "Sending authenticated REGISTER:\n{}",
-                String::from_utf8_lossy(&auth_bytes),
+                "Sending authenticated REGISTER"
             );
             socket.send_to(&auth_bytes, target).await
                 .map_err(|e| format!("Send auth REGISTER failed: {e}"))?;
@@ -319,7 +324,7 @@ impl TrunkRegistrar {
                 .map_err(|_| "Timeout waiting for auth response".to_string())?
                 .map_err(|e| format!("Recv auth response failed: {e}"))?;
 
-            info!(
+            trace!(
                 trunk_id = %config.trunk_id,
                 "Received auth response:\n{}",
                 String::from_utf8_lossy(&buf[..n2]),
