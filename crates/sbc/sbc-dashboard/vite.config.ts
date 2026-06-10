@@ -15,7 +15,9 @@ export default defineConfig({
   server: {
     port: 4200,
     proxy: {
-      // Forward API calls in dev to a locally-running sbc-daemon.
+      // Forward API calls in dev to a locally-running sbc-api-server
+      // (which owns /api/v1 incl. /auth/login). Override the target to
+      // match wherever you run sbc-api locally.
       '/api': 'http://localhost:8080',
     },
   },
