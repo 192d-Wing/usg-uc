@@ -70,6 +70,28 @@ spec:
                   name: {{ .Values.sbcPostgres.existingSecret.name }}
                   key: {{ .Values.sbcPostgres.existingSecret.key | default "dsn" }}
             {{- end }}
+            # Management-plane auth (fail-closed: the pod won't start
+            # without these). Shared signing key so any replica validates
+            # any replica's tokens.
+            {{- $authSecret := .Values.auth.existingSecret.name | default (printf "%s-auth" (include "sbc.fullname" .)) }}
+            - name: SBC_AUTH_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $authSecret }}
+                  key: signing-key
+            {{- if .Values.auth.adminPasswordHash }}
+            - name: SBC_ADMIN_PASSWORD_HASH
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $authSecret }}
+                  key: admin-password-hash
+            {{- else }}
+            - name: SBC_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $authSecret }}
+                  key: admin-password
+            {{- end }}
           ports:
             - { name: http, containerPort: 80, protocol: TCP }
           livenessProbe:

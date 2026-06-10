@@ -82,6 +82,25 @@ sbcFrontend:
 # Production: set `enabled: false` and point `existingSecret.name` at a
 # Secret you manage that contains a `dsn` key. (Some teams want managed
 # Postgres; this lets them.)
+# Management-plane authentication (sbc-api / sbc-provision). These pods
+# are fail-closed: they refuse to start without an admin credential. The
+# 00-sbc-auth-secret.yaml template generates and preserves a shared HMAC
+# signing key and (if you don't supply one) a random admin password.
+auth:
+  # Create the auth Secret from this chart. Set false and use
+  # existingSecret to manage credentials out-of-band (sealed-secrets/Vault).
+  create: true
+  # Preferred: a pre-computed argon2 PHC hash (keeps plaintext out of values).
+  adminPasswordHash: ""
+  # Convenience: a plaintext admin password (hashed by the pod at startup).
+  # If both are empty a random password is generated and preserved in the
+  # Secret — retrieve it per NOTES.txt.
+  adminPassword: ""
+  # Reference an externally-managed Secret instead of the generated one.
+  # Must contain keys: signing-key, and admin-password-hash OR admin-password.
+  existingSecret:
+    name: ""
+
 sbcPostgres:
   enabled: true
   image:

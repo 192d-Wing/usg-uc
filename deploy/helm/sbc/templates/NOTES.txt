@@ -83,3 +83,18 @@ Verify on upstream router:
   show ip bgp summary
   show ip bgp {{ .Values.site.kea_lb_ip }}/32
   ping {{ .Values.site.kea_lb_ip }}
+
+Management-plane login (sbc-api / sbc-provision are now authenticated):
+{{- if .Values.auth.adminPasswordHash }}
+  Admin password: (set via auth.adminPasswordHash)
+{{- else if .Values.auth.adminPassword }}
+  Admin password: (set via auth.adminPassword)
+{{- else }}
+  A random admin password was generated. Retrieve it with:
+    kubectl -n {{ .Release.Namespace }} get secret {{ include "sbc.fullname" . }}-auth \
+      -o jsonpath='{.data.admin-password}' | base64 -d ; echo
+{{- end }}
+  Log in:  curl -k https://<host>/api/v1/auth/login \
+             -H 'content-type: application/json' \
+             -d '{"username":"admin","password":"<password>"}'
+  Then send the returned token as:  Authorization: Bearer <token>
