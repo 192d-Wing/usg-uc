@@ -470,7 +470,10 @@ pub struct StirShakenConfig {
     /// Enable STIR/SHAKEN signing for outbound calls.
     pub signing_enabled: bool,
 
-    /// Enable STIR/SHAKEN verification for inbound calls.
+    /// Enable STIR/SHAKEN verification for inbound calls (default: `false`).
+    ///
+    /// Defaults to `false`: the daemon has no verification code path today,
+    /// so a `true` default would only give a false sense of security.
     pub verification_enabled: bool,
 
     /// Path to STI certificate (P-384).
@@ -496,7 +499,7 @@ impl Default for StirShakenConfig {
     fn default() -> Self {
         Self {
             signing_enabled: false,
-            verification_enabled: true,
+            verification_enabled: false,
             certificate_path: None,
             private_key_path: None,
             certificate_url: None,
