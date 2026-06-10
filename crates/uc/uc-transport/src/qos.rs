@@ -465,10 +465,32 @@ fn set_ipv6_tclass_windows(socket: &Socket, tclass: u32) -> io::Result<()> {
 pub fn apply_dscp(socket: &Socket, dscp: DscpValue, is_ipv6: bool) -> io::Result<()> {
     let tos = u32::from(dscp.to_tos());
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(
+        windows,
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    )))]
     {
         if is_ipv6 {
             socket.set_tclass_v6(tos)?;
+        } else {
+            socket.set_tos_v4(tos)?;
+        }
+    }
+
+    // Apple mobile platforms: socket2 does not expose IPV6_TCLASS (and the
+    // cellular path bleaches client DSCP regardless), so only mark IPv4.
+    #[cfg(any(
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))]
+    {
+        if is_ipv6 {
+            tracing::debug!("IPv6 traffic-class marking unsupported on this platform; skipping");
         } else {
             socket.set_tos_v4(tos)?;
         }
