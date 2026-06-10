@@ -237,17 +237,18 @@ impl ExternalIpMonitor {
     ) -> Result<(), String> {
         let stun_server = parse_stun_server(stun_src);
 
-        let server_addr: SocketAddr = stun_server
-            .parse()
-            .or_else(|_| {
-                use std::net::ToSocketAddrs;
-                stun_server
-                    .to_socket_addrs()
-                    .map_err(|e| e.to_string())?
-                    .find(|a| a.is_ipv4())
-                    .ok_or_else(|| "No IPv4 address found".to_string())
-            })
-            .map_err(|e| format!("Cannot resolve STUN server {stun_server}: {e}"))?;
+        // Async DNS — std::net::ToSocketAddrs blocks the tokio worker
+        // thread for up to the resolver timeout (5s per nameserver).
+        let server_addr: SocketAddr = match stun_server.parse() {
+            Ok(addr) => addr,
+            Err(_) => tokio::net::lookup_host(&stun_server)
+                .await
+                .map_err(|e| format!("Cannot resolve STUN server {stun_server}: {e}"))?
+                .find(SocketAddr::is_ipv4)
+                .ok_or_else(|| {
+                    format!("No IPv4 address found for STUN server {stun_server}")
+                })?,
+        };
 
         let socket = UdpSocket::bind(SocketAddr::new(bind_ip, 0))
             .await

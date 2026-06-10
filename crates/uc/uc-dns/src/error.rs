@@ -35,6 +35,13 @@ pub enum DnsError {
         reason: String,
     },
 
+    /// Resolver initialization failed.
+    #[error("DNS resolver initialization failed: {reason}")]
+    ResolverInit {
+        /// Error reason.
+        reason: String,
+    },
+
     /// Invalid SRV record.
     #[error("invalid SRV record: {reason}")]
     InvalidSrv {
