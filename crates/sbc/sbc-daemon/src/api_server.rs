@@ -137,6 +137,10 @@ impl MemStore {
     }
 
     /// Persists trunk groups to disk (atomic write via temp file + rename).
+    ///
+    /// Serialization happens inline; the disk I/O runs on the blocking
+    /// thread pool so callers holding the `mem_store` lock don't stall a
+    /// tokio worker on a slow disk.
     pub fn save_trunk_groups(&self) {
         let data = match serde_json::to_string_pretty(&self.trunk_groups) {
             Ok(d) => d,
@@ -145,8 +149,19 @@ impl MemStore {
                 return;
             }
         };
+        let count = self.trunk_groups.len();
+        tokio::task::spawn_blocking(move || Self::write_trunk_groups_file(&data, count));
+    }
+
+    /// Atomic, serialized write of the trunk-groups file (blocking context).
+    fn write_trunk_groups_file(data: &str, count: usize) {
+        // Serialize concurrent writers: two tasks sharing one temp path
+        // could otherwise interleave writes and rename a torn file.
+        static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = WRITE_LOCK.lock();
+
         let tmp_path = format!("{TRUNK_GROUPS_PATH}.tmp");
-        if let Err(e) = std::fs::write(&tmp_path, &data) {
+        if let Err(e) = std::fs::write(&tmp_path, data) {
             tracing::warn!(error = %e, "Failed to write {tmp_path}");
             return;
         }
@@ -165,7 +180,7 @@ impl MemStore {
             tracing::warn!(error = %e, "Failed to rename {tmp_path} to {TRUNK_GROUPS_PATH}");
             return;
         }
-        tracing::debug!(count = self.trunk_groups.len(), "Persisted trunk groups to {TRUNK_GROUPS_PATH}");
+        tracing::debug!(count, "Persisted trunk groups to {TRUNK_GROUPS_PATH}");
     }
 }
 
@@ -1277,9 +1292,12 @@ async fn get_trunk_group(
         Some(group) => {
             let mut group = group.clone();
             redact_trunk_group(&mut group);
-            Json(group)
+            (StatusCode::OK, Json(group))
         }
-        None => Json(serde_json::json!({ "error": format!("Trunk group {group_id} not found") })),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("Trunk group {group_id} not found") })),
+        ),
     }
 }
 
@@ -1871,8 +1889,11 @@ async fn get_phone(
 ) -> impl IntoResponse {
     let store = state.mem_store.read().await;
     match store.phones.get(&id) {
-        Some(phone) => Json(phone.clone()),
-        None => Json(serde_json::json!({ "error": format!("Phone {id} not found") })),
+        Some(phone) => (StatusCode::OK, Json(phone.clone())),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("Phone {id} not found") })),
+        ),
     }
 }
 
@@ -1891,12 +1912,25 @@ async fn update_phone(
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let mut store = state.mem_store.write().await;
-    if store.phones.contains_key(&id) {
-        store.phones.insert(id.clone(), body.clone());
-        Json(serde_json::json!({ "success": true, "phone": body }))
-    } else {
-        Json(serde_json::json!({ "success": false, "error": "Phone not found" }))
+    let Some(existing) = store.phones.get_mut(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "success": false, "error": "Phone not found" })),
+        );
+    };
+    // Merge into the stored record (a wholesale replace silently dropped
+    // fields the client omitted, e.g. id/status) and re-stamp the id.
+    if let (Some(obj), Some(updates)) = (existing.as_object_mut(), body.as_object()) {
+        for (k, v) in updates {
+            obj.insert(k.clone(), v.clone());
+        }
+        obj.insert("id".to_string(), serde_json::json!(id));
     }
+    let merged = existing.clone();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "success": true, "phone": merged })),
+    )
 }
 
 /// Reboot a phone.
@@ -1906,9 +1940,15 @@ async fn reboot_phone(
 ) -> impl IntoResponse {
     let store = state.mem_store.read().await;
     if store.phones.contains_key(&id) {
-        Json(serde_json::json!({ "success": true, "message": format!("Reboot initiated for {id}") }))
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "success": true, "message": format!("Reboot initiated for {id}") })),
+        )
     } else {
-        Json(serde_json::json!({ "success": false, "error": "Phone not found" }))
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "success": false, "error": "Phone not found" })),
+        )
     }
 }
 
@@ -2042,9 +2082,12 @@ async fn delete_partition(
 ) -> impl IntoResponse {
     if let Some(ref router) = state.cucm_router {
         router.write().await.remove_partition(&id);
-        Json(serde_json::json!({ "success": true, "id": id }))
+        (StatusCode::OK, Json(serde_json::json!({ "success": true, "id": id })))
     } else {
-        Json(serde_json::json!({ "success": false }))
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "success": false, "error": "CUCM router not configured" })),
+        )
     }
 }
 
@@ -2091,9 +2134,12 @@ async fn delete_css(
 ) -> impl IntoResponse {
     if let Some(ref router) = state.cucm_router {
         router.write().await.remove_css(&id);
-        Json(serde_json::json!({ "success": true, "id": id }))
+        (StatusCode::OK, Json(serde_json::json!({ "success": true, "id": id })))
     } else {
-        Json(serde_json::json!({ "success": false }))
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "success": false, "error": "CUCM router not configured" })),
+        )
     }
 }
 
@@ -2116,9 +2162,12 @@ async fn update_css(
             css.add_partition(p);
         }
         router.write().await.add_css(css);
-        Json(serde_json::json!({ "success": true, "id": id }))
+        (StatusCode::OK, Json(serde_json::json!({ "success": true, "id": id })))
     } else {
-        Json(serde_json::json!({ "success": false }))
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "success": false, "error": "CUCM router not configured" })),
+        )
     }
 }
 
@@ -2194,9 +2243,12 @@ async fn delete_route_pattern(
 ) -> impl IntoResponse {
     if let Some(ref router) = state.cucm_router {
         router.write().await.remove_route_pattern(&id);
-        Json(serde_json::json!({ "success": true, "id": id }))
+        (StatusCode::OK, Json(serde_json::json!({ "success": true, "id": id })))
     } else {
-        Json(serde_json::json!({ "success": false }))
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "success": false, "error": "CUCM router not configured" })),
+        )
     }
 }
 
@@ -2225,9 +2277,12 @@ async fn update_route_pattern(
             rp = rp.with_priority(p as u32);
         }
         router.write().await.add_route_pattern(rp);
-        Json(serde_json::json!({ "success": true, "id": id }))
+        (StatusCode::OK, Json(serde_json::json!({ "success": true, "id": id })))
     } else {
-        Json(serde_json::json!({ "success": false }))
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "success": false, "error": "CUCM router not configured" })),
+        )
     }
 }
 
@@ -2264,9 +2319,12 @@ async fn delete_route_list(
 ) -> impl IntoResponse {
     if let Some(ref router) = state.cucm_router {
         router.write().await.remove_route_list(&id);
-        Json(serde_json::json!({ "success": true, "id": id }))
+        (StatusCode::OK, Json(serde_json::json!({ "success": true, "id": id })))
     } else {
-        Json(serde_json::json!({ "success": false }))
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "success": false, "error": "CUCM router not configured" })),
+        )
     }
 }
 
@@ -2281,9 +2339,12 @@ async fn update_route_list(
         let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
         let rl = uc_routing::RouteList::new(&id, &name);
         router.write().await.add_route_list(rl);
-        Json(serde_json::json!({ "success": true, "id": id }))
+        (StatusCode::OK, Json(serde_json::json!({ "success": true, "id": id })))
     } else {
-        Json(serde_json::json!({ "success": false }))
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "success": false, "error": "CUCM router not configured" })),
+        )
     }
 }
 
