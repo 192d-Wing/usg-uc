@@ -1,92 +1,143 @@
 //! Health command implementation.
+//!
+//! Queries `GET /api/v1/system/health` on the daemon and renders the real
+//! component statuses. The daemon answers 200 for healthy/degraded and 503
+//! (with the same JSON body) when unhealthy, so the body is rendered for
+//! both and the exit code reflects the result.
 
-use crate::args::Args;
-use crate::output::OutputFormatter;
-use uc_health::{HealthChecker, HealthCheckerConfig, HealthStatus};
+use super::{CommandError, CommandResult};
+use crate::api::ApiClient;
+use crate::args::{Args, OutputFormat};
+use crate::output;
+use serde_json::Value;
 
 /// Runs the health command.
-pub fn run(args: &Args) {
-    let formatter = OutputFormatter::new(args.format);
+///
+/// # Errors
+///
+/// Returns a [`CommandError`] when the daemon cannot be reached,
+/// authentication fails, the response cannot be parsed, or the daemon
+/// reports itself unhealthy (non-2xx status).
+pub fn run(args: &Args) -> CommandResult {
+    let client = ApiClient::from_args(args)?;
+    let path = "/api/v1/system/health";
+    let resp = client.get_any_status(path)?;
 
-    println!("Health Check");
-    println!("============\n");
+    // 401 or a non-JSON error page should be reported as errors, not
+    // rendered as if they were health documents.
+    if resp.status == 401 {
+        return Err(client.status_error(path, &resp).into());
+    }
+    let Ok(health) = resp.json() else {
+        return Err(client.status_error(path, &resp).into());
+    };
 
-    // Create a health checker with simulated checks
-    let mut checker =
-        HealthChecker::new(HealthCheckerConfig::default()).with_version(env!("CARGO_PKG_VERSION"));
+    render(args, &health);
 
-    // Add checks
-    checker.register(Box::new(uc_health::check::AlwaysHealthyCheck::new(
-        "sbc_core",
-    )));
-    checker.register(Box::new(uc_health::check::MemoryCheck::new()));
-    checker.register(Box::new(uc_health::check::DiskCheck::new("/")));
+    if resp.is_success() {
+        Ok(())
+    } else {
+        Err(CommandError::new(format!(
+            "daemon reports unhealthy (HTTP {})",
+            resp.status
+        )))
+    }
+}
 
-    // Perform health check
-    let health = checker.check();
-
-    // Overall status
-    let status_str = health.status.as_str();
-    let is_healthy = health.is_healthy();
-    println!(
-        "Overall Status: {}",
-        formatter.format_status(status_str, is_healthy)
-    );
-    println!();
-
-    // Component statuses
-    println!("Components");
-    println!("----------");
-    for component in &health.components {
-        let healthy = component.status == HealthStatus::Healthy;
-        println!("  {}", formatter.format_status(&component.name, healthy));
-        if let Some(ref msg) = component.message {
-            println!("    Message: {msg}");
+/// Renders the health document in the requested format.
+fn render(args: &Args, health: &Value) {
+    match args.format {
+        OutputFormat::Json => output::print_json(health),
+        OutputFormat::Text => render_text(health),
+        OutputFormat::Table => {
+            let mut pairs = vec![
+                (
+                    "status".to_string(),
+                    output::scalar_to_string(&health["status"]),
+                ),
+                (
+                    "version".to_string(),
+                    output::scalar_to_string(&health["version"]),
+                ),
+                (
+                    "uptime_secs".to_string(),
+                    output::scalar_to_string(&health["uptime_secs"]),
+                ),
+            ];
+            pairs.extend(component_pairs(health));
+            println!("{}", output::format_pairs_table(&pairs));
         }
     }
+}
+
+/// Renders the health document as human-readable text.
+fn render_text(health: &Value) {
+    println!("Daemon Health");
+    println!("=============");
     println!();
-
-    // Summary
-    println!("Summary");
-    println!("-------");
-    println!("  Healthy:   {}", health.healthy_count());
-    println!("  Unhealthy: {}", health.unhealthy_count());
-    println!("  Total:     {}", health.components.len());
-
-    if let Some(version) = &health.version {
-        println!("\nVersion: {version}");
-    }
-
-    if let Some(uptime) = health.uptime_secs {
-        println!("Uptime:  {uptime}s");
-    }
-
-    // Liveness and readiness
-    println!();
-    println!("Probes");
-    println!("------");
     println!(
-        "  Liveness:  {}",
-        formatter.format_status("alive", checker.is_alive())
+        "Overall Status: {}",
+        output::scalar_to_string(&health["status"])
     );
+    println!("Version:        {}", output::scalar_to_string(&health["version"]));
     println!(
-        "  Readiness: {}",
-        formatter.format_status("ready", checker.is_ready())
+        "Uptime:         {}s",
+        output::scalar_to_string(&health["uptime_secs"])
     );
+
+    let components = component_pairs(health);
+    if !components.is_empty() {
+        println!();
+        println!("Components");
+        println!("----------");
+        println!("{}", output::format_pairs_text(&components));
+    }
+}
+
+/// Extracts `component name -> status (message)` pairs.
+fn component_pairs(health: &Value) -> Vec<(String, String)> {
+    health["components"]
+        .as_array()
+        .map_or_else(Vec::new, |components| {
+            components
+                .iter()
+                .map(|c| {
+                    let name = output::scalar_to_string(&c["name"]);
+                    let mut status = output::scalar_to_string(&c["status"]);
+                    if let Some(message) = c["message"].as_str() {
+                        status = format!("{status} ({message})");
+                    }
+                    (name, status)
+                })
+                .collect()
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::args::OutputFormat;
+    use serde_json::json;
 
     #[test]
-    fn test_health_command() {
-        let args = Args {
-            format: OutputFormat::Text,
-            ..Default::default()
-        };
+    fn test_component_pairs() {
+        let health = json!({
+            "status": "healthy",
+            "components": [
+                {"name": "sip", "status": "healthy", "message": null},
+                {"name": "media", "status": "degraded", "message": "high jitter"},
+            ],
+        });
+        let pairs = component_pairs(&health);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0], ("sip".to_string(), "healthy".to_string()));
+        assert_eq!(
+            pairs[1],
+            ("media".to_string(), "degraded (high jitter)".to_string())
+        );
+    }
 
-        run(&args);
+    #[test]
+    fn test_component_pairs_missing() {
+        assert!(component_pairs(&json!({"status": "healthy"})).is_empty());
     }
 }

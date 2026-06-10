@@ -13,10 +13,9 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
-uc-types.workspace = true
 sbc-config = { path = "../sbc-config" }
-uc-health.workspace = true
-uc-metrics.workspace = true
+serde_json.workspace = true
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [[bin]]
 name = "sbc-cli"

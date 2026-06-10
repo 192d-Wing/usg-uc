@@ -1,168 +1,120 @@
 //! Output formatting for CLI.
+//!
+//! In `--json` mode each command emits exactly one parseable JSON
+//! document on stdout (via [`print_json`]) and nothing else; all
+//! human-oriented formatting is reserved for the text and table modes.
 
-use crate::args::OutputFormat;
-use std::collections::HashMap;
+use serde_json::Value;
 
-/// Formats output based on the specified format.
-pub struct OutputFormatter {
-    /// Output format.
-    format: OutputFormat,
+/// Prints a value as a single pretty-printed JSON document on stdout.
+pub fn print_json(value: &Value) {
+    // `to_string_pretty` only fails for non-string map keys or failing
+    // `Serialize` impls; `Value` has neither, so fall back to compact form.
+    let rendered =
+        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+    println!("{rendered}");
 }
 
-impl OutputFormatter {
-    /// Creates a new formatter.
-    pub const fn new(format: OutputFormat) -> Self {
-        Self { format }
-    }
-
-    /// Formats a key-value pair.
-    pub fn format_kv(&self, key: &str, value: &str) -> String {
-        match self.format {
-            OutputFormat::Text => format!("{key}: {value}"),
-            OutputFormat::Json => format!(r#""{key}": "{value}""#),
-            OutputFormat::Table => format!("| {key:<20} | {value:<40} |"),
-        }
-    }
-
-    /// Formats a map of key-value pairs.
-    pub fn format_map(&self, map: &HashMap<String, String>) -> String {
-        match self.format {
-            OutputFormat::Text => map
-                .iter()
-                .map(|(k, v)| format!("{k}: {v}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            OutputFormat::Json => {
-                let pairs: Vec<String> = map
-                    .iter()
-                    .map(|(k, v)| format!(r#"  "{k}": "{v}""#))
-                    .collect();
-                format!("{{\n{}\n}}", pairs.join(",\n"))
-            }
-            OutputFormat::Table => {
-                use std::fmt::Write;
-                let mut output = String::new();
-                let _ = writeln!(output, "+{:-<22}+{:-<42}+", "", "");
-                let _ = writeln!(output, "| {:^20} | {:^40} |", "Key", "Value");
-                let _ = writeln!(output, "+{:-<22}+{:-<42}+", "", "");
-                for (k, v) in map {
-                    let _ = writeln!(output, "| {k:<20} | {v:<40} |");
-                }
-                let _ = write!(output, "+{:-<22}+{:-<42}+", "", "");
-                output
-            }
-        }
-    }
-
-    /// Formats a status message.
-    pub fn format_status(&self, status: &str, healthy: bool) -> String {
-        match self.format {
-            OutputFormat::Text => {
-                let indicator = if healthy { "✓" } else { "✗" };
-                format!("{indicator} {status}")
-            }
-            OutputFormat::Json => {
-                format!(r#"{{"status": "{status}", "healthy": {healthy}}}"#)
-            }
-            OutputFormat::Table => {
-                let indicator = if healthy { "HEALTHY" } else { "UNHEALTHY" };
-                format!("| {status:<20} | {indicator:<40} |")
-            }
-        }
-    }
-
-    /// Formats an error message.
-    pub fn format_error(&self, message: &str) -> String {
-        match self.format {
-            OutputFormat::Text => format!("Error: {message}"),
-            OutputFormat::Json => format!(r#"{{"error": "{message}"}}"#),
-            OutputFormat::Table => format!("| ERROR | {message:<40} |"),
-        }
-    }
-
-    /// Formats a list of items.
-    pub fn format_list<T: std::fmt::Display>(&self, items: &[T]) -> String {
-        match self.format {
-            OutputFormat::Text => items
-                .iter()
-                .map(|i| format!("  - {i}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            OutputFormat::Json => {
-                let json_items: Vec<String> = items.iter().map(|i| format!(r#""{i}""#)).collect();
-                format!("[{}]", json_items.join(", "))
-            }
-            OutputFormat::Table => items
-                .iter()
-                .map(|i| format!("| {i:<62} |"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        }
-    }
+/// Renders ordered key/value pairs as aligned plain-text lines.
+pub fn format_pairs_text(pairs: &[(String, String)]) -> String {
+    let width = pairs.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{k:<width$}  {v}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-/// Helper to print formatted output.
-pub fn print_formatted(format: OutputFormat, content: &str) {
-    println!("{content}");
-    if format == OutputFormat::Json {
-        // JSON output gets a trailing newline for cleaner piping
+/// Renders ordered key/value pairs as an ASCII table.
+pub fn format_pairs_table(pairs: &[(String, String)]) -> String {
+    use std::fmt::Write;
+    let mut output = String::new();
+    let _ = writeln!(output, "+{:-<22}+{:-<42}+", "", "");
+    let _ = writeln!(output, "| {:^20} | {:^40} |", "Key", "Value");
+    let _ = writeln!(output, "+{:-<22}+{:-<42}+", "", "");
+    for (k, v) in pairs {
+        let _ = writeln!(output, "| {k:<20} | {v:<40} |");
+    }
+    let _ = write!(output, "+{:-<22}+{:-<42}+", "", "");
+    output
+}
+
+/// Flattens a JSON object into ordered key/value display pairs.
+///
+/// Nested arrays and objects are rendered as compact JSON.
+pub fn object_to_pairs(value: &Value) -> Vec<(String, String)> {
+    value.as_object().map_or_else(Vec::new, |map| {
+        map.iter()
+            .map(|(k, v)| (k.clone(), scalar_to_string(v)))
+            .collect()
+    })
+}
+
+/// Renders a scalar JSON value without surrounding quotes.
+pub fn scalar_to_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Null => "null".to_string(),
+        other => other.to_string(),
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
-    fn test_format_kv_text() {
-        let formatter = OutputFormatter::new(OutputFormat::Text);
-        let output = formatter.format_kv("status", "running");
-        assert_eq!(output, "status: running");
+    fn test_print_json_roundtrip() {
+        // Values with quotes/newlines must stay valid JSON via serde_json.
+        let value = json!({"message": "line1\nline2 \"quoted\""});
+        let rendered = serde_json::to_string_pretty(&value).unwrap();
+        let parsed: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed, value);
     }
 
     #[test]
-    fn test_format_kv_json() {
-        let formatter = OutputFormatter::new(OutputFormat::Json);
-        let output = formatter.format_kv("status", "running");
-        assert_eq!(output, r#""status": "running""#);
+    fn test_format_pairs_text() {
+        let pairs = vec![
+            ("status".to_string(), "running".to_string()),
+            ("calls_active".to_string(), "3".to_string()),
+        ];
+        let output = format_pairs_text(&pairs);
+        assert!(output.contains("status"));
+        assert!(output.contains("running"));
+        assert!(output.contains("calls_active"));
     }
 
     #[test]
-    fn test_format_status() {
-        let formatter = OutputFormatter::new(OutputFormat::Text);
-        let output = formatter.format_status("Database", true);
-        assert!(output.contains("✓"));
-
-        let output = formatter.format_status("Cache", false);
-        assert!(output.contains("✗"));
+    fn test_format_pairs_table() {
+        let pairs = vec![("key1".to_string(), "value1".to_string())];
+        let output = format_pairs_table(&pairs);
+        assert!(output.contains("| key1"));
+        assert!(output.contains("value1"));
+        assert!(output.contains("+--"));
     }
 
     #[test]
-    fn test_format_error() {
-        let formatter = OutputFormatter::new(OutputFormat::Text);
-        let output = formatter.format_error("Connection failed");
-        assert!(output.contains("Error:"));
-
-        let formatter = OutputFormatter::new(OutputFormat::Json);
-        let output = formatter.format_error("Connection failed");
-        assert!(output.contains("error"));
+    fn test_object_to_pairs() {
+        let value = json!({"name": "sbc-01", "calls": 42, "tags": ["a", "b"]});
+        let pairs = object_to_pairs(&value);
+        assert_eq!(pairs.len(), 3);
+        assert!(pairs.contains(&("name".to_string(), "sbc-01".to_string())));
+        assert!(pairs.contains(&("calls".to_string(), "42".to_string())));
+        assert!(pairs.contains(&("tags".to_string(), "[\"a\",\"b\"]".to_string())));
     }
 
     #[test]
-    fn test_format_list() {
-        let formatter = OutputFormatter::new(OutputFormat::Text);
-        let items = vec!["item1", "item2", "item3"];
-        let output = formatter.format_list(&items);
-        assert!(output.contains("item1"));
-        assert!(output.contains("item2"));
+    fn test_object_to_pairs_non_object() {
+        assert!(object_to_pairs(&json!([1, 2, 3])).is_empty());
     }
 
     #[test]
-    fn test_format_map() {
-        let formatter = OutputFormatter::new(OutputFormat::Text);
-        let mut map = HashMap::new();
-        map.insert("key1".to_string(), "value1".to_string());
-        let output = formatter.format_map(&map);
-        assert!(output.contains("key1: value1"));
+    fn test_scalar_to_string() {
+        assert_eq!(scalar_to_string(&json!("text")), "text");
+        assert_eq!(scalar_to_string(&json!(7)), "7");
+        assert_eq!(scalar_to_string(&json!(null)), "null");
+        assert_eq!(scalar_to_string(&json!(true)), "true");
     }
 }

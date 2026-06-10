@@ -1,62 +1,41 @@
 //! Status command implementation.
+//!
+//! Queries `GET /api/v1/system/stats` on the daemon and renders the real
+//! statistics. No data is synthesized client-side.
 
-use crate::args::Args;
-use crate::output::OutputFormatter;
-use std::collections::HashMap;
+use super::CommandResult;
+use crate::api::ApiClient;
+use crate::args::{Args, OutputFormat};
+use crate::output;
 
 /// Runs the status command.
-pub fn run(args: &Args) {
-    let formatter = OutputFormatter::new(args.format);
+///
+/// # Errors
+///
+/// Returns a [`super::CommandError`] when the daemon cannot be reached,
+/// authentication fails, or the response cannot be parsed.
+pub fn run(args: &Args) -> CommandResult {
+    let client = ApiClient::from_args(args)?;
+    let stats = client.get("/api/v1/system/stats")?.json()?;
 
-    // In production, would query the SBC API
-    // For now, show simulated status
-
-    println!("SBC Status");
-    println!("==========\n");
-
-    let mut status = HashMap::new();
-    status.insert("Instance".to_string(), "sbc-01".to_string());
-    status.insert("State".to_string(), "Running".to_string());
-    status.insert("Uptime".to_string(), "12h 34m 56s".to_string());
-    status.insert("Version".to_string(), env!("CARGO_PKG_VERSION").to_string());
-
-    println!("{}", formatter.format_map(&status));
-    println!();
-
-    println!("Call Statistics");
-    println!("---------------");
-    let mut call_stats = HashMap::new();
-    call_stats.insert("Active Calls".to_string(), "42".to_string());
-    call_stats.insert("Total Calls (24h)".to_string(), "1,234".to_string());
-    call_stats.insert("Failed Calls (24h)".to_string(), "23".to_string());
-    call_stats.insert("Success Rate".to_string(), "98.1%".to_string());
-
-    println!("{}", formatter.format_map(&call_stats));
-    println!();
-
-    println!("Resource Usage");
-    println!("--------------");
-    let mut resources = HashMap::new();
-    resources.insert("CPU".to_string(), "15%".to_string());
-    resources.insert("Memory".to_string(), "512 MB (25%)".to_string());
-    resources.insert("Connections".to_string(), "156".to_string());
-    resources.insert("RTP Streams".to_string(), "84".to_string());
-
-    println!("{}", formatter.format_map(&resources));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::args::OutputFormat;
-
-    #[test]
-    fn test_status_command() {
-        let args = Args {
-            format: OutputFormat::Text,
-            ..Default::default()
-        };
-
-        run(&args);
+    match args.format {
+        OutputFormat::Json => output::print_json(&stats),
+        OutputFormat::Text => {
+            println!("SBC Status ({})", args.api_url);
+            println!("==========");
+            println!();
+            println!(
+                "{}",
+                output::format_pairs_text(&output::object_to_pairs(&stats))
+            );
+        }
+        OutputFormat::Table => {
+            println!(
+                "{}",
+                output::format_pairs_table(&output::object_to_pairs(&stats))
+            );
+        }
     }
+
+    Ok(())
 }

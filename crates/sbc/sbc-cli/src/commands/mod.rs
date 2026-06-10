@@ -3,8 +3,11 @@
 pub mod calls;
 pub mod config;
 pub mod health;
+pub mod login;
 pub mod metrics;
 pub mod status;
+
+use crate::api::ApiError;
 
 /// Command execution error.
 #[derive(Debug)]
@@ -27,6 +30,12 @@ impl CommandError {
         Self {
             message: message.into(),
         }
+    }
+}
+
+impl From<ApiError> for CommandError {
+    fn from(err: ApiError) -> Self {
+        Self::new(err.message)
     }
 }
 
