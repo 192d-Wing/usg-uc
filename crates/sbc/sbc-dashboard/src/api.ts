@@ -1,9 +1,15 @@
 // Minimal fetch wrapper for the SBC's /api/v1 surface. Used by all pages.
 // Same-origin in production (dashboard served by the sbc-frontend nginx pod,
-// which reverse-proxies /api to the SBC daemon's ClusterIP Service); the
-// Vite dev server proxies /api → http://localhost:8080 (see vite.config.ts).
+// which reverse-proxies /api to sbc-api); the Vite dev server proxies /api
+// (see vite.config.ts).
+//
+// Auth: sbc-api issues an HttpOnly sbc_session cookie on login, sent
+// automatically on same-origin requests. A 401 on any call fires
+// UNAUTHORIZED_EVENT so the auth gate can show the login view.
 
 const API_BASE = '/api/v1';
+
+export const UNAUTHORIZED_EVENT = 'sbc:unauthorized';
 
 export class ApiError extends Error {
   constructor(
@@ -19,9 +25,12 @@ export class ApiError extends Error {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const url = `${API_BASE}${path}`;
   const res = await fetch(url, {
-    headers: { 'Content-Type': 'application/json', ...init?.headers },
     ...init,
+    headers: { 'Content-Type': 'application/json', ...init?.headers },
   });
+  if (res.status === 401 && path !== '/auth/login') {
+    globalThis.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+  }
   if (!res.ok) {
     let detail = '';
     try {

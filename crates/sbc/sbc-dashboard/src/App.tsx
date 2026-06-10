@@ -5,6 +5,8 @@ import TopNavigation from '@cloudscape-design/components/top-navigation';
 import { Mode } from '@cloudscape-design/global-styles';
 
 import { Sidebar } from './components/Sidebar';
+import { AuthGate } from './components/AuthGate';
+import { api, UNAUTHORIZED_EVENT } from './api';
 import { getStoredMode, persistMode } from './theme';
 import { Dashboard } from './pages/Dashboard';
 import { Phones } from './pages/Phones';
@@ -31,8 +33,19 @@ export function App() {
     persistMode(next);
   };
 
+  const signOut = () => {
+    api
+      .post('/auth/logout', {})
+      .catch(() => {
+        // Session may already be gone; show login either way.
+      })
+      .finally(() => {
+        globalThis.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+      });
+  };
+
   return (
-    <>
+    <AuthGate>
       <TopNavigation
         identity={{
           href: '/',
@@ -48,6 +61,11 @@ export function App() {
             text: mode === Mode.Dark ? 'Light mode' : 'Dark mode',
             ariaLabel: 'Toggle color theme',
             onClick: toggleTheme,
+          },
+          {
+            type: 'button',
+            text: 'Sign out',
+            onClick: signOut,
           },
         ]}
       />
@@ -75,6 +93,6 @@ export function App() {
           </Routes>
         }
       />
-    </>
+    </AuthGate>
   );
 }
