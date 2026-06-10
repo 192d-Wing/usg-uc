@@ -108,6 +108,18 @@ struct TokenBucket {
     window_start: Instant,
 }
 
+/// Cap on per-IP token buckets before idle eviction kicks in. Bounds memory
+/// against spoofed-source floods.
+const MAX_TRACKED_SOURCES: usize = 65_536;
+
+/// A bucket idle this long is evicted under memory pressure (a quiet
+/// returning source simply starts with a full bucket again).
+const BUCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Minimum spacing between idle-bucket sweeps, so a flood of new sources at
+/// capacity cannot trigger an O(n) scan on every packet.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
 impl TokenBucket {
     /// Creates a new token bucket.
     fn new(burst: u32) -> Self {
@@ -118,6 +130,11 @@ impl TokenBucket {
             request_count: 0,
             window_start: now,
         }
+    }
+
+    /// Whether this bucket has seen no traffic for `idle`.
+    fn is_idle(&self, idle: Duration) -> bool {
+        self.last_update.elapsed() >= idle
     }
 
     /// Updates the token bucket and tries to consume a token.
@@ -189,6 +206,8 @@ pub struct RateLimiter {
     global_bucket: TokenBucket,
     /// Blocked sources.
     blocked: HashMap<IpAddr, BlockEntry>,
+    /// Last time the per-IP bucket map was swept for idle entries.
+    last_sweep: Instant,
 }
 
 impl RateLimiter {
@@ -200,6 +219,7 @@ impl RateLimiter {
             buckets: HashMap::new(),
             global_bucket,
             blocked: HashMap::new(),
+            last_sweep: Instant::now(),
         }
     }
 
@@ -255,8 +275,29 @@ impl RateLimiter {
             }
         }
 
-        // Get or create bucket
+        // Get or create bucket. Spoofed UDP source addresses can otherwise
+        // grow the per-IP map without bound.
         let (allowed, rate) = if self.config.per_ip {
+            let known = self.buckets.contains_key(&source);
+            if !known && self.buckets.len() >= MAX_TRACKED_SOURCES {
+                // At capacity with a new source. Sweep idle buckets at most
+                // once per second (a full retain on every packet would be an
+                // O(n) scan per packet under the caller's lock during a
+                // flood — the very condition the cap defends against).
+                if self.last_sweep.elapsed() >= SWEEP_INTERVAL {
+                    self.buckets
+                        .retain(|_, bucket| !bucket.is_idle(BUCKET_IDLE_TIMEOUT));
+                    self.last_sweep = Instant::now();
+                }
+                // Still full after the sweep (an active flood keeps every
+                // bucket fresh): reject without inserting, so the map is a
+                // hard cap instead of growing unbounded. Legitimate sources
+                // already tracked are unaffected; collateral on a genuinely
+                // new source during a flood is acceptable shedding.
+                if self.buckets.len() >= MAX_TRACKED_SOURCES {
+                    return RateLimitAction::Reject;
+                }
+            }
             let bucket = self
                 .buckets
                 .entry(source)

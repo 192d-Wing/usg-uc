@@ -149,6 +149,20 @@ impl ShutdownSignal {
                 }
             }
         }
+
+        // Shutdown is in progress. A second termination signal means the
+        // operator wants out NOW (e.g. the drain is hung) — exit instead of
+        // ignoring further Ctrl+C.
+        tokio::select! {
+            _ = sigterm.recv() => {
+                warn!("Second termination signal during shutdown — exiting immediately");
+                std::process::exit(130);
+            }
+            _ = sigint.recv() => {
+                warn!("Second termination signal during shutdown — exiting immediately");
+                std::process::exit(130);
+            }
+        }
     }
 
     /// Internal signal handler loop for non-Unix platforms.
@@ -215,7 +229,11 @@ impl ConnectionTracker {
 
     /// Decrements the active call count.
     pub fn call_ended(&self) {
-        self.active_calls.fetch_sub(1, Ordering::SeqCst);
+        // Saturating decrement: an unmatched *_ended() must not wrap to
+        // ~4 billion and make is_drained() permanently false.
+        let _ = self
+            .active_calls
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1));
     }
 
     /// Returns the active call count.
@@ -230,7 +248,11 @@ impl ConnectionTracker {
 
     /// Decrements the active transaction count.
     pub fn transaction_ended(&self) {
-        self.active_transactions.fetch_sub(1, Ordering::SeqCst);
+        // Saturating decrement: an unmatched *_ended() must not wrap to
+        // ~4 billion and make is_drained() permanently false.
+        let _ = self
+            .active_transactions
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1));
     }
 
     /// Returns the active transaction count.
@@ -245,7 +267,11 @@ impl ConnectionTracker {
 
     /// Decrements the pending registration count.
     pub fn registration_ended(&self) {
-        self.pending_registrations.fetch_sub(1, Ordering::SeqCst);
+        // Saturating decrement: an unmatched *_ended() must not wrap to
+        // ~4 billion and make is_drained() permanently false.
+        let _ = self
+            .pending_registrations
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1));
     }
 
     /// Returns the pending registration count.
@@ -339,6 +365,13 @@ impl ShutdownCoordinator {
     /// 1. Signals shutdown to stop accepting new connections
     /// 2. Polls active connections until drained or timeout
     /// 3. Returns the final shutdown phase with statistics
+    ///
+    /// NOTE: the daemon's live drain is performed inside the SIP server loop
+    /// (`Server::run` enters draining mode and polls the real call count).
+    /// This method's [`ConnectionTracker`] is a self-contained utility — it
+    /// is only meaningful if callers actually invoke `call_started`/
+    /// `call_ended`; the daemon does not, so `Runtime::run` does not call
+    /// this. Wire the tracker into call lifecycle before relying on it.
     #[allow(clippy::cast_possible_truncation)]
     pub async fn shutdown_gracefully(&self) -> DrainResult {
         let phase = self.initiate_shutdown();

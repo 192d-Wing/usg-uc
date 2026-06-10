@@ -5744,6 +5744,7 @@ dependencies = [
  "proto-stun",
  "proto-transaction",
  "proto-turn",
+ "rand 0.8.6",
  "rustls",
  "rustls-pki-types",
  "sbc-config",

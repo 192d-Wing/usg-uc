@@ -83,9 +83,16 @@ pub struct SipStack {
     inbound_trunk_map: RwLock<std::collections::HashMap<std::net::IpAddr, (String, Option<String>)>>,
     /// Directory number mapping: DID → username for inbound call routing.
     did_map: RwLock<std::collections::HashMap<String, String>>,
+    /// Call-IDs currently being played an announcement (dedup retransmits).
+    /// Arc so the spawned playback task can remove its entry when done —
+    /// previously entries were never removed (unbounded growth from
+    /// unroutable INVITEs).
+    announcement_calls: Arc<tokio::sync::RwLock<std::collections::HashSet<String>>>,
     /// Registration statistics.
     registrations_active: AtomicU64,
     registrations_total: AtomicU64,
+    /// Draining: reject new INVITEs (503) while existing calls finish.
+    draining: std::sync::atomic::AtomicBool,
 }
 
 /// SIP stack configuration.
@@ -105,6 +112,9 @@ pub struct SipStackConfig {
     pub require_auth: bool,
     /// Static credentials: username → password (for standalone deployment).
     pub auth_credentials: HashMap<String, String>,
+    /// Maximum concurrent calls — INVITEs beyond this are rejected with
+    /// 503 (admission control, `general.max_calls`).
+    pub max_calls: u32,
 }
 
 impl Default for SipStackConfig {
@@ -117,6 +127,7 @@ impl Default for SipStackConfig {
             auth_realm: "sbc.local".to_string(),
             require_auth: false,
             auth_credentials: HashMap::new(),
+            max_calls: 1000,
         }
     }
 }
@@ -139,24 +150,57 @@ struct TransactionStore {
 struct ServerInviteState {
     transaction: ServerInviteTransaction,
     source: SbcSocketAddr,
+    created_at: std::time::Instant,
 }
 
 /// State for server non-INVITE transaction.
 struct ServerNonInviteState {
     transaction: ServerNonInviteTransaction,
     source: SbcSocketAddr,
+    created_at: std::time::Instant,
 }
 
 /// State for client INVITE transaction.
 struct ClientInviteState {
     transaction: ClientInviteTransaction,
     destination: SbcSocketAddr,
+    created_at: std::time::Instant,
 }
 
 /// State for client non-INVITE transaction.
 struct ClientNonInviteState {
     transaction: ClientNonInviteTransaction,
     destination: SbcSocketAddr,
+    created_at: std::time::Instant,
+}
+
+impl TransactionStore {
+    /// Sweep threshold: once any map exceeds this, expired entries are
+    /// purged on the next insert. Bounds memory against INVITE floods —
+    /// transaction entries were never removed otherwise.
+    const SWEEP_THRESHOLD: usize = 1024;
+
+    /// RFC 3261 Timer-derived transaction lifetime (64*T1 = 32s, doubled
+    /// for safety margin).
+    const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(64);
+
+    /// Removes transactions older than [`Self::MAX_AGE`] once any map has
+    /// grown past [`Self::SWEEP_THRESHOLD`]. Amortized O(1) per insert.
+    fn sweep_if_needed(&mut self) {
+        let over = self.server_invite.len().max(self.client_invite.len())
+            .max(self.server_non_invite.len())
+            .max(self.client_non_invite.len())
+            > Self::SWEEP_THRESHOLD;
+        if !over {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let young = |created: std::time::Instant| now.duration_since(created) < Self::MAX_AGE;
+        self.server_invite.retain(|_, s| young(s.created_at));
+        self.server_non_invite.retain(|_, s| young(s.created_at));
+        self.client_invite.retain(|_, s| young(s.created_at));
+        self.client_non_invite.retain(|_, s| young(s.created_at));
+    }
 }
 
 /// Store for active dialogs.
@@ -182,8 +226,6 @@ struct CallCorrelation {
     b_leg: HashMap<String, CallId>,
     /// Maps internal CallId → call addressing info.
     addresses: HashMap<CallId, CallAddresses>,
-    /// Call-IDs currently being handled by announcement playback (dedup retransmits).
-    announcement_calls: std::collections::HashSet<String>,
 }
 
 /// Addressing info for both legs of a B2BUA call.
@@ -201,6 +243,25 @@ struct CallAddresses {
     local_addr: String,
     /// Failover trunk IDs for retry on B-leg failure.
     failover_trunks: Vec<String>,
+    /// Via header values from the original A-leg INVITE (responses to the
+    /// A-leg must carry these, not the B-leg's Via).
+    a_leg_via: Vec<String>,
+    /// From header of the original A-leg INVITE (caller, with tag).
+    a_leg_from: String,
+    /// To header of the original A-leg INVITE (no tag until answered).
+    a_leg_to: String,
+    /// CSeq value of the original A-leg INVITE (e.g. "314 INVITE").
+    a_leg_cseq: String,
+    /// From header sent on the B-leg INVITE (includes our from-tag).
+    b_leg_from: String,
+    /// To header sent on the B-leg INVITE (no tag until answered).
+    b_leg_to: String,
+    /// Top Via branch of the B-leg INVITE (CANCEL must mirror it; also
+    /// used to validate that responses belong to our client transaction).
+    b_leg_branch: String,
+    /// Remote (callee) tag learned from the first tagged B-leg response.
+    /// Completes the dialog identity on both legs.
+    dialog_to_tag: Option<String>,
 }
 
 /// Result of processing a SIP message.
@@ -267,10 +328,14 @@ impl SipStack {
             topology_hider: None,
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
+            draining: std::sync::atomic::AtomicBool::new(false),
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
             did_map: RwLock::new(std::collections::HashMap::new()),
+            announcement_calls: Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashSet::new(),
+            )),
         }
     }
 
@@ -313,16 +378,31 @@ impl SipStack {
             topology_hider: None,
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
+            draining: std::sync::atomic::AtomicBool::new(false),
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
             did_map: RwLock::new(std::collections::HashMap::new()),
+            announcement_calls: Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashSet::new(),
+            )),
         }
     }
 
     /// Sets the media pipeline for RTP relay.
     pub fn set_media_pipeline(&mut self, pipeline: Arc<crate::media_pipeline::MediaPipeline>) {
         self.media_pipeline = Some(pipeline);
+    }
+
+    /// Enters draining mode: new INVITEs are rejected with 503 while
+    /// existing dialogs continue (graceful shutdown).
+    pub fn set_draining(&self) {
+        self.draining.store(true, Ordering::Relaxed);
+    }
+
+    /// Number of active B2BUA calls (drain progress).
+    pub async fn active_call_count(&self) -> usize {
+        self.calls.read().await.calls.len()
     }
 
     /// Sets the zone registry for zone-aware SIP processing.
@@ -677,8 +757,51 @@ impl SipStack {
             warn!(call_id = %sip_call_id, "No addresses for call");
             return ProcessResult::NoAction;
         };
-        let addrs = a.clone();
+        let mut addrs = a.clone();
         drop(corr);
+
+        // Transaction validation (RFC 3261 §17.1.3): the response's top Via
+        // branch must match our B-leg client transaction and the CSeq method
+        // must be INVITE. Matching on Call-ID alone let anyone who learned
+        // the B-leg Call-ID inject a forged 200 OK.
+        let via_branch_ok = resp
+            .headers
+            .get_value(&HeaderName::Via)
+            .and_then(|v| extract_param(v, "branch"))
+            .is_some_and(|branch| branch == addrs.b_leg_branch);
+        if !via_branch_ok {
+            debug!(
+                call_id = %sip_call_id,
+                "Response Via branch does not match client transaction, ignoring"
+            );
+            return ProcessResult::NoAction;
+        }
+        let cseq_method_invite = resp
+            .headers
+            .cseq()
+            .map(str::trim)
+            .is_some_and(|c| c.ends_with("INVITE"));
+        if !cseq_method_invite {
+            debug!(call_id = %sip_call_id, "Non-INVITE response on call, ignoring");
+            return ProcessResult::NoAction;
+        }
+
+        // Learn the remote (callee) tag from the first tagged response —
+        // it completes the dialog identity used by in-dialog BYE/ACK.
+        if addrs.dialog_to_tag.is_none() {
+            if let Some(tag) = resp
+                .headers
+                .get_value(&HeaderName::To)
+                .and_then(|to| extract_param(to, "tag"))
+                .map(String::from)
+            {
+                addrs.dialog_to_tag = Some(tag.clone());
+                let mut corr = self.call_correlation.write().await;
+                if let Some(entry) = corr.addresses.get_mut(&internal_id) {
+                    entry.dialog_to_tag = Some(tag);
+                }
+            }
+        }
 
         // Handle based on status code class
         if status_code == 100 {
@@ -723,19 +846,11 @@ impl SipStack {
             }
         }
 
-        // Build provisional response for A-leg with A-leg's Call-ID
-        let mut a_response = proto_sip::message::SipResponse::new(resp.status);
+        // Build provisional response for A-leg with the A-leg dialog's
+        // own Via/From/To/CSeq.
+        let mut a_response = build_a_leg_response(resp.status, addrs);
 
-        // Copy Via from A-leg (original request's Via, not B-leg's)
-        // For now, copy from B-leg response and trust the headers
-        copy_response_headers(resp, &mut a_response);
-
-        // Replace Call-ID with A-leg's
-        a_response
-            .headers
-            .set(HeaderName::CallId, &addrs.a_leg_sip_call_id);
-
-        // If 183 with SDP, rewrite SDP for A-leg
+        // If 183 with SDP, rewrite SDP for A-leg (early media / ringback)
         if status_code == 183
             && let Some(ref body) = resp.body {
                 let sdp_str = String::from_utf8_lossy(body);
@@ -744,7 +859,14 @@ impl SipStack {
                 let result = self
                     .sdp_rewriter
                     .rewrite_answer_for_a_leg(&sdp_str, &local_media);
-                a_response.body = Some(Bytes::from(result.rewritten));
+                let rewritten = Bytes::from(result.rewritten);
+                // build_a_leg_response set Content-Length: 0; correct it to
+                // the attached body length or the A-leg UA truncates the SDP
+                // and the caller gets no early media.
+                a_response
+                    .headers
+                    .set(HeaderName::ContentLength, rewritten.len().to_string());
+                a_response.body = Some(rewritten);
                 a_response
                     .headers
                     .set(HeaderName::ContentType, "application/sdp");
@@ -789,12 +911,9 @@ impl SipStack {
             }
         }
 
-        // Build 200 OK for A-leg with rewritten SDP
-        let mut a_response = proto_sip::message::SipResponse::new(StatusCode::OK);
-        copy_response_headers(resp, &mut a_response);
-        a_response
-            .headers
-            .set(HeaderName::CallId, &addrs.a_leg_sip_call_id);
+        // Build 200 OK for A-leg with rewritten SDP, carrying the A-leg
+        // dialog's own Via/From/To/CSeq.
+        let mut a_response = build_a_leg_response(StatusCode::OK, addrs);
 
         // Rewrite SDP for A-leg
         if let Some(ref body) = resp.body {
@@ -816,13 +935,27 @@ impl SipStack {
             }
         }
 
-        // Build ACK for B-leg
+        // Build ACK for B-leg. The ACK belongs to the B-leg dialog: it
+        // must carry the INVITE's From (our tag), the To with the callee's
+        // tag, and the INVITE's CSeq number with method ACK (RFC 3261
+        // §13.2.2.4). The previous bare ACK (Call-ID + "1 ACK" only) was
+        // unmatchable, so far ends kept retransmitting their 200 OK.
         let b_leg_uri = SipUri::new(addrs.b_leg_destination.ip().to_string())
             .with_port(addrs.b_leg_destination.port());
         let mut ack_request = proto_sip::message::SipRequest::new(Method::Ack, b_leg_uri);
         ack_request.headers.set(HeaderName::CallId, &addrs.b_leg_sip_call_id);
         ack_request.headers.set(HeaderName::CSeq, "1 ACK");
-        let _local_ip = addrs.local_addr.split(':').next().unwrap_or("0.0.0.0");
+        ack_request.headers.set(HeaderName::From, &addrs.b_leg_from);
+        ack_request.headers.set(
+            HeaderName::To,
+            resp.headers
+                .get_value(&HeaderName::To)
+                .map_or_else(
+                    || with_tag(&addrs.b_leg_to, addrs.dialog_to_tag.as_deref()),
+                    String::from,
+                ),
+        );
+        ack_request.headers.set(HeaderName::MaxForwards, "70");
         let branch = generate_branch();
         ack_request.headers.add(Header::new(
             HeaderName::Via,
@@ -884,6 +1017,28 @@ impl SipStack {
                     .max_forwards(70);
 
                 if let Ok(new_request) = builder.build_with_defaults() {
+                    // The retry INVITE carries a fresh Via branch and From
+                    // tag generated by the builder; capture them so the
+                    // stored dialog state matches what went on the wire.
+                    // Without this, process_response's branch validation
+                    // (it matches the top Via branch against b_leg_branch)
+                    // would silently drop every response to the failover
+                    // INVITE, and a CANCEL would mirror the stale branch.
+                    let new_branch = new_request
+                        .headers
+                        .get_value(&HeaderName::Via)
+                        .and_then(|v| extract_param(v, "branch").map(String::from))
+                        .unwrap_or_else(generate_branch);
+                    let new_from = new_request
+                        .headers
+                        .get_value(&HeaderName::From)
+                        .unwrap_or_default()
+                        .to_string();
+                    let new_to = new_request
+                        .headers
+                        .get_value(&HeaderName::To)
+                        .unwrap_or_default()
+                        .to_string();
                     {
                         let mut corr = self.call_correlation.write().await;
                         corr.b_leg.remove(&addrs.b_leg_sip_call_id);
@@ -892,6 +1047,12 @@ impl SipStack {
                             addr_entry.b_leg_destination = new_dest;
                             addr_entry.b_leg_sip_call_id.clone_from(&new_call_id);
                             addr_entry.failover_trunks = remaining;
+                            addr_entry.b_leg_branch = new_branch;
+                            addr_entry.b_leg_from = new_from;
+                            addr_entry.b_leg_to = new_to;
+                            // New transaction: a tagged response will be
+                            // re-learned for the dialog.
+                            addr_entry.dialog_to_tag = None;
                         }
                     }
 
@@ -918,12 +1079,17 @@ impl SipStack {
             }
         }
 
-        // Build error response for A-leg
-        let mut a_response = proto_sip::message::SipResponse::new(resp.status);
-        copy_response_headers(resp, &mut a_response);
-        a_response
-            .headers
-            .set(HeaderName::CallId, &addrs.a_leg_sip_call_id);
+        // Build error response for A-leg with the A-leg dialog's headers
+        let a_response = build_a_leg_response(resp.status, addrs);
+
+        // Release any media resources allocated for this call — the BYE/
+        // CANCEL paths do this, but the error path leaked relay tasks and
+        // their bound ports.
+        if let Some(ref pipeline) = self.media_pipeline {
+            let call_id_str = internal_id.to_string();
+            let _ = pipeline.stop_relay(&call_id_str).await;
+            let _ = pipeline.remove_session(&call_id_str).await;
+        }
 
         // Cleanup call state
         {
@@ -1049,33 +1215,53 @@ impl SipStack {
                     response.add_header(Header::new(HeaderName::Contact, contact_str));
                 }
 
-                // Sync bindings to shared location service for routing
+                // Sync bindings to the shared location service from the
+                // registrar's authoritative contact set. This honors
+                // multi-device registration and de-registration
+                // (Expires: 0 yields an empty set).
+                //
+                // NAT handling: a phone behind NAT advertises its own
+                // (private, unroutable) address in Contact, so the binding
+                // for the device that just registered is rewritten to the
+                // packet source — its NAT pinhole — keyed by Call-ID. Other
+                // devices' bindings (different Call-IDs) are left as the
+                // registrar stored them; each was NAT-fixed to its own
+                // source when it registered. Skipping this rewrite (the
+                // regression) sent every inbound INVITE for a NAT'd phone to
+                // its private address.
                 let binding_count = reg_response.contacts.len();
                 {
                     let mut loc = self.location_service.write().await;
-                    // Always remove ALL existing bindings for this AOR before
-                    // re-adding. Only keep the latest Contact from this REGISTER.
                     let _ = loc.remove_all_bindings(&aor);
-
-                    // Only add the contact from the current source address,
-                    // using the actual source IP if Contact has 0.0.0.0
                     let src_ip = match source.ip() {
                         std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped()
                             .map_or_else(|| v6.to_string(), |v4| v4.to_string()),
                         std::net::IpAddr::V4(v4) => v4.to_string(),
                     };
                     let src_port = source.port();
-
-                    // Build a single canonical contact from the actual source
-                    let contact_uri = format!("sip:{dest_user}@{src_ip}:{src_port};transport=udp",
-                        dest_user = aor.split(':').nth(1).and_then(|s| s.split('@').next()).unwrap_or("unknown"));
-                    let new_binding = proto_registrar::Binding::new(
-                        &aor,
-                        &contact_uri,
-                        &call_id,
-                        cseq,
-                    );
-                    let _ = loc.add_binding(new_binding);
+                    let aor_user = aor
+                        .split(':')
+                        .nth(1)
+                        .and_then(|s| s.split('@').next())
+                        .unwrap_or("unknown");
+                    for binding in &reg_response.contacts {
+                        // The binding created/refreshed by *this* REGISTER
+                        // (same Call-ID) is reachable via the source pinhole;
+                        // also fix any wildcard host that can never be routed.
+                        let is_this_device = binding.call_id() == call_id;
+                        if is_this_device || binding.contact_uri().contains("0.0.0.0") {
+                            let contact_uri =
+                                format!("sip:{aor_user}@{src_ip}:{src_port};transport=udp");
+                            let _ = loc.add_binding(proto_registrar::Binding::new(
+                                &aor,
+                                &contact_uri,
+                                binding.call_id(),
+                                binding.cseq(),
+                            ));
+                        } else {
+                            let _ = loc.add_binding(binding.clone());
+                        }
+                    }
                 }
 
                 self.registrations_total.fetch_add(1, Ordering::Relaxed);
@@ -1157,13 +1343,73 @@ impl SipStack {
         // Check for INVITE retransmit — if we already know this Call-ID, absorb it
         {
             let corr = self.call_correlation.read().await;
-            if corr.a_leg.contains_key(&a_leg_call_id)
-                || corr.announcement_calls.contains(&a_leg_call_id)
-            {
+            if corr.a_leg.contains_key(&a_leg_call_id) {
                 debug!(call_id = %a_leg_call_id, "INVITE retransmit, absorbing");
                 return ProcessResult::NoAction;
             }
         }
+        if self
+            .announcement_calls
+            .read()
+            .await
+            .contains(&a_leg_call_id)
+        {
+            debug!(call_id = %a_leg_call_id, "INVITE retransmit (announcement), absorbing");
+            return ProcessResult::NoAction;
+        }
+
+        // Draining (graceful shutdown): refuse new calls, let existing ones
+        // finish.
+        if self.draining.load(Ordering::Relaxed) {
+            info!(call_id = %a_leg_call_id, "Draining — rejecting new INVITE");
+            let unavailable = create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
+            return ProcessResult::Response {
+                message: SipMessage::Response(unavailable),
+                destination: source,
+            };
+        }
+
+        // Admission control: reject new calls beyond the configured ceiling
+        // (general.max_calls) instead of allocating unbounded state.
+        //
+        // ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+        {
+            let calls = self.calls.read().await;
+            if calls.calls.len() >= self.config.max_calls as usize {
+                warn!(
+                    call_id = %a_leg_call_id,
+                    max_calls = self.config.max_calls,
+                    "Maximum concurrent calls reached, rejecting INVITE"
+                );
+                let unavailable =
+                    create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
+                return ProcessResult::Response {
+                    message: SipMessage::Response(unavailable),
+                    destination: source,
+                };
+            }
+        }
+
+        // Loop protection (RFC 3261 §16.3): honor the incoming Max-Forwards
+        // and propagate it decremented — previously every hop reset it to
+        // 70, so two SBCs could forward in a loop forever.
+        let incoming_max_forwards: u8 = req
+            .headers
+            .get_value(&HeaderName::MaxForwards)
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(70);
+        if incoming_max_forwards == 0 {
+            warn!(call_id = %a_leg_call_id, "Max-Forwards exhausted, rejecting INVITE");
+            let too_many_hops = create_response_from_request(
+                req,
+                StatusCode::new(483).unwrap_or(StatusCode::SERVER_INTERNAL_ERROR),
+            );
+            return ProcessResult::Response {
+                message: SipMessage::Response(too_many_hops),
+                destination: source,
+            };
+        }
+        let b_leg_max_forwards = incoming_max_forwards - 1;
 
         // 1. Build 100 Trying for A-leg
         let trying = create_response_from_request(req, StatusCode::TRYING);
@@ -1388,7 +1634,7 @@ impl SipStack {
             )
             .call_id(&b_leg_sip_call_id)
             .cseq(1)
-            .max_forwards(70)
+            .max_forwards(b_leg_max_forwards)
             .contact_uri(
                 SipUri::new(&local_ip).with_port(source.port()),
             );
@@ -1435,6 +1681,43 @@ impl SipStack {
             let mut corr = self.call_correlation.write().await;
             corr.a_leg.insert(a_leg_call_id.clone(), internal_call_id.clone());
             corr.b_leg.insert(b_leg_sip_call_id.clone(), internal_call_id.clone());
+            // Dialog state for in-dialog requests and forwarded responses:
+            // both legs' From/To/Via/CSeq must be carried exactly, not
+            // reconstructed (a BYE without dialog tags is unmatchable).
+            let a_leg_via: Vec<String> = req
+                .headers
+                .get_all(&HeaderName::Via)
+                .map(|h| h.value.clone())
+                .collect();
+            let a_leg_from = req
+                .headers
+                .get_value(&HeaderName::From)
+                .unwrap_or_default()
+                .to_string();
+            let a_leg_to = req
+                .headers
+                .get_value(&HeaderName::To)
+                .unwrap_or_default()
+                .to_string();
+            let a_leg_cseq = req.headers.cseq().unwrap_or("1 INVITE").to_string();
+            let b_leg_from = b_leg_request
+                .headers
+                .get_value(&HeaderName::From)
+                .unwrap_or_default()
+                .to_string();
+            let b_leg_to = b_leg_request
+                .headers
+                .get_value(&HeaderName::To)
+                .unwrap_or_default()
+                .to_string();
+            // The transaction branch is the one actually on the wire (the
+            // builder generates its own), so capture it from the built
+            // request.
+            let b_leg_wire_branch = b_leg_request
+                .headers
+                .get_value(&HeaderName::Via)
+                .and_then(|v| extract_param(v, "branch").map(String::from))
+                .unwrap_or_else(|| b_leg_branch.clone());
             corr.addresses.insert(
                 internal_call_id.clone(),
                 CallAddresses {
@@ -1444,6 +1727,14 @@ impl SipStack {
                     b_leg_sip_call_id: b_leg_sip_call_id.clone(),
                     local_addr: local_sip_addr,
                     failover_trunks,
+                    a_leg_via,
+                    a_leg_from,
+                    a_leg_to,
+                    a_leg_cseq,
+                    b_leg_from,
+                    b_leg_to,
+                    b_leg_branch: b_leg_wire_branch,
+                    dialog_to_tag: None,
                 },
             );
         }
@@ -1457,6 +1748,8 @@ impl SipStack {
                 .unwrap_or_else(generate_branch);
 
             let mut txns = self.transactions.write().await;
+            txns.sweep_if_needed();
+            let now = std::time::Instant::now();
             let server_key = TransactionKey::server(&a_branch, "INVITE");
             txns.server_invite.insert(
                 server_key,
@@ -1466,6 +1759,7 @@ impl SipStack {
                         TransportType::Unreliable,
                     ),
                     source,
+                    created_at: now,
                 },
             );
 
@@ -1478,6 +1772,7 @@ impl SipStack {
                         TransportType::Unreliable,
                     ),
                     destination: b_leg_destination,
+                    created_at: now,
                 },
             );
         }
@@ -1584,7 +1879,9 @@ impl SipStack {
         // Build 200 OK for BYE sender
         let ok_response = create_response_from_request(req, StatusCode::OK);
 
-        // Build BYE for the other leg
+        // Build BYE for the other leg with that leg's dialog identity
+        // (From/To with tags). A BYE carrying only Call-ID + CSeq cannot be
+        // matched to the dialog by the receiving UA, leaking the far leg.
         let (other_call_id, other_dest) = if is_from_a_leg {
             (&addrs.b_leg_sip_call_id, addrs.b_leg_destination)
         } else {
@@ -1595,7 +1892,27 @@ impl SipStack {
             .with_port(other_dest.port());
         let mut bye_request = proto_sip::message::SipRequest::new(Method::Bye, other_uri);
         bye_request.headers.set(HeaderName::CallId, other_call_id);
-        bye_request.headers.set(HeaderName::CSeq, "2 BYE");
+        if is_from_a_leg {
+            // SBC is the UAC on the B-leg: From = our INVITE From, To = the
+            // callee with their tag; next CSeq after the INVITE (1).
+            bye_request.headers.set(HeaderName::From, &addrs.b_leg_from);
+            bye_request.headers.set(
+                HeaderName::To,
+                with_tag(&addrs.b_leg_to, addrs.dialog_to_tag.as_deref()),
+            );
+            bye_request.headers.set(HeaderName::CSeq, "2 BYE");
+        } else {
+            // SBC is the UAS on the A-leg: swap the A-leg dialog headers
+            // (our From = the To we answered with, our To = the caller's
+            // From). The SBC→A direction has its own CSeq space.
+            bye_request.headers.set(
+                HeaderName::From,
+                with_tag(&addrs.a_leg_to, addrs.dialog_to_tag.as_deref()),
+            );
+            bye_request.headers.set(HeaderName::To, &addrs.a_leg_from);
+            bye_request.headers.set(HeaderName::CSeq, "1 BYE");
+        }
+        bye_request.headers.set(HeaderName::MaxForwards, "70");
         let branch = generate_branch();
         bye_request.headers.add(Header::new(
             HeaderName::Via,
@@ -1716,19 +2033,26 @@ impl SipStack {
             terminated.headers.set(HeaderName::To, to_with_tag);
         }
         terminated.headers.set(HeaderName::CallId, &sip_call_id);
-        terminated.headers.set(HeaderName::CSeq, "1 INVITE");
+        terminated.headers.set(HeaderName::CSeq, &addrs.a_leg_cseq);
         terminated.headers.set(HeaderName::ContentLength, "0");
 
-        // CANCEL to B-leg
+        // CANCEL to B-leg. RFC 3261 §9.1: a CANCEL must mirror the INVITE
+        // it cancels — same Via branch, From, To (no tag), and CSeq number
+        // with method CANCEL. A fresh branch made it unmatchable.
         let b_uri = SipUri::new(addrs.b_leg_destination.ip().to_string())
             .with_port(addrs.b_leg_destination.port());
         let mut b_cancel = proto_sip::message::SipRequest::new(Method::Cancel, b_uri);
         b_cancel.headers.set(HeaderName::CallId, &addrs.b_leg_sip_call_id);
         b_cancel.headers.set(HeaderName::CSeq, "1 CANCEL");
-        let branch = generate_branch();
+        b_cancel.headers.set(HeaderName::From, &addrs.b_leg_from);
+        b_cancel.headers.set(HeaderName::To, &addrs.b_leg_to);
+        b_cancel.headers.set(HeaderName::MaxForwards, "70");
         b_cancel.headers.add(Header::new(
             HeaderName::Via,
-            format!("SIP/2.0/UDP {};branch={}", addrs.local_addr, branch),
+            format!(
+                "SIP/2.0/UDP {};branch={}",
+                addrs.local_addr, addrs.b_leg_branch
+            ),
         ));
         b_cancel.headers.set(HeaderName::ContentLength, "0");
 
@@ -2145,10 +2469,8 @@ impl SipStack {
 
         // Track this Call-ID to absorb INVITE retransmits
         let call_id = req.headers.call_id().unwrap_or("unknown").to_string();
-        {
-            let mut corr = self.call_correlation.write().await;
-            corr.announcement_calls.insert(call_id.clone());
-        }
+        let announcement_calls = Arc::clone(&self.announcement_calls);
+        announcement_calls.write().await.insert(call_id.clone());
         // Capture full From/To headers for the BYE dialog matching.
         // In BYE from UAS: From = our To (with our tag), To = caller's From (with their tag)
         let invite_from = req.headers.get_value(&HeaderName::From).unwrap_or_default().to_string();
@@ -2239,6 +2561,10 @@ impl SipStack {
                     warn!(error = %e, "Failed to build BYE after announcement");
                 }
             }
+
+            // Playback finished — drop the retransmit-dedup entry so the
+            // set stays bounded (it previously grew forever).
+            announcement_calls.write().await.remove(&call_id);
         });
 
         // Return 200 OK to answer the call
@@ -2382,37 +2708,47 @@ fn create_response_from_request(
 }
 
 /// Generates a random tag for From/To headers.
+///
+/// Cryptographically random — predictable tags weaken protection against
+/// off-path forged in-dialog requests (e.g. a spoofed BYE).
 fn generate_tag() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{:x}", timestamp & 0xFFFF_FFFF)
+    format!("{:08x}", rand::random::<u32>())
 }
 
 /// Copies common headers from a B-leg response for forwarding to A-leg.
 ///
 /// Copies Via, From, To, CSeq, and Content-Length.
 /// Call-ID should be replaced by the caller with the A-leg's Call-ID.
-fn copy_response_headers(
-    from: &proto_sip::message::SipResponse,
-    to: &mut proto_sip::message::SipResponse,
-) {
-    // Copy Via (will be the A-leg's Via from the original INVITE)
-    for via in from.headers.get_all(&HeaderName::Via) {
-        to.headers.add(Header::new(HeaderName::Via, &via.value));
+/// Appends a tag parameter to a From/To header value if not present.
+fn with_tag(header_value: &str, tag: Option<&str>) -> String {
+    match tag {
+        Some(t) if !header_value.contains("tag=") => format!("{header_value};tag={t}"),
+        _ => header_value.to_string(),
     }
-    if let Some(from_val) = from.headers.get_value(&HeaderName::From) {
-        to.headers.set(HeaderName::From, from_val);
+}
+
+/// Builds a response toward the A-leg carrying the A-leg dialog's own
+/// Via/From/To/CSeq/Call-ID (forwarding the B-leg's headers verbatim makes
+/// the response unmatchable for the A-leg UA).
+fn build_a_leg_response(
+    status: StatusCode,
+    addrs: &CallAddresses,
+) -> proto_sip::message::SipResponse {
+    let mut response = proto_sip::message::SipResponse::new(status);
+    for via in &addrs.a_leg_via {
+        response.headers.add(Header::new(HeaderName::Via, via));
     }
-    if let Some(to_val) = from.headers.get_value(&HeaderName::To) {
-        to.headers.set(HeaderName::To, to_val);
-    }
-    if let Some(cseq) = from.headers.cseq() {
-        to.headers.set(HeaderName::CSeq, cseq);
-    }
-    to.headers.set(HeaderName::ContentLength, "0");
+    response.headers.set(HeaderName::From, &addrs.a_leg_from);
+    response.headers.set(
+        HeaderName::To,
+        with_tag(&addrs.a_leg_to, addrs.dialog_to_tag.as_deref()),
+    );
+    response
+        .headers
+        .set(HeaderName::CallId, &addrs.a_leg_sip_call_id);
+    response.headers.set(HeaderName::CSeq, &addrs.a_leg_cseq);
+    response.headers.set(HeaderName::ContentLength, "0");
+    response
 }
 
 /// Parses a manipulation action from config strings.
@@ -2630,6 +2966,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_with_tag() {
+        assert_eq!(
+            with_tag("<sip:a@b>", Some("xyz")),
+            "<sip:a@b>;tag=xyz"
+        );
+        // Existing tag is preserved, not duplicated
+        assert_eq!(
+            with_tag("<sip:a@b>;tag=abc", Some("xyz")),
+            "<sip:a@b>;tag=abc"
+        );
+        assert_eq!(with_tag("<sip:a@b>", None), "<sip:a@b>");
+    }
+
+    /// An INVITE arriving with Max-Forwards: 0 must be rejected with 483,
+    /// not forwarded with a fresh Max-Forwards (loop protection).
+    #[tokio::test]
+    async fn test_invite_max_forwards_exhausted() {
+        let config = SipStackConfig::default();
+        let stack = SipStack::new(config);
+
+        let invite = b"INVITE sip:9999@sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP client.example.com:5060;branch=z9hG4bKmf0\r\n\
+            From: <sip:alice@example.com>;tag=mf0\r\n\
+            To: <sip:9999@sbc.local>\r\n\
+            Call-ID: maxfwd0@example.com\r\n\
+            CSeq: 1 INVITE\r\n\
+            Max-Forwards: 0\r\n\
+            Contact: <sip:alice@client.example.com:5060>\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+
+        let source = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
+        let result = stack
+            .process_message(&Bytes::from_static(invite), source, None)
+            .await;
+
+        match result {
+            ProcessResult::Response { message, .. } => {
+                let SipMessage::Response(resp) = message else {
+                    panic!("Expected response message");
+                };
+                assert_eq!(resp.status.code(), 483, "must reject with 483 Too Many Hops");
+            }
+            other => panic!("Expected 483 response, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn test_process_register() {
         let config = SipStackConfig::default();
@@ -2669,9 +3053,13 @@ mod tests {
         );
         let bindings = loc.lookup("sip:alice@example.com");
         assert_eq!(bindings.len(), 1);
+        // The binding is NAT-fixed to the packet source (127.0.0.1:5060),
+        // not the phone's advertised Contact host — a phone behind NAT
+        // advertises an unroutable private address, so the location binding
+        // must point at the source pinhole for inbound calls to reach it.
         assert_eq!(
             bindings[0].contact_uri(),
-            "sip:alice@client.example.com:5060"
+            "sip:alice@127.0.0.1:5060;transport=udp"
         );
     }
 
@@ -3026,9 +3414,13 @@ mod tests {
         assert_eq!(stack.registration_aor_count().await, 1);
         assert_eq!(stack.registration_binding_count().await, 1);
 
-        // Delete registration
+        // Delete registration (binding is NAT-fixed to the source pinhole
+        // with an explicit transport param).
         stack
-            .delete_registration("sip:alice@sbc.local", "sip:alice@127.0.0.1:5060")
+            .delete_registration(
+                "sip:alice@sbc.local",
+                "sip:alice@127.0.0.1:5060;transport=udp",
+            )
             .await
             .unwrap();
         assert_eq!(stack.registration_aor_count().await, 0);

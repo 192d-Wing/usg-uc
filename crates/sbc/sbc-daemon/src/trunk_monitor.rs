@@ -125,6 +125,11 @@ pub struct MonitoredTrunk {
 pub struct TrunkMonitor {
     /// Health status for each monitored trunk.
     health: Arc<RwLock<HashMap<String, TrunkHealthStatus>>>,
+    /// Running monitor tasks by trunk ID. Tracked so re-configuring a trunk
+    /// replaces its loop instead of spawning a duplicate, and so loops can
+    /// be stopped on trunk deletion and daemon shutdown (previously the
+    /// JoinHandles were dropped and the loops ran forever).
+    tasks: std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// SBC's local domain for From/Via headers.
     local_domain: String,
 }
@@ -134,7 +139,28 @@ impl TrunkMonitor {
     pub fn new(local_domain: &str) -> Self {
         Self {
             health: Arc::new(RwLock::new(HashMap::new())),
+            tasks: std::sync::Mutex::new(HashMap::new()),
             local_domain: local_domain.to_string(),
+        }
+    }
+
+    /// Stops monitoring a trunk and removes its health entry.
+    pub async fn stop_trunk(&self, trunk_id: &str) {
+        if let Ok(mut tasks) = self.tasks.lock() {
+            if let Some(handle) = tasks.remove(trunk_id) {
+                handle.abort();
+                info!(trunk_id, "Stopped OPTIONS health monitor");
+            }
+        }
+        self.health.write().await.remove(trunk_id);
+    }
+
+    /// Aborts all monitor tasks (daemon shutdown).
+    pub fn stop_all(&self) {
+        if let Ok(mut tasks) = self.tasks.lock() {
+            for (_, handle) in tasks.drain() {
+                handle.abort();
+            }
         }
     }
 
@@ -143,27 +169,22 @@ impl TrunkMonitor {
         Arc::clone(&self.health)
     }
 
-    /// Starts monitoring a trunk. Spawns a background task.
-    pub fn monitor_trunk(&self, trunk: MonitoredTrunk) -> tokio::task::JoinHandle<()> {
+    /// Starts (or replaces) monitoring for a trunk.
+    pub fn monitor_trunk(&self, trunk: MonitoredTrunk) {
         let health = Arc::clone(&self.health);
         let domain = self.local_domain.clone();
-        let trunk_id = trunk.trunk_id.clone();
-
-        // Initialize health entry
-        {
-            let health_clone = Arc::clone(&health);
-            tokio::spawn(async move {
-                health_clone
-                    .write()
-                    .await
-                    .entry(trunk_id.clone())
-                    .or_insert_with(|| TrunkHealthStatus::new(&trunk_id));
-            });
-        }
+        let registry_id = trunk.trunk_id.clone();
 
         let interval = Duration::from_secs(u64::from(trunk.interval_secs.max(5)));
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
+            // Initialize health entry in this task (a separately spawned
+            // init raced the first ping result).
+            health
+                .write()
+                .await
+                .entry(trunk.trunk_id.clone())
+                .or_insert_with(|| TrunkHealthStatus::new(&trunk.trunk_id));
             info!(
                 trunk_id = %trunk.trunk_id,
                 host = %trunk.host,
@@ -214,7 +235,14 @@ impl TrunkMonitor {
                     }
                 }
             }
-        })
+        });
+
+        if let Ok(mut tasks) = self.tasks.lock() {
+            if let Some(previous) = tasks.insert(registry_id.clone(), handle) {
+                previous.abort();
+                info!(trunk_id = %registry_id, "Replaced existing OPTIONS monitor task");
+            }
+        }
     }
 
     /// Sends a single OPTIONS ping and returns response time in ms.
@@ -227,17 +255,16 @@ impl TrunkMonitor {
     ) -> Result<u64, String> {
         // Resolve target address
         let addr_str = format!("{host}:{port}");
-        let target: SocketAddr = addr_str
-            .parse()
-            .or_else(|_| {
-                use std::net::ToSocketAddrs;
-                addr_str
-                    .to_socket_addrs()
-                    .map_err(|e| e.to_string())?
-                    .next()
-                    .ok_or_else(|| "DNS resolution failed".to_string())
-            })
-            .map_err(|e| format!("Cannot resolve {addr_str}: {e}"))?;
+        // Async DNS — std::net::ToSocketAddrs blocks the tokio worker
+        // thread for up to the resolver timeout (5s per nameserver).
+        let target: SocketAddr = match addr_str.parse() {
+            Ok(addr) => addr,
+            Err(_) => tokio::net::lookup_host(&addr_str)
+                .await
+                .map_err(|e| format!("Cannot resolve {addr_str}: {e}"))?
+                .next()
+                .ok_or_else(|| format!("DNS resolution failed for {addr_str}"))?,
+        };
 
         // Bind to zone IP on port 5060 (matching the SIP listener) so the
         // OPTIONS goes out the correct interface and the response comes back.
@@ -290,15 +317,32 @@ impl TrunkMonitor {
             .await
             .map_err(|e| format!("Send failed: {e}"))?;
 
-        // Wait for response with 5-second timeout
+        // Wait for a MATCHING response: same source IP as the target and
+        // our Call-ID. The socket shares port 5060 with the SIP listener,
+        // so an unmatched first datagram (stray traffic, spoofed packet)
+        // must not be mistaken for the OPTIONS response.
         let mut buf = [0u8; 4096];
-        let response = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
-            .await
-            .map_err(|_| format!("Timeout waiting for response from {trunk_id}"))?
-            .map_err(|e| format!("Recv failed: {e}"))?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let n = loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| format!("Timeout waiting for response from {trunk_id}"))?;
+            let (n, from) = tokio::time::timeout(remaining, socket.recv_from(&mut buf))
+                .await
+                .map_err(|_| format!("Timeout waiting for response from {trunk_id}"))?
+                .map_err(|e| format!("Recv failed: {e}"))?;
+            if from.ip() != target.ip() {
+                debug!(trunk_id, source = %from, "Ignoring datagram from unexpected source");
+                continue;
+            }
+            if !String::from_utf8_lossy(&buf[..n]).contains(call_id.as_str()) {
+                debug!(trunk_id, "Ignoring SIP message with foreign Call-ID");
+                continue;
+            }
+            break n;
+        };
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
-        let (n, _from) = response;
 
         // Check for a valid SIP response
         let resp_str = String::from_utf8_lossy(&buf[..n]);

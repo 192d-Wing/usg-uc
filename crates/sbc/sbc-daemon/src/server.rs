@@ -43,8 +43,11 @@ pub struct Server {
     udp_transports: RwLock<Vec<Arc<UdpTransport>>>,
     /// SIP stack for message processing.
     sip_stack: Arc<SipStack>,
-    /// Rate limiter for `DoS` protection.
+    /// Per-source rate limiter for `DoS` protection.
     rate_limiter: Arc<Mutex<RateLimiter>>,
+    /// Global (all-sources) rate limiter — backstop against distributed
+    /// floods that stay under the per-IP limit.
+    global_limiter: Arc<Mutex<RateLimiter>>,
     /// Resolved zone registry (None if no zones configured).
     zone_registry: Option<Arc<crate::zone::ResolvedZoneRegistry>>,
     /// Cluster manager (when cluster feature is enabled).
@@ -72,6 +75,7 @@ impl Server {
         Self::init_sip_stack_from_config(&mut sip_stack, &config);
         let sip_stack = Arc::new(sip_stack);
         let rate_limiter = Self::build_rate_limiter(&config);
+        let global_limiter = Self::build_global_limiter(&config);
 
         Self {
             config,
@@ -82,6 +86,7 @@ impl Server {
             udp_transports: RwLock::new(Vec::new()),
             sip_stack,
             rate_limiter,
+            global_limiter,
             zone_registry: None,
             #[cfg(feature = "cluster")]
             cluster: None,
@@ -139,6 +144,7 @@ impl Server {
         let sip_stack = Arc::new(sip_stack);
 
         let rate_limiter = Self::build_rate_limiter(&config);
+        let global_limiter = Self::build_global_limiter(&config);
 
         Self {
             config,
@@ -149,6 +155,7 @@ impl Server {
             udp_transports: RwLock::new(Vec::new()),
             sip_stack,
             rate_limiter,
+            global_limiter,
             zone_registry: None,
             cluster,
         }
@@ -159,11 +166,12 @@ impl Server {
         SipStackConfig {
             instance_name: config.general.instance_name.clone(),
             domain: config.general.instance_name.clone(),
+            max_calls: config.general.max_calls,
             ..SipStackConfig::default()
         }
     }
 
-    /// Builds rate limiter from config.
+    /// Builds the per-source rate limiter from config.
     fn build_rate_limiter(config: &SbcConfig) -> Arc<Mutex<RateLimiter>> {
         #[allow(
             clippy::cast_possible_truncation,
@@ -178,9 +186,25 @@ impl Server {
         info!(
             enabled = config.rate_limit.enabled,
             per_ip_rps = config.rate_limit.per_ip_rps,
+            global_rps = config.rate_limit.global_rps,
             burst_multiplier = config.rate_limit.burst_multiplier,
             "Rate limiting configured"
         );
+
+        Arc::new(Mutex::new(RateLimiter::new(rate_limit_config)))
+    }
+
+    /// Builds the global (all-sources) rate limiter from config.
+    fn build_global_limiter(config: &SbcConfig) -> Arc<Mutex<RateLimiter>> {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let burst_size = (f64::from(config.rate_limit.global_rps)
+            * f64::from(config.rate_limit.burst_multiplier)) as u32;
+        let rate_limit_config =
+            RateLimiterConfig::new(config.rate_limit.global_rps, burst_size).with_per_ip(false);
 
         Arc::new(Mutex::new(RateLimiter::new(rate_limit_config)))
     }
@@ -258,6 +282,14 @@ impl Server {
 
         // Bind UDP listeners
         self.bind_udp_listeners().await?;
+
+        // Seed the live-transport count at bind time (before the API server
+        // starts serving readiness), so the readiness probe never sees a
+        // spurious 0 during the window before run() spawns the loops.
+        let bound = self.udp_transports.read().await.len();
+        self.stats
+            .live_transports
+            .store(bound as u64, Ordering::SeqCst);
 
         Ok(())
     }
@@ -340,6 +372,7 @@ impl Server {
             let stats = Arc::clone(&self.stats);
             let sip_stack = Arc::clone(&self.sip_stack);
             let rate_limiter = Arc::clone(&self.rate_limiter);
+            let global_limiter = Arc::clone(&self.global_limiter);
             let rate_limit_enabled = self.config.rate_limit.enabled;
 
             // Determine zone for this transport from its local bind address
@@ -353,6 +386,7 @@ impl Server {
                     stats,
                     sip_stack,
                     rate_limiter,
+                    global_limiter,
                     rate_limit_enabled,
                     zone_name,
                 )
@@ -371,7 +405,28 @@ impl Server {
 
         // Wait for shutdown or all tasks to complete
         self.shutdown.wait_for_shutdown().await;
-        info!("Shutdown signal received, stopping event loop");
+        info!("Shutdown signal received — draining active calls");
+
+        // Drain: reject new INVITEs (503) but keep the receive loops alive
+        // so in-dialog BYEs still tear calls down. Previously the loops were
+        // aborted immediately, so "draining" could never complete and
+        // active calls were killed on SIGTERM.
+        self.sip_stack.set_draining();
+        let drain_deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+        loop {
+            let active = self.sip_stack.active_call_count().await;
+            if active == 0 {
+                info!("All active calls drained");
+                break;
+            }
+            if tokio::time::Instant::now() >= drain_deadline {
+                warn!(active, "Drain timeout reached, terminating with active calls");
+                break;
+            }
+            debug!(active, "Waiting for calls to drain");
+            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+        }
 
         // Cancel all tasks
         for handle in handles {
@@ -390,6 +445,7 @@ impl Server {
         stats: Arc<ServerStats>,
         sip_stack: Arc<SipStack>,
         rate_limiter: Arc<Mutex<RateLimiter>>,
+        global_limiter: Arc<Mutex<RateLimiter>>,
         rate_limit_enabled: bool,
         zone_name: Option<String>,
     ) {
@@ -399,18 +455,41 @@ impl Server {
             "Starting transport receive loop"
         );
 
+        let mut consecutive_errors: u64 = 0;
         loop {
+            // No shutdown arm here: during graceful shutdown the loop keeps
+            // processing in-dialog requests (BYEs) so active calls can
+            // drain; Server::run aborts the task once draining completes.
             tokio::select! {
                 result = transport.recv() => {
                     match result {
                         Ok(msg) => {
+                            consecutive_errors = 0;
                             stats.messages_received.fetch_add(1, Ordering::Relaxed);
 
                             // Extract source IP for rate limiting
                             let source_ip = msg.source.ip();
 
-                            // Check rate limit
+                            // Check rate limits: global backstop first
+                            // (one bucket, catches distributed floods that
+                            // stay under the per-IP limit), then per-source.
                             if rate_limit_enabled {
+                                let global_action = {
+                                    let mut limiter = global_limiter.lock().await;
+                                    limiter.check(source_ip)
+                                };
+                                if matches!(
+                                    global_action,
+                                    RateLimitAction::Reject | RateLimitAction::Block { .. }
+                                ) {
+                                    stats.rate_limited.fetch_add(1, Ordering::Relaxed);
+                                    debug!(
+                                        source = %source_ip,
+                                        "Global rate limit exceeded, rejecting message"
+                                    );
+                                    continue;
+                                }
+
                                 let action = {
                                     let mut limiter = rate_limiter.lock().await;
                                     limiter.check(source_ip)
@@ -466,12 +545,31 @@ impl Server {
                                 break;
                             }
                             warn!(error = %e, "Transport receive error");
+                            // Persistent errors (closed fd, dead transport)
+                            // return immediately — back off instead of
+                            // busy-spinning at 100% CPU flooding the log.
+                            consecutive_errors += 1;
+                            if consecutive_errors >= 32 {
+                                error!(
+                                    transport_idx = idx,
+                                    "Transport failing persistently, stopping receive loop"
+                                );
+                                // Mark this transport dead so readiness can
+                                // reflect it (the daemon must not stay green
+                                // while deaf on a listener).
+                                stats.live_transports.fetch_update(
+                                    Ordering::SeqCst,
+                                    Ordering::SeqCst,
+                                    |v| v.checked_sub(1),
+                                ).ok();
+                                break;
+                            }
+                            tokio::time::sleep(tokio::time::Duration::from_millis(
+                                50 * consecutive_errors.min(20),
+                            ))
+                            .await;
                         }
                     }
-                }
-                () = shutdown.wait_for_shutdown() => {
-                    debug!(transport_idx = idx, "Transport receive loop shutting down");
-                    break;
                 }
             }
         }
@@ -594,6 +692,11 @@ pub struct ServerStats {
     pub messages_sent: AtomicU64,
     /// Messages rejected due to rate limiting.
     pub rate_limited: AtomicU64,
+    /// Transport receive loops still running. Set to the bound-transport
+    /// count at startup and decremented when a loop dies abnormally
+    /// (persistent recv errors). Readiness flips to not-ready at 0 so a
+    /// daemon deaf on all transports stops reporting healthy.
+    pub live_transports: AtomicU64,
 }
 
 /// Server error.
