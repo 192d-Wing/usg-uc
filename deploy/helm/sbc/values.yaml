@@ -156,6 +156,13 @@ sbcProvision:
   resources:
     requests: { cpu: "20m",  memory: "32Mi"  }
     limits:   { cpu: "200m", memory: "128Mi" }
+  # Source-network restriction for provisioning (decision: phones are
+  # gated by source network, not per-device auth). List the phone VLAN
+  # CIDRs; the server checks the client IP from nginx's X-Forwarded-For
+  # and 403s anything outside them. Empty = app-layer check disabled
+  # (rely on the NetworkPolicy / LB source ranges only).
+  allowedSourceCidrs: []
+    # - "10.0.100.0/24"
 
 sbcDaemon:
   replicas: 1

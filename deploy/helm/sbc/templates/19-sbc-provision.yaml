@@ -53,6 +53,13 @@ spec:
               value: "sbc.{{ .Values.site.fqdn_base }}"
             - name: SBC_PROVISION_PORT
               value: "80"
+            # Source-network restriction (defense in depth): only these
+            # CIDRs (the phone VLANs, as seen via nginx X-Forwarded-For)
+            # may fetch provisioning configs. Empty = app-layer check off.
+            {{- with .Values.sbcProvision.allowedSourceCidrs }}
+            - name: SBC_PROVISION_ALLOWED_CIDRS
+              value: {{ join "," . | quote }}
+            {{- end }}
             # Same Postgres DSN the daemon + sbc-api read.
             {{- if .Values.sbcPostgres.enabled }}
             - name: SBC_POSTGRES_URL
