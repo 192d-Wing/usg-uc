@@ -32,6 +32,8 @@ pub enum StateError {
     Grpc(String),
     #[error("daemon http client build failed: {0}")]
     Http(String),
+    #[error("authentication setup failed: {0}")]
+    Auth(String),
 }
 
 #[derive(Clone)]
@@ -85,6 +87,10 @@ pub struct AppState {
 
     /// Process start instant, for /system/version uptime reporting.
     pub start_time: std::time::Instant,
+
+    /// Management-plane authenticator (admin login + stateless tokens).
+    /// Shared, replica-safe via a common signing key.
+    pub auth: Arc<uc_auth::Authenticator>,
 }
 
 impl AppState {
@@ -160,6 +166,14 @@ impl AppState {
             .build()
             .map_err(|e| StateError::Http(e.to_string()))?;
 
+        // Fail closed: without admin credentials the management plane
+        // cannot authenticate anyone, so refuse to start (forces the Helm
+        // chart to mount SBC_ADMIN_PASSWORD[_HASH] + SBC_AUTH_SIGNING_KEY).
+        let auth = Arc::new(
+            uc_auth::Authenticator::from_env().map_err(|e| StateError::Auth(e.to_string()))?,
+        );
+        info!("management-plane authentication enabled");
+
         Ok(Arc::new(Self {
             phones,
             directory,
@@ -181,6 +195,7 @@ impl AppState {
             http_client,
             daemon_http_base: cfg.daemon_http_url.trim_end_matches('/').to_string(),
             start_time: std::time::Instant::now(),
+            auth,
         }))
     }
 }

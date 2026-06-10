@@ -15,6 +15,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::state::AppState;
 
+mod auth;
 mod calls;
 mod cucm;
 mod dial_plans;
@@ -29,6 +30,10 @@ mod users;
 
 pub fn router(state: Arc<AppState>) -> Router {
     let api_v1 = Router::new()
+        // Authentication (login/session are exempt from the auth layer below)
+        .route("/auth/login", post(auth::login))
+        .route("/auth/logout", post(auth::logout))
+        .route("/auth/session", get(auth::session))
         // Phones
         .route("/phones", get(phones::list).post(phones::create))
         .route(
@@ -145,12 +150,31 @@ pub fn router(state: Arc<AppState>) -> Router {
             .delete(proxy::proxy_delete))
         .with_state(Arc::clone(&state));
 
+    // Deny-by-default authentication applied at the OUTER router so it
+    // also covers the reverse-proxy catch-all (which forwards unowned
+    // paths to the daemon) — a nest-level layer would miss it. Exemptions
+    // are full paths: health probes, sbc-api's own version, and login.
+    let auth_layer = uc_auth::AuthLayer::new(
+        Arc::clone(&state.auth),
+        &[
+            "/healthz",
+            "/readyz",
+            "/api/v1/system/version",
+            "/api/v1/auth/login",
+            "/api/v1/auth/session",
+        ],
+    );
+
     Router::new()
         .route("/healthz", get(system::liveness))
         .route("/readyz", get(system::readiness))
         .route("/api/v1/system/version", get(system::version))
         .nest("/api/v1", api_v1)
         .merge(api_proxy)
+        .layer(axum::middleware::from_fn_with_state(
+            auth_layer,
+            uc_auth::require_auth,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

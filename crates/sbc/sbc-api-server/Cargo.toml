@@ -20,6 +20,7 @@ workspace = true
 # Shared SBC pieces
 sbc-config-store = { workspace = true }
 sbc-grpc-api = { workspace = true }
+uc-auth = { workspace = true }
 uc-phone-mgmt.workspace = true
 # Users move into sbc-api as of PR10. We use the Postgres backend
 # directly (no sqlite/dispatch shim) — sbc-api always runs against

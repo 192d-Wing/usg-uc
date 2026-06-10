@@ -5671,6 +5671,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uc-auth",
  "uc-phone-mgmt",
  "uc-user-mgmt",
  "uuid",
