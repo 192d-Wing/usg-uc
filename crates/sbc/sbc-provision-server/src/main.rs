@@ -75,6 +75,16 @@ async fn main() -> ExitCode {
         start_time: std::time::Instant::now(),
     };
 
+    // Source-network restriction (defense in depth behind the Cilium
+    // NetworkPolicy). Health/version probes come from the node, not the
+    // phone subnet, so they bypass the check.
+    let allowed = Arc::new(cfg.allowed_cidrs.clone());
+    if allowed.is_empty() {
+        info!("SBC_PROVISION_ALLOWED_CIDRS unset — app-layer source restriction disabled (NetworkPolicy only)");
+    } else {
+        info!(cidrs = ?allowed, "provisioning restricted to source networks");
+    }
+
     let app = Router::new()
         .route("/healthz", get(liveness))
         .route("/readyz", get(readiness))
@@ -86,6 +96,7 @@ async fn main() -> ExitCode {
         // specific body; same thing here so phones don't fall through
         // to nginx's SPA fallback.
         .route("/TCS7000A.xml", get(serve_teo_global))
+        .layer(axum::middleware::from_fn_with_state(allowed, restrict_source))
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 
@@ -126,6 +137,47 @@ async fn main() -> ExitCode {
     }
     info!("clean shutdown");
     ExitCode::SUCCESS
+}
+
+/// Rejects provisioning requests whose originating client IP (from the
+/// `X-Forwarded-For` header set by nginx) is outside the allowed source
+/// networks. A no-op when no CIDRs are configured.
+///
+/// ## NIST 800-53 Rev5: SC-7 (Boundary Protection)
+async fn restrict_source(
+    axum::extract::State(allowed): axum::extract::State<Arc<Vec<ipnet::IpNet>>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if allowed.is_empty() {
+        return next.run(req).await;
+    }
+    // Probes (kubelet) and version come from the node, not the phone
+    // subnet — exempt them.
+    let path = req.uri().path();
+    if matches!(path, "/healthz" | "/readyz" | "/system/version") {
+        return next.run(req).await;
+    }
+
+    let client_ip = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        // Leftmost entry is the originating client as nginx saw it.
+        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok());
+
+    let permitted = client_ip.is_some_and(|ip| allowed.iter().any(|net| net.contains(&ip)));
+    if permitted {
+        return next.run(req).await;
+    }
+
+    warn!(?client_ip, "provisioning request from disallowed source network");
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({"error": "source network not permitted"})),
+    )
+        .into_response()
 }
 
 async fn liveness() -> impl IntoResponse {

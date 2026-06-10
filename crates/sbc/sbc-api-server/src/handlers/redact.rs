@@ -24,14 +24,13 @@ pub fn trunk_group(group: &mut Value) {
 
 /// Redacts a single trunk's `sip_password`.
 pub fn trunk(trunk: &mut Value) {
-    if let Some(obj) = trunk.as_object_mut() {
-        if obj
+    if let Some(obj) = trunk.as_object_mut()
+        && obj
             .get("sip_password")
             .and_then(|v| v.as_str())
             .is_some_and(|p| !p.is_empty())
-        {
-            obj.insert("sip_password".to_string(), Value::String(REDACTED.to_string()));
-        }
+    {
+        obj.insert("sip_password".to_string(), Value::String(REDACTED.to_string()));
     }
 }
 

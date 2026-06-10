@@ -33,3 +33,4 @@ tower-http = { workspace = true, features = ["trace"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror.workspace = true
+ipnet = "2"

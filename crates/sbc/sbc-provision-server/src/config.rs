@@ -28,6 +28,13 @@ pub struct Config {
 
     /// Port baked alongside `provision_host`.
     pub provision_port: u16,
+
+    /// Source networks allowed to fetch provisioning configs (defense in
+    /// depth behind the Cilium NetworkPolicy). Parsed from
+    /// `SBC_PROVISION_ALLOWED_CIDRS` (comma-separated CIDRs). Empty =
+    /// unrestricted at the app layer. The client IP is read from
+    /// `X-Forwarded-For` (set by the frontend nginx).
+    pub allowed_cidrs: Vec<ipnet::IpNet>,
 }
 
 impl Config {
@@ -54,11 +61,25 @@ impl Config {
                 reason: e.to_string(),
             })?;
 
+        let allowed_cidrs = std::env::var("SBC_PROVISION_ALLOWED_CIDRS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse::<ipnet::IpNet>().map_err(|e| ConfigError::Invalid {
+                    var: "SBC_PROVISION_ALLOWED_CIDRS",
+                    reason: format!("{s}: {e}"),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(Self {
             listen_addr,
             database_url,
             provision_host,
             provision_port,
+            allowed_cidrs,
         })
     }
 }

@@ -21,13 +21,18 @@ use serde::{Deserialize, Serialize};
 /// JSONB so queries can index them later without a column add.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectoryNumber {
+    /// The dialed number / directory number (primary key).
     pub did: String,
+    /// Owning username, if assigned to a user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// Routing partition this DID belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition: Option<String>,
+    /// Free-text description.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Forward-compatible fields not yet modeled (stored as JSONB).
     #[serde(default, skip_serializing_if = "HashMap::is_empty", flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }

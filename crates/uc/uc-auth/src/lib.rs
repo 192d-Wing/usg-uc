@@ -315,12 +315,11 @@ impl Authenticator {
 /// first, then the `sbc_session` cookie.
 #[must_use]
 pub fn extract_credential(headers: &axum::http::HeaderMap) -> Option<String> {
-    if let Some(value) = headers.get(axum::http::header::AUTHORIZATION) {
-        if let Ok(s) = value.to_str() {
-            if let Some(t) = s.strip_prefix("Bearer ") {
-                return Some(t.trim().to_string());
-            }
-        }
+    if let Some(value) = headers.get(axum::http::header::AUTHORIZATION)
+        && let Ok(s) = value.to_str()
+        && let Some(t) = s.strip_prefix("Bearer ")
+    {
+        return Some(t.trim().to_string());
     }
     let cookies = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
     for pair in cookies.split(';') {
