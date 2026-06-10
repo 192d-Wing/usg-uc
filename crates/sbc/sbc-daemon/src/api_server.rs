@@ -1318,9 +1318,21 @@ async fn delete_trunk_group(
     axum::extract::Path(group_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     let mut store = state.mem_store.write().await;
-    store.trunk_groups.remove(&group_id);
+    let removed_group = store.trunk_groups.remove(&group_id);
     store.save_trunk_groups();
     drop(store);
+    // Stop monitor/registration loops for every trunk in the group.
+    if let Some(trunks) = removed_group
+        .as_ref()
+        .and_then(|g| g.get("trunks"))
+        .and_then(|v| v.as_array())
+    {
+        for trunk in trunks {
+            if let Some(id) = trunk.get("id").and_then(|v| v.as_str()) {
+                stop_trunk_services(&state, id).await;
+            }
+        }
+    }
     if let Some(ref cucm) = state.cucm_router {
         cucm.write().await.remove_route_group(&group_id);
     }
@@ -1368,7 +1380,7 @@ async fn add_trunk(
         store.save_trunk_groups();
         let group_json = store.trunk_groups.get(&group_id).cloned();
         drop(store);
-        start_trunk_services(&state, &body);
+        start_trunk_services(&state, &body).await;
         if let Some(gj) = group_json {
             sync_trunk_group_to_router(&state, &gj).await;
         }
@@ -1411,7 +1423,7 @@ async fn update_trunk(
                 let updated = trunk.clone();
                 store.save_trunk_groups();
                 drop(store);
-                start_trunk_services(&state, &updated);
+                start_trunk_services(&state, &updated).await;
                 let mut response_trunk = updated;
                 redact_trunk(&mut response_trunk);
                 return (StatusCode::OK, Json(serde_json::json!({ "success": true, "trunk": response_trunk })));
@@ -1423,7 +1435,7 @@ async fn update_trunk(
 }
 
 /// Start OPTIONS monitoring and/or SIP registration for a trunk if enabled.
-pub fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
+pub async fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
     let trunk_id = trunk.get("id").and_then(|v| v.as_str()).unwrap_or_default();
     let host = trunk.get("host").and_then(|v| v.as_str()).unwrap_or_default();
     let port = trunk.get("port").and_then(|v| v.as_u64()).unwrap_or(5060) as u16;
@@ -1446,9 +1458,10 @@ pub fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
         (None, None)
     };
 
-    // Start OPTIONS health monitoring
-    if trunk.get("options_ping_enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
-        if let Some(ref monitor) = state.trunk_monitor {
+    // Start (or stop) OPTIONS health monitoring. Disabling the flag on an
+    // update must stop the existing loop, not leave it running forever.
+    if let Some(ref monitor) = state.trunk_monitor {
+        if trunk.get("options_ping_enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
             let interval = trunk.get("options_ping_interval").and_then(|v| v.as_u64()).unwrap_or(30) as u32;
             monitor.monitor_trunk(crate::trunk_monitor::MonitoredTrunk {
                 trunk_id: trunk_id.to_string(),
@@ -1458,32 +1471,45 @@ pub fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
                 bind_ip,
             });
             tracing::info!(trunk_id, ?bind_ip, "Started OPTIONS health monitor via API");
+        } else {
+            monitor.stop_trunk(trunk_id).await;
         }
     }
 
-    // Start SIP registration
-    if trunk.get("register_enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
+    // Start (or stop) SIP registration
+    if let Some(ref registrar) = state.trunk_registrar {
         let username = trunk.get("sip_username").and_then(|v| v.as_str()).unwrap_or_default();
         let password = trunk.get("sip_password").and_then(|v| v.as_str()).unwrap_or_default();
-        if !username.is_empty() && !password.is_empty() {
-            if let Some(ref registrar) = state.trunk_registrar {
-                let domain = trunk.get("sip_domain").and_then(|v| v.as_str()).unwrap_or(host);
-                let expires = trunk.get("register_expires").and_then(|v| v.as_u64()).unwrap_or(25) as u32;
-                tracing::info!(trunk_id, ?bind_ip, ?external_ip, expires, "Starting trunk registration with zone IPs");
-                registrar.register_trunk(crate::trunk_registrar::TrunkRegConfig {
-                    trunk_id: trunk_id.to_string(),
-                    host: host.to_string(),
-                    port,
-                    username: username.to_string(),
-                    password: password.to_string(),
-                    domain: domain.to_string(),
-                    expires,
-                    bind_ip,
-                    external_ip,
-                });
-                tracing::info!(trunk_id, "Started SIP registration via API");
-            }
+        let register_enabled = trunk.get("register_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+        if register_enabled && !username.is_empty() && !password.is_empty() {
+            let domain = trunk.get("sip_domain").and_then(|v| v.as_str()).unwrap_or(host);
+            let expires = trunk.get("register_expires").and_then(|v| v.as_u64()).unwrap_or(25) as u32;
+            tracing::info!(trunk_id, ?bind_ip, ?external_ip, expires, "Starting trunk registration with zone IPs");
+            registrar.register_trunk(crate::trunk_registrar::TrunkRegConfig {
+                trunk_id: trunk_id.to_string(),
+                host: host.to_string(),
+                port,
+                username: username.to_string(),
+                password: password.to_string(),
+                domain: domain.to_string(),
+                expires,
+                bind_ip,
+                external_ip,
+            });
+            tracing::info!(trunk_id, "Started SIP registration via API");
+        } else {
+            registrar.stop_trunk(trunk_id).await;
         }
+    }
+}
+
+/// Stops monitoring and registration loops for a deleted trunk.
+pub async fn stop_trunk_services(state: &Arc<AppState>, trunk_id: &str) {
+    if let Some(ref monitor) = state.trunk_monitor {
+        monitor.stop_trunk(trunk_id).await;
+    }
+    if let Some(ref registrar) = state.trunk_registrar {
+        registrar.stop_trunk(trunk_id).await;
     }
 }
 
@@ -1595,6 +1621,8 @@ async fn delete_trunk(
     if let Some(gj) = group_json {
         sync_trunk_group_to_router(&state, &gj).await;
     }
+    // Stop the deleted trunk's monitor/registration loops.
+    stop_trunk_services(&state, &trunk_id).await;
     (
         StatusCode::OK,
         Json(serde_json::json!({ "success": true, "group_id": group_id, "trunk_id": trunk_id })),

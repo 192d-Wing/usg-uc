@@ -397,7 +397,28 @@ impl Server {
 
         // Wait for shutdown or all tasks to complete
         self.shutdown.wait_for_shutdown().await;
-        info!("Shutdown signal received, stopping event loop");
+        info!("Shutdown signal received — draining active calls");
+
+        // Drain: reject new INVITEs (503) but keep the receive loops alive
+        // so in-dialog BYEs still tear calls down. Previously the loops were
+        // aborted immediately, so "draining" could never complete and
+        // active calls were killed on SIGTERM.
+        self.sip_stack.set_draining();
+        let drain_deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+        loop {
+            let active = self.sip_stack.active_call_count().await;
+            if active == 0 {
+                info!("All active calls drained");
+                break;
+            }
+            if tokio::time::Instant::now() >= drain_deadline {
+                warn!(active, "Drain timeout reached, terminating with active calls");
+                break;
+            }
+            debug!(active, "Waiting for calls to drain");
+            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+        }
 
         // Cancel all tasks
         for handle in handles {
@@ -426,11 +447,16 @@ impl Server {
             "Starting transport receive loop"
         );
 
+        let mut consecutive_errors: u64 = 0;
         loop {
+            // No shutdown arm here: during graceful shutdown the loop keeps
+            // processing in-dialog requests (BYEs) so active calls can
+            // drain; Server::run aborts the task once draining completes.
             tokio::select! {
                 result = transport.recv() => {
                     match result {
                         Ok(msg) => {
+                            consecutive_errors = 0;
                             stats.messages_received.fetch_add(1, Ordering::Relaxed);
 
                             // Extract source IP for rate limiting
@@ -511,12 +537,23 @@ impl Server {
                                 break;
                             }
                             warn!(error = %e, "Transport receive error");
+                            // Persistent errors (closed fd, dead transport)
+                            // return immediately — back off instead of
+                            // busy-spinning at 100% CPU flooding the log.
+                            consecutive_errors += 1;
+                            if consecutive_errors >= 32 {
+                                error!(
+                                    transport_idx = idx,
+                                    "Transport failing persistently, stopping receive loop"
+                                );
+                                break;
+                            }
+                            tokio::time::sleep(tokio::time::Duration::from_millis(
+                                50 * consecutive_errors.min(20),
+                            ))
+                            .await;
                         }
                     }
-                }
-                () = shutdown.wait_for_shutdown() => {
-                    debug!(transport_idx = idx, "Transport receive loop shutting down");
-                    break;
                 }
             }
         }

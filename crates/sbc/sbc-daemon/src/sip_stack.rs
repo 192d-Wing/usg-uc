@@ -91,6 +91,8 @@ pub struct SipStack {
     /// Registration statistics.
     registrations_active: AtomicU64,
     registrations_total: AtomicU64,
+    /// Draining: reject new INVITEs (503) while existing calls finish.
+    draining: std::sync::atomic::AtomicBool,
 }
 
 /// SIP stack configuration.
@@ -307,6 +309,7 @@ impl SipStack {
             topology_hider: None,
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
+            draining: std::sync::atomic::AtomicBool::new(false),
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
@@ -356,6 +359,7 @@ impl SipStack {
             topology_hider: None,
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
+            draining: std::sync::atomic::AtomicBool::new(false),
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
@@ -369,6 +373,17 @@ impl SipStack {
     /// Sets the media pipeline for RTP relay.
     pub fn set_media_pipeline(&mut self, pipeline: Arc<crate::media_pipeline::MediaPipeline>) {
         self.media_pipeline = Some(pipeline);
+    }
+
+    /// Enters draining mode: new INVITEs are rejected with 503 while
+    /// existing dialogs continue (graceful shutdown).
+    pub fn set_draining(&self) {
+        self.draining.store(true, Ordering::Relaxed);
+    }
+
+    /// Number of active B2BUA calls (drain progress).
+    pub async fn active_call_count(&self) -> usize {
+        self.calls.read().await.calls.len()
     }
 
     /// Sets the zone registry for zone-aware SIP processing.
@@ -1224,6 +1239,17 @@ impl SipStack {
         {
             debug!(call_id = %a_leg_call_id, "INVITE retransmit (announcement), absorbing");
             return ProcessResult::NoAction;
+        }
+
+        // Draining (graceful shutdown): refuse new calls, let existing ones
+        // finish.
+        if self.draining.load(Ordering::Relaxed) {
+            info!(call_id = %a_leg_call_id, "Draining — rejecting new INVITE");
+            let unavailable = create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
+            return ProcessResult::Response {
+                message: SipMessage::Response(unavailable),
+                destination: source,
+            };
         }
 
         // Admission control: reject new calls beyond the configured ceiling

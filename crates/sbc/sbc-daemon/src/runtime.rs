@@ -645,7 +645,7 @@ impl Runtime {
                 crate::api_server::sync_trunk_group_to_router(&app_state, group_json).await;
                 if let Some(trunks) = group_json.get("trunks").and_then(|v| v.as_array()) {
                     for trunk in trunks {
-                        crate::api_server::start_trunk_services(&app_state, trunk);
+                        crate::api_server::start_trunk_services(&app_state, trunk).await;
                     }
                 }
             }
@@ -671,7 +671,7 @@ impl Runtime {
         let api_server = ApiServer::new(api_config, app_state.clone(), signal.clone());
 
         // Spawn API server task
-        let api_handle = tokio::spawn(async move {
+        let mut api_handle = tokio::spawn(async move {
             if let Err(e) = api_server.run().await {
                 error!("API server error: {e}");
             }
@@ -727,13 +727,34 @@ impl Runtime {
         // Stop reload monitor
         reload_handle.abort();
 
-        // Stop API server
-        api_handle.abort();
+        // Stop trunk monitor/registration loops — they would otherwise keep
+        // sending OPTIONS/REGISTER during teardown.
+        if let Some(ref monitor) = app_state.trunk_monitor {
+            monitor.stop_all();
+        }
+        if let Some(ref registrar) = app_state.trunk_registrar {
+            registrar.stop_all();
+        }
 
-        // Stop gRPC server
+        // The API/gRPC servers exit on their own via with_graceful_shutdown
+        // once the signal fires; give in-flight requests a short grace
+        // window before aborting (an immediate abort cut responses off
+        // mid-flight).
+        if tokio::time::timeout(std::time::Duration::from_secs(3), &mut api_handle)
+            .await
+            .is_err()
+        {
+            api_handle.abort();
+        }
+
         #[cfg(feature = "grpc")]
-        if let Some(handle) = grpc_handle {
-            handle.abort();
+        if let Some(mut handle) = grpc_handle {
+            if tokio::time::timeout(std::time::Duration::from_secs(3), &mut handle)
+                .await
+                .is_err()
+            {
+                handle.abort();
+            }
             info!("gRPC server stopped");
         }
 

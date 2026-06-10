@@ -49,6 +49,11 @@ pub struct TrunkRegConfig {
 /// Trunk registrar that maintains registrations to carriers.
 pub struct TrunkRegistrar {
     statuses: Arc<RwLock<HashMap<String, TrunkRegistrationStatus>>>,
+    /// Running registration loops by trunk ID. Tracked so re-configuring a
+    /// trunk replaces its loop (previously every trunk update spawned an
+    /// additional permanent loop re-REGISTERing with stale credentials)
+    /// and so loops stop on trunk deletion and daemon shutdown.
+    tasks: std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     local_domain: String,
 }
 
@@ -56,7 +61,28 @@ impl TrunkRegistrar {
     pub fn new(local_domain: &str) -> Self {
         Self {
             statuses: Arc::new(RwLock::new(HashMap::new())),
+            tasks: std::sync::Mutex::new(HashMap::new()),
             local_domain: local_domain.to_string(),
+        }
+    }
+
+    /// Stops registration for a trunk and removes its status entry.
+    pub async fn stop_trunk(&self, trunk_id: &str) {
+        if let Ok(mut tasks) = self.tasks.lock() {
+            if let Some(handle) = tasks.remove(trunk_id) {
+                handle.abort();
+                info!(trunk_id, "Stopped trunk registration loop");
+            }
+        }
+        self.statuses.write().await.remove(trunk_id);
+    }
+
+    /// Aborts all registration loops (daemon shutdown).
+    pub fn stop_all(&self) {
+        if let Ok(mut tasks) = self.tasks.lock() {
+            for (_, handle) in tasks.drain() {
+                handle.abort();
+            }
         }
     }
 
@@ -64,15 +90,16 @@ impl TrunkRegistrar {
         Arc::clone(&self.statuses)
     }
 
-    /// Starts registration for a trunk. Spawns a background task.
-    pub fn register_trunk(&self, config: TrunkRegConfig) -> tokio::task::JoinHandle<()> {
+    /// Starts (or replaces) registration for a trunk.
+    pub fn register_trunk(&self, config: TrunkRegConfig) {
         let statuses = Arc::clone(&self.statuses);
         let local_domain = self.local_domain.clone();
         let trunk_id = config.trunk_id.clone();
         let registrar = format!("{}:{}", config.host, config.port);
         let username = config.username.clone();
 
-        tokio::spawn(async move {
+        let registry_id = config.trunk_id.clone();
+        let handle = tokio::spawn(async move {
             info!(
                 trunk_id = %config.trunk_id,
                 host = %config.host,
@@ -155,7 +182,46 @@ impl TrunkRegistrar {
                 info!(trunk_id = %config.trunk_id, wait_secs = wait.as_secs(), "Scheduling re-registration");
                 tokio::time::sleep(wait).await;
             }
-        })
+        });
+
+        if let Ok(mut tasks) = self.tasks.lock() {
+            if let Some(previous) = tasks.insert(registry_id.clone(), handle) {
+                previous.abort();
+                info!(trunk_id = %registry_id, "Replaced existing registration loop");
+            }
+        }
+    }
+
+    /// Receives until a datagram arrives from the target's IP containing
+    /// our Call-ID, or the 5s deadline passes. Stray or spoofed datagrams
+    /// on the shared :5060 socket are ignored instead of being parsed as
+    /// the registration response.
+    async fn recv_matching(
+        socket: &UdpSocket,
+        buf: &mut [u8],
+        target: std::net::SocketAddr,
+        call_id: &str,
+    ) -> Result<usize, String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = std::time::Instant::now();
+            let remaining = deadline
+                .checked_duration_since(remaining)
+                .ok_or_else(|| "Timeout waiting for response".to_string())?;
+            let (n, from) = tokio::time::timeout(remaining, socket.recv_from(buf))
+                .await
+                .map_err(|_| "Timeout waiting for response".to_string())?
+                .map_err(|e| format!("Recv failed: {e}"))?;
+            if from.ip() != target.ip() {
+                trace!(source = %from, "Ignoring datagram from unexpected source");
+                continue;
+            }
+            if !String::from_utf8_lossy(&buf[..n]).contains(call_id) {
+                trace!("Ignoring SIP message with foreign Call-ID");
+                continue;
+            }
+            return Ok(n);
+        }
     }
 
     /// Performs a single REGISTER transaction with digest auth.
@@ -241,12 +307,11 @@ impl TrunkRegistrar {
         socket.send_to(&msg_bytes, target).await
             .map_err(|e| format!("Send failed: {e}"))?;
 
-        // Receive response
+        // Receive a MATCHING response (same source IP, our Call-ID). The
+        // socket shares port 5060 with the SIP listener, so the first
+        // datagram is not necessarily our response.
         let mut buf = [0u8; 4096];
-        let (n, _) = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
-            .await
-            .map_err(|_| "Timeout waiting for response".to_string())?
-            .map_err(|e| format!("Recv failed: {e}"))?;
+        let n = Self::recv_matching(&socket, &mut buf, target, &call_id).await?;
 
         trace!(
             trunk_id = %config.trunk_id,
@@ -332,11 +397,8 @@ impl TrunkRegistrar {
             socket.send_to(&auth_bytes, target).await
                 .map_err(|e| format!("Send auth REGISTER failed: {e}"))?;
 
-            // Receive final response
-            let (n2, _) = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
-                .await
-                .map_err(|_| "Timeout waiting for auth response".to_string())?
-                .map_err(|e| format!("Recv auth response failed: {e}"))?;
+            // Receive final response (matched by source + Call-ID)
+            let n2 = Self::recv_matching(&socket, &mut buf, target, &call_id).await?;
 
             trace!(
                 trunk_id = %config.trunk_id,

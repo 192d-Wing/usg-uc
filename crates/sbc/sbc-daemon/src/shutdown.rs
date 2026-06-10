@@ -149,6 +149,20 @@ impl ShutdownSignal {
                 }
             }
         }
+
+        // Shutdown is in progress. A second termination signal means the
+        // operator wants out NOW (e.g. the drain is hung) — exit instead of
+        // ignoring further Ctrl+C.
+        tokio::select! {
+            _ = sigterm.recv() => {
+                warn!("Second termination signal during shutdown — exiting immediately");
+                std::process::exit(130);
+            }
+            _ = sigint.recv() => {
+                warn!("Second termination signal during shutdown — exiting immediately");
+                std::process::exit(130);
+            }
+        }
     }
 
     /// Internal signal handler loop for non-Unix platforms.
@@ -215,7 +229,11 @@ impl ConnectionTracker {
 
     /// Decrements the active call count.
     pub fn call_ended(&self) {
-        self.active_calls.fetch_sub(1, Ordering::SeqCst);
+        // Saturating decrement: an unmatched *_ended() must not wrap to
+        // ~4 billion and make is_drained() permanently false.
+        let _ = self
+            .active_calls
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1));
     }
 
     /// Returns the active call count.
@@ -230,7 +248,11 @@ impl ConnectionTracker {
 
     /// Decrements the active transaction count.
     pub fn transaction_ended(&self) {
-        self.active_transactions.fetch_sub(1, Ordering::SeqCst);
+        // Saturating decrement: an unmatched *_ended() must not wrap to
+        // ~4 billion and make is_drained() permanently false.
+        let _ = self
+            .active_transactions
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1));
     }
 
     /// Returns the active transaction count.
@@ -245,7 +267,11 @@ impl ConnectionTracker {
 
     /// Decrements the pending registration count.
     pub fn registration_ended(&self) {
-        self.pending_registrations.fetch_sub(1, Ordering::SeqCst);
+        // Saturating decrement: an unmatched *_ended() must not wrap to
+        // ~4 billion and make is_drained() permanently false.
+        let _ = self
+            .pending_registrations
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1));
     }
 
     /// Returns the pending registration count.
