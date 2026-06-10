@@ -22,6 +22,7 @@ mod dial_plans;
 mod directory;
 mod phones;
 mod proxy;
+mod redact;
 mod registrations;
 mod system;
 mod trunk_groups;

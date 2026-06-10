@@ -19,6 +19,12 @@ pub struct User {
     /// Authentication method for this user.
     pub auth_type: AuthType,
     /// Pre-computed HA1 for SIP digest authentication.
+    ///
+    /// Never serialized: the HA1 is password-equivalent for SIP digest auth,
+    /// and `User` is returned directly in sbc-api responses. Stores persist
+    /// this via explicit column binding, not serde, so skipping it here is
+    /// safe.
+    #[serde(skip_serializing)]
     pub digest_ha1: Option<String>,
     /// X.509 Subject Distinguished Name for mTLS/PKI authentication.
     pub certificate_dn: Option<String>,

@@ -13,6 +13,7 @@ use axum::Json;
 use sbc_grpc_api::prelude::{RemoveTrunkGroupRequest, SyncTrunkGroupRequest};
 use tracing::warn;
 
+use crate::handlers::redact;
 use crate::state::AppState;
 
 async fn lookup(state: &Arc<AppState>, id: &str) -> Option<serde_json::Value> {
@@ -54,6 +55,7 @@ pub async fn list_groups(State(state): State<Arc<AppState>>) -> impl IntoRespons
     match state.trunk_groups.list().await {
         Ok(groups) => {
             let total = groups.len();
+            let groups: Vec<_> = groups.into_iter().map(redact::redacted).collect();
             Json(serde_json::json!({"trunk_groups": groups, "total": total}))
         }
         Err(e) => {
@@ -68,7 +70,7 @@ pub async fn get_group(
     Path(group_id): Path<String>,
 ) -> impl IntoResponse {
     match lookup(&state, &group_id).await {
-        Some(g) => Json(g),
+        Some(g) => Json(redact::redacted(g)),
         None => Json(serde_json::json!({"error": format!("Trunk group {group_id} not found")})),
     }
 }
@@ -86,6 +88,8 @@ pub async fn add_group(
     if body.get("trunks").is_none() {
         body["trunks"] = serde_json::json!([]);
     }
+    let existing = lookup(&state, &id).await;
+    redact::restore_passwords(&mut body, existing.as_ref());
     if !persist(&state, &id, &body).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -93,6 +97,7 @@ pub async fn add_group(
         );
     }
     notify_sync(&state, &id).await;
+    redact::trunk_group(&mut body);
     (
         StatusCode::CREATED,
         Json(serde_json::json!({"success": true, "trunk_group": body})),
@@ -105,6 +110,8 @@ pub async fn update_group(
     Json(mut body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     body["id"] = serde_json::json!(&group_id);
+    let existing = lookup(&state, &group_id).await;
+    redact::restore_passwords(&mut body, existing.as_ref());
     if !persist(&state, &group_id, &body).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -112,6 +119,7 @@ pub async fn update_group(
         );
     }
     notify_sync(&state, &group_id).await;
+    redact::trunk_group(&mut body);
     (
         StatusCode::OK,
         Json(serde_json::json!({"success": true, "trunk_group": body})),
@@ -134,7 +142,7 @@ pub async fn delete_group(
 pub async fn add_trunk(
     State(state): State<Arc<AppState>>,
     Path(group_id): Path<String>,
-    Json(body): Json<serde_json::Value>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let Some(mut group_json) = lookup(&state, &group_id).await else {
         return (
@@ -142,6 +150,8 @@ pub async fn add_trunk(
             Json(serde_json::json!({"success": false, "error": "Group not found"})),
         );
     };
+    // A round-tripped marker on a brand-new trunk has no stored secret.
+    redact::drop_marker_password(&mut body);
     match group_json.get_mut("trunks").and_then(|v| v.as_array_mut()) {
         Some(arr) => arr.push(body.clone()),
         None => {
@@ -152,6 +162,7 @@ pub async fn add_trunk(
     }
     persist(&state, &group_id, &group_json).await;
     notify_sync(&state, &group_id).await;
+    redact::trunk(&mut body);
     (
         StatusCode::CREATED,
         Json(serde_json::json!({"success": true, "trunk": body})),
@@ -189,14 +200,20 @@ pub async fn update_trunk(
     };
     if let (Some(obj), Some(updates)) = (trunk.as_object_mut(), body.as_object()) {
         for (k, v) in updates {
-            if k != "id" {
-                obj.insert(k.clone(), v.clone());
+            if k == "id" {
+                continue;
             }
+            // Round-tripped marker keeps the stored secret.
+            if k == "sip_password" && v.as_str() == Some(redact::REDACTED) {
+                continue;
+            }
+            obj.insert(k.clone(), v.clone());
         }
     }
-    let updated = trunk.clone();
+    let mut updated = trunk.clone();
     persist(&state, &group_id, &group_json).await;
     notify_sync(&state, &group_id).await;
+    redact::trunk(&mut updated);
     (
         StatusCode::OK,
         Json(serde_json::json!({"success": true, "trunk": updated})),
