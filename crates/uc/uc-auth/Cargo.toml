@@ -1,0 +1,21 @@
+[package]
+name = "uc-auth"
+description = "Shared management-plane authentication for USG SBC (stateless bearer tokens + argon2 admin credentials)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror.workspace = true
+tracing.workspace = true
+axum = { workspace = true }
+argon2 = "0.5"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2.6"
+base64 = "0.22"
+hex = "0.4"
+rand = "0.8"

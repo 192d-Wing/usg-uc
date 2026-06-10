@@ -29,6 +29,7 @@ members = [
 
     # Layer 4: Security (uc-* = reusable)
     "crates/uc/uc-acl",
+    "crates/uc/uc-auth",
     "crates/uc/uc-dos-protection",
 
     # Layer 5: Orchestration (uc-* = reusable)
@@ -154,6 +155,7 @@ uc-transport = { path = "crates/uc/uc-transport" }
 uc-codecs = { path = "crates/uc/uc-codecs" }
 uc-media-engine = { path = "crates/uc/uc-media-engine" }
 uc-acl = { path = "crates/uc/uc-acl" }
+uc-auth = { path = "crates/uc/uc-auth" }
 uc-dos-protection = { path = "crates/uc/uc-dos-protection" }
 uc-policy = { path = "crates/uc/uc-policy" }
 uc-routing = { path = "crates/uc/uc-routing" }
