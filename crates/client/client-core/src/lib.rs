@@ -27,7 +27,7 @@ pub mod credential_store;
 pub mod settings;
 pub mod sip_transport;
 
-pub use app::{AppEvent, AppState, ClientApp, PinOperationType};
+pub use app::{AppEvent, AppState, ClientApp, PinOperationType, StoragePaths};
 pub use audio_session::{
     AudioSession, AudioSessionConfig, AudioSessionConfigBuilder, AudioSessionEvent,
 };

@@ -137,6 +137,20 @@ pub enum AppState {
     ShuttingDown,
 }
 
+/// Filesystem locations for persisted client state.
+///
+/// Desktop builds resolve these automatically via the `directories` crate
+/// (see [`ClientApp::new`]). Mobile shells must pass their app-sandbox
+/// container paths via [`ClientApp::with_paths`] instead, since mobile
+/// platforms have no XDG/Known Folders equivalent visible to this process.
+#[derive(Debug, Clone)]
+pub struct StoragePaths {
+    /// Directory for configuration (`settings.toml`).
+    pub config_dir: std::path::PathBuf,
+    /// Directory for application data (`contacts.json`, call history).
+    pub data_dir: std::path::PathBuf,
+}
+
 /// Main application coordinator.
 pub struct ClientApp {
     /// Application state.
@@ -179,15 +193,59 @@ impl ClientApp {
         local_media_addr: SocketAddr,
         app_event_tx: mpsc::Sender<AppEvent>,
     ) -> AppResult<Self> {
+        let settings_manager = SettingsManager::new()?;
+        let contact_manager = ContactManager::new()?;
+        Self::from_parts(
+            local_sip_addr,
+            local_media_addr,
+            app_event_tx,
+            settings_manager,
+            contact_manager,
+        )
+    }
+
+    /// Creates a new client application with explicit storage locations.
+    ///
+    /// Mobile shells (iOS/Android) must use this constructor and pass their
+    /// app-sandbox container paths; the default [`ClientApp::new`] resolves
+    /// desktop config directories that don't exist on mobile platforms.
+    /// The directories are created if missing.
+    pub fn with_paths(
+        local_sip_addr: SocketAddr,
+        local_media_addr: SocketAddr,
+        app_event_tx: mpsc::Sender<AppEvent>,
+        paths: &StoragePaths,
+    ) -> AppResult<Self> {
+        std::fs::create_dir_all(&paths.config_dir)?;
+        std::fs::create_dir_all(&paths.data_dir)?;
+        let settings_manager = SettingsManager::with_path(paths.config_dir.join("settings.toml"))?;
+        let contact_manager = ContactManager::with_path(paths.data_dir.join("contacts.json"))?;
+        Self::from_parts(
+            local_sip_addr,
+            local_media_addr,
+            app_event_tx,
+            settings_manager,
+            contact_manager,
+        )
+    }
+
+    /// Shared constructor body: wires agents, channels, and transport around
+    /// already-loaded settings and contacts.
+    fn from_parts(
+        local_sip_addr: SocketAddr,
+        local_media_addr: SocketAddr,
+        app_event_tx: mpsc::Sender<AppEvent>,
+        settings_manager: SettingsManager,
+        contact_manager: ContactManager,
+    ) -> AppResult<Self> {
         info!(
             sip_addr = %local_sip_addr,
             media_addr = %local_media_addr,
             "Initializing client application"
         );
 
-        // Load settings
         #[allow(unused_mut)] // mut only needed with digest-auth feature
-        let mut settings_manager = SettingsManager::new()?;
+        let mut settings_manager = settings_manager;
 
         // Load any persisted passwords from secure storage (keychain)
         #[cfg(feature = "digest-auth")]
@@ -199,8 +257,7 @@ impl ClientApp {
             }
         }
 
-        // Load contacts
-        let contact_manager = Arc::new(RwLock::new(ContactManager::new()?));
+        let contact_manager = Arc::new(RwLock::new(contact_manager));
 
         // Create registration agent channel
         let (reg_event_tx, reg_event_rx) = mpsc::channel(32);
