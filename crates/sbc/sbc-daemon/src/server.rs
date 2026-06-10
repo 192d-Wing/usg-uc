@@ -283,6 +283,14 @@ impl Server {
         // Bind UDP listeners
         self.bind_udp_listeners().await?;
 
+        // Seed the live-transport count at bind time (before the API server
+        // starts serving readiness), so the readiness probe never sees a
+        // spurious 0 during the window before run() spawns the loops.
+        let bound = self.udp_transports.read().await.len();
+        self.stats
+            .live_transports
+            .store(bound as u64, Ordering::SeqCst);
+
         Ok(())
     }
 
@@ -546,6 +554,14 @@ impl Server {
                                     transport_idx = idx,
                                     "Transport failing persistently, stopping receive loop"
                                 );
+                                // Mark this transport dead so readiness can
+                                // reflect it (the daemon must not stay green
+                                // while deaf on a listener).
+                                stats.live_transports.fetch_update(
+                                    Ordering::SeqCst,
+                                    Ordering::SeqCst,
+                                    |v| v.checked_sub(1),
+                                ).ok();
                                 break;
                             }
                             tokio::time::sleep(tokio::time::Duration::from_millis(
@@ -676,6 +692,11 @@ pub struct ServerStats {
     pub messages_sent: AtomicU64,
     /// Messages rejected due to rate limiting.
     pub rate_limited: AtomicU64,
+    /// Transport receive loops still running. Set to the bound-transport
+    /// count at startup and decremented when a loop dies abnormally
+    /// (persistent recv errors). Readiness flips to not-ready at 0 so a
+    /// daemon deaf on all transports stops reporting healthy.
+    pub live_transports: AtomicU64,
 }
 
 /// Server error.

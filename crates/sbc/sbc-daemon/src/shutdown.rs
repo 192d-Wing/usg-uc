@@ -365,6 +365,13 @@ impl ShutdownCoordinator {
     /// 1. Signals shutdown to stop accepting new connections
     /// 2. Polls active connections until drained or timeout
     /// 3. Returns the final shutdown phase with statistics
+    ///
+    /// NOTE: the daemon's live drain is performed inside the SIP server loop
+    /// (`Server::run` enters draining mode and polls the real call count).
+    /// This method's [`ConnectionTracker`] is a self-contained utility — it
+    /// is only meaningful if callers actually invoke `call_started`/
+    /// `call_ended`; the daemon does not, so `Runtime::run` does not call
+    /// this. Wire the tracker into call lifecycle before relying on it.
     #[allow(clippy::cast_possible_truncation)]
     pub async fn shutdown_gracefully(&self) -> DrainResult {
         let phase = self.initiate_shutdown();

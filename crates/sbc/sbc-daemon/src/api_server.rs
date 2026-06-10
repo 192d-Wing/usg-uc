@@ -150,17 +150,32 @@ impl MemStore {
             }
         };
         let count = self.trunk_groups.len();
-        tokio::task::spawn_blocking(move || Self::write_trunk_groups_file(&data, count));
+        // Assign a monotonic sequence to this snapshot. Callers hold the
+        // mem_store write lock, so sequence order matches data order. The
+        // writer skips any snapshot older than one already persisted, so
+        // spawn_blocking's non-FIFO scheduling can't let a stale snapshot
+        // win the race and clobber newer data.
+        let seq = TRUNK_SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::task::spawn_blocking(move || Self::write_trunk_groups_file(&data, count, seq));
     }
 
-    /// Atomic, serialized write of the trunk-groups file (blocking context).
-    fn write_trunk_groups_file(data: &str, count: usize) {
-        // Serialize concurrent writers: two tasks sharing one temp path
-        // could otherwise interleave writes and rename a torn file.
+    /// Atomic, ordered write of the trunk-groups file (blocking context).
+    fn write_trunk_groups_file(data: &str, count: usize, seq: u64) {
+        use std::sync::atomic::Ordering;
+        // Serialize concurrent writers and enforce snapshot ordering.
         static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = WRITE_LOCK.lock();
 
-        let tmp_path = format!("{TRUNK_GROUPS_PATH}.tmp");
+        // Drop snapshots older than one already written (out-of-order
+        // scheduling). `fetch_max` records the highest seq seen.
+        let prev = TRUNK_WRITTEN_SEQ.fetch_max(seq, Ordering::SeqCst);
+        if seq < prev {
+            tracing::debug!(seq, prev, "Skipping stale trunk-groups snapshot");
+            return;
+        }
+
+        // Unique temp path per writer so two writes never share one file.
+        let tmp_path = format!("{TRUNK_GROUPS_PATH}.{seq}.tmp");
         if let Err(e) = std::fs::write(&tmp_path, data) {
             tracing::warn!(error = %e, "Failed to write {tmp_path}");
             return;
@@ -178,11 +193,17 @@ impl MemStore {
         }
         if let Err(e) = std::fs::rename(&tmp_path, TRUNK_GROUPS_PATH) {
             tracing::warn!(error = %e, "Failed to rename {tmp_path} to {TRUNK_GROUPS_PATH}");
+            let _ = std::fs::remove_file(&tmp_path);
             return;
         }
-        tracing::debug!(count, "Persisted trunk groups to {TRUNK_GROUPS_PATH}");
+        tracing::debug!(count, seq, "Persisted trunk groups to {TRUNK_GROUPS_PATH}");
     }
 }
+
+/// Monotonic sequence assigned to each trunk-groups snapshot at save time.
+static TRUNK_SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Highest snapshot sequence already persisted (ordering guard).
+static TRUNK_WRITTEN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Shared application state for the API server.
 pub struct AppState {
@@ -875,7 +896,11 @@ async fn liveness_probe() -> impl IntoResponse {
 ///
 /// Returns 200 OK if the server is ready to accept traffic.
 async fn readiness_probe(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let is_ready = state.is_ready();
+    // Not ready if every SIP transport receive loop has died — a daemon
+    // deaf on all listeners must not report ready even though the process
+    // and HTTP API are alive.
+    let transports_live = state.stats.live_transports.load(Ordering::Relaxed) > 0;
+    let is_ready = state.is_ready() && transports_live;
 
     let response = ReadinessResponse {
         ready: is_ready,
@@ -1326,6 +1351,12 @@ async fn add_trunk_group(
     }
     // Sync to SIP stack router
     sync_trunk_group_to_router(&state, &body).await;
+    // Start monitor/registration loops for any trunks declared in the group.
+    if let Some(trunks) = body.get("trunks").and_then(|v| v.as_array()) {
+        for trunk in trunks {
+            start_trunk_services(&state, trunk).await;
+        }
+    }
     redact_trunk_group(&mut body);
     (StatusCode::CREATED, Json(serde_json::json!({ "success": true, "trunk_group": body })))
 }
@@ -1360,6 +1391,20 @@ async fn delete_trunk_group(
     Json(serde_json::json!({ "success": true, "group_id": group_id }))
 }
 
+/// Collects the trunk IDs declared in a trunk-group JSON body.
+fn trunk_ids_of(group: &serde_json::Value) -> Vec<String> {
+    group
+        .get("trunks")
+        .and_then(|v| v.as_array())
+        .map(|trunks| {
+            trunks
+                .iter()
+                .filter_map(|t| t.get("id").and_then(|v| v.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Update a trunk group.
 async fn update_trunk_group(
     State(state): State<Arc<AppState>>,
@@ -1368,11 +1413,33 @@ async fn update_trunk_group(
 ) -> impl IntoResponse {
     body["id"] = serde_json::json!(group_id);
     let mut store = state.mem_store.write().await;
+    let old_trunk_ids = store.trunk_groups.get(&group_id).map(trunk_ids_of);
     restore_redacted_passwords(&mut body, store.trunk_groups.get(&group_id));
     store.trunk_groups.insert(group_id.clone(), body.clone());
     store.save_trunk_groups();
     drop(store);
     sync_trunk_group_to_router(&state, &body).await;
+
+    // Reconcile per-trunk monitor/registration loops: stop services for
+    // trunks removed by this replace, and (re)start them for every trunk in
+    // the new body. Without this, a PUT that drops a trunk leaves its
+    // OPTIONS/REGISTER loops running against the carrier forever, and added
+    // trunks get no services until restart.
+    let new_trunks = body
+        .get("trunks")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let new_ids = trunk_ids_of(&body);
+    if let Some(old_ids) = old_trunk_ids {
+        for removed in old_ids.iter().filter(|id| !new_ids.contains(id)) {
+            stop_trunk_services(&state, removed).await;
+        }
+    }
+    for trunk in &new_trunks {
+        start_trunk_services(&state, trunk).await;
+    }
+
     redact_trunk_group(&mut body);
     Json(serde_json::json!({ "success": true, "trunk_group": body }))
 }
@@ -1695,32 +1762,30 @@ async fn trigger_trunk_register(
         return Json(serde_json::json!({ "success": false, "error": "Trunk not found" }));
     };
 
-    let username = trunk.get("sip_username").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let password = trunk.get("sip_password").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let host = trunk.get("host").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let port = trunk.get("port").and_then(|v| v.as_u64()).unwrap_or(5060) as u16;
-
-    if username.is_empty() || host.is_empty() {
-        return Json(serde_json::json!({ "success": false, "error": "Trunk missing SIP credentials or host" }));
+    if state.trunk_registrar.is_none() {
+        return Json(
+            serde_json::json!({ "success": false, "error": "Trunk registrar not configured" }),
+        );
     }
 
-    if let Some(ref registrar) = state.trunk_registrar {
-        let config = crate::trunk_registrar::TrunkRegConfig {
-            trunk_id: trunk_id.clone(),
-            host: host.clone(),
-            port,
-            username,
-            password,
-            domain: host,
-            expires: 3600,
-            bind_ip: None,
-            external_ip: None,
-        };
-        registrar.register_trunk(config);
-        Json(serde_json::json!({ "success": true, "message": format!("Registration started for {trunk_id}") }))
-    } else {
-        Json(serde_json::json!({ "success": false, "error": "Trunk registrar not configured" }))
+    let register_enabled = trunk
+        .get("register_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !register_enabled {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": "Trunk does not have registration enabled",
+        }));
     }
+
+    // (Re)start through the shared path so the registration uses the trunk's
+    // zone bind/external IPs, configured expiry, and SIP domain. Building a
+    // bespoke TrunkRegConfig here (bind_ip: None, expires: 3600) would, with
+    // the new replace-on-spawn semantics, abort the correctly-configured
+    // loop and replace it with a degraded one bound to the wrong interface.
+    start_trunk_services(&state, &trunk).await;
+    Json(serde_json::json!({ "success": true, "message": format!("Registration (re)started for {trunk_id}") }))
 }
 
 // ============================================================================
@@ -2736,6 +2801,8 @@ mod tests {
     fn test_state() -> Arc<AppState> {
         let metrics = SbcMetrics::standard();
         let stats = Arc::new(ServerStats::default());
+        // Simulate a bound transport so readiness reflects a live server.
+        stats.live_transports.store(1, Ordering::SeqCst);
         Arc::new(AppState::new(metrics, stats))
     }
 

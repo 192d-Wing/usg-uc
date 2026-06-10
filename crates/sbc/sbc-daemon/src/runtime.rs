@@ -758,23 +758,15 @@ impl Runtime {
             info!("gRPC server stopped");
         }
 
-        // Perform graceful shutdown with connection draining
-        info!("Initiating graceful shutdown with connection draining");
-        let drain_result = self.shutdown.shutdown_gracefully().await;
-
-        if drain_result.drained {
-            info!(
-                duration_ms = drain_result.drain_duration_ms,
-                "All connections drained successfully"
-            );
-        } else {
-            warn!(
-                remaining_calls = drain_result.remaining_calls,
-                remaining_transactions = drain_result.remaining_transactions,
-                duration_ms = drain_result.drain_duration_ms,
-                "Shutdown completed with force-terminated connections"
-            );
-        }
+        // Connection draining already happened inside `server.run()`: on the
+        // shutdown signal it put the SIP stack into draining mode (new
+        // INVITEs rejected with 503) and polled the live call count until it
+        // reached zero or the drain deadline. That is the single source of
+        // truth for drain progress — the ConnectionTracker on
+        // ShutdownCoordinator is not wired into call lifecycle, so calling
+        // shutdown_gracefully() here would only poll an always-zero counter
+        // and report vacuous instant success.
+        info!("Connection draining completed by the SIP server loop");
 
         // Stop SIP server
         server
