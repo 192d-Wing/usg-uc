@@ -68,8 +68,14 @@ impl CredentialStore {
 
     /// Detects the best available storage backend.
     fn detect_backend() -> StorageBackend {
-        // Try keyring first
-        #[cfg(feature = "digest-auth")]
+        // Try keyring first. The keyring dependency only exists on desktop
+        // platforms (see Cargo.toml target tables); mobile uses the
+        // encrypted-file fallback until iOS Keychain / Android KeyStore
+        // providers land (CertProvider/PlatformServices work).
+        #[cfg(all(
+            feature = "digest-auth",
+            any(windows, target_os = "macos", target_os = "linux")
+        ))]
         {
             // Test if keyring is accessible by trying to create an entry
             match keyring::Entry::new(SERVICE_NAME, "__probe__") {
@@ -125,7 +131,10 @@ impl CredentialStore {
 
     // ========== Keyring Backend ==========
 
-    #[cfg(feature = "digest-auth")]
+    #[cfg(all(
+        feature = "digest-auth",
+        any(windows, target_os = "macos", target_os = "linux")
+    ))]
     #[allow(clippy::unused_self)]
     fn store_keyring(&self, account_id: &str, password: &str) -> AppResult<()> {
         let entry = keyring::Entry::new(SERVICE_NAME, account_id)
@@ -139,14 +148,20 @@ impl CredentialStore {
         Ok(())
     }
 
-    #[cfg(not(feature = "digest-auth"))]
+    #[cfg(not(all(
+        feature = "digest-auth",
+        any(windows, target_os = "macos", target_os = "linux")
+    )))]
     fn store_keyring(&self, _account_id: &str, _password: &str) -> AppResult<()> {
         Err(AppError::Settings(
             "Keyring storage not available".to_string(),
         ))
     }
 
-    #[cfg(feature = "digest-auth")]
+    #[cfg(all(
+        feature = "digest-auth",
+        any(windows, target_os = "macos", target_os = "linux")
+    ))]
     #[allow(clippy::unused_self)]
     fn get_keyring(&self, account_id: &str) -> AppResult<Option<Zeroizing<String>>> {
         let entry = keyring::Entry::new(SERVICE_NAME, account_id)
@@ -167,14 +182,20 @@ impl CredentialStore {
         }
     }
 
-    #[cfg(not(feature = "digest-auth"))]
+    #[cfg(not(all(
+        feature = "digest-auth",
+        any(windows, target_os = "macos", target_os = "linux")
+    )))]
     fn get_keyring(&self, _account_id: &str) -> AppResult<Option<Zeroizing<String>>> {
         Err(AppError::Settings(
             "Keyring storage not available".to_string(),
         ))
     }
 
-    #[cfg(feature = "digest-auth")]
+    #[cfg(all(
+        feature = "digest-auth",
+        any(windows, target_os = "macos", target_os = "linux")
+    ))]
     #[allow(clippy::unused_self)]
     fn delete_keyring(&self, account_id: &str) -> AppResult<()> {
         let entry = keyring::Entry::new(SERVICE_NAME, account_id)
@@ -195,7 +216,10 @@ impl CredentialStore {
         }
     }
 
-    #[cfg(not(feature = "digest-auth"))]
+    #[cfg(not(all(
+        feature = "digest-auth",
+        any(windows, target_os = "macos", target_os = "linux")
+    )))]
     fn delete_keyring(&self, _account_id: &str) -> AppResult<()> {
         Err(AppError::Settings(
             "Keyring storage not available".to_string(),

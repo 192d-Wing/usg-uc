@@ -19,7 +19,9 @@ TARGET_DIR="$(cargo metadata --format-version 1 --no-deps --manifest-path "$REPO
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 
 PROFILE=debug
-CARGO_FLAGS=()
+# digest-auth: password-based SIP auth for commercial-provider interop testing
+# (BulkVS). Production government builds are mTLS-only — drop the feature then.
+CARGO_FLAGS=(--features digest-auth)
 SKIP_IOS=0
 for arg in "$@"; do
     case "$arg" in
