@@ -1569,12 +1569,36 @@ async fn delete_trunk(
     axum::extract::Path((group_id, trunk_id)): axum::extract::Path<(String, String)>,
 ) -> impl IntoResponse {
     let mut store = state.mem_store.write().await;
-    if let Some(group) = store.trunk_groups.get_mut(&group_id) {
-        if let Some(trunks) = group.get_mut("trunks").and_then(|v| v.as_array_mut()) {
-            trunks.retain(|t| t.get("id").and_then(|v| v.as_str()) != Some(&trunk_id));
-        }
+    let Some(group) = store.trunk_groups.get_mut(&group_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "success": false, "error": "Group not found" })),
+        );
+    };
+    let mut removed = false;
+    if let Some(trunks) = group.get_mut("trunks").and_then(|v| v.as_array_mut()) {
+        let before = trunks.len();
+        trunks.retain(|t| t.get("id").and_then(|v| v.as_str()) != Some(&trunk_id));
+        removed = trunks.len() != before;
     }
-    Json(serde_json::json!({ "success": true, "group_id": group_id, "trunk_id": trunk_id }))
+    if !removed {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "success": false, "error": "Trunk not found" })),
+        );
+    }
+    // Persist and re-sync — previously the removal was lost on restart and
+    // the trunk stayed live in routing until then.
+    store.save_trunk_groups();
+    let group_json = store.trunk_groups.get(&group_id).cloned();
+    drop(store);
+    if let Some(gj) = group_json {
+        sync_trunk_group_to_router(&state, &gj).await;
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "success": true, "group_id": group_id, "trunk_id": trunk_id })),
+    )
 }
 
 // ============================================================================

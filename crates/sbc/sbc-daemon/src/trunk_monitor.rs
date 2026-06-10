@@ -227,17 +227,16 @@ impl TrunkMonitor {
     ) -> Result<u64, String> {
         // Resolve target address
         let addr_str = format!("{host}:{port}");
-        let target: SocketAddr = addr_str
-            .parse()
-            .or_else(|_| {
-                use std::net::ToSocketAddrs;
-                addr_str
-                    .to_socket_addrs()
-                    .map_err(|e| e.to_string())?
-                    .next()
-                    .ok_or_else(|| "DNS resolution failed".to_string())
-            })
-            .map_err(|e| format!("Cannot resolve {addr_str}: {e}"))?;
+        // Async DNS — std::net::ToSocketAddrs blocks the tokio worker
+        // thread for up to the resolver timeout (5s per nameserver).
+        let target: SocketAddr = match addr_str.parse() {
+            Ok(addr) => addr,
+            Err(_) => tokio::net::lookup_host(&addr_str)
+                .await
+                .map_err(|e| format!("Cannot resolve {addr_str}: {e}"))?
+                .next()
+                .ok_or_else(|| format!("DNS resolution failed for {addr_str}"))?,
+        };
 
         // Bind to zone IP on port 5060 (matching the SIP listener) so the
         // OPTIONS goes out the correct interface and the response comes back.

@@ -532,8 +532,16 @@ impl Runtime {
             // Load seed config first (if present)
             let seed_path = std::env::var("SBC_SEED_CONFIG")
                 .unwrap_or_else(|_| "/etc/sbc/seed.json".to_string());
-            if let Ok(seed_data) = std::fs::read_to_string(&seed_path) {
-                if let Ok(seed) = serde_json::from_str::<serde_json::Value>(&seed_data) {
+            match std::fs::read_to_string(&seed_path) {
+                Err(e) if std::path::Path::new(&seed_path).exists() => {
+                    warn!(path = %seed_path, error = %e, "Seed configuration exists but could not be read");
+                }
+                Err(_) => {} // No seed file — normal.
+                Ok(seed_data) => match serde_json::from_str::<serde_json::Value>(&seed_data) {
+                Err(e) => {
+                    warn!(path = %seed_path, error = %e, "Seed configuration is not valid JSON, ignoring");
+                }
+                Ok(seed) => {
                     info!(path = %seed_path, "Loading seed configuration");
 
                     // Seed trunk groups
@@ -611,6 +619,7 @@ impl Runtime {
                         }
                     }
                 }
+                },
             }
 
             // Load persisted trunk groups (overrides seed if same IDs)

@@ -72,28 +72,6 @@ impl TrunkRegistrar {
         let registrar = format!("{}:{}", config.host, config.port);
         let username = config.username.clone();
 
-        // Initialize status
-        {
-            let statuses = Arc::clone(&statuses);
-            tokio::spawn(async move {
-                statuses.write().await.insert(
-                    trunk_id.clone(),
-                    TrunkRegistrationStatus {
-                        trunk_id,
-                        registered: false,
-                        state: "Initializing".to_string(),
-                        registrar,
-                        username,
-                        last_registered: None,
-                        last_error: None,
-                        expires: 3600,
-                        attempts: 0,
-                        successes: 0,
-                    },
-                );
-            });
-        }
-
         tokio::spawn(async move {
             info!(
                 trunk_id = %config.trunk_id,
@@ -102,8 +80,31 @@ impl TrunkRegistrar {
                 "Starting trunk registration"
             );
 
+            // Initialize status in this task, before the first attempt —
+            // a separately spawned init task raced the first registration
+            // result (dropping it or overwriting it with "Initializing").
+            statuses.write().await.insert(
+                trunk_id.clone(),
+                TrunkRegistrationStatus {
+                    trunk_id,
+                    registered: false,
+                    state: "Initializing".to_string(),
+                    registrar,
+                    username,
+                    last_registered: None,
+                    last_error: None,
+                    expires: 3600,
+                    attempts: 0,
+                    successes: 0,
+                },
+            );
+
+            let mut backoff_secs: u64 = 5;
             loop {
                 let result = Self::do_register(&config, &local_domain).await;
+
+                let succeeded = result.is_ok();
+                let granted = *result.as_ref().unwrap_or(&config.expires);
 
                 let mut st = statuses.write().await;
                 if let Some(status) = st.get_mut(&config.trunk_id) {
@@ -133,11 +134,24 @@ impl TrunkRegistrar {
                 }
                 drop(st);
 
-                // Re-register at 80% of the configured expires (not the server-granted
-                // value, which may be much larger than what the provider actually requires).
-                let wait = Duration::from_secs(
-                    (u64::from(config.expires) * 80 / 100).max(10),
-                );
+                let wait = if succeeded {
+                    backoff_secs = 5;
+                    // Re-register at 80% of the effective expiry. RFC 3261
+                    // lets the registrar grant a SHORTER expiry than
+                    // requested — honoring only the configured value left
+                    // the trunk unregistered (unreachable for inbound
+                    // calls) between the granted expiry and the next
+                    // refresh.
+                    let effective = u64::from(granted.min(config.expires).max(1));
+                    Duration::from_secs((effective * 80 / 100).max(10))
+                } else {
+                    // Failure: exponential backoff with jitter instead of
+                    // waiting most of a full registration interval.
+                    let jitter = u64::from(rand::random::<u8>() % 5);
+                    let wait = Duration::from_secs(backoff_secs + jitter);
+                    backoff_secs = (backoff_secs * 2).min(60);
+                    wait
+                };
                 info!(trunk_id = %config.trunk_id, wait_secs = wait.as_secs(), "Scheduling re-registration");
                 tokio::time::sleep(wait).await;
             }
@@ -147,16 +161,16 @@ impl TrunkRegistrar {
     /// Performs a single REGISTER transaction with digest auth.
     async fn do_register(config: &TrunkRegConfig, local_domain: &str) -> Result<u32, String> {
         let addr_str = format!("{}:{}", config.host, config.port);
-        let target: std::net::SocketAddr = addr_str
-            .parse()
-            .or_else(|_| {
-                use std::net::ToSocketAddrs;
-                addr_str.to_socket_addrs()
-                    .map_err(|e| e.to_string())?
-                    .next()
-                    .ok_or_else(|| "DNS resolution failed".to_string())
-            })
-            .map_err(|e| format!("Cannot resolve {addr_str}: {e}"))?;
+        // Async DNS — std::net::ToSocketAddrs blocks the tokio worker
+        // thread for up to the resolver timeout (5s per nameserver).
+        let target: std::net::SocketAddr = match addr_str.parse() {
+            Ok(addr) => addr,
+            Err(_) => tokio::net::lookup_host(&addr_str)
+                .await
+                .map_err(|e| format!("Cannot resolve {addr_str}: {e}"))?
+                .next()
+                .ok_or_else(|| format!("DNS resolution failed for {addr_str}"))?,
+        };
 
         // Bind to zone signaling IP on port 5060 so the NAT mapping matches
         // what the provider expects for inbound traffic. Uses SO_REUSEADDR

@@ -1095,33 +1095,41 @@ impl SipStack {
                     response.add_header(Header::new(HeaderName::Contact, contact_str));
                 }
 
-                // Sync bindings to shared location service for routing
+                // Sync bindings to the shared location service from the
+                // registrar's authoritative contact set. This honors
+                // multi-device registration and de-registration
+                // (Expires: 0 yields an empty set) — previously all
+                // bindings were wiped and a single contact synthesized
+                // from the source IP, which clobbered other devices,
+                // resurrected de-registrations, and discarded the
+                // client's actual Contact URI.
                 let binding_count = reg_response.contacts.len();
                 {
                     let mut loc = self.location_service.write().await;
-                    // Always remove ALL existing bindings for this AOR before
-                    // re-adding. Only keep the latest Contact from this REGISTER.
                     let _ = loc.remove_all_bindings(&aor);
-
-                    // Only add the contact from the current source address,
-                    // using the actual source IP if Contact has 0.0.0.0
                     let src_ip = match source.ip() {
                         std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped()
                             .map_or_else(|| v6.to_string(), |v4| v4.to_string()),
                         std::net::IpAddr::V4(v4) => v4.to_string(),
                     };
-                    let src_port = source.port();
-
-                    // Build a single canonical contact from the actual source
-                    let contact_uri = format!("sip:{dest_user}@{src_ip}:{src_port};transport=udp",
-                        dest_user = aor.split(':').nth(1).and_then(|s| s.split('@').next()).unwrap_or("unknown"));
-                    let new_binding = proto_registrar::Binding::new(
-                        &aor,
-                        &contact_uri,
-                        &call_id,
-                        cseq,
-                    );
-                    let _ = loc.add_binding(new_binding);
+                    for binding in &reg_response.contacts {
+                        // NAT fix-up: a wildcard contact host can never be
+                        // routed to — substitute the actual source address.
+                        if binding.contact_uri().contains("0.0.0.0") {
+                            let rewritten = binding.contact_uri().replace(
+                                "0.0.0.0",
+                                &src_ip,
+                            );
+                            let _ = loc.add_binding(proto_registrar::Binding::new(
+                                &aor,
+                                &rewritten,
+                                &call_id,
+                                cseq,
+                            ));
+                        } else {
+                            let _ = loc.add_binding(binding.clone());
+                        }
+                    }
                 }
 
                 self.registrations_total.fetch_add(1, Ordering::Relaxed);
