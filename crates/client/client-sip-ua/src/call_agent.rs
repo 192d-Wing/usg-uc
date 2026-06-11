@@ -12,14 +12,16 @@ use proto_sip::builder::{RequestBuilder, generate_branch, generate_call_id, gene
 use proto_sip::header::HeaderName;
 use proto_sip::header_params::{NameAddr, ViaHeader};
 use proto_sip::message::{SipRequest, SipResponse};
-use proto_sip::uri::SipUri;
+use proto_sip::uri::{SipUri, UriScheme};
 use proto_transaction::client::{ClientInviteTransaction, ClientNonInviteTransaction};
 use proto_transaction::{TransactionKey, TransportType};
 use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::time::Instant;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+use uc_dns::{SipResolver, TransportPreference};
 use uuid::Uuid;
 
 /// User agent string for SIP messages.
@@ -39,6 +41,15 @@ pub struct CallAgent {
     display_name: String,
     /// Transport type for SIP signaling (UDP, TCP, or TLS).
     transport_type: String,
+    /// RFC 3263 resolver (NAPTR/SRV/A) for SIP URI destinations. Created
+    /// lazily on first use because the underlying DNS resolver needs a
+    /// running tokio runtime.
+    resolver: OnceLock<SipResolver>,
+    /// Our public address as seen by the peer, learned from `received`/
+    /// `rport` on the top Via of responses (RFC 3581). When set, it is
+    /// used as the advertised address (Via sent-by, Contact) of
+    /// subsequently built requests on the call paths.
+    public_addr: Option<SocketAddr>,
     /// Digest auth credentials for INVITE challenges (`BulkVS` etc.).
     #[cfg(feature = "digest-auth")]
     digest_credentials: Option<client_types::DigestAuthCredentials>,
@@ -81,8 +92,29 @@ struct CallSession {
     start_time: chrono::DateTime<Utc>,
     /// Call connect time (when Connected).
     connected_at: Option<Instant>,
+    /// Dialog route set, stored in the order Route headers are emitted on
+    /// in-dialog requests. For this UAC that is the REVERSED Record-Route
+    /// order of the dialog-establishing response (RFC 3261 §12.1.2).
+    /// Entries are full name-addr values (e.g. `<sip:proxy;lr>`).
+    route_set: Vec<String>,
+    /// Remote target: the URI from the Contact header of the
+    /// dialog-establishing response, refreshed by re-INVITE 2xx responses
+    /// (RFC 3261 §12.2.1.1). It is the Request-URI of in-dialog requests.
+    remote_target: Option<String>,
     /// Last branch parameter.
     last_branch: Option<String>,
+    /// Max-Forwards of the last INVITE actually sent. RFC 3261 §9.1
+    /// requires the CANCEL to carry the same Max-Forwards as the request
+    /// it cancels, and §17.1.1.3 requires the same for the ACK to a
+    /// non-2xx final response — neither may reset it to 70.
+    last_max_forwards: Option<u8>,
+    /// SDP and hold-flag of the last re-INVITE sent, kept for the one-shot
+    /// 491 glare retry (RFC 3261 §14.1).
+    last_reinvite: Option<(String, bool)>,
+    /// Number of consecutive 491 responses to the current re-INVITE.
+    reinvite_glare_attempts: u8,
+    /// Pending re-INVITE retry scheduled after a 491 (RFC 3261 §14.1).
+    reinvite_retry: Option<ReinviteRetry>,
     /// Exact Via header value of the last INVITE actually sent (including a
     /// digest-auth resend). RFC 3261 §9.1 requires the CANCEL's single Via
     /// to match the INVITE's, host AND port, and §17.1.1.3 requires the same
@@ -112,6 +144,29 @@ struct CallSession {
     /// Last digest challenge received for this call.
     #[cfg(feature = "digest-auth")]
     last_challenge: Option<proto_sip::auth::DigestChallenge>,
+}
+
+/// A scheduled re-INVITE retry after 491 glare (RFC 3261 §14.1).
+struct ReinviteRetry {
+    /// When the retry fires.
+    at: Instant,
+    /// The SDP of the re-INVITE to retry.
+    sdp: String,
+    /// Whether the re-INVITE was a hold.
+    is_hold: bool,
+}
+
+/// Request routing for an in-dialog request (RFC 3261 §12.2.1.1):
+/// where the Request-URI points, which Route headers to carry, and which
+/// hop the request is physically sent to.
+struct DialogTarget {
+    /// The Request-URI (the remote target, or the first strict route).
+    request_uri: String,
+    /// Route header values, in emission order.
+    routes: Vec<String>,
+    /// URI whose resolved address the request is sent to (first route,
+    /// or the remote target when the route set is empty).
+    next_hop: String,
 }
 
 /// The ACK sent for an INVITE's 2xx response, kept so a retransmitted 2xx
@@ -207,6 +262,8 @@ impl CallAgent {
             aor,
             display_name,
             transport_type: "TLS".to_string(), // Default to TLS, updated by configure()
+            resolver: OnceLock::new(),
+            public_addr: None,
             #[cfg(feature = "digest-auth")]
             digest_credentials: None,
         }
@@ -260,6 +317,10 @@ impl CallAgent {
     ///
     /// This allows hangup (BYE) and other in-dialog operations to work for
     /// inbound calls the same way they work for outbound calls.
+    ///
+    /// `record_routes` are the raw Record-Route header values of the
+    /// incoming INVITE, in received order. For a UAS the dialog route set
+    /// is that order, NOT reversed (RFC 3261 §12.1.1).
     #[allow(clippy::too_many_arguments)]
     pub fn register_inbound_call(
         &mut self,
@@ -270,7 +331,19 @@ impl CallAgent {
         remote_uri: &str,
         remote_display_name: Option<&str>,
         remote_sdp: Option<&str>,
+        record_routes: &[String],
     ) {
+        let route_set: Vec<String> = record_routes
+            .iter()
+            .flat_map(|v| Self::split_header_list(v))
+            .collect();
+        if !route_set.is_empty() {
+            info!(
+                call_id = %call_id,
+                route_set = ?route_set,
+                "Captured dialog route set from incoming INVITE Record-Route (RFC 3261 §12.1.1)"
+            );
+        }
         let session = CallSession {
             id: call_id.to_string(),
             sip_call_id: sip_call_id.to_string(),
@@ -288,7 +361,13 @@ impl CallAgent {
             remote_sdp: remote_sdp.map(String::from),
             start_time: Utc::now(),
             connected_at: Some(Instant::now()),
+            route_set,
+            remote_target: Some(remote_uri.to_string()),
             last_branch: None,
+            last_max_forwards: None,
+            last_reinvite: None,
+            reinvite_glare_attempts: 0,
+            reinvite_retry: None,
             last_via: None,
             cancel_pending: false,
             last_ack: None,
@@ -311,6 +390,7 @@ impl CallAgent {
     /// Makes an outbound call.
     ///
     /// Returns the call ID for tracking.
+    #[allow(clippy::too_many_lines)]
     pub async fn make_call(&mut self, remote_uri: &str, sdp_offer: &str) -> SipUaResult<String> {
         // Verify agent is configured
         if self.aor.is_empty() {
@@ -330,11 +410,10 @@ impl CallAgent {
         );
 
         // Parse destination address from URI (includes DNS resolution)
-        let destination = Self::parse_destination(remote_uri).await?;
+        let destination = self.parse_destination(remote_uri).await?;
 
         // Get the local IP address that can reach the destination
-        let effective_local_addr =
-            Self::get_local_addr_for_destination(destination, self.local_addr).await?;
+        let effective_local_addr = self.effective_local_addr(destination).await?;
         debug!(
             destination = %destination,
             local_addr = %effective_local_addr,
@@ -366,6 +445,10 @@ impl CallAgent {
             .get_value(&HeaderName::Via)
             .map(String::from);
 
+        // Snapshot the INVITE's Max-Forwards; CANCEL and the ACK to a
+        // non-2xx final response must reuse it (RFC 3261 §9.1 / §17.1.1.3).
+        let invite_max_forwards = Self::request_max_forwards(&request);
+
         // Create INVITE transaction
         let tx_key = TransactionKey::client(&branch, "INVITE");
         let transaction =
@@ -388,7 +471,13 @@ impl CallAgent {
             remote_sdp: None,
             start_time: Utc::now(),
             connected_at: None,
+            route_set: Vec::new(),
+            remote_target: None,
             last_branch: Some(branch),
+            last_max_forwards: invite_max_forwards,
+            last_reinvite: None,
+            reinvite_glare_attempts: 0,
+            reinvite_retry: None,
             last_via: invite_via,
             cancel_pending: false,
             last_ack: None,
@@ -493,6 +582,7 @@ impl CallAgent {
 
         info!(call_id = %call_id, "Putting call on hold");
 
+        self.reset_glare_attempts(call_id);
         self.send_reinvite(call_id, hold_sdp, true).await
     }
 
@@ -514,6 +604,7 @@ impl CallAgent {
 
         info!(call_id = %call_id, "Resuming held call");
 
+        self.reset_glare_attempts(call_id);
         self.send_reinvite(call_id, resume_sdp, false).await
     }
 
@@ -537,6 +628,7 @@ impl CallAgent {
 
         info!(call_id = %call_id, "Sending media update re-INVITE");
 
+        self.reset_glare_attempts(call_id);
         self.send_reinvite(call_id, sdp, false).await
     }
 
@@ -578,7 +670,7 @@ impl CallAgent {
 
     /// Sends a REFER request to transfer the call.
     async fn send_refer(&mut self, call_id: &str, transfer_target: &str) -> SipUaResult<()> {
-        let (remote_uri, sip_call_id, cseq, from_tag, to_tag) = {
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag, target) = {
             let session = self
                 .calls
                 .get_mut(call_id)
@@ -592,12 +684,12 @@ impl CallAgent {
                 session.cseq,
                 session.from_tag.clone(),
                 session.to_tag.clone(),
+                Self::dialog_target(session),
             )
         };
 
-        let destination = Self::parse_destination(&remote_uri).await?;
-        let effective_local_addr =
-            Self::get_local_addr_for_destination(destination, self.local_addr).await?;
+        let destination = self.parse_destination(&target.next_hop).await?;
+        let effective_local_addr = self.effective_local_addr(destination).await?;
 
         // The transaction key must carry the branch actually sent on the
         // wire so responses match it (RFC 3261 §17.1.3).
@@ -605,7 +697,9 @@ impl CallAgent {
 
         // Build REFER request
         let request = Self::build_refer_request_static(
+            &target.request_uri,
             &remote_uri,
+            &target.routes,
             &self.aor,
             &self.display_name,
             effective_local_addr,
@@ -659,7 +753,7 @@ impl CallAgent {
     ///
     /// Used for hold/resume and other mid-call SDP renegotiation.
     async fn send_reinvite(&mut self, call_id: &str, sdp: &str, is_hold: bool) -> SipUaResult<()> {
-        let (remote_uri, sip_call_id, cseq, from_tag, to_tag) = {
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag, target) = {
             let session = self
                 .calls
                 .get_mut(call_id)
@@ -667,6 +761,9 @@ impl CallAgent {
 
             session.cseq += 1;
             session.local_sdp = Some(sdp.to_string());
+            // Keep the offer around for a one-shot 491 glare retry
+            // (RFC 3261 §14.1).
+            session.last_reinvite = Some((sdp.to_string(), is_hold));
 
             (
                 session.remote_uri.clone(),
@@ -674,17 +771,19 @@ impl CallAgent {
                 session.cseq,
                 session.from_tag.clone(),
                 session.to_tag.clone(),
+                Self::dialog_target(session),
             )
         };
 
-        let destination = Self::parse_destination(&remote_uri).await?;
-        let effective_local_addr =
-            Self::get_local_addr_for_destination(destination, self.local_addr).await?;
+        let destination = self.parse_destination(&target.next_hop).await?;
+        let effective_local_addr = self.effective_local_addr(destination).await?;
         let branch = generate_branch();
 
         // Build re-INVITE request
         let request = Self::build_reinvite_request_static(
+            &target.request_uri,
             &remote_uri,
+            &target.routes,
             &self.aor,
             &self.display_name,
             effective_local_addr,
@@ -702,6 +801,7 @@ impl CallAgent {
             .headers
             .get_value(&HeaderName::Via)
             .map(String::from);
+        let reinvite_max_forwards = Self::request_max_forwards(&request);
 
         // Create INVITE transaction for re-INVITE
         let tx_key = TransactionKey::client(&branch, "INVITE");
@@ -712,6 +812,7 @@ impl CallAgent {
             session.invite_transaction = Some(transaction);
             session.last_branch = Some(branch);
             session.last_via = reinvite_via;
+            session.last_max_forwards = reinvite_max_forwards;
         }
 
         // Send request
@@ -787,6 +888,11 @@ impl CallAgent {
             return Ok(());
         }
 
+        // RFC 3581: learn our NAT public address from received/rport on
+        // the top Via before anything else — even absorbed retransmissions
+        // carry valid transport-layer information.
+        self.update_public_addr_from_via(response);
+
         // Transaction-layer gate: only responses that belong to a pending
         // transaction (and are not retransmissions) reach the handlers.
         if !self.gate_response_to_transaction(response, call_id).await? {
@@ -821,6 +927,10 @@ impl CallAgent {
             }
             487 => {
                 self.handle_cancelled_response(call_id, response).await?;
+            }
+            491 => {
+                self.handle_request_pending_response(call_id, response)
+                    .await?;
             }
             code if (400..700).contains(&code) => {
                 self.handle_failure_response(call_id, code, response)
@@ -1047,33 +1157,64 @@ impl CallAgent {
                 .map_err(|e| SipUaError::TransportError(e.to_string()))?;
         }
 
-        // Extract early SDP if present (183)
+        // RFC 3261 §12.1: ANY provisional response with a To-tag (180
+        // included, not just 183) establishes an early dialog — capture the
+        // tag, the Record-Route route set, and the remote target. Once set,
+        // a DIFFERING tag on a later 1xx (a forked early dialog) is ignored
+        // with a warning; only a 2xx may finalize a different tag.
+        if let Some(session) = self.calls.get_mut(call_id)
+            && let Some(tag) = Self::extract_to_tag(response)
+        {
+            match &session.to_tag {
+                None => {
+                    session.to_tag = Some(tag);
+                    Self::capture_route_set(session, response);
+                    Self::capture_remote_target(session, response);
+                }
+                Some(existing) if *existing != tag => {
+                    warn!(
+                        call_id = %call_id,
+                        existing_tag = %existing,
+                        new_tag = %tag,
+                        "Ignoring differing To-tag on later 1xx (forked early dialog); \
+                         only a 2xx may finalize a different tag (RFC 3261 §12.1)"
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+
+        // Extract early SDP if present (183). RFC 3264 §6: ignore an early
+        // answer whose codecs do not intersect our offer — starting media
+        // on it would produce one-way or no audio.
         if status_code == 183
             && let Some(body) = &response.body
         {
             let sdp = String::from_utf8_lossy(body).to_string();
-            if let Some(session) = self.calls.get_mut(call_id) {
-                session.remote_sdp = Some(sdp.clone());
+            let offer = self.calls.get(call_id).and_then(|s| s.local_sdp.clone());
+            if offer.is_some_and(|o| !Self::sdp_codecs_intersect(&o, &sdp)) {
+                warn!(
+                    call_id = %call_id,
+                    "Ignoring early SDP (183): answer codecs do not intersect our offer (RFC 3264 §6)"
+                );
+            } else {
+                if let Some(session) = self.calls.get_mut(call_id) {
+                    session.remote_sdp = Some(sdp.clone());
+                }
+                let _ = self
+                    .event_tx
+                    .send(CallEvent::SdpAnswerReceived {
+                        call_id: call_id.to_string(),
+                        sdp,
+                    })
+                    .await;
             }
-            let _ = self
-                .event_tx
-                .send(CallEvent::SdpAnswerReceived {
-                    call_id: call_id.to_string(),
-                    sdp,
-                })
-                .await;
-        }
-
-        // Extract To tag if present
-        if let Some(session) = self.calls.get_mut(call_id)
-            && session.to_tag.is_none()
-        {
-            session.to_tag = Self::extract_to_tag(response);
         }
 
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn handle_success_response(
         &mut self,
         call_id: &str,
@@ -1090,7 +1231,7 @@ impl CallAgent {
         }
 
         // Extract data needed for ACK
-        let (remote_uri, sip_call_id, cseq, from_tag, to_tag, current_state) = {
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag, current_state, target) = {
             let session = self
                 .calls
                 .get_mut(call_id)
@@ -1111,6 +1252,15 @@ impl CallAgent {
                 return Ok(());
             }
 
+            // RFC 3261 §12.1.2: the dialog-establishing 2xx fixes the route
+            // set from its Record-Route headers (reversed for this UAC). A
+            // re-INVITE 2xx never modifies the route set, but its Contact
+            // DOES refresh the remote target (§12.2.1.1).
+            if session.connected_at.is_none() {
+                Self::capture_route_set(session, response);
+            }
+            Self::capture_remote_target(session, response);
+
             // For a hold re-INVITE 200 OK, preserve the OnHold state.
             // Only transition to Connected for the initial INVITE or resume.
             if session.state != CallState::OnHold {
@@ -1118,9 +1268,29 @@ impl CallAgent {
                 session.connected_at = Some(Instant::now());
             }
             session.invite_transaction = None;
+            // A 2xx ends any 491 glare backoff for the re-INVITE.
+            session.reinvite_glare_attempts = 0;
+            session.reinvite_retry = None;
 
-            if session.to_tag.is_none() {
-                session.to_tag = Self::extract_to_tag(response);
+            // RFC 3261 §12.1: the 2xx finalizes the dialog's To-tag. A tag
+            // differing from one learned on a 1xx means a different fork
+            // answered — adopt the 2xx's tag (it identifies the confirmed
+            // dialog the ACK must address).
+            if let Some(tag) = Self::extract_to_tag(response) {
+                if session
+                    .to_tag
+                    .as_deref()
+                    .is_some_and(|existing| existing != tag)
+                {
+                    warn!(
+                        call_id = %call_id,
+                        provisional_tag = ?session.to_tag,
+                        final_tag = %tag,
+                        "2xx finalizes dialog with a To-tag differing from the provisional's \
+                         (forking); adopting the 2xx tag (RFC 3261 §12.1)"
+                    );
+                }
+                session.to_tag = Some(tag);
             }
 
             if let Some(body) = &response.body {
@@ -1145,15 +1315,19 @@ impl CallAgent {
                 session.from_tag.clone(),
                 session.to_tag.clone(),
                 current_state,
+                Self::dialog_target(session),
             )
         };
 
-        // Send ACK (for a 2xx: a new transaction with a fresh Via/branch)
-        let destination = Self::parse_destination(&remote_uri).await?;
-        let effective_local_addr =
-            Self::get_local_addr_for_destination(destination, self.local_addr).await?;
+        // Send ACK (for a 2xx: a new transaction with a fresh Via/branch),
+        // routed through the dialog's route set to the remote target
+        // (RFC 3261 §13.2.2.4 / §12.2.1.1).
+        let destination = self.parse_destination(&target.next_hop).await?;
+        let effective_local_addr = self.effective_local_addr(destination).await?;
         let ack_request = Self::build_ack_request_static(
+            &target.request_uri,
             &remote_uri,
+            &target.routes,
             &self.aor,
             &self.display_name,
             effective_local_addr,
@@ -1163,6 +1337,7 @@ impl CallAgent {
             to_tag.as_deref(),
             &self.transport_type,
             None,
+            70,
         )?;
 
         // Keep the ACK verbatim: a retransmitted 200 (our ACK was lost)
@@ -1213,7 +1388,7 @@ impl CallAgent {
         call_id: &str,
         response: &SipResponse,
     ) -> SipUaResult<()> {
-        let (remote_uri, sip_call_id, cseq, from_tag, to_tag) = {
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag, target) = {
             let session = self
                 .calls
                 .get_mut(call_id)
@@ -1221,6 +1396,14 @@ impl CallAgent {
 
             session.cancel_pending = false;
             session.invite_transaction = None;
+
+            // The 200 established a dialog: capture its route set and
+            // remote target so the ACK and the tear-down BYE traverse any
+            // Record-Routing proxies (RFC 3261 §12.1.2).
+            if session.connected_at.is_none() {
+                Self::capture_route_set(session, response);
+            }
+            Self::capture_remote_target(session, response);
 
             // The ACK and BYE belong to the dialog the 200 established, so
             // they must carry the 200's To-tag (RFC 3261 §13.2.2.4), not a
@@ -1235,6 +1418,7 @@ impl CallAgent {
                 session.cseq,
                 session.from_tag.clone(),
                 session.to_tag.clone(),
+                Self::dialog_target(session),
             )
         };
 
@@ -1244,11 +1428,12 @@ impl CallAgent {
         );
 
         // ACK the 2xx: a new transaction with a fresh Via/branch (§13.2.2.4).
-        let destination = Self::parse_destination(&remote_uri).await?;
-        let effective_local_addr =
-            Self::get_local_addr_for_destination(destination, self.local_addr).await?;
+        let destination = self.parse_destination(&target.next_hop).await?;
+        let effective_local_addr = self.effective_local_addr(destination).await?;
         let ack_request = Self::build_ack_request_static(
+            &target.request_uri,
             &remote_uri,
+            &target.routes,
             &self.aor,
             &self.display_name,
             effective_local_addr,
@@ -1258,6 +1443,7 @@ impl CallAgent {
             to_tag.as_deref(),
             &self.transport_type,
             None,
+            70,
         )?;
 
         // Keep the ACK verbatim for retransmitted 200s (RFC 6026 §2).
@@ -1391,10 +1577,8 @@ impl CallAgent {
                         let new_cseq = session.cseq;
 
                         // Re-derive effective local address for the new request
-                        let destination = Self::parse_destination(&remote_uri).await?;
-                        let effective_local_addr =
-                            Self::get_local_addr_for_destination(destination, self.local_addr)
-                                .await?;
+                        let destination = self.parse_destination(&remote_uri).await?;
+                        let effective_local_addr = self.effective_local_addr(destination).await?;
 
                         // Rebuild the INVITE with a new branch (new transaction)
                         let new_branch = generate_branch();
@@ -1453,6 +1637,7 @@ impl CallAgent {
                             .headers
                             .get_value(&HeaderName::Via)
                             .map(String::from);
+                        let new_max_forwards = Self::request_max_forwards(&request);
 
                         // Create new INVITE transaction
                         let tx_key = TransactionKey::client(&new_branch, "INVITE");
@@ -1464,6 +1649,7 @@ impl CallAgent {
                             session.invite_transaction = Some(transaction);
                             session.last_branch = Some(new_branch);
                             session.last_via = new_via;
+                            session.last_max_forwards = new_max_forwards;
                         }
 
                         // Send the authenticated INVITE
@@ -1570,11 +1756,18 @@ impl CallAgent {
         let (remote_uri, sip_call_id, cseq, from_tag, to_tag) =
             self.extract_session_data_for_ack(call_id)?;
 
+        // RFC 3261 §21.5.2: surface Retry-After so the app can back off
+        // instead of immediately redialing a busy/declined destination.
+        let reason = Self::retry_after_secs(response).map_or_else(
+            || "Busy".to_string(),
+            |secs| format!("Busy (Retry-After: {secs}s)"),
+        );
+
         if let Some(session) = self.calls.get_mut(call_id) {
             session.state = CallState::Terminated;
             session.failure_reason = Some(CallFailureReason::Rejected {
                 status_code,
-                reason: "Busy".to_string(),
+                reason,
             });
             session.invite_transaction = None;
         }
@@ -1647,10 +1840,16 @@ impl CallAgent {
             "Call failed"
         );
 
-        let reason = response
+        let mut reason = response
             .reason
             .clone()
             .unwrap_or_else(|| "Unknown error".to_string());
+
+        // RFC 3261 §21.5.2: surface Retry-After (503 Service Unavailable
+        // etc.) so the app can back off instead of hammering the server.
+        if let Some(secs) = Self::retry_after_secs(response) {
+            reason = format!("{reason} (Retry-After: {secs}s)");
+        }
 
         let (remote_uri, sip_call_id, cseq, from_tag, to_tag) =
             self.extract_session_data_for_ack(call_id)?;
@@ -1685,6 +1884,122 @@ impl CallAgent {
         .await
     }
 
+    /// Handles a 491 Request Pending (RFC 3261 §14.1 glare).
+    ///
+    /// For a re-INVITE on an established dialog the 491 means our offer
+    /// collided with one from the peer: ACK the 491, keep the call alive,
+    /// and retry the re-INVITE ONCE after a 2–4 s backoff (as the
+    /// Call-ID owner; the retry fires from `process_timers`). A 491 to the
+    /// initial INVITE is handled as an ordinary call failure.
+    async fn handle_request_pending_response(
+        &mut self,
+        call_id: &str,
+        response: &SipResponse,
+    ) -> SipUaResult<()> {
+        let is_reinvite = self
+            .calls
+            .get(call_id)
+            .is_some_and(|s| s.connected_at.is_some());
+        if !is_reinvite {
+            return self.handle_failure_response(call_id, 491, response).await;
+        }
+
+        // ACK the non-2xx final response (RFC 3261 §17.1.1.3).
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag) =
+            self.extract_session_data_for_ack(call_id)?;
+        self.send_ack_for_failure(
+            call_id,
+            &remote_uri,
+            &sip_call_id,
+            cseq,
+            &from_tag,
+            to_tag.as_deref(),
+            response,
+        )
+        .await?;
+
+        let session = self
+            .calls
+            .get_mut(call_id)
+            .ok_or_else(|| SipUaError::InvalidState("Call not found".to_string()))?;
+        session.invite_transaction = None;
+        session.reinvite_glare_attempts = session.reinvite_glare_attempts.saturating_add(1);
+
+        if session.reinvite_glare_attempts > 1 {
+            warn!(
+                call_id = %call_id,
+                "re-INVITE rejected with 491 again after backoff; giving up (RFC 3261 §14.1)"
+            );
+            session.last_reinvite = None;
+            return Ok(());
+        }
+
+        if let Some((sdp, is_hold)) = session.last_reinvite.clone() {
+            let delay_ms = Self::glare_retry_delay_ms();
+            session.reinvite_retry = Some(ReinviteRetry {
+                at: Instant::now() + Duration::from_millis(delay_ms),
+                sdp,
+                is_hold,
+            });
+            info!(
+                call_id = %call_id,
+                delay_ms = delay_ms,
+                "491 glare on re-INVITE; retrying once after backoff (RFC 3261 §14.1)"
+            );
+        }
+        Ok(())
+    }
+
+    /// Returns a 2–4 s backoff for the 491 glare retry (RFC 3261 §14.1).
+    fn glare_retry_delay_ms() -> u64 {
+        // Cheap jitter without a rand dependency: sub-millisecond clock
+        // noise is more than random enough for collision avoidance.
+        let nanos = u64::from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos()),
+        );
+        2000 + (nanos % 2001)
+    }
+
+    /// Drives the agent's time-based behavior (currently the 491 glare
+    /// retry, RFC 3261 §14.1). Call periodically from the app event pump.
+    pub async fn process_timers(&mut self) -> SipUaResult<()> {
+        let now = Instant::now();
+        let due: Vec<(String, String, bool)> = self
+            .calls
+            .values_mut()
+            .filter_map(|session| {
+                if session
+                    .reinvite_retry
+                    .as_ref()
+                    .is_some_and(|retry| retry.at <= now)
+                {
+                    session
+                        .reinvite_retry
+                        .take()
+                        .map(|retry| (session.id.clone(), retry.sdp, retry.is_hold))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (call_id, sdp, is_hold) in due {
+            if matches!(
+                self.get_state(&call_id),
+                Some(CallState::Connected | CallState::OnHold)
+            ) {
+                info!(
+                    call_id = %call_id,
+                    "Retrying re-INVITE after 491 glare backoff (RFC 3261 §14.1)"
+                );
+                self.send_reinvite(&call_id, &sdp, is_hold).await?;
+            }
+        }
+        Ok(())
+    }
+
     fn extract_session_data_for_ack(
         &self,
         call_id: &str,
@@ -1714,14 +2029,40 @@ impl CallAgent {
         to_tag: Option<&str>,
         response: &SipResponse,
     ) -> SipUaResult<()> {
-        let destination = Self::parse_destination(remote_uri).await?;
-        let effective_local_addr =
-            Self::get_local_addr_for_destination(destination, self.local_addr).await?;
+        // RFC 3261 §17.1.1.3: the ACK must carry the same Request-URI and
+        // Route headers as the INVITE it acknowledges. The initial INVITE
+        // was sent to the remote URI with no routes; a re-INVITE on an
+        // established dialog used the dialog's remote target + route set.
+        let target = self.calls.get(call_id).map_or_else(
+            || DialogTarget {
+                request_uri: remote_uri.to_string(),
+                routes: Vec::new(),
+                next_hop: remote_uri.to_string(),
+            },
+            |session| {
+                if session.connected_at.is_some() {
+                    Self::dialog_target(session)
+                } else {
+                    DialogTarget {
+                        request_uri: session.remote_uri.clone(),
+                        routes: Vec::new(),
+                        next_hop: session.remote_uri.clone(),
+                    }
+                }
+            },
+        );
+
+        let destination = self.parse_destination(&target.next_hop).await?;
+        let effective_local_addr = self.effective_local_addr(destination).await?;
 
         // RFC 3261 §17.1.1.3: the ACK for a non-2xx final response must
         // carry the INVITE's Via verbatim (same branch, same sent-by
-        // host:port) so it matches the INVITE transaction.
-        let invite_via = self.calls.get(call_id).and_then(|s| s.last_via.clone());
+        // host:port) so it matches the INVITE transaction — and the
+        // INVITE's Max-Forwards (§9.1 family), not a reset 70.
+        let (invite_via, invite_max_forwards) = self
+            .calls
+            .get(call_id)
+            .map_or((None, None), |s| (s.last_via.clone(), s.last_max_forwards));
 
         // §17.1.1.3 also requires the ACK's To header to equal the To of
         // the response being acknowledged (including any to-tag the server
@@ -1730,7 +2071,9 @@ impl CallAgent {
         let ack_to_tag = response_to_tag.as_deref().or(to_tag);
 
         let ack_request = Self::build_ack_request_static(
+            &target.request_uri,
             remote_uri,
+            &target.routes,
             &self.aor,
             &self.display_name,
             effective_local_addr,
@@ -1740,6 +2083,7 @@ impl CallAgent {
             ack_to_tag,
             &self.transport_type,
             invite_via.as_deref(),
+            invite_max_forwards.unwrap_or(70),
         )?;
 
         self.event_tx
@@ -1821,7 +2165,7 @@ impl CallAgent {
     /// reply 481 "Call/Transaction Does Not Exist" and the far end keeps
     /// ringing. The stored `last_via` is therefore copied verbatim.
     async fn send_cancel(&mut self, call_id: &str) -> SipUaResult<()> {
-        let (remote_uri, sip_call_id, cseq, from_tag, branch, invite_via) = {
+        let (remote_uri, sip_call_id, cseq, from_tag, branch, invite_via, invite_max_forwards) = {
             let session = self
                 .calls
                 .get(call_id)
@@ -1845,12 +2189,15 @@ impl CallAgent {
                         "No pending INVITE Via to CANCEL (RFC 3261 §9.1)".to_string(),
                     )
                 })?,
+                // Reuse the INVITE's Max-Forwards (RFC 3261 §9.1).
+                session.last_max_forwards.unwrap_or(70),
             )
         };
 
-        let destination = Self::parse_destination(&remote_uri).await?;
+        let destination = self.parse_destination(&remote_uri).await?;
 
-        // Build CANCEL request (same Via line and CSeq number as the INVITE)
+        // Build CANCEL request (same Via line, CSeq number, and
+        // Max-Forwards as the INVITE)
         let request = Self::build_cancel_request_static(
             &remote_uri,
             &self.aor,
@@ -1859,6 +2206,7 @@ impl CallAgent {
             cseq,
             &from_tag,
             &invite_via,
+            invite_max_forwards,
         )?;
 
         // The CANCEL client transaction reuses the INVITE's branch so that
@@ -1899,8 +2247,13 @@ impl CallAgent {
     }
 
     /// Sends a BYE request to end a connected call.
+    ///
+    /// The BYE is an in-dialog request: its Request-URI is the dialog's
+    /// remote target (the peer's Contact) and it carries the dialog's
+    /// route set so Record-Routing proxies stay on the path
+    /// (RFC 3261 §12.2.1.1).
     async fn send_bye(&mut self, call_id: &str) -> SipUaResult<()> {
-        let (remote_uri, sip_call_id, cseq, from_tag, to_tag) = {
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag, target) = {
             let session = self
                 .calls
                 .get_mut(call_id)
@@ -1915,12 +2268,12 @@ impl CallAgent {
                 session.cseq,
                 session.from_tag.clone(),
                 session.to_tag.clone(),
+                Self::dialog_target(session),
             )
         };
 
-        let destination = Self::parse_destination(&remote_uri).await?;
-        let effective_local_addr =
-            Self::get_local_addr_for_destination(destination, self.local_addr).await?;
+        let destination = self.parse_destination(&target.next_hop).await?;
+        let effective_local_addr = self.effective_local_addr(destination).await?;
 
         // The transaction key must carry the branch actually sent on the
         // wire so the BYE's 200 matches it (RFC 3261 §17.1.3).
@@ -1928,7 +2281,9 @@ impl CallAgent {
 
         // Build BYE request
         let request = Self::build_bye_request_static(
+            &target.request_uri,
             &remote_uri,
+            &target.routes,
             &self.aor,
             &self.display_name,
             effective_local_addr,
@@ -1980,7 +2335,7 @@ impl CallAgent {
         digit: DtmfDigit,
         duration_ms: u32,
     ) -> SipUaResult<()> {
-        let (remote_uri, sip_call_id, cseq, from_tag, to_tag) = {
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag, target) = {
             let session = self
                 .calls
                 .get_mut(call_id)
@@ -2001,15 +2356,17 @@ impl CallAgent {
                 session.cseq,
                 session.from_tag.clone(),
                 session.to_tag.clone(),
+                Self::dialog_target(session),
             )
         };
 
-        let destination = Self::parse_destination(&remote_uri).await?;
-        let effective_local_addr =
-            Self::get_local_addr_for_destination(destination, self.local_addr).await?;
+        let destination = self.parse_destination(&target.next_hop).await?;
+        let effective_local_addr = self.effective_local_addr(destination).await?;
 
         let request = Self::build_info_request_static(
+            &target.request_uri,
             &remote_uri,
+            &target.routes,
             &self.aor,
             &self.display_name,
             effective_local_addr,
@@ -2035,9 +2392,15 @@ impl CallAgent {
     }
 
     /// Builds a SIP INFO request for DTMF relay.
+    ///
+    /// `request_uri_str` is the dialog's remote target and `routes` its
+    /// route set (RFC 3261 §12.2.1.1); `remote_uri_str` is the dialog's
+    /// remote URI used in the To header.
     #[allow(clippy::too_many_arguments)]
     fn build_info_request_static(
+        request_uri_str: &str,
         remote_uri_str: &str,
+        routes: &[String],
         aor: &str,
         display_name: &str,
         local_addr: SocketAddr,
@@ -2050,6 +2413,10 @@ impl CallAgent {
         duration_ms: u32,
     ) -> SipUaResult<SipRequest> {
         use proto_sip::method::Method;
+
+        let request_uri: SipUri = request_uri_str
+            .parse()
+            .map_err(|e| SipUaError::ConfigError(format!("Invalid request URI: {e}")))?;
 
         let remote_uri: SipUri = remote_uri_str
             .parse()
@@ -2070,7 +2437,7 @@ impl CallAgent {
             .with_display_name(display_name)
             .with_tag(from_tag.to_string());
 
-        let mut to = NameAddr::new(remote_uri.clone());
+        let mut to = NameAddr::new(remote_uri);
         if let Some(tag) = to_tag {
             to = to.with_tag(tag.to_string());
         }
@@ -2079,13 +2446,17 @@ impl CallAgent {
         let rtp_duration = duration_ms * 8;
         let body = format!("Signal={}\r\nDuration={rtp_duration}", digit.to_char());
 
-        let request = RequestBuilder::new(Method::Info, remote_uri)
+        let mut builder = RequestBuilder::new(Method::Info, request_uri)
             .via(&via)
             .from(&from)
             .to(&to)
             .call_id(sip_call_id)
             .cseq(cseq)
-            .max_forwards(70)
+            .max_forwards(70);
+        for route in routes {
+            builder = builder.header(HeaderName::Route, route);
+        }
+        let request = builder
             .content_type("application/dtmf-relay")
             .body(body)
             .build()
@@ -2172,6 +2543,7 @@ impl CallAgent {
         cseq: u32,
         from_tag: &str,
         invite_via: &str,
+        max_forwards: u8,
     ) -> SipUaResult<SipRequest> {
         let remote_uri: SipUri = remote_uri_str
             .parse()
@@ -2195,7 +2567,8 @@ impl CallAgent {
             .to(&to)
             .call_id(sip_call_id)
             .cseq(cseq)
-            .max_forwards(70)
+            // The INVITE's Max-Forwards, not a reset 70 (RFC 3261 §9.1).
+            .max_forwards(max_forwards)
             .build()
             .map_err(|e| SipUaError::TransactionError(e.to_string()))?;
 
@@ -2206,9 +2579,14 @@ impl CallAgent {
     ///
     /// `branch` is the Via branch the caller registered in the transaction
     /// key, so responses match the transaction (RFC 3261 §17.1.3).
+    /// `request_uri_str` is the dialog's remote target and `routes` its
+    /// route set (RFC 3261 §12.2.1.1); `remote_uri_str` is the dialog's
+    /// remote URI used in the To header.
     #[allow(clippy::too_many_arguments)]
     fn build_bye_request_static(
+        request_uri_str: &str,
         remote_uri_str: &str,
+        routes: &[String],
         aor: &str,
         display_name: &str,
         local_addr: SocketAddr,
@@ -2219,6 +2597,10 @@ impl CallAgent {
         branch: &str,
         transport_type: &str,
     ) -> SipUaResult<SipRequest> {
+        let request_uri: SipUri = request_uri_str
+            .parse()
+            .map_err(|e| SipUaError::ConfigError(format!("Invalid request URI: {e}")))?;
+
         let remote_uri: SipUri = remote_uri_str
             .parse()
             .map_err(|e| SipUaError::ConfigError(format!("Invalid remote URI: {e}")))?;
@@ -2236,18 +2618,22 @@ impl CallAgent {
             .with_display_name(display_name)
             .with_tag(from_tag.to_string());
 
-        let mut to = NameAddr::new(remote_uri.clone());
+        let mut to = NameAddr::new(remote_uri);
         if let Some(tag) = to_tag {
             to = to.with_tag(tag.to_string());
         }
 
-        let request = RequestBuilder::bye(remote_uri)
+        let mut builder = RequestBuilder::bye(request_uri)
             .via(&via)
             .from(&from)
             .to(&to)
             .call_id(sip_call_id)
             .cseq(cseq)
-            .max_forwards(70)
+            .max_forwards(70);
+        for route in routes {
+            builder = builder.header(HeaderName::Route, route);
+        }
+        let request = builder
             .build()
             .map_err(|e| SipUaError::TransactionError(e.to_string()))?;
 
@@ -2259,13 +2645,21 @@ impl CallAgent {
     /// `invite_via` selects which transaction this ACK belongs to:
     /// - `Some(via)`: ACK for a non-2xx final response. RFC 3261 §17.1.1.3
     ///   requires the ACK to carry the INVITE's Via verbatim (same branch
-    ///   and same sent-by host:port) so it matches the INVITE transaction.
+    ///   and same sent-by host:port) so it matches the INVITE transaction,
+    ///   and the INVITE's `max_forwards` rather than a reset 70.
     /// - `None`: ACK for a 2xx response. That ACK is a new transaction
     ///   (RFC 3261 §13.2.2.4), so a fresh Via with a new branch is built
     ///   from `local_addr`.
+    ///
+    /// `request_uri_str` and `routes` carry the same Request-URI and Route
+    /// set as the INVITE being acknowledged (RFC 3261 §17.1.1.3 /
+    /// §12.2.1.1); `remote_uri_str` is the dialog's remote URI for the To
+    /// header.
     #[allow(clippy::too_many_arguments)]
     fn build_ack_request_static(
+        request_uri_str: &str,
         remote_uri_str: &str,
+        routes: &[String],
         aor: &str,
         display_name: &str,
         local_addr: SocketAddr,
@@ -2275,7 +2669,12 @@ impl CallAgent {
         to_tag: Option<&str>,
         transport_type: &str,
         invite_via: Option<&str>,
+        max_forwards: u8,
     ) -> SipUaResult<SipRequest> {
+        let request_uri: SipUri = request_uri_str
+            .parse()
+            .map_err(|e| SipUaError::ConfigError(format!("Invalid request URI: {e}")))?;
+
         let remote_uri: SipUri = remote_uri_str
             .parse()
             .map_err(|e| SipUaError::ConfigError(format!("Invalid remote URI: {e}")))?;
@@ -2288,12 +2687,12 @@ impl CallAgent {
             .with_display_name(display_name)
             .with_tag(from_tag.to_string());
 
-        let mut to = NameAddr::new(remote_uri.clone());
+        let mut to = NameAddr::new(remote_uri);
         if let Some(tag) = to_tag {
             to = to.with_tag(tag.to_string());
         }
 
-        let mut builder = RequestBuilder::ack(remote_uri);
+        let mut builder = RequestBuilder::ack(request_uri);
         builder = if let Some(via_value) = invite_via {
             // Non-2xx ACK: the INVITE's Via, verbatim (RFC 3261 §17.1.1.3).
             builder.header(HeaderName::Via, via_value)
@@ -2305,13 +2704,16 @@ impl CallAgent {
                 .with_rport();
             builder.via(&via)
         };
+        for route in routes {
+            builder = builder.header(HeaderName::Route, route);
+        }
 
         let request = builder
             .from(&from)
             .to(&to)
             .call_id(sip_call_id)
             .cseq(cseq)
-            .max_forwards(70)
+            .max_forwards(max_forwards)
             .build()
             .map_err(|e| SipUaError::TransactionError(e.to_string()))?;
 
@@ -2319,9 +2721,15 @@ impl CallAgent {
     }
 
     /// Builds a re-INVITE request for mid-call SDP renegotiation (hold/resume).
+    ///
+    /// `request_uri_str` is the dialog's remote target and `routes` its
+    /// route set (RFC 3261 §12.2.1.1); `remote_uri_str` is the dialog's
+    /// remote URI used in the To header.
     #[allow(clippy::too_many_arguments)]
     fn build_reinvite_request_static(
+        request_uri_str: &str,
         remote_uri_str: &str,
+        routes: &[String],
         aor: &str,
         display_name: &str,
         local_addr: SocketAddr,
@@ -2333,6 +2741,10 @@ impl CallAgent {
         sdp: &str,
         transport_type: &str,
     ) -> SipUaResult<SipRequest> {
+        let request_uri: SipUri = request_uri_str
+            .parse()
+            .map_err(|e| SipUaError::ConfigError(format!("Invalid request URI: {e}")))?;
+
         let remote_uri: SipUri = remote_uri_str
             .parse()
             .map_err(|e| SipUaError::ConfigError(format!("Invalid remote URI: {e}")))?;
@@ -2350,7 +2762,7 @@ impl CallAgent {
             .with_display_name(display_name)
             .with_tag(from_tag.to_string());
 
-        let mut to = NameAddr::new(remote_uri.clone());
+        let mut to = NameAddr::new(remote_uri);
         if let Some(tag) = to_tag {
             to = to.with_tag(tag.to_string());
         }
@@ -2365,13 +2777,17 @@ impl CallAgent {
         }
         let contact = NameAddr::new(contact_uri);
 
-        let request = RequestBuilder::invite(remote_uri)
+        let mut builder = RequestBuilder::invite(request_uri)
             .via(&via)
             .from(&from)
             .to(&to)
             .call_id(sip_call_id)
             .cseq(cseq)
-            .max_forwards(70)
+            .max_forwards(70);
+        for route in routes {
+            builder = builder.header(HeaderName::Route, route);
+        }
+        let request = builder
             .contact(&contact)
             .user_agent(USER_AGENT)
             .content_type("application/sdp")
@@ -2386,9 +2802,14 @@ impl CallAgent {
     ///
     /// `branch` is the Via branch the caller registered in the transaction
     /// key, so responses match the transaction (RFC 3261 §17.1.3).
+    /// `request_uri_str` is the dialog's remote target and `routes` its
+    /// route set (RFC 3261 §12.2.1.1); `remote_uri_str` is the dialog's
+    /// remote URI used in the To header.
     #[allow(clippy::too_many_arguments)]
     fn build_refer_request_static(
+        request_uri_str: &str,
         remote_uri_str: &str,
+        routes: &[String],
         aor: &str,
         display_name: &str,
         local_addr: SocketAddr,
@@ -2401,6 +2822,10 @@ impl CallAgent {
         transport_type: &str,
     ) -> SipUaResult<SipRequest> {
         use proto_sip::method::Method;
+
+        let request_uri: SipUri = request_uri_str
+            .parse()
+            .map_err(|e| SipUaError::ConfigError(format!("Invalid request URI: {e}")))?;
 
         let remote_uri: SipUri = remote_uri_str
             .parse()
@@ -2419,7 +2844,7 @@ impl CallAgent {
             .with_display_name(display_name)
             .with_tag(from_tag.to_string());
 
-        let mut to = NameAddr::new(remote_uri.clone());
+        let mut to = NameAddr::new(remote_uri);
         if let Some(tag) = to_tag {
             to = to.with_tag(tag.to_string());
         }
@@ -2435,13 +2860,17 @@ impl CallAgent {
         let contact = NameAddr::new(contact_uri);
 
         // Build REFER request with Refer-To header
-        let request = RequestBuilder::new(Method::Refer, remote_uri)
+        let mut builder = RequestBuilder::new(Method::Refer, request_uri)
             .via(&via)
             .from(&from)
             .to(&to)
             .call_id(sip_call_id)
             .cseq(cseq)
-            .max_forwards(70)
+            .max_forwards(70);
+        for route in routes {
+            builder = builder.header(HeaderName::Route, route);
+        }
+        let request = builder
             .contact(&contact)
             .user_agent(USER_AGENT)
             .header(HeaderName::ReferTo, transfer_target)
@@ -2452,8 +2881,17 @@ impl CallAgent {
         Ok(request)
     }
 
-    /// Parses a SIP URI to get destination address, performing DNS resolution if needed.
-    async fn parse_destination(uri: &str) -> SipUaResult<SocketAddr> {
+    /// Parses a SIP URI to get a destination address, performing RFC 3263
+    /// resolution (NAPTR → SRV → A/AAAA) when needed.
+    ///
+    /// Per RFC 3263 §4: a numeric IP host or an explicit port skips the
+    /// NAPTR/SRV steps. The SRV service is derived from the transport
+    /// (`_sip._udp` for UDP, `_sips._tcp` for TLS): the URI's `transport`
+    /// parameter wins, then a `sips` scheme forces TLS, then the agent's
+    /// configured transport applies. If RFC 3263 resolution fails (e.g.
+    /// the DNS resolver is unreachable), falls back to a plain system
+    /// A/AAAA lookup as before.
+    async fn parse_destination(&self, uri: &str) -> SipUaResult<SocketAddr> {
         debug!(uri = %uri, "parse_destination: parsing SIP URI");
 
         let sip_uri: SipUri = uri.parse().map_err(|e| {
@@ -2461,23 +2899,68 @@ impl CallAgent {
             SipUaError::ConfigError(format!("Invalid URI: {e}"))
         })?;
 
-        let host = &sip_uri.host;
-        // Use transport-appropriate default port: UDP/TCP = 5060, TLS = 5061
-        let port = sip_uri.port.unwrap_or(5060);
+        // Transport selection (RFC 3263 §4.1): URI transport param, else
+        // sips scheme ⇒ TLS, else the agent's configured transport.
+        let transport = sip_uri.transport().map_or_else(
+            || {
+                if sip_uri.scheme == UriScheme::Sips {
+                    "TLS".to_string()
+                } else {
+                    self.transport_type.clone()
+                }
+            },
+            str::to_ascii_uppercase,
+        );
+        let preference = match transport.as_str() {
+            "TCP" => TransportPreference::Tcp,
+            "TLS" => TransportPreference::Tls,
+            _ => TransportPreference::Udp,
+        };
 
-        debug!(host = %host, port = port, "parse_destination: extracted host and port");
-
-        // Try to parse host as IP address first
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            let addr = SocketAddr::new(ip, port);
-            debug!(addr = %addr, "parse_destination: host is already an IP address");
-            return Ok(addr);
+        let resolver = self.resolver.get_or_init(SipResolver::with_defaults);
+        match resolver
+            .resolve(&sip_uri.host, sip_uri.port, preference)
+            .await
+        {
+            Ok(targets) => {
+                // Targets arrive sorted by SRV priority/weight; among the
+                // best priority, prefer IPv6 to match the socket family.
+                let best_priority = targets.first().map(|t| t.priority);
+                let result = targets
+                    .iter()
+                    .filter(|t| Some(t.priority) == best_priority)
+                    .find(|t| t.address.is_ipv6())
+                    .or_else(|| targets.first())
+                    .map(|t| t.address)
+                    .ok_or_else(|| {
+                        SipUaError::ConfigError(format!("No addresses found for {}", sip_uri.host))
+                    })?;
+                info!(
+                    uri = %uri,
+                    resolved = %result,
+                    transport = %transport,
+                    "parse_destination: resolved destination address (RFC 3263)"
+                );
+                Ok(result)
+            }
+            Err(e) => {
+                warn!(
+                    host = %sip_uri.host,
+                    error = %e,
+                    "parse_destination: RFC 3263 resolution failed; falling back to system A/AAAA lookup"
+                );
+                Self::lookup_host_fallback(&sip_uri, &transport).await
+            }
         }
+    }
 
-        // DNS resolution for hostnames
-        debug!(host = %host, "parse_destination: performing DNS resolution");
-        let lookup_host = format!("{host}:{port}");
-        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&lookup_host)
+    /// Plain system A/AAAA lookup used when RFC 3263 resolution fails.
+    async fn lookup_host_fallback(sip_uri: &SipUri, transport: &str) -> SipUaResult<SocketAddr> {
+        let host = &sip_uri.host;
+        let default_port = if transport == "TLS" { 5061 } else { 5060 };
+        let port = sip_uri.port.unwrap_or(default_port);
+
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&format!("{host}:{port}"))
             .await
             .map_err(|e| {
                 error!(host = %host, error = %e, "parse_destination: DNS resolution failed");
@@ -2486,7 +2969,7 @@ impl CallAgent {
             .collect();
 
         // Prefer IPv6 (AAAA) over IPv4 (A) to match socket address family
-        let result = addrs
+        addrs
             .iter()
             .find(|a| a.is_ipv6())
             .or_else(|| addrs.first())
@@ -2494,21 +2977,22 @@ impl CallAgent {
             .ok_or_else(|| {
                 error!(host = %host, "parse_destination: no addresses found");
                 SipUaError::ConfigError(format!("No addresses found for {host}"))
-            })?;
+            })
+    }
 
-        debug!(
-            host = %host,
-            resolved = %result,
-            "parse_destination: DNS resolution returned address"
-        );
-
-        info!(
-            uri = %uri,
-            resolved = %result,
-            "parse_destination: resolved destination address"
-        );
-
-        Ok(result)
+    /// Returns the local address to advertise (Via sent-by, Contact) for a
+    /// request toward `destination`: the NAT public address learned via
+    /// RFC 3581 `received`/`rport` when known, otherwise the locally
+    /// discovered interface address.
+    async fn effective_local_addr(&self, destination: SocketAddr) -> SipUaResult<SocketAddr> {
+        if let Some(public) = self.public_addr {
+            debug!(
+                public = %public,
+                "Using NAT public address from RFC 3581 received/rport for advertised headers"
+            );
+            return Ok(public);
+        }
+        Self::get_local_addr_for_destination(destination, self.local_addr).await
     }
 
     /// Gets the local address to use for reaching a destination.
@@ -2799,6 +3283,277 @@ impl CallAgent {
             .map(str::to_ascii_uppercase)
     }
 
+    /// Resets the 491 glare attempt counter for a call (a fresh
+    /// user-initiated re-INVITE starts a new glare budget).
+    fn reset_glare_attempts(&mut self, call_id: &str) {
+        if let Some(session) = self.calls.get_mut(call_id) {
+            session.reinvite_glare_attempts = 0;
+        }
+    }
+
+    /// Computes the Request-URI, Route headers, and next hop for an
+    /// in-dialog request (RFC 3261 §12.2.1.1).
+    ///
+    /// - Empty route set: Request-URI = remote target, no Route headers,
+    ///   send to the remote target.
+    /// - First route is a loose router (`;lr`): Request-URI = remote
+    ///   target, Route headers = the route set verbatim, send to the
+    ///   first route.
+    /// - First route is a strict router (no `;lr`): Request-URI = first
+    ///   route's URI, Route headers = remaining routes plus the remote
+    ///   target as the last Route, send to the first route.
+    fn dialog_target(session: &CallSession) -> DialogTarget {
+        let remote_target = session
+            .remote_target
+            .clone()
+            .unwrap_or_else(|| session.remote_uri.clone());
+
+        let Some(first_route) = session.route_set.first() else {
+            return DialogTarget {
+                request_uri: remote_target.clone(),
+                routes: Vec::new(),
+                next_hop: remote_target,
+            };
+        };
+
+        let first_uri = Self::name_addr_uri(first_route);
+        if first_uri.contains(";lr") {
+            DialogTarget {
+                request_uri: remote_target,
+                routes: session.route_set.clone(),
+                next_hop: first_uri,
+            }
+        } else {
+            // Strict-routing fallback (RFC 3261 §12.2.1.1): the request
+            // is aimed AT the first route; the remote target goes last.
+            let mut routes: Vec<String> = session.route_set[1..].to_vec();
+            routes.push(format!("<{remote_target}>"));
+            DialogTarget {
+                request_uri: first_uri.clone(),
+                routes,
+                next_hop: first_uri,
+            }
+        }
+    }
+
+    /// Captures the dialog route set from a dialog-establishing response's
+    /// Record-Route headers, REVERSED for this UAC (RFC 3261 §12.1.2).
+    fn capture_route_set(session: &mut CallSession, response: &SipResponse) {
+        let mut routes: Vec<String> = response
+            .headers
+            .get_all(&HeaderName::RecordRoute)
+            .flat_map(|h| Self::split_header_list(&h.value))
+            .collect();
+        if routes.is_empty() {
+            return;
+        }
+        routes.reverse();
+        info!(
+            call_id = %session.id,
+            route_set = ?routes,
+            "Captured dialog route set from Record-Route (RFC 3261 §12.1.2)"
+        );
+        session.route_set = routes;
+    }
+
+    /// Captures or refreshes the dialog's remote target from a response's
+    /// Contact header (RFC 3261 §12.1.2 / §12.2.1.1).
+    fn capture_remote_target(session: &mut CallSession, response: &SipResponse) {
+        let Some(contact) = response.headers.get_value(&HeaderName::Contact) else {
+            return;
+        };
+        let uri = Self::name_addr_uri(contact);
+        if uri.is_empty() || session.remote_target.as_deref() == Some(uri.as_str()) {
+            return;
+        }
+        info!(
+            call_id = %session.id,
+            remote_target = %uri,
+            "Captured dialog remote target from Contact (RFC 3261 §12.1.2)"
+        );
+        session.remote_target = Some(uri);
+    }
+
+    /// Extracts the URI from a name-addr or addr-spec header value
+    /// (`"Name" <sip:uri;params>` → `sip:uri;params`).
+    fn name_addr_uri(value: &str) -> String {
+        if let Some(start) = value.find('<')
+            && let Some(len) = value[start + 1..].find('>')
+        {
+            return value[start + 1..start + 1 + len].to_string();
+        }
+        // addr-spec form: strip header params after the first top-level ';'
+        // is NOT safe (URI params share the syntax), so take it verbatim.
+        value.trim().to_string()
+    }
+
+    /// Splits a comma-separated header value into its elements, ignoring
+    /// commas inside `<...>` (Record-Route can carry several entries in
+    /// one header line).
+    fn split_header_list(value: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut depth = 0_u32;
+        let mut start = 0_usize;
+        for (i, c) in value.char_indices() {
+            match c {
+                '<' => depth += 1,
+                '>' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    let part = value[start..i].trim();
+                    if !part.is_empty() {
+                        out.push(part.to_string());
+                    }
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        let last = value[start..].trim();
+        if !last.is_empty() {
+            out.push(last.to_string());
+        }
+        out
+    }
+
+    /// Parses a request's Max-Forwards header value.
+    fn request_max_forwards(request: &SipRequest) -> Option<u8> {
+        request
+            .headers
+            .get_value(&HeaderName::MaxForwards)
+            .and_then(|v| v.trim().parse().ok())
+    }
+
+    /// Parses a response's Retry-After header (RFC 3261 §20.33): leading
+    /// integer seconds, optionally followed by a comment or parameters.
+    fn retry_after_secs(response: &SipResponse) -> Option<u32> {
+        let value = response.headers.get_value(&HeaderName::RetryAfter)?;
+        let digits: String = value
+            .trim()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    }
+
+    /// RFC 3581: learns our NAT public address from `received`/`rport` on
+    /// the top Via of a response. When it differs from the address we
+    /// advertised, it becomes the address used in the Via/Contact of
+    /// subsequently built requests on the call paths.
+    fn update_public_addr_from_via(&mut self, response: &SipResponse) {
+        let Some(via) = response.headers.get_value(&HeaderName::Via) else {
+            return;
+        };
+
+        let received = Self::via_param(via, "received").and_then(|v| v.parse::<IpAddr>().ok());
+        let rport = Self::via_param(via, "rport").and_then(|v| v.parse::<u16>().ok());
+        if received.is_none() && rport.is_none() {
+            return;
+        }
+
+        // The sent-by we advertised (the server echoes our Via verbatim,
+        // adding received/rport): "SIP/2.0/UDP host:port;params".
+        let sent_by = via
+            .split_whitespace()
+            .nth(1)
+            .map_or("", |s| s.split(';').next().unwrap_or(s));
+        let (adv_host, adv_port) = sent_by
+            .rsplit_once(':')
+            .map_or((sent_by, None), |(h, p)| (h, p.parse::<u16>().ok()));
+        let advertised_ip = adv_host.trim_matches(['[', ']']).parse::<IpAddr>().ok();
+        let advertised_port = adv_port.unwrap_or(5060);
+
+        let Some(public_ip) = received.or(advertised_ip) else {
+            return;
+        };
+        let public = SocketAddr::new(public_ip, rport.unwrap_or(advertised_port));
+
+        let advertised = advertised_ip.map(|ip| SocketAddr::new(ip, advertised_port));
+        if advertised == Some(public) || self.public_addr == Some(public) {
+            return;
+        }
+
+        info!(
+            advertised = ?advertised,
+            public = %public,
+            "Discovered NAT public address from Via received/rport (RFC 3581); \
+             using it for subsequently built requests"
+        );
+        self.public_addr = Some(public);
+    }
+
+    /// Extracts a parameter value from a Via header value.
+    fn via_param(via: &str, name: &str) -> Option<String> {
+        via.split(';').skip(1).find_map(|param| {
+            let (key, value) = param.trim().split_once('=')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
+    }
+
+    /// Returns the audio codec names of an SDP's first `m=audio` line,
+    /// lowercase, resolved through `a=rtpmap` (with the RFC 3551 static
+    /// payload-type table as fallback). `telephone-event` is excluded.
+    fn sdp_audio_codecs(sdp: &str) -> Vec<String> {
+        let mut payload_types: Vec<&str> = Vec::new();
+        let mut rtpmap: HashMap<&str, String> = HashMap::new();
+
+        for line in sdp.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("m=audio ") {
+                if payload_types.is_empty() {
+                    // "m=audio <port> <proto> <pt> <pt> ..."
+                    payload_types = rest.split_whitespace().skip(2).collect();
+                }
+            } else if let Some(rest) = line.strip_prefix("a=rtpmap:") {
+                // "<pt> <encoding>/<clock>[/<channels>]"
+                let mut parts = rest.split_whitespace();
+                if let (Some(pt), Some(encoding)) = (parts.next(), parts.next())
+                    && let Some(name) = encoding.split('/').next()
+                {
+                    rtpmap.insert(pt, name.to_ascii_lowercase());
+                }
+            }
+        }
+
+        payload_types
+            .iter()
+            .filter_map(|pt| {
+                rtpmap
+                    .get(pt)
+                    .cloned()
+                    .or_else(|| Self::static_payload_name(pt))
+            })
+            .filter(|name| name != "telephone-event")
+            .collect()
+    }
+
+    /// RFC 3551 static audio payload-type names (subset in use here).
+    fn static_payload_name(pt: &str) -> Option<String> {
+        let name = match pt {
+            "0" => "pcmu",
+            "3" => "gsm",
+            "4" => "g723",
+            "8" => "pcma",
+            "9" => "g722",
+            "18" => "g729",
+            _ => return None,
+        };
+        Some(name.to_string())
+    }
+
+    /// RFC 3264 §6: returns true when the answer's audio codecs intersect
+    /// the offer's. When either side cannot be parsed, returns true (do
+    /// not block on what we cannot validate).
+    fn sdp_codecs_intersect(offer: &str, answer: &str) -> bool {
+        let offered = Self::sdp_audio_codecs(offer);
+        let answered = Self::sdp_audio_codecs(answer);
+        if offered.is_empty() || answered.is_empty() {
+            return true;
+        }
+        answered.iter().any(|codec| offered.contains(codec))
+    }
+
     /// Extracts To tag from response.
     fn extract_to_tag(response: &SipResponse) -> Option<String> {
         response.headers.get(&HeaderName::To).and_then(|h| {
@@ -2832,9 +3587,22 @@ mod tests {
         assert!(agent.calls.is_empty());
     }
 
+    fn test_agent() -> CallAgent {
+        let (tx, _rx) = mpsc::channel(10);
+        let local_addr: SocketAddr = "192.168.1.100:5060".parse().unwrap();
+        CallAgent::new(
+            local_addr,
+            "sips:alice@example.com".to_string(),
+            "Alice".to_string(),
+            tx,
+        )
+    }
+
     #[tokio::test]
     async fn test_parse_destination() {
-        let addr = CallAgent::parse_destination("sips:bob@192.168.1.1:5061")
+        let agent = test_agent();
+        let addr = agent
+            .parse_destination("sips:bob@192.168.1.1:5061")
             .await
             .unwrap();
         assert_eq!(addr.ip().to_string(), "192.168.1.1");
@@ -2843,11 +3611,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_destination_default_port() {
-        let addr = CallAgent::parse_destination("sips:bob@192.168.1.1")
+        let agent = test_agent();
+        // RFC 3263: a sips URI without a port defaults to TLS port 5061.
+        let addr = agent
+            .parse_destination("sips:bob@192.168.1.1")
             .await
             .unwrap();
         assert_eq!(addr.ip().to_string(), "192.168.1.1");
-        // Default port for non-TLS is now 5060 (not 5061)
+        assert_eq!(addr.port(), 5061);
+
+        // A plain sip URI without a port resolves with the agent's
+        // transport; the test agent defaults to TLS ⇒ 5061. With UDP
+        // configured it is 5060.
+        let mut udp_agent = test_agent();
+        udp_agent.configure(
+            "sip:alice@example.com".to_string(),
+            "Alice".to_string(),
+            None,
+            "UDP",
+            #[cfg(feature = "digest-auth")]
+            None,
+        );
+        let addr = udp_agent
+            .parse_destination("sip:bob@192.168.1.1")
+            .await
+            .unwrap();
         assert_eq!(addr.port(), 5060);
     }
 
@@ -2954,6 +3742,13 @@ mod tests {
             cancel.headers.get_value(&HeaderName::Via).unwrap(),
             invite.headers.get_value(&HeaderName::Via).unwrap(),
             "CANCEL must copy the INVITE's exact Via line (RFC 3261 §9.1)"
+        );
+
+        // Same Max-Forwards as the INVITE — not a reset 70 (RFC 3261 §9.1)
+        assert_eq!(
+            cancel.headers.get_value(&HeaderName::MaxForwards),
+            invite.headers.get_value(&HeaderName::MaxForwards),
+            "CANCEL must reuse the INVITE's Max-Forwards (RFC 3261 §9.1)"
         );
 
         // Same CSeq number, method CANCEL
@@ -3203,6 +3998,11 @@ mod tests {
             "ACK To must equal the To of the response being acknowledged"
         );
         assert_eq!(ack.headers.get_value(&HeaderName::CSeq).unwrap(), "1 ACK");
+        assert_eq!(
+            ack.headers.get_value(&HeaderName::MaxForwards),
+            invite1.headers.get_value(&HeaderName::MaxForwards),
+            "non-2xx ACK must reuse the INVITE's Max-Forwards (RFC 3261 §17.1.1.3)"
+        );
 
         // Authenticated INVITE resend (CSeq 2) — the LAST INVITE sent.
         let invite2 = sent_request(rx.recv().await.unwrap());
@@ -3443,6 +4243,496 @@ mod tests {
             "a retransmitted 200 must not re-emit state changes or SDP events"
         );
         assert_eq!(agent.get_state(&call_id), Some(CallState::Connected));
+    }
+
+    /// Drives an outbound call to Connected; returns (`call_id`, INVITE,
+    /// drained requests from the 200 processing).
+    async fn connect_call(
+        agent: &mut CallAgent,
+        rx: &mut mpsc::Receiver<CallEvent>,
+        ok_response: &mut SipResponse,
+    ) -> (String, SipRequest) {
+        let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\nm=audio 49170 RTP/AVP 0 8\r\n";
+        let call_id = agent
+            .make_call("sip:bob@127.0.0.1:5061", sdp)
+            .await
+            .unwrap();
+        let _ = rx.recv().await.unwrap(); // StateChanged(Dialing)
+        let invite = sent_request(rx.recv().await.unwrap());
+
+        ok_response.headers.set(HeaderName::CSeq, "1 INVITE");
+        if ok_response.headers.get_value(&HeaderName::To).is_none() {
+            ok_response
+                .headers
+                .set(HeaderName::To, "<sip:bob@127.0.0.1:5061>;tag=tag-200");
+        }
+        agent.handle_response(ok_response, &call_id).await.unwrap();
+        (call_id, invite)
+    }
+
+    /// RFC 3261 §12.1.2 / §12.2.1.1: the dialog-establishing 200 carries
+    /// Record-Route and Contact; the in-dialog BYE must set its
+    /// Request-URI to the remote target (the 200's Contact URI), carry the
+    /// Route set REVERSED, keep the dialog's remote URI in To, and be sent
+    /// to the resolved address of the first Route.
+    #[tokio::test]
+    async fn test_in_dialog_bye_uses_route_set_and_remote_target() {
+        use proto_sip::header::Header;
+        use proto_sip::response::StatusCode;
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let mut agent = CallAgent::new(
+            local_addr,
+            "sip:alice@127.0.0.1".to_string(),
+            "Alice".to_string(),
+            tx,
+        );
+
+        let mut ok = SipResponse::new(StatusCode::OK);
+        // Two Record-Routing proxies (topmost first, as received).
+        ok.add_header(Header::new(
+            HeaderName::RecordRoute,
+            "<sip:127.0.0.1:5080;lr>",
+        ));
+        ok.add_header(Header::new(
+            HeaderName::RecordRoute,
+            "<sip:127.0.0.2:5081;lr>",
+        ));
+        ok.headers
+            .set(HeaderName::Contact, "<sip:bob-contact@127.0.0.1:5070>");
+
+        let (call_id, _invite) = connect_call(&mut agent, &mut rx, &mut ok).await;
+
+        // Drain the ACK and StateChanged(Connected); the ACK must already
+        // be routed through the route set toward the remote target.
+        let mut ack = None;
+        while let Ok(event) = rx.try_recv() {
+            if let CallEvent::SendRequest {
+                request,
+                destination,
+            } = event
+            {
+                ack = Some((request, destination));
+            }
+        }
+        let (ack, ack_dest) = ack.unwrap();
+        assert_eq!(ack.method.to_string(), "ACK");
+        assert_eq!(ack.uri.to_string(), "sip:bob-contact@127.0.0.1:5070");
+        assert_eq!(
+            ack_dest,
+            "127.0.0.2:5081".parse::<SocketAddr>().unwrap(),
+            "in-dialog request must be sent to the first Route (reversed Record-Route)"
+        );
+
+        // Hang up: the BYE is the in-dialog request under test.
+        agent.hangup(&call_id).await.unwrap();
+        let (bye, bye_dest) = match rx.recv().await.unwrap() {
+            CallEvent::SendRequest {
+                request,
+                destination,
+            } => (request, destination),
+            other => panic!("expected SendRequest, got {other:?}"),
+        };
+
+        assert_eq!(bye.method.to_string(), "BYE");
+        assert_eq!(
+            bye.uri.to_string(),
+            "sip:bob-contact@127.0.0.1:5070",
+            "BYE Request-URI must be the remote target (the 200's Contact)"
+        );
+
+        let routes: Vec<&str> = bye
+            .headers
+            .get_all(&HeaderName::Route)
+            .map(|h| h.value.as_str())
+            .collect();
+        assert_eq!(
+            routes,
+            vec!["<sip:127.0.0.2:5081;lr>", "<sip:127.0.0.1:5080;lr>"],
+            "BYE must carry the Record-Route set reversed (RFC 3261 §12.1.2)"
+        );
+
+        // To still names the dialog's remote URI (not the Contact).
+        let to = bye.headers.get_value(&HeaderName::To).unwrap();
+        assert!(to.contains("sip:bob@127.0.0.1:5061"), "To was: {to}");
+        assert!(to.contains("tag=tag-200"));
+
+        assert_eq!(
+            bye_dest,
+            "127.0.0.2:5081".parse::<SocketAddr>().unwrap(),
+            "BYE must be sent to the first Route's address"
+        );
+    }
+
+    /// RFC 3261 §12.2.1.1 strict-routing fallback: when the first route
+    /// lacks `;lr`, the Request-URI becomes the first route's URI and the
+    /// remote target moves to the last Route header.
+    #[tokio::test]
+    async fn test_in_dialog_bye_strict_route_fallback() {
+        use proto_sip::header::Header;
+        use proto_sip::response::StatusCode;
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let mut agent = CallAgent::new(
+            local_addr,
+            "sip:alice@127.0.0.1".to_string(),
+            "Alice".to_string(),
+            tx,
+        );
+
+        let mut ok = SipResponse::new(StatusCode::OK);
+        // A single strict (no ;lr) Record-Route proxy.
+        ok.add_header(Header::new(HeaderName::RecordRoute, "<sip:127.0.0.1:5080>"));
+        ok.headers
+            .set(HeaderName::Contact, "<sip:bob-contact@127.0.0.1:5070>");
+
+        let (call_id, _invite) = connect_call(&mut agent, &mut rx, &mut ok).await;
+        while rx.try_recv().is_ok() {}
+
+        agent.hangup(&call_id).await.unwrap();
+        let bye = sent_request(rx.recv().await.unwrap());
+
+        assert_eq!(
+            bye.uri.to_string(),
+            "sip:127.0.0.1:5080",
+            "strict routing: Request-URI must be the first route's URI"
+        );
+        let routes: Vec<&str> = bye
+            .headers
+            .get_all(&HeaderName::Route)
+            .map(|h| h.value.as_str())
+            .collect();
+        assert_eq!(
+            routes,
+            vec!["<sip:bob-contact@127.0.0.1:5070>"],
+            "strict routing: remote target must become the last Route"
+        );
+    }
+
+    /// RFC 3261 §12.1: the To-tag must be captured from ANY first tagged
+    /// provisional — 180 included — a later 1xx with a DIFFERENT tag is
+    /// ignored, and only a 2xx may finalize a different tag (forking).
+    #[tokio::test]
+    async fn test_to_tag_captured_from_180_and_forking_rules() {
+        use proto_sip::response::StatusCode;
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let mut agent = CallAgent::new(
+            local_addr,
+            "sip:alice@127.0.0.1".to_string(),
+            "Alice".to_string(),
+            tx,
+        );
+
+        let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n";
+        let call_id = agent
+            .make_call("sip:bob@127.0.0.1:5061", sdp)
+            .await
+            .unwrap();
+        while rx.try_recv().is_ok() {}
+
+        // 180 with a tag: captured (previously only the 183 path stored it)
+        let mut ringing = SipResponse::new(StatusCode::RINGING);
+        ringing
+            .headers
+            .set(HeaderName::To, "<sip:bob@127.0.0.1:5061>;tag=tag-from-180");
+        ringing.headers.set(HeaderName::CSeq, "1 INVITE");
+        agent.handle_response(&ringing, &call_id).await.unwrap();
+        assert_eq!(
+            agent.calls.get(&call_id).unwrap().to_tag.as_deref(),
+            Some("tag-from-180"),
+            "To-tag must be captured from the 180 (RFC 3261 §12.1)"
+        );
+
+        // A later 183 with a DIFFERENT tag (fork): ignored
+        let mut progress = SipResponse::new(StatusCode::SESSION_PROGRESS);
+        progress
+            .headers
+            .set(HeaderName::To, "<sip:bob@127.0.0.1:5061>;tag=other-fork");
+        progress.headers.set(HeaderName::CSeq, "1 INVITE");
+        agent.handle_response(&progress, &call_id).await.unwrap();
+        assert_eq!(
+            agent.calls.get(&call_id).unwrap().to_tag.as_deref(),
+            Some("tag-from-180"),
+            "a differing To-tag on a later 1xx must be ignored"
+        );
+
+        // The 2xx MAY finalize a different tag (the answering fork)
+        let mut ok = SipResponse::new(StatusCode::OK);
+        ok.headers
+            .set(HeaderName::To, "<sip:bob@127.0.0.1:5061>;tag=final-tag");
+        ok.headers.set(HeaderName::CSeq, "1 INVITE");
+        agent.handle_response(&ok, &call_id).await.unwrap();
+        assert_eq!(
+            agent.calls.get(&call_id).unwrap().to_tag.as_deref(),
+            Some("final-tag"),
+            "the 2xx finalizes the dialog's To-tag (forking)"
+        );
+
+        // And the ACK addresses the confirmed dialog (final tag)
+        let mut ack = None;
+        while let Ok(event) = rx.try_recv() {
+            if let CallEvent::SendRequest { request, .. } = event {
+                ack = Some(request);
+            }
+        }
+        let ack = ack.unwrap();
+        assert_eq!(ack.method.to_string(), "ACK");
+        assert!(
+            ack.headers
+                .get_value(&HeaderName::To)
+                .unwrap()
+                .contains("tag=final-tag")
+        );
+    }
+
+    /// RFC 3581: `received`/`rport` on the top Via of a response reveal
+    /// our NAT public address; subsequently built requests must advertise
+    /// it in their Via.
+    #[tokio::test]
+    async fn test_received_rport_updates_effective_address() {
+        use proto_sip::response::StatusCode;
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let mut agent = CallAgent::new(
+            local_addr,
+            "sip:alice@127.0.0.1".to_string(),
+            "Alice".to_string(),
+            tx,
+        );
+
+        let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n";
+        let call_id = agent
+            .make_call("sip:bob@127.0.0.1:5061", sdp)
+            .await
+            .unwrap();
+        let _ = rx.recv().await.unwrap();
+        let invite = sent_request(rx.recv().await.unwrap());
+        let invite_via = invite.headers.get_value(&HeaderName::Via).unwrap();
+
+        // The server echoes our Via, filling received + rport (RFC 3581)
+        let mut ok = SipResponse::new(StatusCode::OK);
+        ok.headers.set(
+            HeaderName::Via,
+            format!("{invite_via};received=203.0.113.5;rport=12345"),
+        );
+        ok.headers
+            .set(HeaderName::To, "<sip:bob@127.0.0.1:5061>;tag=tag-200");
+        ok.headers.set(HeaderName::CSeq, "1 INVITE");
+        agent.handle_response(&ok, &call_id).await.unwrap();
+        while rx.try_recv().is_ok() {}
+
+        assert_eq!(
+            agent.public_addr,
+            Some("203.0.113.5:12345".parse().unwrap()),
+            "received/rport must be stored as the effective public address"
+        );
+
+        // The next built request (BYE) advertises the public address
+        agent.hangup(&call_id).await.unwrap();
+        let bye = sent_request(rx.recv().await.unwrap());
+        let bye_via = bye.headers.get_value(&HeaderName::Via).unwrap();
+        assert!(
+            bye_via.contains("203.0.113.5:12345"),
+            "BYE Via must carry the RFC 3581 public address, was: {bye_via}"
+        );
+    }
+
+    /// RFC 3264 §6 hardening: an early (183) SDP answer whose codecs do
+    /// not intersect our offer must be logged and ignored — no
+    /// `SdpAnswerReceived` (no audio start) for an unusable answer.
+    #[tokio::test]
+    async fn test_early_sdp_codec_mismatch_ignored() {
+        use proto_sip::response::StatusCode;
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let mut agent = CallAgent::new(
+            local_addr,
+            "sip:alice@127.0.0.1".to_string(),
+            "Alice".to_string(),
+            tx,
+        );
+
+        // Offer PCMU/PCMA (0, 8)
+        let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\nm=audio 49170 RTP/AVP 0 8\r\n";
+        let call_id = agent
+            .make_call("sip:bob@127.0.0.1:5061", sdp)
+            .await
+            .unwrap();
+        while rx.try_recv().is_ok() {}
+
+        // 183 answering with G729 only (18): no intersection
+        let mut progress = SipResponse::new(StatusCode::SESSION_PROGRESS);
+        progress
+            .headers
+            .set(HeaderName::To, "<sip:bob@127.0.0.1:5061>;tag=tag-183");
+        progress.headers.set(HeaderName::CSeq, "1 INVITE");
+        progress.body = Some(bytes::Bytes::from_static(
+            b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\nm=audio 4000 RTP/AVP 18\r\n",
+        ));
+        agent.handle_response(&progress, &call_id).await.unwrap();
+
+        let mut saw_sdp_answer = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, CallEvent::SdpAnswerReceived { .. }) {
+                saw_sdp_answer = true;
+            }
+        }
+        assert!(
+            !saw_sdp_answer,
+            "mismatched early SDP must not be surfaced (RFC 3264 §6)"
+        );
+        assert!(
+            agent.calls.get(&call_id).unwrap().remote_sdp.is_none(),
+            "mismatched early SDP must not be stored"
+        );
+
+        // Interleave a 180 so the next 183 is not absorbed as a
+        // same-status retransmission by the INVITE transaction.
+        let mut ringing = SipResponse::new(StatusCode::RINGING);
+        ringing
+            .headers
+            .set(HeaderName::To, "<sip:bob@127.0.0.1:5061>;tag=tag-183");
+        ringing.headers.set(HeaderName::CSeq, "1 INVITE");
+        agent.handle_response(&ringing, &call_id).await.unwrap();
+        while rx.try_recv().is_ok() {}
+
+        // A compatible 183 (PCMU + telephone-event) IS surfaced
+        let mut progress2 = SipResponse::new(StatusCode::SESSION_PROGRESS);
+        progress2
+            .headers
+            .set(HeaderName::To, "<sip:bob@127.0.0.1:5061>;tag=tag-183");
+        progress2.headers.set(HeaderName::CSeq, "1 INVITE");
+        progress2.body = Some(bytes::Bytes::from_static(
+            b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\nm=audio 4000 RTP/AVP 0 101\r\na=rtpmap:101 telephone-event/8000\r\n",
+        ));
+        agent.handle_response(&progress2, &call_id).await.unwrap();
+        let mut saw_sdp_answer = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, CallEvent::SdpAnswerReceived { .. }) {
+                saw_sdp_answer = true;
+            }
+        }
+        assert!(saw_sdp_answer, "compatible early SDP must be surfaced");
+    }
+
+    /// RFC 3261 §14.1: a 491 to a re-INVITE (glare) must not kill the
+    /// call; the re-INVITE is `ACK`ed and retried once after the glare
+    /// backoff via `process_timers`.
+    #[tokio::test]
+    async fn test_491_glare_reinvite_acked_and_retried_once() {
+        use proto_sip::response::StatusCode;
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let mut agent = CallAgent::new(
+            local_addr,
+            "sip:alice@127.0.0.1".to_string(),
+            "Alice".to_string(),
+            tx,
+        );
+
+        let mut ok = SipResponse::new(StatusCode::OK);
+        let (call_id, _invite) = connect_call(&mut agent, &mut rx, &mut ok).await;
+        while rx.try_recv().is_ok() {}
+
+        // Hold: re-INVITE (CSeq 2) goes out
+        agent
+            .hold_call(&call_id, "v=0\r\na=sendonly\r\n")
+            .await
+            .unwrap();
+        let reinvite = sent_request(rx.recv().await.unwrap());
+        assert_eq!(
+            reinvite.headers.get_value(&HeaderName::CSeq).unwrap(),
+            "2 INVITE"
+        );
+        while rx.try_recv().is_ok() {}
+
+        // Glare: 491 Request Pending
+        let mut pending = SipResponse::new(StatusCode::REQUEST_PENDING);
+        pending
+            .headers
+            .set(HeaderName::To, "<sip:bob@127.0.0.1:5061>;tag=tag-200");
+        pending.headers.set(HeaderName::CSeq, "2 INVITE");
+        agent.handle_response(&pending, &call_id).await.unwrap();
+
+        // The 491 must be ACKed, the call must stay alive, a retry queued
+        let ack = sent_request(rx.recv().await.unwrap());
+        assert_eq!(ack.method.to_string(), "ACK");
+        assert_eq!(ack.headers.get_value(&HeaderName::CSeq).unwrap(), "2 ACK");
+        assert_ne!(agent.get_state(&call_id), Some(CallState::Terminated));
+        assert!(agent.calls.get(&call_id).unwrap().reinvite_retry.is_some());
+
+        // Fire the timer early and pump: the re-INVITE is retried (CSeq 3)
+        if let Some(session) = agent.calls.get_mut(&call_id)
+            && let Some(retry) = session.reinvite_retry.as_mut()
+        {
+            retry.at = Instant::now();
+        }
+        agent.process_timers().await.unwrap();
+        let retry_invite = sent_request(rx.recv().await.unwrap());
+        assert_eq!(retry_invite.method.to_string(), "INVITE");
+        assert_eq!(
+            retry_invite.headers.get_value(&HeaderName::CSeq).unwrap(),
+            "3 INVITE"
+        );
+        while rx.try_recv().is_ok() {}
+
+        // A second 491 exhausts the one-shot retry: ACKed, no new retry
+        let mut pending2 = SipResponse::new(StatusCode::REQUEST_PENDING);
+        pending2
+            .headers
+            .set(HeaderName::To, "<sip:bob@127.0.0.1:5061>;tag=tag-200");
+        pending2.headers.set(HeaderName::CSeq, "3 INVITE");
+        agent.handle_response(&pending2, &call_id).await.unwrap();
+        let ack2 = sent_request(rx.recv().await.unwrap());
+        assert_eq!(ack2.method.to_string(), "ACK");
+        assert!(
+            agent.calls.get(&call_id).unwrap().reinvite_retry.is_none(),
+            "only ONE glare retry is scheduled (RFC 3261 §14.1)"
+        );
+    }
+
+    /// RFC 3261 §21.5.2: Retry-After on a 486 is surfaced in the failure
+    /// reason so the app can back off instead of redialing immediately.
+    #[tokio::test]
+    async fn test_retry_after_surfaced_on_busy() {
+        use proto_sip::response::StatusCode;
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let mut agent = CallAgent::new(
+            local_addr,
+            "sip:alice@127.0.0.1".to_string(),
+            "Alice".to_string(),
+            tx,
+        );
+
+        let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n";
+        let call_id = agent
+            .make_call("sip:bob@127.0.0.1:5061", sdp)
+            .await
+            .unwrap();
+        while rx.try_recv().is_ok() {}
+
+        let mut busy = SipResponse::new(StatusCode::BUSY_HERE);
+        busy.headers
+            .set(HeaderName::To, "<sip:bob@127.0.0.1:5061>;tag=tag-486");
+        busy.headers.set(HeaderName::CSeq, "1 INVITE");
+        busy.headers.set(HeaderName::RetryAfter, "120");
+        agent.handle_response(&busy, &call_id).await.unwrap();
+
+        let info = agent.get_call_info(&call_id).unwrap();
+        let reason = info.failure_reason.unwrap().to_string();
+        assert!(
+            reason.contains("Retry-After: 120s"),
+            "failure reason must surface Retry-After, was: {reason}"
+        );
     }
 
     #[tokio::test]

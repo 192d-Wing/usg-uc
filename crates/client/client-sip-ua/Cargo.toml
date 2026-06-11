@@ -25,6 +25,7 @@ proto-ice.workspace = true
 proto-stun.workspace = true
 proto-turn.workspace = true
 uc-crypto.workspace = true
+uc-dns = { workspace = true, features = ["resolver"] }
 uc-transport.workspace = true
 uc-types.workspace = true
 tokio.workspace = true

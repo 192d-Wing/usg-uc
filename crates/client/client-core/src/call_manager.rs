@@ -615,6 +615,16 @@ impl CallManager {
         std::iter::from_fn(|| self.call_event_rx.try_recv().ok()).collect()
     }
 
+    /// Drives the call agent's time-based behavior (e.g. the one-shot
+    /// re-INVITE retry after 491 glare, RFC 3261 §14.1). Call periodically
+    /// from the app event pump.
+    pub async fn process_timers(&mut self) -> AppResult<()> {
+        self.call_agent
+            .process_timers()
+            .await
+            .map_err(|e| AppError::Sip(e.to_string()))
+    }
+
     /// Routes an incoming SIP response to the appropriate call.
     ///
     /// This should be called when the transport layer receives a SIP response
@@ -1251,6 +1261,16 @@ impl CallManager {
                 },
             );
 
+        // Record-Route values of the INVITE, in received order: for a UAS
+        // the dialog route set is that order, NOT reversed (RFC 3261
+        // §12.1.1), so in-dialog requests traverse Record-Routing proxies.
+        let record_routes: Vec<String> = incoming
+            .invite_request
+            .headers
+            .get_all(&proto_sip::header::HeaderName::RecordRoute)
+            .map(|h| h.value.clone())
+            .collect();
+
         self.call_agent.register_inbound_call(
             call_id,
             &sip_call_id,
@@ -1259,6 +1279,7 @@ impl CallManager {
             &bye_target,
             remote_display.as_deref(),
             remote_sdp_str.as_deref(),
+            &record_routes,
         );
 
         // Start audio session using remote media address from INVITE SDP
