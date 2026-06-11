@@ -309,8 +309,10 @@ enum AnnouncementPlayback {
     /// In-process playback on this bound socket.
     Local(tokio::net::UdpSocket),
     /// Remote playback; resolves when the pod reports Completed.
+    /// Boxed: `RemoteAnnouncement` is far larger than the `Local` socket,
+    /// so inlining it would bloat every `AnnouncementPlayback` value.
     #[cfg(feature = "grpc")]
-    Remote(crate::announcement_client::RemoteAnnouncement),
+    Remote(Box<crate::announcement_client::RemoteAnnouncement>),
 }
 
 impl SipStack {
@@ -2578,7 +2580,7 @@ impl SipStack {
                 (
                     session.advertised_ip.clone(),
                     session.rtp_port,
-                    AnnouncementPlayback::Remote(session),
+                    AnnouncementPlayback::Remote(Box::new(session)),
                 )
             }),
             _ => None,
