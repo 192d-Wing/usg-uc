@@ -30,11 +30,16 @@ let package = Package(
                 .linkedFramework("Security"),
                 .linkedFramework("SystemConfiguration"),
                 .linkedFramework("AVFoundation"),
+                // macOS host builds (swift build / swift run) link the macOS
+                // FIPS dylib from the staged native dir. iOS app builds consume
+                // this library through Xcode and link/embed the iOS-slice FIPS
+                // dylib at the app target instead (see ios/project.yml), so this
+                // macOS-only path must NOT apply to the iOS platform.
                 .unsafeFlags([
                     "-L", nativeLibDir,
                     "-laws_lc_fips_0_13_14_crypto",
                     "-Xlinker", "-rpath", "-Xlinker", nativeLibDir,
-                ]),
+                ], .when(platforms: [.macOS])),
             ]
         ),
         // Minimal SwiftUI smoke-test app (macOS): registration + dialpad.

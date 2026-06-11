@@ -1,0 +1,85 @@
+# xcodegen project spec for the iOS app.
+#
+# Generates SipClientApp-iOS.xcodeproj (gitignored — regenerate with
+# `xcodegen generate` or ../build-ios-app.sh). The app reuses the SAME SwiftUI
+# sources as the macOS executable (../UsgSipClient/Sources/SipClientApp) rather
+# than duplicating them, and depends on the local UsgSipClient SwiftPM package's
+# library product, which re-exports the generated UniFFI bindings and links the
+# Rust core (ClientFFI.xcframework).
+#
+# Run ../build-xcframework.sh first: ClientFFI.swift, ClientFFI.xcframework, and
+# the native FIPS dylib are generated, not committed.
+
+name: SipClientApp-iOS
+
+options:
+  bundleIdPrefix: org.jhics
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    CODE_SIGNING_ALLOWED: NO
+    CODE_SIGN_IDENTITY: ""
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    # ClientFFI.xcframework ships arm64 (device + simulator) only — no x86_64
+    # simulator slice — so build the active arch and exclude x86_64.
+    ONLY_ACTIVE_ARCH: YES
+    EXCLUDED_ARCHS: x86_64
+
+packages:
+  UsgSipClient:
+    path: ../UsgSipClient
+
+targets:
+  SipClientApp-iOS:
+    type: application
+    platform: iOS
+    sources:
+      # The shared SwiftUI app sources (same files as the macOS executable),
+      # the bundled seal resource, and the iOS-only launch screen. The
+      # UsgSipClient module (bindings + Rust core) comes from the package dep.
+      - path: ../UsgSipClient/Sources/SipClientApp
+        name: SipClientApp
+        excludes:
+          - Resources/**
+      - path: ../UsgSipClient/Sources/SipClientApp/Resources/DOW-Seal.png
+        buildPhase: resources
+      - path: LaunchScreen.storyboard
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.jhics.usgsipclient
+        PRODUCT_NAME: USG SIP Client
+        # Use the hand-authored Info.plist verbatim (mic permission, VoIP/audio
+        # background modes, launch screen) rather than an xcodegen-merged one.
+        INFOPLIST_FILE: Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        # The shared sources reference Bundle.module under SwiftPM; the Xcode
+        # app target copies resources into Bundle.main instead (see
+        # PlatformImage.swift Bundle.appResources).
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: XCODE_APP
+        LD_RUNPATH_SEARCH_PATHS:
+          - "@executable_path/Frameworks"
+        # The Rust staticlib (client_ffi) records a link dependency on the
+        # aws-lc FIPS dylib (-laws_lc_fips_..._crypto). Point the linker at the
+        # iOS-simulator slice staged by build-xcframework.sh.
+        LIBRARY_SEARCH_PATHS:
+          - "$(inherited)"
+          - "$(SRCROOT)/../UsgSipClient/Frameworks/native/aarch64-apple-ios-sim"
+    dependencies:
+      # The UsgSipClient library product: generated UniFFI bindings +
+      # ClientFFI.xcframework (the Rust core staticlib).
+      - package: UsgSipClient
+        product: UsgSipClient
+      # The aws-lc FIPS module is a dylib (FIPS boundary). Embed the simulator
+      # slice; build-ios-app.sh targets the simulator destination.
+      - framework: ../UsgSipClient/Frameworks/native/aarch64-apple-ios-sim/libaws_lc_fips_0_13_14_crypto.dylib
+        embed: true
+        codeSign: true
+      - sdk: AVFoundation.framework
+      - sdk: AudioToolbox.framework
+      - sdk: CoreAudio.framework
+      - sdk: Security.framework
+      - sdk: SystemConfiguration.framework
