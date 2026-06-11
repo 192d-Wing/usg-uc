@@ -101,6 +101,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: cross-${{ matrix.target }}
+      # aws-lc-fips-sys builds the FIPS module with Go; macOS runners do not
+      # ship it on PATH (ubuntu/windows do).
+      - uses: actions/setup-go@v5
+        if: runner.os == 'macOS'
+        with:
+          go-version: stable
+          cache: false
       - name: Configure Android NDK toolchain
         if: contains(matrix.target, 'android')
         run: |

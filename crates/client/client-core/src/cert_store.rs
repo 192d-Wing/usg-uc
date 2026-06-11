@@ -1025,19 +1025,26 @@ impl CertificateStore {
             // Get smart card reader name if available
             let reader_name = self.get_reader_name(cert_context);
 
-            // Get full subject DN
+            // Get full subject and issuer DNs
             let subject_dn = self.get_cert_dn_string(cert_context, true);
+            let issuer_dn = self.get_cert_dn_string(cert_context, false);
 
             Some(CertificateInfo {
                 thumbprint,
                 subject_cn,
                 subject_dn,
                 issuer_cn,
+                issuer_dn,
                 not_before,
                 not_after,
                 is_valid,
                 reader_name,
                 key_algorithm,
+                // EKU extraction via CertGetEnhancedKeyUsage is not wired up
+                // yet; leave unknown (matches the macOS Keychain path).
+                extended_key_usage: vec![],
+                has_smart_card_logon: false,
+                has_client_auth: false,
             })
         }
     }

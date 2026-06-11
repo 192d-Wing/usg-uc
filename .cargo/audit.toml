@@ -1,0 +1,12 @@
+# cargo-audit configuration (Security Audit CI job).
+
+[advisories]
+ignore = [
+    # glib VariantStrIter unsoundness; fixed only in glib >= 0.20, but the
+    # legacy Tauri/GTK3 desktop GUI pins glib 0.18 (gtk3-rs is unmaintained
+    # and tauri v2 on Linux still binds it). The affected iterator is not
+    # used by this codebase, and client-gui-tauri is being replaced by the
+    # native clients (docs/CLIENT-NATIVE-MIGRATION-PLAN.md). Re-evaluate
+    # when the Tauri client is retired or tauri moves off gtk3.
+    "RUSTSEC-2024-0429",
+]
