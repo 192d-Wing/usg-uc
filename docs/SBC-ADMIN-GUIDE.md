@@ -30,6 +30,23 @@ flowchart LR
     relay <-->|RTP| trunk
 ```
 
+### Optional pods
+
+The SBC ships as a single `sbc-daemon` binary (or container) that handles
+all subsystems in-process. Two subsystems can be split out into dedicated
+pods when the deployment grows beyond a single node:
+
+| Pod | Env var switch | What it does |
+| --- | --- | --- |
+| `sbc-announcement-server` | `SBC_ANNOUNCEMENT_URL` | RTP playback of "number not in service" / "all circuits busy" announcements on a dedicated media node. The daemon retains the SIP dialog; the pod binds the UDP socket and streams PCMU audio. Falls back to in-process if the URL is unset or the pod is unreachable. |
+| `sbc-trunk-agent` | `SBC_TRUNK_SERVICES=external` | Carrier REGISTER and SIP OPTIONS health loops running outside the daemon. Reads trunk config from Postgres and pushes status snapshots to the daemon via gRPC. **Deploy exactly one replica** — two agents would double-REGISTER to carriers. |
+
+Both pods use the same fallback pattern: when the env var is absent or
+the pod is unreachable, the daemon runs the subsystem in-process, so
+single-node deployments require no configuration changes.
+
+See [architecture.md](architecture.md) for the full pod topology diagram.
+
 ---
 
 ## Installation
@@ -46,8 +63,11 @@ cargo build --release --bin sbc-daemon --features grpc
 # With clustering support
 cargo build --release --bin sbc-daemon --features full
 
-# CLI tool
+# CLI tool (basic — status, config, calls, health, metrics)
 cargo build --release --bin sbc-cli
+
+# CLI tool with trunk subcommands (connects directly to daemon gRPC :9091)
+cargo build --release --bin sbc-cli --features grpc
 ```
 
 ### Binary Location
@@ -564,7 +584,112 @@ Available gRPC services:
 - **RegistrationService** — List, get, delete registrations; stats
 - **ConfigService** — Get, update, validate, reload configuration
 - **SystemService** — Version, stats, metrics, TLS reload, shutdown
+- **TrunkHealthService** — List trunk health and registration status (reads from in-process monitor or `sbc-trunk-agent` snapshot, transparently)
+- **TrunkStatusPublishService** — Receives status snapshots from `sbc-trunk-agent` (consumed by the agent pod, not by operators directly)
 - **ClusterService** — Cluster status, node management, failover (with `--features cluster`)
+
+---
+
+## Announcement Playback
+
+When a call cannot be completed (unallocated DID, all trunks in cooldown,
+etc.) the daemon plays a PCMU announcement to the caller before sending BYE.
+By default this runs in-process. For deployments where media should not
+terminate on the signaling node, set `SBC_ANNOUNCEMENT_URL` to point at a
+running `sbc-announcement-server` pod.
+
+```sh
+SBC_ANNOUNCEMENT_URL=http://sbc-announcement.sbc-system.svc.cluster.local:9095
+```
+
+**Fallback behaviour**: if the env var is unset, or the pod is unreachable at
+call time (connection refused, timeout > 2 s), the daemon silently falls back
+to in-process playback. No call is dropped due to the announcement pod being
+unavailable.
+
+**Announcement pod configuration** (env vars on `sbc-announcement-server`):
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `SBC_ANN_GRPC_LISTEN` | `0.0.0.0:9095` | gRPC listener address |
+| `SBC_ANN_ADVERTISED_IP` | *(required)* | IP embedded in SDP and returned to the daemon in the `Bound` event. Must be reachable by calling phones/carriers. |
+| `SBC_ANN_BIND_IP` | `0.0.0.0` | Local IP to bind RTP sockets on. |
+| `SBC_ANN_RTP_PORT_MIN` | *(ephemeral)* | Lower bound of RTP port range. |
+| `SBC_ANN_RTP_PORT_MAX` | *(ephemeral)* | Upper bound of RTP port range. |
+| `SBC_ANN_DEFAULT_DELAY_MS` | `200` | Silence before the first media frame (ms). |
+
+The pod is stateless and scales horizontally. The daemon picks one instance
+per call at gRPC connection time; any replica can serve any call.
+
+---
+
+## Trunk Agent
+
+By default, carrier REGISTER and SIP OPTIONS health loops run inside
+`sbc-daemon`. For deployments where SIP registration must originate from a
+node with a stable public IP (separate from the signaling node), or where
+trunk restarts should not affect the SIP-serving process, run
+`sbc-trunk-agent` as a separate pod.
+
+Set the following on `sbc-daemon` to disable its own trunk loops:
+
+```sh
+SBC_TRUNK_SERVICES=external
+```
+
+The agent reads trunk configuration from Postgres, runs OPTIONS probes and
+outbound REGISTER, and pushes status snapshots to the daemon's
+`TrunkStatusPublishService` gRPC endpoint on the configured interval. The
+existing `TrunkHealthService` RPCs (used by `sbc-cli trunk list` and the
+dashboard) automatically read from the agent's snapshot when the daemon's
+own loops are disabled — no CLI or dashboard changes are required.
+
+> **Single-replica requirement**: run exactly **one** replica of
+> `sbc-trunk-agent`. A second instance would send duplicate REGISTER
+> requests to every carrier, causing authentication failures and potential
+> carrier-side rate limiting. Use `strategy: Recreate` (not RollingUpdate)
+> in the Deployment so the old pod terminates before the new one starts.
+
+**Trunk agent configuration** (env vars on `sbc-trunk-agent`):
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `SBC_POSTGRES_URL` | *(required)* | Postgres DSN — same database the daemon reads. |
+| `SBC_DAEMON_GRPC_URL` | *(required)* | gRPC URL of the daemon's management port (`:9091`). |
+| `SBC_AGENT_GRPC_LISTEN` | `0.0.0.0:9096` | gRPC health probe listener. |
+| `SBC_INSTANCE_NAME` | `$HOSTNAME` | Agent identity reported in status snapshots. |
+| `SBC_SIP_CONTACT_IP` | *(unset)* | SIP Contact IP for REGISTER/OPTIONS. Must be the public IP visible to carriers. If unset, carriers may route inbound calls to the agent pod IP instead of the daemon — set this in almost all deployments. |
+| `SBC_TRUNK_BIND_IP` | *(unset)* | Bind local UDP `:5060` on this IP for NAT keepalive (requires `CAP_NET_BIND_SERVICE`). |
+| `SBC_TRUNK_POLL_SECS` | `30` | How often to poll Postgres for trunk config changes. |
+| `SBC_PUBLISH_INTERVAL_SECS` | `10` | How often to push a status snapshot to the daemon. |
+
+### Monitoring trunk health from the CLI
+
+`sbc-cli` (built with `--features grpc`) can query trunk state directly from the
+daemon's gRPC management port:
+
+```sh
+# OPTIONS-ping health for every trunk
+sbc-cli trunk list
+
+# Outbound-registration status for every trunk
+sbc-cli trunk registrations
+
+# Target a remote daemon
+sbc-cli --grpc-url http://sbc-daemon.sbc.svc.cluster.local:9091 trunk list
+```
+
+When `sbc-trunk-agent` is deployed (`SBC_TRUNK_SERVICES=external`), a
+**staleness indicator** is printed to stderr before the table:
+
+| Indicator | Condition | Meaning |
+| --- | --- | --- |
+| `OK       Snapshot Xs ago` | `age ≤ 30 s` | Agent is healthy and reporting normally |
+| `WARNING  Snapshot Xs ago` | `30 s < age ≤ 120 s` | Agent is slow or backlogged |
+| `STALE    Snapshot Xs ago` | `age > 120 s` | Agent may be down — data unreliable |
+| `WARNING  No snapshot received yet` | `age = 0` | Agent not yet connected or not running |
+
+No indicator is printed when trunk services run in-process (default mode).
 
 ---
 

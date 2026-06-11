@@ -47,8 +47,53 @@ and media relay together. Supporting crates:
 - `sbc-grpc-api`, `sbc-api-server` — gRPC management API and REST server
 - `sbc-provision-server`, `sbc-client-config-server` — device and client
   provisioning endpoints
+- `sbc-announcement` (lib), `sbc-announcement-server` (pod) —
+  announcement playback engine and the gRPC-fronted pod that streams
+  announcements ("number not in service", "all circuits busy") on the
+  daemon's behalf
+- `sbc-trunk-services` (lib), `sbc-trunk-agent` (pod) — OPTIONS trunk
+  health monitoring and outbound carrier registration, runnable
+  in-process or as a dedicated single-replica pod
 - `sbc-cli` — operator command-line tool
 - `sbc-dashboard` — web dashboard
+
+### SBC container topology
+
+The SBC ships as one image per concern. Pods marked *optional* have an
+in-daemon fallback: when the pod (or its env var switch) is absent, the
+daemon runs that subsystem in-process, preserving single-pod deploys.
+
+``` mermaid
+flowchart LR
+    carriers["Carriers / Phones"]
+    subgraph cluster["SBC deployment"]
+        daemon["sbc-daemon<br>SIP B2BUA, routing, registrar,<br>RTP relay (5060/5061, 16384-32768/udp)"]
+        api["sbc-api-server<br>REST config CRUD"]
+        prov["sbc-provision-server<br>phone provisioning"]
+        ccfg["sbc-client-config-server<br>soft-client OIDC config"]
+        ann["sbc-announcement-server*<br>announcement RTP playback"]
+        trunk["sbc-trunk-agent*<br>OPTIONS pings + carrier REGISTER<br>(single replica)"]
+        pg[("PostgreSQL")]
+    end
+    carriers <-->|"SIP + RTP"| daemon
+    carriers <-->|"announcement RTP"| ann
+    carriers <-->|"OPTIONS / REGISTER"| trunk
+    daemon -->|"gRPC AnnouncementService<br>(SBC_ANNOUNCEMENT_URL)"| ann
+    trunk -->|"gRPC TrunkStatusPublishService<br>(daemon: SBC_TRUNK_SERVICES=external)"| daemon
+    api -->|"gRPC sync services :9091"| daemon
+    api --> pg
+    prov --> pg
+    trunk -->|"trunk config"| pg
+    daemon --> pg
+```
+
+\* optional pods with in-daemon fallback. `sbc-trunk-agent` must run as
+exactly one replica (a second agent would double-REGISTER to carriers);
+the daemon must then run with `SBC_TRUNK_SERVICES=external`.
+
+A further decomposition of the daemon itself (signaling pod + N media
+relay pods) is explored in
+[Signaling / Media Split](SIGNALING-MEDIA-SPLIT.md).
 
 Operational details live in the [Administrator Guide](SBC-ADMIN-GUIDE.md),
 [Clustering](CLUSTERING.md), and [Storage Backends](STORAGE-BACKENDS.md).
