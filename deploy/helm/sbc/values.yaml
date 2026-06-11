@@ -264,6 +264,61 @@ sbcClientConfig:
     JOFx1IIEKFjDnUh711lPlk0EMegpnG62n0m0Q2koLw==
     -----END CERTIFICATE-----
 
+# sbc-announcement-server — announcement playback pod (optional).
+# Hosts the gRPC AnnouncementService: the daemon delegates announcement
+# media here via SBC_ANNOUNCEMENT_URL; the pod binds the RTP socket,
+# streams the PCMU announcement to the caller, and reports completion.
+# Stateless — the daemon falls back to in-process playback when this pod
+# is absent or unreachable. Docs: docs/architecture.md.
+sbcAnnouncement:
+  enabled: false
+  replicas: 2
+  image:
+    repository: localhost/usg-sbc-announcement-server
+    tag: local
+    pullPolicy: Never
+  resources:
+    requests: { cpu: "20m",  memory: "32Mi"  }
+    limits:   { cpu: "200m", memory: "128Mi" }
+  # IP advertised in SDP (and returned in the gRPC Bound event). Must be
+  # reachable by calling phones/carriers. Required when enabled.
+  advertisedIp: ""
+  # Bind RTP on a specific IP (defaults to 0.0.0.0).
+  bindIp: ""
+  # RTP port range. If unset the pod uses ephemeral ports — expose the
+  # node's ephemeral range, or set a pinned range and expose it.
+  rtpPortMin: ""
+  rtpPortMax: ""
+  # Initial silence before the first media frame (milliseconds).
+  defaultDelayMs: 200
+
+# sbc-trunk-agent — trunk health + carrier registration pod (optional).
+# Runs the SIP OPTIONS health monitor and outbound carrier REGISTER loops
+# outside the daemon. The daemon must run with SBC_TRUNK_SERVICES=external
+# when this pod is enabled. Deploy exactly ONE replica — a second agent
+# would double-REGISTER to carriers.
+sbcTrunkAgent:
+  enabled: false
+  image:
+    repository: localhost/usg-sbc-trunk-agent
+    tag: local
+    pullPolicy: Never
+  resources:
+    requests: { cpu: "20m",  memory: "64Mi"  }
+    limits:   { cpu: "200m", memory: "256Mi" }
+  # SIP Contact IP embedded in REGISTER/OPTIONS — must be the pod's
+  # public IP (or a NAT'd public IP visible to carriers). Warning: if
+  # unset, carriers may route inbound calls here instead of the daemon.
+  sipContactIp: ""
+  # Bind local UDP :5060 on this IP so the SIP source port matches what
+  # carriers expect for NAT keepalive. Requires CAP_NET_BIND_SERVICE
+  # (set in the Dockerfile via setcap).
+  trunkBindIp: ""
+  # How often to poll Postgres for trunk config changes (seconds).
+  trunkPollSecs: 30
+  # How often to push status snapshots to the daemon (seconds).
+  publishIntervalSecs: 10
+
 sbcDaemon:
   replicas: 1
   # PVC for /var/lib/sbc — holds the file-backed SQLite (users / HA1s) and

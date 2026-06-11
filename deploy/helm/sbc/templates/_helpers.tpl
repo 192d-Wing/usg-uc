@@ -69,6 +69,24 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: client-config
 {{- end }}
 
+{{/* Selector labels for the sbc-announcement-server pod. Announcement
+     media playback rolls and scales independently of SIP — the daemon
+     falls back to in-process when the pod is absent. */}}
+{{- define "sbc.announcementSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "sbc.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: announcement
+{{- end }}
+
+{{/* Selector labels for the sbc-trunk-agent pod. Trunk registration and
+     OPTIONS health-probe loops run outside the daemon. Deploy exactly ONE
+     replica — two agents would double-REGISTER to carriers. */}}
+{{- define "sbc.trunkAgentSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "sbc.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: trunk-agent
+{{- end }}
+
 {{- define "sbc.serviceAccountName" -}}
 {{ include "sbc.fullname" . }}
 {{- end }}

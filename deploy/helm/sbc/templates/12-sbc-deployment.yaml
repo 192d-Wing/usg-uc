@@ -87,6 +87,21 @@ spec:
                   name: {{ .Values.sbcPostgres.existingSecret.name }}
                   key: {{ .Values.sbcPostgres.existingSecret.key | default "dsn" }}
             {{- end }}
+            {{- if .Values.sbcAnnouncement.enabled }}
+            # Announcement pod is deployed — point the daemon at it so
+            # "number not in service" / "all circuits busy" RTP flows
+            # to the dedicated pod instead of running in-process.
+            - name: SBC_ANNOUNCEMENT_URL
+              value: "http://{{ include "sbc.fullname" . }}-announcement.{{ .Release.Namespace }}.svc.cluster.local:9095"
+            {{- end }}
+            {{- if .Values.sbcTrunkAgent.enabled }}
+            # Trunk-agent pod is deployed — disable the daemon's own
+            # registration + OPTIONS loops to avoid double-REGISTERing
+            # to carriers. The agent pushes status snapshots back via
+            # TrunkStatusPublishService.
+            - name: SBC_TRUNK_SERVICES
+              value: "external"
+            {{- end }}
           ports:
             # SIP signaling — no hostPort; k3s ServiceLB DaemonSet already
             # binds hostPort 5060 on every node for the sip LoadBalancer

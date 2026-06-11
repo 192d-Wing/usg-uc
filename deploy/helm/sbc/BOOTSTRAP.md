@@ -150,22 +150,61 @@ kea:
 
 For 184 sites: render values from a CSV/YAML inventory + a template. Site differences are just `name`, `node`, `fqdn_base`, `lb_pool_cidr`, `kea_lb_ip`, `bgp.upstream.ip`, and the phone subnet block.
 
-## Step 5 — Build & import the SBC image
+## Step 5 — Build & import the SBC images
 
-The image is built locally and imported into microk8s containerd. **Known issue**: Cilium's BPF programs attach to all veths, which breaks podman's normal build-time veth creation — use `--network=host` to skip podman's network namespace.
+Images are built locally and imported into microk8s containerd. **Known issue**: Cilium's BPF programs attach to all veths, which breaks podman's normal build-time veth creation — use `--network=host` to skip podman's network namespace.
+
+### sbc-daemon (required)
 
 ```bash
 cd /path/to/usg-uc
 sudo podman build --network=host -t localhost/usg-sbc-daemon:local -f Dockerfile .
 
-# Import into microk8s containerd, tag for kubelet's bare-name lookup
 sudo podman save --quiet localhost/usg-sbc-daemon:local | \
   sudo microk8s ctr image import -
 sudo microk8s ctr image tag --force \
   localhost/usg-sbc-daemon:local docker.io/library/usg-sbc-daemon:local
 ```
 
-For 184 sites: build once on a build host, push the OCI tarball to each site's microk8s ctr.
+### sbc-announcement-server (optional — enable with `sbcAnnouncement.enabled: true`)
+
+Delegates announcement RTP playback ("number not in service", "all circuits
+busy") to a dedicated pod. The daemon falls back to in-process when absent.
+
+```bash
+sudo podman build --network=host -t localhost/usg-sbc-announcement-server:local \
+  -f crates/sbc/sbc-announcement-server/Dockerfile .
+
+sudo podman save --quiet localhost/usg-sbc-announcement-server:local | \
+  sudo microk8s ctr image import -
+sudo microk8s ctr image tag --force \
+  localhost/usg-sbc-announcement-server:local \
+  docker.io/library/usg-sbc-announcement-server:local
+```
+
+Set `sbcAnnouncement.advertisedIp` in site values to the pod's public IP (must
+be reachable by calling phones/carriers). Set `SBC_ANNOUNCEMENT_URL` on the
+daemon (or add it to `sbcDaemon.extraEnv` once that field is wired) pointing at
+the ClusterIP service `http://<release>-announcement.<namespace>.svc:9095`.
+
+### sbc-trunk-agent (optional — enable with `sbcTrunkAgent.enabled: true`)
+
+Runs carrier REGISTER and OPTIONS health loops outside the daemon. Deploy
+exactly one replica — two agents would double-REGISTER to carriers. When
+enabled, also set `SBC_TRUNK_SERVICES=external` on the daemon.
+
+```bash
+sudo podman build --network=host -t localhost/usg-sbc-trunk-agent:local \
+  -f crates/sbc/sbc-trunk-agent/Dockerfile .
+
+sudo podman save --quiet localhost/usg-sbc-trunk-agent:local | \
+  sudo microk8s ctr image import -
+sudo microk8s ctr image tag --force \
+  localhost/usg-sbc-trunk-agent:local \
+  docker.io/library/usg-sbc-trunk-agent:local
+```
+
+For 184 sites: build once on a build host, push the OCI tarballs to each site's microk8s ctr.
 
 ## Step 6 — Deploy the chart
 
@@ -242,9 +281,11 @@ For each of the 184 sites:
 - [ ] Upstream router BGP peer config added (3 lines)
 - [ ] Phone VLAN `ip helper-address` lines added (one per VLAN)
 - [ ] microk8s installed + Cilium reinstall completed (Steps 1-2)
-- [ ] SBC image imported into local containerd (Step 4)
+- [ ] `usg-sbc-daemon` image imported into local containerd (Step 5)
+- [ ] (optional) `usg-sbc-announcement-server` image imported if using announcement pod
+- [ ] (optional) `usg-sbc-trunk-agent` image imported if using trunk-agent pod
 - [ ] `values-<site-id>.yaml` committed to inventory repo
-- [ ] `helm install` completes successfully (Step 5)
+- [ ] `helm install` completes successfully (Step 6)
 - [ ] Upstream router shows pod CIDR via BGP (`show ip bgp <cidr>`)
 - [ ] Test phone DHCPs successfully from Kea
 - [ ] Test trunk REGISTER succeeds

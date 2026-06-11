@@ -1,0 +1,119 @@
+{{- if .Values.sbcTrunkAgent.enabled }}
+# sbc-trunk-agent — trunk health + carrier registration pod.
+#
+# Runs the SIP OPTIONS health monitor and outbound carrier REGISTER loops
+# outside the daemon. Reads trunk configuration from Postgres and pushes
+# status snapshots to the daemon's gRPC TrunkStatusPublishService.
+#
+# IMPORTANT: Deploy exactly ONE replica. A second instance would
+# double-REGISTER to carriers and cause call-routing failures. The daemon
+# must run with SBC_TRUNK_SERVICES=external to disable its own loops.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sbc.fullname" . }}-trunk-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: trunk-agent
+spec:
+  # DO NOT increase beyond 1. Two agents would double-REGISTER to carriers.
+  replicas: 1
+  strategy:
+    # Recreate avoids a brief overlap where both old and new pods run
+    # simultaneously and both send REGISTER to carriers.
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "sbc.trunkAgentSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sbc.trunkAgentSelectorLabels" . | nindent 8 }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: sbc-trunk-agent
+          image: "{{ .Values.sbcTrunkAgent.image.repository }}:{{ .Values.sbcTrunkAgent.image.tag }}"
+          imagePullPolicy: {{ .Values.sbcTrunkAgent.image.pullPolicy }}
+          env:
+            # Postgres DSN — same Secret the daemon reads.
+            {{- if .Values.sbcPostgres.enabled }}
+            - name: SBC_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sbc.fullname" . }}-postgres
+                  key: dsn
+            {{- else if .Values.sbcPostgres.existingSecret.name }}
+            - name: SBC_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.sbcPostgres.existingSecret.name }}
+                  key: {{ .Values.sbcPostgres.existingSecret.key | default "dsn" }}
+            {{- end }}
+            # gRPC endpoint of the daemon's TrunkStatusPublishService.
+            - name: SBC_DAEMON_GRPC_URL
+              value: "http://{{ include "sbc.fullname" . }}-grpc.{{ .Release.Namespace }}.svc.cluster.local:9091"
+            - name: SBC_AGENT_GRPC_LISTEN
+              value: "0.0.0.0:9096"
+            - name: SBC_INSTANCE_NAME
+              value: {{ .Values.site.name | quote }}
+            - name: SBC_TRUNK_POLL_SECS
+              value: {{ .Values.sbcTrunkAgent.trunkPollSecs | quote }}
+            - name: SBC_PUBLISH_INTERVAL_SECS
+              value: {{ .Values.sbcTrunkAgent.publishIntervalSecs | quote }}
+            {{- with .Values.sbcTrunkAgent.sipContactIp }}
+            # SIP Contact IP for REGISTER/OPTIONS — must be reachable by
+            # carriers. Without this, carriers may route inbound calls to
+            # the agent pod IP instead of the daemon.
+            - name: SBC_SIP_CONTACT_IP
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.sbcTrunkAgent.trunkBindIp }}
+            # Bind local UDP :5060 on this IP for NAT keepalive.
+            - name: SBC_TRUNK_BIND_IP
+              value: {{ . | quote }}
+            {{- end }}
+          ports:
+            - { name: grpc, containerPort: 9096, protocol: TCP }
+          livenessProbe:
+            grpc:
+              port: 9096
+              service: ""
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            grpc:
+              port: 9096
+              service: ""
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.sbcTrunkAgent.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              # Required to bind local UDP :5060 when SBC_TRUNK_BIND_IP is set.
+              add: [NET_BIND_SERVICE]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sbc.fullname" . }}-trunk-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: trunk-agent
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "sbc.trunkAgentSelectorLabels" . | nindent 4 }}
+  ports:
+    - { name: grpc, port: 9096, targetPort: grpc, protocol: TCP }
+{{- end }}

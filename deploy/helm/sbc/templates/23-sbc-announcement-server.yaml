@@ -1,0 +1,100 @@
+{{- if .Values.sbcAnnouncement.enabled }}
+# sbc-announcement-server — announcement playback pod.
+#
+# Hosts the gRPC AnnouncementService. The daemon delegates "number not in
+# service" / "all circuits busy" announcement media here via
+# SBC_ANNOUNCEMENT_URL; this pod binds the RTP socket, streams PCMU
+# audio to the caller, and reports completion back to the daemon.
+# Stateless — the daemon falls back to in-process playback when the pod
+# is absent or unreachable, so it can be enabled per-site without
+# changing any daemon logic. Docs: docs/architecture.md.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sbc.fullname" . }}-announcement
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: announcement
+spec:
+  replicas: {{ .Values.sbcAnnouncement.replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "sbc.announcementSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sbc.announcementSelectorLabels" . | nindent 8 }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: sbc-announcement
+          image: "{{ .Values.sbcAnnouncement.image.repository }}:{{ .Values.sbcAnnouncement.image.tag }}"
+          imagePullPolicy: {{ .Values.sbcAnnouncement.image.pullPolicy }}
+          env:
+            - name: SBC_ANN_GRPC_LISTEN
+              value: "0.0.0.0:9095"
+            # IP embedded in the gRPC Bound event and the SDP c= line sent
+            # to the daemon. Must be reachable by calling phones/carriers.
+            - name: SBC_ANN_ADVERTISED_IP
+              value: {{ required "sbcAnnouncement.advertisedIp is required when sbcAnnouncement.enabled" .Values.sbcAnnouncement.advertisedIp | quote }}
+            {{- with .Values.sbcAnnouncement.bindIp }}
+            - name: SBC_ANN_BIND_IP
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.sbcAnnouncement.rtpPortMin }}
+            - name: SBC_ANN_RTP_PORT_MIN
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.sbcAnnouncement.rtpPortMax }}
+            - name: SBC_ANN_RTP_PORT_MAX
+              value: {{ . | quote }}
+            {{- end }}
+            - name: SBC_ANN_DEFAULT_DELAY_MS
+              value: {{ .Values.sbcAnnouncement.defaultDelayMs | quote }}
+          ports:
+            - { name: grpc, containerPort: 9095, protocol: TCP }
+          livenessProbe:
+            grpc:
+              port: 9095
+              service: ""
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          readinessProbe:
+            grpc:
+              port: 9095
+              service: ""
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.sbcAnnouncement.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sbc.fullname" . }}-announcement
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: announcement
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "sbc.announcementSelectorLabels" . | nindent 4 }}
+  ports:
+    - { name: grpc, port: 9095, targetPort: grpc, protocol: TCP }
+{{- end }}
