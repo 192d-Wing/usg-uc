@@ -109,7 +109,17 @@ impl JwksCache {
         if let Some(at) = state.last_attempt
             && at.elapsed() < MIN_REFRESH_INTERVAL
         {
-            return Ok(()); // someone else just tried; use whatever is cached
+            // Someone just tried; don't hammer the IdP again. That's fine
+            // when a key set is cached, but with an empty cache this must
+            // stay an error — otherwise /readyz reports ready for the
+            // whole rate-limit window after a failed startup prefetch.
+            return if state.keys.is_some() {
+                Ok(())
+            } else {
+                Err(JwksError::Unavailable(
+                    "fetch recently failed; retry pending".to_string(),
+                ))
+            };
         }
         state.last_attempt = Some(Instant::now());
 
@@ -162,5 +172,27 @@ impl JwksCache {
             .json()
             .await
             .map_err(|e| JwksError::Metadata(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Regression: a rate-limited refresh with an empty cache must stay an
+    /// error. Returning Ok(()) here made /readyz report ready for the whole
+    /// rate-limit window after a failed startup prefetch (caught by the
+    /// first container smoke test against an unreachable `IdP`).
+    #[tokio::test]
+    async fn rate_limited_refresh_without_keys_stays_an_error() {
+        // Nothing listens on port 1 — connection refused, immediately.
+        let cache = JwksCache::new(reqwest::Client::new(), "https://127.0.0.1:1");
+
+        assert!(cache.refresh().await.is_err(), "real fetch failure");
+        // Second call lands inside MIN_REFRESH_INTERVAL: rate-limited, and
+        // with no cached key set it must still be an error.
+        assert!(cache.refresh().await.is_err(), "rate-limited + empty cache");
+        assert!(!cache.ready().await);
     }
 }
