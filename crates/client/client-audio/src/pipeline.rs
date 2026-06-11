@@ -71,6 +71,32 @@ pub struct AudioProcessingConfig {
     pub drift: DriftConfig,
     /// Jitter buffer adaptive algorithm settings.
     pub jitter_buffer: JitterBufferConfig,
+    /// RTP transport behavior toggles (DTMF interleave, source filtering).
+    pub rtp: RtpTransportConfig,
+}
+
+/// RTP transport behavior toggles.
+#[derive(Debug, Clone)]
+pub struct RtpTransportConfig {
+    /// Interleave in-band DTMF tone audio alongside RFC 4733
+    /// telephone-event packets (RFC 4733 §2.5.1.3), for peers that ignore
+    /// telephone-event. Default `false` — telephone-event packets only.
+    pub dtmf_inband_interleave: bool,
+    /// Drop incoming RTP whose source address differs from the negotiated
+    /// remote (RFC 4961 symmetric RTP hardening). A conservative
+    /// symmetric-NAT latching exception applies: before any packet from the
+    /// negotiated remote arrives, a source with the same IP but a different
+    /// port is latched onto. Default `true`.
+    pub source_filter: bool,
+}
+
+impl Default for RtpTransportConfig {
+    fn default() -> Self {
+        Self {
+            dtmf_inband_interleave: false,
+            source_filter: true,
+        }
+    }
 }
 
 impl AudioProcessingConfig {
@@ -476,7 +502,9 @@ impl AudioPipeline {
         let mut receiver = RtpReceiver::new(socket, jitter_buffer.clone());
 
         // Validate RTP source — only accept packets from the negotiated remote
+        // (RFC 4961; symmetric-NAT latching applies, see RtpReceiver docs)
         receiver.set_expected_remote(config.remote_addr);
+        receiver.set_source_filter(config.audio.rtp.source_filter);
 
         // Enable RFC 2198 redundancy reception if negotiated in SDP
         if let Some(pt) = config.redundancy_pt {
@@ -644,6 +672,7 @@ impl AudioPipeline {
             local_ssrc: ssrc,
             dtmf_volume: config.dtmf_volume,
             dtmf_inter_digit_pause_ms: config.dtmf_inter_digit_pause_ms,
+            dtmf_inband_interleave: config.audio.rtp.dtmf_inband_interleave,
             aec_ref,
             agc: config.audio.agc,
             noise_gate: config.audio.noise_gate,

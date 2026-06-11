@@ -69,8 +69,12 @@ fn dbov_to_rms(dbov: f32) -> f32 {
 /// Encodes an RFC 3389 Comfort Noise payload from the VAD noise floor RMS.
 ///
 /// The minimum CN payload is 1 byte: the noise level in -dBov (0 = max, 127 = silence).
-/// Optional spectral information (bytes 2+) is not generated — the receiver's
-/// CNG will shape the noise independently.
+/// The spectral information coefficients (bytes 2+) are *intentionally
+/// omitted* — they are optional per RFC 3389 §4.3 ("The use of spectral
+/// information is left to the discretion of the implementor"). The
+/// receiver's CNG shapes the noise independently (see
+/// [`ComfortNoiseGenerator::update_spectrum`], which derives an LPC model
+/// from locally observed noise instead).
 ///
 /// # Wire format (RFC 3389 §3)
 /// ```text

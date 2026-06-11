@@ -123,8 +123,13 @@ pub struct JitterBufferStats {
     pub current_depth_ms: u32,
     /// Current number of packets in buffer.
     pub current_packet_count: usize,
-    /// Average jitter in milliseconds.
+    /// Average jitter in milliseconds (local stats display only).
     pub average_jitter_ms: f32,
+    /// RFC 3550 §A.8 interarrival jitter in RTP timestamp units.
+    ///
+    /// This is the value to report in RTCP reception report blocks —
+    /// the spec requires timestamp units, not milliseconds.
+    pub interarrival_jitter: u32,
     /// Number of timestamp discontinuity resyncs.
     pub timestamp_resyncs: u64,
 }
@@ -437,6 +442,19 @@ impl JitterBuffer {
             let d = (arrival_diff - timestamp_diff).abs();
             self.jitter_accumulator += (d - self.jitter_accumulator) / 16.0;
             self.stats.average_jitter_ms = self.jitter_accumulator * 1000.0;
+            // RFC 3550 §A.8: RTCP reports jitter in RTP timestamp units.
+            // The accumulator is kept in seconds; scaling by the clock rate
+            // is equivalent to running the J += (|D| - J)/16 estimator
+            // directly in timestamp units.
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                clippy::cast_precision_loss
+            )]
+            {
+                self.stats.interarrival_jitter =
+                    (self.jitter_accumulator * self.clock_rate as f32) as u32;
+            }
 
             // Record per-packet jitter in history for percentile calculation
             let jitter_ms = d * 1000.0;
@@ -546,6 +564,7 @@ impl JitterBuffer {
         self.jitter_history.clear();
         self.adapt_counter = 0;
         self.stats.current_packet_count = 0;
+        self.stats.interarrival_jitter = 0;
     }
 
     /// Returns the current statistics.
@@ -1013,6 +1032,68 @@ mod tests {
 
         assert_eq!(jb.stats().timestamp_resyncs, 0);
         assert_eq!(jb.len(), 4);
+    }
+
+    #[test]
+    fn test_interarrival_jitter_in_timestamp_units() {
+        // RFC 3550 §A.8: RTCP jitter must be in RTP timestamp units.
+        // Simulate packets whose RTP timestamps advance 160 samples (20ms at
+        // 8kHz) but whose arrivals are spaced 25ms apart → |D| = 5ms = 40 ts
+        // units per packet.
+        let mut jb = JitterBuffer::new(8000, 160, 40);
+        let base = std::time::Instant::now();
+
+        for i in 0..200u16 {
+            let pkt = BufferedPacket {
+                sequence: i,
+                timestamp: u32::from(i) * 160,
+                payload_type: 0,
+                payload: Bytes::from_static(&[0u8; 160]),
+                received_at: base + std::time::Duration::from_millis(u64::from(i) * 25),
+            };
+            jb.push(pkt);
+        }
+
+        let stats = jb.stats();
+        // The J += (|D| - J)/16 estimator converges toward 40 ts units (5ms).
+        assert!(
+            (35..=40).contains(&stats.interarrival_jitter),
+            "expected ~40 ts units, got {}",
+            stats.interarrival_jitter
+        );
+        // ms value stays consistent: ts units = ms × clock_rate/1000.
+        let expected_ts = stats.average_jitter_ms * 8.0;
+        #[allow(clippy::cast_precision_loss)]
+        let actual_ts = stats.interarrival_jitter as f32;
+        assert!(
+            (actual_ts - expected_ts).abs() <= 1.0,
+            "ts-unit jitter {actual_ts} inconsistent with ms jitter {}",
+            stats.average_jitter_ms
+        );
+    }
+
+    #[test]
+    fn test_interarrival_jitter_zero_for_perfect_stream() {
+        // Arrivals exactly match the RTP timestamp cadence → jitter ≈ 0.
+        let mut jb = JitterBuffer::new(8000, 160, 40);
+        let base = std::time::Instant::now();
+
+        for i in 0..50u16 {
+            let pkt = BufferedPacket {
+                sequence: i,
+                timestamp: u32::from(i) * 160,
+                payload_type: 0,
+                payload: Bytes::from_static(&[0u8; 160]),
+                received_at: base + std::time::Duration::from_millis(u64::from(i) * 20),
+            };
+            jb.push(pkt);
+        }
+
+        assert!(
+            jb.stats().interarrival_jitter <= 1,
+            "perfectly paced stream should report ~0 jitter, got {}",
+            jb.stats().interarrival_jitter
+        );
     }
 
     #[test]

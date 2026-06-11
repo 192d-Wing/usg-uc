@@ -133,6 +133,10 @@ pub struct IoThreadConfig {
     /// When false, RTP is sent continuously even during silence.
     /// Disable for providers that don't handle DTX gaps well (e.g., `BulkVS`).
     pub enable_dtx: bool,
+    /// Interleave in-band DTMF tone audio alongside RFC 4733 telephone-event
+    /// packets (RFC 4733 §2.5.1.3), for peers that ignore telephone-event.
+    /// Default OFF — telephone-event packets only.
+    pub dtmf_inband_interleave: bool,
 }
 
 /// Spawns the I/O thread.
@@ -298,6 +302,7 @@ fn io_loop(
         codec_clock_rate,
         codec_samples,
     );
+    dtmf_sender.set_inband_interleave(config.dtmf_inband_interleave);
 
     // Pre-allocated scratch buffers — reused every frame to avoid heap allocs.
     let mut capture_pcm = vec![0i16; capture_device_samples];
@@ -346,16 +351,21 @@ fn io_loop(
             }
         }
 
-        // SSRC collision handling (RFC 3550 §8.2): if the receiver
-        // detected that the remote's SSRC matches our local SSRC,
-        // regenerate ours so both sides have unique identifiers.
-        if receiver.ssrc_collision_detected() {
+        // SSRC collision handling (RFC 3550 §8.2): if the receiver (RTP) or
+        // the RTCP session (SR/RR/SDES with our SSRC from another
+        // participant) detected a collision, regenerate our SSRC so both
+        // sides have unique identifiers.
+        let rtcp_collision = rtcp_session
+            .as_ref()
+            .is_some_and(RtcpSession::ssrc_collision_detected);
+        if receiver.ssrc_collision_detected() || rtcp_collision {
             let new_ssrc = crate::rtp_handler::generate_ssrc();
             transmitter.change_ssrc(new_ssrc);
             receiver.set_local_ssrc(new_ssrc);
             receiver.clear_ssrc_collision();
             if let Some(ref mut rtcp) = rtcp_session {
                 rtcp.set_local_ssrc(new_ssrc);
+                rtcp.clear_ssrc_collision();
             }
             warn!("SSRC collision resolved: new local SSRC={:#010x}", new_ssrc);
         }
@@ -456,6 +466,12 @@ fn io_loop(
                         if let Err(e) = transmitter.send_cn(&cn_payload) {
                             trace!("CN send error: {e}");
                         }
+                    } else {
+                        // RFC 3550 §5.1: the RTP timestamp must keep advancing
+                        // during DTX-suppressed frames so it reflects wall-clock
+                        // samples elapsed when transmission resumes. (The CN
+                        // packet above already consumes one frame's increment.)
+                        transmitter.skip_frame();
                     }
                     was_speech_last_frame = false;
                 } else {
@@ -615,6 +631,14 @@ fn io_loop(
 
     // Flush any in-progress DTMF (forced end-bit) before teardown
     dtmf_sender.flush(&mut transmitter);
+
+    // RFC 3550 §6.6: send an RTCP BYE (compound with SR/RR + SDES) so the
+    // remote can distinguish a deliberate hangup from a crash.
+    if let Some(ref mut rtcp) = rtcp_session {
+        let tx = transmitter.stats();
+        let jb = receiver.jitter_buffer_stats();
+        rtcp.send_bye(&tx, &jb);
+    }
 
     // Final stats update on exit
     update_stats(&transmitter, &receiver, rtcp_session.as_ref(), &stats);
