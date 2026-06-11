@@ -92,7 +92,11 @@ pub struct Verifier {
 impl Verifier {
     /// New verifier requiring `iss == issuer` and `aud` containing
     /// `audience`.
-    pub fn new(jwks: Arc<JwksCache>, issuer: impl Into<String>, audience: impl Into<String>) -> Self {
+    pub fn new(
+        jwks: Arc<JwksCache>,
+        issuer: impl Into<String>,
+        audience: impl Into<String>,
+    ) -> Self {
         Self {
             jwks,
             issuer: issuer.into(),
@@ -123,7 +127,9 @@ impl Verifier {
             // Unknown kid after refresh = token we'll never be able to
             // validate → 401, not 503.
             Err(JwksError::UnknownKid(k)) => {
-                return Err(AuthError::InvalidToken(format!("unknown signing key `{k}`")));
+                return Err(AuthError::InvalidToken(format!(
+                    "unknown signing key `{k}`"
+                )));
             }
             Err(e) => return Err(AuthError::Jwks(e)),
         };

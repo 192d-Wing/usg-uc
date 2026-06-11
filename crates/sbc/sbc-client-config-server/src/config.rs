@@ -108,11 +108,13 @@ impl Config {
             get("SBC_CLIENT_CONFIG_SERVICE_NAME").unwrap_or_else(|| "USG UC".to_string());
 
         let pop_id = required(&get, "SBC_CLIENT_CONFIG_POP_ID")?;
-        let public_url =
-            required(&get, "SBC_CLIENT_CONFIG_PUBLIC_URL")?.trim_end_matches('/').to_string();
+        let public_url = required(&get, "SBC_CLIENT_CONFIG_PUBLIC_URL")?
+            .trim_end_matches('/')
+            .to_string();
 
-        let oidc_issuer =
-            required(&get, "SBC_CLIENT_CONFIG_OIDC_ISSUER")?.trim_end_matches('/').to_string();
+        let oidc_issuer = required(&get, "SBC_CLIENT_CONFIG_OIDC_ISSUER")?
+            .trim_end_matches('/')
+            .to_string();
         if !oidc_issuer.starts_with("https://") {
             // http:// issuers are a test-bench foot-gun in production; the
             // discovery document is the client's trust bootstrap.
@@ -124,10 +126,8 @@ impl Config {
         let oidc_client_id = required(&get, "SBC_CLIENT_CONFIG_OIDC_CLIENT_ID")?;
         let oidc_audience = get("SBC_CLIENT_CONFIG_OIDC_AUDIENCE")
             .unwrap_or_else(|| "usg-uc-provisioning".to_string());
-        let oidc_scopes = csv(
-            &get("SBC_CLIENT_CONFIG_OIDC_SCOPES")
-                .unwrap_or_else(|| "openid,profile,offline_access,sip".to_string()),
-        );
+        let oidc_scopes = csv(&get("SBC_CLIENT_CONFIG_OIDC_SCOPES")
+            .unwrap_or_else(|| "openid,profile,offline_access,sip".to_string()));
 
         let sip_domain = required(&get, "SBC_CLIENT_CONFIG_SIP_DOMAIN")?;
         let registrar_domain = required(&get, "SBC_CLIENT_CONFIG_REGISTRAR_DOMAIN")?;
@@ -135,7 +135,8 @@ impl Config {
         let reg_expires_secs = parse_u32(&get, "SBC_CLIENT_CONFIG_REG_EXPIRES_SECS", 300)?;
         let ttl_secs = parse_u32(&get, "SBC_CLIENT_CONFIG_TTL_SECS", 3600)?;
 
-        let codecs = csv(&get("SBC_CLIENT_CONFIG_CODECS").unwrap_or_else(|| "opus,pcmu,pcma".to_string()));
+        let codecs =
+            csv(&get("SBC_CLIENT_CONFIG_CODECS").unwrap_or_else(|| "opus,pcmu,pcma".to_string()));
 
         Ok(Self {
             listen_addr,
@@ -214,7 +215,10 @@ mod tests {
         assert_eq!(cfg.public_url, "https://us-east-1.pop.example.mil");
         assert_eq!(cfg.oidc_issuer, "https://idp.example.mil/realms/voice");
         assert_eq!(cfg.oidc_audience, "usg-uc-provisioning");
-        assert_eq!(cfg.oidc_scopes, ["openid", "profile", "offline_access", "sip"]);
+        assert_eq!(
+            cfg.oidc_scopes,
+            ["openid", "profile", "offline_access", "sip"]
+        );
         assert_eq!(cfg.reg_expires_secs, 300);
         assert_eq!(cfg.ttl_secs, 3600);
         assert_eq!(cfg.codecs, ["opus", "pcmu", "pcma"]);
@@ -224,7 +228,9 @@ mod tests {
     #[test]
     fn missing_required_var_is_reported() {
         let err = Config::from_lookup(|var| {
-            (var != "SBC_CLIENT_CONFIG_REGISTRAR_DOMAIN").then(|| base_env(var)).flatten()
+            (var != "SBC_CLIENT_CONFIG_REGISTRAR_DOMAIN")
+                .then(|| base_env(var))
+                .flatten()
         })
         .expect_err("must fail");
         assert!(matches!(

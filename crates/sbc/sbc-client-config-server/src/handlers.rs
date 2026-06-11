@@ -7,12 +7,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Json;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
@@ -158,11 +158,7 @@ async fn discovery(State(state): State<AppState>) -> Response {
         },
         minimum_client_version,
     };
-    (
-        [(header::CACHE_CONTROL, "public, max-age=300")],
-        Json(doc),
-    )
-        .into_response()
+    ([(header::CACHE_CONTROL, "public, max-age=300")], Json(doc)).into_response()
 }
 
 /// `GET /v1/client-config` — per-user SIP configuration, authorized by an
@@ -187,9 +183,7 @@ async fn client_config(State(state): State<AppState>, headers: HeaderMap) -> Res
     info!(sub = %claims.sub, dn = %dn, "client config issued");
 
     let cfg = &state.cfg;
-    let domain = claims
-        .sip_domain
-        .unwrap_or_else(|| cfg.sip_domain.clone());
+    let domain = claims.sip_domain.unwrap_or_else(|| cfg.sip_domain.clone());
     let display_name = claims
         .name
         .or(claims.preferred_username)
@@ -330,11 +324,8 @@ fn auth_error_response(err: &AuthError) -> Response {
         ),
     };
 
-    let mut response = (
-        status,
-        Json(serde_json::json!({"error": err.to_string()})),
-    )
-        .into_response();
+    let mut response =
+        (status, Json(serde_json::json!({"error": err.to_string()}))).into_response();
     if let Ok(value) = HeaderValue::from_str(&challenge) {
         response
             .headers_mut()
@@ -383,9 +374,11 @@ mod tests {
 
         static KEY: std::sync::OnceLock<TestKey> = std::sync::OnceLock::new();
         KEY.get_or_init(|| {
-            let pkcs8 =
-                EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &SystemRandom::new())
-                    .expect("generate test key");
+            let pkcs8 = EcdsaKeyPair::generate_pkcs8(
+                &ECDSA_P256_SHA256_FIXED_SIGNING,
+                &SystemRandom::new(),
+            )
+            .expect("generate test key");
             let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref())
                 .expect("parse test key");
             // Uncompressed SEC1 point: 0x04 || X (32 bytes) || Y (32 bytes).
@@ -467,7 +460,11 @@ mod tests {
         })
     }
 
-    async fn get_json(app: Router, uri: &str, token: Option<&str>) -> (StatusCode, HeaderMap, serde_json::Value) {
+    async fn get_json(
+        app: Router,
+        uri: &str,
+        token: Option<&str>,
+    ) -> (StatusCode, HeaderMap, serde_json::Value) {
         let mut req = Request::builder().uri(uri);
         if let Some(t) = token {
             req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
@@ -478,7 +475,12 @@ mod tests {
             .expect("response");
         let status = response.status();
         let headers = response.headers().clone();
-        let bytes = response.into_body().collect().await.expect("body").to_bytes();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
         let json = if bytes.is_empty() {
             serde_json::Value::Null
         } else {
@@ -493,7 +495,9 @@ mod tests {
             get_json(test_app(), "/.well-known/sip-client-config", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            headers.get(header::CACHE_CONTROL).and_then(|v| v.to_str().ok()),
+            headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
             Some("public, max-age=300")
         );
         assert_eq!(body["schema_version"], 1);
@@ -519,11 +523,12 @@ mod tests {
     #[tokio::test]
     async fn valid_token_yields_config() {
         let token = sign(&valid_claims());
-        let (status, headers, body) =
-            get_json(test_app(), "/v1/client-config", Some(&token)).await;
+        let (status, headers, body) = get_json(test_app(), "/v1/client-config", Some(&token)).await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
         assert_eq!(
-            headers.get(header::CACHE_CONTROL).and_then(|v| v.to_str().ok()),
+            headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
             Some("no-store")
         );
         assert_eq!(body["schema_version"], 1);
@@ -531,7 +536,10 @@ mod tests {
         assert_eq!(body["sip"]["uri"], "sip:1455550100@example.mil");
         assert_eq!(body["sip"]["auth"]["mode"], "bearer");
         assert!(body["sip"]["auth"]["digest"].is_null());
-        assert_eq!(body["registration"]["registrar_domain"], "us-east-1.reg.example.mil");
+        assert_eq!(
+            body["registration"]["registrar_domain"],
+            "us-east-1.reg.example.mil"
+        );
         assert_eq!(body["registration"]["expires_seconds"], 300);
         assert_eq!(body["user"]["display_name"], "Jane Doe");
         assert_eq!(body["features"]["voicemail_uri"], "sip:*97@example.mil");
@@ -549,7 +557,10 @@ mod tests {
             .get(header::WWW_AUTHENTICATE)
             .and_then(|v| v.to_str().ok())
             .expect("challenge");
-        assert!(challenge.contains(r#"error="invalid_token""#), "got: {challenge}");
+        assert!(
+            challenge.contains(r#"error="invalid_token""#),
+            "got: {challenge}"
+        );
     }
 
     #[tokio::test]
@@ -572,7 +583,10 @@ mod tests {
             .get(header::WWW_AUTHENTICATE)
             .and_then(|v| v.to_str().ok())
             .expect("challenge");
-        assert!(challenge.contains(r#"error="insufficient_scope""#), "got: {challenge}");
+        assert!(
+            challenge.contains(r#"error="insufficient_scope""#),
+            "got: {challenge}"
+        );
     }
 
     #[tokio::test]
