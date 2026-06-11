@@ -59,25 +59,15 @@ Matches **all numbers** unconditionally. Used as a catch-all or default route.
 
 ## Routing Chain
 
-```
-Inbound Call
-  |
-  v
-Trunk Group (has CSS assigned)
-  |
-  v
-Calling Search Space (ordered list of Partitions)
-  |
-  v
-Partition 1 --> Route Patterns (matched by specificity then priority)
-  |                |
-  |                +--> Route Group (direct trunk selection)
-  |                +--> Route List (failover: try Route Groups in order)
-  |
-Partition 2 --> Route Patterns ...
-  |
-  v
-No match --> Announcement ("Number Not In Service")
+``` mermaid
+flowchart TD
+    call["Inbound Call"] --> tg["Trunk Group<br>(has CSS assigned)"]
+    tg --> css["Calling Search Space<br>(ordered list of Partitions)"]
+    css --> p1["Partition 1 — Route Patterns<br>(matched by specificity then priority)"]
+    p1 -->|match| rg["Route Group<br>(direct trunk selection)"]
+    p1 -->|match| rl["Route List<br>(failover: try Route Groups in order)"]
+    p1 -->|no match| p2["Partition 2 — Route Patterns …"]
+    p2 -->|no match| ann["Announcement<br>(&quot;Number Not In Service&quot;)"]
 ```
 
 ## Pattern Specificity

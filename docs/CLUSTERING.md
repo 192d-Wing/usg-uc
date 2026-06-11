@@ -21,24 +21,30 @@ The USG SBC supports carrier-grade high availability through:
 
 ## Architecture
 
-```text
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Cluster Manager                               │
-├─────────────────────────────────────────────────────────────────────┤
-│  Membership    │   Heartbeat     │   Failover      │   Quorum      │
-│  Tracking      │   Protocol      │   Coordinator   │   Policy      │
-├─────────────────────────────────────────────────────────────────────┤
-│                     Service Discovery                                │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐            │
-│  │  Static  │  │   DNS    │  │ Kubernetes│  │  Gossip  │            │
-│  │   List   │  │  SRV/A   │  │ Endpoints │  │ Protocol │            │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────┘            │
-├─────────────────────────────────────────────────────────────────────┤
-│                     Storage Backends                                 │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐                          │
-│  │ In-Memory│  │  Redis   │  │PostgreSQL│                          │
-│  └──────────┘  └──────────┘  └──────────┘                          │
-└─────────────────────────────────────────────────────────────────────┘
+``` mermaid
+flowchart TB
+    subgraph cm["Cluster Manager"]
+        direction LR
+        membership["Membership<br>Tracking"]
+        heartbeat["Heartbeat<br>Protocol"]
+        failover["Failover<br>Coordinator"]
+        quorum["Quorum<br>Policy"]
+    end
+    subgraph sd["Service Discovery"]
+        direction LR
+        static["Static<br>List"]
+        dns["DNS<br>SRV/A"]
+        k8s["Kubernetes<br>Endpoints"]
+        gossip["Gossip<br>Protocol"]
+    end
+    subgraph sb["Storage Backends"]
+        direction LR
+        mem["In-Memory"]
+        redis["Redis"]
+        pg["PostgreSQL"]
+    end
+    cm --> sd
+    sd --> sb
 ```
 
 ## Node Roles
@@ -51,10 +57,17 @@ The USG SBC supports carrier-grade high availability through:
 
 ## Node States
 
-```text
-Starting → Syncing → Ready → Active → Draining → ShuttingDown
-                ↓              ↓
-            Unhealthy ←────────┘
+``` mermaid
+stateDiagram-v2
+    [*] --> Starting
+    Starting --> Syncing
+    Syncing --> Ready
+    Ready --> Active
+    Active --> Draining
+    Draining --> ShuttingDown
+    Syncing --> Unhealthy
+    Active --> Unhealthy
+    ShuttingDown --> [*]
 ```
 
 | State | Description |
@@ -110,6 +123,7 @@ max_lag_ms = 5000
 | `dead_threshold` | 5 | Missed heartbeats before dead |
 
 **Timeouts:**
+
 - Suspect timeout = interval × suspect_threshold = 3 seconds
 - Dead timeout = interval × dead_threshold = 5 seconds
 
@@ -353,4 +367,4 @@ level = "info"
 
 - [STORAGE-BACKENDS.md](STORAGE-BACKENDS.md) - Storage backend configuration
 - [API-REFERENCE.md](API-REFERENCE.md) - REST API documentation
-- [RUNBOOK.md](../deploy/docs/RUNBOOK.md) - Operational procedures
+- [RUNBOOK.md](https://github.com/192d-Wing/usg-uc/blob/main/deploy/docs/RUNBOOK.md) - Operational procedures

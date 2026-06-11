@@ -27,6 +27,7 @@ coverage/
 
 # Documentation build
 /docs/build/
+/site/
 
 .claude/
 pcaps/

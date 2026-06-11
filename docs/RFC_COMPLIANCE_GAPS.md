@@ -268,6 +268,7 @@ This document maps each proto-* crate to its relevant RFCs and identifies specif
 ### Gap: RFC 3711 §6 - Default Transforms
 
 CNSA 2.0 compliance prohibits AES-128. The following are intentionally not implemented:
+
 - AES_CM_128_HMAC_SHA1_80
 - AES_CM_128_HMAC_SHA1_32
 
@@ -376,6 +377,7 @@ This is **by design** for security compliance.
 Last Updated: 2026-02-03
 
 This document should be updated when:
+
 1. New RFC implementations are added
 2. Existing gaps are filled
 3. New gaps are discovered during testing

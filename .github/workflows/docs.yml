@@ -1,0 +1,43 @@
+name: Docs
+
+# Publishes the Zensical docs site to GitHub Pages. Releases are cut by
+# pushing a tag like docs-v1.2.3; workflow_dispatch allows ad-hoc deploys.
+on:
+  push:
+    tags: ["docs-v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One Pages deployment at a time; let in-flight deploys finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # setup-uv publishes no floating major tag — pin the full version.
+      - uses: astral-sh/setup-uv@v8.2.0
+      # Zensical is pre-1.0 — pin and bump deliberately.
+      - run: uvx zensical==0.0.45 build
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

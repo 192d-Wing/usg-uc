@@ -166,6 +166,7 @@ macOS/Windows keep the always-running model (menu bar / tray).
 ## 5. CI / release
 
 Extend the existing release pipeline (`.github/workflows/release.yml` currently covers SBC images):
+
 - Rust core: build + clippy + test matrix for the 5 triples (mac runners cover apple targets, ubuntu + NDK for Android, windows runner for MSVC).
 - Artifacts: XCFramework (Apple), `.aar` (Android), NuGet (Windows) — versioned with the workspace.
 - App shells build in their own jobs; distribution is MDM/TestFlight/internal (government context — App Store/Play submission and NIAP/STIG evaluation tracked separately under `stigs/`).

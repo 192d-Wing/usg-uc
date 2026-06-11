@@ -21,19 +21,17 @@ The USG SBC supports multiple storage backends for persisting:
 
 ## Architecture
 
-```text
-┌─────────────────────────────────────────────────────────────────────┐
-│                      Storage Manager                                 │
-├─────────────────────────────────────────────────────────────────────┤
-│                      StorageBackend Trait                            │
-│   get() | set() | delete() | keys() | increment() | health_check() │
-├─────────────────────────────────────────────────────────────────────┤
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
-│  │  In-Memory   │  │    Redis     │  │  PostgreSQL  │              │
-│  │   HashMap    │  │  Cluster/Pool│  │ Connection   │              │
-│  │   + TTL      │  │  + TLS       │  │   Pool       │              │
-│  └──────────────┘  └──────────────┘  └──────────────┘              │
-└─────────────────────────────────────────────────────────────────────┘
+``` mermaid
+flowchart TB
+    mgr["Storage Manager"]
+    trait["StorageBackend Trait<br>get() · set() · delete() · keys() · increment() · health_check()"]
+    mem["In-Memory<br>HashMap + TTL"]
+    redis["Redis<br>Cluster/Pool + TLS"]
+    pg["PostgreSQL<br>Connection Pool"]
+    mgr --> trait
+    trait --> mem
+    trait --> redis
+    trait --> pg
 ```
 
 ## Backend Comparison
@@ -60,6 +58,7 @@ default_ttl_secs = 0   # 0 = no expiry
 ### In-Memory Backend
 
 The in-memory backend stores data in a local HashMap with TTL support. Suitable for:
+
 - Development and testing
 - Single-node deployments
 - Ephemeral data only
@@ -71,6 +70,7 @@ key_prefix = "sbc:"
 ```
 
 **Limitations:**
+
 - Data lost on restart
 - Not shared between nodes
 - Memory-bound capacity
@@ -78,6 +78,7 @@ key_prefix = "sbc:"
 ### Redis Backend
 
 The Redis backend provides distributed caching with connection pooling. Suitable for:
+
 - Multi-node clusters
 - High-performance requirements
 - Session state sharing
@@ -145,6 +146,7 @@ verify_certificate = true
 ### PostgreSQL Backend
 
 The PostgreSQL backend provides persistent relational storage. Suitable for:
+
 - Long-term data retention
 - Audit trail requirements
 - Complex queries
@@ -245,6 +247,7 @@ storage.set(&key, &data, Some(ttl)).await?;
 ```
 
 The buffer accounts for:
+
 - Clock skew between nodes
 - Grace period for re-registration
 - Network latency
@@ -371,23 +374,23 @@ let healthy = storage.health_check().await;
 ### Redis
 
 1. **Pool Size**: Set based on concurrent requests
-   - Rule of thumb: 2-4x the number of worker threads
+    - Rule of thumb: 2-4x the number of worker threads
 
 2. **Timeouts**: Balance between responsiveness and reliability
-   - Connection: 5 seconds (initial setup)
-   - Command: 1 second (per operation)
+    - Connection: 5 seconds (initial setup)
+    - Command: 1 second (per operation)
 
 3. **Pipelining**: Batch operations when possible
 
 ### PostgreSQL
 
 1. **Pool Size**: Match to expected concurrent queries
-   - min_size: Number of always-ready connections
-   - max_size: Peak concurrent query capacity
+    - min_size: Number of always-ready connections
+    - max_size: Peak concurrent query capacity
 
 2. **Query Timeout**: Set based on expected query complexity
-   - Simple key-value: 1-5 seconds
-   - Pattern matching: 10-30 seconds
+    - Simple key-value: 1-5 seconds
+    - Pattern matching: 10-30 seconds
 
 3. **Indexes**: The schema includes indexes for TTL cleanup
 
@@ -453,4 +456,4 @@ done
 
 - [CLUSTERING.md](CLUSTERING.md) - High availability configuration
 - [API-REFERENCE.md](API-REFERENCE.md) - REST API documentation
-- [RUNBOOK.md](../deploy/docs/RUNBOOK.md) - Operational procedures
+- [RUNBOOK.md](https://github.com/192d-Wing/usg-uc/blob/main/deploy/docs/RUNBOOK.md) - Operational procedures
