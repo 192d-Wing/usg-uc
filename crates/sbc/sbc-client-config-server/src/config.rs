@@ -84,6 +84,12 @@ pub struct Config {
     pub min_version_desktop: Option<String>,
     /// See [`Config::min_version_desktop`].
     pub min_version_android: Option<String>,
+
+    /// Path to a PEM file containing extra CA certificates to trust when
+    /// fetching the OIDC discovery document and JWKS. Required when the IdP
+    /// uses a private CA not in the Mozilla root bundle.
+    /// `SBC_CLIENT_CONFIG_EXTRA_CA_CERT_FILE`, optional.
+    pub extra_ca_cert_file: Option<String>,
 }
 
 impl Config {
@@ -155,6 +161,7 @@ impl Config {
             voicemail_uri: get("SBC_CLIENT_CONFIG_VOICEMAIL_URI"),
             min_version_desktop: get("SBC_CLIENT_CONFIG_MIN_VERSION_DESKTOP"),
             min_version_android: get("SBC_CLIENT_CONFIG_MIN_VERSION_ANDROID"),
+            extra_ca_cert_file: get("SBC_CLIENT_CONFIG_EXTRA_CA_CERT_FILE"),
         })
     }
 }

@@ -55,11 +55,30 @@ async fn main() -> ExitCode {
         }
     };
 
-    let http = match reqwest::Client::builder()
+    let mut http_builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
+        .timeout(Duration::from_secs(10));
+
+    if let Some(ref path) = cfg.extra_ca_cert_file {
+        match std::fs::read(path) {
+            Ok(pem) => match reqwest::Certificate::from_pem(&pem) {
+                Ok(cert) => {
+                    info!(path, "loaded extra CA certificate");
+                    http_builder = http_builder.add_root_certificate(cert);
+                }
+                Err(e) => {
+                    error!(path, error = %e, "failed to parse extra CA cert PEM");
+                    return ExitCode::from(3);
+                }
+            },
+            Err(e) => {
+                error!(path, error = %e, "failed to read extra CA cert file");
+                return ExitCode::from(3);
+            }
+        }
+    }
+
+    let http = match http_builder.build() {
         Ok(c) => c,
         Err(e) => {
             error!(error = %e, "http client build failed");

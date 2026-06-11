@@ -222,6 +222,44 @@ sbcClientConfig:
   voicemailUri: ""
   minVersionDesktop: ""
   minVersionAndroid: ""
+  # PEM-encoded CA certificate(s) to trust when fetching OIDC metadata / JWKS.
+  # Required when the IdP uses a private CA (e.g. OOPL Internal CA) that is
+  # not in the Mozilla root bundle compiled into the binary.
+  # Set to the full PEM block; the chart creates a ConfigMap + volume mount and
+  # passes SBC_CLIENT_CONFIG_EXTRA_CA_CERT_FILE to the container.
+  # Leave empty to skip (uses Mozilla roots only).
+  extraCaCert: |
+    -----BEGIN CERTIFICATE-----
+    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
+    -----END CERTIFICATE-----
 
 sbcDaemon:
   replicas: 1

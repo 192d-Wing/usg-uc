@@ -1,4 +1,18 @@
 {{- if .Values.sbcClientConfig.enabled }}
+{{- if .Values.sbcClientConfig.extraCaCert }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sbc.fullname" . }}-client-config-ca
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: client-config
+data:
+  oopl-ca.pem: |
+    {{- .Values.sbcClientConfig.extraCaCert | nindent 4 }}
+---
+{{- end }}
 # sbc-client-config-server — soft-client discovery + provisioning pod.
 #
 # Owns `/.well-known/sip-client-config` (unauthenticated discovery
@@ -82,6 +96,16 @@ spec:
             - name: SBC_CLIENT_CONFIG_MIN_VERSION_ANDROID
               value: {{ . | quote }}
             {{- end }}
+            {{- if .Values.sbcClientConfig.extraCaCert }}
+            - name: SBC_CLIENT_CONFIG_EXTRA_CA_CERT_FILE
+              value: "/etc/ssl/extra-ca/oopl-ca.pem"
+            {{- end }}
+          {{- if .Values.sbcClientConfig.extraCaCert }}
+          volumeMounts:
+            - name: extra-ca
+              mountPath: /etc/ssl/extra-ca
+              readOnly: true
+          {{- end }}
           ports:
             - { name: http, containerPort: 80, protocol: TCP }
           livenessProbe:
@@ -102,6 +126,12 @@ spec:
             capabilities:
               drop: [ALL]
               add: [NET_BIND_SERVICE]
+      {{- if .Values.sbcClientConfig.extraCaCert }}
+      volumes:
+        - name: extra-ca
+          configMap:
+            name: {{ include "sbc.fullname" . }}-client-config-ca
+      {{- end }}
 ---
 apiVersion: v1
 kind: Service
