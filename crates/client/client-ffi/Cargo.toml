@@ -1,0 +1,38 @@
+[package]
+name = "client-ffi"
+description = "UniFFI bindings layer for the SIP Soft Client (Swift/Kotlin/C# native shells)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# staticlib: linked into the iOS XCFramework; cdylib: Android .so / Windows .dll;
+# lib: lets the uniffi-bindgen bin and Rust tests consume the crate directly.
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi_bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+default = []
+# Enables the bundled `uniffi-bindgen` CLI used to generate Swift/Kotlin sources.
+bindgen = ["uniffi/cli"]
+# Password-based SIP auth (commercial VoIP testing only; production is mTLS).
+digest-auth = ["client-core/digest-auth"]
+
+[dependencies]
+client-core.workspace = true
+client-types.workspace = true
+client-audio.workspace = true
+uniffi.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

@@ -61,6 +61,13 @@ impl SharedDtmfQueue {
     pub fn pop(&self) -> Option<BufferedPacket> {
         self.inner.lock().ok()?.pop_front()
     }
+
+    /// Returns `true` if no DTMF packets are queued.
+    ///
+    /// Cheap enough to poll between frame decodes (uncontended mutex).
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().is_ok_and(|q| q.is_empty())
+    }
 }
 
 /// Default RTP payload type for audio.
@@ -885,20 +892,18 @@ impl RtpReceiver {
             _ => {}
         }
 
-        // DTMF JB bypass: route telephone-event packets to the dedicated
-        // queue instead of the jitter buffer (matches pjproject).
+        // DTMF early notice: copy telephone-event packets to the dedicated
+        // queue so the decode thread can schedule tones ahead of playout.
+        // The packet ALSO continues into the jitter buffer below — removing
+        // it entirely leaves holes in the sequence-number stream, which the
+        // JB treats as loss/reordering and stalls on, pushing playout further
+        // behind arrivals with every digit (the decode side skips PT=101
+        // packets popped from the JB).
         if self.dtmf_pt == Some(pt)
             && let Some(ref queue) = self.dtmf_queue
         {
-            let buffered = BufferedPacket::new(seq, ts, pt, payload);
+            let buffered = BufferedPacket::new(seq, ts, pt, payload.clone());
             queue.push(buffered);
-            self.stats.packets_received.fetch_add(1, Ordering::Relaxed);
-            #[allow(clippy::cast_possible_truncation)]
-            self.stats
-                .bytes_received
-                .fetch_add(len as u64, Ordering::Relaxed);
-            return Ok(());
-            // No queue configured — fall through to JB (legacy path)
         }
 
         // RFC 2198 redundancy: extract primary + redundant payloads.

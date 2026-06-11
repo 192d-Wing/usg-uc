@@ -27,7 +27,7 @@ pub mod credential_store;
 pub mod settings;
 pub mod sip_transport;
 
-pub use app::{AppEvent, AppState, ClientApp, PinOperationType};
+pub use app::{AppEvent, AppState, ClientApp, PinOperationType, StoragePaths};
 pub use audio_session::{
     AudioSession, AudioSessionConfig, AudioSessionConfigBuilder, AudioSessionEvent,
 };
@@ -43,7 +43,7 @@ pub use settings::{
 pub use sip_transport::{
     CertVerificationMode, SipTransport, TransportConfig, TransportEvent,
     build_response_from_request, generate_tag, load_certs_from_pem_file, run_udp_receive_loop,
-    start_udp_receive_thread,
+    run_udp_receive_loop_async, start_udp_receive_thread,
 };
 
 use thiserror::Error;

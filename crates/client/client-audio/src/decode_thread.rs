@@ -37,6 +37,42 @@ fn dump_samples(dump: &mut impl std::io::Write, samples: &[i16]) {
         let _ = dump.write_all(&buf[..byte_len]);
     }
 }
+
+/// Cross-fades `tone` with `other` in place over the first `fade_len` samples.
+///
+/// `to_tone = true` ramps from `other` into `tone` (generator onset; the rest
+/// of the frame stays pure tone); `false` ramps from `tone` into `other`
+/// (generator release; the rest of the frame is `other`). Used at DTMF
+/// generator boundaries: carriers leak real in-band tone around the
+/// telephone-event window, and a hard splice between leaked and generated
+/// tone is heard as a doubled/retriggered tone. The fade is kept short
+/// (~5ms) — a frame-length ramp creates an audible amplitude scoop instead.
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn crossfade_frames(tone: &mut [i16], other: &[i16], fade_len: usize, to_tone: bool) {
+    let n = tone.len().min(other.len());
+    if n == 0 {
+        return;
+    }
+    let fade = fade_len.clamp(1, n);
+    #[allow(clippy::cast_precision_loss)]
+    let fade_f = fade as f32;
+    for (i, (sample, &o)) in tone.iter_mut().zip(other).enumerate() {
+        if i >= fade {
+            if to_tone {
+                break; // remainder of the frame is already pure tone
+            }
+            *sample = o; // remainder of the frame is the decoded audio
+            continue;
+        }
+        let t = i as f32 / fade_f;
+        let (from, to) = if to_tone {
+            (f32::from(o), f32::from(*sample))
+        } else {
+            (f32::from(*sample), f32::from(o))
+        };
+        *sample = (from + (to - from) * t).round() as i16;
+    }
+}
 use ringbuf::traits::{Observer, Producer};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -99,6 +135,108 @@ const GAIN_RAMP_SPEED: f32 = 0.15;
 
 /// Minimum valid DTMF duration in timestamp units (40ms at 8kHz = 320).
 const DTMF_MIN_DURATION: u16 = 320;
+
+/// How far before a scheduled event's stamped start the tone activates, in
+/// RTP timestamp units (50ms at 8kHz). Carriers leak 20-40ms of real in-band
+/// tone into the audio just before the stamped start (gateway detection
+/// latency); starting the generator inside the guard re-covers that leak.
+const DTMF_START_GUARD: u32 = 400;
+
+/// A telephone-event scheduled for playout by RTP timestamp.
+struct ScheduledDtmf {
+    digit: DtmfDigit,
+    start_ts: u32,
+    /// Provisional until `ended`: the NEW packet carries only ~20ms of
+    /// duration; continuations grow it and the END packet finalizes it.
+    end_ts: u32,
+    /// Whether the END packet for this event has been seen.
+    ended: bool,
+}
+
+/// Mutable DTMF playout state threaded through [`advance_dtmf_schedule`].
+struct DtmfPlayout {
+    schedule: std::collections::VecDeque<ScheduledDtmf>,
+    active_gen: Option<DtmfToneGenerator>,
+    fade_in: bool,
+    /// Stamped start of the playing tone (routes duration updates to it).
+    active_start: Option<u32>,
+    /// Playout-timeline end of the playing tone (grows with continuations).
+    end_ts: Option<u32>,
+    /// Whether the playing tone's END packet has been seen.
+    active_ended: bool,
+}
+
+impl DtmfPlayout {
+    fn new() -> Self {
+        Self {
+            schedule: std::collections::VecDeque::new(),
+            active_gen: None,
+            fade_in: false,
+            active_start: None,
+            end_ts: None,
+            active_ended: false,
+        }
+    }
+
+    /// Clears the active tone (boundary frame played or failsafe).
+    fn clear_active(&mut self) {
+        self.active_gen = None;
+        self.fade_in = false;
+        self.active_start = None;
+        self.end_ts = None;
+        self.active_ended = false;
+    }
+}
+
+/// Advances the DTMF playout schedule to `now_ts` (RTP timestamp units):
+/// activates the next queued tone once the playout point enters its window
+/// (minus [`DTMF_START_GUARD`]), drops *ended* windows entirely behind the
+/// playout point, and returns whether the active tone's end has been reached.
+///
+/// An event whose END packet hasn't been seen is never expired or
+/// end-reached: its `end_ts` is provisional (the NEW packet carries only
+/// ~20ms) and still growing — expiring on it discards the whole tone.
+///
+/// `now_ts` comes from the decoded frame when audio is flowing, or from a
+/// wall-clock extrapolation when the carrier suppresses audio during DTMF —
+/// tones must start and stop on time either way.
+#[allow(clippy::cast_possible_wrap)]
+fn advance_dtmf_schedule(now_ts: u32, dtmf: &mut DtmfPlayout, device_rate: u32) -> bool {
+    if dtmf.active_gen.is_none() {
+        while let Some(head) = dtmf.schedule.front() {
+            let expired = head.ended && now_ts.wrapping_sub(head.end_ts) as i32 >= 0;
+            let reached =
+                now_ts.wrapping_sub(head.start_ts.wrapping_sub(DTMF_START_GUARD)) as i32 >= 0;
+            if expired {
+                // Whole (finalized) window is behind the playout point.
+                trace!(
+                    "dtmf sched: expired digit={:?} window=({},{}) now={now_ts}",
+                    head.digit, head.start_ts, head.end_ts
+                );
+                dtmf.schedule.pop_front();
+                continue;
+            }
+            if reached {
+                trace!(
+                    "dtmf sched: activate digit={:?} window=({},{}) ended={} now={now_ts}",
+                    head.digit, head.start_ts, head.end_ts, head.ended
+                );
+                dtmf.active_gen = Some(DtmfToneGenerator::new(head.digit, device_rate));
+                dtmf.fade_in = true;
+                dtmf.active_start = Some(head.start_ts);
+                dtmf.end_ts = Some(head.end_ts);
+                dtmf.active_ended = head.ended;
+                dtmf.schedule.pop_front();
+            }
+            break;
+        }
+    }
+    dtmf.active_gen.is_some()
+        && dtmf.active_ended
+        && dtmf
+            .end_ts
+            .is_some_and(|end| now_ts.wrapping_sub(end) as i32 >= 0)
+}
 
 /// Maximum valid DTMF duration in timestamp units (5000ms at 8kHz = 40000).
 const DTMF_MAX_DURATION: u16 = 40000;
@@ -294,6 +432,10 @@ fn decode_loop(
 
     let codec_clock_rate = codec.clock_rate();
     let codec_samples = codec.samples_per_frame();
+    // RTP timestamp units per millisecond (e.g. 8 at 8kHz G.711) — used to
+    // extrapolate the playout clock by wall time when the JB is empty.
+    #[allow(clippy::cast_possible_truncation)]
+    let ts_units_per_ms = (codec_samples / 20).max(1) as u32;
     let mut device_rate = config.device_rate;
     #[allow(clippy::cast_possible_truncation)]
     let mut device_samples = (codec_samples as u32 * device_rate / codec_clock_rate) as usize;
@@ -337,10 +479,18 @@ fn decode_loop(
     // RFC 4733 duration increases monotonically across continuation packets;
     // a decrease indicates a malformed packet.
     let mut current_dtmf_duration: u16 = 0;
-    // Persistent tone generator: produces sustained DTMF tone across multiple
-    // decode cycles until the end packet arrives. Without this, only one 20ms
-    // frame is generated per event (sounds like a click instead of a tone).
-    let mut active_dtmf_gen: Option<DtmfToneGenerator> = None;
+    // DTMF playout state: scheduled events, the active tone generator, and
+    // its fade/boundary bookkeeping (see DtmfPlayout / advance_dtmf_schedule).
+    let mut dtmf = DtmfPlayout::new();
+    // Failsafe: event packets repeat every ~20ms while a tone is held, so a
+    // quiet bypass queue for 200ms means every END retransmission was lost.
+    let mut dtmf_last_packet = Instant::now();
+    // Playout-clock anchor: RTP ts of the last decoded frame and when it was
+    // decoded. The JB-empty path extrapolates the playout position from this
+    // by wall time — carriers suppress audio outright during rapid DTMF, and
+    // scheduled tones must still start/stop on time with no frames arriving.
+    let mut last_decoded_ts: Option<u32> = None;
+    let mut last_decoded_at = Instant::now();
 
     // Gain gate state: holds the gate open during speech to prevent
     // gain fluctuation at speech boundaries that amplifies quantization noise.
@@ -447,14 +597,7 @@ fn decode_loop(
         // Check ring buffer fill level (lock-free)
         let occupied = producer.occupied_len();
 
-        // When DTMF tone is active and JB is building pressure, skip the
-        // ring buffer gate — we need to drain audio packets from the JB
-        // even though the ring buffer is healthy, because the DTMF path
-        // discards decoded audio and generates tone instead.
-        let jb_depth = jitter_buffer.len();
-        let dtmf_jb_pressure = active_dtmf_gen.is_some() && jb_depth > 4;
-
-        if occupied >= target_fill && !dtmf_jb_pressure {
+        if occupied >= target_fill {
             // Healthy — wait for condvar signal from I/O thread (packet push).
             // Falls back to 10ms timeout if no packet arrives (e.g., silence
             // suppression / DTX). At 48kHz the CPAL callback consumes ~480
@@ -494,7 +637,16 @@ fn decode_loop(
                         if !is_new && event.duration < current_dtmf_duration {
                             continue; // Non-monotonic duration within event
                         }
+                        if event.duration > DTMF_MAX_DURATION {
+                            metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
+                            continue; // Duration exceeds RFC sanity bound (5s)
+                        }
                         current_dtmf_duration = event.duration;
+                        dtmf_last_packet = Instant::now();
+                        // Every packet refines the playout end: ts is the
+                        // event start, duration grows monotonically and the
+                        // END packet carries the final value.
+                        let event_end_ts = packet.timestamp.wrapping_add(u32::from(event.duration));
 
                         if is_new {
                             if event.end && event.duration < DTMF_MIN_DURATION {
@@ -511,11 +663,32 @@ fn decode_loop(
                                 event.end,
                                 event.duration
                             );
-                            active_dtmf_gen =
-                                Some(DtmfToneGenerator::new(event.digit, device_rate));
+                            // Schedule for playout-timeline activation rather
+                            // than activating now: with rapid digit sequences
+                            // this packet arrives while the previous tone is
+                            // still playing out, and switching the generator
+                            // here blurred/stuttered digits.
+                            dtmf.schedule.push_back(ScheduledDtmf {
+                                digit: event.digit,
+                                start_ts: packet.timestamp,
+                                end_ts: event_end_ts,
+                                ended: event.end,
+                            });
                             if let Some(ref tx) = config.dtmf_rx_tx {
                                 let _ = tx.send(event.digit);
                             }
+                        } else if dtmf.active_start == Some(packet.timestamp) {
+                            // Continuation/END for the currently playing tone.
+                            dtmf.end_ts = Some(event_end_ts);
+                            dtmf.active_ended |= event.end;
+                        } else if let Some(entry) = dtmf
+                            .schedule
+                            .iter_mut()
+                            .find(|e| e.start_ts == packet.timestamp)
+                        {
+                            // Continuation/END for a not-yet-started tone.
+                            entry.end_ts = event_end_ts;
+                            entry.ended |= event.end;
                         }
                         // Write DTMF trace entry
                         if let Some(ref mut trace) = dtmf_trace {
@@ -529,7 +702,7 @@ fn decode_loop(
                                 event.duration_to_ms(),
                                 event.end,
                                 is_new,
-                                active_dtmf_gen.is_some(),
+                                dtmf.active_gen.is_some(),
                                 decoded_this_cycle,
                             );
                         }
@@ -540,13 +713,30 @@ fn decode_loop(
                                 packet.timestamp,
                                 event.duration_to_ms()
                             );
-                            active_dtmf_gen = None;
+                            // The generator keeps running: it stops on the
+                            // first decoded frame at/after dtmf.end_ts, which
+                            // is when the event end reaches the playout
+                            // timeline (the JB still holds in-event frames
+                            // right now).
                         }
                     }
                 }
             }
 
             for _ in 0..frames_to_decode {
+                // Re-check the DTMF bypass queue between frames: carriers
+                // flush the event-window audio as a burst right before the
+                // first event packet, and decoding through that burst in one
+                // cycle would play its muted frames before the event
+                // activates the tone generator (heard as a gap splitting the
+                // tone). Breaking re-runs the outer cycle, which drains the
+                // bypass queue first.
+                if let Some(ref q) = config.dtmf_queue
+                    && !q.is_empty()
+                {
+                    break;
+                }
+
                 // Get drift adjustment from compensator
                 #[allow(clippy::cast_precision_loss)]
                 let depth_ms = jitter_buffer.buffered_duration_ms() as f32;
@@ -574,125 +764,13 @@ fn decode_loop(
                             continue;
                         }
 
-                        // Handle RFC 4733 telephone-event packets (PT=101)
-                        // RFC 4733 sends multiple packets per event (start +
-                        // continuations every 20ms + 3× end), all with the same
-                        // RTP timestamp.
-                        //
-                        // On the first packet of a new event, create a persistent
-                        // DtmfToneGenerator. Each decode cycle that has an active
-                        // generator produces one frame of tone. The end packet
-                        // stops the generator but does NOT clear current_dtmf_ts,
-                        // so retransmitted end packets are still filtered as dupes.
+                        // Telephone-event packets ride through the JB to
+                        // keep its sequence-number stream continuous (gaps
+                        // stall it as presumed loss). All event handling —
+                        // scheduling, tone generation — happens via the
+                        // bypass queue drained at the top of the cycle; here
+                        // they are simply consumed.
                         if packet.payload_type == dtmf_pt {
-                            if packet.payload.len() < 4 {
-                                // RFC 4733 requires exactly 4 bytes
-                                trace!(
-                                    "Malformed DTMF: payload too short ({}B)",
-                                    packet.payload.len()
-                                );
-                                metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
-                                continue;
-                            }
-                            let bytes: [u8; 4] = [
-                                packet.payload[0],
-                                packet.payload[1],
-                                packet.payload[2],
-                                packet.payload[3],
-                            ];
-                            let is_new = current_dtmf_ts != Some(packet.timestamp);
-                            if let Some(event) = DtmfEvent::decode(&bytes) {
-                                info!(
-                                    "DTMF jb: digit={:?} ts={} seq={} end={} dur={} ({}ms) is_new={} gen_active={}",
-                                    event.digit,
-                                    packet.timestamp,
-                                    packet.sequence,
-                                    event.end,
-                                    event.duration,
-                                    event.duration_to_ms(),
-                                    is_new,
-                                    active_dtmf_gen.is_some(),
-                                );
-
-                                // Validate duration range (40ms-5000ms at 8kHz)
-                                if event.duration > DTMF_MAX_DURATION {
-                                    warn!(
-                                        "Malformed DTMF: duration {} exceeds max {}",
-                                        event.duration, DTMF_MAX_DURATION
-                                    );
-                                    metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
-                                    continue;
-                                }
-
-                                // Validate monotonic duration within same event:
-                                // continuation packets must have non-decreasing duration.
-                                if !is_new && event.duration < current_dtmf_duration {
-                                    warn!(
-                                        "Malformed DTMF: duration decreased {}→{} within event",
-                                        current_dtmf_duration, event.duration
-                                    );
-                                    metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
-                                    continue;
-                                }
-                                current_dtmf_duration = event.duration;
-
-                                if is_new {
-                                    // Validate minimum duration on first packet.
-                                    // Allow start packets with 0 duration (some PBXes
-                                    // send initial duration=0 then increment).
-                                    if event.end && event.duration < DTMF_MIN_DURATION {
-                                        warn!(
-                                            "Malformed DTMF: end with short duration {}",
-                                            event.duration
-                                        );
-                                        metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
-                                        continue;
-                                    }
-
-                                    current_dtmf_ts = Some(packet.timestamp);
-                                    current_dtmf_duration = event.duration;
-                                    metrics.dtmf_received.fetch_add(1, Ordering::Relaxed);
-                                    // Create persistent tone generator for this event.
-                                    active_dtmf_gen =
-                                        Some(DtmfToneGenerator::new(event.digit, device_rate));
-                                    // Notify application layer of received digit.
-                                    if let Some(ref tx) = config.dtmf_rx_tx {
-                                        let _ = tx.send(event.digit);
-                                    }
-                                }
-
-                                // Write DTMF trace entry (JB path)
-                                if let Some(ref mut trace) = dtmf_trace {
-                                    use std::io::Write;
-                                    let _ = writeln!(
-                                        trace,
-                                        "{},jb,{:?},{},{},{},{},{},{}",
-                                        dtmf_diag_start.elapsed().as_micros(),
-                                        event.digit,
-                                        event.duration,
-                                        event.duration_to_ms(),
-                                        event.end,
-                                        is_new,
-                                        active_dtmf_gen.is_some(),
-                                        decoded_this_cycle,
-                                    );
-                                }
-
-                                // End packet: stop generating tone but keep
-                                // current_dtmf_ts so retransmitted end packets
-                                // are still filtered by the is_new check.
-                                // Don't generate tone for end packets — the last
-                                // continuation already covered this time slot.
-                                if event.end {
-                                    active_dtmf_gen = None;
-                                }
-                                // Tone is generated in the Empty handler below
-                                // when no audio packets are available.
-                            } else {
-                                // Invalid event code (>16)
-                                trace!("Malformed DTMF: invalid event code {}", bytes[0]);
-                                metrics.dtmf_malformed.fetch_add(1, Ordering::Relaxed);
-                            }
                             continue;
                         }
 
@@ -727,9 +805,62 @@ fn decode_loop(
                         // generate tone instead. BulkVS sends audio interleaved
                         // with telephone-event packets — we must replace the audio
                         // with locally-generated tone, not just wait for JB empty.
-                        if let Some(ref mut tone_gen) = active_dtmf_gen {
+                        // Anchor the playout clock: when the JB runs dry the
+                        // empty branch extrapolates from here by wall time.
+                        last_decoded_ts = Some(packet.timestamp);
+                        last_decoded_at = Instant::now();
+
+                        // Activate/expire scheduled tones at this frame's
+                        // position on the playout timeline. The first decoded
+                        // frame at/after the event-end ts is the boundary
+                        // frame — fade the tone back into the decoded audio
+                        // across it and stop the generator.
+                        let dtmf_end_reached =
+                            advance_dtmf_schedule(packet.timestamp, &mut dtmf, device_rate);
+                        if dtmf_end_reached {
+                            if let Some(mut tone_gen) = dtmf.active_gen.take() {
+                                let tone_buf = &mut scratch[..adjusted_device_samples];
+                                tone_gen.generate_samples(tone_buf);
+                                let device_pcm = &mut resample_buf[..adjusted_device_samples];
+                                resampler.process_adjusted_into(codec_buf, device_pcm);
+                                crossfade_frames(
+                                    tone_buf,
+                                    device_pcm,
+                                    device_rate as usize / 200,
+                                    false,
+                                );
+
+                                if let Some(ref mut dump) = dtmf_tone_dump {
+                                    dump_samples(dump, tone_buf);
+                                }
+                                if let Some(ref mut dump) = audio_dump {
+                                    dump_samples(dump, tone_buf);
+                                }
+                                diag_dtmf_tone_frames += 1;
+                                producer.push_slice(tone_buf);
+                            }
+                            dtmf.clear_active();
+                            continue;
+                        }
+
+                        if let Some(ref mut tone_gen) = dtmf.active_gen {
                             let tone_buf = &mut scratch[..adjusted_device_samples];
                             tone_gen.generate_samples(tone_buf);
+
+                            if dtmf.fade_in {
+                                // First replaced frame: ramp decoded audio into
+                                // the tone to mask the splice from any leaked
+                                // in-band tone already played.
+                                let device_pcm = &mut resample_buf[..adjusted_device_samples];
+                                resampler.process_adjusted_into(codec_buf, device_pcm);
+                                crossfade_frames(
+                                    tone_buf,
+                                    device_pcm,
+                                    device_rate as usize / 200,
+                                    true,
+                                );
+                                dtmf.fade_in = false;
+                            }
 
                             if let Some(ref mut dump) = dtmf_tone_dump {
                                 dump_samples(dump, tone_buf);
@@ -866,13 +997,61 @@ fn decode_loop(
                             break;
                         }
 
+                        // No frames to key the playout clock from: extrapolate
+                        // by wall time so scheduled tones still start and stop
+                        // on time (carriers suppress audio during rapid DTMF).
+                        if let Some(anchor_ts) = last_decoded_ts {
+                            #[allow(clippy::cast_possible_truncation)]
+                            let elapsed_units = (last_decoded_at.elapsed().as_millis() as u32)
+                                .saturating_mul(ts_units_per_ms);
+                            let now_ts = anchor_ts.wrapping_add(elapsed_units);
+                            let end_reached = advance_dtmf_schedule(now_ts, &mut dtmf, device_rate);
+                            if end_reached && let Some(mut tone_gen) = dtmf.active_gen.take() {
+                                // Boundary frame with no decoded audio to
+                                // blend into: fade the tone into silence.
+                                let tone_buf = &mut scratch[..device_samples];
+                                tone_gen.generate_samples(tone_buf);
+                                let silence = &mut resample_buf[..device_samples];
+                                silence.fill(0);
+                                crossfade_frames(
+                                    tone_buf,
+                                    silence,
+                                    device_rate as usize / 200,
+                                    false,
+                                );
+                                if let Some(ref mut dump) = dtmf_tone_dump {
+                                    dump_samples(dump, tone_buf);
+                                }
+                                if let Some(ref mut dump) = audio_dump {
+                                    dump_samples(dump, tone_buf);
+                                }
+                                diag_dtmf_tone_frames += 1;
+                                producer.push_slice(tone_buf);
+                                dtmf.clear_active();
+                                break;
+                            }
+                        }
+
                         // If a DTMF tone is active, keep generating frames
                         // even though the JB is empty (DTMF packets may arrive
                         // sparsely while the tone should sustain continuously).
-                        if let Some(ref mut tone_gen) = active_dtmf_gen {
+                        if let Some(ref mut tone_gen) = dtmf.active_gen {
                             let tone_buf = &mut scratch[..device_samples];
                             tone_buf.fill(0);
                             tone_gen.generate_samples(tone_buf);
+
+                            if dtmf.fade_in {
+                                // Tone starts from silence here: short attack.
+                                let silence = &mut resample_buf[..device_samples];
+                                silence.fill(0);
+                                crossfade_frames(
+                                    tone_buf,
+                                    silence,
+                                    device_rate as usize / 200,
+                                    true,
+                                );
+                                dtmf.fade_in = false;
+                            }
 
                             // Dump tone PCM for analysis
                             if let Some(ref mut dump) = dtmf_tone_dump {
@@ -952,34 +1131,23 @@ fn decode_loop(
                 }
             }
 
-            // When DTMF tone is active and JB has accumulated excess packets,
-            // drain them in a tight loop. We decode to keep the codec state
-            // warm but discard the output — only tone goes to the ring buffer
-            // (already pushed above). This prevents JB overflow during DTMF
-            // floods where the remote sends interleaved audio + telephone-event.
-            if active_dtmf_gen.is_some() {
-                let excess = jitter_buffer.len();
-                if excess > 4 {
-                    let drain_count = excess - 2; // keep 2 packets as cushion
-                    let mut drained = 0u32;
-                    for _ in 0..drain_count {
-                        match jitter_buffer.pop() {
-                            JitterBufferResult::Packet(packet) => {
-                                // Skip DTMF packets (already handled via bypass)
-                                if packet.payload_type == dtmf_pt {
-                                    continue;
-                                }
-                                // Decode audio to keep codec state warm, discard output
-                                let _ = codec.decode(&packet.payload);
-                                drained += 1;
-                            }
-                            _ => break,
-                        }
-                    }
-                    if drained > 0 {
-                        trace!("DTMF fast-drain: discarded {drained} audio frames from JB");
-                    }
-                }
+            // NOTE: there used to be a "fast-drain" here that discarded JB
+            // packets above a threshold while a DTMF generator was active.
+            // It cut 120-140ms of stream at every tone onset (the carrier
+            // bursts the event-window audio), starving the decode loop and
+            // splitting the tone with silence. Latency creep is the adaptive
+            // JB's and drift compensator's job; do not re-add a drain here.
+
+            // Failsafe: event packets repeat every ~20ms while a tone is
+            // held; 200ms without one means all END retransmissions were
+            // lost (or the stream died) — stop the tone rather than letting
+            // it ring until the next decoded frame crosses dtmf.end_ts.
+            if (dtmf.active_gen.is_some() || !dtmf.schedule.is_empty())
+                && dtmf_last_packet.elapsed() > Duration::from_millis(200)
+            {
+                trace!("DTMF failsafe: no event packets for 200ms, stopping tone");
+                dtmf.clear_active();
+                dtmf.schedule.clear();
             }
 
             // Wait for next packet notification instead of blind sleep.
@@ -1151,7 +1319,7 @@ fn decode_loop(
                 diag_peak_post_gain,
                 current_gain,
                 diag_dtmf_tone_frames,
-                active_dtmf_gen.is_some(),
+                dtmf.active_gen.is_some(),
             );
             diag_peak_pre_gain = 0;
             diag_peak_post_gain = 0;

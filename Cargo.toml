@@ -81,6 +81,7 @@ members = [
     "crates/client/client-audio",
     "crates/client/client-sip-ua",
     "crates/client/client-core",
+    "crates/client/client-ffi",
     # "crates/client/client-gui-windows",  # TODO: restore when Windows GUI is added
     "crates/client/client-gui-tauri",
     "crates/client/client-integration-tests",
@@ -103,8 +104,14 @@ tokio = { version = "1.49", features = ["full"] }
 
 # Cryptography (CNSA 2.0 compliant)
 aws-lc-rs = { version = "1.15", default-features = false }
+# `fips` routes rustls + webpki through aws-lc-fips-sys (the same FIPS module
+# uc-crypto uses) and turns on rustls' FIPS posture (provider self-check,
+# TLS 1.2 extended-master-secret enforcement). The non-FIPS aws-lc-sys still
+# *compiles* (rustls' aws-lc-rs feature hard-enables it) but nothing
+# references it, so binaries contain exactly one crypto module: FIPS.
 rustls = { version = "0.23", default-features = false, features = [
     "aws-lc-rs",
+    "fips",
     "tls12",
 ] }
 zeroize = { version = "1.8", features = ["derive"] }
@@ -210,6 +217,9 @@ client-audio = { path = "crates/client/client-audio" }
 client-sip-ua = { path = "crates/client/client-sip-ua" }
 client-core = { path = "crates/client/client-core" }
 client-gui-windows = { path = "crates/client/client-gui-windows" }
+
+# FFI bindings generator (Swift/Kotlin shells for native clients)
+uniffi = "0.29"
 
 # Audio (for soft client)
 cpal = "0.17"

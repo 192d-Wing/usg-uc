@@ -1,0 +1,19 @@
+# cargo-audit configuration (Security Audit CI job).
+
+[advisories]
+ignore = [
+    # glib VariantStrIter unsoundness; fixed only in glib >= 0.20, but the
+    # legacy Tauri/GTK3 desktop GUI pins glib 0.18 (gtk3-rs is unmaintained
+    # and tauri v2 on Linux still binds it). The affected iterator is not
+    # used by this codebase, and client-gui-tauri is being replaced by the
+    # native clients (docs/CLIENT-NATIVE-MIGRATION-PLAN.md). Re-evaluate
+    # when the Tauri client is retired or tauri moves off gtk3.
+    "RUSTSEC-2024-0429",
+    # rsa Marvin timing side-channel. The rsa crate is never compiled: it
+    # enters the lockfile only as an optional dependency of sqlx-mysql,
+    # which no feature enables (uc-storage uses sqlx/postgres only) —
+    # lockfiles record all selectable packages and cargo-audit cannot see
+    # feature reachability. No fixed rsa release exists to update to.
+    # Re-evaluate if a MySQL backend is ever enabled.
+    "RUSTSEC-2023-0071",
+]
