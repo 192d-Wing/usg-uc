@@ -781,6 +781,48 @@ impl From<&client_types::AudioConfig> for AudioSettings {
     }
 }
 
+/// DoD-standard classification banner configuration (read-only).
+///
+/// Shells render this as a full-width strip across the top of the window,
+/// e.g. `CUI` or `TOP SECRET//SI/TK//NOFORN` per banner marking conventions.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ClassificationBanner {
+    /// Canonical upper-case classification level, e.g. `"CUI"`,
+    /// `"UNCLASSIFIED"`, `"TOP SECRET"`.
+    pub level: String,
+    /// SCI caveats (e.g. `SI`, `TK`), joined after the level with `//`.
+    pub caveats: Vec<String>,
+    /// Dissemination controls (e.g. `NOFORN`), joined last with `//`.
+    pub dissem: Vec<String>,
+}
+
+impl From<&client_core::settings::UiSettings> for ClassificationBanner {
+    fn from(value: &client_core::settings::UiSettings) -> Self {
+        Self {
+            level: canonical_classification_level(&value.classification_level),
+            caveats: value.classification_caveats.clone(),
+            dissem: value.classification_dissem.clone(),
+        }
+    }
+}
+
+/// Maps the stored classification level (`"cui"`, `"top-secret"`, ...) to the
+/// canonical upper-case banner form. Unrecognized values are upper-cased with
+/// hyphens replaced by spaces so the shell still renders something sensible.
+fn canonical_classification_level(level: &str) -> String {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "u" | "unclassified" => "UNCLASSIFIED".to_string(),
+        "cui" => "CUI".to_string(),
+        "c" | "confidential" => "CONFIDENTIAL".to_string(),
+        "s" | "secret" => "SECRET".to_string(),
+        // SCI ("top-secret-sci") is conveyed by the caveats, not the level.
+        "ts" | "topsecret" | "top-secret" | "sci" | "tssci" | "topsecretsci" | "top-secret-sci" => {
+            "TOP SECRET".to_string()
+        }
+        other => other.to_ascii_uppercase().replace('-', " "),
+    }
+}
+
 /// Errors surfaced across the FFI boundary.
 #[derive(Debug, Clone, thiserror::Error, uniffi::Error)]
 pub enum ClientError {
@@ -871,6 +913,45 @@ mod tests {
     fn app_error_maps_to_storage_for_io() {
         let err = ClientError::from(AppError::Io(std::io::Error::other("disk gone")));
         assert!(matches!(err, ClientError::Storage { .. }));
+    }
+
+    #[test]
+    fn classification_levels_canonicalize() {
+        assert_eq!(
+            canonical_classification_level("unclassified"),
+            "UNCLASSIFIED"
+        );
+        assert_eq!(canonical_classification_level("cui"), "CUI");
+        assert_eq!(
+            canonical_classification_level("confidential"),
+            "CONFIDENTIAL"
+        );
+        assert_eq!(canonical_classification_level("secret"), "SECRET");
+        assert_eq!(canonical_classification_level("top-secret"), "TOP SECRET");
+        assert_eq!(
+            canonical_classification_level("top-secret-sci"),
+            "TOP SECRET"
+        );
+        assert_eq!(canonical_classification_level(" CUI "), "CUI");
+        // Unrecognized values still render sensibly.
+        assert_eq!(
+            canonical_classification_level("nato-restricted"),
+            "NATO RESTRICTED"
+        );
+    }
+
+    #[test]
+    fn classification_banner_mirrors_ui_settings() {
+        let ui = client_core::settings::UiSettings {
+            classification_level: "top-secret-sci".to_string(),
+            classification_caveats: vec!["SI".to_string(), "TK".to_string()],
+            classification_dissem: vec!["NOFORN".to_string()],
+            ..Default::default()
+        };
+        let banner = ClassificationBanner::from(&ui);
+        assert_eq!(banner.level, "TOP SECRET");
+        assert_eq!(banner.caveats, vec!["SI", "TK"]);
+        assert_eq!(banner.dissem, vec!["NOFORN"]);
     }
 
     #[test]

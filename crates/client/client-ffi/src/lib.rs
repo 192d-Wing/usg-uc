@@ -26,6 +26,7 @@ pub use client::{
 };
 pub use types::{
     AppEvent, AudioDevice, AudioDeviceCategory, AudioDeviceKind, AudioSettings, CallDirection,
-    CallEndReason, CallHistoryEntry, CallInfo, CallState, ClientError, CodecKind, Contact,
-    PhoneNumber, PhoneNumberKind, PinOperation, RegistrationState, SipAccountConfig, TransportKind,
+    CallEndReason, CallHistoryEntry, CallInfo, CallState, ClassificationBanner, ClientError,
+    CodecKind, Contact, PhoneNumber, PhoneNumberKind, PinOperation, RegistrationState,
+    SipAccountConfig, TransportKind,
 };

@@ -6,8 +6,8 @@
 //! arrive on a runtime thread; there is no foreign-side polling.
 
 use crate::types::{
-    AppEvent, AudioDevice, AudioSettings, CallHistoryEntry, CallInfo, ClientError, Contact,
-    PhoneNumber, RegistrationState, SipAccountConfig,
+    AppEvent, AudioDevice, AudioSettings, CallHistoryEntry, CallInfo, ClassificationBanner,
+    ClientError, Contact, PhoneNumber, RegistrationState, SipAccountConfig,
 };
 use client_core::{ClientApp, StoragePaths, run_udp_receive_loop_async};
 use client_types::DtmfDigit;
@@ -510,6 +510,15 @@ impl SipClient {
             audio.preferred_codec = settings.preferred_codec.into();
             manager.save()?;
             Ok(())
+        })
+    }
+
+    /// Returns the classification banner configuration from the persisted UI
+    /// settings (read-only; edited via the settings file, not the shell).
+    pub fn classification_banner(&self) -> ClassificationBanner {
+        let app = Arc::clone(&self.app);
+        self.runtime.block_on(async move {
+            ClassificationBanner::from(&app.lock().await.settings().settings().ui)
         })
     }
 

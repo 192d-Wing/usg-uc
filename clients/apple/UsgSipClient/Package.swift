@@ -46,7 +46,8 @@ let package = Package(
         // settings, in-call UI.
         .executableTarget(
             name: "SipClientApp",
-            dependencies: ["UsgSipClient"]
+            dependencies: ["UsgSipClient"],
+            resources: [.process("Resources")]
         ),
     ]
 )

@@ -35,6 +35,7 @@ final class AppModel: ObservableObject, @unchecked Sendable {
     @Published var outputDevices: [AudioDevice] = []
     @Published var eventLog: [String] = []
     @Published var errorMessage: String?
+    @Published var classificationBanner: ClassificationBanner?
 
     var hasCallUi: Bool { activeCall != nil || incomingCall != nil }
 
@@ -226,6 +227,7 @@ final class AppModel: ObservableObject, @unchecked Sendable {
         refreshRecents()
         refreshAccount()
         refreshAudio()
+        fetch { $0.classificationBanner() } publish: { self.classificationBanner = $0 }
         fetch { $0.registrationState() } publish: { state in
             if let state {
                 self.registration = state

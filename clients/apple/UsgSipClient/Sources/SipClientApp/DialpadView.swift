@@ -1,12 +1,18 @@
-// Dialpad tab: number entry + 3x4 keypad. While a call is active the keys
+// Dialpad tab: number readout + 3x4 keypad. While a call is active the keys
 // send DTMF instead of editing the dial string (the in-call overlay also has
 // its own keypad).
+//
+// The readout is a plain Text (not a TextField) so there is no blinking text
+// cursor; digits come from the keypad buttons, and a window-level NSEvent
+// monitor keeps physical-keyboard entry working while the tab is visible.
 
+import AppKit
 import SwiftUI
 
 struct DialpadView: View {
     @EnvironmentObject var model: AppModel
     @State private var dialString = ""
+    @State private var keyMonitor: Any?
 
     private var inCall: Bool { model.activeCall != nil }
 
@@ -14,12 +20,16 @@ struct DialpadView: View {
         VStack(spacing: 16) {
             Spacer(minLength: 8)
 
-            TextField("Number or sip:user@host", text: $dialString)
-                .textFieldStyle(.plain)
+            // Non-focusable display readout (no text cursor).
+            Text(dialString.isEmpty ? "Number or sip:user@host" : dialString)
                 .font(.system(size: 24, weight: .light, design: .rounded))
-                .multilineTextAlignment(.center)
-                .onSubmit(placeCall)
+                .foregroundColor(dialString.isEmpty ? .secondary : .primary)
+                .lineLimit(1)
+                .truncationMode(.head)
+                .frame(maxWidth: .infinity)
                 .padding(.horizontal, 24)
+                .accessibilityLabel(
+                    dialString.isEmpty ? "Number to dial" : "Dialing \(dialString)")
 
             DtmfPad { key in
                 if inCall {
@@ -60,11 +70,55 @@ struct DialpadView: View {
             Spacer(minLength: 12)
         }
         .padding()
+        .onAppear(perform: installKeyMonitor)
+        .onDisappear(perform: removeKeyMonitor)
     }
 
     private func placeCall() {
         guard !inCall else { return }
         model.call(dialString)
+    }
+
+    // MARK: Physical keyboard entry
+
+    /// Window-level key capture: digits/*/#/+ append to the dial string (or
+    /// send DTMF in-call), delete is backspace. Installed only while the
+    /// dialpad tab is on screen.
+    private func installKeyMonitor() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            handleKey(event) ? nil : event
+        }
+    }
+
+    private func removeKeyMonitor() {
+        if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
+        keyMonitor = nil
+    }
+
+    /// Returns true when the event was consumed.
+    private func handleKey(_ event: NSEvent) -> Bool {
+        // Leave shortcuts (Cmd-Q etc.) and any focused text editor alone.
+        guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+            !(NSApp.keyWindow?.firstResponder is NSTextView)
+        else { return false }
+
+        if event.keyCode == 51 {  // delete (backspace)
+            guard !inCall, !dialString.isEmpty else { return false }
+            dialString.removeLast()
+            return true
+        }
+        guard let key = event.charactersIgnoringModifiers, key.count == 1 else {
+            return false
+        }
+        if inCall {
+            guard "0123456789*#".contains(key) else { return false }
+            model.sendDtmf(key)
+        } else {
+            guard "0123456789*#+".contains(key) else { return false }
+            dialString.append(key)
+        }
+        return true
     }
 }
 
