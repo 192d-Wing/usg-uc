@@ -45,29 +45,37 @@ impl TrunkHealthService for TrunkHealthServiceImpl {
         _request: Request<ListTrunkHealthRequest>,
     ) -> Result<Response<ListTrunkHealthResponse>, Status> {
         info!("gRPC ListTrunkHealth");
-        let trunks: Vec<TrunkHealthInfo> = if let Some(ref monitor) = self.state.trunk_monitor {
-            monitor
-                .get_all_status()
-                .await
-                .into_iter()
-                .map(|s| TrunkHealthInfo {
-                    trunk_id: s.trunk_id,
-                    reachable: s.reachable,
-                    last_response_ms: s.last_response_ms.unwrap_or(0) as i64,
-                    last_success_epoch: s.last_success.unwrap_or(0),
-                    last_failure_epoch: s.last_failure.unwrap_or(0),
-                    consecutive_success: s.consecutive_success,
-                    consecutive_failures: s.consecutive_failures,
-                    total_pings: s.total_pings,
-                    total_success: s.total_success,
-                    uptime_pct: s.uptime_pct,
-                    in_service_since_epoch: s.in_service_since.unwrap_or(0),
-                })
-                .collect()
+        let external = self.state.trunk_monitor.is_none();
+        let (statuses, snapshot_age_secs) = if let Some(ref monitor) = self.state.trunk_monitor {
+            (monitor.get_all_status().await, 0u32)
         } else {
-            Vec::new()
+            let remote = self.state.remote_trunk_status.read().await;
+            let age = remote.received_at.map_or(0u32, |t| {
+                t.elapsed().as_secs().min(u32::MAX as u64) as u32
+            });
+            (remote.health.clone(), age)
         };
-        Ok(Response::new(ListTrunkHealthResponse { trunks }))
+        let trunks: Vec<TrunkHealthInfo> = statuses
+            .into_iter()
+            .map(|s| TrunkHealthInfo {
+                trunk_id: s.trunk_id,
+                reachable: s.reachable,
+                last_response_ms: s.last_response_ms.unwrap_or(0) as i64,
+                last_success_epoch: s.last_success.unwrap_or(0),
+                last_failure_epoch: s.last_failure.unwrap_or(0),
+                consecutive_success: s.consecutive_success,
+                consecutive_failures: s.consecutive_failures,
+                total_pings: s.total_pings,
+                total_success: s.total_success,
+                uptime_pct: s.uptime_pct,
+                in_service_since_epoch: s.in_service_since.unwrap_or(0),
+            })
+            .collect();
+        Ok(Response::new(ListTrunkHealthResponse {
+            trunks,
+            trunk_services_external: external,
+            snapshot_age_secs,
+        }))
     }
 
     async fn list_trunk_registrations(
@@ -75,27 +83,36 @@ impl TrunkHealthService for TrunkHealthServiceImpl {
         _request: Request<ListTrunkRegistrationsRequest>,
     ) -> Result<Response<ListTrunkRegistrationsResponse>, Status> {
         info!("gRPC ListTrunkRegistrations");
-        let trunks: Vec<TrunkRegistrationInfo> = if let Some(ref reg) = self.state.trunk_registrar {
-            reg.get_all_status()
-                .await
-                .into_iter()
-                .map(|s| TrunkRegistrationInfo {
-                    trunk_id: s.trunk_id,
-                    registered: s.registered,
-                    state: s.state,
-                    registrar: s.registrar,
-                    username: s.username,
-                    last_registered_epoch: s.last_registered.unwrap_or(0),
-                    last_error: s.last_error.unwrap_or_default(),
-                    expires_secs: s.expires,
-                    attempts: s.attempts,
-                    successes: s.successes,
-                })
-                .collect()
+        let external = self.state.trunk_registrar.is_none();
+        let (statuses, snapshot_age_secs) = if let Some(ref reg) = self.state.trunk_registrar {
+            (reg.get_all_status().await, 0u32)
         } else {
-            Vec::new()
+            let remote = self.state.remote_trunk_status.read().await;
+            let age = remote.received_at.map_or(0u32, |t| {
+                t.elapsed().as_secs().min(u32::MAX as u64) as u32
+            });
+            (remote.registrations.clone(), age)
         };
-        Ok(Response::new(ListTrunkRegistrationsResponse { trunks }))
+        let trunks: Vec<TrunkRegistrationInfo> = statuses
+            .into_iter()
+            .map(|s| TrunkRegistrationInfo {
+                trunk_id: s.trunk_id,
+                registered: s.registered,
+                state: s.state,
+                registrar: s.registrar,
+                username: s.username,
+                last_registered_epoch: s.last_registered.unwrap_or(0),
+                last_error: s.last_error.unwrap_or_default(),
+                expires_secs: s.expires,
+                attempts: s.attempts,
+                successes: s.successes,
+            })
+            .collect();
+        Ok(Response::new(ListTrunkRegistrationsResponse {
+            trunks,
+            trunk_services_external: external,
+            snapshot_age_secs,
+        }))
     }
 
     async fn register_trunk(
@@ -163,7 +180,10 @@ impl TrunkHealthService for TrunkHealthServiceImpl {
             warn!(trunk_id, "Trunk registrar not configured");
             return Ok(Response::new(RegisterTrunkResponse {
                 success: false,
-                message: "Trunk registrar not configured".to_string(),
+                message: "trunk registration runs in the sbc-trunk-agent pod \
+                          (SBC_TRUNK_SERVICES=external); it re-registers \
+                          automatically on its next config poll"
+                    .to_string(),
             }));
         };
 
