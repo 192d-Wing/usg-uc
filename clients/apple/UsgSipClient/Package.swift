@@ -13,6 +13,7 @@ let package = Package(
     products: [
         .library(name: "UsgSipClient", targets: ["UsgSipClient"]),
         .executable(name: "SipClientDemo", targets: ["SipClientDemo"]),
+        .executable(name: "SipClientApp", targets: ["SipClientApp"]),
     ],
     targets: [
         // Rust core, built by ../build-xcframework.sh
@@ -39,6 +40,12 @@ let package = Package(
         // Minimal SwiftUI smoke-test app (macOS): registration + dialpad.
         .executableTarget(
             name: "SipClientDemo",
+            dependencies: ["UsgSipClient"]
+        ),
+        // The real SwiftUI client app (macOS): dialpad, contacts, recents,
+        // settings, in-call UI.
+        .executableTarget(
+            name: "SipClientApp",
             dependencies: ["UsgSipClient"]
         ),
     ]
