@@ -6,16 +6,18 @@
 # sbc-api-server's Dockerfile.
 #
 # Build (from repo root):
-#   docker build -t sbc-provision-server:local \
+#   docker build -t usg-sbc-provision-server:local \
 #     -f crates/sbc/sbc-provision-server/Dockerfile .
 
-FROM rust:1-bookworm AS chef
+FROM rust:1-alpine AS chef
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# build-base = gcc/make/musl-dev (native build deps); cmake + perl for
+# aws-lc-sys. No openssl: the binary is rustls-only.
+RUN apk add --no-cache \
+    build-base \
     cmake \
-    pkg-config \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
+    perl \
+    pkgconfig
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -51,17 +53,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --package sbc-provision-server \
     && cp target/release/sbc-provision-server /tmp/sbc-provision-server
 
-FROM debian:bookworm-slim AS runtime
+FROM alpine:3.21 AS runtime
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    libssl3 \
-    libcap2-bin \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
-
-RUN groupadd --gid 1000 sbc \
-    && useradd --uid 1000 --gid sbc --shell /bin/bash --create-home sbc
+RUN apk add --no-cache ca-certificates libcap \
+    && addgroup -g 1000 sbc \
+    && adduser -D -u 1000 -G sbc -s /bin/sh sbc
 
 COPY --from=builder /tmp/sbc-provision-server /usr/local/bin/sbc-provision-server
 

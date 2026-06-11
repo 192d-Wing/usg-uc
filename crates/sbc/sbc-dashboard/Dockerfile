@@ -7,12 +7,12 @@
 # ClusterIP Service, so the browser sees a single origin.
 #
 # Build (from repo root):
-#   docker build -t sbc-frontend:local -f crates/sbc/sbc-dashboard/Dockerfile crates/sbc/sbc-dashboard/
+#   docker build -t usg-sbc-frontend:local -f crates/sbc/sbc-dashboard/Dockerfile crates/sbc/sbc-dashboard/
 
 # =============================================================================
 # Stage 1: Build the SPA bundle.
 # =============================================================================
-FROM docker.io/library/node:22-bookworm-slim AS build
+FROM docker.io/library/node:22-alpine AS build
 
 WORKDIR /app
 COPY package.json package-lock.json* ./

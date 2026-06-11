@@ -77,7 +77,7 @@ spec:
               mountPath: /var/lib/sbc
       containers:
         - name: sbc
-          image: sbc-daemon:local
+          image: usg-sbc-daemon:local
           imagePullPolicy: Never
           args: ["-c", "/etc/sbc/config.toml"]
           securityContext:

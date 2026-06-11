@@ -7,8 +7,8 @@
 #  - BuildKit cache mounts on /usr/local/cargo/registry and /app/target
 #    persist Rust build artifacts across builds.
 #
-# Build: docker build -t sbc-daemon:latest .  (or: podman build ...)
-# Run:   docker run -p 5060:5060/udp -p 80:80 sbc-daemon:latest
+# Build: docker build -t usg-sbc-daemon:latest .  (or: podman build ...)
+# Run:   docker run -p 5060:5060/udp -p 80:80 usg-sbc-daemon:latest
 #
 # ## NIST 800-53 Rev5 Controls
 # - **CM-2**: Baseline Configuration - Minimal base image with defined packages
@@ -24,6 +24,13 @@
 # Stage 2a: Rust toolchain + build-deps + cargo-chef. Shared base for the
 # planner / cacher / builder stages so the apt-install + cargo-install
 # layers cache once.
+#
+# NOTE: this image deliberately stays glibc (Debian) while the other SBC
+# pods are Alpine. sbc-daemon links the FIPS-validated aws-lc module
+# (rustls `fips` + uc-crypto, see docs/CNSA-2-COMPLIANCE.md), and
+# aws-lc-fips-sys does not support musl — an Alpine build would fail or
+# silently drop the FIPS posture. Same applies to ci/image (FIPS builds
+# need the Go toolchain on glibc).
 # =============================================================================
 FROM rust:1-trixie AS chef
 
