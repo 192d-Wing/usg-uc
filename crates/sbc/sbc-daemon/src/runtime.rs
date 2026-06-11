@@ -430,16 +430,28 @@ impl Runtime {
             uc_routing::CucmRouter::new(),
         )));
 
-        // Initialize trunk health monitor
-        let trunk_monitor = Arc::new(crate::trunk_monitor::TrunkMonitor::new(&instance_name));
-        app_state.trunk_monitor = Some(Arc::clone(&trunk_monitor));
-        info!("Trunk health monitor initialized");
+        // Initialize the trunk health monitor and trunk registrar —
+        // unless trunk services run externally in the sbc-trunk-agent
+        // pod (SBC_TRUNK_SERVICES=external). With both handles left
+        // None, start_trunk_services() is a no-op and the gRPC
+        // TrunkHealthService serves the snapshots the agent publishes
+        // via TrunkStatusPublishService instead. Running the loops in
+        // BOTH places would double-REGISTER to carriers.
+        let external_trunk_services = std::env::var("SBC_TRUNK_SERVICES")
+            .is_ok_and(|v| v.eq_ignore_ascii_case("external"));
+        if external_trunk_services {
+            info!("Trunk services delegated to sbc-trunk-agent (SBC_TRUNK_SERVICES=external)");
+        } else {
+            let trunk_monitor = Arc::new(crate::trunk_monitor::TrunkMonitor::new(&instance_name));
+            app_state.trunk_monitor = Some(trunk_monitor);
+            info!("Trunk health monitor initialized");
 
-        // Initialize trunk registrar
-        let trunk_registrar = Arc::new(crate::trunk_registrar::TrunkRegistrar::new(&instance_name));
-        app_state.trunk_registrar = Some(Arc::clone(&trunk_registrar));
+            let trunk_registrar =
+                Arc::new(crate::trunk_registrar::TrunkRegistrar::new(&instance_name));
+            app_state.trunk_registrar = Some(trunk_registrar);
+            info!("Trunk registrar initialized");
+        }
         app_state.zone_registry = zone_registry.clone();
-        info!("Trunk registrar initialized");
 
         // User store init moved to sbc-api as of PR10 — sbc-api owns
         // /users CRUD via PostgresUserStore. The daemon no longer holds

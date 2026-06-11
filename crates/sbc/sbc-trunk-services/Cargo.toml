@@ -1,0 +1,22 @@
+[package]
+name = "sbc-trunk-services"
+description = "Outbound trunk maintenance loops for the USG SBC: SIP OPTIONS health monitoring and carrier REGISTER (digest auth) with re-registration. Shared by the sbc-daemon (in-process mode) and the sbc-trunk-agent pod (external mode, status published back over gRPC)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+proto-sip = { workspace = true, features = ["digest-auth"] }
+rand = "0.8"
+serde = { workspace = true, features = ["derive"] }
+socket2.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
+tracing.workspace = true

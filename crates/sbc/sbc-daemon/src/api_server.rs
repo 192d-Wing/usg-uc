@@ -198,6 +198,24 @@ impl MemStore {
     }
 }
 
+/// Trunk status snapshot pushed by an external sbc-trunk-agent pod
+/// (gRPC `TrunkStatusPublishService`). The agent owns the OPTIONS-ping
+/// and carrier-registration loops in `SBC_TRUNK_SERVICES=external`
+/// deployments; the daemon stores the latest snapshot here so the
+/// `TrunkHealthService` read RPCs keep one consistent view for sbc-api
+/// and the dashboard regardless of where the loops run.
+#[derive(Debug, Default)]
+pub struct RemoteTrunkStatus {
+    /// Publishing agent's identity (pod name).
+    pub agent_id: String,
+    /// OPTIONS-ping health per trunk.
+    pub health: Vec<crate::trunk_monitor::TrunkHealthStatus>,
+    /// Carrier-registration status per trunk.
+    pub registrations: Vec<crate::trunk_registrar::TrunkRegistrationStatus>,
+    /// When the snapshot was received (staleness detection).
+    pub received_at: Option<Instant>,
+}
+
 /// Shared application state for the API server.
 pub struct AppState {
     /// Metrics registry.
@@ -216,10 +234,17 @@ pub struct AppState {
     pub provisioning: Option<Arc<uc_phone_mgmt::provisioning::ProvisioningServer>>,
     /// CUCM router for CSS/partition-based routing.
     pub cucm_router: Option<Arc<tokio::sync::RwLock<uc_routing::CucmRouter>>>,
-    /// Trunk health monitor.
+    /// Trunk health monitor. `None` when trunk services run externally
+    /// in the sbc-trunk-agent pod (`SBC_TRUNK_SERVICES=external`).
     pub trunk_monitor: Option<Arc<crate::trunk_monitor::TrunkMonitor>>,
-    /// Trunk registrar (SBC registers to carriers).
+    /// Trunk registrar (SBC registers to carriers). `None` when trunk
+    /// services run externally (see [`Self::trunk_monitor`]).
     pub trunk_registrar: Option<Arc<crate::trunk_registrar::TrunkRegistrar>>,
+    /// Latest trunk status snapshot published by an external
+    /// sbc-trunk-agent pod via the gRPC `TrunkStatusPublishService`.
+    /// Served by `TrunkHealthService` reads when `trunk_monitor` /
+    /// `trunk_registrar` are `None`.
+    pub remote_trunk_status: Arc<tokio::sync::RwLock<RemoteTrunkStatus>>,
     /// Zone registry for resolving zone IPs (signaling, media, external).
     pub zone_registry: Option<Arc<crate::zone::ResolvedZoneRegistry>>,
     /// In-memory store for management objects (phones, directory numbers, etc.).
@@ -294,6 +319,7 @@ impl AppState {
             route_list_store: None,
             trunk_monitor: None,
             trunk_registrar: None,
+            remote_trunk_status: Arc::new(tokio::sync::RwLock::new(RemoteTrunkStatus::default())),
             zone_registry: None,
             tls_acceptor: None,
             #[cfg(feature = "cluster")]
@@ -327,6 +353,7 @@ impl AppState {
             route_list_store: None,
             trunk_monitor: None,
             trunk_registrar: None,
+            remote_trunk_status: Arc::new(tokio::sync::RwLock::new(RemoteTrunkStatus::default())),
             zone_registry: None,
             tls_acceptor: Some(tls_acceptor),
             #[cfg(feature = "cluster")]

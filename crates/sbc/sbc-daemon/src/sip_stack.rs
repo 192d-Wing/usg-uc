@@ -302,6 +302,17 @@ pub enum ProcessResult {
     },
 }
 
+/// Where announcement media for a failed call is produced: a locally
+/// bound RTP socket (in-process engine, pre-split behavior) or a session
+/// on the sbc-announcement-server pod (`SBC_ANNOUNCEMENT_URL`).
+enum AnnouncementPlayback {
+    /// In-process playback on this bound socket.
+    Local(tokio::net::UdpSocket),
+    /// Remote playback; resolves when the pod reports Completed.
+    #[cfg(feature = "grpc")]
+    Remote(crate::announcement_client::RemoteAnnouncement),
+}
+
 impl SipStack {
     /// Creates a new SIP stack.
     pub fn new(config: SipStackConfig) -> Self {
@@ -2486,53 +2497,51 @@ impl SipStack {
     /// Answers a call, plays an announcement via RTP, then sends BYE.
     ///
     /// Flow:
-    /// 1. Allocate RTP port
+    /// 1. Set up media: delegate to the sbc-announcement-server pod when
+    ///    `SBC_ANNOUNCEMENT_URL` is configured (it binds the RTP socket
+    ///    and reports the IP/port for our SDP), otherwise bind a local
+    ///    RTP socket (in-process fallback, pre-split behavior)
     /// 2. Send 200 OK with SDP (sendonly PCMU) to caller
-    /// 3. Spawn background task: stream announcement audio, then send BYE
+    /// 3. Spawn background task: stream announcement audio (or wait for
+    ///    the pod to finish streaming), then send BYE
     async fn play_announcement_to_caller(
         &self,
         req: &proto_sip::message::SipRequest,
         source: SbcSocketAddr,
         announcement: crate::announcement::AnnouncementType,
     ) -> ProcessResult {
-        // Bind announcement RTP socket first to discover actual port
-        let preferred_port = if let Some(ref pipeline) = self.media_pipeline {
-            pipeline
-                .port_allocator()
-                .allocate_pair()
-                .await
-                .map_or(0, |(rtp, _)| rtp)
-        } else {
-            0
+        // Extract the caller's RTP destination from their SDP offer up
+        // front: the remote announcement pod needs it before we can
+        // build our 200 OK.
+        let caller_rtp_dest = req.body.as_ref().and_then(|body| {
+            let sdp_str = String::from_utf8_lossy(body);
+            crate::announcement::extract_rtp_dest_from_sdp(&sdp_str)
+        });
+
+        let call_id = req.headers.call_id().unwrap_or("unknown").to_string();
+
+        let ssrc = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            (now.as_nanos() as u32) ^ (now.as_secs() as u32)
         };
 
         // Bind RTP socket to the outside zone's signaling IP so media
-        // exits via the correct macvlan interface.
+        // exits via the correct macvlan interface (in-process mode).
         let rtp_bind_ip = if let Some(ref zr) = self.zone_registry {
             zr.signaling_ip("outside")
         } else {
             None
         };
-        let (ann_socket, actual_rtp_port) =
-            match crate::announcement::AnnouncementServer::bind_socket(preferred_port, rtp_bind_ip)
-                .await
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    warn!(error = %e, "Cannot bind announcement socket");
-                    let unavailable =
-                        create_response_from_request(req, StatusCode::TEMPORARILY_UNAVAILABLE);
-                    return ProcessResult::Response {
-                        message: SipMessage::Response(unavailable),
-                        destination: source,
-                    };
-                }
-            };
 
-        // Use the outside zone's external IP (STUN/public) for the SDP so
-        // the remote party (on the internet) can send RTP to a routable address.
-        // Falls back to the signaling IP if no external IP is configured.
-        let sdp_ip = if let Some(ref zr) = self.zone_registry {
+        // The daemon's own externally reachable IP: the outside zone's
+        // external IP (STUN/public), falling back to the signaling IP,
+        // then to the address the INVITE arrived on. Used for the SIP
+        // Contact and the BYE, and as the SDP media address when
+        // playback runs in-process.
+        let daemon_ip = if let Some(ref zr) = self.zone_registry {
             zr.external_ip("outside")
                 .or_else(|| zr.signaling_ip("outside"))
                 .map(|ip| ip.to_string())
@@ -2545,17 +2554,84 @@ impl SipStack {
                 .map_or_else(|| v6.to_string(), |v4| v4.to_string()),
             std::net::IpAddr::V4(v4) => v4.to_string(),
         });
+
+        // Prefer the external announcement pod when configured. Any
+        // failure here falls back to in-process playback so a missing
+        // or crashed pod degrades to pre-split behavior.
+        #[cfg(feature = "grpc")]
+        let remote_media: Option<(String, u16, AnnouncementPlayback)> = match (
+            std::env::var(crate::announcement_client::ANNOUNCEMENT_URL_ENV),
+            caller_rtp_dest,
+        ) {
+            (Ok(url), Some(dest)) => crate::announcement_client::start_remote_announcement(
+                &url,
+                announcement,
+                dest,
+                ssrc,
+                &call_id,
+            )
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "Remote announcement unavailable; using in-process playback");
+            })
+            .ok()
+            .map(|session| {
+                (
+                    session.advertised_ip.clone(),
+                    session.rtp_port,
+                    AnnouncementPlayback::Remote(session),
+                )
+            }),
+            _ => None,
+        };
+        #[cfg(not(feature = "grpc"))]
+        let remote_media: Option<(String, u16, AnnouncementPlayback)> = None;
+
+        let (sdp_ip, actual_rtp_port, playback) = if let Some(remote) = remote_media {
+            remote
+        } else {
+            // In-process playback: bind the announcement RTP socket now
+            // to discover the actual port before building the SDP.
+            let preferred_port = if let Some(ref pipeline) = self.media_pipeline {
+                pipeline
+                    .port_allocator()
+                    .allocate_pair()
+                    .await
+                    .map_or(0, |(rtp, _)| rtp)
+            } else {
+                0
+            };
+            match crate::announcement::AnnouncementServer::bind_socket(preferred_port, rtp_bind_ip)
+                .await
+            {
+                Ok((socket, port)) => {
+                    (daemon_ip.clone(), port, AnnouncementPlayback::Local(socket))
+                }
+                Err(e) => {
+                    warn!(error = %e, "Cannot bind announcement socket");
+                    let unavailable =
+                        create_response_from_request(req, StatusCode::TEMPORARILY_UNAVAILABLE);
+                    return ProcessResult::Response {
+                        message: SipMessage::Response(unavailable),
+                        destination: source,
+                    };
+                }
+            }
+        };
+
         info!(sdp_ip = %sdp_ip, rtp_port = actual_rtp_port, zone_registry_present = self.zone_registry.is_some(), "SDP media address for announcement");
         let sdp = crate::announcement::build_announcement_sdp(&sdp_ip, actual_rtp_port);
 
         // Build 200 OK with SDP
         let mut ok_response = create_response_from_request(req, StatusCode::OK);
+        // Contact is the daemon's SIP address — not sdp_ip, which is the
+        // announcement pod's media IP when playback runs remotely.
         ok_response.add_header(Header::new(
             HeaderName::Contact,
             format!(
                 "<sip:{}@{}:{}>",
                 self.config.instance_name,
-                sdp_ip,
+                daemon_ip,
                 source.port()
             ),
         ));
@@ -2568,14 +2644,7 @@ impl SipStack {
             .set(HeaderName::ContentLength, sdp_bytes.len().to_string());
         ok_response.body = Some(Bytes::from(sdp_bytes));
 
-        // Extract caller's RTP destination from their SDP offer
-        let caller_rtp_dest = req.body.as_ref().and_then(|body| {
-            let sdp_str = String::from_utf8_lossy(body);
-            crate::announcement::extract_rtp_dest_from_sdp(&sdp_str)
-        });
-
         // Track this Call-ID to absorb INVITE retransmits
-        let call_id = req.headers.call_id().unwrap_or("unknown").to_string();
         let announcement_calls = Arc::clone(&self.announcement_calls);
         announcement_calls.write().await.insert(call_id.clone());
         // Capture full From/To headers for the BYE dialog matching.
@@ -2592,35 +2661,43 @@ impl SipStack {
             .to_string();
 
         let source_port = source.port();
-        // local_ip = macvlan IP for binding sockets; sdp_ip = external/public IP for SDP
-        let local_ip = rtp_bind_ip.map_or_else(|| sdp_ip.clone(), |ip| ip.to_string());
+        // local_ip = macvlan IP for binding sockets; daemon_ip = the
+        // daemon's external/public IP (sdp_ip may be the announcement
+        // pod's address and must not be used for the BYE)
+        let local_ip = rtp_bind_ip.map_or_else(|| daemon_ip.clone(), |ip| ip.to_string());
 
         // Spawn background task to play announcement then BYE
         tokio::spawn(async move {
-            // Wait for caller to process the 200 OK and send ACK
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            match playback {
+                AnnouncementPlayback::Local(ann_socket) => {
+                    // Wait for caller to process the 200 OK and send ACK
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-            if let Some(rtp_dest) = caller_rtp_dest {
-                let ssrc = {
-                    use std::time::{SystemTime, UNIX_EPOCH};
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default();
-                    (now.as_nanos() as u32) ^ (now.as_secs() as u32)
-                };
-                if let Err(e) = crate::announcement::AnnouncementServer::play_on_socket(
-                    announcement,
-                    ann_socket,
-                    rtp_dest,
-                    ssrc,
-                )
-                .await
-                {
-                    warn!(error = %e, "Announcement playback failed");
+                    if let Some(rtp_dest) = caller_rtp_dest {
+                        if let Err(e) = crate::announcement::AnnouncementServer::play_on_socket(
+                            announcement,
+                            ann_socket,
+                            rtp_dest,
+                            ssrc,
+                        )
+                        .await
+                        {
+                            warn!(error = %e, "Announcement playback failed");
+                        }
+                    } else {
+                        warn!("No RTP destination from caller SDP, skipping audio playback");
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    }
                 }
-            } else {
-                warn!("No RTP destination from caller SDP, skipping audio playback");
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                #[cfg(feature = "grpc")]
+                AnnouncementPlayback::Remote(session) => {
+                    // The pod paces the audio; this resolves when its
+                    // Completed event arrives (or the stream breaks —
+                    // we still BYE so the call is not left hanging).
+                    if let Err(e) = session.wait_complete().await {
+                        warn!(error = %e, "Remote announcement playback failed");
+                    }
+                }
             }
 
             // Send BYE after announcement

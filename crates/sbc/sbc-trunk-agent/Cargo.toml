@@ -1,0 +1,30 @@
+[package]
+name = "sbc-trunk-agent"
+description = "Trunk maintenance pod for the USG SBC. Runs the SIP OPTIONS health monitor and outbound carrier-registration loops (from sbc-trunk-services) outside the daemon, reading trunk configuration from Postgres and publishing status snapshots back to the daemon over gRPC (TrunkStatusPublishService). Deploy exactly one replica: two agents would double-REGISTER to carriers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "sbc-trunk-agent"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "0.1"
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["json"] }
+
+tonic.workspace = true
+sbc-grpc-api.workspace = true
+sbc-trunk-services.workspace = true
+sbc-config-store.workspace = true
+
+serde_json.workspace = true

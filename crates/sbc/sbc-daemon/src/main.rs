@@ -53,7 +53,8 @@
 // Allow u64-to-i64 cast for protobuf timestamps
 #![allow(clippy::cast_sign_loss)]
 
-mod announcement;
+#[cfg(feature = "grpc")]
+mod announcement_client;
 mod api_server;
 mod args;
 #[cfg(feature = "cluster")]
@@ -66,9 +67,15 @@ mod runtime;
 mod server;
 mod shutdown;
 mod sip_stack;
-mod trunk_monitor;
-mod trunk_registrar;
 mod zone;
+
+// Extracted subsystems, re-exported under their old module paths so call
+// sites keep reading `crate::announcement::…` / `crate::trunk_monitor::…`.
+// The same code now also runs in the sbc-announcement-server and
+// sbc-trunk-agent pods; these aliases are the daemon's in-process mode.
+pub(crate) use sbc_announcement as announcement;
+pub(crate) use sbc_trunk_services::monitor as trunk_monitor;
+pub(crate) use sbc_trunk_services::registrar as trunk_registrar;
 
 use args::Args;
 use runtime::Runtime;

@@ -20,27 +20,44 @@ use tracing::{info, trace, warn};
 /// Registration state for a trunk.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TrunkRegistrationStatus {
+    /// Trunk ID.
     pub trunk_id: String,
+    /// Whether the trunk is currently registered.
     pub registered: bool,
+    /// Lifecycle state ("Initializing", "Registered", "Failed").
     pub state: String,
+    /// Registrar address ("host:port").
     pub registrar: String,
+    /// SIP username used for registration.
     pub username: String,
+    /// Last successful registration timestamp (Unix epoch seconds).
     pub last_registered: Option<i64>,
+    /// Last registration error, if any.
     pub last_error: Option<String>,
+    /// Granted registration expiry in seconds.
     pub expires: u32,
+    /// Total registration attempts.
     pub attempts: u64,
+    /// Total successful registrations.
     pub successes: u64,
 }
 
 /// Configuration for trunk registration.
 #[derive(Debug, Clone)]
 pub struct TrunkRegConfig {
+    /// Trunk ID.
     pub trunk_id: String,
+    /// Registrar host.
     pub host: String,
+    /// Registrar port.
     pub port: u16,
+    /// SIP username (digest auth).
     pub username: String,
+    /// SIP password (digest auth).
     pub password: String,
+    /// SIP domain for the From/To URIs.
     pub domain: String,
+    /// Requested registration expiry in seconds.
     pub expires: u32,
     /// Zone signaling IP to bind from (if zones configured).
     pub bind_ip: Option<std::net::IpAddr>,
@@ -60,6 +77,8 @@ pub struct TrunkRegistrar {
 }
 
 impl TrunkRegistrar {
+    /// Creates a new trunk registrar. `local_domain` seeds Call-ID
+    /// generation for outgoing REGISTERs.
     pub fn new(local_domain: &str) -> Self {
         Self {
             statuses: Arc::new(RwLock::new(HashMap::new())),
@@ -88,6 +107,7 @@ impl TrunkRegistrar {
         }
     }
 
+    /// Returns the shared registration status map.
     pub fn statuses(&self) -> Arc<RwLock<HashMap<String, TrunkRegistrationStatus>>> {
         Arc::clone(&self.statuses)
     }
@@ -474,10 +494,12 @@ impl TrunkRegistrar {
         }
     }
 
+    /// Returns registration status for all trunks.
     pub async fn get_all_status(&self) -> Vec<TrunkRegistrationStatus> {
         self.statuses.read().await.values().cloned().collect()
     }
 
+    /// Returns registration status for a specific trunk.
     pub async fn get_status(&self, trunk_id: &str) -> Option<TrunkRegistrationStatus> {
         self.statuses.read().await.get(trunk_id).cloned()
     }
