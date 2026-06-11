@@ -46,6 +46,14 @@ message ListTrunkHealthRequest {}
 
 message ListTrunkHealthResponse {
     repeated TrunkHealthInfo trunks = 1;
+    // True when SBC_TRUNK_SERVICES=external (trunk-agent pod mode).
+    // When false the data comes from the daemon's own in-process loops
+    // and snapshot_age_secs is meaningless.
+    bool trunk_services_external = 2;
+    // Seconds since the daemon last received a snapshot from sbc-trunk-agent.
+    // 0 means no snapshot has arrived yet (agent not yet connected or not
+    // running). Only meaningful when trunk_services_external is true.
+    uint32 snapshot_age_secs = 3;
 }
 
 message TrunkRegistrationInfo {
@@ -66,6 +74,9 @@ message ListTrunkRegistrationsRequest {}
 
 message ListTrunkRegistrationsResponse {
     repeated TrunkRegistrationInfo trunks = 1;
+    // Mirrors the same fields in ListTrunkHealthResponse.
+    bool trunk_services_external = 2;
+    uint32 snapshot_age_secs = 3;
 }
 
 message RegisterTrunkRequest {
@@ -74,5 +85,32 @@ message RegisterTrunkRequest {
 
 message RegisterTrunkResponse {
     bool success = 1;
+    string message = 2;
+}
+
+// Write-side companion to TrunkHealthService: the sbc-trunk-agent pod
+// (which owns the OPTIONS-ping monitor and carrier-registration loops
+// when trunk services run externally) pushes periodic status snapshots
+// into the daemon. The daemon stores the latest snapshot and serves it
+// from the TrunkHealthService read RPCs above, so sbc-api and the
+// dashboard see one consistent view regardless of where the loops run.
+service TrunkStatusPublishService {
+    // PublishTrunkStatus replaces the daemon's stored snapshot with the
+    // agent's current view (full snapshot, not a delta).
+    rpc PublishTrunkStatus(PublishTrunkStatusRequest) returns (PublishTrunkStatusResponse);
+}
+
+message PublishTrunkStatusRequest {
+    // Identifies the publishing agent instance (pod name) for logs and
+    // for detecting duplicate agents publishing concurrently.
+    string agent_id = 1;
+    repeated TrunkHealthInfo health = 2;
+    repeated TrunkRegistrationInfo registrations = 3;
+}
+
+message PublishTrunkStatusResponse {
+    bool accepted = 1;
+    // Non-empty when accepted is false (e.g. daemon runs its own local
+    // trunk services and rejects external publishes).
     string message = 2;
 }

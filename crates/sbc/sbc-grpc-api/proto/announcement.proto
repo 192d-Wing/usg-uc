@@ -1,0 +1,70 @@
+// SBC Announcement Service
+//
+// Plays pre-recorded RTP announcements ("number not in service",
+// "all circuits busy") toward a caller on behalf of the SIP daemon.
+// Hosted by the sbc-announcement-server pod; the daemon is the client.
+//
+// Lifecycle of one announcement (single server-streaming RPC):
+//   1. Daemon calls Play with the caller's RTP destination (from the
+//      INVITE's SDP offer) and the announcement kind.
+//   2. Server binds an RTP socket and immediately streams back a Bound
+//      event carrying the IP/port to advertise in the daemon's 200 OK SDP.
+//   3. After initial_delay_ms (lets the caller process the 200 OK and
+//      ACK), the server streams the announcement audio via RTP.
+//   4. When playback finishes the server sends a Completed event and
+//      closes the stream; the daemon then sends the SIP BYE.
+// Dropping the stream (daemon restart, call abandoned) aborts playback.
+//
+// NIST 800-53 Rev5: AU-6 (logged announcement events), SC-7 (controlled
+// call termination at the boundary).
+syntax = "proto3";
+
+package sbc.api.v1;
+
+service AnnouncementService {
+    // Play binds an RTP socket, reports it (Bound), streams the
+    // announcement to the given destination, then reports Completed.
+    rpc Play(PlayAnnouncementRequest) returns (stream PlayAnnouncementEvent);
+}
+
+enum AnnouncementKind {
+    ANNOUNCEMENT_KIND_UNSPECIFIED = 0;
+    // "The number you have dialed is not in service."
+    ANNOUNCEMENT_KIND_NUMBER_NOT_IN_SERVICE = 1;
+    // "All circuits are busy. Please try again later."
+    ANNOUNCEMENT_KIND_ALL_CIRCUITS_BUSY = 2;
+    // Two seconds of silence (testing).
+    ANNOUNCEMENT_KIND_SILENCE = 3;
+}
+
+message PlayAnnouncementRequest {
+    AnnouncementKind kind = 1;
+    // Caller's RTP destination ("ip:port") extracted from their SDP offer.
+    string rtp_destination = 2;
+    // RTP SSRC to stamp on outgoing packets.
+    uint32 ssrc = 3;
+    // Milliseconds to wait between Bound and the first RTP packet, so the
+    // caller can process the 200 OK / send ACK. 0 means the server default.
+    uint32 initial_delay_ms = 4;
+    // Opaque correlation id (SIP Call-ID) for log correlation.
+    string call_id = 5;
+}
+
+message AnnouncementBound {
+    // IP to advertise in the SDP c= line (the pod's media IP, which may
+    // be an external/NAT address configured on the pod).
+    string advertised_ip = 1;
+    // Bound RTP port for the SDP m=audio line.
+    uint32 rtp_port = 2;
+}
+
+message AnnouncementCompleted {
+    uint64 packets_sent = 1;
+}
+
+message PlayAnnouncementEvent {
+    oneof event {
+        AnnouncementBound bound = 1;
+        AnnouncementCompleted completed = 2;
+    }
+}

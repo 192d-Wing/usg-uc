@@ -233,6 +233,26 @@ pub mod prelude {
         TrunkHealthInfo, TrunkRegistrationInfo,
     };
 
+    // Trunk status publish service — sbc-trunk-agent → daemon snapshot
+    // push when the OPTIONS monitor / carrier-registration loops run in
+    // their own pod instead of inside the daemon.
+    pub use super::sbc::trunk_status_publish_service_client::TrunkStatusPublishServiceClient;
+    pub use super::sbc::trunk_status_publish_service_server::{
+        TrunkStatusPublishService, TrunkStatusPublishServiceServer,
+    };
+    pub use super::sbc::{PublishTrunkStatusRequest, PublishTrunkStatusResponse};
+
+    // Announcement service — daemon → sbc-announcement-server "play this
+    // announcement toward the caller's RTP address" streaming RPC.
+    pub use super::sbc::announcement_service_client::AnnouncementServiceClient;
+    pub use super::sbc::announcement_service_server::{
+        AnnouncementService, AnnouncementServiceServer,
+    };
+    pub use super::sbc::{
+        AnnouncementBound, AnnouncementCompleted, AnnouncementKind, PlayAnnouncementEvent,
+        PlayAnnouncementRequest,
+    };
+
     // CUCM routing sync service (PR11) — sbc-api → daemon "I changed
     // partition/css/route-pattern/route-list X, please re-sync from
     // Postgres into the live CucmRouter".
