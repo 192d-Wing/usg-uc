@@ -44,6 +44,7 @@ proto-turn.workspace = true
 proto-ice.workspace = true
 uc-api.workspace = true
 uc-dos-protection.workspace = true
+uc-vps.workspace = true
 uc-routing.workspace = true
 uc-phone-mgmt.workspace = true
 socket2.workspace = true

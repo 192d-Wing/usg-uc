@@ -233,6 +233,35 @@ impl Server {
         if let Some(ref topo) = config.topology_hiding {
             sip_stack.init_topology_hider_from_config(topo);
         }
+
+        // Initialize Voice Protection System call screening (if configured).
+        // The config was validated at load time, so a build failure here is
+        // unreachable in practice; refuse to start half-protected if it
+        // happens anyway.
+        if let Some(ref vps) = config.vps
+            && vps.enabled
+        {
+            match uc_vps::VpsEngine::new(vps) {
+                Ok(engine) => {
+                    sip_stack.set_vps_engine(engine);
+                    tracing::info!(
+                        rules = vps.rules.len(),
+                        per_source_cps = vps.tdos.per_source_cps,
+                        stir_shaken_mode = ?vps.stir_shaken.mode,
+                        "VPS call screening enabled"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Invalid VPS configuration — aborting startup");
+                    // Fail closed: running without the configured call
+                    // screening is worse than not starting.
+                    #[allow(clippy::panic)]
+                    {
+                        panic!("invalid VPS configuration: {e}");
+                    }
+                }
+            }
+        }
     }
 
     /// Returns the cluster manager if available.

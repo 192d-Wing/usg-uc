@@ -34,6 +34,7 @@ members = [
 
     # Layer 5: Orchestration (uc-* = reusable)
     "crates/uc/uc-policy",
+    "crates/uc/uc-vps",
     "crates/uc/uc-routing",
     "crates/uc/uc-cdr",
 
@@ -170,6 +171,7 @@ uc-acl = { path = "crates/uc/uc-acl" }
 uc-auth = { path = "crates/uc/uc-auth" }
 uc-dos-protection = { path = "crates/uc/uc-dos-protection" }
 uc-policy = { path = "crates/uc/uc-policy" }
+uc-vps = { path = "crates/uc/uc-vps" }
 uc-routing = { path = "crates/uc/uc-routing" }
 uc-cdr = { path = "crates/uc/uc-cdr" }
 uc-api = { path = "crates/uc/uc-api" }

@@ -68,6 +68,7 @@ pub fn validate_config(config: &SbcConfig) -> ConfigResult<()> {
     validate_security(&config.security)?;
     validate_stir_shaken(&config.stir_shaken)?;
     validate_rate_limit(&config.rate_limit)?;
+    validate_vps(config)?;
     validate_zones(&config.zones)?;
     validate_trunk_groups(config)?;
     validate_routing(config)?;
@@ -222,6 +223,15 @@ fn validate_stir_shaken(config: &crate::schema::StirShakenConfig) -> ConfigResul
             message: "default_attestation must be A, B, or C".to_string(),
         }),
     }
+}
+
+fn validate_vps(config: &SbcConfig) -> ConfigResult<()> {
+    if let Some(ref vps) = config.vps {
+        vps.validate().map_err(|message| ConfigError::Validation {
+            message: format!("vps: {message}"),
+        })?;
+    }
+    Ok(())
 }
 
 fn validate_rate_limit(config: &crate::schema::RateLimitConfig) -> ConfigResult<()> {

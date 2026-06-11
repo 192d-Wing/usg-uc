@@ -91,6 +91,10 @@ pub struct SipStack {
     /// previously entries were never removed (unbounded growth from
     /// unroutable INVITEs).
     announcement_calls: Arc<tokio::sync::RwLock<std::collections::HashSet<String>>>,
+    /// Voice Protection System engine for pre-routing call screening
+    /// (see docs/VPS-ARCHITECTURE.md). Mutex: screening mutates rate
+    /// counters and stats.
+    vps: Option<tokio::sync::Mutex<uc_vps::VpsEngine>>,
     /// Registration statistics.
     registrations_active: AtomicU64,
     registrations_total: AtomicU64,
@@ -340,6 +344,7 @@ impl SipStack {
             announcement_calls: Arc::new(
                 tokio::sync::RwLock::new(std::collections::HashSet::new()),
             ),
+            vps: None,
         }
     }
 
@@ -388,12 +393,18 @@ impl SipStack {
             announcement_calls: Arc::new(
                 tokio::sync::RwLock::new(std::collections::HashSet::new()),
             ),
+            vps: None,
         }
     }
 
     /// Sets the media pipeline for RTP relay.
     pub fn set_media_pipeline(&mut self, pipeline: Arc<crate::media_pipeline::MediaPipeline>) {
         self.media_pipeline = Some(pipeline);
+    }
+
+    /// Sets the Voice Protection System engine for call screening.
+    pub fn set_vps_engine(&mut self, engine: uc_vps::VpsEngine) {
+        self.vps = Some(tokio::sync::Mutex::new(engine));
     }
 
     /// Enters draining mode: new INVITEs are rejected with 503 while
@@ -1416,6 +1427,65 @@ impl SipStack {
         let dest_user = req.uri.user.as_deref().unwrap_or("").to_string();
         let dest_host = req.uri.host.clone();
         let dest_aor = format!("sip:{dest_user}@{dest_host}");
+
+        // Voice Protection System: pre-routing call screening (blocklist,
+        // call-level rate limits, concurrency caps, policy rules). See
+        // docs/VPS-ARCHITECTURE.md.
+        //
+        // ## NIST 800-53 Rev5: AC-3 (Access Enforcement), SC-5 (DoS Protection)
+        if let Some(ref vps) = self.vps {
+            let direction = if self
+                .inbound_trunk_map
+                .read()
+                .await
+                .contains_key(&source.ip())
+            {
+                uc_vps::CallDirection::Inbound
+            } else {
+                uc_vps::CallDirection::Unknown
+            };
+            let mut attempt = uc_vps::CallAttempt::new(source.ip())
+                .with_callee(dest_user.clone())
+                .with_request_uri(req.uri.to_string())
+                .with_direction(direction);
+            if let Some(from) = req.headers.get_value(&HeaderName::From) {
+                attempt = attempt.with_from_uri(extract_uri_from_header(from));
+            }
+            let verdict = vps.lock().await.screen_call(&attempt);
+            match verdict.action() {
+                uc_vps::VpsAction::Allow => {}
+                uc_vps::VpsAction::Reject {
+                    status_code,
+                    reason,
+                } => {
+                    warn!(
+                        call_id = %a_leg_call_id,
+                        status_code,
+                        reason = %reason,
+                        stage = ?verdict.source(),
+                        rule = verdict.matched_rule().unwrap_or("-"),
+                        "VPS rejected INVITE"
+                    );
+                    let rejection = create_response_from_request(
+                        req,
+                        StatusCode::new(*status_code)
+                            .unwrap_or(StatusCode::SERVER_INTERNAL_ERROR),
+                    );
+                    return ProcessResult::Response {
+                        message: SipMessage::Response(rejection),
+                        destination: source,
+                    };
+                }
+                uc_vps::VpsAction::Drop => {
+                    warn!(
+                        call_id = %a_leg_call_id,
+                        stage = ?verdict.source(),
+                        "VPS dropped INVITE (blocked source)"
+                    );
+                    return ProcessResult::NoAction;
+                }
+            }
+        }
 
         // 3. Look up destination:
         //    a) Check DID → user mapping, then LocationService

@@ -28,6 +28,8 @@ pub use uc_aaa::{AaaConfig, AaaProviderType, RadiusConfig};
 #[cfg(feature = "snmp")]
 pub use uc_snmp::SnmpConfig;
 
+pub use uc_vps::VpsConfig;
+
 #[cfg(feature = "syslog")]
 pub use uc_syslog::SyslogConfig;
 
@@ -58,6 +60,12 @@ pub struct SbcConfig {
 
     /// Rate limiting settings.
     pub rate_limit: RateLimitConfig,
+
+    /// Voice Protection System (call-level screening) settings.
+    ///
+    /// ## NIST 800-53 Rev5: AC-3 (Access Enforcement), SC-5 (Denial of Service Protection)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vps: Option<VpsConfig>,
 
     /// Logging settings.
     pub logging: LoggingConfig,
