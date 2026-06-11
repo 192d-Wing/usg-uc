@@ -132,6 +132,15 @@ struct CallSession {
     /// retransmitted 2xx (our ACK was lost) is answered with the identical
     /// ACK instead of being dropped or reprocessed (RFC 6026 §2).
     last_ack: Option<StoredAck>,
+    /// Negotiated session interval in seconds (RFC 4028). Set from the
+    /// Min-SE of a 422 Session Interval Too Small, refreshed from the
+    /// `Session-Expires` echoed on a 2xx. Once set, every subsequent
+    /// (re-)INVITE on this call carries the session-timer headers at this
+    /// interval.
+    session_expires: Option<u32>,
+    /// Whether the one-shot 422 Min-SE retry has been used (RFC 4028
+    /// §5.3). A second 422 fails the call instead of retrying again.
+    session_interval_retried: bool,
     /// Failure reason if the call failed.
     failure_reason: Option<CallFailureReason>,
     /// Active REFER request for call transfer (RFC 3515).
@@ -371,6 +380,8 @@ impl CallAgent {
             last_via: None,
             cancel_pending: false,
             last_ack: None,
+            session_expires: None,
+            session_interval_retried: false,
             failure_reason: None,
             refer_request: None,
             transfer_target: None,
@@ -481,6 +492,8 @@ impl CallAgent {
             last_via: invite_via,
             cancel_pending: false,
             last_ack: None,
+            session_expires: None,
+            session_interval_retried: false,
             failure_reason: None,
             refer_request: None,
             transfer_target: None,
@@ -753,7 +766,7 @@ impl CallAgent {
     ///
     /// Used for hold/resume and other mid-call SDP renegotiation.
     async fn send_reinvite(&mut self, call_id: &str, sdp: &str, is_hold: bool) -> SipUaResult<()> {
-        let (remote_uri, sip_call_id, cseq, from_tag, to_tag, target) = {
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag, target, session_expires) = {
             let session = self
                 .calls
                 .get_mut(call_id)
@@ -772,6 +785,7 @@ impl CallAgent {
                 session.from_tag.clone(),
                 session.to_tag.clone(),
                 Self::dialog_target(session),
+                session.session_expires,
             )
         };
 
@@ -780,7 +794,7 @@ impl CallAgent {
         let branch = generate_branch();
 
         // Build re-INVITE request
-        let request = Self::build_reinvite_request_static(
+        let mut request = Self::build_reinvite_request_static(
             &target.request_uri,
             &remote_uri,
             &target.routes,
@@ -795,6 +809,13 @@ impl CallAgent {
             sdp,
             &self.transport_type,
         )?;
+
+        // RFC 4028: once a session interval has been negotiated (422
+        // Min-SE bump, or `Session-Expires` echoed by the peer on a 2xx),
+        // every re-INVITE carries the session-timer headers at that value.
+        if let Some(interval) = session_expires {
+            Self::apply_session_timer_headers(&mut request, interval);
+        }
 
         // Snapshot the exact Via for a potential CANCEL (RFC 3261 §9.1)
         let reinvite_via = request
@@ -916,6 +937,10 @@ impl CallAgent {
             }
             401 | 407 => {
                 self.handle_auth_challenge(call_id, status_code, response)
+                    .await?;
+            }
+            422 => {
+                self.handle_session_interval_too_small(call_id, response)
                     .await?;
             }
             480 => {
@@ -1260,6 +1285,13 @@ impl CallAgent {
                 Self::capture_route_set(session, response);
             }
             Self::capture_remote_target(session, response);
+
+            // RFC 4028 §7.2: honor the Session-Expires echoed (possibly
+            // raised) by the peer on the 2xx — subsequent re-INVITEs must
+            // carry the value the UAS actually granted.
+            if let Some(interval) = Self::session_expires_secs(response) {
+                session.session_expires = Some(interval);
+            }
 
             // For a hold re-INVITE 200 OK, preserve the OnHold state.
             // Only transition to Connected for the initial INVITE or resume.
@@ -1629,6 +1661,15 @@ impl CallAgent {
                         };
                         request.headers.set(auth_header, auth_creds.to_string());
 
+                        // Carry an already-negotiated session interval
+                        // (RFC 4028) on the authenticated resend, like any
+                        // other INVITE for this call.
+                        if let Some(interval) =
+                            self.calls.get(call_id).and_then(|s| s.session_expires)
+                        {
+                            Self::apply_session_timer_headers(&mut request, interval);
+                        }
+
                         // Snapshot the exact Via of this authenticated INVITE —
                         // it is the LAST INVITE actually sent, so a later
                         // CANCEL/ACK must copy this Via, not the original's
@@ -1948,6 +1989,189 @@ impl CallAgent {
             );
         }
         Ok(())
+    }
+
+    /// Handles a 422 Session Interval Too Small (RFC 4028 §5.3).
+    ///
+    /// The response's Min-SE is the smallest session interval the server
+    /// will accept. The 422 is ACKed like any non-2xx final response
+    /// (RFC 3261 §17.1.1.3), the Min-SE value is adopted as the call's
+    /// negotiated session interval, and the INVITE is retried ONCE as a
+    /// new transaction (bumped `CSeq`, fresh branch) carrying
+    /// `Session-Expires`/`Min-SE` at that value plus `Supported: timer`.
+    /// A second 422 — or a 422 without a parseable Min-SE — fails the
+    /// call like any other 4xx. The negotiated interval persists on the
+    /// session, so subsequent re-INVITEs carry it too.
+    #[allow(clippy::too_many_lines)]
+    async fn handle_session_interval_too_small(
+        &mut self,
+        call_id: &str,
+        response: &SipResponse,
+    ) -> SipUaResult<()> {
+        let Some(min_se) = Self::min_se_secs(response) else {
+            warn!(
+                call_id = %call_id,
+                "422 without a parseable Min-SE; failing the call (RFC 4028 §5.3)"
+            );
+            return self.handle_failure_response(call_id, 422, response).await;
+        };
+
+        let already_retried = self
+            .calls
+            .get(call_id)
+            .is_some_and(|s| s.session_interval_retried);
+        if already_retried {
+            warn!(
+                call_id = %call_id,
+                min_se = min_se,
+                "Second 422 after the one-shot Min-SE retry; failing the call (RFC 4028 §5.3)"
+            );
+            return self.handle_failure_response(call_id, 422, response).await;
+        }
+
+        // ACK the 422 before retrying (RFC 3261 §17.1.1.3).
+        let (remote_uri, sip_call_id, cseq, from_tag, to_tag) =
+            self.extract_session_data_for_ack(call_id)?;
+        self.send_ack_for_failure(
+            call_id,
+            &remote_uri,
+            &sip_call_id,
+            cseq,
+            &from_tag,
+            to_tag.as_deref(),
+            response,
+        )
+        .await?;
+
+        let is_reinvite = self
+            .calls
+            .get(call_id)
+            .is_some_and(|s| s.connected_at.is_some());
+
+        {
+            let session = self
+                .calls
+                .get_mut(call_id)
+                .ok_or_else(|| SipUaError::InvalidState("Call not found".to_string()))?;
+            session.session_interval_retried = true;
+            session.session_expires = Some(min_se);
+            session.invite_transaction = None;
+        }
+
+        info!(
+            call_id = %call_id,
+            min_se = min_se,
+            "422 Session Interval Too Small; retrying INVITE once with Session-Expires = Min-SE \
+             (RFC 4028 §5.3)"
+        );
+
+        if is_reinvite {
+            // The rejected request was a re-INVITE: resend the same offer.
+            // `send_reinvite` picks up the just-stored interval and stamps
+            // the RFC 4028 headers on the retry.
+            let retry = self
+                .calls
+                .get(call_id)
+                .and_then(|s| s.last_reinvite.clone());
+            if let Some((sdp, is_hold)) = retry {
+                self.send_reinvite(call_id, &sdp, is_hold).await?;
+            }
+            return Ok(());
+        }
+
+        // Initial INVITE: retry as a new transaction with a bumped CSeq
+        // and a fresh branch (RFC 3261 §17.1.1 — it is a new request).
+        let (new_cseq, sdp_offer) = {
+            let session = self
+                .calls
+                .get_mut(call_id)
+                .ok_or_else(|| SipUaError::InvalidState("Call not found".to_string()))?;
+            session.cseq += 1;
+            (session.cseq, session.local_sdp.clone().unwrap_or_default())
+        };
+
+        let destination = self.parse_destination(&remote_uri).await?;
+        let effective_local_addr = self.effective_local_addr(destination).await?;
+        let new_branch = generate_branch();
+
+        let mut request = Self::build_invite_request_static(
+            &remote_uri,
+            &self.aor,
+            &self.display_name,
+            effective_local_addr,
+            &sip_call_id,
+            new_cseq,
+            &from_tag,
+            &new_branch,
+            &sdp_offer,
+            &self.transport_type,
+        )?;
+        Self::apply_session_timer_headers(&mut request, min_se);
+
+        // Snapshot the exact Via/Max-Forwards of this retried INVITE — it
+        // is now the LAST INVITE actually sent, so a later CANCEL/ACK must
+        // copy them (RFC 3261 §9.1 / §17.1.1.3).
+        let new_via = request
+            .headers
+            .get_value(&HeaderName::Via)
+            .map(String::from);
+        let new_max_forwards = Self::request_max_forwards(&request);
+
+        let tx_key = TransactionKey::client(&new_branch, "INVITE");
+        let transaction =
+            ClientInviteTransaction::new(tx_key, TransportType::Reliable).with_cseq(new_cseq);
+
+        if let Some(session) = self.calls.get_mut(call_id) {
+            session.invite_transaction = Some(transaction);
+            session.last_branch = Some(new_branch);
+            session.last_via = new_via;
+            session.last_max_forwards = new_max_forwards;
+        }
+
+        self.event_tx
+            .send(CallEvent::SendRequest {
+                request,
+                destination,
+            })
+            .await
+            .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Stamps the RFC 4028 session-timer headers on an outgoing INVITE:
+    /// `Session-Expires` and `Min-SE` at the negotiated interval, plus
+    /// `Supported: timer`.
+    fn apply_session_timer_headers(request: &mut SipRequest, interval: u32) {
+        request
+            .headers
+            .set(HeaderName::SessionExpires, interval.to_string());
+        request.headers.set(HeaderName::MinSe, interval.to_string());
+        request.headers.set(HeaderName::Supported, "timer");
+    }
+
+    /// Parses the Min-SE header of a 422 response (RFC 4028 §5.3):
+    /// delta-seconds, optionally followed by generic parameters.
+    fn min_se_secs(response: &SipResponse) -> Option<u32> {
+        Self::header_delta_seconds(response, &HeaderName::MinSe)
+    }
+
+    /// Parses the `Session-Expires` header of a response (RFC 4028 §7.2):
+    /// delta-seconds, optionally followed by `;refresher=uac|uas`.
+    fn session_expires_secs(response: &SipResponse) -> Option<u32> {
+        Self::header_delta_seconds(response, &HeaderName::SessionExpires)
+    }
+
+    /// Parses a delta-seconds header value, ignoring any `;param` suffix.
+    fn header_delta_seconds(response: &SipResponse, name: &HeaderName) -> Option<u32> {
+        response
+            .headers
+            .get_value(name)?
+            .split(';')
+            .next()?
+            .trim()
+            .parse()
+            .ok()
     }
 
     /// Returns a 2–4 s backoff for the 491 glare retry (RFC 3261 §14.1).
@@ -4732,6 +4956,206 @@ mod tests {
         assert!(
             reason.contains("Retry-After: 120s"),
             "failure reason must surface Retry-After, was: {reason}"
+        );
+    }
+
+    /// RFC 4028 §5.3: an INVITE rejected with 422 Session Interval Too
+    /// Small is ACKed (non-2xx final response, §17.1.1.3) and retried ONCE
+    /// as a new transaction — bumped `CSeq`, fresh branch — carrying
+    /// `Session-Expires` at the server's Min-SE, `Min-SE`, and
+    /// `Supported: timer`. A second 422 fails the call instead of looping.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_422_min_se_retried_once_then_fails() {
+        use proto_sip::response::StatusCode;
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let mut agent = CallAgent::new(
+            local_addr,
+            "sip:alice@127.0.0.1".to_string(),
+            "Alice".to_string(),
+            tx,
+        );
+
+        let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n";
+        let call_id = agent
+            .make_call("sip:bob@127.0.0.1:5061", sdp)
+            .await
+            .unwrap();
+
+        // Drain StateChanged(Dialing), capture the first INVITE (CSeq 1)
+        let _ = rx.recv().await.unwrap();
+        let invite1 = sent_request(rx.recv().await.unwrap());
+        let invite1_via = invite1
+            .headers
+            .get_value(&HeaderName::Via)
+            .unwrap()
+            .to_string();
+        assert!(
+            invite1
+                .headers
+                .get_value(&HeaderName::SessionExpires)
+                .is_none(),
+            "no Session-Expires before the server demanded one"
+        );
+
+        // 422: the server demands a session interval of at least 900 s
+        let mut too_small = SipResponse::new(StatusCode::new(422).unwrap());
+        too_small.headers.set(HeaderName::Via, invite1_via.clone());
+        too_small
+            .headers
+            .set(HeaderName::To, "<sip:bob@127.0.0.1:5061>;tag=tag-422");
+        too_small.headers.set(HeaderName::CSeq, "1 INVITE");
+        too_small.headers.set(HeaderName::MinSe, "900");
+        agent.handle_response(&too_small, &call_id).await.unwrap();
+
+        // First the 422 is ACKed with the INVITE's exact Via (§17.1.1.3)
+        let ack = sent_request(rx.recv().await.unwrap());
+        assert_eq!(ack.method.to_string(), "ACK");
+        assert_eq!(
+            ack.headers.get_value(&HeaderName::Via).unwrap(),
+            invite1_via,
+            "ACK for the 422 must copy the INVITE's exact Via line"
+        );
+        assert_eq!(ack.headers.get_value(&HeaderName::CSeq).unwrap(), "1 ACK");
+
+        // Then the retried INVITE: CSeq bumped, fresh branch, RFC 4028 headers
+        let invite2 = sent_request(rx.recv().await.unwrap());
+        assert_eq!(invite2.method.to_string(), "INVITE");
+        assert_eq!(
+            invite2.headers.get_value(&HeaderName::CSeq).unwrap(),
+            "2 INVITE",
+            "the Min-SE retry is a new request and must bump CSeq"
+        );
+        assert_ne!(
+            via_branch(&invite2),
+            via_branch(&invite1),
+            "the Min-SE retry is a new transaction and needs a fresh branch"
+        );
+        assert_eq!(
+            invite2
+                .headers
+                .get_value(&HeaderName::SessionExpires)
+                .unwrap(),
+            "900",
+            "retry must offer Session-Expires at the server's Min-SE"
+        );
+        assert_eq!(
+            invite2.headers.get_value(&HeaderName::MinSe).unwrap(),
+            "900"
+        );
+        assert_eq!(
+            invite2.headers.get_value(&HeaderName::Supported).unwrap(),
+            "timer"
+        );
+        assert_eq!(
+            agent.get_state(&call_id),
+            Some(CallState::Dialing),
+            "the call survives the first 422"
+        );
+
+        // A second 422 exhausts the one-shot retry: ACK, then call failure
+        let invite2_via = invite2
+            .headers
+            .get_value(&HeaderName::Via)
+            .unwrap()
+            .to_string();
+        let mut too_small2 = SipResponse::new(StatusCode::new(422).unwrap());
+        too_small2.headers.set(HeaderName::Via, invite2_via.clone());
+        too_small2
+            .headers
+            .set(HeaderName::To, "<sip:bob@127.0.0.1:5061>;tag=tag-422-2");
+        too_small2.headers.set(HeaderName::CSeq, "2 INVITE");
+        too_small2.headers.set(HeaderName::MinSe, "1800");
+        agent.handle_response(&too_small2, &call_id).await.unwrap();
+
+        let mut requests = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let CallEvent::SendRequest { request, .. } = event {
+                requests.push(request);
+            }
+        }
+        assert_eq!(
+            requests.len(),
+            1,
+            "a second 422 must only be ACKed, never retried: {requests:#?}"
+        );
+        assert_eq!(requests[0].method.to_string(), "ACK");
+        assert_eq!(
+            requests[0].headers.get_value(&HeaderName::Via).unwrap(),
+            invite2_via,
+            "ACK for the second 422 must copy the retried INVITE's Via"
+        );
+        assert_eq!(agent.get_state(&call_id), Some(CallState::Terminated));
+    }
+
+    /// RFC 4028: the negotiated session interval persists on the session.
+    /// The 2xx may echo (or raise) `Session-Expires`; subsequent
+    /// re-INVITEs must carry the value the UAS actually granted.
+    #[tokio::test]
+    async fn test_negotiated_session_expires_carried_on_reinvite() {
+        use proto_sip::response::StatusCode;
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let mut agent = CallAgent::new(
+            local_addr,
+            "sip:alice@127.0.0.1".to_string(),
+            "Alice".to_string(),
+            tx,
+        );
+
+        let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n";
+        let call_id = agent
+            .make_call("sip:bob@127.0.0.1:5061", sdp)
+            .await
+            .unwrap();
+        while rx.try_recv().is_ok() {}
+
+        // 422 with Min-SE: 900 → ACK + retried INVITE (CSeq 2)
+        let mut too_small = SipResponse::new(StatusCode::new(422).unwrap());
+        too_small
+            .headers
+            .set(HeaderName::To, "<sip:bob@127.0.0.1:5061>;tag=tag-422");
+        too_small.headers.set(HeaderName::CSeq, "1 INVITE");
+        too_small.headers.set(HeaderName::MinSe, "900");
+        agent.handle_response(&too_small, &call_id).await.unwrap();
+        while rx.try_recv().is_ok() {}
+
+        // The UAS answers, raising the granted interval to 1800 s
+        let mut ok = SipResponse::new(StatusCode::OK);
+        ok.headers
+            .set(HeaderName::To, "<sip:bob@127.0.0.1:5061>;tag=tag-200");
+        ok.headers.set(HeaderName::CSeq, "2 INVITE");
+        ok.headers
+            .set(HeaderName::SessionExpires, "1800;refresher=uas");
+        agent.handle_response(&ok, &call_id).await.unwrap();
+        while rx.try_recv().is_ok() {} // drain ACK + StateChanged(Connected)
+        assert_eq!(agent.get_state(&call_id), Some(CallState::Connected));
+
+        // A subsequent re-INVITE carries the granted interval (RFC 4028)
+        agent
+            .hold_call(&call_id, "v=0\r\na=sendonly\r\n")
+            .await
+            .unwrap();
+        let reinvite = sent_request(rx.recv().await.unwrap());
+        assert_eq!(reinvite.method.to_string(), "INVITE");
+        assert_eq!(
+            reinvite.headers.get_value(&HeaderName::CSeq).unwrap(),
+            "3 INVITE"
+        );
+        assert_eq!(
+            reinvite
+                .headers
+                .get_value(&HeaderName::SessionExpires)
+                .unwrap(),
+            "1800",
+            "re-INVITE must carry the Session-Expires the 2xx granted"
+        );
+        assert_eq!(
+            reinvite.headers.get_value(&HeaderName::Supported).unwrap(),
+            "timer"
         );
     }
 

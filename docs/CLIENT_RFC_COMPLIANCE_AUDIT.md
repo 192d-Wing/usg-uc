@@ -35,14 +35,14 @@ wave 2 = b79893b0.
 | # | Finding | RFC § | Where |
 |---|---------|-------|-------|
 | 11 | Unregister sends specific Contact, not `Contact: *` (stale bindings from other instances) — ✅ fixed (909890cf) | 3261 §10.2.2 | `registration.rs:663-670` |
-| 12 | 422 Session-Interval-Too-Small (Min-SE) not handled | 4028 §5.3 | no handler |
+| 12 | 422 Session-Interval-Too-Small (Min-SE) not handled — ✅ fixed (422 retry with Session-Expires/Supported: timer, wave 3) | 4028 §5.3 | no handler |
 | 13 | No CSeq validation on responses (late 200s can confirm wrong request) — ✅ fixed (0642c3be) | 3261 §12.2.1.1 | `call_agent.rs` CSeq sites |
-| 14 | Incoming BYE/CANCEL with no matching dialog: no explicit 481 reply | 3261 §8.2.2.2 | `call_manager.rs:1376-1428` |
+| 14 | Incoming BYE/CANCEL with no matching dialog: no explicit 481 reply — ✅ fixed (0642c3be) | 3261 §8.2.2.2 | `call_manager.rs:1376-1428` |
 | 15 | No Retry-After parsing on 503/600 (immediate retry hammering) — ✅ fixed (909890cf + b79893b0) | 3261 §21.5.2 | no handler |
 | 16 | RTCP interval fixed at 5s, not randomized — ✅ fixed (56000e43) | 3550 §6.3.1 | `rtcp_session.rs:28-29` |
 | 17 | RTCP RR interarrival jitter possibly reported in ms, not RTP timestamp units — ✅ fixed (56000e43) | 3550 §A.8 | `jitter_buffer.rs` / RR builder — verify |
 | 18 | SSRC collision detection receiver-side only — ✅ fixed (56000e43) | 3550 §8.2 | `rtp_handler.rs:868-876` |
-| 19 | DTMF send: 4733-only with mic suppressed; no in-band interleave option for event-blind peers | 4733 §2.5.1.3 | `dtmf_sender.rs` / `io_thread.rs:404-408` |
+| 19 | DTMF send: 4733-only with mic suppressed; no in-band interleave option for event-blind peers — ✅ fixed (56000e43, `dtmf_inband_interleave` flag, default off) | 4733 §2.5.1.3 | `dtmf_sender.rs` / `io_thread.rs:404-408` |
 | 20 | ACK-to-2xx not retransmitted when the 200 is retransmitted — ✅ fixed (0642c3be) | 6026 §2 | `call_agent.rs:1122-1137` |
 
 ## P3 — hardening
@@ -72,4 +72,4 @@ wave 2 = b79893b0.
 3. ✅ **Registration robustness (#5, #11)** and **NAT (#6)** — small, high value.
 4. ✅ **RTP DTX timestamp + marker (#8, #9)** — small fixes in io_thread/rtp_handler.
 5. ✅ **RFC 3263 DNS (#4)** — resolved via `uc-dns` (NAPTR/SRV, `resolver` feature).
-6. Remaining P2s opportunistically (#12 Min-SE, #14 481 replies, #19 DTMF interleave remain open); P3s done or documented above.
+6. ✅ All findings are now fixed or accepted as documented limitations (SRTP ROC across DTLS rekey, early-media start, ICE trickling).
