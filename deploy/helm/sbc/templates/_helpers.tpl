@@ -60,6 +60,15 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: provision
 {{- end }}
 
+{{/* Selector labels for the sbc-client-config-server pod. Soft-client
+     discovery + provisioning (docs/CLIENT-PROVISIONING-OIDC.md); stateless,
+     rolls independently of SIP — clients re-fetch config on their TTL. */}}
+{{- define "sbc.clientConfigSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "sbc.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: client-config
+{{- end }}
+
 {{- define "sbc.serviceAccountName" -}}
 {{ include "sbc.fullname" . }}
 {{- end }}
