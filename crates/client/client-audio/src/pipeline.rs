@@ -76,7 +76,11 @@ pub struct AudioProcessingConfig {
 }
 
 /// RTP transport behavior toggles.
-#[derive(Debug, Clone)]
+///
+/// Both toggles default off (the derived `Default`): in-band DTMF interleave
+/// and RFC 4961 source filtering are opt-in deployment hardening, not safe
+/// defaults against commercial carriers.
+#[derive(Debug, Clone, Default)]
 pub struct RtpTransportConfig {
     /// Interleave in-band DTMF tone audio alongside RFC 4733
     /// telephone-event packets (RFC 4733 §2.5.1.3), for peers that ignore
@@ -86,17 +90,13 @@ pub struct RtpTransportConfig {
     /// remote (RFC 4961 symmetric RTP hardening). A conservative
     /// symmetric-NAT latching exception applies: before any packet from the
     /// negotiated remote arrives, a source with the same IP but a different
-    /// port is latched onto. Default `true`.
+    /// port is latched onto.
+    ///
+    /// Default `false`: carriers commonly send media from a different IP than
+    /// the SDP c-line (media-server farms), which this filter would drop.
+    /// Enable only in controlled/enterprise deployments where the media
+    /// source address is guaranteed to match the SDP.
     pub source_filter: bool,
-}
-
-impl Default for RtpTransportConfig {
-    fn default() -> Self {
-        Self {
-            dtmf_inband_interleave: false,
-            source_filter: true,
-        }
-    }
 }
 
 impl AudioProcessingConfig {

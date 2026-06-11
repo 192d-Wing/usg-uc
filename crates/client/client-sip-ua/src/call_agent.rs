@@ -3209,13 +3209,16 @@ impl CallAgent {
     /// RFC 3581 `received`/`rport` when known, otherwise the locally
     /// discovered interface address.
     async fn effective_local_addr(&self, destination: SocketAddr) -> SipUaResult<SocketAddr> {
-        if let Some(public) = self.public_addr {
-            debug!(
-                public = %public,
-                "Using NAT public address from RFC 3581 received/rport for advertised headers"
-            );
-            return Ok(public);
-        }
+        // RFC 3581: a UAC honors rport simply by sending `;rport` in its Via —
+        // the server then routes responses to the source address it actually
+        // received from, independent of our advertised sent-by. We therefore
+        // do NOT rewrite our Via/Contact to the NAT-learned public address:
+        // doing so disturbed carrier media latching (the SDP advertises the
+        // interface address and the carrier latches onto our RTP source; a
+        // mismatched signaling address broke inbound RTP). `public_addr` is
+        // still learned (see update_public_addr_from_via) for diagnostics and
+        // potential future Contact use, but is not applied here.
+        let _ = self.public_addr;
         Self::get_local_addr_for_destination(destination, self.local_addr).await
     }
 
@@ -4750,19 +4753,26 @@ mod tests {
         agent.handle_response(&ok, &call_id).await.unwrap();
         while rx.try_recv().is_ok() {}
 
+        // received/rport is learned for diagnostics...
         assert_eq!(
             agent.public_addr,
             Some("203.0.113.5:12345".parse().unwrap()),
-            "received/rport must be stored as the effective public address"
+            "received/rport must be learned and stored"
         );
 
-        // The next built request (BYE) advertises the public address
+        // ...but NOT rewritten into call-path Via/Contact: doing so disturbs
+        // carrier media latching. The UAC honors rport by sending `;rport`;
+        // the server routes responses to the received source regardless.
         agent.hangup(&call_id).await.unwrap();
         let bye = sent_request(rx.recv().await.unwrap());
         let bye_via = bye.headers.get_value(&HeaderName::Via).unwrap();
         assert!(
-            bye_via.contains("203.0.113.5:12345"),
-            "BYE Via must carry the RFC 3581 public address, was: {bye_via}"
+            !bye_via.contains("203.0.113.5:12345"),
+            "BYE Via must NOT be rewritten to the NAT public address, was: {bye_via}"
+        );
+        assert!(
+            bye_via.contains(";rport"),
+            "BYE Via must still request rport, was: {bye_via}"
         );
     }
 

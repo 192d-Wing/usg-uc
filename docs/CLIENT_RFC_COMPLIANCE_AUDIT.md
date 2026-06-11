@@ -24,7 +24,7 @@ wave 2 = b79893b0.
 | 3 | **No retransmission absorption** (dup 180s reprocessed; no merged-request detection) — ✅ fixed (0642c3be) | 3261 §17.1.2.2 | `proto-transaction/client.rs` | UDP retransmits double-drive the call state machine; forking proxies stall it |
 | 4 | **RFC 3263 ignored**: A/AAAA lookup only, no NAPTR/SRV, hardcoded 5060/5061 — ✅ fixed (b79893b0) | 3263 | `call_agent.rs:2397-2453` | Carriers using SRV load-balancing are misrouted; SRV-only domains fail outright |
 | 5 | **423 Interval-Too-Brief not handled** (Min-Expires ignored, no retry) — ✅ fixed (909890cf) | 3261 §10.2.8 | `registration.rs:424-435` | Registrar demanding longer expiry locks the client out until app restart |
-| 6 | **rport/received not honored** on responses (sent, never parsed) — ✅ fixed (b79893b0) | 3581 | `call_agent.rs` (Via construction sites) | Behind NAT, advertised addresses go stale; responses/requests misroute after address change |
+| 6 | **rport/received** (sent, never parsed) — ✅ learned (b79893b0); **address-rewrite reverted** after live testing — see note below | 3581 | `call_agent.rs` | A UAC honors rport by *sending* `;rport`; the server routes responses to the received source regardless. Rewriting our own Via/Contact to the NAT-learned public address broke carrier media latching (caused total audio loss against BulkVS) and is not required — `public_addr` is now learned for diagnostics only |
 | 7 | To-tag captured from 183 but **not from 180** — ✅ fixed (b79893b0) | 3261 §12.1 | `call_agent.rs:772-775, 1040-1042` | 180-then-487 race ACKs with the wrong tag → 481, dialog lingers ~32s |
 | 8 | **No audio timestamp advance during DTX** suppression — ✅ fixed (56000e43) | 3550 §5.1 | `io_thread.rs:673-678` | Speech resumption looks like timestamp rollback; strict jitter buffers/SBCs drop or stall — audible |
 | 9 | **Marker bit never set** on talkspurt start (audio) — ✅ fixed (56000e43) | 3550 §4.4 | `rtp_handler.rs:408-415` | Remote playout-delay reset heuristics misfire after silence |
@@ -49,7 +49,7 @@ wave 2 = b79893b0.
 
 - ✅ fixed (56000e43) — No RTCP BYE on session end (3550 §6.6).
 - 📋 documented limitation — SRTP ROC not preserved across DTLS renegotiation (3711 §3.2.1); replay window resets on renegotiation. Accepted until DTLS rekey support is revisited.
-- ✅ fixed (56000e43) — Symmetric RTP source filtering (4961).
+- ✅ implemented (56000e43) — Symmetric RTP source filtering (4961), **default OFF**: carriers commonly source media from a different IP than the SDP c-line, so this is opt-in deployment hardening, not a safe default.
 - ✅ fixed (b79893b0) — To-tag no longer silently mutable across 1xx responses; differing tag on a later 1xx is warned and ignored, only a 2xx finalizes a different tag (3261 §12.1.2).
 - 📋 documented limitation — Early media on 183+SDP not started until 200 (3960); deliberate functional choice (no audio before answer).
 - ✅ fixed (b79893b0) — 491 glare to a re-INVITE is ACKed and retried once after a 2–4 s backoff (3261 §14.1).
