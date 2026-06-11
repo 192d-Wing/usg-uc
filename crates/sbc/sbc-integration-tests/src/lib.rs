@@ -42,3 +42,6 @@ mod cluster_tests;
 
 #[cfg(all(test, feature = "grpc"))]
 mod grpc_tests;
+
+#[cfg(all(test, feature = "grpc"))]
+mod grpc_pod_tests;
