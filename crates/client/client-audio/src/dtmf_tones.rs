@@ -65,7 +65,11 @@ impl DtmfToneGenerator {
             high_freq,
             low_phase: 0.0,
             high_phase: 0.0,
-            amplitude: 0.5, // 50% amplitude for each tone to prevent clipping
+            // Per-tone amplitude. Combined peak ≈ 0.4 FS ≈ -8 dBFS, matching
+            // the level carriers deliver DTMF at (measured ~0.27-0.44 FS from
+            // BulkVS). 0.5 each peaked near full scale — ~9 dB louder than
+            // the surrounding leaked in-band tone, heard as a re-attack.
+            amplitude: 0.2,
         }
     }
 
