@@ -34,10 +34,30 @@ struct SipClientApp: App {
     }
 }
 
-/// Tab container plus the call overlay and the error banner, all beneath the
-/// classification banner strip (which nothing may cover).
+/// The app's tabs, shown in the custom bottom tab bar.
+enum AppTab: String, CaseIterable {
+    case dialpad = "Dialpad"
+    case contacts = "Contacts"
+    case recents = "Recents"
+    case settings = "Settings"
+
+    var icon: String {
+        switch self {
+        case .dialpad: return "circle.grid.3x3.fill"
+        case .contacts: return "person.2.fill"
+        case .recents: return "clock.fill"
+        case .settings: return "gearshape.fill"
+        }
+    }
+}
+
+/// Tab content plus the bottom tab bar, the call overlay, and the error
+/// banner, all sandwiched between the classification banner strips (DoD
+/// convention: banner top AND bottom — nothing may cover either strip).
+/// The call overlay may cover the content area and the tab bar.
 struct RootView: View {
     @EnvironmentObject var model: AppModel
+    @State private var selectedTab: AppTab = .dialpad
 
     var body: some View {
         VStack(spacing: 0) {
@@ -46,15 +66,11 @@ struct RootView: View {
             Divider()
 
             ZStack {
-                TabView {
-                    DialpadView()
-                        .tabItem { Label("Dialpad", systemImage: "circle.grid.3x3.fill") }
-                    ContactsView()
-                        .tabItem { Label("Contacts", systemImage: "person.2.fill") }
-                    RecentsView()
-                        .tabItem { Label("Recents", systemImage: "clock.fill") }
-                    SettingsView()
-                        .tabItem { Label("Settings", systemImage: "gearshape.fill") }
+                VStack(spacing: 0) {
+                    tabContent
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    Divider()
+                    TabBarView(selection: $selectedTab)
                 }
 
                 if model.hasCallUi {
@@ -64,8 +80,20 @@ struct RootView: View {
             }
             .animation(.easeInOut(duration: 0.2), value: model.hasCallUi)
             .overlay(alignment: .top) { errorBanner }
+
+            ClassificationBannerView(banner: model.classificationBanner)
         }
         .onAppear { model.start() }
+    }
+
+    @ViewBuilder
+    private var tabContent: some View {
+        switch selectedTab {
+        case .dialpad: DialpadView()
+        case .contacts: ContactsView()
+        case .recents: RecentsView()
+        case .settings: SettingsView()
+        }
     }
 
     @ViewBuilder
@@ -94,8 +122,50 @@ struct RootView: View {
     }
 }
 
+/// Custom bottom navigation bar: a row of equal-size square buttons, one per
+/// tab — icon above a small caption label. Sits directly above the bottom
+/// classification strip.
+struct TabBarView: View {
+    @Binding var selection: AppTab
+
+    var body: some View {
+        HStack(spacing: 12) {
+            ForEach(AppTab.allCases, id: \.self) { tab in
+                tabButton(tab)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 6)
+        .background(.bar)
+    }
+
+    private func tabButton(_ tab: AppTab) -> some View {
+        let selected = selection == tab
+        return Button {
+            selection = tab
+        } label: {
+            VStack(spacing: 4) {
+                Image(systemName: tab.icon)
+                    .font(.system(size: 20))
+                Text(tab.rawValue)
+                    .font(.system(size: 10, weight: .medium))
+            }
+            .frame(width: 60, height: 60)
+            .foregroundColor(selected ? .accentColor : .secondary)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(selected ? Color.accentColor.opacity(0.15) : Color.clear)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(tab.rawValue)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
 /// DoD-standard classification banner: a full-width strip pinned to the very
-/// top of the window, above all tabs and the call overlay.
+/// top and bottom of the window, above/below all tabs and the call overlay.
 struct ClassificationBannerView: View {
     /// `nil` until the core loads; fail safe to the CUI marking meanwhile.
     let banner: ClassificationBanner?
