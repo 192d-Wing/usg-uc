@@ -32,6 +32,8 @@
 # silently drop the FIPS posture. Same applies to ci/image (FIPS builds
 # need the Go toolchain on glibc).
 # =============================================================================
+# NOTE: bookworm (glibc) is intentional — aws-lc-fips-sys does NOT support musl.
+# Do NOT change to Alpine; see comment above and docs/CNSA-2-COMPLIANCE.md.
 FROM rust:1-bookworm AS chef
 
 # Install build dependencies (Go required for aws-lc-fips-sys)
