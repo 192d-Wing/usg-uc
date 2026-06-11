@@ -9,7 +9,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.CallMade
 import androidx.compose.material.icons.automirrored.filled.CallMissed
@@ -63,7 +63,10 @@ fun RecentsScreen(model: AppViewModel) {
             }
         } else {
             LazyColumn(Modifier.fillMaxSize()) {
-                items(recents, key = { it.id }) { entry ->
+                // Key on index too: call-history entries can share an id
+                // (the same call logged more than once), and LazyColumn
+                // throws on duplicate keys.
+                itemsIndexed(recents, key = { index, entry -> "$index:${entry.id}" }) { _, entry ->
                     RecentRow(entry) { model.call(entry.remoteUri) }
                     Divider()
                 }
