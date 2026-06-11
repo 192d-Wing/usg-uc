@@ -32,7 +32,7 @@
 # silently drop the FIPS posture. Same applies to ci/image (FIPS builds
 # need the Go toolchain on glibc).
 # =============================================================================
-FROM rust:1-trixie AS chef
+FROM rust:1-bookworm AS chef
 
 # Install build dependencies (Go required for aws-lc-fips-sys)
 RUN apt-get update && apt-get install -y --no-install-recommends \
