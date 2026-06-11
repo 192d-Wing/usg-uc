@@ -41,12 +41,26 @@ device and Apple code-signing.
 - [ ] **App distribution** — TestFlight / MDM; NIAP/STIG evaluation tracked
   under `stigs/`.
 
+## Android on-device
+
+The Android client (PR #18) builds, registers, and places connected calls in
+the emulator with the Oboe backend; far-end playback is audibly confirmed. The
+emulator can't validate capture (no host mic) or background/incoming-call
+behavior.
+
+- [ ] **On-device audio validation** — bidirectional audio through the Oboe
+  duplex backend on a physical device: capture (the emulator only ever fed it
+  silence — `max_amp=0`), route changes, Bluetooth, `AcousticEchoCanceler`
+  (Android's AEC is a separate AudioEffect, not wired — software AEC is on).
+- [ ] **ConnectionService (self-managed)** — system call integration + a
+  foreground service (`microphone`/`phoneCall` type) during active calls.
+- [ ] **FCM high-priority push** — wake the app for incoming INVITEs in the
+  background. Shares the server-side push gateway with iOS PushKit (see above).
+- [ ] **Android KeyStore `CertProvider`** — hardware-backed keys / derived
+  credentials, replacing the DEBUG dev-seed + encrypted-file store.
+
 ## Other native clients
 
-- [ ] **Android client** — Oboe/AAudio backend into the existing
-  `create_capture`/`create_playback` factory (same seam iOS uses), Kotlin/
-  Compose UI reusing the FFI, `AudioManager` `MODE_IN_COMMUNICATION`,
-  ConnectionService + FCM wake-up, Android KeyStore `CertProvider`.
 - [ ] **Windows-native client** — `uniffi-bindgen-cs` C# bindings + WinUI 3.
   Lightest lift: CPAL/WASAPI audio and the Windows cert store are reused
   unchanged, so it's mostly UI. Retire or Linux-ify the Tauri client once it

@@ -203,6 +203,39 @@ impl CaptureSource for crate::ios_vpio::IosVpioCapture {
     }
 }
 
+#[cfg(target_os = "android")]
+impl CaptureSource for crate::android_oboe::OboeCapture {
+    fn read(&mut self, buf: &mut [i16]) -> usize {
+        Self::read(self, buf)
+    }
+
+    fn available(&self) -> usize {
+        Self::available(self)
+    }
+
+    fn sample_rate(&self) -> u32 {
+        Self::sample_rate(self)
+    }
+
+    fn is_running(&self) -> bool {
+        Self::is_running(self)
+    }
+
+    fn has_error(&self) -> bool {
+        Self::has_error(self)
+    }
+
+    fn stop(&self) {
+        Self::stop(self);
+    }
+
+    fn is_vpio(&self) -> bool {
+        // Oboe performs no AEC; Android's AcousticEchoCanceler is a separate
+        // AudioEffect not wired here, so the pipeline keeps software AEC on.
+        false
+    }
+}
+
 /// Creates the platform capture backend for the current target.
 ///
 /// On iOS this returns the [`crate::ios_vpio`] duplex VPIO capture source
@@ -217,10 +250,22 @@ pub fn create_capture(_device_manager: &DeviceManager) -> AudioResult<Box<dyn Ca
 
 /// Creates the platform capture backend for the current target.
 ///
+/// On Android this returns the [`crate::android_oboe`] duplex Oboe capture
+/// source (software AEC kept active by the pipeline). The DSP core and
+/// I/O/decode threads are unaffected.
+#[cfg(target_os = "android")]
+pub fn create_capture(_device_manager: &DeviceManager) -> AudioResult<Box<dyn CaptureSource>> {
+    // Device selection is handled by the platform AudioManager routing; the
+    // Rust side uses the shared duplex Oboe unit.
+    Ok(Box::new(crate::android_oboe::create_android_capture()?))
+}
+
+/// Creates the platform capture backend for the current target.
+///
 /// On macOS and other desktop targets this wraps [`CaptureBackend::new`]
 /// (CPAL, with macOS VPIO selection kept inside it). The DSP core and
 /// I/O/decode threads are unaffected.
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub fn create_capture(device_manager: &DeviceManager) -> AudioResult<Box<dyn CaptureSource>> {
     Ok(Box::new(CaptureBackend::new(device_manager)?))
 }
@@ -240,9 +285,21 @@ pub fn create_playback(_device_manager: &DeviceManager) -> AudioResult<Box<dyn P
 
 /// Creates the platform playback backend for the current target.
 ///
+/// On Android this returns the [`crate::android_oboe`] duplex Oboe playback
+/// sink, which shares its paired streams with capture. The DSP core and
+/// I/O/decode threads are unaffected.
+#[cfg(target_os = "android")]
+pub fn create_playback(_device_manager: &DeviceManager) -> AudioResult<Box<dyn PlaybackSink>> {
+    // Device selection is handled by the platform AudioManager routing; the
+    // Rust side uses the shared duplex Oboe unit.
+    Ok(Box::new(crate::android_oboe::create_android_playback()?))
+}
+
+/// Creates the platform playback backend for the current target.
+///
 /// On macOS and other desktop targets this wraps [`PlaybackStream::new`]
 /// (CPAL). The DSP core and I/O/decode threads are unaffected.
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub fn create_playback(device_manager: &DeviceManager) -> AudioResult<Box<dyn PlaybackSink>> {
     Ok(Box::new(PlaybackStream::new(device_manager)?))
 }

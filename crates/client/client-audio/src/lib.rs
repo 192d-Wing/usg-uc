@@ -67,6 +67,8 @@
 #![cfg_attr(test, allow(clippy::panic))]
 
 pub mod aec;
+#[cfg(target_os = "android")]
+pub mod android_oboe;
 pub mod audio_processing;
 pub mod backend;
 pub mod codec;

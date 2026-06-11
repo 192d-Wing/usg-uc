@@ -18,6 +18,8 @@
 
 uniffi::setup_scaffolding!();
 
+#[cfg(target_os = "android")]
+mod android;
 mod client;
 mod types;
 
