@@ -137,7 +137,9 @@ impl AnnouncementServiceImpl {
             let span = u32::from(max - min) + 1;
             let mut last_err = String::new();
             for _ in 0..16 {
-                let port = min + (rand::random::<u32>() % span) as u16;
+                #[allow(clippy::cast_possible_truncation)]
+                let offset = (rand::random::<u32>() % span) as u16;
+                let port = min.saturating_add(offset).min(max);
                 match Engine::bind_socket(port, self.config.bind_ip).await {
                     Ok(ok) => return Ok(ok),
                     Err(e) => last_err = e,

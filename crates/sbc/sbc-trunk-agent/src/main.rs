@@ -181,6 +181,7 @@ async fn reconcile_trunks(
 /// trunk, mirroring the daemon's `start_trunk_services` field handling.
 /// Unlike the daemon there is no zone registry here: bind and Contact IPs
 /// come from the agent's env (`SBC_TRUNK_BIND_IP`, `SBC_SIP_CONTACT_IP`).
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 async fn start_trunk_services(
     config: &Config,
     monitor: &TrunkMonitor,
@@ -265,6 +266,7 @@ async fn start_trunk_services(
 }
 
 /// Builds the publish request from current monitor/registrar snapshots.
+#[allow(clippy::cast_possible_wrap)]
 async fn build_snapshot(
     config: &Config,
     monitor: &TrunkMonitor,
@@ -342,6 +344,7 @@ impl Health for AlwaysServing {
 }
 
 #[tokio::main(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn main() -> ExitCode {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,sbc_trunk_agent=debug"));
