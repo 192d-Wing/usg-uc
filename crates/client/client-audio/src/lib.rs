@@ -78,6 +78,8 @@ pub mod dtmf_sender;
 pub mod dtmf_tones;
 pub mod file_source;
 pub mod io_thread;
+#[cfg(target_os = "ios")]
+pub mod ios_vpio;
 pub mod jitter_buffer;
 pub mod noise_shaper;
 pub mod pipeline;
