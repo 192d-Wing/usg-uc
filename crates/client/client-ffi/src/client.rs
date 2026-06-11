@@ -5,7 +5,10 @@
 //! Native shells get *push* delivery: register an [`EventListener`] and events
 //! arrive on a runtime thread; there is no foreign-side polling.
 
-use crate::types::{AppEvent, AudioDevice, CallInfo, ClientError, RegistrationState};
+use crate::types::{
+    AppEvent, AudioDevice, AudioSettings, CallHistoryEntry, CallInfo, ClientError, Contact,
+    PhoneNumber, RegistrationState, SipAccountConfig,
+};
 use client_core::{ClientApp, StoragePaths, run_udp_receive_loop_async};
 use client_types::DtmfDigit;
 use std::net::SocketAddr;
@@ -325,6 +328,228 @@ impl SipClient {
             .block_on(async move { app.lock().await.switch_output_device(device_name) })?)
     }
 
+    /// Returns all contacts, sorted alphabetically by display name.
+    pub fn list_contacts(&self) -> Vec<Contact> {
+        let app = Arc::clone(&self.app);
+        self.runtime.block_on(async move {
+            let contacts = Arc::clone(app.lock().await.contacts());
+            let guard = contacts.read().await;
+            guard
+                .contacts_sorted()
+                .into_iter()
+                .cloned()
+                .map(Into::into)
+                .collect()
+        })
+    }
+
+    /// Creates a contact with a generated ID and persists it. Returns the
+    /// stored contact (pass its `id` to `update_contact`/`remove_contact`).
+    pub fn add_contact(
+        &self,
+        name: String,
+        sip_uri: String,
+        phone_numbers: Vec<PhoneNumber>,
+    ) -> Result<Contact, ClientError> {
+        let app = Arc::clone(&self.app);
+        self.runtime.block_on(async move {
+            let contacts = Arc::clone(app.lock().await.contacts());
+            let mut guard = contacts.write().await;
+            let contact = client_core::create_contact(
+                name,
+                sip_uri,
+                phone_numbers.into_iter().map(Into::into).collect(),
+            );
+            guard.set_contact(contact.clone());
+            guard.save_if_dirty()?;
+            Ok(contact.into())
+        })
+    }
+
+    /// Replaces an existing contact (matched by `contact.id`) and persists.
+    pub fn update_contact(&self, contact: Contact) -> Result<(), ClientError> {
+        if contact.id.is_empty() {
+            return Err(ClientError::InvalidArgument {
+                message: "contact id must not be empty".to_string(),
+            });
+        }
+        let app = Arc::clone(&self.app);
+        self.runtime.block_on(async move {
+            let contacts = Arc::clone(app.lock().await.contacts());
+            let mut guard = contacts.write().await;
+            if guard.get_contact(&contact.id).is_none() {
+                return Err(ClientError::InvalidArgument {
+                    message: format!("no contact with id {:?}", contact.id),
+                });
+            }
+            guard.set_contact(contact.into());
+            guard.save_if_dirty()?;
+            Ok(())
+        })
+    }
+
+    /// Removes a contact by ID and persists.
+    pub fn remove_contact(&self, contact_id: String) -> Result<(), ClientError> {
+        let app = Arc::clone(&self.app);
+        self.runtime.block_on(async move {
+            let contacts = Arc::clone(app.lock().await.contacts());
+            let mut guard = contacts.write().await;
+            if guard.remove_contact(&contact_id).is_none() {
+                return Err(ClientError::InvalidArgument {
+                    message: format!("no contact with id {contact_id:?}"),
+                });
+            }
+            guard.save_if_dirty()?;
+            Ok(())
+        })
+    }
+
+    /// Returns the most recent call history entries (most recent first),
+    /// capped at `limit`.
+    pub fn call_history(&self, limit: u32) -> Vec<CallHistoryEntry> {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let app = Arc::clone(&self.app);
+        self.runtime.block_on(async move {
+            let contacts = Arc::clone(app.lock().await.contacts());
+            let guard = contacts.read().await;
+            guard
+                .recent_calls(limit)
+                .iter()
+                .cloned()
+                .map(Into::into)
+                .collect()
+        })
+    }
+
+    /// Clears all call history and persists.
+    pub fn clear_call_history(&self) -> Result<(), ClientError> {
+        let app = Arc::clone(&self.app);
+        self.runtime.block_on(async move {
+            let contacts = Arc::clone(app.lock().await.contacts());
+            let mut guard = contacts.write().await;
+            guard.clear_call_history();
+            guard.save_if_dirty()?;
+            Ok(())
+        })
+    }
+
+    /// Returns the default SIP account configuration, if one is set.
+    pub fn get_account(&self) -> Option<SipAccountConfig> {
+        let app = Arc::clone(&self.app);
+        self.runtime.block_on(async move {
+            app.lock()
+                .await
+                .settings()
+                .default_account()
+                .map(Into::into)
+        })
+    }
+
+    /// Stores the account, makes it the default account, and persists
+    /// settings. Fields not in the mirror (outbound proxy, STUN/TURN,
+    /// certificate selection) of a pre-existing account are preserved.
+    ///
+    /// `digest_password`, when provided non-empty and the crate is built with
+    /// the `digest-auth` feature, is written to secure credential storage and
+    /// paired with `account.digest_username`; when omitted, a previously
+    /// stored password is kept. Without the feature both digest fields are
+    /// ignored. Re-registering after a change (`register`) is the caller's
+    /// responsibility.
+    pub fn update_account(
+        &self,
+        account: SipAccountConfig,
+        digest_password: Option<String>,
+    ) -> Result<(), ClientError> {
+        if account.id.is_empty() {
+            return Err(ClientError::InvalidArgument {
+                message: "account id must not be empty".to_string(),
+            });
+        }
+        let app = Arc::clone(&self.app);
+        self.runtime.block_on(async move {
+            let mut guard = app.lock().await;
+            let manager = guard.settings_mut();
+
+            let mut core = manager
+                .get_account(&account.id)
+                .cloned()
+                .unwrap_or_default();
+            account.apply_to(&mut core);
+
+            #[cfg(feature = "digest-auth")]
+            apply_digest_credentials(manager, &account, digest_password.as_deref(), &mut core)?;
+            #[cfg(not(feature = "digest-auth"))]
+            let _ = digest_password; // ignored without the digest-auth feature
+
+            manager.set_account(core);
+            manager.set_default_account(Some(account.id.clone()));
+            manager.save()?;
+            Ok(())
+        })
+    }
+
+    /// Returns the persisted audio preferences.
+    pub fn get_audio_settings(&self) -> AudioSettings {
+        let app = Arc::clone(&self.app);
+        self.runtime.block_on(async move {
+            AudioSettings::from(&app.lock().await.settings().settings().audio)
+        })
+    }
+
+    /// Updates and persists the audio preferences. Only the mirrored fields
+    /// change; other stored audio options keep their values. Does not affect
+    /// a live call — use `switch_input_device`/`switch_output_device` for that.
+    pub fn update_audio_settings(&self, settings: AudioSettings) -> Result<(), ClientError> {
+        let app = Arc::clone(&self.app);
+        self.runtime.block_on(async move {
+            let mut guard = app.lock().await;
+            let manager = guard.settings_mut();
+            let audio = &mut manager.settings_mut().audio;
+            audio.input_device = settings.input_device;
+            audio.output_device = settings.output_device;
+            audio.preferred_codec = settings.preferred_codec.into();
+            manager.save()?;
+            Ok(())
+        })
+    }
+
+    /// Persists any unsaved settings and contacts changes.
+    pub fn save_settings(&self) -> Result<(), ClientError> {
+        let app = Arc::clone(&self.app);
+        self.runtime.block_on(async move {
+            let mut guard = app.lock().await;
+            guard.settings_mut().save_if_dirty()?;
+            let contacts = Arc::clone(guard.contacts());
+            drop(guard);
+            contacts.write().await.save_if_dirty()?;
+            Ok(())
+        })
+    }
+
+    /// Registers the default account with its registrar. Fails if no account
+    /// is configured (`update_account` first).
+    pub fn register(&self) -> Result<(), ClientError> {
+        let app = Arc::clone(&self.app);
+        self.runtime.block_on(async move {
+            let mut guard = app.lock().await;
+            let account = guard.settings().default_account().cloned().ok_or_else(|| {
+                ClientError::InvalidArgument {
+                    message: "no account configured; call update_account first".to_string(),
+                }
+            })?;
+            guard.register_account(&account).await?;
+            Ok(())
+        })
+    }
+
+    /// Unregisters the currently registered account (REGISTER expires=0).
+    pub fn unregister(&self) -> Result<(), ClientError> {
+        let app = Arc::clone(&self.app);
+        Ok(self
+            .runtime
+            .block_on(async move { app.lock().await.unregister().await })?)
+    }
+
     /// Shuts down: hangs up calls, unregisters, persists state, and stops all
     /// background tasks. The client cannot be reused afterwards.
     pub fn shutdown(&self) -> Result<(), ClientError> {
@@ -349,6 +574,49 @@ impl SipClient {
         }
         Ok(())
     }
+}
+
+/// Builds and stores digest credentials for [`SipClient::update_account`].
+///
+/// A new (non-empty) password is persisted to secure credential storage via
+/// [`client_core::SettingsManager::store_digest_password`]; with no new
+/// password the previously loaded one is kept. A missing or empty
+/// `digest_username` clears the credentials.
+#[cfg(feature = "digest-auth")]
+fn apply_digest_credentials(
+    manager: &mut client_core::SettingsManager,
+    account: &SipAccountConfig,
+    digest_password: Option<&str>,
+    core: &mut client_types::SipAccount,
+) -> Result<(), ClientError> {
+    use client_types::DigestAuthCredentials;
+
+    let Some(username) = account.digest_username.as_deref().filter(|u| !u.is_empty()) else {
+        core.digest_credentials = None;
+        return Ok(());
+    };
+
+    let previous = core.digest_credentials.take();
+    let credentials = if let Some(password) = digest_password.filter(|p| !p.is_empty()) {
+        let persisted = manager
+            .store_digest_password(&core.id, password)
+            .map_err(ClientError::from)?;
+        if persisted {
+            DigestAuthCredentials::with_persisted(username, password)
+        } else {
+            DigestAuthCredentials::new(username, password)
+        }
+    } else if let Some(previous) = previous {
+        // Keep the already-loaded password; only the username may change.
+        DigestAuthCredentials {
+            username: username.to_string(),
+            ..previous
+        }
+    } else {
+        DigestAuthCredentials::new(username, String::new())
+    };
+    core.digest_credentials = Some(credentials);
+    Ok(())
 }
 
 /// Initializes Rust-side logging to stderr. Call once, before constructing

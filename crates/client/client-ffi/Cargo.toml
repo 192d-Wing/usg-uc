@@ -17,6 +17,10 @@ name = "uniffi-bindgen"
 path = "src/bin/uniffi_bindgen.rs"
 required-features = ["bindgen"]
 
+[[example]]
+name = "register_smoke"
+required-features = ["digest-auth"]
+
 [features]
 default = []
 # Enables the bundled `uniffi-bindgen` CLI used to generate Swift/Kotlin sources.
@@ -33,6 +37,9 @@ tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
 
 [lints]
 workspace = true

@@ -25,6 +25,7 @@ pub use client::{
     ClientConfig, EventListener, SipClient, init_logging, list_input_devices, list_output_devices,
 };
 pub use types::{
-    AppEvent, AudioDevice, AudioDeviceCategory, AudioDeviceKind, CallDirection, CallInfo,
-    CallState, ClientError, PinOperation, RegistrationState,
+    AppEvent, AudioDevice, AudioDeviceCategory, AudioDeviceKind, AudioSettings, CallDirection,
+    CallEndReason, CallHistoryEntry, CallInfo, CallState, ClientError, CodecKind, Contact,
+    PhoneNumber, PhoneNumberKind, PinOperation, RegistrationState, SipAccountConfig, TransportKind,
 };
