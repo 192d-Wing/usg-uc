@@ -43,8 +43,8 @@ env:
 
 jobs:
   build:
-    name: ${{ matrix.image }} (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.image.name }} (${{ matrix.platform.arch }})
+    runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
       matrix:
