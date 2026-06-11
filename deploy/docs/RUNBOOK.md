@@ -42,7 +42,7 @@ This runbook provides operational procedures for the USG UC Session Border Contr
 
 ```bash
 # Build
-docker build -t sbc-daemon:latest .
+docker build -t usg-sbc-daemon:latest .
 
 # Run (development)
 docker run -d \
@@ -52,7 +52,7 @@ docker run -d \
   -p 5061:5061/tcp \
   -p 8080:8080/tcp \
   -v ./config.toml:/etc/sbc/config.toml:ro \
-  sbc-daemon:latest
+  usg-sbc-daemon:latest
 
 # Run (with TLS certificates)
 docker run -d \
@@ -64,7 +64,7 @@ docker run -d \
   -p 8443:8443/tcp \
   -v ./config.toml:/etc/sbc/config.toml:ro \
   -v ./certs:/etc/sbc/certs:ro \
-  sbc-daemon:latest
+  usg-sbc-daemon:latest
 ```
 
 ### Kubernetes (Raw Manifests)

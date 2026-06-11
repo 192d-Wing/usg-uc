@@ -156,13 +156,13 @@ The image is built locally and imported into microk8s containerd. **Known issue*
 
 ```bash
 cd /path/to/usg-uc
-sudo podman build --network=host -t localhost/sbc-daemon:local -f Dockerfile .
+sudo podman build --network=host -t localhost/usg-sbc-daemon:local -f Dockerfile .
 
 # Import into microk8s containerd, tag for kubelet's bare-name lookup
-sudo podman save --quiet localhost/sbc-daemon:local | \
+sudo podman save --quiet localhost/usg-sbc-daemon:local | \
   sudo microk8s ctr image import -
 sudo microk8s ctr image tag --force \
-  localhost/sbc-daemon:local docker.io/library/sbc-daemon:local
+  localhost/usg-sbc-daemon:local docker.io/library/usg-sbc-daemon:local
 ```
 
 For 184 sites: build once on a build host, push the OCI tarball to each site's microk8s ctr.

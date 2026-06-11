@@ -6,20 +6,23 @@
 # binary so the dependency-cooking layer is much smaller.
 #
 # Build (from repo root):
-#   docker build -t sbc-api-server:local -f crates/sbc/sbc-api-server/Dockerfile .
+#   docker build -t usg-sbc-api-server:local -f crates/sbc/sbc-api-server/Dockerfile .
 
 # =============================================================================
 # Stage 1: Rust toolchain + build-deps + cargo-chef.
 # =============================================================================
-FROM rust:1-bookworm AS chef
+FROM rust:1-alpine AS chef
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# build-base = gcc/make/musl-dev (native build deps); cmake + perl for
+# aws-lc-sys; protobuf for the daemon gRPC client (tonic/prost codegen).
+# No openssl: the binary is rustls-only.
+RUN apk add --no-cache \
+    build-base \
     cmake \
-    pkg-config \
-    libssl-dev \
-    protobuf-compiler \
-    libprotobuf-dev \
-    && rm -rf /var/lib/apt/lists/*
+    perl \
+    pkgconfig \
+    protobuf \
+    protobuf-dev
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -62,19 +65,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/sbc-api-server /tmp/sbc-api-server
 
 # =============================================================================
-# Stage 4: Runtime — debian-slim with the bare libs the binary needs.
+# Stage 4: Runtime — alpine with the bare libs the binary needs.
 # =============================================================================
-FROM debian:bookworm-slim AS runtime
+FROM alpine:3.21 AS runtime
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    libssl3 \
-    libcap2-bin \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
-
-RUN groupadd --gid 1000 sbc \
-    && useradd --uid 1000 --gid sbc --shell /bin/bash --create-home sbc
+RUN apk add --no-cache ca-certificates libcap \
+    && addgroup -g 1000 sbc \
+    && adduser -D -u 1000 -G sbc -s /bin/sh sbc
 
 COPY --from=builder /tmp/sbc-api-server /usr/local/bin/sbc-api-server
 

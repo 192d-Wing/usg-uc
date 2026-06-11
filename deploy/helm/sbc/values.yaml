@@ -56,7 +56,7 @@ externalDns:
 # default repo containerd applies on `ctr image import` of an unprefixed
 # tag, so this is also what `microk8s ctr` already stores under.
 image:
-  repository: localhost/sbc-daemon
+  repository: localhost/usg-sbc-daemon
   tag: local
   pullPolicy: Never
 
@@ -68,7 +68,7 @@ sbcFrontend:
   enabled: true
   replicas: 2                            # rolling update is meaningful at >1
   image:
-    repository: localhost/sbc-frontend
+    repository: localhost/usg-sbc-frontend
     tag: local
     pullPolicy: Never
   resources:
@@ -150,7 +150,7 @@ sbcApi:
   enabled: true
   replicas: 2                            # rolling update needs >1
   image:
-    repository: localhost/sbc-api-server
+    repository: localhost/usg-sbc-api-server
     tag: local
     pullPolicy: Never
   resources:
@@ -166,7 +166,7 @@ sbcProvision:
   enabled: true
   replicas: 2
   image:
-    repository: localhost/sbc-provision-server
+    repository: localhost/usg-sbc-provision-server
     tag: local
     pullPolicy: Never
   resources:
@@ -179,6 +179,50 @@ sbcProvision:
   # (rely on the NetworkPolicy / LB source ranges only).
   allowedSourceCidrs: []
     # - "10.0.100.0/24"
+
+# sbc-client-config-server — soft-client discovery + provisioning pod
+# (docs/CLIENT-PROVISIONING-OIDC.md). Serves the unauthenticated
+# /.well-known/sip-client-config discovery document and the OIDC
+# bearer-token-authorized /v1/client-config endpoint (DN, SIP URI,
+# POP-scoped registrar domain). Stateless — no database; user identity
+# comes from validated token claims. Disabled by default: it needs an
+# OIDC issuer (Keycloak realm) to be useful.
+sbcClientConfig:
+  enabled: false
+  replicas: 2
+  image:
+    repository: localhost/usg-sbc-client-config-server
+    tag: local
+    pullPolicy: Never
+  resources:
+    requests: { cpu: "20m",  memory: "32Mi"  }
+    limits:   { cpu: "200m", memory: "128Mi" }
+  # Shown by soft clients on the sign-in page.
+  serviceName: "USG UC"
+  # POP identity returned in the discovery document, e.g. "us-east-1".
+  popId: ""
+  # Externally visible HTTPS base URL of this POP; becomes
+  # provisioning.config_endpoint in the discovery document.
+  # e.g. "https://us-east-1.pop.example.mil"
+  publicUrl: ""
+  oidc:
+    # Keycloak realm issuer, e.g. "https://idp.example.mil/realms/voice".
+    issuer: ""
+    # Public PKCE client the soft client uses in the browser flow.
+    clientId: "usg-uc-softclient"
+    # aud tokens must carry to fetch /v1/client-config.
+    audience: "usg-uc-provisioning"
+  # SIP domain of user AORs. Empty = site.fqdn_base.
+  sipDomain: ""
+  # POP-scoped registrar domain clients resolve via NAPTR/SRV (RFC 3263).
+  # Empty = "sbc.<site.fqdn_base>".
+  registrarDomain: ""
+  regExpiresSecs: 300
+  ttlSecs: 3600
+  # Optional extras (empty = omitted from responses).
+  voicemailUri: ""
+  minVersionDesktop: ""
+  minVersionAndroid: ""
 
 sbcDaemon:
   replicas: 1

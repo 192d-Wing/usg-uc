@@ -73,6 +73,7 @@ members = [
     "crates/sbc/sbc-daemon",
     "crates/sbc/sbc-api-server",
     "crates/sbc/sbc-provision-server",
+    "crates/sbc/sbc-client-config-server",
     "crates/sbc/sbc-cli",
     "crates/sbc/sbc-integration-tests",
 
@@ -153,6 +154,10 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 tokio-rustls = "0.26"
 rustls-pki-types = { version = "1.14", features = ["std"] }
 rustls-native-certs = "0.8"
+
+# OIDC bearer-token validation (sbc-client-config-server). aws_lc_rs
+# backend = same FIPS crypto module the TLS stack links.
+jsonwebtoken = { version = "10.4", features = ["aws_lc_rs"] }
 
 # Internal crates - Foundation (uc-* = reusable UC infrastructure)
 uc-types = { path = "crates/uc/uc-types" }

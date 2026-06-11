@@ -1,0 +1,120 @@
+{{- if .Values.sbcClientConfig.enabled }}
+# sbc-client-config-server — soft-client discovery + provisioning pod.
+#
+# Owns `/.well-known/sip-client-config` (unauthenticated discovery
+# document pointing soft clients at the IdP) and `/v1/client-config`
+# (per-user SIP configuration, authorized by an OIDC bearer token
+# validated against the IdP's JWKS). Stateless — identity comes from
+# token claims, policy from env — so it scales horizontally and rolls
+# independently of the daemon. Design: docs/CLIENT-PROVISIONING-OIDC.md.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sbc.fullname" . }}-client-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: client-config
+spec:
+  replicas: {{ .Values.sbcClientConfig.replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "sbc.clientConfigSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sbc.clientConfigSelectorLabels" . | nindent 8 }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: sbc-client-config
+          image: "{{ .Values.sbcClientConfig.image.repository }}:{{ .Values.sbcClientConfig.image.tag }}"
+          imagePullPolicy: {{ .Values.sbcClientConfig.image.pullPolicy }}
+          env:
+            - name: SBC_CLIENT_CONFIG_LISTEN_ADDR
+              value: "0.0.0.0:80"
+            - name: SBC_CLIENT_CONFIG_SERVICE_NAME
+              value: {{ .Values.sbcClientConfig.serviceName | quote }}
+            # POP identity — which site this discovery endpoint speaks for.
+            - name: SBC_CLIENT_CONFIG_POP_ID
+              value: {{ required "sbcClientConfig.popId is required" .Values.sbcClientConfig.popId | quote }}
+            # Externally visible base URL; becomes provisioning.config_endpoint
+            # in the discovery document (the anycast→unicast handoff).
+            - name: SBC_CLIENT_CONFIG_PUBLIC_URL
+              value: {{ required "sbcClientConfig.publicUrl is required" .Values.sbcClientConfig.publicUrl | quote }}
+            # OIDC trust anchors. Tokens must carry iss=issuer + aud=audience;
+            # JWKS is fetched from the issuer's metadata.
+            - name: SBC_CLIENT_CONFIG_OIDC_ISSUER
+              value: {{ required "sbcClientConfig.oidc.issuer is required" .Values.sbcClientConfig.oidc.issuer | quote }}
+            - name: SBC_CLIENT_CONFIG_OIDC_CLIENT_ID
+              value: {{ .Values.sbcClientConfig.oidc.clientId | quote }}
+            - name: SBC_CLIENT_CONFIG_OIDC_AUDIENCE
+              value: {{ .Values.sbcClientConfig.oidc.audience | quote }}
+            # SIP identity policy handed to clients.
+            - name: SBC_CLIENT_CONFIG_SIP_DOMAIN
+              value: {{ .Values.sbcClientConfig.sipDomain | default .Values.site.fqdn_base | quote }}
+            # POP-scoped registrar domain clients resolve via NAPTR/SRV
+            # (RFC 3263). Defaults to the SBC's own FQDN.
+            - name: SBC_CLIENT_CONFIG_REGISTRAR_DOMAIN
+              value: {{ .Values.sbcClientConfig.registrarDomain | default (printf "sbc.%s" .Values.site.fqdn_base) | quote }}
+            - name: SBC_CLIENT_CONFIG_REG_EXPIRES_SECS
+              value: {{ .Values.sbcClientConfig.regExpiresSecs | quote }}
+            - name: SBC_CLIENT_CONFIG_TTL_SECS
+              value: {{ .Values.sbcClientConfig.ttlSecs | quote }}
+            {{- with .Values.sbcClientConfig.voicemailUri }}
+            - name: SBC_CLIENT_CONFIG_VOICEMAIL_URI
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.sbcClientConfig.minVersionDesktop }}
+            - name: SBC_CLIENT_CONFIG_MIN_VERSION_DESKTOP
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.sbcClientConfig.minVersionAndroid }}
+            - name: SBC_CLIENT_CONFIG_MIN_VERSION_ANDROID
+              value: {{ . | quote }}
+            {{- end }}
+          ports:
+            - { name: http, containerPort: 80, protocol: TCP }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          # Readiness requires the IdP's JWKS to have been fetched — a pod
+          # that can't validate tokens shouldn't take traffic.
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.sbcClientConfig.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              add: [NET_BIND_SERVICE]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sbc.fullname" . }}-client-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: client-config
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "sbc.clientConfigSelectorLabels" . | nindent 4 }}
+  ports:
+    - { name: http, port: 80, targetPort: http, protocol: TCP }
+{{- end }}

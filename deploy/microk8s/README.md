@@ -62,13 +62,13 @@ XML at `http://<sbc-inside>/provision/<MAC>.xml`
 
 ## SBC image — required before applying `sbc-daemonset.yaml`
 
-The SBC daemonset references `image: sbc-daemon:local` with
+The SBC daemonset references `image: usg-sbc-daemon:local` with
 `imagePullPolicy: Never`. Microk8s containerd must already have this image.
 Build externally (Linux box with docker + Rust + Node), then import:
 
 ```sh
 # On a build host:
-docker build -t sbc-daemon:local .
+docker build -t usg-sbc-daemon:local .
 docker save sbc-daemon:local -o sbc-daemon.tar
 
 # Copy sbc-daemon.tar to the microk8s host, then:

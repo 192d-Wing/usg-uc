@@ -95,7 +95,7 @@ spec:
           # NOTE: image must be present in microk8s containerd.
           # Build externally and import with:
           #   microk8s ctr image import sbc-daemon.tar
-          image: sbc-daemon:local
+          image: usg-sbc-daemon:local
           imagePullPolicy: Never
           args: ["-c", "/etc/sbc/config.toml"]
           securityContext:
