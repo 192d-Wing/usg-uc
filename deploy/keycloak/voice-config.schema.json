@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "voice-config.schema.json",
+  "title": "USG-UC Keycloak voice configuration",
+  "description": "Parameters for Configure-Voice.ps1. Deliberately contains NO credentials — auth is supplied via flags or env vars (KC_ADMIN_TOKEN, KC_SA_CLIENT_ID/_SECRET, KC_ADMIN_USER/_PASSWORD) so this file is safe to commit.",
+  "type": "object",
+  "required": ["keycloak", "voice"],
+  "additionalProperties": false,
+  "properties": {
+    "keycloak": {
+      "type": "object",
+      "required": ["url", "realm"],
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "type": "string",
+          "pattern": "^https?://",
+          "description": "Base URL of the Keycloak instance, e.g. https://icam.oopl.dev.mil (http only for local dev)"
+        },
+        "realm": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Target realm to configure. Must already exist."
+        },
+        "authRealm": {
+          "type": "string",
+          "default": "master",
+          "description": "Realm the admin credential lives in (master for the global admin; the target realm for a realm-local admin)"
+        }
+      }
+    },
+    "voice": {
+      "type": "object",
+      "required": ["sipDomain"],
+      "additionalProperties": false,
+      "properties": {
+        "sipDomain": {
+          "type": "string",
+          "minLength": 1,
+          "description": "SIP domain of user AORs; emitted as the hardcoded sip_domain claim, e.g. example.mil"
+        },
+        "softClientId": {
+          "type": "string",
+          "default": "usg-uc-softclient",
+          "description": "Client id of the public PKCE client the soft client uses for browser sign-in"
+        },
+        "provisioningClientId": {
+          "type": "string",
+          "default": "usg-uc-provisioning",
+          "description": "Bearer-only client acting as the token audience for sbc-client-config-server"
+        },
+        "redirectUris": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "default": ["http://127.0.0.1/*"],
+          "description": "Allowed redirect URIs: desktop loopback (RFC 8252 §7.3) and/or Android claimed App Link"
+        },
+        "enableDeviceFlow": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the Device Authorization Grant on the soft client so Get-TestToken.ps1 can mint test tokens"
+        }
+      }
+    },
+    "testUser": {
+      "type": "object",
+      "required": ["username", "dn"],
+      "additionalProperties": false,
+      "description": "Optional test account, created/updated with the sipDn attribute. Omit the whole section in production realms.",
+      "properties": {
+        "username": { "type": "string", "minLength": 1 },
+        "dn": {
+          "type": "string",
+          "pattern": "^[0-9*#+]+$",
+          "description": "Directory number stored in the sipDn user attribute"
+        },
+        "password": {
+          "type": "string",
+          "description": "Test-only credential, set via reset-password. Never put a production credential here; prefer the -TestUserPassword flag or TEST_USER_PASSWORD env var to keep it out of the file."
+        }
+      }
+    }
+  }
+}
