@@ -246,8 +246,12 @@ final class AppModel: ObservableObject, @unchecked Sendable {
         case let .registrationStateChanged(_, state):
             registration = state
             registrationText = Self.describe(state)
-        case let .callStateChanged(_, _, info):
-            if info.state == .terminated {
+        case let .callStateChanged(_, state, info):
+            // Use the event's authoritative `state`, NOT `info.state`: the
+            // core emits the termination event with a CallInfo snapshot still
+            // marked Connected, so keying off info.state leaves the call on
+            // screen after a remote BYE.
+            if state == .terminated {
                 if activeCall?.id == info.id { activeCall = nil }
             } else {
                 activeCall = info
@@ -257,7 +261,7 @@ final class AppModel: ObservableObject, @unchecked Sendable {
             // Once an inbound call leaves ringing (we answered it), the
             // incoming banner is obsolete.
             if let ringing = incomingCall, ringing.id == info.id,
-                info.state != .ringing
+                state != .ringing
             {
                 incomingCall = nil
             }

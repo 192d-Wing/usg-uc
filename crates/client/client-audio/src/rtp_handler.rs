@@ -203,6 +203,9 @@ pub struct RtpTransmitter {
     /// stream has been silent (muted/DTX) — otherwise the marker timestamp
     /// would be "stale" and the remote end's jitter buffer might drop it.
     last_send_time: Instant,
+    /// Set while transmission is suppressed (DTX silence). The next audio
+    /// packet starts a new talkspurt and carries the marker bit (RFC 3550 §4.4).
+    talkspurt_pending: bool,
 }
 
 impl RtpTransmitter {
@@ -240,7 +243,21 @@ impl RtpTransmitter {
             cached_ext_header: None,
             header_size: RTP_HEADER_SIZE,
             last_send_time: Instant::now(),
+            talkspurt_pending: false,
         }
+    }
+
+    /// Advances the RTP timestamp for one DTX-suppressed frame (RFC 3550 §5.1).
+    ///
+    /// The timestamp must reflect wall-clock samples elapsed even when no
+    /// packet is transmitted, so that speech resumption after silence
+    /// suppression does not look like a timestamp rollback to strict jitter
+    /// buffers/SBCs. Also arms the talkspurt marker bit for the next audio
+    /// packet (RFC 3550 §4.4).
+    pub fn skip_frame(&mut self) {
+        self.timestamp
+            .fetch_add(self.timestamp_increment, Ordering::Relaxed);
+        self.talkspurt_pending = true;
     }
 
     /// Enables RFC 2198 redundancy (sends previous frame alongside current).
@@ -405,7 +422,7 @@ impl RtpTransmitter {
         }
 
         // Build RTP header, attaching extension if negotiated.
-        let header = {
+        let mut header = {
             let h = RtpHeader::new(effective_pt, seq, ts, self.ssrc);
             if let Some(ref ext) = self.cached_ext_header {
                 h.with_extension(ext.clone())
@@ -413,6 +430,12 @@ impl RtpTransmitter {
                 h
             }
         };
+        // First audio packet of a talkspurt after DTX silence carries the
+        // marker bit (RFC 3550 §4.4) so remote playout-delay heuristics can
+        // reset cleanly.
+        if std::mem::take(&mut self.talkspurt_pending) {
+            header.marker = true;
+        }
 
         let protected: Bytes;
         let send_data: &[u8] = if let Some(ref srtp) = self.srtp {
@@ -473,6 +496,10 @@ impl RtpTransmitter {
         let ts = self
             .timestamp
             .fetch_add(self.timestamp_increment, Ordering::Relaxed);
+
+        // The CN packet starts a silence period — the next audio packet
+        // begins a new talkspurt and must carry the marker bit (RFC 3550 §4.4).
+        self.talkspurt_pending = true;
 
         let header = RtpHeader::new(proto_rtp::payload_types::CN, seq, ts, self.ssrc);
 
@@ -616,11 +643,21 @@ impl RtpTransmitter {
 /// Receives RTP packets from a `std::net::UdpSocket` (blocking with
 /// `recv_timeout`), decrypts via SRTP if configured, and pushes into
 /// a `SharedJitterBuffer` for consumption by the decode thread.
+// Independent feature/state flags, not a state machine.
+#[allow(clippy::struct_excessive_bools)]
 pub struct RtpReceiver {
     /// UDP socket for receiving.
     socket: Arc<UdpSocket>,
     /// Expected remote address (for filtering).
     expected_remote: Option<SocketAddr>,
+    /// Whether to drop RTP from source addresses other than the negotiated
+    /// remote (RFC 4961 symmetric RTP hardening). Default: enabled.
+    filter_source: bool,
+    /// Whether any packet has been received from the negotiated remote yet.
+    /// Until then, a same-IP/different-port source may be latched (symmetric-NAT).
+    seen_expected_source: bool,
+    /// One-time warning flag for dropped packets from unexpected sources.
+    warned_unexpected_source: bool,
     /// SRTP context for decryption (no Mutex needed — interior mutability).
     srtp: Option<SrtpContext>,
     /// Shared jitter buffer (also read by decode thread).
@@ -695,6 +732,9 @@ impl RtpReceiver {
         Self {
             socket,
             expected_remote: None,
+            filter_source: true,
+            seen_expected_source: false,
+            warned_unexpected_source: false,
             srtp: None,
             jitter_buffer,
             stats: Arc::new(AtomicRtpStats::new()),
@@ -725,6 +765,63 @@ impl RtpReceiver {
     /// Sets the expected remote address for packet filtering.
     pub const fn set_expected_remote(&mut self, addr: SocketAddr) {
         self.expected_remote = Some(addr);
+    }
+
+    /// Enables or disables source-address filtering (RFC 4961).
+    ///
+    /// When enabled (default), RTP from a source address other than the
+    /// negotiated remote is dropped, with a one-time warning on first drop.
+    /// One conservative exception is made for symmetric-NAT latching: if no
+    /// packet has been received from the negotiated remote yet and the new
+    /// source has the *same IP* but a different port, the receiver latches
+    /// onto the new source address (the remote is behind a NAT that
+    /// rewrites the port). Sources with a different IP are always dropped.
+    pub const fn set_source_filter(&mut self, enabled: bool) {
+        self.filter_source = enabled;
+    }
+
+    /// Decides whether a packet from `addr` should be accepted, applying
+    /// the RFC 4961 source filter and symmetric-NAT latching rules.
+    ///
+    /// Returns `true` to accept the packet. May update `expected_remote`
+    /// (latching) and internal one-time-warning state.
+    fn accept_source(&mut self, addr: SocketAddr) -> bool {
+        let Some(expected) = self.expected_remote else {
+            return true; // No negotiated remote — accept everything.
+        };
+
+        if addr == expected {
+            self.seen_expected_source = true;
+            return true;
+        }
+
+        if !self.filter_source {
+            return true;
+        }
+
+        // Symmetric-NAT latching: the negotiated remote has not sent yet
+        // and this source matches its IP (port rewritten by NAT). Latch on.
+        if !self.seen_expected_source && addr.ip() == expected.ip() {
+            warn!(
+                "Symmetric RTP latch: negotiated remote {} silent, \
+                 latching onto source {} (same IP, NAT port rewrite)",
+                expected, addr
+            );
+            self.expected_remote = Some(addr);
+            self.seen_expected_source = true;
+            return true;
+        }
+
+        if !self.warned_unexpected_source {
+            self.warned_unexpected_source = true;
+            warn!(
+                "Dropping RTP from unexpected source {} (negotiated remote {}); \
+                 further drops logged at trace level (RFC 4961 source filter)",
+                addr, expected
+            );
+        }
+        trace!("Ignoring packet from unexpected address: {addr}");
+        false
     }
 
     /// Sets the SRTP context for decryption.
@@ -777,11 +874,8 @@ impl RtpReceiver {
 
         match result {
             Ok((len, addr)) => {
-                // Check if from expected remote
-                if let Some(expected) = self.expected_remote
-                    && addr != expected
-                {
-                    trace!("Ignoring packet from unexpected address: {addr}");
+                // RFC 4961 source filter (with symmetric-NAT latching)
+                if !self.accept_source(addr) {
                     return Ok(false);
                 }
 
@@ -1464,6 +1558,138 @@ mod tests {
         assert_eq!(tx.ssrc(), 0xAAAA);
         tx.change_ssrc(0xBBBB);
         assert_eq!(tx.ssrc(), 0xBBBB);
+    }
+
+    // ── DTX timestamp advance + talkspurt marker (RFC 3550 §5.1/§4.4) ──
+
+    /// Receives one packet from `socket` and returns (marker, seq, ts).
+    fn recv_marker_seq_ts(socket: &UdpSocket) -> (bool, u16, u32) {
+        let mut buf = [0u8; MAX_RTP_PACKET_SIZE];
+        let (len, _) = socket.recv_from(&mut buf).unwrap();
+        let marker = (buf[1] & 0x80) != 0;
+        let (_, seq, ts, _, _, _) = parse_rtp_fields(&buf[..len]).unwrap();
+        (marker, seq, ts)
+    }
+
+    #[test]
+    fn test_dtx_skip_frame_advances_timestamp() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_addr = socket.local_addr().unwrap();
+        let socket = Arc::new(socket);
+        let mut tx = RtpTransmitter::new(socket.clone(), local_addr, 0x1111, 0, 160);
+
+        let frame = [0u8; 160];
+        tx.send(&frame).unwrap();
+        let (_, seq1, ts1) = recv_marker_seq_ts(&socket);
+
+        // Three DTX-suppressed frames: no packets, but timestamp advances.
+        tx.skip_frame();
+        tx.skip_frame();
+        tx.skip_frame();
+
+        tx.send(&frame).unwrap();
+        let (_, seq2, ts2) = recv_marker_seq_ts(&socket);
+
+        // Timestamp covers all 4 frame periods (1 sent + 3 suppressed).
+        assert_eq!(ts2.wrapping_sub(ts1), 4 * 160);
+        // Sequence number only advances for transmitted packets (RFC 3550 §5.1).
+        assert_eq!(seq2.wrapping_sub(seq1), 1);
+    }
+
+    #[test]
+    fn test_marker_set_on_talkspurt_resume() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_addr = socket.local_addr().unwrap();
+        let socket = Arc::new(socket);
+        let mut tx = RtpTransmitter::new(socket.clone(), local_addr, 0x2222, 0, 160);
+
+        let frame = [0u8; 160];
+        // Steady-state speech: no marker.
+        tx.send(&frame).unwrap();
+        let (m1, _, _) = recv_marker_seq_ts(&socket);
+        assert!(!m1, "steady-state packet must not carry marker");
+
+        // DTX silence, then resume: first packet of new talkspurt has marker.
+        tx.skip_frame();
+        tx.send(&frame).unwrap();
+        let (m2, _, _) = recv_marker_seq_ts(&socket);
+        assert!(m2, "first packet after DTX must carry marker");
+
+        // Marker is one-shot: next packet is unmarked again.
+        tx.send(&frame).unwrap();
+        let (m3, _, _) = recv_marker_seq_ts(&socket);
+        assert!(!m3, "marker must clear after talkspurt start");
+    }
+
+    #[test]
+    fn test_marker_after_cn_packet() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_addr = socket.local_addr().unwrap();
+        let socket = Arc::new(socket);
+        let mut tx = RtpTransmitter::new(socket.clone(), local_addr, 0x3333, 0, 160);
+
+        let frame = [0u8; 160];
+        tx.send(&frame).unwrap();
+        let _ = recv_marker_seq_ts(&socket);
+
+        // Speech→silence transition: CN packet, then resumed speech.
+        tx.send_cn(&[40]).unwrap();
+        let _ = recv_marker_seq_ts(&socket); // CN packet itself
+        tx.send(&frame).unwrap();
+        let (marker, _, _) = recv_marker_seq_ts(&socket);
+        assert!(marker, "first audio packet after CN must carry marker");
+    }
+
+    // ── RFC 4961 source-address filtering ───────────────────────
+
+    #[test]
+    fn test_source_filter_drops_unexpected_ip() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let jb = SharedJitterBuffer::new(8000, 160, 60);
+        let mut rx = RtpReceiver::new(Arc::new(socket), jb);
+
+        let expected: SocketAddr = "192.0.2.10:5000".parse().unwrap();
+        rx.set_expected_remote(expected);
+
+        // Negotiated source accepted
+        assert!(rx.accept_source(expected));
+        // Different IP dropped (even before latching window: IP must match)
+        assert!(!rx.accept_source("198.51.100.7:5000".parse().unwrap()));
+        // Different port after expected source seen: dropped
+        assert!(!rx.accept_source("192.0.2.10:6000".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_source_filter_symmetric_nat_latch() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let jb = SharedJitterBuffer::new(8000, 160, 60);
+        let mut rx = RtpReceiver::new(Arc::new(socket), jb);
+
+        rx.set_expected_remote("192.0.2.10:5000".parse().unwrap());
+
+        // No packet from the negotiated remote yet — same IP, different
+        // port latches (NAT port rewrite).
+        let latched: SocketAddr = "192.0.2.10:31337".parse().unwrap();
+        assert!(rx.accept_source(latched));
+        assert_eq!(rx.expected_remote, Some(latched));
+
+        // After latching, the *original* negotiated port is now unexpected.
+        assert!(!rx.accept_source("192.0.2.10:5000".parse().unwrap()));
+        // Different IP never accepted.
+        assert!(!rx.accept_source("198.51.100.7:31337".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_source_filter_disabled_accepts_all() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let jb = SharedJitterBuffer::new(8000, 160, 60);
+        let mut rx = RtpReceiver::new(Arc::new(socket), jb);
+
+        rx.set_expected_remote("192.0.2.10:5000".parse().unwrap());
+        rx.set_source_filter(false);
+
+        assert!(rx.accept_source("198.51.100.7:5000".parse().unwrap()));
+        assert!(rx.accept_source("203.0.113.99:1234".parse().unwrap()));
     }
 
     // ── RTP header extension tests ──────────────────────────────

@@ -1080,6 +1080,9 @@ impl ClientApp {
             self.handle_call_event(event).await?;
         }
 
+        // Drive call-agent timers (491 glare re-INVITE retry, RFC 3261 §14.1)
+        self.call_manager.process_timers().await?;
+
         // Check for expiring registrations and trigger refresh
         self.registration_agent
             .check_expiring()

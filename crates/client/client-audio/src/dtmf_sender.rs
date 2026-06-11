@@ -64,6 +64,10 @@ pub struct DtmfSender {
     codec_samples_per_frame: usize,
     /// Pre-allocated buffer for tone generation (avoids per-packet allocation).
     tone_buffer: Vec<i16>,
+    /// RFC 4733 §2.5.1.3: also interleave in-band DTMF tone audio alongside
+    /// telephone-event packets, for peers that ignore telephone-event.
+    /// Default OFF (events only, mic suppressed during the tone).
+    inband_interleave: bool,
 }
 
 /// State for the digit currently being transmitted.
@@ -110,7 +114,17 @@ impl DtmfSender {
             codec_clock_rate,
             codec_samples_per_frame,
             tone_buffer: Vec::new(),
+            inband_interleave: false,
         }
+    }
+
+    /// Enables/disables in-band tone interleaving for RFC 4733 digits.
+    ///
+    /// When enabled, an in-band DTMF tone audio frame is sent alongside each
+    /// telephone-event packet so event-blind peers still hear the digit.
+    /// Default is disabled (telephone-event only, matching pjproject).
+    pub const fn set_inband_interleave(&mut self, enabled: bool) {
+        self.inband_interleave = enabled;
     }
 
     /// Enqueues a DTMF digit. Returns `false` if the queue is full.
@@ -217,8 +231,9 @@ impl DtmfSender {
         );
 
         let total_duration_ts = DtmfEvent::duration_from_ms(cmd.duration_ms);
-        // Only create tone generator for inband-only mode
-        let tone_gen = if cmd.use_rfc2833 {
+        // Tone generator is needed for inband-only mode, and for RFC 4733
+        // mode when in-band interleaving is enabled (RFC 4733 §2.5.1.3).
+        let tone_gen = if cmd.use_rfc2833 && !self.inband_interleave {
             None
         } else {
             Some(DtmfToneGenerator::new(cmd.digit, self.codec_clock_rate))
@@ -253,7 +268,13 @@ impl DtmfSender {
         if !digit.marker_sent || digit.last_packet_time.elapsed() >= PACKET_INTERVAL {
             if digit.cmd.use_rfc2833 {
                 self.send_rfc4733_packet(transmitter);
-                return None; // RFC 4733 only — no inband audio
+                // Optional RFC 4733 §2.5.1.3 interleave: also return one
+                // in-band tone frame per event packet for event-blind peers.
+                // Skip if the event just finished (phase moved to EndPackets).
+                if self.inband_interleave && self.phase == DtmfPhase::Sending {
+                    return self.generate_tone_frame(codec);
+                }
+                return None; // Default: RFC 4733 only — no inband audio
             }
             return self.send_inband_packet(codec);
         }
@@ -359,9 +380,16 @@ impl DtmfSender {
             // Advance audio timestamp past the DTMF event so the next
             // audio packet resumes at the correct position. Without this,
             // the timestamp would be stale (no send() calls during DTMF).
+            //
+            // With in-band interleaving, each event packet was paired with
+            // an audio `send()` that already advanced the timestamp — only
+            // the unpaired end packets need to be accounted for.
             if digit.cmd.use_rfc2833 {
-                #[allow(clippy::cast_possible_truncation)]
-                let total_frames = digit.packets_sent + END_PACKET_REPEATS;
+                let total_frames = if self.inband_interleave {
+                    END_PACKET_REPEATS
+                } else {
+                    digit.packets_sent + END_PACKET_REPEATS
+                };
                 #[allow(clippy::cast_possible_truncation)]
                 let advance = total_frames * self.codec_samples_per_frame as u32;
                 transmitter.advance_dtmf_timestamp(advance);
@@ -524,5 +552,62 @@ mod tests {
         sender.enqueue(make_cmd(DtmfDigit::Five, 100, false));
         assert_eq!(sender.phase, DtmfPhase::Sending);
         assert!(sender.current.as_ref().unwrap().tone_gen.is_some());
+    }
+
+    #[test]
+    fn test_rfc4733_default_no_inband_interleave() {
+        // Default: RFC 4733 digits do not create a tone generator and
+        // poll() returns no in-band audio frame.
+        use crate::codec::CodecPipeline;
+        use crate::rtp_handler::RtpTransmitter;
+        use client_types::CodecPreference;
+        use std::net::UdpSocket;
+        use std::sync::Arc;
+
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let remote = socket.local_addr().unwrap();
+        let mut tx = RtpTransmitter::new(socket, remote, 0x42, 0, 160);
+        let mut codec = CodecPipeline::new(CodecPreference::G711Ulaw).unwrap();
+
+        let mut sender = DtmfSender::default();
+        sender.enqueue(make_cmd(DtmfDigit::One, 100, true));
+        assert!(sender.current.as_ref().unwrap().tone_gen.is_none());
+
+        let frame = sender.poll(&mut tx, &mut codec);
+        assert!(frame.is_none(), "default RFC4733 mode must not emit audio");
+    }
+
+    #[test]
+    fn test_rfc4733_inband_interleave_emits_tone_frames() {
+        // RFC 4733 §2.5.1.3: with interleave enabled, each event packet is
+        // paired with one in-band tone audio frame.
+        use crate::codec::CodecPipeline;
+        use crate::rtp_handler::RtpTransmitter;
+        use client_types::CodecPreference;
+        use std::net::UdpSocket;
+        use std::sync::Arc;
+
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let remote = socket.local_addr().unwrap();
+        let mut tx = RtpTransmitter::new(socket, remote, 0x43, 0, 160);
+        let mut codec = CodecPipeline::new(CodecPreference::G711Ulaw).unwrap();
+
+        let mut sender = DtmfSender::default();
+        sender.set_inband_interleave(true);
+        sender.enqueue(make_cmd(DtmfDigit::Nine, 100, true));
+        assert!(
+            sender.current.as_ref().unwrap().tone_gen.is_some(),
+            "interleave mode must create a tone generator for RFC4733 digits"
+        );
+
+        let frame = sender.poll(&mut tx, &mut codec);
+        assert!(
+            frame.is_some(),
+            "interleave mode must emit an in-band tone frame"
+        );
+        let frame = frame.unwrap();
+        assert_eq!(frame.len(), 160, "G.711 20ms frame is 160 bytes");
+        // Tone audio must not be all-silence (µ-law silence is 0xFF).
+        assert!(frame.iter().any(|&b| b != 0xFF));
     }
 }

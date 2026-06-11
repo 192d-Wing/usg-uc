@@ -23,10 +23,13 @@ use proto_rtp::{ReceptionReport, RtcpHeader, RtcpType, SenderInfo};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
-/// RTCP send interval (5 seconds per RFC 3550 recommendation).
-const RTCP_INTERVAL: Duration = Duration::from_secs(5);
+/// Base RTCP send interval (5 seconds per RFC 3550 recommendation).
+///
+/// The actual interval is randomized to `5s × uniform[0.5, 1.5]` per
+/// RFC 3550 §6.3.1 to avoid synchronized reports across participants.
+const RTCP_BASE_INTERVAL_SECS: f64 = 5.0;
 
 /// NTP epoch offset: seconds between 1900-01-01 and 1970-01-01.
 const NTP_EPOCH_OFFSET: u64 = 2_208_988_800;
@@ -46,8 +49,6 @@ pub struct RtcpSession {
     remote_ssrc: Option<u32>,
     /// CNAME for SDES (e.g., "user@host").
     cname: String,
-    /// Codec clock rate (for jitter timestamp conversion).
-    clock_rate: u32,
     /// Last time an RTCP packet was sent.
     last_send_time: Instant,
     /// Snapshot of TX stats at the time of last SR.
@@ -66,6 +67,15 @@ pub struct RtcpSession {
     recv_buffer: Vec<u8>,
     /// Latest measured round-trip time in milliseconds (from RR block LSR/DLSR).
     rtt_ms: Option<f32>,
+    /// Current randomized report interval (RFC 3550 §6.3.1).
+    report_interval: Duration,
+    /// LCG state for interval randomization (no external RNG dependency).
+    interval_rng: u32,
+    /// Set when an incoming RTCP packet carries our own SSRC from another
+    /// participant (sender-side collision, RFC 3550 §8.2).
+    ssrc_collision: bool,
+    /// Whether an RTCP BYE has been sent (session ended).
+    bye_sent: bool,
 }
 
 impl RtcpSession {
@@ -75,7 +85,9 @@ impl RtcpSession {
     /// * `socket` - UDP socket (should be bound to RTP port + 1)
     /// * `remote_addr` - Remote RTCP address (remote RTP port + 1)
     /// * `local_ssrc` - Local SSRC (same as RTP stream)
-    /// * `clock_rate` - Codec clock rate (Hz) for jitter conversion
+    /// * `clock_rate` - Codec clock rate (Hz), logged for diagnostics.
+    ///   Jitter arrives from the jitter buffer already in timestamp units
+    ///   (RFC 3550 §A.8), so no conversion happens here.
     /// * `cname` - Canonical name for SDES
     pub fn new(
         socket: Arc<UdpSocket>,
@@ -89,13 +101,20 @@ impl RtcpSession {
             remote_addr, local_ssrc, clock_rate, cname
         );
 
-        Self {
+        // Seed the interval LCG from the SSRC mixed with the current time so
+        // two endpoints sharing an SSRC-derived seed still diverge.
+        let seed = local_ssrc
+            ^ (SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .subsec_nanos());
+
+        let mut session = Self {
             socket,
             remote_addr,
             local_ssrc,
             remote_ssrc: None,
             cname,
-            clock_rate,
             last_send_time: Instant::now(),
             last_sr_tx_stats: RtpStats::default(),
             last_rtp_timestamp: 0,
@@ -105,7 +124,27 @@ impl RtcpSession {
             prev_cumulative_lost: 0,
             recv_buffer: vec![0u8; 512],
             rtt_ms: None,
-        }
+            report_interval: Duration::from_secs_f64(RTCP_BASE_INTERVAL_SECS),
+            interval_rng: seed,
+            ssrc_collision: false,
+            bye_sent: false,
+        };
+        session.report_interval = session.next_report_interval();
+        session
+    }
+
+    /// Computes the next randomized report interval per RFC 3550 §6.3.1:
+    /// `base × uniform[0.5, 1.5]`, using a small LCG (no `rand` dependency).
+    fn next_report_interval(&mut self) -> Duration {
+        // Numerical Recipes LCG constants.
+        self.interval_rng = self
+            .interval_rng
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
+        // Top 24 bits → uniform fraction in [0, 1).
+        let frac = f64::from(self.interval_rng >> 8) / f64::from(1u32 << 24);
+        let factor = 0.5 + frac; // [0.5, 1.5)
+        Duration::from_secs_f64(RTCP_BASE_INTERVAL_SECS * factor)
     }
 
     /// Updates the local SSRC (used after SSRC collision resolution).
@@ -117,14 +156,27 @@ impl RtcpSession {
     /// Checks if it's time to send an RTCP report and sends one if so.
     ///
     /// Call this from the I/O thread on every iteration. It internally
-    /// tracks the 5-second interval.
+    /// tracks the randomized report interval (5s × uniform[0.5, 1.5],
+    /// RFC 3550 §6.3.1).
     pub fn maybe_send_report(&mut self, tx_stats: &RtpStats, jb_stats: &JitterBufferStats) {
-        if self.last_send_time.elapsed() < RTCP_INTERVAL {
+        if self.last_send_time.elapsed() < self.report_interval {
             return;
         }
         self.last_send_time = Instant::now();
+        self.report_interval = self.next_report_interval();
 
         self.send_compound_report(tx_stats, jb_stats);
+    }
+
+    /// Returns `true` if an incoming RTCP packet carried our own SSRC
+    /// (sender-side collision per RFC 3550 §8.2).
+    pub const fn ssrc_collision_detected(&self) -> bool {
+        self.ssrc_collision
+    }
+
+    /// Clears the collision flag after the caller has changed the local SSRC.
+    pub const fn clear_ssrc_collision(&mut self) {
+        self.ssrc_collision = false;
     }
 
     /// Updates the last RTP timestamp (call after each RTP send).
@@ -154,41 +206,65 @@ impl RtcpSession {
     pub fn try_receive(&mut self) {
         let result = self.socket.recv_from(&mut self.recv_buffer);
         match result {
-            Ok((len, _addr)) if len >= 8 => {
-                // Minimal RTCP header check: V=2
-                let version = (self.recv_buffer[0] >> 6) & 0x03;
-                let pt = self.recv_buffer[1];
-                let rc = self.recv_buffer[0] & 0x1F; // report count
-                if version == 2 && pt == 200 && len >= 28 {
-                    // Sender Report: NTP timestamp at bytes 8-15
-                    let ntp_sec = u32::from_be_bytes([
-                        self.recv_buffer[8],
-                        self.recv_buffer[9],
-                        self.recv_buffer[10],
-                        self.recv_buffer[11],
-                    ]);
-                    let ntp_frac = u32::from_be_bytes([
-                        self.recv_buffer[12],
-                        self.recv_buffer[13],
-                        self.recv_buffer[14],
-                        self.recv_buffer[15],
-                    ]);
-                    self.received_sender_report(ntp_sec, ntp_frac);
-                    trace!(
-                        "Received RTCP SR: ntp={}.{}, lsr={:#010x}",
-                        ntp_sec, ntp_frac, self.last_received_sr_ntp
-                    );
-
-                    // Parse RR blocks within the SR (start at byte 28, each 24 bytes)
-                    self.extract_rtt_from_rr_blocks(len, 28, rc);
-                } else if version == 2 && pt == 201 && len >= 8 {
-                    // Receiver Report: RR blocks start at byte 8 (after header + SSRC)
-                    self.extract_rtt_from_rr_blocks(len, 8, rc);
-                }
-            }
+            Ok((len, _addr)) if len >= 8 => self.process_rtcp_packet(len),
             Ok(_) | Err(_) => {
                 // No packet or too short — ignore
             }
+        }
+    }
+
+    /// Processes one incoming RTCP packet from `self.recv_buffer[..len]`.
+    fn process_rtcp_packet(&mut self, len: usize) {
+        // Minimal RTCP header check: V=2
+        let version = (self.recv_buffer[0] >> 6) & 0x03;
+        let pt = self.recv_buffer[1];
+        let rc = self.recv_buffer[0] & 0x1F; // report count
+
+        // Sender-side SSRC collision detection (RFC 3550 §8.2):
+        // SR/RR/SDES/BYE/APP all carry the sender's SSRC in bytes
+        // 4..8. If another participant uses our SSRC, flag it so the
+        // I/O thread regenerates ours.
+        if version == 2 && (200..=204).contains(&pt) {
+            let sender_ssrc = u32::from_be_bytes([
+                self.recv_buffer[4],
+                self.recv_buffer[5],
+                self.recv_buffer[6],
+                self.recv_buffer[7],
+            ]);
+            if sender_ssrc == self.local_ssrc {
+                warn!(
+                    "RTCP SSRC collision: remote participant uses our SSRC {:#010x}",
+                    sender_ssrc
+                );
+                self.ssrc_collision = true;
+            }
+        }
+
+        if version == 2 && pt == 200 && len >= 28 {
+            // Sender Report: NTP timestamp at bytes 8-15
+            let ntp_sec = u32::from_be_bytes([
+                self.recv_buffer[8],
+                self.recv_buffer[9],
+                self.recv_buffer[10],
+                self.recv_buffer[11],
+            ]);
+            let ntp_frac = u32::from_be_bytes([
+                self.recv_buffer[12],
+                self.recv_buffer[13],
+                self.recv_buffer[14],
+                self.recv_buffer[15],
+            ]);
+            self.received_sender_report(ntp_sec, ntp_frac);
+            trace!(
+                "Received RTCP SR: ntp={}.{}, lsr={:#010x}",
+                ntp_sec, ntp_frac, self.last_received_sr_ntp
+            );
+
+            // Parse RR blocks within the SR (start at byte 28, each 24 bytes)
+            self.extract_rtt_from_rr_blocks(len, 28, rc);
+        } else if version == 2 && pt == 201 && len >= 8 {
+            // Receiver Report: RR blocks start at byte 8 (after header + SSRC)
+            self.extract_rtt_from_rr_blocks(len, 8, rc);
         }
     }
 
@@ -286,6 +362,49 @@ impl RtcpSession {
         }
     }
 
+    /// Sends an RTCP BYE on session shutdown (RFC 3550 §6.6).
+    ///
+    /// The BYE is sent as part of a compound packet (SR/RR + SDES + BYE,
+    /// RFC 3550 §6.1) so the remote can distinguish a deliberate hangup
+    /// from a crash/network failure. Idempotent: only the first call sends.
+    pub fn send_bye(&mut self, tx_stats: &RtpStats, jb_stats: &JitterBufferStats) {
+        if self.bye_sent {
+            return;
+        }
+        self.bye_sent = true;
+
+        let mut compound = BytesMut::with_capacity(256);
+
+        if tx_stats.packets_sent > 0 {
+            self.build_sender_report(&mut compound, tx_stats, jb_stats);
+        } else {
+            self.build_receiver_report(&mut compound, jb_stats);
+        }
+        self.build_sdes(&mut compound);
+        self.build_bye(&mut compound);
+
+        match self.socket.send_to(&compound, self.remote_addr) {
+            Ok(sent) => {
+                debug!(
+                    "Sent RTCP BYE compound packet: {} bytes to {}",
+                    sent, self.remote_addr
+                );
+            }
+            Err(e) => {
+                trace!("RTCP BYE send failed: {e}");
+            }
+        }
+    }
+
+    /// Builds a BYE packet (header + our SSRC) into the compound buffer.
+    fn build_bye(&self, buf: &mut BytesMut) {
+        // BYE: 4 (header) + 4 (SSRC) = 8 bytes → length = 1
+        let mut header = RtcpHeader::new(RtcpType::Goodbye, 1); // 1 SSRC
+        header.length = 1;
+        buf.put(header.to_bytes());
+        buf.put_u32(self.local_ssrc);
+    }
+
     /// Builds a Sender Report packet into the compound buffer.
     #[allow(clippy::similar_names)]
     fn build_sender_report(
@@ -365,8 +484,8 @@ impl RtcpSession {
     /// Builds a single reception report block (24 bytes).
     ///
     /// Uses jitter buffer stats for loss/jitter (the authoritative source
-    /// for actual stream loss), and `self.clock_rate` for correct jitter
-    /// timestamp conversion.
+    /// for actual stream loss). Jitter is reported in RTP timestamp units
+    /// per RFC 3550 §A.8.
     fn build_reception_report_block(&mut self, jb_stats: &JitterBufferStats) -> bytes::Bytes {
         let remote_ssrc = self.remote_ssrc.unwrap_or(0);
 
@@ -394,13 +513,10 @@ impl RtcpSession {
         #[allow(clippy::cast_possible_truncation)]
         let extended_highest_seq = (jb_stats.packets_received + jb_stats.packets_lost) as u32;
 
-        // Jitter in timestamp units: ms × (clock_rate / 1000)
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss
-        )]
-        let jitter = (jb_stats.average_jitter_ms * (self.clock_rate as f32 / 1000.0)) as u32;
+        // Interarrival jitter in RTP timestamp units (RFC 3550 §A.8).
+        // The jitter buffer maintains this directly; the ms value in
+        // `average_jitter_ms` is for local stats display only.
+        let jitter = jb_stats.interarrival_jitter;
 
         // DLSR (delay since last SR in 1/65536 seconds)
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -616,7 +732,10 @@ mod tests {
     }
 
     #[test]
-    fn test_jitter_clock_rate_conversion() {
+    fn test_jitter_reported_in_timestamp_units() {
+        // RFC 3550 §A.8: the RR jitter field is in RTP timestamp units,
+        // taken verbatim from the jitter buffer's §A.8 estimator — NOT
+        // converted from milliseconds.
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let socket = Arc::new(socket);
         let remote: SocketAddr = "127.0.0.1:5001".parse().unwrap();
@@ -627,14 +746,154 @@ mod tests {
 
         let jb_stats = JitterBufferStats {
             packets_received: 100,
-            average_jitter_ms: 10.0, // 10ms jitter
+            average_jitter_ms: 10.0,  // local display value (ms)
+            interarrival_jitter: 480, // 10ms × 48 = 480 ts units at 48kHz
             ..JitterBufferStats::default()
         };
 
         let rr_bytes = session.build_reception_report_block(&jb_stats);
         let rr = ReceptionReport::parse(&rr_bytes).unwrap();
 
-        // 10ms × 48 = 480 timestamp units (at 48kHz)
+        // The wire value must be the timestamp-unit estimate, not 10 (ms).
         assert_eq!(rr.jitter, 480);
+    }
+
+    #[test]
+    fn test_report_interval_randomized() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let socket = Arc::new(socket);
+        let remote: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+        let mut session = RtcpSession::new(socket, remote, 12345, 8000, "test@host".to_string());
+
+        // RFC 3550 §6.3.1: every interval must be 5s × uniform[0.5, 1.5].
+        let mut intervals = Vec::with_capacity(64);
+        intervals.push(session.report_interval);
+        for _ in 0..63 {
+            intervals.push(session.next_report_interval());
+        }
+
+        for iv in &intervals {
+            let secs = iv.as_secs_f64();
+            assert!(
+                (2.5..7.5).contains(&secs),
+                "interval {secs}s outside [2.5, 7.5)"
+            );
+        }
+        // The intervals must actually vary (not a fixed 5s).
+        let first = intervals[0];
+        assert!(
+            intervals.iter().any(|iv| *iv != first),
+            "intervals should be randomized, all were {first:?}"
+        );
+    }
+
+    #[test]
+    fn test_rtcp_ssrc_collision_detection() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let socket = Arc::new(socket);
+        let remote: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+        let local_ssrc = 0xDEAD_BEEF;
+        let mut session =
+            RtcpSession::new(socket, remote, local_ssrc, 8000, "test@host".to_string());
+        assert!(!session.ssrc_collision_detected());
+
+        // Craft a minimal RR (PT=201) whose sender SSRC is OUR SSRC.
+        let mut pkt = [0u8; 8];
+        pkt[0] = 0x80; // V=2, RC=0
+        pkt[1] = 201; // RR
+        pkt[2..4].copy_from_slice(&1u16.to_be_bytes()); // length
+        pkt[4..8].copy_from_slice(&local_ssrc.to_be_bytes());
+        session.recv_buffer[..8].copy_from_slice(&pkt);
+        session.process_rtcp_packet(8);
+
+        assert!(session.ssrc_collision_detected());
+        session.clear_ssrc_collision();
+        assert!(!session.ssrc_collision_detected());
+
+        // A packet with a different sender SSRC does NOT flag a collision.
+        session.recv_buffer[4..8].copy_from_slice(&0xCAFE_F00Du32.to_be_bytes());
+        session.process_rtcp_packet(8);
+        assert!(!session.ssrc_collision_detected());
+    }
+
+    #[test]
+    fn test_rtcp_ssrc_collision_on_sdes() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let socket = Arc::new(socket);
+        let remote: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+        let local_ssrc = 0x1234_5678;
+        let mut session =
+            RtcpSession::new(socket, remote, local_ssrc, 8000, "test@host".to_string());
+
+        // SDES (PT=202) chunk with our SSRC.
+        let mut pkt = [0u8; 12];
+        pkt[0] = 0x81; // V=2, SC=1
+        pkt[1] = 202; // SDES
+        pkt[2..4].copy_from_slice(&2u16.to_be_bytes());
+        pkt[4..8].copy_from_slice(&local_ssrc.to_be_bytes());
+        session.recv_buffer[..12].copy_from_slice(&pkt);
+        session.process_rtcp_packet(12);
+
+        assert!(session.ssrc_collision_detected());
+    }
+
+    #[test]
+    fn test_send_bye_compound_contains_bye() {
+        // Receive the BYE compound on a loopback socket and verify it ends
+        // with a Goodbye packet (PT=203) carrying our SSRC.
+        let rx_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx_socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let remote = rx_socket.local_addr().unwrap();
+
+        let tx_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let local_ssrc = 0xABCD_0123;
+        let mut session =
+            RtcpSession::new(tx_socket, remote, local_ssrc, 8000, "test@host".to_string());
+
+        let tx_stats = RtpStats {
+            packets_sent: 50,
+            bytes_sent: 8000,
+            ..RtpStats::default()
+        };
+        let jb_stats = JitterBufferStats::default();
+        session.send_bye(&tx_stats, &jb_stats);
+
+        let mut buf = [0u8; 512];
+        let (len, _) = rx_socket.recv_from(&mut buf).unwrap();
+
+        // Walk the compound packet: each RTCP packet is 4*(length+1) bytes.
+        let mut offset = 0;
+        let mut found_bye = false;
+        let mut first_pt = None;
+        while offset + 4 <= len {
+            let pt = buf[offset + 1];
+            if first_pt.is_none() {
+                first_pt = Some(pt);
+            }
+            let length = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
+            let pkt_len = 4 * (length + 1);
+            if pt == 203 {
+                found_bye = true;
+                // BYE carries our SSRC
+                let ssrc = u32::from_be_bytes([
+                    buf[offset + 4],
+                    buf[offset + 5],
+                    buf[offset + 6],
+                    buf[offset + 7],
+                ]);
+                assert_eq!(ssrc, local_ssrc);
+            }
+            offset += pkt_len;
+        }
+
+        assert_eq!(first_pt, Some(200), "compound must start with SR (sender)");
+        assert!(found_bye, "compound packet must contain a BYE (PT=203)");
+
+        // Idempotent: a second call must not send again.
+        session.send_bye(&tx_stats, &jb_stats);
+        let res = rx_socket.recv_from(&mut buf);
+        assert!(res.is_err(), "second send_bye must not transmit");
     }
 }

@@ -111,6 +111,7 @@ pub use jitter_buffer::{
 };
 pub use pipeline::{
     AudioPipeline, AudioProcessingConfig, PipelineConfig, PipelineState, PipelineStats,
+    RtpTransportConfig,
 };
 pub use plc::PacketLossConcealer;
 pub use ringtone::RingtonePlayer;

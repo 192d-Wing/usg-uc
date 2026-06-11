@@ -21,6 +21,15 @@ use tracing::{debug, error, info, warn};
 /// User agent string for SIP messages.
 const USER_AGENT: &str = "USG-SIP-Client/0.1.0 (CNSA 2.0)";
 
+/// Maximum automatic retries after a 423 Interval Too Brief response (RFC 3261 §10.2.8).
+const MAX_INTERVAL_RETRIES: u32 = 2;
+
+/// Maximum automatic retries scheduled from a 503 Retry-After (RFC 3261 §21.5.2).
+const MAX_SERVICE_RETRIES: u32 = 2;
+
+/// Upper bound on the Retry-After delay we honor, in seconds.
+const MAX_RETRY_AFTER_SECS: u32 = 1800;
+
 /// Resolves the local IP address that would be used to reach a given destination.
 ///
 /// Creates a temporary UDP socket, "connects" it to the destination (no actual traffic),
@@ -70,6 +79,16 @@ struct AccountRegistration {
     server_expires_secs: u32,
     /// Last branch parameter used.
     last_branch: Option<String>,
+    /// Minimum expiry demanded by the registrar via 423 Min-Expires (RFC 3261 §10.2.8).
+    min_expires_override: Option<u32>,
+    /// Number of 423 Interval Too Brief retries in the current registration cycle.
+    interval_retry_count: u32,
+    /// When a scheduled retry (from 503 Retry-After) should fire.
+    retry_at: Option<Instant>,
+    /// Number of 503 Retry-After retries in the current registration cycle.
+    service_retry_count: u32,
+    /// Whether the in-flight REGISTER is an unregistration (Contact: *, Expires: 0).
+    unregistering: bool,
     /// Nonce count for digest auth retries.
     #[cfg(feature = "digest-auth")]
     nonce_count: u32,
@@ -169,6 +188,11 @@ impl RegistrationAgent {
                 expires_at: None,
                 server_expires_secs: 0,
                 last_branch: None,
+                min_expires_override: None,
+                interval_retry_count: 0,
+                retry_at: None,
+                service_retry_count: 0,
+                unregistering: false,
                 #[cfg(feature = "digest-auth")]
                 nonce_count: 0,
                 #[cfg(feature = "digest-auth")]
@@ -178,6 +202,14 @@ impl RegistrationAgent {
         // Update account config
         registration.account = account.clone();
         registration.cseq += 1;
+
+        // Reset retry bookkeeping for a fresh registration cycle.
+        // Note: min_expires_override is intentionally kept so refreshes honor
+        // a previously received Min-Expires (RFC 3261 §10.2.8).
+        registration.interval_retry_count = 0;
+        registration.retry_at = None;
+        registration.service_retry_count = 0;
+        registration.unregistering = false;
 
         // Reset digest auth state for fresh registration attempt
         #[cfg(feature = "digest-auth")]
@@ -245,8 +277,18 @@ impl RegistrationAgent {
 
         registration.cseq += 1;
         registration.state = RegistrationState::Registering;
+        registration.unregistering = true;
+        registration.retry_at = None;
 
-        // Build unregister request (Expires: 0)
+        // Reset digest auth state so a fresh challenge on the unregister
+        // path can be answered (bounded re-auth, same as register()).
+        #[cfg(feature = "digest-auth")]
+        {
+            registration.nonce_count = 0;
+            registration.last_challenge = None;
+        }
+
+        // Build unregister request (Contact: *, Expires: 0)
         let request = Self::build_unregister_request(registration, self.local_addr)?;
         let branch = registration.last_branch.clone().unwrap_or_default();
 
@@ -293,6 +335,21 @@ impl RegistrationAgent {
 
         match status_code {
             200 => {
+                if registration.unregistering {
+                    // Unregistration confirmed - all bindings cleared
+                    registration.unregistering = false;
+                    registration.state = RegistrationState::Unregistered;
+                    registration.expires_at = None;
+                    registration.server_expires_secs = 0;
+                    registration.transaction = None;
+
+                    info!(account_id = %account_id, "Unregistration successful");
+
+                    self.notify_state_change(account_id, RegistrationState::Unregistered)
+                        .await;
+                    return Ok(());
+                }
+
                 // Success - extract expiry from response
                 let expires = Self::extract_expires(response);
                 registration.state = RegistrationState::Registered;
@@ -300,6 +357,9 @@ impl RegistrationAgent {
                     Some(Instant::now() + Duration::from_secs(u64::from(expires)));
                 registration.server_expires_secs = expires;
                 registration.transaction = None;
+                registration.interval_retry_count = 0;
+                registration.service_retry_count = 0;
+                registration.retry_at = None;
 
                 info!(
                     account_id = %account_id,
@@ -422,12 +482,48 @@ impl RegistrationAgent {
                     .await;
             }
             423 => {
-                // Interval too brief - retry with longer expiry
+                // Interval Too Brief - clamp expiry to Min-Expires and retry (RFC 3261 §10.2.8)
+                if !registration.unregistering
+                    && registration.interval_retry_count < MAX_INTERVAL_RETRIES
+                    && let Some(min_expires) = Self::parse_min_expires(response)
+                {
+                    registration.interval_retry_count += 1;
+                    let current = registration.min_expires_override.unwrap_or(0);
+                    registration.min_expires_override = Some(min_expires.max(current));
+                    registration.cseq += 1;
+
+                    warn!(
+                        account_id = %account_id,
+                        min_expires = min_expires,
+                        retry = registration.interval_retry_count,
+                        "423 Interval Too Brief - retrying with Min-Expires"
+                    );
+
+                    match Self::prepare_register_send(registration, self.local_addr).await {
+                        Ok((request, destination)) => {
+                            let _ = self
+                                .event_tx
+                                .send(RegistrationEvent::SendRequest {
+                                    request,
+                                    destination,
+                                })
+                                .await;
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            error!(
+                                account_id = %account_id,
+                                error = %e,
+                                "Failed to rebuild REGISTER after 423"
+                            );
+                        }
+                    }
+                }
+
                 warn!(
                     account_id = %account_id,
-                    "Registration interval too brief, will retry with longer expiry"
+                    "Registration interval too brief and retry not possible"
                 );
-                // Could extract Min-Expires header and retry
                 registration.state = RegistrationState::Failed;
                 registration.transaction = None;
 
@@ -435,6 +531,27 @@ impl RegistrationAgent {
                     .await;
             }
             code if (400..600).contains(&code) => {
+                // 503 with Retry-After: schedule a bounded retry instead of
+                // failing immediately (RFC 3261 §21.5.2)
+                if code == 503
+                    && !registration.unregistering
+                    && registration.service_retry_count < MAX_SERVICE_RETRIES
+                    && let Some(retry_after) = Self::parse_retry_after(response)
+                {
+                    let delay_secs = retry_after.min(MAX_RETRY_AFTER_SECS);
+                    registration.service_retry_count += 1;
+                    registration.retry_at =
+                        Some(Instant::now() + Duration::from_secs(u64::from(delay_secs)));
+                    registration.transaction = None;
+
+                    warn!(
+                        account_id = %account_id,
+                        retry_after_secs = delay_secs,
+                        retry = registration.service_retry_count,
+                        "503 Service Unavailable - retry scheduled per Retry-After"
+                    );
+                    return Ok(());
+                }
                 // Other failure
                 error!(
                     account_id = %account_id,
@@ -461,10 +578,51 @@ impl RegistrationAgent {
     }
 
     /// Checks for registrations that need refresh.
+    ///
+    /// Also fires retries scheduled from 503 Retry-After responses.
     pub async fn check_expiring(&mut self) -> SipUaResult<()> {
         let now = Instant::now();
 
         for (account_id, registration) in &mut self.registrations {
+            // Fire a scheduled retry (e.g. from 503 Retry-After) if due
+            if let Some(retry_at) = registration.retry_at
+                && now >= retry_at
+            {
+                registration.retry_at = None;
+                registration.cseq += 1;
+                registration.state = RegistrationState::Registering;
+
+                info!(account_id = %account_id, "Scheduled registration retry firing");
+
+                match Self::prepare_register_send(registration, self.local_addr).await {
+                    Ok((request, destination)) => {
+                        let _ = self
+                            .event_tx
+                            .send(RegistrationEvent::SendRequest {
+                                request,
+                                destination,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        warn!(
+                            account_id = %account_id,
+                            error = %e,
+                            "Failed to build scheduled registration retry"
+                        );
+                        registration.state = RegistrationState::Failed;
+                        let _ = self
+                            .event_tx
+                            .send(RegistrationEvent::StateChanged {
+                                account_id: account_id.clone(),
+                                state: RegistrationState::Failed,
+                            })
+                            .await;
+                    }
+                }
+                continue;
+            }
+
             if registration.state != RegistrationState::Registered {
                 continue;
             }
@@ -586,6 +744,14 @@ impl RegistrationAgent {
         }
         let contact = NameAddr::new(contact_uri);
 
+        // Honor a Min-Expires demand from a previous 423 response by clamping
+        // our requested expiry up to it (RFC 3261 §10.2.8)
+        let requested_expiry = registration
+            .min_expires_override
+            .map_or(account.register_expiry, |min| {
+                account.register_expiry.max(min)
+            });
+
         // Build request
         let request = RequestBuilder::register(registrar_uri)
             .via(&via)
@@ -595,12 +761,36 @@ impl RegistrationAgent {
             .cseq(registration.cseq)
             .max_forwards(70)
             .contact(&contact)
-            .expires(account.register_expiry)
+            .expires(requested_expiry)
             .user_agent(USER_AGENT)
             .build()
             .map_err(|e| SipUaError::TransactionError(e.to_string()))?;
 
         Ok(request)
+    }
+
+    /// Builds a REGISTER (or unregister) request plus its destination and
+    /// installs a fresh client transaction. Used for automatic retries
+    /// (423 Interval Too Brief, scheduled 503 Retry-After).
+    async fn prepare_register_send(
+        registration: &mut AccountRegistration,
+        local_addr: SocketAddr,
+    ) -> SipUaResult<(SipRequest, SocketAddr)> {
+        let request = if registration.unregistering {
+            Self::build_unregister_request(registration, local_addr)?
+        } else {
+            Self::build_register_request(registration, local_addr)?
+        };
+        let destination = Self::parse_registrar_addr(&registration.account.registrar_uri).await?;
+
+        let branch = registration.last_branch.clone().unwrap_or_default();
+        let tx_key = TransactionKey::client(&branch, "REGISTER");
+        registration.transaction = Some(ClientNonInviteTransaction::new(
+            tx_key,
+            TransportType::Reliable,
+        ));
+
+        Ok((request, destination))
     }
 
     /// Builds an unregister request (Expires: 0).
@@ -629,11 +819,6 @@ impl RegistrationAgent {
             client_types::TransportPreference::Tcp => "TCP",
             client_types::TransportPreference::Udp => "UDP",
         };
-        let transport_param = match account.transport {
-            client_types::TransportPreference::TlsOnly => "tls",
-            client_types::TransportPreference::Tcp => "tcp",
-            client_types::TransportPreference::Udp => "udp",
-        };
 
         // Resolve effective local IP (same as build_register_request)
         let effective_ip = if local_addr.ip().is_unspecified() {
@@ -658,17 +843,10 @@ impl RegistrationAgent {
             .with_display_name(&account.display_name)
             .with_tag(registration.from_tag.clone());
 
-        let to = NameAddr::new(aor_uri.clone()).with_display_name(&account.display_name);
+        let to = NameAddr::new(aor_uri).with_display_name(&account.display_name);
 
-        // Contact: * for removing all bindings, or specific contact with expires=0
-        let mut contact_uri = SipUri::new(effective_ip.to_string())
-            .with_port(local_addr.port())
-            .with_param("transport", Some(transport_param.to_string()));
-        if let Some(user) = &aor_uri.user {
-            contact_uri = contact_uri.with_user(user.clone());
-        }
-        let contact = NameAddr::new(contact_uri);
-
+        // Contact: * with Expires: 0 removes all bindings for the AOR,
+        // including stale ones from other client instances (RFC 3261 §10.2.2)
         let request = RequestBuilder::register(registrar_uri)
             .via(&via)
             .from(&from)
@@ -676,7 +854,7 @@ impl RegistrationAgent {
             .call_id(&registration.call_id)
             .cseq(registration.cseq)
             .max_forwards(70)
-            .contact(&contact)
+            .header(HeaderName::Contact, "*")
             .expires(0) // Unregister
             .user_agent(USER_AGENT)
             .build()
@@ -711,8 +889,14 @@ impl RegistrationAgent {
         let digest_uri = registration.account.registrar_uri.clone();
         let nonce_count = registration.nonce_count;
 
-        // Build base REGISTER request (this mutates registration)
-        let mut request = Self::build_register_request(registration, local_addr)?;
+        // Build base REGISTER request (this mutates registration).
+        // On the unregister path, rebuild the unregister form
+        // (Contact: *, Expires: 0) so re-auth doesn't re-register.
+        let mut request = if registration.unregistering {
+            Self::build_unregister_request(registration, local_addr)?
+        } else {
+            Self::build_register_request(registration, local_addr)?
+        };
 
         // Compute digest response
         let hasher = Md5DigestHasher;
@@ -768,6 +952,29 @@ impl RegistrationAgent {
             .or_else(|| addrs.first())
             .copied()
             .ok_or_else(|| SipUaError::ConfigError(format!("No addresses found for {host}")))
+    }
+
+    /// Parses the Min-Expires header from a response (RFC 3261 §20.23).
+    fn parse_min_expires(response: &SipResponse) -> Option<u32> {
+        response
+            .headers
+            .get(&HeaderName::MinExpires)?
+            .value
+            .trim()
+            .parse::<u32>()
+            .ok()
+    }
+
+    /// Parses the Retry-After header delay in seconds (RFC 3261 §20.33).
+    ///
+    /// Ignores any trailing comment or parameters, e.g.
+    /// `Retry-After: 120 (maintenance);duration=3600` yields 120.
+    fn parse_retry_after(response: &SipResponse) -> Option<u32> {
+        let value = response.headers.get(&HeaderName::RetryAfter)?.value.trim();
+        let digits_end = value
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(value.len());
+        value.get(..digits_end)?.parse::<u32>().ok()
     }
 
     /// Extracts expiry from response (Contact header or Expires header).
@@ -874,6 +1081,145 @@ mod tests {
             agent.get_state("test"),
             Some(RegistrationState::Registering)
         );
+    }
+
+    /// Extracts the request from a `SendRequest` event, panicking otherwise.
+    fn sent_request(event: RegistrationEvent) -> SipRequest {
+        match event {
+            RegistrationEvent::SendRequest { request, .. } => request,
+            other => panic!("expected SendRequest, got {other:?}"),
+        }
+    }
+
+    /// Registers the test account and drains the `StateChanged` + `SendRequest` events.
+    async fn registered_agent(
+        rx: &mut mpsc::Receiver<RegistrationEvent>,
+        agent: &mut RegistrationAgent,
+    ) {
+        agent.register(&test_account()).await.unwrap();
+        let _ = rx.recv().await.unwrap(); // StateChanged
+        let _ = rx.recv().await.unwrap(); // SendRequest
+    }
+
+    /// RFC 3261 §10.2.8: a 423 with Min-Expires must trigger a retry with
+    /// the requested expiry clamped up to Min-Expires.
+    #[tokio::test]
+    async fn test_423_retries_with_min_expires() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let local_addr: SocketAddr = "192.168.1.100:5060".parse().unwrap();
+        let mut agent = RegistrationAgent::new(local_addr, tx);
+        registered_agent(&mut rx, &mut agent).await;
+
+        let mut response = SipResponse::new(proto_sip::StatusCode::INTERVAL_TOO_BRIEF);
+        response.headers.set(HeaderName::MinExpires, "7200");
+        agent.handle_response(&response, "test").await.unwrap();
+
+        let request = sent_request(rx.recv().await.unwrap());
+        let expires = request.headers.get(&HeaderName::Expires).unwrap();
+        assert_eq!(expires.value, "7200");
+        assert_eq!(
+            agent.get_state("test"),
+            Some(RegistrationState::Registering)
+        );
+    }
+
+    /// 423 retries are bounded: after `MAX_INTERVAL_RETRIES` attempts the
+    /// registration fails instead of looping.
+    #[tokio::test]
+    async fn test_423_retries_bounded() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let local_addr: SocketAddr = "192.168.1.100:5060".parse().unwrap();
+        let mut agent = RegistrationAgent::new(local_addr, tx);
+        registered_agent(&mut rx, &mut agent).await;
+
+        let mut response = SipResponse::new(proto_sip::StatusCode::INTERVAL_TOO_BRIEF);
+        response.headers.set(HeaderName::MinExpires, "7200");
+
+        // First two 423s produce retries
+        for _ in 0..MAX_INTERVAL_RETRIES {
+            agent.handle_response(&response, "test").await.unwrap();
+            let _ = sent_request(rx.recv().await.unwrap());
+        }
+
+        // Third 423 gives up
+        agent.handle_response(&response, "test").await.unwrap();
+        let event = rx.recv().await.unwrap();
+        assert!(matches!(
+            event,
+            RegistrationEvent::StateChanged {
+                state: RegistrationState::Failed,
+                ..
+            }
+        ));
+        assert_eq!(agent.get_state("test"), Some(RegistrationState::Failed));
+    }
+
+    /// RFC 3261 §10.2.2: unregistering must clear all bindings for the AOR
+    /// with `Contact: *` and `Expires: 0`.
+    #[tokio::test]
+    async fn test_unregister_sends_contact_star_expires_zero() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let local_addr: SocketAddr = "192.168.1.100:5060".parse().unwrap();
+        let mut agent = RegistrationAgent::new(local_addr, tx);
+        registered_agent(&mut rx, &mut agent).await;
+
+        agent.unregister("test").await.unwrap();
+        let request = sent_request(rx.recv().await.unwrap());
+
+        let contact = request.headers.get(&HeaderName::Contact).unwrap();
+        assert_eq!(contact.value, "*");
+        let expires = request.headers.get(&HeaderName::Expires).unwrap();
+        assert_eq!(expires.value, "0");
+    }
+
+    /// RFC 3261 §21.5.2: a 503 with Retry-After schedules a delayed retry
+    /// instead of retrying immediately or failing.
+    #[tokio::test]
+    async fn test_503_retry_after_schedules_retry() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let local_addr: SocketAddr = "192.168.1.100:5060".parse().unwrap();
+        let mut agent = RegistrationAgent::new(local_addr, tx);
+        registered_agent(&mut rx, &mut agent).await;
+
+        let mut response = SipResponse::new(proto_sip::StatusCode::SERVICE_UNAVAILABLE);
+        response.headers.set(HeaderName::RetryAfter, "0");
+        agent.handle_response(&response, "test").await.unwrap();
+
+        // No immediate retry and no failure
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            agent.get_state("test"),
+            Some(RegistrationState::Registering)
+        );
+
+        // Once the (zero-second) delay elapses, check_expiring fires the retry
+        agent.check_expiring().await.unwrap();
+        let request = sent_request(rx.recv().await.unwrap());
+        assert_eq!(request.method, proto_sip::Method::Register);
+    }
+
+    /// A 503 without Retry-After fails immediately (no schedule to honor).
+    #[tokio::test]
+    async fn test_503_without_retry_after_fails() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let local_addr: SocketAddr = "192.168.1.100:5060".parse().unwrap();
+        let mut agent = RegistrationAgent::new(local_addr, tx);
+        registered_agent(&mut rx, &mut agent).await;
+
+        let response = SipResponse::new(proto_sip::StatusCode::SERVICE_UNAVAILABLE);
+        agent.handle_response(&response, "test").await.unwrap();
+
+        assert_eq!(agent.get_state("test"), Some(RegistrationState::Failed));
+    }
+
+    /// Retry-After parsing ignores trailing comments/parameters.
+    #[test]
+    fn test_parse_retry_after_with_comment() {
+        let mut response = SipResponse::new(proto_sip::StatusCode::SERVICE_UNAVAILABLE);
+        response
+            .headers
+            .set(HeaderName::RetryAfter, "120 (maintenance);duration=3600");
+        assert_eq!(RegistrationAgent::parse_retry_after(&response), Some(120));
     }
 
     #[tokio::test]
