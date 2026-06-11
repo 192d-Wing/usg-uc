@@ -56,6 +56,8 @@ pub struct ClientInviteTransaction {
     retransmit_count: u32,
     /// Last response status code received.
     last_response_code: Option<u16>,
+    /// `CSeq` number of the request this transaction carries.
+    cseq: Option<u32>,
 }
 
 impl ClientInviteTransaction {
@@ -82,7 +84,23 @@ impl ClientInviteTransaction {
             timer_d_deadline: None,
             retransmit_count: 0,
             last_response_code: None,
+            cseq: None,
         }
+    }
+
+    /// Records the `CSeq` number of the request this transaction carries.
+    ///
+    /// The TU uses it to validate that a response's `CSeq` number matches
+    /// the pending request's (RFC 3261 Section 12.2.1.1) before acting on it.
+    #[must_use]
+    pub fn with_cseq(mut self, cseq: u32) -> Self {
+        self.cseq = Some(cseq);
+        self
+    }
+
+    /// Returns the `CSeq` number of the request, if recorded.
+    pub fn cseq(&self) -> Option<u32> {
+        self.cseq
     }
 
     /// Returns the transaction key.
@@ -122,11 +140,16 @@ impl ClientInviteTransaction {
 
     /// Processes a received response.
     ///
-    /// Returns true if the response was accepted.
+    /// Returns true if the response was accepted and must be passed to the
+    /// TU; false if it was absorbed by the transaction. Per RFC 3261
+    /// Section 17.1.1 / Section 17.1.2.2, a response carrying the same
+    /// status code as one already processed is a retransmission and must
+    /// not re-drive the TU's state machine.
     ///
     /// # Errors
     /// Returns an error if the operation fails.
     pub fn receive_response(&mut self, status_code: u16) -> TransactionResult<bool> {
+        let is_retransmission = self.last_response_code == Some(status_code);
         self.last_response_code = Some(status_code);
 
         match self.state {
@@ -150,8 +173,9 @@ impl ClientInviteTransaction {
             }
             ClientInviteState::Proceeding => {
                 if (100..200).contains(&status_code) {
-                    // Another 1xx response
-                    Ok(true)
+                    // Another 1xx response. A duplicate (e.g. retransmitted
+                    // 180) is absorbed — not passed to the TU again.
+                    Ok(!is_retransmission)
                 } else if (200..300).contains(&status_code) {
                     // 2xx response -> Terminated
                     self.state = ClientInviteState::Terminated;
@@ -165,12 +189,10 @@ impl ClientInviteTransaction {
                 }
             }
             ClientInviteState::Completed => {
-                // Retransmitted response - resend ACK
-                if (300..700).contains(&status_code) {
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
+                // Retransmitted final response: absorbed by the transaction
+                // (RFC 3261 Section 17.1.1.2). The TU does not see it again;
+                // any ACK re-send is driven from stored TU state.
+                Ok(false)
             }
             ClientInviteState::Terminated => Ok(false),
         }
@@ -303,6 +325,8 @@ pub struct ClientNonInviteTransaction {
     retransmit_count: u32,
     /// Last response status code received.
     last_response_code: Option<u16>,
+    /// `CSeq` number of the request this transaction carries.
+    cseq: Option<u32>,
 }
 
 impl ClientNonInviteTransaction {
@@ -328,7 +352,23 @@ impl ClientNonInviteTransaction {
             timer_k_deadline: None,
             retransmit_count: 0,
             last_response_code: None,
+            cseq: None,
         }
+    }
+
+    /// Records the `CSeq` number of the request this transaction carries.
+    ///
+    /// The TU uses it to validate that a response's `CSeq` number matches
+    /// the pending request's (RFC 3261 Section 12.2.1.1) before acting on it.
+    #[must_use]
+    pub fn with_cseq(mut self, cseq: u32) -> Self {
+        self.cseq = Some(cseq);
+        self
+    }
+
+    /// Returns the `CSeq` number of the request, if recorded.
+    pub fn cseq(&self) -> Option<u32> {
+        self.cseq
     }
 
     /// Returns the transaction key.
@@ -343,9 +383,16 @@ impl ClientNonInviteTransaction {
 
     /// Processes a received response.
     ///
+    /// Returns true if the response was accepted and must be passed to the
+    /// TU; false if it was absorbed by the transaction. Per RFC 3261
+    /// Section 17.1.2.2, retransmitted responses (same status code as one
+    /// already processed, or any response in the Completed state) are
+    /// absorbed and must not re-drive the TU's state machine.
+    ///
     /// # Errors
     /// Returns an error if the operation fails.
     pub fn receive_response(&mut self, status_code: u16) -> TransactionResult<bool> {
+        let is_retransmission = self.last_response_code == Some(status_code);
         self.last_response_code = Some(status_code);
 
         match self.state {
@@ -362,7 +409,8 @@ impl ClientNonInviteTransaction {
             }
             ClientNonInviteState::Proceeding => {
                 if (100..200).contains(&status_code) {
-                    Ok(true)
+                    // Duplicate provisional responses are absorbed.
+                    Ok(!is_retransmission)
                 } else if (200..700).contains(&status_code) {
                     self.enter_completed();
                     Ok(true)
@@ -371,8 +419,9 @@ impl ClientNonInviteTransaction {
                 }
             }
             ClientNonInviteState::Completed => {
-                // Absorb retransmits
-                Ok(true)
+                // RFC 3261 Section 17.1.2.2: absorb retransmitted final
+                // responses; they are not passed to the TU again.
+                Ok(false)
             }
             ClientNonInviteState::Terminated => Ok(false),
         }
@@ -513,6 +562,87 @@ mod tests {
         // Receive 200
         assert!(tx.receive_response(200).unwrap());
         assert_eq!(tx.state(), ClientNonInviteState::Completed);
+    }
+
+    #[test]
+    fn test_client_invite_duplicate_provisional_absorbed() {
+        // RFC 3261 Section 17.1.1: a retransmitted 180 must be absorbed by
+        // the transaction, not passed to the TU a second time.
+        let key = TransactionKey::client("z9hG4bK776asdhds", "INVITE");
+        let mut tx = ClientInviteTransaction::new(key, TransportType::Unreliable);
+
+        assert!(tx.receive_response(180).unwrap(), "first 180 passes to TU");
+        assert_eq!(tx.state(), ClientInviteState::Proceeding);
+        assert!(
+            !tx.receive_response(180).unwrap(),
+            "retransmitted 180 must be absorbed"
+        );
+        // A different provisional is new information and passes through.
+        assert!(tx.receive_response(183).unwrap());
+        // The final response still passes to the TU.
+        assert!(tx.receive_response(200).unwrap());
+    }
+
+    #[test]
+    fn test_client_invite_completed_absorbs_final_retransmits() {
+        // RFC 3261 Section 17.1.1.2: retransmitted final responses in
+        // Completed are absorbed (the TU re-sends the ACK from stored state).
+        let key = TransactionKey::client("z9hG4bK776asdhds", "INVITE");
+        let mut tx = ClientInviteTransaction::new(key, TransportType::Unreliable);
+
+        assert!(tx.receive_response(486).unwrap());
+        assert_eq!(tx.state(), ClientInviteState::Completed);
+        assert!(
+            !tx.receive_response(486).unwrap(),
+            "retransmitted 486 must be absorbed"
+        );
+    }
+
+    #[test]
+    fn test_client_non_invite_completed_absorbs_retransmits() {
+        // RFC 3261 Section 17.1.2.2: any response received in Completed is a
+        // retransmission and must not be passed to the TU again.
+        let key = TransactionKey::client("z9hG4bK776asdhds", "BYE");
+        let mut tx = ClientNonInviteTransaction::new(key, TransportType::Unreliable);
+
+        assert!(tx.receive_response(200).unwrap(), "first 200 passes to TU");
+        assert_eq!(tx.state(), ClientNonInviteState::Completed);
+        assert!(
+            !tx.receive_response(200).unwrap(),
+            "retransmitted 200 must be absorbed"
+        );
+    }
+
+    #[test]
+    fn test_client_non_invite_duplicate_provisional_absorbed() {
+        let key = TransactionKey::client("z9hG4bK776asdhds", "BYE");
+        let mut tx = ClientNonInviteTransaction::new(key, TransportType::Unreliable);
+
+        assert!(tx.receive_response(100).unwrap());
+        assert!(
+            !tx.receive_response(100).unwrap(),
+            "duplicate 100 must be absorbed"
+        );
+        assert!(tx.receive_response(200).unwrap());
+    }
+
+    #[test]
+    fn test_client_transaction_cseq_recorded() {
+        // RFC 3261 Section 12.2.1.1: the TU validates response CSeq numbers
+        // against the pending request's, recorded on the transaction.
+        let invite = ClientInviteTransaction::new(
+            TransactionKey::client("z9hG4bK1", "INVITE"),
+            TransportType::Reliable,
+        )
+        .with_cseq(2);
+        assert_eq!(invite.cseq(), Some(2));
+
+        let bye = ClientNonInviteTransaction::new(
+            TransactionKey::client("z9hG4bK2", "BYE"),
+            TransportType::Reliable,
+        )
+        .with_cseq(3);
+        assert_eq!(bye.cseq(), Some(3));
     }
 
     #[test]

@@ -96,6 +96,10 @@ struct CallSession {
     /// cancelled — the UAC MUST ACK the 200 and immediately send a BYE for
     /// the now-established dialog instead of surfacing Connected.
     cancel_pending: bool,
+    /// The ACK sent in answer to an INVITE's 2xx, stored verbatim so a
+    /// retransmitted 2xx (our ACK was lost) is answered with the identical
+    /// ACK instead of being dropped or reprocessed (RFC 6026 §2).
+    last_ack: Option<StoredAck>,
     /// Failure reason if the call failed.
     failure_reason: Option<CallFailureReason>,
     /// Active REFER request for call transfer (RFC 3515).
@@ -108,6 +112,29 @@ struct CallSession {
     /// Last digest challenge received for this call.
     #[cfg(feature = "digest-auth")]
     last_challenge: Option<proto_sip::auth::DigestChallenge>,
+}
+
+/// The ACK sent for an INVITE's 2xx response, kept so a retransmitted 2xx
+/// can be answered with a byte-identical ACK (RFC 6026 §2).
+struct StoredAck {
+    /// `CSeq` number of the INVITE whose 2xx this ACK acknowledges.
+    cseq: u32,
+    /// The ACK request exactly as first sent.
+    request: SipRequest,
+    /// Destination the ACK was sent to.
+    destination: SocketAddr,
+}
+
+/// Which pending client transaction owns an incoming response
+/// (RFC 3261 §17.1.3: matched by top Via branch + `CSeq` method).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseTxMatch {
+    /// The pending INVITE transaction.
+    Invite,
+    /// The pending non-INVITE transaction (BYE, CANCEL, REFER, ...).
+    NonInvite,
+    /// No pending client transaction matches.
+    Unmatched,
 }
 
 /// Events emitted by the call agent.
@@ -264,6 +291,7 @@ impl CallAgent {
             last_branch: None,
             last_via: None,
             cancel_pending: false,
+            last_ack: None,
             failure_reason: None,
             refer_request: None,
             transfer_target: None,
@@ -340,7 +368,8 @@ impl CallAgent {
 
         // Create INVITE transaction
         let tx_key = TransactionKey::client(&branch, "INVITE");
-        let transaction = ClientInviteTransaction::new(tx_key, TransportType::Reliable);
+        let transaction =
+            ClientInviteTransaction::new(tx_key, TransportType::Reliable).with_cseq(1);
 
         let session = CallSession {
             id: call_id.clone(),
@@ -362,6 +391,7 @@ impl CallAgent {
             last_branch: Some(branch),
             last_via: invite_via,
             cancel_pending: false,
+            last_ack: None,
             failure_reason: None,
             refer_request: None,
             transfer_target: None,
@@ -569,6 +599,10 @@ impl CallAgent {
         let effective_local_addr =
             Self::get_local_addr_for_destination(destination, self.local_addr).await?;
 
+        // The transaction key must carry the branch actually sent on the
+        // wire so responses match it (RFC 3261 §17.1.3).
+        let branch = generate_branch();
+
         // Build REFER request
         let request = Self::build_refer_request_static(
             &remote_uri,
@@ -579,14 +613,15 @@ impl CallAgent {
             cseq,
             &from_tag,
             to_tag.as_deref(),
+            &branch,
             transfer_target,
             &self.transport_type,
         )?;
 
         // Create non-INVITE transaction for REFER
-        let branch = generate_branch();
         let tx_key = TransactionKey::client(&branch, "REFER");
-        let transaction = ClientNonInviteTransaction::new(tx_key, TransportType::Reliable);
+        let transaction =
+            ClientNonInviteTransaction::new(tx_key, TransportType::Reliable).with_cseq(cseq);
 
         // Create ReferRequest to track the implicit subscription (RFC 3515)
         let refer_request = ReferRequest::new(transfer_target).with_referred_by(self.aor.clone());
@@ -670,7 +705,8 @@ impl CallAgent {
 
         // Create INVITE transaction for re-INVITE
         let tx_key = TransactionKey::client(&branch, "INVITE");
-        let transaction = ClientInviteTransaction::new(tx_key, TransportType::Reliable);
+        let transaction =
+            ClientInviteTransaction::new(tx_key, TransportType::Reliable).with_cseq(cseq);
 
         if let Some(session) = self.calls.get_mut(call_id) {
             session.invite_transaction = Some(transaction);
@@ -711,6 +747,15 @@ impl CallAgent {
     }
 
     /// Handles a received SIP response.
+    ///
+    /// The response was routed to this call by Call-ID alone; before any
+    /// call state is mutated it is matched to the owning client transaction
+    /// by top Via branch + `CSeq` method (RFC 3261 §17.1.3), and its `CSeq`
+    /// number is validated against the pending request's (RFC 3261
+    /// §12.2.1.1). Retransmitted responses are absorbed by the transaction
+    /// (RFC 3261 §17.1.2.2). Responses matching no transaction are dropped,
+    /// except a retransmitted 2xx to an already-ACKed INVITE, which
+    /// re-sends the identical ACK (RFC 6026 §2).
     pub async fn handle_response(
         &mut self,
         response: &SipResponse,
@@ -742,26 +787,10 @@ impl CallAgent {
             return Ok(());
         }
 
-        // Responses are routed here by Call-ID alone, so a response to the
-        // CANCEL transaction (CSeq method CANCEL, RFC 3261 §17.1.3) also
-        // lands here. It never decides the call's fate by itself: a 200
-        // only confirms the CANCEL was received (§9.1) and a 481 means the
-        // INVITE already completed — in both cases the INVITE's own final
-        // response (487, or a 2xx that won the race) arrives separately.
-        if Self::cseq_method(response).as_deref() == Some("CANCEL") {
-            debug!(
-                call_id = %call_id,
-                status_code = status_code,
-                "Response to CANCEL transaction; awaiting INVITE final response"
-            );
+        // Transaction-layer gate: only responses that belong to a pending
+        // transaction (and are not retransmissions) reach the handlers.
+        if !self.gate_response_to_transaction(response, call_id).await? {
             return Ok(());
-        }
-
-        // Update transaction state
-        if let Some(session) = self.calls.get_mut(call_id)
-            && let Some(ref mut tx) = session.invite_transaction
-        {
-            let _ = tx.receive_response(status_code);
         }
 
         match status_code {
@@ -1136,6 +1165,16 @@ impl CallAgent {
             None,
         )?;
 
+        // Keep the ACK verbatim: a retransmitted 200 (our ACK was lost)
+        // must be answered with the identical ACK (RFC 6026 §2).
+        if let Some(session) = self.calls.get_mut(call_id) {
+            session.last_ack = Some(StoredAck {
+                cseq,
+                request: ack_request.clone(),
+                destination,
+            });
+        }
+
         self.event_tx
             .send(CallEvent::SendRequest {
                 request: ack_request,
@@ -1220,6 +1259,15 @@ impl CallAgent {
             &self.transport_type,
             None,
         )?;
+
+        // Keep the ACK verbatim for retransmitted 200s (RFC 6026 §2).
+        if let Some(session) = self.calls.get_mut(call_id) {
+            session.last_ack = Some(StoredAck {
+                cseq,
+                request: ack_request.clone(),
+                destination,
+            });
+        }
 
         self.event_tx
             .send(CallEvent::SendRequest {
@@ -1409,7 +1457,8 @@ impl CallAgent {
                         // Create new INVITE transaction
                         let tx_key = TransactionKey::client(&new_branch, "INVITE");
                         let transaction =
-                            ClientInviteTransaction::new(tx_key, TransportType::Reliable);
+                            ClientInviteTransaction::new(tx_key, TransportType::Reliable)
+                                .with_cseq(new_cseq);
 
                         if let Some(session) = self.calls.get_mut(call_id) {
                             session.invite_transaction = Some(transaction);
@@ -1815,7 +1864,8 @@ impl CallAgent {
         // The CANCEL client transaction reuses the INVITE's branch so that
         // responses to the CANCEL (200/481) match this transaction.
         let tx_key = TransactionKey::client(&branch, "CANCEL");
-        let transaction = ClientNonInviteTransaction::new(tx_key, TransportType::Reliable);
+        let transaction =
+            ClientNonInviteTransaction::new(tx_key, TransportType::Reliable).with_cseq(cseq);
 
         if let Some(session) = self.calls.get_mut(call_id) {
             session.non_invite_transaction = Some(transaction);
@@ -1872,6 +1922,10 @@ impl CallAgent {
         let effective_local_addr =
             Self::get_local_addr_for_destination(destination, self.local_addr).await?;
 
+        // The transaction key must carry the branch actually sent on the
+        // wire so the BYE's 200 matches it (RFC 3261 §17.1.3).
+        let branch = generate_branch();
+
         // Build BYE request
         let request = Self::build_bye_request_static(
             &remote_uri,
@@ -1882,13 +1936,14 @@ impl CallAgent {
             cseq,
             &from_tag,
             to_tag.as_deref(),
+            &branch,
             &self.transport_type,
         )?;
 
         // Create non-INVITE transaction
-        let branch = generate_branch();
         let tx_key = TransactionKey::client(&branch, "BYE");
-        let transaction = ClientNonInviteTransaction::new(tx_key, TransportType::Reliable);
+        let transaction =
+            ClientNonInviteTransaction::new(tx_key, TransportType::Reliable).with_cseq(cseq);
 
         if let Some(session) = self.calls.get_mut(call_id) {
             session.non_invite_transaction = Some(transaction);
@@ -2148,6 +2203,9 @@ impl CallAgent {
     }
 
     /// Builds a BYE request (static version).
+    ///
+    /// `branch` is the Via branch the caller registered in the transaction
+    /// key, so responses match the transaction (RFC 3261 §17.1.3).
     #[allow(clippy::too_many_arguments)]
     fn build_bye_request_static(
         remote_uri_str: &str,
@@ -2158,6 +2216,7 @@ impl CallAgent {
         cseq: u32,
         from_tag: &str,
         to_tag: Option<&str>,
+        branch: &str,
         transport_type: &str,
     ) -> SipUaResult<SipRequest> {
         let remote_uri: SipUri = remote_uri_str
@@ -2168,11 +2227,9 @@ impl CallAgent {
             .parse()
             .map_err(|e| SipUaError::ConfigError(format!("Invalid AOR: {e}")))?;
 
-        let branch = generate_branch();
-
         let via = ViaHeader::new(transport_type, local_addr.ip().to_string())
             .with_port(local_addr.port())
-            .with_branch(branch)
+            .with_branch(branch.to_string())
             .with_rport();
 
         let from = NameAddr::new(aor_uri)
@@ -2326,6 +2383,9 @@ impl CallAgent {
     }
 
     /// Builds a REFER request for call transfer (RFC 3515).
+    ///
+    /// `branch` is the Via branch the caller registered in the transaction
+    /// key, so responses match the transaction (RFC 3261 §17.1.3).
     #[allow(clippy::too_many_arguments)]
     fn build_refer_request_static(
         remote_uri_str: &str,
@@ -2336,6 +2396,7 @@ impl CallAgent {
         cseq: u32,
         from_tag: &str,
         to_tag: Option<&str>,
+        branch: &str,
         transfer_target: &str,
         transport_type: &str,
     ) -> SipUaResult<SipRequest> {
@@ -2349,11 +2410,9 @@ impl CallAgent {
             .parse()
             .map_err(|e| SipUaError::ConfigError(format!("Invalid AOR: {e}")))?;
 
-        let branch = generate_branch();
-
         let via = ViaHeader::new(transport_type, local_addr.ip().to_string())
             .with_port(local_addr.port())
-            .with_branch(branch)
+            .with_branch(branch.to_string())
             .with_rport();
 
         let from = NameAddr::new(aor_uri.clone())
@@ -2500,6 +2559,232 @@ impl CallAgent {
         );
 
         Ok(local_addr)
+    }
+
+    /// Transaction-layer gate run before any call state is mutated.
+    ///
+    /// Matches the response to the owning client transaction (RFC 3261
+    /// §17.1.3), lets the transaction absorb retransmissions (§17.1.2.2),
+    /// and consumes responses that must not reach the dialog handlers
+    /// (CANCEL-transaction responses, 2xx completions of other non-INVITE
+    /// transactions, unmatched responses).
+    ///
+    /// Returns true if the response must be passed to the dialog/call
+    /// handlers; false if it was consumed here.
+    async fn gate_response_to_transaction(
+        &mut self,
+        response: &SipResponse,
+        call_id: &str,
+    ) -> SipUaResult<bool> {
+        let status_code = response.status.code();
+        let response_branch = Self::response_top_via_branch(response);
+        let response_cseq = Self::response_cseq(response);
+
+        // RFC 3261 §17.1.3: match the response to the client transaction
+        // whose request carried the same top Via branch and CSeq method —
+        // Call-ID only located the call, not the transaction.
+        let tx_match = self
+            .calls
+            .get(call_id)
+            .map_or(ResponseTxMatch::Unmatched, |session| {
+                Self::match_response_transaction(
+                    session,
+                    response_branch.as_deref(),
+                    response_cseq.as_ref(),
+                )
+            });
+
+        match tx_match {
+            ResponseTxMatch::Invite => {
+                // RFC 3261 §17.1.1: let the transaction absorb retransmitted
+                // responses (e.g. a duplicate 180) so they cannot re-drive
+                // the call state machine or re-emit state changes.
+                let accepted = self
+                    .calls
+                    .get_mut(call_id)
+                    .and_then(|s| s.invite_transaction.as_mut())
+                    .is_some_and(|tx| tx.receive_response(status_code).unwrap_or(false));
+                if !accepted {
+                    debug!(
+                        call_id = %call_id,
+                        status_code = status_code,
+                        "Absorbed retransmitted response (INVITE transaction, RFC 3261 §17.1.1)"
+                    );
+                    return Ok(false);
+                }
+                Ok(true)
+            }
+            ResponseTxMatch::NonInvite => {
+                let accepted = self
+                    .calls
+                    .get_mut(call_id)
+                    .and_then(|s| s.non_invite_transaction.as_mut())
+                    .is_some_and(|tx| tx.receive_response(status_code).unwrap_or(false));
+                if !accepted {
+                    debug!(
+                        call_id = %call_id,
+                        status_code = status_code,
+                        "Absorbed retransmitted response (non-INVITE transaction, RFC 3261 §17.1.2.2)"
+                    );
+                    return Ok(false);
+                }
+
+                match response_cseq.as_ref().map(|(_, m)| m.as_str()) {
+                    // A response to the CANCEL transaction never decides the
+                    // call's fate by itself: a 200 only confirms the CANCEL
+                    // was received (§9.1) and a 481 means the INVITE already
+                    // completed — in both cases the INVITE's own final
+                    // response (487, or a 2xx that won the race) arrives
+                    // separately.
+                    Some("CANCEL") => {
+                        debug!(
+                            call_id = %call_id,
+                            status_code = status_code,
+                            "Response to CANCEL transaction; awaiting INVITE final response"
+                        );
+                        Ok(false)
+                    }
+                    // A BYE response drives teardown via the normal dispatch.
+                    Some("BYE") => Ok(true),
+                    // A 2xx to any other non-INVITE request (REFER, ...)
+                    // just completes that transaction. It must not reach the
+                    // INVITE/dialog handlers — a late 200 must never confirm
+                    // the wrong request (RFC 3261 §12.2.1.1); REFER progress
+                    // arrives via NOTIFY (RFC 3515).
+                    _ => {
+                        if (200..300).contains(&status_code) {
+                            debug!(
+                                call_id = %call_id,
+                                status_code = status_code,
+                                cseq = ?response_cseq,
+                                "Non-INVITE transaction completed"
+                            );
+                            return Ok(false);
+                        }
+                        Ok(true)
+                    }
+                }
+            }
+            ResponseTxMatch::Unmatched => {
+                self.handle_unmatched_response(
+                    call_id,
+                    status_code,
+                    response_branch.as_deref(),
+                    response_cseq.as_ref(),
+                )
+                .await?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Identifies which pending client transaction owns a response.
+    ///
+    /// RFC 3261 §17.1.3: a response matches the client transaction whose
+    /// request carried the same top Via branch and `CSeq` method. The
+    /// `CSeq` number is additionally validated against the pending
+    /// request's (RFC 3261 §12.2.1.1) so a late 2xx cannot confirm the
+    /// wrong request. A response with no Via branch is tolerated (matched
+    /// by `CSeq` method + number alone); a response with no `CSeq` matches
+    /// nothing.
+    fn match_response_transaction(
+        session: &CallSession,
+        branch: Option<&str>,
+        cseq: Option<&(u32, String)>,
+    ) -> ResponseTxMatch {
+        let Some((seq, method)) = cseq else {
+            return ResponseTxMatch::Unmatched;
+        };
+
+        let key_matches = |key: &TransactionKey, tx_cseq: Option<u32>| {
+            key.method == *method
+                && branch.is_none_or(|b| b == key.branch)
+                && tx_cseq.is_none_or(|c| c == *seq)
+        };
+
+        if let Some(tx) = &session.invite_transaction
+            && key_matches(tx.key(), tx.cseq())
+        {
+            return ResponseTxMatch::Invite;
+        }
+        if let Some(tx) = &session.non_invite_transaction
+            && key_matches(tx.key(), tx.cseq())
+        {
+            return ResponseTxMatch::NonInvite;
+        }
+        ResponseTxMatch::Unmatched
+    }
+
+    /// Handles a response that matches no pending client transaction.
+    ///
+    /// RFC 6026 §2: a retransmitted 2xx to an INVITE we already acknowledged
+    /// means our ACK was lost — re-send the identical ACK rather than
+    /// dropping or reprocessing the response. Anything else is dropped with
+    /// a log (RFC 3261 §17.1.3): acting on it would let late or stray
+    /// responses (a BYE 200, a CANCEL 481) corrupt the state of newer
+    /// transactions on the same call.
+    async fn handle_unmatched_response(
+        &self,
+        call_id: &str,
+        status_code: u16,
+        branch: Option<&str>,
+        cseq: Option<&(u32, String)>,
+    ) -> SipUaResult<()> {
+        if (200..300).contains(&status_code)
+            && let Some((seq, method)) = cseq
+            && method == "INVITE"
+        {
+            let stored = self
+                .calls
+                .get(call_id)
+                .and_then(|s| s.last_ack.as_ref())
+                .filter(|ack| ack.cseq == *seq)
+                .map(|ack| (ack.request.clone(), ack.destination));
+
+            if let Some((request, destination)) = stored {
+                info!(
+                    call_id = %call_id,
+                    cseq = seq,
+                    "Retransmitted 2xx to INVITE; re-sending identical ACK (RFC 6026 §2)"
+                );
+                self.event_tx
+                    .send(CallEvent::SendRequest {
+                        request,
+                        destination,
+                    })
+                    .await
+                    .map_err(|e| SipUaError::TransportError(e.to_string()))?;
+                return Ok(());
+            }
+        }
+
+        warn!(
+            call_id = %call_id,
+            status_code = status_code,
+            branch = ?branch,
+            cseq = ?cseq,
+            "Dropping response that matches no pending client transaction (RFC 3261 §17.1.3)"
+        );
+        Ok(())
+    }
+
+    /// Extracts the branch parameter from a response's top Via header
+    /// (RFC 3261 §17.1.3).
+    fn response_top_via_branch(response: &SipResponse) -> Option<String> {
+        let via = response.headers.get_value(&HeaderName::Via)?;
+        let start = via.find("branch=")? + "branch=".len();
+        let rest = &via[start..];
+        let end = rest.find([';', ',', ' ', '\t']).map_or(rest.len(), |i| i);
+        Some(rest[..end].to_string())
+    }
+
+    /// Parses a response's `CSeq` header into (sequence number, method).
+    fn response_cseq(response: &SipResponse) -> Option<(u32, String)> {
+        let value = response.headers.get_value(&HeaderName::CSeq)?;
+        let mut parts = value.split_whitespace();
+        let seq = parts.next()?.parse().ok()?;
+        let method = parts.next()?.to_ascii_uppercase();
+        Some((seq, method))
     }
 
     /// Extracts the method from a response's `CSeq` header (RFC 3261
@@ -2891,6 +3176,10 @@ mod tests {
         challenge
             .headers
             .set(HeaderName::To, "<sip:bob@127.0.0.1:5061>;tag=srv-401-tag");
+        challenge.headers.set(HeaderName::CSeq, "1 INVITE");
+        challenge
+            .headers
+            .set(HeaderName::Via, invite1_via.to_string());
         challenge.headers.set(
             HeaderName::WwwAuthenticate,
             "Digest realm=\"bulkvs\", nonce=\"abc123\"",
@@ -2937,6 +3226,223 @@ mod tests {
             cancel.headers.get_value(&HeaderName::CSeq).unwrap(),
             "2 CANCEL"
         );
+    }
+
+    /// RFC 3261 §17.1.1 / §17.1.2.2: a retransmitted 180 within the INVITE
+    /// transaction must be absorbed — it must not re-emit a state change or
+    /// otherwise re-drive the call state machine.
+    #[tokio::test]
+    async fn test_duplicate_180_absorbed() {
+        use proto_sip::response::StatusCode;
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let mut agent = CallAgent::new(
+            local_addr,
+            "sip:alice@127.0.0.1".to_string(),
+            "Alice".to_string(),
+            tx,
+        );
+
+        let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n";
+        let call_id = agent
+            .make_call("sip:bob@127.0.0.1:5061", sdp)
+            .await
+            .unwrap();
+
+        // Drain StateChanged(Dialing), capture the INVITE for its Via
+        let _ = rx.recv().await.unwrap();
+        let invite = sent_request(rx.recv().await.unwrap());
+        let invite_via = invite
+            .headers
+            .get_value(&HeaderName::Via)
+            .unwrap()
+            .to_string();
+
+        let mut ringing = SipResponse::new(StatusCode::RINGING);
+        ringing.headers.set(HeaderName::Via, invite_via);
+        ringing
+            .headers
+            .set(HeaderName::To, "<sip:bob@127.0.0.1:5061>;tag=tag-180");
+        ringing.headers.set(HeaderName::CSeq, "1 INVITE");
+
+        agent.handle_response(&ringing, &call_id).await.unwrap();
+        let event = rx.recv().await.unwrap();
+        assert!(matches!(
+            event,
+            CallEvent::StateChanged {
+                state: CallState::Ringing,
+                ..
+            }
+        ));
+        assert_eq!(agent.get_state(&call_id), Some(CallState::Ringing));
+
+        // Retransmitted 180: absorbed by the transaction, no second event
+        agent.handle_response(&ringing, &call_id).await.unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "retransmitted 180 must not emit any event"
+        );
+        assert_eq!(agent.get_state(&call_id), Some(CallState::Ringing));
+    }
+
+    /// RFC 3261 §17.1.3 / §12.2.1.1: a late 200 to an old BYE (stale
+    /// branch, stale `CSeq`) must not touch a newer INVITE transaction on
+    /// the same Call-ID — it matches no pending transaction and is dropped.
+    #[tokio::test]
+    async fn test_late_bye_200_does_not_touch_newer_invite_transaction() {
+        use proto_sip::response::StatusCode;
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let mut agent = CallAgent::new(
+            local_addr,
+            "sip:alice@127.0.0.1".to_string(),
+            "Alice".to_string(),
+            tx,
+        );
+
+        let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n";
+        let call_id = agent
+            .make_call("sip:bob@127.0.0.1:5061", sdp)
+            .await
+            .unwrap();
+
+        // Drain StateChanged(Dialing), capture the INVITE
+        let _ = rx.recv().await.unwrap();
+        let invite = sent_request(rx.recv().await.unwrap());
+        let invite_via = invite
+            .headers
+            .get_value(&HeaderName::Via)
+            .unwrap()
+            .to_string();
+
+        // Connect the call: 200 OK to the INVITE (matched by branch + CSeq)
+        let mut ok = SipResponse::new(StatusCode::OK);
+        ok.headers.set(HeaderName::Via, invite_via);
+        ok.headers
+            .set(HeaderName::To, "<sip:bob@127.0.0.1:5061>;tag=tag-200");
+        ok.headers.set(HeaderName::CSeq, "1 INVITE");
+        agent.handle_response(&ok, &call_id).await.unwrap();
+        while rx.try_recv().is_ok() {} // drain ACK + StateChanged(Connected)
+        assert_eq!(agent.get_state(&call_id), Some(CallState::Connected));
+
+        // Send a hold re-INVITE: a NEWER INVITE transaction is now pending
+        agent
+            .hold_call(&call_id, "v=0\r\na=sendonly\r\n")
+            .await
+            .unwrap();
+        while rx.try_recv().is_ok() {} // drain re-INVITE + StateChanged(OnHold)
+        assert!(agent.has_pending_invite_transaction(&call_id));
+        assert_eq!(agent.get_state(&call_id), Some(CallState::OnHold));
+
+        // A late 200 to some old BYE arrives (stale branch, stale CSeq).
+        // It must be dropped: no events, no state change, the pending
+        // re-INVITE transaction untouched.
+        let mut late_bye_ok = SipResponse::new(StatusCode::OK);
+        late_bye_ok.headers.set(
+            HeaderName::Via,
+            "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKstale",
+        );
+        late_bye_ok.headers.set(HeaderName::CSeq, "9 BYE");
+        agent.handle_response(&late_bye_ok, &call_id).await.unwrap();
+
+        assert!(
+            rx.try_recv().is_err(),
+            "late BYE 200 must not emit any event"
+        );
+        assert_eq!(agent.get_state(&call_id), Some(CallState::OnHold));
+        assert!(
+            agent.has_pending_invite_transaction(&call_id),
+            "the newer INVITE transaction must be untouched"
+        );
+    }
+
+    /// RFC 6026 §2: a retransmitted 200 OK to the INVITE (the first ACK was
+    /// lost) must be answered with the identical ACK — not reprocessed
+    /// (which would re-emit state changes) and not dropped (which would
+    /// leave the UAS retransmitting until Timer H fires).
+    #[tokio::test]
+    async fn test_retransmitted_invite_200_resends_identical_ack() {
+        use proto_sip::response::StatusCode;
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let mut agent = CallAgent::new(
+            local_addr,
+            "sip:alice@127.0.0.1".to_string(),
+            "Alice".to_string(),
+            tx,
+        );
+
+        let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n";
+        let call_id = agent
+            .make_call("sip:bob@127.0.0.1:5061", sdp)
+            .await
+            .unwrap();
+
+        let _ = rx.recv().await.unwrap();
+        let invite = sent_request(rx.recv().await.unwrap());
+        let invite_via = invite
+            .headers
+            .get_value(&HeaderName::Via)
+            .unwrap()
+            .to_string();
+
+        let mut ok = SipResponse::new(StatusCode::OK);
+        ok.headers.set(HeaderName::Via, invite_via);
+        ok.headers
+            .set(HeaderName::To, "<sip:bob@127.0.0.1:5061>;tag=tag-200");
+        ok.headers.set(HeaderName::CSeq, "1 INVITE");
+        ok.body = Some(bytes::Bytes::from_static(
+            b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n",
+        ));
+        agent.handle_response(&ok, &call_id).await.unwrap();
+
+        // Drain the first 200's processing and capture the original ACK
+        let mut ack1 = None;
+        let mut saw_connected = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                CallEvent::SendRequest { request, .. } => ack1 = Some(request),
+                CallEvent::StateChanged { state, .. } => {
+                    saw_connected |= state == CallState::Connected;
+                }
+                _ => {}
+            }
+        }
+        let ack1 = ack1.unwrap();
+        assert_eq!(ack1.method.to_string(), "ACK");
+        assert!(saw_connected);
+
+        // The 200 is retransmitted (our ACK was lost): the agent must
+        // re-send the IDENTICAL ACK and nothing else.
+        agent.handle_response(&ok, &call_id).await.unwrap();
+        let ack2 = sent_request(rx.recv().await.unwrap());
+        assert_eq!(ack2.method.to_string(), "ACK");
+        assert_eq!(
+            ack2.headers.get_value(&HeaderName::Via),
+            ack1.headers.get_value(&HeaderName::Via),
+            "re-sent ACK must reuse the original ACK's Via (same branch)"
+        );
+        assert_eq!(
+            ack2.headers.get_value(&HeaderName::CSeq),
+            ack1.headers.get_value(&HeaderName::CSeq)
+        );
+        assert_eq!(
+            ack2.headers.get_value(&HeaderName::To),
+            ack1.headers.get_value(&HeaderName::To)
+        );
+        assert_eq!(
+            ack2.headers.get_value(&HeaderName::CallId),
+            ack1.headers.get_value(&HeaderName::CallId)
+        );
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a retransmitted 200 must not re-emit state changes or SDP events"
+        );
+        assert_eq!(agent.get_state(&call_id), Some(CallState::Connected));
     }
 
     #[tokio::test]

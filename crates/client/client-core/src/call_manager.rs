@@ -619,6 +619,12 @@ impl CallManager {
     ///
     /// This should be called when the transport layer receives a SIP response
     /// for a call (INVITE 1xx/2xx/3xx-6xx, BYE 200, CANCEL 200, etc.).
+    ///
+    /// The Call-ID is only the *call* lookup key. Transaction-level matching
+    /// — top Via branch + `CSeq` method (RFC 3261 §17.1.3) and `CSeq` number
+    /// validation (§12.2.1.1) — is enforced by `CallAgent::handle_response`
+    /// before any call state is mutated, so late or retransmitted responses
+    /// cannot corrupt newer transactions on the same call.
     pub async fn handle_sip_response(&mut self, response: &SipResponse) -> AppResult<()> {
         // Extract Call-ID from response to find the matching call
         let Some(id) = response.headers.get_value(&HeaderName::CallId) else {
@@ -1364,7 +1370,9 @@ impl CallManager {
 
     /// Handles an incoming BYE request.
     ///
-    /// Sends a 200 OK response and terminates the call.
+    /// Sends a 200 OK response and terminates the call. A BYE that matches
+    /// no existing dialog gets a 481 Call/Transaction Does Not Exist
+    /// (RFC 3261 §8.2.2.2) instead of being silently dropped.
     async fn handle_incoming_bye(
         &mut self,
         request: &SipRequest,
@@ -1378,7 +1386,26 @@ impl CallManager {
         };
         let sip_call_id = id.to_string();
 
-        // Always send 200 OK response for BYE
+        let Some(call_id) = self.find_call_by_sip_id(&sip_call_id).or_else(|| {
+            self.find_active_call_by_sip_call_id(&sip_call_id)
+                .map(|(id, _)| id)
+        }) else {
+            // RFC 3261 §8.2.2.2: a request that matches no existing dialog
+            // MUST be answered with 481 Call/Transaction Does Not Exist.
+            warn!(sip_call_id = %sip_call_id, "Received BYE for unknown dialog, replying 481");
+            let response =
+                build_response_from_request(request, StatusCode::CALL_DOES_NOT_EXIST, None);
+            let _ = self
+                .app_event_tx
+                .send(CallManagerEvent::SendResponse {
+                    response,
+                    destination: source,
+                })
+                .await;
+            return Ok(());
+        };
+
+        // Send 200 OK for the matched dialog's BYE
         let ok_response = build_response_from_request(request, StatusCode::OK, None);
         info!(destination = %source, "Queueing 200 OK response for BYE");
         if let Err(e) = self
@@ -1392,24 +1419,20 @@ impl CallManager {
             error!(error = %e, "Failed to queue 200 OK response for BYE");
         }
 
-        if let Some(call_id) = self.find_call_by_sip_id(&sip_call_id).or_else(|| {
-            self.find_active_call_by_sip_call_id(&sip_call_id)
-                .map(|(id, _)| id)
-        }) {
-            info!(call_id = %call_id, sip_call_id = %sip_call_id, "Remote party sent BYE, terminating call");
-            // Mark the call as terminated - the remote party hung up
-            self.handle_state_changed(&call_id, CallState::Terminated, None)
-                .await?;
-        } else {
-            warn!(sip_call_id = %sip_call_id, "Received BYE for unknown call");
-        }
+        info!(call_id = %call_id, sip_call_id = %sip_call_id, "Remote party sent BYE, terminating call");
+        // Mark the call as terminated - the remote party hung up
+        self.handle_state_changed(&call_id, CallState::Terminated, None)
+            .await?;
 
         Ok(())
     }
 
     /// Handles an incoming CANCEL request.
     ///
-    /// Sends a 200 OK response and terminates the call.
+    /// Sends a 200 OK response and terminates the call. A CANCEL that
+    /// matches no known call or pending incoming INVITE gets a 481
+    /// Call/Transaction Does Not Exist (RFC 3261 §8.2.2.2 / §9.2) instead
+    /// of being silently dropped.
     async fn handle_incoming_cancel(
         &mut self,
         request: &SipRequest,
@@ -1423,7 +1446,33 @@ impl CallManager {
         };
         let sip_call_id = id.to_string();
 
-        // Always send 200 OK response for CANCEL
+        let active_call = self.find_call_by_sip_id(&sip_call_id).or_else(|| {
+            self.find_active_call_by_sip_call_id(&sip_call_id)
+                .map(|(id, _)| id)
+        });
+        let incoming_call = if active_call.is_none() {
+            self.find_incoming_call_by_sip_id(&sip_call_id)
+        } else {
+            None
+        };
+
+        if active_call.is_none() && incoming_call.is_none() {
+            // RFC 3261 §8.2.2.2 / §9.2: a CANCEL that matches no existing
+            // transaction MUST be answered with 481.
+            warn!(sip_call_id = %sip_call_id, "Received CANCEL for unknown call, replying 481");
+            let response =
+                build_response_from_request(request, StatusCode::CALL_DOES_NOT_EXIST, None);
+            let _ = self
+                .app_event_tx
+                .send(CallManagerEvent::SendResponse {
+                    response,
+                    destination: source,
+                })
+                .await;
+            return Ok(());
+        }
+
+        // Send 200 OK for the matched CANCEL transaction
         let ok_response = build_response_from_request(request, StatusCode::OK, None);
         let _ = self
             .app_event_tx
@@ -1433,15 +1482,12 @@ impl CallManager {
             })
             .await;
 
-        if let Some(call_id) = self.find_call_by_sip_id(&sip_call_id).or_else(|| {
-            self.find_active_call_by_sip_call_id(&sip_call_id)
-                .map(|(id, _)| id)
-        }) {
+        if let Some(call_id) = active_call {
             info!(call_id = %call_id, sip_call_id = %sip_call_id, "Remote party sent CANCEL, terminating call");
             // Mark the call as terminated - the remote party cancelled
             self.handle_state_changed(&call_id, CallState::Terminated, None)
                 .await?;
-        } else if let Some(call_id) = self.find_incoming_call_by_sip_id(&sip_call_id) {
+        } else if let Some(call_id) = incoming_call {
             info!(call_id = %call_id, sip_call_id = %sip_call_id, "Remote party cancelled incoming call before answer");
             // Remove from pending incoming calls
             self.incoming_calls.remove(&call_id);
@@ -1450,8 +1496,6 @@ impl CallManager {
                 .app_event_tx
                 .send(CallManagerEvent::IncomingCallCancelled { call_id })
                 .await;
-        } else {
-            warn!(sip_call_id = %sip_call_id, "Received CANCEL for unknown call");
         }
 
         Ok(())
@@ -3501,6 +3545,107 @@ mod tests {
         let (display, uri) = parse_from_header("Dave <sip:dave@example.com>");
         assert_eq!(display, Some("Dave".to_string()));
         assert_eq!(uri, "sip:dave@example.com");
+    }
+
+    /// Builds an in-dialog request (BYE/CANCEL) for an unknown dialog.
+    fn build_unmatched_request(method: proto_sip::method::Method) -> SipRequest {
+        use proto_sip::header::Header;
+        use proto_sip::uri::SipUri;
+
+        let uri = SipUri::new("192.168.1.100").with_user("alice");
+        let mut request = SipRequest::new(method, uri);
+        request.add_header(Header::new(
+            HeaderName::Via,
+            "SIP/2.0/UDP 192.168.1.50:5060;branch=z9hG4bKunknowndialog",
+        ));
+        request.add_header(Header::new(
+            HeaderName::From,
+            "<sip:bob@192.168.1.50>;tag=remote-tag",
+        ));
+        request.add_header(Header::new(
+            HeaderName::To,
+            "<sip:alice@192.168.1.100>;tag=stale-local-tag",
+        ));
+        request.add_header(Header::new(
+            HeaderName::CallId,
+            "no-such-dialog@192.168.1.50",
+        ));
+        request.add_header(Header::new(
+            HeaderName::CSeq,
+            format!("2 {}", request.method),
+        ));
+        request
+    }
+
+    /// RFC 3261 §8.2.2.2: a BYE that matches no existing dialog MUST be
+    /// answered with 481 Call/Transaction Does Not Exist — not silently
+    /// dropped, and certainly not confirmed with a 200 OK.
+    #[tokio::test]
+    async fn test_unmatched_bye_gets_481() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let sip_addr: SocketAddr = "192.168.1.100:5060".parse().unwrap();
+        let media_addr: SocketAddr = "192.168.1.100:16384".parse().unwrap();
+        let mut manager = CallManager::new(sip_addr, media_addr, tx);
+
+        let request = build_unmatched_request(proto_sip::method::Method::Bye);
+        let source: SocketAddr = "192.168.1.50:5060".parse().unwrap();
+        manager
+            .handle_sip_request_from(&request, source)
+            .await
+            .unwrap();
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            CallManagerEvent::SendResponse {
+                response,
+                destination,
+            } => {
+                assert_eq!(
+                    response.status.code(),
+                    481,
+                    "unmatched BYE must get 481 Call/Transaction Does Not Exist"
+                );
+                assert_eq!(destination, source);
+                // The 481 belongs to the BYE's transaction: Via/CSeq copied
+                assert_eq!(response.headers.get_value(&HeaderName::CSeq), Some("2 BYE"));
+                assert!(
+                    response
+                        .headers
+                        .get_value(&HeaderName::Via)
+                        .unwrap()
+                        .contains("z9hG4bKunknowndialog")
+                );
+            }
+            other => panic!("expected SendResponse(481), got {other:?}"),
+        }
+
+        // No call state events for a dialog we don't have
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// RFC 3261 §8.2.2.2 / §9.2: a CANCEL that matches nothing gets 481.
+    #[tokio::test]
+    async fn test_unmatched_cancel_gets_481() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let sip_addr: SocketAddr = "192.168.1.100:5060".parse().unwrap();
+        let media_addr: SocketAddr = "192.168.1.100:16384".parse().unwrap();
+        let mut manager = CallManager::new(sip_addr, media_addr, tx);
+
+        let request = build_unmatched_request(proto_sip::method::Method::Cancel);
+        let source: SocketAddr = "192.168.1.50:5060".parse().unwrap();
+        manager
+            .handle_sip_request_from(&request, source)
+            .await
+            .unwrap();
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            CallManagerEvent::SendResponse { response, .. } => {
+                assert_eq!(response.status.code(), 481);
+            }
+            other => panic!("expected SendResponse(481), got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
