@@ -23,26 +23,26 @@ The client implements comprehensive SDP functionality for audio-only calls with 
 
 - **Section 5.1 (Protocol Version)**: `v=0` - Correctly implemented
 - **Section 5.2 (Origin)**: `o=- <sess-id> <sess-version> IN {IP4|IP6} <address>` - **FIXED 2026-02-07**
-  - Uses NTP-like timestamp format (high 32 bits: seconds, low 32 bits: fractional)
-  - Session version tracked per call and increments on modifications
-  - IPv4 and IPv6 support working
+    - Uses NTP-like timestamp format (high 32 bits: seconds, low 32 bits: fractional)
+    - Session version tracked per call and increments on modifications
+    - IPv4 and IPv6 support working
 - **Section 5.3 (Session Name)**: `s=USG SIP Client` - Implemented
 - **Section 5.4 (Session Information)**: Not used (optional)
 - **Section 5.7 (Connection Data)**: `c=IN {IP4|IP6} <address>` - **FIXED 2026-02-07**
-  - Session-level connection line present
-  - Dynamic IPv4/IPv6 detection via `sdp_addr_type()` helper
+    - Session-level connection line present
+    - Dynamic IPv4/IPv6 detection via `sdp_addr_type()` helper
 - **Section 5.8 (Bandwidth)**: `b=AS:<kbps>` - **FIXED 2026-02-07**
-  - Plain RTP templates: `b=AS:80` (G.711 64 kbps + IP/UDP/RTP overhead)
-  - SRTP templates: `b=AS:100` (Opus variable rate + SRTP + overhead)
+    - Plain RTP templates: `b=AS:80` (G.711 64 kbps + IP/UDP/RTP overhead)
+    - SRTP templates: `b=AS:100` (Opus variable rate + SRTP + overhead)
 - **Section 5.9 (Timing)**: `t=0 0` - Permanent session (correct for SIP)
 - **Section 5.13 (Attributes - ptime)**: `a=ptime:20` - **FIXED 2026-02-07**
-  - Added to all SDP templates
+    - Added to all SDP templates
 - **Section 5.13 (Attributes - maxptime)**: `a=maxptime:120` - **FIXED 2026-02-07**
-  - Added to all SDP templates (Opus supports up to 120ms frames)
+    - Added to all SDP templates (Opus supports up to 120ms frames)
 - **Section 5.14 (Media Descriptions)**: `m=audio <port> <proto> <fmt-list>` - Implemented
-  - Plain RTP: `m=audio <port> RTP/AVP 0 8 101`
-  - Secure RTP: `m=audio <port> UDP/TLS/RTP/SAVPF 111 0 8 101`
-  - Explicit `a=sendrecv` (or `a=sendonly`/`a=recvonly` for hold) - **FIXED 2026-02-07**
+    - Plain RTP: `m=audio <port> RTP/AVP 0 8 101`
+    - Secure RTP: `m=audio <port> UDP/TLS/RTP/SAVPF 111 0 8 101`
+    - Explicit `a=sendrecv` (or `a=sendonly`/`a=recvonly` for hold) - **FIXED 2026-02-07**
 
 #### Not Implemented (Optional, Not Needed) ℹ️
 
@@ -64,26 +64,26 @@ The client implements comprehensive SDP functionality for audio-only calls with 
 #### Implemented ✅
 
 - **Section 5 (Generating the Initial Offer)**
-  - Offers multiple codecs: PCMU(0), PCMA(8), Opus(111 for ICE), telephone-event(101)
-  - Proper m= line construction
-  - Connection address included with IPv4/IPv6 support
+    - Offers multiple codecs: PCMU(0), PCMA(8), Opus(111 for ICE), telephone-event(101)
+    - Proper m= line construction
+    - Connection address included with IPv4/IPv6 support
 
 - **Section 6 (Generating the Answer)**
-  - Parser correctly extracts first codec from answer
-  - Parser detects telephone-event support
-  - Remote media address extraction working
-  - **Answer validation** - **FIXED 2026-02-07**
-    - Validates codec in answer is in our offer (RFC 3264 Section 6.1)
-    - Rejects answer if codec not offered
+    - Parser correctly extracts first codec from answer
+    - Parser detects telephone-event support
+    - Remote media address extraction working
+    - **Answer validation** - **FIXED 2026-02-07**
+        - Validates codec in answer is in our offer (RFC 3264 Section 6.1)
+        - Rejects answer if codec not offered
 
 - **Section 8 (Modifying the Session)**
-  - Re-INVITE with updated SDP for hold/resume supported
-  - Session version increments correctly - **FIXED 2026-02-07**
+    - Re-INVITE with updated SDP for hold/resume supported
+    - Session version increments correctly - **FIXED 2026-02-07**
 
 - **Section 8.4 (Putting a Stream on Hold)**
-  - Hold uses re-INVITE with `a=sendonly`
-  - Resume uses re-INVITE with `a=sendrecv`
-  - Verified correct implementation
+    - Hold uses re-INVITE with `a=sendonly`
+    - Resume uses re-INVITE with `a=sendrecv`
+    - Verified correct implementation
 
 #### Notes
 
@@ -125,18 +125,18 @@ The client implements comprehensive SDP functionality for audio-only calls with 
 
 - RTP packet format with proper headers
 - **SSRC randomness** (Section 5.1) - **FIXED 2026-02-07**
-  - Uses multi-source entropy: timestamp + thread ID + stack address (ASLR) + process ID
-  - Mixed with splitmix64 for uniform distribution
-  - Sequence number initialization also randomized
+    - Uses multi-source entropy: timestamp + thread ID + stack address (ASLR) + process ID
+    - Mixed with splitmix64 for uniform distribution
+    - Sequence number initialization also randomized
 - Timestamp generation for audio samples
 - Payload types: 0 (PCMU), 8 (PCMA), 9 (G722), 111 (Opus), 101 (telephone-event)
 - **RTCP** (RFC 3550 Section 6) - **VERIFIED 2026-02-07**
-  - Compound RTCP packets: SR/RR + SDES (per RFC 3550 Section 6.1)
-  - Sender Reports (SR) with NTP timestamp and RTP timestamp
-  - Receiver Reports (RR) with fraction lost, cumulative lost, jitter
-  - SDES with CNAME for SSRC binding
-  - 5-second transmission interval (within RFC 3550 Section 6.2 guidelines)
-  - Handles incoming SR for round-trip time estimation
+    - Compound RTCP packets: SR/RR + SDES (per RFC 3550 Section 6.1)
+    - Sender Reports (SR) with NTP timestamp and RTP timestamp
+    - Receiver Reports (RR) with fraction lost, cumulative lost, jitter
+    - SDES with CNAME for SSRC binding
+    - 5-second transmission interval (within RFC 3550 Section 6.2 guidelines)
+    - Handles incoming SR for round-trip time estimation
 
 ---
 
@@ -212,9 +212,9 @@ The client implements comprehensive SDP functionality for audio-only calls with 
 
 - `a=rtpmap:111 opus/48000/2` - Correct format (48000 Hz clock rate, 2 channels per RFC 7587 Section 7)
 - `a=fmtp:111 minptime=20;useinbandfec=1;stereo=1` - **FIXED 2026-02-07**
-  - `minptime=20`: Minimum packet time (matches `a=ptime:20`)
-  - `useinbandfec=1`: Enables Opus in-band FEC for packet loss resilience
-  - `stereo=1`: Enables stereo decoding capability
+    - `minptime=20`: Minimum packet time (matches `a=ptime:20`)
+    - `useinbandfec=1`: Enables Opus in-band FEC for packet loss resilience
+    - `stereo=1`: Enables stereo decoding capability
 - `a=maxptime:120` - Maximum packet time for Opus (up to 120ms frames)
 
 ---
@@ -239,10 +239,10 @@ The `proto-sdp` crate provides structured SDP parsing and generation used by `cl
 
 - **All required lines**: `v=`, `o=`, `s=`, `t=` - parsed and generated
 - **All optional lines**: `i=`, `u=`, `e=`, `p=`, `c=`, `b=`, `z=`, `k=`, `a=`, `m=` - **FIXED 2026-02-07**
-  - `b=` (Bandwidth, §5.8): Session-level and media-level bandwidth parsing/generation via `BandwidthInfo` struct
-  - `z=` (Time Zones, §5.11): Parsed and round-tripped as raw string
-  - `k=` (Encryption Key, §5.12): Parsed at session and media level (deprecated but preserved)
-  - `i=` (Media Information, §5.4): Now stored on `MediaDescription` instead of being silently dropped
+    - `b=` (Bandwidth, §5.8): Session-level and media-level bandwidth parsing/generation via `BandwidthInfo` struct
+    - `z=` (Time Zones, §5.11): Parsed and round-tripped as raw string
+    - `k=` (Encryption Key, §5.12): Parsed at session and media level (deprecated but preserved)
+    - `i=` (Media Information, §5.4): Now stored on `MediaDescription` instead of being silently dropped
 - **Repeat times** (`r=` §5.10-5.11): Full structured parsing with compact time values (`7d`, `1h`, etc.)
 - **Offer/Answer model** (RFC 3264): `generate_answer()`, `validate_answer()`, hold/resume/disable/enable
 - **Multicast** (RFC 8866 §5.7): IPv4/IPv6 multicast address parsing, TTL, address count
@@ -251,9 +251,9 @@ The `proto-sdp` crate provides structured SDP parsing and generation used by `cl
 #### Security Fixes
 
 - **SRTP keying material PRNG** - **FIXED 2026-02-07**
-  - Before: Timestamp-based pseudo-random generation (predictable, unsuitable for crypto)
-  - After: `getrandom::fill()` using OS CSPRNG
-  - Impact: Keying material now cryptographically random per NIST SP 800-90A
+    - Before: Timestamp-based pseudo-random generation (predictable, unsuitable for crypto)
+    - After: `getrandom::fill()` using OS CSPRNG
+    - Impact: Keying material now cryptographically random per NIST SP 800-90A
 
 #### Code Quality Fixes (2026-02-07)
 
@@ -293,52 +293,52 @@ The `proto-sdp` crate provides structured SDP parsing and generation used by `cl
 ### HIGH Priority 🔴 - **ALL COMPLETED** ✅
 
 1. ✅ **Session ID Uniqueness** (RFC 8866 Section 5.2) - **COMPLETED 2026-02-07**
-   - Fix: Implemented NTP-like timestamp (high 32: seconds, low 32: fractional)
-   - Result: Collision risk eliminated
+    - Fix: Implemented NTP-like timestamp (high 32: seconds, low 32: fractional)
+    - Result: Collision risk eliminated
 
 2. ✅ **Session Version Tracking** (RFC 8866 Section 5.2, RFC 3264 Section 8.2) - **COMPLETED 2026-02-07**
-   - Fix: Added `sdp_session_ids` and `sdp_session_versions` HashMaps per call
-   - Result: Session version persists and increments on re-INVITE
+    - Fix: Added `sdp_session_ids` and `sdp_session_versions` HashMaps per call
+    - Result: Session version persists and increments on re-INVITE
 
 3. ✅ **Answer Validation** (RFC 3264 Section 6.1) - **COMPLETED 2026-02-07**
-   - Fix: Added `is_codec_offered()` validation in `handle_sdp_answer()`
-   - Result: Rejects answers with codecs not in offer
+    - Fix: Added `is_codec_offered()` validation in `handle_sdp_answer()`
+    - Result: Rejects answers with codecs not in offer
 
 ### MEDIUM Priority 🟡 - **ALL COMPLETED** ✅
 
 1. ✅ **Add ptime Attribute** (RFC 8866 Section 5.13) - **COMPLETED 2026-02-07**
-   - Fix: Added `a=ptime:20` to all four SDP templates
-   - Result: Packet time explicitly declared
+    - Fix: Added `a=ptime:20` to all four SDP templates
+    - Result: Packet time explicitly declared
 
 2. ✅ **Explicit Media Direction** (RFC 8866 Section 5.14, RFC 3264) - **COMPLETED 2026-02-07**
-   - Fix: Already present - `a=sendrecv` in initial, `a={direction}` in re-INVITE
-   - Result: Direction always explicit
+    - Fix: Already present - `a=sendrecv` in initial, `a={direction}` in re-INVITE
+    - Result: Direction always explicit
 
 3. ✅ **IPv6 Support** (RFC 8866 Section 5.7) - **COMPLETED 2026-02-07**
-   - Fix: Added `sdp_addr_type()` helper; all 4 SDP templates use dynamic `IN {IP4|IP6}`
-   - Result: Both IPv4 and IPv6 addresses supported in SDP generation
+    - Fix: Added `sdp_addr_type()` helper; all 4 SDP templates use dynamic `IN {IP4|IP6}`
+    - Result: Both IPv4 and IPv6 addresses supported in SDP generation
 
 4. ✅ **Opus SDP Parameters** (RFC 7587) - **COMPLETED 2026-02-07**
-   - Fix: Added `a=fmtp:111 minptime=20;useinbandfec=1;stereo=1` to SRTP templates
-   - Result: Full Opus fmtp compliance with FEC and stereo support
+    - Fix: Added `a=fmtp:111 minptime=20;useinbandfec=1;stereo=1` to SRTP templates
+    - Result: Full Opus fmtp compliance with FEC and stereo support
 
 5. ✅ **maxptime Attribute** (RFC 8866 Section 5.13) - **COMPLETED 2026-02-07**
-   - Fix: Added `a=maxptime:120` to all four SDP templates
-   - Result: Maximum packet time declared for Opus compatibility
+    - Fix: Added `a=maxptime:120` to all four SDP templates
+    - Result: Maximum packet time declared for Opus compatibility
 
 ### LOW Priority 🟢 - **ALL COMPLETED** ✅
 
 1. ✅ **Bandwidth Hints** (RFC 8866 Section 5.8) - **COMPLETED 2026-02-07**
-   - Fix: Added `b=AS:80` (plain RTP) and `b=AS:100` (SRTP) to all SDP templates
-   - Result: QoS hints available for network elements
+    - Fix: Added `b=AS:80` (plain RTP) and `b=AS:100` (SRTP) to all SDP templates
+    - Result: QoS hints available for network elements
 
 2. ✅ **SSRC Randomness** (RFC 3550 Section 5.1) - **COMPLETED 2026-02-07**
-   - Fix: Replaced time-based PRNG with multi-source entropy + splitmix64 mixing
-   - Result: Cryptographically better SSRC distribution, collision risk minimized
+    - Fix: Replaced time-based PRNG with multi-source entropy + splitmix64 mixing
+    - Result: Cryptographically better SSRC distribution, collision risk minimized
 
 3. ✅ **RTCP Verification** (RFC 3550 Section 6) - **VERIFIED 2026-02-07**
-   - Review: Full compound RTCP (SR/RR + SDES) implemented in `rtcp_session.rs`
-   - Result: Confirmed compliant with 5-second interval, NTP timestamps, loss statistics
+    - Review: Full compound RTCP (SR/RR + SDES) implemented in `rtcp_session.rs`
+    - Result: Confirmed compliant with 5-second interval, NTP timestamps, loss statistics
 
 ---
 

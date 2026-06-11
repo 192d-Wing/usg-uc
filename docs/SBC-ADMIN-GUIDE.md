@@ -16,16 +16,18 @@ The USG SBC is a SIP Session Border Controller that provides:
 
 ### Architecture
 
-```
-                    +-----------+
-  SIP UA ---------> |           | ---------> SIP Trunk / PSTN
-  (A-leg)           |  USG SBC  |            (B-leg)
-  <----------------- |           | <---------
-                    |  -------  |
-                    |  | RTP |  |
-  RTP (A-leg) ----> |  |Relay|  | ---------> RTP (B-leg)
-  <----------------- |  -------  | <---------
-                    +-----------+
+``` mermaid
+flowchart LR
+    ua["SIP UA<br>(A-leg)"]
+    subgraph sbc["USG SBC"]
+        b2bua["B2BUA"]
+        relay["RTP Relay"]
+    end
+    trunk["SIP Trunk / PSTN<br>(B-leg)"]
+    ua <-->|SIP| b2bua
+    b2bua <-->|SIP| trunk
+    ua <-->|RTP| relay
+    relay <-->|RTP| trunk
 ```
 
 ---
@@ -510,6 +512,7 @@ burst_multiplier = 2.0          # Allow short bursts
 ```
 
 When rate limits are exceeded:
+
 - **Throttle**: Suggested delay (logged but not enforced)
 - **Reject**: Message silently dropped
 - **Block**: Source temporarily blocked
@@ -556,6 +559,7 @@ max_connections = 100
 ```
 
 Available gRPC services:
+
 - **CallService** — List, get, terminate calls; watch call events
 - **RegistrationService** — List, get, delete registrations; stats
 - **ConfigService** — Get, update, validate, reload configuration
@@ -615,6 +619,7 @@ pool_size = 10
 ### CNSA 2.0 Compliance
 
 The SBC is designed for CNSA 2.0 compliance:
+
 - TLS 1.3 with P-384 ECDSA certificates
 - SRTP with AEAD_AES_256_GCM (256-bit)
 - DTLS-SRTP key exchange with SHA-384 fingerprint
@@ -624,6 +629,7 @@ See [CNSA-2-COMPLIANCE.md](CNSA-2-COMPLIANCE.md) for details.
 ### NIST 800-53 Rev5 Controls
 
 The SBC implements controls from NIST 800-53 Rev5:
+
 - **AC-4**: Information flow enforcement (routing, topology hiding)
 - **AU-2**: Audit logging
 - **CM-2/CM-6**: Configuration management

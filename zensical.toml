@@ -1,0 +1,84 @@
+# Zensical configuration for the USG UC documentation site.
+# Build with `uvx zensical build`, preview with `uvx zensical serve`.
+# Content lives in docs/, output in site/ (gitignored).
+
+[project]
+site_name = "USG Unified Communications"
+site_description = "Rust SIP Session Border Controller and soft clients with CNSA 2.0 cryptography"
+site_url = "https://192d-wing.github.io/usg-uc/"
+repo_name = "192d-Wing/usg-uc"
+repo_url = "https://github.com/192d-Wing/usg-uc"
+copyright = "&copy; 2026 192d Wing"
+docs_dir = "docs"
+site_dir = "site"
+
+nav = [
+    { "Home" = "index.md" },
+    { "Architecture" = "architecture.md" },
+    { "SBC Administration" = [
+        { "Administrator Guide" = "SBC-ADMIN-GUIDE.md" },
+        { "REST API Reference" = "API-REFERENCE.md" },
+        { "Route Patterns" = "route-patterns.md" },
+        { "Clustering & High Availability" = "CLUSTERING.md" },
+        { "Storage Backends" = "STORAGE-BACKENDS.md" },
+    ] },
+    { "Clients" = [
+        { "Native Client Migration Plan" = "CLIENT-NATIVE-MIGRATION-PLAN.md" },
+        { "Provisioning & OIDC Sign-In" = "CLIENT-PROVISIONING-OIDC.md" },
+    ] },
+    { "Compliance" = [
+        { "CNSA 2.0" = "CNSA-2-COMPLIANCE.md" },
+        { "NIST 800-53 Controls" = "NIST-800-53-CONTROLS.md" },
+        { "RFC Compliance Gaps" = "RFC_COMPLIANCE_GAPS.md" },
+        { "Client RFC Compliance Audit" = "CLIENT_RFC_COMPLIANCE_AUDIT.md" },
+        { "SDP RFC Compliance" = "SDP_RFC_Compliance.md" },
+        { "G.711 ITU-T Compliance" = "G711_ITU_Compliance.md" },
+    ] },
+]
+
+[project.markdown_extensions.pymdownx.superfences]
+custom_fences = [
+    { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" },
+]
+
+[project.theme]
+language = "en"
+features = [
+    "navigation.tabs",
+    "navigation.tabs.sticky",
+    "navigation.sections",
+    "navigation.indexes",
+    "navigation.top",
+    "navigation.tracking",
+    "search.highlight",
+    "search.suggest",
+    "content.code.copy",
+]
+
+[project.theme.icon]
+repo = "fontawesome/brands/github"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme)"
+toggle.icon = "lucide/sun-moon"
+toggle.name = "Switch to light mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+primary = "blue grey"
+accent = "indigo"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+primary = "blue grey"
+accent = "indigo"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to system preference"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/192d-Wing/usg-uc"

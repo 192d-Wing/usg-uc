@@ -133,6 +133,7 @@ fips = ["aws-lc-rs/fips"]
 ```
 
 AWS-LC-FIPS 3.0 includes:
+
 - First FIPS-validated ML-KEM implementation
 - AES-256-GCM
 - SHA-384/512
@@ -148,6 +149,7 @@ CNSA 2.0 mandates migration to post-quantum algorithms by 2033:
 | Signatures | ECDSA P-384 | ML-DSA-87 |
 
 The architecture is prepared for this migration:
+
 - `sbc-crypto` has a `pqc` feature flag
 - aws-lc-rs includes ML-KEM support
 - Key exchange abstractions support algorithm agility

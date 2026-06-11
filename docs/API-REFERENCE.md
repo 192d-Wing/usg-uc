@@ -5,6 +5,7 @@ This document describes the REST API endpoints for the USG Session Border Contro
 ## Overview
 
 The SBC exposes a RESTful API for management and monitoring. The API is available on:
+
 - HTTP: Port 8080 (internal)
 - HTTPS: Port 8443 (external, TLS 1.3 required)
 
@@ -21,6 +22,7 @@ curl -H "Authorization: Bearer <api-key>" \
 ## API Versioning
 
 The API is versioned via URL path:
+
 - Current version: `/api/v1/`
 
 ## Common Response Formats
@@ -791,6 +793,7 @@ GET /readyz
 ## Rate Limiting
 
 API endpoints are rate-limited per client IP:
+
 - Default: 100 requests/minute
 - Export endpoints: 10 requests/minute
 
@@ -807,4 +810,4 @@ X-RateLimit-Reset: 1705320000
 
 - [CLUSTERING.md](CLUSTERING.md) - High availability configuration
 - [STORAGE-BACKENDS.md](STORAGE-BACKENDS.md) - Storage backend configuration
-- [RUNBOOK.md](../deploy/docs/RUNBOOK.md) - Operational procedures
+- [RUNBOOK.md](https://github.com/192d-Wing/usg-uc/blob/main/deploy/docs/RUNBOOK.md) - Operational procedures
