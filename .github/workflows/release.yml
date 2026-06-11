@@ -1,6 +1,7 @@
 name: Release
 
 # Builds the SBC pod images (sbc-daemon, sbc-api-server, sbc-provision-server,
+# sbc-client-config-server, sbc-announcement-server, sbc-trunk-agent,
 # sbc-dashboard) for linux/amd64 + linux/arm64 and publishes a multi-arch
 # manifest per image.
 #
@@ -56,6 +57,8 @@ jobs:
           - { name: sbc-api-server, dockerfile: crates/sbc/sbc-api-server/Dockerfile, context: . }
           - { name: sbc-provision-server, dockerfile: crates/sbc/sbc-provision-server/Dockerfile, context: . }
           - { name: sbc-client-config-server, dockerfile: crates/sbc/sbc-client-config-server/Dockerfile, context: . }
+          - { name: sbc-announcement-server, dockerfile: crates/sbc/sbc-announcement-server/Dockerfile, context: . }
+          - { name: sbc-trunk-agent, dockerfile: crates/sbc/sbc-trunk-agent/Dockerfile, context: . }
           - { name: sbc-dashboard, dockerfile: crates/sbc/sbc-dashboard/Dockerfile, context: crates/sbc/sbc-dashboard }
         platform:
           - { arch: linux/amd64, runner: ubuntu-24.04 }
@@ -131,7 +134,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [sbc-daemon, sbc-api-server, sbc-provision-server, sbc-client-config-server, sbc-dashboard]
+        image: [sbc-daemon, sbc-api-server, sbc-provision-server, sbc-client-config-server, sbc-announcement-server, sbc-trunk-agent, sbc-dashboard]
     steps:
       - name: Download digests
         uses: actions/download-artifact@v4
