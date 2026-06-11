@@ -1007,12 +1007,14 @@ dependencies = [
 name = "client-ffi"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "client-audio",
  "client-core",
  "client-types",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uniffi",
 ]
 
