@@ -47,6 +47,11 @@ targets:
           - Resources/**
       - path: ../UsgSipClient/Sources/SipClientApp/Resources/DOW-Seal.png
         buildPhase: resources
+      # Gitignored dev-only account seed (DEBUG). optional: true so the
+      # project still generates and builds when the file is absent.
+      - path: ../UsgSipClient/Sources/SipClientApp/Resources/DevSeed.json
+        buildPhase: resources
+        optional: true
       - path: LaunchScreen.storyboard
     settings:
       base:
@@ -59,7 +64,6 @@ targets:
         # The shared sources reference Bundle.module under SwiftPM; the Xcode
         # app target copies resources into Bundle.main instead (see
         # PlatformImage.swift Bundle.appResources).
-        SWIFT_ACTIVE_COMPILATION_CONDITIONS: XCODE_APP
         LD_RUNPATH_SEARCH_PATHS:
           - "@executable_path/Frameworks"
         # The Rust staticlib (client_ffi) records a link dependency on the
@@ -68,6 +72,13 @@ targets:
         LIBRARY_SEARCH_PATHS:
           - "$(inherited)"
           - "$(SRCROOT)/../UsgSipClient/Frameworks/native/aarch64-apple-ios-sim"
+      configs:
+        # Debug also defines DEBUG (gates the DevSeed account loader); release
+        # gets only XCODE_APP, so the dev seed can never ship.
+        debug:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: XCODE_APP DEBUG
+        release:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: XCODE_APP
     dependencies:
       # The UsgSipClient library product: generated UniFFI bindings +
       # ClientFFI.xcframework (the Rust core staticlib).

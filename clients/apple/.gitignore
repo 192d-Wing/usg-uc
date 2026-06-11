@@ -10,3 +10,6 @@ UsgSipClient/.swiftpm/
 # commit the generated Xcode project.
 ios/SipClientApp-iOS.xcodeproj/
 ios/*.xcworkspace/
+
+# Dev-only account seed (credentials — never commit)
+**/Resources/DevSeed.json

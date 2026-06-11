@@ -64,12 +64,31 @@ final class AppModel: ObservableObject, @unchecked Sendable {
                 DispatchQueue.main.async {
                     self.registrationText = "initialized"
                 }
+                seedAccountIfNeeded(client)
             } catch {
                 DispatchQueue.main.async { self.errorMessage = "\(error)" }
                 return
             }
             refreshAll()
         }
+    }
+
+    /// DEBUG-only: seed a dev account from the gitignored `DevSeed.json` when
+    /// no account is configured (fresh iOS Simulator sandbox), then register.
+    /// No-op in release, when an account already exists, or when the file is
+    /// absent. Runs on the FFI queue (called from `start`).
+    private func seedAccountIfNeeded(_ client: SipClient) {
+        #if DEBUG
+            guard client.getAccount() == nil, let seed = DevSeed.load() else { return }
+            do {
+                try client.updateAccount(
+                    account: DevSeed.account(from: seed), digestPassword: seed.password)
+                try client.register()
+                DispatchQueue.main.async { self.registrationText = "seeded; registering…" }
+            } catch {
+                DispatchQueue.main.async { self.errorMessage = "seed failed: \(error)" }
+            }
+        #endif
     }
 
     /// Runs an FFI call on the serial queue; errors surface as the banner.
