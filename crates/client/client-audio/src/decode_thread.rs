@@ -7,6 +7,7 @@
 //! delays that cause playback gaps.
 
 use crate::aec::AecReference;
+use crate::backend::{PlaybackHandle, create_playback};
 use crate::codec::CodecPipeline;
 use crate::comfort_noise::{ComfortNoiseConfig, ComfortNoiseGenerator, decode_cn_payload};
 use crate::drift_compensator::{DriftCompensator, DriftConfig};
@@ -15,7 +16,7 @@ use crate::jitter_buffer::{JitterBufferResult, SharedJitterBuffer};
 use crate::postfilter::{Postfilter, PostfilterConfig};
 use crate::rtp_handler::SharedDtmfQueue;
 use crate::sinc_resampler::Resampler;
-use crate::stream::{PlaybackStream, PlaybackStreamHandle, Sample};
+use crate::stream::Sample;
 use crate::wsola::WsolaPlc;
 use client_types::{CodecPreference, DtmfDigit, DtmfEvent};
 
@@ -356,14 +357,14 @@ pub struct DecodeThreadConfig {
 /// # Arguments
 /// * `config` - Decode thread configuration
 /// * `producer` - Ring buffer producer (writes decoded audio for CPAL to read)
-/// * `playback_handle` - CPAL playback stream handle (kept alive by this thread)
+/// * `playback_handle` - Playback stream handle (kept alive by this thread)
 /// * `jitter_buffer` - Shared jitter buffer (reads packets pushed by I/O thread)
 /// * `running` - Shared flag to signal shutdown
 /// * `playback_underruns` - Counter shared with CPAL callback for underrun tracking
 pub fn spawn(
     config: DecodeThreadConfig,
     producer: ringbuf::HeapProd<Sample>,
-    playback_handle: PlaybackStreamHandle,
+    playback_handle: Box<dyn PlaybackHandle>,
     jitter_buffer: SharedJitterBuffer,
     running: Arc<AtomicBool>,
     playback_underruns: Arc<AtomicU64>,
@@ -414,7 +415,7 @@ pub fn spawn(
 fn decode_loop(
     config: DecodeThreadConfig,
     mut producer: ringbuf::HeapProd<Sample>,
-    mut playback_handle: PlaybackStreamHandle,
+    mut playback_handle: Box<dyn PlaybackHandle>,
     jitter_buffer: SharedJitterBuffer,
     running: &AtomicBool,
     playback_underruns: &AtomicU64,
@@ -1168,7 +1169,7 @@ fn decode_loop(
                     );
                     let mut dm = crate::device::DeviceManager::new();
                     dm.set_output_device(device_name);
-                    match PlaybackStream::new(&dm) {
+                    match create_playback(&dm) {
                         Ok(new_playback) => {
                             let new_rate = new_playback.sample_rate();
                             let (new_handle, mut new_producer, _new_underruns) =
@@ -1225,7 +1226,7 @@ fn decode_loop(
             warn!("Decode thread: playback device error detected, switching to default output");
             let mut dm = crate::device::DeviceManager::new();
             dm.set_output_device(None);
-            match PlaybackStream::new(&dm) {
+            match create_playback(&dm) {
                 Ok(new_playback) => {
                     let new_rate = new_playback.sample_rate();
                     let (new_handle, mut new_producer, _new_underruns) =
@@ -1337,7 +1338,7 @@ mod tests {
     fn test_spawn_and_stop() {
         // Create a real playback stream (skip if no audio device available)
         let dm = crate::device::DeviceManager::new();
-        let Ok(playback) = PlaybackStream::new(&dm) else {
+        let Ok(playback) = create_playback(&dm) else {
             return; // skip if no audio device
         };
         let (playback_handle, producer, underruns) = playback.take_producer();

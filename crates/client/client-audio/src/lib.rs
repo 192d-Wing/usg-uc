@@ -39,6 +39,7 @@
 //!
 //! ## Modules
 //!
+//! - [`backend`]: Platform device I/O traits (`CaptureSource`/`PlaybackSink`)
 //! - [`device`]: Audio device enumeration and selection
 //! - [`stream`]: CPAL-based audio capture and playback
 //! - [`codec`]: Audio codec integration (G.711, G.722, Opus)
@@ -67,6 +68,7 @@
 
 pub mod aec;
 pub mod audio_processing;
+pub mod backend;
 pub mod codec;
 pub mod comfort_noise;
 pub mod decode_thread;
@@ -94,6 +96,7 @@ pub mod wsola;
 
 pub use aec::{AecProcessor, AecReference};
 pub use audio_processing::AudioProcessor;
+pub use backend::{CaptureSource, PlaybackHandle, PlaybackSink, create_capture, create_playback};
 pub use codec::{CodecPipeline, negotiate_codec};
 pub use comfort_noise::ComfortNoiseGenerator;
 pub use decode_thread::DecodeThreadHandle;
