@@ -103,6 +103,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val ctx = getApplication<Application>()
+                // Give the Rust core the JavaVM + Context before anything that
+                // uses ndk_context (cpal device enumeration, hickory DNS).
+                RustAndroid.ensureInitialized(ctx)
                 // Android has no directories-crate default: pass the app sandbox
                 // paths explicitly, or settings/contacts persistence fails.
                 val cfg = ClientConfig(

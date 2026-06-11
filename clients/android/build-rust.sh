@@ -78,6 +78,11 @@ echo "==> Staging the aws-lc FIPS crypto module"
 TARGET_ROOT="$(cargo metadata --format-version 1 --no-deps \
     --manifest-path "$REPO_ROOT/Cargo.toml" 2>/dev/null \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+# The Oboe backend links C++ (libc++_shared.so); without it libclient_ffi.so
+# fails to resolve __cxa_pure_virtual and other C++ runtime symbols at load.
+NDK_ROOT="${ANDROID_NDK_ROOT:-${ANDROID_NDK_HOME:-}}"
+NDK_LIBDIR="$NDK_ROOT/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr/lib"
+
 # macOS ships bash 3.2 (no associative arrays); map ABI -> triple with a case.
 for abi in arm64-v8a x86_64; do
     case "$abi" in
@@ -91,6 +96,13 @@ for abi in arm64-v8a x86_64; do
         echo "    $abi: $(basename "$crypto_so")"
     else
         echo "    warning: no FIPS crypto .so found for $abi" >&2
+    fi
+    cxx_so="$NDK_LIBDIR/$triple/libc++_shared.so"
+    if [[ -f "$cxx_so" ]]; then
+        cp "$cxx_so" "$APP_DIR/src/main/jniLibs/$abi/"
+        echo "    $abi: libc++_shared.so"
+    else
+        echo "    warning: libc++_shared.so not found for $abi at $cxx_so" >&2
     fi
 done
 
