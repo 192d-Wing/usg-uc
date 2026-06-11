@@ -3,7 +3,12 @@
 // Run from clients/apple/UsgSipClient:  swift run SipClientApp
 // (macOS mic permission is inherited from the terminal, as with cargo run.)
 
+#if canImport(AppKit)
 import AppKit
+#endif
+#if os(iOS)
+import AVFoundation
+#endif
 import SwiftUI
 import UsgSipClient
 
@@ -14,23 +19,63 @@ struct SipClientApp: App {
     init() {
         setvbuf(stdout, nil, _IOLBF, 0)  // line-buffer events when piped to a log
         initLogging(filter: nil)  // Rust core logs -> stderr (RUST_LOG honored)
+        #if os(iOS)
+        configureAudioSession()
+        #endif
+        #if os(macOS)
         // Bare executables (no .app bundle) are never activated by macOS, so
         // the window can't take keyboard focus and clicks are swallowed by
-        // focus changes. Activate explicitly.
+        // focus changes. Activate explicitly. (iOS apps are always foregrounded
+        // by the system; no equivalent is needed.)
         DispatchQueue.main.async {
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
         }
+        #endif
     }
+
+    #if os(iOS)
+    /// The Rust audio backend (cpal/VPIO) requires an active AVAudioSession
+    /// before it can open input/output units. Configure it once at launch:
+    /// `.playAndRecord` + `.voiceChat` is the standard VoIP profile (echo
+    /// cancellation, ducking, default-to-speaker disabled for earpiece use).
+    private func configureAudioSession() {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setCategory(
+                .playAndRecord,
+                mode: .voiceChat,
+                options: [.allowBluetooth, .allowBluetoothA2DP])
+            try session.setActive(true)
+        } catch {
+            print("AVAudioSession configuration failed: \(error)")
+        }
+    }
+    #endif
 
     var body: some Scene {
         WindowGroup("USG SIP Client") {
             RootView()
                 .environmentObject(model)
-                .frame(minWidth: 420, minHeight: 640)
-                .frame(idealWidth: 420, idealHeight: 640)
+                // Window sizing only applies on macOS; iOS is full-screen.
+                .modifier(WindowSizing())
         }
+        #if os(macOS)
         .windowResizability(.contentSize)
+        #endif
+    }
+}
+
+/// macOS fixed-window sizing; a no-op on iOS (full-screen).
+private struct WindowSizing: ViewModifier {
+    func body(content: Content) -> some View {
+        #if os(macOS)
+        content
+            .frame(minWidth: 420, minHeight: 640)
+            .frame(idealWidth: 420, idealHeight: 640)
+        #else
+        content
+        #endif
     }
 }
 
@@ -204,14 +249,14 @@ struct ClassificationBannerView: View {
 /// Compact branding row: DoW seal (bundled resource) plus the app title.
 /// Falls back to an SF Symbol shield if the seal asset is missing.
 struct BrandingHeaderView: View {
-    private static let seal: NSImage? = Bundle.module
+    private static let seal: PlatformImage? = Bundle.appResources
         .url(forResource: "DOW-Seal", withExtension: "png")
-        .flatMap { NSImage(contentsOf: $0) }
+        .flatMap { PlatformImage.load(contentsOf: $0) }
 
     var body: some View {
         HStack(spacing: 8) {
             if let seal = Self.seal {
-                Image(nsImage: seal)
+                Image(platformImage: seal)
                     .resizable()
                     .interpolation(.high)
                     .scaledToFit()

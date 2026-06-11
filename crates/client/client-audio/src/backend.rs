@@ -171,20 +171,78 @@ impl PlaybackHandle for PlaybackStreamHandle {
     }
 }
 
+#[cfg(target_os = "ios")]
+impl CaptureSource for crate::ios_vpio::IosVpioCapture {
+    fn read(&mut self, buf: &mut [i16]) -> usize {
+        Self::read(self, buf)
+    }
+
+    fn available(&self) -> usize {
+        Self::available(self)
+    }
+
+    fn sample_rate(&self) -> u32 {
+        Self::sample_rate(self)
+    }
+
+    fn is_running(&self) -> bool {
+        Self::is_running(self)
+    }
+
+    fn has_error(&self) -> bool {
+        Self::has_error(self)
+    }
+
+    fn stop(&self) {
+        Self::stop(self);
+    }
+
+    fn is_vpio(&self) -> bool {
+        // Hardware AEC is active via the duplex VoiceProcessingIO unit.
+        true
+    }
+}
+
 /// Creates the platform capture backend for the current target.
 ///
-/// Today this wraps [`CaptureBackend::new`] (CPAL, with macOS VPIO selection
-/// kept inside it). iOS (`AudioUnit` VPIO) and Android (Oboe) backends plug
-/// in here behind `cfg(target_os = ...)` without touching the DSP core.
+/// On iOS this returns the [`crate::ios_vpio`] duplex VPIO capture source
+/// (hardware AEC). On macOS and other desktop targets it wraps
+/// [`CaptureBackend::new`] (CPAL, with macOS VPIO selection kept inside it).
+/// The DSP core and I/O/decode threads are unaffected.
+#[cfg(target_os = "ios")]
+pub fn create_capture(_device_manager: &DeviceManager) -> AudioResult<Box<dyn CaptureSource>> {
+    // Device selection is fixed to the shared duplex VPIO unit on iOS.
+    Ok(Box::new(crate::ios_vpio::create_ios_capture()?))
+}
+
+/// Creates the platform capture backend for the current target.
+///
+/// On macOS and other desktop targets this wraps [`CaptureBackend::new`]
+/// (CPAL, with macOS VPIO selection kept inside it). The DSP core and
+/// I/O/decode threads are unaffected.
+#[cfg(not(target_os = "ios"))]
 pub fn create_capture(device_manager: &DeviceManager) -> AudioResult<Box<dyn CaptureSource>> {
     Ok(Box::new(CaptureBackend::new(device_manager)?))
 }
 
 /// Creates the platform playback backend for the current target.
 ///
-/// Today this wraps [`PlaybackStream::new`] (CPAL). iOS (`AudioUnit`) and
-/// Android (Oboe) backends plug in here behind `cfg(target_os = ...)`
-/// without touching the DSP core.
+/// On iOS this returns the [`crate::ios_vpio`] duplex VPIO playback sink,
+/// which shares one `VoiceProcessingIO` unit with capture (hardware AEC,
+/// full duplex). On macOS and other desktop targets it wraps
+/// [`PlaybackStream::new`] (CPAL). The DSP core and I/O/decode threads are
+/// unaffected.
+#[cfg(target_os = "ios")]
+pub fn create_playback(_device_manager: &DeviceManager) -> AudioResult<Box<dyn PlaybackSink>> {
+    // Device selection is fixed to the shared duplex VPIO unit on iOS.
+    Ok(Box::new(crate::ios_vpio::create_ios_playback()?))
+}
+
+/// Creates the platform playback backend for the current target.
+///
+/// On macOS and other desktop targets this wraps [`PlaybackStream::new`]
+/// (CPAL). The DSP core and I/O/decode threads are unaffected.
+#[cfg(not(target_os = "ios"))]
 pub fn create_playback(device_manager: &DeviceManager) -> AudioResult<Box<dyn PlaybackSink>> {
     Ok(Box::new(PlaybackStream::new(device_manager)?))
 }

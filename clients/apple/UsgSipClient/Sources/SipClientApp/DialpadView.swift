@@ -6,13 +6,17 @@
 // cursor; digits come from the keypad buttons, and a window-level NSEvent
 // monitor keeps physical-keyboard entry working while the tab is visible.
 
+#if canImport(AppKit)
 import AppKit
+#endif
 import SwiftUI
 
 struct DialpadView: View {
     @EnvironmentObject var model: AppModel
     @State private var dialString = ""
+    #if os(macOS)
     @State private var keyMonitor: Any?
+    #endif
 
     private var inCall: Bool { model.activeCall != nil }
 
@@ -70,8 +74,7 @@ struct DialpadView: View {
             Spacer(minLength: 12)
         }
         .padding()
-        .onAppear(perform: installKeyMonitor)
-        .onDisappear(perform: removeKeyMonitor)
+        .modifier(HardwareKeyboardMonitor(install: installKeyMonitor, remove: removeKeyMonitor))
     }
 
     private func placeCall() {
@@ -79,8 +82,13 @@ struct DialpadView: View {
         model.call(dialString)
     }
 
-    // MARK: Physical keyboard entry
+    // MARK: Physical keyboard entry (macOS only)
+    //
+    // iOS has no hardware-keyboard monitor here — entry is via the on-screen
+    // keypad buttons only — so these become no-ops and the modifier below skips
+    // the .onAppear/.onDisappear wiring on iOS.
 
+    #if os(macOS)
     /// Window-level key capture: digits/*/#/+ append to the dial string (or
     /// send DTMF in-call), delete is backspace. Installed only while the
     /// dialpad tab is on screen.
@@ -119,6 +127,27 @@ struct DialpadView: View {
             dialString.append(key)
         }
         return true
+    }
+    #else
+    private func installKeyMonitor() {}
+    private func removeKeyMonitor() {}
+    #endif
+}
+
+/// Wires the hardware-keyboard monitor's lifecycle to the view on macOS; a
+/// no-op on iOS (on-screen keypad only).
+private struct HardwareKeyboardMonitor: ViewModifier {
+    let install: () -> Void
+    let remove: () -> Void
+
+    func body(content: Content) -> some View {
+        #if os(macOS)
+        content
+            .onAppear(perform: install)
+            .onDisappear(perform: remove)
+        #else
+        content
+        #endif
     }
 }
 
