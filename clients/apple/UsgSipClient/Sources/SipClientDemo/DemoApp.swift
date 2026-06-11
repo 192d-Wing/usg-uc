@@ -8,12 +8,25 @@
 // Run from clients/apple/UsgSipClient:  swift run SipClientDemo
 // (macOS mic permission is inherited from the terminal, as with cargo run.)
 
+import AppKit
 import SwiftUI
 import UsgSipClient
 
 @main
 struct SipClientDemoApp: App {
     @StateObject private var model = ClientModel()
+
+    init() {
+        setvbuf(stdout, nil, _IOLBF, 0)  // line-buffer events when piped to a log
+        initLogging(filter: nil)  // Rust core logs -> stderr (RUST_LOG honored)
+        // Bare executables (no .app bundle) are never activated by macOS, so
+        // the window can't take keyboard focus and clicks are swallowed by
+        // focus changes. Activate explicitly.
+        DispatchQueue.main.async {
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
 
     var body: some Scene {
         WindowGroup("USG SIP Client (FFI smoke test)") {
@@ -101,6 +114,7 @@ final class ClientModel: ObservableObject, @unchecked Sendable {
         weak var model: ClientModel?
         init(model: ClientModel) { self.model = model }
         func onEvent(event: AppEvent) {
+            print("event: \(event)")  // mirror to stdout for headless log-watching
             DispatchQueue.main.async { self.model?.handle(event) }
         }
     }
