@@ -1,8 +1,12 @@
-//! SBC Announcement Server.
+//! SBC announcement playback engine.
 //!
 //! Plays pre-recorded audio announcements to callers via RTP when
 //! routes are unavailable or other error conditions occur. The SBC
 //! answers the call with a 200 OK, streams PCMU audio, then sends BYE.
+//!
+//! Extracted from `sbc-daemon` so the same engine backs both the
+//! daemon's in-process fallback path and the `sbc-announcement-server`
+//! pod (gRPC-fronted playback in its own container).
 //!
 //! ## NIST 800-53 Rev5 Controls
 //!
@@ -35,7 +39,7 @@ const SAMPLES_PER_PACKET: usize = 160;
 const TIMESTAMP_INCREMENT: u32 = SAMPLES_PER_PACKET as u32;
 
 /// Pre-built announcement types.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnnouncementType {
     /// "The number you have dialed is not in service."
     NumberNotInService,
@@ -49,13 +53,13 @@ pub enum AnnouncementType {
 pub struct AnnouncementServer;
 
 impl AnnouncementServer {
-    /// Plays an announcement to the given destination.
-    ///
-    /// Binds a local UDP socket, streams PCMU RTP packets with the
-    /// announcement audio, then returns when playback is complete.
-    /// Binds an announcement socket and returns (socket, actual_port).
+    /// Binds an announcement socket and returns (socket, `actual_port`).
     /// Call this before building the SDP so the port is known.
     /// `bind_ip` specifies the zone media IP to bind to (None = 0.0.0.0).
+    ///
+    /// # Errors
+    /// Returns an error when the socket cannot be bound to the requested
+    /// address/port.
     pub async fn bind_socket(
         preferred_port: u16,
         bind_ip: Option<std::net::IpAddr>,
@@ -74,12 +78,19 @@ impl AnnouncementServer {
     }
 
     /// Plays an announcement on an already-bound socket.
+    ///
+    /// Streams PCMU RTP packets with the announcement audio at 20ms
+    /// pacing, then returns the number of packets sent.
+    ///
+    /// # Errors
+    /// Returns an error when the socket's local address cannot be read.
+    /// Individual packet send failures are logged and skipped.
     pub async fn play_on_socket(
         announcement: AnnouncementType,
         socket: UdpSocket,
         destination: SocketAddr,
         ssrc: u32,
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
         // Ensure destination is IPv4 (not IPv6-mapped) for IPv4 sockets
         let destination = match destination {
             SocketAddr::V6(v6) => {
@@ -132,7 +143,7 @@ impl AnnouncementServer {
             "Announcement playback complete"
         );
 
-        Ok(())
+        Ok(total_packets as u64)
     }
 }
 
@@ -534,6 +545,7 @@ struct SpeechSegment {
 }
 
 /// Builds a minimal SDP offer for announcement playback (PCMU only).
+#[must_use]
 pub fn build_announcement_sdp(local_ip: &str, rtp_port: u16) -> String {
     format!(
         "v=0\r\n\
@@ -550,6 +562,7 @@ pub fn build_announcement_sdp(local_ip: &str, rtp_port: u16) -> String {
 
 /// Extracts the RTP destination (IP:port) from a remote SDP answer/offer.
 /// Looks for `c=IN IP4 <ip>` and `m=audio <port>`.
+#[must_use]
 pub fn extract_rtp_dest_from_sdp(sdp: &str) -> Option<SocketAddr> {
     let mut ip = None;
     let mut port = None;
@@ -568,5 +581,34 @@ pub fn extract_rtp_dest_from_sdp(sdp: &str) -> Option<SocketAddr> {
     match (ip, port) {
         (Some(ip), Some(port)) => format!("{ip}:{port}").parse().ok(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_silence_generation() {
+        let samples = generate_announcement(AnnouncementType::Silence);
+        assert_eq!(samples.len(), PCMU_CLOCK_RATE as usize * 2);
+        assert!(samples.iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn test_build_announcement_sdp() {
+        let sdp = build_announcement_sdp("192.0.2.10", 16400);
+        assert!(sdp.contains("c=IN IP4 192.0.2.10\r\n"));
+        assert!(sdp.contains("m=audio 16400 RTP/AVP 0\r\n"));
+        assert!(sdp.contains("a=sendonly"));
+    }
+
+    #[test]
+    fn test_extract_rtp_dest_from_sdp() {
+        let sdp = "v=0\r\nc=IN IP4 203.0.113.5\r\nm=audio 49170 RTP/AVP 0\r\n";
+        let dest = extract_rtp_dest_from_sdp(sdp).unwrap();
+        assert_eq!(dest.to_string(), "203.0.113.5:49170");
+        assert!(extract_rtp_dest_from_sdp("v=0\r\n").is_none());
     }
 }

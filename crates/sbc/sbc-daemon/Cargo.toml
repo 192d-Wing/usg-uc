@@ -48,7 +48,8 @@ uc-vps.workspace = true
 uc-routing.workspace = true
 uc-phone-mgmt.workspace = true
 socket2.workspace = true
-include_dir.workspace = true
+sbc-announcement.workspace = true
+sbc-trunk-services.workspace = true
 
 # Clustering dependencies (optional)
 uc-cluster = { workspace = true, optional = true }

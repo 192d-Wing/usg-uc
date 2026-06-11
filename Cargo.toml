@@ -71,10 +71,14 @@ members = [
     "crates/sbc/sbc-config",
     "crates/sbc/sbc-config-store",
     "crates/sbc/sbc-grpc-api",
+    "crates/sbc/sbc-announcement",
+    "crates/sbc/sbc-trunk-services",
     "crates/sbc/sbc-daemon",
     "crates/sbc/sbc-api-server",
     "crates/sbc/sbc-provision-server",
     "crates/sbc/sbc-client-config-server",
+    "crates/sbc/sbc-announcement-server",
+    "crates/sbc/sbc-trunk-agent",
     "crates/sbc/sbc-cli",
     "crates/sbc/sbc-integration-tests",
 
@@ -210,6 +214,8 @@ proto-stir-shaken = { path = "crates/proto/proto-stir-shaken" }
 sbc-config = { path = "crates/sbc/sbc-config" }
 sbc-config-store = { path = "crates/sbc/sbc-config-store" }
 sbc-grpc-api = { path = "crates/sbc/sbc-grpc-api" }
+sbc-announcement = { path = "crates/sbc/sbc-announcement" }
+sbc-trunk-services = { path = "crates/sbc/sbc-trunk-services" }
 
 # gRPC/Protobuf
 prost = "0.13"

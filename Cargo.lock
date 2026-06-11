@@ -5901,6 +5901,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "sbc-announcement"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "include_dir",
+ "proto-rtp",
+ "tokio",
+ "tracing",
+ "uc-codecs",
+]
+
+[[package]]
+name = "sbc-announcement-server"
+version = "0.1.0"
+dependencies = [
+ "rand 0.8.6",
+ "sbc-announcement",
+ "sbc-grpc-api",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sbc-api-server"
 version = "0.1.0"
 dependencies = [
@@ -5929,6 +5955,9 @@ name = "sbc-cli"
 version = "0.1.0"
 dependencies = [
  "sbc-config",
+ "sbc-grpc-api",
+ "tokio",
+ "tonic",
  "uc-health",
  "uc-metrics",
  "uc-types",
@@ -5972,6 +6001,7 @@ dependencies = [
  "uc-syslog",
  "uc-telemetry",
  "uc-types",
+ "uc-vps",
  "validator",
 ]
 
@@ -5997,7 +6027,6 @@ dependencies = [
  "bytes",
  "hyper",
  "hyper-util",
- "include_dir",
  "prost",
  "prost-types",
  "proto-b2bua",
@@ -6014,9 +6043,11 @@ dependencies = [
  "rand 0.8.6",
  "rustls",
  "rustls-pki-types",
+ "sbc-announcement",
  "sbc-config",
  "sbc-config-store",
  "sbc-grpc-api",
+ "sbc-trunk-services",
  "serde",
  "serde_json",
  "socket2",
@@ -6045,6 +6076,7 @@ dependencies = [
  "uc-telemetry",
  "uc-transport",
  "uc-types",
+ "uc-vps",
 ]
 
 [[package]]
@@ -6099,6 +6131,34 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uc-phone-mgmt",
+]
+
+[[package]]
+name = "sbc-trunk-agent"
+version = "0.1.0"
+dependencies = [
+ "sbc-config-store",
+ "sbc-grpc-api",
+ "sbc-trunk-services",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "sbc-trunk-services"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "proto-sip",
+ "rand 0.8.6",
+ "serde",
+ "socket2",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -8401,6 +8461,19 @@ dependencies = [
  "tracing",
  "uc-crypto",
  "uuid",
+]
+
+[[package]]
+name = "uc-vps"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "thiserror 2.0.18",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "uc-dos-protection",
+ "uc-policy",
 ]
 
 [[package]]

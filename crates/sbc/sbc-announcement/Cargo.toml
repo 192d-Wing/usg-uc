@@ -1,0 +1,21 @@
+[package]
+name = "sbc-announcement"
+description = "Announcement playback engine for the USG SBC: embedded/synthesized PCMU audio, paced RTP streaming, and the SDP helpers for announcement calls. Shared by the sbc-daemon (in-process fallback) and the sbc-announcement-server pod (gRPC-fronted playback)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+include_dir.workspace = true
+proto-rtp.workspace = true
+tokio = { workspace = true, features = ["net", "time"] }
+tracing.workspace = true
+uc-codecs.workspace = true

@@ -1,0 +1,29 @@
+[package]
+name = "sbc-announcement-server"
+description = "Announcement playback pod for the USG SBC. Hosts the gRPC AnnouncementService: the daemon asks it to play a pre-recorded PCMU announcement (number-not-in-service, all-circuits-busy) toward a caller's RTP address; the pod binds the RTP socket, reports the advertised IP/port for the daemon's 200 OK SDP, streams the audio, and reports completion so the daemon can send BYE."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "sbc-announcement-server"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio-stream = "0.1"
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["json"] }
+
+tonic.workspace = true
+sbc-grpc-api.workspace = true
+sbc-announcement.workspace = true
+
+rand = "0.8"
