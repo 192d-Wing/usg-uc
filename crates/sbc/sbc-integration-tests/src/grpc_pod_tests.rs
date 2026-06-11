@@ -158,7 +158,8 @@ mod announcement_proto_tests {
 mod announcement_service_smoke {
     use sbc_grpc_api::sbc::{
         AnnouncementBound, AnnouncementCompleted, AnnouncementKind, PlayAnnouncementEvent,
-        PlayAnnouncementRequest, announcement_service_client::AnnouncementServiceClient,
+        PlayAnnouncementRequest,
+        announcement_service_client::AnnouncementServiceClient,
         announcement_service_server::{AnnouncementService, AnnouncementServiceServer},
         play_announcement_event,
     };
@@ -234,7 +235,11 @@ mod announcement_service_smoke {
             .into_inner();
 
         // First event: Bound.
-        let ev1 = stream.message().await.unwrap().expect("expected Bound event");
+        let ev1 = stream
+            .message()
+            .await
+            .unwrap()
+            .expect("expected Bound event");
         match ev1.event.unwrap() {
             play_announcement_event::Event::Bound(b) => {
                 assert_eq!(b.advertised_ip, "127.0.0.1");
@@ -255,7 +260,10 @@ mod announcement_service_smoke {
         }
 
         // Stream closes after Completed.
-        assert!(stream.message().await.unwrap().is_none(), "stream should be closed");
+        assert!(
+            stream.message().await.unwrap().is_none(),
+            "stream should be closed"
+        );
     }
 
     #[tokio::test]
@@ -278,7 +286,11 @@ mod announcement_service_smoke {
             .into_inner();
 
         // The mock accepts all non-Unspecified kinds; Silence is valid.
-        let ev = stream.message().await.unwrap().expect("expected Bound event");
+        let ev = stream
+            .message()
+            .await
+            .unwrap()
+            .expect("expected Bound event");
         assert!(matches!(
             ev.event.unwrap(),
             play_announcement_event::Event::Bound(_)
@@ -691,7 +703,10 @@ mod trunk_health_response_proto_tests {
         };
         let encoded = original.encode_to_vec();
         let decoded = ListTrunkHealthResponse::decode(encoded.as_slice()).unwrap();
-        assert_eq!(decoded.trunk_services_external, original.trunk_services_external);
+        assert_eq!(
+            decoded.trunk_services_external,
+            original.trunk_services_external
+        );
         assert_eq!(decoded.snapshot_age_secs, original.snapshot_age_secs);
         assert_eq!(decoded.trunks[0].trunk_id, "carrier-1");
         assert_eq!(decoded.trunks[0].consecutive_failures, 7);
@@ -738,7 +753,10 @@ mod trunk_health_response_proto_tests {
         };
         let encoded = original.encode_to_vec();
         let decoded = ListTrunkRegistrationsResponse::decode(encoded.as_slice()).unwrap();
-        assert_eq!(decoded.trunk_services_external, original.trunk_services_external);
+        assert_eq!(
+            decoded.trunk_services_external,
+            original.trunk_services_external
+        );
         assert_eq!(decoded.snapshot_age_secs, original.snapshot_age_secs);
         assert_eq!(decoded.trunks[0].last_error, "503 Service Unavailable");
         assert_eq!(decoded.trunks[0].attempts, 12);

@@ -2,9 +2,7 @@
 
 use crate::blocklist::Blocklist;
 use crate::call_limiter::{CallLimiter, CallLimiterConfig};
-use crate::config::{
-    ScreeningMode, VpsConfig, VpsDefaultAction, VpsRuleAction, VpsRuleConfig,
-};
+use crate::config::{ScreeningMode, VpsConfig, VpsDefaultAction, VpsRuleAction, VpsRuleConfig};
 use crate::context::{CallAttempt, CallDirection};
 use crate::error::{VpsError, VpsResult};
 use crate::verdict::{VerdictSource, VpsVerdict};
@@ -54,15 +52,14 @@ impl VpsEngine {
     /// Builds an engine from configuration. Fails on an invalid config
     /// (duplicate rule IDs, bad status codes, malformed blocked IPs).
     pub fn new(config: &VpsConfig) -> VpsResult<Self> {
-        config
-            .validate()
-            .map_err(VpsError::invalid_config)?;
+        config.validate().map_err(VpsError::invalid_config)?;
 
         let default_action = match config.default_action {
             VpsDefaultAction::Allow => PolicyAction::Allow,
-            VpsDefaultAction::Deny => {
-                PolicyAction::deny(crate::DEFAULT_DENY_STATUS, "Forbidden by voice protection policy")
-            }
+            VpsDefaultAction::Deny => PolicyAction::deny(
+                crate::DEFAULT_DENY_STATUS,
+                "Forbidden by voice protection policy",
+            ),
         };
         let mut policy = PolicyEngine::new(PolicyEngineConfig {
             default_action,
@@ -253,8 +250,10 @@ impl VpsEngine {
         }
 
         let violation = attempt.stir_shaken.attestation().map_or(
-            matches!(attempt.stir_shaken, crate::context::StirShakenStatus::Failed)
-                || ss.require_identity_header,
+            matches!(
+                attempt.stir_shaken,
+                crate::context::StirShakenStatus::Failed
+            ) || ss.require_identity_header,
             |level| level < ss.minimum_attestation,
         );
         if !violation {
@@ -452,8 +451,7 @@ mod tests {
             ..enabled_config()
         };
         let mut engine = VpsEngine::new(&config).unwrap();
-        let verdict =
-            engine.screen_call(&attempt(ip(1)).with_caller("+19005551234"));
+        let verdict = engine.screen_call(&attempt(ip(1)).with_caller("+19005551234"));
         assert!(!verdict.is_allowed());
         assert_eq!(verdict.matched_rule(), Some("blocklist:+1900"));
     }
@@ -512,9 +510,7 @@ mod tests {
         };
         let mut engine = VpsEngine::new(&config).unwrap();
 
-        let verdict = engine.screen_call(
-            &attempt(ip(1)).with_callee("19005551234"),
-        );
+        let verdict = engine.screen_call(&attempt(ip(1)).with_callee("19005551234"));
         assert!(!verdict.is_allowed());
         assert_eq!(verdict.source(), VerdictSource::PolicyRule);
         assert_eq!(verdict.matched_rule(), Some("block-premium"));
@@ -553,27 +549,33 @@ mod tests {
         assert!(!verdict.is_allowed());
 
         // Attestation at minimum → allowed.
-        assert!(engine
-            .screen_call(
-                &attempt(ip(1))
-                    .with_direction(CallDirection::Inbound)
-                    .with_stir_shaken(StirShakenStatus::VerifiedB),
-            )
-            .is_allowed());
+        assert!(
+            engine
+                .screen_call(
+                    &attempt(ip(1))
+                        .with_direction(CallDirection::Inbound)
+                        .with_stir_shaken(StirShakenStatus::VerifiedB),
+                )
+                .is_allowed()
+        );
 
         // Missing Identity header allowed unless required.
-        assert!(engine
-            .screen_call(&attempt(ip(1)).with_direction(CallDirection::Inbound))
-            .is_allowed());
+        assert!(
+            engine
+                .screen_call(&attempt(ip(1)).with_direction(CallDirection::Inbound))
+                .is_allowed()
+        );
 
         // Internal calls never screened.
-        assert!(engine
-            .screen_call(
-                &attempt(ip(1))
-                    .with_direction(CallDirection::Internal)
-                    .with_stir_shaken(StirShakenStatus::Failed),
-            )
-            .is_allowed());
+        assert!(
+            engine
+                .screen_call(
+                    &attempt(ip(1))
+                        .with_direction(CallDirection::Internal)
+                        .with_stir_shaken(StirShakenStatus::Failed),
+                )
+                .is_allowed()
+        );
     }
 
     #[test]
@@ -587,13 +589,15 @@ mod tests {
             ..enabled_config()
         };
         let mut engine = VpsEngine::new(&config).unwrap();
-        assert!(engine
-            .screen_call(
-                &attempt(ip(1))
-                    .with_direction(CallDirection::Inbound)
-                    .with_stir_shaken(StirShakenStatus::Failed),
-            )
-            .is_allowed());
+        assert!(
+            engine
+                .screen_call(
+                    &attempt(ip(1))
+                        .with_direction(CallDirection::Inbound)
+                        .with_stir_shaken(StirShakenStatus::Failed),
+                )
+                .is_allowed()
+        );
     }
 
     #[test]

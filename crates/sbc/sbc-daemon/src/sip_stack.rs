@@ -1479,8 +1479,7 @@ impl SipStack {
                     );
                     let rejection = create_response_from_request(
                         req,
-                        StatusCode::new(*status_code)
-                            .unwrap_or(StatusCode::SERVER_INTERNAL_ERROR),
+                        StatusCode::new(*status_code).unwrap_or(StatusCode::SERVER_INTERNAL_ERROR),
                     );
                     return ProcessResult::Response {
                         message: SipMessage::Response(rejection),

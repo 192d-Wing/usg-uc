@@ -437,8 +437,8 @@ impl Runtime {
         // TrunkHealthService serves the snapshots the agent publishes
         // via TrunkStatusPublishService instead. Running the loops in
         // BOTH places would double-REGISTER to carriers.
-        let external_trunk_services = std::env::var("SBC_TRUNK_SERVICES")
-            .is_ok_and(|v| v.eq_ignore_ascii_case("external"));
+        let external_trunk_services =
+            std::env::var("SBC_TRUNK_SERVICES").is_ok_and(|v| v.eq_ignore_ascii_case("external"));
         if external_trunk_services {
             info!("Trunk services delegated to sbc-trunk-agent (SBC_TRUNK_SERVICES=external)");
         } else {

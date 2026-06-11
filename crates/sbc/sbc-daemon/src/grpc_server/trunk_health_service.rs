@@ -50,9 +50,9 @@ impl TrunkHealthService for TrunkHealthServiceImpl {
             (monitor.get_all_status().await, 0u32)
         } else {
             let remote = self.state.remote_trunk_status.read().await;
-            let age = remote.received_at.map_or(0u32, |t| {
-                t.elapsed().as_secs().min(u32::MAX as u64) as u32
-            });
+            let age = remote
+                .received_at
+                .map_or(0u32, |t| t.elapsed().as_secs().min(u32::MAX as u64) as u32);
             (remote.health.clone(), age)
         };
         let trunks: Vec<TrunkHealthInfo> = statuses
@@ -88,9 +88,9 @@ impl TrunkHealthService for TrunkHealthServiceImpl {
             (reg.get_all_status().await, 0u32)
         } else {
             let remote = self.state.remote_trunk_status.read().await;
-            let age = remote.received_at.map_or(0u32, |t| {
-                t.elapsed().as_secs().min(u32::MAX as u64) as u32
-            });
+            let age = remote
+                .received_at
+                .map_or(0u32, |t| t.elapsed().as_secs().min(u32::MAX as u64) as u32);
             (remote.registrations.clone(), age)
         };
         let trunks: Vec<TrunkRegistrationInfo> = statuses

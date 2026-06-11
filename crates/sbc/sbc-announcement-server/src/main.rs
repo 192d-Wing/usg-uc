@@ -305,16 +305,15 @@ async fn main() -> ExitCode {
         let ctrl_c = tokio::signal::ctrl_c();
         #[cfg(unix)]
         {
-            let mut sigterm = match tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::terminate(),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!(error = %e, "failed to install SIGTERM handler");
-                    let _ = ctrl_c.await;
-                    return;
-                }
-            };
+            let mut sigterm =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!(error = %e, "failed to install SIGTERM handler");
+                        let _ = ctrl_c.await;
+                        return;
+                    }
+                };
             tokio::select! {
                 _ = ctrl_c => {}
                 _ = sigterm.recv() => {}

@@ -57,7 +57,7 @@ pub use config::{
     AttestationLevel, ScreeningMode, StirShakenScreeningConfig, TdosConfig, VpsConfig,
     VpsDefaultAction, VpsRuleAction, VpsRuleConfig,
 };
-pub use context::{uri_user, CallAttempt, CallDirection, StirShakenStatus};
+pub use context::{CallAttempt, CallDirection, StirShakenStatus, uri_user};
 pub use engine::{VpsEngine, VpsStats};
 pub use error::{VpsError, VpsResult};
 pub use verdict::{VerdictSource, VpsAction, VpsVerdict};

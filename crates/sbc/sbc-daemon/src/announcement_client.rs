@@ -60,9 +60,7 @@ const fn to_proto_kind(kind: crate::announcement::AnnouncementType) -> Announcem
         crate::announcement::AnnouncementType::NumberNotInService => {
             AnnouncementKind::NumberNotInService
         }
-        crate::announcement::AnnouncementType::AllCircuitsBusy => {
-            AnnouncementKind::AllCircuitsBusy
-        }
+        crate::announcement::AnnouncementType::AllCircuitsBusy => AnnouncementKind::AllCircuitsBusy,
         crate::announcement::AnnouncementType::Silence => AnnouncementKind::Silence,
     }
 }

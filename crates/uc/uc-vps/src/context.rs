@@ -158,7 +158,10 @@ mod tests {
     #[test]
     fn test_uri_user() {
         assert_eq!(uri_user("sip:alice@example.com"), Some("alice"));
-        assert_eq!(uri_user("sips:+15551234567@host:5061"), Some("+15551234567"));
+        assert_eq!(
+            uri_user("sips:+15551234567@host:5061"),
+            Some("+15551234567")
+        );
         assert_eq!(uri_user("tel:+15551234567"), Some("+15551234567"));
         assert_eq!(uri_user("sip:example.com"), None);
         assert_eq!(uri_user("sip:bob;p=x@host"), Some("bob"));
