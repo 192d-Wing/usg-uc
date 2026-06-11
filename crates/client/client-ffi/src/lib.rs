@@ -21,7 +21,9 @@ uniffi::setup_scaffolding!();
 mod client;
 mod types;
 
-pub use client::{ClientConfig, EventListener, SipClient, list_input_devices, list_output_devices};
+pub use client::{
+    ClientConfig, EventListener, SipClient, init_logging, list_input_devices, list_output_devices,
+};
 pub use types::{
     AppEvent, AudioDevice, AudioDeviceCategory, AudioDeviceKind, CallDirection, CallInfo,
     CallState, ClientError, PinOperation, RegistrationState,

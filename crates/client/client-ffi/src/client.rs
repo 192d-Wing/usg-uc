@@ -351,6 +351,29 @@ impl SipClient {
     }
 }
 
+/// Initializes Rust-side logging to stderr. Call once, before constructing
+/// [`SipClient`]; subsequent calls are ignored.
+///
+/// `filter` is a tracing directive string (e.g. `"info"`,
+/// `"client_audio=debug,client_core=info"`); `None` uses the `RUST_LOG`
+/// environment variable, falling back to `info` for the client crates.
+#[uniffi::export]
+pub fn init_logging(filter: Option<String>) {
+    let env_filter = match filter {
+        Some(f) => tracing_subscriber::EnvFilter::new(f),
+        None => tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new(
+                "client_core=info,client_sip_ua=info,client_audio=info",
+            )
+        }),
+    };
+    // try_init: ignore AlreadyInit when the host app re-calls across reloads.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 /// Lists available audio input (microphone) devices.
 #[uniffi::export]
 pub fn list_input_devices() -> Result<Vec<AudioDevice>, ClientError> {
