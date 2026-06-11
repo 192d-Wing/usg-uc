@@ -326,8 +326,7 @@ impl Verifier {
     pub fn verify_age(&self, iat: u64) -> StirShakenResult<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
 
         if now > iat {
             let age = now - iat;

@@ -150,8 +150,8 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             max_sessions: 100,
-            idle_timeout: Duration::from_secs(300),
-            page_timeout: Duration::from_secs(60),
+            idle_timeout: Duration::from_mins(5),
+            page_timeout: Duration::from_mins(1),
             auto_switch_on_cng: true,
             auto_switch_on_ced: true,
         }

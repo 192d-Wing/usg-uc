@@ -86,7 +86,7 @@ pub struct Config {
     pub min_version_android: Option<String>,
 
     /// Path to a PEM file containing extra CA certificates to trust when
-    /// fetching the OIDC discovery document and JWKS. Required when the IdP
+    /// fetching the OIDC discovery document and JWKS. Required when the `IdP`
     /// uses a private CA not in the Mozilla root bundle.
     /// `SBC_CLIENT_CONFIG_EXTRA_CA_CERT_FILE`, optional.
     pub extra_ca_cert_file: Option<String>,

@@ -182,8 +182,8 @@ async fn initialize_client(state: State<'_, TauriAppState>) -> Result<(), String
             match tokio::net::lookup_host(format!("{host}:5060")).await {
                 Ok(addrs) => {
                     let all_addrs: Vec<_> = addrs.collect();
-                    let has_ipv4 = all_addrs.iter().any(|a| a.is_ipv4());
-                    let has_ipv6 = all_addrs.iter().any(|a| a.is_ipv6());
+                    let has_ipv4 = all_addrs.iter().any(std::net::SocketAddr::is_ipv4);
+                    let has_ipv6 = all_addrs.iter().any(std::net::SocketAddr::is_ipv6);
                     info!(
                         registrar = host,
                         ipv4 = has_ipv4,

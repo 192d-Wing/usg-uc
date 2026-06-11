@@ -47,7 +47,7 @@ impl HickoryDnsResolver {
         Ok(Self {
             resolver,
             cache,
-            default_ttl: Duration::from_secs(300),
+            default_ttl: Duration::from_mins(5),
         })
     }
 
@@ -71,7 +71,7 @@ impl HickoryDnsResolver {
         Ok(Self {
             resolver,
             cache,
-            default_ttl: Duration::from_secs(300),
+            default_ttl: Duration::from_mins(5),
         })
     }
 

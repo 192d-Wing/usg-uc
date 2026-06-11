@@ -126,7 +126,7 @@ pub struct TrunkMonitor {
     /// Running monitor tasks by trunk ID. Tracked so re-configuring a trunk
     /// replaces its loop instead of spawning a duplicate, and so loops can
     /// be stopped on trunk deletion and daemon shutdown (previously the
-    /// JoinHandles were dropped and the loops ran forever).
+    /// `JoinHandles` were dropped and the loops ran forever).
     tasks: std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// SBC's local domain for From/Via headers.
     local_domain: String,
@@ -134,6 +134,7 @@ pub struct TrunkMonitor {
 
 impl TrunkMonitor {
     /// Creates a new trunk monitor.
+    #[must_use] 
     pub fn new(local_domain: &str) -> Self {
         Self {
             health: Arc::new(RwLock::new(HashMap::new())),

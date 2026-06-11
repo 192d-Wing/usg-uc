@@ -1,6 +1,6 @@
 //! FFI mirror types.
 //!
-//! These flatten the `client-types`/`client-core` types into shapes UniFFI can
+//! These flatten the `client-types`/`client-core` types into shapes `UniFFI` can
 //! lower into Swift/Kotlin/C#. They are deliberately decoupled from the core
 //! crates so the core API can evolve without breaking the foreign-language ABI;
 //! conversions live next to each type.

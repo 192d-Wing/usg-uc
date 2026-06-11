@@ -1994,7 +1994,7 @@ impl CallAgent {
     /// Handles a 422 Session Interval Too Small (RFC 4028 §5.3).
     ///
     /// The response's Min-SE is the smallest session interval the server
-    /// will accept. The 422 is ACKed like any non-2xx final response
+    /// will accept. The 422 is `ACKed` like any non-2xx final response
     /// (RFC 3261 §17.1.1.3), the Min-SE value is adopted as the call's
     /// negotiated session interval, and the INVITE is retried ONCE as a
     /// new transaction (bumped `CSeq`, fresh branch) carrying

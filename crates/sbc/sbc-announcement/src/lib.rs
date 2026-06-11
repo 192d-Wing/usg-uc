@@ -23,7 +23,7 @@ use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 use uc_codecs::G711Ulaw;
 
-/// Embedded audio files from the project's audio_files/ directory.
+/// Embedded audio files from the project's `audio_files`/ directory.
 /// Files should be raw PCM: signed 16-bit little-endian, mono, 8000Hz.
 static AUDIO_FILES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../../audio_files");
 

@@ -71,7 +71,7 @@ fn crossfade_frames(tone: &mut [i16], other: &[i16], fade_len: usize, to_tone: b
         } else {
             (f32::from(*sample), f32::from(o))
         };
-        *sample = (from + (to - from) * t).round() as i16;
+        *sample = (to - from).mul_add(t, from).round() as i16;
     }
 }
 use ringbuf::traits::{Observer, Producer};
@@ -168,7 +168,7 @@ struct DtmfPlayout {
 }
 
 impl DtmfPlayout {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             schedule: std::collections::VecDeque::new(),
             active_gen: None,
@@ -180,7 +180,7 @@ impl DtmfPlayout {
     }
 
     /// Clears the active tone (boundary frame played or failsafe).
-    fn clear_active(&mut self) {
+    const fn clear_active(&mut self) {
         self.active_gen = None;
         self.fade_in = false;
         self.active_start = None;

@@ -77,8 +77,7 @@ impl OrigId {
     pub fn generate() -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos());
         Self(format!("{timestamp:x}"))
     }
 
@@ -229,8 +228,7 @@ impl PASSporTClaims {
     pub fn new(orig: TelephoneNumber, dest: Vec<TelephoneNumber>, attest: Attestation) -> Self {
         let iat = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
 
         Self {
             attest,
@@ -263,8 +261,7 @@ impl PASSporTClaims {
         // Check expiration
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
 
         if now > self.iat {
             let age = now - self.iat;
@@ -290,8 +287,7 @@ impl PASSporTClaims {
     pub fn age_seconds(&self) -> u64 {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
 
         now.saturating_sub(self.iat)
     }
