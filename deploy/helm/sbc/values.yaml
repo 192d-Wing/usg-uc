@@ -222,6 +222,9 @@ sbcClientConfig:
   voicemailUri: ""
   minVersionDesktop: ""
   minVersionAndroid: ""
+  # Hostname for the Traefik Ingress. Defaults to sbc.<site.fqdn_base>.
+  # Override when the ingress hostname differs from the FQDN base.
+  ingressHost: ""
   # PEM-encoded CA certificate(s) to trust when fetching OIDC metadata / JWKS.
   # Required when the IdP uses a private CA (e.g. OOPL Internal CA) that is
   # not in the Mozilla root bundle compiled into the binary.

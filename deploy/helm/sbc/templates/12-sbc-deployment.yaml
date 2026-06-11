@@ -88,15 +88,13 @@ spec:
                   key: {{ .Values.sbcPostgres.existingSecret.key | default "dsn" }}
             {{- end }}
           ports:
-            # SIP signaling — exposed via hostPort so the Unifi edge can
-            # port-forward UDP 5060 directly to the host IP. The cluster
-            # LB IP (10.50.1.x) is BGP-learned on Unifi but not ARP-able,
-            # so Unifi's NAT engine silently drops port-forwards to it.
-            # Host IP is directly connected and works. East-west SIP
-            # still uses the LB IP through the kube-proxy iptables NAT.
-            - { name: sip-udp,  containerPort: 5060, hostPort: 5060, protocol: UDP }
-            - { name: sip-tcp,  containerPort: 5060, hostPort: 5060, protocol: TCP }
-            - { name: sip-tls,  containerPort: 5061, hostPort: 5061, protocol: TCP }
+            # SIP signaling — no hostPort; k3s ServiceLB DaemonSet already
+            # binds hostPort 5060 on every node for the sip LoadBalancer
+            # Service, so a second hostPort claim here would block scheduling.
+            # Traffic reaches the daemon via kube-proxy DNAT on the LB IP.
+            - { name: sip-udp,  containerPort: 5060, protocol: UDP }
+            - { name: sip-tcp,  containerPort: 5060, protocol: TCP }
+            - { name: sip-tls,  containerPort: 5061, protocol: TCP }
             - { name: api,      containerPort: 80,   protocol: TCP }
             - { name: metrics,  containerPort: 9090, protocol: TCP }
             # gRPC admin API; consumed by sbc-api-server (when enabled)

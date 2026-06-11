@@ -1,0 +1,29 @@
+{{- if .Values.sbcClientConfig.enabled }}
+# Traefik Ingress for the soft-client config endpoint.
+# Exposes sbc.<site.fqdn_base> → sbc-client-config ClusterIP Service.
+# Uses the standard Kubernetes Ingress API (className: traefik); no
+# cert-manager or Gateway API required. TLS termination is handled by the
+# upstream edge (or left to Traefik's default self-signed cert) — adjust
+# tls: to suit when cert-manager is available.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "sbc.fullname" . }}-client-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: client-config
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: {{ .Values.sbcClientConfig.ingressHost | default (printf "sbc.%s" .Values.site.fqdn_base) | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "sbc.fullname" . }}-client-config
+                port:
+                  name: http
+{{- end }}

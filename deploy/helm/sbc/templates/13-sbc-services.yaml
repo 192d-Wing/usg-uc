@@ -14,24 +14,18 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "sbc.labels" . | nindent 4 }}
-  {{- if .Values.externalDns.enabled }}
   annotations:
-    external-dns.alpha.kubernetes.io/hostname: "sbc.{{ .Values.site.fqdn_base }}"
-    external-dns.alpha.kubernetes.io/ttl: "60"
-    # k8s_gateway plugin (sibling coredns-site chart) — v0.4.0 only honors
-    # this annotation name.
-    coredns.io/hostname: "sbc.{{ .Values.site.fqdn_base }}"
-    # Allow this Service to share its LB IP with other Services in this
-    # site. sbc-sip claims (IP, 5060/UDP+TCP) and (IP, 5061/TCP); the
-    # sbc-frontend nginx Service claims (IP, 80/TCP). The (IP, port) tuples
-    # don't collide, so Cilium's LB IPAM allows the shared IP.
-    # Cilium 1.19 honors LB IP sharing via the `lbipam.cilium.io/ips`
-    # annotation; the legacy spec.loadBalancerIP field is silently ignored
-    # for shared allocations.
+    # Cilium LBIPAM — always set so the SIP service can share its LB IP
+    # with the frontend Service (same IP, non-overlapping ports). These are
+    # Cilium-level annotations and must be present regardless of ExternalDNS.
     lbipam.cilium.io/ips: "{{ .Values.site.sbc_lb_ip }}"
     lbipam.cilium.io/sharing-key: "{{ .Values.site.name }}-sbc"
     lbipam.cilium.io/sharing-cross-namespace: "*"
-  {{- end }}
+    {{- if .Values.externalDns.enabled }}
+    external-dns.alpha.kubernetes.io/hostname: "sbc.{{ .Values.site.fqdn_base }}"
+    external-dns.alpha.kubernetes.io/ttl: "60"
+    coredns.io/hostname: "sbc.{{ .Values.site.fqdn_base }}"
+    {{- end }}
 spec:
   type: LoadBalancer
   loadBalancerIP: {{ .Values.site.sbc_lb_ip }}

@@ -145,19 +145,16 @@ metadata:
   labels:
     {{- include "sbc.labels" . | nindent 4 }}
     app.kubernetes.io/component: frontend
-  {{- if and .Values.externalDns.enabled (not .Values.gateway.enabled) }}
   annotations:
+    {{- if and .Values.externalDns.enabled (not .Values.gateway.enabled) }}
     external-dns.alpha.kubernetes.io/hostname: "sbc.{{ .Values.site.fqdn_base }}"
     external-dns.alpha.kubernetes.io/ttl: "60"
     coredns.io/hostname: "sbc.{{ .Values.site.fqdn_base }}"
-    # Both Services request the same explicit IP via lbipam.cilium.io/ips
-    # and the same sharing-key. Cilium allows multiple services to bind a
-    # single LB IP when the (IP, port) tuples are non-overlapping.
+    {{- end }}
+    {{- if not .Values.gateway.enabled }}
     lbipam.cilium.io/ips: "{{ .Values.site.sbc_lb_ip }}"
-
-
     lbipam.cilium.io/sharing-key: "{{ .Values.site.name }}-sbc"
-  {{- end }}
+    {{- end }}
 spec:
   # When the Gateway is enabled it owns the LB IP and terminates TLS; the
   # frontend then sits behind it as a ClusterIP backend (the :80 port would
