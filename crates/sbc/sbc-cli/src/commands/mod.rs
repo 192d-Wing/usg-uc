@@ -5,6 +5,7 @@ pub mod config;
 pub mod health;
 pub mod metrics;
 pub mod status;
+pub mod trunk;
 
 /// Command execution error.
 #[derive(Debug)]

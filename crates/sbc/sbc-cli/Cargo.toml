@@ -12,11 +12,21 @@ categories.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# grpc: enables `sbc-cli trunk` subcommands that speak directly to the daemon's
+# gRPC port (default :9091) rather than going through the REST API server.
+grpc = ["sbc-grpc-api", "tonic", "tokio"]
+
 [dependencies]
 uc-types.workspace = true
 sbc-config = { path = "../sbc-config" }
 uc-health.workspace = true
 uc-metrics.workspace = true
+
+sbc-grpc-api = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 
 [[bin]]
 name = "sbc-cli"

@@ -15,6 +15,8 @@ pub struct Args {
     pub format: OutputFormat,
     /// API endpoint URL.
     pub api_url: String,
+    /// Daemon gRPC endpoint URL (used by `trunk` subcommands).
+    pub grpc_url: String,
     /// Verbosity level.
     pub verbose: u8,
 }
@@ -27,6 +29,7 @@ impl Default for Args {
             version: false,
             format: OutputFormat::Text,
             api_url: "http://localhost:8080".to_string(),
+            grpc_url: "http://localhost:9091".to_string(),
             verbose: 0,
         }
     }
@@ -41,6 +44,8 @@ pub enum Command {
     Config(ConfigCommand),
     /// Call management.
     Calls(CallsCommand),
+    /// Trunk health and registration (requires --features grpc).
+    Trunk(TrunkCommand),
     /// Health check.
     Health,
     /// Show metrics.
@@ -51,6 +56,15 @@ pub enum Command {
     Help,
     /// No command specified.
     None,
+}
+
+/// Trunk subcommands.
+#[derive(Debug, Clone)]
+pub enum TrunkCommand {
+    /// Show trunk OPTIONS-ping health.
+    List,
+    /// Show trunk outbound-registration status.
+    Registrations,
 }
 
 /// Configuration subcommands.
@@ -123,6 +137,12 @@ impl Args {
                         args.api_url = url;
                     }
                 }
+                "--grpc-url" => {
+                    iter.next();
+                    if let Some(url) = iter.next() {
+                        args.grpc_url = url;
+                    }
+                }
                 _ => break,
             }
         }
@@ -133,6 +153,7 @@ impl Args {
                 "status" => Command::Status,
                 "config" => Self::parse_config_command(&mut iter),
                 "calls" => Self::parse_calls_command(&mut iter),
+                "trunk" => Self::parse_trunk_command(&mut iter),
                 "health" => Command::Health,
                 "metrics" => Command::Metrics,
                 "version" => Command::Version,
@@ -178,6 +199,18 @@ impl Args {
         }
     }
 
+    /// Parses trunk subcommand.
+    fn parse_trunk_command(iter: &mut impl Iterator<Item = String>) -> Command {
+        match iter.next().as_deref() {
+            Some("list") | None => Command::Trunk(TrunkCommand::List),
+            Some("registrations") => Command::Trunk(TrunkCommand::Registrations),
+            Some(other) => {
+                eprintln!("Unknown trunk subcommand: {other}");
+                Command::Trunk(TrunkCommand::List)
+            }
+        }
+    }
+
     /// Prints help information.
     pub fn print_help() {
         println!(
@@ -197,18 +230,22 @@ COMMANDS:
         show <ID>       Show call details
         terminate <ID>  Terminate a call
         stats           Show call statistics
+    trunk               Trunk health and registration (requires --features grpc)
+        list            Show OPTIONS-ping health for every trunk
+        registrations   Show outbound-registration status for every trunk
     health              Perform health check
     metrics             Show Prometheus metrics
     version             Show version information
     help                Print this help message
 
 OPTIONS:
-    -h, --help          Print help information
-    -V, --version       Print version information
-    -v, --verbose       Increase verbosity
-    --json              Output in JSON format
-    --table             Output in table format
-    --api-url <URL>     API endpoint URL (default: http://localhost:8080)
+    -h, --help              Print help information
+    -V, --version           Print version information
+    -v, --verbose           Increase verbosity
+    --json                  Output in JSON format
+    --table                 Output in table format
+    --api-url <URL>         API endpoint URL (default: http://localhost:8080)
+    --grpc-url <URL>        Daemon gRPC URL for trunk subcommands (default: http://localhost:9091)
 
 EXAMPLES:
     sbc-cli status
@@ -217,6 +254,8 @@ EXAMPLES:
     sbc-cli calls terminate abc123
     sbc-cli health
     sbc-cli metrics
+    sbc-cli trunk list
+    sbc-cli --grpc-url http://sbc-daemon:9091 trunk registrations
 
 For more information, see the documentation at https://github.com/usg/usg-uc-sbc"
         );
