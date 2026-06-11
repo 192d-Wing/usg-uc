@@ -35,6 +35,12 @@ hound = "3.5"
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 coreaudio-rs = "0.13"
 
+# Android low-latency audio. The `oboe` crate (oboe-rs) bundles Google's Oboe
+# C++ library and builds it from source via the NDK (cc crate, C++17), selecting
+# AAudio (API 26+) or OpenSL ES at runtime. See `android_oboe.rs`.
+[target.'cfg(target_os = "android")'.dependencies]
+oboe = "0.6"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 criterion.workspace = true
