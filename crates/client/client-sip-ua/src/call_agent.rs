@@ -83,6 +83,13 @@ struct CallSession {
     connected_at: Option<Instant>,
     /// Last branch parameter.
     last_branch: Option<String>,
+    /// Exact Via header value of the last INVITE actually sent (including a
+    /// digest-auth resend). RFC 3261 §9.1 requires the CANCEL's single Via
+    /// to match the INVITE's, host AND port, and §17.1.1.3 requires the same
+    /// for the ACK to a non-2xx final response. The Via sent-by port comes
+    /// from a per-request ephemeral discovery socket, so it cannot be
+    /// re-derived later — it must be stored verbatim.
+    last_via: Option<String>,
     /// Failure reason if the call failed.
     failure_reason: Option<CallFailureReason>,
     /// Active REFER request for call transfer (RFC 3515).
@@ -249,6 +256,7 @@ impl CallAgent {
             start_time: Utc::now(),
             connected_at: Some(Instant::now()),
             last_branch: None,
+            last_via: None,
             failure_reason: None,
             refer_request: None,
             transfer_target: None,
@@ -316,6 +324,13 @@ impl CallAgent {
             &self.transport_type,
         )?;
 
+        // Snapshot the exact Via we are sending; CANCEL/ACK must reuse it
+        // verbatim (RFC 3261 §9.1 / §17.1.1.3).
+        let invite_via = request
+            .headers
+            .get_value(&HeaderName::Via)
+            .map(String::from);
+
         // Create INVITE transaction
         let tx_key = TransactionKey::client(&branch, "INVITE");
         let transaction = ClientInviteTransaction::new(tx_key, TransportType::Reliable);
@@ -338,6 +353,7 @@ impl CallAgent {
             start_time: Utc::now(),
             connected_at: None,
             last_branch: Some(branch),
+            last_via: invite_via,
             failure_reason: None,
             refer_request: None,
             transfer_target: None,
@@ -638,6 +654,12 @@ impl CallAgent {
             &self.transport_type,
         )?;
 
+        // Snapshot the exact Via for a potential CANCEL (RFC 3261 §9.1)
+        let reinvite_via = request
+            .headers
+            .get_value(&HeaderName::Via)
+            .map(String::from);
+
         // Create INVITE transaction for re-INVITE
         let tx_key = TransactionKey::client(&branch, "INVITE");
         let transaction = ClientInviteTransaction::new(tx_key, TransportType::Reliable);
@@ -645,6 +667,7 @@ impl CallAgent {
         if let Some(session) = self.calls.get_mut(call_id) {
             session.invite_transaction = Some(transaction);
             session.last_branch = Some(branch);
+            session.last_via = reinvite_via;
         }
 
         // Send request
@@ -1063,7 +1086,7 @@ impl CallAgent {
             )
         };
 
-        // Send ACK
+        // Send ACK (for a 2xx: a new transaction with a fresh Via/branch)
         let destination = Self::parse_destination(&remote_uri).await?;
         let effective_local_addr =
             Self::get_local_addr_for_destination(destination, self.local_addr).await?;
@@ -1077,6 +1100,7 @@ impl CallAgent {
             &from_tag,
             to_tag.as_deref(),
             &self.transport_type,
+            None,
         )?;
 
         self.event_tx
@@ -1261,6 +1285,15 @@ impl CallAgent {
                         };
                         request.headers.set(auth_header, auth_creds.to_string());
 
+                        // Snapshot the exact Via of this authenticated INVITE —
+                        // it is the LAST INVITE actually sent, so a later
+                        // CANCEL/ACK must copy this Via, not the original's
+                        // (RFC 3261 §9.1 / §17.1.1.3).
+                        let new_via = request
+                            .headers
+                            .get_value(&HeaderName::Via)
+                            .map(String::from);
+
                         // Create new INVITE transaction
                         let tx_key = TransactionKey::client(&new_branch, "INVITE");
                         let transaction =
@@ -1269,6 +1302,7 @@ impl CallAgent {
                         if let Some(session) = self.calls.get_mut(call_id) {
                             session.invite_transaction = Some(transaction);
                             session.last_branch = Some(new_branch);
+                            session.last_via = new_via;
                         }
 
                         // Send the authenticated INVITE
@@ -1511,17 +1545,29 @@ impl CallAgent {
     #[allow(clippy::too_many_arguments)]
     async fn send_ack_for_failure(
         &self,
-        _call_id: &str,
+        call_id: &str,
         remote_uri: &str,
         sip_call_id: &str,
         cseq: u32,
         from_tag: &str,
         to_tag: Option<&str>,
-        _response: &SipResponse,
+        response: &SipResponse,
     ) -> SipUaResult<()> {
         let destination = Self::parse_destination(remote_uri).await?;
         let effective_local_addr =
             Self::get_local_addr_for_destination(destination, self.local_addr).await?;
+
+        // RFC 3261 §17.1.1.3: the ACK for a non-2xx final response must
+        // carry the INVITE's Via verbatim (same branch, same sent-by
+        // host:port) so it matches the INVITE transaction.
+        let invite_via = self.calls.get(call_id).and_then(|s| s.last_via.clone());
+
+        // §17.1.1.3 also requires the ACK's To header to equal the To of
+        // the response being acknowledged (including any to-tag the server
+        // added), not the INVITE's tag-less To.
+        let response_to_tag = Self::extract_to_tag(response);
+        let ack_to_tag = response_to_tag.as_deref().or(to_tag);
+
         let ack_request = Self::build_ack_request_static(
             remote_uri,
             &self.aor,
@@ -1530,8 +1576,9 @@ impl CallAgent {
             sip_call_id,
             cseq,
             from_tag,
-            to_tag,
+            ack_to_tag,
             &self.transport_type,
+            invite_via.as_deref(),
         )?;
 
         self.event_tx
@@ -1604,13 +1651,16 @@ impl CallAgent {
     ///
     /// Per RFC 3261 §9.1, the CANCEL must be identical to the INVITE it
     /// cancels in Request-URI, Call-ID, To, From (including tags), and `CSeq`
-    /// number (with method CANCEL), and must carry a single Via with the
-    /// SAME branch parameter as the INVITE. The To header must NOT include
-    /// a remote tag learned from a provisional response — the original
-    /// INVITE had none. Sending a fresh branch makes proxies reply
-    /// 481 "Call/Transaction Does Not Exist" and the far end keeps ringing.
+    /// number (with method CANCEL), and must carry a single Via IDENTICAL to
+    /// the INVITE's — same branch AND same sent-by host:port. The To header
+    /// must NOT include a remote tag learned from a provisional response —
+    /// the original INVITE had none. Live evidence: a fresh branch, or the
+    /// same branch with a different sent-by port (each request used to
+    /// snapshot a fresh ephemeral discovery-socket port), makes `BulkVS`
+    /// reply 481 "Call/Transaction Does Not Exist" and the far end keeps
+    /// ringing. The stored `last_via` is therefore copied verbatim.
     async fn send_cancel(&mut self, call_id: &str) -> SipUaResult<()> {
-        let (remote_uri, sip_call_id, cseq, from_tag, branch) = {
+        let (remote_uri, sip_call_id, cseq, from_tag, branch, invite_via) = {
             let session = self
                 .calls
                 .get(call_id)
@@ -1628,24 +1678,26 @@ impl CallAgent {
                         "No pending INVITE branch to CANCEL (RFC 3261 §9.1)".to_string(),
                     )
                 })?,
+                // Reuse the INVITE's exact Via line (host AND port).
+                session.last_via.clone().ok_or_else(|| {
+                    SipUaError::InvalidState(
+                        "No pending INVITE Via to CANCEL (RFC 3261 §9.1)".to_string(),
+                    )
+                })?,
             )
         };
 
         let destination = Self::parse_destination(&remote_uri).await?;
-        let effective_local_addr =
-            Self::get_local_addr_for_destination(destination, self.local_addr).await?;
 
-        // Build CANCEL request (same Via branch and CSeq number as the INVITE)
+        // Build CANCEL request (same Via line and CSeq number as the INVITE)
         let request = Self::build_cancel_request_static(
             &remote_uri,
             &self.aor,
             &self.display_name,
-            effective_local_addr,
             &sip_call_id,
             cseq,
             &from_tag,
-            &branch,
-            &self.transport_type,
+            &invite_via,
         )?;
 
         // The CANCEL client transaction reuses the INVITE's branch so that
@@ -1922,20 +1974,22 @@ impl CallAgent {
 
     /// Builds a CANCEL request (static version).
     ///
-    /// Per RFC 3261 §9.1 the caller must pass the INVITE's Via `branch` and
-    /// `CSeq` number. The To header deliberately carries no tag: the INVITE
-    /// being cancelled was sent without one, and a CANCEL must match it.
+    /// Per RFC 3261 §9.1 the caller must pass the INVITE's complete Via
+    /// header value (`invite_via`) — same branch AND same sent-by host:port
+    /// — and the INVITE's `CSeq` number. The Via is copied verbatim rather
+    /// than rebuilt, because the sent-by port is otherwise re-derived from a
+    /// fresh ephemeral socket and would differ from the INVITE's. The To
+    /// header deliberately carries no tag: the INVITE being cancelled was
+    /// sent without one, and a CANCEL must match it.
     #[allow(clippy::too_many_arguments)]
     fn build_cancel_request_static(
         remote_uri_str: &str,
         aor: &str,
         display_name: &str,
-        local_addr: SocketAddr,
         sip_call_id: &str,
         cseq: u32,
         from_tag: &str,
-        branch: &str,
-        transport_type: &str,
+        invite_via: &str,
     ) -> SipUaResult<SipRequest> {
         let remote_uri: SipUri = remote_uri_str
             .parse()
@@ -1945,11 +1999,6 @@ impl CallAgent {
             .parse()
             .map_err(|e| SipUaError::ConfigError(format!("Invalid AOR: {e}")))?;
 
-        let via = ViaHeader::new(transport_type, local_addr.ip().to_string())
-            .with_port(local_addr.port())
-            .with_branch(branch.to_string())
-            .with_rport();
-
         let from = NameAddr::new(aor_uri)
             .with_display_name(display_name)
             .with_tag(from_tag.to_string());
@@ -1958,7 +2007,8 @@ impl CallAgent {
         let to = NameAddr::new(remote_uri.clone());
 
         let request = RequestBuilder::cancel(remote_uri)
-            .via(&via)
+            // The INVITE's Via, verbatim (RFC 3261 §9.1).
+            .header(HeaderName::Via, invite_via)
             .from(&from)
             .to(&to)
             .call_id(sip_call_id)
@@ -2021,6 +2071,14 @@ impl CallAgent {
     }
 
     /// Builds an ACK request (static version).
+    ///
+    /// `invite_via` selects which transaction this ACK belongs to:
+    /// - `Some(via)`: ACK for a non-2xx final response. RFC 3261 §17.1.1.3
+    ///   requires the ACK to carry the INVITE's Via verbatim (same branch
+    ///   and same sent-by host:port) so it matches the INVITE transaction.
+    /// - `None`: ACK for a 2xx response. That ACK is a new transaction
+    ///   (RFC 3261 §13.2.2.4), so a fresh Via with a new branch is built
+    ///   from `local_addr`.
     #[allow(clippy::too_many_arguments)]
     fn build_ack_request_static(
         remote_uri_str: &str,
@@ -2032,6 +2090,7 @@ impl CallAgent {
         from_tag: &str,
         to_tag: Option<&str>,
         transport_type: &str,
+        invite_via: Option<&str>,
     ) -> SipUaResult<SipRequest> {
         let remote_uri: SipUri = remote_uri_str
             .parse()
@@ -2040,13 +2099,6 @@ impl CallAgent {
         let aor_uri: SipUri = aor
             .parse()
             .map_err(|e| SipUaError::ConfigError(format!("Invalid AOR: {e}")))?;
-
-        let branch = generate_branch();
-
-        let via = ViaHeader::new(transport_type, local_addr.ip().to_string())
-            .with_port(local_addr.port())
-            .with_branch(branch)
-            .with_rport();
 
         let from = NameAddr::new(aor_uri)
             .with_display_name(display_name)
@@ -2057,8 +2109,20 @@ impl CallAgent {
             to = to.with_tag(tag.to_string());
         }
 
-        let request = RequestBuilder::ack(remote_uri)
-            .via(&via)
+        let mut builder = RequestBuilder::ack(remote_uri);
+        builder = if let Some(via_value) = invite_via {
+            // Non-2xx ACK: the INVITE's Via, verbatim (RFC 3261 §17.1.1.3).
+            builder.header(HeaderName::Via, via_value)
+        } else {
+            // 2xx ACK: new transaction, fresh branch (RFC 3261 §13.2.2.4).
+            let via = ViaHeader::new(transport_type, local_addr.ip().to_string())
+                .with_port(local_addr.port())
+                .with_branch(generate_branch())
+                .with_rport();
+            builder.via(&via)
+        };
+
+        let request = builder
             .from(&from)
             .to(&to)
             .call_id(sip_call_id)
@@ -2413,13 +2477,21 @@ mod tests {
     }
 
     /// RFC 3261 §9.1: a CANCEL must reuse the INVITE's Via branch and `CSeq`
-    /// number (with method CANCEL), and must not include a To-tag the
-    /// INVITE didn't have. Live evidence: a fresh branch makes `BulkVS` reply
-    /// 481 "Call/Transaction Does Not Exist" and the far phone keeps ringing.
+    /// number (with method CANCEL), carry a Via line IDENTICAL to the
+    /// INVITE's (host AND port), and must not include a To-tag the INVITE
+    /// didn't have. Live evidence: a fresh branch — or the same branch with
+    /// a different Via sent-by port (each request used to snapshot a fresh
+    /// ephemeral discovery-socket port) — makes `BulkVS` reply 481
+    /// "Call/Transaction Does Not Exist" and the far phone keeps ringing.
+    ///
+    /// The agent is deliberately configured with an unspecified local
+    /// address (0.0.0.0:0) so each request goes through per-request
+    /// ephemeral-port discovery — the exact condition that produced the
+    /// differing Via ports on the wire.
     #[tokio::test]
     async fn test_cancel_reuses_invite_branch_and_cseq() {
         let (tx, mut rx) = mpsc::channel(10);
-        let local_addr: SocketAddr = "192.168.1.100:5060".parse().unwrap();
+        let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
         let mut agent = CallAgent::new(
             local_addr,
             "sips:alice@192.168.1.100".to_string(),
@@ -2429,7 +2501,7 @@ mod tests {
 
         let sdp = "v=0\r\no=- 0 0 IN IP4 192.168.1.100\r\n";
         let call_id = agent
-            .make_call("sips:bob@192.168.1.1:5061", sdp)
+            .make_call("sips:bob@127.0.0.1:5061", sdp)
             .await
             .unwrap();
 
@@ -2450,6 +2522,15 @@ mod tests {
 
         // Same Via branch as the INVITE (RFC 3261 §9.1)
         assert_eq!(via_branch(&cancel), via_branch(&invite));
+
+        // The FULL Via line must match verbatim — host AND port. A matching
+        // branch with a different sent-by port still fails transaction
+        // matching at the server (live wire: 58707 vs 60827 → 481).
+        assert_eq!(
+            cancel.headers.get_value(&HeaderName::Via).unwrap(),
+            invite.headers.get_value(&HeaderName::Via).unwrap(),
+            "CANCEL must copy the INVITE's exact Via line (RFC 3261 §9.1)"
+        );
 
         // Same CSeq number, method CANCEL
         let invite_cseq = invite.headers.get_value(&HeaderName::CSeq).unwrap();
@@ -2479,6 +2560,96 @@ mod tests {
         assert_eq!(
             cancel_to,
             invite.headers.get_value(&HeaderName::To).unwrap()
+        );
+    }
+
+    /// `BulkVS` flow: INVITE (`CSeq` 1) → 401 → ACK → auth'd INVITE (`CSeq` 2).
+    /// The auth'd INVITE is the LAST one actually sent, so a CANCEL must
+    /// copy ITS exact Via line (RFC 3261 §9.1), and the ACK to the 401 must
+    /// copy the FIRST INVITE's exact Via line (RFC 3261 §17.1.1.3) along
+    /// with the 401's To-tag.
+    #[cfg(feature = "digest-auth")]
+    #[tokio::test]
+    async fn test_cancel_via_matches_authed_invite_after_401_resend() {
+        use proto_sip::response::StatusCode;
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let mut agent = CallAgent::new(
+            local_addr,
+            "sip:alice@127.0.0.1".to_string(),
+            "Alice".to_string(),
+            tx,
+        );
+        agent.configure(
+            "sip:alice@127.0.0.1".to_string(),
+            "Alice".to_string(),
+            None,
+            "UDP",
+            Some(client_types::DigestAuthCredentials::new("alice", "secret")),
+        );
+
+        let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n";
+        let call_id = agent
+            .make_call("sip:bob@127.0.0.1:5061", sdp)
+            .await
+            .unwrap();
+
+        // Drain StateChanged, then capture the first INVITE (CSeq 1)
+        let _ = rx.recv().await.unwrap();
+        let invite1 = sent_request(rx.recv().await.unwrap());
+        let invite1_via = invite1.headers.get_value(&HeaderName::Via).unwrap();
+
+        // Simulate the provider's 401 challenge (with a server To-tag)
+        let mut challenge = SipResponse::new(StatusCode::UNAUTHORIZED);
+        challenge
+            .headers
+            .set(HeaderName::To, "<sip:bob@127.0.0.1:5061>;tag=srv-401-tag");
+        challenge.headers.set(
+            HeaderName::WwwAuthenticate,
+            "Digest realm=\"bulkvs\", nonce=\"abc123\"",
+        );
+        agent.handle_response(&challenge, &call_id).await.unwrap();
+
+        // ACK for the 401: must copy INVITE 1's exact Via line (§17.1.1.3)
+        // and echo the 401's To-tag, with the INVITE's CSeq number.
+        let ack = sent_request(rx.recv().await.unwrap());
+        assert_eq!(ack.method.to_string(), "ACK");
+        assert_eq!(
+            ack.headers.get_value(&HeaderName::Via).unwrap(),
+            invite1_via,
+            "ACK for non-2xx must copy the INVITE's exact Via line (RFC 3261 §17.1.1.3)"
+        );
+        assert!(
+            ack.headers
+                .get_value(&HeaderName::To)
+                .unwrap()
+                .contains("tag=srv-401-tag"),
+            "ACK To must equal the To of the response being acknowledged"
+        );
+        assert_eq!(ack.headers.get_value(&HeaderName::CSeq).unwrap(), "1 ACK");
+
+        // Authenticated INVITE resend (CSeq 2) — the LAST INVITE sent.
+        let invite2 = sent_request(rx.recv().await.unwrap());
+        assert_eq!(invite2.method.to_string(), "INVITE");
+        let invite2_via = invite2.headers.get_value(&HeaderName::Via).unwrap();
+        assert_eq!(
+            invite2.headers.get_value(&HeaderName::CSeq).unwrap(),
+            "2 INVITE"
+        );
+
+        // CANCEL must copy the auth'd INVITE's exact Via line and CSeq number.
+        agent.send_cancel(&call_id).await.unwrap();
+        let cancel = sent_request(rx.recv().await.unwrap());
+        assert_eq!(cancel.method.to_string(), "CANCEL");
+        assert_eq!(
+            cancel.headers.get_value(&HeaderName::Via).unwrap(),
+            invite2_via,
+            "CANCEL must copy the last-sent INVITE's exact Via line (RFC 3261 §9.1)"
+        );
+        assert_eq!(
+            cancel.headers.get_value(&HeaderName::CSeq).unwrap(),
+            "2 CANCEL"
         );
     }
 
