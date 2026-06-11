@@ -313,23 +313,22 @@ impl T38Session {
     /// Handles a received T.30 indication.
     fn handle_indication(&mut self, indication: T30Indication) {
         match indication {
-            T30Indication::Cng | T30Indication::Ced
-                if self.state == T38SessionState::PhaseA => {
-                    debug!(session = %self.id, "Phase A: Call establishment");
-                }
-            T30Indication::V21Preamble
-                if self.state == T38SessionState::PhaseA => {
-                    self.state = T38SessionState::PhaseB;
-                    debug!(session = %self.id, "Transitioning to Phase B");
-                }
+            T30Indication::Cng | T30Indication::Ced if self.state == T38SessionState::PhaseA => {
+                debug!(session = %self.id, "Phase A: Call establishment");
+            }
+            T30Indication::V21Preamble if self.state == T38SessionState::PhaseA => {
+                self.state = T38SessionState::PhaseB;
+                debug!(session = %self.id, "Transitioning to Phase B");
+            }
             T30Indication::V17ShortTraining
             | T30Indication::V17LongTraining
             | T30Indication::V27Training
             | T30Indication::V29Training
-                if self.state == T38SessionState::PhaseB => {
-                    self.state = T38SessionState::PhaseC;
-                    debug!(session = %self.id, "Transitioning to Phase C");
-                }
+                if self.state == T38SessionState::PhaseB =>
+            {
+                self.state = T38SessionState::PhaseC;
+                debug!(session = %self.id, "Transitioning to Phase C");
+            }
             T30Indication::PageMarker => {
                 self.stats.pages_received += 1;
                 self.state = T38SessionState::PhaseD;

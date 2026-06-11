@@ -79,7 +79,7 @@ pub struct TrunkRegistrar {
 impl TrunkRegistrar {
     /// Creates a new trunk registrar. `local_domain` seeds Call-ID
     /// generation for outgoing REGISTERs.
-    #[must_use] 
+    #[must_use]
     pub fn new(local_domain: &str) -> Self {
         Self {
             statuses: Arc::new(RwLock::new(HashMap::new())),

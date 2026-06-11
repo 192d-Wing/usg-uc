@@ -134,7 +134,7 @@ pub struct TrunkMonitor {
 
 impl TrunkMonitor {
     /// Creates a new trunk monitor.
-    #[must_use] 
+    #[must_use]
     pub fn new(local_domain: &str) -> Self {
         Self {
             health: Arc::new(RwLock::new(HashMap::new())),
