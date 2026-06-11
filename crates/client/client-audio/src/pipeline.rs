@@ -11,6 +11,7 @@
 
 use crate::aec::{AecConfig, AecReference};
 use crate::audio_processing::{AgcConfig, NoiseGateConfig};
+use crate::backend::{create_capture, create_playback};
 use crate::codec::CodecPipeline;
 use crate::comfort_noise::ComfortNoiseConfig;
 use crate::decode_thread::{self, DecodeThreadConfig, DecodeThreadHandle};
@@ -22,7 +23,6 @@ use crate::jitter_buffer::{JitterBufferConfig, SharedJitterBuffer};
 use crate::noise_shaper::NoiseShaperConfig;
 use crate::postfilter::PostfilterConfig;
 use crate::rtp_handler::{RtpReceiver, RtpStats, RtpTransmitter, generate_ssrc};
-use crate::stream::PlaybackStream;
 use crate::vad::VadConfig;
 use crate::{AudioError, AudioResult};
 use client_types::DtmfDigit;
@@ -521,12 +521,12 @@ impl AudioPipeline {
             debug!("SRTP enabled for audio pipeline");
         }
 
-        // Start capture stream
-        let capture = crate::stream::CaptureBackend::new(&self.device_manager)?;
+        // Start capture stream (platform backend behind the CaptureSource trait)
+        let capture = create_capture(&self.device_manager)?;
         let capture_rate = capture.sample_rate();
 
         // Start playback stream and split off the producer
-        let playback = PlaybackStream::new(&self.device_manager)?;
+        let playback = create_playback(&self.device_manager)?;
         let device_rate = playback.sample_rate();
 
         info!(
