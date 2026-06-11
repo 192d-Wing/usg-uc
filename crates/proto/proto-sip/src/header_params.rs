@@ -97,13 +97,20 @@ impl ViaHeader {
     ///
     /// Uses cryptographic randomness to prevent prediction and replay attacks.
     #[must_use]
-    // A failing CSPRNG is unrecoverable and must not yield a predictable
-    // branch; `expect` is the correct response and the API is infallible.
+    /// Generates a random branch parameter with RFC 3261 magic cookie prefix.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the CSPRNG fails (via `getrandom`), which is unrecoverable.
     #[allow(clippy::expect_used)]
     pub fn generate_branch() -> String {
         let mut bytes = [0u8; 16];
         getrandom::fill(&mut bytes).expect("getrandom failed");
-        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let hex: String = bytes.iter().fold(String::with_capacity(32), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
         format!("{VIA_BRANCH_MAGIC_COOKIE}{hex}")
     }
 
@@ -325,13 +332,20 @@ impl NameAddr {
     ///
     /// Uses cryptographic randomness to prevent prediction and call hijacking.
     #[must_use]
-    // A failing CSPRNG is unrecoverable and must not yield a predictable
-    // tag; `expect` is the correct response and the API is infallible.
+    /// Generates a random tag parameter.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the CSPRNG fails (via `getrandom`), which is unrecoverable.
     #[allow(clippy::expect_used)]
     pub fn generate_tag() -> String {
         let mut bytes = [0u8; 8];
         getrandom::fill(&mut bytes).expect("getrandom failed");
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+        bytes.iter().fold(String::with_capacity(16), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
     }
 }
 

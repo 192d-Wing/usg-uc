@@ -588,13 +588,20 @@ impl DigestHasher for Md5DigestHasher {
 /// Uses cryptographic randomness to prevent prediction and replay attacks.
 #[cfg(feature = "digest-auth")]
 #[must_use]
-// A failing CSPRNG is unrecoverable and must not yield a predictable
-// cnonce; `expect` is the correct response and the API is infallible.
+/// Generates a random cnonce (client nonce) for digest authentication.
+///
+/// # Panics
+///
+/// Panics if the CSPRNG fails (via `getrandom`), which is unrecoverable.
 #[allow(clippy::expect_used)]
 pub fn generate_cnonce() -> String {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("getrandom failed");
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    bytes.iter().fold(String::with_capacity(32), |mut s, b| {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 /// Computes HA1 for digest authentication per RFC 2617 Section 3.2.2.1.
