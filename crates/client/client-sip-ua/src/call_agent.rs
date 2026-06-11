@@ -1601,8 +1601,16 @@ impl CallAgent {
     }
 
     /// Sends a CANCEL request for a pending INVITE.
+    ///
+    /// Per RFC 3261 §9.1, the CANCEL must be identical to the INVITE it
+    /// cancels in Request-URI, Call-ID, To, From (including tags), and `CSeq`
+    /// number (with method CANCEL), and must carry a single Via with the
+    /// SAME branch parameter as the INVITE. The To header must NOT include
+    /// a remote tag learned from a provisional response — the original
+    /// INVITE had none. Sending a fresh branch makes proxies reply
+    /// 481 "Call/Transaction Does Not Exist" and the far end keeps ringing.
     async fn send_cancel(&mut self, call_id: &str) -> SipUaResult<()> {
-        let (remote_uri, sip_call_id, cseq, from_tag, to_tag, branch) = {
+        let (remote_uri, sip_call_id, cseq, from_tag, branch) = {
             let session = self
                 .calls
                 .get(call_id)
@@ -1611,10 +1619,15 @@ impl CallAgent {
             (
                 session.remote_uri.clone(),
                 session.sip_call_id.clone(),
+                // CSeq number must equal the INVITE's CSeq (method CANCEL).
                 session.cseq,
                 session.from_tag.clone(),
-                session.to_tag.clone(),
-                session.last_branch.clone().unwrap_or_else(generate_branch),
+                // Reuse the INVITE's Via branch — never generate a new one.
+                session.last_branch.clone().ok_or_else(|| {
+                    SipUaError::InvalidState(
+                        "No pending INVITE branch to CANCEL (RFC 3261 §9.1)".to_string(),
+                    )
+                })?,
             )
         };
 
@@ -1622,7 +1635,7 @@ impl CallAgent {
         let effective_local_addr =
             Self::get_local_addr_for_destination(destination, self.local_addr).await?;
 
-        // Build CANCEL request
+        // Build CANCEL request (same Via branch and CSeq number as the INVITE)
         let request = Self::build_cancel_request_static(
             &remote_uri,
             &self.aor,
@@ -1631,14 +1644,13 @@ impl CallAgent {
             &sip_call_id,
             cseq,
             &from_tag,
-            to_tag.as_deref(),
             &branch,
             &self.transport_type,
         )?;
 
-        // Create non-INVITE transaction
-        let new_branch = generate_branch();
-        let tx_key = TransactionKey::client(&new_branch, "CANCEL");
+        // The CANCEL client transaction reuses the INVITE's branch so that
+        // responses to the CANCEL (200/481) match this transaction.
+        let tx_key = TransactionKey::client(&branch, "CANCEL");
         let transaction = ClientNonInviteTransaction::new(tx_key, TransportType::Reliable);
 
         if let Some(session) = self.calls.get_mut(call_id) {
@@ -1909,6 +1921,10 @@ impl CallAgent {
     }
 
     /// Builds a CANCEL request (static version).
+    ///
+    /// Per RFC 3261 §9.1 the caller must pass the INVITE's Via `branch` and
+    /// `CSeq` number. The To header deliberately carries no tag: the INVITE
+    /// being cancelled was sent without one, and a CANCEL must match it.
     #[allow(clippy::too_many_arguments)]
     fn build_cancel_request_static(
         remote_uri_str: &str,
@@ -1918,7 +1934,6 @@ impl CallAgent {
         sip_call_id: &str,
         cseq: u32,
         from_tag: &str,
-        to_tag: Option<&str>,
         branch: &str,
         transport_type: &str,
     ) -> SipUaResult<SipRequest> {
@@ -1939,10 +1954,8 @@ impl CallAgent {
             .with_display_name(display_name)
             .with_tag(from_tag.to_string());
 
-        let mut to = NameAddr::new(remote_uri.clone());
-        if let Some(tag) = to_tag {
-            to = to.with_tag(tag.to_string());
-        }
+        // No to-tag: must match the original INVITE's To header exactly.
+        let to = NameAddr::new(remote_uri.clone());
 
         let request = RequestBuilder::cancel(remote_uri)
             .via(&via)
@@ -2383,6 +2396,90 @@ mod tests {
 
         // State should be Dialing
         assert_eq!(agent.get_state(&call_id), Some(CallState::Dialing));
+    }
+
+    /// Extracts the branch parameter from a Via header value.
+    fn via_branch(request: &SipRequest) -> String {
+        let via = request.headers.get_value(&HeaderName::Via).unwrap();
+        let start = via.find("branch=").unwrap() + "branch=".len();
+        via[start..].split(';').next().unwrap().to_string()
+    }
+
+    fn sent_request(event: CallEvent) -> SipRequest {
+        match event {
+            CallEvent::SendRequest { request, .. } => request,
+            other => panic!("expected SendRequest, got {other:?}"),
+        }
+    }
+
+    /// RFC 3261 §9.1: a CANCEL must reuse the INVITE's Via branch and `CSeq`
+    /// number (with method CANCEL), and must not include a To-tag the
+    /// INVITE didn't have. Live evidence: a fresh branch makes `BulkVS` reply
+    /// 481 "Call/Transaction Does Not Exist" and the far phone keeps ringing.
+    #[tokio::test]
+    async fn test_cancel_reuses_invite_branch_and_cseq() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let local_addr: SocketAddr = "192.168.1.100:5060".parse().unwrap();
+        let mut agent = CallAgent::new(
+            local_addr,
+            "sips:alice@192.168.1.100".to_string(),
+            "Alice".to_string(),
+            tx,
+        );
+
+        let sdp = "v=0\r\no=- 0 0 IN IP4 192.168.1.100\r\n";
+        let call_id = agent
+            .make_call("sips:bob@192.168.1.1:5061", sdp)
+            .await
+            .unwrap();
+
+        // Drain StateChanged, then capture the INVITE
+        let _ = rx.recv().await.unwrap();
+        let invite = sent_request(rx.recv().await.unwrap());
+
+        // Simulate a 180 Ringing that delivered a remote To-tag; the CANCEL
+        // must NOT echo it (the INVITE was sent without one).
+        let session = agent.calls.get_mut(&call_id).unwrap();
+        session.state = CallState::Ringing;
+        session.to_tag = Some("remote-tag-from-180".to_string());
+
+        agent.send_cancel(&call_id).await.unwrap();
+        let cancel = sent_request(rx.recv().await.unwrap());
+
+        assert_eq!(cancel.method.to_string(), "CANCEL");
+
+        // Same Via branch as the INVITE (RFC 3261 §9.1)
+        assert_eq!(via_branch(&cancel), via_branch(&invite));
+
+        // Same CSeq number, method CANCEL
+        let invite_cseq = invite.headers.get_value(&HeaderName::CSeq).unwrap();
+        let cancel_cseq = cancel.headers.get_value(&HeaderName::CSeq).unwrap();
+        let invite_cseq_num = invite_cseq.split_whitespace().next().unwrap();
+        let mut cancel_cseq_parts = cancel_cseq.split_whitespace();
+        assert_eq!(cancel_cseq_parts.next().unwrap(), invite_cseq_num);
+        assert_eq!(cancel_cseq_parts.next().unwrap(), "CANCEL");
+
+        // Identical Request-URI, Call-ID, and From (including tag)
+        assert_eq!(cancel.uri.to_string(), invite.uri.to_string());
+        assert_eq!(
+            cancel.headers.get_value(&HeaderName::CallId),
+            invite.headers.get_value(&HeaderName::CallId)
+        );
+        assert_eq!(
+            cancel.headers.get_value(&HeaderName::From),
+            invite.headers.get_value(&HeaderName::From)
+        );
+
+        // To must match the INVITE's To: no remote tag from the 180
+        let cancel_to = cancel.headers.get_value(&HeaderName::To).unwrap();
+        assert!(
+            !cancel_to.contains("tag="),
+            "CANCEL To header must not carry a to-tag the INVITE didn't have: {cancel_to}"
+        );
+        assert_eq!(
+            cancel_to,
+            invite.headers.get_value(&HeaderName::To).unwrap()
+        );
     }
 
     #[tokio::test]
