@@ -55,6 +55,7 @@ jobs:
           - { name: sbc-daemon, dockerfile: Dockerfile, context: . }
           - { name: sbc-api-server, dockerfile: crates/sbc/sbc-api-server/Dockerfile, context: . }
           - { name: sbc-provision-server, dockerfile: crates/sbc/sbc-provision-server/Dockerfile, context: . }
+          - { name: sbc-client-config-server, dockerfile: crates/sbc/sbc-client-config-server/Dockerfile, context: . }
           - { name: sbc-dashboard, dockerfile: crates/sbc/sbc-dashboard/Dockerfile, context: crates/sbc/sbc-dashboard }
         platform:
           - { arch: linux/amd64, runner: ubuntu-24.04 }
@@ -130,7 +131,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [sbc-daemon, sbc-api-server, sbc-provision-server, sbc-dashboard]
+        image: [sbc-daemon, sbc-api-server, sbc-provision-server, sbc-client-config-server, sbc-dashboard]
     steps:
       - name: Download digests
         uses: actions/download-artifact@v4

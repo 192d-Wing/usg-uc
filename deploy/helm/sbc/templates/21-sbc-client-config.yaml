@@ -46,11 +46,11 @@ spec:
               value: {{ .Values.sbcClientConfig.serviceName | quote }}
             # POP identity — which site this discovery endpoint speaks for.
             - name: SBC_CLIENT_CONFIG_POP_ID
-              value: {{ required "sbcClientConfig.popId is required" .Values.sbcClientConfig.popId | quote }}
+              value: {{ .Values.sbcClientConfig.popId | default .Values.site.name | quote }}
             # Externally visible base URL; becomes provisioning.config_endpoint
             # in the discovery document (the anycast→unicast handoff).
             - name: SBC_CLIENT_CONFIG_PUBLIC_URL
-              value: {{ required "sbcClientConfig.publicUrl is required" .Values.sbcClientConfig.publicUrl | quote }}
+              value: {{ .Values.sbcClientConfig.publicUrl | default (printf "https://sbc.%s" .Values.site.fqdn_base) | quote }}
             # OIDC trust anchors. Tokens must carry iss=issuer + aud=audience;
             # JWKS is fetched from the issuer's metadata.
             - name: SBC_CLIENT_CONFIG_OIDC_ISSUER
