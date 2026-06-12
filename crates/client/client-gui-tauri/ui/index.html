@@ -351,10 +351,12 @@
                                 <label>Registrar:</label>
                                 <input type="text" id="sipRegistrar" placeholder="sip.example.com (or leave empty to use domain)" maxlength="256">
                             </div>
-                            <div class="form-row">
+                            <!-- TLS-only by default: port/transport are build-time
+                                 options (insecure-transports feature) for lab use. -->
+                            <div class="form-row hidden" id="sipTransportRow">
                                 <div class="form-group half">
                                     <label>Port:</label>
-                                    <input type="number" id="sipPort" value="5060" min="1" max="65535">
+                                    <input type="number" id="sipPort" value="5061" min="1" max="65535">
                                 </div>
                                 <div class="form-group half">
                                     <label>Transport:</label>
@@ -377,28 +379,8 @@
                             </button>
                         </div>
 
-                        <h3><svg class="section-icon" viewBox="0 0 24 24" fill="currentColor">
-                                <path
-                                    d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z" />
-                            </svg> Client Certificates (CAC/PIV/SIPR)</h3>
-                        <div class="cert-section">
-                            <p class="cert-hint">Insert your smart card and select a certificate</p>
-                            <div class="cert-status" id="certStatus">No certificate selected</div>
-
-                            <div class="cert-list" id="certList">
-                                <!-- Certificates will be loaded dynamically -->
-                            </div>
-
-                            <div class="cert-actions">
-                                <button id="refreshCertsBtn" class="action-btn secondary">
-                                    <svg class="btn-icon" viewBox="0 0 24 24" fill="currentColor">
-                                        <path
-                                            d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" />
-                                    </svg>
-                                    Refresh
-                                </button>
-                            </div>
-                        </div>
+                        <!-- Smart-card client certificates (CAC/PIV/SIPR) were removed:
+                             SIP authenticates via OIDC Bearer (RFC 8898), not mTLS. -->
 
                         <!-- Digest Auth Section (hidden by default, shown when feature enabled) -->
                         <div id="digestAuthSection" class="hidden">

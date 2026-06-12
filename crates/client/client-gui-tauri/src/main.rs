@@ -143,6 +143,14 @@ fn is_digest_auth_enabled() -> bool {
     cfg!(feature = "digest-auth")
 }
 
+/// Whether this build allows UDP/TCP SIP transports (lab testing). The
+/// settings UI hides the port/transport controls in TLS-only builds.
+#[tauri::command]
+#[allow(clippy::missing_const_for_fn)]
+fn is_insecure_transports_enabled() -> bool {
+    cfg!(feature = "insecure-transports")
+}
+
 /// Trusts the provisioning extra CA (private-CA labs) for SIP TLS, so TLS
 /// registration verifies against the same root as provisioning HTTPS.
 /// Without this the SIP transport only trusts the system store.
@@ -1781,6 +1789,7 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
             is_digest_auth_enabled,
+            is_insecure_transports_enabled,
             initialize_client,
             make_call,
             end_call,

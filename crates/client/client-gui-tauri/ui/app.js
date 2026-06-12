@@ -800,11 +800,27 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Check if digest auth feature is enabled and show/hide UI accordingly
     await initializeDigestAuth();
+    await initializeTransportOptions();
 
     // OIDC sign-in gate: silent-resume a persisted session or show the
     // first-run sign-in screen (manual configs bypass the gate).
     await initializeSignin();
 });
+
+// Show the port/transport controls only in builds that allow non-TLS
+// SIP transports (insecure-transports feature); TLS-only builds keep
+// them hidden and the persisted values untouched.
+async function initializeTransportOptions() {
+    try {
+        const enabled = await invoke('is_insecure_transports_enabled');
+        const row = document.getElementById('sipTransportRow');
+        if (row && enabled) {
+            row.classList.remove('hidden');
+        }
+    } catch (error) {
+        console.log('Transport options check skipped:', error);
+    }
+}
 
 // Initialize digest auth UI based on feature flag
 async function initializeDigestAuth() {
