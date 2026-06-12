@@ -25,8 +25,24 @@ use uc_dos_protection::{RateLimitAction, RateLimiter, RateLimiterConfig};
 use uc_health::{HealthChecker, HealthCheckerConfig};
 use uc_metrics::{MetricRegistry, SbcMetrics};
 use uc_transport::Transport;
+use uc_transport::listener::ListenerConfig;
+use uc_transport::tcp::TcpListener;
+use uc_transport::tls::TlsListener;
 use uc_transport::udp::UdpTransport;
-use uc_types::address::SbcSocketAddr;
+use uc_types::address::{SbcSocketAddr, TransportType};
+
+/// Shared handles a stream (TCP/TLS) accept loop and its per-connection
+/// receive loops need for their lifetime.
+#[derive(Clone)]
+struct StreamLoopContext {
+    shutdown: ShutdownSignal,
+    stats: Arc<ServerStats>,
+    sip_stack: Arc<SipStack>,
+    rate_limiter: Arc<Mutex<RateLimiter>>,
+    global_limiter: Arc<Mutex<RateLimiter>>,
+    rate_limit_enabled: bool,
+    zone_name: Option<String>,
+}
 
 /// SBC server state.
 pub struct Server {
@@ -42,6 +58,10 @@ pub struct Server {
     stats: Arc<ServerStats>,
     /// UDP transports for SIP signaling.
     udp_transports: RwLock<Vec<Arc<UdpTransport>>>,
+    /// TCP listeners for SIP signaling (`transport.tcp_listen`).
+    tcp_listeners: RwLock<Vec<Arc<TcpListener>>>,
+    /// TLS listeners for SIP signaling (`transport.tls_listen`).
+    tls_listeners: RwLock<Vec<Arc<TlsListener>>>,
     /// SIP stack for message processing.
     sip_stack: Arc<SipStack>,
     /// Per-source rate limiter for `DoS` protection.
@@ -88,6 +108,8 @@ impl Server {
             metrics,
             stats: Arc::new(ServerStats::default()),
             udp_transports: RwLock::new(Vec::new()),
+            tcp_listeners: RwLock::new(Vec::new()),
+            tls_listeners: RwLock::new(Vec::new()),
             sip_stack,
             rate_limiter,
             global_limiter,
@@ -111,12 +133,14 @@ impl Server {
 
     /// Determines which zone a transport belongs to based on its local bind address.
     fn zone_for_transport(&self, transport: &UdpTransport) -> Option<String> {
-        if let Some(ref registry) = self.zone_registry {
-            let local_ip = transport.local_addr().ip();
-            registry.zone_for_signaling_ip(local_ip)
-        } else {
-            None
-        }
+        self.zone_for_local_ip(transport.local_addr().ip())
+    }
+
+    /// Determines which zone a local bind IP belongs to.
+    fn zone_for_local_ip(&self, local_ip: std::net::IpAddr) -> Option<String> {
+        self.zone_registry
+            .as_ref()
+            .and_then(|registry| registry.zone_for_signaling_ip(local_ip))
     }
 
     /// Creates a new server with cluster support.
@@ -160,6 +184,8 @@ impl Server {
             metrics,
             stats: Arc::new(ServerStats::default()),
             udp_transports: RwLock::new(Vec::new()),
+            tcp_listeners: RwLock::new(Vec::new()),
+            tls_listeners: RwLock::new(Vec::new()),
             sip_stack,
             rate_limiter,
             global_limiter,
@@ -406,10 +432,16 @@ impl Server {
         // Bind UDP listeners
         self.bind_udp_listeners().await?;
 
+        // Bind stream listeners (SIP over TCP / TLS)
+        self.bind_tcp_listeners().await?;
+        self.bind_tls_listeners().await?;
+
         // Seed the live-transport count at bind time (before the API server
         // starts serving readiness), so the readiness probe never sees a
         // spurious 0 during the window before run() spawns the loops.
-        let bound = self.udp_transports.read().await.len();
+        let bound = self.udp_transports.read().await.len()
+            + self.tcp_listeners.read().await.len()
+            + self.tls_listeners.read().await.len();
         self.stats
             .live_transports
             .store(bound as u64, Ordering::SeqCst);
@@ -474,13 +506,102 @@ impl Server {
         Ok(())
     }
 
+    /// Binds SIP-over-TCP listeners from `transport.tcp_listen`.
+    async fn bind_tcp_listeners(&mut self) -> Result<(), ServerError> {
+        let mut listeners = self.tcp_listeners.write().await;
+
+        for socket_addr in &self.config.transport.tcp_listen {
+            let addr = SbcSocketAddr::from(*socket_addr);
+            match TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    info!(address = %listener.local_addr(), "TCP listener bound");
+                    listeners.push(Arc::new(listener));
+                }
+                Err(e) => {
+                    error!(address = %addr, error = %e, "Failed to bind TCP listener");
+                    return Err(ServerError::BindFailed {
+                        address: addr.to_string(),
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Binds SIP-over-TLS listeners from `transport.tls_listen`.
+    ///
+    /// TLS needs server credentials: `security.tls_cert_path` /
+    /// `security.tls_key_path`. When the paths are not configured the
+    /// listeners are skipped with a warning rather than failing startup, so
+    /// UDP-only deployments keep working with the shipped default config
+    /// (which declares a TLS listener but no certificate).
+    async fn bind_tls_listeners(&mut self) -> Result<(), ServerError> {
+        if self.config.transport.tls_listen.is_empty() {
+            return Ok(());
+        }
+
+        let (Some(cert_path), Some(key_path)) = (
+            self.config.security.tls_cert_path.as_ref(),
+            self.config.security.tls_key_path.as_ref(),
+        ) else {
+            warn!(
+                listeners = ?self.config.transport.tls_listen,
+                "transport.tls_listen configured but security.tls_cert_path / \
+                 tls_key_path are not set — SIP TLS listeners DISABLED"
+            );
+            return Ok(());
+        };
+
+        let tls_error = |reason: String| ServerError::BindFailed {
+            address: "tls".to_string(),
+            reason,
+        };
+        let cert_chain = uc_transport::tls::load_certs(cert_path)
+            .map_err(|e| tls_error(format!("loading {}: {e}", cert_path.display())))?;
+        let private_key = uc_transport::tls::load_private_key(key_path)
+            .map_err(|e| tls_error(format!("loading {}: {e}", key_path.display())))?;
+        let server_config = Arc::new(
+            uc_transport::tls::create_server_config(cert_chain, private_key)
+                .map_err(|e| tls_error(format!("building TLS server config: {e}")))?,
+        );
+        info!(
+            cert = %cert_path.display(),
+            "TLS server credentials loaded for SIP listeners"
+        );
+
+        let mut listeners = self.tls_listeners.write().await;
+        for socket_addr in &self.config.transport.tls_listen {
+            let addr = SbcSocketAddr::from(*socket_addr);
+            let listener_config = ListenerConfig::new(addr, TransportType::Tls);
+            match TlsListener::bind(listener_config, Arc::clone(&server_config)).await {
+                Ok(listener) => {
+                    info!(address = %listener.local_addr(), "TLS listener bound");
+                    listeners.push(Arc::new(listener));
+                }
+                Err(e) => {
+                    error!(address = %addr, error = %e, "Failed to bind TLS listener");
+                    return Err(ServerError::BindFailed {
+                        address: addr.to_string(),
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Runs the main event loop.
     pub async fn run(&mut self) -> Result<(), ServerError> {
         info!("Entering async event loop");
 
         // Get transport handles for spawning receive tasks
         let transports = self.udp_transports.read().await;
-        let transport_count = transports.len();
+        let tcp_listeners: Vec<_> = self.tcp_listeners.read().await.clone();
+        let tls_listeners: Vec<_> = self.tls_listeners.read().await.clone();
+        let transport_count = transports.len() + tcp_listeners.len() + tls_listeners.len();
 
         if transport_count == 0 {
             warn!("No transports bound, exiting event loop");
@@ -518,6 +639,40 @@ impl Server {
             handles.push(handle);
         }
         drop(transports);
+
+        // Spawn accept loops for stream listeners (SIP over TCP / TLS).
+        // Each accepted connection gets its own receive task; responses go
+        // back over the connection the request arrived on (RFC 3261 §18).
+        for listener in tcp_listeners {
+            let zone_name = self.zone_for_local_ip(listener.local_addr().ip());
+            let ctx = StreamLoopContext {
+                shutdown: self.shutdown.clone(),
+                stats: Arc::clone(&self.stats),
+                sip_stack: Arc::clone(&self.sip_stack),
+                rate_limiter: Arc::clone(&self.rate_limiter),
+                global_limiter: Arc::clone(&self.global_limiter),
+                rate_limit_enabled: self.config.rate_limit.enabled,
+                zone_name,
+            };
+            handles.push(tokio::spawn(async move {
+                Self::tcp_accept_loop(listener, ctx).await;
+            }));
+        }
+        for listener in tls_listeners {
+            let zone_name = self.zone_for_local_ip(listener.local_addr().ip());
+            let ctx = StreamLoopContext {
+                shutdown: self.shutdown.clone(),
+                stats: Arc::clone(&self.stats),
+                sip_stack: Arc::clone(&self.sip_stack),
+                rate_limiter: Arc::clone(&self.rate_limiter),
+                global_limiter: Arc::clone(&self.global_limiter),
+                rate_limit_enabled: self.config.rate_limit.enabled,
+                zone_name,
+            };
+            handles.push(tokio::spawn(async move {
+                Self::tls_accept_loop(listener, ctx).await;
+            }));
+        }
 
         // Spawn health check polling task
         let shutdown = self.shutdown.clone();
@@ -602,58 +757,16 @@ impl Server {
                             // Check rate limits: global backstop first
                             // (one bucket, catches distributed floods that
                             // stay under the per-IP limit), then per-source.
-                            if rate_limit_enabled {
-                                let global_action = {
-                                    let mut limiter = global_limiter.lock().await;
-                                    limiter.check(source_ip)
-                                };
-                                if matches!(
-                                    global_action,
-                                    RateLimitAction::Reject | RateLimitAction::Block { .. }
-                                ) {
-                                    stats.rate_limited.fetch_add(1, Ordering::Relaxed);
-                                    debug!(
-                                        source = %source_ip,
-                                        "Global rate limit exceeded, rejecting message"
-                                    );
-                                    continue;
-                                }
-
-                                let action = {
-                                    let mut limiter = rate_limiter.lock().await;
-                                    limiter.check(source_ip)
-                                };
-
-                                match action {
-                                    RateLimitAction::Allow => {
-                                        // Continue processing
-                                    }
-                                    RateLimitAction::Throttle { delay_ms } => {
-                                        // Log throttling but continue
-                                        debug!(
-                                            source = %source_ip,
-                                            delay_ms,
-                                            "Rate limit throttle suggested"
-                                        );
-                                    }
-                                    RateLimitAction::Reject => {
-                                        stats.rate_limited.fetch_add(1, Ordering::Relaxed);
-                                        debug!(
-                                            source = %source_ip,
-                                            "Rate limit exceeded, rejecting message"
-                                        );
-                                        continue;
-                                    }
-                                    RateLimitAction::Block { duration_secs } => {
-                                        stats.rate_limited.fetch_add(1, Ordering::Relaxed);
-                                        warn!(
-                                            source = %source_ip,
-                                            duration_secs,
-                                            "Source blocked due to rate limit violation"
-                                        );
-                                        continue;
-                                    }
-                                }
+                            if rate_limit_enabled
+                                && !Self::rate_limit_allows(
+                                    source_ip,
+                                    &rate_limiter,
+                                    &global_limiter,
+                                    &stats,
+                                )
+                                .await
+                            {
+                                continue;
                             }
 
                             debug!(
@@ -667,7 +780,7 @@ impl Server {
                             let result = sip_stack.process_message(&msg.data, msg.source, zone_name.as_deref()).await;
 
                             // Handle the processing result
-                            Self::handle_result(result, &transport, &stats).await;
+                            Self::handle_result(result, transport.as_ref(), &stats).await;
                         }
                         Err(e) => {
                             if shutdown.is_shutdown_requested() {
@@ -704,8 +817,191 @@ impl Server {
         }
     }
 
+    /// Checks the global and per-source rate limits for one message.
+    ///
+    /// Returns `true` when the message may be processed. Increments
+    /// `stats.rate_limited` on every rejection.
+    async fn rate_limit_allows(
+        source_ip: std::net::IpAddr,
+        rate_limiter: &Mutex<RateLimiter>,
+        global_limiter: &Mutex<RateLimiter>,
+        stats: &ServerStats,
+    ) -> bool {
+        let global_action = {
+            let mut limiter = global_limiter.lock().await;
+            limiter.check(source_ip)
+        };
+        if matches!(
+            global_action,
+            RateLimitAction::Reject | RateLimitAction::Block { .. }
+        ) {
+            stats.rate_limited.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                source = %source_ip,
+                "Global rate limit exceeded, rejecting message"
+            );
+            return false;
+        }
+
+        let action = {
+            let mut limiter = rate_limiter.lock().await;
+            limiter.check(source_ip)
+        };
+
+        match action {
+            RateLimitAction::Allow => true,
+            RateLimitAction::Throttle { delay_ms } => {
+                // Log throttling but continue
+                debug!(
+                    source = %source_ip,
+                    delay_ms,
+                    "Rate limit throttle suggested"
+                );
+                true
+            }
+            RateLimitAction::Reject => {
+                stats.rate_limited.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    source = %source_ip,
+                    "Rate limit exceeded, rejecting message"
+                );
+                false
+            }
+            RateLimitAction::Block { duration_secs } => {
+                stats.rate_limited.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    source = %source_ip,
+                    duration_secs,
+                    "Source blocked due to rate limit violation"
+                );
+                false
+            }
+        }
+    }
+
+    /// Accept loop for a SIP-over-TCP listener.
+    async fn tcp_accept_loop(listener: Arc<TcpListener>, ctx: StreamLoopContext) {
+        info!(address = %listener.local_addr(), "SIP TCP accept loop started");
+        loop {
+            match listener.accept().await {
+                Ok((transport, peer)) => {
+                    debug!(peer = %peer, "Accepted SIP TCP connection");
+                    let conn_ctx = ctx.clone();
+                    tokio::spawn(async move {
+                        Self::stream_connection_loop(Arc::new(transport), peer, conn_ctx).await;
+                    });
+                }
+                Err(e) => {
+                    if ctx.shutdown.is_shutdown_requested() {
+                        break;
+                    }
+                    warn!(error = %e, "TCP accept failed");
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    /// Accept loop for a SIP-over-TLS listener.
+    ///
+    /// Note: the TLS handshake runs inline in `accept()`, so one slow
+    /// handshake briefly stalls new connections on this listener. The
+    /// per-IP rate limiter bounds the damage; revisit if it shows up.
+    async fn tls_accept_loop(listener: Arc<TlsListener>, ctx: StreamLoopContext) {
+        info!(address = %listener.local_addr(), "SIP TLS accept loop started");
+        loop {
+            match listener.accept().await {
+                Ok((transport, peer)) => {
+                    debug!(peer = %peer, "Accepted SIP TLS connection");
+                    let conn_ctx = ctx.clone();
+                    tokio::spawn(async move {
+                        Self::stream_connection_loop(Arc::new(transport), peer, conn_ctx).await;
+                    });
+                }
+                Err(e) => {
+                    if ctx.shutdown.is_shutdown_requested() {
+                        break;
+                    }
+                    // Failed handshakes land here too — log and keep accepting.
+                    warn!(error = %e, "TLS accept failed");
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    /// Receive loop for one accepted stream connection (TCP or TLS).
+    ///
+    /// Stream transports deliver byte chunks, not datagrams, so messages are
+    /// re-framed here via Content-Length (RFC 3261 §18.3) before entering the
+    /// SIP stack. Responses go back over this same connection.
+    async fn stream_connection_loop<T: Transport + 'static>(
+        transport: Arc<T>,
+        peer: SbcSocketAddr,
+        ctx: StreamLoopContext,
+    ) {
+        let mut buf = bytes::BytesMut::new();
+
+        loop {
+            match transport.recv().await {
+                Ok(chunk) => {
+                    buf.extend_from_slice(&chunk.data);
+                    if buf.len() > uc_transport::MAX_STREAM_MESSAGE_SIZE {
+                        warn!(
+                            peer = %peer,
+                            buffered = buf.len(),
+                            "No complete SIP message within size limit, closing connection"
+                        );
+                        break;
+                    }
+
+                    while let Some(frame) = next_sip_frame(&mut buf) {
+                        ctx.stats.messages_received.fetch_add(1, Ordering::Relaxed);
+
+                        if ctx.rate_limit_enabled
+                            && !Self::rate_limit_allows(
+                                peer.ip(),
+                                &ctx.rate_limiter,
+                                &ctx.global_limiter,
+                                &ctx.stats,
+                            )
+                            .await
+                        {
+                            continue;
+                        }
+
+                        debug!(
+                            source = %peer,
+                            size = frame.len(),
+                            transport = ?transport.transport_type(),
+                            "Received message"
+                        );
+
+                        let result = ctx
+                            .sip_stack
+                            .process_message(&frame, peer, ctx.zone_name.as_deref())
+                            .await;
+                        Self::handle_result(result, transport.as_ref(), &ctx.stats).await;
+                    }
+                }
+                Err(uc_transport::TransportError::ConnectionClosed) => {
+                    debug!(peer = %peer, "Stream connection closed by peer");
+                    break;
+                }
+                Err(e) => {
+                    if !ctx.shutdown.is_shutdown_requested() {
+                        warn!(peer = %peer, error = %e, "Stream receive error, closing connection");
+                    }
+                    break;
+                }
+            }
+        }
+
+        let _ = transport.close().await;
+    }
+
     /// Handles a single `ProcessResult`, sending responses/forwards via the transport.
-    async fn handle_result(result: ProcessResult, transport: &UdpTransport, stats: &ServerStats) {
+    async fn handle_result(result: ProcessResult, transport: &dyn Transport, stats: &ServerStats) {
         match result {
             ProcessResult::Response {
                 message,
@@ -773,6 +1069,20 @@ impl Server {
         for transport in transports.iter() {
             if let Err(e) = transport.close().await {
                 warn!(error = %e, "Error closing transport");
+            }
+        }
+        drop(transports);
+
+        // Close stream listeners (established connections wind down on
+        // their own as peers disconnect or recv fails).
+        for listener in self.tcp_listeners.read().await.iter() {
+            if let Err(e) = listener.close() {
+                warn!(error = %e, "Error closing TCP listener");
+            }
+        }
+        for listener in self.tls_listeners.read().await.iter() {
+            if let Err(e) = listener.close() {
+                warn!(error = %e, "Error closing TLS listener");
             }
         }
 
@@ -872,6 +1182,53 @@ impl std::fmt::Display for ServerError {
 
 impl std::error::Error for ServerError {}
 
+/// Extracts the next complete SIP message from a stream reassembly buffer.
+///
+/// SIP over stream transports is framed by Content-Length (RFC 3261 §18.3):
+/// a message is complete at end-of-headers (`\r\n\r\n`) plus the declared
+/// body length. Leading CRLFs (RFC 5626 keep-alive pings/pongs) are
+/// discarded. Returns `None` until a full message is buffered.
+fn next_sip_frame(buf: &mut bytes::BytesMut) -> Option<bytes::Bytes> {
+    // Discard keep-alive CRLFs between messages.
+    while buf.starts_with(b"\r\n") {
+        let _ = buf.split_to(2);
+    }
+    if buf.is_empty() {
+        return None;
+    }
+
+    let headers_end = buf
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")?
+        .checked_add(4)?;
+    let body_len = parse_content_length(&buf[..headers_end]);
+    let total = headers_end.checked_add(body_len)?;
+    if buf.len() < total {
+        return None;
+    }
+    Some(buf.split_to(total).freeze())
+}
+
+/// Parses the Content-Length header (or its compact form `l`) from a SIP
+/// header block. Absent or malformed values are treated as 0; the SIP
+/// parser downstream rejects the message properly.
+fn parse_content_length(headers: &[u8]) -> usize {
+    for line in headers.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        let name = line[..colon].trim_ascii();
+        if name.eq_ignore_ascii_case(b"content-length") || name.eq_ignore_ascii_case(b"l") {
+            return std::str::from_utf8(line[colon + 1..].trim_ascii())
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+        }
+    }
+    0
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -925,5 +1282,60 @@ mod tests {
         let socket_addr: std::net::SocketAddr = "0.0.0.0:5060".parse().unwrap();
         let sbc_addr = SbcSocketAddr::from(socket_addr);
         assert_eq!(sbc_addr.port(), 5060);
+    }
+
+    const REGISTER: &[u8] = b"REGISTER sip:example.mil SIP/2.0\r\n\
+        Via: SIP/2.0/TLS host:5061;branch=z9hG4bK1\r\n\
+        Content-Length: 0\r\n\
+        \r\n";
+
+    #[test]
+    fn frame_complete_message() {
+        let mut buf = bytes::BytesMut::from(REGISTER);
+        let frame = next_sip_frame(&mut buf).expect("complete message");
+        assert_eq!(&frame[..], REGISTER);
+        assert!(buf.is_empty());
+        assert!(next_sip_frame(&mut buf).is_none());
+    }
+
+    #[test]
+    fn frame_waits_for_full_body() {
+        let msg = b"MESSAGE sip:example.mil SIP/2.0\r\nContent-Length: 5\r\n\r\nhel";
+        let mut buf = bytes::BytesMut::from(&msg[..]);
+        assert!(next_sip_frame(&mut buf).is_none());
+        buf.extend_from_slice(b"lo");
+        let frame = next_sip_frame(&mut buf).expect("complete after body");
+        assert!(frame.ends_with(b"hello"));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn frame_splits_pipelined_messages_and_skips_keepalives() {
+        let mut buf = bytes::BytesMut::new();
+        buf.extend_from_slice(b"\r\n\r\n"); // RFC 5626 keep-alive ping
+        buf.extend_from_slice(REGISTER);
+        buf.extend_from_slice(REGISTER);
+        assert_eq!(next_sip_frame(&mut buf).expect("first").len(), REGISTER.len());
+        assert_eq!(next_sip_frame(&mut buf).expect("second").len(), REGISTER.len());
+        assert!(next_sip_frame(&mut buf).is_none());
+    }
+
+    #[test]
+    fn frame_partial_headers_returns_none() {
+        let mut buf = bytes::BytesMut::from(&b"REGISTER sip:example.mil SIP/2.0\r\nVia: x"[..]);
+        assert!(next_sip_frame(&mut buf).is_none());
+        assert!(!buf.is_empty()); // kept for the next chunk
+    }
+
+    #[test]
+    fn content_length_compact_form() {
+        let headers = b"MESSAGE sip:a SIP/2.0\r\nl: 7\r\n\r\n";
+        assert_eq!(parse_content_length(headers), 7);
+    }
+
+    #[test]
+    fn content_length_request_line_colon_not_confused() {
+        // The request-line contains ':' but is not a header.
+        assert_eq!(parse_content_length(b"REGISTER sip:a SIP/2.0\r\n\r\n"), 0);
     }
 }
