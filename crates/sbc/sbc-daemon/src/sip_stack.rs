@@ -3263,7 +3263,11 @@ mod tests {
 
     #[test]
     fn latch_rewrites_unspecified_v6_host_with_brackets() {
-        let source = SbcSocketAddr::from("[2601:443:c200:570::1]:55748".parse::<std::net::SocketAddr>().unwrap());
+        let source = SbcSocketAddr::from(
+            "[2601:443:c200:570::1]:55748"
+                .parse::<std::net::SocketAddr>()
+                .unwrap(),
+        );
         let mut contact = ContactInfo::new("sip:1209@[::]:61676;transport=tls");
         latch_unspecified_contact(&mut contact, &source);
         assert_eq!(
@@ -3274,7 +3278,8 @@ mod tests {
 
     #[test]
     fn latch_rewrites_unspecified_v4_host() {
-        let source = SbcSocketAddr::from("198.51.100.7:5060".parse::<std::net::SocketAddr>().unwrap());
+        let source =
+            SbcSocketAddr::from("198.51.100.7:5060".parse::<std::net::SocketAddr>().unwrap());
         let mut contact = ContactInfo::new("sip:alice@0.0.0.0:5080");
         latch_unspecified_contact(&mut contact, &source);
         assert_eq!(contact.uri, "sip:alice@198.51.100.7:5060");
@@ -3282,7 +3287,8 @@ mod tests {
 
     #[test]
     fn latch_leaves_routable_and_wildcard_contacts_alone() {
-        let source = SbcSocketAddr::from("198.51.100.7:5060".parse::<std::net::SocketAddr>().unwrap());
+        let source =
+            SbcSocketAddr::from("198.51.100.7:5060".parse::<std::net::SocketAddr>().unwrap());
         let mut routable = ContactInfo::new("sip:alice@203.0.113.9:5080;transport=tls");
         latch_unspecified_contact(&mut routable, &source);
         assert_eq!(routable.uri, "sip:alice@203.0.113.9:5080;transport=tls");
