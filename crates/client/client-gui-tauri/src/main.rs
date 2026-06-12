@@ -1717,6 +1717,49 @@ fn create_app_state() -> Option<(TauriAppState, EventReceiver)> {
     Some((app_state, event_rx))
 }
 
+/// Tauri run-event hook: intercepts the first exit request to send a
+/// REGISTER with Expires: 0, so the SBC drops this client's binding
+/// immediately instead of waiting out the registration expiry. The
+/// second pass (our own `exit(0)`) falls through untouched, and a 2 s
+/// cap keeps shutdown snappy when the network is gone.
+fn handle_run_event(app_handle: &AppHandle, event: tauri::RunEvent) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static EXITING: AtomicBool = AtomicBool::new(false);
+
+    let tauri::RunEvent::ExitRequested { api, .. } = event else {
+        return;
+    };
+    if EXITING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    api.prevent_exit();
+    info!("Exit requested — unregistering from SIP service");
+
+    let handle = app_handle.clone();
+    tauri::async_runtime::spawn(async move {
+        let unregister = async {
+            let state = handle.state::<TauriAppState>();
+            let mut guard = state.client.lock().await;
+            if let Some(client) = guard.as_mut() {
+                if client.unregister().await.is_ok() {
+                    // Pump the event loop so the un-REGISTER actually
+                    // reaches the wire (unregister() only queues it).
+                    let _ = client.poll_events().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    let _ = client.poll_events().await;
+                }
+            }
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(2), unregister)
+            .await
+            .is_err()
+        {
+            warn!("Unregister on exit timed out; exiting anyway");
+        }
+        handle.exit(0);
+    });
+}
+
 fn main() {
     // Initialize logging - use RUST_LOG env var if set, otherwise default to INFO
     tracing_subscriber::fmt()
@@ -1806,10 +1849,11 @@ fn main() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .unwrap_or_else(|e| {
-            error!("Error running Tauri application: {e}");
-        });
+        .build(tauri::generate_context!())
+        .map_or_else(
+            |e| error!("Error running Tauri application: {e}"),
+            |app| app.run(handle_run_event),
+        );
 
     info!("Application shutting down");
 }
