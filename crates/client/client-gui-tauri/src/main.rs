@@ -710,11 +710,21 @@ async fn get_sip_settings(state: State<'_, TauriAppState>) -> Result<SipSettings
                 _ => 5060,
             };
 
+            // The UI shows the registrar as a bare host: the scheme is an
+            // implementation detail re-derived from the transport on save
+            // (update_sip_settings), so strip it here.
+            let registrar = acc
+                .registrar_uri
+                .strip_prefix("sips:")
+                .or_else(|| acc.registrar_uri.strip_prefix("sip:"))
+                .unwrap_or(&acc.registrar_uri)
+                .to_string();
+
             Ok(SipSettings {
                 display_name: acc.display_name.clone(),
                 username,
                 domain,
-                registrar: acc.registrar_uri.clone(),
+                registrar,
                 port: default_port,
                 transport: transport.to_string(),
                 auto_register: acc.enabled,
