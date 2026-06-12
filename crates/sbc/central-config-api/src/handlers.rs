@@ -11,16 +11,16 @@ use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post, put};
 use axum::Json;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use tower_http::trace::TraceLayer;
 use tracing::warn;
 
-use central_config_store::{CentralError, DeltaResult};
+use central_config_store::{CentralError, ConfigTable, DeltaResult};
 
-use crate::auth::authorize_site;
+use crate::auth::{authorize_operator, authorize_site};
 use crate::state::AppState;
 
 /// Build the router.
@@ -28,9 +28,21 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        // Sync surface (site-scoped tokens).
         .route("/v1/sync/{site_code}/epoch", get(sync_epoch))
         .route("/v1/sync/{site_code}/delta", get(sync_delta))
         .route("/v1/sync/{site_code}/snapshot", get(sync_snapshot))
+        // Operator write surface (config-admin tokens).
+        .route("/v1/sites", post(register_site))
+        .route("/v1/sites/{site_code}/phones", post(upsert_phone))
+        .route("/v1/sites/{site_code}/phones/{id}", axum::routing::delete(delete_phone))
+        .route("/v1/sites/{site_code}/directory", post(upsert_did))
+        .route("/v1/sites/{site_code}/directory/{did}", axum::routing::delete(delete_did))
+        .route("/v1/sites/{site_code}/trunkgroups", post(upsert_trunk_group))
+        .route("/v1/sites/{site_code}/trunkgroups/{id}", axum::routing::delete(delete_trunk_group))
+        .route("/v1/sites/{site_code}/dialplans", post(upsert_dial_plan))
+        .route("/v1/sites/{site_code}/dialplans/{id}", axum::routing::delete(delete_dial_plan))
+        .route("/v1/sites/{site_code}/config", put(put_site_config))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -44,7 +56,7 @@ async fn healthz() -> impl IntoResponse {
 /// Unready (503) keeps the pod out of rotation until it can serve.
 async fn readyz(State(state): State<Arc<AppState>>) -> Response {
     let db_ok = state.store.ping().await.is_ok();
-    let jwks_ok = state.validator.jwks().ready().await;
+    let jwks_ok = state.sync_validator.jwks().ready().await;
     if db_ok && jwks_ok {
         Json(json!({ "status": "ready",
             "uptime_secs": state.start_time.elapsed().as_secs() }))
@@ -71,7 +83,7 @@ async fn sync_epoch(
     Path(site_code): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(rej) = authorize_site(&state.validator, &headers, &site_code).await {
+    if let Err(rej) = authorize_site(&state.sync_validator, &headers, &site_code).await {
         return rej.into_response();
     }
     match state.store.epoch(&site_code).await {
@@ -90,7 +102,7 @@ async fn sync_delta(
     Query(q): Query<DeltaQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(rej) = authorize_site(&state.validator, &headers, &site_code).await {
+    if let Err(rej) = authorize_site(&state.sync_validator, &headers, &site_code).await {
         return rej.into_response();
     }
     match state.store.delta(&site_code, q.since).await {
@@ -107,7 +119,7 @@ async fn sync_snapshot(
     Path(site_code): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(rej) = authorize_site(&state.validator, &headers, &site_code).await {
+    if let Err(rej) = authorize_site(&state.sync_validator, &headers, &site_code).await {
         return rej.into_response();
     }
     match state.store.snapshot(&site_code).await {
@@ -136,8 +148,267 @@ fn store_error(site: &str, op: &str, err: &CentralError) -> Response {
     }
 }
 
+// ============================================================ write surface
+//
+// Operator-authorized (config-admin scope). Each write drives one
+// transactional store call (epoch bump + revision stamp + journal) and is
+// attributed to the token subject.
+
+/// Normalize a MAC the same way the phone store and sync agent do.
+fn normalize_mac(mac: &str) -> String {
+    mac.replace([':', '-'], "").to_lowercase()
+}
+
+/// Map a write-path store error to HTTP.
+fn write_error(err: &CentralError) -> Response {
+    let (status, code) = match err {
+        CentralError::UnknownSite(_) => (StatusCode::NOT_FOUND, "unknown_site"),
+        CentralError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
+        CentralError::DidConflict { .. } => (StatusCode::CONFLICT, "did_conflict"),
+        CentralError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
+        CentralError::InvalidSiteCode(_) => (StatusCode::BAD_REQUEST, "invalid_site_code"),
+        CentralError::Serialization(_) => (StatusCode::BAD_REQUEST, "bad_payload"),
+        CentralError::Storage(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    };
+    (status, Json(json!({ "error": code, "detail": err.to_string() }))).into_response()
+}
+
+/// 400 with a validation message.
+fn bad_request(detail: impl Into<String>) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": "bad_request", "detail": detail.into() })))
+        .into_response()
+}
+
+/// `{ epoch }` 200 on a successful write.
+fn ok_epoch(epoch: i64) -> Response {
+    Json(json!({ "epoch": epoch })).into_response()
+}
+
+/// `POST /v1/sites` — register a site (creates its partitions).
+async fn register_site(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(rej) = authorize_operator(&state.admin_validator, &headers).await {
+        return rej.into_response();
+    }
+    let Some(site) = body.get("site_code").and_then(Value::as_str) else {
+        return bad_request("site_code is required");
+    };
+    let display = body.get("display_name").and_then(Value::as_str).unwrap_or(site);
+    let Some(fqdn) = body.get("fqdn_base").and_then(Value::as_str) else {
+        return bad_request("fqdn_base is required");
+    };
+    let tz = body.get("timezone").and_then(Value::as_str).unwrap_or("UTC");
+    let status = body.get("status").and_then(Value::as_str).unwrap_or("planned");
+    match state.store.register_site(site, display, fqdn, tz, status).await {
+        Ok(()) => (StatusCode::CREATED, Json(json!({ "site_code": site }))).into_response(),
+        Err(e) => write_error(&e),
+    }
+}
+
+/// `POST /v1/sites/{site}/phones` — upsert a phone (body is the Phone JSON).
+async fn upsert_phone(
+    State(state): State<Arc<AppState>>,
+    Path(site): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+        Ok(c) => c.sub,
+        Err(rej) => return rej.into_response(),
+    };
+    let Some(id) = body.get("id").and_then(Value::as_str) else {
+        return bad_request("phone id is required");
+    };
+    let Some(mac) = body.get("mac_address").and_then(Value::as_str) else {
+        return bad_request("mac_address is required");
+    };
+    match state.store.upsert_phone(&site, id, &normalize_mac(mac), &body, &actor).await {
+        Ok(epoch) => ok_epoch(epoch),
+        Err(e) => write_error(&e),
+    }
+}
+
+/// `DELETE /v1/sites/{site}/phones/{id}` — tombstone a phone.
+async fn delete_phone(
+    State(state): State<Arc<AppState>>,
+    Path((site, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+        Ok(c) => c.sub,
+        Err(rej) => return rej.into_response(),
+    };
+    match state.store.delete(ConfigTable::Phones, &site, &id, &actor).await {
+        Ok(epoch) => ok_epoch(epoch),
+        Err(e) => write_error(&e),
+    }
+}
+
+/// `POST /v1/sites/{site}/directory` — upsert a DID (body `{did, user?, …}`).
+async fn upsert_did(
+    State(state): State<Arc<AppState>>,
+    Path(site): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+        Ok(c) => c.sub,
+        Err(rej) => return rej.into_response(),
+    };
+    let Some(obj) = body.as_object() else {
+        return bad_request("directory body must be a JSON object");
+    };
+    let Some(did) = obj.get("did").and_then(Value::as_str) else {
+        return bad_request("did is required");
+    };
+    let str_field = |k: &str| obj.get(k).and_then(Value::as_str).map(str::to_string);
+    let (user, partition, description) =
+        (str_field("user"), str_field("partition"), str_field("description"));
+    // Everything else becomes `extra`.
+    let mut extra = obj.clone();
+    for k in ["did", "user", "partition", "description"] {
+        extra.remove(k);
+    }
+    match state
+        .store
+        .upsert_did(
+            &site,
+            did,
+            user.as_deref(),
+            partition.as_deref(),
+            description.as_deref(),
+            &extra,
+            &actor,
+        )
+        .await
+    {
+        Ok(epoch) => ok_epoch(epoch),
+        Err(e) => write_error(&e),
+    }
+}
+
+/// `DELETE /v1/sites/{site}/directory/{did}` — tombstone a DID.
+async fn delete_did(
+    State(state): State<Arc<AppState>>,
+    Path((site, did)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+        Ok(c) => c.sub,
+        Err(rej) => return rej.into_response(),
+    };
+    match state.store.delete(ConfigTable::DirectoryNumbers, &site, &did, &actor).await {
+        Ok(epoch) => ok_epoch(epoch),
+        Err(e) => write_error(&e),
+    }
+}
+
+/// `POST /v1/sites/{site}/trunkgroups` — upsert a trunk group, validated
+/// against the typed `TrunkGroupConfig` schema before it's stored.
+async fn upsert_trunk_group(
+    State(state): State<Arc<AppState>>,
+    Path(site): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+        Ok(c) => c.sub,
+        Err(rej) => return rej.into_response(),
+    };
+    let cfg = match serde_json::from_value::<sbc_config::schema::TrunkGroupConfig>(body.clone()) {
+        Ok(c) => c,
+        Err(e) => return bad_request(format!("invalid trunk group: {e}")),
+    };
+    match state.store.upsert_json(ConfigTable::TrunkGroups, &site, &cfg.id, &body, &actor).await {
+        Ok(epoch) => ok_epoch(epoch),
+        Err(e) => write_error(&e),
+    }
+}
+
+/// `DELETE /v1/sites/{site}/trunkgroups/{id}`.
+async fn delete_trunk_group(
+    State(state): State<Arc<AppState>>,
+    Path((site, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+        Ok(c) => c.sub,
+        Err(rej) => return rej.into_response(),
+    };
+    match state.store.delete(ConfigTable::TrunkGroups, &site, &id, &actor).await {
+        Ok(epoch) => ok_epoch(epoch),
+        Err(e) => write_error(&e),
+    }
+}
+
+/// `POST /v1/sites/{site}/dialplans` — upsert a dial plan, validated
+/// against the typed `DialPlanConfig` schema.
+async fn upsert_dial_plan(
+    State(state): State<Arc<AppState>>,
+    Path(site): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+        Ok(c) => c.sub,
+        Err(rej) => return rej.into_response(),
+    };
+    let cfg = match serde_json::from_value::<sbc_config::schema::DialPlanConfig>(body.clone()) {
+        Ok(c) => c,
+        Err(e) => return bad_request(format!("invalid dial plan: {e}")),
+    };
+    match state.store.upsert_json(ConfigTable::DialPlans, &site, &cfg.id, &body, &actor).await {
+        Ok(epoch) => ok_epoch(epoch),
+        Err(e) => write_error(&e),
+    }
+}
+
+/// `DELETE /v1/sites/{site}/dialplans/{id}`.
+async fn delete_dial_plan(
+    State(state): State<Arc<AppState>>,
+    Path((site, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+        Ok(c) => c.sub,
+        Err(rej) => return rej.into_response(),
+    };
+    match state.store.delete(ConfigTable::DialPlans, &site, &id, &actor).await {
+        Ok(epoch) => ok_epoch(epoch),
+        Err(e) => write_error(&e),
+    }
+}
+
+/// `PUT /v1/sites/{site}/config` — replace the site's telephony settings
+/// document (a single `default` row).
+async fn put_site_config(
+    State(state): State<Arc<AppState>>,
+    Path(site): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+        Ok(c) => c.sub,
+        Err(rej) => return rej.into_response(),
+    };
+    if !body.is_object() {
+        return bad_request("site config must be a JSON object");
+    }
+    match state
+        .store
+        .upsert_json(ConfigTable::SiteTelephonyConfig, &site, "default", &body, &actor)
+        .await
+    {
+        Ok(epoch) => ok_epoch(epoch),
+        Err(e) => write_error(&e),
+    }
+}
+
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::option_if_let_else)]
 mod tests {
     //! End-to-end HTTP tests over the real router, store, and OIDC
     //! validator. The bearer tokens are minted with a fresh ES256 key
@@ -166,7 +437,7 @@ mod tests {
     use central_config_store::CentralConfigStore;
 
     use super::*;
-    use crate::state::{AppState, SYNC_SCOPE};
+    use crate::state::{ADMIN_SCOPE, AppState, SYNC_SCOPE};
 
     const TEST_KID: &str = "test-key-1";
     const TEST_ISSUER: &str = "https://idp.example.mil/realms/config";
@@ -258,16 +529,24 @@ mod tests {
             .upsert_phone("MUHJ", "p1", "aabbccddeeff", &serde_json::json!({"id": "p1"}), "op")
             .await
             .expect("seed phone");
-        let validator = Arc::new(Validator::new(
-            Arc::new(JwksCache::with_static(test_key().jwks.clone())),
-            ValidatorConfig {
-                issuer: TEST_ISSUER.to_string(),
-                audiences: vec![TEST_AUDIENCE.to_string()],
-                required_scope: SYNC_SCOPE,
-                leeway_secs: 30,
-            },
-        ));
-        router(Arc::new(AppState { store, validator, start_time: Instant::now() }))
+        let jwks = Arc::new(JwksCache::with_static(test_key().jwks.clone()));
+        let validator_for = |scope: &'static str| {
+            Arc::new(Validator::new(
+                Arc::clone(&jwks),
+                ValidatorConfig {
+                    issuer: TEST_ISSUER.to_string(),
+                    audiences: vec![TEST_AUDIENCE.to_string()],
+                    required_scope: scope,
+                    leeway_secs: 30,
+                },
+            ))
+        };
+        router(Arc::new(AppState {
+            store,
+            sync_validator: validator_for(SYNC_SCOPE),
+            admin_validator: validator_for(ADMIN_SCOPE),
+            start_time: Instant::now(),
+        }))
     }
 
     async fn send(app: &Router, uri: &str, auth: Option<&str>) -> (StatusCode, Value) {
@@ -288,6 +567,157 @@ mod tests {
             serde_json::from_slice(&bytes).expect("json body")
         };
         (status, body)
+    }
+
+    /// Send a request with a method, optional JSON body, and bearer token.
+    async fn send_req(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        token: Option<&str>,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut req = Request::builder().uri(uri).method(method);
+        if let Some(t) = token {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let body = match body {
+            Some(v) => {
+                req = req.header(header::CONTENT_TYPE, "application/json");
+                Body::from(serde_json::to_vec(&v).expect("encode body"))
+            }
+            None => Body::empty(),
+        };
+        let resp = app.clone().oneshot(req.body(body).expect("req")).await.expect("response");
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+        let body =
+            if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).expect("json") };
+        (status, body)
+    }
+
+    /// An operator token (config-admin scope, no site claim).
+    fn admin_token() -> String {
+        mint(None, ADMIN_SCOPE, TEST_AUDIENCE, now() + 3600)
+    }
+
+    #[tokio::test]
+    async fn write_surface_authz_validation_and_epochs() {
+        let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else { return };
+        let app = app(&admin, "cca_writes").await; // seeds site MUHJ + phone p1 (epoch 1)
+        let admin_tok = admin_token();
+
+        // A site sync token must NOT be able to write (wrong scope here).
+        let (s, _) = send_req(
+            &app,
+            "POST",
+            "/v1/sites/MUHJ/phones",
+            Some(&good_token("MUHJ")),
+            Some(json!({"id": "p9", "mac_address": "99:99:99:99:99:99"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "sync-scoped token cannot write");
+
+        // No token → 401.
+        let (s, _) = send_req(&app, "POST", "/v1/sites/MUHJ/phones", None, Some(json!({}))).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+        // Operator upsert lands and bumps the epoch (seed was 1 → 2).
+        let (s, b) = send_req(
+            &app,
+            "POST",
+            "/v1/sites/MUHJ/phones",
+            Some(&admin_tok),
+            Some(json!({"id": "p2", "mac_address": "22:22:22:22:22:22"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b["epoch"], 2);
+
+        // Missing required field → 400.
+        let (s, _) = send_req(
+            &app,
+            "POST",
+            "/v1/sites/MUHJ/phones",
+            Some(&admin_tok),
+            Some(json!({"mac_address": "33:33:33:33:33:33"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "phone id required");
+
+        // Typed validation: a trunk group with no id fails the schema → 400.
+        let (s, _) = send_req(
+            &app,
+            "POST",
+            "/v1/sites/MUHJ/trunkgroups",
+            Some(&admin_tok),
+            Some(json!({"name": "no id here"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "trunk group must validate");
+
+        // A valid trunk group stores and bumps the epoch (2 → 3).
+        let (s, b) = send_req(
+            &app,
+            "POST",
+            "/v1/sites/MUHJ/trunkgroups",
+            Some(&admin_tok),
+            Some(json!({"id": "us-domestic", "strategy": "priority", "trunks": []})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b["epoch"], 3);
+
+        // Register a brand-new site, then write into it.
+        let (s, _) = send_req(
+            &app,
+            "POST",
+            "/v1/sites",
+            Some(&admin_tok),
+            Some(json!({"site_code": "MPLS", "fqdn_base": "mpls.x"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        let (s, b) = send_req(
+            &app,
+            "POST",
+            "/v1/sites/MPLS/dialplans",
+            Some(&admin_tok),
+            Some(json!({"id": "main", "entries": []})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b["epoch"], 1, "new site's first write is epoch 1");
+
+        // Writing to an unregistered site → 404.
+        let (s, _) = send_req(
+            &app,
+            "POST",
+            "/v1/sites/GHST/dialplans",
+            Some(&admin_tok),
+            Some(json!({"id": "main", "entries": []})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+
+        // Delete the seeded phone (tombstone), epoch advances; re-delete 404s.
+        let (s, _) =
+            send_req(&app, "DELETE", "/v1/sites/MUHJ/phones/p1", Some(&admin_tok), None).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) =
+            send_req(&app, "DELETE", "/v1/sites/MUHJ/phones/p1", Some(&admin_tok), None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "second delete finds no live row");
+
+        // The writes are visible on the sync surface the agent pulls.
+        let (s, b) = send(&app, "/v1/sync/MUHJ/snapshot", Some(&good_token("MUHJ"))).await;
+        assert_eq!(s, StatusCode::OK);
+        let tg = b["tables"]
+            .as_array()
+            .expect("tables")
+            .iter()
+            .find(|t| t["table"] == "trunk_groups")
+            .expect("trunk_groups");
+        assert_eq!(tg["rows"].as_array().expect("rows").len(), 1);
     }
 
     #[tokio::test]

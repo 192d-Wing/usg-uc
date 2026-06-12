@@ -29,6 +29,10 @@ serde_json = { workspace = true }
 thiserror.workspace = true
 
 central-config-store = { path = "../central-config-store" }
+# Typed config schemas the write handlers validate trunk-group / dial-plan
+# payloads against before they're stored — the same structs the daemon
+# consumes, so central validation matches what sites will parse.
+sbc-config = { workspace = true }
 # OIDC bearer-token validation (JWKS cache + JWT validator), shared with
 # the SIP registrar and provisioning pods so the fleet authorizes tokens
 # identically.

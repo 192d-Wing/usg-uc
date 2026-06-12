@@ -83,3 +83,24 @@ pub async fn authorize_site(
         Err(AuthRejection::WrongSite)
     }
 }
+
+/// Validate an operator token for the write surface. The `admin_validator`
+/// already requires the `config-admin` scope; this returns the claims so a
+/// handler can attribute the write to `claims.sub`. An operator is a fleet
+/// admin — there is no per-site claim check (writes name the site in the
+/// path).
+///
+/// # Errors
+/// [`AuthRejection`] for a missing/invalid token or one lacking the admin
+/// scope.
+pub async fn authorize_operator(
+    validator: &Validator,
+    headers: &HeaderMap,
+) -> Result<Claims, AuthRejection> {
+    let token = bearer(headers)
+        .ok_or_else(|| AuthRejection::Unauthorized("missing bearer token".to_string()))?;
+    validator.validate(token).await.map_err(|e| match e {
+        ValidateError::InsufficientScope => AuthRejection::InsufficientScope,
+        other => AuthRejection::Unauthorized(other.to_string()),
+    })
+}

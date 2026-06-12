@@ -288,17 +288,26 @@ epoch), which the journal handles naturally and lets you do staged rollout
 
 ## 6. Write path
 
-- All writes go through `central-config-api` (extend the existing
-  `sbc-api-server` REST surface; same routes, central host).
-- The `usg-sbc-dashboard` SPA points at the central API and gains a site
-  selector + fleet views. Operator authz: Keycloak roles scoped per site
-  (`config-admin:MUHJ`) plus fleet-admin.
-- Validation moves central: payloads are parsed against the typed Rust
-  schemas (`DialPlanConfig`, `TrunkGroupConfig`, …) before commit — today's
-  JSONB pass-through finally gets enforcement, at one choke point.
-- The per-site `sbc-api-server` becomes **read-only** for config entities
-  (it still serves live status, registrations, call state — those are
-  site-local runtime data, not config).
+- All writes go through `central-config-api`'s operator surface
+  (`POST /v1/sites`, `POST|DELETE /v1/sites/{site}/{phones|directory|
+  trunkgroups|dialplans}`, `PUT /v1/sites/{site}/config`) — **implemented**,
+  each driving one transactional store write (epoch + revision + journal),
+  attributed to the token subject.
+- Operator authz is a second OIDC scope, `config-admin`, validated by a
+  separate validator sharing the same issuer/JWKS as the sync validator —
+  so a site's `config-sync` pull token can never write and an operator
+  token can never masquerade as a site agent. (Per-site operator scoping
+  like `config-admin:MUHJ` and the dashboard site-selector/fleet views
+  remain to wire up.)
+- Validation moved central: trunk-group and dial-plan payloads are parsed
+  against the typed `sbc-config` schemas (`TrunkGroupConfig`,
+  `DialPlanConfig`) before commit — the JSONB pass-through finally gets
+  enforcement at one choke point. (CUCM-entity validation is the same
+  pattern, to add as those write routes land.)
+- Still to do: point the `usg-sbc-dashboard` SPA at the central API and
+  flip the per-site `sbc-api-server` to **read-only** for config entities
+  (it keeps serving live status, registrations, call state — site-local
+  runtime data, not config).
 
 ---
 

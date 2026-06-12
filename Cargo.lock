@@ -803,6 +803,7 @@ dependencies = [
  "jsonwebtoken",
  "proto-jwt",
  "reqwest 0.12.28",
+ "sbc-config",
  "serde",
  "serde_json",
  "sqlx",
