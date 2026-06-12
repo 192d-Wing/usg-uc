@@ -409,7 +409,7 @@ async fn run_signin_flow(
     //    TLS channel. PKCE rides along because the Keycloak client enforces
     //    S256 on every grant (Configure-Voice sets the client policy).
     let pkce = client_provisioning::generate_pkce()
-        .ok_or("failed to generate PKCE material".to_string())?;
+        .ok_or_else(|| "failed to generate PKCE material".to_string())?;
     let device = pc
         .start_device_authorization(&meta, &discovery.oidc, &pkce.challenge)
         .await
