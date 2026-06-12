@@ -20,12 +20,11 @@ voice:
   softClientId: usg-uc-softclient
   provisioningClientId: usg-uc-provisioning
   redirectUris:
-    # Desktop loopback (RFC 8252 §7.3 — any port)
-    - http://127.0.0.1/*
-    # Android claimed App Link (preferred per RFC 8252 §7.2)
+    # Android claimed App Link (RFC 8252 §7.2). The desktop client needs NO
+    # redirect URI — it signs in via the Device Authorization Grant.
     - https://app.uc.oopl.dev.mil/oauth2redirect
-  # Device Authorization Grant for Get-TestToken.ps1 (CLI token minting
-  # with browser/CAC auth). Disable once real clients are rolled out.
+  # Device Authorization Grant (RFC 8628) — the desktop client's sign-in
+  # flow (no loopback listener); also used by Get-TestToken.ps1.
   enableDeviceFlow: true
 
 # Optional — omit this whole section in production realms.

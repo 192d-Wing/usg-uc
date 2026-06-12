@@ -2,11 +2,12 @@
 //!
 //! Implements the desktop half of docs/CLIENT-PROVISIONING-OIDC.md on top of
 //! `client-provisioning`: the user enters one value (the service domain), the
-//! flow discovers the POP, authenticates in the **system browser**
-//! (Authorization Code + PKCE via a loopback redirect, RFC 8252), fetches the
-//! per-user SIP config, maps it onto the default [`SipAccount`], and
-//! registers. The refresh token is persisted in the OS keychain for silent
-//! resume; the access token is refreshed at ~half-life by a background task.
+//! flow discovers the POP, authenticates in the **system browser** via the
+//! Device Authorization Grant (RFC 8628 — no loopback listener, no redirect
+//! URI), fetches the per-user SIP config, maps it onto the default
+//! [`SipAccount`], and registers. The refresh token is persisted in the OS
+//! keychain for silent resume; the access token is refreshed at ~half-life by
+//! a background task.
 
 #![allow(clippy::doc_markdown)]
 
@@ -16,9 +17,8 @@ use std::time::Duration;
 use chrono::Utc;
 use client_core::{ClientApp, ProvisioningSettings, SettingsManager};
 use client_provisioning::{
-    generate_pkce, id_token_nonce, random_token, start_loopback, verify_issuer_pinned, CaTrust,
-    ClientConfig, DiscoveryDoc, OidcMetadata, ProvisionedSession, ProvisioningClient, SessionState,
-    TokenResponse,
+    verify_issuer_pinned, CaTrust, ClientConfig, DiscoveryDoc, OidcMetadata, ProvisionedSession,
+    ProvisioningClient, SessionState, TokenResponse,
 };
 use client_types::TransportPreference;
 use serde::Serialize;
@@ -30,7 +30,8 @@ use zeroize::Zeroizing;
 
 use crate::TauriAppState;
 
-/// How long we wait for the browser redirect before giving up.
+/// How long we wait for the user to approve the device grant in the browser
+/// before giving up (the IdP's device-code lifetime also applies).
 const SIGNIN_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Refresh-loop tick interval.
@@ -403,20 +404,17 @@ async fn run_signin_flow(
         .await
         .map_err(|e| e.to_string())?;
 
-    // 2. PKCE + state/nonce + loopback redirect.
-    let pkce = generate_pkce().ok_or("secure RNG unavailable")?;
-    let oauth_state = random_token(16).ok_or("secure RNG unavailable")?;
-    let nonce = random_token(16).ok_or("secure RNG unavailable")?;
-    let loopback = start_loopback().await.map_err(|e| e.to_string())?;
-    let redirect_uri = loopback.redirect_uri.clone();
-    let auth_url = ProvisioningClient::build_authorization_url(
-        &meta,
-        &discovery.oidc,
-        &redirect_uri,
-        &pkce.challenge,
-        &oauth_state,
-        &nonce,
-    );
+    // 2. Device Authorization Grant (RFC 8628) — no listening socket, no
+    //    redirect URI; the binding is possession of the device_code on this
+    //    TLS channel.
+    let device = pc
+        .start_device_authorization(&meta, &discovery.oidc)
+        .await
+        .map_err(|e| e.to_string())?;
+    let verify_url = device
+        .verification_uri_complete
+        .clone()
+        .unwrap_or_else(|| device.verification_uri.clone());
 
     // 3. System browser (RFC 8252 — never an embedded webview).
     set_session_state(app, ctx, SessionState::Authenticating).await;
@@ -426,42 +424,32 @@ async fn run_signin_flow(
     // the rest of the app's plugin usage.
     #[allow(deprecated)]
     app.shell()
-        .open(&auth_url, None)
+        .open(&verify_url, None)
         .map_err(|e| format!("failed to open the system browser: {e}"))?;
-    emit_progress(app, "waiting", "Complete sign-in in your browser…");
+    // Surface the user_code so the user can match it against the browser
+    // page (RFC 8628 §5.4 — remote-phishing mitigation).
+    emit_progress(
+        app,
+        "waiting",
+        &format!(
+            "Complete sign-in in your browser. Verification code: {}",
+            device.user_code
+        ),
+    );
 
-    // 4. Await the redirect (cancellable).
-    let callback = tokio::select! {
-        cb = loopback.wait_for_code(SIGNIN_TIMEOUT) => cb.map_err(|e| e.to_string())?,
+    // 4. Poll the token endpoint until the user approves (cancellable).
+    let tokens = tokio::select! {
+        polled = tokio::time::timeout(
+            SIGNIN_TIMEOUT,
+            pc.poll_device_token(&meta, &discovery.oidc.client_id, &device),
+        ) => match polled {
+            Ok(t) => t.map_err(|e| e.to_string())?,
+            Err(_) => return Err("sign-in was not completed in time".to_string()),
+        },
         _ = &mut cancel_rx => return Err("cancelled".to_string()),
     };
-    if let Some(err) = callback.error {
-        return Err(format!("sign-in was not completed: {err}"));
-    }
-    let code = callback.code.ok_or("no authorization code returned")?;
-    if callback.state.as_deref() != Some(oauth_state.as_str()) {
-        return Err("OAuth state mismatch — possible interception; aborting".to_string());
-    }
 
-    // 5. Code → tokens; bind via the id_token nonce.
-    emit_progress(app, "exchanging", "Completing sign-in…");
-    let tokens = pc
-        .exchange_code(
-            &meta,
-            &discovery.oidc.client_id,
-            &redirect_uri,
-            &code,
-            &pkce.verifier,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    if let Some(id_token) = tokens.id_token.as_deref() {
-        if id_token_nonce(id_token).as_deref() != Some(nonce.as_str()) {
-            return Err("ID token nonce mismatch — aborting".to_string());
-        }
-    }
-
-    // 6. Tokens → per-user SIP config → account + register.
+    // 5. Tokens → per-user SIP config → account + register.
     set_session_state(app, ctx, SessionState::Provisioning).await;
     emit_progress(app, "provisioning", "Fetching your phone configuration…");
     let cfg = pc

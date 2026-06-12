@@ -10,7 +10,9 @@ A user installs the soft client, types a single value — the service domain
 
 1. The client discovers the nearest POP via the anycast/GeoDNS address.
 2. The POP points the client at the IdP (Keycloak).
-3. The user authenticates in the **system browser** (OIDC Authorization Code + PKCE, RFC 8252).
+3. The user authenticates in the **system browser** — Device Authorization
+   Grant (RFC 8628) on desktop (no loopback listener, no redirect URI);
+   Authorization Code + PKCE (RFC 8252) via claimed App Links on Android.
 4. The client fetches its per-user configuration (DN, SIP identity, registrar domain) with the bearer token.
 5. The client REGISTERs to its assigned unicast SBC.
 
@@ -23,7 +25,7 @@ flowchart TD
     U["User enters sip.example.mil"] --> C["Soft client"]
     C -->|"1. HTTPS discovery (anycast)"| D["Discovery endpoint<br/>nearest POP"]
     D -->|"2. issuer + endpoints"| C
-    C -->|"3. Auth Code + PKCE<br/>(system browser)"| K["Keycloak<br/>idp.example.mil"]
+    C -->|"3. RFC 8628 device grant<br/>(system browser)"| K["Keycloak<br/>idp.example.mil"]
     K -->|"4. access + refresh token"| C
     C -->|"5. GET /v1/client-config<br/>Bearer token"| P["Provisioning API<br/>nearest POP"]
     P -->|"6. DN, SIP identity, registrar domain"| C
@@ -59,12 +61,15 @@ sequenceDiagram
     POP-->>Client: 200 discovery JSON (issuer, endpoints, pop_id)
     Client->>KC: GET /.well-known/openid-configuration
     KC-->>Client: OIDC metadata
-    Client->>Browser: open authorization URL (PKCE S256, state, nonce)
+    Client->>KC: POST /auth/device (client_id, scope)
+    KC-->>Client: device_code + user_code + verification_uri_complete
+    Client->>Browser: open verification_uri_complete (user_code shown in app)
     Browser->>KC: login page (SSO / password / WebAuthn)
-    User->>Browser: authenticate
-    KC-->>Browser: 302 redirect with code
-    Browser-->>Client: code (loopback :port / app link)
-    Client->>KC: POST /token (code + verifier)
+    User->>Browser: authenticate + approve device code
+    loop poll every `interval` seconds
+        Client->>KC: POST /token (device_code)
+        KC-->>Client: authorization_pending
+    end
     KC-->>Client: access_token + refresh_token + id_token
     Client->>POP: GET /v1/client-config (Authorization: Bearer)
     POP->>KC: validate JWT (cached JWKS)
@@ -109,7 +114,7 @@ browser flow. Active calls are not torn down — only re-REGISTER fails.
     "config_endpoint": "https://us-east-1.pop.example.mil/v1/client-config"
   },
   "minimum_client_version": {
-    "desktop": "0.5.0",
+    "desktop": "0.6.0",
     "android": "0.2.0"
   }
 }
@@ -374,10 +379,11 @@ Ephemeral-digest mode **MUST use RFC 8760 hash algorithms**:
 | Setting | Value |
 | --- | --- |
 | Type | **Public** (no secret — it's a native app) |
-| Standard flow | enabled (Authorization Code) |
+| Device authorization grant | **enabled** (RFC 8628) — the desktop sign-in flow: no listening socket, no redirect URI |
+| Standard flow | enabled only when App Link redirect URIs are registered (Authorization Code for Android) |
 | Direct access grants | **disabled** (no password grant, ever) |
-| PKCE | **required**, method `S256` (set `pkce.code.challenge.method` on the client) |
-| Valid redirect URIs | `http://127.0.0.1/*` (desktop loopback, RFC 8252 §7.3); `https://app.example.mil/oauth2redirect` (Android **claimed App Link** — preferred per RFC 8252 §7.2, verified via hosted `assetlinks.json`); `org.example.usguc:/oauth2redirect` (custom-scheme fallback only, RFC 8252 §7.1) |
+| PKCE | **required**, method `S256` (set `pkce.code.challenge.method` on the client; applies to the code flow) |
+| Valid redirect URIs | none for desktop; `https://app.example.mil/oauth2redirect` (Android **claimed App Link** — preferred per RFC 8252 §7.2, verified via hosted `assetlinks.json`); `org.example.usguc:/oauth2redirect` (custom-scheme fallback only, RFC 8252 §7.1) |
 | Web origins | none needed (not a browser app) |
 | Consent | off for first-party deployment |
 
@@ -429,7 +435,7 @@ flowchart LR
     SBC["SBC fleet"]
     DIR["User directory<br/>attribute sipDn"]
 
-    SC -->|"auth code + PKCE"| KC
+    SC -->|"device grant (desktop)<br/>auth code + PKCE (App Link)"| KC
     KC -->|"JWT with dn claim"| SC
     PR -->|"fetch JWKS, validate iss/aud/exp"| KC
     SBC -->|"fetch JWKS, validate iss/aud/exp"| KC
@@ -470,6 +476,13 @@ round trip — no browser unless the refresh token is dead.
 
 - **System browser only** (RFC 8252). Embedded webviews are forbidden: they
   break SSO/WebAuthn and expose credentials to the app.
+- **No loopback listener on desktop.** The Device Authorization Grant
+  (RFC 8628) means the client never opens a listening socket and registers
+  no redirect URI — nothing for host-based security tooling to flag, and no
+  authorization code transiting an interceptable redirect. The app displays
+  the `user_code` so the user can match it against the browser page
+  (RFC 8628 §5.4 remote-phishing mitigation); the token binding is
+  possession of the `device_code` on the client's TLS polling channel.
 - **Issuer pinning.** Discovery is the trust bootstrap; constrain the issuer
   to the entered domain's registrable domain or a built-in allowlist.
 - **No `password` grant.** Direct access grants stay disabled even though
@@ -500,10 +513,14 @@ round trip — no browser unless the refresh token is dead.
    `deploy/helm/sbc/templates/21-sbc-client-config.yaml`
    (`sbcClientConfig.*` values, disabled by default) +
    per-POP image `crates/sbc/sbc-client-config-server/Dockerfile`.
-2. **Client sign-in flow** — implemented: browser PKCE sign-in + loopback
-   listener in the Tauri backend (`client-gui-tauri/src/signin.rs`),
-   keychain-persisted refresh token, and auto-provisioning via
-   `client-provisioning` (config → `SipAccount`, `auth_mode = Bearer`).
+2. **Client sign-in flow** — implemented: Device Authorization Grant
+   (RFC 8628) browser sign-in in the Tauri backend
+   (`client-gui-tauri/src/signin.rs` — no loopback listener; the app shows
+   the `user_code` and polls the token endpoint), keychain-persisted
+   refresh token, and auto-provisioning via `client-provisioning`
+   (config → `SipAccount`, `auth_mode = Bearer`). The Authorization Code +
+   PKCE helpers remain in `client-provisioning` for the Android
+   claimed-App-Link flow.
    Registration runs over SIP-over-TLS: the UA derives the default port
    from the registrar URI scheme (`sips:` → 5061), presents the registrar
    domain as SNI, and trusts the provisioning extra-CA file for SIP TLS in

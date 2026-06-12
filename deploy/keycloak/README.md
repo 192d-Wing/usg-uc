@@ -8,7 +8,7 @@ anywhere `pwsh` runs). Design:
 
 | Script | Purpose |
 | --- | --- |
-| `Configure-Voice.ps1` | Creates/updates the `sip` client scope + claim mappers, the public PKCE client (`usg-uc-softclient`), the bearer-only audience client (`usg-uc-provisioning`), realm token policy, the `sipDn` user-profile attribute, and optionally a ready-to-use test user. |
+| `Configure-Voice.ps1` | Creates/updates the `sip` client scope + claim mappers, the public client (`usg-uc-softclient` — RFC 8628 device grant for desktop sign-in; PKCE code flow only when App Link redirect URIs are given), the bearer-only audience client (`usg-uc-provisioning`), realm token policy, the `sipDn` user-profile attribute, and optionally a ready-to-use test user. |
 | `Get-TestToken.ps1` | Mints a real access token via the Device Authorization Grant (RFC 8628) — auth happens in your browser (CAC/SSO works), the script polls and returns the token. Use it to exercise `sbc-client-config-server` before any client code exists. |
 
 ## Quick start against icam

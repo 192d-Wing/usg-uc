@@ -64,12 +64,38 @@ pub struct OidcMetadata {
     pub authorization_endpoint: String,
     /// Token endpoint (code exchange + refresh).
     pub token_endpoint: String,
+    /// Device authorization endpoint (RFC 8628), the desktop sign-in flow.
+    #[serde(default)]
+    pub device_authorization_endpoint: Option<String>,
     /// End-session endpoint, used on sign-out when present.
     #[serde(default)]
     pub end_session_endpoint: Option<String>,
     /// Token revocation endpoint (RFC 7009), used on sign-out when present.
     #[serde(default)]
     pub revocation_endpoint: Option<String>,
+}
+
+// ---------------------------------------------------------------------
+// Device authorization endpoint response — RFC 8628 §3.2
+// ---------------------------------------------------------------------
+
+/// Response from the device authorization endpoint (RFC 8628 §3.2).
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeviceAuthorization {
+    /// Opaque code the client presents when polling the token endpoint.
+    pub device_code: String,
+    /// Short code the user can match against the browser page (§5.4).
+    pub user_code: String,
+    /// Verification page where the user enters `user_code` manually.
+    pub verification_uri: String,
+    /// Verification page with the code embedded — open this in the browser.
+    #[serde(default)]
+    pub verification_uri_complete: Option<String>,
+    /// Lifetime of `device_code`/`user_code`, seconds.
+    pub expires_in: u64,
+    /// Minimum polling interval, seconds (5 when absent, per §3.2).
+    #[serde(default)]
+    pub interval: Option<u64>,
 }
 
 // ---------------------------------------------------------------------
@@ -228,6 +254,36 @@ mod tests {
             "us-east-1.reg.example.mil"
         );
         assert_eq!(cfg.ttl_seconds, 3600);
+    }
+
+    /// The device authorization response Keycloak emits must deserialize
+    /// (RFC 8628 §3.2; `verification_uri_complete`/`interval` are optional).
+    #[test]
+    fn device_authorization_matches_rfc8628_shape() {
+        let json = serde_json::json!({
+            "device_code": "dev-code-opaque",
+            "user_code": "WDJB-MJHT",
+            "verification_uri": "https://idp.example.mil/realms/voice/device",
+            "verification_uri_complete":
+                "https://idp.example.mil/realms/voice/device?user_code=WDJB-MJHT",
+            "expires_in": 600,
+            "interval": 5
+        });
+        let da: DeviceAuthorization = serde_json::from_value(json).unwrap();
+        assert_eq!(da.user_code, "WDJB-MJHT");
+        assert_eq!(da.expires_in, 600);
+        assert_eq!(da.interval, Some(5));
+        assert!(da.verification_uri_complete.is_some());
+
+        let minimal = serde_json::json!({
+            "device_code": "d",
+            "user_code": "u",
+            "verification_uri": "https://idp.example.mil/device",
+            "expires_in": 600
+        });
+        let da: DeviceAuthorization = serde_json::from_value(minimal).unwrap();
+        assert!(da.verification_uri_complete.is_none());
+        assert!(da.interval.is_none());
     }
 
     #[test]

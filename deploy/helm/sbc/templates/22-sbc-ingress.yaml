@@ -29,6 +29,33 @@ spec:
     - host: {{ .Values.sbcClientConfig.ingressHost | default (printf "sbc.%s" .Values.site.fqdn_base) | quote }}
       http:
         paths:
+          # Soft-client provisioning endpoints stay pinned to client-config
+          # (longest-prefix wins over the catch-all below).
+          - path: /.well-known/sip-client-config
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "sbc.fullname" . }}-client-config
+                port:
+                  name: http
+          - path: /v1/client-config
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "sbc.fullname" . }}-client-config
+                port:
+                  name: http
+          {{- if .Values.sbcFrontend.enabled }}
+          # Operator dashboard (and its /api, /provision nginx proxies) on
+          # the same HTTPS host.
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "sbc.fullname" . }}-frontend
+                port:
+                  name: http
+          {{- else }}
           - path: /
             pathType: Prefix
             backend:
@@ -36,4 +63,5 @@ spec:
                 name: {{ include "sbc.fullname" . }}-client-config
                 port:
                   name: http
+          {{- end }}
 {{- end }}

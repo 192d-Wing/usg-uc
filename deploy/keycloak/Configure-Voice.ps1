@@ -11,7 +11,8 @@ Implements the Keycloak section of docs/CLIENT-PROVISIONING-OIDC.md:
   1. sipDn declared as a user-profile attribute
   2. client scope `sip` with mappers: dn (user attribute), sip_domain
      (hardcoded), audience (usg-uc-provisioning)
-  3. public PKCE client `usg-uc-softclient` (browser sign-in flow)
+  3. public client `usg-uc-softclient` (RFC 8628 device grant for desktop
+     sign-in; auth code + PKCE only when App Link redirect URIs are given)
   4. bearer-only client `usg-uc-provisioning` (audience anchor)
   5. realm token policy: 5 min access tokens, refresh rotation,
      10h/24h SSO sessions, 30d offline sessions
@@ -59,9 +60,12 @@ param(
     [string]$SipDomain = $env:VOICE_SIP_DOMAIN,
     [string]$SoftClientId = $(if ($env:SOFTCLIENT_ID) { $env:SOFTCLIENT_ID } else { 'usg-uc-softclient' }),
     [string]$ProvisioningClientId = $(if ($env:PROVISIONING_CLIENT_ID) { $env:PROVISIONING_CLIENT_ID } else { 'usg-uc-provisioning' }),
-    # Loopback for desktop (RFC 8252 §7.3) + Android App Link URL(s).
-    [string[]]$RedirectUris = $(if ($env:REDIRECT_URIS) { $env:REDIRECT_URIS -split ',' } else { @('http://127.0.0.1/*') }),
-    # Device flow lets Get-TestToken.ps1 mint tokens with browser (CAC) auth.
+    # Android claimed App Link URL(s) for the Authorization Code flow.
+    # Desktop needs NO redirect URI (Device Authorization Grant); when this
+    # is empty the Authorization Code flow is disabled on the client.
+    [string[]]$RedirectUris = $(if ($env:REDIRECT_URIS) { $env:REDIRECT_URIS -split ',' } else { @() }),
+    # Device Authorization Grant (RFC 8628): the desktop client's sign-in
+    # flow; also lets Get-TestToken.ps1 mint tokens with browser (CAC) auth.
     [bool]$EnableDeviceFlow = $true,
 
     [string]$TestUser = $env:TEST_USER,
@@ -273,14 +277,17 @@ Set-Mapper @{
     }
 }
 
-# --- 3. public PKCE client (the soft client) ----------------------------
+# --- 3. public client (the soft client) ---------------------------------
+# Desktop signs in via the Device Authorization Grant (RFC 8628) — no
+# redirect URI, no loopback listener. The Authorization Code flow (standard
+# flow) is enabled only when claimed App Link redirect URIs are registered.
 $softClient = @{
     clientId                  = $SoftClientId
     name                      = 'USG-UC Soft Client'
-    description               = 'Native soft client browser sign-in (RFC 8252: system browser, auth code + PKCE S256). docs/CLIENT-PROVISIONING-OIDC.md'
+    description               = 'Native soft client browser sign-in (RFC 8628 device grant on desktop; RFC 8252 auth code + PKCE S256 via claimed App Links). docs/CLIENT-PROVISIONING-OIDC.md'
     protocol                  = 'openid-connect'
     publicClient              = $true
-    standardFlowEnabled       = $true
+    standardFlowEnabled       = ($RedirectUris.Count -gt 0)
     directAccessGrantsEnabled = $false
     implicitFlowEnabled       = $false
     serviceAccountsEnabled    = $false

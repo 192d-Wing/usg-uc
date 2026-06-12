@@ -92,7 +92,10 @@ List endpoints support pagination:
 
 ### Health Check
 
-Check system health status.
+Check system health status. `status` is `"healthy"` when the SBC daemon
+answers on its SystemService gRPC, `"degraded"` (with an `error` field)
+when it does not. Always returns 200 — degradation is reported in the
+payload, not as a transport error.
 
 ```
 GET /api/v1/system/health
@@ -102,12 +105,6 @@ GET /api/v1/system/health
 ```json
 {
   "status": "healthy",
-  "components": {
-    "sip": "healthy",
-    "media": "healthy",
-    "storage": "healthy",
-    "cluster": "healthy"
-  },
   "uptime_seconds": 86400
 }
 ```
