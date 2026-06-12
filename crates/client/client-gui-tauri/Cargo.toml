@@ -6,6 +6,8 @@ description = "USG SIP Soft Client - Modern Tauri-based GUI"
 
 [features]
 default = []
+# UDP/TCP SIP transports for lab testing; default builds are TLS-only.
+insecure-transports = ["client-core/insecure-transports"]
 digest-auth = ["client-core/digest-auth", "client-types/digest-auth"]
 
 [dependencies]

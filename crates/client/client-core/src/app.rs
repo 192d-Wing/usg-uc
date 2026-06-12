@@ -505,6 +505,23 @@ impl ClientApp {
     pub async fn register_account(&mut self, account: &SipAccount) -> AppResult<()> {
         info!(account_id = %account.id, "Registering account");
 
+        // Default builds are TLS-only (CNSA 2.0). UDP/TCP exist for lab
+        // and commercial-provider testing and require an explicit
+        // `insecure-transports` build feature.
+        #[cfg(not(feature = "insecure-transports"))]
+        if account.transport != client_types::TransportPreference::TlsOnly {
+            error!(
+                account_id = %account.id,
+                transport = %account.transport,
+                "Non-TLS SIP transport rejected (TLS-only build)"
+            );
+            return Err(AppError::Settings(format!(
+                "{} SIP transport is disabled in this build — TLS only. \
+                 Rebuild with --features insecure-transports for lab testing.",
+                account.transport
+            )));
+        }
+
         self.state = AppState::Registering;
         self.current_account_id = Some(account.id.clone());
 

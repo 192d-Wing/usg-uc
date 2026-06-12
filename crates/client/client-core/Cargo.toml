@@ -9,10 +9,16 @@ repository.workspace = true
 
 [features]
 default = []
-# Digest authentication with optional credential persistence
+# UDP/TCP SIP transports, for lab and commercial-provider testing.
+# Default builds are TLS-only: accounts with a UDP or TCP transport
+# preference are rejected at registration time.
+insecure-transports = []
+# Digest authentication with optional credential persistence. Implies
+# insecure-transports (the digest test providers are UDP).
 digest-auth = [
     "client-types/digest-auth",
     "client-sip-ua/digest-auth",
+    "insecure-transports",
     "keyring",
     "uc-crypto",
     "hostname",
