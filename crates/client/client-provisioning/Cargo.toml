@@ -1,6 +1,6 @@
 [package]
 name = "client-provisioning"
-description = "Soft-client OIDC sign-in + auto-discovery: fetches the SBC discovery document, runs OAuth2 Authorization Code + PKCE (RFC 8252) via a loopback redirect, exchanges/refreshes tokens, fetches per-user SIP config, and maps it onto a SipAccount. Platform-agnostic (no Tauri); the desktop/Android shells supply the system-browser open. Design: docs/CLIENT-PROVISIONING-OIDC.md."
+description = "Soft-client OIDC sign-in + auto-discovery: fetches the SBC discovery document, signs in via the Device Authorization Grant (RFC 8628, desktop — no loopback listener) or Authorization Code + PKCE (RFC 8252, claimed App Links), exchanges/refreshes tokens, fetches per-user SIP config, and maps it onto a SipAccount. Platform-agnostic (no Tauri); the desktop/Android shells supply the system-browser open. Design: docs/CLIENT-PROVISIONING-OIDC.md."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -20,7 +20,7 @@ chrono = { workspace = true }
 zeroize = { workspace = true }
 thiserror.workspace = true
 tracing.workspace = true
-tokio = { workspace = true, features = ["net", "io-util", "rt", "time", "macros"] }
+tokio = { workspace = true, features = ["time"] }
 url = "2"
 base64 = "0.22"
 # Discovery / OIDC-metadata / token / JWKS-less config fetches. rustls only;

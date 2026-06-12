@@ -2,13 +2,22 @@
 //!
 //! Implements the client half of docs/CLIENT-PROVISIONING-OIDC.md: from a
 //! single service domain, fetch the discovery document, verify the issuer is
-//! trusted, run OAuth2 Authorization Code + PKCE (RFC 8252) in the system
-//! browser via a loopback redirect, exchange/refresh tokens, fetch the
-//! per-user SIP config, and map it onto a [`client_types::SipAccount`].
+//! trusted, authenticate in the system browser, exchange/refresh tokens,
+//! fetch the per-user SIP config, and map it onto a
+//! [`client_types::SipAccount`].
+//!
+//! Two browser flows are provided:
+//! - **Device Authorization Grant (RFC 8628)** — the desktop flow: no
+//!   listening socket, no redirect URI. See
+//!   [`ProvisioningClient::start_device_authorization`] /
+//!   [`ProvisioningClient::poll_device_token`].
+//! - **Authorization Code + PKCE (RFC 8252)** — for platforms with a claimed
+//!   HTTPS redirect (Android App Links). See
+//!   [`ProvisioningClient::build_authorization_url`] /
+//!   [`ProvisioningClient::exchange_code`].
 //!
 //! This crate is platform-agnostic: it does NOT open the browser itself (the
-//! Tauri/Android shell does, with the URL from [`ProvisioningClient::build_authorization_url`]).
-//! All secrets are held in [`zeroize::Zeroizing`].
+//! Tauri/Android shell does). All secrets are held in [`zeroize::Zeroizing`].
 
 // Docs are RFC/acronym-heavy (OAuth2, OIDC, PKCE, IdP, JWT, AOR); backticking
 // every term hurts readability more than it helps. Matches proto-registrar.
@@ -17,7 +26,6 @@
 pub mod discovery;
 mod error;
 pub mod http;
-pub mod loopback;
 pub mod mapping;
 pub mod pkce;
 pub mod session;
@@ -26,10 +34,9 @@ pub mod wire;
 pub use discovery::verify_issuer_pinned;
 pub use error::ProvisioningError;
 pub use http::{CaTrust, build_http_client};
-pub use loopback::{AuthCallback, LoopbackServer, start_loopback};
 pub use pkce::{PkcePair, generate_pkce, random_token};
 pub use session::{PersistedProvisioning, ProvisionedSession, SessionState};
-pub use wire::{ClientConfig, DiscoveryDoc, OidcMetadata, TokenResponse};
+pub use wire::{ClientConfig, DeviceAuthorization, DiscoveryDoc, OidcMetadata, TokenResponse};
 
 use wire::DiscoveryOidc;
 
@@ -163,6 +170,120 @@ impl ProvisioningClient {
         self.post_token(&meta.token_endpoint, &form).await
     }
 
+    /// Starts a Device Authorization Grant (RFC 8628 §3.1) — the desktop
+    /// sign-in flow. The caller opens `verification_uri_complete` (falling
+    /// back to `verification_uri`) in the system browser, shows `user_code`
+    /// to the user, and then [`Self::poll_device_token`]s.
+    ///
+    /// # Errors
+    /// [`ProvisioningError::Authorization`] when the IdP advertises no
+    /// device authorization endpoint, [`ProvisioningError::TokenExchange`]
+    /// on a transport/HTTP error, [`ProvisioningError::Json`] on a bad body.
+    pub async fn start_device_authorization(
+        &self,
+        meta: &OidcMetadata,
+        oidc: &DiscoveryOidc,
+    ) -> Result<DeviceAuthorization, ProvisioningError> {
+        let endpoint = meta.device_authorization_endpoint.as_deref().ok_or_else(|| {
+            ProvisioningError::Authorization(
+                "the IdP does not advertise a device_authorization_endpoint — enable the \
+                 OAuth 2.0 Device Authorization Grant on the OIDC client"
+                    .to_string(),
+            )
+        })?;
+        let scope = oidc.scopes.join(" ");
+        let form = [
+            ("client_id", oidc.client_id.as_str()),
+            ("scope", scope.as_str()),
+        ];
+        let resp = self
+            .http
+            .post(endpoint)
+            .form(&form)
+            .send()
+            .await
+            .map_err(|e| ProvisioningError::TokenExchange(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ProvisioningError::TokenExchange(format!(
+                "device authorization endpoint returned {status}: {body}"
+            )));
+        }
+        resp.json()
+            .await
+            .map_err(|e| ProvisioningError::Json(e.to_string()))
+    }
+
+    /// Polls the token endpoint until the user approves the device grant
+    /// (RFC 8628 §3.4–3.5): sleeps `interval` between attempts, backs off
+    /// +5 s on `slow_down`, and gives up when `expires_in` passes.
+    ///
+    /// Cancellable by dropping the future (e.g. inside `tokio::select!`).
+    ///
+    /// # Errors
+    /// [`ProvisioningError::Timeout`] when the code expires before the user
+    /// completes sign-in, [`ProvisioningError::Authorization`] when the user
+    /// denies, [`ProvisioningError::TokenExchange`]/[`ProvisioningError::Json`]
+    /// on transport or protocol errors.
+    pub async fn poll_device_token(
+        &self,
+        meta: &OidcMetadata,
+        client_id: &str,
+        device: &DeviceAuthorization,
+    ) -> Result<TokenResponse, ProvisioningError> {
+        use std::time::Duration;
+        let mut interval = Duration::from_secs(device.interval.unwrap_or(5).max(1));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(device.expires_in);
+        loop {
+            tokio::time::sleep(interval).await;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ProvisioningError::Timeout(
+                    "sign-in was not completed before the code expired".to_string(),
+                ));
+            }
+            let form = [
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("device_code", device.device_code.as_str()),
+                ("client_id", client_id),
+            ];
+            let resp = self
+                .http
+                .post(&meta.token_endpoint)
+                .form(&form)
+                .send()
+                .await
+                .map_err(|e| ProvisioningError::TokenExchange(e.to_string()))?;
+            if resp.status().is_success() {
+                return resp
+                    .json()
+                    .await
+                    .map_err(|e| ProvisioningError::Json(e.to_string()));
+            }
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            match classify_device_poll(&body) {
+                DevicePoll::Pending => {}
+                DevicePoll::SlowDown => interval += Duration::from_secs(5),
+                DevicePoll::Denied => {
+                    return Err(ProvisioningError::Authorization(
+                        "sign-in was denied".to_string(),
+                    ));
+                }
+                DevicePoll::Expired => {
+                    return Err(ProvisioningError::Timeout(
+                        "the sign-in code expired".to_string(),
+                    ));
+                }
+                DevicePoll::Fatal => {
+                    return Err(ProvisioningError::TokenExchange(format!(
+                        "token endpoint returned {status}: {body}"
+                    )));
+                }
+            }
+        }
+    }
+
     /// Refreshes the access token using a refresh token.
     ///
     /// # Errors
@@ -285,6 +406,35 @@ impl ProvisioningClient {
     }
 }
 
+/// How a non-2xx token-endpoint response should steer the device-grant
+/// polling loop (RFC 8628 §3.5).
+#[derive(Debug, PartialEq, Eq)]
+enum DevicePoll {
+    /// `authorization_pending` — keep polling at the current interval.
+    Pending,
+    /// `slow_down` — keep polling, interval +5 s.
+    SlowDown,
+    /// `access_denied` — the user declined.
+    Denied,
+    /// `expired_token` — the device code lapsed before approval.
+    Expired,
+    /// Anything else is a hard protocol/config error.
+    Fatal,
+}
+
+fn classify_device_poll(body: &str) -> DevicePoll {
+    let error = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string));
+    match error.as_deref() {
+        Some("authorization_pending") => DevicePoll::Pending,
+        Some("slow_down") => DevicePoll::SlowDown,
+        Some("access_denied") => DevicePoll::Denied,
+        Some("expired_token") => DevicePoll::Expired,
+        _ => DevicePoll::Fatal,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -297,6 +447,7 @@ mod tests {
             authorization_endpoint:
                 "https://idp.example.mil/realms/voice/protocol/openid-connect/auth".into(),
             token_endpoint: "https://idp.example.mil/token".into(),
+            device_authorization_endpoint: None,
             end_session_endpoint: None,
             revocation_endpoint: None,
         };
@@ -321,6 +472,21 @@ mod tests {
         assert!(url.contains("nonce=NONCE"));
         // scope space-joined and percent-encoded
         assert!(url.contains("scope=openid+sip") || url.contains("scope=openid%20sip"));
+    }
+
+    #[test]
+    fn device_poll_classifies_rfc8628_errors() {
+        let body = |e: &str| format!(r#"{{"error":"{e}","error_description":"x"}}"#);
+        assert_eq!(
+            classify_device_poll(&body("authorization_pending")),
+            DevicePoll::Pending
+        );
+        assert_eq!(classify_device_poll(&body("slow_down")), DevicePoll::SlowDown);
+        assert_eq!(classify_device_poll(&body("access_denied")), DevicePoll::Denied);
+        assert_eq!(classify_device_poll(&body("expired_token")), DevicePoll::Expired);
+        assert_eq!(classify_device_poll(&body("invalid_grant")), DevicePoll::Fatal);
+        assert_eq!(classify_device_poll("not json"), DevicePoll::Fatal);
+        assert_eq!(classify_device_poll("{}"), DevicePoll::Fatal);
     }
 
     #[test]

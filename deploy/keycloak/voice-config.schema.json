@@ -51,15 +51,14 @@
         },
         "redirectUris": {
           "type": "array",
-          "minItems": 1,
           "items": { "type": "string", "minLength": 1 },
-          "default": ["http://127.0.0.1/*"],
-          "description": "Allowed redirect URIs: desktop loopback (RFC 8252 §7.3) and/or Android claimed App Link"
+          "default": [],
+          "description": "Allowed redirect URIs for the Authorization Code flow (Android claimed App Links). Desktop signs in via the Device Authorization Grant and needs none; when empty, the Authorization Code flow is disabled on the client."
         },
         "enableDeviceFlow": {
           "type": "boolean",
           "default": true,
-          "description": "Enable the Device Authorization Grant on the soft client so Get-TestToken.ps1 can mint test tokens"
+          "description": "Enable the Device Authorization Grant (RFC 8628) on the soft client — the desktop sign-in flow; also used by Get-TestToken.ps1"
         }
       }
     },

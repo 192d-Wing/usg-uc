@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-/// Failures across discovery, OIDC, loopback, and config fetch.
+/// Failures across discovery, OIDC, and config fetch.
 #[derive(Debug, Error)]
 pub enum ProvisioningError {
     /// Generic HTTP/transport failure (client build, discovery GETs).
@@ -14,17 +14,16 @@ pub enum ProvisioningError {
     /// The discovery document's issuer is not trusted for the entered domain.
     #[error("issuer not trusted: {0}")]
     IssuerNotTrusted(String),
-    /// The loopback redirect listener failed.
-    #[error("loopback listener error: {0}")]
-    Loopback(String),
-    /// No browser redirect arrived before the timeout.
+    /// Sign-in was not completed in time (the device code expired).
     #[error("timed out: {0}")]
     Timeout(String),
     /// The `state` returned by the IdP did not match what we sent (possible
     /// CSRF / mix-up).
     #[error("oauth state mismatch")]
     StateMismatch,
-    /// The IdP redirected with an `error` parameter, or no `code` was present.
+    /// Authorization failed: the user denied the device grant, the IdP
+    /// lacks the device authorization endpoint, or (code flow) the IdP
+    /// redirected with an `error` parameter.
     #[error("authorization failed: {0}")]
     Authorization(String),
     /// Token exchange or refresh failed.
