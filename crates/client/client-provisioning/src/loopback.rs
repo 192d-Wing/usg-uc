@@ -113,12 +113,13 @@ impl LoopbackServer {
             }
         };
 
-        match tokio::time::timeout(timeout, accept).await {
-            Ok(result) => result,
-            Err(_) => Err(ProvisioningError::Timeout(
-                "no OAuth redirect received before timeout".to_string(),
-            )),
-        }
+        tokio::time::timeout(timeout, accept)
+            .await
+            .unwrap_or_else(|_| {
+                Err(ProvisioningError::Timeout(
+                    "no OAuth redirect received before timeout".to_string(),
+                ))
+            })
     }
 }
 

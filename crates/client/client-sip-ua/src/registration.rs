@@ -745,7 +745,7 @@ impl RegistrationAgent {
                 .map(|ip| SocketAddr::new(ip, registrar_uri.port.unwrap_or(5060)));
             registrar_ip
                 .and_then(|addr| resolve_local_ip(&addr))
-                .unwrap_or(local_addr.ip())
+                .unwrap_or_else(|| local_addr.ip())
         } else {
             local_addr.ip()
         };
@@ -871,7 +871,7 @@ impl RegistrationAgent {
                 .map(|ip| SocketAddr::new(ip, registrar_uri.port.unwrap_or(5060)));
             registrar_ip
                 .and_then(|addr| resolve_local_ip(&addr))
-                .unwrap_or(local_addr.ip())
+                .unwrap_or_else(|| local_addr.ip())
         } else {
             local_addr.ip()
         };

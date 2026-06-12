@@ -85,7 +85,7 @@ pub const DEFAULT_T4: Duration = Duration::from_secs(5);
 pub const TIMER_A_INITIAL: Duration = DEFAULT_T1;
 
 /// Timer B value (64*T1).
-pub const TIMER_B: Duration = Duration::from_millis(32000);
+pub const TIMER_B: Duration = Duration::from_secs(32);
 
 /// Timer D value (32s for unreliable, 0 for reliable).
 pub const TIMER_D_UNRELIABLE: Duration = Duration::from_secs(32);
@@ -94,19 +94,19 @@ pub const TIMER_D_UNRELIABLE: Duration = Duration::from_secs(32);
 pub const TIMER_E_INITIAL: Duration = DEFAULT_T1;
 
 /// Timer F value (64*T1).
-pub const TIMER_F: Duration = Duration::from_millis(32000);
+pub const TIMER_F: Duration = Duration::from_secs(32);
 
 /// Timer G initial value (T1).
 pub const TIMER_G_INITIAL: Duration = DEFAULT_T1;
 
 /// Timer H value (64*T1).
-pub const TIMER_H: Duration = Duration::from_millis(32000);
+pub const TIMER_H: Duration = Duration::from_secs(32);
 
 /// Timer I value (T4 for unreliable, 0 for reliable).
 pub const TIMER_I_UNRELIABLE: Duration = DEFAULT_T4;
 
 /// Timer J value (64*T1 for unreliable, 0 for reliable).
-pub const TIMER_J_UNRELIABLE: Duration = Duration::from_millis(32000);
+pub const TIMER_J_UNRELIABLE: Duration = Duration::from_secs(32);
 
 /// Timer K value (T4 for unreliable, 0 for reliable).
 pub const TIMER_K_UNRELIABLE: Duration = DEFAULT_T4;
@@ -295,7 +295,7 @@ mod tests {
     fn test_timer_constants() {
         assert_eq!(DEFAULT_T1, Duration::from_millis(500));
         assert_eq!(DEFAULT_T2, Duration::from_secs(4));
-        assert_eq!(TIMER_B, Duration::from_millis(32000));
+        assert_eq!(TIMER_B, Duration::from_secs(32));
     }
 
     #[test]

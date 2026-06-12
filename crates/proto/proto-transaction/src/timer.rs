@@ -171,7 +171,7 @@ mod tests {
         let config = TimerConfig::default();
 
         // Timer B = 64 * T1 = 64 * 500ms = 32s
-        assert_eq!(config.timer_b(), Duration::from_millis(32000));
+        assert_eq!(config.timer_b(), Duration::from_secs(32));
 
         // Timer A = T1
         assert_eq!(config.timer_a(), DEFAULT_T1);
@@ -184,19 +184,19 @@ mod tests {
 
         // First retransmit: 500ms -> 1000ms
         let next = next_retransmit_interval(t1, t2);
-        assert_eq!(next, Duration::from_millis(1000));
+        assert_eq!(next, Duration::from_secs(1));
 
         // Second: 1000ms -> 2000ms
         let next = next_retransmit_interval(next, t2);
-        assert_eq!(next, Duration::from_millis(2000));
+        assert_eq!(next, Duration::from_secs(2));
 
         // Third: 2000ms -> 4000ms (capped at T2)
         let next = next_retransmit_interval(next, t2);
-        assert_eq!(next, Duration::from_millis(4000));
+        assert_eq!(next, Duration::from_secs(4));
 
         // Fourth: capped at T2
         let next = next_retransmit_interval(next, t2);
-        assert_eq!(next, Duration::from_millis(4000));
+        assert_eq!(next, Duration::from_secs(4));
     }
 
     #[test]

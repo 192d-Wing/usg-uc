@@ -937,18 +937,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_accounting_stub() {
-        let _client = create_test_client();
+        let client = create_test_client();
         let record = AccountingRecord::start("sess-001", "testuser");
 
         // When radius feature is not enabled, stub always succeeds
         #[cfg(not(feature = "radius"))]
         {
-            let result = _client.account(record).await;
+            let result = client.account(record).await;
             assert!(result.is_ok());
         }
 
         // When radius feature is enabled, it would try to connect
         #[cfg(feature = "radius")]
-        let _ = record;
+        let _ = (client, record);
     }
 }

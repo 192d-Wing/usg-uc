@@ -554,7 +554,7 @@ mod tests {
             "sip:xyz789@example.com;gr",
             "sip:alice@example.com",
             "<urn:uuid:test-instance>",
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
         );
 
         assert_eq!(entry.pub_gruu(), "sip:alice@example.com;gr=abc123");
@@ -578,7 +578,7 @@ mod tests {
             .create_or_update_gruu(
                 "sip:alice@example.com",
                 "<urn:uuid:test-instance>",
-                Duration::from_secs(3600),
+                Duration::from_hours(1),
             )
             .unwrap();
 
@@ -596,7 +596,7 @@ mod tests {
             .create_or_update_gruu(
                 "sip:alice@example.com",
                 "<urn:uuid:test-instance>",
-                Duration::from_secs(3600),
+                Duration::from_hours(1),
             )
             .unwrap();
 
@@ -622,7 +622,7 @@ mod tests {
             .create_or_update_gruu(
                 "sip:alice@example.com",
                 "<urn:uuid:test-instance>",
-                Duration::from_secs(3600),
+                Duration::from_hours(1),
             )
             .unwrap();
 
@@ -641,7 +641,7 @@ mod tests {
             .create_or_update_gruu(
                 "sip:alice@example.com",
                 "<urn:uuid:test-instance>",
-                Duration::from_secs(3600),
+                Duration::from_hours(1),
             )
             .unwrap();
 
@@ -661,21 +661,21 @@ mod tests {
             .create_or_update_gruu(
                 "sip:alice@example.com",
                 "<urn:uuid:instance-1>",
-                Duration::from_secs(3600),
+                Duration::from_hours(1),
             )
             .unwrap();
         service
             .create_or_update_gruu(
                 "sip:alice@example.com",
                 "<urn:uuid:instance-2>",
-                Duration::from_secs(3600),
+                Duration::from_hours(1),
             )
             .unwrap();
         service
             .create_or_update_gruu(
                 "sip:bob@example.com",
                 "<urn:uuid:instance-3>",
-                Duration::from_secs(3600),
+                Duration::from_hours(1),
             )
             .unwrap();
 
@@ -727,7 +727,7 @@ mod tests {
             .create_or_update_gruu(
                 "sip:alice@example.com",
                 "<urn:uuid:test-instance>",
-                Duration::from_secs(3600),
+                Duration::from_hours(1),
             )
             .unwrap();
 
@@ -741,7 +741,7 @@ mod tests {
             .create_or_update_gruu(
                 "sip:alice@example.com",
                 "<urn:uuid:test-instance>",
-                Duration::from_secs(3600),
+                Duration::from_hours(1),
             )
             .unwrap();
 
@@ -788,7 +788,7 @@ mod tests {
             .create_or_update_gruu(
                 "sip:alice@example.com",
                 "<urn:uuid:test-instance>",
-                Duration::from_secs(3600),
+                Duration::from_hours(1),
             )
             .unwrap();
         let pub_gruu = entry.pub_gruu().to_string();
@@ -833,7 +833,7 @@ mod tests {
             .create_or_update_gruu(
                 "sip:alice@example.com",
                 "<urn:uuid:test-instance>",
-                Duration::from_secs(3600),
+                Duration::from_hours(1),
             )
             .unwrap();
         let pub_gruu = entry.pub_gruu().to_string();
@@ -877,7 +877,7 @@ mod tests {
             .create_or_update_gruu(
                 "sip:alice@example.com",
                 "<urn:uuid:test-instance>",
-                Duration::from_secs(3600),
+                Duration::from_hours(1),
             )
             .unwrap();
         let pub_gruu = entry.pub_gruu().to_string();
@@ -937,7 +937,7 @@ mod tests {
             .create_or_update_gruu(
                 "sip:alice@example.com",
                 "<urn:uuid:test-instance>",
-                Duration::from_secs(3600),
+                Duration::from_hours(1),
             )
             .unwrap();
         let pub_gruu = entry.pub_gruu().to_string();
@@ -977,7 +977,7 @@ mod tests {
             .create_or_update_gruu(
                 "sip:alice@example.com",
                 "<urn:uuid:test-instance>",
-                Duration::from_secs(3600),
+                Duration::from_hours(1),
             )
             .unwrap();
         let temp_gruu = entry.temp_gruu().to_string();
@@ -1015,7 +1015,7 @@ mod tests {
             .create_or_update_gruu(
                 "sip:alice@example.com",
                 "<urn:uuid:test-instance>",
-                Duration::from_secs(3600),
+                Duration::from_hours(1),
             )
             .unwrap();
         let pub_gruu = entry.pub_gruu().to_string();
@@ -1050,7 +1050,7 @@ mod tests {
             .create_or_update_gruu(
                 "sip:alice@example.com",
                 "<urn:uuid:test-instance>",
-                Duration::from_secs(3600),
+                Duration::from_hours(1),
             )
             .unwrap();
         let pub_gruu = entry.pub_gruu().to_string();
@@ -1086,7 +1086,7 @@ mod tests {
             .create_or_update_gruu(
                 "sip:alice@example.com",
                 "<urn:uuid:test-instance>",
-                Duration::from_secs(3600),
+                Duration::from_hours(1),
             )
             .unwrap();
         let pub_gruu = entry.pub_gruu().to_string();

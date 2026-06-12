@@ -888,6 +888,7 @@ impl From<AppError> for ClientError {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic)]
 mod tests {
     use super::*;
 

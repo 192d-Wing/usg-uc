@@ -64,10 +64,10 @@ impl ProvisionedSession {
     /// expiry — i.e. a refresh is due.
     #[must_use]
     pub fn needs_refresh(&self, now: DateTime<Utc>, skew_secs: i64) -> bool {
-        match self.access_expires_at {
-            None => self.access_token.is_some(),
-            Some(exp) => now + chrono::Duration::seconds(skew_secs) >= exp,
-        }
+        self.access_expires_at.map_or_else(
+            || self.access_token.is_some(),
+            |exp| now + chrono::Duration::seconds(skew_secs) >= exp,
+        )
     }
 
     /// Skew for the half-life refresh policy: half the access-token

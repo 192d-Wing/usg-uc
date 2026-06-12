@@ -31,7 +31,7 @@ use zeroize::Zeroizing;
 use crate::TauriAppState;
 
 /// How long we wait for the browser redirect before giving up.
-const SIGNIN_TIMEOUT: Duration = Duration::from_secs(300);
+const SIGNIN_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Refresh-loop tick interval.
 const REFRESH_TICK: Duration = Duration::from_secs(30);
@@ -156,7 +156,8 @@ async fn ca_trust(ctx: &SigninCtx) -> CaTrust {
 
 /// Cancels a pending browser sign-in, if any.
 async fn cancel_inflight(cancel: &Arc<Mutex<Option<oneshot::Sender<()>>>>) {
-    if let Some(tx) = cancel.lock().await.take() {
+    let pending = cancel.lock().await.take();
+    if let Some(tx) = pending {
         let _ = tx.send(());
     }
 }
@@ -169,8 +170,13 @@ async fn cancel_inflight(cancel: &Arc<Mutex<Option<oneshot::Sender<()>>>>) {
 #[tauri::command]
 pub async fn get_session_state(state: State<'_, TauriAppState>) -> Result<SessionStateDto, String> {
     let session = state.session.read().await;
-    let sm = state.settings_manager.read().await;
-    let persisted = sm.settings().provisioning.clone();
+    let persisted = state
+        .settings_manager
+        .read()
+        .await
+        .settings()
+        .provisioning
+        .clone();
     let can_silent_resume = persisted
         .as_ref()
         .is_some_and(|p| p.refresh_token_persisted && !p.service_domain.is_empty());
@@ -345,6 +351,7 @@ pub async fn try_silent_resume(
             return Ok(false);
         }
         let refresh = sm.get_refresh_token(&p.service_domain).ok().flatten();
+        drop(sm);
         (p.service_domain, refresh)
     };
     let Some(refresh) = refresh else {

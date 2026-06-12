@@ -398,7 +398,7 @@ mod tests {
     fn test_replication_config_durations() {
         let config = ReplicationConfig::default();
         assert_eq!(config.replication_interval(), Duration::from_millis(100));
-        assert_eq!(config.snapshot_interval(), Duration::from_secs(300));
+        assert_eq!(config.snapshot_interval(), Duration::from_mins(5));
         assert_eq!(config.max_lag(), Duration::from_secs(5));
     }
 }

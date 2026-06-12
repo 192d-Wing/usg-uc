@@ -428,10 +428,7 @@ mod tests {
         backend.set("key", b"value", None).await.unwrap();
 
         // Set expiration
-        let expired = backend
-            .expire("key", Duration::from_secs(60))
-            .await
-            .unwrap();
+        let expired = backend.expire("key", Duration::from_mins(1)).await.unwrap();
         assert!(expired);
 
         // Check TTL

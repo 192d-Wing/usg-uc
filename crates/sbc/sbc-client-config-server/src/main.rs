@@ -30,6 +30,8 @@ use config::Config;
 use handlers::AppState;
 use proto_jwt::{JwksCache, Validator, ValidatorConfig};
 
+// Linear startup sequence (logging, config, JWKS, router, listener).
+#[allow(clippy::too_many_lines)]
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
     let filter = EnvFilter::try_from_default_env()

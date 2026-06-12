@@ -169,7 +169,7 @@ impl TrunkRegistrar {
                             status.last_registered = Some(
                                 std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
-                                    .map_or(0, |d| d.as_secs() as i64),
+                                    .map_or(0, |d| d.as_secs().cast_signed()),
                             );
                             info!(trunk_id = %config.trunk_id, expires, "Trunk registered");
                         }
@@ -247,6 +247,9 @@ impl TrunkRegistrar {
     }
 
     /// Performs a single REGISTER transaction with digest auth.
+    // One linear SIP transaction (send, 401 challenge, re-send, parse);
+    // splitting it would scatter the protocol flow.
+    #[allow(clippy::too_many_lines)]
     async fn do_register(config: &TrunkRegConfig, local_domain: &str) -> Result<u32, String> {
         let addr_str = format!("{}:{}", config.host, config.port);
         // Async DNS — std::net::ToSocketAddrs blocks the tokio worker

@@ -29,6 +29,8 @@ mod trunk_groups;
 mod trunks;
 mod users;
 
+// Flat route table; one line per endpoint is clearer than splitting it up.
+#[allow(clippy::too_many_lines)]
 pub fn router(state: Arc<AppState>) -> Router {
     let api_v1 = Router::new()
         // Authentication (login/session are exempt from the auth layer below)
