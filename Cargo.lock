@@ -816,6 +816,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "central-config-import"
+version = "0.1.0"
+dependencies = [
+ "central-config-store",
+ "sbc-config-store",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "central-config-store"
 version = "0.1.0"
 dependencies = [
