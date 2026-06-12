@@ -36,6 +36,8 @@ const PTIME_MS: u32 = 20;
 /// Samples per packet at 8kHz / 20ms.
 const SAMPLES_PER_PACKET: usize = 160;
 /// Timestamp increment per packet.
+// SAMPLES_PER_PACKET is 160, which always fits in u32.
+#[allow(clippy::cast_possible_truncation)]
 const TIMESTAMP_INCREMENT: u32 = SAMPLES_PER_PACKET as u32;
 
 /// Pre-built announcement types.
@@ -93,14 +95,10 @@ impl AnnouncementServer {
     ) -> Result<u64, String> {
         // Ensure destination is IPv4 (not IPv6-mapped) for IPv4 sockets
         let destination = match destination {
-            SocketAddr::V6(v6) => {
-                if let Some(v4) = v6.ip().to_ipv4_mapped() {
-                    SocketAddr::new(std::net::IpAddr::V4(v4), v6.port())
-                } else {
-                    destination
-                }
-            }
-            other => other,
+            SocketAddr::V6(v6) => v6.ip().to_ipv4_mapped().map_or(destination, |v4| {
+                SocketAddr::new(std::net::IpAddr::V4(v4), v6.port())
+            }),
+            SocketAddr::V4(_) => destination,
         };
 
         let samples = generate_announcement(announcement);
@@ -112,7 +110,7 @@ impl AnnouncementServer {
             destination = %destination,
             local_addr = %local_addr,
             total_packets,
-            duration_ms = total_packets as u32 * PTIME_MS,
+            duration_ms = total_packets as u64 * u64::from(PTIME_MS),
             "Starting announcement playback"
         );
 
@@ -163,27 +161,24 @@ fn load_pcm_file(filename: &str) -> Option<Vec<i16>> {
 /// Generates PCM 16-bit signed samples at 8kHz for the given announcement.
 fn generate_announcement(announcement: AnnouncementType) -> Vec<i16> {
     match announcement {
-        AnnouncementType::NumberNotInService => {
-            if let Some(samples) = load_pcm_file("Not_in_service.pcm") {
+        AnnouncementType::NumberNotInService => load_pcm_file("Not_in_service.pcm").map_or_else(
+            || {
+                warn!(
+                    "Not_in_service.pcm not found in embedded audio_files, using synthesized tones"
+                );
+                generate_number_not_in_service()
+            },
+            |samples| {
                 info!(
                     samples = samples.len(),
                     duration_ms = samples.len() * 1000 / PCMU_CLOCK_RATE as usize,
                     "Loaded embedded PCM: Not_in_service.pcm"
                 );
                 samples
-            } else {
-                warn!(
-                    "Not_in_service.pcm not found in embedded audio_files, using synthesized tones"
-                );
-                generate_number_not_in_service()
-            }
-        }
+            },
+        ),
         AnnouncementType::AllCircuitsBusy => {
-            if let Some(samples) = load_pcm_file("All_circuits_busy.pcm") {
-                samples
-            } else {
-                generate_all_circuits_busy()
-            }
+            load_pcm_file("All_circuits_busy.pcm").unwrap_or_else(generate_all_circuits_busy)
         }
         AnnouncementType::Silence => vec![0i16; PCMU_CLOCK_RATE as usize * 2],
     }
@@ -195,6 +190,14 @@ fn generate_announcement(announcement: AnnouncementType) -> Vec<i16> {
 ///
 /// SIT tone sequence (intercept): 985.2 Hz, 1428.5 Hz, 1776.7 Hz
 /// Each tone: 276ms + 276ms + 380ms
+// Tone-generation math intentionally casts between f64 sample math and
+// integer sample counts/values; durations and amplitudes are bounded.
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 fn generate_number_not_in_service() -> Vec<i16> {
     let sample_rate = f64::from(PCMU_CLOCK_RATE);
     let mut samples = Vec::new();
@@ -501,6 +504,13 @@ fn generate_number_not_in_service() -> Vec<i16> {
 }
 
 /// Generates "all circuits busy" announcement with SIT tones.
+// Tone-generation math intentionally casts between f64 sample math and
+// integer sample counts/values; durations and amplitudes are bounded.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 fn generate_all_circuits_busy() -> Vec<i16> {
     let sample_rate = f64::from(PCMU_CLOCK_RATE);
     let mut samples = Vec::new();

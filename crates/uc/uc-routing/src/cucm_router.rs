@@ -191,19 +191,12 @@ impl CucmRouter {
             for rp in candidates {
                 let specificity = Self::pattern_specificity(rp, dialed_digits);
 
-                let dominated = match best {
-                    Some(current) => {
-                        let cur_spec = best_specificity;
-                        if specificity > cur_spec {
-                            true
-                        } else if specificity == cur_spec {
-                            rp.priority() < current.priority()
-                        } else {
-                            false
-                        }
-                    }
-                    None => true,
-                };
+                let dominated =
+                    best.is_none_or(|current| match specificity.cmp(&best_specificity) {
+                        std::cmp::Ordering::Greater => true,
+                        std::cmp::Ordering::Equal => rp.priority() < current.priority(),
+                        std::cmp::Ordering::Less => false,
+                    });
 
                 if dominated {
                     best = Some(rp);

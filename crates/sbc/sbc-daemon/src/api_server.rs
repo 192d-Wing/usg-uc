@@ -875,16 +875,14 @@ pub fn start_trunk_services(state: &Arc<AppState>, trunk: &serde_json::Value) {
         .get("zone")
         .and_then(|v| v.as_str())
         .unwrap_or("outside");
-    let (bind_ip, external_ip) = if let Some(ref zr) = state.zone_registry {
+    let (bind_ip, external_ip) = state.zone_registry.as_ref().map_or((None, None), |zr| {
         let ip = zr
             .signaling_ip(zone_name)
             .or_else(|| zr.signaling_ip("outside"))
             .or_else(|| zr.signaling_ip("inside"));
         let ext = zr.external_ip(zone_name);
         (ip, ext)
-    } else {
-        (None, None)
-    };
+    });
 
     // Start OPTIONS health monitoring
     if trunk

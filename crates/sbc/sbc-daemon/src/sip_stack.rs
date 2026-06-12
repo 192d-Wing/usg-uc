@@ -1618,7 +1618,7 @@ impl SipStack {
                     std::net::IpAddr::V6(v6) => v6
                         .to_ipv4_mapped()
                         .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
-                    ip => ip,
+                    ip @ std::net::IpAddr::V4(_) => ip,
                 };
                 let inbound_trunk = self.lookup_inbound_trunk(source_ip).await;
                 let css_id_owned = inbound_trunk.as_ref().and_then(|(_, css)| css.clone());
@@ -1654,9 +1654,9 @@ impl SipStack {
                 // 2. Route via dial plan → trunk group → trunk
                 if routed.is_none() {
                     if let Some(ref router_lock) = self.router {
-                        let mut router = router_lock.write().await;
+                        let mut dial_router = router_lock.write().await;
                         info!(dest = %dest_user, "Attempting dial plan routing");
-                        match router.route(&dest_user) {
+                        match dial_router.route(&dest_user) {
                             Ok(decision) => {
                                 info!(
                                     trunk_id = %decision.trunk_id,
@@ -2579,30 +2579,30 @@ impl SipStack {
 
         // Bind RTP socket to the outside zone's signaling IP so media
         // exits via the correct macvlan interface (in-process mode).
-        let rtp_bind_ip = if let Some(ref zr) = self.zone_registry {
-            zr.signaling_ip("outside")
-        } else {
-            None
-        };
+        let rtp_bind_ip = self
+            .zone_registry
+            .as_ref()
+            .and_then(|zr| zr.signaling_ip("outside"));
 
         // The daemon's own externally reachable IP: the outside zone's
         // external IP (STUN/public), falling back to the signaling IP,
         // then to the address the INVITE arrived on. Used for the SIP
         // Contact and the BYE, and as the SDP media address when
         // playback runs in-process.
-        let daemon_ip = if let Some(ref zr) = self.zone_registry {
-            zr.external_ip("outside")
-                .or_else(|| zr.signaling_ip("outside"))
-                .map(|ip| ip.to_string())
-        } else {
-            None
-        }
-        .unwrap_or_else(|| match source.ip() {
-            std::net::IpAddr::V6(v6) => v6
-                .to_ipv4_mapped()
-                .map_or_else(|| v6.to_string(), |v4| v4.to_string()),
-            std::net::IpAddr::V4(v4) => v4.to_string(),
-        });
+        let daemon_ip = self
+            .zone_registry
+            .as_ref()
+            .and_then(|zr| {
+                zr.external_ip("outside")
+                    .or_else(|| zr.signaling_ip("outside"))
+                    .map(|ip| ip.to_string())
+            })
+            .unwrap_or_else(|| match source.ip() {
+                std::net::IpAddr::V6(v6) => v6
+                    .to_ipv4_mapped()
+                    .map_or_else(|| v6.to_string(), |v4| v4.to_string()),
+                std::net::IpAddr::V4(v4) => v4.to_string(),
+            });
 
         // Prefer the external announcement pod when configured. Any
         // failure here falls back to in-process playback so a missing

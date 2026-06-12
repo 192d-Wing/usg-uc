@@ -65,10 +65,12 @@ impl TrunkHealthStatus {
         }
     }
 
+    // Ping counters stay far below 2^52, so the f64 percentage math is exact enough.
+    #[allow(clippy::cast_precision_loss)]
     fn record_success(&mut self, response_ms: u64) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
+            .map_or(0, |d| d.as_secs().cast_signed());
 
         // Track down→up transition for service duration timer
         if !self.reachable {
@@ -84,10 +86,12 @@ impl TrunkHealthStatus {
         self.uptime_pct = (self.total_success as f64 / self.total_pings as f64) * 100.0;
     }
 
+    // Ping counters stay far below 2^52, so the f64 percentage math is exact enough.
+    #[allow(clippy::cast_precision_loss)]
     fn record_failure(&mut self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
+            .map_or(0, |d| d.as_secs().cast_signed());
 
         self.reachable = false;
         self.last_response_ms = None;
@@ -169,6 +173,10 @@ impl TrunkMonitor {
     }
 
     /// Starts (or replaces) monitoring for a trunk.
+    // significant_drop_tightening: the write-lock guard in the ping loop is
+    // already scoped to the mutation; the lint's suggested rewrite does not
+    // compile (Entry method called on the guard).
+    #[allow(clippy::significant_drop_tightening)]
     pub fn monitor_trunk(&self, trunk: MonitoredTrunk) {
         let health = Arc::clone(&self.health);
         let domain = self.local_domain.clone();
@@ -208,27 +216,34 @@ impl TrunkMonitor {
                 )
                 .await;
 
-                let mut h = health.write().await;
-                let status = h
-                    .entry(trunk.trunk_id.clone())
-                    .or_insert_with(|| TrunkHealthStatus::new(&trunk.trunk_id));
+                // Update under the lock, then release it before logging.
+                let (uptime_pct, consecutive_failures) = {
+                    let mut h = health.write().await;
+                    let status = h
+                        .entry(trunk.trunk_id.clone())
+                        .or_insert_with(|| TrunkHealthStatus::new(&trunk.trunk_id));
+
+                    match &result {
+                        Ok(response_ms) => status.record_success(*response_ms),
+                        Err(_) => status.record_failure(),
+                    }
+                    (status.uptime_pct, status.consecutive_failures)
+                };
 
                 match result {
                     Ok(response_ms) => {
-                        status.record_success(response_ms);
                         debug!(
                             trunk_id = %trunk.trunk_id,
                             response_ms,
-                            uptime = format!("{:.1}%", status.uptime_pct),
+                            uptime = format!("{uptime_pct:.1}%"),
                             "OPTIONS ping OK"
                         );
                     }
                     Err(reason) => {
-                        status.record_failure();
                         warn!(
                             trunk_id = %trunk.trunk_id,
                             reason = %reason,
-                            consecutive_failures = status.consecutive_failures,
+                            consecutive_failures,
                             "OPTIONS ping FAILED"
                         );
                     }
@@ -349,6 +364,8 @@ impl TrunkMonitor {
             break n;
         };
 
+        // An OPTIONS ping RTT always fits in u64 milliseconds.
+        #[allow(clippy::cast_possible_truncation)]
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
         // Check for a valid SIP response

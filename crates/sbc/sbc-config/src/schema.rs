@@ -950,6 +950,8 @@ mod tests {
         assert_eq!(monitoring.scrape_interval_secs, 15);
     }
 
+    // One long TOML fixture plus its assertions; splitting hides the example config.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn test_routing_config_parse() {
         let toml_str = r#"

@@ -10,8 +10,10 @@
     missing_docs
 )]
 
+use std::hint::black_box;
+
 use bytes::Bytes;
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 use client_audio::jitter_buffer::{BufferedPacket, SharedJitterBuffer};
 use client_audio::rtp_handler::{RTP_HEADER_SIZE, parse_rfc2198, parse_rtp_fields};

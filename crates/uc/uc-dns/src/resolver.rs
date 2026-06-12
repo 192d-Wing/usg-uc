@@ -740,7 +740,7 @@ mod tests {
                 "sip:example.com:Any",
                 "SIP",
                 CacheEntry::Address(addrs),
-                Duration::from_secs(300),
+                Duration::from_mins(5),
             )
             .await;
 

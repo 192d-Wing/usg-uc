@@ -34,10 +34,12 @@ pub use wire::{ClientConfig, DiscoveryDoc, OidcMetadata, TokenResponse};
 use wire::DiscoveryOidc;
 
 /// Extracts the `nonce` claim from an ID token's payload WITHOUT verifying
-/// the signature — used only to bind the token response to this sign-in
-/// attempt (OIDC Core §3.1.3.7). The access token's authenticity is enforced
-/// server-side by the POP/SBC validators; the nonce here defends the client
-/// against authorization-response injection.
+/// the signature.
+///
+/// Used only to bind the token response to this sign-in attempt (OIDC Core
+/// §3.1.3.7). The access token's authenticity is enforced server-side by the
+/// POP/SBC validators; the nonce here defends the client against
+/// authorization-response injection.
 #[must_use]
 pub fn id_token_nonce(id_token: &str) -> Option<String> {
     use base64::Engine as _;
@@ -120,12 +122,11 @@ impl ProvisioningClient {
         state: &str,
         nonce: &str,
     ) -> String {
-        let mut url = match url::Url::parse(&meta.authorization_endpoint) {
-            Ok(u) => u,
-            // Endpoint comes from validated metadata; fall back to the raw
-            // string if it somehow won't parse (it will fail the request
-            // later with a clear error).
-            Err(_) => return meta.authorization_endpoint.clone(),
+        // Endpoint comes from validated metadata; fall back to the raw
+        // string if it somehow won't parse (it will fail the request
+        // later with a clear error).
+        let Ok(mut url) = url::Url::parse(&meta.authorization_endpoint) else {
+            return meta.authorization_endpoint.clone();
         };
         url.query_pairs_mut()
             .append_pair("response_type", "code")

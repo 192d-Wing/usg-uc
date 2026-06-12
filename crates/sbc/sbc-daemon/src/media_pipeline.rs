@@ -115,6 +115,8 @@ impl RtpPortAllocator {
     }
 
     /// Allocates an even-numbered RTP port. Returns (rtp_port, rtcp_port).
+    // rtp/rtcp are the standard protocol names for the port pair.
+    #[allow(clippy::similar_names)]
     pub async fn allocate_pair(&self) -> Result<(u16, u16), MediaPipelineError> {
         let mut allocated = self.allocated.write().await;
         let pairs = self.pair_count();
@@ -1148,10 +1150,10 @@ async fn relay_leg(
             result = recv_sock.recv_from(&mut buf) => {
                 match result {
                     Ok((n, src)) => {
-                        let acceptable = match latched {
-                            Some(latched_src) => src == latched_src,
-                            None => src.ip() == expected_remote.ip(),
-                        };
+                        let acceptable = latched.map_or_else(
+                            || src.ip() == expected_remote.ip(),
+                            |latched_src| src == latched_src,
+                        );
                         if !acceptable {
                             dropped += 1;
                             if dropped == 1 || dropped.is_multiple_of(1000) {
@@ -1334,6 +1336,8 @@ mod tests {
     }
 
     /// Port allocator must survive index wraparound and tiny/reversed ranges.
+    // rtp/rtcp are the standard protocol names for the port pair.
+    #[allow(clippy::similar_names)]
     #[tokio::test]
     async fn test_port_allocator_bounds() {
         // Reversed range is swapped, not panicked on.

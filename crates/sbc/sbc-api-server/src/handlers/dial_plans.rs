@@ -61,13 +61,13 @@ pub async fn delete_entry(
 ) -> impl IntoResponse {
     match state.dial_plans.get(&plan_id).await {
         Ok(mut doc) => {
-            let became_empty =
-                if let Some(arr) = doc.get_mut("entries").and_then(|v| v.as_array_mut()) {
+            let became_empty = doc
+                .get_mut("entries")
+                .and_then(|v| v.as_array_mut())
+                .is_none_or(|arr| {
                     arr.retain(|e| e.get("id").and_then(|v| v.as_str()) != Some(&entry_id));
                     arr.is_empty()
-                } else {
-                    true
-                };
+                });
             if became_empty {
                 if let Err(e) = state.dial_plans.delete(&plan_id).await {
                     warn!(plan_id, error = %e, "dial plan delete failed");

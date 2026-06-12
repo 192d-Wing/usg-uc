@@ -173,8 +173,7 @@ impl ReliableProvisionalTracker {
         // Use a random value between 1 and 2^31 per RFC 3262
         let initial_rseq = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u32)
-            .unwrap_or(1))
+            .map_or(1, |d| d.as_nanos() as u32))
             % 0x7FFFFFFF
             + 1;
         Self::new(invite_cseq, initial_rseq)
@@ -273,7 +272,7 @@ impl ReliableProvisionalTracker {
             if elapsed >= pending.retransmit_interval {
                 // Check for timeout (64*T1 = 32 seconds)
                 let total_elapsed = now.duration_since(pending.first_sent);
-                if total_elapsed >= Duration::from_millis(32000) {
+                if total_elapsed >= Duration::from_secs(32) {
                     pending.state = ReliableProvisionalState::TimedOut;
                     continue;
                 }

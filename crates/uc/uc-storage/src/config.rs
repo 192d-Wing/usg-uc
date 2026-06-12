@@ -349,7 +349,7 @@ mod tests {
         assert!(config.default_ttl().is_none());
 
         config.default_ttl_secs = 3600;
-        assert_eq!(config.default_ttl(), Some(Duration::from_secs(3600)));
+        assert_eq!(config.default_ttl(), Some(Duration::from_hours(1)));
     }
 
     #[test]

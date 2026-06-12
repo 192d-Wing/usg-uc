@@ -67,6 +67,9 @@ impl PkiValidator {
     ///
     /// Returns `UserMgmtError::CertificateValidationFailed` if the certificate
     /// cannot be parsed.
+    // `subject_dn` and `subject_cn` are distinct X.509 fields; the names are
+    // intentionally parallel.
+    #[allow(clippy::similar_names)]
     pub fn extract_identity(&self, cert_der: &[u8]) -> Result<PkiIdentity, UserMgmtError> {
         // Convert DER bytes to a lossy string for basic DN extraction.
         // This is a placeholder until full ASN.1 parsing is implemented.

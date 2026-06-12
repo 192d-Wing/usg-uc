@@ -4,6 +4,7 @@
 //! HA deployments where multiple SBC nodes share a single database.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
@@ -94,9 +95,9 @@ impl PostgresUserStore {
     fn row_to_user(row: &sqlx::postgres::PgRow) -> std::result::Result<User, sqlx::Error> {
         let auth_type_str: String = row.try_get("auth_type")?;
         let auth_type = match auth_type_str.as_str() {
-            "Digest" => AuthType::Digest,
             "MtlsPki" => AuthType::MtlsPki,
             "Both" => AuthType::Both,
+            // "Digest" and anything unrecognized fall back to digest auth.
             _ => AuthType::Digest,
         };
 
@@ -243,7 +244,7 @@ impl UserStore for PostgresUserStore {
         let mut bind_idx = 1u32;
 
         if let Some(ref username) = filter.username_contains {
-            sql.push_str(&format!(" AND username ILIKE ${bind_idx}"));
+            let _ = write!(sql, " AND username ILIKE ${bind_idx}");
             binds.push(format!("%{username}%"));
             bind_idx += 1;
         }
@@ -254,34 +255,35 @@ impl UserStore for PostgresUserStore {
                 AuthType::MtlsPki => "MtlsPki",
                 AuthType::Both => "Both",
             };
-            sql.push_str(&format!(" AND auth_type = ${bind_idx}"));
+            let _ = write!(sql, " AND auth_type = ${bind_idx}");
             binds.push(type_str.to_owned());
             bind_idx += 1;
         }
 
         if let Some(ref css) = filter.css_id {
-            sql.push_str(&format!(" AND calling_search_space = ${bind_idx}"));
+            let _ = write!(sql, " AND calling_search_space = ${bind_idx}");
             binds.push(css.clone());
             bind_idx += 1;
         }
 
         if let Some(enabled) = filter.enabled {
-            sql.push_str(&format!(
+            let _ = write!(
+                sql,
                 " AND enabled = {}",
                 if enabled { "TRUE" } else { "FALSE" }
-            ));
+            );
         }
 
         sql.push_str(" ORDER BY username");
 
         if let Some(limit) = filter.limit {
-            sql.push_str(&format!(" LIMIT ${bind_idx}"));
+            let _ = write!(sql, " LIMIT ${bind_idx}");
             binds.push(limit.to_string());
             bind_idx += 1;
         }
 
         if let Some(offset) = filter.offset {
-            sql.push_str(&format!(" OFFSET ${bind_idx}"));
+            let _ = write!(sql, " OFFSET ${bind_idx}");
             binds.push(offset.to_string());
         }
 
@@ -419,6 +421,7 @@ impl UserStore for PostgresUserStore {
             .try_get("count")
             .map_err(|e| UserMgmtError::StorageError(e.to_string()))?;
 
-        Ok(count as usize)
+        // COUNT(*) is never negative; fall back to 0 defensively.
+        Ok(usize::try_from(count).unwrap_or(0))
     }
 }

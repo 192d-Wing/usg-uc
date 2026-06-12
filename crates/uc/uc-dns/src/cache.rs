@@ -273,9 +273,9 @@ mod tests {
 
     #[test]
     fn test_cached_record() {
-        let record = CachedRecord::new("test data", Duration::from_secs(60));
+        let record = CachedRecord::new("test data", Duration::from_mins(1));
         assert!(!record.is_expired());
-        assert!(record.remaining_ttl() <= Duration::from_secs(60));
+        assert!(record.remaining_ttl() <= Duration::from_mins(1));
         assert!(record.age() < Duration::from_millis(100));
     }
 
@@ -289,7 +289,7 @@ mod tests {
                 "example.com",
                 "A",
                 CacheEntry::Address(vec!["1.2.3.4".parse().unwrap()]),
-                Duration::from_secs(300),
+                Duration::from_mins(5),
             )
             .await;
 
@@ -327,7 +327,7 @@ mod tests {
                 "example.com",
                 "A",
                 CacheEntry::Address(vec![]),
-                Duration::from_secs(300),
+                Duration::from_mins(5),
             )
             .await;
 
@@ -341,8 +341,8 @@ mod tests {
         let cache = DnsCache::new(
             100,
             Duration::from_secs(1),
-            Duration::from_secs(3600),
-            Duration::from_secs(60),
+            Duration::from_hours(1),
+            Duration::from_mins(1),
         );
 
         cache
@@ -350,7 +350,7 @@ mod tests {
                 "a.com",
                 "A",
                 CacheEntry::Address(vec![]),
-                Duration::from_secs(60),
+                Duration::from_mins(1),
             )
             .await;
         cache.put_negative("b.com", "A").await;

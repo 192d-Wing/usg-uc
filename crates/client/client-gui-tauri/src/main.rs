@@ -732,6 +732,17 @@ async fn get_sip_settings(state: State<'_, TauriAppState>) -> Result<SipSettings
     result
 }
 
+/// Validates a SIP URI component to prevent header injection.
+fn validate_sip_component(value: &str, field: &str) -> Result<(), String> {
+    if value.contains('\r') || value.contains('\n') || value.contains('\0') {
+        return Err(format!("{field} contains illegal characters (CR/LF/NUL)"));
+    }
+    if value.contains('>') || value.contains('<') {
+        return Err(format!("{field} contains illegal angle brackets"));
+    }
+    Ok(())
+}
+
 /// Update SIP registration settings.
 #[tauri::command]
 async fn update_sip_settings(
@@ -756,15 +767,6 @@ async fn update_sip_settings(
     };
 
     // Validate SIP URI components to prevent header injection
-    fn validate_sip_component(value: &str, field: &str) -> Result<(), String> {
-        if value.contains('\r') || value.contains('\n') || value.contains('\0') {
-            return Err(format!("{field} contains illegal characters (CR/LF/NUL)"));
-        }
-        if value.contains('>') || value.contains('<') {
-            return Err(format!("{field} contains illegal angle brackets"));
-        }
-        Ok(())
-    }
     validate_sip_component(&settings.username, "Username")?;
     validate_sip_component(&settings.domain, "Domain")?;
     validate_sip_component(&settings.registrar, "Registrar")?;

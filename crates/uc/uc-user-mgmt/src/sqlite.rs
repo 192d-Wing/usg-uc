@@ -1,6 +1,7 @@
 //! SQLite storage backend for user management.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::Mutex;
 
 use rusqlite::{Connection, params};
@@ -78,6 +79,7 @@ impl SqliteUserStore {
             );",
         )
         .map_err(|e| UserMgmtError::StorageError(e.to_string()))?;
+        drop(conn);
         debug!("SQLite user tables initialized");
         Ok(())
     }
@@ -85,9 +87,9 @@ impl SqliteUserStore {
     fn row_to_user(row: &rusqlite::Row<'_>) -> std::result::Result<User, rusqlite::Error> {
         let auth_type_str: String = row.get(5)?;
         let auth_type = match auth_type_str.as_str() {
-            "Digest" => AuthType::Digest,
             "MtlsPki" => AuthType::MtlsPki,
             "Both" => AuthType::Both,
+            // "Digest" and anything unrecognized fall back to digest auth.
             _ => AuthType::Digest,
         };
 
@@ -170,6 +172,7 @@ impl UserStore for SqliteUserStore {
                 UserMgmtError::StorageError(e.to_string())
             }
         })?;
+        drop(conn);
 
         Ok(user)
     }
@@ -234,6 +237,9 @@ impl UserStore for SqliteUserStore {
         })
     }
 
+    // `conn` is borrowed by the prepared statement until the rows are
+    // consumed, so the guard cannot be dropped any earlier.
+    #[allow(clippy::significant_drop_tightening)]
     async fn list_users(&self, filter: &UserFilter) -> Result<Vec<User>> {
         let conn = self
             .conn
@@ -251,7 +257,7 @@ impl UserStore for SqliteUserStore {
         let mut param_idx = 1u32;
 
         if let Some(ref username) = filter.username_contains {
-            sql.push_str(&format!(" AND username LIKE ?{param_idx}"));
+            let _ = write!(sql, " AND username LIKE ?{param_idx}");
             param_values.push(Box::new(format!("%{username}%")));
             param_idx += 1;
         }
@@ -262,19 +268,19 @@ impl UserStore for SqliteUserStore {
                 AuthType::MtlsPki => "MtlsPki",
                 AuthType::Both => "Both",
             };
-            sql.push_str(&format!(" AND auth_type = ?{param_idx}"));
+            let _ = write!(sql, " AND auth_type = ?{param_idx}");
             param_values.push(Box::new(type_str.to_owned()));
             param_idx += 1;
         }
 
         if let Some(ref css) = filter.css_id {
-            sql.push_str(&format!(" AND calling_search_space = ?{param_idx}"));
+            let _ = write!(sql, " AND calling_search_space = ?{param_idx}");
             param_values.push(Box::new(css.clone()));
             param_idx += 1;
         }
 
         if let Some(enabled) = filter.enabled {
-            sql.push_str(&format!(" AND enabled = ?{param_idx}"));
+            let _ = write!(sql, " AND enabled = ?{param_idx}");
             param_values.push(Box::new(i32::from(enabled)));
             param_idx += 1;
         }
@@ -282,13 +288,13 @@ impl UserStore for SqliteUserStore {
         sql.push_str(" ORDER BY username");
 
         if let Some(limit) = filter.limit {
-            sql.push_str(&format!(" LIMIT ?{param_idx}"));
+            let _ = write!(sql, " LIMIT ?{param_idx}");
             param_values.push(Box::new(limit));
             param_idx += 1;
         }
 
         if let Some(offset) = filter.offset {
-            sql.push_str(&format!(" OFFSET ?{param_idx}"));
+            let _ = write!(sql, " OFFSET ?{param_idx}");
             param_values.push(Box::new(offset));
             // param_idx not needed after this point
         }
@@ -357,6 +363,7 @@ impl UserStore for SqliteUserStore {
                 ],
             )
             .map_err(|e| UserMgmtError::StorageError(e.to_string()))?;
+        drop(conn);
 
         if rows_affected == 0 {
             return Err(UserMgmtError::UserNotFound);
@@ -374,6 +381,7 @@ impl UserStore for SqliteUserStore {
         let rows_affected = conn
             .execute("DELETE FROM users WHERE id = ?1", params![id])
             .map_err(|e| UserMgmtError::StorageError(e.to_string()))?;
+        drop(conn);
 
         if rows_affected == 0 {
             return Err(UserMgmtError::UserNotFound);
@@ -394,6 +402,7 @@ impl UserStore for SqliteUserStore {
             params![username],
             |row| row.get(0),
         );
+        drop(conn);
 
         match result {
             Ok(ha1) => Ok(ha1),
@@ -417,6 +426,7 @@ impl UserStore for SqliteUserStore {
             params![dn, san],
             Self::row_to_user,
         );
+        drop(conn);
 
         match result {
             Ok(user) => Ok(Some(user)),
@@ -434,7 +444,9 @@ impl UserStore for SqliteUserStore {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
             .map_err(|e| UserMgmtError::StorageError(e.to_string()))?;
+        drop(conn);
 
-        Ok(count as usize)
+        // COUNT(*) is never negative; fall back to 0 defensively.
+        Ok(usize::try_from(count).unwrap_or(0))
     }
 }

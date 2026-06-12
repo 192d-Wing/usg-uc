@@ -4970,7 +4970,7 @@ mod tests {
     }
 
     /// RFC 4028 §5.3: an INVITE rejected with 422 Session Interval Too
-    /// Small is ACKed (non-2xx final response, §17.1.1.3) and retried ONCE
+    /// Small is `ACKed` (non-2xx final response, §17.1.1.3) and retried ONCE
     /// as a new transaction — bumped `CSeq`, fresh branch — carrying
     /// `Session-Expires` at the server's Min-SE, `Min-SE`, and
     /// `Supported: timer`. A second 422 fails the call instead of looping.

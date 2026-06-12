@@ -73,10 +73,10 @@ pub async fn get_group(
     State(state): State<Arc<AppState>>,
     Path(group_id): Path<String>,
 ) -> impl IntoResponse {
-    match lookup(&state, &group_id).await {
-        Some(g) => Json(redact::redacted(g)),
-        None => Json(serde_json::json!({"error": format!("Trunk group {group_id} not found")})),
-    }
+    lookup(&state, &group_id).await.map_or_else(
+        || Json(serde_json::json!({"error": format!("Trunk group {group_id} not found")})),
+        |g| Json(redact::redacted(g)),
+    )
 }
 
 pub async fn add_group(

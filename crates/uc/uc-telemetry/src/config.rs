@@ -372,7 +372,7 @@ mod tests {
     #[test]
     fn test_metrics_export_interval() {
         let config = MetricsConfig::default();
-        assert_eq!(config.export_interval(), Duration::from_secs(60));
+        assert_eq!(config.export_interval(), Duration::from_mins(1));
     }
 
     #[test]

@@ -196,6 +196,7 @@ impl SipClient {
                 }
             }
         }));
+        drop(tasks);
 
         Ok(())
     }
@@ -362,6 +363,7 @@ impl SipClient {
             );
             guard.set_contact(contact.clone());
             guard.save_if_dirty()?;
+            drop(guard);
             Ok(contact.into())
         })
     }
@@ -384,6 +386,7 @@ impl SipClient {
             }
             guard.set_contact(contact.into());
             guard.save_if_dirty()?;
+            drop(guard);
             Ok(())
         })
     }
@@ -400,6 +403,7 @@ impl SipClient {
                 });
             }
             guard.save_if_dirty()?;
+            drop(guard);
             Ok(())
         })
     }
@@ -429,6 +433,7 @@ impl SipClient {
             let mut guard = contacts.write().await;
             guard.clear_call_history();
             guard.save_if_dirty()?;
+            drop(guard);
             Ok(())
         })
     }
@@ -484,6 +489,7 @@ impl SipClient {
             manager.set_account(core);
             manager.set_default_account(Some(account.id.clone()));
             manager.save()?;
+            drop(guard);
             Ok(())
         })
     }
@@ -509,6 +515,7 @@ impl SipClient {
             audio.output_device = settings.output_device;
             audio.preferred_codec = settings.preferred_codec.into();
             manager.save()?;
+            drop(guard);
             Ok(())
         })
     }
@@ -547,6 +554,7 @@ impl SipClient {
                 }
             })?;
             guard.register_account(&account).await?;
+            drop(guard);
             Ok(())
         })
     }
@@ -575,6 +583,7 @@ impl SipClient {
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            drop(guard);
             result
         })?;
 
@@ -636,14 +645,16 @@ fn apply_digest_credentials(
 /// environment variable, falling back to `info` for the client crates.
 #[uniffi::export]
 pub fn init_logging(filter: Option<String>) {
-    let env_filter = match filter {
-        Some(f) => tracing_subscriber::EnvFilter::new(f),
-        None => tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            tracing_subscriber::EnvFilter::new(
-                "client_core=info,client_sip_ua=info,client_audio=info",
-            )
-        }),
-    };
+    let env_filter = filter.map_or_else(
+        || {
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(
+                    "client_core=info,client_sip_ua=info,client_audio=info",
+                )
+            })
+        },
+        tracing_subscriber::EnvFilter::new,
+    );
     // try_init: ignore AlreadyInit when the host app re-calls across reloads.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(env_filter)

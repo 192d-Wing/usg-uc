@@ -410,7 +410,7 @@ mod tests {
                 "test.example.com",
                 "A",
                 CacheEntry::Address(vec!["10.0.0.1".parse().unwrap()]),
-                Duration::from_secs(300),
+                Duration::from_mins(5),
             )
             .await;
 
@@ -450,7 +450,7 @@ mod tests {
                 "_sip._udp.example.com",
                 "SRV",
                 CacheEntry::Srv(srv_records),
-                Duration::from_secs(300),
+                Duration::from_mins(5),
             )
             .await;
 
@@ -483,7 +483,7 @@ mod tests {
                 "example.com",
                 "NAPTR",
                 CacheEntry::Naptr(naptr_records),
-                Duration::from_secs(300),
+                Duration::from_mins(5),
             )
             .await;
 
@@ -499,8 +499,8 @@ mod tests {
         let cache = Arc::new(DnsCache::default());
         let resolver = HickoryDnsResolver::new(cache)
             .unwrap()
-            .with_default_ttl(Duration::from_secs(600));
+            .with_default_ttl(Duration::from_mins(10));
 
-        assert_eq!(resolver.default_ttl, Duration::from_secs(600));
+        assert_eq!(resolver.default_ttl, Duration::from_mins(10));
     }
 }
