@@ -1,0 +1,82 @@
+{{- if .Values.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "central-config.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "central-config.labels" . | nindent 4 }}
+---
+{{- end }}
+# central-config-api — operator write surface + per-site sync read surface.
+#
+# Writes the central, site_code-sharded Postgres and serves it back to the
+# fleet. Stateless and horizontally scalable; the database is the source
+# of truth. It never talks to the SIP daemons — sites pull and apply on
+# their own via sbc-config-sync.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "central-config.fullname" . }}-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "central-config.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  replicas: {{ .Values.api.replicas }}
+  selector:
+    matchLabels:
+      {{- include "central-config.apiSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "central-config.apiSelectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "central-config.serviceAccountName" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: central-config-api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: CENTRAL_API_LISTEN_ADDR
+              value: "0.0.0.0:{{ .Values.api.listenPort }}"
+            {{- include "central-config.dsnEnv" . | nindent 12 }}
+            - name: CENTRAL_OIDC_ISSUER
+              value: {{ required "api.oidc.issuer is required" .Values.api.oidc.issuer | quote }}
+            - name: CENTRAL_OIDC_AUDIENCE
+              value: {{ .Values.api.oidc.audience | quote }}
+          ports:
+            - { name: http, containerPort: {{ .Values.api.listenPort }}, protocol: TCP }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "central-config.fullname" . }}-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "central-config.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  selector:
+    {{- include "central-config.apiSelectorLabels" . | nindent 4 }}
+  ports:
+    - { name: http, port: 80, targetPort: http, protocol: TCP }

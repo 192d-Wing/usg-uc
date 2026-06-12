@@ -93,6 +93,12 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: trunk-agent
 {{- end }}
 
+{{- define "sbc.configSyncSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "sbc.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: config-sync
+{{- end }}
+
 {{- define "sbc.serviceAccountName" -}}
 {{ include "sbc.fullname" . }}
 {{- end }}

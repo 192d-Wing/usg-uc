@@ -1,0 +1,105 @@
+{{- if .Values.sbcConfigSync.enabled }}
+# sbc-config-sync — per-site config sync agent.
+#
+# Pulls this site's shard from the central config API and applies deltas/
+# snapshots into the same local Postgres the daemon, sbc-api, and
+# provision-server read, making that DB a synced replica of the site's
+# central shard. Survives WAN outages by serving the last-applied state.
+#
+# Single replica: one writer of central-origin rows per site. It only
+# touches existing tables (the SBC stack owns the schema), so it rolls
+# independently of everything else.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sbc.fullname" . }}-config-sync
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: config-sync
+spec:
+  replicas: 1
+  # One writer at a time — never run two appliers against one shard.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "sbc.configSyncSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sbc.configSyncSelectorLabels" . | nindent 8 }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: sbc-config-sync
+          image: "{{ .Values.sbcConfigSync.image.repository }}:{{ .Values.sbcConfigSync.image.tag }}"
+          imagePullPolicy: {{ .Values.sbcConfigSync.image.pullPolicy }}
+          env:
+            # Canonical (uppercase) site code = this site's shard. Falls
+            # back to the upper-cased helm site name.
+            - name: SYNC_SITE_CODE
+              value: {{ .Values.sbcConfigSync.siteCode | default (upper .Values.site.name) | quote }}
+            # Local Postgres DSN — the same Secret the daemon reads.
+            {{- if .Values.sbcPostgres.enabled }}
+            - name: SYNC_LOCAL_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sbc.fullname" . }}-postgres
+                  key: dsn
+            {{- else if .Values.sbcPostgres.existingSecret.name }}
+            - name: SYNC_LOCAL_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.sbcPostgres.existingSecret.name }}
+                  key: {{ .Values.sbcPostgres.existingSecret.key | default "dsn" }}
+            {{- end }}
+            # Central config API base URL (no trailing slash).
+            - name: SYNC_CENTRAL_URL
+              value: {{ required "sbcConfigSync.centralUrl is required" .Values.sbcConfigSync.centralUrl | quote }}
+            # OIDC service-account bearer token (config-sync scope,
+            # site_code claim). Supplied via Secret.
+            - name: SYNC_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.sbcConfigSync.tokenSecret.name | default (printf "%s-config-sync" (include "sbc.fullname" .)) }}
+                  key: {{ .Values.sbcConfigSync.tokenSecret.key | default "token" }}
+            - name: SYNC_INTERVAL_SECS
+              value: {{ .Values.sbcConfigSync.intervalSecs | quote }}
+            - name: SYNC_METRICS_ADDR
+              value: "0.0.0.0:9090"
+          ports:
+            - { name: metrics, containerPort: 9090, protocol: TCP }
+          livenessProbe:
+            httpGet: { path: /healthz, port: metrics }
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: { path: /readyz, port: metrics }
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.sbcConfigSync.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sbc.fullname" . }}-config-sync
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sbc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: config-sync
+spec:
+  selector:
+    {{- include "sbc.configSyncSelectorLabels" . | nindent 4 }}
+  ports:
+    - { name: metrics, port: 9090, targetPort: metrics, protocol: TCP }
+{{- end }}

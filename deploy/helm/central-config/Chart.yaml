@@ -1,0 +1,16 @@
+apiVersion: v2
+name: central-config
+description: USG UC central configuration plane — central-config-api over the fleet-wide, site-sharded config database.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - config
+  - sip
+  - sbc
+  - fleet
+maintainers:
+  - name: USG UC Team
+    email: team@example.com
+annotations:
+  nist.gov/800-53-controls: "CM-2,CM-3,CM-6,AC-3,AU-2"

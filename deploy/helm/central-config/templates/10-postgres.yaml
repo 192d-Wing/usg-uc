@@ -1,0 +1,101 @@
+{{- if .Values.postgres.enabled }}
+# Bundled single-instance central Postgres — LAB/DEV ONLY.
+#
+# Production must use an HA, PITR-backed Postgres (CNPG / Patroni) and set
+# postgres.enabled=false with postgres.existingSecret pointing at its DSN.
+# This is the one datastore in the system that must not lose writes.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "central-config.fullname" . }}-postgres
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "central-config.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  username: {{ .Values.postgres.user | quote }}
+  password: {{ .Values.postgres.password | quote }}
+  dsn: "postgres://{{ .Values.postgres.user }}:{{ .Values.postgres.password }}@{{ include "central-config.fullname" . }}-postgres.{{ .Release.Namespace }}.svc.cluster.local:5432/{{ .Values.postgres.database }}"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "central-config.fullname" . }}-postgres
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "central-config.labels" . | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ .Values.postgres.storage }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "central-config.fullname" . }}-postgres
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "central-config.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  serviceName: {{ include "central-config.fullname" . }}-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "central-config.pgSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "central-config.pgSelectorLabels" . | nindent 8 }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70
+        runAsGroup: 70
+        fsGroup: 70
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.image }}
+          env:
+            - name: POSTGRES_DB
+              value: {{ .Values.postgres.database | quote }}
+            - name: POSTGRES_USER
+              value: {{ .Values.postgres.user | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "central-config.fullname" . }}-postgres
+                  key: password
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - { name: postgres, containerPort: 5432 }
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.postgres.user | quote }}]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.postgres.resources | nindent 12 }}
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "central-config.fullname" . }}-postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "central-config.fullname" . }}-postgres
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "central-config.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "central-config.pgSelectorLabels" . | nindent 4 }}
+  ports:
+    - { name: postgres, port: 5432, targetPort: postgres }
+{{- end }}
