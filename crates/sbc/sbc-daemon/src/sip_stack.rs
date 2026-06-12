@@ -1220,8 +1220,14 @@ impl SipStack {
             }
         }
 
-        // Parse Contact headers into ContactInfo list
-        let contacts = parse_contacts_from_request(req);
+        // Parse Contact headers into ContactInfo list, then latch any
+        // unroutable contact host (an unspecified address such as "[::]"
+        // from clients advertising their wildcard bind) to the request
+        // source, so the stored binding is actually dialable.
+        let mut contacts = parse_contacts_from_request(req);
+        for contact in &mut contacts {
+            latch_unspecified_contact(contact, &source);
+        }
 
         // Parse Expires header
         let expires: Option<u32> = req
@@ -2324,7 +2330,11 @@ impl SipStack {
                     contact_count: bindings.len(),
                     contacts: bindings
                         .iter()
-                        .map(|b| b.contact_uri().to_string())
+                        .map(|b| ContactSummary {
+                            uri: b.contact_uri().to_string(),
+                            expires_secs: b.remaining_seconds(),
+                            q_value: b.q_value(),
+                        })
                         .collect(),
                 }
             })
@@ -2904,8 +2914,19 @@ pub struct RegistrationSummary {
     pub aor: String,
     /// Number of contacts.
     pub contact_count: usize,
-    /// Contact URIs.
-    pub contacts: Vec<String>,
+    /// Contact bindings.
+    pub contacts: Vec<ContactSummary>,
+}
+
+/// One contact binding within a [`RegistrationSummary`].
+#[derive(Debug, Clone)]
+pub struct ContactSummary {
+    /// Contact URI.
+    pub uri: String,
+    /// Seconds until the binding expires.
+    pub expires_secs: u32,
+    /// Q-value priority.
+    pub q_value: f32,
 }
 
 /// Creates a response from a request, copying required headers.
@@ -3115,6 +3136,31 @@ fn aor_user_part(aor: &str) -> &str {
 }
 
 /// Parses Contact headers from a SIP request into `ContactInfo` list.
+/// Rewrites a contact whose host is an unspecified address (`[::]` /
+/// `0.0.0.0` — clients that advertise their wildcard bind address) to the
+/// request's source IP and port. `SipUri`'s display re-brackets IPv6
+/// hosts, so latched URIs come out well-formed.
+fn latch_unspecified_contact(contact: &mut ContactInfo, source: &SbcSocketAddr) {
+    if contact.uri == "*" {
+        return;
+    }
+    let Ok(mut uri) = contact.uri.parse::<proto_sip::uri::SipUri>() else {
+        return;
+    };
+    let is_unspecified = uri
+        .host
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_unspecified());
+    if !is_unspecified {
+        return;
+    }
+    let latched_from = contact.uri.clone();
+    uri.host = source.ip().to_string();
+    uri.port = Some(source.port());
+    contact.uri = uri.to_string();
+    debug!(from = %latched_from, to = %contact.uri, "Latched unspecified contact host to request source");
+}
+
 fn parse_contacts_from_request(req: &proto_sip::message::SipRequest) -> Vec<ContactInfo> {
     let mut contacts = Vec::new();
 
@@ -3193,6 +3239,41 @@ fn extract_param<'a>(header_value: &'a str, name: &str) -> Option<&'a str> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latch_rewrites_unspecified_v6_host_with_brackets() {
+        let source = SbcSocketAddr::from("[2601:443:c200:570::1]:55748".parse::<std::net::SocketAddr>().unwrap());
+        let mut contact = ContactInfo::new("sip:1209@[::]:61676;transport=tls");
+        latch_unspecified_contact(&mut contact, &source);
+        assert_eq!(
+            contact.uri,
+            "sip:1209@[2601:443:c200:570::1]:55748;transport=tls"
+        );
+    }
+
+    #[test]
+    fn latch_rewrites_unspecified_v4_host() {
+        let source = SbcSocketAddr::from("198.51.100.7:5060".parse::<std::net::SocketAddr>().unwrap());
+        let mut contact = ContactInfo::new("sip:alice@0.0.0.0:5080");
+        latch_unspecified_contact(&mut contact, &source);
+        assert_eq!(contact.uri, "sip:alice@198.51.100.7:5060");
+    }
+
+    #[test]
+    fn latch_leaves_routable_and_wildcard_contacts_alone() {
+        let source = SbcSocketAddr::from("198.51.100.7:5060".parse::<std::net::SocketAddr>().unwrap());
+        let mut routable = ContactInfo::new("sip:alice@203.0.113.9:5080;transport=tls");
+        latch_unspecified_contact(&mut routable, &source);
+        assert_eq!(routable.uri, "sip:alice@203.0.113.9:5080;transport=tls");
+
+        let mut wildcard = ContactInfo::new("*");
+        latch_unspecified_contact(&mut wildcard, &source);
+        assert_eq!(wildcard.uri, "*");
+
+        let mut hostname = ContactInfo::new("sip:alice@phone.example.mil");
+        latch_unspecified_contact(&mut hostname, &source);
+        assert_eq!(hostname.uri, "sip:alice@phone.example.mil");
+    }
 
     #[tokio::test]
     async fn test_sip_stack_creation() {

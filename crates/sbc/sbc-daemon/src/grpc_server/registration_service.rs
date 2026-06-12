@@ -70,7 +70,9 @@ impl RegistrationService for RegistrationServiceImpl {
                         .contacts
                         .iter()
                         .map(|c| sbc_grpc_api::sbc::ContactInfo {
-                            uri: c.clone(),
+                            uri: c.uri.clone(),
+                            expires: i64::from(c.expires_secs),
+                            q_value: c.q_value,
                             ..Default::default()
                         })
                         .collect(),

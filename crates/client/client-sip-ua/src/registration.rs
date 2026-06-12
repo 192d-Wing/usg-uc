@@ -889,7 +889,7 @@ impl RegistrationAgent {
 
         // Contact: * with Expires: 0 removes all bindings for the AOR,
         // including stale ones from other client instances (RFC 3261 §10.2.2)
-        let request = RequestBuilder::register(registrar_uri)
+        let mut request = RequestBuilder::register(registrar_uri)
             .via(&via)
             .from(&from)
             .to(&to)
@@ -901,6 +901,19 @@ impl RegistrationAgent {
             .user_agent(USER_AGENT)
             .build()
             .map_err(|e| SipUaError::TransactionError(e.to_string()))?;
+
+        // RFC 8898 applies to unregistration too: without the bearer token
+        // the registrar 401s the Expires: 0 REGISTER and the bindings
+        // survive until natural expiry — bitten by the unregister-on-exit
+        // path, where nobody is left to answer a challenge.
+        if account.auth_mode == client_types::SipAuthMode::Bearer
+            && let Some(token) = account.bearer_token.as_ref()
+        {
+            request.headers.set(
+                HeaderName::Authorization,
+                format!("Bearer {}", token.as_str()),
+            );
+        }
 
         Ok(request)
     }
