@@ -342,6 +342,23 @@ Because materialization is per-site, fleet-wide changes get rings for free:
 
 ## 9. Implementation phases
 
+> **Status (build-out complete for the core).** The end-to-end spine is
+> implemented and Postgres-tested: a config write at the center
+> (`central-config-api` operator surface) flows through the transactional
+> store (`central-config-store`: epoch + revision + journal) and is pulled
+> and applied at each site by `sbc-config-sync` into the site-local
+> Postgres the SBC daemon reads. Crates: `central-config-store` (txn layer
+> + sync reads + templates), `central-config-api` (sync + operator HTTP +
+> dual-scope OIDC), `sbc-config-sync` (pull/apply agent + metrics),
+> `central-config-import` (onboarding), plus the `sbc-config-store` Phase-0
+> envelope. Deploy: `deploy/helm/central-config`, the `sbc` chart's
+> `sbcConfigSync` component, and `deploy/keycloak/central-config-clients
+> .md`. Remaining: production HA-Postgres wiring, the dashboard SPA
+> cutover, flipping per-site `sbc-api-server` config writes to read-only,
+> the break-glass override path (§7), and the agent's daemon-gRPC
+> refresh-after-apply (today changes land in local Postgres and the daemon
+> picks them up on its normal config-reload path).
+
 ### Phase 0 — Foundations (no behavior change)
 
 - Real SQL migrations (sqlx migrate) replacing inline `CREATE TABLE IF NOT
