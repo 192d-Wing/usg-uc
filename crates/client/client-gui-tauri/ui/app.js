@@ -716,7 +716,15 @@ async function initializeSignin() {
             showSigninForm(null);
             return;
         }
-        // No OIDC session — but don't gate users with an existing manual
+        // A provisioning service domain means this install signs in via
+        // OIDC — and tokens are never persisted, so every launch requires
+        // a fresh sign-in. Gate unconditionally.
+        if (session.service_domain) {
+            showSigninOverlay();
+            showSigninForm(null);
+            return;
+        }
+        // No OIDC config at all — don't gate users with an existing manual
         // SIP configuration (the pre-OIDC setup path).
         let manuallyConfigured = false;
         try {
