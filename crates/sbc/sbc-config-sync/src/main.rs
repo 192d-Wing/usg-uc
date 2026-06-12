@@ -12,7 +12,8 @@ use tokio::time::{MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use sbc_config_sync::{CentralClient, Config, Outcome, reconcile};
+use sbc_config_sync::{CentralClient, Config, Outcome, SyncStatus, reconcile};
+use sbc_config_sync::status;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
@@ -51,6 +52,24 @@ async fn main() -> ExitCode {
         .unwrap_or_else(|_| reqwest::Client::new());
     let client = CentralClient::new(http, cfg.central_url.clone(), cfg.bearer_token.clone());
 
+    // Metrics/health server, sharing status with the reconcile loop.
+    let sync_status = SyncStatus::new(&cfg.site_code);
+    match tokio::net::TcpListener::bind(cfg.metrics_addr).await {
+        Ok(listener) => {
+            let router = status::router(sync_status.clone());
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(listener, router).await {
+                    error!(error = %e, "metrics server exited");
+                }
+            });
+            info!(addr = %cfg.metrics_addr, "metrics server listening");
+        }
+        Err(e) => {
+            // Non-fatal: keep syncing even if the metrics port is taken.
+            warn!(addr = %cfg.metrics_addr, error = %e, "metrics bind failed; continuing without it");
+        }
+    }
+
     let tick = cfg.jittered_interval();
     info!(site = %cfg.site_code, interval_secs = tick.as_secs(), "entering sync loop");
     let mut ticker = interval(tick);
@@ -67,19 +86,22 @@ async fn main() -> ExitCode {
             }
             _ = ticker.tick() => {
                 match reconcile(&pool, &client, &cfg.site_code).await {
-                    Ok(Outcome::UpToDate { epoch }) => {
-                        info!(site = %cfg.site_code, epoch, "up to date");
-                    }
-                    Ok(Outcome::DeltaApplied { from, to, changes }) => {
-                        info!(site = %cfg.site_code, from, to, changes, "delta applied");
-                    }
-                    Ok(Outcome::Snapshotted { epoch, rows }) => {
-                        info!(site = %cfg.site_code, epoch, rows, "snapshot applied");
+                    Ok(outcome) => {
+                        match &outcome {
+                            Outcome::UpToDate { epoch } =>
+                                info!(site = %cfg.site_code, epoch = *epoch, "up to date"),
+                            Outcome::DeltaApplied { from, to, changes } =>
+                                info!(site = %cfg.site_code, from = *from, to = *to, changes = *changes, "delta applied"),
+                            Outcome::Snapshotted { epoch, rows } =>
+                                info!(site = %cfg.site_code, epoch = *epoch, rows = *rows, "snapshot applied"),
+                        }
+                        sync_status.record_success(&outcome);
                     }
                     Err(e) => {
                         // Transient (WAN down, central restarting): keep the
                         // last-applied state and retry next tick.
                         warn!(site = %cfg.site_code, error = %e, "reconcile failed; will retry");
+                        sync_status.record_error();
                     }
                 }
             }

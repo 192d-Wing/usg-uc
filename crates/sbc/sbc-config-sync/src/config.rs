@@ -34,6 +34,8 @@ pub struct Config {
     /// Base poll interval. A per-site jitter is added so 184 agents don't
     /// stampede the central API in lockstep.
     pub interval: Duration,
+    /// Listen address for the metrics/health HTTP server.
+    pub metrics_addr: std::net::SocketAddr,
 }
 
 impl Config {
@@ -69,12 +71,20 @@ impl Config {
             })
             .transpose()?
             .unwrap_or(60);
+        let metrics_addr = lookup("SYNC_METRICS_ADDR")
+            .unwrap_or_else(|| "0.0.0.0:9090".to_string())
+            .parse()
+            .map_err(|e: std::net::AddrParseError| ConfigError::Invalid {
+                var: "SYNC_METRICS_ADDR",
+                reason: e.to_string(),
+            })?;
         Ok(Self {
             site_code,
             local_database_url,
             central_url,
             bearer_token,
             interval: Duration::from_secs(interval_secs),
+            metrics_addr,
         })
     }
 
