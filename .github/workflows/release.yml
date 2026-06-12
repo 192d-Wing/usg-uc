@@ -105,8 +105,14 @@ jobs:
           file: ${{ matrix.image.dockerfile }}
           platforms: ${{ matrix.platform.arch }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.image.name }}-${{ env.PLATFORM_PAIR }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}-${{ env.PLATFORM_PAIR }}
+          # Registry cache instead of type=gha: the GHA cache backend can't fit
+          # 7 images x 2 arches of mode=max Rust layers under the 10 GB repo
+          # limit (constant eviction), and its API throttles the 14 concurrent
+          # exporters. GHCR dedupes blobs already pushed, so steady-state
+          # exports are cheap. cache-to is empty on build-only dispatch runs
+          # (no GHCR login, so no way to write cache); empty is ignored.
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ matrix.image.name }}:buildcache-${{ env.PLATFORM_PAIR }}
+          cache-to: ${{ (github.event_name == 'push' || inputs.push) && format('type=registry,ref={0}/{1}:buildcache-{2},mode=max,image-manifest=true,oci-mediatypes=true', env.REGISTRY, matrix.image.name, env.PLATFORM_PAIR) || '' }}
           provenance: false
           outputs: type=image,name=${{ env.REGISTRY }}/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=${{ github.event_name == 'push' || inputs.push }}
 
