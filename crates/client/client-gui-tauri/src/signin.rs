@@ -214,6 +214,16 @@ pub async fn start_signin(
         return Err("Enter the service domain (e.g. sbc.oopl.dev.mil)".to_string());
     }
 
+    // A non-empty extra CA path from the form replaces the persisted one,
+    // so reject anything that isn't a readable file — a typo here would
+    // otherwise silently clobber a working persisted path.
+    let extra_ca_path = extra_ca_path.filter(|p| !p.trim().is_empty());
+    if let Some(ref p) = extra_ca_path {
+        if !std::path::Path::new(p.trim()).is_file() {
+            return Err(format!("Extra CA certificate path is not a file: {p}"));
+        }
+    }
+
     // Persist the domain + optional extra CA up front so the HTTP client
     // builder and a later silent resume can find them.
     {
@@ -226,7 +236,7 @@ pub async fn start_signin(
         sm.settings_mut().provisioning = Some(ProvisioningSettings {
             service_domain: domain.clone(),
             refresh_token_persisted: false,
-            extra_ca_cert_file: extra_ca_path.filter(|p| !p.trim().is_empty()).or(prev_ca),
+            extra_ca_cert_file: extra_ca_path.or(prev_ca),
         });
         if let Err(e) = sm.save() {
             warn!(error = %e, "failed to persist provisioning settings");
