@@ -363,7 +363,10 @@ mod tests {
             .iter()
             .find(|t| t["table"] == "phones")
             .expect("phones table");
-        assert_eq!(phones["rows"].as_array().expect("rows").len(), 1);
+        let rows = phones["rows"].as_array().expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], "p1");
+        assert_eq!(rows[0]["payload"], serde_json::json!({"id": "p1"}));
 
         // A site that exists in auth but not the registry: token for a
         // never-registered site (auth passes on claim match, store 404s).

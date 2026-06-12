@@ -14,7 +14,7 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::{Postgres, Row, Transaction};
 
 use crate::error::{CentralError, CentralResult};
-use crate::model::{Change, ChangeOp, ConfigTable, DeltaResult, Snapshot, TableRows};
+use crate::model::{Change, ChangeOp, ConfigTable, DeltaResult, Snapshot, SnapshotRow, TableRows};
 
 /// Tables that are LIST-partitioned by `site_code`; [`register_site`]
 /// creates one partition of each per site. Mirrors the array in
@@ -487,12 +487,12 @@ async fn journal(
     Ok(())
 }
 
-/// Read one table's live rows for a site as canonical JSON payloads.
+/// Read one table's live rows for a site as id + canonical JSON payload.
 async fn snapshot_table(
     tx: &mut Transaction<'_, Postgres>,
     table: ConfigTable,
     site_code: &str,
-) -> CentralResult<Vec<Value>> {
+) -> CentralResult<Vec<SnapshotRow>> {
     if table == ConfigTable::DirectoryNumbers {
         let rows = sqlx::query(
             "SELECT did, sip_user, partition, description, extra
@@ -505,27 +505,32 @@ async fn snapshot_table(
         .await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
+            let did: String = row.try_get("did")?;
             let extra: Value = row.try_get("extra")?;
             let extra_map = extra.as_object().cloned().unwrap_or_default();
-            out.push(did_payload(
-                row.try_get::<String, _>("did")?.as_str(),
+            let payload = did_payload(
+                &did,
                 row.try_get::<Option<String>, _>("sip_user")?.as_deref(),
                 row.try_get::<Option<String>, _>("partition")?.as_deref(),
                 row.try_get::<Option<String>, _>("description")?.as_deref(),
                 &extra_map,
-            ));
+            );
+            out.push(SnapshotRow { id: did, payload });
         }
         Ok(out)
     } else {
-        // phones + JSONB tables all expose `data`.
+        // phones + JSONB tables all expose `id` + `data`.
         let sql = format!(
-            "SELECT data FROM {} WHERE site_code = $1 AND NOT deleted ORDER BY id",
+            "SELECT id, data FROM {} WHERE site_code = $1 AND NOT deleted ORDER BY id",
             table.name()
         );
         let rows = sqlx::query(&sql).bind(site_code).fetch_all(&mut **tx).await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
-            out.push(row.try_get::<Value, _>("data")?);
+            out.push(SnapshotRow {
+                id: row.try_get::<String, _>("id")?,
+                payload: row.try_get::<Value, _>("data")?,
+            });
         }
         Ok(out)
     }

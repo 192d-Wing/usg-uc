@@ -149,6 +149,17 @@ pub struct Snapshot {
 pub struct TableRows {
     /// Which table these rows belong to.
     pub table: ConfigTable,
-    /// The rows' canonical JSON payloads.
-    pub rows: Vec<serde_json::Value>,
+    /// The live rows.
+    pub rows: Vec<SnapshotRow>,
+}
+
+/// One row in a [`Snapshot`]: its identifier and canonical JSON payload.
+/// The id is carried explicitly because some payloads (e.g. site
+/// telephony config) don't embed it, and the applying agent keys on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotRow {
+    /// The row's identifier within its table (`id`, or `did`).
+    pub id: String,
+    /// The row's canonical JSON payload (what the site store consumes).
+    pub payload: serde_json::Value,
 }

@@ -181,7 +181,8 @@ async fn delta_returns_changes_and_snapshot_materializes_live_rows() {
         .find(|t| t.table == ConfigTable::Phones)
         .expect("phones table in snapshot");
     assert_eq!(phones.rows.len(), 1, "only the live phone");
-    assert_eq!(phones.rows[0], json!({"id": "p1", "v": 2}));
+    assert_eq!(phones.rows[0].id, "p1");
+    assert_eq!(phones.rows[0].payload, json!({"id": "p1", "v": 2}));
 }
 
 #[tokio::test]
@@ -278,5 +279,6 @@ async fn tombstoned_mac_is_reusable() {
     let snap = store.snapshot("DDDD").await.expect("snapshot");
     let phones = snap.tables.iter().find(|t| t.table == ConfigTable::Phones).expect("phones");
     assert_eq!(phones.rows.len(), 1);
-    assert_eq!(phones.rows[0], json!({"id": "new"}));
+    assert_eq!(phones.rows[0].id, "new");
+    assert_eq!(phones.rows[0].payload, json!({"id": "new"}));
 }

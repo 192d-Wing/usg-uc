@@ -257,6 +257,7 @@ async fn central_and_local_schemas_agree() {
         "cucm_calling_search_spaces",
         "cucm_route_patterns",
         "cucm_route_lists",
+        "site_telephony_config",
     ] {
         let local_cols = columns(&local, table).await;
         let central_cols = columns(&central, table).await;

@@ -21,6 +21,6 @@ pub mod schema;
 pub mod store;
 
 pub use error::{CentralError, CentralResult};
-pub use model::{Change, ChangeOp, ConfigTable, DeltaResult, Snapshot, TableRows};
+pub use model::{Change, ChangeOp, ConfigTable, DeltaResult, Snapshot, SnapshotRow, TableRows};
 pub use schema::ensure_schema;
 pub use store::CentralConfigStore;

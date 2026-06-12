@@ -230,19 +230,32 @@ claim must match the path
 `{site_code}` or 403. Recommend OIDC since Keycloak and JWKS validation
 already exist in the stack (`proto-jwt`).
 
-### 5.2 Edge agent: `sbc-config-sync` (new crate + pod)
+### 5.2 Edge agent: `sbc-config-sync` (implemented)
 
-- Polls `/epoch` on an interval (default 60s ± jitter to spread 184 sites'
-  load; the probe is one tiny row).
-- On change: fetch delta, apply to local Postgres **in one transaction**,
-  record applied epoch in a local `sync_state` table, then call the daemon's
-  existing gRPC refresh (same hook `sbc-api-server` uses today) so dial-plan
-  and trunk changes take effect without restart.
-- On 410 / fresh install / corrupted state: full snapshot, then deltas.
-- Exposes `/metrics`: `applied_epoch`, `central_epoch`, `last_success_ts`,
-  `sync_errors_total` → central dashboard charts staleness per site.
+Lives in [`crates/sbc/sbc-config-sync`](../crates/sbc/sbc-config-sync); one
+pod per base.
+
+- Polls `/epoch` on an interval (default 60s ± a per-site jitter derived
+  from the site code, so 184 agents don't stampede in lockstep; the probe
+  is one tiny row).
+- On change: fetch delta, apply to local Postgres **in one transaction**
+  (the apply engine), recording the applied epoch in the local `sync_state`
+  table within that same transaction.
+- Fresh install / `must_snapshot` directive / regressed local epoch → full
+  snapshot (whole-shard replace), then resume deltas.
 - Crash-safe and idempotent: re-applying a delta is harmless (upserts +
-  tombstones keyed by row id).
+  tombstones keyed by row id); applied rows are stamped
+  `updated_by = 'central'`, leaving local break-glass writes
+  (`updated_by = 'local'`) untouched.
+- The convergence policy (`reconcile`) is exercised end-to-end in tests via
+  an in-process `ConfigSource` over the real `CentralConfigStore` — snapshot
+  bootstrap, incremental deltas, tombstones, and regression recovery.
+
+**Deferred to a follow-up** (not blocking the pull/apply core): calling the
+daemon's gRPC refresh after an apply (so dial-plan/trunk changes take effect
+without a restart — same hook `sbc-api-server` uses), and a `/metrics`
+endpoint (`applied_epoch`, `central_epoch`, `last_success_ts`,
+`sync_errors_total`) for central staleness dashboards.
 
 ### 5.3 Failure behavior
 
