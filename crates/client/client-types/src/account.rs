@@ -57,6 +57,20 @@ impl DigestAuthCredentials {
     }
 }
 
+/// How a [`SipAccount`] authenticates its SIP requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SipAuthMode {
+    /// Mutual-TLS smart-card client certificate (CNSA 2.0 default).
+    #[default]
+    Mtls,
+    /// Username/password digest (testing only; NOT CNSA 2.0 compliant).
+    #[cfg(feature = "digest-auth")]
+    Digest,
+    /// RFC 8898 OIDC Bearer access token, set by the provisioning flow.
+    Bearer,
+}
+
 /// SIP account configuration.
 ///
 /// Note: Authentication uses smart card client certificates via mutual TLS.
@@ -93,6 +107,14 @@ pub struct SipAccount {
     /// Optional digest auth credentials for testing (NOT CNSA 2.0 compliant).
     #[cfg(feature = "digest-auth")]
     pub digest_credentials: Option<DigestAuthCredentials>,
+    /// SIP authentication mode (defaults to mTLS smart card).
+    #[serde(default)]
+    pub auth_mode: SipAuthMode,
+    /// OIDC bearer access token (JWT) for RFC 8898 REGISTER, set by the
+    /// provisioning/refresh flow. Never persisted to disk — held only in
+    /// memory and refreshed from the OIDC session.
+    #[serde(skip)]
+    pub bearer_token: Option<zeroize::Zeroizing<String>>,
 }
 
 impl Default for SipAccount {
@@ -112,6 +134,8 @@ impl Default for SipAccount {
             caller_id: None,
             #[cfg(feature = "digest-auth")]
             digest_credentials: None,
+            auth_mode: SipAuthMode::default(),
+            bearer_token: None,
         }
     }
 }

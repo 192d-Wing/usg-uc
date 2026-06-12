@@ -32,6 +32,12 @@ pub enum AppEvent {
         /// New state.
         state: RegistrationState,
     },
+    /// The registrar rejected our OIDC Bearer token (RFC 8898); the
+    /// provisioning session should refresh the token and re-register.
+    TokenRefreshRequired {
+        /// Account ID whose token needs refreshing.
+        account_id: String,
+    },
     /// Call state changed.
     CallStateChanged {
         /// Call ID.
@@ -790,6 +796,15 @@ impl ClientApp {
                 } else {
                     warn!("SIP transport not initialized");
                 }
+            }
+            RegistrationEvent::TokenRefreshRequired { account_id } => {
+                debug!(account_id = %account_id, "Bearer token refresh requested by registrar");
+                // Forward to the GUI/provisioning session, which owns the
+                // OIDC refresh + re-register.
+                let _ = self
+                    .app_event_tx
+                    .send(AppEvent::TokenRefreshRequired { account_id })
+                    .await;
             }
         }
 

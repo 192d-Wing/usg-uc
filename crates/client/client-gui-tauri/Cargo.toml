@@ -6,7 +6,7 @@ description = "USG SIP Soft Client - Modern Tauri-based GUI"
 
 [features]
 default = []
-digest-auth = ["client-core/digest-auth", "client-types/digest-auth", "dep:zeroize"]
+digest-auth = ["client-core/digest-auth", "client-types/digest-auth"]
 
 [dependencies]
 # Tauri for desktop app framework
@@ -15,18 +15,21 @@ tauri-plugin-shell = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# Client core and types
+# Client core and types. OIDC sign-in (discovery + browser PKCE +
+# keychain-persisted refresh token) ships on by default.
 client-types = { path = "../client-types" }
-client-core = { path = "../client-core" }
+client-core = { path = "../client-core", features = ["oidc"] }
 client-audio = { path = "../client-audio" }
+client-provisioning = { path = "../client-provisioning" }
 
 # Async runtime
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-# Optional dependencies for digest-auth feature
-zeroize = { workspace = true, optional = true }
+# Token/secret handling for the OIDC session.
+zeroize = { workspace = true }
+chrono = { workspace = true }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

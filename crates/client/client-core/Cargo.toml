@@ -18,6 +18,14 @@ digest-auth = [
     "hostname",
     "whoami",
 ]
+# OIDC sign-in support: persists the refresh token in the OS keychain
+# (CredentialStore) without pulling in the digest-auth code paths.
+oidc = [
+    "keyring",
+    "uc-crypto",
+    "hostname",
+    "whoami",
+]
 
 [dependencies]
 client-types = { path = "../client-types" }

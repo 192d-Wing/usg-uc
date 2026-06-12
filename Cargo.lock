@@ -1026,8 +1026,10 @@ dependencies = [
 name = "client-gui-tauri"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "client-audio",
  "client-core",
+ "client-provisioning",
  "client-types",
  "serde",
  "serde_json",
@@ -1055,6 +1057,24 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "client-provisioning"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "chrono",
+ "client-types",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -5704,6 +5724,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",

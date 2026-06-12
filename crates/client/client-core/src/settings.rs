@@ -42,10 +42,34 @@ pub struct Settings {
     /// Certificate filter settings.
     #[serde(default)]
     pub certificates: CertificateFilterSettings,
+
+    /// OIDC provisioning session (service domain + keychain flag). The
+    /// refresh token itself lives in the OS keychain, never in this file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provisioning: Option<ProvisioningSettings>,
 }
 
 fn default_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// Non-secret slice of the OIDC sign-in session persisted across launches.
+///
+/// Mirrors `client_provisioning::PersistedProvisioning`; kept as a local
+/// type so `client-core` does not depend on the provisioning crate.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProvisioningSettings {
+    /// Service domain entered at sign-in (e.g. `sbc.oopl.dev.mil`).
+    #[serde(default)]
+    pub service_domain: String,
+    /// Whether a refresh token for `service_domain` is stored in the OS
+    /// keychain (enables silent resume on next launch).
+    #[serde(default)]
+    pub refresh_token_persisted: bool,
+    /// Optional extra CA PEM path used for discovery/IdP TLS trust (the
+    /// internal CA), mirrored from the sign-in form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_ca_cert_file: Option<String>,
 }
 
 /// General application settings.
@@ -369,6 +393,7 @@ impl Default for Settings {
             network: NetworkSettings::default(),
             ui: UiSettings::default(),
             certificates: CertificateFilterSettings::default(),
+            provisioning: None,
         }
     }
 }
@@ -382,7 +407,7 @@ pub struct SettingsManager {
     /// Whether settings have been modified since last save.
     dirty: bool,
     /// Secure credential storage (when digest-auth feature is enabled).
-    #[cfg(feature = "digest-auth")]
+    #[cfg(any(feature = "digest-auth", feature = "oidc"))]
     credential_store: Option<crate::credential_store::CredentialStore>,
 }
 
@@ -391,7 +416,7 @@ impl SettingsManager {
     pub fn new() -> AppResult<Self> {
         let settings_path = Self::settings_file_path()?;
 
-        #[cfg(feature = "digest-auth")]
+        #[cfg(any(feature = "digest-auth", feature = "oidc"))]
         let config_dir = settings_path
             .parent()
             .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
@@ -403,7 +428,7 @@ impl SettingsManager {
             Settings::default()
         };
 
-        #[cfg(feature = "digest-auth")]
+        #[cfg(any(feature = "digest-auth", feature = "oidc"))]
         let credential_store = match crate::credential_store::CredentialStore::new(config_dir) {
             Ok(store) => {
                 info!(backend = %store.backend(), "Credential store initialized");
@@ -419,14 +444,14 @@ impl SettingsManager {
             settings,
             settings_path,
             dirty: false,
-            #[cfg(feature = "digest-auth")]
+            #[cfg(any(feature = "digest-auth", feature = "oidc"))]
             credential_store,
         })
     }
 
     /// Creates a settings manager with a custom path (for testing).
     pub fn with_path(path: PathBuf) -> AppResult<Self> {
-        #[cfg(feature = "digest-auth")]
+        #[cfg(any(feature = "digest-auth", feature = "oidc"))]
         let config_dir = path
             .parent()
             .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
@@ -437,14 +462,14 @@ impl SettingsManager {
             Settings::default()
         };
 
-        #[cfg(feature = "digest-auth")]
+        #[cfg(any(feature = "digest-auth", feature = "oidc"))]
         let credential_store = crate::credential_store::CredentialStore::new(config_dir).ok();
 
         Ok(Self {
             settings,
             settings_path: path,
             dirty: false,
-            #[cfg(feature = "digest-auth")]
+            #[cfg(any(feature = "digest-auth", feature = "oidc"))]
             credential_store,
         })
     }
@@ -691,6 +716,61 @@ impl SettingsManager {
             .as_ref()
             .map(crate::credential_store::CredentialStore::backend)
     }
+
+    // ========== OIDC refresh-token persistence (feature = "oidc") ==========
+    //
+    // The refresh token enables silent resume across launches (design doc:
+    // "Persisted across restarts (OS keystore)"). It is keyed per service
+    // domain under the shared `usg-sip-client` keyring service, in a
+    // namespace distinct from digest passwords.
+
+    /// Keychain account key for a service domain's refresh token.
+    #[cfg(feature = "oidc")]
+    fn refresh_token_key(service_domain: &str) -> String {
+        format!("oidc-refresh:{service_domain}")
+    }
+
+    /// Stores the OIDC refresh token for `service_domain` in the OS keychain.
+    ///
+    /// Returns `Ok(true)` when stored, `Ok(false)` when credential storage is
+    /// unavailable (the caller should fall back to browser sign-in next
+    /// launch).
+    #[cfg(feature = "oidc")]
+    pub fn store_refresh_token(&mut self, service_domain: &str, token: &str) -> AppResult<bool> {
+        let key = Self::refresh_token_key(service_domain);
+        if let Some(ref mut store) = self.credential_store {
+            store.store_password(&key, token)?;
+            info!(service_domain = %service_domain, "OIDC refresh token stored");
+            Ok(true)
+        } else {
+            warn!("Credential storage not available; refresh token not persisted");
+            Ok(false)
+        }
+    }
+
+    /// Retrieves the OIDC refresh token for `service_domain` from the OS
+    /// keychain, if one was persisted.
+    #[cfg(feature = "oidc")]
+    pub fn get_refresh_token(
+        &mut self,
+        service_domain: &str,
+    ) -> AppResult<Option<zeroize::Zeroizing<String>>> {
+        let key = Self::refresh_token_key(service_domain);
+        self.credential_store
+            .as_mut()
+            .map_or_else(|| Ok(None), |store| store.get_password(&key))
+    }
+
+    /// Deletes the OIDC refresh token for `service_domain` (sign-out).
+    #[cfg(feature = "oidc")]
+    pub fn delete_refresh_token(&mut self, service_domain: &str) -> AppResult<()> {
+        let key = Self::refresh_token_key(service_domain);
+        if let Some(ref mut store) = self.credential_store {
+            store.delete_password(&key)?;
+            info!(service_domain = %service_domain, "OIDC refresh token deleted");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -715,6 +795,8 @@ mod tests {
             caller_id: None,
             #[cfg(feature = "digest-auth")]
             digest_credentials: None,
+            auth_mode: client_types::SipAuthMode::Mtls,
+            bearer_token: None,
         }
     }
 

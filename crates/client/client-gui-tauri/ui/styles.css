@@ -2376,3 +2376,135 @@ h2 .section-icon {
     background-color: #FFE11A;
     color: #000000;
 }
+/* ===== OIDC Sign-In Gate ===== */
+.signin-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 2000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: var(--md-sys-color-surface);
+}
+
+.signin-overlay.hidden {
+    display: none;
+}
+
+.signin-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+    width: min(420px, 90vw);
+    padding: 32px;
+    border-radius: 28px;
+    background-color: var(--md-sys-color-surface-container);
+    border: 1px solid var(--md-sys-color-outline-variant);
+}
+
+.signin-logo {
+    width: 96px;
+    height: 96px;
+    object-fit: contain;
+}
+
+.signin-title {
+    font-size: 22px;
+    font-weight: 500;
+    color: var(--md-sys-color-on-surface);
+}
+
+.signin-subtitle {
+    font-size: 14px;
+    color: var(--md-sys-color-on-surface-variant);
+    text-align: center;
+}
+
+.signin-form {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    width: 100%;
+}
+
+.signin-form .form-group label {
+    color: var(--md-sys-color-on-surface-variant);
+    font-size: 13px;
+}
+
+.signin-form input {
+    width: 100%;
+}
+
+.signin-submit {
+    width: 100%;
+    justify-content: center;
+}
+
+.signin-advanced-ca {
+    width: 100%;
+    font-size: 13px;
+    color: var(--md-sys-color-on-surface-variant);
+}
+
+.signin-advanced-ca summary {
+    cursor: pointer;
+    padding: 4px 0;
+}
+
+.signin-progress {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    color: var(--md-sys-color-on-surface-variant);
+    font-size: 14px;
+    text-align: center;
+}
+
+.signin-progress.hidden {
+    display: none;
+}
+
+.signin-spinner {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    border: 3px solid var(--md-sys-color-outline-variant);
+    border-top-color: var(--md-sys-color-primary);
+    animation: signin-spin 0.9s linear infinite;
+}
+
+@keyframes signin-spin {
+    to { transform: rotate(360deg); }
+}
+
+.signin-error {
+    width: 100%;
+    padding: 12px;
+    border-radius: 12px;
+    background-color: var(--md-sys-color-error-container);
+    color: var(--md-sys-color-on-error-container);
+    font-size: 13px;
+    text-align: center;
+    overflow-wrap: anywhere;
+}
+
+.signin-error.hidden {
+    display: none;
+}
+
+.signin-advanced-link {
+    background: none;
+    border: none;
+    color: var(--md-sys-color-primary);
+    font-size: 13px;
+    cursor: pointer;
+    padding: 4px 8px;
+}
+
+.signin-advanced-link:hover {
+    text-decoration: underline;
+}

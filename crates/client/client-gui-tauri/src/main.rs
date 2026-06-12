@@ -23,8 +23,10 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{error, info, warn};
 
+mod signin;
+
 /// Application state holding the SIP client core.
-struct TauriAppState {
+pub(crate) struct TauriAppState {
     /// SIP client core application.
     client: Arc<Mutex<Option<ClientApp>>>,
     /// Audio device manager for device enumeration.
@@ -39,6 +41,10 @@ struct TauriAppState {
     selected_cert_thumbprint: Arc<RwLock<Option<String>>>,
     /// Event receiver for app events.
     event_rx: Arc<Mutex<Option<mpsc::Receiver<AppEvent>>>>,
+    /// OIDC sign-in session (discovery/auth/provisioning lifecycle).
+    session: Arc<RwLock<client_provisioning::ProvisionedSession>>,
+    /// Cancellation handle for an in-flight browser sign-in.
+    signin_cancel: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
 
 /// Audio device information for the frontend.
@@ -1467,6 +1473,7 @@ async fn open_config_file(state: State<'_, TauriAppState>) -> Result<(), String>
 const fn event_name(event: &AppEvent) -> &'static str {
     match event {
         AppEvent::RegistrationStateChanged { .. } => "registration-state-changed",
+        AppEvent::TokenRefreshRequired { .. } => "token-refresh-required",
         AppEvent::CallStateChanged { .. } => "call-state-changed",
         AppEvent::IncomingCall { .. } => "incoming-call",
         AppEvent::IncomingCallCancelled { .. } => "incoming-call-cancelled",
@@ -1489,6 +1496,9 @@ fn event_payload(event: &AppEvent) -> serde_json::Value {
                 "account_id": account_id,
                 "state": format!("{state:?}")
             })
+        }
+        AppEvent::TokenRefreshRequired { account_id } => {
+            serde_json::json!({ "account_id": account_id })
         }
         AppEvent::CallStateChanged {
             call_id,
@@ -1686,6 +1696,10 @@ fn create_app_state() -> Option<(TauriAppState, EventReceiver)> {
         cert_store,
         selected_cert_thumbprint: Arc::new(RwLock::new(None)),
         event_rx: event_rx.clone(),
+        session: Arc::new(RwLock::new(
+            client_provisioning::ProvisionedSession::default(),
+        )),
+        signin_cancel: Arc::new(Mutex::new(None)),
     };
 
     Some((app_state, event_rx))
@@ -1758,12 +1772,24 @@ fn main() {
             save_classification_config,
             // Config file command
             open_config_file,
+            // OIDC sign-in / provisioning commands
+            signin::get_session_state,
+            signin::start_signin,
+            signin::cancel_signin,
+            signin::sign_out,
+            signin::try_silent_resume,
         ])
         .setup(move |app| {
             // Start event polling task
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 poll_events(app_handle, event_rx).await;
+            });
+
+            // Half-life OIDC token refresh + config-TTL re-fetch loop
+            let refresh_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                signin::refresh_loop(refresh_handle).await;
             });
 
             Ok(())

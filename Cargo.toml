@@ -85,6 +85,7 @@ members = [
 
     # SIP Soft Client
     "crates/client/client-types",
+    "crates/client/client-provisioning",
     "crates/client/client-audio",
     "crates/client/client-sip-ua",
     "crates/client/client-core",
@@ -228,6 +229,7 @@ tonic-reflection = "0.14"
 
 # Internal crates - SIP Soft Client
 client-types = { path = "crates/client/client-types" }
+client-provisioning = { path = "crates/client/client-provisioning" }
 client-audio = { path = "crates/client/client-audio" }
 client-sip-ua = { path = "crates/client/client-sip-ua" }
 client-core = { path = "crates/client/client-core" }
