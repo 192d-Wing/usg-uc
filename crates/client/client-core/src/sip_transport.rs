@@ -426,38 +426,59 @@ pub enum TransportEvent {
     },
 }
 
-/// Active TLS connection to a SIP peer.
+/// Active TLS connection to a SIP peer (write half only).
+///
+/// The read half lives in the per-connection receive task: a read must
+/// never execute under the shared connections lock, or every sender
+/// deadlocks behind a receive that is itself waiting for the response to
+/// the message the sender is trying to write.
 struct TlsConnection {
-    /// TLS stream.
-    stream: TlsStream<TcpStream>,
+    /// TLS stream write half.
+    write_half: tokio::io::WriteHalf<TlsStream<TcpStream>>,
+    /// Peer address.
+    peer_addr: SocketAddr,
+}
+
+impl TlsConnection {
+    /// Creates a new TLS connection from the write half of a split stream.
+    const fn new(write_half: tokio::io::WriteHalf<TlsStream<TcpStream>>, peer_addr: SocketAddr) -> Self {
+        Self { write_half, peer_addr }
+    }
+
+    /// Sends a SIP message.
+    async fn send(&mut self, message: &[u8]) -> AppResult<()> {
+        let peer = self.peer_addr;
+        self.write_half
+            .write_all(message)
+            .await
+            .map_err(|e| AppError::Sip(format!("Failed to send to {peer}: {e}")))?;
+        self.write_half
+            .flush()
+            .await
+            .map_err(|e| AppError::Sip(format!("Failed to flush to {peer}: {e}")))?;
+        Ok(())
+    }
+}
+
+/// Read half of a TLS connection plus its reassembly buffer, owned
+/// exclusively by the connection's receive task.
+struct TlsReader {
+    /// TLS stream read half.
+    read_half: tokio::io::ReadHalf<TlsStream<TcpStream>>,
     /// Peer address.
     peer_addr: SocketAddr,
     /// Read buffer for partial messages.
     read_buffer: BytesMut,
 }
 
-impl TlsConnection {
-    /// Creates a new TLS connection.
-    fn new(stream: TlsStream<TcpStream>, peer_addr: SocketAddr) -> Self {
+impl TlsReader {
+    /// Creates a reader over the read half of a split stream.
+    fn new(read_half: tokio::io::ReadHalf<TlsStream<TcpStream>>, peer_addr: SocketAddr) -> Self {
         Self {
-            stream,
+            read_half,
             peer_addr,
             read_buffer: BytesMut::with_capacity(MAX_SIP_MESSAGE_SIZE),
         }
-    }
-
-    /// Sends a SIP message.
-    async fn send(&mut self, message: &[u8]) -> AppResult<()> {
-        let peer = self.peer_addr;
-        self.stream
-            .write_all(message)
-            .await
-            .map_err(|e| AppError::Sip(format!("Failed to send to {peer}: {e}")))?;
-        self.stream
-            .flush()
-            .await
-            .map_err(|e| AppError::Sip(format!("Failed to flush to {peer}: {e}")))?;
-        Ok(())
     }
 
     /// Reads data from the connection and returns any complete SIP messages.
@@ -465,7 +486,7 @@ impl TlsConnection {
         let mut buf = [0u8; 4096];
         let peer = self.peer_addr;
         let n = self
-            .stream
+            .read_half
             .read(&mut buf)
             .await
             .map_err(|e| AppError::Sip(format!("Failed to read from {peer}: {e}")))?;
@@ -1051,39 +1072,39 @@ impl SipTransport {
 
         info!(peer = %peer, "TLS connection established");
 
-        // Store connection
-        let conn = TlsConnection::new(tls_stream, peer);
+        // Split the stream: senders share the write half through the
+        // connections map; the receive task owns the read half outright so
+        // a pending read can never hold the connections lock.
+        let (read_half, write_half) = tokio::io::split(tls_stream);
         {
             let mut connections = self.connections.lock().await;
-            connections.insert(peer, conn);
+            connections.insert(peer, TlsConnection::new(write_half, peer));
         }
 
         // Notify connected
         let _ = self.event_tx.send(TransportEvent::Connected { peer }).await;
 
         // Spawn receive task for this connection
-        self.spawn_receive_task(peer);
+        self.spawn_receive_task(TlsReader::new(read_half, peer));
 
         Ok(())
     }
 
     /// Spawns a task to receive messages from a connection.
-    fn spawn_receive_task(&self, peer: SocketAddr) {
+    fn spawn_receive_task(&self, mut reader: TlsReader) {
         let connections = self.connections.clone();
         let event_tx = self.event_tx.clone();
+        let peer = reader.peer_addr;
 
         tokio::spawn(async move {
             loop {
-                let result = {
-                    let mut conns = connections.lock().await;
-                    if let Some(conn) = conns.get_mut(&peer) {
-                        conn.recv().await
-                    } else {
-                        break; // Connection removed
-                    }
-                };
+                // Stop when the connection was removed (shutdown/replace);
+                // the lock is taken briefly and never held across the read.
+                if !connections.lock().await.contains_key(&peer) {
+                    break;
+                }
 
-                match result {
+                match reader.recv().await {
                     Ok(Some(message)) => {
                         debug!(peer = %peer, "Received SIP message");
                         match message {
