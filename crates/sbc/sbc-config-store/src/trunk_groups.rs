@@ -15,9 +15,9 @@
 
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
-use tracing::debug;
 
 use crate::error::{ConfigStoreError, ConfigStoreResult};
+use crate::schema;
 
 /// Pooled Postgres backend for trunk groups.
 #[derive(Clone)]
@@ -35,9 +35,8 @@ impl PostgresTrunkGroupStore {
             .max_connections(5)
             .connect(database_url)
             .await?;
-        let store = Self { pool };
-        store.create_tables().await?;
-        Ok(store)
+        schema::ensure_schema(&pool).await?;
+        Ok(Self { pool })
     }
 
     /// Construct from an existing pool.
@@ -45,30 +44,14 @@ impl PostgresTrunkGroupStore {
     /// # Errors
     /// Returns `ConfigStoreError::Storage` on schema bootstrap failure.
     pub async fn from_pool(pool: PgPool) -> ConfigStoreResult<Self> {
-        let store = Self { pool };
-        store.create_tables().await?;
-        Ok(store)
+        schema::ensure_schema(&pool).await?;
+        Ok(Self { pool })
     }
 
     /// Expose the underlying pool for cross-store reuse.
     #[must_use]
     pub const fn pool(&self) -> &PgPool {
         &self.pool
-    }
-
-    async fn create_tables(&self) -> ConfigStoreResult<()> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS trunk_groups (
-                id TEXT PRIMARY KEY,
-                data JSONB NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )",
-        )
-        .execute(&self.pool)
-        .await?;
-        debug!("trunk_groups table ready");
-        Ok(())
     }
 
     /// Upsert a trunk group's full JSON body.
@@ -81,6 +64,7 @@ impl PostgresTrunkGroupStore {
              VALUES ($1, $2)
              ON CONFLICT (id) DO UPDATE SET
                  data       = EXCLUDED.data,
+                 deleted    = FALSE,
                  updated_at = NOW()",
         )
         .bind(id)
@@ -111,7 +95,7 @@ impl PostgresTrunkGroupStore {
     /// # Errors
     /// Returns `ConfigStoreError::NotFound` if absent.
     pub async fn get(&self, id: &str) -> ConfigStoreResult<serde_json::Value> {
-        let row = sqlx::query("SELECT data FROM trunk_groups WHERE id = $1")
+        let row = sqlx::query("SELECT data FROM trunk_groups WHERE id = $1 AND NOT deleted")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?
@@ -124,7 +108,7 @@ impl PostgresTrunkGroupStore {
     /// # Errors
     /// Returns `ConfigStoreError::Storage` for DB errors.
     pub async fn list(&self) -> ConfigStoreResult<Vec<serde_json::Value>> {
-        let rows = sqlx::query("SELECT data FROM trunk_groups ORDER BY id")
+        let rows = sqlx::query("SELECT data FROM trunk_groups WHERE NOT deleted ORDER BY id")
             .fetch_all(&self.pool)
             .await?;
         let mut out = Vec::with_capacity(rows.len());
@@ -139,7 +123,7 @@ impl PostgresTrunkGroupStore {
     /// # Errors
     /// Returns `ConfigStoreError::Storage` for DB errors.
     pub async fn is_empty(&self) -> ConfigStoreResult<bool> {
-        let row = sqlx::query("SELECT COUNT(*) AS count FROM trunk_groups")
+        let row = sqlx::query("SELECT COUNT(*) AS count FROM trunk_groups WHERE NOT deleted")
             .fetch_one(&self.pool)
             .await?;
         let count: i64 = row.try_get("count")?;

@@ -24,6 +24,7 @@ pub mod error;
 pub mod migration;
 pub mod model;
 pub mod phones;
+pub mod schema;
 pub mod trunk_groups;
 
 pub use cucm::{
@@ -39,4 +40,5 @@ pub use migration::{
 };
 pub use model::DirectoryNumber;
 pub use phones::PostgresPhoneStore;
+pub use schema::ensure_schema;
 pub use trunk_groups::PostgresTrunkGroupStore;

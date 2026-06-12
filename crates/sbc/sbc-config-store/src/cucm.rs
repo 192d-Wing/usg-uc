@@ -15,9 +15,9 @@
 
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
-use tracing::debug;
 
 use crate::error::{ConfigStoreError, ConfigStoreResult};
+use crate::schema;
 
 /// Generic JSONB-by-id store. One physical table per CUCM entity type,
 /// one [`CucmJsonStore`] instance per table.
@@ -28,10 +28,11 @@ pub struct CucmJsonStore {
 }
 
 impl CucmJsonStore {
-    /// Connect with a fresh pool and ensure the table exists.
+    /// Connect with a fresh pool and ensure the schema exists.
     ///
-    /// `table` must be a static identifier — it's interpolated into DDL
-    /// directly (no sqlx bind-params possible for identifiers).
+    /// `table` must be a static identifier — it's interpolated into SQL
+    /// directly (no sqlx bind-params possible for identifiers) and must
+    /// name a table the crate's migrations create.
     ///
     /// # Errors
     /// Returns `ConfigStoreError::Storage` on pool/schema failure.
@@ -40,9 +41,8 @@ impl CucmJsonStore {
             .max_connections(5)
             .connect(database_url)
             .await?;
-        let store = Self { pool, table };
-        store.create_tables().await?;
-        Ok(store)
+        schema::ensure_schema(&pool).await?;
+        Ok(Self { pool, table })
     }
 
     /// Construct from an existing pool (no extra connections).
@@ -50,30 +50,14 @@ impl CucmJsonStore {
     /// # Errors
     /// Returns `ConfigStoreError::Storage` on schema bootstrap failure.
     pub async fn from_pool(pool: PgPool, table: &'static str) -> ConfigStoreResult<Self> {
-        let store = Self { pool, table };
-        store.create_tables().await?;
-        Ok(store)
+        schema::ensure_schema(&pool).await?;
+        Ok(Self { pool, table })
     }
 
     /// Expose the underlying pool for cross-store reuse.
     #[must_use]
     pub const fn pool(&self) -> &PgPool {
         &self.pool
-    }
-
-    async fn create_tables(&self) -> ConfigStoreResult<()> {
-        let ddl = format!(
-            "CREATE TABLE IF NOT EXISTS {} (
-                id TEXT PRIMARY KEY,
-                data JSONB NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )",
-            self.table
-        );
-        sqlx::query(&ddl).execute(&self.pool).await?;
-        debug!(table = self.table, "cucm table ready");
-        Ok(())
     }
 
     /// Upsert a row's JSON body. Updates `updated_at` on conflict.
@@ -86,6 +70,7 @@ impl CucmJsonStore {
              VALUES ($1, $2)
              ON CONFLICT (id) DO UPDATE SET
                  data       = EXCLUDED.data,
+                 deleted    = FALSE,
                  updated_at = NOW()",
             self.table
         );
@@ -115,7 +100,7 @@ impl CucmJsonStore {
     /// # Errors
     /// Returns `ConfigStoreError::NotFound` if absent.
     pub async fn get(&self, id: &str) -> ConfigStoreResult<serde_json::Value> {
-        let sql = format!("SELECT data FROM {} WHERE id = $1", self.table);
+        let sql = format!("SELECT data FROM {} WHERE id = $1 AND NOT deleted", self.table);
         let row = sqlx::query(&sql)
             .bind(id)
             .fetch_optional(&self.pool)
@@ -129,7 +114,7 @@ impl CucmJsonStore {
     /// # Errors
     /// Returns `ConfigStoreError::Storage` for DB errors.
     pub async fn list(&self) -> ConfigStoreResult<Vec<serde_json::Value>> {
-        let sql = format!("SELECT data FROM {} ORDER BY id", self.table);
+        let sql = format!("SELECT data FROM {} WHERE NOT deleted ORDER BY id", self.table);
         let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {

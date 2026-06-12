@@ -32,6 +32,12 @@ impl From<sqlx::Error> for ConfigStoreError {
     }
 }
 
+impl From<sqlx::migrate::MigrateError> for ConfigStoreError {
+    fn from(err: sqlx::migrate::MigrateError) -> Self {
+        Self::Storage(err.to_string())
+    }
+}
+
 impl From<serde_json::Error> for ConfigStoreError {
     fn from(err: serde_json::Error) -> Self {
         Self::Serialization(err.to_string())

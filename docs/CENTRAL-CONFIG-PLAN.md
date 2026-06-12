@@ -85,7 +85,7 @@ Key properties:
 ## 3. What lives where
 
 | Config | Today | Target | Rationale |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Phones (MAC, vendor, lines, template) | Site Postgres `phones` | **Central, sharded** | Core provisioning data |
 | Directory numbers / DIDs | Site Postgres `directory_numbers` | **Central, sharded** | Fleet-wide number management, E.164 uniqueness checks |
 | Trunk groups + trunks | Site Postgres `trunk_groups` + Helm TOML examples | **Central, sharded** + global templates (§5.4) | Most trunks (e.g. BulkVS) are fleet-shared definitions with per-site selection |
@@ -118,9 +118,17 @@ CREATE TABLE sites (
 );
 ```
 
-Adding site #185 = insert a row + run the partition-DDL generator (a
-migration script that diffs `sites` against existing partitions and emits
-`CREATE TABLE … PARTITION OF …`). Never hand-write partition DDL.
+Adding site #185 = insert a row + run the partition-DDL generator
+(`deploy/central-db/scripts/gen-site-partitions.sh`, which diffs `sites`
+against existing partitions and emits `CREATE TABLE … PARTITION OF …`).
+Never hand-write partition DDL.
+
+**Site-code canon:** canonical form is uppercase — `^[A-Z][A-Z0-9-]{1,15}$`
+(starts with a letter; A–Z, 0–9, hyphen; 2–16 chars). Examples: `MUHJ`,
+`MPLS`, `OOPL-001`. The registry stores only the canonical form (enforced by
+a CHECK constraint); lowercase derivations — DNS labels, helm `site.name`,
+partition table names (`phones_p_oopl_001`) — are computed on demand, never
+stored. Inputs are uppercased at the API boundary before lookup.
 
 ### 4.2 Sharded config tables
 
@@ -142,10 +150,17 @@ CREATE TABLE phones (
 ) PARTITION BY LIST (site_code);
 ```
 
-`directory_numbers`, `trunk_groups`, `dial_plans`, and
-`site_telephony_config` follow the same shape (same envelope columns,
-existing payload formats). `directory_numbers` additionally gets a **global**
-unique index on the DID where E.164 uniqueness must hold fleet-wide.
+`directory_numbers`, `trunk_groups`, `dial_plans`, the four CUCM routing
+tables (`cucm_partitions`, `cucm_calling_search_spaces`,
+`cucm_route_patterns`, `cucm_route_lists`), and `site_telephony_config`
+follow the same shape (same envelope columns, existing payload formats).
+
+Fleet-wide DID uniqueness cannot be a unique index on `directory_numbers`
+itself — Postgres requires unique constraints on a partitioned table to
+include the partition key. Instead, an unpartitioned `did_registry (did
+PRIMARY KEY, site_code)` table is maintained by the central API in the same
+transaction as every `directory_numbers` write; the primary key turns a DID
+collision between two sites into a hard error.
 
 ### 4.3 Change journal (drives delta sync + audit)
 
@@ -175,7 +190,7 @@ snapshot if a site is further behind than any pruned horizon.
 
 ### 5.1 Endpoints (central-config-api)
 
-```
+```text
 GET /v1/sync/{site_code}/epoch
     → { "epoch": 4012 }                      # cheap staleness probe
 
@@ -210,7 +225,7 @@ already exist in the stack (`proto-jwt`).
 ### 5.3 Failure behavior
 
 | Failure | Behavior |
-|---|---|
+| --- | --- |
 | WAN down | Site serves last-applied config indefinitely; phones provision, calls route. Staleness metric climbs centrally. |
 | Central DB down | Same as WAN down for all sites; writes blocked (acceptable — writes are operator actions). |
 | Site Postgres lost | Sync agent detects empty `sync_state` → snapshot restore. Recovery = minutes, no central coordination. |
@@ -284,6 +299,7 @@ Because materialization is per-site, fleet-wide changes get rings for free:
 ## 9. Implementation phases
 
 ### Phase 0 — Foundations (no behavior change)
+
 - Real SQL migrations (sqlx migrate) replacing inline `CREATE TABLE IF NOT
   EXISTS`; add envelope columns (`site_code`, `revision`, `deleted`,
   `updated_by`) to existing table definitions, defaulted so current
@@ -293,6 +309,7 @@ Because materialization is per-site, fleet-wide changes get rings for free:
   and a path segment everywhere.
 
 ### Phase 1 — Central stack
+
 - Stand up central Postgres (HA: Patroni/CNPG pair + WAL archiving to object
   storage; this is the one DB that must not lose data).
 - New `central-config-api` service (reuses `sbc-config-store` +
@@ -303,6 +320,7 @@ Because materialization is per-site, fleet-wide changes get rings for free:
   (`trunk_groups`, `dial_plans` sections) into its shard.
 
 ### Phase 2 — Sync agent
+
 - New crate `sbc-config-sync` + container `usg-sbc-config-sync` (follows the
   `usg-` naming convention) + Helm template; `sync_state` table local-side.
 - Snapshot + delta apply + daemon gRPC refresh + metrics.
@@ -310,11 +328,13 @@ Because materialization is per-site, fleet-wide changes get rings for free:
   refresh behavior.
 
 ### Phase 3 — Write-path cutover
+
 - Dashboard → central API; site api-server config writes flipped read-only.
 - Central validation against typed schemas; journal/audit live.
 - Global templates + materialization + site assignments.
 
 ### Phase 4 — Fleet rollout
+
 - Onboard sites in rings: register site → import its data → deploy sync
   agent via `helm upgrade` → verify epoch convergence → flip local writes
   off. Per-site onboarding is one runbook page; bulk it with the existing
@@ -322,6 +342,7 @@ Because materialization is per-site, fleet-wide changes get rings for free:
 - Staleness dashboard + alerting (site > N hours behind, sync errors).
 
 ### Phase 5 — Hardening & extensions
+
 - Break-glass override mode (§7) for designated sites.
 - Firmware/template artifact management (phone firmware blobs in object
   storage, referenced by config rows; sync agent pre-fetches per-site).
@@ -333,7 +354,7 @@ Because materialization is per-site, fleet-wide changes get rings for free:
 ## 10. Risks & mitigations
 
 | Risk | Mitigation |
-|---|---|
+| --- | --- |
 | Central DB is a single point of failure for *writes* | HA pair + PITR backups; reads at sites unaffected by central outage |
 | 184 sites polling | `/epoch` probe is one indexed row; 184 req/min is negligible; jittered intervals |
 | Journal/main-table drift | Journal rows written in the same transaction as the mutation; nightly checker compares shard hash vs replayed journal |
@@ -341,4 +362,3 @@ Because materialization is per-site, fleet-wide changes get rings for free:
 | A bad fleet-wide dial-plan push | Ring-based materialization (§8); rollback = previous epoch payloads |
 | Site credential compromise | Credential is read-only and scoped to one shard; revoke in Keycloak |
 | JSONB payload divergence between central validation and daemon parsing | Both sides use the same `sbc-config` crate structs; CI round-trip test |
-```
