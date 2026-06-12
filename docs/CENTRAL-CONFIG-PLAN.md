@@ -201,17 +201,32 @@ snapshot if a site is further behind than any pruned horizon.
 GET /v1/sync/{site_code}/epoch
     → { "epoch": 4012 }                      # cheap staleness probe
 
-GET /v1/sync/{site_code}/delta?since={epoch}
-    → { "from": 3990, "to": 4012, "changes": [ {table, row_id, op, payload}… ] }
-    → 410 Gone if `since` is unknown/pruned  # client must snapshot
+GET /v1/sync/{site_code}/delta?since={epoch}   # since defaults to 0
+    → { "kind": "delta", "from": 3990, "to": 4012,
+        "changes": [ {epoch, table, row_id, op, payload?}… ] }
+    → { "kind": "must_snapshot", "current": 4012 }
+          when `since` is ahead of the shard (client regressed); re-snapshot
 
 GET /v1/sync/{site_code}/snapshot
-    → full shard dump, streamed, with current epoch
+    → { "epoch": 4012, "tables": [ {table, rows: [payload…]}… ] }
 ```
 
-Auth: per-site service account — OIDC client-credentials against Keycloak
-(`usg-uc-site-sync` client, one credential per site, `site_code` claim), or
-mTLS with internal-CA client certs. Token claim must match the path
+Both delta outcomes return HTTP 200 with a `kind`-tagged body — the client
+matches on `kind` rather than on status codes. (The journal is retained
+indefinitely, so a delta never falls off a lower pruning horizon; the only
+re-snapshot trigger is a client whose `since` exceeds the current epoch.)
+Implemented by [`central-config-api`](../crates/sbc/central-config-api),
+over the [`central-config-store`](../crates/sbc/central-config-store)
+transactional layer.
+
+Auth (implemented): per-site service account — OIDC client-credentials
+against Keycloak (`usg-uc-site-sync` client, one credential per site,
+carrying a `site_code` claim and the `config-sync` scope). The API
+validates the token against the issuer/audience via the shared `proto-jwt`
+validator and requires `claims.site_code == {site_code}` in the path — a
+401 on a bad/missing/expired token, 403 on a wrong-scope or wrong-site
+token. (mTLS with internal-CA client certs remains an alternative.) Token
+claim must match the path
 `{site_code}` or 403. Recommend OIDC since Keycloak and JWKS validation
 already exist in the stack (`proto-jwt`).
 

@@ -792,6 +792,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "central-config-api"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "axum",
+ "base64 0.22.1",
+ "central-config-store",
+ "http-body-util",
+ "jsonwebtoken",
+ "proto-jwt",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "central-config-store"
 version = "0.1.0"
 dependencies = [

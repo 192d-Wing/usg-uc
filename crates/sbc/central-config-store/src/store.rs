@@ -63,10 +63,22 @@ impl CentralConfigStore {
         Ok(Self { pool })
     }
 
-    /// The underlying pool (for health checks, shared construction).
+    /// The underlying pool (for shared construction).
     #[must_use]
     pub const fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Cheap round-trip to confirm the database is reachable (for
+    /// readiness probes).
+    ///
+    /// # Errors
+    /// [`CentralError::Storage`] if the query fails.
+    pub async fn ping(&self) -> CentralResult<()> {
+        sqlx::query_scalar::<_, i32>("SELECT 1")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(())
     }
 
     // ---------------------------------------------------------- registry

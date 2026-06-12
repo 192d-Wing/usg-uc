@@ -72,6 +72,7 @@ members = [
     "crates/sbc/sbc-config",
     "crates/sbc/sbc-config-store",
     "crates/sbc/central-config-store",
+    "crates/sbc/central-config-api",
     "crates/sbc/sbc-grpc-api",
     "crates/sbc/sbc-announcement",
     "crates/sbc/sbc-trunk-services",

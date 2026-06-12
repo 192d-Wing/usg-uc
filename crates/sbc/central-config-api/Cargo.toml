@@ -1,0 +1,47 @@
+[package]
+name = "central-config-api"
+description = "Central config API: the fleet-facing HTTP service. Serves the site-scoped sync surface (epoch/delta/snapshot) the per-site sbc-config-sync agent pulls, authorized by per-site OIDC service-account tokens. Phase 1 of docs/CENTRAL-CONFIG-PLAN.md."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "central-config-api"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["json"] }
+
+axum.workspace = true
+tower-http = { workspace = true, features = ["trace"] }
+
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror.workspace = true
+
+central-config-store = { path = "../central-config-store" }
+# OIDC bearer-token validation (JWKS cache + JWT validator), shared with
+# the SIP registrar and provisioning pods so the fleet authorizes tokens
+# identically.
+proto-jwt.workspace = true
+# HTTP client the JWKS cache fetches with. rustls only, no native-tls.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+http-body-util.workspace = true
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
+# Test-only token signing: ES256 keypair generation + JWT encode. No
+# static private key in the tree.
+jsonwebtoken.workspace = true
+aws-lc-rs = { workspace = true, default-features = false, features = ["aws-lc-sys"] }
+base64 = "0.22"
