@@ -328,6 +328,40 @@ impl RegisterResponse {
         }
     }
 
+    /// Creates a 401 Unauthorized response with a Bearer challenge
+    /// (RFC 8898 / RFC 6750). `challenge` is the `WWW-Authenticate` value,
+    /// e.g. from [`crate::bearer::BearerAuthenticator::challenge_header`].
+    pub fn unauthorized_bearer(challenge: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            status_code: 401,
+            reason: "Unauthorized".to_string(),
+            contacts: Vec::new(),
+            min_expires: None,
+            path: Vec::new(),
+            service_route: Vec::new(),
+            www_authenticate: Some(challenge.into()),
+            authentication_info: None,
+        }
+    }
+
+    /// Creates a 403 Forbidden response — the request authenticated but is
+    /// not authorized (e.g. a Bearer token whose `dn` does not own the AOR).
+    /// No challenge is included; re-authenticating would not help.
+    pub fn forbidden(reason: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            status_code: 403,
+            reason: reason.into(),
+            contacts: Vec::new(),
+            min_expires: None,
+            path: Vec::new(),
+            service_route: Vec::new(),
+            www_authenticate: None,
+            authentication_info: None,
+        }
+    }
+
     /// Sets authentication info for successful auth response.
     #[must_use]
     pub fn with_authentication_info(mut self, info: impl Into<String>) -> Self {

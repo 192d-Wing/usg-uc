@@ -32,6 +32,13 @@ site:
   # version), so SIP/API Services are LoadBalancer-type with a stable LB
   # IP. The FQDN `sbc.<fqdn_base>` resolves to this address.
   sbc_lb_ip: "10.50.1.10"
+  # Optional IPv6 anycast for the SIP VIP. When DNS publishes an AAAA for
+  # the registrar, soft clients PREFER it — so it must be a real allocated,
+  # BGP-advertised address or registration hangs. Both empty = v4-only.
+  # lb_pool_cidr6: a v6 block for the pool (e.g. "<prefix>::58/128");
+  # sbc_lb_ip6: the SIP Service's address within it.
+  lb_pool_cidr6: ""
+  sbc_lb_ip6: ""
 
 bgp:
   # Set true on the first chart install per cluster (creates cluster-wide
@@ -41,6 +48,11 @@ bgp:
   upstream:
     ip: "10.0.100.1"
     asn: 65000
+  # Label value the active CiliumBGPPeerConfig selects advertisements by.
+  # Leave as "bgp" when this chart installed the cluster BGP config; set to
+  # the existing config's matchLabels value when joining a cluster whose
+  # BGP config came from elsewhere (install_cluster_config: false).
+  advertise_label: bgp
 
 # ExternalDNS integration. The chart adds standard ExternalDNS hostname
 # annotations to Services; ExternalDNS itself is a cluster-wide install
@@ -192,7 +204,7 @@ sbcClientConfig:
   replicas: 2
   image:
     repository: ghcr.io/192d-wing/sbc-client-config-server
-    tag: "0.3.0"
+    tag: "0.5.0"
     pullPolicy: IfNotPresent
   resources:
     requests: { cpu: "20m",  memory: "32Mi"  }
@@ -225,6 +237,11 @@ sbcClientConfig:
   # Hostname for the Traefik Ingress. Defaults to sbc.<site.fqdn_base>.
   # Override when the ingress hostname differs from the FQDN base.
   ingressHost: ""
+  # Name of a kubernetes.io/tls Secret (in the release namespace) holding the
+  # cert/key for ingressHost. Empty = no tls block on the Ingress (Traefik
+  # falls back to its self-signed default cert — soft clients that pin the
+  # internal CA will refuse the discovery fetch).
+  ingressTlsSecretName: ""
   # PEM-encoded CA certificate(s) to trust when fetching OIDC metadata / JWKS.
   # Required when the IdP uses a private CA (e.g. OOPL Internal CA) that is
   # not in the Mozilla root bundle compiled into the binary.
@@ -344,6 +361,30 @@ sbcDaemon:
     runAsUser: 1000
     runAsGroup: 1000
     fsGroup: 1000
+  # SIP-over-TLS server credentials: name of a kubernetes.io/tls Secret
+  # (tls.crt = leaf+chain PEM, tls.key) in the release namespace, mounted at
+  # /etc/sbc/sip-tls and wired to security.tls_cert_path/tls_key_path. The
+  # cert must cover the SIP registrar domain (sbcClientConfig.registrarDomain).
+  # Empty = SIP TLS listeners disabled; the daemon serves UDP/TCP only and
+  # logs a warning for the configured tls_listen.
+  sipTls:
+    secretName: ""
+  # RFC 8898 Bearer-token REGISTER authorization. When enabled, the daemon
+  # rejects REGISTERs that don't carry a valid OIDC access token whose `dn`
+  # claim equals the AOR user part — the server-side half of the soft
+  # client's OIDC sign-in flow (docs/CLIENT-PROVISIONING-OIDC.md). The JWKS
+  # is fetched from the same IdP as sbcClientConfig, trusting
+  # sbcClientConfig.extraCaCert when set.
+  oidc:
+    enabled: false
+    # Issuer whose JWKS validates REGISTER tokens. Empty = reuse
+    # sbcClientConfig.oidc.issuer (the realm clients authenticate to).
+    issuer: ""
+    # Audience the SBC requires in the token's `aud`. The Keycloak `sip`
+    # scope must add "sbc" to the audience (see Configure-Voice.ps1).
+    audience: "sbc"
+    # WWW-Authenticate realm in 401 Bearer challenges. Empty = instance name.
+    realm: ""
   config:
     max_calls: 5000
     max_registrations: 10000

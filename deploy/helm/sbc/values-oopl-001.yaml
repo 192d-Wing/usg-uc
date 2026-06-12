@@ -1,0 +1,70 @@
+# oopl-001 site values — chart v0.5.0, all images pulled from GHCR @ 0.5.0
+# Preserves the existing release's site/bgp/kea/externalDns settings.
+
+site:
+  name: oopl-001
+  node: uk8wtwr002
+  fqdn_base: oopl.dev.mil
+  lb_pool_cidr: 10.10.10.58/31
+  sbc_lb_ip: 10.10.10.58
+  kea_lb_ip: 10.10.10.59
+  # v6 anycast mirror of sbc_lb_ip (pihole-anycast convention: v4/32 + v6/128
+  # per service). pihole DNS already publishes the matching AAAA.
+  lb_pool_cidr6: 2601:443:c200:575::58/128
+  sbc_lb_ip6: 2601:443:c200:575::58
+
+bgp:
+  install_cluster_config: false
+  # This cluster's pre-existing CiliumBGPPeerConfig (upstream-k3s-v4)
+  # selects advertisements labeled advertise=k3s-pod-cidrs.
+  advertise_label: k3s-pod-cidrs
+
+externalDns:
+  enabled: false
+
+kea:
+  enabled: false
+
+# --- all USG component images: GHCR, tag 0.5.0 (latest release) ---
+image:
+  repository: ghcr.io/192d-wing/sbc-daemon
+  tag: "0.5.0"
+  pullPolicy: IfNotPresent
+
+sbcFrontend:
+  image:
+    repository: ghcr.io/192d-wing/sbc-dashboard
+    tag: "0.5.0"
+    pullPolicy: IfNotPresent
+
+sbcApi:
+  image:
+    repository: ghcr.io/192d-wing/sbc-api-server
+    tag: "0.5.0"
+    pullPolicy: IfNotPresent
+
+sbcProvision:
+  image:
+    repository: ghcr.io/192d-wing/sbc-provision-server
+    tag: "0.5.0"
+    pullPolicy: IfNotPresent
+
+sbcClientConfig:
+  image:
+    repository: ghcr.io/192d-wing/sbc-client-config-server
+    tag: "0.5.0"
+    pullPolicy: IfNotPresent
+  # SIP registrar gets its own name: sbc.oopl.dev.mil must stay on the
+  # traefik LB (10.10.10.54) for the HTTPS provisioning ingress, while SIP
+  # listens on the sip LB (10.10.10.58). DNS: sip.oopl.dev.mil A 10.10.10.58
+  # (A record only — clients prefer AAAA and v6 to these VIPs is blackholed).
+  registrarDomain: sip.oopl.dev.mil
+  # OOPL-CA-signed leaf for sbc.oopl.dev.mil (created out-of-band; see
+  # usg-tacacs/deploy/k3s/pki for the issuance pattern).
+  ingressTlsSecretName: sbc-oopl-001-ingress-tls
+
+sbcDaemon:
+  # SIP-over-TLS server cert for sip.oopl.dev.mil (kubernetes.io/tls Secret,
+  # created out-of-band like the ingress cert above).
+  sipTls:
+    secretName: sbc-oopl-001-sip-tls

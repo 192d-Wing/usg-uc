@@ -14,6 +14,7 @@ members = [
     "crates/proto/proto-dialog",
     "crates/proto/proto-b2bua",
     "crates/proto/proto-registrar",
+    "crates/proto/proto-jwt",
     "crates/proto/proto-sdp",
     "crates/proto/proto-rtp",
     "crates/proto/proto-srtp",
@@ -84,6 +85,7 @@ members = [
 
     # SIP Soft Client
     "crates/client/client-types",
+    "crates/client/client-provisioning",
     "crates/client/client-audio",
     "crates/client/client-sip-ua",
     "crates/client/client-core",
@@ -201,6 +203,7 @@ proto-transaction = { path = "crates/proto/proto-transaction" }
 proto-dialog = { path = "crates/proto/proto-dialog" }
 proto-b2bua = { path = "crates/proto/proto-b2bua" }
 proto-registrar = { path = "crates/proto/proto-registrar" }
+proto-jwt = { path = "crates/proto/proto-jwt" }
 proto-sdp = { path = "crates/proto/proto-sdp" }
 proto-rtp = { path = "crates/proto/proto-rtp" }
 proto-srtp = { path = "crates/proto/proto-srtp" }
@@ -226,6 +229,7 @@ tonic-reflection = "0.14"
 
 # Internal crates - SIP Soft Client
 client-types = { path = "crates/client/client-types" }
+client-provisioning = { path = "crates/client/client-provisioning" }
 client-audio = { path = "crates/client/client-audio" }
 client-sip-ua = { path = "crates/client/client-sip-ua" }
 client-core = { path = "crates/client/client-core" }

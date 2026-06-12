@@ -63,7 +63,8 @@ impl JwksCache {
     }
 
     /// Cache preloaded with a static key set and no issuer to fetch from.
-    #[cfg(test)]
+    /// Intended for tests in this crate and in downstream consumers.
+    #[must_use]
     pub fn with_static(keys: JwkSet) -> Self {
         Self {
             http: reqwest::Client::new(),
@@ -83,6 +84,11 @@ impl JwksCache {
     /// Returns the JWK for `kid`, refreshing the cached set (rate-limited)
     /// when the kid is unknown — that's what a routine `IdP` key rotation
     /// looks like from here.
+    ///
+    /// # Errors
+    /// [`JwksError::UnknownKid`] if no key matches even after a refresh, or
+    /// [`JwksError::Unavailable`] / [`JwksError::Metadata`] if the refresh
+    /// itself failed and no key set is cached.
     pub async fn get_key(&self, kid: &str) -> Result<Jwk, JwksError> {
         if let Some(jwk) = self.find(kid).await {
             return Ok(jwk);
@@ -101,6 +107,10 @@ impl JwksCache {
     /// Fetches OIDC metadata + JWKS from the issuer. On failure the cached
     /// set (if any) stays in service. Rate-limited to one attempt per
     /// [`MIN_REFRESH_INTERVAL`].
+    ///
+    /// # Errors
+    /// [`JwksError::Unavailable`] or [`JwksError::Metadata`] when the fetch
+    /// fails and there is no cached key set to fall back on.
     pub async fn refresh(&self) -> Result<(), JwksError> {
         if self.issuer.is_empty() {
             return Ok(()); // static cache — nothing to fetch

@@ -1,9 +1,9 @@
-//! Secure credential storage for digest authentication.
+//! Secure credential storage (digest passwords, OIDC refresh tokens).
 //!
 //! Uses platform keyring (macOS Keychain, Windows Credential Manager, Linux Secret Service)
 //! when available, with AES-256-GCM encrypted file fallback for headless environments.
 //!
-//! This module is only available when the `digest-auth` feature is enabled.
+//! This module is available when the `digest-auth` or `oidc` feature is enabled.
 
 use crate::{AppError, AppResult};
 use std::collections::HashMap;
@@ -46,7 +46,7 @@ pub struct CredentialStore {
     /// Config directory for encrypted file fallback.
     config_dir: PathBuf,
     /// Encryption key for file backend (derived on first use).
-    #[cfg(feature = "digest-auth")]
+    #[cfg(any(feature = "digest-auth", feature = "oidc"))]
     encryption_key: Option<uc_crypto::aead::Aes256GcmKey>,
 }
 
@@ -61,7 +61,7 @@ impl CredentialStore {
         Ok(Self {
             backend,
             config_dir,
-            #[cfg(feature = "digest-auth")]
+            #[cfg(any(feature = "digest-auth", feature = "oidc"))]
             encryption_key: None,
         })
     }
@@ -73,7 +73,7 @@ impl CredentialStore {
         // encrypted-file fallback until iOS Keychain / Android KeyStore
         // providers land (CertProvider/PlatformServices work).
         #[cfg(all(
-            feature = "digest-auth",
+            any(feature = "digest-auth", feature = "oidc"),
             any(windows, target_os = "macos", target_os = "linux")
         ))]
         {
@@ -132,7 +132,7 @@ impl CredentialStore {
     // ========== Keyring Backend ==========
 
     #[cfg(all(
-        feature = "digest-auth",
+        any(feature = "digest-auth", feature = "oidc"),
         any(windows, target_os = "macos", target_os = "linux")
     ))]
     #[allow(clippy::unused_self)]
@@ -149,7 +149,7 @@ impl CredentialStore {
     }
 
     #[cfg(not(all(
-        feature = "digest-auth",
+        any(feature = "digest-auth", feature = "oidc"),
         any(windows, target_os = "macos", target_os = "linux")
     )))]
     fn store_keyring(&self, _account_id: &str, _password: &str) -> AppResult<()> {
@@ -159,7 +159,7 @@ impl CredentialStore {
     }
 
     #[cfg(all(
-        feature = "digest-auth",
+        any(feature = "digest-auth", feature = "oidc"),
         any(windows, target_os = "macos", target_os = "linux")
     ))]
     #[allow(clippy::unused_self)]
@@ -183,7 +183,7 @@ impl CredentialStore {
     }
 
     #[cfg(not(all(
-        feature = "digest-auth",
+        any(feature = "digest-auth", feature = "oidc"),
         any(windows, target_os = "macos", target_os = "linux")
     )))]
     fn get_keyring(&self, _account_id: &str) -> AppResult<Option<Zeroizing<String>>> {
@@ -193,7 +193,7 @@ impl CredentialStore {
     }
 
     #[cfg(all(
-        feature = "digest-auth",
+        any(feature = "digest-auth", feature = "oidc"),
         any(windows, target_os = "macos", target_os = "linux")
     ))]
     #[allow(clippy::unused_self)]
@@ -217,7 +217,7 @@ impl CredentialStore {
     }
 
     #[cfg(not(all(
-        feature = "digest-auth",
+        any(feature = "digest-auth", feature = "oidc"),
         any(windows, target_os = "macos", target_os = "linux")
     )))]
     fn delete_keyring(&self, _account_id: &str) -> AppResult<()> {
@@ -229,7 +229,7 @@ impl CredentialStore {
     // ========== Encrypted File Backend ==========
 
     /// Gets or derives the encryption key for the file backend.
-    #[cfg(feature = "digest-auth")]
+    #[cfg(any(feature = "digest-auth", feature = "oidc"))]
     fn get_or_derive_key(&mut self) -> AppResult<&uc_crypto::aead::Aes256GcmKey> {
         if self.encryption_key.is_none() {
             // Derive key from machine-specific data
@@ -267,7 +267,7 @@ impl CredentialStore {
     }
 
     /// Loads the credentials map from the encrypted file.
-    #[cfg(feature = "digest-auth")]
+    #[cfg(any(feature = "digest-auth", feature = "oidc"))]
     fn load_credentials_map(&mut self) -> AppResult<HashMap<String, String>> {
         let path = self.credentials_file_path();
 
@@ -303,7 +303,7 @@ impl CredentialStore {
     }
 
     /// Saves the credentials map to the encrypted file.
-    #[cfg(feature = "digest-auth")]
+    #[cfg(any(feature = "digest-auth", feature = "oidc"))]
     fn save_credentials_map(&mut self, map: &HashMap<String, String>) -> AppResult<()> {
         let path = self.credentials_file_path();
 
@@ -335,7 +335,7 @@ impl CredentialStore {
         Ok(())
     }
 
-    #[cfg(feature = "digest-auth")]
+    #[cfg(any(feature = "digest-auth", feature = "oidc"))]
     fn store_encrypted_file(&mut self, account_id: &str, password: &str) -> AppResult<()> {
         let mut map = self.load_credentials_map()?;
         map.insert(account_id.to_string(), password.to_string());
@@ -344,14 +344,14 @@ impl CredentialStore {
         Ok(())
     }
 
-    #[cfg(not(feature = "digest-auth"))]
+    #[cfg(not(any(feature = "digest-auth", feature = "oidc")))]
     fn store_encrypted_file(&mut self, _account_id: &str, _password: &str) -> AppResult<()> {
         Err(AppError::Settings(
             "Encrypted file storage not available".to_string(),
         ))
     }
 
-    #[cfg(feature = "digest-auth")]
+    #[cfg(any(feature = "digest-auth", feature = "oidc"))]
     fn get_encrypted_file(&mut self, account_id: &str) -> AppResult<Option<Zeroizing<String>>> {
         let map = self.load_credentials_map()?;
         Ok(map.get(account_id).map_or_else(
@@ -366,14 +366,14 @@ impl CredentialStore {
         ))
     }
 
-    #[cfg(not(feature = "digest-auth"))]
+    #[cfg(not(any(feature = "digest-auth", feature = "oidc")))]
     fn get_encrypted_file(&mut self, _account_id: &str) -> AppResult<Option<Zeroizing<String>>> {
         Err(AppError::Settings(
             "Encrypted file storage not available".to_string(),
         ))
     }
 
-    #[cfg(feature = "digest-auth")]
+    #[cfg(any(feature = "digest-auth", feature = "oidc"))]
     fn delete_encrypted_file(&mut self, account_id: &str) -> AppResult<()> {
         let mut map = self.load_credentials_map()?;
         if map.remove(account_id).is_some() {
@@ -385,7 +385,7 @@ impl CredentialStore {
         Ok(())
     }
 
-    #[cfg(not(feature = "digest-auth"))]
+    #[cfg(not(any(feature = "digest-auth", feature = "oidc")))]
     fn delete_encrypted_file(&mut self, _account_id: &str) -> AppResult<()> {
         Err(AppError::Settings(
             "Encrypted file storage not available".to_string(),
@@ -424,7 +424,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "digest-auth")]
+    #[cfg(any(feature = "digest-auth", feature = "oidc"))]
     #[test]
     fn test_encrypted_file_roundtrip() {
         let dir = tempdir().unwrap();
@@ -454,7 +454,7 @@ mod tests {
         assert!(retrieved.is_none());
     }
 
-    #[cfg(feature = "digest-auth")]
+    #[cfg(any(feature = "digest-auth", feature = "oidc"))]
     #[test]
     fn test_encrypted_file_multiple_accounts() {
         let dir = tempdir().unwrap();

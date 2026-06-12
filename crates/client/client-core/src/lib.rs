@@ -22,7 +22,7 @@ pub mod audio_session;
 pub mod call_manager;
 pub mod cert_store;
 pub mod contact_manager;
-#[cfg(feature = "digest-auth")]
+#[cfg(any(feature = "digest-auth", feature = "oidc"))]
 pub mod credential_store;
 pub mod settings;
 pub mod sip_transport;
@@ -34,11 +34,11 @@ pub use audio_session::{
 pub use call_manager::{CallManager, CallManagerEvent, IncomingCallInfo};
 pub use cert_store::{CertStoreError, CertStoreResult, CertificateStore, SignatureAlgorithm};
 pub use contact_manager::{ContactManager, ContactStore, create_contact};
-#[cfg(feature = "digest-auth")]
+#[cfg(any(feature = "digest-auth", feature = "oidc"))]
 pub use credential_store::{CredentialStore, StorageBackend};
 pub use settings::{
-    CertificateFilterSettings, GeneralSettings, NetworkSettings, Settings, SettingsManager,
-    UiSettings,
+    CertificateFilterSettings, GeneralSettings, NetworkSettings, ProvisioningSettings, Settings,
+    SettingsManager, UiSettings,
 };
 pub use sip_transport::{
     CertVerificationMode, SipTransport, TransportConfig, TransportEvent,

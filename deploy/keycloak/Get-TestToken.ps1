@@ -38,8 +38,19 @@ function ConvertFrom-JwtPayload([string]$Jwt) {
     [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
 }
 
+# The client is configured with pkce.code.challenge.method=S256
+# (Configure-Voice.ps1), which Keycloak enforces on the device grant too.
+$verifierBytes = [byte[]]::new(32)
+[System.Security.Cryptography.RandomNumberGenerator]::Fill($verifierBytes)
+$codeVerifier = [Convert]::ToBase64String($verifierBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+$challengeBytes = [System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::ASCII.GetBytes($codeVerifier))
+$codeChallenge = [Convert]::ToBase64String($challengeBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+
 $dev = Invoke-RestMethod -Method Post -Uri "$base/auth/device" -Body @{
-    client_id = $ClientId; scope = $Scopes
+    client_id             = $ClientId
+    scope                 = $Scopes
+    code_challenge        = $codeChallenge
+    code_challenge_method = 'S256'
 }
 $verificationUri = if ($dev.PSObject.Properties['verification_uri_complete']) {
     $dev.verification_uri_complete
@@ -56,20 +67,24 @@ while ([DateTime]::UtcNow -lt $deadline) {
     Start-Sleep -Seconds $interval
     try {
         $resp = Invoke-RestMethod -Method Post -Uri "$base/token" -Body @{
-            grant_type  = 'urn:ietf:params:oauth:grant-type:device_code'
-            client_id   = $ClientId
-            device_code = $dev.device_code
+            grant_type    = 'urn:ietf:params:oauth:grant-type:device_code'
+            client_id     = $ClientId
+            device_code   = $dev.device_code
+            code_verifier = $codeVerifier
         }
         Write-Host 'claims:' -ForegroundColor Green
         ConvertFrom-JwtPayload $resp.access_token | ConvertTo-Json -Depth 4 | Write-Host
         return $resp.access_token
     }
     catch {
-        $err = try { ($_.ErrorDetails.Message | ConvertFrom-Json).error } catch { 'unknown' }
+        # ErrorDetails is $null on non-HTTP failures (DNS, timeout); guard it
+        # or StrictMode turns the property access into a masking error.
+        $msg = if ($_.ErrorDetails) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+        $err = try { ($msg | ConvertFrom-Json).error } catch { 'unknown' }
         switch ($err) {
             'authorization_pending' { }                       # keep polling
             'slow_down' { $interval += 5 }
-            default { throw "device grant failed: $($_.ErrorDetails.Message)" }
+            default { throw "device grant failed: $msg" }
         }
     }
 }

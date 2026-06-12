@@ -122,6 +122,12 @@ pub enum RegistrationEvent {
         /// Destination address.
         destination: SocketAddr,
     },
+    /// The registrar rejected our Bearer token (RFC 8898). The provisioning
+    /// session should refresh the access token and re-register this account.
+    TokenRefreshRequired {
+        /// Account ID whose token needs refreshing.
+        account_id: String,
+    },
 }
 
 impl RegistrationAgent {
@@ -371,6 +377,29 @@ impl RegistrationAgent {
                     .await;
             }
             401 | 407 => {
+                // RFC 8898 Bearer: the registrar rejected our access token
+                // (typically `error="invalid_token"`). We do not retry inline
+                // — a fresh token must come from the IdP — so we ask the
+                // provisioning session to refresh and re-register.
+                if registration.account.auth_mode == client_types::SipAuthMode::Bearer {
+                    warn!(
+                        account_id = %account_id,
+                        status_code = status_code,
+                        "Bearer REGISTER rejected; requesting token refresh"
+                    );
+                    registration.state = RegistrationState::Failed;
+                    registration.transaction = None;
+                    let _ = self
+                        .event_tx
+                        .send(RegistrationEvent::TokenRefreshRequired {
+                            account_id: account_id.to_string(),
+                        })
+                        .await;
+                    self.notify_state_change(account_id, RegistrationState::Failed)
+                        .await;
+                    return Ok(());
+                }
+
                 // Authentication challenge
                 #[cfg(feature = "digest-auth")]
                 {
@@ -753,7 +782,7 @@ impl RegistrationAgent {
             });
 
         // Build request
-        let request = RequestBuilder::register(registrar_uri)
+        let mut request = RequestBuilder::register(registrar_uri)
             .via(&via)
             .from(&from)
             .to(&to)
@@ -765,6 +794,18 @@ impl RegistrationAgent {
             .user_agent(USER_AGENT)
             .build()
             .map_err(|e| SipUaError::TransactionError(e.to_string()))?;
+
+        // RFC 8898: when this account authenticates by OIDC bearer token,
+        // attach it proactively (no need to wait for a challenge). The token
+        // is refreshed out of band by the provisioning session, which
+        // re-registers with a fresh `account.bearer_token` each cycle.
+        if account.auth_mode == client_types::SipAuthMode::Bearer
+            && let Some(token) = account.bearer_token.as_ref()
+        {
+            request
+                .headers
+                .set(HeaderName::Authorization, format!("Bearer {}", token.as_str()));
+        }
 
         Ok(request)
     }
@@ -931,8 +972,16 @@ impl RegistrationAgent {
             .map_err(|e| SipUaError::ConfigError(format!("Invalid registrar URI: {e}")))?;
 
         let host = &uri.host;
-        // Use transport-appropriate default port: UDP/TCP = 5060, TLS = 5061
-        let port = uri.port.unwrap_or(5060);
+        // Default port follows the URI: sips (or ;transport=tls) = 5061,
+        // otherwise 5060 (RFC 3261 §19.1.2).
+        let is_tls = uri.scheme == proto_sip::uri::UriScheme::Sips
+            || uri.params.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("transport")
+                    && value
+                        .as_deref()
+                        .is_some_and(|v| v.eq_ignore_ascii_case("tls"))
+            });
+        let port = uri.port.unwrap_or(if is_tls { 5061 } else { 5060 });
 
         // Try to parse host as IP address first
         if let Ok(ip) = host.parse::<std::net::IpAddr>() {
@@ -1037,6 +1086,8 @@ mod tests {
             caller_id: None,
             #[cfg(feature = "digest-auth")]
             digest_credentials: None,
+            auth_mode: client_types::SipAuthMode::Mtls,
+            bearer_token: None,
         }
     }
 
@@ -1233,10 +1284,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_registrar_addr_default_port() {
+        // sips: defaults to 5061 (RFC 3261 §19.1.2)
         let addr = RegistrationAgent::parse_registrar_addr("sips:192.168.1.1")
             .await
             .unwrap();
         assert_eq!(addr.ip().to_string(), "192.168.1.1");
-        assert_eq!(addr.port(), 5060); // Default port
+        assert_eq!(addr.port(), 5061);
+
+        // sip: defaults to 5060
+        let addr = RegistrationAgent::parse_registrar_addr("sip:192.168.1.1")
+            .await
+            .unwrap();
+        assert_eq!(addr.port(), 5060);
+
+        // sip: with ;transport=tls defaults to 5061
+        let addr = RegistrationAgent::parse_registrar_addr("sip:192.168.1.1;transport=tls")
+            .await
+            .unwrap();
+        assert_eq!(addr.port(), 5061);
     }
 }

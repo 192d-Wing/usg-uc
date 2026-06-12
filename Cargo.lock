@@ -1026,8 +1026,10 @@ dependencies = [
 name = "client-gui-tauri"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "client-audio",
  "client-core",
+ "client-provisioning",
  "client-types",
  "serde",
  "serde_json",
@@ -1055,6 +1057,24 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "client-provisioning"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "chrono",
+ "client-types",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -5213,9 +5233,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "proto-jwt"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "jsonwebtoken",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "proto-registrar"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "jsonwebtoken",
+ "proto-jwt",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -5685,6 +5724,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -5972,6 +6012,7 @@ dependencies = [
  "base64 0.22.1",
  "http-body-util",
  "jsonwebtoken",
+ "proto-jwt",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -6033,6 +6074,7 @@ dependencies = [
  "proto-dialog",
  "proto-dtls",
  "proto-ice",
+ "proto-jwt",
  "proto-registrar",
  "proto-rtp",
  "proto-sip",
@@ -6041,6 +6083,7 @@ dependencies = [
  "proto-transaction",
  "proto-turn",
  "rand 0.8.6",
+ "reqwest 0.12.28",
  "rustls",
  "rustls-pki-types",
  "sbc-announcement",

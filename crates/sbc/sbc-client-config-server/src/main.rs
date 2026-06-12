@@ -25,13 +25,10 @@ use tracing_subscriber::EnvFilter;
 
 mod config;
 mod handlers;
-mod jwks;
-mod token;
 
 use config::Config;
 use handlers::AppState;
-use jwks::JwksCache;
-use token::Verifier;
+use proto_jwt::{JwksCache, Validator, ValidatorConfig};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
@@ -94,10 +91,9 @@ async fn main() -> ExitCode {
         warn!(issuer = %cfg.oidc_issuer, error = %e, "JWKS prefetch failed; pod stays not-ready until the IdP is reachable");
     }
 
-    let verifier = Arc::new(Verifier::new(
+    let verifier = Arc::new(Validator::new(
         Arc::clone(&jwks),
-        cfg.oidc_issuer.clone(),
-        cfg.oidc_audience.clone(),
+        ValidatorConfig::new(cfg.oidc_issuer.clone(), vec![cfg.oidc_audience.clone()]),
     ));
     info!(
         issuer = %cfg.oidc_issuer,

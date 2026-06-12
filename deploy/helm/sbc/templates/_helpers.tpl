@@ -129,14 +129,26 @@ media_interface = "__POD_IP__"
 external_ip = "__POD_IP__"
 
 [transport]
-udp_listen = ["0.0.0.0:5060"]
-tcp_listen = ["0.0.0.0:5060"]
-tls_listen = ["0.0.0.0:5061"]
+# All SIP listeners are dual-stack wildcards: one socket serves IPv4 and
+# IPv6 (IPV6_V6ONLY=0). Required for the v6 anycast SIP VIP
+# (site.sbc_lb_ip6) — soft clients prefer AAAA. uc-transport canonicalizes
+# IPv4-mapped UDP sources; stream connections may log v4 peers in
+# ::ffff:a.b.c.d form, which is cosmetic.
+udp_listen = ["[::]:5060"]
+tcp_listen = ["[::]:5060"]
+tls_listen = ["[::]:5061"]
 ws_listen = []
 wss_listen = []
 tcp_timeout_secs = 30
 tcp_idle_timeout_secs = 300
 api_listen = {{ .Values.sbcDaemon.config.api_listen | quote }}
+{{- if .Values.sbcDaemon.sipTls.secretName }}
+# With security.tls_cert_path set, the API server would otherwise switch its
+# main listener to HTTPS (legacy single-listener mode) and break the chart's
+# HTTP services/probes. Naming an HTTPS address keeps HTTP on api_listen and
+# serves HTTPS side-by-side here.
+api_tls_listen = "0.0.0.0:8443"
+{{- end }}
 
 [media]
 default_mode = {{ .Values.sbcDaemon.config.media_mode | quote }}
@@ -155,6 +167,11 @@ fingerprint_hash = "Sha384"
 curve = "P384"
 min_tls_version = "1.3"
 require_mtls = false
+{{- if .Values.sbcDaemon.sipTls.secretName }}
+# SIP-over-TLS server credentials (Secret {{ .Values.sbcDaemon.sipTls.secretName }})
+tls_cert_path = "/etc/sbc/sip-tls/tls.crt"
+tls_key_path = "/etc/sbc/sip-tls/tls.key"
+{{- end }}
 
 [monitoring]
 metrics_bind = {{ .Values.sbcDaemon.config.metrics_listen | quote }}

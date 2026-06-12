@@ -12,6 +12,10 @@ categories.workspace = true
 [features]
 default = []
 storage = ["dep:uc-storage", "dep:serde", "dep:serde_json", "dep:tokio", "dep:tracing"]
+# RFC 8898 Bearer-token REGISTER authorization (OIDC JWT via the shared
+# proto-jwt validator). Off by default so digest-only / testing builds stay
+# lean and free of the reqwest/JWKS dependency tree.
+bearer = ["dep:proto-jwt", "dep:tracing"]
 
 [dependencies]
 thiserror = "2.0"
@@ -22,6 +26,17 @@ serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["sync"], optional = true }
 tracing = { workspace = true, optional = true }
 uc-storage = { path = "../../uc/uc-storage", optional = true }
+
+# Optional bearer-auth dependency (feature = "bearer").
+proto-jwt = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Bearer tests: sign ES256 tokens to drive the validator end-to-end.
+jsonwebtoken.workspace = true
+serde_json.workspace = true
+aws-lc-rs = { workspace = true, default-features = false, features = ["aws-lc-sys"] }
+base64 = "0.22"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

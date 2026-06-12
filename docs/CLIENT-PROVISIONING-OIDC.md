@@ -109,7 +109,7 @@ browser flow. Active calls are not torn down — only re-REGISTER fails.
     "config_endpoint": "https://us-east-1.pop.example.mil/v1/client-config"
   },
   "minimum_client_version": {
-    "desktop": "0.4.0",
+    "desktop": "0.5.0",
     "android": "0.2.0"
   }
 }
@@ -307,6 +307,11 @@ Notes:
   _sips._tcp.us-east-1.reg.example.mil. IN SRV 20 100 5061 sbc1.us-west-2.pop.example.mil.
   ```
 
+  *Implementation status:* the desktop client does not resolve NAPTR/SRV
+  yet — it does an A/AAAA lookup of the registrar domain (IPv6 preferred)
+  with the default port derived from the URI scheme (`sips:` → 5061,
+  `sip:` → 5060). See Implementation Phases below.
+
 - Registration robustness uses SIP Outbound (RFC 5626): the Contact carries
   `reg-id` and `+sip.instance`, flows are kept alive per RFC 5626 keepalives,
   and on flow failure the client re-resolves and registers to the next SRV
@@ -495,14 +500,23 @@ round trip — no browser unless the refresh token is dead.
    `deploy/helm/sbc/templates/21-sbc-client-config.yaml`
    (`sbcClientConfig.*` values, disabled by default) +
    per-POP image `crates/sbc/sbc-client-config-server/Dockerfile`.
-2. **Client sign-in flow**: `openidconnect` crate + loopback listener in the
-   Tauri backend; Custom Tabs + claimed App Link on Android. Feed the config
-   into the existing registration path in
-   `crates/client/client-sip-ua/src/call_agent.rs` — the digest-auth code
-   path gains SHA-256 support (RFC 8760); MD5 stays disabled. RFC 3263
-   NAPTR/SRV resolution and RFC 5626 outbound (reg-id, instance-id,
-   keepalives) land in the SIP UA here.
+2. **Client sign-in flow** — implemented: browser PKCE sign-in + loopback
+   listener in the Tauri backend (`client-gui-tauri/src/signin.rs`),
+   keychain-persisted refresh token, and auto-provisioning via
+   `client-provisioning` (config → `SipAccount`, `auth_mode = Bearer`).
+   Registration runs over SIP-over-TLS: the UA derives the default port
+   from the registrar URI scheme (`sips:` → 5061), presents the registrar
+   domain as SNI, and trusts the provisioning extra-CA file for SIP TLS in
+   private-CA environments. **Still pending:** RFC 3263 NAPTR/SRV
+   resolution (the UA currently does A/AAAA lookup of the registrar
+   domain, preferring IPv6) and RFC 5626 outbound (reg-id, instance-id,
+   keepalives) — until those land, transport selection comes from the
+   provisioned account, not DNS.
 3. **Keycloak**: `voice` realm, two clients, `sip` scope and mappers as above.
-4. **Bearer SIP auth (RFC 8898)** on client + SBC — REGISTER plus 401/407
-   Bearer challenge handling for out-of-dialog and mid-dialog requests — then
-   retire ephemeral-digest.
+4. **Bearer SIP auth (RFC 8898)** — implemented for REGISTER on both sides:
+   the client attaches `Authorization: Bearer` and reacts to 401 rejection
+   with a token refresh + re-register; the SBC validates the JWT against
+   the IdP JWKS and challenges with `WWW-Authenticate: Bearer` /
+   `error="invalid_token"` (`proto-registrar`, `SBC_AUTH_MODE=bearer`).
+   Mid-dialog request authorization and ephemeral-digest retirement are
+   follow-ups.

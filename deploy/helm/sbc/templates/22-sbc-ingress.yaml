@@ -15,6 +15,16 @@ metadata:
     app.kubernetes.io/component: client-config
 spec:
   ingressClassName: traefik
+  {{- if .Values.sbcClientConfig.ingressTlsSecretName }}
+  # TLS termination at Traefik with an operator-provided kubernetes.io/tls
+  # secret (e.g. a leaf signed by the site's internal CA). Without this,
+  # Traefik serves its self-signed default cert and clients that pin the
+  # internal CA refuse the discovery fetch.
+  tls:
+    - hosts:
+        - {{ .Values.sbcClientConfig.ingressHost | default (printf "sbc.%s" .Values.site.fqdn_base) | quote }}
+      secretName: {{ .Values.sbcClientConfig.ingressTlsSecretName }}
+  {{- end }}
   rules:
     - host: {{ .Values.sbcClientConfig.ingressHost | default (printf "sbc.%s" .Values.site.fqdn_base) | quote }}
       http:

@@ -1,0 +1,35 @@
+[package]
+name = "client-provisioning"
+description = "Soft-client OIDC sign-in + auto-discovery: fetches the SBC discovery document, runs OAuth2 Authorization Code + PKCE (RFC 8252) via a loopback redirect, exchanges/refreshes tokens, fetches per-user SIP config, and maps it onto a SipAccount. Platform-agnostic (no Tauri); the desktop/Android shells supply the system-browser open. Design: docs/CLIENT-PROVISIONING-OIDC.md."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+client-types = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+zeroize = { workspace = true }
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "rt", "time", "macros"] }
+url = "2"
+base64 = "0.22"
+# Discovery / OIDC-metadata / token / JWKS-less config fetches. rustls only;
+# native-roots so the workstation trust store is consulted, plus an explicit
+# extra-CA path for the internal IdP (mirrors the server pods).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+# SHA-256 (PKCE S256) + CSPRNG (verifier/state/nonce) via the workspace FIPS
+# crypto module — same one the TLS stack links.
+aws-lc-rs = { workspace = true, default-features = false, features = ["aws-lc-sys"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

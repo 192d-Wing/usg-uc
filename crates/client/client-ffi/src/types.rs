@@ -181,6 +181,12 @@ pub enum AppEvent {
         /// New state.
         state: RegistrationState,
     },
+    /// The registrar rejected the OIDC Bearer token (RFC 8898); the host
+    /// should refresh the access token and re-register.
+    TokenRefreshRequired {
+        /// Account ID whose token needs refreshing.
+        account_id: String,
+    },
     /// Call state changed.
     CallStateChanged {
         /// Call ID.
@@ -267,6 +273,9 @@ impl From<client_core::AppEvent> for AppEvent {
                     account_id,
                     state: state.into(),
                 }
+            }
+            Core::TokenRefreshRequired { account_id } => {
+                Self::TokenRefreshRequired { account_id }
             }
             Core::CallStateChanged {
                 call_id,

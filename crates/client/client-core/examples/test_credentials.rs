@@ -60,6 +60,8 @@ fn main() {
                 "5551234567",
                 "my-secret-password-123",
             )),
+            auth_mode: client_types::SipAuthMode::Digest,
+            bearer_token: None,
         };
 
         manager.set_account(account);

@@ -290,6 +290,17 @@ window.__tauriEventFallback = function(eventName, payload) {
         case 'transfer-progress':
             handleTransferProgress(event.payload);
             break;
+        case 'signin-progress':
+            handleSigninProgress(event.payload);
+            break;
+        case 'session-state-changed':
+            handleSessionStateChanged(event.payload);
+            break;
+        case 'token-refresh-required':
+            // Registrar rejected our bearer token — silently refresh + re-register.
+            invoke('try_silent_resume').catch((e) =>
+                console.error('Silent token refresh failed:', e));
+            break;
     }
 };
 
@@ -523,6 +534,172 @@ async function loadClassification() {
 }
 
 
+// ===== OIDC Sign-In Gate =====
+
+function signinEl(id) { return document.getElementById(id); }
+
+function showSigninOverlay() {
+    signinEl('signinOverlay')?.classList.remove('hidden');
+}
+
+function hideSigninOverlay() {
+    signinEl('signinOverlay')?.classList.add('hidden');
+}
+
+// Show the domain-entry form (idle state) inside the overlay.
+function showSigninForm(errorMessage) {
+    signinEl('signinForm')?.classList.remove('hidden');
+    signinEl('signinProgress')?.classList.add('hidden');
+    const err = signinEl('signinError');
+    if (err) {
+        if (errorMessage) {
+            err.textContent = errorMessage;
+            err.classList.remove('hidden');
+        } else {
+            err.textContent = '';
+            err.classList.add('hidden');
+        }
+    }
+    const btn = signinEl('signinSubmitBtn');
+    if (btn) btn.disabled = false;
+}
+
+// Show the in-flight progress panel inside the overlay.
+function showSigninProgress(message) {
+    signinEl('signinForm')?.classList.add('hidden');
+    signinEl('signinError')?.classList.add('hidden');
+    signinEl('signinProgress')?.classList.remove('hidden');
+    const text = signinEl('signinProgressText');
+    if (text && message) text.textContent = message;
+}
+
+function handleSigninProgress(payload) {
+    if (payload && payload.message) {
+        showSigninOverlay();
+        showSigninProgress(payload.message);
+    }
+}
+
+function handleSessionStateChanged(payload) {
+    const state = (payload && payload.state) || '';
+    console.log('Session state changed:', state);
+    switch (state) {
+        case 'registered':
+            hideSigninOverlay();
+            updateRegistrationStatus().catch(() => {});
+            break;
+        case 'error':
+            showSigninOverlay();
+            showSigninForm(payload.error || 'Sign-in failed. Please try again.');
+            break;
+        case 'authenticating':
+            // A failed silent refresh lands here with an error message —
+            // re-show the gate so the user can sign in again. (In-flight
+            // browser auth also passes through; the progress panel stays.)
+            if (payload.error) {
+                showSigninOverlay();
+                showSigninForm(payload.error);
+            }
+            break;
+        case 'needs_domain':
+            showSigninForm(payload.error || null);
+            break;
+        default:
+            break;
+    }
+}
+
+// Wires the sign-in UI and decides whether to gate the app on launch.
+async function initializeSignin() {
+    const form = signinEl('signinForm');
+    if (form) {
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            if (!rateLimiter.canCall('start_signin')) return;
+            const domain = (signinEl('signinDomain')?.value || '').trim();
+            if (!domain) {
+                showSigninForm('Enter the service domain (e.g. sbc.oopl.dev.mil)');
+                return;
+            }
+            const extraCa = (signinEl('signinExtraCa')?.value || '').trim() || null;
+            showSigninProgress('Contacting service…');
+            try {
+                await invoke('start_signin', { domain, extraCaPath: extraCa });
+            } catch (error) {
+                showSigninForm(String(error));
+            }
+        });
+    }
+
+    signinEl('signinCancelBtn')?.addEventListener('click', async () => {
+        try { await invoke('cancel_signin'); } catch (e) { console.error(e); }
+        showSigninForm(null);
+    });
+
+    // Escape hatch: keep the existing manual/smartcard Settings flow reachable.
+    signinEl('signinAdvancedLink')?.addEventListener('click', () => {
+        hideSigninOverlay();
+        const settingsTab = document.querySelector('.tab-btn[data-tab="settings"]');
+        if (settingsTab) settingsTab.click();
+    });
+
+    document.getElementById('signOutBtn')?.addEventListener('click', async () => {
+        if (!rateLimiter.canCall('sign_out')) return;
+        try {
+            await invoke('sign_out');
+            updateRegistrationStatus().catch(() => {});
+            showSigninOverlay();
+            showSigninForm(null);
+        } catch (error) {
+            console.error('Sign-out failed:', error);
+            safeAlert('Sign-out failed');
+        }
+    });
+
+    // Gate decision.
+    try {
+        const session = await invoke('get_session_state');
+        console.log('Session state at launch:', session);
+        if (session.state === 'registered') {
+            hideSigninOverlay();
+            return;
+        }
+        if (session.service_domain) {
+            const domainInput = signinEl('signinDomain');
+            if (domainInput && !domainInput.value) domainInput.value = session.service_domain;
+        }
+        if (session.can_silent_resume) {
+            showSigninOverlay();
+            showSigninProgress('Restoring your session…');
+            const resumed = await invoke('try_silent_resume');
+            if (resumed) {
+                hideSigninOverlay();
+                updateRegistrationStatus().catch(() => {});
+                return;
+            }
+            showSigninForm(null);
+            return;
+        }
+        // No OIDC session — but don't gate users with an existing manual
+        // SIP configuration (the pre-OIDC setup path).
+        let manuallyConfigured = false;
+        try {
+            const settings = await invoke('get_sip_settings');
+            manuallyConfigured = Boolean(settings && settings.domain);
+        } catch (e) { /* no settings — fall through to the gate */ }
+        if (manuallyConfigured) {
+            hideSigninOverlay();
+        } else {
+            showSigninOverlay();
+            showSigninForm(null);
+        }
+    } catch (error) {
+        // Never block the app on gate errors — fall back to the main UI.
+        console.error('Sign-in gate initialization failed:', error);
+        hideSigninOverlay();
+    }
+}
+
 // Initialize the application
 document.addEventListener('DOMContentLoaded', async () => {
     console.log('DOMContentLoaded fired - starting initialization');
@@ -579,6 +756,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Check if digest auth feature is enabled and show/hide UI accordingly
     await initializeDigestAuth();
+
+    // OIDC sign-in gate: silent-resume a persisted session or show the
+    // first-run sign-in screen (manual configs bypass the gate).
+    await initializeSignin();
 });
 
 // Initialize digest auth UI based on feature flag

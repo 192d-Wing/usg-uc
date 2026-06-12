@@ -25,7 +25,7 @@ pub mod sensitive;
 pub use account::DigestAuthCredentials;
 pub use account::{
     CertificateConfig, CertificateInfo, CertificateSelectionMode, RegistrationState,
-    ServerCertVerificationMode, SipAccount, TransportPreference, TurnConfig,
+    ServerCertVerificationMode, SipAccount, SipAuthMode, TransportPreference, TurnConfig,
 };
 pub use audio::{AudioConfig, AudioDevice, CallQualityMetrics, CodecPreference};
 pub use call::{

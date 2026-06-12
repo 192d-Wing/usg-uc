@@ -102,6 +102,27 @@ spec:
             - name: SBC_TRUNK_SERVICES
               value: "external"
             {{- end }}
+            {{- if .Values.sbcDaemon.oidc.enabled }}
+            # RFC 8898 Bearer-token REGISTER authorization. The daemon
+            # validates the client's OIDC access token against the IdP's
+            # JWKS and requires the `dn` claim to match the registering AOR.
+            - name: SBC_AUTH_MODE
+              value: "bearer"
+            - name: SBC_OIDC_ISSUER
+              value: {{ .Values.sbcDaemon.oidc.issuer | default .Values.sbcClientConfig.oidc.issuer | quote }}
+            - name: SBC_OIDC_AUDIENCE
+              value: {{ .Values.sbcDaemon.oidc.audience | quote }}
+            {{- if .Values.sbcDaemon.oidc.realm }}
+            - name: SBC_OIDC_REALM
+              value: {{ .Values.sbcDaemon.oidc.realm | quote }}
+            {{- end }}
+            {{- if .Values.sbcClientConfig.extraCaCert }}
+            # Trust the internal IdP CA for the JWKS fetch (same PEM the
+            # client-config pod uses).
+            - name: SBC_OIDC_EXTRA_CA_CERT_FILE
+              value: "/etc/ssl/extra-ca/oopl-ca.pem"
+            {{- end }}
+            {{- end }}
           ports:
             # SIP signaling — no hostPort; k3s ServiceLB DaemonSet already
             # binds hostPort 5060 on every node for the sip LoadBalancer
@@ -136,6 +157,12 @@ spec:
             - { name: config-rendered, mountPath: /etc/sbc/config.toml, subPath: config.toml, readOnly: true }
             - { name: data, mountPath: /var/lib/sbc }
             - { name: logs, mountPath: /var/log/sbc }
+            {{- if and .Values.sbcDaemon.oidc.enabled .Values.sbcClientConfig.extraCaCert }}
+            - { name: extra-ca, mountPath: /etc/ssl/extra-ca, readOnly: true }
+            {{- end }}
+            {{- if .Values.sbcDaemon.sipTls.secretName }}
+            - { name: sip-tls, mountPath: /etc/sbc/sip-tls, readOnly: true }
+            {{- end }}
       volumes:
         - name: config-template
           configMap:
@@ -151,3 +178,13 @@ spec:
           {{- end }}
         - name: logs
           emptyDir: {}
+        {{- if and .Values.sbcDaemon.oidc.enabled .Values.sbcClientConfig.extraCaCert }}
+        - name: extra-ca
+          configMap:
+            name: {{ include "sbc.fullname" . }}-client-config-ca
+        {{- end }}
+        {{- if .Values.sbcDaemon.sipTls.secretName }}
+        - name: sip-tls
+          secret:
+            secretName: {{ .Values.sbcDaemon.sipTls.secretName }}
+        {{- end }}

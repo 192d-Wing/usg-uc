@@ -133,14 +133,17 @@ max_registrations = 50000
 
 ```toml
 [transport]
-# UDP listen addresses (IPv4 and/or IPv6)
-udp_listen = ["0.0.0.0:5060", "[::]:5060"]
+# UDP listen addresses. A [::] wildcard is dual-stack (IPV6_V6ONLY=0):
+# one socket serves IPv4 and IPv6; v4-mapped sources are canonicalized.
+udp_listen = ["[::]:5060"]
 
-# TCP listen addresses
-tcp_listen = ["0.0.0.0:5060"]
+# SIP-over-TCP listen addresses (dual-stack on [::] like UDP).
+tcp_listen = ["[::]:5060"]
 
-# TLS listen addresses (requires security.tls_cert_path)
-tls_listen = ["0.0.0.0:5061"]
+# SIP-over-TLS listen addresses. Requires security.tls_cert_path /
+# tls_key_path — when the cert paths are not set, TLS listeners are
+# skipped at startup with a warning (the daemon serves UDP/TCP only).
+tls_listen = ["[::]:5061"]
 
 # WebSocket listen addresses
 ws_listen = ["0.0.0.0:8080"]
@@ -151,13 +154,25 @@ wss_listen = ["0.0.0.0:8443"]
 
 If no listeners are configured, the SBC binds to `[::]:5060` (IPv6 with IPv4 fallback).
 
+Stream transports (TCP/TLS) frame messages by `Content-Length`
+(RFC 3261 §18.3) and return responses over the connection the request
+arrived on. Failed TLS handshakes are logged and do not stop the
+listener.
+
+> **Note:** setting `security.tls_cert_path` also activates HTTPS on the
+> REST API. Unless `transport.api_tls_listen` is set, the API server
+> switches its main listener to HTTPS-only; set `api_tls_listen` (e.g.
+> `"0.0.0.0:8443"`) to keep HTTP on `api_listen` and serve HTTPS
+> side-by-side. The Helm chart does this automatically when
+> `sbcDaemon.sipTls.secretName` is set.
+
 ---
 
 ## SIP Registration
 
 The SBC acts as a B2BUA registrar, storing user bindings in an in-memory location service. When clustering is enabled, bindings are replicated to Redis or PostgreSQL.
 
-Registration is automatic — any SIP UA that sends a REGISTER request will have its bindings stored. Digest authentication can be enabled for security.
+Registration is automatic — any SIP UA that sends a REGISTER request will have its bindings stored. Two authentication modes can be enabled: OIDC Bearer tokens (RFC 8898, `SBC_AUTH_MODE=bearer` — the mode used by the soft client's sign-in flow) or digest authentication.
 
 ### Authentication
 

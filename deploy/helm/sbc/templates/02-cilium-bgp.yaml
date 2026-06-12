@@ -55,7 +55,11 @@ kind: CiliumBGPAdvertisement
 metadata:
   name: {{ include "sbc.fullname" . }}-lb-advertisement
   labels:
-    advertise: bgp
+    # Must match the matchLabels of the ACTIVE CiliumBGPPeerConfig. When
+    # joining a cluster whose BGP config was installed by another chart
+    # (install_cluster_config: false), set bgp.advertise_label to that
+    # config's selector value or the LB IPs are never advertised upstream.
+    advertise: {{ .Values.bgp.advertise_label | default "bgp" }}
     {{- include "sbc.labels" . | nindent 4 }}
 spec:
   advertisements:

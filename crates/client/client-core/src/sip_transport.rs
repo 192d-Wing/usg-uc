@@ -539,6 +539,11 @@ pub struct TransportConfig {
     /// Client private key for mTLS (DER-encoded).
     /// If `None` and `client_cert_chain` is `Some`, smart card signing is assumed.
     pub client_private_key: Option<Vec<u8>>,
+    /// DNS name presented as SNI and verified against the server certificate
+    /// when connecting over TLS. Connections are made to resolved socket
+    /// addresses, so without this the peer IP is used — which fails
+    /// verification for certificates that only carry DNS SANs.
+    pub tls_server_name: Option<String>,
 }
 
 impl TransportConfig {
@@ -630,6 +635,17 @@ impl SipTransport {
         self.connections.lock().await.clear();
 
         Ok(())
+    }
+
+    /// Sets the DNS name used for SNI / certificate verification on
+    /// outbound TLS connections (typically the registrar host).
+    ///
+    /// Existing connections are closed so the next send reconnects and
+    /// verifies against the new name.
+    pub async fn set_tls_server_name(&self, name: Option<String>) {
+        info!(name = ?name, "Setting TLS server name for SIP connections");
+        self.config.write().await.tls_server_name = name;
+        self.connections.lock().await.clear();
     }
 
     /// Sets the client certificate for mTLS authentication.
@@ -1009,12 +1025,19 @@ impl SipTransport {
             .await
             .map_err(|e| AppError::Sip(format!("Failed to connect to {peer}: {e}")))?;
 
-        // Derive server name from peer (use IP for now)
-        let server_name: ServerName<'static> = peer
-            .ip()
-            .to_string()
-            .try_into()
-            .map_err(|_| AppError::Sip("Invalid server name".to_string()))?;
+        // Verify against the configured registrar DNS name when set;
+        // otherwise fall back to the peer IP (only works for certs with
+        // IP SANs).
+        let configured_name = self.config.read().await.tls_server_name.clone();
+        let server_name: ServerName<'static> = match configured_name {
+            Some(host) => ServerName::try_from(host.clone())
+                .map_err(|_| AppError::Sip(format!("Invalid TLS server name: {host}")))?,
+            None => peer
+                .ip()
+                .to_string()
+                .try_into()
+                .map_err(|_| AppError::Sip("Invalid server name".to_string()))?,
+        };
 
         // Get current TLS config
         let tls_config = self.tls_config.read().await.clone();

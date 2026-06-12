@@ -96,6 +96,16 @@ fn main() {
     // Initialize tracing subscriber
     init_tracing(args.verbose);
 
+    // Install the process-level rustls CryptoProvider (aws-lc, FIPS). With
+    // multiple provider crate features enabled rustls cannot pick one
+    // automatically and panics at first use (e.g. the API HTTPS listener).
+    if rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .is_err()
+    {
+        eprintln!("rustls CryptoProvider was already installed");
+    }
+
     // Create tokio runtime and run the daemon
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -162,9 +162,9 @@ fn validate_security(config: &crate::schema::SecurityConfig) -> ConfigResult<()>
     // NOTE (relaxed rule): requiring cert/key whenever transport.tls_listen
     // or transport.wss_listen is non-empty would reject `SbcConfig::default()`
     // and every shipped deploy config (all declare a TLS listener with no
-    // operator-provided certificate; the daemon bootstraps self-signed
-    // material instead). We therefore only enforce that the paths are set
-    // together.
+    // operator-provided certificate; the daemon skips binding those
+    // listeners and logs a warning). We therefore only enforce that the
+    // paths are set together.
     match (&config.tls_cert_path, &config.tls_key_path) {
         (Some(_), None) | (None, Some(_)) => {
             return Err(ConfigError::Validation {
