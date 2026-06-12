@@ -15,7 +15,7 @@ storage = ["dep:uc-storage", "dep:serde", "dep:serde_json", "dep:tokio", "dep:tr
 # RFC 8898 Bearer-token REGISTER authorization (OIDC JWT via the shared
 # proto-jwt validator). Off by default so digest-only / testing builds stay
 # lean and free of the reqwest/JWKS dependency tree.
-bearer = ["dep:proto-jwt"]
+bearer = ["dep:proto-jwt", "dep:tracing"]
 
 [dependencies]
 thiserror = "2.0"

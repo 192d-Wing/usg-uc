@@ -110,6 +110,29 @@ impl BearerAuthenticator {
         };
 
         match self.validator.validate(token).await {
+            // The challenge sent to the client deliberately carries only the
+            // RFC 6750 error code — log the underlying reason here or
+            // operators see nothing but unexplained 401s.
+            Err(ref e @ ValidateError::Jwks(_)) => {
+                tracing::warn!(error = %e, "bearer REGISTER rejected: JWKS unavailable");
+                BearerResult::Challenge {
+                    error: BearerError::InvalidToken,
+                }
+            }
+            Err(ValidateError::InsufficientScope) => BearerResult::Challenge {
+                error: BearerError::InsufficientScope,
+            },
+            // Authenticated-but-unprovisioned never reaches here (validate()
+            // does not enforce `dn`), but map it defensively to Forbidden.
+            Err(ValidateError::NotProvisioned) => BearerResult::Forbidden {
+                reason: "token not provisioned for voice".to_string(),
+            },
+            Err(ref e @ (ValidateError::MissingToken | ValidateError::InvalidToken(_))) => {
+                tracing::debug!(error = %e, aor_user, "bearer REGISTER rejected: invalid token");
+                BearerResult::Challenge {
+                    error: BearerError::InvalidToken,
+                }
+            }
             Ok(claims) => {
                 let Some(dn) = claims.dn else {
                     return BearerResult::Forbidden {
@@ -125,19 +148,6 @@ impl BearerAuthenticator {
                 BearerResult::Authorized {
                     dn,
                     sip_domain: claims.sip_domain,
-                }
-            }
-            Err(ValidateError::InsufficientScope) => BearerResult::Challenge {
-                error: BearerError::InsufficientScope,
-            },
-            // Authenticated-but-unprovisioned never reaches here (validate()
-            // does not enforce `dn`), but map it defensively to Forbidden.
-            Err(ValidateError::NotProvisioned) => BearerResult::Forbidden {
-                reason: "token not provisioned for voice".to_string(),
-            },
-            Err(ValidateError::MissingToken | ValidateError::InvalidToken(_) | ValidateError::Jwks(_)) => {
-                BearerResult::Challenge {
-                    error: BearerError::InvalidToken,
                 }
             }
         }
