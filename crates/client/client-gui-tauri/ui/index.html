@@ -45,14 +45,6 @@
                     <input type="text" id="signinDomain" placeholder="sbc.oopl.dev.mil"
                            maxlength="256" autocomplete="off" spellcheck="false">
                 </div>
-                <details class="signin-advanced-ca">
-                    <summary>TLS trust options</summary>
-                    <div class="form-group">
-                        <label for="signinExtraCa">Extra CA certificate (PEM path, optional):</label>
-                        <input type="text" id="signinExtraCa" placeholder="/path/to/internal-ca.pem"
-                               maxlength="512" autocomplete="off" spellcheck="false">
-                    </div>
-                </details>
                 <button type="submit" id="signinSubmitBtn" class="action-btn primary signin-submit">
                     Sign in
                 </button>
@@ -63,6 +55,19 @@
                 <div class="signin-spinner"></div>
                 <p id="signinProgressText">Contacting service…</p>
                 <button type="button" id="signinCancelBtn" class="action-btn secondary small">Cancel</button>
+            </div>
+
+            <!-- Untrusted-CA warning (Continue/Cancel) -->
+            <div id="signinUntrusted" class="signin-untrusted hidden">
+                <h3>&#9888; Warning: untrusted CA</h3>
+                <p>The service presented a TLS certificate this device does not trust.
+                   Continue only if you expect this (lab or test network) &mdash; anywhere
+                   else it can indicate an intercepted connection.</p>
+                <p id="signinUntrustedDetail" class="signin-untrusted-detail"></p>
+                <div class="signin-untrusted-buttons">
+                    <button type="button" id="signinUntrustedCancel" class="action-btn secondary">Cancel</button>
+                    <button type="button" id="signinUntrustedContinue" class="action-btn danger">Continue</button>
+                </div>
             </div>
 
             <!-- Error -->

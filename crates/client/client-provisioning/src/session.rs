@@ -45,7 +45,7 @@ pub struct ProvisionedSession {
     pub oidc_meta: Option<OidcMetadata>,
     /// Current access token (JWT).
     pub access_token: Option<Zeroizing<String>>,
-    /// Current refresh token (also persisted to the keychain).
+    /// Current refresh token (memory only; zeroized on drop).
     pub refresh_token: Option<Zeroizing<String>>,
     /// Absolute access-token expiry.
     pub access_expires_at: Option<DateTime<Utc>>,
@@ -57,6 +57,10 @@ pub struct ProvisionedSession {
     pub config_fetched_at: Option<DateTime<Utc>>,
     /// Last error message, when `state == Error`.
     pub error: Option<String>,
+    /// The user accepted the untrusted-CA warning for this app run;
+    /// provisioning HTTP skips server-certificate verification. Never
+    /// persisted — reset on sign-out and at every launch.
+    pub accept_untrusted_ca: bool,
 }
 
 impl ProvisionedSession {

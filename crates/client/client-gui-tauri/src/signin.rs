@@ -25,7 +25,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_shell::ShellExt;
 use tokio::sync::{oneshot, Mutex, RwLock};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 use crate::TauriAppState;
@@ -136,6 +136,26 @@ async fn set_session_state(app: &AppHandle, ctx: &SigninCtx, state: SessionState
 
 async fn set_session_error(app: &AppHandle, ctx: &SigninCtx, message: String) {
     warn!(error = %message, "sign-in flow failed");
+
+    // Mark TLS-trust failures so the frontend can offer the
+    // Continue/Cancel untrusted-CA warning — but only when the override
+    // flow is enabled and the user hasn't already accepted it.
+    let message = {
+        let warn_enabled = ctx
+            .settings_manager
+            .read()
+            .await
+            .settings()
+            .general
+            .allow_untrusted_cert_warning;
+        let already_accepted = ctx.session.read().await.accept_untrusted_ca;
+        if warn_enabled && !already_accepted && is_untrusted_cert_error(&message) {
+            format!("UNTRUSTED_CA:{message}")
+        } else {
+            message
+        }
+    };
+
     {
         let mut s = ctx.session.write().await;
         s.state = SessionState::Error;
@@ -144,8 +164,13 @@ async fn set_session_error(app: &AppHandle, ctx: &SigninCtx, message: String) {
     emit_session_changed(app, ctx).await;
 }
 
-/// CA trust for provisioning HTTP, from the persisted extra-CA path.
+/// CA trust for provisioning HTTP: the user's in-run untrusted-CA
+/// acceptance wins, then the persisted extra-CA path, then the system
+/// store.
 async fn ca_trust(ctx: &SigninCtx) -> CaTrust {
+    if ctx.session.read().await.accept_untrusted_ca {
+        return CaTrust::Insecure;
+    }
     let sm = ctx.settings_manager.read().await;
     sm.settings()
         .provisioning
@@ -153,6 +178,15 @@ async fn ca_trust(ctx: &SigninCtx) -> CaTrust {
         .and_then(|p| p.extra_ca_cert_file.clone())
         .filter(|p| !p.trim().is_empty())
         .map_or(CaTrust::System, |p| CaTrust::ExtraPem(p.into()))
+}
+
+/// Heuristic: does this provisioning error look like a TLS trust failure
+/// (unknown/untrusted issuer) rather than any other transport error?
+fn is_untrusted_cert_error(message: &str) -> bool {
+    message.contains("invalid peer certificate")
+        || message.contains("UnknownIssuer")
+        || message.contains("certificate verify failed")
+        || message.contains("self-signed certificate")
 }
 
 /// Cancels a pending browser sign-in, if any.
@@ -205,7 +239,7 @@ pub async fn get_session_state(state: State<'_, TauriAppState>) -> Result<Sessio
 #[tauri::command]
 pub async fn start_signin(
     domain: String,
-    extra_ca_path: Option<String>,
+    accept_untrusted: Option<bool>,
     app: AppHandle,
     state: State<'_, TauriAppState>,
 ) -> Result<(), String> {
@@ -214,18 +248,27 @@ pub async fn start_signin(
         return Err("Enter the service domain (e.g. sbc.oopl.dev.mil)".to_string());
     }
 
-    // A non-empty extra CA path from the form replaces the persisted one,
-    // so reject anything that isn't a readable file — a typo here would
-    // otherwise silently clobber a working persisted path.
-    let extra_ca_path = extra_ca_path.filter(|p| !p.trim().is_empty());
-    if let Some(ref p) = extra_ca_path {
-        if !std::path::Path::new(p.trim()).is_file() {
-            return Err(format!("Extra CA certificate path is not a file: {p}"));
+    // The user clicked Continue on the untrusted-CA warning: provisioning
+    // HTTP for this app run skips server-cert verification. Only honored
+    // when the warning flow is enabled in settings.
+    if accept_untrusted == Some(true) {
+        let allowed = state
+            .settings_manager
+            .read()
+            .await
+            .settings()
+            .general
+            .allow_untrusted_cert_warning;
+        if !allowed {
+            return Err("Untrusted certificates are not allowed by settings".to_string());
         }
+        state.session.write().await.accept_untrusted_ca = true;
+        warn!(domain = %domain, "proceeding with UNTRUSTED CA at user request");
     }
 
-    // Persist the domain + optional extra CA up front so the HTTP client
-    // builder and a later silent resume can find them.
+    // Persist the domain up front so the HTTP client builder and later
+    // refreshes can find it. The optional extra-CA path is a TOML-only
+    // setting ([provisioning] extra_ca_cert_file) and is preserved as-is.
     {
         let mut sm = state.settings_manager.write().await;
         let prev_ca = sm
@@ -236,7 +279,7 @@ pub async fn start_signin(
         sm.settings_mut().provisioning = Some(ProvisioningSettings {
             service_domain: domain.clone(),
             refresh_token_persisted: false,
-            extra_ca_cert_file: extra_ca_path.or(prev_ca),
+            extra_ca_cert_file: prev_ca,
         });
         if let Err(e) = sm.save() {
             warn!(error = %e, "failed to persist provisioning settings");
@@ -526,23 +569,17 @@ async fn finish_provisioning(
         TransportPreference::TlsOnly,
     );
 
-    // Persist: account, default-account pointer, refresh token (keychain),
-    // and the non-secret session slice.
+    // Persist: account, default-account pointer, and the non-secret
+    // session slice. Tokens are deliberately NOT persisted: they live
+    // only in the in-memory session (Zeroizing, wiped on drop), so every
+    // app launch starts with a fresh sign-in. Scrub anything an earlier
+    // build left in the keychain.
     {
         let mut sm = ctx.settings_manager.write().await;
         sm.set_account(account.clone());
         sm.set_default_account(Some(account.id.clone()));
-        let mut persisted_flag = sm
-            .settings()
-            .provisioning
-            .as_ref()
-            .is_some_and(|p| p.refresh_token_persisted);
-        if let Some(rt) = tokens.refresh_token.as_deref() {
-            // Keycloak rotates refresh tokens — always store the newest.
-            match sm.store_refresh_token(domain, rt) {
-                Ok(stored) => persisted_flag = stored,
-                Err(e) => warn!(error = %e, "failed to store refresh token"),
-            }
+        if let Err(e) = sm.delete_refresh_token(domain) {
+            debug!(error = %e, "no legacy keychain refresh token to scrub");
         }
         let extra_ca = sm
             .settings()
@@ -551,7 +588,7 @@ async fn finish_provisioning(
             .and_then(|p| p.extra_ca_cert_file.clone());
         sm.settings_mut().provisioning = Some(ProvisioningSettings {
             service_domain: domain.to_string(),
-            refresh_token_persisted: persisted_flag,
+            refresh_token_persisted: false,
             extra_ca_cert_file: extra_ca,
         });
         sm.save()

@@ -2442,15 +2442,43 @@ h2 .section-icon {
     justify-content: center;
 }
 
-.signin-advanced-ca {
+.signin-untrusted {
     width: 100%;
+    padding: 16px;
+    border-radius: 12px;
+    background-color: var(--md-sys-color-error-container);
+    color: var(--md-sys-color-on-error-container);
     font-size: 13px;
-    color: var(--md-sys-color-on-surface-variant);
+    text-align: left;
 }
 
-.signin-advanced-ca summary {
-    cursor: pointer;
-    padding: 4px 0;
+.signin-untrusted.hidden {
+    display: none;
+}
+
+.signin-untrusted h3 {
+    margin: 0 0 8px;
+    font-size: 15px;
+}
+
+.signin-untrusted-detail {
+    font-family: monospace;
+    font-size: 11px;
+    overflow-wrap: anywhere;
+    opacity: 0.8;
+    margin: 8px 0;
+}
+
+.signin-untrusted-buttons {
+    display: flex;
+    gap: 12px;
+    justify-content: flex-end;
+    margin-top: 12px;
+}
+
+.signin-untrusted-buttons .danger {
+    background-color: var(--md-sys-color-error);
+    color: var(--md-sys-color-on-error);
 }
 
 .signin-progress {

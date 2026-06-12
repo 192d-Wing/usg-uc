@@ -107,6 +107,13 @@ pub struct GeneralSettings {
     /// Delay in seconds before auto-answering (0 = immediate).
     #[serde(default = "default_auto_answer_delay")]
     pub auto_answer_delay_secs: u32,
+
+    /// Offer a "continue anyway" warning when the service presents a TLS
+    /// certificate chain this device does not trust (private-CA lab
+    /// networks). When false, untrusted certificates are rejected outright
+    /// with no override prompt.
+    #[serde(default = "default_true")]
+    pub allow_untrusted_cert_warning: bool,
 }
 
 const fn default_auto_answer_delay() -> u32 {
@@ -124,6 +131,7 @@ impl Default for GeneralSettings {
             default_account: None,
             auto_answer_enabled: false,
             auto_answer_delay_secs: default_auto_answer_delay(),
+            allow_untrusted_cert_warning: true,
         }
     }
 }

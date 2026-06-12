@@ -548,8 +548,15 @@ function hideSigninOverlay() {
 
 // Show the domain-entry form (idle state) inside the overlay.
 function showSigninForm(errorMessage) {
+    // TLS-trust failures get the Continue/Cancel warning instead of a
+    // plain error (backend marks them when the override is enabled).
+    if (errorMessage && String(errorMessage).startsWith('UNTRUSTED_CA:')) {
+        showSigninUntrusted(String(errorMessage).slice('UNTRUSTED_CA:'.length));
+        return;
+    }
     signinEl('signinForm')?.classList.remove('hidden');
     signinEl('signinProgress')?.classList.add('hidden');
+    signinEl('signinUntrusted')?.classList.add('hidden');
     const err = signinEl('signinError');
     if (err) {
         if (errorMessage) {
@@ -564,10 +571,21 @@ function showSigninForm(errorMessage) {
     if (btn) btn.disabled = false;
 }
 
+// Show the untrusted-CA warning panel (Continue / Cancel).
+function showSigninUntrusted(detail) {
+    signinEl('signinForm')?.classList.add('hidden');
+    signinEl('signinProgress')?.classList.add('hidden');
+    signinEl('signinError')?.classList.add('hidden');
+    signinEl('signinUntrusted')?.classList.remove('hidden');
+    const el = signinEl('signinUntrustedDetail');
+    if (el) el.textContent = (detail || '').trim();
+}
+
 // Show the in-flight progress panel inside the overlay.
 function showSigninProgress(message) {
     signinEl('signinForm')?.classList.add('hidden');
     signinEl('signinError')?.classList.add('hidden');
+    signinEl('signinUntrusted')?.classList.add('hidden');
     signinEl('signinProgress')?.classList.remove('hidden');
     const text = signinEl('signinProgressText');
     if (text && message) text.textContent = message;
@@ -621,10 +639,9 @@ async function initializeSignin() {
                 showSigninForm('Enter the service domain (e.g. sbc.oopl.dev.mil)');
                 return;
             }
-            const extraCa = (signinEl('signinExtraCa')?.value || '').trim() || null;
             showSigninProgress('Contacting service…');
             try {
-                await invoke('start_signin', { domain, extraCaPath: extraCa });
+                await invoke('start_signin', { domain });
             } catch (error) {
                 showSigninForm(String(error));
             }
@@ -633,6 +650,25 @@ async function initializeSignin() {
 
     signinEl('signinCancelBtn')?.addEventListener('click', async () => {
         try { await invoke('cancel_signin'); } catch (e) { console.error(e); }
+        showSigninForm(null);
+    });
+
+    // Untrusted-CA warning: Continue retries the sign-in accepting the
+    // untrusted chain for this app run; Cancel returns to the form.
+    signinEl('signinUntrustedContinue')?.addEventListener('click', async () => {
+        const domain = (signinEl('signinDomain')?.value || '').trim();
+        if (!domain) {
+            showSigninForm('Enter the service domain first');
+            return;
+        }
+        showSigninProgress('Contacting service (untrusted CA accepted)…');
+        try {
+            await invoke('start_signin', { domain, acceptUntrusted: true });
+        } catch (error) {
+            showSigninForm(String(error));
+        }
+    });
+    signinEl('signinUntrustedCancel')?.addEventListener('click', () => {
         showSigninForm(null);
     });
 
