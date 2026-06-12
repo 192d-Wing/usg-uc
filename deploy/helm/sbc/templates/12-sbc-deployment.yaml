@@ -160,6 +160,9 @@ spec:
             {{- if and .Values.sbcDaemon.oidc.enabled .Values.sbcClientConfig.extraCaCert }}
             - { name: extra-ca, mountPath: /etc/ssl/extra-ca, readOnly: true }
             {{- end }}
+            {{- if .Values.sbcDaemon.sipTls.secretName }}
+            - { name: sip-tls, mountPath: /etc/sbc/sip-tls, readOnly: true }
+            {{- end }}
       volumes:
         - name: config-template
           configMap:
@@ -179,4 +182,9 @@ spec:
         - name: extra-ca
           configMap:
             name: {{ include "sbc.fullname" . }}-client-config-ca
+        {{- end }}
+        {{- if .Values.sbcDaemon.sipTls.secretName }}
+        - name: sip-tls
+          secret:
+            secretName: {{ .Values.sbcDaemon.sipTls.secretName }}
         {{- end }}

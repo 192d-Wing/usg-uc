@@ -62,3 +62,9 @@ sbcClientConfig:
   # OOPL-CA-signed leaf for sbc.oopl.dev.mil (created out-of-band; see
   # usg-tacacs/deploy/k3s/pki for the issuance pattern).
   ingressTlsSecretName: sbc-oopl-001-ingress-tls
+
+sbcDaemon:
+  # SIP-over-TLS server cert for sip.oopl.dev.mil (kubernetes.io/tls Secret,
+  # created out-of-band like the ingress cert above).
+  sipTls:
+    secretName: sbc-oopl-001-sip-tls

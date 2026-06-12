@@ -361,6 +361,14 @@ sbcDaemon:
     runAsUser: 1000
     runAsGroup: 1000
     fsGroup: 1000
+  # SIP-over-TLS server credentials: name of a kubernetes.io/tls Secret
+  # (tls.crt = leaf+chain PEM, tls.key) in the release namespace, mounted at
+  # /etc/sbc/sip-tls and wired to security.tls_cert_path/tls_key_path. The
+  # cert must cover the SIP registrar domain (sbcClientConfig.registrarDomain).
+  # Empty = SIP TLS listeners disabled; the daemon serves UDP/TCP only and
+  # logs a warning for the configured tls_listen.
+  sipTls:
+    secretName: ""
   # RFC 8898 Bearer-token REGISTER authorization. When enabled, the daemon
   # rejects REGISTERs that don't carry a valid OIDC access token whose `dn`
   # claim equals the AOR user part — the server-side half of the soft
