@@ -75,6 +75,31 @@ pub async fn daemon_version(State(state): State<Arc<AppState>>) -> impl IntoResp
     }
 }
 
+/// Daemon health summary for the dashboard's health card
+/// (`/api/v1/system/health`): `status` reflects whether the daemon
+/// answers on its `SystemService` gRPC, `uptime_seconds` comes from its
+/// stats. Always 200 — "degraded" is a payload, not a transport error,
+/// so the panel can render it.
+pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut client = state.system.clone();
+    match client.get_stats(GetStatsRequest::default()).await {
+        Ok(resp) => {
+            let r = resp.into_inner();
+            Json(serde_json::json!({
+                "status": "healthy",
+                "uptime_seconds": r.uptime_secs,
+            }))
+        }
+        Err(status) => {
+            warn!(error = %status, "SystemService.GetStats failed for health");
+            Json(serde_json::json!({
+                "status": "degraded",
+                "error": status.message(),
+            }))
+        }
+    }
+}
+
 pub async fn stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let mut client = state.system.clone();
     match client.get_stats(GetStatsRequest::default()).await {

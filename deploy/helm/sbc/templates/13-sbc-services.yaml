@@ -15,9 +15,10 @@ metadata:
   labels:
     {{- include "sbc.labels" . | nindent 4 }}
   annotations:
-    # Cilium LBIPAM — always set so the SIP service can share its LB IP
-    # with the frontend Service (same IP, non-overlapping ports). These are
-    # Cilium-level annotations and must be present regardless of ExternalDNS.
+    # Cilium LBIPAM — the SIP service owns this LB IP exclusively now that
+    # the frontend rides the ingress (sharing across traffic policies is
+    # rejected by LBIPAM). The sharing-key stays for sites that still
+    # co-locate other Local-policy services on the VIP.
     lbipam.cilium.io/ips: "{{ .Values.site.sbc_lb_ip }}{{ with .Values.site.sbc_lb_ip6 }},{{ . }}{{ end }}"
     lbipam.cilium.io/sharing-key: "{{ .Values.site.name }}-sbc"
     lbipam.cilium.io/sharing-cross-namespace: "*"
@@ -36,14 +37,14 @@ spec:
   ipFamilyPolicy: PreferDualStack
   ipFamilies: [IPv4, IPv6]
   {{- end }}
-  # Cluster (not Local) — must match the frontend Service's policy for
-  # Cilium's lbipam sharing-key to permit IP sharing. The cost is that
-  # the SBC sees kube-proxy's SNAT'd IP (not the original client) for
-  # ingress traffic — SIP peer authentication via `received=` header
-  # still works, but IP-based ACLs would need rework. If you want strict
-  # source-IP preservation, switch back to Local AND give sbc-sip its
-  # own LB IP separate from sbc-frontend.
-  externalTrafficPolicy: Cluster
+  # Local preserves the client's source IP (no kube SNAT) — required for
+  # IP-based ACLs, per-source rate limiting, and honest access logs. The
+  # VIP is only served from nodes with a local daemon pod (the daemon is
+  # node-pinned, and BGP/L2 announcement follows endpoint locality), and
+  # the frontend no longer shares this IP: it sits behind the traefik
+  # ingress (or Gateway) as ClusterIP, because LBIPAM refuses to share an
+  # IP across services with different traffic policies.
+  externalTrafficPolicy: Local
   selector:
     {{- include "sbc.selectorLabels" . | nindent 4 }}
   ports:

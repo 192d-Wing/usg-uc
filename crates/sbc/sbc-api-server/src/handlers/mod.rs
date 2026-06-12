@@ -126,6 +126,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // own identity); /system/daemon-version exposes the daemon's
         // version via gRPC. The rest passthrough to SystemService.
         .route("/system/daemon-version", get(system::daemon_version))
+        .route("/system/health", get(system::health))
         .route("/system/stats", get(system::stats))
         .route("/system/metrics", get(system::metrics))
         .route("/system/tls", get(system::tls_status))
