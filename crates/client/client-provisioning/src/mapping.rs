@@ -13,8 +13,9 @@ use crate::wire::ClientConfig;
 /// Builds a [`SipAccount`] (`id = "default"`) from a provisioned config and
 /// the current access token.
 ///
-/// - `registrar_uri` is derived as `sips:<registrar_domain>` (TLS; RFC 3263
-///   NAPTR/SRV resolution happens in the SIP UA).
+/// - `registrar_uri` is derived from `registrar_domain`, with the scheme
+///   following `transport`: `sips:` for TLS, `sip:` for UDP/TCP (the scheme
+///   drives the UA's default port — 5061 vs 5060).
 /// - `caller_id` is set to the `dn`.
 /// - For `auth.mode == "bearer"`, `auth_mode = Bearer` and `bearer_token` is
 ///   set; other modes fall back to the account default (mTLS).
@@ -31,7 +32,12 @@ pub fn to_sip_account(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| cfg.sip.dn.clone());
 
-    let mut account = SipAccount::new("default", display_name, &cfg.sip.uri, registrar_uri(cfg));
+    let mut account = SipAccount::new(
+        "default",
+        display_name,
+        &cfg.sip.uri,
+        registrar_uri(cfg, transport),
+    );
     account.transport = transport;
     account.register_expiry = cfg.registration.expires_seconds;
     account.caller_id = Some(cfg.sip.dn.clone());
@@ -45,10 +51,14 @@ pub fn to_sip_account(
     account
 }
 
-/// `sips:<registrar_domain>` — seeds the registrar host; transport/failover
-/// are resolved per RFC 3263 by the SIP UA.
-fn registrar_uri(cfg: &ClientConfig) -> String {
-    format!("sips:{}", cfg.registration.registrar_domain)
+/// Seeds the registrar host with a scheme matching the transport: `sips:`
+/// for TLS (default port 5061), `sip:` for UDP/TCP (default port 5060).
+fn registrar_uri(cfg: &ClientConfig, transport: TransportPreference) -> String {
+    let scheme = match transport {
+        TransportPreference::TlsOnly => "sips",
+        TransportPreference::Udp | TransportPreference::Tcp => "sip",
+    };
+    format!("{scheme}:{}", cfg.registration.registrar_domain)
 }
 
 #[cfg(test)]
@@ -83,5 +93,12 @@ mod tests {
         assert_eq!(acct.register_expiry, 300);
         assert_eq!(acct.auth_mode, SipAuthMode::Bearer);
         assert_eq!(acct.bearer_token.as_deref().map(String::as_str), Some("tok-123"));
+    }
+
+    #[test]
+    fn udp_transport_uses_sip_scheme() {
+        let acct = to_sip_account(&bearer_config(), "tok-123", TransportPreference::Udp);
+        assert_eq!(acct.registrar_uri, "sip:us-east-1.reg.example.mil");
+        assert_eq!(acct.transport, TransportPreference::Udp);
     }
 }

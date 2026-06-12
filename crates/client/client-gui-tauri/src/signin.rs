@@ -566,8 +566,27 @@ async fn finish_provisioning(
     // Register with the fresh bearer token (best effort — the client may not
     // be initialized yet on first run; the frontend registers after init).
     {
+        let extra_ca = {
+            let sm = ctx.settings_manager.read().await;
+            sm.settings()
+                .provisioning
+                .as_ref()
+                .and_then(|p| p.extra_ca_cert_file.clone())
+                .filter(|p| !p.trim().is_empty())
+        };
         let mut guard = ctx.client.lock().await;
         if let Some(client) = guard.as_mut() {
+            // The extra CA may have been entered with this sign-in, after
+            // the client initialized — trust it for SIP TLS before
+            // registering over TLS.
+            if let Some(path) = extra_ca {
+                if let Err(e) = client
+                    .set_trusted_ca_certs_from_pem_file(std::path::Path::new(&path))
+                    .await
+                {
+                    warn!(path = %path, error = %e, "failed to load extra CA for SIP TLS");
+                }
+            }
             if let Err(e) = client.register_account(&account).await {
                 warn!(error = %e, "registration after provisioning failed");
             }

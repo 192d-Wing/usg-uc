@@ -972,8 +972,16 @@ impl RegistrationAgent {
             .map_err(|e| SipUaError::ConfigError(format!("Invalid registrar URI: {e}")))?;
 
         let host = &uri.host;
-        // Use transport-appropriate default port: UDP/TCP = 5060, TLS = 5061
-        let port = uri.port.unwrap_or(5060);
+        // Default port follows the URI: sips (or ;transport=tls) = 5061,
+        // otherwise 5060 (RFC 3261 §19.1.2).
+        let is_tls = uri.scheme == proto_sip::uri::UriScheme::Sips
+            || uri.params.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("transport")
+                    && value
+                        .as_deref()
+                        .is_some_and(|v| v.eq_ignore_ascii_case("tls"))
+            });
+        let port = uri.port.unwrap_or(if is_tls { 5061 } else { 5060 });
 
         // Try to parse host as IP address first
         if let Ok(ip) = host.parse::<std::net::IpAddr>() {
@@ -1276,10 +1284,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_registrar_addr_default_port() {
+        // sips: defaults to 5061 (RFC 3261 §19.1.2)
         let addr = RegistrationAgent::parse_registrar_addr("sips:192.168.1.1")
             .await
             .unwrap();
         assert_eq!(addr.ip().to_string(), "192.168.1.1");
-        assert_eq!(addr.port(), 5060); // Default port
+        assert_eq!(addr.port(), 5061);
+
+        // sip: defaults to 5060
+        let addr = RegistrationAgent::parse_registrar_addr("sip:192.168.1.1")
+            .await
+            .unwrap();
+        assert_eq!(addr.port(), 5060);
+
+        // sip: with ;transport=tls defaults to 5061
+        let addr = RegistrationAgent::parse_registrar_addr("sip:192.168.1.1;transport=tls")
+            .await
+            .unwrap();
+        assert_eq!(addr.port(), 5061);
     }
 }

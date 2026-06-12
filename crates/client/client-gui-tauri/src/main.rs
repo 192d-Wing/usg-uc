@@ -143,6 +143,32 @@ fn is_digest_auth_enabled() -> bool {
     cfg!(feature = "digest-auth")
 }
 
+/// Trusts the provisioning extra CA (private-CA labs) for SIP TLS, so TLS
+/// registration verifies against the same root as provisioning HTTPS.
+/// Without this the SIP transport only trusts the system store.
+async fn trust_extra_ca_for_sip(
+    client: &mut ClientApp,
+    settings_manager: &Arc<RwLock<SettingsManager>>,
+) {
+    let extra_ca = settings_manager
+        .read()
+        .await
+        .settings()
+        .provisioning
+        .as_ref()
+        .and_then(|p| p.extra_ca_cert_file.clone())
+        .filter(|p| !p.trim().is_empty());
+    if let Some(path) = extra_ca {
+        match client
+            .set_trusted_ca_certs_from_pem_file(std::path::Path::new(&path))
+            .await
+        {
+            Ok(()) => info!(path = %path, "Extra CA trusted for SIP TLS"),
+            Err(e) => warn!(path = %path, error = %e, "Failed to load extra CA for SIP TLS"),
+        }
+    }
+}
+
 /// Initialize the SIP client core.
 #[tauri::command]
 async fn initialize_client(state: State<'_, TauriAppState>) -> Result<(), String> {
@@ -163,6 +189,8 @@ async fn initialize_client(state: State<'_, TauriAppState>) -> Result<(), String
     // Create the client application
     let mut client = ClientApp::new(local_sip_addr, local_media_addr, event_tx)
         .map_err(|e| format!("Failed to create client: {e}"))?;
+
+    trust_extra_ca_for_sip(&mut client, &state.settings_manager).await;
 
     // Resolve registrar DNS to determine if we need IPv4 or IPv6 socket.
     // Check the configured registrar hostname — if it resolves to AAAA (IPv6),
@@ -863,30 +891,12 @@ async fn register_sip(state: State<'_, TauriAppState>) -> Result<(), String> {
         }
     }
 
-    // Check if a certificate is selected for mTLS authentication
-    let selected_thumbprint = state.selected_cert_thumbprint.read().await.clone();
-
+    // mTLS client-certificate configuration is disabled: registration
+    // authenticates via OIDC Bearer (RFC 8898), not a smart-card cert.
     let mut client_guard = state.client.lock().await;
     let client = client_guard
         .as_mut()
         .ok_or_else(|| "Client not initialized".to_string())?;
-
-    // If a certificate is selected, configure it for mTLS before registering
-    if let Some(thumbprint) = selected_thumbprint {
-        info!(thumbprint = %thumbprint, "Configuring client certificate for mTLS");
-
-        // Get the certificate chain from the store
-        let cert_store = state.cert_store.read().await;
-        let cert_chain = cert_store
-            .get_certificate_chain(&thumbprint)
-            .map_err(|e| format!("Failed to get certificate chain: {e}"))?;
-        drop(cert_store);
-
-        // Set the client certificate for mTLS authentication
-        client.set_client_certificate(cert_chain, &thumbprint);
-    } else {
-        warn!("No client certificate selected - mTLS may fail if server requires client auth");
-    }
 
     client
         .register_account(&account)

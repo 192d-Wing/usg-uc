@@ -426,6 +426,33 @@ impl ClientApp {
         self.set_verification_mode(mode).await
     }
 
+    /// Loads PEM-encoded CA certificate(s) from `path` and trusts them for
+    /// SIP TLS server verification (private-CA environments; same file as
+    /// the provisioning extra-CA setting).
+    pub async fn set_trusted_ca_certs_from_pem_file(
+        &mut self,
+        path: &std::path::Path,
+    ) -> AppResult<()> {
+        use rustls::pki_types::{CertificateDer, pem::PemObject};
+
+        let certs: Vec<Vec<u8>> = CertificateDer::pem_file_iter(path)
+            .map_err(|e| {
+                AppError::Settings(format!("Failed to read CA file {}: {e}", path.display()))
+            })?
+            .filter_map(Result::ok)
+            .map(|cert| cert.to_vec())
+            .collect();
+
+        if certs.is_empty() {
+            return Err(AppError::Settings(format!(
+                "No certificates found in {}",
+                path.display()
+            )));
+        }
+
+        self.set_trusted_ca_certs(certs).await
+    }
+
     /// Returns the configured client certificate thumbprint.
     pub fn client_certificate_thumbprint(&self) -> Option<&str> {
         self.client_cert_thumbprint.as_deref()
@@ -480,6 +507,19 @@ impl ClientApp {
 
         self.state = AppState::Registering;
         self.current_account_id = Some(account.id.clone());
+
+        // TLS connections are made to resolved socket addresses, so tell the
+        // transport which DNS name to present as SNI and verify the server
+        // certificate against (IP-literal registrars keep the IP fallback).
+        if let Some(ref transport) = self.sip_transport {
+            let host = account
+                .registrar_uri
+                .parse::<proto_sip::uri::SipUri>()
+                .ok()
+                .map(|uri| uri.host)
+                .filter(|host| host.parse::<std::net::IpAddr>().is_err());
+            transport.set_tls_server_name(host).await;
+        }
 
         // Configure call manager with account
         self.call_manager.configure_account(account);
