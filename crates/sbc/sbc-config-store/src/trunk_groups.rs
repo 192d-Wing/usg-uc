@@ -65,6 +65,8 @@ impl PostgresTrunkGroupStore {
              ON CONFLICT (id) DO UPDATE SET
                  data       = EXCLUDED.data,
                  deleted    = FALSE,
+                 revision   = 0,
+                 updated_by = 'local',
                  updated_at = NOW()",
         )
         .bind(id)
@@ -74,16 +76,22 @@ impl PostgresTrunkGroupStore {
         Ok(())
     }
 
-    /// Delete a trunk group by ID.
+    /// Delete a trunk group by ID. Writes a tombstone (`deleted = TRUE`)
+    /// rather than removing the row, so central sync can distinguish
+    /// "deleted here" from "never existed" and never resurrects it.
     ///
     /// # Errors
-    /// Returns `ConfigStoreError::NotFound` if no row matched, or
+    /// Returns `ConfigStoreError::NotFound` if no live row matched, or
     /// `ConfigStoreError::Storage` for other DB errors.
     pub async fn delete(&self, id: &str) -> ConfigStoreResult<()> {
-        let result = sqlx::query("DELETE FROM trunk_groups WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE trunk_groups
+             SET deleted = TRUE, revision = 0, updated_by = 'local', updated_at = NOW()
+             WHERE id = $1 AND NOT deleted",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(ConfigStoreError::NotFound);
         }
@@ -118,12 +126,16 @@ impl PostgresTrunkGroupStore {
         Ok(out)
     }
 
-    /// `true` when there are no trunk groups; used by the migration helper.
+    /// `true` when there are no trunk groups at all — tombstones
+    /// included. This gates the one-shot legacy JSON import: "the table
+    /// has ever been written" is the signal, so an all-tombstoned table
+    /// must NOT read as empty (a stale JSON re-import would resurrect
+    /// rows).
     ///
     /// # Errors
     /// Returns `ConfigStoreError::Storage` for DB errors.
     pub async fn is_empty(&self) -> ConfigStoreResult<bool> {
-        let row = sqlx::query("SELECT COUNT(*) AS count FROM trunk_groups WHERE NOT deleted")
+        let row = sqlx::query("SELECT COUNT(*) AS count FROM trunk_groups")
             .fetch_one(&self.pool)
             .await?;
         let count: i64 = row.try_get("count")?;

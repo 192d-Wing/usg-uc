@@ -71,6 +71,8 @@ impl CucmJsonStore {
              ON CONFLICT (id) DO UPDATE SET
                  data       = EXCLUDED.data,
                  deleted    = FALSE,
+                 revision   = 0,
+                 updated_by = 'local',
                  updated_at = NOW()",
             self.table
         );
@@ -82,12 +84,19 @@ impl CucmJsonStore {
         Ok(())
     }
 
-    /// Delete a row by ID.
+    /// Delete a row by ID. Writes a tombstone (`deleted = TRUE`) rather
+    /// than removing the row, so central sync can distinguish "deleted
+    /// here" from "never existed" and never resurrects it.
     ///
     /// # Errors
-    /// Returns `ConfigStoreError::NotFound` if no row matched.
+    /// Returns `ConfigStoreError::NotFound` if no live row matched.
     pub async fn delete(&self, id: &str) -> ConfigStoreResult<()> {
-        let sql = format!("DELETE FROM {} WHERE id = $1", self.table);
+        let sql = format!(
+            "UPDATE {}
+             SET deleted = TRUE, revision = 0, updated_by = 'local', updated_at = NOW()
+             WHERE id = $1 AND NOT deleted",
+            self.table
+        );
         let result = sqlx::query(&sql).bind(id).execute(&self.pool).await?;
         if result.rows_affected() == 0 {
             return Err(ConfigStoreError::NotFound);

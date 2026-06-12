@@ -81,6 +81,8 @@ impl PostgresPhoneStore {
                  mac_normalized = EXCLUDED.mac_normalized,
                  data           = EXCLUDED.data,
                  deleted        = FALSE,
+                 revision       = 0,
+                 updated_by     = 'local',
                  updated_at     = NOW()",
         )
         .bind(&phone.id)
@@ -91,16 +93,22 @@ impl PostgresPhoneStore {
         Ok(())
     }
 
-    /// Delete a phone by ID.
+    /// Delete a phone by ID. Writes a tombstone (`deleted = TRUE`)
+    /// rather than removing the row, so central sync can distinguish
+    /// "deleted here" from "never existed" and never resurrects it.
     ///
     /// # Errors
-    /// Returns `ConfigStoreError::NotFound` if no row matched, or
+    /// Returns `ConfigStoreError::NotFound` if no live row matched, or
     /// `ConfigStoreError::Storage` for other DB errors.
     pub async fn delete(&self, id: &str) -> ConfigStoreResult<()> {
-        let result = sqlx::query("DELETE FROM phones WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE phones
+             SET deleted = TRUE, revision = 0, updated_by = 'local', updated_at = NOW()
+             WHERE id = $1 AND NOT deleted",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(ConfigStoreError::NotFound);
         }
@@ -154,12 +162,15 @@ impl PostgresPhoneStore {
         Ok(out)
     }
 
-    /// `true` when there are no phones; used by the migration helper.
+    /// `true` when there are no phones at all — tombstones included.
+    /// This gates the one-shot legacy JSON import: "the table has ever
+    /// been written" is the signal, so an all-tombstoned table must NOT
+    /// read as empty (a stale JSON re-import would resurrect rows).
     ///
     /// # Errors
     /// Returns `ConfigStoreError::Storage` for DB errors.
     pub async fn is_empty(&self) -> ConfigStoreResult<bool> {
-        let row = sqlx::query("SELECT COUNT(*) AS count FROM phones WHERE NOT deleted")
+        let row = sqlx::query("SELECT COUNT(*) AS count FROM phones")
             .fetch_one(&self.pool)
             .await?;
         let count: i64 = row.try_get("count")?;

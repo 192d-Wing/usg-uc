@@ -63,6 +63,15 @@ ALTER TABLE cucm_route_lists
     ADD COLUMN IF NOT EXISTS updated_by TEXT NOT NULL DEFAULT 'local',
     ADD COLUMN IF NOT EXISTS site_code TEXT;
 
+-- With deletes becoming tombstones, a full unique index would let a
+-- tombstoned phone hold its MAC hostage forever (the row is invisible
+-- to reads but still occupies the index, and upsert's ON CONFLICT (id)
+-- doesn't cover it). Scope uniqueness to live rows so a replacement
+-- phone can reuse the MAC of a tombstoned record.
+DROP INDEX IF EXISTS idx_phones_mac_normalized;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_phones_mac_normalized_live
+    ON phones (mac_normalized) WHERE NOT deleted;
+
 -- Tracks the last centrally-applied epoch per shard. One row per site
 -- code (in practice one row total — a site DB replicates one shard).
 -- Written only by sbc-config-sync; absence of a row means "never

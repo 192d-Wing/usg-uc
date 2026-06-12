@@ -1,16 +1,20 @@
 //! Integration tests for the embedded sqlx migrator against a real
 //! Postgres. Skipped (pass trivially) unless `SBC_CONFIG_STORE_TEST_DSN`
-//! is set to a DSN with CREATE DATABASE rights; the test creates and
-//! drops its own scratch databases so any throwaway server works:
+//! is set to a DSN with CREATE DATABASE rights; the tests create and
+//! drop their own scratch databases so any throwaway server works:
 //!
 //! ```sh
 //! SBC_CONFIG_STORE_TEST_DSN=postgres://postgres@127.0.0.1:5432/postgres \
 //!     cargo test -p sbc-config-store --test schema_pg
 //! ```
 
-#![allow(clippy::expect_used)] // test harness: fail loudly with context
+#![allow(clippy::expect_used, clippy::panic)] // test harness: fail loudly with context
 
-use sqlx::postgres::PgPoolOptions;
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::str::FromStr;
+
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
 
 use sbc_config_store::{PostgresPhoneStore, ensure_schema};
@@ -21,10 +25,13 @@ fn admin_dsn() -> Option<String> {
 }
 
 /// Drop-if-exists + create a scratch database, returning a pool on it.
+/// Uses `PgConnectOptions::database()` to swap the database name so DSN
+/// query parameters (`?sslmode=require`, etc.) survive.
 async fn scratch_db(admin: &str, name: &str) -> PgPool {
+    let admin_opts = PgConnectOptions::from_str(admin).expect("parse admin DSN");
     let admin_pool = PgPoolOptions::new()
         .max_connections(1)
-        .connect(admin)
+        .connect_with(admin_opts.clone())
         .await
         .expect("connect admin DSN");
     sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
@@ -35,18 +42,30 @@ async fn scratch_db(admin: &str, name: &str) -> PgPool {
         .execute(&admin_pool)
         .await
         .expect("create scratch db");
-    let scratch = replace_dbname(admin, name);
     PgPoolOptions::new()
         .max_connections(5)
-        .connect(&scratch)
+        .connect_with(admin_opts.database(name))
         .await
         .expect("connect scratch db")
 }
 
-/// Swap the database name (path segment) in a postgres:// DSN.
-fn replace_dbname(dsn: &str, name: &str) -> String {
-    let (base, _) = dsn.rsplit_once('/').expect("DSN has a path");
-    format!("{base}/{name}")
+async fn columns(pool: &PgPool, table: &str) -> BTreeMap<String, String> {
+    sqlx::query(
+        "SELECT column_name, data_type FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = $1",
+    )
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .expect("columns query")
+    .iter()
+    .map(|r| {
+        (
+            r.try_get::<String, _>("column_name").expect("name"),
+            r.try_get::<String, _>("data_type").expect("type"),
+        )
+    })
+    .collect()
 }
 
 async fn column_exists(pool: &PgPool, table: &str, column: &str) -> bool {
@@ -157,16 +176,94 @@ async fn adopts_legacy_database_and_preserves_rows() {
     assert!(!row.try_get::<bool, _>("deleted").expect("deleted"));
     assert_eq!(row.try_get::<String, _>("updated_by").expect("updated_by"), "local");
 
-    // Tombstoned rows disappear from reads; a re-upsert revives them.
-    sqlx::query("UPDATE phones SET deleted = TRUE WHERE id = 'legacy-1'")
-        .execute(&pool)
-        .await
-        .expect("tombstone");
+    // delete() writes a tombstone: invisible to reads, but the physical
+    // row (and the fact a deletion happened) survives.
+    store.delete("legacy-1").await.expect("tombstone delete");
     assert!(store.get_by_mac("aabbccddeeff").await.is_err(), "tombstone visible");
     assert!(store.list().await.expect("list").is_empty(), "tombstone listed");
-    store.upsert(&phone).await.expect("revive upsert");
-    assert_eq!(
-        store.get("legacy-1").await.expect("revived row").id,
-        "legacy-1"
+    assert!(
+        store.delete("legacy-1").await.is_err(),
+        "double delete must be NotFound"
     );
+    let row = sqlx::query("SELECT deleted, updated_by FROM phones WHERE id = 'legacy-1'")
+        .fetch_one(&pool)
+        .await
+        .expect("tombstone row gone from table");
+    assert!(row.try_get::<bool, _>("deleted").expect("deleted"));
+    assert_eq!(row.try_get::<String, _>("updated_by").expect("updated_by"), "local");
+
+    // The legacy-JSON import guard must NOT see an all-tombstoned table
+    // as empty — that would re-import a stale file and resurrect rows.
+    assert!(!store.is_empty().await.expect("is_empty"), "tombstones must count");
+
+    // A tombstoned phone must not hold its MAC hostage: a replacement
+    // phone with a new id and the same MAC is provisionable (partial
+    // unique index over live rows only).
+    let mut replacement = Phone::new("AA:BB:CC:DD:EE:FF", PhoneModel::PolycomVVX150, "repl");
+    replacement.id = "replacement-2".to_string();
+    store.upsert(&replacement).await.expect("MAC reuse after tombstone");
+    assert_eq!(
+        store.get_by_mac("aabbccddeeff").await.expect("live row").id,
+        "replacement-2"
+    );
+
+    // Re-upserting the tombstoned id revives it with local provenance —
+    // but first move its MAC aside so the live-MAC uniqueness holds.
+    let mut revived = phone.clone();
+    revived.mac_address = "AA:BB:CC:DD:EE:00".to_string();
+    store.upsert(&revived).await.expect("revive upsert");
+    let row = sqlx::query("SELECT deleted, revision, updated_by FROM phones WHERE id = 'legacy-1'")
+        .fetch_one(&pool)
+        .await
+        .expect("revived row");
+    assert!(!row.try_get::<bool, _>("deleted").expect("deleted"));
+    assert_eq!(row.try_get::<i64, _>("revision").expect("revision"), 0);
+    assert_eq!(row.try_get::<String, _>("updated_by").expect("updated_by"), "local");
+}
+
+/// The central database (deploy/central-db, raw SQL applied via psql)
+/// and the site-local embedded migrations define the same eight logical
+/// config tables. Nothing else mechanically ties them together, so this
+/// test applies both schemas to scratch databases and diffs the column
+/// name→type maps; the first envelope/payload column added to one side
+/// only fails here instead of at a site when the sync agent ships rows.
+/// (Nullability and defaults intentionally differ — central is stricter
+/// — so only names and types are compared.)
+#[tokio::test]
+async fn central_and_local_schemas_agree() {
+    let Some(admin) = admin_dsn() else { return };
+
+    let local = scratch_db(&admin, "csmt_drift_local").await;
+    ensure_schema(&local).await.expect("local migrate");
+
+    let central = scratch_db(&admin, "csmt_drift_central").await;
+    let central_dir =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../deploy/central-db/migrations");
+    for file in ["0001_sites.sql", "0002_config_tables.sql"] {
+        let sql = std::fs::read_to_string(central_dir.join(file))
+            .unwrap_or_else(|e| panic!("read central migration {file}: {e}"));
+        sqlx::raw_sql(&sql)
+            .execute(&central)
+            .await
+            .unwrap_or_else(|e| panic!("apply central migration {file}: {e}"));
+    }
+
+    for table in [
+        "phones",
+        "directory_numbers",
+        "trunk_groups",
+        "dial_plans",
+        "cucm_partitions",
+        "cucm_calling_search_spaces",
+        "cucm_route_patterns",
+        "cucm_route_lists",
+    ] {
+        let local_cols = columns(&local, table).await;
+        let central_cols = columns(&central, table).await;
+        assert!(!local_cols.is_empty(), "{table} missing locally");
+        assert_eq!(
+            local_cols, central_cols,
+            "schema drift between site-local and central definitions of {table}"
+        );
+    }
 }

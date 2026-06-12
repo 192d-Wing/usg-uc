@@ -23,13 +23,17 @@ CREATE TABLE IF NOT EXISTS phones (
     updated_by     text NOT NULL,
     created_at     timestamptz NOT NULL DEFAULT now(),
     updated_at     timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (site_code, id),
-    -- MAC must be unique within a site (provisioning lookup); the same
-    -- MAC may not legitimately appear at two sites either, but partition
-    -- constraints can only cover the partition key — fleet-wide MAC
-    -- uniqueness is enforced by the central API at write time.
-    UNIQUE (site_code, mac_normalized)
+    PRIMARY KEY (site_code, id)
 ) PARTITION BY LIST (site_code);
+
+-- MAC must be unique within a site (provisioning lookup), but only
+-- among live rows — deletions are tombstones, and a tombstoned phone
+-- must not block re-provisioning its MAC under a new id. The same MAC
+-- may not legitimately appear at two sites either, but partition
+-- constraints can only cover the partition key — fleet-wide MAC
+-- uniqueness is enforced by the central API at write time.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_phones_site_mac_live
+    ON phones (site_code, mac_normalized) WHERE NOT deleted;
 
 -- ----------------------------------------------------- directory_numbers
 -- Fleet-wide DID uniqueness cannot be a unique index here (a unique
@@ -156,6 +160,11 @@ CREATE TABLE IF NOT EXISTS site_telephony_config (
 -- Append-only change log, one entry per row mutation, written in the
 -- same transaction as the mutation and the sites.config_epoch bump.
 -- Drives GET /sync/{site}/delta and doubles as the audit log.
+--
+-- Epoch is the *transaction-level* cursor: a multi-row write (bulk
+-- import, dial-plan apply) bumps it once and journals N entries under
+-- the same epoch, so the PK must extend to (table_name, row_id). Its
+-- (site_code, epoch) prefix still serves delta range scans.
 CREATE TABLE IF NOT EXISTS config_journal (
     site_code  text NOT NULL REFERENCES sites(site_code),
     epoch      bigint NOT NULL,
@@ -165,5 +174,5 @@ CREATE TABLE IF NOT EXISTS config_journal (
     payload    jsonb,                        -- full row at this epoch (upsert)
     actor      text NOT NULL,
     at         timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (site_code, epoch)
+    PRIMARY KEY (site_code, epoch, table_name, row_id)
 ) PARTITION BY LIST (site_code);

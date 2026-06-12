@@ -65,6 +65,8 @@ impl PostgresDialPlanStore {
              ON CONFLICT (id) DO UPDATE SET
                  data       = EXCLUDED.data,
                  deleted    = FALSE,
+                 revision   = 0,
+                 updated_by = 'local',
                  updated_at = NOW()",
         )
         .bind(id)
@@ -74,16 +76,22 @@ impl PostgresDialPlanStore {
         Ok(())
     }
 
-    /// Delete a dial plan by ID.
+    /// Delete a dial plan by ID. Writes a tombstone (`deleted = TRUE`)
+    /// rather than removing the row, so central sync can distinguish
+    /// "deleted here" from "never existed" and never resurrects it.
     ///
     /// # Errors
-    /// Returns `ConfigStoreError::NotFound` if no row matched, or
+    /// Returns `ConfigStoreError::NotFound` if no live row matched, or
     /// `ConfigStoreError::Storage` for other DB errors.
     pub async fn delete(&self, id: &str) -> ConfigStoreResult<()> {
-        let result = sqlx::query("DELETE FROM dial_plans WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE dial_plans
+             SET deleted = TRUE, revision = 0, updated_by = 'local', updated_at = NOW()
+             WHERE id = $1 AND NOT deleted",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(ConfigStoreError::NotFound);
         }

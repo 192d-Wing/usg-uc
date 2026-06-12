@@ -26,6 +26,8 @@ psql "$CENTRAL_DB_DSN" -c \
 CENTRAL_DB_DSN=... ./scripts/gen-site-partitions.sh
 ```
 
-Site codes are canonical uppercase (`^[A-Z][A-Z0-9-]{1,15}$`); the CHECK
-constraint on `sites` rejects anything else. Lowercase derivations (DNS
-names, helm `site.name`, partition names) are computed, never stored.
+Site codes are canonical uppercase (`^[A-Z][A-Z0-9-]{0,14}[A-Z0-9]$` —
+must end with a letter or digit so lowercased DNS derivations stay valid);
+the CHECK constraint on `sites` rejects anything else. Lowercase
+derivations (DNS names, helm `site.name`, partition names) are computed,
+never stored.

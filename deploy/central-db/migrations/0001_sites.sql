@@ -6,13 +6,15 @@
 -- scripts/gen-site-partitions.sh (never hand-written DDL).
 --
 -- Site-code canon: uppercase A–Z, digits, hyphen; must start with a
--- letter; 2–16 chars total. Examples: MUHJ, MPLS, OOPL-001. Lowercase
--- forms (DNS names, helm site.name, partition table names) are derived
--- by lowercasing; the registry stores only the canonical uppercase form.
+-- letter and end with a letter or digit (a trailing hyphen would make
+-- the lowercased DNS derivations invalid per RFC 1035); 2–16 chars
+-- total. Examples: MUHJ, MPLS, OOPL-001. Lowercase forms (DNS names,
+-- helm site.name, partition table names) are derived by lowercasing;
+-- the registry stores only the canonical uppercase form.
 
 CREATE TABLE IF NOT EXISTS sites (
     site_code     text PRIMARY KEY
-                  CHECK (site_code ~ '^[A-Z][A-Z0-9-]{1,15}$'),
+                  CHECK (site_code ~ '^[A-Z][A-Z0-9-]{0,14}[A-Z0-9]$'),
     display_name  text NOT NULL,
     fqdn_base     text NOT NULL,             -- mirrors helm site.fqdn_base
     timezone      text NOT NULL DEFAULT 'UTC',

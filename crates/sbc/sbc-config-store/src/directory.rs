@@ -73,6 +73,8 @@ impl PostgresDirectoryNumberStore {
                  description = EXCLUDED.description,
                  extra       = EXCLUDED.extra,
                  deleted     = FALSE,
+                 revision    = 0,
+                 updated_by  = 'local',
                  updated_at  = NOW()",
         )
         .bind(&dn.did)
@@ -85,16 +87,22 @@ impl PostgresDirectoryNumberStore {
         Ok(())
     }
 
-    /// Delete a DID. Returns `NotFound` if the DID didn't exist.
+    /// Delete a DID. Writes a tombstone (`deleted = TRUE`) rather than
+    /// removing the row, so central sync can distinguish "deleted here"
+    /// from "never existed" and never resurrects it.
     ///
     /// # Errors
     /// Returns `ConfigStoreError::Storage` for DB errors, or
-    /// `ConfigStoreError::NotFound` if the DID didn't exist.
+    /// `ConfigStoreError::NotFound` if no live row matched.
     pub async fn delete(&self, did: &str) -> ConfigStoreResult<()> {
-        let result = sqlx::query("DELETE FROM directory_numbers WHERE did = $1")
-            .bind(did)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE directory_numbers
+             SET deleted = TRUE, revision = 0, updated_by = 'local', updated_at = NOW()
+             WHERE did = $1 AND NOT deleted",
+        )
+        .bind(did)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(ConfigStoreError::NotFound);
         }
@@ -137,13 +145,15 @@ impl PostgresDirectoryNumberStore {
         Ok(out)
     }
 
-    /// `true` when there are no DIDs in the table. Used by the JSON
-    /// migration helper to decide whether backfill is needed.
+    /// `true` when there are no DIDs at all — tombstones included.
+    /// This gates the one-shot legacy JSON import: "the table has ever
+    /// been written" is the signal, so an all-tombstoned table must NOT
+    /// read as empty (a stale JSON re-import would resurrect rows).
     ///
     /// # Errors
     /// Returns `ConfigStoreError::Storage` for DB errors.
     pub async fn is_empty(&self) -> ConfigStoreResult<bool> {
-        let row = sqlx::query("SELECT COUNT(*) AS count FROM directory_numbers WHERE NOT deleted")
+        let row = sqlx::query("SELECT COUNT(*) AS count FROM directory_numbers")
             .fetch_one(&self.pool)
             .await?;
         let count: i64 = row.try_get("count")?;

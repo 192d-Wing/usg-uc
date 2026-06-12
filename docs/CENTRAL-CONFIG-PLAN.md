@@ -123,8 +123,10 @@ Adding site #185 = insert a row + run the partition-DDL generator
 against existing partitions and emits `CREATE TABLE … PARTITION OF …`).
 Never hand-write partition DDL.
 
-**Site-code canon:** canonical form is uppercase — `^[A-Z][A-Z0-9-]{1,15}$`
-(starts with a letter; A–Z, 0–9, hyphen; 2–16 chars). Examples: `MUHJ`,
+**Site-code canon:** canonical form is uppercase —
+`^[A-Z][A-Z0-9-]{0,14}[A-Z0-9]$` (starts with a letter, ends with a letter
+or digit so lowercased DNS derivations stay valid; A–Z, 0–9, hyphen; 2–16
+chars). Examples: `MUHJ`,
 `MPLS`, `OOPL-001`. The registry stores only the canonical form (enforced by
 a CHECK constraint); lowercase derivations — DNS labels, helm `site.name`,
 partition table names (`phones_p_oopl_001`) — are computed on demand, never
@@ -145,9 +147,12 @@ CREATE TABLE phones (
     deleted     boolean NOT NULL DEFAULT false,  -- tombstone for delta sync
     updated_at  timestamptz NOT NULL DEFAULT now(),
     updated_by  text NOT NULL,               -- OIDC subject of the operator
-    PRIMARY KEY (site_code, id),
-    UNIQUE (site_code, mac_normalized)
+    PRIMARY KEY (site_code, id)
 ) PARTITION BY LIST (site_code);
+
+-- Partial: tombstoned phones must not block MAC reuse by a replacement.
+CREATE UNIQUE INDEX idx_phones_site_mac_live
+    ON phones (site_code, mac_normalized) WHERE NOT deleted;
 ```
 
 `directory_numbers`, `trunk_groups`, `dial_plans`, the four CUCM routing
@@ -174,7 +179,9 @@ CREATE TABLE config_journal (
     payload     jsonb,                       -- full row at this epoch (upsert)
     actor       text NOT NULL,
     at          timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (site_code, epoch)
+    -- epoch is per-transaction, not per-row: a bulk write journals N
+    -- entries under one epoch, so the PK extends to (table_name, row_id).
+    PRIMARY KEY (site_code, epoch, table_name, row_id)
 ) PARTITION BY LIST (site_code);
 ```
 
