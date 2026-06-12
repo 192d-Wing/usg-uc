@@ -26,6 +26,12 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: daemon
 {{- end }}
 
+{{- define "sbc.postgresSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "sbc.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: postgres
+{{- end }}
+
 {{- define "sbc.keaSelectorLabels" -}}
 app.kubernetes.io/name: {{ include "sbc.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}

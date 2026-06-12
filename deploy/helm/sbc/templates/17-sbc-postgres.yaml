@@ -49,8 +49,7 @@ spec:
   type: ClusterIP
   clusterIP: None              # headless for StatefulSet stable DNS
   selector:
-    {{- include "sbc.labels" . | nindent 4 }}
-    app.kubernetes.io/component: postgres
+    {{- include "sbc.postgresSelectorLabels" . | nindent 4 }}
   ports:
     - { name: postgres, port: 5432, targetPort: 5432, protocol: TCP }
 ---
@@ -65,10 +64,13 @@ metadata:
 spec:
   serviceName: {{ include "sbc.fullname" . }}-postgres
   replicas: 1
+  # Selector must stay version-free: it is immutable on StatefulSets, and
+  # full sbc.labels carry helm.sh/chart / app version, which change every
+  # release and made upgrades fail with "Forbidden: updates to statefulset
+  # spec".
   selector:
     matchLabels:
-      {{- include "sbc.labels" . | nindent 6 }}
-      app.kubernetes.io/component: postgres
+      {{- include "sbc.postgresSelectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
