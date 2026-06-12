@@ -11,6 +11,11 @@ metadata:
 spec:
   blocks:
     - cidr: {{ .Values.site.lb_pool_cidr }}
+    {{- if .Values.site.lb_pool_cidr6 }}
+    # IPv6 anycast block (e.g. a /128 per service, mirroring the v4 /32
+    # convention). Requires dual-stack Services — see site.sbc_lb_ip6.
+    - cidr: {{ .Values.site.lb_pool_cidr6 }}
+    {{- end }}
   serviceSelector:
     matchLabels:
       sbc.usg/site: {{ .Values.site.name }}

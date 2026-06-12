@@ -129,7 +129,11 @@ media_interface = "__POD_IP__"
 external_ip = "__POD_IP__"
 
 [transport]
-udp_listen = ["0.0.0.0:5060"]
+# UDP is a dual-stack wildcard: one socket serves IPv4 and IPv6
+# (IPV6_V6ONLY=0); uc-transport canonicalizes IPv4-mapped sources so the
+# SIP layer sees plain v4 addresses. Required for the v6 anycast SIP VIP
+# (site.sbc_lb_ip6). TCP/TLS stay v4-only until given the same treatment.
+udp_listen = ["[::]:5060"]
 tcp_listen = ["0.0.0.0:5060"]
 tls_listen = ["0.0.0.0:5061"]
 ws_listen = []

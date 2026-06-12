@@ -8,9 +8,16 @@ site:
   lb_pool_cidr: 10.10.10.58/31
   sbc_lb_ip: 10.10.10.58
   kea_lb_ip: 10.10.10.59
+  # v6 anycast mirror of sbc_lb_ip (pihole-anycast convention: v4/32 + v6/128
+  # per service). pihole DNS already publishes the matching AAAA.
+  lb_pool_cidr6: 2601:443:c200:575::58/128
+  sbc_lb_ip6: 2601:443:c200:575::58
 
 bgp:
   install_cluster_config: false
+  # This cluster's pre-existing CiliumBGPPeerConfig (upstream-k3s-v4)
+  # selects advertisements labeled advertise=k3s-pod-cidrs.
+  advertise_label: k3s-pod-cidrs
 
 externalDns:
   enabled: false
@@ -47,3 +54,11 @@ sbcClientConfig:
     repository: ghcr.io/192d-wing/sbc-client-config-server
     tag: "0.4.0"
     pullPolicy: IfNotPresent
+  # SIP registrar gets its own name: sbc.oopl.dev.mil must stay on the
+  # traefik LB (10.10.10.54) for the HTTPS provisioning ingress, while SIP
+  # listens on the sip LB (10.10.10.58). DNS: sip.oopl.dev.mil A 10.10.10.58
+  # (A record only — clients prefer AAAA and v6 to these VIPs is blackholed).
+  registrarDomain: sip.oopl.dev.mil
+  # OOPL-CA-signed leaf for sbc.oopl.dev.mil (created out-of-band; see
+  # usg-tacacs/deploy/k3s/pki for the issuance pattern).
+  ingressTlsSecretName: sbc-oopl-001-ingress-tls
