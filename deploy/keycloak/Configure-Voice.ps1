@@ -330,13 +330,13 @@ else {
 # --- 5. realm token policy (merge into existing settings) ---------------
 $realmRep = Invoke-Kc GET ''
 $realmRep.accessTokenLifespan = 300          # matches REGISTER expiry
-$realmRep.ssoSessionIdleTimeout = 36000      # 10 h
-$realmRep.ssoSessionMaxLifespan = 86400      # 24 h
+$realmRep.ssoSessionIdleTimeout = 28800      # 8 h (must be <= max lifespan)
+$realmRep.ssoSessionMaxLifespan = 28800      # 8 h — hard ceiling on a sign-in session
 $realmRep.offlineSessionIdleTimeout = 2592000 # 30 d (mobile offline_access)
 $realmRep.revokeRefreshToken = $true         # rotation: revoke on reuse
 $realmRep.refreshTokenMaxReuse = 0
 $null = Invoke-Kc PUT '' $realmRep
-Write-Note 'realm token policy set (access 5m, SSO 10h/24h, offline 30d, refresh rotation on)'
+Write-Note 'realm token policy set (access 5m, SSO 8h/8h, offline 30d, refresh rotation on)'
 
 # --- 6. optional test user ----------------------------------------------
 if ($TestUser -and $TestUserDn) {
