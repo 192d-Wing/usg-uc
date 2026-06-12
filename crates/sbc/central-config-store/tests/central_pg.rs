@@ -1,0 +1,282 @@
+//! Integration tests for the central config store against a real
+//! Postgres. Skipped (pass trivially) unless `CENTRAL_STORE_TEST_DSN` is
+//! set to a DSN with CREATE DATABASE rights; each test creates and drops
+//! its own scratch database:
+//!
+//! ```sh
+//! CENTRAL_STORE_TEST_DSN=postgres://postgres@127.0.0.1:5432/postgres \
+//!     cargo test -p central-config-store --test central_pg
+//! ```
+
+#![allow(clippy::expect_used, clippy::panic)] // test harness: fail loudly
+
+use std::str::FromStr;
+
+use serde_json::{Map, Value, json};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+
+use central_config_store::{CentralConfigStore, ChangeOp, ConfigTable, DeltaResult};
+
+fn admin_dsn() -> Option<String> {
+    std::env::var("CENTRAL_STORE_TEST_DSN").ok()
+}
+
+/// Drop-if-exists + create a scratch database; return a store on it with
+/// migrations applied.
+async fn fresh_store(admin: &str, name: &str) -> CentralConfigStore {
+    let admin_opts = PgConnectOptions::from_str(admin).expect("parse admin DSN");
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(admin_opts.clone())
+        .await
+        .expect("connect admin DSN");
+    sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+        .execute(&admin_pool)
+        .await
+        .expect("drop scratch db");
+    sqlx::query(&format!("CREATE DATABASE {name}"))
+        .execute(&admin_pool)
+        .await
+        .expect("create scratch db");
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect_with(admin_opts.database(name))
+        .await
+        .expect("connect scratch db");
+    CentralConfigStore::from_pool(pool).await.expect("migrate central schema")
+}
+
+fn no_extra() -> Map<String, Value> {
+    Map::new()
+}
+
+#[tokio::test]
+async fn register_creates_partitions_and_is_idempotent() {
+    let Some(admin) = admin_dsn() else { return };
+    let store = fresh_store(&admin, "cst_register").await;
+
+    store
+        .register_site("OOPL-001", "OOPL lab", "oopl-001.x", "UTC", "active")
+        .await
+        .expect("register");
+    // Re-register: no-op on the row, backfills partitions, no error.
+    store
+        .register_site("OOPL-001", "OOPL lab", "oopl-001.x", "UTC", "active")
+        .await
+        .expect("re-register");
+
+    let parts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_inherits i
+         JOIN pg_class c ON c.oid = i.inhrelid
+         JOIN pg_class p ON p.oid = i.inhparent
+         WHERE p.relname = 'phones' AND c.relkind = 'r'",
+    )
+    .fetch_one(store.pool())
+    .await
+    .expect("count phone partitions");
+    assert_eq!(parts, 1, "exactly one phones partition for the one site");
+
+    assert!(
+        store.register_site("oopl", "x", "x", "UTC", "active").await.is_err(),
+        "lowercase site code rejected before DB"
+    );
+    assert_eq!(store.epoch("OOPL-001").await.expect("epoch"), 0);
+    assert!(store.epoch("NOPE").await.is_err(), "unknown site errors");
+}
+
+#[tokio::test]
+async fn writes_bump_epoch_and_journal_in_lockstep() {
+    let Some(admin) = admin_dsn() else { return };
+    let store = fresh_store(&admin, "cst_writes").await;
+    store.register_site("MUHJ", "MUHJ", "muhj.x", "UTC", "active").await.expect("register");
+
+    let e1 = store
+        .upsert_phone("MUHJ", "p1", "aabbccddeeff", &json!({"id": "p1"}), "alice")
+        .await
+        .expect("phone upsert");
+    assert_eq!(e1, 1, "first write is epoch 1");
+
+    let e2 = store
+        .upsert_json(ConfigTable::DialPlans, "MUHJ", "main", &json!({"entries": []}), "alice")
+        .await
+        .expect("dial plan upsert");
+    assert_eq!(e2, 2);
+
+    // sites.config_epoch tracks the latest; journal has one row per write.
+    assert_eq!(store.epoch("MUHJ").await.expect("epoch"), 2);
+    let journal_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM config_journal WHERE site_code = 'MUHJ'")
+            .fetch_one(store.pool())
+            .await
+            .expect("journal count");
+    assert_eq!(journal_rows, 2);
+
+    // The phone row carries revision = its write epoch.
+    let rev: i64 = sqlx::query_scalar(
+        "SELECT revision FROM phones WHERE site_code = 'MUHJ' AND id = 'p1'",
+    )
+    .fetch_one(store.pool())
+    .await
+    .expect("phone revision");
+    assert_eq!(rev, 1);
+}
+
+#[tokio::test]
+async fn delta_returns_changes_and_snapshot_materializes_live_rows() {
+    let Some(admin) = admin_dsn() else { return };
+    let store = fresh_store(&admin, "cst_delta").await;
+    store.register_site("MPLS", "MPLS", "mpls.x", "UTC", "active").await.expect("register");
+
+    store
+        .upsert_phone("MPLS", "p1", "aaaaaaaaaaaa", &json!({"id": "p1", "v": 1}), "a")
+        .await
+        .expect("p1");
+    store
+        .upsert_phone("MPLS", "p2", "bbbbbbbbbbbb", &json!({"id": "p2"}), "a")
+        .await
+        .expect("p2");
+    let e_after_update = store
+        .upsert_phone("MPLS", "p1", "aaaaaaaaaaaa", &json!({"id": "p1", "v": 2}), "a")
+        .await
+        .expect("p1 update");
+    let e_after_delete = store.delete(ConfigTable::Phones, "MPLS", "p2", "a").await.expect("del p2");
+    assert_eq!(e_after_delete, e_after_update + 1);
+
+    // Delta from 0 replays every change in order, last write of p1 wins on
+    // apply, and p2 ends in a delete.
+    let DeltaResult::Delta { from, to, changes } =
+        store.delta("MPLS", 0).await.expect("delta from 0")
+    else {
+        panic!("expected a delta, not a snapshot directive");
+    };
+    assert_eq!(from, 0);
+    assert_eq!(to, e_after_delete);
+    assert_eq!(changes.len(), 4, "p1, p2, p1-update, p2-delete");
+    assert!(changes.windows(2).all(|w| w[0].epoch <= w[1].epoch), "ascending epochs");
+    let last = changes.last().expect("a change");
+    assert_eq!(last.op, ChangeOp::Delete);
+    assert_eq!(last.row_id, "p2");
+    assert!(last.payload.is_none(), "delete carries no payload");
+
+    // Incremental delta: only the tail after the second epoch.
+    let DeltaResult::Delta { changes: tail, .. } =
+        store.delta("MPLS", 2).await.expect("delta from 2")
+    else {
+        panic!("expected delta");
+    };
+    assert_eq!(tail.len(), 2, "only the update and the delete");
+
+    // since ahead of current → must snapshot.
+    assert!(matches!(
+        store.delta("MPLS", 999).await.expect("delta ahead"),
+        DeltaResult::MustSnapshot { current } if current == e_after_delete
+    ));
+
+    // Snapshot has only the one live phone (p1, v2); the deleted p2 is gone.
+    let snap = store.snapshot("MPLS").await.expect("snapshot");
+    assert_eq!(snap.epoch, e_after_delete);
+    let phones = snap
+        .tables
+        .iter()
+        .find(|t| t.table == ConfigTable::Phones)
+        .expect("phones table in snapshot");
+    assert_eq!(phones.rows.len(), 1, "only the live phone");
+    assert_eq!(phones.rows[0], json!({"id": "p1", "v": 2}));
+}
+
+#[tokio::test]
+async fn did_uniqueness_is_fleet_wide() {
+    let Some(admin) = admin_dsn() else { return };
+    let store = fresh_store(&admin, "cst_did").await;
+    store.register_site("AAAA", "A", "a.x", "UTC", "active").await.expect("reg A");
+    store.register_site("BBBB", "B", "b.x", "UTC", "active").await.expect("reg B");
+
+    store
+        .upsert_did("AAAA", "5551234567", Some("jdoe"), None, None, &no_extra(), "a")
+        .await
+        .expect("claim DID for A");
+
+    // Same DID at another site is a hard error.
+    let err = store
+        .upsert_did("BBBB", "5551234567", Some("other"), None, None, &no_extra(), "b")
+        .await
+        .expect_err("cross-site DID claim must fail");
+    assert!(
+        matches!(&err, central_config_store::CentralError::DidConflict { owner, .. } if owner == "AAAA"),
+        "got {err:?}"
+    );
+
+    // Re-claiming at the owning site is fine (update).
+    store
+        .upsert_did("AAAA", "5551234567", Some("jdoe2"), None, None, &no_extra(), "a")
+        .await
+        .expect("re-claim at owner");
+
+    // Deleting frees it fleet-wide; another site may then claim it.
+    store.delete(ConfigTable::DirectoryNumbers, "AAAA", "5551234567", "a").await.expect("del");
+    let reg_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM did_registry WHERE did = '5551234567'")
+            .fetch_one(store.pool())
+            .await
+            .expect("registry count");
+    assert_eq!(reg_rows, 0, "tombstoning the DID frees the registry");
+    store
+        .upsert_did("BBBB", "5551234567", Some("nowB"), None, None, &no_extra(), "b")
+        .await
+        .expect("B claims the freed DID");
+}
+
+#[tokio::test]
+async fn failed_write_rolls_back_epoch() {
+    let Some(admin) = admin_dsn() else { return };
+    let store = fresh_store(&admin, "cst_rollback").await;
+    store.register_site("CCCC", "C", "c.x", "UTC", "active").await.expect("register");
+
+    store
+        .upsert_phone("CCCC", "p1", "aaaaaaaaaaaa", &json!({"id": "p1"}), "a")
+        .await
+        .expect("p1");
+    assert_eq!(store.epoch("CCCC").await.expect("epoch"), 1);
+
+    // A second live phone with the same MAC must fail the partial unique
+    // index — and the epoch bump from that attempt must roll back.
+    let err = store
+        .upsert_phone("CCCC", "p2", "aaaaaaaaaaaa", &json!({"id": "p2"}), "a")
+        .await
+        .expect_err("duplicate live MAC must conflict");
+    assert!(matches!(err, central_config_store::CentralError::Conflict(_)), "got {err:?}");
+    assert_eq!(store.epoch("CCCC").await.expect("epoch"), 1, "epoch rolled back");
+
+    // Deleting a missing row is NotFound and also rolls back the epoch.
+    let err = store.delete(ConfigTable::Phones, "CCCC", "ghost", "a").await.expect_err("ghost");
+    assert!(matches!(err, central_config_store::CentralError::NotFound), "got {err:?}");
+    assert_eq!(store.epoch("CCCC").await.expect("epoch"), 1, "epoch rolled back on NotFound");
+
+    // Writing to an unknown site never advances anything.
+    assert!(store.upsert_phone("ZZZZ", "p", "ffffffffffff", &json!({}), "a").await.is_err());
+}
+
+#[tokio::test]
+async fn tombstoned_mac_is_reusable() {
+    let Some(admin) = admin_dsn() else { return };
+    let store = fresh_store(&admin, "cst_macreuse").await;
+    store.register_site("DDDD", "D", "d.x", "UTC", "active").await.expect("register");
+
+    store
+        .upsert_phone("DDDD", "old", "aabbccddeeff", &json!({"id": "old"}), "a")
+        .await
+        .expect("old phone");
+    store.delete(ConfigTable::Phones, "DDDD", "old", "a").await.expect("tombstone old");
+
+    // A replacement with a new id and the same MAC is provisionable (the
+    // unique index is partial over live rows).
+    store
+        .upsert_phone("DDDD", "new", "aabbccddeeff", &json!({"id": "new"}), "a")
+        .await
+        .expect("MAC reuse after tombstone");
+
+    let snap = store.snapshot("DDDD").await.expect("snapshot");
+    let phones = snap.tables.iter().find(|t| t.table == ConfigTable::Phones).expect("phones");
+    assert_eq!(phones.rows.len(), 1);
+    assert_eq!(phones.rows[0], json!({"id": "new"}));
+}

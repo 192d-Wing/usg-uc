@@ -1,0 +1,24 @@
+[package]
+name = "central-config-store"
+description = "Partition-aware persistence for the fleet-wide central config database: transactional writes (epoch bump + revision stamp + journal append in one tx), DID-registry uniqueness, and the sync read API (epoch/delta/snapshot). Phase 1 of docs/CENTRAL-CONFIG-PLAN.md."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror.workspace = true
+tracing.workspace = true
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "migrate", "chrono"] }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

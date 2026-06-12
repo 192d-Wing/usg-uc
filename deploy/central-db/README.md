@@ -9,13 +9,19 @@ copy of its own shard.
 
 ## Layout
 
-- `migrations/` — ordered SQL applied to the central database.
-  `0001_sites.sql` is the site registry (the shard list); `0002` creates
-  the LIST-partitioned config tables and the change journal. Phase 1
-  wraps these in the `central-config-api` service's embedded migrator;
-  until then apply with `psql -f` in filename order.
+- `migrations/` — ordered SQL applied to the central database, and the
+  single source of truth for the central schema. `0001_sites.sql` is the
+  site registry (the shard list); `0002` creates the LIST-partitioned
+  config tables and the change journal. The `central-config-store` crate
+  embeds these same files via `sqlx::migrate!` (relative path) and runs
+  them on startup, so a fresh central database needs no `psql -f`
+  bootstrap — connecting a store migrates it. Apply manually with
+  `psql -f` in filename order only for out-of-band inspection.
 - `scripts/gen-site-partitions.sh` — creates missing per-site partitions
-  for every registered site. Idempotent.
+  from the `sites` table for the shell/ops path. Idempotent. The same
+  per-site partition creation also happens in code via
+  `CentralConfigStore::register_site`, so onboarding through the central
+  API needs no separate script run.
 
 ## Onboarding a site
 
