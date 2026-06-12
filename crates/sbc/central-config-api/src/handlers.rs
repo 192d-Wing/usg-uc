@@ -43,8 +43,20 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/sites/{site_code}/dialplans", post(upsert_dial_plan))
         .route("/v1/sites/{site_code}/dialplans/{id}", axum::routing::delete(delete_dial_plan))
         .route("/v1/sites/{site_code}/config", put(put_site_config))
+        // Global templates + materialization (config-admin tokens).
+        .route("/v1/templates/{kind}/{id}", put(put_template).delete(delete_template))
+        .route("/v1/templates/{kind}/{id}/sites/{site_code}", put(assign_template))
+        .route("/v1/templates/{kind}/{id}/materialize", post(materialize_template))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// Parse a `{kind}` path segment into a [`TemplateKind`]. The error arm is
+/// a ready-to-return 400 `Response` (intentionally large).
+#[allow(clippy::result_large_err)]
+fn parse_kind(kind: &str) -> Result<central_config_store::TemplateKind, Response> {
+    central_config_store::TemplateKind::parse(kind)
+        .ok_or_else(|| bad_request("kind must be trunk_group or dial_plan"))
 }
 
 /// Liveness: the process is up. No dependencies checked.
@@ -407,6 +419,101 @@ async fn put_site_config(
     }
 }
 
+/// `PUT /v1/templates/{kind}/{id}` — author/update a global template.
+async fn put_template(
+    State(state): State<Arc<AppState>>,
+    Path((kind, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+        Ok(c) => c.sub,
+        Err(rej) => return rej.into_response(),
+    };
+    let kind = match parse_kind(&kind) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    match state.store.upsert_template(kind, &id, &body, &actor).await {
+        Ok(()) => (StatusCode::OK, Json(json!({ "id": id }))).into_response(),
+        Err(e) => write_error(&e),
+    }
+}
+
+/// `DELETE /v1/templates/{kind}/{id}` — delete a template (tombstones its
+/// materialized rows, leaves site overrides).
+async fn delete_template(
+    State(state): State<Arc<AppState>>,
+    Path((kind, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(rej) = authorize_operator(&state.admin_validator, &headers).await {
+        return rej.into_response();
+    }
+    let kind = match parse_kind(&kind) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    match state.store.delete_template(kind, &id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => write_error(&e),
+    }
+}
+
+/// `PUT /v1/templates/{kind}/{id}/sites/{site}` — assign a template to a
+/// site in a rollout ring (body `{ "ring": N }`, default 0).
+async fn assign_template(
+    State(state): State<Arc<AppState>>,
+    Path((kind, id, site)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(rej) = authorize_operator(&state.admin_validator, &headers).await {
+        return rej.into_response();
+    }
+    let kind = match parse_kind(&kind) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    let ring = body
+        .get("ring")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|n| i32::try_from(n).ok())
+        .unwrap_or(0);
+    match state.store.assign_template(kind, &id, &site, ring).await {
+        Ok(()) => (StatusCode::OK, Json(json!({ "site_code": site, "ring": ring }))).into_response(),
+        Err(e) => write_error(&e),
+    }
+}
+
+/// `?ring=` ceiling for materialization; absent means ring 0 (canary only).
+#[derive(Debug, Deserialize)]
+struct MaterializeQuery {
+    #[serde(default)]
+    ring: i32,
+}
+
+/// `POST /v1/templates/{kind}/{id}/materialize?ring=N` — materialize the
+/// template into assigned sites up to ring `N`, returning a per-site report.
+async fn materialize_template(
+    State(state): State<Arc<AppState>>,
+    Path((kind, id)): Path<(String, String)>,
+    Query(q): Query<MaterializeQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(rej) = authorize_operator(&state.admin_validator, &headers).await {
+        return rej.into_response();
+    }
+    let kind = match parse_kind(&kind) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    match state.store.materialize_template(kind, &id, q.ring).await {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => write_error(&e),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::option_if_let_else)]
 mod tests {
@@ -602,6 +709,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn write_surface_authz_validation_and_epochs() {
         let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else { return };
         let app = app(&admin, "cca_writes").await; // seeds site MUHJ + phone p1 (epoch 1)
@@ -718,6 +826,53 @@ mod tests {
             .find(|t| t["table"] == "trunk_groups")
             .expect("trunk_groups");
         assert_eq!(tg["rows"].as_array().expect("rows").len(), 1);
+
+        // Template flow over HTTP: author → assign MPLS at ring 0 →
+        // materialize → MPLS's dial_plans shard gets the materialized row.
+        let (s, _) = send_req(
+            &app,
+            "PUT",
+            "/v1/templates/dial_plan/baseline",
+            Some(&admin_tok),
+            Some(json!({"id": "baseline", "entries": []})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = send_req(
+            &app,
+            "PUT",
+            "/v1/templates/dial_plan/baseline/sites/MPLS",
+            Some(&admin_tok),
+            Some(json!({"ring": 0})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, b) = send_req(
+            &app,
+            "POST",
+            "/v1/templates/dial_plan/baseline/materialize?ring=0",
+            Some(&admin_tok),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let applied = b["sites"]
+            .as_array()
+            .expect("sites")
+            .iter()
+            .any(|x| x["result"] == "applied" && x["site_code"] == "MPLS");
+        assert!(applied, "MPLS materialized: {b}");
+
+        // Invalid kind → 400.
+        let (s, _) = send_req(
+            &app,
+            "PUT",
+            "/v1/templates/bogus/x",
+            Some(&admin_tok),
+            Some(json!({"id": "x"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

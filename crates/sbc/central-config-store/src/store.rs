@@ -446,7 +446,10 @@ impl CentralConfigStore {
 /// Bump and return the site's epoch. The `UPDATE ... RETURNING` locks the
 /// `sites` row for the rest of the transaction, serializing concurrent
 /// writers to this site. Absent row → [`CentralError::UnknownSite`].
-async fn bump_epoch(tx: &mut Transaction<'_, Postgres>, site_code: &str) -> CentralResult<i64> {
+pub(crate) async fn bump_epoch(
+    tx: &mut Transaction<'_, Postgres>,
+    site_code: &str,
+) -> CentralResult<i64> {
     let epoch: Option<i64> = sqlx::query_scalar(
         "UPDATE sites SET config_epoch = config_epoch + 1, updated_at = NOW()
          WHERE site_code = $1
@@ -460,7 +463,7 @@ async fn bump_epoch(tx: &mut Transaction<'_, Postgres>, site_code: &str) -> Cent
 
 /// Append one journal entry within the write transaction.
 #[allow(clippy::too_many_arguments)]
-async fn journal(
+pub(crate) async fn journal(
     tx: &mut Transaction<'_, Postgres>,
     site_code: &str,
     epoch: i64,

@@ -153,6 +153,85 @@ pub struct TableRows {
     pub rows: Vec<SnapshotRow>,
 }
 
+/// A kind of global config template. Maps to the sharded table its
+/// materialized rows land in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemplateKind {
+    /// Trunk-group template → `trunk_groups`.
+    TrunkGroup,
+    /// Dial-plan template → `dial_plans`.
+    DialPlan,
+}
+
+impl TemplateKind {
+    /// The `config_templates.kind` string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TrunkGroup => "trunk_group",
+            Self::DialPlan => "dial_plan",
+        }
+    }
+
+    /// Parse from the wire/string form.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "trunk_group" => Some(Self::TrunkGroup),
+            "dial_plan" => Some(Self::DialPlan),
+            _ => None,
+        }
+    }
+
+    /// The sharded table materialized rows are written into.
+    #[must_use]
+    pub const fn target_table(self) -> ConfigTable {
+        match self {
+            Self::TrunkGroup => ConfigTable::TrunkGroups,
+            Self::DialPlan => ConfigTable::DialPlans,
+        }
+    }
+}
+
+/// What materializing a template to one site did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum SiteMaterialization {
+    /// The template was written into the site's shard at `epoch`.
+    Applied {
+        /// Site whose shard advanced.
+        site_code: String,
+        /// New shard epoch.
+        epoch: i64,
+    },
+    /// Skipped: the site has a local override of this id (it wins).
+    SkippedOverridden {
+        /// Site left untouched.
+        site_code: String,
+    },
+    /// Skipped: the site's assignment ring is above the requested ceiling.
+    SkippedRing {
+        /// Site left untouched.
+        site_code: String,
+        /// The site's ring.
+        ring: i32,
+    },
+}
+
+/// The outcome of materializing one template across its assigned sites.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterializeReport {
+    /// The template materialized.
+    pub kind: TemplateKind,
+    /// The template id.
+    pub template_id: String,
+    /// The ring ceiling the request applied up to.
+    pub up_to_ring: i32,
+    /// Per-site outcomes, ordered by site code.
+    pub sites: Vec<SiteMaterialization>,
+}
+
 /// One row in a [`Snapshot`]: its identifier and canonical JSON payload.
 /// The id is carried explicitly because some payloads (e.g. site
 /// telephony config) don't embed it, and the applying agent keys on it.

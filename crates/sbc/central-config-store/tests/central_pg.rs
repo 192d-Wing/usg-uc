@@ -15,7 +15,9 @@ use std::str::FromStr;
 use serde_json::{Map, Value, json};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
-use central_config_store::{CentralConfigStore, ChangeOp, ConfigTable, DeltaResult};
+use central_config_store::{
+    CentralConfigStore, ChangeOp, ConfigTable, DeltaResult, SiteMaterialization, TemplateKind,
+};
 
 fn admin_dsn() -> Option<String> {
     std::env::var("CENTRAL_STORE_TEST_DSN").ok()
@@ -281,4 +283,81 @@ async fn tombstoned_mac_is_reusable() {
     assert_eq!(phones.rows.len(), 1);
     assert_eq!(phones.rows[0].id, "new");
     assert_eq!(phones.rows[0].payload, json!({"id": "new"}));
+}
+
+/// Helper: count live rows in a JSON shard table for a site.
+async fn live_count(store: &CentralConfigStore, table: &str, site: &str) -> i64 {
+    sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {table} WHERE site_code = $1 AND NOT deleted"
+    ))
+    .bind(site)
+    .fetch_one(store.pool())
+    .await
+    .expect("count")
+}
+
+#[tokio::test]
+async fn template_materialization_rings_overrides_and_delete() {
+    let Some(admin) = admin_dsn() else { return };
+    let store = fresh_store(&admin, "cst_templates").await;
+    // Ring 0 (canary), ring 1 sites, plus a site that overrides locally.
+    for s in ["AAAA", "BBBB", "CCCC"] {
+        store.register_site(s, s, &format!("{s}.x"), "UTC", "active").await.expect("register");
+    }
+
+    // Author one trunk-group template, assign to three sites in two rings.
+    store
+        .upsert_template(TemplateKind::TrunkGroup, "us-domestic", &json!({"id": "us-domestic", "strategy": "priority"}), "op")
+        .await
+        .expect("template");
+    store.assign_template(TemplateKind::TrunkGroup, "us-domestic", "AAAA", 0).await.expect("assign A");
+    store.assign_template(TemplateKind::TrunkGroup, "us-domestic", "BBBB", 1).await.expect("assign B");
+    store.assign_template(TemplateKind::TrunkGroup, "us-domestic", "CCCC", 1).await.expect("assign C");
+
+    // CCCC has a local override of the same id (operator-written).
+    store
+        .upsert_json(ConfigTable::TrunkGroups, "CCCC", "us-domestic", &json!({"id": "us-domestic", "strategy": "round_robin"}), "alice@op")
+        .await
+        .expect("override");
+
+    // Materialize up to ring 0: only AAAA gets it; B/C are ring 1 (skipped).
+    let report = store.materialize_template(TemplateKind::TrunkGroup, "us-domestic", 0).await.expect("materialize r0");
+    let applied = report.sites.iter().filter(|s| matches!(s, SiteMaterialization::Applied { .. })).count();
+    assert_eq!(applied, 1, "only canary AAAA");
+    assert!(report.sites.iter().any(|s| matches!(s, SiteMaterialization::Applied{site_code,..} if site_code=="AAAA")));
+    assert_eq!(live_count(&store, "trunk_groups", "AAAA").await, 1);
+    assert_eq!(live_count(&store, "trunk_groups", "BBBB").await, 0, "ring 1 not yet");
+
+    // Promote to ring 1: BBBB gets it; CCCC is skipped (override wins).
+    let report = store.materialize_template(TemplateKind::TrunkGroup, "us-domestic", 1).await.expect("materialize r1");
+    let overridden = report.sites.iter().any(|s| matches!(s, SiteMaterialization::SkippedOverridden { site_code } if site_code == "CCCC"));
+    assert!(overridden, "CCCC override must be skipped: {report:?}");
+    assert_eq!(live_count(&store, "trunk_groups", "BBBB").await, 1);
+
+    // CCCC still has its own version, not the template's.
+    let ccc: serde_json::Value = sqlx::query_scalar("SELECT data FROM trunk_groups WHERE site_code='CCCC' AND id='us-domestic'")
+        .fetch_one(store.pool()).await.expect("ccc data");
+    assert_eq!(ccc["strategy"], "round_robin", "override preserved");
+
+    // Editing the template + re-materializing updates the non-overridden sites.
+    store
+        .upsert_template(TemplateKind::TrunkGroup, "us-domestic", &json!({"id": "us-domestic", "strategy": "least_connections"}), "op")
+        .await
+        .expect("edit template");
+    store.materialize_template(TemplateKind::TrunkGroup, "us-domestic", 1).await.expect("re-materialize");
+    let aaa: serde_json::Value = sqlx::query_scalar("SELECT data FROM trunk_groups WHERE site_code='AAAA' AND id='us-domestic'")
+        .fetch_one(store.pool()).await.expect("aaa data");
+    assert_eq!(aaa["strategy"], "least_connections", "AAAA tracks the template");
+
+    // Delete the template: tombstones template-origin rows (A, B), leaves
+    // CCCC's override.
+    store.delete_template(TemplateKind::TrunkGroup, "us-domestic").await.expect("delete template");
+    assert_eq!(live_count(&store, "trunk_groups", "AAAA").await, 0, "A tombstoned");
+    assert_eq!(live_count(&store, "trunk_groups", "BBBB").await, 0, "B tombstoned");
+    assert_eq!(live_count(&store, "trunk_groups", "CCCC").await, 1, "C override survives");
+
+    // Template + assignments are gone (cascade).
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM template_assignments WHERE template_id='us-domestic'")
+        .fetch_one(store.pool()).await.expect("assign count");
+    assert_eq!(n, 0);
 }
