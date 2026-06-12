@@ -47,6 +47,8 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic))]
 
 pub mod authentication;
+#[cfg(feature = "bearer")]
+pub mod bearer;
 pub mod binding;
 pub mod error;
 pub mod gruu;
@@ -80,6 +82,10 @@ pub use registrar::{
     AuthenticatedRegistrar, ContactInfo, RegisterRequest, RegisterResponse, Registrar,
     RegistrarConfig, RegistrarMode,
 };
+
+// RFC 8898 Bearer-token REGISTER authorization (feature = "bearer").
+#[cfg(feature = "bearer")]
+pub use bearer::{BearerAuthenticator, BearerError, BearerResult};
 
 // RFC 3261 §22 Digest Authentication
 pub use authentication::{

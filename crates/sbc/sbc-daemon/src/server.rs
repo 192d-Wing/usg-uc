@@ -14,6 +14,7 @@
 use crate::cluster::ClusterManager;
 use crate::shutdown::ShutdownSignal;
 use crate::sip_stack::{ProcessResult, SipStack, SipStackConfig};
+use proto_registrar::BearerAuthenticator;
 use sbc_config::SbcConfig;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -73,6 +74,9 @@ impl Server {
         let sip_config = Self::build_sip_config(&config);
         let mut sip_stack = SipStack::new(sip_config);
         Self::init_sip_stack_from_config(&mut sip_stack, &config);
+        if let Some(bearer) = Self::build_bearer_authenticator(&config) {
+            sip_stack.set_bearer_authenticator(bearer);
+        }
         let sip_stack = Arc::new(sip_stack);
         let rate_limiter = Self::build_rate_limiter(&config);
         let global_limiter = Self::build_global_limiter(&config);
@@ -141,6 +145,9 @@ impl Server {
             SipStack::new(sip_config)
         };
         Self::init_sip_stack_from_config(&mut sip_stack, &config);
+        if let Some(bearer) = Self::build_bearer_authenticator(&config) {
+            sip_stack.set_bearer_authenticator(bearer);
+        }
         let sip_stack = Arc::new(sip_stack);
 
         let rate_limiter = Self::build_rate_limiter(&config);
@@ -169,6 +176,89 @@ impl Server {
             max_calls: config.general.max_calls,
             ..SipStackConfig::default()
         }
+    }
+
+    /// Builds the RFC 8898 Bearer-token REGISTER authorizer from environment,
+    /// or `None` when bearer auth is not enabled (`SBC_AUTH_MODE` ≠ `bearer`).
+    ///
+    /// Mirrors `sbc-client-config-server`'s OIDC config: the JWKS is fetched
+    /// over a rustls client that optionally trusts an extra CA (the internal
+    /// IdP). The JWKS cache lazy-loads on the first REGISTER, so no async
+    /// work is needed here.
+    fn build_bearer_authenticator(config: &SbcConfig) -> Option<Arc<BearerAuthenticator>> {
+        let mode = std::env::var("SBC_AUTH_MODE").unwrap_or_default();
+        if !mode.eq_ignore_ascii_case("bearer") {
+            return None;
+        }
+
+        let issuer = match std::env::var("SBC_OIDC_ISSUER") {
+            Ok(v) if !v.trim().is_empty() => v.trim().trim_end_matches('/').to_string(),
+            _ => {
+                error!("SBC_AUTH_MODE=bearer but SBC_OIDC_ISSUER is unset — bearer auth disabled");
+                return None;
+            }
+        };
+
+        let audiences: Vec<String> = std::env::var("SBC_OIDC_AUDIENCE")
+            .unwrap_or_else(|_| "sbc".to_string())
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if audiences.is_empty() {
+            error!("SBC_OIDC_AUDIENCE resolved to an empty set — bearer auth disabled");
+            return None;
+        }
+
+        let realm = std::env::var("SBC_OIDC_REALM")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| config.general.instance_name.clone());
+
+        let mut http_builder = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10));
+        if let Ok(path) = std::env::var("SBC_OIDC_EXTRA_CA_CERT_FILE")
+            && !path.trim().is_empty()
+        {
+            match std::fs::read(&path) {
+                Ok(pem) => match reqwest::Certificate::from_pem(&pem) {
+                    Ok(cert) => {
+                        info!(path, "loaded extra CA certificate for IdP JWKS fetch");
+                        http_builder = http_builder.add_root_certificate(cert);
+                    }
+                    Err(e) => {
+                        error!(path, error = %e, "failed to parse SBC_OIDC_EXTRA_CA_CERT_FILE — bearer auth disabled");
+                        return None;
+                    }
+                },
+                Err(e) => {
+                    error!(path, error = %e, "failed to read SBC_OIDC_EXTRA_CA_CERT_FILE — bearer auth disabled");
+                    return None;
+                }
+            }
+        }
+
+        let http = match http_builder.build() {
+            Ok(c) => c,
+            Err(e) => {
+                error!(error = %e, "failed to build IdP HTTP client — bearer auth disabled");
+                return None;
+            }
+        };
+
+        let jwks = Arc::new(proto_jwt::JwksCache::new(http, issuer.clone()));
+        let validator = Arc::new(proto_jwt::Validator::new(
+            jwks,
+            proto_jwt::ValidatorConfig::new(issuer.clone(), audiences.clone()),
+        ));
+        info!(
+            %issuer,
+            ?audiences,
+            %realm,
+            "RFC 8898 Bearer-token REGISTER authorization enabled"
+        );
+        Some(Arc::new(BearerAuthenticator::new(validator, realm)))
     }
 
     /// Builds the per-source rate limiter from config.

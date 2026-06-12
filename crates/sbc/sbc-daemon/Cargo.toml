@@ -33,7 +33,10 @@ proto-sip = { workspace = true, features = ["digest-auth"] }
 proto-transaction.workspace = true
 proto-dialog.workspace = true
 proto-b2bua.workspace = true
-proto-registrar.workspace = true
+# `bearer` enables RFC 8898 OIDC Bearer-token REGISTER authorization.
+proto-registrar = { workspace = true, features = ["bearer"] }
+# Shared OIDC JWT validation (JWKS cache + validator) for Bearer REGISTER.
+proto-jwt.workspace = true
 proto-rtp.workspace = true
 proto-srtp.workspace = true
 proto-dtls.workspace = true
@@ -68,6 +71,9 @@ serde_json.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pki-types.workspace = true
+# JWKS / OIDC-metadata fetch for Bearer REGISTER validation (rustls, optional
+# extra CA for the internal IdP). Mirrors sbc-client-config-server.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 hyper.workspace = true
 hyper-util.workspace = true
 

@@ -344,6 +344,22 @@ sbcDaemon:
     runAsUser: 1000
     runAsGroup: 1000
     fsGroup: 1000
+  # RFC 8898 Bearer-token REGISTER authorization. When enabled, the daemon
+  # rejects REGISTERs that don't carry a valid OIDC access token whose `dn`
+  # claim equals the AOR user part — the server-side half of the soft
+  # client's OIDC sign-in flow (docs/CLIENT-PROVISIONING-OIDC.md). The JWKS
+  # is fetched from the same IdP as sbcClientConfig, trusting
+  # sbcClientConfig.extraCaCert when set.
+  oidc:
+    enabled: false
+    # Issuer whose JWKS validates REGISTER tokens. Empty = reuse
+    # sbcClientConfig.oidc.issuer (the realm clients authenticate to).
+    issuer: ""
+    # Audience the SBC requires in the token's `aud`. The Keycloak `sip`
+    # scope must add "sbc" to the audience (see Configure-Voice.ps1).
+    audience: "sbc"
+    # WWW-Authenticate realm in 401 Bearer challenges. Empty = instance name.
+    realm: ""
   config:
     max_calls: 5000
     max_registrations: 10000

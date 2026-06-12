@@ -259,6 +259,19 @@ Set-Mapper @{
         'id.token.claim'           = 'false'
     }
 }
+# The SBC registrar validates REGISTER bearer tokens (RFC 8898) and requires
+# `aud` to contain "sbc" (daemon env SBC_OIDC_AUDIENCE). Same token, second
+# audience — see docs/CLIENT-PROVISIONING-OIDC.md, "Client scope: sip".
+Set-Mapper @{
+    name           = 'sbc-audience'
+    protocol       = 'openid-connect'
+    protocolMapper = 'oidc-audience-mapper'
+    config         = @{
+        'included.custom.audience' = 'sbc'
+        'access.token.claim'       = 'true'
+        'id.token.claim'           = 'false'
+    }
+}
 
 # --- 3. public PKCE client (the soft client) ----------------------------
 $softClient = @{

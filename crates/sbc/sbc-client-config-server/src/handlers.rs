@@ -16,9 +16,9 @@ use axum::routing::get;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
+use proto_jwt::{JwksError, ValidateError, Validator};
+
 use crate::config::Config;
-use crate::jwks::JwksError;
-use crate::token::{AuthError, Verifier};
 
 /// Shared per-request state.
 #[derive(Clone)]
@@ -26,7 +26,7 @@ pub struct AppState {
     /// Service config (env-derived, immutable after startup).
     pub cfg: Arc<Config>,
     /// Bearer-token verifier (owns the JWKS cache).
-    pub verifier: Arc<Verifier>,
+    pub verifier: Arc<Validator>,
     /// Process start, for `/system/version` uptime.
     pub start_time: std::time::Instant,
 }
@@ -168,7 +168,7 @@ async fn client_config(State(state): State<AppState>, headers: HeaderMap) -> Res
         Ok(t) => t,
         Err(e) => return auth_error_response(&e),
     };
-    let claims = match state.verifier.verify(token).await {
+    let claims = match state.verifier.validate(token).await {
         Ok(c) => c,
         Err(e) => {
             info!(error = %e, "client-config request rejected");
@@ -177,7 +177,7 @@ async fn client_config(State(state): State<AppState>, headers: HeaderMap) -> Res
     };
     let Some(dn) = claims.dn else {
         info!(sub = %claims.sub, "client-config request from user without dn claim");
-        return auth_error_response(&AuthError::NotProvisioned);
+        return auth_error_response(&ValidateError::NotProvisioned);
     };
     // Provisioning event — who fetched a config, as which DN.
     info!(sub = %claims.sub, dn = %dn, "client config issued");
@@ -257,7 +257,7 @@ async fn version(State(state): State<AppState>) -> impl IntoResponse {
 // Bearer plumbing
 // ---------------------------------------------------------------------
 
-fn bearer_token(headers: &HeaderMap) -> Result<&str, AuthError> {
+fn bearer_token(headers: &HeaderMap) -> Result<&str, ValidateError> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -269,31 +269,31 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, AuthError> {
                 .then(|| rest.trim())
                 .filter(|t| !t.is_empty())
         })
-        .ok_or(AuthError::MissingToken)
+        .ok_or(ValidateError::MissingToken)
 }
 
-/// Maps an [`AuthError`] to the RFC 6750 challenge responses the design
+/// Maps an [`ValidateError`] to the RFC 6750 challenge responses the design
 /// doc specifies.
-fn auth_error_response(err: &AuthError) -> Response {
+fn auth_error_response(err: &ValidateError) -> Response {
     let (status, challenge) = match err {
-        AuthError::MissingToken => (
+        ValidateError::MissingToken => (
             StatusCode::UNAUTHORIZED,
             r#"Bearer realm="sip-client-config""#.to_string(),
         ),
-        AuthError::InvalidToken(desc) => (
+        ValidateError::InvalidToken(desc) => (
             StatusCode::UNAUTHORIZED,
             format!(
                 r#"Bearer realm="sip-client-config", error="invalid_token", error_description="{}""#,
                 sanitize(desc)
             ),
         ),
-        AuthError::InsufficientScope => (
+        ValidateError::InsufficientScope => (
             StatusCode::FORBIDDEN,
             r#"Bearer realm="sip-client-config", error="insufficient_scope", scope="sip""#
                 .to_string(),
         ),
         // Authenticated but not a voice user — no challenge would help.
-        AuthError::NotProvisioned => {
+        ValidateError::NotProvisioned => {
             return (
                 StatusCode::FORBIDDEN,
                 Json(serde_json::json!({
@@ -304,7 +304,7 @@ fn auth_error_response(err: &AuthError) -> Response {
                 .into_response();
         }
         // We couldn't obtain keys at all — the token may be fine.
-        AuthError::Jwks(e @ (JwksError::Unavailable(_) | JwksError::Metadata(_))) => {
+        ValidateError::Jwks(e @ (JwksError::Unavailable(_) | JwksError::Metadata(_))) => {
             warn!(error = %e, "cannot validate tokens: JWKS unavailable");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -315,7 +315,7 @@ fn auth_error_response(err: &AuthError) -> Response {
             )
                 .into_response();
         }
-        AuthError::Jwks(JwksError::UnknownKid(kid)) => (
+        ValidateError::Jwks(JwksError::UnknownKid(kid)) => (
             StatusCode::UNAUTHORIZED,
             format!(
                 r#"Bearer realm="sip-client-config", error="invalid_token", error_description="unknown signing key {}""#,
@@ -355,7 +355,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::jwks::JwksCache;
+    use proto_jwt::{JwksCache, ValidatorConfig};
 
     const TEST_KID: &str = "test-key-1";
 
@@ -420,10 +420,9 @@ mod tests {
     }
 
     fn test_app() -> Router {
-        let verifier = Verifier::new(
+        let verifier = Validator::new(
             Arc::new(JwksCache::with_static(test_key().jwks.clone())),
-            TEST_ISSUER,
-            TEST_AUDIENCE,
+            ValidatorConfig::new(TEST_ISSUER, vec![TEST_AUDIENCE.to_string()]),
         );
         router(AppState {
             cfg: Arc::new(test_config()),

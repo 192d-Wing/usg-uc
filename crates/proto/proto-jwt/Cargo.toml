@@ -1,0 +1,32 @@
+[package]
+name = "proto-jwt"
+description = "OIDC bearer-token validation (JWT signature via cached JWKS, iss/aud/exp/scope) shared by the SBC's provisioning pod and SIP registrar. RS256/PS256/ES256/ES384 via the aws-lc-rs FIPS module; symmetric algorithms rejected. Design: docs/CLIENT-PROVISIONING-OIDC.md."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+# OIDC bearer-token validation (RS256/PS256/ES256/ES384 via the aws-lc-rs
+# backend — same FIPS crypto module the rest of the workspace links).
+jsonwebtoken.workspace = true
+# JWKS / OIDC-metadata fetch from the IdP. rustls only, no native-tls.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json = { workspace = true }
+# Test-only ES256 keypair generation — no static private key in the tree.
+aws-lc-rs = { workspace = true, default-features = false, features = ["aws-lc-sys"] }
+base64 = "0.22"

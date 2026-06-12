@@ -14,6 +14,7 @@ members = [
     "crates/proto/proto-dialog",
     "crates/proto/proto-b2bua",
     "crates/proto/proto-registrar",
+    "crates/proto/proto-jwt",
     "crates/proto/proto-sdp",
     "crates/proto/proto-rtp",
     "crates/proto/proto-srtp",
@@ -201,6 +202,7 @@ proto-transaction = { path = "crates/proto/proto-transaction" }
 proto-dialog = { path = "crates/proto/proto-dialog" }
 proto-b2bua = { path = "crates/proto/proto-b2bua" }
 proto-registrar = { path = "crates/proto/proto-registrar" }
+proto-jwt = { path = "crates/proto/proto-jwt" }
 proto-sdp = { path = "crates/proto/proto-sdp" }
 proto-rtp = { path = "crates/proto/proto-rtp" }
 proto-srtp = { path = "crates/proto/proto-srtp" }

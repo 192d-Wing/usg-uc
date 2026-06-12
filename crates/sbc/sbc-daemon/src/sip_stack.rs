@@ -21,8 +21,8 @@ use proto_dialog::{Dialog, DialogId};
 #[cfg(feature = "cluster")]
 use proto_registrar::AsyncLocationService;
 use proto_registrar::{
-    AuthenticatedRegistrar, ContactInfo, LocationService, RegisterRequest, RegistrarConfig,
-    RegistrarMode,
+    AuthenticatedRegistrar, BearerAuthenticator, BearerResult, ContactInfo, LocationService,
+    RegisterRequest, RegistrarConfig, RegistrarMode,
 };
 use proto_sip::builder::{RequestBuilder, generate_branch, generate_call_id};
 use proto_sip::manipulation::{
@@ -57,6 +57,10 @@ pub struct SipStack {
     calls: RwLock<CallStore>,
     /// Authenticated registrar for REGISTER handling with digest auth.
     registrar: RwLock<AuthenticatedRegistrar>,
+    /// RFC 8898 Bearer-token REGISTER authorizer (OIDC JWT). When `Some`,
+    /// REGISTER is authorized against the IdP's JWKS and the `dn` claim must
+    /// match the AOR user part, instead of (or alongside) digest auth.
+    bearer: Option<Arc<BearerAuthenticator>>,
     /// Location service for routing (in-memory, shared with registrar).
     location_service: Arc<RwLock<LocationService>>,
     /// Async location service for routing (storage-backed, when cluster enabled).
@@ -337,6 +341,7 @@ impl SipStack {
             dialogs: RwLock::new(DialogStore::default()),
             calls: RwLock::new(CallStore::default()),
             registrar: RwLock::new(registrar),
+            bearer: None,
             location_service,
             #[cfg(feature = "cluster")]
             async_location_service: None,
@@ -387,6 +392,7 @@ impl SipStack {
             dialogs: RwLock::new(DialogStore::default()),
             calls: RwLock::new(CallStore::default()),
             registrar: RwLock::new(registrar),
+            bearer: None,
             location_service,
             async_location_service: Some(async_location_service),
             call_correlation: RwLock::new(CallCorrelation::default()),
@@ -413,6 +419,13 @@ impl SipStack {
     /// Sets the media pipeline for RTP relay.
     pub fn set_media_pipeline(&mut self, pipeline: Arc<crate::media_pipeline::MediaPipeline>) {
         self.media_pipeline = Some(pipeline);
+    }
+
+    /// Enables RFC 8898 Bearer-token REGISTER authorization. When set,
+    /// `handle_register` validates the OIDC access token and binds the `dn`
+    /// claim to the AOR before accepting the registration.
+    pub fn set_bearer_authenticator(&mut self, bearer: Arc<BearerAuthenticator>) {
+        self.bearer = Some(bearer);
     }
 
     /// Sets the Voice Protection System engine for call screening.
@@ -1171,6 +1184,42 @@ impl SipStack {
                 };
             }
         };
+
+        // RFC 8898 Bearer-token authorization (when enabled). Validate the
+        // OIDC access token and bind its `dn` claim to the AOR *before* any
+        // binding work. Digest auth (if configured) still runs in the
+        // registrar below; bearer is an alternative, not a replacement.
+        if let Some(bearer) = &self.bearer {
+            let auth_hdr = req.headers.get_value(&HeaderName::Authorization);
+            let aor_user = aor_user_part(&aor);
+            match bearer.authorize(auth_hdr, aor_user).await {
+                BearerResult::Authorized { dn, .. } => {
+                    debug!(%dn, aor = %aor, "REGISTER bearer-authorized (RFC 8898)");
+                }
+                BearerResult::Challenge { error } => {
+                    let mut response =
+                        create_response_from_request(req, StatusCode::UNAUTHORIZED);
+                    response.add_header(Header::new(
+                        HeaderName::WwwAuthenticate,
+                        bearer.challenge_header(error),
+                    ));
+                    return ProcessResult::Response {
+                        message: SipMessage::Response(response),
+                        destination: source,
+                    };
+                }
+                BearerResult::Forbidden { reason } => {
+                    warn!(aor = %aor, %reason, "REGISTER bearer authorization denied");
+                    return ProcessResult::Response {
+                        message: SipMessage::Response(create_response_from_request(
+                            req,
+                            StatusCode::FORBIDDEN,
+                        )),
+                        destination: source,
+                    };
+                }
+            }
+        }
 
         // Parse Contact headers into ContactInfo list
         let contacts = parse_contacts_from_request(req);
@@ -3049,6 +3098,21 @@ fn extract_uri_from_header(header_value: &str) -> String {
         .unwrap_or(header_value)
         .trim()
         .to_string()
+}
+
+/// Extracts the user part of an AOR URI for RFC 8898 `dn`-to-AOR binding.
+///
+/// `aor` is a SIP/SIPS URI like `sip:1455550100@example.mil`; this returns
+/// the user part (`1455550100`), tolerating a missing scheme or host.
+fn aor_user_part(aor: &str) -> &str {
+    // Strip the scheme (`sip:` / `sips:`) if present, then take the part
+    // before `@`. URI parameters after the host are irrelevant here.
+    let after_scheme = aor.split_once(':').map_or(aor, |(_, rest)| rest);
+    after_scheme
+        .split('@')
+        .next()
+        .unwrap_or(after_scheme)
+        .trim()
 }
 
 /// Parses Contact headers from a SIP request into `ContactInfo` list.
