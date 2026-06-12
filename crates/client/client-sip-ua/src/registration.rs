@@ -802,9 +802,10 @@ impl RegistrationAgent {
         if account.auth_mode == client_types::SipAuthMode::Bearer
             && let Some(token) = account.bearer_token.as_ref()
         {
-            request
-                .headers
-                .set(HeaderName::Authorization, format!("Bearer {}", token.as_str()));
+            request.headers.set(
+                HeaderName::Authorization,
+                format!("Bearer {}", token.as_str()),
+            );
         }
 
         Ok(request)

@@ -93,8 +93,14 @@ impl ProvisioningClient {
         &self,
         issuer: &str,
     ) -> Result<OidcMetadata, ProvisioningError> {
-        let url = format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'));
-        let meta: OidcMetadata = self.get_json(&url, None).await.map_err(ProvisioningError::into_discovery)?;
+        let url = format!(
+            "{}/.well-known/openid-configuration",
+            issuer.trim_end_matches('/')
+        );
+        let meta: OidcMetadata = self
+            .get_json(&url, None)
+            .await
+            .map_err(ProvisioningError::into_discovery)?;
         if meta.issuer.trim_end_matches('/') != issuer.trim_end_matches('/') {
             return Err(ProvisioningError::Discovery(format!(
                 "OIDC issuer mismatch: expected {issuer}, metadata says {}",
@@ -287,7 +293,8 @@ mod tests {
     fn authorization_url_has_pkce_and_state() {
         let meta = OidcMetadata {
             issuer: "https://idp.example.mil/realms/voice".into(),
-            authorization_endpoint: "https://idp.example.mil/realms/voice/protocol/openid-connect/auth".into(),
+            authorization_endpoint:
+                "https://idp.example.mil/realms/voice/protocol/openid-connect/auth".into(),
             token_endpoint: "https://idp.example.mil/token".into(),
             end_session_endpoint: None,
             revocation_endpoint: None,

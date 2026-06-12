@@ -1197,8 +1197,7 @@ impl SipStack {
                     debug!(%dn, aor = %aor, "REGISTER bearer-authorized (RFC 8898)");
                 }
                 BearerResult::Challenge { error } => {
-                    let mut response =
-                        create_response_from_request(req, StatusCode::UNAUTHORIZED);
+                    let mut response = create_response_from_request(req, StatusCode::UNAUTHORIZED);
                     response.add_header(Header::new(
                         HeaderName::WwwAuthenticate,
                         bearer.challenge_header(error),

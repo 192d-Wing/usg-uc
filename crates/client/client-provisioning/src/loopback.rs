@@ -57,10 +57,7 @@ impl LoopbackServer {
     /// # Errors
     /// [`ProvisioningError::Timeout`] if no redirect arrives in time, or
     /// [`ProvisioningError::Loopback`] on a socket error.
-    pub async fn wait_for_code(
-        self,
-        timeout: Duration,
-    ) -> Result<AuthCallback, ProvisioningError> {
+    pub async fn wait_for_code(self, timeout: Duration) -> Result<AuthCallback, ProvisioningError> {
         let accept = async {
             loop {
                 let (mut stream, _) = self
@@ -104,7 +101,11 @@ impl LoopbackServer {
                     }
                 }
 
-                let page = if error.is_some() { FAILURE_PAGE } else { SUCCESS_PAGE };
+                let page = if error.is_some() {
+                    FAILURE_PAGE
+                } else {
+                    SUCCESS_PAGE
+                };
                 let _ = stream.write_all(page.as_bytes()).await;
                 let _ = stream.flush().await;
 
@@ -140,10 +141,7 @@ mod tests {
             let url = format!("{uri}?code=abc123&state=xyz789");
             let _ = reqwest::Client::new().get(&url).send().await;
         });
-        let cb = server
-            .wait_for_code(Duration::from_secs(5))
-            .await
-            .unwrap();
+        let cb = server.wait_for_code(Duration::from_secs(5)).await.unwrap();
         let _ = client.await;
         assert_eq!(cb.code.as_deref(), Some("abc123"));
         assert_eq!(cb.state.as_deref(), Some("xyz789"));

@@ -223,7 +223,10 @@ mod tests {
         assert_eq!(cfg.sip.auth.mode, "bearer");
         assert!(cfg.sip.auth.digest.is_none());
         assert_eq!(cfg.registration.expires_seconds, 300);
-        assert_eq!(cfg.registration.registrar_domain, "us-east-1.reg.example.mil");
+        assert_eq!(
+            cfg.registration.registrar_domain,
+            "us-east-1.reg.example.mil"
+        );
         assert_eq!(cfg.ttl_seconds, 3600);
     }
 
@@ -244,7 +247,15 @@ mod tests {
         let doc: DiscoveryDoc = serde_json::from_value(json).unwrap();
         assert_eq!(doc.oidc.issuer, "https://icam.oopl.dev.mil/realms/dcim");
         assert_eq!(doc.oidc.client_id, "usg-uc-softclient");
-        assert_eq!(doc.provisioning.config_endpoint, "https://sbc.oopl.dev.mil/v1/client-config");
-        assert_eq!(doc.minimum_client_version.get("desktop").map(String::as_str), Some("0.4.0"));
+        assert_eq!(
+            doc.provisioning.config_endpoint,
+            "https://sbc.oopl.dev.mil/v1/client-config"
+        );
+        assert_eq!(
+            doc.minimum_client_version
+                .get("desktop")
+                .map(String::as_str),
+            Some("0.4.0")
+        );
     }
 }

@@ -25,10 +25,7 @@ const PINNED_ISSUER_HOSTS: &[&str] = &["icam.oopl.dev.mil"];
 /// # Errors
 /// [`ProvisioningError::IssuerNotTrusted`] when the issuer is not HTTPS or its
 /// registrable domain differs from the entered service domain.
-pub fn verify_issuer_pinned(
-    service_domain: &str,
-    issuer: &str,
-) -> Result<(), ProvisioningError> {
+pub fn verify_issuer_pinned(service_domain: &str, issuer: &str) -> Result<(), ProvisioningError> {
     let url = Url::parse(issuer)
         .map_err(|e| ProvisioningError::IssuerNotTrusted(format!("unparseable issuer: {e}")))?;
     if url.scheme() != "https" {

@@ -16,15 +16,15 @@ use std::time::Duration;
 use chrono::Utc;
 use client_core::{ClientApp, ProvisioningSettings, SettingsManager};
 use client_provisioning::{
-    CaTrust, ClientConfig, DiscoveryDoc, OidcMetadata, ProvisionedSession, ProvisioningClient,
-    SessionState, TokenResponse, generate_pkce, id_token_nonce, random_token, start_loopback,
-    verify_issuer_pinned,
+    generate_pkce, id_token_nonce, random_token, start_loopback, verify_issuer_pinned, CaTrust,
+    ClientConfig, DiscoveryDoc, OidcMetadata, ProvisionedSession, ProvisioningClient, SessionState,
+    TokenResponse,
 };
 use client_types::TransportPreference;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_shell::ShellExt;
-use tokio::sync::{Mutex, RwLock, oneshot};
+use tokio::sync::{oneshot, Mutex, RwLock};
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
@@ -167,9 +167,7 @@ async fn cancel_inflight(cancel: &Arc<Mutex<Option<oneshot::Sender<()>>>>) {
 
 /// Returns the current sign-in session state (drives the frontend gate).
 #[tauri::command]
-pub async fn get_session_state(
-    state: State<'_, TauriAppState>,
-) -> Result<SessionStateDto, String> {
+pub async fn get_session_state(state: State<'_, TauriAppState>) -> Result<SessionStateDto, String> {
     let session = state.session.read().await;
     let sm = state.settings_manager.read().await;
     let persisted = sm.settings().provisioning.clone();
@@ -251,10 +249,7 @@ pub async fn start_signin(
 
 /// Cancels an in-flight browser sign-in and returns to the domain prompt.
 #[tauri::command]
-pub async fn cancel_signin(
-    app: AppHandle,
-    state: State<'_, TauriAppState>,
-) -> Result<(), String> {
+pub async fn cancel_signin(app: AppHandle, state: State<'_, TauriAppState>) -> Result<(), String> {
     cancel_inflight(&state.signin_cancel).await;
     let ctx = SigninCtx::from_state(&state);
     {
@@ -391,7 +386,10 @@ async fn run_signin_flow(
     emit_progress(app, "discovering", "Contacting service…");
     let trust = ca_trust(ctx).await;
     let pc = ProvisioningClient::new(&trust).map_err(|e| e.to_string())?;
-    let discovery = pc.fetch_discovery(domain).await.map_err(|e| e.to_string())?;
+    let discovery = pc
+        .fetch_discovery(domain)
+        .await
+        .map_err(|e| e.to_string())?;
     verify_issuer_pinned(domain, &discovery.oidc.issuer).map_err(|e| e.to_string())?;
     let meta = pc
         .fetch_oidc_metadata(&discovery.oidc.issuer)
@@ -460,7 +458,10 @@ async fn run_signin_flow(
     set_session_state(app, ctx, SessionState::Provisioning).await;
     emit_progress(app, "provisioning", "Fetching your phone configuration…");
     let cfg = pc
-        .fetch_client_config(&discovery.provisioning.config_endpoint, &tokens.access_token)
+        .fetch_client_config(
+            &discovery.provisioning.config_endpoint,
+            &tokens.access_token,
+        )
         .await
         .map_err(|e| e.to_string())?;
 
@@ -477,7 +478,10 @@ async fn silent_refresh(
 ) -> Result<(), String> {
     let trust = ca_trust(ctx).await;
     let pc = ProvisioningClient::new(&trust).map_err(|e| e.to_string())?;
-    let discovery = pc.fetch_discovery(domain).await.map_err(|e| e.to_string())?;
+    let discovery = pc
+        .fetch_discovery(domain)
+        .await
+        .map_err(|e| e.to_string())?;
     verify_issuer_pinned(domain, &discovery.oidc.issuer).map_err(|e| e.to_string())?;
     let meta = pc
         .fetch_oidc_metadata(&discovery.oidc.issuer)
@@ -488,7 +492,10 @@ async fn silent_refresh(
         .await
         .map_err(|e| e.to_string())?;
     let cfg = pc
-        .fetch_client_config(&discovery.provisioning.config_endpoint, &tokens.access_token)
+        .fetch_client_config(
+            &discovery.provisioning.config_endpoint,
+            &tokens.access_token,
+        )
         .await
         .map_err(|e| e.to_string())?;
     finish_provisioning(app, ctx, domain, discovery, meta, tokens, cfg).await
@@ -539,7 +546,8 @@ async fn finish_provisioning(
             refresh_token_persisted: persisted_flag,
             extra_ca_cert_file: extra_ca,
         });
-        sm.save().map_err(|e| format!("failed to save settings: {e}"))?;
+        sm.save()
+            .map_err(|e| format!("failed to save settings: {e}"))?;
     }
 
     // Update the in-memory session.

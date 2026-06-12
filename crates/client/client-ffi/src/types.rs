@@ -274,9 +274,7 @@ impl From<client_core::AppEvent> for AppEvent {
                     state: state.into(),
                 }
             }
-            Core::TokenRefreshRequired { account_id } => {
-                Self::TokenRefreshRequired { account_id }
-            }
+            Core::TokenRefreshRequired { account_id } => Self::TokenRefreshRequired { account_id },
             Core::CallStateChanged {
                 call_id,
                 state,

@@ -1315,8 +1315,14 @@ mod tests {
         buf.extend_from_slice(b"\r\n\r\n"); // RFC 5626 keep-alive ping
         buf.extend_from_slice(REGISTER);
         buf.extend_from_slice(REGISTER);
-        assert_eq!(next_sip_frame(&mut buf).expect("first").len(), REGISTER.len());
-        assert_eq!(next_sip_frame(&mut buf).expect("second").len(), REGISTER.len());
+        assert_eq!(
+            next_sip_frame(&mut buf).expect("first").len(),
+            REGISTER.len()
+        );
+        assert_eq!(
+            next_sip_frame(&mut buf).expect("second").len(),
+            REGISTER.len()
+        );
         assert!(next_sip_frame(&mut buf).is_none());
     }
 

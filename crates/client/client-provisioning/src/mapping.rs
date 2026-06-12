@@ -92,7 +92,10 @@ mod tests {
         assert_eq!(acct.caller_id.as_deref(), Some("1455550100"));
         assert_eq!(acct.register_expiry, 300);
         assert_eq!(acct.auth_mode, SipAuthMode::Bearer);
-        assert_eq!(acct.bearer_token.as_deref().map(String::as_str), Some("tok-123"));
+        assert_eq!(
+            acct.bearer_token.as_deref().map(String::as_str),
+            Some("tok-123")
+        );
     }
 
     #[test]

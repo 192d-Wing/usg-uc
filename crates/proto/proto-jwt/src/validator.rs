@@ -143,7 +143,8 @@ impl Validator {
     /// [`ValidateError::InsufficientScope`] when the required scope is
     /// absent; [`ValidateError::Jwks`] when signing keys cannot be obtained.
     pub async fn validate(&self, token: &str) -> Result<Claims, ValidateError> {
-        let header = decode_header(token).map_err(|e| ValidateError::InvalidToken(e.to_string()))?;
+        let header =
+            decode_header(token).map_err(|e| ValidateError::InvalidToken(e.to_string()))?;
         if !ALLOWED_ALGS.contains(&header.alg) {
             return Err(ValidateError::InvalidToken(format!(
                 "algorithm {:?} not accepted",
@@ -216,9 +217,11 @@ mod tests {
 
         static KEY: std::sync::OnceLock<TestKey> = std::sync::OnceLock::new();
         KEY.get_or_init(|| {
-            let pkcs8 =
-                EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &SystemRandom::new())
-                    .expect("generate test key");
+            let pkcs8 = EcdsaKeyPair::generate_pkcs8(
+                &ECDSA_P256_SHA256_FIXED_SIGNING,
+                &SystemRandom::new(),
+            )
+            .expect("generate test key");
             let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref())
                 .expect("parse test key");
             let point = pair.public_key().as_ref();
@@ -333,7 +336,10 @@ mod tests {
         // authorization step. A token without `dn` must still validate.
         let mut c = valid_claims();
         c.as_object_mut().expect("object").remove("dn");
-        let claims = validator(&["sbc"]).validate(&sign(&c)).await.expect("valid");
+        let claims = validator(&["sbc"])
+            .validate(&sign(&c))
+            .await
+            .expect("valid");
         assert!(claims.dn.is_none());
     }
 

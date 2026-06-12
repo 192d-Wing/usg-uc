@@ -136,7 +136,8 @@ impl BearerAuthenticator {
             Ok(claims) => {
                 let Some(dn) = claims.dn else {
                     return BearerResult::Forbidden {
-                        reason: "token has no `dn` claim — not a provisioned voice user".to_string(),
+                        reason: "token has no `dn` claim — not a provisioned voice user"
+                            .to_string(),
                     };
                 };
                 // RFC 8898 §3: the authenticated identity must own the AOR.
@@ -203,9 +204,11 @@ mod tests {
 
         static KEY: std::sync::OnceLock<TestKey> = std::sync::OnceLock::new();
         KEY.get_or_init(|| {
-            let pkcs8 =
-                EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &SystemRandom::new())
-                    .expect("generate test key");
+            let pkcs8 = EcdsaKeyPair::generate_pkcs8(
+                &ECDSA_P256_SHA256_FIXED_SIGNING,
+                &SystemRandom::new(),
+            )
+            .expect("generate test key");
             let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref())
                 .expect("parse test key");
             let point = pair.public_key().as_ref();
@@ -333,6 +336,9 @@ mod tests {
     #[test]
     fn challenge_header_is_rfc6750_shaped() {
         let h = authenticator().challenge_header(BearerError::InvalidToken);
-        assert_eq!(h, r#"Bearer realm="sbc.example.mil", error="invalid_token""#);
+        assert_eq!(
+            h,
+            r#"Bearer realm="sbc.example.mil", error="invalid_token""#
+        );
     }
 }
