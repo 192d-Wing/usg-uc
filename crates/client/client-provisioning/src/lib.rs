@@ -183,6 +183,7 @@ impl ProvisioningClient {
         &self,
         meta: &OidcMetadata,
         oidc: &DiscoveryOidc,
+        pkce_challenge: &str,
     ) -> Result<DeviceAuthorization, ProvisioningError> {
         let endpoint = meta
             .device_authorization_endpoint
@@ -195,9 +196,14 @@ impl ProvisioningClient {
                 )
             })?;
         let scope = oidc.scopes.join(" ");
+        // PKCE on the device grant (RFC 8628 + RFC 7636): Keycloak clients
+        // with an enforced code-challenge method reject device authorization
+        // requests that omit it ("Missing parameter: code_challenge_method").
         let form = [
             ("client_id", oidc.client_id.as_str()),
             ("scope", scope.as_str()),
+            ("code_challenge", pkce_challenge),
+            ("code_challenge_method", "S256"),
         ];
         let resp = self
             .http
@@ -234,6 +240,7 @@ impl ProvisioningClient {
         meta: &OidcMetadata,
         client_id: &str,
         device: &DeviceAuthorization,
+        pkce_verifier: &str,
     ) -> Result<TokenResponse, ProvisioningError> {
         use std::time::Duration;
         let mut interval = Duration::from_secs(device.interval.unwrap_or(5).max(1));
@@ -249,6 +256,7 @@ impl ProvisioningClient {
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ("device_code", device.device_code.as_str()),
                 ("client_id", client_id),
+                ("code_verifier", pkce_verifier),
             ];
             let resp = self
                 .http

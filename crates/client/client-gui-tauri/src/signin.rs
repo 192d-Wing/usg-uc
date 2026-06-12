@@ -406,9 +406,12 @@ async fn run_signin_flow(
 
     // 2. Device Authorization Grant (RFC 8628) — no listening socket, no
     //    redirect URI; the binding is possession of the device_code on this
-    //    TLS channel.
+    //    TLS channel. PKCE rides along because the Keycloak client enforces
+    //    S256 on every grant (Configure-Voice sets the client policy).
+    let pkce = client_provisioning::generate_pkce()
+        .ok_or("failed to generate PKCE material".to_string())?;
     let device = pc
-        .start_device_authorization(&meta, &discovery.oidc)
+        .start_device_authorization(&meta, &discovery.oidc, &pkce.challenge)
         .await
         .map_err(|e| e.to_string())?;
     let verify_url = device
@@ -441,7 +444,7 @@ async fn run_signin_flow(
     let tokens = tokio::select! {
         polled = tokio::time::timeout(
             SIGNIN_TIMEOUT,
-            pc.poll_device_token(&meta, &discovery.oidc.client_id, &device),
+            pc.poll_device_token(&meta, &discovery.oidc.client_id, &device, &pkce.verifier),
         ) => match polled {
             Ok(t) => t.map_err(|e| e.to_string())?,
             Err(_) => return Err("sign-in was not completed in time".to_string()),
