@@ -93,6 +93,15 @@ use std::pin::Pin;
 /// but TCP/TLS can handle larger messages.
 pub const MAX_UDP_MESSAGE_SIZE: usize = 1300;
 
+/// UDP receive buffer size.
+///
+/// RFC 3261 §18.1.1 only caps what we SEND over UDP (the 1300-byte MTU
+/// guard above); receivers must accept datagrams up to the 65,535-byte
+/// UDP maximum. Peers legitimately exceed 1300 — an RFC 8898 Bearer
+/// REGISTER carries a ~1.5 KB JWT — and `recv_from` into a smaller buffer
+/// silently truncates the datagram, mangling the request.
+pub const MAX_UDP_RECV_SIZE: usize = 65535;
+
 /// Maximum message size for stream transports (TCP/TLS/WS).
 pub const MAX_STREAM_MESSAGE_SIZE: usize = 65535;
 

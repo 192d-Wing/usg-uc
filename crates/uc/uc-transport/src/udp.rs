@@ -12,7 +12,7 @@
 
 use crate::error::{TransportError, TransportResult};
 use crate::listener::ListenerConfig;
-use crate::{MAX_UDP_MESSAGE_SIZE, ReceivedMessage, Transport};
+use crate::{MAX_UDP_MESSAGE_SIZE, MAX_UDP_RECV_SIZE, ReceivedMessage, Transport};
 use bytes::Bytes;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::future::Future;
@@ -156,7 +156,7 @@ impl UdpTransport {
         Ok(Self {
             socket: Arc::new(tokio_socket),
             local_addr: local_addr.into(),
-            recv_buffer: Mutex::new(vec![0u8; MAX_UDP_MESSAGE_SIZE]),
+            recv_buffer: Mutex::new(vec![0u8; MAX_UDP_RECV_SIZE]),
             closed: AtomicBool::new(false),
         })
     }
@@ -191,7 +191,15 @@ impl Transport for UdpTransport {
                 });
             }
 
-            let dest_addr: SocketAddr = (*dest).into();
+            let mut dest_addr: SocketAddr = (*dest).into();
+            // A dual-stack ([::] with IPV6_V6ONLY=0) socket can reach IPv4
+            // peers, but the OS rejects an AF_INET sockaddr on an AF_INET6
+            // socket — represent the destination as IPv4-mapped IPv6.
+            if SocketAddr::from(self.local_addr).is_ipv6()
+                && let SocketAddr::V4(v4) = dest_addr
+            {
+                dest_addr = SocketAddr::new(v4.ip().to_ipv6_mapped().into(), v4.port());
+            }
             trace!(dest = %dest_addr, size = data.len(), "sending UDP packet");
 
             self.socket
@@ -221,6 +229,12 @@ impl Transport for UdpTransport {
             })?;
 
             trace!(source = %source, size = len, "received UDP packet");
+
+            // On a dual-stack socket, IPv4 peers surface as IPv4-mapped IPv6
+            // (::ffff:a.b.c.d). Canonicalize so SIP-layer consumers (Via
+            // `received=`, trunk-peer matching, registration bindings) see
+            // the same plain-IPv4 addresses they would from a v4 socket.
+            let source = SocketAddr::new(source.ip().to_canonical(), source.port());
 
             Ok(ReceivedMessage {
                 data: Bytes::copy_from_slice(&buffer[..len]),
