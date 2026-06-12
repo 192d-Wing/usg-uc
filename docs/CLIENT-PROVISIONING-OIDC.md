@@ -114,7 +114,7 @@ browser flow. Active calls are not torn down — only re-REGISTER fails.
     "config_endpoint": "https://us-east-1.pop.example.mil/v1/client-config"
   },
   "minimum_client_version": {
-    "desktop": "0.5.0",
+    "desktop": "0.6.0",
     "android": "0.2.0"
   }
 }

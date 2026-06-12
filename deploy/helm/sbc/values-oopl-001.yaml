@@ -1,4 +1,4 @@
-# oopl-001 site values — chart v0.5.0, all images pulled from GHCR @ 0.5.0
+# oopl-001 site values — chart v0.6.0, all images pulled from GHCR @ 0.6.0
 # Preserves the existing release's site/bgp/kea/externalDns settings.
 
 site:
@@ -25,34 +25,34 @@ externalDns:
 kea:
   enabled: false
 
-# --- all USG component images: GHCR, tag 0.5.0 (latest release) ---
+# --- all USG component images: GHCR, tag 0.6.0 (latest release) ---
 image:
   repository: ghcr.io/192d-wing/sbc-daemon
-  tag: "0.5.0"
+  tag: "0.6.0"
   pullPolicy: IfNotPresent
 
 sbcFrontend:
   image:
     repository: ghcr.io/192d-wing/sbc-dashboard
-    tag: "0.5.0"
+    tag: "0.6.0"
     pullPolicy: IfNotPresent
 
 sbcApi:
   image:
     repository: ghcr.io/192d-wing/sbc-api-server
-    tag: "0.5.0"
+    tag: "0.6.0"
     pullPolicy: IfNotPresent
 
 sbcProvision:
   image:
     repository: ghcr.io/192d-wing/sbc-provision-server
-    tag: "0.5.0"
+    tag: "0.6.0"
     pullPolicy: IfNotPresent
 
 sbcClientConfig:
   image:
     repository: ghcr.io/192d-wing/sbc-client-config-server
-    tag: "0.5.0"
+    tag: "0.6.0"
     pullPolicy: IfNotPresent
   # SIP registrar gets its own name: sbc.oopl.dev.mil must stay on the
   # traefik LB (10.10.10.54) for the HTTPS provisioning ingress, while SIP
