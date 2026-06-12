@@ -184,13 +184,16 @@ impl ProvisioningClient {
         meta: &OidcMetadata,
         oidc: &DiscoveryOidc,
     ) -> Result<DeviceAuthorization, ProvisioningError> {
-        let endpoint = meta.device_authorization_endpoint.as_deref().ok_or_else(|| {
-            ProvisioningError::Authorization(
-                "the IdP does not advertise a device_authorization_endpoint — enable the \
+        let endpoint = meta
+            .device_authorization_endpoint
+            .as_deref()
+            .ok_or_else(|| {
+                ProvisioningError::Authorization(
+                    "the IdP does not advertise a device_authorization_endpoint — enable the \
                  OAuth 2.0 Device Authorization Grant on the OIDC client"
-                    .to_string(),
-            )
-        })?;
+                        .to_string(),
+                )
+            })?;
         let scope = oidc.scopes.join(" ");
         let form = [
             ("client_id", oidc.client_id.as_str()),
@@ -481,10 +484,22 @@ mod tests {
             classify_device_poll(&body("authorization_pending")),
             DevicePoll::Pending
         );
-        assert_eq!(classify_device_poll(&body("slow_down")), DevicePoll::SlowDown);
-        assert_eq!(classify_device_poll(&body("access_denied")), DevicePoll::Denied);
-        assert_eq!(classify_device_poll(&body("expired_token")), DevicePoll::Expired);
-        assert_eq!(classify_device_poll(&body("invalid_grant")), DevicePoll::Fatal);
+        assert_eq!(
+            classify_device_poll(&body("slow_down")),
+            DevicePoll::SlowDown
+        );
+        assert_eq!(
+            classify_device_poll(&body("access_denied")),
+            DevicePoll::Denied
+        );
+        assert_eq!(
+            classify_device_poll(&body("expired_token")),
+            DevicePoll::Expired
+        );
+        assert_eq!(
+            classify_device_poll(&body("invalid_grant")),
+            DevicePoll::Fatal
+        );
         assert_eq!(classify_device_poll("not json"), DevicePoll::Fatal);
         assert_eq!(classify_device_poll("{}"), DevicePoll::Fatal);
     }

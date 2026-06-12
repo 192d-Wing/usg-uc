@@ -441,8 +441,14 @@ struct TlsConnection {
 
 impl TlsConnection {
     /// Creates a new TLS connection from the write half of a split stream.
-    const fn new(write_half: tokio::io::WriteHalf<TlsStream<TcpStream>>, peer_addr: SocketAddr) -> Self {
-        Self { write_half, peer_addr }
+    const fn new(
+        write_half: tokio::io::WriteHalf<TlsStream<TcpStream>>,
+        peer_addr: SocketAddr,
+    ) -> Self {
+        Self {
+            write_half,
+            peer_addr,
+        }
     }
 
     /// Sends a SIP message.
