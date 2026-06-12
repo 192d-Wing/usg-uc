@@ -1326,20 +1326,41 @@ impl SipStack {
                         .nth(1)
                         .and_then(|s| s.split('@').next())
                         .unwrap_or("unknown");
+                    // The pinhole is only reachable over the transport the
+                    // REGISTER used — take it from the top Via
+                    // ("SIP/2.0/TLS ..."), not a hardcoded udp.
+                    let via_transport = req
+                        .headers
+                        .get_value(&HeaderName::Via)
+                        .and_then(|v| {
+                            v.split_whitespace()
+                                .next()
+                                .and_then(|proto| proto.rsplit('/').next())
+                                .map(str::to_ascii_lowercase)
+                        })
+                        .unwrap_or_else(|| "udp".to_string());
                     for binding in &reg_response.contacts {
                         // The binding created/refreshed by *this* REGISTER
                         // (same Call-ID) is reachable via the source pinhole;
                         // also fix any wildcard host that can never be routed.
                         let is_this_device = binding.call_id() == call_id;
                         if is_this_device || binding.contact_uri().contains("0.0.0.0") {
-                            let contact_uri =
-                                format!("sip:{aor_user}@{src_ip}:{src_port};transport=udp");
-                            let _ = loc.add_binding(proto_registrar::Binding::new(
+                            // SipUri's display brackets IPv6 hosts.
+                            let contact_uri = proto_sip::uri::SipUri::new(src_ip.clone())
+                                .with_user(aor_user)
+                                .with_port(src_port)
+                                .with_param("transport", Some(via_transport.clone()))
+                                .to_string();
+                            let mut latched = proto_registrar::Binding::new(
                                 &aor,
                                 &contact_uri,
                                 binding.call_id(),
                                 binding.cseq(),
-                            ));
+                            );
+                            // Keep the negotiated expiry instead of resetting
+                            // the binding to the default lifetime.
+                            let _ = latched.set_expires(binding.remaining_seconds());
+                            let _ = loc.add_binding(latched);
                         } else {
                             let _ = loc.add_binding(binding.clone());
                         }
