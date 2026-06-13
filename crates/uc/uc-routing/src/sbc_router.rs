@@ -1,8 +1,8 @@
-//! CUCM-compatible routing engine.
+//! SBC-compatible routing engine.
 //!
-//! Implements Cisco Unified Communications Manager-style call routing:
-//! Calling Search Spaces select partitions, partitions contain route
-//! patterns, and route patterns point to route lists or route groups.
+//! Implements partition-based call routing: Calling Search Spaces select
+//! partitions, partitions contain route patterns, and route patterns point
+//! to route lists or route groups.
 
 use crate::css::CallingSearchSpace;
 use crate::partition::Partition;
@@ -11,9 +11,9 @@ use crate::route_pattern::RoutePattern;
 use crate::trunk::TrunkGroup;
 use std::collections::HashMap;
 
-/// Result of the CUCM routing algorithm.
+/// Result of the SBC routing algorithm.
 #[derive(Debug, Clone)]
-pub struct CucmRoutingResult {
+pub struct SbcRoutingResult {
     /// ID of the matched route pattern.
     pub pattern_id: String,
     /// ID of the partition the matched pattern belongs to.
@@ -26,12 +26,12 @@ pub struct CucmRoutingResult {
     pub transforms_applied: Vec<String>,
 }
 
-/// A CUCM-compatible routing engine.
+/// A SBC-compatible routing engine.
 ///
 /// Combines Partitions, Calling Search Spaces, Route Patterns, Route Lists,
 /// and Route Groups (trunk groups) into a single routing decision.
 #[derive(Debug)]
-pub struct CucmRouter {
+pub struct SbcRouter {
     /// Partitions indexed by ID.
     partitions: HashMap<String, Partition>,
     /// Calling Search Spaces indexed by ID.
@@ -46,7 +46,7 @@ pub struct CucmRouter {
     default_css: Option<String>,
 }
 
-impl CucmRouter {
+impl SbcRouter {
     /// Creates a new empty router.
     pub fn new() -> Self {
         Self {
@@ -169,14 +169,14 @@ impl CucmRouter {
 
     // ---- Routing ----
 
-    /// Routes dialed digits through the CUCM algorithm.
+    /// Routes dialed digits through the SBC algorithm.
     ///
     /// 1. Resolve the CSS (explicit or default).
     /// 2. Walk partitions in CSS order.
     /// 3. For each partition, find enabled, non-blocked patterns that match.
     /// 4. Among matches, prefer the longest prefix, then lowest priority value.
     /// 5. Resolve route list or route group, apply transforms.
-    pub fn route(&self, dialed_digits: &str, css_id: Option<&str>) -> Option<CucmRoutingResult> {
+    pub fn route(&self, dialed_digits: &str, css_id: Option<&str>) -> Option<SbcRoutingResult> {
         // 1. Resolve CSS
         let css_key = css_id.or(self.default_css.as_deref())?;
         let css = self.css_list.get(css_key)?;
@@ -204,7 +204,7 @@ impl CucmRouter {
                 }
             }
 
-            // CUCM semantics: first partition with *any* match wins.
+            // SBC semantics: first partition with *any* match wins.
             // Within that partition, the best (most-specific, lowest-priority) pattern is used.
             if best.is_some() {
                 break;
@@ -227,7 +227,7 @@ impl CucmRouter {
         let route_group_ids =
             self.resolve_route_groups(matched, &mut transformed, &mut transforms_applied);
 
-        Some(CucmRoutingResult {
+        Some(SbcRoutingResult {
             pattern_id: matched.id().to_string(),
             partition_id: matched.partition_id().to_string(),
             transformed_number: transformed,
@@ -296,7 +296,7 @@ impl CucmRouter {
     }
 }
 
-impl Default for CucmRouter {
+impl Default for SbcRouter {
     fn default() -> Self {
         Self::new()
     }
@@ -309,9 +309,9 @@ mod tests {
     use crate::route_list::{RouteList, RouteListMember};
     use crate::trunk::{Trunk, TrunkConfig, TrunkGroup};
 
-    /// Helper: build a fully wired CUCM router for testing.
-    fn setup_cucm_router() -> CucmRouter {
-        let mut router = CucmRouter::new();
+    /// Helper: build a fully wired SBC router for testing.
+    fn setup_sbc_router() -> SbcRouter {
+        let mut router = SbcRouter::new();
 
         // Partitions
         router.add_partition(Partition::new("pt-emergency", "Emergency"));
@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn test_route_emergency() {
-        let router = setup_cucm_router();
+        let router = setup_sbc_router();
         let result = router.route("911", Some("css-phone"));
         assert!(result.is_some());
         let r = result.unwrap();
@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn test_route_us_long_distance() {
-        let router = setup_cucm_router();
+        let router = setup_sbc_router();
         let result = router.route("+15551234567", Some("css-phone"));
         assert!(result.is_some());
         let r = result.unwrap();
@@ -419,7 +419,7 @@ mod tests {
 
     #[test]
     fn test_route_blocked_premium() {
-        let router = setup_cucm_router();
+        let router = setup_sbc_router();
         // +1900 is blocked — it should not match the +1 LD pattern either,
         // because the blocked pattern has higher priority (1 < 50), but
         // the routing algorithm filters out blocked patterns entirely.
@@ -434,7 +434,7 @@ mod tests {
 
     #[test]
     fn test_css_filtering_lobby() {
-        let router = setup_cucm_router();
+        let router = setup_sbc_router();
         // Lobby CSS only has emergency + internal.
         // Long distance +1 should NOT match.
         let result = router.route("+15551234567", Some("css-lobby"));
@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn test_css_filtering_lobby_911() {
-        let router = setup_cucm_router();
+        let router = setup_sbc_router();
         // Lobby can still reach 911.
         let result = router.route("911", Some("css-lobby"));
         assert!(result.is_some());
@@ -452,7 +452,7 @@ mod tests {
 
     #[test]
     fn test_default_css() {
-        let router = setup_cucm_router();
+        let router = setup_sbc_router();
         // No explicit CSS — uses default (css-phone).
         let result = router.route("911", None);
         assert!(result.is_some());
@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn test_no_css_no_default() {
-        let mut router = CucmRouter::new();
+        let mut router = SbcRouter::new();
         // No CSS at all.
         let result = router.route("911", None);
         assert!(result.is_none());
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn test_partition_crud() {
-        let mut router = CucmRouter::new();
+        let mut router = SbcRouter::new();
         router.add_partition(Partition::new("pt-1", "One"));
         assert!(router.get_partition("pt-1").is_some());
         assert_eq!(router.list_partitions().len(), 1);
@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_css_crud() {
-        let mut router = CucmRouter::new();
+        let mut router = SbcRouter::new();
         router.add_css(CallingSearchSpace::new("css-1", "CSS One"));
         assert!(router.get_css("css-1").is_some());
         assert_eq!(router.list_css().len(), 1);
@@ -496,7 +496,7 @@ mod tests {
 
     #[test]
     fn test_route_pattern_crud() {
-        let mut router = CucmRouter::new();
+        let mut router = SbcRouter::new();
         router.add_route_pattern(RoutePattern::new("rp-1", DialPattern::exact("100"), "pt-1"));
         assert_eq!(router.list_route_patterns().len(), 1);
 
@@ -510,7 +510,7 @@ mod tests {
 
     #[test]
     fn test_route_list_crud() {
-        let mut router = CucmRouter::new();
+        let mut router = SbcRouter::new();
         router.add_route_list(RouteList::new("rl-1", "RL One"));
         let removed = router.remove_route_list("rl-1");
         assert!(removed.is_some());
@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn test_internal_extension() {
-        let router = setup_cucm_router();
+        let router = setup_sbc_router();
         let result = router.route("1234", Some("css-phone"));
         assert!(result.is_some());
         let r = result.unwrap();
@@ -528,7 +528,7 @@ mod tests {
 
     #[test]
     fn test_local_seven_digit() {
-        let router = setup_cucm_router();
+        let router = setup_sbc_router();
         let result = router.route("5551234", Some("css-phone"));
         assert!(result.is_some());
         let r = result.unwrap();
@@ -540,7 +540,7 @@ mod tests {
     fn test_partition_order_precedence() {
         // Verify that partition order in the CSS determines winner
         // when the same pattern exists in multiple partitions.
-        let mut router = CucmRouter::new();
+        let mut router = SbcRouter::new();
 
         router.add_partition(Partition::new("pt-a", "A"));
         router.add_partition(Partition::new("pt-b", "B"));

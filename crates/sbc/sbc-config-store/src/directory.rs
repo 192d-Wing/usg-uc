@@ -7,10 +7,10 @@
 
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
-use tracing::debug;
 
 use crate::error::{ConfigStoreError, ConfigStoreResult};
 use crate::model::DirectoryNumber;
+use crate::schema;
 
 /// Pooled Postgres backend for directory numbers.
 #[derive(Clone)]
@@ -32,9 +32,8 @@ impl PostgresDirectoryNumberStore {
             .max_connections(5)
             .connect(database_url)
             .await?;
-        let store = Self { pool };
-        store.create_tables().await?;
-        Ok(store)
+        schema::ensure_schema(&pool).await?;
+        Ok(Self { pool })
     }
 
     /// Construct from a pre-existing pool (lets multiple stores share one
@@ -43,9 +42,8 @@ impl PostgresDirectoryNumberStore {
     /// # Errors
     /// Returns `ConfigStoreError::Storage` if schema bootstrap fails.
     pub async fn from_pool(pool: PgPool) -> ConfigStoreResult<Self> {
-        let store = Self { pool };
-        store.create_tables().await?;
-        Ok(store)
+        schema::ensure_schema(&pool).await?;
+        Ok(Self { pool })
     }
 
     /// Expose the underlying pool so future stores in this crate (phones,
@@ -53,30 +51,6 @@ impl PostgresDirectoryNumberStore {
     #[must_use]
     pub const fn pool(&self) -> &PgPool {
         &self.pool
-    }
-
-    async fn create_tables(&self) -> ConfigStoreResult<()> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS directory_numbers (
-                did TEXT PRIMARY KEY,
-                sip_user TEXT,
-                partition TEXT,
-                description TEXT,
-                extra JSONB NOT NULL DEFAULT '{}'::jsonb,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )",
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_directory_numbers_user
-             ON directory_numbers (sip_user)",
-        )
-        .execute(&self.pool)
-        .await?;
-        debug!("directory_numbers table ready");
-        Ok(())
     }
 
     /// Insert a DID, or replace the existing row if `did` already exists.
@@ -98,6 +72,9 @@ impl PostgresDirectoryNumberStore {
                  partition   = EXCLUDED.partition,
                  description = EXCLUDED.description,
                  extra       = EXCLUDED.extra,
+                 deleted     = FALSE,
+                 revision    = 0,
+                 updated_by  = 'local',
                  updated_at  = NOW()",
         )
         .bind(&dn.did)
@@ -110,16 +87,22 @@ impl PostgresDirectoryNumberStore {
         Ok(())
     }
 
-    /// Delete a DID. Returns `NotFound` if the DID didn't exist.
+    /// Delete a DID. Writes a tombstone (`deleted = TRUE`) rather than
+    /// removing the row, so central sync can distinguish "deleted here"
+    /// from "never existed" and never resurrects it.
     ///
     /// # Errors
     /// Returns `ConfigStoreError::Storage` for DB errors, or
-    /// `ConfigStoreError::NotFound` if the DID didn't exist.
+    /// `ConfigStoreError::NotFound` if no live row matched.
     pub async fn delete(&self, did: &str) -> ConfigStoreResult<()> {
-        let result = sqlx::query("DELETE FROM directory_numbers WHERE did = $1")
-            .bind(did)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE directory_numbers
+             SET deleted = TRUE, revision = 0, updated_by = 'local', updated_at = NOW()
+             WHERE did = $1 AND NOT deleted",
+        )
+        .bind(did)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(ConfigStoreError::NotFound);
         }
@@ -134,7 +117,7 @@ impl PostgresDirectoryNumberStore {
     pub async fn get(&self, did: &str) -> ConfigStoreResult<DirectoryNumber> {
         let row = sqlx::query(
             "SELECT did, sip_user, partition, description, extra
-             FROM directory_numbers WHERE did = $1",
+             FROM directory_numbers WHERE did = $1 AND NOT deleted",
         )
         .bind(did)
         .fetch_optional(&self.pool)
@@ -151,7 +134,7 @@ impl PostgresDirectoryNumberStore {
     pub async fn list(&self) -> ConfigStoreResult<Vec<DirectoryNumber>> {
         let rows = sqlx::query(
             "SELECT did, sip_user, partition, description, extra
-             FROM directory_numbers ORDER BY did",
+             FROM directory_numbers WHERE NOT deleted ORDER BY did",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -162,8 +145,10 @@ impl PostgresDirectoryNumberStore {
         Ok(out)
     }
 
-    /// `true` when there are no DIDs in the table. Used by the JSON
-    /// migration helper to decide whether backfill is needed.
+    /// `true` when there are no DIDs at all — tombstones included.
+    /// This gates the one-shot legacy JSON import: "the table has ever
+    /// been written" is the signal, so an all-tombstoned table must NOT
+    /// read as empty (a stale JSON re-import would resurrect rows).
     ///
     /// # Errors
     /// Returns `ConfigStoreError::Storage` for DB errors.

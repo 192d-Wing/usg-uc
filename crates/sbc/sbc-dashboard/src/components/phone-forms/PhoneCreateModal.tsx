@@ -6,7 +6,8 @@ import Modal from '@cloudscape-design/components/modal';
 import SpaceBetween from '@cloudscape-design/components/space-between';
 import Tabs from '@cloudscape-design/components/tabs';
 
-import { api, ApiError } from '../../api';
+import { ApiError } from '../../api';
+import { centralApi } from '../../centralApi';
 import type { ModelValue, Phone, SerializedModel } from '../../lib/phoneModel';
 import {
   emptyPhone,
@@ -41,12 +42,15 @@ export function PhoneCreateModal({
   visible,
   mode,
   target,
+  site,
   onClose,
   onSaved,
 }: Readonly<{
   visible: boolean;
   mode: Mode;
   target: Phone | null;
+  /** Active site whose shard the phone is written to. */
+  site: string | null;
   onClose: () => void;
   onSaved: () => void | Promise<void>;
 }>) {
@@ -99,20 +103,25 @@ export function PhoneCreateModal({
       setError(v);
       return;
     }
+    if (!site) {
+      setError('No site selected.');
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
+      // Central requires the id in the body; mint one for new phones (the
+      // old per-site API generated it server-side).
+      const id = mode === 'edit' && target?.id ? target.id : form.id || crypto.randomUUID();
       const body: Phone = {
         ...form,
+        id,
         mac_address: form.mac_address.trim().toLowerCase(),
         name: form.name.trim(),
         model: packModel(modelValue, genericName),
       };
-      if (mode === 'create') {
-        await api.post('/phones', body);
-      } else if (target?.id) {
-        await api.put(`/phones/${encodeURIComponent(target.id)}`, body);
-      }
+      // Central upsert covers create and update.
+      await centralApi.upsert(site, 'phones', body);
       await onSaved();
       onClose();
     } catch (e) {

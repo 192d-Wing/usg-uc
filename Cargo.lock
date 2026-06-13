@@ -792,6 +792,60 @@ dependencies = [
 ]
 
 [[package]]
+name = "central-config-api"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "axum",
+ "base64 0.22.1",
+ "central-config-store",
+ "http-body-util",
+ "jsonwebtoken",
+ "proto-jwt",
+ "reqwest 0.12.28",
+ "sbc-config",
+ "sbc-config-store",
+ "sbc-config-sync",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "central-config-import"
+version = "0.1.0"
+dependencies = [
+ "central-config-store",
+ "sbc-config-store",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "central-config-store"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cesu8"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5972,6 +6026,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "hyper",
+ "proto-jwt",
  "reqwest 0.12.28",
  "sbc-config-store",
  "sbc-grpc-api",
@@ -6058,6 +6113,26 @@ dependencies = [
  "tracing",
  "uc-phone-mgmt",
  "uuid",
+]
+
+[[package]]
+name = "sbc-config-sync"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "central-config-store",
+ "reqwest 0.12.28",
+ "sbc-config-store",
+ "sbc-grpc-api",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

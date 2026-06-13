@@ -1,0 +1,49 @@
+# central-config — the fleet's central configuration plane.
+#
+# Runs once for the whole fleet (not per-site). Hosts central-config-api,
+# which serves the operator write surface and the per-site sync read
+# surface over the central, site_code-sharded Postgres.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: localhost/usg-central-config-api
+  tag: local
+  pullPolicy: Never
+
+api:
+  replicas: 2
+  listenPort: 80
+  resources:
+    requests: { cpu: "50m",  memory: "128Mi" }
+    limits:   { cpu: "500m", memory: "512Mi" }
+  # OIDC the site service-account + operator tokens are minted by. Issuer
+  # must round-trip exactly with the IdP discovery doc.
+  oidc:
+    issuer: ""
+    audience: "usg-uc-config"
+
+# Central Postgres. The bundled single-instance Deployment is for
+# lab/dev only — set `enabled: false` and point `existingSecret` at an HA
+# managed/operator Postgres (CNPG, Patroni) with PITR for production. The
+# central DB is the one datastore that must not lose writes.
+postgres:
+  enabled: true
+  image: postgres:18-alpine
+  storage: 5Gi
+  database: usg_config
+  user: central
+  # Set a strong password for the bundled instance (lab only).
+  password: "change-me"
+  resources:
+    requests: { cpu: "100m", memory: "256Mi" }
+    limits:   { cpu: "1",    memory: "1Gi" }
+  # For production: bring your own Postgres and reference its DSN secret.
+  existingSecret:
+    name: ""
+    key: dsn
+
+serviceAccount:
+  create: true
+  name: ""

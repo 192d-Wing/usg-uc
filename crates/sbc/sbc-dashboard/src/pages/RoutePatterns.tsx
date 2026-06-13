@@ -12,7 +12,9 @@ import Table from '@cloudscape-design/components/table';
 import Textarea from '@cloudscape-design/components/textarea';
 import TextFilter from '@cloudscape-design/components/text-filter';
 
-import { api, ApiError } from '../api';
+import { ApiError } from '../api';
+import { centralApi } from '../centralApi';
+import { useSite } from '../SiteContext';
 import { DeleteConfirmModal, FormModal } from '../components/CrudModal';
 
 type RoutePattern = {
@@ -121,23 +123,30 @@ export function RoutePatterns() {
   const [modalError, setModalError] = useState<string | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
 
+  const { site } = useSite();
+
   const load = async () => {
+    if (!site) {
+      setItems([]);
+      setPartitions([]);
+      setRouteLists([]);
+      setTrunkGroups([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
-      const [rpRes, partRes, rlRes, tgRes] = await Promise.all([
-        api.get<{ route_patterns: RoutePattern[] }>('/routepatterns'),
-        api.get<{ partitions: PartitionOpt[] }>('/partitions').catch(() => ({ partitions: [] })),
-        api.get<{ route_lists: RouteListOpt[] }>('/routelists').catch(() => ({ route_lists: [] })),
-        api
-          .get<{ trunk_groups: TrunkGroupOpt[] }>('/trunkgroups')
-          .catch(() => ({ trunk_groups: [] })),
+      const [next, parts, rls, tgs] = await Promise.all([
+        centralApi.list<RoutePattern>(site, 'routepatterns'),
+        centralApi.list<PartitionOpt>(site, 'partitions').catch(() => []),
+        centralApi.list<RouteListOpt>(site, 'routelists').catch(() => []),
+        centralApi.list<TrunkGroupOpt>(site, 'trunkgroups').catch(() => []),
       ]);
-      const next = rpRes.route_patterns ?? [];
       setItems(next);
-      setPartitions(partRes.partitions ?? []);
-      setRouteLists(rlRes.route_lists ?? []);
-      setTrunkGroups(tgRes.trunk_groups ?? []);
+      setPartitions(parts);
+      setRouteLists(rls);
+      setTrunkGroups(tgs);
       setSelected((cur) => cur.filter((s) => next.some((p) => p.id === s.id)));
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e));
@@ -146,9 +155,10 @@ export function RoutePatterns() {
     }
   };
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     void load();
-  }, []);
+  }, [site]);
 
   const filtered = filter
     ? items.filter((p) => {
@@ -234,12 +244,13 @@ export function RoutePatterns() {
     } else if (form.target_kind === 'route_group' && form.route_group) {
       body.route_group_id = form.route_group.value;
     }
+    if (!site) {
+      setModalError('No site selected.');
+      setBusy(false);
+      return;
+    }
     try {
-      if (modalMode === 'create') {
-        await api.post('/routepatterns', body);
-      } else {
-        await api.put(`/routepatterns/${encodeURIComponent(form.id.trim())}`, body);
-      }
+      await centralApi.upsert(site, 'routepatterns', body);
       closeModal();
       await load();
     } catch (e) {
@@ -255,11 +266,11 @@ export function RoutePatterns() {
     setDeleteOpen(true);
   };
   const confirmDelete = async () => {
-    if (!target) return;
+    if (!target || !site) return;
     setBusy(true);
     setModalError(null);
     try {
-      await api.delete(`/routepatterns/${encodeURIComponent(target.id)}`);
+      await centralApi.remove(site, 'routepatterns', target.id);
       setDeleteOpen(false);
       setSelected([]);
       await load();

@@ -12,6 +12,8 @@ import StatusIndicator from '@cloudscape-design/components/status-indicator';
 import Table from '@cloudscape-design/components/table';
 
 import { api, ApiError } from '../api';
+import { centralApi } from '../centralApi';
+import { useSite } from '../SiteContext';
 
 type Line = {
   index?: number;
@@ -40,31 +42,30 @@ function valueText(v: unknown): string {
 
 export function PhoneDetail() {
   const { id } = useParams();
+  const { site } = useSite();
   const navigate = useNavigate();
   const [phone, setPhone] = useState<Phone | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    if (!id) return;
+    if (!id || !site) {
+      setLoading(false);
+      return;
+    }
     let cancelled = false;
-    api
-      .get<Phone>(`/phones/${id}`)
+    centralApi
+      .get<Phone>(site, 'phones', id)
       .then((p) => {
         if (cancelled) return;
-        // Tolerate the {error: ...} response shape from the existing API.
-        if ('error' in p && !p.mac_address) {
-          setError(String(p.error));
-        } else {
-          setPhone(p);
-        }
+        setPhone(p);
       })
       .catch((e) => !cancelled && setError(e instanceof ApiError ? e.message : String(e)))
       .finally(() => !cancelled && setLoading(false));
     return () => {
       cancelled = true;
     };
-  }, [id]);
+  }, [id, site]);
 
   return (
     <ContentLayout

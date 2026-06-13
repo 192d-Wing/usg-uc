@@ -15,9 +15,9 @@
 
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
-use tracing::debug;
 
 use crate::error::{ConfigStoreError, ConfigStoreResult};
+use crate::schema;
 
 /// Pooled Postgres backend for trunk groups.
 #[derive(Clone)]
@@ -35,9 +35,8 @@ impl PostgresTrunkGroupStore {
             .max_connections(5)
             .connect(database_url)
             .await?;
-        let store = Self { pool };
-        store.create_tables().await?;
-        Ok(store)
+        schema::ensure_schema(&pool).await?;
+        Ok(Self { pool })
     }
 
     /// Construct from an existing pool.
@@ -45,30 +44,14 @@ impl PostgresTrunkGroupStore {
     /// # Errors
     /// Returns `ConfigStoreError::Storage` on schema bootstrap failure.
     pub async fn from_pool(pool: PgPool) -> ConfigStoreResult<Self> {
-        let store = Self { pool };
-        store.create_tables().await?;
-        Ok(store)
+        schema::ensure_schema(&pool).await?;
+        Ok(Self { pool })
     }
 
     /// Expose the underlying pool for cross-store reuse.
     #[must_use]
     pub const fn pool(&self) -> &PgPool {
         &self.pool
-    }
-
-    async fn create_tables(&self) -> ConfigStoreResult<()> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS trunk_groups (
-                id TEXT PRIMARY KEY,
-                data JSONB NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )",
-        )
-        .execute(&self.pool)
-        .await?;
-        debug!("trunk_groups table ready");
-        Ok(())
     }
 
     /// Upsert a trunk group's full JSON body.
@@ -81,6 +64,9 @@ impl PostgresTrunkGroupStore {
              VALUES ($1, $2)
              ON CONFLICT (id) DO UPDATE SET
                  data       = EXCLUDED.data,
+                 deleted    = FALSE,
+                 revision   = 0,
+                 updated_by = 'local',
                  updated_at = NOW()",
         )
         .bind(id)
@@ -90,16 +76,22 @@ impl PostgresTrunkGroupStore {
         Ok(())
     }
 
-    /// Delete a trunk group by ID.
+    /// Delete a trunk group by ID. Writes a tombstone (`deleted = TRUE`)
+    /// rather than removing the row, so central sync can distinguish
+    /// "deleted here" from "never existed" and never resurrects it.
     ///
     /// # Errors
-    /// Returns `ConfigStoreError::NotFound` if no row matched, or
+    /// Returns `ConfigStoreError::NotFound` if no live row matched, or
     /// `ConfigStoreError::Storage` for other DB errors.
     pub async fn delete(&self, id: &str) -> ConfigStoreResult<()> {
-        let result = sqlx::query("DELETE FROM trunk_groups WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE trunk_groups
+             SET deleted = TRUE, revision = 0, updated_by = 'local', updated_at = NOW()
+             WHERE id = $1 AND NOT deleted",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(ConfigStoreError::NotFound);
         }
@@ -111,7 +103,7 @@ impl PostgresTrunkGroupStore {
     /// # Errors
     /// Returns `ConfigStoreError::NotFound` if absent.
     pub async fn get(&self, id: &str) -> ConfigStoreResult<serde_json::Value> {
-        let row = sqlx::query("SELECT data FROM trunk_groups WHERE id = $1")
+        let row = sqlx::query("SELECT data FROM trunk_groups WHERE id = $1 AND NOT deleted")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?
@@ -124,7 +116,7 @@ impl PostgresTrunkGroupStore {
     /// # Errors
     /// Returns `ConfigStoreError::Storage` for DB errors.
     pub async fn list(&self) -> ConfigStoreResult<Vec<serde_json::Value>> {
-        let rows = sqlx::query("SELECT data FROM trunk_groups ORDER BY id")
+        let rows = sqlx::query("SELECT data FROM trunk_groups WHERE NOT deleted ORDER BY id")
             .fetch_all(&self.pool)
             .await?;
         let mut out = Vec::with_capacity(rows.len());
@@ -134,7 +126,11 @@ impl PostgresTrunkGroupStore {
         Ok(out)
     }
 
-    /// `true` when there are no trunk groups; used by the migration helper.
+    /// `true` when there are no trunk groups at all — tombstones
+    /// included. This gates the one-shot legacy JSON import: "the table
+    /// has ever been written" is the signal, so an all-tombstoned table
+    /// must NOT read as empty (a stale JSON re-import would resurrect
+    /// rows).
     ///
     /// # Errors
     /// Returns `ConfigStoreError::Storage` for DB errors.

@@ -74,8 +74,8 @@ pub struct SipStack {
     media_pipeline: Option<Arc<crate::media_pipeline::MediaPipeline>>,
     /// Call router for dial plan matching and trunk selection.
     router: Option<RwLock<Router>>,
-    /// CUCM-compatible router for CSS/Partition-based routing.
-    cucm_router: Option<Arc<RwLock<uc_routing::CucmRouter>>>,
+    /// SBC-compatible router for CSS/Partition-based routing.
+    sbc_router: Option<Arc<RwLock<uc_routing::SbcRouter>>>,
     /// SIP header manipulator for per-trunk/global header rules.
     header_manipulator: Option<HeaderManipulator>,
     /// Topology hider for Via/Contact/Call-ID anonymization.
@@ -349,7 +349,7 @@ impl SipStack {
             sdp_rewriter: SdpRewriter::new(B2buaMode::MediaRelay),
             media_pipeline: None,
             router: None,
-            cucm_router: None,
+            sbc_router: None,
             header_manipulator: None,
             topology_hider: None,
             registrations_active: AtomicU64::new(0),
@@ -399,7 +399,7 @@ impl SipStack {
             sdp_rewriter: SdpRewriter::new(B2buaMode::MediaRelay),
             media_pipeline: None,
             router: None,
-            cucm_router: None,
+            sbc_router: None,
             header_manipulator: None,
             topology_hider: None,
             registrations_active: AtomicU64::new(0),
@@ -469,9 +469,9 @@ impl SipStack {
         }
     }
 
-    /// Sets the CUCM router for CSS/Partition-based call routing.
-    pub fn set_cucm_router(&mut self, router: Arc<RwLock<uc_routing::CucmRouter>>) {
-        self.cucm_router = Some(router);
+    /// Sets the SBC router for CSS/Partition-based call routing.
+    pub fn set_sbc_router(&mut self, router: Arc<RwLock<uc_routing::SbcRouter>>) {
+        self.sbc_router = Some(router);
     }
 
     /// Initializes the call router from SBC config sections.
@@ -1577,7 +1577,7 @@ impl SipStack {
         // 3. Look up destination:
         //    a) Check DID → user mapping, then LocationService
         //    b) Check LocationService directly for registered users
-        //    c) Try CUCM router (CSS/Partition)
+        //    c) Try SBC router (CSS/Partition)
         //    d) Try dial plan router
         //    e) Fall back to announcement
         let failover_trunks: Vec<String> = Vec::new();
@@ -1636,7 +1636,7 @@ impl SipStack {
             if let Some(contact) = found_contact {
                 resolve_sip_uri_to_addr(&contact)
             } else {
-                // Not registered — try CUCM router (CSS-based), then dial plan, then direct
+                // Not registered — try SBC router (CSS-based), then dial plan, then direct
                 let mut routed = None;
 
                 // Identify which trunk group this inbound call came from (by source IP)
@@ -1660,17 +1660,17 @@ impl SipStack {
                     );
                 }
 
-                // 1. Route via CUCM router (CSS/Partition → Route Pattern → Route List → Route Group)
-                if let Some(ref cucm) = self.cucm_router {
-                    let cucm_r = cucm.read().await;
+                // 1. Route via SBC router (CSS/Partition → Route Pattern → Route List → Route Group)
+                if let Some(ref sbc) = self.sbc_router {
+                    let sbc_r = sbc.read().await;
                     let css_ref = css_id_owned.as_deref();
-                    if let Some(result) = cucm_r.route(&dest_user, css_ref) {
+                    if let Some(result) = sbc_r.route(&dest_user, css_ref) {
                         info!(
                             pattern = %result.pattern_id,
                             partition = %result.partition_id,
                             destination = %result.transformed_number,
                             css = ?css_ref,
-                            "Routed via CUCM CSS/Partition"
+                            "Routed via SBC CSS/Partition"
                         );
                         if let Some(rg_id) = result.route_group_ids.first() {
                             routed = resolve_sip_uri_to_addr(&format!("sip:{rg_id}"));

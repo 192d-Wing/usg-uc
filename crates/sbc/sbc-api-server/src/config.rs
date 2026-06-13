@@ -36,6 +36,15 @@ pub struct Config {
     /// reverse-proxy fallback for the few read-only endpoints sbc-api
     /// doesn't own (CDRs and dial-plan reads).
     pub daemon_http_url: String,
+
+    /// Optional OIDC issuer. When set (with `oidc_audience`), the auth
+    /// middleware *also* accepts operator OIDC bearer tokens (scope
+    /// `config-admin`) — so the dashboard uses one token for both the
+    /// central config API and this per-site API. The legacy cookie/HMAC
+    /// admin login keeps working alongside it.
+    pub oidc_issuer: Option<String>,
+    /// Accepted OIDC audience (required iff `oidc_issuer` is set).
+    pub oidc_audience: Option<String>,
 }
 
 impl Config {
@@ -57,11 +66,27 @@ impl Config {
         let daemon_http_url = std::env::var("SBC_DAEMON_HTTP_URL")
             .map_err(|_| ConfigError::Missing("SBC_DAEMON_HTTP_URL"))?;
 
+        // OIDC is optional but issuer+audience must come as a pair.
+        let oidc_issuer = std::env::var("SBC_OIDC_ISSUER")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let oidc_audience = std::env::var("SBC_OIDC_AUDIENCE")
+            .ok()
+            .filter(|s| !s.is_empty());
+        if oidc_issuer.is_some() != oidc_audience.is_some() {
+            return Err(ConfigError::Invalid {
+                var: "SBC_OIDC_ISSUER/SBC_OIDC_AUDIENCE",
+                reason: "set both or neither".to_string(),
+            });
+        }
+
         Ok(Self {
             listen_addr,
             database_url,
             daemon_grpc_url,
             daemon_http_url,
+            oidc_issuer,
+            oidc_audience,
         })
     }
 }

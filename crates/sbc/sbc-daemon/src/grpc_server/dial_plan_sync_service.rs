@@ -2,7 +2,7 @@
 //!
 //! Same shape as TrunkSyncService: pulls the current plan body from
 //! Postgres and calls `sync_dial_plan_to_router` so the router ends up
-//! in sync. Removal clears the plan from `CucmRouter` directly via the
+//! in sync. Removal clears the plan from `SbcRouter` directly via the
 //! same path the REST `delete_dial_plan_entry` handler uses when a plan
 //! goes empty.
 

@@ -1,0 +1,19 @@
+central-config deployed.
+
+central-config-api:  {{ include "central-config.fullname" . }}-api.{{ .Release.Namespace }}.svc:80
+{{- if .Values.postgres.enabled }}
+central Postgres:    bundled single instance (LAB/DEV) — NOT HA. For
+                     production set postgres.enabled=false and point
+                     postgres.existingSecret at an HA/PITR database.
+{{- else }}
+central Postgres:    external (postgres.existingSecret={{ .Values.postgres.existingSecret.name }})
+{{- end }}
+
+Next steps:
+  1. Onboard a site: register it (POST /v1/sites) and import its existing
+     config with `central-config-import` (IMPORT_* env).
+  2. Create the site's OIDC service-account credential in Keycloak
+     (config-sync scope, site_code claim) — see
+     deploy/keycloak/central-config-clients.md.
+  3. In the site's `sbc` chart, set sbcConfigSync.enabled=true and point
+     sbcConfigSync.centralUrl at this API.

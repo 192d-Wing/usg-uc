@@ -86,11 +86,11 @@ impl TrunkSyncService for TrunkSyncServiceImpl {
         let group_id = req.group_id;
         info!(group_id, "gRPC RemoveTrunkGroup");
 
-        // Also clear from the CucmRouter for symmetry with the REST
+        // Also clear from the SbcRouter for symmetry with the REST
         // delete handler — keeps both internal routers in step even
         // when only the SIP-stack sync was requested.
-        if let Some(ref cucm) = self.state.cucm_router {
-            cucm.write().await.remove_route_group(&group_id);
+        if let Some(ref sbc) = self.state.sbc_router {
+            sbc.write().await.remove_route_group(&group_id);
         }
         if let Some(ref sip_stack) = self.state.sip_stack {
             sip_stack.remove_trunk_group_from_router(&group_id).await;

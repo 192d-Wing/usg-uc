@@ -10,6 +10,8 @@ import Table from '@cloudscape-design/components/table';
 import TextFilter from '@cloudscape-design/components/text-filter';
 
 import { api, ApiError } from '../api';
+import { centralApi } from '../centralApi';
+import { useSite } from '../SiteContext';
 import { DeleteConfirmModal } from '../components/CrudModal';
 import { PhoneCreateModal } from '../components/phone-forms/PhoneCreateModal';
 import type { Phone } from '../lib/phoneModel';
@@ -44,12 +46,18 @@ export function Phones() {
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
 
+  const { site } = useSite();
+
   const load = async () => {
+    if (!site) {
+      setPhones([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
-      const res = await api.get<{ phones: Phone[] }>('/phones');
-      const next = res.phones ?? [];
+      const next = await centralApi.list<Phone>(site, 'phones');
       setPhones(next);
       setSelected((cur) => cur.filter((s) => next.some((p) => p.id === s.id)));
     } catch (e) {
@@ -59,9 +67,10 @@ export function Phones() {
     }
   };
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     void load();
-  }, []);
+  }, [site]);
 
   const filtered = filter
     ? phones.filter((p) => {
@@ -89,8 +98,9 @@ export function Phones() {
     if (!target) return;
     setBusy(true);
     setDeleteError(null);
+    if (!site) return;
     try {
-      await api.delete(`/phones/${encodeURIComponent(target.id)}`);
+      await centralApi.remove(site, 'phones', target.id);
       setDeleteOpen(false);
       setSelected([]);
       await load();
@@ -205,6 +215,7 @@ export function Phones() {
         visible={modalMode !== null}
         mode={modalMode ?? 'create'}
         target={modalMode === 'edit' ? (target ?? null) : null}
+        site={site}
         onClose={closeModal}
         onSaved={load}
       />

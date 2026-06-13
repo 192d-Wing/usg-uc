@@ -47,6 +47,13 @@ pub struct Claims {
     /// domain.
     #[serde(default)]
     pub sip_domain: Option<String>,
+    /// Canonical site code this token is scoped to. Present on the
+    /// per-site `config-sync` service-account tokens the central config
+    /// API authorizes; absent on voice-user tokens (registrar /
+    /// provisioning ignore it). The central API requires it to equal the
+    /// `{site_code}` in the request path.
+    #[serde(default)]
+    pub site_code: Option<String>,
     /// Space-separated OAuth scopes.
     #[serde(default)]
     pub scope: Option<String>,
@@ -289,6 +296,7 @@ mod tests {
             email: None,
             dn: None,
             sip_domain: None,
+            site_code: None,
             scope: Some("openid sipping profile".into()),
         };
         assert!(!claims.has_scope("sip"));

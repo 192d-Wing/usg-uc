@@ -253,15 +253,15 @@ pub mod prelude {
         PlayAnnouncementRequest,
     };
 
-    // CUCM routing sync service (PR11) — sbc-api → daemon "I changed
+    // SBC routing sync service (PR11) — sbc-api → daemon "I changed
     // partition/css/route-pattern/route-list X, please re-sync from
-    // Postgres into the live CucmRouter".
-    pub use super::sbc::cucm_sync_service_client::CucmSyncServiceClient;
-    pub use super::sbc::cucm_sync_service_server::{CucmSyncService, CucmSyncServiceServer};
+    // Postgres into the live SbcRouter".
+    pub use super::sbc::sbc_sync_service_client::SbcSyncServiceClient;
+    pub use super::sbc::sbc_sync_service_server::{SbcSyncService, SbcSyncServiceServer};
     pub use super::sbc::{
         RemoveCallingSearchSpaceRequest, RemovePartitionRequest, RemoveRouteListRequest,
-        RemoveRoutePatternRequest, SyncCallingSearchSpaceRequest, SyncCucmResponse,
-        SyncPartitionRequest, SyncRouteListRequest, SyncRoutePatternRequest,
+        RemoveRoutePatternRequest, SyncCallingSearchSpaceRequest, SyncPartitionRequest,
+        SyncRouteListRequest, SyncRoutePatternRequest, SyncSbcResponse,
     };
 }
 

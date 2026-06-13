@@ -21,6 +21,9 @@ workspace = true
 sbc-config-store = { workspace = true }
 sbc-grpc-api = { workspace = true }
 uc-auth = { workspace = true }
+# OIDC bearer validation so operators authenticate once (the same
+# config-admin tokens the central config API accepts).
+proto-jwt = { workspace = true }
 uc-phone-mgmt.workspace = true
 # Users move into sbc-api as of PR10. We use the Postgres backend
 # directly (no sqlite/dispatch shim) — sbc-api always runs against

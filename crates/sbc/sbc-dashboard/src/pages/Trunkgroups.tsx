@@ -10,7 +10,9 @@ import Table from '@cloudscape-design/components/table';
 import Textarea from '@cloudscape-design/components/textarea';
 import TextFilter from '@cloudscape-design/components/text-filter';
 
-import { api, ApiError } from '../api';
+import { ApiError } from '../api';
+import { centralApi } from '../centralApi';
+import { useSite } from '../SiteContext';
 import { DeleteConfirmModal, FormModal } from '../components/CrudModal';
 
 type Trunk = { id?: string; host?: string; port?: number; transport?: string };
@@ -37,17 +39,18 @@ export function Trunkgroups() {
   const [modalError, setModalError] = useState<string | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
 
+  const { site } = useSite();
+
   const load = async () => {
+    if (!site) {
+      setItems([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
-      const res = await api.get<
-        { trunk_groups: TrunkGroup[] } | { trunkgroups: TrunkGroup[] }
-      >('/trunkgroups');
-      const list =
-        (res as { trunk_groups?: TrunkGroup[] }).trunk_groups ??
-        (res as { trunkgroups?: TrunkGroup[] }).trunkgroups ??
-        [];
+      const list = await centralApi.list<TrunkGroup>(site, 'trunkgroups');
       setItems(list);
       setSelected((cur) => cur.filter((s) => list.some((g) => groupKey(g) === groupKey(s))));
     } catch (e) {
@@ -57,9 +60,10 @@ export function Trunkgroups() {
     }
   };
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     void load();
-  }, []);
+  }, [site]);
 
   const filtered = filter
     ? items.filter((g) => {
@@ -94,19 +98,26 @@ export function Trunkgroups() {
     }
     setBusy(true);
     setModalError(null);
+    const id = modalMode === 'edit' ? (target?.id ?? '') : formId.trim();
+    if (!id) {
+      setModalError('Trunk group id is required.');
+      setBusy(false);
+      return;
+    }
+    if (!site) {
+      setModalError('No site selected.');
+      setBusy(false);
+      return;
+    }
     const body: Record<string, unknown> = {
+      id,
       name: formName.trim(),
       description: formDesc.trim() || undefined,
+      // Preserve existing trunks on update (central validates the full doc).
+      trunks: modalMode === 'edit' ? (target?.trunks ?? []) : [],
     };
-    if (formId.trim()) body.id = formId.trim();
     try {
-      if (modalMode === 'create') {
-        await api.post('/trunkgroups', body);
-      } else if (target?.id) {
-        // Preserve existing trunks on update (the backend treats body as the full state).
-        body.trunks = target.trunks ?? [];
-        await api.put(`/trunkgroups/${encodeURIComponent(target.id)}`, body);
-      }
+      await centralApi.upsert(site, 'trunkgroups', body);
       closeModal();
       await load();
     } catch (e) {
@@ -122,11 +133,11 @@ export function Trunkgroups() {
     setDeleteOpen(true);
   };
   const confirmDelete = async () => {
-    if (!target?.id) return;
+    if (!target?.id || !site) return;
     setBusy(true);
     setModalError(null);
     try {
-      await api.delete(`/trunkgroups/${encodeURIComponent(target.id)}`);
+      await centralApi.remove(site, 'trunkgroups', target.id);
       setDeleteOpen(false);
       setSelected([]);
       await load();

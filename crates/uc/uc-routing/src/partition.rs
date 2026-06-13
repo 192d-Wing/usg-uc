@@ -5,7 +5,7 @@ use std::fmt;
 
 /// A Partition groups route patterns into a namespace.
 ///
-/// In CUCM, partitions isolate dialing scopes so that the same pattern can
+/// In SBC, partitions isolate dialing scopes so that the same pattern can
 /// exist in multiple partitions without conflict.  A Calling Search Space
 /// (CSS) selects which partitions a device or user can reach.
 #[derive(Debug, Clone, Serialize, Deserialize)]

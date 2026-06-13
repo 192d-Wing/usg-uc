@@ -17,13 +17,13 @@ use crate::state::AppState;
 
 mod auth;
 mod calls;
-mod cucm;
 mod dial_plans;
 mod directory;
 mod phones;
 mod proxy;
 mod redact;
 mod registrations;
+mod sbc;
 mod system;
 mod trunk_groups;
 mod trunks;
@@ -92,35 +92,35 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/users/{id}",
             get(users::get).put(users::update).delete(users::delete),
         )
-        // CUCM routing CRUD — Postgres-backed as of PR11. Each write
-        // notifies the daemon via CucmSyncService so the live router
+        // SBC routing CRUD — Postgres-backed as of PR11. Each write
+        // notifies the daemon via SbcSyncService so the live router
         // catches up without a daemon restart. Replaces the daemon's
         // REST /partitions, /css, /routepatterns, /routelists handlers.
         .route(
             "/partitions",
-            get(cucm::list_partitions).post(cucm::create_partition),
+            get(sbc::list_partitions).post(sbc::create_partition),
         )
         .route(
             "/partitions/{id}",
-            put(cucm::update_partition).delete(cucm::delete_partition),
+            put(sbc::update_partition).delete(sbc::delete_partition),
         )
-        .route("/css", get(cucm::list_css).post(cucm::create_css))
-        .route("/css/{id}", put(cucm::update_css).delete(cucm::delete_css))
+        .route("/css", get(sbc::list_css).post(sbc::create_css))
+        .route("/css/{id}", put(sbc::update_css).delete(sbc::delete_css))
         .route(
             "/routepatterns",
-            get(cucm::list_route_patterns).post(cucm::create_route_pattern),
+            get(sbc::list_route_patterns).post(sbc::create_route_pattern),
         )
         .route(
             "/routepatterns/{id}",
-            put(cucm::update_route_pattern).delete(cucm::delete_route_pattern),
+            put(sbc::update_route_pattern).delete(sbc::delete_route_pattern),
         )
         .route(
             "/routelists",
-            get(cucm::list_route_lists).post(cucm::create_route_list),
+            get(sbc::list_route_lists).post(sbc::create_route_list),
         )
         .route(
             "/routelists/{id}",
-            put(cucm::update_route_list).delete(cucm::delete_route_list),
+            put(sbc::update_route_list).delete(sbc::delete_route_list),
         )
         // System endpoints. /system/version stays local (sbc-api's
         // own identity); /system/daemon-version exposes the daemon's
@@ -158,8 +158,9 @@ pub fn router(state: Arc<AppState>) -> Router {
     // also covers the reverse-proxy catch-all (which forwards unowned
     // paths to the daemon) — a nest-level layer would miss it. Exemptions
     // are full paths: health probes, sbc-api's own version, and login.
-    let auth_layer = uc_auth::AuthLayer::new(
+    let auth_layer = crate::authmw::AuthState::new(
         Arc::clone(&state.auth),
+        state.oidc.clone(),
         &[
             "/healthz",
             "/readyz",
@@ -177,7 +178,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(api_proxy)
         .layer(axum::middleware::from_fn_with_state(
             auth_layer,
-            uc_auth::require_auth,
+            crate::authmw::require_auth,
         ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)

@@ -1,0 +1,48 @@
+[package]
+name = "sbc-config-sync"
+description = "Per-site config sync agent: pulls its shard's deltas/snapshots from central-config-api and applies them transactionally into the site-local Postgres, advancing sync_state. The distributed read path of docs/CENTRAL-CONFIG-PLAN.md (Phase 2)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "sbc-config-sync"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["json"] }
+
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror.workspace = true
+
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
+# Tiny HTTP server for the /metrics + /healthz + /readyz endpoints the
+# central staleness dashboards scrape.
+axum.workspace = true
+# The wire model (Change/DeltaResult/Snapshot/ConfigTable) the central API
+# serves; we deserialize its JSON into these exact types.
+central-config-store = { path = "../central-config-store" }
+# The site-local schema/migrations + MAC normalization the apply engine
+# writes against.
+sbc-config-store = { workspace = true }
+# HTTP client for the central sync API. rustls only.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# gRPC clients for the best-effort daemon refresh after an apply (so
+# dial-plan/trunk/routing changes take effect without a daemon restart).
+sbc-grpc-api = { workspace = true }
+tonic = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+# Serve the mock daemon's gRPC services on an ephemeral port in the wire test.
+tokio-stream = { version = "0.1", features = ["net"] }

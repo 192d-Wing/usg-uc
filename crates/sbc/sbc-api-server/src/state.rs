@@ -13,9 +13,9 @@ use sbc_config_store::{
     PostgresTrunkGroupStore,
 };
 use sbc_grpc_api::prelude::{
-    CallServiceClient, CucmSyncServiceClient, DialPlanSyncServiceClient,
-    DidMappingSyncServiceClient, RegistrationServiceClient, SystemServiceClient,
-    TrunkHealthServiceClient, TrunkSyncServiceClient,
+    CallServiceClient, DialPlanSyncServiceClient, DidMappingSyncServiceClient,
+    RegistrationServiceClient, SbcSyncServiceClient, SystemServiceClient, TrunkHealthServiceClient,
+    TrunkSyncServiceClient,
 };
 use thiserror::Error;
 use tonic::transport::{Channel, Endpoint};
@@ -46,8 +46,8 @@ pub struct AppState {
     /// of PR10. SIP digest auth still happens in the daemon, but it
     /// reads through the same `users` table via its own pool.
     pub users: Arc<PostgresUserStore>,
-    /// Postgres-backed CUCM-routing stores (PR11). sbc-api owns CRUD;
-    /// after each write it notifies the daemon via `cucm_sync` so the
+    /// Postgres-backed SBC-routing stores (PR11). sbc-api owns CRUD;
+    /// after each write it notifies the daemon via `sbc_sync` so the
     /// live router catches up without a daemon restart.
     pub partitions: Arc<PostgresPartitionStore>,
     /// See [`Self::partitions`].
@@ -75,10 +75,10 @@ pub struct AppState {
     /// daemon's REST `/trunk-health`, `/trunk-registration`, and
     /// `/trunk-registration/{id}/register` endpoints (PR9).
     pub trunk_health: TrunkHealthServiceClient<Channel>,
-    /// CUCM-routing sync client (PR11) — sbc-api notifies the daemon
+    /// SBC-routing sync client (PR11) — sbc-api notifies the daemon
     /// "I changed partition / CSS / route-pattern / route-list X,
-    /// please re-apply from Postgres to the live `CucmRouter`".
-    pub cucm_sync: CucmSyncServiceClient<Channel>,
+    /// please re-apply from Postgres to the live `SbcRouter`".
+    pub sbc_sync: SbcSyncServiceClient<Channel>,
 
     /// HTTP client + base URL used by the reverse-proxy fallback for
     /// endpoints sbc-api doesn't own.
@@ -91,9 +91,15 @@ pub struct AppState {
     /// Management-plane authenticator (admin login + stateless tokens).
     /// Shared, replica-safe via a common signing key.
     pub auth: Arc<uc_auth::Authenticator>,
+
+    /// Optional operator OIDC validator. When configured, the auth
+    /// middleware also accepts `config-admin` bearer tokens, so the
+    /// dashboard authenticates once for both the central and per-site APIs.
+    pub oidc: Option<Arc<proto_jwt::Validator>>,
 }
 
 impl AppState {
+    #[allow(clippy::too_many_lines)] // flat wiring of all stores + clients
     pub async fn build(cfg: &Config) -> Result<Arc<Self>, StateError> {
         info!(database_url = %scrub_dsn(&cfg.database_url), "connecting to postgres");
         let phones = Arc::new(
@@ -159,7 +165,7 @@ impl AppState {
         let registrations = RegistrationServiceClient::new(channel.clone());
         let system = SystemServiceClient::new(channel.clone());
         let trunk_health = TrunkHealthServiceClient::new(channel.clone());
-        let cucm_sync = CucmSyncServiceClient::new(channel);
+        let sbc_sync = SbcSyncServiceClient::new(channel);
 
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -173,6 +179,29 @@ impl AppState {
             uc_auth::Authenticator::from_env().map_err(|e| StateError::Auth(e.to_string()))?,
         );
         info!("management-plane authentication enabled");
+
+        // Optional operator OIDC: accept the same config-admin tokens the
+        // central config API takes, so the dashboard signs in once.
+        let oidc = match (&cfg.oidc_issuer, &cfg.oidc_audience) {
+            (Some(issuer), Some(audience)) => {
+                let http = reqwest::Client::builder()
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new());
+                let jwks = Arc::new(proto_jwt::JwksCache::new(http, issuer.clone()));
+                let validator = proto_jwt::Validator::new(
+                    jwks,
+                    proto_jwt::ValidatorConfig {
+                        issuer: issuer.clone(),
+                        audiences: vec![audience.clone()],
+                        required_scope: crate::authmw::ADMIN_SCOPE,
+                        leeway_secs: 30,
+                    },
+                );
+                info!(issuer = %issuer, "operator OIDC bearer auth enabled");
+                Some(Arc::new(validator))
+            }
+            _ => None,
+        };
 
         Ok(Arc::new(Self {
             phones,
@@ -191,11 +220,12 @@ impl AppState {
             registrations,
             system,
             trunk_health,
-            cucm_sync,
+            sbc_sync,
             http_client,
             daemon_http_base: cfg.daemon_http_url.trim_end_matches('/').to_string(),
             start_time: std::time::Instant::now(),
             auth,
+            oidc,
         }))
     }
 }

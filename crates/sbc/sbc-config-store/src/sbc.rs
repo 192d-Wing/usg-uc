@@ -1,9 +1,9 @@
-//! Postgres-backed stores for the four CUCM-routing entities the SBC
+//! Postgres-backed stores for the four SBC-routing entities the SBC
 //! exposes via REST: partitions, calling search spaces, route patterns,
 //! and route lists.
 //!
 //! All four share the same shape — id PK + JSONB body — and pre-PR11
-//! lived in-memory only inside [`uc_routing::CucmRouter`], so a daemon
+//! lived in-memory only inside [`uc_routing::SbcRouter`], so a daemon
 //! restart wiped them. This module is the persistence half of the move;
 //! the daemon's startup loop now replays these tables back into the
 //! router on boot.
@@ -15,23 +15,24 @@
 
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
-use tracing::debug;
 
 use crate::error::{ConfigStoreError, ConfigStoreResult};
+use crate::schema;
 
-/// Generic JSONB-by-id store. One physical table per CUCM entity type,
-/// one [`CucmJsonStore`] instance per table.
+/// Generic JSONB-by-id store. One physical table per SBC entity type,
+/// one [`SbcJsonStore`] instance per table.
 #[derive(Clone)]
-pub struct CucmJsonStore {
+pub struct SbcJsonStore {
     pool: PgPool,
     table: &'static str,
 }
 
-impl CucmJsonStore {
-    /// Connect with a fresh pool and ensure the table exists.
+impl SbcJsonStore {
+    /// Connect with a fresh pool and ensure the schema exists.
     ///
-    /// `table` must be a static identifier — it's interpolated into DDL
-    /// directly (no sqlx bind-params possible for identifiers).
+    /// `table` must be a static identifier — it's interpolated into SQL
+    /// directly (no sqlx bind-params possible for identifiers) and must
+    /// name a table the crate's migrations create.
     ///
     /// # Errors
     /// Returns `ConfigStoreError::Storage` on pool/schema failure.
@@ -40,9 +41,8 @@ impl CucmJsonStore {
             .max_connections(5)
             .connect(database_url)
             .await?;
-        let store = Self { pool, table };
-        store.create_tables().await?;
-        Ok(store)
+        schema::ensure_schema(&pool).await?;
+        Ok(Self { pool, table })
     }
 
     /// Construct from an existing pool (no extra connections).
@@ -50,30 +50,14 @@ impl CucmJsonStore {
     /// # Errors
     /// Returns `ConfigStoreError::Storage` on schema bootstrap failure.
     pub async fn from_pool(pool: PgPool, table: &'static str) -> ConfigStoreResult<Self> {
-        let store = Self { pool, table };
-        store.create_tables().await?;
-        Ok(store)
+        schema::ensure_schema(&pool).await?;
+        Ok(Self { pool, table })
     }
 
     /// Expose the underlying pool for cross-store reuse.
     #[must_use]
     pub const fn pool(&self) -> &PgPool {
         &self.pool
-    }
-
-    async fn create_tables(&self) -> ConfigStoreResult<()> {
-        let ddl = format!(
-            "CREATE TABLE IF NOT EXISTS {} (
-                id TEXT PRIMARY KEY,
-                data JSONB NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )",
-            self.table
-        );
-        sqlx::query(&ddl).execute(&self.pool).await?;
-        debug!(table = self.table, "cucm table ready");
-        Ok(())
     }
 
     /// Upsert a row's JSON body. Updates `updated_at` on conflict.
@@ -86,6 +70,9 @@ impl CucmJsonStore {
              VALUES ($1, $2)
              ON CONFLICT (id) DO UPDATE SET
                  data       = EXCLUDED.data,
+                 deleted    = FALSE,
+                 revision   = 0,
+                 updated_by = 'local',
                  updated_at = NOW()",
             self.table
         );
@@ -97,12 +84,19 @@ impl CucmJsonStore {
         Ok(())
     }
 
-    /// Delete a row by ID.
+    /// Delete a row by ID. Writes a tombstone (`deleted = TRUE`) rather
+    /// than removing the row, so central sync can distinguish "deleted
+    /// here" from "never existed" and never resurrects it.
     ///
     /// # Errors
-    /// Returns `ConfigStoreError::NotFound` if no row matched.
+    /// Returns `ConfigStoreError::NotFound` if no live row matched.
     pub async fn delete(&self, id: &str) -> ConfigStoreResult<()> {
-        let sql = format!("DELETE FROM {} WHERE id = $1", self.table);
+        let sql = format!(
+            "UPDATE {}
+             SET deleted = TRUE, revision = 0, updated_by = 'local', updated_at = NOW()
+             WHERE id = $1 AND NOT deleted",
+            self.table
+        );
         let result = sqlx::query(&sql).bind(id).execute(&self.pool).await?;
         if result.rows_affected() == 0 {
             return Err(ConfigStoreError::NotFound);
@@ -115,7 +109,10 @@ impl CucmJsonStore {
     /// # Errors
     /// Returns `ConfigStoreError::NotFound` if absent.
     pub async fn get(&self, id: &str) -> ConfigStoreResult<serde_json::Value> {
-        let sql = format!("SELECT data FROM {} WHERE id = $1", self.table);
+        let sql = format!(
+            "SELECT data FROM {} WHERE id = $1 AND NOT deleted",
+            self.table
+        );
         let row = sqlx::query(&sql)
             .bind(id)
             .fetch_optional(&self.pool)
@@ -129,7 +126,10 @@ impl CucmJsonStore {
     /// # Errors
     /// Returns `ConfigStoreError::Storage` for DB errors.
     pub async fn list(&self) -> ConfigStoreResult<Vec<serde_json::Value>> {
-        let sql = format!("SELECT data FROM {} ORDER BY id", self.table);
+        let sql = format!(
+            "SELECT data FROM {} WHERE NOT deleted ORDER BY id",
+            self.table
+        );
         let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -147,28 +147,28 @@ impl CucmJsonStore {
 /// Newtype wrappers so handler code can ask for one specific entity's
 /// store without accidentally getting another. They're zero-cost and
 /// make `AppState` field types descriptive.
-macro_rules! cucm_store {
+macro_rules! sbc_store {
     ($name:ident, $table:literal) => {
-        /// Postgres-backed store for the named CUCM entity. JSONB
-        /// pass-through over [`CucmJsonStore`].
+        /// Postgres-backed store for the named SBC entity. JSONB
+        /// pass-through over [`SbcJsonStore`].
         #[derive(Clone)]
-        pub struct $name(CucmJsonStore);
+        pub struct $name(SbcJsonStore);
 
         impl $name {
             /// Open with a fresh pool.
             ///
             /// # Errors
-            /// See [`CucmJsonStore::new`].
+            /// See [`SbcJsonStore::new`].
             pub async fn new(database_url: &str) -> ConfigStoreResult<Self> {
-                Ok(Self(CucmJsonStore::new(database_url, $table).await?))
+                Ok(Self(SbcJsonStore::new(database_url, $table).await?))
             }
 
             /// Open from an existing pool.
             ///
             /// # Errors
-            /// See [`CucmJsonStore::from_pool`].
+            /// See [`SbcJsonStore::from_pool`].
             pub async fn from_pool(pool: PgPool) -> ConfigStoreResult<Self> {
-                Ok(Self(CucmJsonStore::from_pool(pool, $table).await?))
+                Ok(Self(SbcJsonStore::from_pool(pool, $table).await?))
             }
 
             /// Expose the underlying pool.
@@ -180,7 +180,7 @@ macro_rules! cucm_store {
             /// Upsert by ID.
             ///
             /// # Errors
-            /// See [`CucmJsonStore::upsert`].
+            /// See [`SbcJsonStore::upsert`].
             pub async fn upsert(
                 &self,
                 id: &str,
@@ -192,7 +192,7 @@ macro_rules! cucm_store {
             /// Delete by ID.
             ///
             /// # Errors
-            /// See [`CucmJsonStore::delete`].
+            /// See [`SbcJsonStore::delete`].
             pub async fn delete(&self, id: &str) -> ConfigStoreResult<()> {
                 self.0.delete(id).await
             }
@@ -200,7 +200,7 @@ macro_rules! cucm_store {
             /// Fetch JSON body by ID.
             ///
             /// # Errors
-            /// See [`CucmJsonStore::get`].
+            /// See [`SbcJsonStore::get`].
             pub async fn get(&self, id: &str) -> ConfigStoreResult<serde_json::Value> {
                 self.0.get(id).await
             }
@@ -208,7 +208,7 @@ macro_rules! cucm_store {
             /// List all rows' bodies, ordered by ID.
             ///
             /// # Errors
-            /// See [`CucmJsonStore::list`].
+            /// See [`SbcJsonStore::list`].
             pub async fn list(&self) -> ConfigStoreResult<Vec<serde_json::Value>> {
                 self.0.list().await
             }
@@ -216,10 +216,7 @@ macro_rules! cucm_store {
     };
 }
 
-cucm_store!(PostgresPartitionStore, "cucm_partitions");
-cucm_store!(
-    PostgresCallingSearchSpaceStore,
-    "cucm_calling_search_spaces"
-);
-cucm_store!(PostgresRoutePatternStore, "cucm_route_patterns");
-cucm_store!(PostgresRouteListStore, "cucm_route_lists");
+sbc_store!(PostgresPartitionStore, "sbc_partitions");
+sbc_store!(PostgresCallingSearchSpaceStore, "sbc_calling_search_spaces");
+sbc_store!(PostgresRoutePatternStore, "sbc_route_patterns");
+sbc_store!(PostgresRouteListStore, "sbc_route_lists");

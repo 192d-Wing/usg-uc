@@ -11,11 +11,11 @@
 
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
-use tracing::debug;
 
 use uc_phone_mgmt::model::Phone;
 
 use crate::error::{ConfigStoreError, ConfigStoreResult};
+use crate::schema;
 
 /// Pooled Postgres backend for phones.
 #[derive(Clone)]
@@ -33,9 +33,8 @@ impl PostgresPhoneStore {
             .max_connections(5)
             .connect(database_url)
             .await?;
-        let store = Self { pool };
-        store.create_tables().await?;
-        Ok(store)
+        schema::ensure_schema(&pool).await?;
+        Ok(Self { pool })
     }
 
     /// Construct from a pre-existing pool. Lets the daemon share one pool
@@ -46,9 +45,8 @@ impl PostgresPhoneStore {
     /// # Errors
     /// Returns `ConfigStoreError::Storage` on schema bootstrap failure.
     pub async fn from_pool(pool: PgPool) -> ConfigStoreResult<Self> {
-        let store = Self { pool };
-        store.create_tables().await?;
-        Ok(store)
+        schema::ensure_schema(&pool).await?;
+        Ok(Self { pool })
     }
 
     /// Expose the underlying pool for cross-store reuse.
@@ -63,31 +61,6 @@ impl PostgresPhoneStore {
     #[must_use]
     pub fn normalize_mac(mac: &str) -> String {
         mac.replace([':', '-'], "").to_lowercase()
-    }
-
-    async fn create_tables(&self) -> ConfigStoreResult<()> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS phones (
-                id TEXT PRIMARY KEY,
-                mac_normalized TEXT NOT NULL,
-                data JSONB NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )",
-        )
-        .execute(&self.pool)
-        .await?;
-        // Unique on normalized MAC: two phone records sharing a MAC is a
-        // provisioning ambiguity (which config wins?), so we surface it
-        // at write time instead of silently picking one at lookup time.
-        sqlx::query(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_phones_mac_normalized
-             ON phones (mac_normalized)",
-        )
-        .execute(&self.pool)
-        .await?;
-        debug!("phones table ready");
-        Ok(())
     }
 
     /// Insert or replace a phone. The MAC is normalized on the way in so
@@ -107,6 +80,9 @@ impl PostgresPhoneStore {
              ON CONFLICT (id) DO UPDATE SET
                  mac_normalized = EXCLUDED.mac_normalized,
                  data           = EXCLUDED.data,
+                 deleted        = FALSE,
+                 revision       = 0,
+                 updated_by     = 'local',
                  updated_at     = NOW()",
         )
         .bind(&phone.id)
@@ -117,16 +93,22 @@ impl PostgresPhoneStore {
         Ok(())
     }
 
-    /// Delete a phone by ID.
+    /// Delete a phone by ID. Writes a tombstone (`deleted = TRUE`)
+    /// rather than removing the row, so central sync can distinguish
+    /// "deleted here" from "never existed" and never resurrects it.
     ///
     /// # Errors
-    /// Returns `ConfigStoreError::NotFound` if no row matched, or
+    /// Returns `ConfigStoreError::NotFound` if no live row matched, or
     /// `ConfigStoreError::Storage` for other DB errors.
     pub async fn delete(&self, id: &str) -> ConfigStoreResult<()> {
-        let result = sqlx::query("DELETE FROM phones WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE phones
+             SET deleted = TRUE, revision = 0, updated_by = 'local', updated_at = NOW()
+             WHERE id = $1 AND NOT deleted",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(ConfigStoreError::NotFound);
         }
@@ -139,7 +121,7 @@ impl PostgresPhoneStore {
     /// Returns `ConfigStoreError::NotFound` if absent, or
     /// `ConfigStoreError::Storage`/`Serialization` for other failures.
     pub async fn get(&self, id: &str) -> ConfigStoreResult<Phone> {
-        let row = sqlx::query("SELECT data FROM phones WHERE id = $1")
+        let row = sqlx::query("SELECT data FROM phones WHERE id = $1 AND NOT deleted")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?
@@ -156,7 +138,7 @@ impl PostgresPhoneStore {
     /// Returns `ConfigStoreError::NotFound` if no phone owns this MAC.
     pub async fn get_by_mac(&self, mac: &str) -> ConfigStoreResult<Phone> {
         let normalized = Self::normalize_mac(mac);
-        let row = sqlx::query("SELECT data FROM phones WHERE mac_normalized = $1")
+        let row = sqlx::query("SELECT data FROM phones WHERE mac_normalized = $1 AND NOT deleted")
             .bind(&normalized)
             .fetch_optional(&self.pool)
             .await?
@@ -170,7 +152,7 @@ impl PostgresPhoneStore {
     /// Returns `ConfigStoreError::Storage` for DB errors,
     /// `ConfigStoreError::Serialization` if any row's `data` is malformed.
     pub async fn list(&self) -> ConfigStoreResult<Vec<Phone>> {
-        let rows = sqlx::query("SELECT data FROM phones ORDER BY id")
+        let rows = sqlx::query("SELECT data FROM phones WHERE NOT deleted ORDER BY id")
             .fetch_all(&self.pool)
             .await?;
         let mut out = Vec::with_capacity(rows.len());
@@ -180,7 +162,10 @@ impl PostgresPhoneStore {
         Ok(out)
     }
 
-    /// `true` when there are no phones; used by the migration helper.
+    /// `true` when there are no phones at all — tombstones included.
+    /// This gates the one-shot legacy JSON import: "the table has ever
+    /// been written" is the signal, so an all-tombstoned table must NOT
+    /// read as empty (a stale JSON re-import would resurrect rows).
     ///
     /// # Errors
     /// Returns `ConfigStoreError::Storage` for DB errors.

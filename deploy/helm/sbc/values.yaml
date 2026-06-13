@@ -168,6 +168,13 @@ sbcApi:
   resources:
     requests: { cpu: "50m",  memory: "64Mi"  }
     limits:   { cpu: "500m", memory: "256Mi" }
+  # Operator OIDC: when issuer+audience are set, sbc-api also accepts the
+  # config-admin bearer tokens the central config API takes, so the
+  # dashboard authenticates once. The legacy admin login still works.
+  # Match the central-config chart's api.oidc.{issuer,audience}.
+  oidc:
+    issuer: ""
+    audience: "usg-uc-config"
 
 # sbc-provision-server — stand-alone phone-provisioning pod (PR6).
 # Owns /provision/<MAC>.{cfg,xml}: reads the phone record from Postgres
@@ -335,6 +342,34 @@ sbcTrunkAgent:
   trunkPollSecs: 30
   # How often to push status snapshots to the daemon (seconds).
   publishIntervalSecs: 10
+
+# sbc-config-sync — per-site config sync agent. Pulls this site's shard
+# from the central config API into the local Postgres. Off by default;
+# enable once the site is registered centrally and onboarded (imported).
+sbcConfigSync:
+  enabled: false
+  image:
+    repository: localhost/usg-sbc-config-sync
+    tag: local
+    pullPolicy: Never
+  resources:
+    requests: { cpu: "10m",  memory: "32Mi"  }
+    limits:   { cpu: "100m", memory: "128Mi" }
+  # Canonical (uppercase) site code = this site's central shard. Defaults
+  # to the upper-cased helm site.name (oopl-001 → OOPL-001) if unset.
+  siteCode: ""
+  # Central config API base URL, no trailing slash, e.g.
+  # https://config.uc.example.mil
+  centralUrl: ""
+  # How often to poll the central /epoch probe (seconds). A per-site
+  # jitter is added in-agent so 184 agents don't poll in lockstep.
+  intervalSecs: 60
+  # Secret holding the OIDC service-account bearer token (config-sync
+  # scope, this site's site_code claim). Defaults to a Secret named
+  # <release>-config-sync with key "token".
+  tokenSecret:
+    name: ""
+    key: token
 
 sbcDaemon:
   replicas: 1

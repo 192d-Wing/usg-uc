@@ -1,8 +1,8 @@
-// SBC CUCM-Routing Sync Service
+// SBC SBC-Routing Sync Service
 //
-// Notification API used by sbc-api to tell the daemon "I changed CUCM
+// Notification API used by sbc-api to tell the daemon "I changed SBC
 // entity X — please re-read it from Postgres and apply it to the live
-// CucmRouter". Same ID-only pattern as TrunkSyncService and
+// SbcRouter". Same ID-only pattern as TrunkSyncService and
 // DialPlanSyncService: the daemon owns Postgres reads, so the RPC
 // carries only the affected ID to keep the proto schema small and
 // proto/storage in sync by construction.
@@ -17,28 +17,28 @@ syntax = "proto3";
 
 package sbc.api.v1;
 
-service CucmSyncService {
+service SbcSyncService {
     // Partitions
-    rpc SyncPartition(SyncPartitionRequest) returns (SyncCucmResponse);
-    rpc RemovePartition(RemovePartitionRequest) returns (SyncCucmResponse);
+    rpc SyncPartition(SyncPartitionRequest) returns (SyncSbcResponse);
+    rpc RemovePartition(RemovePartitionRequest) returns (SyncSbcResponse);
 
     // Calling Search Spaces
-    rpc SyncCallingSearchSpace(SyncCallingSearchSpaceRequest) returns (SyncCucmResponse);
-    rpc RemoveCallingSearchSpace(RemoveCallingSearchSpaceRequest) returns (SyncCucmResponse);
+    rpc SyncCallingSearchSpace(SyncCallingSearchSpaceRequest) returns (SyncSbcResponse);
+    rpc RemoveCallingSearchSpace(RemoveCallingSearchSpaceRequest) returns (SyncSbcResponse);
 
     // Route Patterns
-    rpc SyncRoutePattern(SyncRoutePatternRequest) returns (SyncCucmResponse);
-    rpc RemoveRoutePattern(RemoveRoutePatternRequest) returns (SyncCucmResponse);
+    rpc SyncRoutePattern(SyncRoutePatternRequest) returns (SyncSbcResponse);
+    rpc RemoveRoutePattern(RemoveRoutePatternRequest) returns (SyncSbcResponse);
 
     // Route Lists
-    rpc SyncRouteList(SyncRouteListRequest) returns (SyncCucmResponse);
-    rpc RemoveRouteList(RemoveRouteListRequest) returns (SyncCucmResponse);
+    rpc SyncRouteList(SyncRouteListRequest) returns (SyncSbcResponse);
+    rpc RemoveRouteList(RemoveRouteListRequest) returns (SyncSbcResponse);
 }
 
 // Shared response type — every Sync/Remove operation returns the same
 // {bool synced, string message} shape, so callers can dispatch on result
 // state without per-RPC marshaling.
-message SyncCucmResponse {
+message SyncSbcResponse {
     bool synced = 1;
     string message = 2;
 }
