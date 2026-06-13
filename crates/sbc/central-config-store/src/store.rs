@@ -543,6 +543,87 @@ impl CentralConfigStore {
         tx.commit().await?;
         Ok(Snapshot { epoch, tables })
     }
+
+    // --------------------------------------------------- operator reads
+
+    /// List all registered sites (for the operator/dashboard selector),
+    /// ordered by site code.
+    ///
+    /// # Errors
+    /// [`CentralError::Storage`] on DB failure.
+    pub async fn list_sites(&self) -> CentralResult<Vec<crate::model::SiteInfo>> {
+        let rows = sqlx::query(
+            "SELECT site_code, display_name, status, config_epoch FROM sites ORDER BY site_code",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            out.push(crate::model::SiteInfo {
+                site_code: row.try_get("site_code")?,
+                display_name: row.try_get("display_name")?,
+                status: row.try_get("status")?,
+                config_epoch: row.try_get("config_epoch")?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// List a table's live rows for a site (id + canonical payload).
+    ///
+    /// # Errors
+    /// [`CentralError::Storage`] on DB failure.
+    pub async fn list_rows(
+        &self,
+        table: ConfigTable,
+        site_code: &str,
+    ) -> CentralResult<Vec<SnapshotRow>> {
+        let mut tx = self.pool.begin().await?;
+        let rows = snapshot_table(&mut tx, table, site_code).await?;
+        tx.commit().await?;
+        Ok(rows)
+    }
+
+    /// Fetch one live row's canonical payload by id, or `None` if absent
+    /// (or tombstoned).
+    ///
+    /// # Errors
+    /// [`CentralError::Storage`] on DB failure.
+    pub async fn get_row(
+        &self,
+        table: ConfigTable,
+        site_code: &str,
+        row_id: &str,
+    ) -> CentralResult<Option<Value>> {
+        if table == ConfigTable::DirectoryNumbers {
+            let row = sqlx::query(
+                "SELECT did, sip_user, partition, description, extra
+                 FROM directory_numbers WHERE site_code = $1 AND did = $2 AND NOT deleted",
+            )
+            .bind(site_code)
+            .bind(row_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            let Some(row) = row else { return Ok(None) };
+            let extra: Value = row.try_get("extra")?;
+            let extra_map = extra.as_object().cloned().unwrap_or_default();
+            Ok(Some(did_payload(
+                row.try_get::<String, _>("did")?.as_str(),
+                row.try_get::<Option<String>, _>("sip_user")?.as_deref(),
+                row.try_get::<Option<String>, _>("partition")?.as_deref(),
+                row.try_get::<Option<String>, _>("description")?.as_deref(),
+                &extra_map,
+            )))
+        } else {
+            let sql = format!(
+                "SELECT data FROM {} WHERE site_code = $1 AND id = $2 AND NOT deleted",
+                table.name()
+            );
+            let row =
+                sqlx::query(&sql).bind(site_code).bind(row_id).fetch_optional(&self.pool).await?;
+            row.map(|r| r.try_get::<Value, _>("data")).transpose().map_err(CentralError::from)
+        }
+    }
 }
 
 // ----------------------------------------------------------- tx helpers

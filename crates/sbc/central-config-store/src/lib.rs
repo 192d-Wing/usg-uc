@@ -23,8 +23,8 @@ pub mod templates;
 
 pub use error::{CentralError, CentralResult};
 pub use model::{
-    Change, ChangeOp, ConfigTable, DeltaResult, MaterializeReport, SiteMaterialization, Snapshot,
-    SnapshotRow, TableRows, TemplateKind, UploadBatch, UploadChange,
+    Change, ChangeOp, ConfigTable, DeltaResult, MaterializeReport, SiteInfo, SiteMaterialization,
+    Snapshot, SnapshotRow, TableRows, TemplateKind, UploadBatch, UploadChange,
 };
 pub use schema::ensure_schema;
 pub use store::CentralConfigStore;

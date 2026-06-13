@@ -33,38 +33,41 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/sync/{site_code}/delta", get(sync_delta))
         .route("/v1/sync/{site_code}/snapshot", get(sync_snapshot))
         .route("/v1/sync/{site_code}/upload", post(sync_upload))
-        // Operator write surface (config-admin tokens).
-        .route("/v1/sites", post(register_site))
-        .route("/v1/sites/{site_code}/phones", post(upsert_phone))
+        // Operator surface (config-admin tokens). GET reads + writes.
+        .route("/v1/sites", get(list_sites).post(register_site))
+        .route("/v1/sites/{site_code}/phones", get(list_phones).post(upsert_phone))
         .route(
             "/v1/sites/{site_code}/phones/{id}",
-            axum::routing::delete(delete_phone),
+            get(get_phone).delete(delete_phone),
         )
-        .route("/v1/sites/{site_code}/directory", post(upsert_did))
+        .route("/v1/sites/{site_code}/directory", get(list_directory).post(upsert_did))
         .route(
             "/v1/sites/{site_code}/directory/{did}",
-            axum::routing::delete(delete_did),
+            get(get_directory).delete(delete_did),
         )
         .route(
             "/v1/sites/{site_code}/trunkgroups",
-            post(upsert_trunk_group),
+            get(list_trunk_groups).post(upsert_trunk_group),
         )
         .route(
             "/v1/sites/{site_code}/trunkgroups/{id}",
-            axum::routing::delete(delete_trunk_group),
+            get(get_trunk_group).delete(delete_trunk_group),
         )
-        .route("/v1/sites/{site_code}/dialplans", post(upsert_dial_plan))
+        .route(
+            "/v1/sites/{site_code}/dialplans",
+            get(list_dial_plans).post(upsert_dial_plan),
+        )
         .route(
             "/v1/sites/{site_code}/dialplans/{id}",
-            axum::routing::delete(delete_dial_plan),
+            get(get_dial_plan).delete(delete_dial_plan),
         )
-        .route("/v1/sites/{site_code}/config", put(put_site_config))
+        .route("/v1/sites/{site_code}/config", get(get_site_config).put(put_site_config))
         // SBC routing entities (partitions / calling_search_spaces /
         // route_patterns / route_lists), JSON pass-through by id.
-        .route("/v1/sites/{site_code}/routing/{kind}", post(upsert_routing))
+        .route("/v1/sites/{site_code}/routing/{kind}", get(list_routing).post(upsert_routing))
         .route(
             "/v1/sites/{site_code}/routing/{kind}/{id}",
-            axum::routing::delete(delete_routing),
+            get(get_routing).delete(delete_routing),
         )
         // Global templates + materialization (config-admin tokens).
         .route(
@@ -283,6 +286,95 @@ fn bad_request(detail: impl Into<String>) -> Response {
 /// `{ epoch }` 200 on a successful write.
 fn ok_epoch(epoch: i64) -> Response {
     Json(json!({ "epoch": epoch })).into_response()
+}
+
+// ----------------------------------------------------------- read surface
+//
+// Operator-authorized GET reads for the dashboard. Lists return
+// `{ "items": [payload…] }`; single-row GETs return the payload or 404.
+
+/// List a table's live rows for a site as `{ "items": [...] }`.
+async fn do_list(state: &AppState, headers: &HeaderMap, site: &str, table: ConfigTable) -> Response {
+    if let Err(rej) = authorize_operator(&state.admin_validator, headers).await {
+        return rej.into_response();
+    }
+    match state.store.list_rows(table, site).await {
+        Ok(rows) => {
+            let items: Vec<Value> = rows.into_iter().map(|r| r.payload).collect();
+            Json(json!({ "items": items })).into_response()
+        }
+        Err(e) => write_error(&e),
+    }
+}
+
+/// Fetch one row's payload, or 404.
+async fn do_get(
+    state: &AppState,
+    headers: &HeaderMap,
+    site: &str,
+    table: ConfigTable,
+    id: &str,
+) -> Response {
+    if let Err(rej) = authorize_operator(&state.admin_validator, headers).await {
+        return rej.into_response();
+    }
+    match state.store.get_row(table, site, id).await {
+        Ok(Some(v)) => Json(v).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({ "error": "not_found" }))).into_response(),
+        Err(e) => write_error(&e),
+    }
+}
+
+/// `GET /v1/sites` — list registered sites (the dashboard's site selector).
+async fn list_sites(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(rej) = authorize_operator(&state.admin_validator, &headers).await {
+        return rej.into_response();
+    }
+    match state.store.list_sites().await {
+        Ok(sites) => Json(json!({ "sites": sites })).into_response(),
+        Err(e) => write_error(&e),
+    }
+}
+
+async fn list_phones(State(s): State<Arc<AppState>>, Path(site): Path<String>, h: HeaderMap) -> Response {
+    do_list(&s, &h, &site, ConfigTable::Phones).await
+}
+async fn get_phone(State(s): State<Arc<AppState>>, Path((site, id)): Path<(String, String)>, h: HeaderMap) -> Response {
+    do_get(&s, &h, &site, ConfigTable::Phones, &id).await
+}
+async fn list_directory(State(s): State<Arc<AppState>>, Path(site): Path<String>, h: HeaderMap) -> Response {
+    do_list(&s, &h, &site, ConfigTable::DirectoryNumbers).await
+}
+async fn get_directory(State(s): State<Arc<AppState>>, Path((site, did)): Path<(String, String)>, h: HeaderMap) -> Response {
+    do_get(&s, &h, &site, ConfigTable::DirectoryNumbers, &did).await
+}
+async fn list_trunk_groups(State(s): State<Arc<AppState>>, Path(site): Path<String>, h: HeaderMap) -> Response {
+    do_list(&s, &h, &site, ConfigTable::TrunkGroups).await
+}
+async fn get_trunk_group(State(s): State<Arc<AppState>>, Path((site, id)): Path<(String, String)>, h: HeaderMap) -> Response {
+    do_get(&s, &h, &site, ConfigTable::TrunkGroups, &id).await
+}
+async fn list_dial_plans(State(s): State<Arc<AppState>>, Path(site): Path<String>, h: HeaderMap) -> Response {
+    do_list(&s, &h, &site, ConfigTable::DialPlans).await
+}
+async fn get_dial_plan(State(s): State<Arc<AppState>>, Path((site, id)): Path<(String, String)>, h: HeaderMap) -> Response {
+    do_get(&s, &h, &site, ConfigTable::DialPlans, &id).await
+}
+async fn list_routing(State(s): State<Arc<AppState>>, Path((site, kind)): Path<(String, String)>, h: HeaderMap) -> Response {
+    match routing_table(&kind) {
+        Some(t) => do_list(&s, &h, &site, t).await,
+        None => bad_request("unknown routing kind"),
+    }
+}
+async fn get_routing(State(s): State<Arc<AppState>>, Path((site, kind, id)): Path<(String, String, String)>, h: HeaderMap) -> Response {
+    match routing_table(&kind) {
+        Some(t) => do_get(&s, &h, &site, t, &id).await,
+        None => bad_request("unknown routing kind"),
+    }
+}
+/// `GET /v1/sites/{site}/config` — the site telephony settings document.
+async fn get_site_config(State(s): State<Arc<AppState>>, Path(site): Path<String>, h: HeaderMap) -> Response {
+    do_get(&s, &h, &site, ConfigTable::SiteTelephonyConfig, "default").await
 }
 
 /// `POST /v1/sites` — register a site (creates its partitions).
@@ -1147,6 +1239,30 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::OK);
+
+        // Operator reads (the dashboard's GETs): list sites, list phones,
+        // get one phone, and a get-miss → 404.
+        let (s, b) = send_req(&app, "GET", "/v1/sites", Some(&admin_tok), None).await;
+        assert_eq!(s, StatusCode::OK);
+        let sites = b["sites"].as_array().expect("sites");
+        assert!(sites.iter().any(|x| x["site_code"] == "MUHJ"));
+        assert!(sites.iter().any(|x| x["site_code"] == "MPLS"));
+
+        let (s, b) = send_req(&app, "GET", "/v1/sites/MUHJ/phones", Some(&admin_tok), None).await;
+        assert_eq!(s, StatusCode::OK);
+        let items = b["items"].as_array().expect("items");
+        assert!(items.iter().any(|p| p["id"] == "p2"), "p1 was deleted, p2 listed: {b}");
+
+        let (s, b) = send_req(&app, "GET", "/v1/sites/MUHJ/phones/p2", Some(&admin_tok), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b["id"], "p2");
+
+        let (s, _) = send_req(&app, "GET", "/v1/sites/MUHJ/phones/ghost", Some(&admin_tok), None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+
+        // A GET still requires the admin scope (a sync token is rejected).
+        let (s, _) = send_req(&app, "GET", "/v1/sites/MUHJ/phones", Some(&good_token("MUHJ")), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "config-sync token can't use the operator read surface");
     }
 
     #[tokio::test]
@@ -1281,6 +1397,7 @@ mod tests {
     /// pull (snapshot + delta) and the DDIL upload — the seams the other
     /// tests only reach in-process.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn http_wire_pull_and_ddil_upload() {
         let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else {
             return;

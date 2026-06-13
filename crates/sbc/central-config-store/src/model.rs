@@ -153,6 +153,20 @@ pub struct TableRows {
     pub rows: Vec<SnapshotRow>,
 }
 
+/// A registered site, as listed for the operator (the dashboard's site
+/// selector).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteInfo {
+    /// Canonical site code.
+    pub site_code: String,
+    /// Human-readable name.
+    pub display_name: String,
+    /// `planned` | `active` | `decommissioned`.
+    pub status: String,
+    /// Current shard epoch.
+    pub config_epoch: i64,
+}
+
 /// A kind of global config template. Maps to the sharded table its
 /// materialized rows land in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
