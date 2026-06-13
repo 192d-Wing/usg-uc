@@ -13,7 +13,7 @@ use sbc_config_store::{
     PostgresTrunkGroupStore,
 };
 use sbc_grpc_api::prelude::{
-    CallServiceClient, CucmSyncServiceClient, DialPlanSyncServiceClient,
+    CallServiceClient, SbcSyncServiceClient, DialPlanSyncServiceClient,
     DidMappingSyncServiceClient, RegistrationServiceClient, SystemServiceClient,
     TrunkHealthServiceClient, TrunkSyncServiceClient,
 };
@@ -46,8 +46,8 @@ pub struct AppState {
     /// of PR10. SIP digest auth still happens in the daemon, but it
     /// reads through the same `users` table via its own pool.
     pub users: Arc<PostgresUserStore>,
-    /// Postgres-backed CUCM-routing stores (PR11). sbc-api owns CRUD;
-    /// after each write it notifies the daemon via `cucm_sync` so the
+    /// Postgres-backed SBC-routing stores (PR11). sbc-api owns CRUD;
+    /// after each write it notifies the daemon via `sbc_sync` so the
     /// live router catches up without a daemon restart.
     pub partitions: Arc<PostgresPartitionStore>,
     /// See [`Self::partitions`].
@@ -75,10 +75,10 @@ pub struct AppState {
     /// daemon's REST `/trunk-health`, `/trunk-registration`, and
     /// `/trunk-registration/{id}/register` endpoints (PR9).
     pub trunk_health: TrunkHealthServiceClient<Channel>,
-    /// CUCM-routing sync client (PR11) — sbc-api notifies the daemon
+    /// SBC-routing sync client (PR11) — sbc-api notifies the daemon
     /// "I changed partition / CSS / route-pattern / route-list X,
-    /// please re-apply from Postgres to the live `CucmRouter`".
-    pub cucm_sync: CucmSyncServiceClient<Channel>,
+    /// please re-apply from Postgres to the live `SbcRouter`".
+    pub sbc_sync: SbcSyncServiceClient<Channel>,
 
     /// HTTP client + base URL used by the reverse-proxy fallback for
     /// endpoints sbc-api doesn't own.
@@ -159,7 +159,7 @@ impl AppState {
         let registrations = RegistrationServiceClient::new(channel.clone());
         let system = SystemServiceClient::new(channel.clone());
         let trunk_health = TrunkHealthServiceClient::new(channel.clone());
-        let cucm_sync = CucmSyncServiceClient::new(channel);
+        let sbc_sync = SbcSyncServiceClient::new(channel);
 
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -191,7 +191,7 @@ impl AppState {
             registrations,
             system,
             trunk_health,
-            cucm_sync,
+            sbc_sync,
             http_client,
             daemon_http_base: cfg.daemon_http_url.trim_end_matches('/').to_string(),
             start_time: std::time::Instant::now(),

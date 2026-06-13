@@ -1,7 +1,7 @@
 // SBC Dial-Plan Sync Service
 //
 // Same shape as TrunkSyncService: ID-only notification, daemon re-reads
-// the dial plan from Postgres and pushes it into the CucmRouter via the
+// the dial plan from Postgres and pushes it into the SbcRouter via the
 // existing sync_dial_plan_to_router helper.
 //
 // NIST 800-53 Rev5: CM-5, AC-3.

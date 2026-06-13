@@ -425,9 +425,9 @@ impl Runtime {
             );
         }
 
-        // Initialize CUCM router for partition/CSS/route pattern management
-        app_state.cucm_router = Some(Arc::new(tokio::sync::RwLock::new(
-            uc_routing::CucmRouter::new(),
+        // Initialize SBC router for partition/CSS/route pattern management
+        app_state.sbc_router = Some(Arc::new(tokio::sync::RwLock::new(
+            uc_routing::SbcRouter::new(),
         )));
 
         // Initialize the trunk health monitor and trunk registrar —
@@ -555,7 +555,7 @@ impl Runtime {
             }
 
             // Dial plans had no JSON predecessor — they lived only in the
-            // CucmRouter and were lost on every restart. No migration step
+            // SbcRouter and were lost on every restart. No migration step
             // needed; just stand up the store and let the post-Arc replay
             // block re-sync any persisted plans into the router.
             match connect_with_retry("dial_plans", || {
@@ -573,10 +573,10 @@ impl Runtime {
                 }
             }
 
-            // CUCM routing stores (PR11). Same shape as dial_plans: no
+            // SBC routing stores (PR11). Same shape as dial_plans: no
             // JSON predecessor (these lived in-memory only), so just
             // stand up the four stores and let the replay block below
-            // re-sync them into the CucmRouter.
+            // re-sync them into the SbcRouter.
             match connect_with_retry("partitions", || {
                 sbc_config_store::PostgresPartitionStore::new(&pg_url)
             })
@@ -673,14 +673,14 @@ impl Runtime {
                     info!(count = dns.len(), "Seeded directory numbers");
                 }
 
-                // Seed partitions, CSS, route patterns, route lists into CUCM router
-                if let Some(ref cucm) = app_state.cucm_router {
-                    let mut cucm_w = cucm.write().await;
+                // Seed partitions, CSS, route patterns, route lists into SBC router
+                if let Some(ref sbc) = app_state.sbc_router {
+                    let mut sbc_w = sbc.write().await;
                     if let Some(parts) = seed.get("partitions").and_then(|v| v.as_array()) {
                         for p in parts {
                             let id = p.get("id").and_then(|v| v.as_str()).unwrap_or_default();
                             let name = p.get("name").and_then(|v| v.as_str()).unwrap_or(id);
-                            cucm_w.add_partition(uc_routing::Partition::new(id, name));
+                            sbc_w.add_partition(uc_routing::Partition::new(id, name));
                         }
                         info!(count = parts.len(), "Seeded partitions");
                     }
@@ -703,7 +703,7 @@ impl Runtime {
                             for p in &parts {
                                 css.add_partition(p);
                             }
-                            cucm_w.add_css(css);
+                            sbc_w.add_css(css);
                         }
                         info!(count = csses.len(), "Seeded calling search spaces");
                     }
@@ -741,7 +741,7 @@ impl Runtime {
                             {
                                 route_pattern = route_pattern.with_route_list(rl);
                             }
-                            cucm_w.add_route_pattern(route_pattern);
+                            sbc_w.add_route_pattern(route_pattern);
                         }
                         info!(count = rps.len(), "Seeded route patterns");
                     }
@@ -842,7 +842,7 @@ impl Runtime {
             }
         }
 
-        // Postgres path: replay dial plans into CucmRouter. This is genuinely
+        // Postgres path: replay dial plans into SbcRouter. This is genuinely
         // new functionality — dial plans were ephemeral pre-PR3 (lived only
         // in the router, lost on every restart). With the store configured,
         // plans survive restarts and downtime no longer requires the
@@ -874,8 +874,8 @@ impl Runtime {
             }
         }
 
-        // Postgres path: replay CUCM routing (partitions → CSS → route
-        // patterns → route lists) into CucmRouter. Order matters because
+        // Postgres path: replay SBC routing (partitions → CSS → route
+        // patterns → route lists) into SbcRouter. Order matters because
         // CSSes reference partitions and route patterns reference both
         // partitions and route lists/groups; replaying out of order
         // would temporarily leave dangling references and could mis-

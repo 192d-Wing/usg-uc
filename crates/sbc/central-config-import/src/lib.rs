@@ -45,8 +45,8 @@ pub struct ImportReport {
     pub trunk_groups: usize,
     /// Dial plans imported.
     pub dial_plans: usize,
-    /// CUCM routing entities imported (all four tables).
-    pub cucm: usize,
+    /// SBC routing entities imported (all four tables).
+    pub sbc: usize,
     /// Site telephony config documents imported (0 or 1).
     pub site_config: usize,
 }
@@ -55,10 +55,10 @@ pub struct ImportReport {
 const JSON_TABLES: &[ConfigTable] = &[
     ConfigTable::TrunkGroups,
     ConfigTable::DialPlans,
-    ConfigTable::CucmPartitions,
-    ConfigTable::CucmCallingSearchSpaces,
-    ConfigTable::CucmRoutePatterns,
-    ConfigTable::CucmRouteLists,
+    ConfigTable::SbcPartitions,
+    ConfigTable::SbcCallingSearchSpaces,
+    ConfigTable::SbcRoutePatterns,
+    ConfigTable::SbcRouteLists,
     ConfigTable::SiteTelephonyConfig,
 ];
 
@@ -118,7 +118,7 @@ pub async fn import_site(
         report.directory_numbers += 1;
     }
 
-    // JSONB pass-through tables. Some (CUCM, site config) may not exist in
+    // JSONB pass-through tables. Some (SBC, site config) may not exist in
     // an older site schema — a missing relation is treated as "nothing to
     // import", not an error.
     for &table in JSON_TABLES {
@@ -136,7 +136,7 @@ pub async fn import_site(
                 ConfigTable::TrunkGroups => report.trunk_groups += 1,
                 ConfigTable::DialPlans => report.dial_plans += 1,
                 ConfigTable::SiteTelephonyConfig => report.site_config += 1,
-                _ => report.cucm += 1,
+                _ => report.sbc += 1,
             }
         }
     }

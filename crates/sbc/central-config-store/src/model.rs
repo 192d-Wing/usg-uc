@@ -16,14 +16,14 @@ pub enum ConfigTable {
     TrunkGroups,
     /// `dial_plans` — JSONB pass-through.
     DialPlans,
-    /// `cucm_partitions` — JSONB pass-through.
-    CucmPartitions,
-    /// `cucm_calling_search_spaces` — JSONB pass-through.
-    CucmCallingSearchSpaces,
-    /// `cucm_route_patterns` — JSONB pass-through.
-    CucmRoutePatterns,
-    /// `cucm_route_lists` — JSONB pass-through.
-    CucmRouteLists,
+    /// `sbc_partitions` — JSONB pass-through.
+    SbcPartitions,
+    /// `sbc_calling_search_spaces` — JSONB pass-through.
+    SbcCallingSearchSpaces,
+    /// `sbc_route_patterns` — JSONB pass-through.
+    SbcRoutePatterns,
+    /// `sbc_route_lists` — JSONB pass-through.
+    SbcRouteLists,
     /// `site_telephony_config` — per-site scalar settings.
     SiteTelephonyConfig,
 }
@@ -35,10 +35,10 @@ impl ConfigTable {
         Self::DirectoryNumbers,
         Self::TrunkGroups,
         Self::DialPlans,
-        Self::CucmPartitions,
-        Self::CucmCallingSearchSpaces,
-        Self::CucmRoutePatterns,
-        Self::CucmRouteLists,
+        Self::SbcPartitions,
+        Self::SbcCallingSearchSpaces,
+        Self::SbcRoutePatterns,
+        Self::SbcRouteLists,
         Self::SiteTelephonyConfig,
     ];
 
@@ -51,10 +51,10 @@ impl ConfigTable {
             Self::DirectoryNumbers => "directory_numbers",
             Self::TrunkGroups => "trunk_groups",
             Self::DialPlans => "dial_plans",
-            Self::CucmPartitions => "cucm_partitions",
-            Self::CucmCallingSearchSpaces => "cucm_calling_search_spaces",
-            Self::CucmRoutePatterns => "cucm_route_patterns",
-            Self::CucmRouteLists => "cucm_route_lists",
+            Self::SbcPartitions => "sbc_partitions",
+            Self::SbcCallingSearchSpaces => "sbc_calling_search_spaces",
+            Self::SbcRoutePatterns => "sbc_route_patterns",
+            Self::SbcRouteLists => "sbc_route_lists",
             Self::SiteTelephonyConfig => "site_telephony_config",
         }
     }

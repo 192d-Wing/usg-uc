@@ -36,7 +36,7 @@
 #![cfg_attr(test, allow(clippy::panic))]
 
 pub mod css;
-pub mod cucm_router;
+pub mod sbc_router;
 pub mod dialplan;
 pub mod error;
 pub mod partition;
@@ -46,7 +46,7 @@ pub mod router;
 pub mod trunk;
 
 pub use css::CallingSearchSpace;
-pub use cucm_router::{CucmRouter, CucmRoutingResult};
+pub use sbc_router::{SbcRouter, SbcRoutingResult};
 pub use dialplan::{
     DestinationType, DialPattern, DialPlan, DialPlanEntry, DialPlanResult, Direction,
     NumberTransform,

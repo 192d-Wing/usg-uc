@@ -315,10 +315,10 @@ pub async fn collect_local_changes(
     for table in [
         ConfigTable::TrunkGroups,
         ConfigTable::DialPlans,
-        ConfigTable::CucmPartitions,
-        ConfigTable::CucmCallingSearchSpaces,
-        ConfigTable::CucmRoutePatterns,
-        ConfigTable::CucmRouteLists,
+        ConfigTable::SbcPartitions,
+        ConfigTable::SbcCallingSearchSpaces,
+        ConfigTable::SbcRoutePatterns,
+        ConfigTable::SbcRouteLists,
         ConfigTable::SiteTelephonyConfig,
     ] {
         let sql = format!("SELECT id, data, deleted FROM {} WHERE updated_by = 'local'", table.name());

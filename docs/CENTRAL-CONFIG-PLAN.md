@@ -43,7 +43,7 @@ flowchart TB
         dashboard["usg-sbc-dashboard<br/>(fleet views + site selector)"]
         api["central-config-api<br/>(operator writes + validation,<br/>sync read + upload,<br/>template materialization)"]
         kc["Keycloak OIDC<br/>(config-admin operators +<br/>per-site config-sync svc accts)"]
-        pg[("central Postgres<br/>list-partitioned by site_code (~184)<br/>─────────────<br/>sites · phones · directory_numbers<br/>trunk_groups · dial_plans<br/>site_telephony_config · cucm_*<br/>config_journal (deltas) · did_registry<br/>config_templates + assignments")]
+        pg[("central Postgres<br/>list-partitioned by site_code (~184)<br/>─────────────<br/>sites · phones · directory_numbers<br/>trunk_groups · dial_plans<br/>site_telephony_config · sbc_*<br/>config_journal (deltas) · did_registry<br/>config_templates + assignments")]
         importer["central-config-import<br/>(onboard: site DB → shard)"]
         dashboard -- "config-admin" --> api
         kc -. "authn/authz" .- api
@@ -163,9 +163,9 @@ CREATE UNIQUE INDEX idx_phones_site_mac_live
     ON phones (site_code, mac_normalized) WHERE NOT deleted;
 ```
 
-`directory_numbers`, `trunk_groups`, `dial_plans`, the four CUCM routing
-tables (`cucm_partitions`, `cucm_calling_search_spaces`,
-`cucm_route_patterns`, `cucm_route_lists`), and `site_telephony_config`
+`directory_numbers`, `trunk_groups`, `dial_plans`, the four sbc routing
+tables (`sbc_partitions`, `sbc_calling_search_spaces`,
+`sbc_route_patterns`, `sbc_route_lists`), and `site_telephony_config`
 follow the same shape (same envelope columns, existing payload formats).
 
 Fleet-wide DID uniqueness cannot be a unique index on `directory_numbers`
@@ -331,7 +331,7 @@ epoch), which the journal handles naturally and lets you do staged rollout
 - Validation moved central: trunk-group and dial-plan payloads are parsed
   against the typed `sbc-config` schemas (`TrunkGroupConfig`,
   `DialPlanConfig`) before commit — the JSONB pass-through finally gets
-  enforcement at one choke point. (CUCM-entity validation is the same
+  enforcement at one choke point. (sbc-entity validation is the same
   pattern, to add as those write routes land.)
 - Still to do: point the `usg-sbc-dashboard` SPA at the central API. The
   per-site `sbc-api-server` keeps a config write path **on purpose** — it

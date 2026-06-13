@@ -1,7 +1,7 @@
 //! Postgres-backed store for dial plans.
 //!
 //! Dial plans were genuinely ephemeral before this PR: the daemon held
-//! them in `CucmRouter` only, and a restart lost every plan unless the
+//! them in `SbcRouter` only, and a restart lost every plan unless the
 //! operator re-POSTed them or had them in the `ConfigMap` seed. With a
 //! Postgres store wired in, dial plans persist across daemon restarts
 //! and (once `sbc-api` lands in PR5) become writeable from a separate
@@ -112,7 +112,7 @@ impl PostgresDialPlanStore {
     }
 
     /// List every dial plan's JSON body, ordered by ID. Used on startup
-    /// to replay plans into the `CucmRouter` (so SIP routing decisions
+    /// to replay plans into the `SbcRouter` (so SIP routing decisions
     /// don't fall back to the empty default after a restart).
     ///
     /// # Errors

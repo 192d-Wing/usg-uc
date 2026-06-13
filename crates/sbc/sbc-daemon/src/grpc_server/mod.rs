@@ -14,7 +14,7 @@
 //!   when SBC_POSTGRES_URL is unset.
 //! - `DialPlanSyncService` - Same shape as TrunkSyncService, for dial plans.
 //! - `DidMappingSyncService` - Same shape, for DID→user mappings.
-//! - `CucmSyncService` - Same shape, for partitions / CSS / route patterns /
+//! - `SbcSyncService` - Same shape, for partitions / CSS / route patterns /
 //!   route lists (PR11).
 //! - `ClusterService` - Cluster management (requires `cluster` feature)
 //! - `Health` - Standard gRPC health checking
@@ -31,7 +31,7 @@ mod call_service;
 #[cfg(feature = "cluster")]
 mod cluster_service;
 mod config_service;
-mod cucm_sync_service;
+mod sbc_sync_service;
 mod dial_plan_sync_service;
 mod did_mapping_sync_service;
 mod health_service;
@@ -51,7 +51,7 @@ use sbc_grpc_api::sbc::call_service_server::CallServiceServer;
 #[cfg(feature = "cluster")]
 use sbc_grpc_api::sbc::cluster_service_server::ClusterServiceServer;
 use sbc_grpc_api::sbc::config_service_server::ConfigServiceServer;
-use sbc_grpc_api::sbc::cucm_sync_service_server::CucmSyncServiceServer;
+use sbc_grpc_api::sbc::sbc_sync_service_server::SbcSyncServiceServer;
 use sbc_grpc_api::sbc::dial_plan_sync_service_server::DialPlanSyncServiceServer;
 use sbc_grpc_api::sbc::did_mapping_sync_service_server::DidMappingSyncServiceServer;
 use sbc_grpc_api::sbc::registration_service_server::RegistrationServiceServer;
@@ -69,7 +69,7 @@ pub use call_service::CallServiceImpl;
 #[cfg(feature = "cluster")]
 pub use cluster_service::ClusterServiceImpl;
 pub use config_service::ConfigServiceImpl;
-pub use cucm_sync_service::CucmSyncServiceImpl;
+pub use sbc_sync_service::SbcSyncServiceImpl;
 pub use dial_plan_sync_service::DialPlanSyncServiceImpl;
 pub use did_mapping_sync_service::DidMappingSyncServiceImpl;
 pub use health_service::HealthServiceImpl;
@@ -191,7 +191,7 @@ impl GrpcServer {
         // Write-side: the sbc-trunk-agent pod pushes trunk status
         // snapshots here when trunk services run externally.
         let trunk_status_publish_svc = TrunkStatusPublishServiceImpl::new(Arc::clone(&self.state));
-        let cucm_sync_svc = CucmSyncServiceImpl::new(Arc::clone(&self.state));
+        let sbc_sync_svc = SbcSyncServiceImpl::new(Arc::clone(&self.state));
 
         // Configure TLS if enabled
         let tls_config = self.configure_tls()?;
@@ -224,7 +224,7 @@ impl GrpcServer {
             .add_service(TrunkStatusPublishServiceServer::new(
                 trunk_status_publish_svc,
             ))
-            .add_service(CucmSyncServiceServer::new(cucm_sync_svc));
+            .add_service(SbcSyncServiceServer::new(sbc_sync_svc));
 
         // Build router with reflection but no cluster
         #[cfg(all(not(feature = "cluster"), feature = "grpc-reflection"))]
@@ -239,7 +239,7 @@ impl GrpcServer {
                 .add_service(DialPlanSyncServiceServer::new(dial_plan_sync_svc))
                 .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc))
                 .add_service(TrunkHealthServiceServer::new(trunk_health_svc))
-                .add_service(CucmSyncServiceServer::new(cucm_sync_svc));
+                .add_service(SbcSyncServiceServer::new(sbc_sync_svc));
 
             // Add reflection service if enabled in config
             if self.config.enable_reflection {
@@ -269,7 +269,7 @@ impl GrpcServer {
                 .add_service(DialPlanSyncServiceServer::new(dial_plan_sync_svc))
                 .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc))
                 .add_service(TrunkHealthServiceServer::new(trunk_health_svc))
-                .add_service(CucmSyncServiceServer::new(cucm_sync_svc));
+                .add_service(SbcSyncServiceServer::new(sbc_sync_svc));
 
             // Add ClusterService if cluster manager is available
             if let Some(cluster) = &self.cluster {
@@ -295,7 +295,7 @@ impl GrpcServer {
                 .add_service(DialPlanSyncServiceServer::new(dial_plan_sync_svc))
                 .add_service(DidMappingSyncServiceServer::new(did_mapping_sync_svc))
                 .add_service(TrunkHealthServiceServer::new(trunk_health_svc))
-                .add_service(CucmSyncServiceServer::new(cucm_sync_svc));
+                .add_service(SbcSyncServiceServer::new(sbc_sync_svc));
 
             // Add ClusterService if cluster manager is available
             let with_cluster = if let Some(cluster) = &self.cluster {

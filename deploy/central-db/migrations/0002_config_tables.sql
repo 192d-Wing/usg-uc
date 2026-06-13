@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS did_registry (
 );
 
 -- ---------------------------------------------- JSONB pass-through tables
--- trunk_groups, dial_plans, and the four CUCM routing entities share the
+-- trunk_groups, dial_plans, and the four SBC routing entities share the
 -- same envelope + JSONB body shape as their site-local counterparts.
 CREATE TABLE IF NOT EXISTS trunk_groups (
     site_code  text NOT NULL REFERENCES sites(site_code),
@@ -91,7 +91,7 @@ CREATE TABLE IF NOT EXISTS dial_plans (
     PRIMARY KEY (site_code, id)
 ) PARTITION BY LIST (site_code);
 
-CREATE TABLE IF NOT EXISTS cucm_partitions (
+CREATE TABLE IF NOT EXISTS sbc_partitions (
     site_code  text NOT NULL REFERENCES sites(site_code),
     id         text NOT NULL,
     data       jsonb NOT NULL,
@@ -103,7 +103,7 @@ CREATE TABLE IF NOT EXISTS cucm_partitions (
     PRIMARY KEY (site_code, id)
 ) PARTITION BY LIST (site_code);
 
-CREATE TABLE IF NOT EXISTS cucm_calling_search_spaces (
+CREATE TABLE IF NOT EXISTS sbc_calling_search_spaces (
     site_code  text NOT NULL REFERENCES sites(site_code),
     id         text NOT NULL,
     data       jsonb NOT NULL,
@@ -115,7 +115,7 @@ CREATE TABLE IF NOT EXISTS cucm_calling_search_spaces (
     PRIMARY KEY (site_code, id)
 ) PARTITION BY LIST (site_code);
 
-CREATE TABLE IF NOT EXISTS cucm_route_patterns (
+CREATE TABLE IF NOT EXISTS sbc_route_patterns (
     site_code  text NOT NULL REFERENCES sites(site_code),
     id         text NOT NULL,
     data       jsonb NOT NULL,
@@ -127,7 +127,7 @@ CREATE TABLE IF NOT EXISTS cucm_route_patterns (
     PRIMARY KEY (site_code, id)
 ) PARTITION BY LIST (site_code);
 
-CREATE TABLE IF NOT EXISTS cucm_route_lists (
+CREATE TABLE IF NOT EXISTS sbc_route_lists (
     site_code  text NOT NULL REFERENCES sites(site_code),
     id         text NOT NULL,
     data       jsonb NOT NULL,

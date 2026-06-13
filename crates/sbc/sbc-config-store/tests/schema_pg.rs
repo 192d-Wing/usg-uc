@@ -95,10 +95,10 @@ async fn migrates_fresh_database() {
         "phones",
         "trunk_groups",
         "dial_plans",
-        "cucm_partitions",
-        "cucm_calling_search_spaces",
-        "cucm_route_patterns",
-        "cucm_route_lists",
+        "sbc_partitions",
+        "sbc_calling_search_spaces",
+        "sbc_route_patterns",
+        "sbc_route_lists",
         "sync_state",
     ] {
         assert!(
@@ -253,10 +253,10 @@ async fn central_and_local_schemas_agree() {
         "directory_numbers",
         "trunk_groups",
         "dial_plans",
-        "cucm_partitions",
-        "cucm_calling_search_spaces",
-        "cucm_route_patterns",
-        "cucm_route_lists",
+        "sbc_partitions",
+        "sbc_calling_search_spaces",
+        "sbc_route_patterns",
+        "sbc_route_lists",
         "site_telephony_config",
     ] {
         let local_cols = columns(&local, table).await;

@@ -5,7 +5,7 @@ use crate::dialplan::{DialPattern, NumberTransform};
 
 /// A Route Pattern belongs to a partition and matches dialed digits.
 ///
-/// CUCM equivalent: a route pattern with partition membership, optional
+/// SBC equivalent: a route pattern with partition membership, optional
 /// route list or route group destination, digit manipulation, and blocking.
 #[derive(Debug, Clone)]
 pub struct RoutePattern {

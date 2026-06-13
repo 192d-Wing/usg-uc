@@ -44,28 +44,28 @@ CREATE TABLE IF NOT EXISTS dial_plans (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS cucm_partitions (
+CREATE TABLE IF NOT EXISTS sbc_partitions (
     id TEXT PRIMARY KEY,
     data JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS cucm_calling_search_spaces (
+CREATE TABLE IF NOT EXISTS sbc_calling_search_spaces (
     id TEXT PRIMARY KEY,
     data JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS cucm_route_patterns (
+CREATE TABLE IF NOT EXISTS sbc_route_patterns (
     id TEXT PRIMARY KEY,
     data JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS cucm_route_lists (
+CREATE TABLE IF NOT EXISTS sbc_route_lists (
     id TEXT PRIMARY KEY,
     data JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

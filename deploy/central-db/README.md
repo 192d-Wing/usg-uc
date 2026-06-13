@@ -3,7 +3,7 @@
 Schema and operational scripts for the fleet-wide configuration database
 described in [docs/CENTRAL-CONFIG-PLAN.md](../../docs/CENTRAL-CONFIG-PLAN.md).
 This database is the source of truth for telephony configuration (phones,
-DIDs, trunk groups, dial plans, CUCM routing entities, per-site telephony
+DIDs, trunk groups, dial plans, routing entities, per-site telephony
 settings) across all sites; each site's in-cluster Postgres holds a synced
 copy of its own shard.
 

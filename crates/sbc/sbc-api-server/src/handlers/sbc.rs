@@ -1,17 +1,17 @@
-//! CUCM routing CRUD handlers (PR11) — partitions, calling search
+//! SBC routing CRUD handlers (PR11) — partitions, calling search
 //! spaces, route patterns, route lists.
 //!
 //! Pattern matches the dial-plan handler set: write to Postgres, then
-//! notify the daemon via the [`CucmSyncService`] gRPC so the live
-//! `CucmRouter` catches up. Response shapes are kept byte-identical to
+//! notify the daemon via the [`SbcSyncService`] gRPC so the live
+//! `SbcRouter` catches up. Response shapes are kept byte-identical to
 //! the daemon's old REST handlers so the dashboard doesn't need any
 //! changes when nginx flips the upstream.
 //!
-//! `CucmSyncService` notify failures are logged but never block the
+//! `SbcSyncService` notify failures are logged but never block the
 //! write — Postgres is the source of truth and the daemon's startup
 //! replay re-applies whatever's there on the next boot.
 //!
-//! [`CucmSyncService`]: sbc_grpc_api::prelude::CucmSyncService
+//! [`SbcSyncService`]: sbc_grpc_api::prelude::SbcSyncService
 
 use std::sync::Arc;
 
@@ -111,27 +111,27 @@ pub async fn delete_partition(
     {
         warn!(id, error = %e, "delete partition failed");
     }
-    let mut client = state.cucm_sync.clone();
+    let mut client = state.sbc_sync.clone();
     if let Err(e) = client
         .remove_partition(RemovePartitionRequest {
             partition_id: id.clone(),
         })
         .await
     {
-        warn!(id, error = %e, "CucmSyncService.RemovePartition failed");
+        warn!(id, error = %e, "SbcSyncService.RemovePartition failed");
     }
     Json(serde_json::json!({"success": true, "id": id}))
 }
 
 async fn notify_sync_partition(state: &Arc<AppState>, id: &str) {
-    let mut client = state.cucm_sync.clone();
+    let mut client = state.sbc_sync.clone();
     if let Err(e) = client
         .sync_partition(SyncPartitionRequest {
             partition_id: id.to_string(),
         })
         .await
     {
-        warn!(id, error = %e, "CucmSyncService.SyncPartition failed");
+        warn!(id, error = %e, "SbcSyncService.SyncPartition failed");
     }
 }
 
@@ -207,25 +207,25 @@ pub async fn delete_css(
     {
         warn!(id, error = %e, "delete css failed");
     }
-    let mut client = state.cucm_sync.clone();
+    let mut client = state.sbc_sync.clone();
     if let Err(e) = client
         .remove_calling_search_space(RemoveCallingSearchSpaceRequest { css_id: id.clone() })
         .await
     {
-        warn!(id, error = %e, "CucmSyncService.RemoveCallingSearchSpace failed");
+        warn!(id, error = %e, "SbcSyncService.RemoveCallingSearchSpace failed");
     }
     Json(serde_json::json!({"success": true, "id": id}))
 }
 
 async fn notify_sync_css(state: &Arc<AppState>, id: &str) {
-    let mut client = state.cucm_sync.clone();
+    let mut client = state.sbc_sync.clone();
     if let Err(e) = client
         .sync_calling_search_space(SyncCallingSearchSpaceRequest {
             css_id: id.to_string(),
         })
         .await
     {
-        warn!(id, error = %e, "CucmSyncService.SyncCallingSearchSpace failed");
+        warn!(id, error = %e, "SbcSyncService.SyncCallingSearchSpace failed");
     }
 }
 
@@ -298,27 +298,27 @@ pub async fn delete_route_pattern(
     {
         warn!(id, error = %e, "delete route_pattern failed");
     }
-    let mut client = state.cucm_sync.clone();
+    let mut client = state.sbc_sync.clone();
     if let Err(e) = client
         .remove_route_pattern(RemoveRoutePatternRequest {
             pattern_id: id.clone(),
         })
         .await
     {
-        warn!(id, error = %e, "CucmSyncService.RemoveRoutePattern failed");
+        warn!(id, error = %e, "SbcSyncService.RemoveRoutePattern failed");
     }
     Json(serde_json::json!({"success": true, "id": id}))
 }
 
 async fn notify_sync_route_pattern(state: &Arc<AppState>, id: &str) {
-    let mut client = state.cucm_sync.clone();
+    let mut client = state.sbc_sync.clone();
     if let Err(e) = client
         .sync_route_pattern(SyncRoutePatternRequest {
             pattern_id: id.to_string(),
         })
         .await
     {
-        warn!(id, error = %e, "CucmSyncService.SyncRoutePattern failed");
+        warn!(id, error = %e, "SbcSyncService.SyncRoutePattern failed");
     }
 }
 
@@ -391,26 +391,26 @@ pub async fn delete_route_list(
     {
         warn!(id, error = %e, "delete route_list failed");
     }
-    let mut client = state.cucm_sync.clone();
+    let mut client = state.sbc_sync.clone();
     if let Err(e) = client
         .remove_route_list(RemoveRouteListRequest {
             list_id: id.clone(),
         })
         .await
     {
-        warn!(id, error = %e, "CucmSyncService.RemoveRouteList failed");
+        warn!(id, error = %e, "SbcSyncService.RemoveRouteList failed");
     }
     Json(serde_json::json!({"success": true, "id": id}))
 }
 
 async fn notify_sync_route_list(state: &Arc<AppState>, id: &str) {
-    let mut client = state.cucm_sync.clone();
+    let mut client = state.sbc_sync.clone();
     if let Err(e) = client
         .sync_route_list(SyncRouteListRequest {
             list_id: id.to_string(),
         })
         .await
     {
-        warn!(id, error = %e, "CucmSyncService.SyncRouteList failed");
+        warn!(id, error = %e, "SbcSyncService.SyncRouteList failed");
     }
 }

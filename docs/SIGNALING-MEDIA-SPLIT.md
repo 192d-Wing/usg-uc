@@ -3,7 +3,7 @@
 Status: **design exploration** (not scheduled). This document examines
 splitting `sbc-daemon` into a signaling pod and N media-relay pods — the
 standard carrier SBC scale-out architecture (Kamailio + RTPEngine,
-OpenSIPS + MediaProxy, Cisco distributed SBC). It builds on the
+OpenSIPS + MediaProxy, distributed SBC). It builds on the
 already-completed extractions: `sbc-api-server`, `sbc-provision-server`,
 `sbc-client-config-server`, `sbc-announcement-server`, and
 `sbc-trunk-agent`.
@@ -75,7 +75,7 @@ All references are to `crates/sbc/sbc-daemon/src/`.
 ```
 
 - **sbc-signaling** — everything that speaks SIP: transactions, dialogs,
-  B2BUA, registrar, digest auth, routing (dial plan + CUCM), CDRs,
+  B2BUA, registrar, digest auth, routing (dial plan), CDRs,
   DoS protection, the gRPC management surface. No RTP sockets at all.
 - **sbc-media** — a thin, dumb, fast RTP/SRTP relay: socket pairs,
   SRTP/DTLS, ICE candidates, codec passthrough (transcoding optional,

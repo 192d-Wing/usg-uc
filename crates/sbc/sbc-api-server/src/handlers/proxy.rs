@@ -2,7 +2,7 @@
 //! doesn't own.
 //!
 //! sbc-api owns config entities (phones, DIDs, trunk groups, dial-plan
-//! writes), users (PR10), CUCM routing CRUD (PR11), SIP-state reads
+//! writes), users (PR10), SBC routing CRUD (PR11), SIP-state reads
 //! (PR7), and trunk runtime state (PR9). What's left for the proxy is
 //! the read-only `/cdrs` and `/dialplans` views, which still live on
 //! the daemon — they're cheap to expose locally there and have no

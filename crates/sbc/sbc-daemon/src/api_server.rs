@@ -232,8 +232,8 @@ pub struct AppState {
     pub sip_stack: Option<Arc<crate::sip_stack::SipStack>>,
     /// Phone provisioning server.
     pub provisioning: Option<Arc<uc_phone_mgmt::provisioning::ProvisioningServer>>,
-    /// CUCM router for CSS/partition-based routing.
-    pub cucm_router: Option<Arc<tokio::sync::RwLock<uc_routing::CucmRouter>>>,
+    /// SBC router for CSS/partition-based routing.
+    pub sbc_router: Option<Arc<tokio::sync::RwLock<uc_routing::SbcRouter>>>,
     /// Trunk health monitor. `None` when trunk services run externally
     /// in the sbc-trunk-agent pod (`SBC_TRUNK_SERVICES=external`).
     pub trunk_monitor: Option<Arc<crate::trunk_monitor::TrunkMonitor>>,
@@ -261,18 +261,18 @@ pub struct AppState {
     pub phone_store: Option<Arc<sbc_config_store::PostgresPhoneStore>>,
     /// Postgres-backed trunk-group store. When `Some`, trunk-group and
     /// nested trunk CRUD persist to Postgres in addition to the existing
-    /// `sip_stack`/`cucm_router` synchronization (which is unchanged —
+    /// `sip_stack`/`sbc_router` synchronization (which is unchanged —
     /// persistence and SIP-stack wiring are separate concerns here).
     pub trunk_group_store: Option<Arc<sbc_config_store::PostgresTrunkGroupStore>>,
     /// Postgres-backed dial-plan store. Before this PR, dial plans lived
-    /// only in the `CucmRouter` and were lost on every daemon restart.
+    /// only in the `SbcRouter` and were lost on every daemon restart.
     /// When `Some`, dial-plan writes persist and the startup loop replays
     /// them into the router so SIP routing decisions survive restarts.
     pub dial_plan_store: Option<Arc<sbc_config_store::PostgresDialPlanStore>>,
-    /// Postgres-backed CUCM-routing stores (PR11). Pre-PR11 these lived
-    /// only in-memory inside `CucmRouter` — a daemon restart wiped them.
+    /// Postgres-backed SBC-routing stores (PR11). Pre-PR11 these lived
+    /// only in-memory inside `SbcRouter` — a daemon restart wiped them.
     /// When `Some`, sbc-api owns the writes (and notifies via the gRPC
-    /// `CucmSyncService`) and the daemon's startup loop replays them
+    /// `SbcSyncService`) and the daemon's startup loop replays them
     /// into the router so partition/CSS/route-pattern/route-list state
     /// survives restarts.
     pub partition_store: Option<Arc<sbc_config_store::PostgresPartitionStore>>,
@@ -307,7 +307,7 @@ impl AppState {
             ready: AtomicU64::new(1), // Start as ready
             sip_stack: None,
             provisioning: None,
-            cucm_router: None,
+            sbc_router: None,
             mem_store: Arc::new(tokio::sync::RwLock::new(MemStore::default())),
             directory_store: None,
             phone_store: None,
@@ -341,7 +341,7 @@ impl AppState {
             ready: AtomicU64::new(1),
             sip_stack: None,
             provisioning: None,
-            cucm_router: None,
+            sbc_router: None,
             mem_store: Arc::new(tokio::sync::RwLock::new(MemStore::default())),
             directory_store: None,
             phone_store: None,
@@ -534,10 +534,10 @@ impl ApiServer {
             // sbc-api in PR9; backed by daemon's TrunkHealthService gRPC.)
             // (user CRUD moved to sbc-api in PR10; PostgresUserStore is
             // hit directly from sbc-api instead of via the daemon.)
-            // (CUCM routing CRUD — partitions, CSS, route patterns,
+            // (SBC routing CRUD — partitions, CSS, route patterns,
             // route lists — moved to sbc-api in PR11; sbc-api owns the
             // Postgres writes and the daemon's live router catches up
-            // via the new CucmSyncService gRPC.)
+            // via the new SbcSyncService gRPC.)
             ;
 
         Router::new()
@@ -1086,12 +1086,12 @@ pub async fn sync_dial_plan_to_router(
     );
 }
 
-/// Apply a JSON partition body to the live `CucmRouter`. Used by both
-/// the boot-time replay (when `cucm_router` is `Some`) and the gRPC
-/// `CucmSyncService.SyncPartition` handler. Idempotent: `add_partition`
+/// Apply a JSON partition body to the live `SbcRouter`. Used by both
+/// the boot-time replay (when `sbc_router` is `Some`) and the gRPC
+/// `SbcSyncService.SyncPartition` handler. Idempotent: `add_partition`
 /// upserts by ID.
 pub async fn apply_partition_to_router(state: &Arc<AppState>, body: &serde_json::Value) {
-    let Some(ref router) = state.cucm_router else {
+    let Some(ref router) = state.sbc_router else {
         return;
     };
     let Some(id) = body.get("id").and_then(|v| v.as_str()) else {
@@ -1111,9 +1111,9 @@ pub async fn apply_partition_to_router(state: &Arc<AppState>, body: &serde_json:
 }
 
 /// Apply a JSON CSS body. `partitions` is an array of partition-ID
-/// strings; ordering is preserved (CUCM CSS lookup is ordered).
+/// strings; ordering is preserved (SBC CSS lookup is ordered).
 pub async fn apply_css_to_router(state: &Arc<AppState>, body: &serde_json::Value) {
-    let Some(ref router) = state.cucm_router else {
+    let Some(ref router) = state.sbc_router else {
         return;
     };
     let Some(id) = body.get("id").and_then(|v| v.as_str()) else {
@@ -1139,7 +1139,7 @@ pub async fn apply_css_to_router(state: &Arc<AppState>, body: &serde_json::Value
 /// `DialPattern` variant; unknown values fall back to `prefix` to match
 /// the legacy REST handler.
 pub async fn apply_route_pattern_to_router(state: &Arc<AppState>, body: &serde_json::Value) {
-    let Some(ref router) = state.cucm_router else {
+    let Some(ref router) = state.sbc_router else {
         return;
     };
     let Some(id) = body.get("id").and_then(|v| v.as_str()) else {
@@ -1214,7 +1214,7 @@ pub async fn apply_route_pattern_to_router(state: &Arc<AppState>, body: &serde_j
 /// Per-member digit transforms aren't wired here yet; add them when a
 /// dashboard caller needs them.
 pub async fn apply_route_list_to_router(state: &Arc<AppState>, body: &serde_json::Value) {
-    let Some(ref router) = state.cucm_router else {
+    let Some(ref router) = state.sbc_router else {
         return;
     };
     let Some(id) = body.get("id").and_then(|v| v.as_str()) else {
@@ -1263,10 +1263,10 @@ pub async fn apply_route_list_to_router(state: &Arc<AppState>, body: &serde_json
 // ============================================================================
 
 // ============================================================================
-// (CUCM routing handlers removed in PR11 — sbc-api owns Postgres-
+// (SBC routing handlers removed in PR11 — sbc-api owns Postgres-
 // backed CRUD for partitions, CSS, route patterns, and route lists;
-// it notifies the daemon via CucmSyncService gRPC so the live
-// CucmRouter catches up without a daemon restart.)
+// it notifies the daemon via SbcSyncService gRPC so the live
+// SbcRouter catches up without a daemon restart.)
 // ============================================================================
 
 // ============================================================================
