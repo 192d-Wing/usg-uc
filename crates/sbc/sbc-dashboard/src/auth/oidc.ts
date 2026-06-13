@@ -1,8 +1,10 @@
 // Minimal OIDC Authorization-Code + PKCE client for the central config API.
 //
-// The central API only accepts OIDC bearer tokens carrying the
-// `config-admin` scope, so the dashboard authenticates the operator against
-// Keycloak and presents the resulting access token. This is a dependency-free
+// The central API only accepts OIDC bearer tokens carrying the base
+// operator scope `config` (per-action authorization is then applied by the
+// API's ABAC policy from the token's `roles`/`sites` claims), so the
+// dashboard authenticates the operator against Keycloak and presents the
+// resulting access token. This is a dependency-free
 // PKCE implementation (Keycloak endpoint layout); a frontend team that
 // prefers `oidc-client-ts` can swap it behind the same `getAccessToken()` /
 // `login()` / `handleCallback()` surface.
