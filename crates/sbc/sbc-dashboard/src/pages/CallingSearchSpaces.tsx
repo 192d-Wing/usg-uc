@@ -12,7 +12,9 @@ import StatusIndicator from '@cloudscape-design/components/status-indicator';
 import Table from '@cloudscape-design/components/table';
 import TextFilter from '@cloudscape-design/components/text-filter';
 
-import { api, ApiError } from '../api';
+import { ApiError } from '../api';
+import { centralApi } from '../centralApi';
+import { useSite } from '../SiteContext';
 import { DeleteConfirmModal, FormModal } from '../components/CrudModal';
 
 type Css = {
@@ -59,17 +61,24 @@ export function CallingSearchSpaces() {
   const [modalError, setModalError] = useState<string | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
 
+  const { site } = useSite();
+
   const load = async () => {
+    if (!site) {
+      setItems([]);
+      setPartitions([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
-      const [cssRes, partRes] = await Promise.all([
-        api.get<{ calling_search_spaces: Css[] }>('/css'),
-        api.get<{ partitions: PartitionOpt[] }>('/partitions').catch(() => ({ partitions: [] })),
+      const [next, parts] = await Promise.all([
+        centralApi.list<Css>(site, 'css'),
+        centralApi.list<PartitionOpt>(site, 'partitions').catch(() => []),
       ]);
-      const next = cssRes.calling_search_spaces ?? [];
       setItems(next);
-      setPartitions(partRes.partitions ?? []);
+      setPartitions(parts);
       setSelected((cur) => cur.filter((s) => next.some((c) => c.id === s.id)));
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e));
@@ -78,9 +87,10 @@ export function CallingSearchSpaces() {
     }
   };
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     void load();
-  }, []);
+  }, [site]);
 
   const filtered = filter
     ? items.filter((c) => {
@@ -125,6 +135,10 @@ export function CallingSearchSpaces() {
       setModalError('ID is required.');
       return;
     }
+    if (!site) {
+      setModalError('No site selected.');
+      return;
+    }
     setBusy(true);
     setModalError(null);
     const body = {
@@ -133,11 +147,7 @@ export function CallingSearchSpaces() {
       partitions: formPartitions.map((o) => o.value),
     };
     try {
-      if (modalMode === 'create') {
-        await api.post('/css', body);
-      } else {
-        await api.put(`/css/${encodeURIComponent(id)}`, body);
-      }
+      await centralApi.upsert(site, 'css', body);
       closeModal();
       await load();
     } catch (e) {
@@ -153,11 +163,11 @@ export function CallingSearchSpaces() {
     setDeleteOpen(true);
   };
   const confirmDelete = async () => {
-    if (!target) return;
+    if (!target || !site) return;
     setBusy(true);
     setModalError(null);
     try {
-      await api.delete(`/css/${encodeURIComponent(target.id)}`);
+      await centralApi.remove(site, 'css', target.id);
       setDeleteOpen(false);
       setSelected([]);
       await load();

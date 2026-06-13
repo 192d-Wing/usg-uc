@@ -15,10 +15,13 @@ export default defineConfig({
   server: {
     port: 4200,
     proxy: {
-      // Forward API calls in dev to a locally-running sbc-api-server
-      // (which owns /api/v1 incl. /auth/login). Override the target to
-      // match wherever you run sbc-api locally.
+      // Per-site runtime API (registrations, CDRs, system, users, phone
+      // reboot) → a locally-running sbc-api-server. Owns /api/v1 incl.
+      // /auth/login.
       '/api': 'http://localhost:8080',
+      // Central config API (phones/directory/trunk groups/dial plans/
+      // routing/config, site-scoped) → a locally-running central-config-api.
+      '/v1': 'http://localhost:8090',
     },
   },
 });

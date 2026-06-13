@@ -10,7 +10,9 @@ import Table from '@cloudscape-design/components/table';
 import Textarea from '@cloudscape-design/components/textarea';
 import TextFilter from '@cloudscape-design/components/text-filter';
 
-import { api, ApiError } from '../api';
+import { ApiError } from '../api';
+import { centralApi } from '../centralApi';
+import { useSite } from '../SiteContext';
 import { DeleteConfirmModal, FormModal } from '../components/CrudModal';
 
 type Partition = {
@@ -40,12 +42,18 @@ export function Partitions() {
   const [modalError, setModalError] = useState<string | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
 
+  const { site } = useSite();
+
   const load = async () => {
+    if (!site) {
+      setItems([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
-      const res = await api.get<{ partitions: Partition[] }>('/partitions');
-      const next = res.partitions ?? [];
+      const next = await centralApi.list<Partition>(site, 'partitions');
       setItems(next);
       setSelected((cur) => cur.filter((s) => next.some((p) => p.id === s.id)));
     } catch (e) {
@@ -55,9 +63,10 @@ export function Partitions() {
     }
   };
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     void load();
-  }, []);
+  }, [site]);
 
   const filtered = filter
     ? items.filter((p) =>
@@ -91,17 +100,24 @@ export function Partitions() {
     }
     setBusy(true);
     setModalError(null);
+    const id = modalMode === 'edit' ? (target?.id ?? '') : form.id.trim();
+    if (!id) {
+      setModalError('Partition id is required.');
+      setBusy(false);
+      return;
+    }
+    if (!site) {
+      setModalError('No site selected.');
+      setBusy(false);
+      return;
+    }
     const body: Record<string, unknown> = {
+      id,
       name: form.name.trim(),
       description: form.description.trim() || undefined,
     };
     try {
-      if (modalMode === 'create') {
-        body.id = form.id.trim() || undefined;
-        await api.post('/partitions', body);
-      } else if (target) {
-        await api.put(`/partitions/${encodeURIComponent(target.id)}`, body);
-      }
+      await centralApi.upsert(site, 'partitions', body);
       closeModal();
       await load();
     } catch (e) {
@@ -117,11 +133,11 @@ export function Partitions() {
     setDeleteOpen(true);
   };
   const confirmDelete = async () => {
-    if (!target) return;
+    if (!target || !site) return;
     setBusy(true);
     setModalError(null);
     try {
-      await api.delete(`/partitions/${encodeURIComponent(target.id)}`);
+      await centralApi.remove(site, 'partitions', target.id);
       setDeleteOpen(false);
       setSelected([]);
       await load();

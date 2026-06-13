@@ -30,6 +30,28 @@ server {
         proxy_read_timeout 60s;
     }
 
+    # Central config API — phones/directory/trunk groups/dial plans/routing/
+    # config, site-scoped, OIDC-bearer. Proxied to the fleet-wide
+    # central-config-api Service ($CENTRAL_API_UPSTREAM). Runtime data
+    # (above, /api) stays on the per-site daemon.
+    location /v1/ {
+        proxy_pass         http://${CENTRAL_API_UPSTREAM};
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout 60s;
+    }
+
+    # Runtime config injected at container start (envsubst). Supplies the
+    # OIDC issuer/client for the central config sign-in.
+    location = /config.js {
+        default_type application/javascript;
+        add_header Cache-Control "no-cache";
+        return 200 "window.SBC_CONFIG={centralBase:'/v1',oidcIssuer:'${OIDC_ISSUER}',oidcClientId:'${OIDC_CLIENT_ID}',oidcScopes:'${OIDC_SCOPES}'};";
+    }
+
     # Phone provisioning — Yealink/Polycom HTTP config fetch. Same upstream
     # as /api since the daemon still owns provisioning today.
     location /provision/ {

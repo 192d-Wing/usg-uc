@@ -9,7 +9,9 @@ import StatusIndicator from '@cloudscape-design/components/status-indicator';
 import Table from '@cloudscape-design/components/table';
 import TextFilter from '@cloudscape-design/components/text-filter';
 
-import { api, ApiError } from '../api';
+import { ApiError } from '../api';
+import { centralApi } from '../centralApi';
+import { useSite } from '../SiteContext';
 import { DeleteConfirmModal, FormModal } from '../components/CrudModal';
 
 type RouteList = {
@@ -33,12 +35,18 @@ export function RouteLists() {
 
   const [deleteOpen, setDeleteOpen] = useState(false);
 
+  const { site } = useSite();
+
   const load = async () => {
+    if (!site) {
+      setItems([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
-      const res = await api.get<{ route_lists: RouteList[] }>('/routelists');
-      const next = res.route_lists ?? [];
+      const next = await centralApi.list<RouteList>(site, 'routelists');
       setItems(next);
       setSelected((cur) => cur.filter((s) => next.some((l) => l.id === s.id)));
     } catch (e) {
@@ -48,9 +56,10 @@ export function RouteLists() {
     }
   };
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     void load();
-  }, []);
+  }, [site]);
 
   const filtered = filter
     ? items.filter((l) => `${l.id} ${l.name ?? ''}`.toLowerCase().includes(filter.toLowerCase()))
@@ -79,15 +88,15 @@ export function RouteLists() {
       setModalError('ID is required.');
       return;
     }
+    if (!site) {
+      setModalError('No site selected.');
+      return;
+    }
     setBusy(true);
     setModalError(null);
     const body = { id, name: formName.trim() || id };
     try {
-      if (modalMode === 'create') {
-        await api.post('/routelists', body);
-      } else {
-        await api.put(`/routelists/${encodeURIComponent(id)}`, body);
-      }
+      await centralApi.upsert(site, 'routelists', body);
       closeModal();
       await load();
     } catch (e) {
@@ -103,11 +112,11 @@ export function RouteLists() {
     setDeleteOpen(true);
   };
   const confirmDelete = async () => {
-    if (!target) return;
+    if (!target || !site) return;
     setBusy(true);
     setModalError(null);
     try {
-      await api.delete(`/routelists/${encodeURIComponent(target.id)}`);
+      await centralApi.remove(site, 'routelists', target.id);
       setDeleteOpen(false);
       setSelected([]);
       await load();

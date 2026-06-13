@@ -10,7 +10,9 @@ import Table from '@cloudscape-design/components/table';
 import Textarea from '@cloudscape-design/components/textarea';
 import TextFilter from '@cloudscape-design/components/text-filter';
 
-import { api, ApiError } from '../api';
+import { ApiError } from '../api';
+import { centralApi } from '../centralApi';
+import { useSite } from '../SiteContext';
 import { DeleteConfirmModal, FormModal } from '../components/CrudModal';
 
 type DirectoryNumber = {
@@ -42,12 +44,18 @@ export function Directory() {
   const [modalError, setModalError] = useState<string | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
 
+  const { site } = useSite();
+
   const load = async () => {
+    if (!site) {
+      setItems([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
-      const res = await api.get<{ directory_numbers: DirectoryNumber[] }>('/directory');
-      const next = res.directory_numbers ?? [];
+      const next = await centralApi.list<DirectoryNumber>(site, 'directory');
       setItems(next);
       setSelected((cur) => cur.filter((s) => next.some((d) => d.did === s.did)));
     } catch (e) {
@@ -57,9 +65,10 @@ export function Directory() {
     }
   };
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     void load();
-  }, []);
+  }, [site]);
 
   const filtered = filter
     ? items.filter((d) =>
@@ -102,12 +111,14 @@ export function Directory() {
       partition: form.partition.trim() || undefined,
       description: form.description.trim() || undefined,
     };
+    if (!site) {
+      setModalError('No site selected.');
+      setBusy(false);
+      return;
+    }
     try {
-      if (modalMode === 'create') {
-        await api.post('/directory', body);
-      } else if (target) {
-        await api.put(`/directory/${encodeURIComponent(target.did)}`, body);
-      }
+      // Central upsert covers both create and update (the body carries did).
+      await centralApi.upsert(site, 'directory', body);
       closeModal();
       await load();
     } catch (e) {
@@ -126,8 +137,9 @@ export function Directory() {
     if (!target) return;
     setBusy(true);
     setModalError(null);
+    if (!site) return;
     try {
-      await api.delete(`/directory/${encodeURIComponent(target.did)}`);
+      await centralApi.remove(site, 'directory', target.did);
       setDeleteOpen(false);
       setSelected([]);
       await load();
