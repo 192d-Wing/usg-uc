@@ -34,6 +34,11 @@ pub enum StateError {
     /// The central store could not be opened or migrated.
     #[error("central store: {0}")]
     Store(String),
+    /// The configured extra OIDC CA cert could not be read or parsed. Fatal:
+    /// without it, JWKS fetches fail and every token is rejected, so the API
+    /// would be uselessly up. Fail fast instead.
+    #[error("oidc CA cert: {0}")]
+    OidcCa(String),
 }
 
 /// Handler-shared state: the store and the two scope-specific validators.
@@ -68,9 +73,22 @@ impl AppState {
         .map_err(|e| StateError::Store(e.to_string()))?;
 
         // rustls-only HTTP client for JWKS fetches; one cache, two validators.
-        let http = reqwest::Client::builder()
+        // An extra CA cert is trusted when the IdP is fronted by an internal
+        // CA the bundled webpki roots don't include.
+        let mut http_builder = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10));
+        if let Some(path) = cfg.oidc_extra_ca_cert_file.as_deref() {
+            let pem =
+                std::fs::read(path).map_err(|e| StateError::OidcCa(format!("read {path}: {e}")))?;
+            let cert = reqwest::Certificate::from_pem(&pem)
+                .map_err(|e| StateError::OidcCa(format!("parse {path}: {e}")))?;
+            tracing::info!(path, "loaded extra CA certificate for IdP JWKS fetch");
+            http_builder = http_builder.add_root_certificate(cert);
+        }
+        let http = http_builder
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .map_err(|e| StateError::OidcCa(format!("build HTTP client: {e}")))?;
         let jwks = Arc::new(JwksCache::new(http, cfg.oidc_issuer.clone()));
         let validator_for = |scope: &'static str| {
             Arc::new(Validator::new(

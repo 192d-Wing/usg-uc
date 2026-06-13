@@ -39,6 +39,10 @@ pub struct Config {
     pub oidc_issuer: String,
     /// Accepted token audience for this API (e.g. `usg-uc-config-sync`).
     pub oidc_audience: String,
+    /// Optional path to an extra CA certificate (PEM) to trust when fetching
+    /// the `IdP` JWKS — needed when Keycloak is fronted by an internal CA the
+    /// system roots don't include. Mirrors sbc's `SBC_OIDC_EXTRA_CA_CERT_FILE`.
+    pub oidc_extra_ca_cert_file: Option<String>,
 }
 
 impl Config {
@@ -82,6 +86,8 @@ impl Config {
             lookup("CENTRAL_OIDC_ISSUER").ok_or(ConfigError::Missing("CENTRAL_OIDC_ISSUER"))?;
         let oidc_audience =
             lookup("CENTRAL_OIDC_AUDIENCE").ok_or(ConfigError::Missing("CENTRAL_OIDC_AUDIENCE"))?;
+        let oidc_extra_ca_cert_file =
+            lookup("CENTRAL_OIDC_EXTRA_CA_CERT_FILE").filter(|s| !s.trim().is_empty());
         Ok(Self {
             listen_addr,
             database_url,
@@ -89,6 +95,7 @@ impl Config {
             db_max_connections,
             oidc_issuer,
             oidc_audience,
+            oidc_extra_ca_cert_file,
         })
     }
 }
