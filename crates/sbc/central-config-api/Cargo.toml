@@ -44,6 +44,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
+# End-to-end wire test: drive the real router (booted on a port) with the
+# real sync-agent HTTP client, applying into a real site-local schema.
+sbc-config-sync = { path = "../sbc-config-sync" }
+sbc-config-store = { workspace = true }
 # Test-only token signing: ES256 keypair generation + JWT encode. No
 # static private key in the tree.
 jsonwebtoken.workspace = true

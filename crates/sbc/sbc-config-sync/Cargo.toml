@@ -44,3 +44,5 @@ tonic = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+# Serve the mock daemon's gRPC services on an ephemeral port in the wire test.
+tokio-stream = { version = "0.1", features = ["net"] }

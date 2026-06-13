@@ -1130,4 +1130,128 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::FORBIDDEN, "cross-site upload rejected");
     }
+
+    /// End-to-end over the real HTTP wire: boot the router on a port and
+    /// drive it with the *actual* sync-agent client (`CentralClient` +
+    /// `reconcile`), not the in-process router. Exercises reqwest GET/POST,
+    /// JSON (de)serialization across the boundary, bearer headers, the
+    /// pull (snapshot + delta) and the DDIL upload — the seams the other
+    /// tests only reach in-process.
+    #[tokio::test]
+    async fn http_wire_pull_and_ddil_upload() {
+        let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else { return };
+
+        // Central store behind the booted API.
+        let central = scratch_store(&admin, "cca_wire_central").await;
+        central.register_site("MUHJ", "MUHJ", "muhj.x", "UTC", "active").await.expect("register");
+        central
+            .upsert_phone("MUHJ", "p1", "aaaaaaaaaaaa", &json!({"id": "p1", "mac_address": "aa:aa:aa:aa:aa:aa"}), "op")
+            .await
+            .expect("seed p1");
+
+        // Boot the real router on an ephemeral port.
+        let jwks = Arc::new(JwksCache::with_static(test_key().jwks.clone()));
+        let validator_for = |scope: &'static str| {
+            Arc::new(Validator::new(
+                Arc::clone(&jwks),
+                ValidatorConfig {
+                    issuer: TEST_ISSUER.to_string(),
+                    audiences: vec![TEST_AUDIENCE.to_string()],
+                    required_scope: scope,
+                    leeway_secs: 30,
+                },
+            ))
+        };
+        let app = router(Arc::new(AppState {
+            store: central.clone(),
+            sync_validator: validator_for(SYNC_SCOPE),
+            admin_validator: validator_for(ADMIN_SCOPE),
+            start_time: Instant::now(),
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base_url = format!("http://{addr}");
+
+        // The real sync-agent client over real HTTP, with a static token.
+        let client = sbc_config_sync::CentralClient::new(
+            reqwest::Client::new(),
+            base_url,
+            sbc_config_sync::Auth::Static(good_token("MUHJ")),
+        );
+
+        // A real site-local DB with the SBC schema for the agent to apply into.
+        let local = {
+            let opts = PgConnectOptions::from_str(&admin).expect("dsn");
+            let admin_pool =
+                PgPoolOptions::new().max_connections(1).connect_with(opts.clone()).await.expect("admin");
+            sqlx::query("DROP DATABASE IF EXISTS cca_wire_local WITH (FORCE)")
+                .execute(&admin_pool)
+                .await
+                .expect("drop");
+            sqlx::query("CREATE DATABASE cca_wire_local").execute(&admin_pool).await.expect("create");
+            PgPoolOptions::new()
+                .max_connections(5)
+                .connect_with(opts.database("cca_wire_local"))
+                .await
+                .expect("local connect")
+        };
+        sbc_config_store::ensure_schema(&local).await.expect("local schema");
+
+        // First reconcile over HTTP: never-synced → snapshot pull.
+        let outcome = sbc_config_sync::reconcile(
+            &local,
+            &client,
+            &sbc_config_sync::NoopRefresher,
+            "MUHJ",
+        )
+        .await
+        .expect("reconcile over http");
+        assert!(
+            matches!(outcome, sbc_config_sync::Outcome::Snapshotted { .. }),
+            "got {outcome:?}"
+        );
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM phones WHERE id = 'p1' AND NOT deleted")
+            .fetch_one(&local)
+            .await
+            .expect("count");
+        assert_eq!(n, 1, "snapshot pulled the phone over HTTP");
+
+        // Central adds a phone → delta pull over HTTP.
+        central
+            .upsert_phone("MUHJ", "p2", "bbbbbbbbbbbb", &json!({"id": "p2", "mac_address": "bb:bb:bb:bb:bb:bb"}), "op")
+            .await
+            .expect("p2");
+        sbc_config_sync::reconcile(&local, &client, &sbc_config_sync::NoopRefresher, "MUHJ")
+            .await
+            .expect("delta over http");
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM phones WHERE NOT deleted")
+            .fetch_one(&local)
+            .await
+            .expect("count");
+        assert_eq!(n, 2, "delta pulled p2 over HTTP");
+
+        // DDIL: a local edit, then reconcile uploads it over HTTP and
+        // central adopts it (local wins).
+        sqlx::query("INSERT INTO phones (id, mac_normalized, data, updated_by) VALUES ($1,$2,$3,'local')")
+            .bind("p-edge")
+            .bind("cccccccccccc")
+            .bind(json!({"id":"p-edge","mac_address":"cc:cc:cc:cc:cc:cc"}))
+            .execute(&local)
+            .await
+            .expect("local edit");
+        sbc_config_sync::reconcile(&local, &client, &sbc_config_sync::NoopRefresher, "MUHJ")
+            .await
+            .expect("upload over http");
+        // The edit reached central through POST /upload.
+        let snap = central.snapshot("MUHJ").await.expect("central snapshot");
+        let has_edge = snap
+            .tables
+            .iter()
+            .find(|t| t.table == ConfigTable::Phones)
+            .is_some_and(|t| t.rows.iter().any(|r| r.id == "p-edge"));
+        assert!(has_edge, "local edit uploaded to central over HTTP");
+    }
 }
