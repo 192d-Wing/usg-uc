@@ -90,6 +90,13 @@ impl AppState {
             .build()
             .map_err(|e| StateError::OidcCa(format!("build HTTP client: {e}")))?;
         let jwks = Arc::new(JwksCache::new(http, cfg.oidc_issuer.clone()));
+        // Prime the JWKS once at startup (best-effort) so /readyz reflects
+        // real IdP reachability instead of staying unready until the first
+        // token validation triggers a lazy fetch.
+        if let Err(e) = jwks.refresh().await {
+            tracing::warn!(error = %e, issuer = %cfg.oidc_issuer,
+                "initial JWKS prime failed; will refresh on first token use");
+        }
         let validator_for = |scope: &'static str| {
             Arc::new(Validator::new(
                 Arc::clone(&jwks),

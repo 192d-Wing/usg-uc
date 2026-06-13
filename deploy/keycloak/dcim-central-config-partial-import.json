@@ -1,0 +1,106 @@
+{
+  "ifResourceExists": "SKIP",
+  "clientScopes": [
+    {
+      "name": "config-sync",
+      "description": "Per-site sync service-account scope for central-config-api.",
+      "protocol": "openid-connect",
+      "attributes": { "include.in.token.scope": "true", "display.on.consent.screen": "false" },
+      "protocolMappers": [
+        {
+          "name": "aud-usg-uc-config",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": { "included.client.audience": "usg-uc-config", "access.token.claim": "true", "id.token.claim": "false" }
+        }
+      ]
+    },
+    {
+      "name": "config",
+      "description": "Base operator scope (gate) for central-config-api; ABAC decides actions from roles/sites.",
+      "protocol": "openid-connect",
+      "attributes": { "include.in.token.scope": "true", "display.on.consent.screen": "false" },
+      "protocolMappers": [
+        {
+          "name": "aud-usg-uc-config",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": { "included.client.audience": "usg-uc-config", "access.token.claim": "true", "id.token.claim": "false" }
+        },
+        {
+          "name": "roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": { "claim.name": "roles", "jsonType.label": "String", "multivalued": "true", "access.token.claim": "true", "id.token.claim": "false", "usermodel.realmRoleMapping.rolePrefix": "" }
+        },
+        {
+          "name": "sites",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": { "user.attribute": "sites", "claim.name": "sites", "jsonType.label": "String", "multivalued": "true", "access.token.claim": "true", "id.token.claim": "false" }
+        }
+      ]
+    },
+    {
+      "name": "config-admin",
+      "description": "Optional fleet-admin scope; presence => full-fleet ABAC + sbc-api SSO.",
+      "protocol": "openid-connect",
+      "attributes": { "include.in.token.scope": "true", "display.on.consent.screen": "false" },
+      "protocolMappers": [
+        {
+          "name": "aud-usg-uc-config",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": { "included.client.audience": "usg-uc-config", "access.token.claim": "true", "id.token.claim": "false" }
+        }
+      ]
+    }
+  ],
+  "roles": {
+    "realm": [
+      { "name": "fleet-admin", "description": "central-config ABAC: full fleet (*:*)" },
+      { "name": "site-admin", "description": "central-config ABAC: all entities, scoped by sites allowlist" },
+      { "name": "auditor", "description": "central-config ABAC: read-only (*:read)" },
+      { "name": "config-reader", "description": "central-config ABAC: read-only (*:read)" },
+      { "name": "phones-admin", "description": "central-config ABAC: phones:*" },
+      { "name": "directory-admin", "description": "central-config ABAC: directory:*" },
+      { "name": "trunk-admin", "description": "central-config ABAC: trunkgroups:*" },
+      { "name": "dialplan-admin", "description": "central-config ABAC: dialplans:* + routing:*" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "usg-uc-site-sync-oopl-001",
+      "description": "OOPL-001 sbc-config-sync service account. Pulls only its own shard.",
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "attributes": { "access.token.lifespan": "900" },
+      "defaultClientScopes": ["config-sync"],
+      "optionalClientScopes": [],
+      "protocolMappers": [
+        {
+          "name": "site_code",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "config": { "claim.name": "site_code", "claim.value": "OOPL-001", "access.token.claim": "true", "id.token.claim": "false", "jsonType.label": "String" }
+        }
+      ]
+    },
+    {
+      "clientId": "usg-uc-config-admin",
+      "description": "Operator/dashboard PKCE client for central-config-api (and sbc-api SSO for fleet admins).",
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "attributes": { "pkce.code.challenge.method": "S256" },
+      "redirectUris": ["https://sbc.oopl.dev.mil/*"],
+      "webOrigins": ["https://sbc.oopl.dev.mil"],
+      "defaultClientScopes": ["config"],
+      "optionalClientScopes": ["config-admin"]
+    }
+  ]
+}

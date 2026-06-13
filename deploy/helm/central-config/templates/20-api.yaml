@@ -69,7 +69,11 @@ spec:
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
-            capabilities: { drop: ["ALL"] }
+            # NET_BIND_SERVICE added so the setcap'd binary (file capability)
+            # can still exec under no_new_privs and bind :80 as non-root.
+            capabilities:
+              drop: [ALL]
+              add: [NET_BIND_SERVICE]
           {{- if .Values.api.oidc.extraCaCert }}
           volumeMounts:
             - { name: extra-ca, mountPath: /etc/ssl/extra-ca, readOnly: true }
