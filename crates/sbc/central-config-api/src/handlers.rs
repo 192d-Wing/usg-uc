@@ -44,6 +44,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/sites/{site_code}/dialplans", post(upsert_dial_plan))
         .route("/v1/sites/{site_code}/dialplans/{id}", axum::routing::delete(delete_dial_plan))
         .route("/v1/sites/{site_code}/config", put(put_site_config))
+        // SBC routing entities (partitions / calling_search_spaces /
+        // route_patterns / route_lists), JSON pass-through by id.
+        .route("/v1/sites/{site_code}/routing/{kind}", post(upsert_routing))
+        .route(
+            "/v1/sites/{site_code}/routing/{kind}/{id}",
+            axum::routing::delete(delete_routing),
+        )
         // Global templates + materialization (config-admin tokens).
         .route("/v1/templates/{kind}/{id}", put(put_template).delete(delete_template))
         .route("/v1/templates/{kind}/{id}/sites/{site_code}", put(assign_template))
@@ -433,6 +440,60 @@ async fn delete_dial_plan(
         Err(rej) => return rej.into_response(),
     };
     match state.store.delete(ConfigTable::DialPlans, &site, &id, &actor).await {
+        Ok(epoch) => ok_epoch(epoch),
+        Err(e) => write_error(&e),
+    }
+}
+
+/// Map a `{kind}` routing path segment to its config table.
+fn routing_table(kind: &str) -> Option<ConfigTable> {
+    match kind {
+        "partitions" => Some(ConfigTable::SbcPartitions),
+        "calling_search_spaces" => Some(ConfigTable::SbcCallingSearchSpaces),
+        "route_patterns" => Some(ConfigTable::SbcRoutePatterns),
+        "route_lists" => Some(ConfigTable::SbcRouteLists),
+        _ => None,
+    }
+}
+
+/// `POST /v1/sites/{site}/routing/{kind}` — upsert an SBC routing entity
+/// (body is the entity JSON; must carry an `id`).
+async fn upsert_routing(
+    State(state): State<Arc<AppState>>,
+    Path((site, kind)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+        Ok(c) => c.sub,
+        Err(rej) => return rej.into_response(),
+    };
+    let Some(table) = routing_table(&kind) else {
+        return bad_request("kind must be partitions, calling_search_spaces, route_patterns, or route_lists");
+    };
+    let Some(id) = body.get("id").and_then(Value::as_str) else {
+        return bad_request("routing entity id is required");
+    };
+    match state.store.upsert_json(table, &site, id, &body, &actor).await {
+        Ok(epoch) => ok_epoch(epoch),
+        Err(e) => write_error(&e),
+    }
+}
+
+/// `DELETE /v1/sites/{site}/routing/{kind}/{id}` — tombstone a routing entity.
+async fn delete_routing(
+    State(state): State<Arc<AppState>>,
+    Path((site, kind, id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+        Ok(c) => c.sub,
+        Err(rej) => return rej.into_response(),
+    };
+    let Some(table) = routing_table(&kind) else {
+        return bad_request("unknown routing kind");
+    };
+    match state.store.delete(table, &site, &id, &actor).await {
         Ok(epoch) => ok_epoch(epoch),
         Err(e) => write_error(&e),
     }
@@ -917,6 +978,36 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        // SBC routing entities: upsert a partition (200), unknown kind (400),
+        // then delete it (200).
+        let (s, _) = send_req(
+            &app,
+            "POST",
+            "/v1/sites/MUHJ/routing/partitions",
+            Some(&admin_tok),
+            Some(json!({"id": "internal", "description": "on-net"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = send_req(
+            &app,
+            "POST",
+            "/v1/sites/MUHJ/routing/bogus",
+            Some(&admin_tok),
+            Some(json!({"id": "x"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = send_req(
+            &app,
+            "DELETE",
+            "/v1/sites/MUHJ/routing/partitions/internal",
+            Some(&admin_tok),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
     }
 
     #[tokio::test]
