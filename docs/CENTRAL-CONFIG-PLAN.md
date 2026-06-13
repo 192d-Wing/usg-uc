@@ -279,11 +279,18 @@ pod per base.
   the edge during a partition → upload on reconnect → central adopts →
   converges, with central's own concurrent change still pulled down).
 
-**Deferred to a follow-up** (not blocking sync): calling the daemon's gRPC
-refresh after an apply (so dial-plan/trunk changes take effect without a
-restart — same hook `sbc-api-server` uses). Today applied changes land in
-the local Postgres and the daemon picks them up on its normal config-reload
-path.
+- After a successful apply the agent does a **best-effort daemon refresh**:
+  it pokes the daemon's per-entity sync RPCs (`TrunkSync` / `DialPlanSync` /
+  `DidMappingSync` / `SbcSync` — the same hooks `sbc-api-server` uses) for
+  the changed entities, so dial-plan / trunk / routing changes take effect
+  without a daemon restart. RPC failures are logged, never fatal (Postgres
+  is the source of truth; the daemon also replays on startup). Enabled by
+  `SYNC_DAEMON_GRPC_URL`; phones and site-config have no live router and are
+  skipped.
+- Auth is OIDC **client-credentials** (`SYNC_OIDC_*`): the agent exchanges
+  a per-site client id/secret for an access token and refreshes it ahead of
+  expiry, so Keycloak secret rotation needs no pod restart. A static
+  `SYNC_BEARER_TOKEN` is still accepted for break-glass / tests.
 
 ### 5.3 Failure behavior
 
@@ -319,9 +326,10 @@ epoch), which the journal handles naturally and lets you do staged rollout
 
 - All writes go through `central-config-api`'s operator surface
   (`POST /v1/sites`, `POST|DELETE /v1/sites/{site}/{phones|directory|
-  trunkgroups|dialplans}`, `PUT /v1/sites/{site}/config`) — **implemented**,
-  each driving one transactional store write (epoch + revision + journal),
-  attributed to the token subject.
+  trunkgroups|dialplans}`, `POST|DELETE /v1/sites/{site}/routing/{kind}`
+  for the four SBC routing entities, `PUT /v1/sites/{site}/config`) —
+  **implemented**, each driving one transactional store write (epoch +
+  revision + journal), attributed to the token subject.
 - Operator authz is a second OIDC scope, `config-admin`, validated by a
   separate validator sharing the same issuer/JWKS as the sync validator —
   so a site's `config-sync` pull token can never write and an operator
@@ -331,8 +339,9 @@ epoch), which the journal handles naturally and lets you do staged rollout
 - Validation moved central: trunk-group and dial-plan payloads are parsed
   against the typed `sbc-config` schemas (`TrunkGroupConfig`,
   `DialPlanConfig`) before commit — the JSONB pass-through finally gets
-  enforcement at one choke point. (sbc-entity validation is the same
-  pattern, to add as those write routes land.)
+  enforcement at one choke point. (The four SBC routing entities are JSON
+  pass-through with no typed schema — same as the per-site api-server — so
+  their routes require only an `id`.)
 - Still to do: point the `usg-sbc-dashboard` SPA at the central API. The
   per-site `sbc-api-server` keeps a config write path **on purpose** — it
   is how a site edits its own config during a partition (§7); those writes
@@ -434,13 +443,13 @@ Because materialization is per-site, fleet-wide changes get rings for free:
 > envelope. **DDIL autonomy (§7) is implemented**: sites edit their own
 > config while partitioned (`updated_by='local'`), the apply engine
 > preserves those rows, and they upload to central on reconnect (local
-> wins) and converge — covered by an end-to-end round-trip test. Deploy:
+> wins) and converge — covered by an end-to-end round-trip test. The agent
+> also refreshes the daemon over gRPC after each apply and authenticates
+> via OIDC client-credentials with token refresh. Deploy:
 > `deploy/helm/central-config`, the `sbc` chart's `sbcConfigSync`
 > component, and `deploy/keycloak/central-config-clients.md`. Remaining:
-> production HA-Postgres wiring, the dashboard SPA cutover, an optional
-> operator-approval gate on uploads, and the agent's daemon-gRPC
-> refresh-after-apply (today changes land in local Postgres and the daemon
-> picks them up on its normal config-reload path).
+> production HA-Postgres wiring, the dashboard SPA cutover, and an optional
+> operator-approval gate on uploads.
 
 ### Phase 0 — Foundations (no behavior change)
 
@@ -467,7 +476,8 @@ Because materialization is per-site, fleet-wide changes get rings for free:
 
 - New crate `sbc-config-sync` + container `usg-sbc-config-sync` (follows the
   `usg-` naming convention) + Helm template; `sync_state` table local-side.
-- Snapshot + delta apply + daemon gRPC refresh + metrics.
+- Snapshot + delta apply + daemon gRPC refresh + metrics. **Implemented**
+  (see §5.2).
 - Soak in lab (OOPL): kill WAN, kill local PG, verify snapshot recovery and
   refresh behavior.
 
