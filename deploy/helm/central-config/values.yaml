@@ -24,12 +24,23 @@ api:
     issuer: ""
     audience: "usg-uc-config"
 
-# Central Postgres. The bundled single-instance Deployment is for
-# lab/dev only — set `enabled: false` and point `existingSecret` at an HA
-# managed/operator Postgres (CNPG, Patroni) with PITR for production. The
-# central DB is the one datastore that must not lose writes.
+# Central Postgres. The central DB is the one datastore that must not lose
+# writes, so production must be HA + PITR-backed.
+#
+#   mode: bundled  — single-instance StatefulSet, LAB/DEV ONLY (not HA).
+#   mode: cnpg     — a CloudNativePG Cluster (primary + replicas, failover,
+#                    optional PITR). PRODUCTION. Requires the CloudNativePG
+#                    operator to be installed in the cluster first:
+#                      kubectl apply --server-side -f \
+#                        https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.24/releases/cnpg-1.24.0.yaml
+#   mode: external — bring your own managed/HA Postgres; reference its DSN
+#                    secret via existingSecret.
 postgres:
-  enabled: true
+  mode: bundled
+  # Max connections per pool the API opens (primary and replica each).
+  maxConnections: 10
+
+  # --- mode: bundled (lab/dev) ---
   image: postgres:18-alpine
   storage: 5Gi
   database: usg_config
@@ -39,10 +50,43 @@ postgres:
   resources:
     requests: { cpu: "100m", memory: "256Mi" }
     limits:   { cpu: "1",    memory: "1Gi" }
-  # For production: bring your own Postgres and reference its DSN secret.
+
+  # --- mode: external ---
+  # The Secret must hold a read-write DSN under `key`. Optionally a
+  # read-only (replica/-ro endpoint) DSN under `roKey`; if unset, the API
+  # serves every read from the primary.
   existingSecret:
     name: ""
     key: dsn
+    roKey: ""
+
+  # --- mode: cnpg (production) ---
+  cnpg:
+    # Instances = 1 primary + (instances-1) hot-standby replicas. The API
+    # routes the heavy snapshot read to the `-ro` service (replicas) and
+    # all writes + epoch/delta to the `-rw` service (primary).
+    instances: 3
+    storage: 20Gi
+    # Optional explicit operand image (else the operator's default).
+    imageName: ""
+    # App-user credential CNPG provisions (we own it so we can build both
+    # the -rw and -ro DSNs). Use a real secret manager in production.
+    database: usg_config
+    user: central
+    password: "change-me"
+    resources:
+      requests: { cpu: "250m", memory: "512Mi" }
+      limits:   { cpu: "2",    memory: "2Gi" }
+    # Continuous backup / PITR to an object store (Barman). Leave disabled
+    # until a bucket + credentials exist; production SHOULD enable it.
+    backup:
+      enabled: false
+      destinationPath: ""        # e.g. s3://my-bucket/central-config
+      endpointURL: ""            # optional custom S3 endpoint
+      retentionPolicy: "30d"
+      # Secret with object-store credentials (keys: ACCESS_KEY_ID,
+      # ACCESS_SECRET_KEY).
+      credentialsSecret: ""
 
 serviceAccount:
   create: true

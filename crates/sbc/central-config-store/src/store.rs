@@ -10,7 +10,7 @@
 //! never sees a row whose change isn't journaled, or vice versa.
 
 use serde_json::{Map, Value};
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use sqlx::{Postgres, Row, Transaction};
 
 use crate::error::{CentralError, CentralResult};
@@ -35,48 +35,129 @@ const PARTITIONED_TABLES: &[&str] = &[
     "config_journal",
 ];
 
+/// Connection settings for [`CentralConfigStore::connect_with`].
+///
+/// `replica_url` enables a read/write split: heavy, lag-tolerant fan-out
+/// reads (currently [`snapshot`](CentralConfigStore::snapshot)) are served
+/// from the replica pool, while writes, migrations, and all
+/// consistency-critical reads (epoch, delta, operator reads) stay on the
+/// primary. When `replica_url` is `None`, the replica pool is a clone of
+/// the primary — a single-node deployment behaves exactly as before.
+#[derive(Clone, Copy, Debug)]
+pub struct StoreConfig<'a> {
+    /// DSN of the read-write primary (must accept writes; migrations run here).
+    pub primary_url: &'a str,
+    /// DSN of a read-only replica endpoint (e.g. a `CloudNativePG` `-ro`
+    /// service). `None` routes every read at the primary.
+    pub replica_url: Option<&'a str>,
+    /// Max connections per pool.
+    pub max_connections: u32,
+    /// `application_name` reported to Postgres (eases `pg_stat_activity`
+    /// attribution); the replica pool appends ` (ro)`.
+    pub application_name: &'a str,
+}
+
+impl<'a> StoreConfig<'a> {
+    /// A single-node config for `primary_url` with library defaults
+    /// (10 connections, no replica).
+    #[must_use]
+    pub const fn single(primary_url: &'a str) -> Self {
+        Self {
+            primary_url,
+            replica_url: None,
+            max_connections: 10,
+            application_name: "central-config-store",
+        }
+    }
+}
+
+/// Build a lazily-connected pool from a DSN, stamping `application_name`.
+/// Lazy so a momentarily-unreachable replica doesn't block startup; the
+/// primary's reachability is still proven by the migration step.
+fn build_pool(url: &str, max_connections: u32, application_name: &str) -> CentralResult<PgPool> {
+    let opts: PgConnectOptions = url.parse()?;
+    let opts = opts.application_name(application_name);
+    Ok(PgPoolOptions::new()
+        .max_connections(max_connections)
+        .connect_lazy_with(opts))
+}
+
 /// Pooled handle to the central config database.
+///
+/// Holds two pools. `primary` is the read-write node: it serves every
+/// write, the startup migrations, and the consistency-critical reads
+/// (epoch/delta and the operator/dashboard reads, so a write is
+/// immediately visible to its author). `replica` serves only the heavy,
+/// lag-tolerant fan-out read ([`snapshot`](Self::snapshot)); it is a clone
+/// of `primary` when no replica DSN is configured.
 #[derive(Clone)]
 pub struct CentralConfigStore {
-    pool: PgPool,
+    primary: PgPool,
+    replica: PgPool,
 }
 
 impl CentralConfigStore {
-    /// Connect with a fresh pool and run pending migrations.
+    /// Connect with a fresh primary pool and run pending migrations. No
+    /// read replica (reads are served from the primary).
     ///
     /// # Errors
     /// [`CentralError::Storage`] on pool or migration failure.
     pub async fn connect(database_url: &str) -> CentralResult<Self> {
-        let pool = PgPoolOptions::new()
-            .max_connections(10)
-            .connect(database_url)
-            .await?;
-        Self::from_pool(pool).await
+        Self::connect_with(StoreConfig::single(database_url)).await
     }
 
-    /// Build from an existing pool, running pending migrations.
+    /// Connect with explicit [`StoreConfig`], wiring a read/write split
+    /// when `replica_url` is set, then run pending migrations on the
+    /// primary.
+    ///
+    /// # Errors
+    /// [`CentralError::Storage`] on a bad DSN, pool, or migration failure.
+    pub async fn connect_with(cfg: StoreConfig<'_>) -> CentralResult<Self> {
+        let primary = build_pool(cfg.primary_url, cfg.max_connections, cfg.application_name)?;
+        let replica = match cfg.replica_url {
+            Some(url) => {
+                let app = format!("{} (ro)", cfg.application_name);
+                build_pool(url, cfg.max_connections, &app)?
+            }
+            None => primary.clone(),
+        };
+        // Migrations run on the primary only; the replica is read-only.
+        crate::schema::ensure_schema(&primary).await?;
+        Ok(Self { primary, replica })
+    }
+
+    /// Build from an existing pool, running pending migrations. The pool
+    /// serves as both primary and replica (no read/write split).
     ///
     /// # Errors
     /// [`CentralError::Storage`] on migration failure.
     pub async fn from_pool(pool: PgPool) -> CentralResult<Self> {
         crate::schema::ensure_schema(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            replica: pool.clone(),
+            primary: pool,
+        })
     }
 
-    /// The underlying pool (for shared construction).
+    /// The primary (read-write) pool — used for shared construction and
+    /// the write/operator-read paths.
     #[must_use]
     pub const fn pool(&self) -> &PgPool {
-        &self.pool
+        &self.primary
     }
 
     /// Cheap round-trip to confirm the database is reachable (for
-    /// readiness probes).
+    /// readiness probes). Checks both the primary and the replica; with no
+    /// replica configured the second check hits the same pool.
     ///
     /// # Errors
-    /// [`CentralError::Storage`] if the query fails.
+    /// [`CentralError::Storage`] if either query fails.
     pub async fn ping(&self) -> CentralResult<()> {
         sqlx::query_scalar::<_, i32>("SELECT 1")
-            .fetch_one(&self.pool)
+            .fetch_one(&self.primary)
+            .await?;
+        sqlx::query_scalar::<_, i32>("SELECT 1")
+            .fetch_one(&self.replica)
             .await?;
         Ok(())
     }
@@ -100,7 +181,7 @@ impl CentralConfigStore {
         status: &str,
     ) -> CentralResult<()> {
         validate_site_code(site_code)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.primary.begin().await?;
         sqlx::query(
             "INSERT INTO sites (site_code, display_name, fqdn_base, timezone, status)
              VALUES ($1, $2, $3, $4, $5)
@@ -147,7 +228,7 @@ impl CentralConfigStore {
         data: &Value,
         actor: &str,
     ) -> CentralResult<i64> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.primary.begin().await?;
         let epoch = bump_epoch(&mut tx, site_code).await?;
         let res = sqlx::query(
             "INSERT INTO phones
@@ -205,7 +286,7 @@ impl CentralConfigStore {
         extra: &Map<String, Value>,
         actor: &str,
     ) -> CentralResult<i64> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.primary.begin().await?;
         let epoch = bump_epoch(&mut tx, site_code).await?;
 
         // Claim the DID fleet-wide. FOR UPDATE locks any existing row so
@@ -296,7 +377,7 @@ impl CentralConfigStore {
             "upsert_json called for typed table {}",
             table.name()
         );
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.primary.begin().await?;
         let epoch = bump_epoch(&mut tx, site_code).await?;
         let sql = format!(
             "INSERT INTO {table} (site_code, id, data, revision, deleted, updated_by)
@@ -351,7 +432,7 @@ impl CentralConfigStore {
         } else {
             "id"
         };
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.primary.begin().await?;
         let epoch = bump_epoch(&mut tx, site_code).await?;
         let sql = format!(
             "UPDATE {table} SET deleted = TRUE, revision = $1, updated_by = $2, updated_at = NOW()
@@ -466,7 +547,7 @@ impl CentralConfigStore {
         let epoch: Option<i64> =
             sqlx::query_scalar("SELECT config_epoch FROM sites WHERE site_code = $1")
                 .bind(site_code)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.primary)
                 .await?;
         epoch.ok_or_else(|| CentralError::UnknownSite(site_code.to_string()))
     }
@@ -491,7 +572,7 @@ impl CentralConfigStore {
         )
         .bind(site_code)
         .bind(since)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.primary)
         .await?;
 
         let mut changes = Vec::with_capacity(rows.len());
@@ -524,7 +605,13 @@ impl CentralConfigStore {
     /// # Errors
     /// [`CentralError::UnknownSite`] or [`CentralError::Storage`].
     pub async fn snapshot(&self, site_code: &str) -> CentralResult<Snapshot> {
-        let mut tx = self.pool.begin().await?;
+        // Served from the replica: snapshot is the heaviest read (full
+        // shard materialization) and is self-consistent within its own
+        // repeatable-read transaction, so replica lag only means a slightly
+        // older — but coherent — epoch + rows. The client then resumes
+        // deltas from `snapshot.epoch` against the primary, so a lagging
+        // replica can never make it miss a change.
+        let mut tx = self.replica.begin().await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             .execute(&mut *tx)
             .await?;
@@ -555,7 +642,7 @@ impl CentralConfigStore {
         let rows = sqlx::query(
             "SELECT site_code, display_name, status, config_epoch FROM sites ORDER BY site_code",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.primary)
         .await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -578,7 +665,7 @@ impl CentralConfigStore {
         table: ConfigTable,
         site_code: &str,
     ) -> CentralResult<Vec<SnapshotRow>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.primary.begin().await?;
         let rows = snapshot_table(&mut tx, table, site_code).await?;
         tx.commit().await?;
         Ok(rows)
@@ -602,7 +689,7 @@ impl CentralConfigStore {
             )
             .bind(site_code)
             .bind(row_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.primary)
             .await?;
             let Some(row) = row else { return Ok(None) };
             let extra: Value = row.try_get("extra")?;
@@ -622,7 +709,7 @@ impl CentralConfigStore {
             let row = sqlx::query(&sql)
                 .bind(site_code)
                 .bind(row_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.primary)
                 .await?;
             row.map(|r| r.try_get::<Value, _>("data"))
                 .transpose()

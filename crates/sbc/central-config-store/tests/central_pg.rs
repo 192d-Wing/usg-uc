@@ -16,7 +16,8 @@ use serde_json::{Map, Value, json};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 use central_config_store::{
-    CentralConfigStore, ChangeOp, ConfigTable, DeltaResult, SiteMaterialization, TemplateKind,
+    CentralConfigStore, ChangeOp, ConfigTable, DeltaResult, SiteMaterialization, StoreConfig,
+    TemplateKind,
 };
 
 fn admin_dsn() -> Option<String> {
@@ -550,4 +551,67 @@ async fn template_materialization_rings_overrides_and_delete() {
     .await
     .expect("assign count");
     assert_eq!(n, 0);
+}
+
+/// Return `dsn` with its database segment replaced by `db` (handles an
+/// optional `?query` suffix). Good enough for the simple harness DSNs.
+fn with_db(dsn: &str, db: &str) -> String {
+    let (base, query) = dsn
+        .split_once('?')
+        .map_or((dsn, None), |(b, q)| (b, Some(q)));
+    let trimmed = base.trim_end_matches('/');
+    let cut = trimmed.rfind('/').expect("dsn has a database path segment");
+    let mut out = format!("{}/{db}", &trimmed[..cut]);
+    if let Some(q) = query {
+        out.push('?');
+        out.push_str(q);
+    }
+    out
+}
+
+/// The read/write split: with a replica DSN configured (here the same node
+/// stands in for a replica), writes land via the primary pool and the
+/// replica-served `snapshot` still sees them; `ping` checks both pools.
+#[tokio::test]
+async fn split_pools_serve_reads_and_writes_on_one_node() {
+    let Some(admin) = admin_dsn() else { return };
+    // Create the scratch DB up front, then connect both pools to it.
+    let _ = fresh_store(&admin, "cst_split").await;
+    let dsn = with_db(&admin, "cst_split");
+    let store = CentralConfigStore::connect_with(StoreConfig {
+        primary_url: &dsn,
+        replica_url: Some(&dsn),
+        max_connections: 5,
+        application_name: "central-config-store-test",
+    })
+    .await
+    .expect("connect split pools");
+
+    // Writes go to the primary.
+    store
+        .register_site("MUHJ", "MUHJ", "muhj.x", "UTC", "active")
+        .await
+        .expect("register");
+    store
+        .upsert_phone("MUHJ", "p1", "aabbccddeeff", &json!({"id": "p1"}), "op")
+        .await
+        .expect("upsert phone");
+
+    // epoch/delta are primary-served and authoritative.
+    assert_eq!(store.epoch("MUHJ").await.expect("epoch"), 1);
+
+    // snapshot is replica-served and still sees the just-written row
+    // (same node here, so no lag).
+    let snap = store.snapshot("MUHJ").await.expect("snapshot");
+    assert_eq!(snap.epoch, 1);
+    let phones = snap
+        .tables
+        .iter()
+        .find(|t| t.table == ConfigTable::Phones)
+        .expect("phones table");
+    assert_eq!(phones.rows.len(), 1);
+    assert_eq!(phones.rows[0].id, "p1");
+
+    // readiness pings both pools.
+    store.ping().await.expect("ping both pools");
 }

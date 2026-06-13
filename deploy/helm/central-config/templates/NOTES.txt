@@ -1,12 +1,24 @@
 central-config deployed.
 
 central-config-api:  {{ include "central-config.fullname" . }}-api.{{ .Release.Namespace }}.svc:80
-{{- if .Values.postgres.enabled }}
+{{- $mode := .Values.postgres.mode | default "bundled" }}
+{{- if eq $mode "bundled" }}
 central Postgres:    bundled single instance (LAB/DEV) — NOT HA. For
-                     production set postgres.enabled=false and point
-                     postgres.existingSecret at an HA/PITR database.
+                     production set postgres.mode=cnpg (CloudNativePG) or
+                     postgres.mode=external. Reads are served from the
+                     primary (no replica).
+{{- else if eq $mode "cnpg" }}
+central Postgres:    CloudNativePG Cluster "{{ include "central-config.cnpgName" . }}"
+                     ({{ .Values.postgres.cnpg.instances | default 3 }} instances). Writes + epoch/delta → -rw
+                     (primary); the heavy snapshot read → -ro (replicas).
+                     Requires the CloudNativePG operator to be installed.
+{{- if not .Values.postgres.cnpg.backup.enabled }}
+                     WARNING: PITR backup is disabled — set
+                     postgres.cnpg.backup.enabled=true for production.
+{{- end }}
 {{- else }}
 central Postgres:    external (postgres.existingSecret={{ .Values.postgres.existingSecret.name }})
+                     {{- if .Values.postgres.existingSecret.roKey }} with read replica (roKey set){{- else }} — reads use the primary (no roKey){{- end }}
 {{- end }}
 
 Next steps:

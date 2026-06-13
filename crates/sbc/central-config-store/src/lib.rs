@@ -27,4 +27,4 @@ pub use model::{
     Snapshot, SnapshotRow, TableRows, TemplateKind, UploadBatch, UploadChange,
 };
 pub use schema::ensure_schema;
-pub use store::CentralConfigStore;
+pub use store::{CentralConfigStore, StoreConfig};

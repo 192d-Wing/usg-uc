@@ -38,16 +38,48 @@ app.kubernetes.io/component: postgres
 {{- end -}}
 {{- end }}
 
-{{/* The Postgres DSN env var: from the bundled secret or an external one. */}}
+{{/* The CloudNativePG Cluster name (its -rw/-ro/-r Services derive from it). */}}
+{{- define "central-config.cnpgName" -}}
+{{- printf "%s-pg" (include "central-config.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
+{{/*
+  Database env for the API: the read-write CENTRAL_POSTGRES_URL, an optional
+  read-only CENTRAL_POSTGRES_RO_URL (which enables the read/write split), and
+  the per-pool connection cap. Sourced per `postgres.mode`:
+    bundled  — one Secret, dsn only (no replica; reads use the primary).
+    cnpg     — our owned Secret with dsn (-rw) and dsnRo (-ro).
+    external — existingSecret.key for RW, optional existingSecret.roKey for RO.
+*/}}
 {{- define "central-config.dsnEnv" -}}
+{{- $mode := .Values.postgres.mode | default "bundled" -}}
 - name: CENTRAL_POSTGRES_URL
   valueFrom:
     secretKeyRef:
-{{- if .Values.postgres.enabled }}
+{{- if eq $mode "bundled" }}
       name: {{ include "central-config.fullname" . }}-postgres
       key: dsn
-{{- else }}
-      name: {{ required "postgres.existingSecret.name required when postgres.enabled=false" .Values.postgres.existingSecret.name }}
+{{- else if eq $mode "cnpg" }}
+      name: {{ include "central-config.fullname" . }}-cnpg
+      key: dsn
+- name: CENTRAL_POSTGRES_RO_URL
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "central-config.fullname" . }}-cnpg
+      key: dsnRo
+{{- else if eq $mode "external" }}
+      name: {{ required "postgres.existingSecret.name required when postgres.mode=external" .Values.postgres.existingSecret.name }}
       key: {{ .Values.postgres.existingSecret.key | default "dsn" }}
+{{- if .Values.postgres.existingSecret.roKey }}
+- name: CENTRAL_POSTGRES_RO_URL
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.postgres.existingSecret.name }}
+      key: {{ .Values.postgres.existingSecret.roKey }}
 {{- end }}
+{{- else }}
+{{- fail (printf "postgres.mode must be bundled|cnpg|external, got %q" $mode) }}
+{{- end }}
+- name: CENTRAL_PG_MAX_CONNS
+  value: {{ .Values.postgres.maxConnections | default 10 | quote }}
 {{- end }}

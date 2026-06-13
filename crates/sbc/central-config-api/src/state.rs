@@ -58,9 +58,14 @@ impl AppState {
     /// # Errors
     /// [`StateError::Store`] if the database can't be reached or migrated.
     pub async fn build(cfg: &Config) -> Result<Arc<Self>, StateError> {
-        let store = CentralConfigStore::connect(&cfg.database_url)
-            .await
-            .map_err(|e| StateError::Store(e.to_string()))?;
+        let store = CentralConfigStore::connect_with(central_config_store::StoreConfig {
+            primary_url: &cfg.database_url,
+            replica_url: cfg.database_ro_url.as_deref(),
+            max_connections: cfg.db_max_connections,
+            application_name: "central-config-api",
+        })
+        .await
+        .map_err(|e| StateError::Store(e.to_string()))?;
 
         // rustls-only HTTP client for JWKS fetches; one cache, two validators.
         let http = reqwest::Client::builder()
