@@ -472,7 +472,16 @@ Because materialization is per-site, fleet-wide changes get rings for free:
 ### Phase 1 — Central stack
 
 - Stand up central Postgres (HA: Patroni/CNPG pair + WAL archiving to object
-  storage; this is the one DB that must not lose data).
+  storage; this is the one DB that must not lose data). **Implemented** —
+  the `central-config` chart has `postgres.mode: bundled|cnpg|external`; the
+  `cnpg` mode declares a CloudNativePG `Cluster` (primary + replicas,
+  automatic failover, optional Barman/PITR object-store backup). The store
+  runs a read/write split: writes, migrations, `epoch`/`delta`, and operator
+  reads go to the primary (`-rw`); the heavy `snapshot` fan-out read is
+  served from a replica (`-ro`) via `CENTRAL_POSTGRES_RO_URL`. Routing keeps
+  `epoch`/`delta` on the primary so replica lag can't trigger spurious
+  `MustSnapshot`, and the client always resumes deltas from the primary, so
+  a lagging snapshot can never make a site miss a change.
 - New `central-config-api` service (reuses `sbc-config-store` +
   `sbc-api-server` code, adds partition-aware stores, journal writes, sync
   endpoints, OIDC site-scoped authz).

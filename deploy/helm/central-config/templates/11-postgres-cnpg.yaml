@@ -1,0 +1,82 @@
+{{- if eq (.Values.postgres.mode | default "bundled") "cnpg" }}
+{{- $cnpg := .Values.postgres.cnpg }}
+{{- $name := include "central-config.cnpgName" . }}
+{{- $ns := .Release.Namespace }}
+{{- $user := $cnpg.user | default "central" }}
+{{- $pass := $cnpg.password | default "change-me" }}
+{{- $db := $cnpg.database | default "usg_config" }}
+# Production central Postgres via the CloudNativePG operator.
+#
+# PREREQUISITE: the CloudNativePG operator must already be installed in the
+# cluster (it provides the postgresql.cnpg.io CRDs and reconciles this
+# Cluster). This chart only declares the Cluster + the app credential.
+#
+# The operator creates three Services from the Cluster name:
+#   {{ $name }}-rw  → the current primary  (writes, epoch/delta, migrations)
+#   {{ $name }}-ro  → hot-standby replicas (the heavy snapshot read)
+#   {{ $name }}-r   → any instance
+# Failover is automatic: -rw always tracks the elected primary, so the API
+# needs no failover logic — its primary pool follows -rw.
+#
+# We own the app-user credential (below) so we can publish both the -rw and
+# -ro DSNs the API consumes; CNPG uses it to create the app user/database.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "central-config.fullname" . }}-cnpg
+  namespace: {{ $ns }}
+  labels:
+    {{- include "central-config.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+type: kubernetes.io/basic-auth
+stringData:
+  username: {{ $user | quote }}
+  password: {{ $pass | quote }}
+  dsn: "postgres://{{ $user }}:{{ $pass }}@{{ $name }}-rw.{{ $ns }}.svc.cluster.local:5432/{{ $db }}"
+  dsnRo: "postgres://{{ $user }}:{{ $pass }}@{{ $name }}-ro.{{ $ns }}.svc.cluster.local:5432/{{ $db }}"
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "central-config.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  instances: {{ $cnpg.instances | default 3 }}
+  {{- with $cnpg.imageName }}
+  imageName: {{ . | quote }}
+  {{- end }}
+  # The app user/db are created from the credential Secret we own above, so
+  # the published DSNs always match.
+  bootstrap:
+    initdb:
+      database: {{ $db | quote }}
+      owner: {{ $user | quote }}
+      secret:
+        name: {{ include "central-config.fullname" . }}-cnpg
+  storage:
+    size: {{ $cnpg.storage | default "20Gi" | quote }}
+  {{- with $cnpg.resources }}
+  resources:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- if $cnpg.backup.enabled }}
+  # Continuous WAL archiving + base backups to an object store (PITR).
+  backup:
+    retentionPolicy: {{ $cnpg.backup.retentionPolicy | default "30d" | quote }}
+    barmanObjectStore:
+      destinationPath: {{ required "postgres.cnpg.backup.destinationPath required when backup.enabled" $cnpg.backup.destinationPath | quote }}
+      {{- with $cnpg.backup.endpointURL }}
+      endpointURL: {{ . | quote }}
+      {{- end }}
+      s3Credentials:
+        accessKeyId:
+          name: {{ required "postgres.cnpg.backup.credentialsSecret required when backup.enabled" $cnpg.backup.credentialsSecret }}
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: {{ $cnpg.backup.credentialsSecret }}
+          key: ACCESS_SECRET_KEY
+  {{- end }}
+{{- end }}

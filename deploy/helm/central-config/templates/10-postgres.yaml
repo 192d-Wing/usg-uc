@@ -1,8 +1,8 @@
-{{- if .Values.postgres.enabled }}
+{{- if eq (.Values.postgres.mode | default "bundled") "bundled" }}
 # Bundled single-instance central Postgres — LAB/DEV ONLY.
 #
-# Production must use an HA, PITR-backed Postgres (CNPG / Patroni) and set
-# postgres.enabled=false with postgres.existingSecret pointing at its DSN.
+# Production must use an HA, PITR-backed Postgres: set postgres.mode=cnpg
+# (CloudNativePG Cluster, see 11-postgres-cnpg.yaml) or postgres.mode=external.
 # This is the one datastore in the system that must not lose writes.
 apiVersion: v1
 kind: Secret
