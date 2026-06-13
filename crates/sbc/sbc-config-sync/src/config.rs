@@ -29,13 +29,31 @@ pub struct Config {
     pub local_database_url: String,
     /// Central config API base URL (no trailing slash).
     pub central_url: String,
-    /// OIDC service-account access token presented to the central API.
-    pub bearer_token: String,
+    /// How the agent obtains its central-API bearer token.
+    pub auth: AuthConfig,
     /// Base poll interval. A per-site jitter is added so 184 agents don't
     /// stampede the central API in lockstep.
     pub interval: Duration,
     /// Listen address for the metrics/health HTTP server.
     pub metrics_addr: std::net::SocketAddr,
+}
+
+/// Token-acquisition configuration.
+#[derive(Debug, Clone)]
+pub enum AuthConfig {
+    /// A pre-issued static token (`SYNC_BEARER_TOKEN`). Break-glass / tests.
+    Static(String),
+    /// `OAuth2` client-credentials (`SYNC_OIDC_*`). The production path.
+    Oidc {
+        /// Token endpoint URL.
+        token_url: String,
+        /// Client id (the per-site service account).
+        client_id: String,
+        /// Client secret.
+        client_secret: String,
+        /// Requested scope (default `config-sync`).
+        scope: String,
+    },
 }
 
 impl Config {
@@ -60,8 +78,21 @@ impl Config {
             .ok_or(ConfigError::Missing("SYNC_LOCAL_POSTGRES_URL"))?;
         let central_url =
             lookup("SYNC_CENTRAL_URL").ok_or(ConfigError::Missing("SYNC_CENTRAL_URL"))?;
-        let bearer_token =
-            lookup("SYNC_BEARER_TOKEN").ok_or(ConfigError::Missing("SYNC_BEARER_TOKEN"))?;
+        // Static token wins if present (break-glass / tests); otherwise
+        // require the OIDC client-credentials set.
+        let auth = if let Some(token) = lookup("SYNC_BEARER_TOKEN") {
+            AuthConfig::Static(token)
+        } else {
+            AuthConfig::Oidc {
+                token_url: lookup("SYNC_OIDC_TOKEN_URL")
+                    .ok_or(ConfigError::Missing("SYNC_OIDC_TOKEN_URL"))?,
+                client_id: lookup("SYNC_OIDC_CLIENT_ID")
+                    .ok_or(ConfigError::Missing("SYNC_OIDC_CLIENT_ID"))?,
+                client_secret: lookup("SYNC_OIDC_CLIENT_SECRET")
+                    .ok_or(ConfigError::Missing("SYNC_OIDC_CLIENT_SECRET"))?,
+                scope: lookup("SYNC_OIDC_SCOPE").unwrap_or_else(|| "config-sync".to_string()),
+            }
+        };
         let interval_secs = lookup("SYNC_INTERVAL_SECS")
             .map(|s| {
                 s.parse::<u64>().map_err(|e| ConfigError::Invalid {
@@ -82,7 +113,7 @@ impl Config {
             site_code,
             local_database_url,
             central_url,
-            bearer_token,
+            auth,
             interval: Duration::from_secs(interval_secs),
             metrics_addr,
         })

@@ -22,8 +22,10 @@ pub mod config;
 pub mod error;
 pub mod source;
 pub mod status;
+pub mod token;
 
-pub use config::Config;
+pub use config::{AuthConfig, Config};
 pub use error::{SyncError, SyncResult};
 pub use source::{CentralClient, ConfigSource, Outcome, reconcile};
 pub use status::SyncStatus;
+pub use token::{Auth, TokenProvider};

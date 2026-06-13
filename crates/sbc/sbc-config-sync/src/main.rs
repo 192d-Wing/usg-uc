@@ -12,8 +12,9 @@ use tokio::time::{MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use sbc_config_sync::{CentralClient, Config, Outcome, SyncStatus, reconcile};
-use sbc_config_sync::status;
+use sbc_config_sync::{
+    Auth, AuthConfig, CentralClient, Config, Outcome, SyncStatus, TokenProvider, reconcile, status,
+};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
@@ -50,7 +51,13 @@ async fn main() -> ExitCode {
         .timeout(Duration::from_secs(30))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
-    let client = CentralClient::new(http, cfg.central_url.clone(), cfg.bearer_token.clone());
+    let auth = match &cfg.auth {
+        AuthConfig::Static(token) => Auth::Static(token.clone()),
+        AuthConfig::Oidc { token_url, client_id, client_secret, scope } => Auth::Oidc(
+            TokenProvider::new(http.clone(), token_url, client_id, client_secret, scope),
+        ),
+    };
+    let client = CentralClient::new(http, cfg.central_url.clone(), auth);
 
     // Metrics/health server, sharing status with the reconcile loop.
     let sync_status = SyncStatus::new(&cfg.site_code);

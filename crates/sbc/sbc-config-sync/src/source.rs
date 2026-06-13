@@ -10,6 +10,8 @@
 use central_config_store::{DeltaResult, Snapshot, UploadBatch, UploadChange};
 use reqwest::StatusCode;
 
+use crate::token::Auth;
+
 use crate::apply::{
     applied_epoch, apply_delta, apply_snapshot, collect_local_changes, restamp_uploaded,
 };
@@ -122,22 +124,23 @@ async fn snapshot_path<S: ConfigSource + Sync>(
 pub struct CentralClient {
     http: reqwest::Client,
     base_url: String,
-    bearer: String,
+    auth: Auth,
 }
 
 impl CentralClient {
     /// Build a client. `base_url` is the API root (no trailing slash);
-    /// `bearer` is the site's OIDC service-account access token.
+    /// `auth` supplies (and refreshes) the site's bearer token.
     #[must_use]
-    pub fn new(http: reqwest::Client, base_url: impl Into<String>, bearer: impl Into<String>) -> Self {
-        Self { http, base_url: base_url.into(), bearer: bearer.into() }
+    pub fn new(http: reqwest::Client, base_url: impl Into<String>, auth: Auth) -> Self {
+        Self { http, base_url: base_url.into(), auth }
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> SyncResult<T> {
+        let token = self.auth.bearer().await?;
         let resp = self
             .http
             .get(url)
-            .bearer_auth(&self.bearer)
+            .bearer_auth(token)
             .send()
             .await?;
         let status = resp.status();
@@ -175,7 +178,8 @@ impl ConfigSource for CentralClient {
     async fn upload(&self, site_code: &str, changes: &[UploadChange]) -> SyncResult<i64> {
         let url = format!("{}/v1/sync/{site_code}/upload", self.base_url);
         let batch = UploadBatch { changes: changes.to_vec() };
-        let resp = self.http.post(&url).bearer_auth(&self.bearer).json(&batch).send().await?;
+        let token = self.auth.bearer().await?;
+        let resp = self.http.post(&url).bearer_auth(token).json(&batch).send().await?;
         let status = resp.status();
         if status != StatusCode::OK {
             let body = resp.text().await.unwrap_or_default();
