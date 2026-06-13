@@ -17,13 +17,13 @@ use crate::state::AppState;
 
 mod auth;
 mod calls;
-mod sbc;
 mod dial_plans;
 mod directory;
 mod phones;
 mod proxy;
 mod redact;
 mod registrations;
+mod sbc;
 mod system;
 mod trunk_groups;
 mod trunks;

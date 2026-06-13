@@ -72,8 +72,7 @@ impl Config {
     pub fn from_lookup(
         lookup: impl Fn(&'static str) -> Option<String>,
     ) -> Result<Self, ConfigError> {
-        let site_code =
-            lookup("SYNC_SITE_CODE").ok_or(ConfigError::Missing("SYNC_SITE_CODE"))?;
+        let site_code = lookup("SYNC_SITE_CODE").ok_or(ConfigError::Missing("SYNC_SITE_CODE"))?;
         let local_database_url = lookup("SYNC_LOCAL_POSTGRES_URL")
             .ok_or(ConfigError::Missing("SYNC_LOCAL_POSTGRES_URL"))?;
         let central_url =
@@ -125,7 +124,10 @@ impl Config {
     pub fn jittered_interval(&self) -> Duration {
         let base = self.interval.as_secs().max(1);
         let span = (base / 8).max(1);
-        let hash: u64 = self.site_code.bytes().fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(b)));
+        let hash: u64 = self
+            .site_code
+            .bytes()
+            .fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(b)));
         let offset = hash % (span * 2 + 1); // 0..=2*span
         Duration::from_secs(base + offset - span)
     }

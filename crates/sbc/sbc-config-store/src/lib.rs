@@ -17,20 +17,16 @@
 //!   chosen at runtime when no DSN is configured, so existing single-pod
 //!   deploys keep working unchanged.
 
-pub mod sbc;
 pub mod dial_plans;
 pub mod directory;
 pub mod error;
 pub mod migration;
 pub mod model;
 pub mod phones;
+pub mod sbc;
 pub mod schema;
 pub mod trunk_groups;
 
-pub use sbc::{
-    PostgresCallingSearchSpaceStore, PostgresPartitionStore, PostgresRouteListStore,
-    PostgresRoutePatternStore,
-};
 pub use dial_plans::PostgresDialPlanStore;
 pub use directory::PostgresDirectoryNumberStore;
 pub use error::{ConfigStoreError, ConfigStoreResult};
@@ -40,5 +36,9 @@ pub use migration::{
 };
 pub use model::DirectoryNumber;
 pub use phones::PostgresPhoneStore;
+pub use sbc::{
+    PostgresCallingSearchSpaceStore, PostgresPartitionStore, PostgresRouteListStore,
+    PostgresRoutePatternStore,
+};
 pub use schema::ensure_schema;
 pub use trunk_groups::PostgresTrunkGroupStore;

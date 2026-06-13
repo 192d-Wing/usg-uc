@@ -111,15 +111,29 @@ impl CentralConfigStore {
             let site: String = row.try_get("site_code")?;
             let ring: i32 = row.try_get("ring")?;
             if ring > up_to_ring {
-                sites.push(SiteMaterialization::SkippedRing { site_code: site, ring });
+                sites.push(SiteMaterialization::SkippedRing {
+                    site_code: site,
+                    ring,
+                });
                 continue;
             }
-            match self.materialize_one(kind, template_id, &site, &data).await? {
-                Some(epoch) => sites.push(SiteMaterialization::Applied { site_code: site, epoch }),
+            match self
+                .materialize_one(kind, template_id, &site, &data)
+                .await?
+            {
+                Some(epoch) => sites.push(SiteMaterialization::Applied {
+                    site_code: site,
+                    epoch,
+                }),
                 None => sites.push(SiteMaterialization::SkippedOverridden { site_code: site }),
             }
         }
-        Ok(MaterializeReport { kind, template_id: template_id.to_string(), up_to_ring, sites })
+        Ok(MaterializeReport {
+            kind,
+            template_id: template_id.to_string(),
+            up_to_ring,
+            sites,
+        })
     }
 
     /// Delete a template: tombstone its materialized rows at assigned sites
@@ -163,8 +177,11 @@ impl CentralConfigStore {
             "SELECT updated_by FROM {} WHERE site_code = $1 AND id = $2 AND NOT deleted",
             kind.target_table().name()
         );
-        let origin: Option<String> =
-            sqlx::query_scalar(&sql).bind(site_code).bind(id).fetch_optional(self.pool()).await?;
+        let origin: Option<String> = sqlx::query_scalar(&sql)
+            .bind(site_code)
+            .bind(id)
+            .fetch_optional(self.pool())
+            .await?;
         Ok(origin)
     }
 
@@ -201,8 +218,17 @@ impl CentralConfigStore {
             .bind(TEMPLATE_ORIGIN)
             .execute(&mut *tx)
             .await?;
-        journal(&mut tx, site_code, epoch, table, template_id, ChangeOp::Upsert, Some(data), TEMPLATE_ORIGIN)
-            .await?;
+        journal(
+            &mut tx,
+            site_code,
+            epoch,
+            table,
+            template_id,
+            ChangeOp::Upsert,
+            Some(data),
+            TEMPLATE_ORIGIN,
+        )
+        .await?;
         tx.commit().await?;
         Ok(Some(epoch))
     }
@@ -234,8 +260,17 @@ impl CentralConfigStore {
             .bind(template_id)
             .execute(&mut *tx)
             .await?;
-        journal(&mut tx, site_code, epoch, table, template_id, ChangeOp::Delete, None, TEMPLATE_ORIGIN)
-            .await?;
+        journal(
+            &mut tx,
+            site_code,
+            epoch,
+            table,
+            template_id,
+            ChangeOp::Delete,
+            None,
+            TEMPLATE_ORIGIN,
+        )
+        .await?;
         tx.commit().await?;
         Ok(Some(epoch))
     }

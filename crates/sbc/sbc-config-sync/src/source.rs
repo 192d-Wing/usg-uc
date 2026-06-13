@@ -104,13 +104,23 @@ pub async fn reconcile<S: ConfigSource + Sync, R: Refresher + Sync>(
                 // Best-effort daemon refresh for the entities that changed.
                 let items: Vec<RefreshItem> = changes
                     .iter()
-                    .map(|c| RefreshItem { table: c.table, id: c.row_id.clone(), op: c.op })
+                    .map(|c| RefreshItem {
+                        table: c.table,
+                        id: c.row_id.clone(),
+                        op: c.op,
+                    })
                     .collect();
                 apply_delta(pool, site_code, &changes, to).await?;
                 refresher.refresh(&items).await;
-                Ok(Outcome::DeltaApplied { from, to, changes: n })
+                Ok(Outcome::DeltaApplied {
+                    from,
+                    to,
+                    changes: n,
+                })
             }
-            DeltaResult::MustSnapshot { .. } => snapshot_path(pool, source, refresher, site_code).await,
+            DeltaResult::MustSnapshot { .. } => {
+                snapshot_path(pool, source, refresher, site_code).await
+            }
         },
         // None (never synced) or local ahead of central (regressed).
         _ => snapshot_path(pool, source, refresher, site_code).await,
@@ -139,7 +149,10 @@ async fn snapshot_path<S: ConfigSource + Sync, R: Refresher + Sync>(
         .collect();
     apply_snapshot(pool, site_code, &snap).await?;
     refresher.refresh(&items).await;
-    Ok(Outcome::Snapshotted { epoch: snap.epoch, rows })
+    Ok(Outcome::Snapshotted {
+        epoch: snap.epoch,
+        rows,
+    })
 }
 
 /// HTTP implementation of [`ConfigSource`] against `central-config-api`.
@@ -154,17 +167,16 @@ impl CentralClient {
     /// `auth` supplies (and refreshes) the site's bearer token.
     #[must_use]
     pub fn new(http: reqwest::Client, base_url: impl Into<String>, auth: Auth) -> Self {
-        Self { http, base_url: base_url.into(), auth }
+        Self {
+            http,
+            base_url: base_url.into(),
+            auth,
+        }
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> SyncResult<T> {
         let token = self.auth.bearer().await?;
-        let resp = self
-            .http
-            .get(url)
-            .bearer_auth(token)
-            .send()
-            .await?;
+        let resp = self.http.get(url).bearer_auth(token).send().await?;
         let status = resp.status();
         if status != StatusCode::OK {
             let body = resp.text().await.unwrap_or_default();
@@ -199,9 +211,17 @@ impl ConfigSource for CentralClient {
 
     async fn upload(&self, site_code: &str, changes: &[UploadChange]) -> SyncResult<i64> {
         let url = format!("{}/v1/sync/{site_code}/upload", self.base_url);
-        let batch = UploadBatch { changes: changes.to_vec() };
+        let batch = UploadBatch {
+            changes: changes.to_vec(),
+        };
         let token = self.auth.bearer().await?;
-        let resp = self.http.post(&url).bearer_auth(token).json(&batch).send().await?;
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .json(&batch)
+            .send()
+            .await?;
         let status = resp.status();
         if status != StatusCode::OK {
             let body = resp.text().await.unwrap_or_default();

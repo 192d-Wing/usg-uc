@@ -45,7 +45,9 @@ async fn fresh_store(admin: &str, name: &str) -> CentralConfigStore {
         .connect_with(admin_opts.database(name))
         .await
         .expect("connect scratch db");
-    CentralConfigStore::from_pool(pool).await.expect("migrate central schema")
+    CentralConfigStore::from_pool(pool)
+        .await
+        .expect("migrate central schema")
 }
 
 fn no_extra() -> Map<String, Value> {
@@ -79,7 +81,10 @@ async fn register_creates_partitions_and_is_idempotent() {
     assert_eq!(parts, 1, "exactly one phones partition for the one site");
 
     assert!(
-        store.register_site("oopl", "x", "x", "UTC", "active").await.is_err(),
+        store
+            .register_site("oopl", "x", "x", "UTC", "active")
+            .await
+            .is_err(),
         "lowercase site code rejected before DB"
     );
     assert_eq!(store.epoch("OOPL-001").await.expect("epoch"), 0);
@@ -90,7 +95,10 @@ async fn register_creates_partitions_and_is_idempotent() {
 async fn writes_bump_epoch_and_journal_in_lockstep() {
     let Some(admin) = admin_dsn() else { return };
     let store = fresh_store(&admin, "cst_writes").await;
-    store.register_site("MUHJ", "MUHJ", "muhj.x", "UTC", "active").await.expect("register");
+    store
+        .register_site("MUHJ", "MUHJ", "muhj.x", "UTC", "active")
+        .await
+        .expect("register");
 
     let e1 = store
         .upsert_phone("MUHJ", "p1", "aabbccddeeff", &json!({"id": "p1"}), "alice")
@@ -99,7 +107,13 @@ async fn writes_bump_epoch_and_journal_in_lockstep() {
     assert_eq!(e1, 1, "first write is epoch 1");
 
     let e2 = store
-        .upsert_json(ConfigTable::DialPlans, "MUHJ", "main", &json!({"entries": []}), "alice")
+        .upsert_json(
+            ConfigTable::DialPlans,
+            "MUHJ",
+            "main",
+            &json!({"entries": []}),
+            "alice",
+        )
         .await
         .expect("dial plan upsert");
     assert_eq!(e2, 2);
@@ -114,12 +128,11 @@ async fn writes_bump_epoch_and_journal_in_lockstep() {
     assert_eq!(journal_rows, 2);
 
     // The phone row carries revision = its write epoch.
-    let rev: i64 = sqlx::query_scalar(
-        "SELECT revision FROM phones WHERE site_code = 'MUHJ' AND id = 'p1'",
-    )
-    .fetch_one(store.pool())
-    .await
-    .expect("phone revision");
+    let rev: i64 =
+        sqlx::query_scalar("SELECT revision FROM phones WHERE site_code = 'MUHJ' AND id = 'p1'")
+            .fetch_one(store.pool())
+            .await
+            .expect("phone revision");
     assert_eq!(rev, 1);
 }
 
@@ -127,10 +140,19 @@ async fn writes_bump_epoch_and_journal_in_lockstep() {
 async fn delta_returns_changes_and_snapshot_materializes_live_rows() {
     let Some(admin) = admin_dsn() else { return };
     let store = fresh_store(&admin, "cst_delta").await;
-    store.register_site("MPLS", "MPLS", "mpls.x", "UTC", "active").await.expect("register");
+    store
+        .register_site("MPLS", "MPLS", "mpls.x", "UTC", "active")
+        .await
+        .expect("register");
 
     store
-        .upsert_phone("MPLS", "p1", "aaaaaaaaaaaa", &json!({"id": "p1", "v": 1}), "a")
+        .upsert_phone(
+            "MPLS",
+            "p1",
+            "aaaaaaaaaaaa",
+            &json!({"id": "p1", "v": 1}),
+            "a",
+        )
         .await
         .expect("p1");
     store
@@ -138,10 +160,19 @@ async fn delta_returns_changes_and_snapshot_materializes_live_rows() {
         .await
         .expect("p2");
     let e_after_update = store
-        .upsert_phone("MPLS", "p1", "aaaaaaaaaaaa", &json!({"id": "p1", "v": 2}), "a")
+        .upsert_phone(
+            "MPLS",
+            "p1",
+            "aaaaaaaaaaaa",
+            &json!({"id": "p1", "v": 2}),
+            "a",
+        )
         .await
         .expect("p1 update");
-    let e_after_delete = store.delete(ConfigTable::Phones, "MPLS", "p2", "a").await.expect("del p2");
+    let e_after_delete = store
+        .delete(ConfigTable::Phones, "MPLS", "p2", "a")
+        .await
+        .expect("del p2");
     assert_eq!(e_after_delete, e_after_update + 1);
 
     // Delta from 0 replays every change in order, last write of p1 wins on
@@ -154,7 +185,10 @@ async fn delta_returns_changes_and_snapshot_materializes_live_rows() {
     assert_eq!(from, 0);
     assert_eq!(to, e_after_delete);
     assert_eq!(changes.len(), 4, "p1, p2, p1-update, p2-delete");
-    assert!(changes.windows(2).all(|w| w[0].epoch <= w[1].epoch), "ascending epochs");
+    assert!(
+        changes.windows(2).all(|w| w[0].epoch <= w[1].epoch),
+        "ascending epochs"
+    );
     let last = changes.last().expect("a change");
     assert_eq!(last.op, ChangeOp::Delete);
     assert_eq!(last.row_id, "p2");
@@ -191,17 +225,39 @@ async fn delta_returns_changes_and_snapshot_materializes_live_rows() {
 async fn did_uniqueness_is_fleet_wide() {
     let Some(admin) = admin_dsn() else { return };
     let store = fresh_store(&admin, "cst_did").await;
-    store.register_site("AAAA", "A", "a.x", "UTC", "active").await.expect("reg A");
-    store.register_site("BBBB", "B", "b.x", "UTC", "active").await.expect("reg B");
+    store
+        .register_site("AAAA", "A", "a.x", "UTC", "active")
+        .await
+        .expect("reg A");
+    store
+        .register_site("BBBB", "B", "b.x", "UTC", "active")
+        .await
+        .expect("reg B");
 
     store
-        .upsert_did("AAAA", "5551234567", Some("jdoe"), None, None, &no_extra(), "a")
+        .upsert_did(
+            "AAAA",
+            "5551234567",
+            Some("jdoe"),
+            None,
+            None,
+            &no_extra(),
+            "a",
+        )
         .await
         .expect("claim DID for A");
 
     // Same DID at another site is a hard error.
     let err = store
-        .upsert_did("BBBB", "5551234567", Some("other"), None, None, &no_extra(), "b")
+        .upsert_did(
+            "BBBB",
+            "5551234567",
+            Some("other"),
+            None,
+            None,
+            &no_extra(),
+            "b",
+        )
         .await
         .expect_err("cross-site DID claim must fail");
     assert!(
@@ -211,12 +267,23 @@ async fn did_uniqueness_is_fleet_wide() {
 
     // Re-claiming at the owning site is fine (update).
     store
-        .upsert_did("AAAA", "5551234567", Some("jdoe2"), None, None, &no_extra(), "a")
+        .upsert_did(
+            "AAAA",
+            "5551234567",
+            Some("jdoe2"),
+            None,
+            None,
+            &no_extra(),
+            "a",
+        )
         .await
         .expect("re-claim at owner");
 
     // Deleting frees it fleet-wide; another site may then claim it.
-    store.delete(ConfigTable::DirectoryNumbers, "AAAA", "5551234567", "a").await.expect("del");
+    store
+        .delete(ConfigTable::DirectoryNumbers, "AAAA", "5551234567", "a")
+        .await
+        .expect("del");
     let reg_rows: i64 =
         sqlx::query_scalar("SELECT count(*) FROM did_registry WHERE did = '5551234567'")
             .fetch_one(store.pool())
@@ -224,7 +291,15 @@ async fn did_uniqueness_is_fleet_wide() {
             .expect("registry count");
     assert_eq!(reg_rows, 0, "tombstoning the DID frees the registry");
     store
-        .upsert_did("BBBB", "5551234567", Some("nowB"), None, None, &no_extra(), "b")
+        .upsert_did(
+            "BBBB",
+            "5551234567",
+            Some("nowB"),
+            None,
+            None,
+            &no_extra(),
+            "b",
+        )
         .await
         .expect("B claims the freed DID");
 }
@@ -233,7 +308,10 @@ async fn did_uniqueness_is_fleet_wide() {
 async fn failed_write_rolls_back_epoch() {
     let Some(admin) = admin_dsn() else { return };
     let store = fresh_store(&admin, "cst_rollback").await;
-    store.register_site("CCCC", "C", "c.x", "UTC", "active").await.expect("register");
+    store
+        .register_site("CCCC", "C", "c.x", "UTC", "active")
+        .await
+        .expect("register");
 
     store
         .upsert_phone("CCCC", "p1", "aaaaaaaaaaaa", &json!({"id": "p1"}), "a")
@@ -247,29 +325,57 @@ async fn failed_write_rolls_back_epoch() {
         .upsert_phone("CCCC", "p2", "aaaaaaaaaaaa", &json!({"id": "p2"}), "a")
         .await
         .expect_err("duplicate live MAC must conflict");
-    assert!(matches!(err, central_config_store::CentralError::Conflict(_)), "got {err:?}");
-    assert_eq!(store.epoch("CCCC").await.expect("epoch"), 1, "epoch rolled back");
+    assert!(
+        matches!(err, central_config_store::CentralError::Conflict(_)),
+        "got {err:?}"
+    );
+    assert_eq!(
+        store.epoch("CCCC").await.expect("epoch"),
+        1,
+        "epoch rolled back"
+    );
 
     // Deleting a missing row is NotFound and also rolls back the epoch.
-    let err = store.delete(ConfigTable::Phones, "CCCC", "ghost", "a").await.expect_err("ghost");
-    assert!(matches!(err, central_config_store::CentralError::NotFound), "got {err:?}");
-    assert_eq!(store.epoch("CCCC").await.expect("epoch"), 1, "epoch rolled back on NotFound");
+    let err = store
+        .delete(ConfigTable::Phones, "CCCC", "ghost", "a")
+        .await
+        .expect_err("ghost");
+    assert!(
+        matches!(err, central_config_store::CentralError::NotFound),
+        "got {err:?}"
+    );
+    assert_eq!(
+        store.epoch("CCCC").await.expect("epoch"),
+        1,
+        "epoch rolled back on NotFound"
+    );
 
     // Writing to an unknown site never advances anything.
-    assert!(store.upsert_phone("ZZZZ", "p", "ffffffffffff", &json!({}), "a").await.is_err());
+    assert!(
+        store
+            .upsert_phone("ZZZZ", "p", "ffffffffffff", &json!({}), "a")
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
 async fn tombstoned_mac_is_reusable() {
     let Some(admin) = admin_dsn() else { return };
     let store = fresh_store(&admin, "cst_macreuse").await;
-    store.register_site("DDDD", "D", "d.x", "UTC", "active").await.expect("register");
+    store
+        .register_site("DDDD", "D", "d.x", "UTC", "active")
+        .await
+        .expect("register");
 
     store
         .upsert_phone("DDDD", "old", "aabbccddeeff", &json!({"id": "old"}), "a")
         .await
         .expect("old phone");
-    store.delete(ConfigTable::Phones, "DDDD", "old", "a").await.expect("tombstone old");
+    store
+        .delete(ConfigTable::Phones, "DDDD", "old", "a")
+        .await
+        .expect("tombstone old");
 
     // A replacement with a new id and the same MAC is provisionable (the
     // unique index is partial over live rows).
@@ -279,7 +385,11 @@ async fn tombstoned_mac_is_reusable() {
         .expect("MAC reuse after tombstone");
 
     let snap = store.snapshot("DDDD").await.expect("snapshot");
-    let phones = snap.tables.iter().find(|t| t.table == ConfigTable::Phones).expect("phones");
+    let phones = snap
+        .tables
+        .iter()
+        .find(|t| t.table == ConfigTable::Phones)
+        .expect("phones");
     assert_eq!(phones.rows.len(), 1);
     assert_eq!(phones.rows[0].id, "new");
     assert_eq!(phones.rows[0].payload, json!({"id": "new"}));
@@ -302,62 +412,142 @@ async fn template_materialization_rings_overrides_and_delete() {
     let store = fresh_store(&admin, "cst_templates").await;
     // Ring 0 (canary), ring 1 sites, plus a site that overrides locally.
     for s in ["AAAA", "BBBB", "CCCC"] {
-        store.register_site(s, s, &format!("{s}.x"), "UTC", "active").await.expect("register");
+        store
+            .register_site(s, s, &format!("{s}.x"), "UTC", "active")
+            .await
+            .expect("register");
     }
 
     // Author one trunk-group template, assign to three sites in two rings.
     store
-        .upsert_template(TemplateKind::TrunkGroup, "us-domestic", &json!({"id": "us-domestic", "strategy": "priority"}), "op")
+        .upsert_template(
+            TemplateKind::TrunkGroup,
+            "us-domestic",
+            &json!({"id": "us-domestic", "strategy": "priority"}),
+            "op",
+        )
         .await
         .expect("template");
-    store.assign_template(TemplateKind::TrunkGroup, "us-domestic", "AAAA", 0).await.expect("assign A");
-    store.assign_template(TemplateKind::TrunkGroup, "us-domestic", "BBBB", 1).await.expect("assign B");
-    store.assign_template(TemplateKind::TrunkGroup, "us-domestic", "CCCC", 1).await.expect("assign C");
+    store
+        .assign_template(TemplateKind::TrunkGroup, "us-domestic", "AAAA", 0)
+        .await
+        .expect("assign A");
+    store
+        .assign_template(TemplateKind::TrunkGroup, "us-domestic", "BBBB", 1)
+        .await
+        .expect("assign B");
+    store
+        .assign_template(TemplateKind::TrunkGroup, "us-domestic", "CCCC", 1)
+        .await
+        .expect("assign C");
 
     // CCCC has a local override of the same id (operator-written).
     store
-        .upsert_json(ConfigTable::TrunkGroups, "CCCC", "us-domestic", &json!({"id": "us-domestic", "strategy": "round_robin"}), "alice@op")
+        .upsert_json(
+            ConfigTable::TrunkGroups,
+            "CCCC",
+            "us-domestic",
+            &json!({"id": "us-domestic", "strategy": "round_robin"}),
+            "alice@op",
+        )
         .await
         .expect("override");
 
     // Materialize up to ring 0: only AAAA gets it; B/C are ring 1 (skipped).
-    let report = store.materialize_template(TemplateKind::TrunkGroup, "us-domestic", 0).await.expect("materialize r0");
-    let applied = report.sites.iter().filter(|s| matches!(s, SiteMaterialization::Applied { .. })).count();
+    let report = store
+        .materialize_template(TemplateKind::TrunkGroup, "us-domestic", 0)
+        .await
+        .expect("materialize r0");
+    let applied = report
+        .sites
+        .iter()
+        .filter(|s| matches!(s, SiteMaterialization::Applied { .. }))
+        .count();
     assert_eq!(applied, 1, "only canary AAAA");
-    assert!(report.sites.iter().any(|s| matches!(s, SiteMaterialization::Applied{site_code,..} if site_code=="AAAA")));
+    assert!(
+        report
+            .sites
+            .iter()
+            .any(|s| matches!(s, SiteMaterialization::Applied{site_code,..} if site_code=="AAAA"))
+    );
     assert_eq!(live_count(&store, "trunk_groups", "AAAA").await, 1);
-    assert_eq!(live_count(&store, "trunk_groups", "BBBB").await, 0, "ring 1 not yet");
+    assert_eq!(
+        live_count(&store, "trunk_groups", "BBBB").await,
+        0,
+        "ring 1 not yet"
+    );
 
     // Promote to ring 1: BBBB gets it; CCCC is skipped (override wins).
-    let report = store.materialize_template(TemplateKind::TrunkGroup, "us-domestic", 1).await.expect("materialize r1");
+    let report = store
+        .materialize_template(TemplateKind::TrunkGroup, "us-domestic", 1)
+        .await
+        .expect("materialize r1");
     let overridden = report.sites.iter().any(|s| matches!(s, SiteMaterialization::SkippedOverridden { site_code } if site_code == "CCCC"));
     assert!(overridden, "CCCC override must be skipped: {report:?}");
     assert_eq!(live_count(&store, "trunk_groups", "BBBB").await, 1);
 
     // CCCC still has its own version, not the template's.
-    let ccc: serde_json::Value = sqlx::query_scalar("SELECT data FROM trunk_groups WHERE site_code='CCCC' AND id='us-domestic'")
-        .fetch_one(store.pool()).await.expect("ccc data");
+    let ccc: serde_json::Value = sqlx::query_scalar(
+        "SELECT data FROM trunk_groups WHERE site_code='CCCC' AND id='us-domestic'",
+    )
+    .fetch_one(store.pool())
+    .await
+    .expect("ccc data");
     assert_eq!(ccc["strategy"], "round_robin", "override preserved");
 
     // Editing the template + re-materializing updates the non-overridden sites.
     store
-        .upsert_template(TemplateKind::TrunkGroup, "us-domestic", &json!({"id": "us-domestic", "strategy": "least_connections"}), "op")
+        .upsert_template(
+            TemplateKind::TrunkGroup,
+            "us-domestic",
+            &json!({"id": "us-domestic", "strategy": "least_connections"}),
+            "op",
+        )
         .await
         .expect("edit template");
-    store.materialize_template(TemplateKind::TrunkGroup, "us-domestic", 1).await.expect("re-materialize");
-    let aaa: serde_json::Value = sqlx::query_scalar("SELECT data FROM trunk_groups WHERE site_code='AAAA' AND id='us-domestic'")
-        .fetch_one(store.pool()).await.expect("aaa data");
-    assert_eq!(aaa["strategy"], "least_connections", "AAAA tracks the template");
+    store
+        .materialize_template(TemplateKind::TrunkGroup, "us-domestic", 1)
+        .await
+        .expect("re-materialize");
+    let aaa: serde_json::Value = sqlx::query_scalar(
+        "SELECT data FROM trunk_groups WHERE site_code='AAAA' AND id='us-domestic'",
+    )
+    .fetch_one(store.pool())
+    .await
+    .expect("aaa data");
+    assert_eq!(
+        aaa["strategy"], "least_connections",
+        "AAAA tracks the template"
+    );
 
     // Delete the template: tombstones template-origin rows (A, B), leaves
     // CCCC's override.
-    store.delete_template(TemplateKind::TrunkGroup, "us-domestic").await.expect("delete template");
-    assert_eq!(live_count(&store, "trunk_groups", "AAAA").await, 0, "A tombstoned");
-    assert_eq!(live_count(&store, "trunk_groups", "BBBB").await, 0, "B tombstoned");
-    assert_eq!(live_count(&store, "trunk_groups", "CCCC").await, 1, "C override survives");
+    store
+        .delete_template(TemplateKind::TrunkGroup, "us-domestic")
+        .await
+        .expect("delete template");
+    assert_eq!(
+        live_count(&store, "trunk_groups", "AAAA").await,
+        0,
+        "A tombstoned"
+    );
+    assert_eq!(
+        live_count(&store, "trunk_groups", "BBBB").await,
+        0,
+        "B tombstoned"
+    );
+    assert_eq!(
+        live_count(&store, "trunk_groups", "CCCC").await,
+        1,
+        "C override survives"
+    );
 
     // Template + assignments are gone (cascade).
-    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM template_assignments WHERE template_id='us-domestic'")
-        .fetch_one(store.pool()).await.expect("assign count");
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM template_assignments WHERE template_id='us-domestic'",
+    )
+    .fetch_one(store.pool())
+    .await
+    .expect("assign count");
     assert_eq!(n, 0);
 }

@@ -110,8 +110,13 @@ impl TokenProvider {
         let (token, ttl) = self.fetch().await?;
         // Refresh a margin before expiry; clamp so a tiny ttl still caches
         // briefly rather than refetching every call.
-        let lifetime = ttl.saturating_sub(REFRESH_MARGIN).max(Duration::from_secs(5));
-        *guard = Some(Cached { token: token.clone(), refresh_at: Instant::now() + lifetime });
+        let lifetime = ttl
+            .saturating_sub(REFRESH_MARGIN)
+            .max(Duration::from_secs(5));
+        *guard = Some(Cached {
+            token: token.clone(),
+            refresh_at: Instant::now() + lifetime,
+        });
         Ok(token)
     }
 
@@ -130,7 +135,9 @@ impl TokenProvider {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(SyncError::Central(format!("token endpoint {status}: {body}")));
+            return Err(SyncError::Central(format!(
+                "token endpoint {status}: {body}"
+            )));
         }
         let body: TokenResponse = resp.json().await?;
         // Default to 5 min if the IdP omits expires_in.
@@ -140,7 +147,11 @@ impl TokenProvider {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::unchecked_time_subtraction)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::unchecked_time_subtraction
+)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -159,17 +170,21 @@ mod tests {
         let app = Router::new()
             .route(
                 "/token",
-                post(|State((hits, exp)): State<(Arc<AtomicUsize>, u64)>| async move {
-                    let n = hits.fetch_add(1, Ordering::SeqCst) + 1;
-                    Json(serde_json::json!({
-                        "access_token": format!("tok-{n}"),
-                        "expires_in": exp,
-                        "token_type": "Bearer",
-                    }))
-                }),
+                post(
+                    |State((hits, exp)): State<(Arc<AtomicUsize>, u64)>| async move {
+                        let n = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                        Json(serde_json::json!({
+                            "access_token": format!("tok-{n}"),
+                            "expires_in": exp,
+                            "token_type": "Bearer",
+                        }))
+                    },
+                ),
             )
             .with_state(state);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -197,7 +212,11 @@ mod tests {
         // Simulate the cached token going stale.
         p.cached.lock().await.as_mut().unwrap().refresh_at =
             Instant::now() - Duration::from_secs(1);
-        assert_eq!(p.token().await.expect("t2"), "tok-2", "refetched after expiry");
+        assert_eq!(
+            p.token().await.expect("t2"),
+            "tok-2",
+            "refetched after expiry"
+        );
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 }

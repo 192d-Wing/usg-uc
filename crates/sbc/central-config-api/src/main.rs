@@ -21,9 +21,15 @@ mod state;
 async fn main() -> ExitCode {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,central_config_api=debug"));
-    tracing_subscriber::fmt().with_env_filter(filter).json().init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .json()
+        .init();
 
-    info!(version = env!("CARGO_PKG_VERSION"), "central-config-api starting");
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "central-config-api starting"
+    );
 
     let cfg = match config::Config::from_env() {
         Ok(c) => c,
@@ -71,7 +77,10 @@ async fn main() -> ExitCode {
         }
     };
 
-    if let Err(e) = axum::serve(listener, router).with_graceful_shutdown(shutdown).await {
+    if let Err(e) = axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown)
+        .await
+    {
         error!(error = %e, "server error");
         return ExitCode::from(5);
     }

@@ -21,9 +21,15 @@ use sbc_config_sync::{
 async fn main() -> ExitCode {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,sbc_config_sync=debug"));
-    tracing_subscriber::fmt().with_env_filter(filter).json().init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .json()
+        .init();
 
-    info!(version = env!("CARGO_PKG_VERSION"), "sbc-config-sync starting");
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "sbc-config-sync starting"
+    );
 
     let cfg = match Config::from_env() {
         Ok(c) => c,
@@ -54,9 +60,18 @@ async fn main() -> ExitCode {
         .unwrap_or_else(|_| reqwest::Client::new());
     let auth = match &cfg.auth {
         AuthConfig::Static(token) => Auth::Static(token.clone()),
-        AuthConfig::Oidc { token_url, client_id, client_secret, scope } => Auth::Oidc(
-            TokenProvider::new(http.clone(), token_url, client_id, client_secret, scope),
-        ),
+        AuthConfig::Oidc {
+            token_url,
+            client_id,
+            client_secret,
+            scope,
+        } => Auth::Oidc(TokenProvider::new(
+            http.clone(),
+            token_url,
+            client_id,
+            client_secret,
+            scope,
+        )),
     };
     let client = CentralClient::new(http, cfg.central_url.clone(), auth);
 

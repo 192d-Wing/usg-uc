@@ -47,7 +47,10 @@ impl SyncStatus {
     /// New status for `site`, before any cycle has run.
     #[must_use]
     pub fn new(site: &str) -> Self {
-        Self { site: Arc::from(site), inner: Arc::new(Mutex::new(Inner::default())) }
+        Self {
+            site: Arc::from(site),
+            inner: Arc::new(Mutex::new(Inner::default())),
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -56,7 +59,9 @@ impl SyncStatus {
 
     /// Record a successful cycle and its outcome.
     pub fn record_success(&self, outcome: &Outcome) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
         let mut s = self.lock();
         s.reconcile_total += 1;
         s.last_ok = true;
@@ -92,9 +97,24 @@ impl SyncStatus {
             let _ = writeln!(out, "# TYPE sbc_config_sync_{name} {kind}");
             let _ = writeln!(out, "sbc_config_sync_{name}{{site=\"{site}\"}} {val}");
         };
-        metric("applied_epoch", "gauge", "Local shard epoch (last applied)", s.applied_epoch);
-        metric("central_epoch", "gauge", "Central shard epoch (last probe)", s.central_epoch);
-        metric("staleness_epochs", "gauge", "central_epoch - applied_epoch", staleness);
+        metric(
+            "applied_epoch",
+            "gauge",
+            "Local shard epoch (last applied)",
+            s.applied_epoch,
+        );
+        metric(
+            "central_epoch",
+            "gauge",
+            "Central shard epoch (last probe)",
+            s.central_epoch,
+        );
+        metric(
+            "staleness_epochs",
+            "gauge",
+            "central_epoch - applied_epoch",
+            staleness,
+        );
         metric(
             "last_success_timestamp_seconds",
             "gauge",
@@ -171,8 +191,16 @@ mod tests {
         assert!(!status.is_ready());
 
         // A success flips readiness and updates the gauges.
-        status.record_success(&Outcome::DeltaApplied { from: 5, to: 8, changes: 2 });
+        status.record_success(&Outcome::DeltaApplied {
+            from: 5,
+            to: 8,
+            changes: 2,
+        });
         assert!(status.is_ready());
-        assert!(status.render_prometheus().contains("applied_epoch{site=\"MUHJ\"} 8"));
+        assert!(
+            status
+                .render_prometheus()
+                .contains("applied_epoch{site=\"MUHJ\"} 8")
+        );
     }
 }

@@ -48,13 +48,22 @@ struct DirectSource(CentralConfigStore);
 
 impl ConfigSource for DirectSource {
     async fn epoch(&self, site: &str) -> SyncResult<i64> {
-        self.0.epoch(site).await.map_err(|e| sbc_config_sync::SyncError::Central(e.to_string()))
+        self.0
+            .epoch(site)
+            .await
+            .map_err(|e| sbc_config_sync::SyncError::Central(e.to_string()))
     }
     async fn delta(&self, site: &str, since: i64) -> SyncResult<DeltaResult> {
-        self.0.delta(site, since).await.map_err(|e| sbc_config_sync::SyncError::Central(e.to_string()))
+        self.0
+            .delta(site, since)
+            .await
+            .map_err(|e| sbc_config_sync::SyncError::Central(e.to_string()))
     }
     async fn snapshot(&self, site: &str) -> SyncResult<Snapshot> {
-        self.0.snapshot(site).await.map_err(|e| sbc_config_sync::SyncError::Central(e.to_string()))
+        self.0
+            .snapshot(site)
+            .await
+            .map_err(|e| sbc_config_sync::SyncError::Central(e.to_string()))
     }
     async fn upload(
         &self,
@@ -81,7 +90,11 @@ impl ConfigSource for DirectSource {
 
 async fn admin_pool(admin: &str) -> PgPool {
     let opts = PgConnectOptions::from_str(admin).expect("parse dsn");
-    PgPoolOptions::new().max_connections(1).connect_with(opts).await.expect("admin connect")
+    PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .expect("admin connect")
 }
 
 async fn make_db(admin: &str, name: &str) -> PgPool {
@@ -90,9 +103,18 @@ async fn make_db(admin: &str, name: &str) -> PgPool {
         .execute(&pool)
         .await
         .expect("drop");
-    sqlx::query(&format!("CREATE DATABASE {name}")).execute(&pool).await.expect("create");
-    let opts = PgConnectOptions::from_str(admin).expect("dsn").database(name);
-    PgPoolOptions::new().max_connections(5).connect_with(opts).await.expect("connect")
+    sqlx::query(&format!("CREATE DATABASE {name}"))
+        .execute(&pool)
+        .await
+        .expect("create");
+    let opts = PgConnectOptions::from_str(admin)
+        .expect("dsn")
+        .database(name);
+    PgPoolOptions::new()
+        .max_connections(5)
+        .connect_with(opts)
+        .await
+        .expect("connect")
 }
 
 fn no_extra() -> Map<String, serde_json::Value> {
@@ -120,64 +142,130 @@ async fn local_applied_epoch(pool: &PgPool) -> Option<i64> {
 
 #[tokio::test]
 async fn converges_via_snapshot_then_deltas() {
-    let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else { return };
+    let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else {
+        return;
+    };
 
     // Central, seeded with a couple of rows before the site ever syncs.
     let central = CentralConfigStore::from_pool(make_db(&admin, "scs_central").await)
         .await
         .expect("central migrate");
-    central.register_site(SITE, "MUHJ", "muhj.x", "UTC", "active").await.expect("register");
     central
-        .upsert_phone(SITE, "p1", "aaaaaaaaaaaa", &json!({"id": "p1", "mac_address": "aa:aa:aa:aa:aa:aa"}), "op")
+        .register_site(SITE, "MUHJ", "muhj.x", "UTC", "active")
+        .await
+        .expect("register");
+    central
+        .upsert_phone(
+            SITE,
+            "p1",
+            "aaaaaaaaaaaa",
+            &json!({"id": "p1", "mac_address": "aa:aa:aa:aa:aa:aa"}),
+            "op",
+        )
         .await
         .expect("p1");
     central
-        .upsert_did(SITE, "5551112222", Some("jdoe"), None, None, &no_extra(), "op")
+        .upsert_did(
+            SITE,
+            "5551112222",
+            Some("jdoe"),
+            None,
+            None,
+            &no_extra(),
+            "op",
+        )
         .await
         .expect("did");
     central
-        .upsert_json(ConfigTable::DialPlans, SITE, "main", &json!({"id": "main", "entries": []}), "op")
+        .upsert_json(
+            ConfigTable::DialPlans,
+            SITE,
+            "main",
+            &json!({"id": "main", "entries": []}),
+            "op",
+        )
         .await
         .expect("dialplan");
     let source = DirectSource(central);
 
     // Local site DB with the SBC schema but no data.
     let local = make_db(&admin, "scs_local").await;
-    sbc_config_store::ensure_schema(&local).await.expect("local schema");
+    sbc_config_store::ensure_schema(&local)
+        .await
+        .expect("local schema");
 
     // First reconcile: never synced → full snapshot.
-    let outcome = reconcile(&local, &source, &NoopRefresher, SITE).await.expect("first reconcile");
-    assert!(matches!(outcome, Outcome::Snapshotted { rows: 3, .. }), "got {outcome:?}");
+    let outcome = reconcile(&local, &source, &NoopRefresher, SITE)
+        .await
+        .expect("first reconcile");
+    assert!(
+        matches!(outcome, Outcome::Snapshotted { rows: 3, .. }),
+        "got {outcome:?}"
+    );
     assert_eq!(local_phone_ids(&local).await, vec!["p1"]);
     assert_eq!(local_applied_epoch(&local).await, Some(3));
 
     // Idempotent: nothing changed centrally → up to date, no work.
-    let outcome = reconcile(&local, &source, &NoopRefresher, SITE).await.expect("noop reconcile");
-    assert!(matches!(outcome, Outcome::UpToDate { epoch: 3 }), "got {outcome:?}");
+    let outcome = reconcile(&local, &source, &NoopRefresher, SITE)
+        .await
+        .expect("noop reconcile");
+    assert!(
+        matches!(outcome, Outcome::UpToDate { epoch: 3 }),
+        "got {outcome:?}"
+    );
 
     // Central mutates: add a phone, delete the DID, update p1.
     source
         .0
-        .upsert_phone(SITE, "p2", "bbbbbbbbbbbb", &json!({"id": "p2", "mac_address": "bb:bb:bb:bb:bb:bb"}), "op")
+        .upsert_phone(
+            SITE,
+            "p2",
+            "bbbbbbbbbbbb",
+            &json!({"id": "p2", "mac_address": "bb:bb:bb:bb:bb:bb"}),
+            "op",
+        )
         .await
         .expect("p2");
-    source.0.delete(ConfigTable::DirectoryNumbers, SITE, "5551112222", "op").await.expect("del did");
     source
         .0
-        .upsert_phone(SITE, "p1", "aaaaaaaaaaaa", &json!({"id": "p1", "mac_address": "aa:aa:aa:aa:aa:aa", "label": "front desk"}), "op")
+        .delete(ConfigTable::DirectoryNumbers, SITE, "5551112222", "op")
+        .await
+        .expect("del did");
+    source
+        .0
+        .upsert_phone(
+            SITE,
+            "p1",
+            "aaaaaaaaaaaa",
+            &json!({"id": "p1", "mac_address": "aa:aa:aa:aa:aa:aa", "label": "front desk"}),
+            "op",
+        )
         .await
         .expect("p1 update");
 
     // Next reconcile: delta path applies all three.
-    let outcome = reconcile(&local, &source, &NoopRefresher, SITE).await.expect("delta reconcile");
-    assert!(matches!(outcome, Outcome::DeltaApplied { from: 3, to: 6, changes: 3 }), "got {outcome:?}");
+    let outcome = reconcile(&local, &source, &NoopRefresher, SITE)
+        .await
+        .expect("delta reconcile");
+    assert!(
+        matches!(
+            outcome,
+            Outcome::DeltaApplied {
+                from: 3,
+                to: 6,
+                changes: 3
+            }
+        ),
+        "got {outcome:?}"
+    );
     assert_eq!(local_phone_ids(&local).await, vec!["p1", "p2"]);
 
     // The DID is tombstoned locally (not live), and p1 carries the update.
-    let live_dids: i64 = sqlx::query_scalar("SELECT count(*) FROM directory_numbers WHERE NOT deleted")
-        .fetch_one(&local)
-        .await
-        .expect("did count");
+    let live_dids: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM directory_numbers WHERE NOT deleted")
+            .fetch_one(&local)
+            .await
+            .expect("did count");
     assert_eq!(live_dids, 0, "DID tombstoned");
     let p1_label: serde_json::Value =
         sqlx::query_scalar("SELECT data -> 'label' FROM phones WHERE id = 'p1'")
@@ -187,88 +275,154 @@ async fn converges_via_snapshot_then_deltas() {
     assert_eq!(p1_label, json!("front desk"));
 
     // Synced rows are stamped central-origin, not local.
-    let p2_origin: String =
-        sqlx::query_scalar("SELECT updated_by FROM phones WHERE id = 'p2'")
-            .fetch_one(&local)
-            .await
-            .expect("p2 origin");
+    let p2_origin: String = sqlx::query_scalar("SELECT updated_by FROM phones WHERE id = 'p2'")
+        .fetch_one(&local)
+        .await
+        .expect("p2 origin");
     assert_eq!(p2_origin, "central");
 }
 
 #[tokio::test]
 async fn ddil_local_edit_survives_and_syncs_up() {
-    let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else { return };
+    let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else {
+        return;
+    };
 
     let central = CentralConfigStore::from_pool(make_db(&admin, "scs_ddil_central").await)
         .await
         .expect("central migrate");
-    central.register_site(SITE, "MUHJ", "muhj.x", "UTC", "active").await.expect("register");
     central
-        .upsert_phone(SITE, "p1", "aaaaaaaaaaaa", &json!({"id": "p1", "mac_address": "aa:aa:aa:aa:aa:aa"}), "op")
+        .register_site(SITE, "MUHJ", "muhj.x", "UTC", "active")
+        .await
+        .expect("register");
+    central
+        .upsert_phone(
+            SITE,
+            "p1",
+            "aaaaaaaaaaaa",
+            &json!({"id": "p1", "mac_address": "aa:aa:aa:aa:aa:aa"}),
+            "op",
+        )
         .await
         .expect("central p1");
     let source = DirectSource(central);
 
     let local = make_db(&admin, "scs_ddil_local").await;
-    sbc_config_store::ensure_schema(&local).await.expect("local schema");
-    reconcile(&local, &source, &NoopRefresher, SITE).await.expect("initial sync"); // pulls p1
+    sbc_config_store::ensure_schema(&local)
+        .await
+        .expect("local schema");
+    reconcile(&local, &source, &NoopRefresher, SITE)
+        .await
+        .expect("initial sync"); // pulls p1
 
     // --- link goes down; the site makes local edits ---
     // A new phone the field operator added, and an edit to p1 — both
     // stamped updated_by='local' as the site-local API would.
-    sqlx::query("INSERT INTO phones (id, mac_normalized, data, updated_by) VALUES ($1,$2,$3,'local')")
-        .bind("p-field").bind("bbbbbbbbbbbb")
-        .bind(json!({"id":"p-field","mac_address":"bb:bb:bb:bb:bb:bb","label":"forward TOC"}))
-        .execute(&local).await.expect("local add");
+    sqlx::query(
+        "INSERT INTO phones (id, mac_normalized, data, updated_by) VALUES ($1,$2,$3,'local')",
+    )
+    .bind("p-field")
+    .bind("bbbbbbbbbbbb")
+    .bind(json!({"id":"p-field","mac_address":"bb:bb:bb:bb:bb:bb","label":"forward TOC"}))
+    .execute(&local)
+    .await
+    .expect("local add");
     sqlx::query("UPDATE phones SET data = $1, updated_by='local', revision=0 WHERE id='p1'")
         .bind(json!({"id":"p1","mac_address":"aa:aa:aa:aa:aa:aa","label":"edited at edge"}))
-        .execute(&local).await.expect("local edit");
+        .execute(&local)
+        .await
+        .expect("local edit");
 
     // Meanwhile central changes something unrelated (another phone).
-    source.0
-        .upsert_phone(SITE, "p-hq", "cccccccccccc", &json!({"id":"p-hq","mac_address":"cc:cc:cc:cc:cc:cc"}), "op")
-        .await.expect("central p-hq");
+    source
+        .0
+        .upsert_phone(
+            SITE,
+            "p-hq",
+            "cccccccccccc",
+            &json!({"id":"p-hq","mac_address":"cc:cc:cc:cc:cc:cc"}),
+            "op",
+        )
+        .await
+        .expect("central p-hq");
 
     // --- link returns: reconcile pushes local edits up, then pulls ---
-    reconcile(&local, &source, &NoopRefresher, SITE).await.expect("reconnect reconcile");
+    reconcile(&local, &source, &NoopRefresher, SITE)
+        .await
+        .expect("reconnect reconcile");
 
     // The local edits propagated to central (local wins).
     let snap = source.0.snapshot(SITE).await.expect("central snapshot");
     let phones: std::collections::HashMap<String, serde_json::Value> = snap
-        .tables.iter().find(|t| t.table == ConfigTable::Phones).expect("phones")
-        .rows.iter().map(|r| (r.id.clone(), r.payload.clone())).collect();
-    assert!(phones.contains_key("p-field"), "new local phone reached central");
-    assert_eq!(phones["p1"]["label"], "edited at edge", "local edit of p1 won at central");
-    assert!(phones.contains_key("p-hq"), "central's own change still present");
+        .tables
+        .iter()
+        .find(|t| t.table == ConfigTable::Phones)
+        .expect("phones")
+        .rows
+        .iter()
+        .map(|r| (r.id.clone(), r.payload.clone()))
+        .collect();
+    assert!(
+        phones.contains_key("p-field"),
+        "new local phone reached central"
+    );
+    assert_eq!(
+        phones["p1"]["label"], "edited at edge",
+        "local edit of p1 won at central"
+    );
+    assert!(
+        phones.contains_key("p-hq"),
+        "central's own change still present"
+    );
 
     // Locally everything converged and nothing is left marked 'local'.
-    let still_local: i64 = sqlx::query_scalar("SELECT count(*) FROM phones WHERE updated_by='local'")
-        .fetch_one(&local).await.expect("count local");
+    let still_local: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM phones WHERE updated_by='local'")
+            .fetch_one(&local)
+            .await
+            .expect("count local");
     assert_eq!(still_local, 0, "uploaded edits re-stamped central-origin");
     assert_eq!(local_phone_ids(&local).await, vec!["p-field", "p-hq", "p1"]);
     // The central change pulled down too.
     let hq: i64 = sqlx::query_scalar("SELECT count(*) FROM phones WHERE id='p-hq' AND NOT deleted")
-        .fetch_one(&local).await.expect("hq");
+        .fetch_one(&local)
+        .await
+        .expect("hq");
     assert_eq!(hq, 1);
 }
 
 #[tokio::test]
 async fn regressed_local_recovers_via_snapshot() {
-    let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else { return };
+    let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else {
+        return;
+    };
 
     let central = CentralConfigStore::from_pool(make_db(&admin, "scs_regress_central").await)
         .await
         .expect("central migrate");
-    central.register_site(SITE, "MUHJ", "muhj.x", "UTC", "active").await.expect("register");
     central
-        .upsert_phone(SITE, "p1", "aaaaaaaaaaaa", &json!({"id": "p1", "mac_address": "aa:aa:aa:aa:aa:aa"}), "op")
+        .register_site(SITE, "MUHJ", "muhj.x", "UTC", "active")
+        .await
+        .expect("register");
+    central
+        .upsert_phone(
+            SITE,
+            "p1",
+            "aaaaaaaaaaaa",
+            &json!({"id": "p1", "mac_address": "aa:aa:aa:aa:aa:aa"}),
+            "op",
+        )
         .await
         .expect("p1");
     let source = DirectSource(central);
 
     let local = make_db(&admin, "scs_regress_local").await;
-    sbc_config_store::ensure_schema(&local).await.expect("local schema");
-    reconcile(&local, &source, &NoopRefresher, SITE).await.expect("initial");
+    sbc_config_store::ensure_schema(&local)
+        .await
+        .expect("local schema");
+    reconcile(&local, &source, &NoopRefresher, SITE)
+        .await
+        .expect("initial");
     assert_eq!(local_applied_epoch(&local).await, Some(1));
 
     // Simulate a regression: local sync_state claims a future epoch (e.g.
@@ -281,46 +435,87 @@ async fn regressed_local_recovers_via_snapshot() {
         .await
         .expect("bump local epoch");
 
-    let outcome = reconcile(&local, &source, &NoopRefresher, SITE).await.expect("regress reconcile");
-    assert!(matches!(outcome, Outcome::Snapshotted { epoch: 1, rows: 1 }), "got {outcome:?}");
-    assert_eq!(local_applied_epoch(&local).await, Some(1), "epoch corrected back down");
+    let outcome = reconcile(&local, &source, &NoopRefresher, SITE)
+        .await
+        .expect("regress reconcile");
+    assert!(
+        matches!(outcome, Outcome::Snapshotted { epoch: 1, rows: 1 }),
+        "got {outcome:?}"
+    );
+    assert_eq!(
+        local_applied_epoch(&local).await,
+        Some(1),
+        "epoch corrected back down"
+    );
     assert_eq!(local_phone_ids(&local).await, vec!["p1"]);
 }
 
 #[tokio::test]
 async fn reconcile_refreshes_changed_entities() {
-    let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else { return };
+    let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else {
+        return;
+    };
 
     let central = CentralConfigStore::from_pool(make_db(&admin, "scs_refresh_central").await)
         .await
         .expect("central migrate");
-    central.register_site(SITE, "MUHJ", "muhj.x", "UTC", "active").await.expect("register");
     central
-        .upsert_json(ConfigTable::DialPlans, SITE, "main", &json!({"id": "main", "entries": []}), "op")
+        .register_site(SITE, "MUHJ", "muhj.x", "UTC", "active")
+        .await
+        .expect("register");
+    central
+        .upsert_json(
+            ConfigTable::DialPlans,
+            SITE,
+            "main",
+            &json!({"id": "main", "entries": []}),
+            "op",
+        )
         .await
         .expect("dialplan");
     central
-        .upsert_json(ConfigTable::TrunkGroups, SITE, "us", &json!({"id": "us"}), "op")
+        .upsert_json(
+            ConfigTable::TrunkGroups,
+            SITE,
+            "us",
+            &json!({"id": "us"}),
+            "op",
+        )
         .await
         .expect("tg");
     let source = DirectSource(central);
 
     let local = make_db(&admin, "scs_refresh_local").await;
-    sbc_config_store::ensure_schema(&local).await.expect("local schema");
+    sbc_config_store::ensure_schema(&local)
+        .await
+        .expect("local schema");
     let rec = RecordingRefresher::default();
 
     // Snapshot bootstrap refreshes the two live routing/trunk rows.
-    reconcile(&local, &source, &rec, SITE).await.expect("snapshot");
+    reconcile(&local, &source, &rec, SITE)
+        .await
+        .expect("snapshot");
     {
         let seen = rec.seen.lock().expect("lock");
-        assert!(seen.contains(&("dial_plans".into(), "main".into())), "snapshot refresh: {seen:?}");
+        assert!(
+            seen.contains(&("dial_plans".into(), "main".into())),
+            "snapshot refresh: {seen:?}"
+        );
         assert!(seen.contains(&("trunk_groups".into(), "us".into())));
     }
     rec.seen.lock().expect("lock").clear();
 
     // A delta refreshes exactly what changed: one trunk-group delete.
-    source.0.delete(ConfigTable::TrunkGroups, SITE, "us", "op").await.expect("del tg");
+    source
+        .0
+        .delete(ConfigTable::TrunkGroups, SITE, "us", "op")
+        .await
+        .expect("del tg");
     reconcile(&local, &source, &rec, SITE).await.expect("delta");
     let seen = rec.seen.lock().expect("lock");
-    assert_eq!(seen.as_slice(), &[("trunk_groups".to_string(), "us".to_string())], "delta refresh");
+    assert_eq!(
+        seen.as_slice(),
+        &[("trunk_groups".to_string(), "us".to_string())],
+        "delta refresh"
+    );
 }

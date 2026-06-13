@@ -172,8 +172,17 @@ impl CentralConfigStore {
         if let Err(e) = res {
             return Err(map_phone_error(e));
         }
-        journal(&mut tx, site_code, epoch, ConfigTable::Phones, id, ChangeOp::Upsert, Some(data), actor)
-            .await?;
+        journal(
+            &mut tx,
+            site_code,
+            epoch,
+            ConfigTable::Phones,
+            id,
+            ChangeOp::Upsert,
+            Some(data),
+            actor,
+        )
+        .await?;
         tx.commit().await?;
         Ok(epoch)
     }
@@ -208,7 +217,10 @@ impl CentralConfigStore {
                 .await?;
         if let Some(owner) = owner {
             if owner != site_code {
-                return Err(CentralError::DidConflict { did: did.to_string(), owner });
+                return Err(CentralError::DidConflict {
+                    did: did.to_string(),
+                    owner,
+                });
             }
         } else {
             sqlx::query("INSERT INTO did_registry (did, site_code) VALUES ($1, $2)")
@@ -305,7 +317,17 @@ impl CentralConfigStore {
             .bind(actor)
             .execute(&mut *tx)
             .await?;
-        journal(&mut tx, site_code, epoch, table, id, ChangeOp::Upsert, Some(data), actor).await?;
+        journal(
+            &mut tx,
+            site_code,
+            epoch,
+            table,
+            id,
+            ChangeOp::Upsert,
+            Some(data),
+            actor,
+        )
+        .await?;
         tx.commit().await?;
         Ok(epoch)
     }
@@ -324,7 +346,11 @@ impl CentralConfigStore {
         row_id: &str,
         actor: &str,
     ) -> CentralResult<i64> {
-        let id_col = if table == ConfigTable::DirectoryNumbers { "did" } else { "id" };
+        let id_col = if table == ConfigTable::DirectoryNumbers {
+            "did"
+        } else {
+            "id"
+        };
         let mut tx = self.pool.begin().await?;
         let epoch = bump_epoch(&mut tx, site_code).await?;
         let sql = format!(
@@ -351,7 +377,17 @@ impl CentralConfigStore {
                 .execute(&mut *tx)
                 .await?;
         }
-        journal(&mut tx, site_code, epoch, table, row_id, ChangeOp::Delete, None, actor).await?;
+        journal(
+            &mut tx,
+            site_code,
+            epoch,
+            table,
+            row_id,
+            ChangeOp::Delete,
+            None,
+            actor,
+        )
+        .await?;
         tx.commit().await?;
         Ok(epoch)
     }
@@ -382,10 +418,16 @@ impl CentralConfigStore {
         })?;
         match table {
             ConfigTable::Phones => {
-                let mac = payload.get("mac_address").and_then(Value::as_str).ok_or_else(|| {
-                    CentralError::Serialization(format!("phone {id} payload missing mac_address"))
-                })?;
-                self.upsert_phone(site_code, id, &normalize_mac(mac), payload, actor).await
+                let mac = payload
+                    .get("mac_address")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        CentralError::Serialization(format!(
+                            "phone {id} payload missing mac_address"
+                        ))
+                    })?;
+                self.upsert_phone(site_code, id, &normalize_mac(mac), payload, actor)
+                    .await
             }
             ConfigTable::DirectoryNumbers => {
                 let obj = payload.as_object().ok_or_else(|| {
@@ -407,7 +449,10 @@ impl CentralConfigStore {
                 )
                 .await
             }
-            json_table => self.upsert_json(json_table, site_code, id, payload, actor).await,
+            json_table => {
+                self.upsert_json(json_table, site_code, id, payload, actor)
+                    .await
+            }
         }
     }
 
@@ -464,7 +509,11 @@ impl CentralConfigStore {
                 payload: row.try_get("payload")?,
             });
         }
-        Ok(DeltaResult::Delta { from: since, to: current, changes })
+        Ok(DeltaResult::Delta {
+            from: since,
+            to: current,
+            changes,
+        })
     }
 
     /// A full materialized snapshot: every live row, grouped by table, at
@@ -582,7 +631,10 @@ async fn snapshot_table(
             "SELECT id, data FROM {} WHERE site_code = $1 AND NOT deleted ORDER BY id",
             table.name()
         );
-        let rows = sqlx::query(&sql).bind(site_code).fetch_all(&mut **tx).await?;
+        let rows = sqlx::query(&sql)
+            .bind(site_code)
+            .fetch_all(&mut **tx)
+            .await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
             out.push(SnapshotRow {
@@ -646,7 +698,11 @@ fn parse_table(name: &str) -> CentralResult<ConfigTable> {
 /// Map a phones-insert error: a unique violation is the live-MAC
 /// collision (partial index `idx_phones_site_mac_live`).
 fn map_phone_error(err: sqlx::Error) -> CentralError {
-    if err.as_database_error().and_then(sqlx::error::DatabaseError::code).as_deref() == Some("23505")
+    if err
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .as_deref()
+        == Some("23505")
     {
         CentralError::Conflict("a live phone already owns this MAC at this site".to_string())
     } else {

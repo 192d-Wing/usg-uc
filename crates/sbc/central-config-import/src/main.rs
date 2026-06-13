@@ -36,7 +36,8 @@ async fn main() -> ExitCode {
         error!("IMPORT_SITE_CODE is required");
         return ExitCode::from(2);
     };
-    let fqdn = std::env::var("IMPORT_SITE_FQDN_BASE").unwrap_or_else(|_| format!("{}.local", site.to_lowercase()));
+    let fqdn = std::env::var("IMPORT_SITE_FQDN_BASE")
+        .unwrap_or_else(|_| format!("{}.local", site.to_lowercase()));
     let Ok(source_dsn) = std::env::var("IMPORT_SOURCE_DSN") else {
         error!("IMPORT_SOURCE_DSN is required");
         return ExitCode::from(2);
@@ -47,7 +48,11 @@ async fn main() -> ExitCode {
     };
     let actor = std::env::var("IMPORT_ACTOR").unwrap_or_else(|_| "importer".to_string());
 
-    let source = match PgPoolOptions::new().max_connections(4).connect(&source_dsn).await {
+    let source = match PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&source_dsn)
+        .await
+    {
         Ok(p) => p,
         Err(e) => {
             error!(error = %e, "connect source DB failed");
@@ -62,7 +67,10 @@ async fn main() -> ExitCode {
         }
     };
 
-    if let Err(e) = central.register_site(&site, &site, &fqdn, "UTC", "active").await {
+    if let Err(e) = central
+        .register_site(&site, &site, &fqdn, "UTC", "active")
+        .await
+    {
         error!(site = %site, error = %e, "register site failed");
         return ExitCode::from(4);
     }

@@ -104,57 +104,87 @@ impl Refresher for GrpcRefresher {
                 ConfigTable::TrunkGroups => {
                     let mut c = self.trunk.clone();
                     if upsert {
-                        c.sync_trunk_group(p::SyncTrunkGroupRequest { group_id: id }).await.map(drop)
+                        c.sync_trunk_group(p::SyncTrunkGroupRequest { group_id: id })
+                            .await
+                            .map(drop)
                     } else {
-                        c.remove_trunk_group(p::RemoveTrunkGroupRequest { group_id: id }).await.map(drop)
+                        c.remove_trunk_group(p::RemoveTrunkGroupRequest { group_id: id })
+                            .await
+                            .map(drop)
                     }
                 }
                 ConfigTable::DialPlans => {
                     let mut c = self.dial_plan.clone();
                     if upsert {
-                        c.sync_dial_plan(p::SyncDialPlanRequest { plan_id: id }).await.map(drop)
+                        c.sync_dial_plan(p::SyncDialPlanRequest { plan_id: id })
+                            .await
+                            .map(drop)
                     } else {
-                        c.remove_dial_plan(p::RemoveDialPlanRequest { plan_id: id }).await.map(drop)
+                        c.remove_dial_plan(p::RemoveDialPlanRequest { plan_id: id })
+                            .await
+                            .map(drop)
                     }
                 }
                 ConfigTable::DirectoryNumbers => {
                     let mut c = self.did.clone();
                     if upsert {
-                        c.sync_directory_number(p::SyncDirectoryNumberRequest { did: id }).await.map(drop)
+                        c.sync_directory_number(p::SyncDirectoryNumberRequest { did: id })
+                            .await
+                            .map(drop)
                     } else {
-                        c.remove_directory_number(p::RemoveDirectoryNumberRequest { did: id }).await.map(drop)
+                        c.remove_directory_number(p::RemoveDirectoryNumberRequest { did: id })
+                            .await
+                            .map(drop)
                     }
                 }
                 ConfigTable::SbcPartitions => {
                     let mut c = self.sbc.clone();
                     if upsert {
-                        c.sync_partition(p::SyncPartitionRequest { partition_id: id }).await.map(drop)
+                        c.sync_partition(p::SyncPartitionRequest { partition_id: id })
+                            .await
+                            .map(drop)
                     } else {
-                        c.remove_partition(p::RemovePartitionRequest { partition_id: id }).await.map(drop)
+                        c.remove_partition(p::RemovePartitionRequest { partition_id: id })
+                            .await
+                            .map(drop)
                     }
                 }
                 ConfigTable::SbcCallingSearchSpaces => {
                     let mut c = self.sbc.clone();
                     if upsert {
-                        c.sync_calling_search_space(p::SyncCallingSearchSpaceRequest { css_id: id }).await.map(drop)
+                        c.sync_calling_search_space(p::SyncCallingSearchSpaceRequest { css_id: id })
+                            .await
+                            .map(drop)
                     } else {
-                        c.remove_calling_search_space(p::RemoveCallingSearchSpaceRequest { css_id: id }).await.map(drop)
+                        c.remove_calling_search_space(p::RemoveCallingSearchSpaceRequest {
+                            css_id: id,
+                        })
+                        .await
+                        .map(drop)
                     }
                 }
                 ConfigTable::SbcRoutePatterns => {
                     let mut c = self.sbc.clone();
                     if upsert {
-                        c.sync_route_pattern(p::SyncRoutePatternRequest { pattern_id: id }).await.map(drop)
+                        c.sync_route_pattern(p::SyncRoutePatternRequest { pattern_id: id })
+                            .await
+                            .map(drop)
                     } else {
-                        c.remove_route_pattern(p::RemoveRoutePatternRequest { pattern_id: id }).await.map(drop)
+                        c.remove_route_pattern(p::RemoveRoutePatternRequest { pattern_id: id })
+                            .await
+                            .map(drop)
                     }
                 }
                 ConfigTable::SbcRouteLists => {
                     let mut c = self.sbc.clone();
                     if upsert {
-                        c.sync_route_list(p::SyncRouteListRequest { list_id: id }).await.map(drop)
+                        c.sync_route_list(p::SyncRouteListRequest { list_id: id })
+                            .await
+                            .map(drop)
                     } else {
-                        c.remove_route_list(p::RemoveRouteListRequest { list_id: id }).await.map(drop)
+                        c.remove_route_list(p::RemoveRouteListRequest { list_id: id })
+                            .await
+                            .map(drop)
                     }
                 }
                 // No live daemon router for these — provisioning reads

@@ -86,14 +86,20 @@ impl p::SbcSyncService for MockDaemon {
         &self,
         req: Request<p::SyncPartitionRequest>,
     ) -> Result<Response<p::SyncSbcResponse>, Status> {
-        self.note(&format!("sbc.sync_partition:{}", req.into_inner().partition_id));
+        self.note(&format!(
+            "sbc.sync_partition:{}",
+            req.into_inner().partition_id
+        ));
         Ok(Response::new(p::SyncSbcResponse::default()))
     }
     async fn remove_partition(
         &self,
         req: Request<p::RemovePartitionRequest>,
     ) -> Result<Response<p::SyncSbcResponse>, Status> {
-        self.note(&format!("sbc.remove_partition:{}", req.into_inner().partition_id));
+        self.note(&format!(
+            "sbc.remove_partition:{}",
+            req.into_inner().partition_id
+        ));
         Ok(Response::new(p::SyncSbcResponse::default()))
     }
     async fn sync_calling_search_space(
@@ -121,7 +127,10 @@ impl p::SbcSyncService for MockDaemon {
         &self,
         req: Request<p::RemoveRoutePatternRequest>,
     ) -> Result<Response<p::SyncSbcResponse>, Status> {
-        self.note(&format!("sbc.remove_pattern:{}", req.into_inner().pattern_id));
+        self.note(&format!(
+            "sbc.remove_pattern:{}",
+            req.into_inner().pattern_id
+        ));
         Ok(Response::new(p::SyncSbcResponse::default()))
     }
     async fn sync_route_list(
@@ -146,7 +155,9 @@ async fn refresh_dispatches_to_the_right_rpc_over_the_wire() {
     let calls = mock.calls.clone();
 
     // Bind an ephemeral port and serve all four sync services.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     tokio::spawn(async move {
@@ -165,14 +176,42 @@ async fn refresh_dispatches_to_the_right_rpc_over_the_wire() {
     let up = ChangeOp::Upsert;
     let del = ChangeOp::Delete;
     let items = vec![
-        RefreshItem { table: ConfigTable::TrunkGroups, id: "us".into(), op: up },
-        RefreshItem { table: ConfigTable::DialPlans, id: "main".into(), op: del },
-        RefreshItem { table: ConfigTable::DirectoryNumbers, id: "5551234".into(), op: up },
-        RefreshItem { table: ConfigTable::SbcPartitions, id: "internal".into(), op: up },
-        RefreshItem { table: ConfigTable::SbcRouteLists, id: "rl1".into(), op: del },
+        RefreshItem {
+            table: ConfigTable::TrunkGroups,
+            id: "us".into(),
+            op: up,
+        },
+        RefreshItem {
+            table: ConfigTable::DialPlans,
+            id: "main".into(),
+            op: del,
+        },
+        RefreshItem {
+            table: ConfigTable::DirectoryNumbers,
+            id: "5551234".into(),
+            op: up,
+        },
+        RefreshItem {
+            table: ConfigTable::SbcPartitions,
+            id: "internal".into(),
+            op: up,
+        },
+        RefreshItem {
+            table: ConfigTable::SbcRouteLists,
+            id: "rl1".into(),
+            op: del,
+        },
         // No live router for these — must NOT produce any RPC.
-        RefreshItem { table: ConfigTable::Phones, id: "p1".into(), op: up },
-        RefreshItem { table: ConfigTable::SiteTelephonyConfig, id: "default".into(), op: up },
+        RefreshItem {
+            table: ConfigTable::Phones,
+            id: "p1".into(),
+            op: up,
+        },
+        RefreshItem {
+            table: ConfigTable::SiteTelephonyConfig,
+            id: "default".into(),
+            op: up,
+        },
     ];
     refresher.refresh(&items).await;
 
@@ -186,5 +225,8 @@ async fn refresh_dispatches_to_the_right_rpc_over_the_wire() {
         "sbc.remove_list:rl1".to_string(),
     ];
     want.sort();
-    assert_eq!(got, want, "exactly the routable items hit their RPCs; phones/site-config skipped");
+    assert_eq!(
+        got, want,
+        "exactly the routable items hit their RPCs; phones/site-config skipped"
+    );
 }

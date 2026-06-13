@@ -109,7 +109,10 @@ impl SbcJsonStore {
     /// # Errors
     /// Returns `ConfigStoreError::NotFound` if absent.
     pub async fn get(&self, id: &str) -> ConfigStoreResult<serde_json::Value> {
-        let sql = format!("SELECT data FROM {} WHERE id = $1 AND NOT deleted", self.table);
+        let sql = format!(
+            "SELECT data FROM {} WHERE id = $1 AND NOT deleted",
+            self.table
+        );
         let row = sqlx::query(&sql)
             .bind(id)
             .fetch_optional(&self.pool)
@@ -123,7 +126,10 @@ impl SbcJsonStore {
     /// # Errors
     /// Returns `ConfigStoreError::Storage` for DB errors.
     pub async fn list(&self) -> ConfigStoreResult<Vec<serde_json::Value>> {
-        let sql = format!("SELECT data FROM {} WHERE NOT deleted ORDER BY id", self.table);
+        let sql = format!(
+            "SELECT data FROM {} WHERE NOT deleted ORDER BY id",
+            self.table
+        );
         let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -211,9 +217,6 @@ macro_rules! sbc_store {
 }
 
 sbc_store!(PostgresPartitionStore, "sbc_partitions");
-sbc_store!(
-    PostgresCallingSearchSpaceStore,
-    "sbc_calling_search_spaces"
-);
+sbc_store!(PostgresCallingSearchSpaceStore, "sbc_calling_search_spaces");
 sbc_store!(PostgresRoutePatternStore, "sbc_route_patterns");
 sbc_store!(PostgresRouteListStore, "sbc_route_lists");

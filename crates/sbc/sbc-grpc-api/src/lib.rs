@@ -260,8 +260,8 @@ pub mod prelude {
     pub use super::sbc::sbc_sync_service_server::{SbcSyncService, SbcSyncServiceServer};
     pub use super::sbc::{
         RemoveCallingSearchSpaceRequest, RemovePartitionRequest, RemoveRouteListRequest,
-        RemoveRoutePatternRequest, SyncCallingSearchSpaceRequest, SyncSbcResponse,
-        SyncPartitionRequest, SyncRouteListRequest, SyncRoutePatternRequest,
+        RemoveRoutePatternRequest, SyncCallingSearchSpaceRequest, SyncPartitionRequest,
+        SyncRouteListRequest, SyncRoutePatternRequest, SyncSbcResponse,
     };
 }
 

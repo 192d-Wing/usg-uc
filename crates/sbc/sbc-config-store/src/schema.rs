@@ -38,8 +38,7 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 /// identity + database name. Lets every store constructor call
 /// [`ensure_schema`] unconditionally without re-paying the migrator's
 /// advisory-lock and history round trips 8–9× per startup.
-static MIGRATED: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+static MIGRATED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// `inet_server_addr()`/`port()` are NULL on unix-socket connections;
 /// the database name alone still disambiguates the common multi-DB case
@@ -59,9 +58,7 @@ const IDENTITY_SQL: &str = "SELECT current_database()::text
 pub async fn ensure_schema(pool: &PgPool) -> ConfigStoreResult<()> {
     let identity: String = sqlx::query_scalar(IDENTITY_SQL).fetch_one(pool).await?;
     {
-        let cache = MIGRATED
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let cache = MIGRATED.lock().unwrap_or_else(PoisonError::into_inner);
         if cache.contains(&identity) {
             return Ok(());
         }

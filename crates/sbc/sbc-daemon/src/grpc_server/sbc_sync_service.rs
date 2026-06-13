@@ -15,8 +15,8 @@ use std::sync::Arc;
 use sbc_grpc_api::sbc::sbc_sync_service_server::SbcSyncService;
 use sbc_grpc_api::sbc::{
     RemoveCallingSearchSpaceRequest, RemovePartitionRequest, RemoveRouteListRequest,
-    RemoveRoutePatternRequest, SyncCallingSearchSpaceRequest, SyncSbcResponse,
-    SyncPartitionRequest, SyncRouteListRequest, SyncRoutePatternRequest,
+    RemoveRoutePatternRequest, SyncCallingSearchSpaceRequest, SyncPartitionRequest,
+    SyncRouteListRequest, SyncRoutePatternRequest, SyncSbcResponse,
 };
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
@@ -32,8 +32,7 @@ pub struct SbcSyncServiceImpl {
 
 impl std::fmt::Debug for SbcSyncServiceImpl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SbcSyncServiceImpl")
-            .finish_non_exhaustive()
+        f.debug_struct("SbcSyncServiceImpl").finish_non_exhaustive()
     }
 }
 

@@ -34,12 +34,11 @@ const CENTRAL_ORIGIN: &str = "central";
 /// # Errors
 /// [`SyncError::Local`] on query failure.
 pub async fn applied_epoch(pool: &sqlx::PgPool, site_code: &str) -> SyncResult<Option<i64>> {
-    let epoch = sqlx::query_scalar::<_, i64>(
-        "SELECT applied_epoch FROM sync_state WHERE site_code = $1",
-    )
-    .bind(site_code)
-    .fetch_optional(pool)
-    .await?;
+    let epoch =
+        sqlx::query_scalar::<_, i64>("SELECT applied_epoch FROM sync_state WHERE site_code = $1")
+            .bind(site_code)
+            .fetch_optional(pool)
+            .await?;
     Ok(epoch)
 }
 
@@ -60,11 +59,21 @@ pub async fn apply_snapshot(
         // made while partitioned, updated_by = 'local') are preserved so
         // DDIL autonomy survives a snapshot reload. They'll be uploaded
         // back to central separately.
-        let sql = format!("DELETE FROM {} WHERE updated_by <> 'local'", table.table.name());
+        let sql = format!(
+            "DELETE FROM {} WHERE updated_by <> 'local'",
+            table.table.name()
+        );
         sqlx::query(&sql).execute(&mut *tx).await?;
         for row in &table.rows {
-            upsert_local(&mut tx, table.table, site_code, &row.id, &row.payload, snapshot.epoch)
-                .await?;
+            upsert_local(
+                &mut tx,
+                table.table,
+                site_code,
+                &row.id,
+                &row.payload,
+                snapshot.epoch,
+            )
+            .await?;
         }
     }
     set_applied_epoch(&mut tx, site_code, snapshot.epoch).await?;
@@ -92,12 +101,25 @@ pub async fn apply_delta(
                     row_id: change.row_id.clone(),
                     reason: "upsert change has no payload".to_string(),
                 })?;
-                upsert_local(&mut tx, change.table, site_code, &change.row_id, payload, change.epoch)
-                    .await?;
+                upsert_local(
+                    &mut tx,
+                    change.table,
+                    site_code,
+                    &change.row_id,
+                    payload,
+                    change.epoch,
+                )
+                .await?;
             }
             ChangeOp::Delete => {
-                tombstone_local(&mut tx, change.table, site_code, &change.row_id, change.epoch)
-                    .await?;
+                tombstone_local(
+                    &mut tx,
+                    change.table,
+                    site_code,
+                    &change.row_id,
+                    change.epoch,
+                )
+                .await?;
             }
         }
     }
@@ -150,11 +172,12 @@ async fn upsert_local(
             .await?;
         }
         ConfigTable::DirectoryNumbers => {
-            let dn = DirectoryNumber::from_json(payload.clone()).map_err(|e| SyncError::Payload {
-                table: "directory_numbers".to_string(),
-                row_id: id.to_string(),
-                reason: e.to_string(),
-            })?;
+            let dn =
+                DirectoryNumber::from_json(payload.clone()).map_err(|e| SyncError::Payload {
+                    table: "directory_numbers".to_string(),
+                    row_id: id.to_string(),
+                    reason: e.to_string(),
+                })?;
             let extra = serde_json::to_value(&dn.extra).unwrap_or(Value::Null);
             sqlx::query(
                 "INSERT INTO directory_numbers
@@ -220,7 +243,11 @@ async fn tombstone_local(
     id: &str,
     revision: i64,
 ) -> SyncResult<()> {
-    let id_col = if table == ConfigTable::DirectoryNumbers { "did" } else { "id" };
+    let id_col = if table == ConfigTable::DirectoryNumbers {
+        "did"
+    } else {
+        "id"
+    };
     // `updated_by <> 'local'` preserves a local edit: central must not
     // tombstone a row the site changed while partitioned.
     let sql = format!(
@@ -261,7 +288,12 @@ pub async fn collect_local_changes(
         let id: String = row.try_get("id")?;
         let deleted: bool = row.try_get("deleted")?;
         out.push(if deleted {
-            UploadChange { table: ConfigTable::Phones, id, op: ChangeOp::Delete, payload: None }
+            UploadChange {
+                table: ConfigTable::Phones,
+                id,
+                op: ChangeOp::Delete,
+                payload: None,
+            }
         } else {
             UploadChange {
                 table: ConfigTable::Phones,
@@ -293,7 +325,11 @@ pub async fn collect_local_changes(
         }
         let mut obj = Map::new();
         obj.insert("did".into(), json!(did));
-        for (col, key) in [("sip_user", "user"), ("partition", "partition"), ("description", "description")] {
+        for (col, key) in [
+            ("sip_user", "user"),
+            ("partition", "partition"),
+            ("description", "description"),
+        ] {
             if let Some(v) = row.try_get::<Option<String>, _>(col)? {
                 obj.insert(key.into(), json!(v));
             }
@@ -321,12 +357,20 @@ pub async fn collect_local_changes(
         ConfigTable::SbcRouteLists,
         ConfigTable::SiteTelephonyConfig,
     ] {
-        let sql = format!("SELECT id, data, deleted FROM {} WHERE updated_by = 'local'", table.name());
+        let sql = format!(
+            "SELECT id, data, deleted FROM {} WHERE updated_by = 'local'",
+            table.name()
+        );
         for row in sqlx::query(&sql).fetch_all(pool).await? {
             let id: String = row.try_get("id")?;
             let deleted: bool = row.try_get("deleted")?;
             out.push(if deleted {
-                UploadChange { table, id, op: ChangeOp::Delete, payload: None }
+                UploadChange {
+                    table,
+                    id,
+                    op: ChangeOp::Delete,
+                    payload: None,
+                }
             } else {
                 UploadChange {
                     table,
@@ -356,7 +400,11 @@ pub async fn restamp_uploaded(
 ) -> SyncResult<()> {
     let mut tx = pool.begin().await?;
     for change in changes {
-        let id_col = if change.table == ConfigTable::DirectoryNumbers { "did" } else { "id" };
+        let id_col = if change.table == ConfigTable::DirectoryNumbers {
+            "did"
+        } else {
+            "id"
+        };
         let sql = format!(
             "UPDATE {} SET updated_by = $1, revision = $2
              WHERE {} = $3 AND updated_by = 'local'",

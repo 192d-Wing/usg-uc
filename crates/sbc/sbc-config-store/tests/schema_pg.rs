@@ -119,7 +119,10 @@ async fn migrates_fresh_database() {
         .expect("migration history")
         .try_get("count")
         .expect("count column");
-    assert!(applied >= 2, "expected ≥2 recorded migrations, got {applied}");
+    assert!(
+        applied >= 2,
+        "expected ≥2 recorded migrations, got {applied}"
+    );
 }
 
 #[tokio::test]
@@ -141,12 +144,10 @@ async fn adopts_legacy_database_and_preserves_rows() {
     .execute(&pool)
     .await
     .expect("legacy phones table");
-    sqlx::query(
-        "CREATE UNIQUE INDEX idx_phones_mac_normalized ON phones (mac_normalized)",
-    )
-    .execute(&pool)
-    .await
-    .expect("legacy mac index");
+    sqlx::query("CREATE UNIQUE INDEX idx_phones_mac_normalized ON phones (mac_normalized)")
+        .execute(&pool)
+        .await
+        .expect("legacy mac index");
     let mut seeded = Phone::new("AA:BB:CC:DD:EE:FF", PhoneModel::PolycomVVX150, "legacy");
     seeded.id = "legacy-1".to_string();
     let legacy_phone = serde_json::to_value(&seeded).expect("encode legacy phone");
@@ -164,7 +165,10 @@ async fn adopts_legacy_database_and_preserves_rows() {
         .await
         .expect("migrate legacy db");
 
-    let phone = store.get_by_mac("aa-bb-cc-dd-ee-ff").await.expect("legacy row readable");
+    let phone = store
+        .get_by_mac("aa-bb-cc-dd-ee-ff")
+        .await
+        .expect("legacy row readable");
     assert_eq!(phone.id, "legacy-1");
 
     // Envelope defaults landed on the pre-existing row.
@@ -174,13 +178,22 @@ async fn adopts_legacy_database_and_preserves_rows() {
         .expect("envelope read");
     assert_eq!(row.try_get::<i64, _>("revision").expect("revision"), 0);
     assert!(!row.try_get::<bool, _>("deleted").expect("deleted"));
-    assert_eq!(row.try_get::<String, _>("updated_by").expect("updated_by"), "local");
+    assert_eq!(
+        row.try_get::<String, _>("updated_by").expect("updated_by"),
+        "local"
+    );
 
     // delete() writes a tombstone: invisible to reads, but the physical
     // row (and the fact a deletion happened) survives.
     store.delete("legacy-1").await.expect("tombstone delete");
-    assert!(store.get_by_mac("aabbccddeeff").await.is_err(), "tombstone visible");
-    assert!(store.list().await.expect("list").is_empty(), "tombstone listed");
+    assert!(
+        store.get_by_mac("aabbccddeeff").await.is_err(),
+        "tombstone visible"
+    );
+    assert!(
+        store.list().await.expect("list").is_empty(),
+        "tombstone listed"
+    );
     assert!(
         store.delete("legacy-1").await.is_err(),
         "double delete must be NotFound"
@@ -190,18 +203,27 @@ async fn adopts_legacy_database_and_preserves_rows() {
         .await
         .expect("tombstone row gone from table");
     assert!(row.try_get::<bool, _>("deleted").expect("deleted"));
-    assert_eq!(row.try_get::<String, _>("updated_by").expect("updated_by"), "local");
+    assert_eq!(
+        row.try_get::<String, _>("updated_by").expect("updated_by"),
+        "local"
+    );
 
     // The legacy-JSON import guard must NOT see an all-tombstoned table
     // as empty — that would re-import a stale file and resurrect rows.
-    assert!(!store.is_empty().await.expect("is_empty"), "tombstones must count");
+    assert!(
+        !store.is_empty().await.expect("is_empty"),
+        "tombstones must count"
+    );
 
     // A tombstoned phone must not hold its MAC hostage: a replacement
     // phone with a new id and the same MAC is provisionable (partial
     // unique index over live rows only).
     let mut replacement = Phone::new("AA:BB:CC:DD:EE:FF", PhoneModel::PolycomVVX150, "repl");
     replacement.id = "replacement-2".to_string();
-    store.upsert(&replacement).await.expect("MAC reuse after tombstone");
+    store
+        .upsert(&replacement)
+        .await
+        .expect("MAC reuse after tombstone");
     assert_eq!(
         store.get_by_mac("aabbccddeeff").await.expect("live row").id,
         "replacement-2"
@@ -218,7 +240,10 @@ async fn adopts_legacy_database_and_preserves_rows() {
         .expect("revived row");
     assert!(!row.try_get::<bool, _>("deleted").expect("deleted"));
     assert_eq!(row.try_get::<i64, _>("revision").expect("revision"), 0);
-    assert_eq!(row.try_get::<String, _>("updated_by").expect("updated_by"), "local");
+    assert_eq!(
+        row.try_get::<String, _>("updated_by").expect("updated_by"),
+        "local"
+    );
 }
 
 /// The central database (deploy/central-db, raw SQL applied via psql)

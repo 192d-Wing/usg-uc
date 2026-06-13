@@ -7,12 +7,12 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
-use axum::Json;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tower_http::trace::TraceLayer;
@@ -36,13 +36,28 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Operator write surface (config-admin tokens).
         .route("/v1/sites", post(register_site))
         .route("/v1/sites/{site_code}/phones", post(upsert_phone))
-        .route("/v1/sites/{site_code}/phones/{id}", axum::routing::delete(delete_phone))
+        .route(
+            "/v1/sites/{site_code}/phones/{id}",
+            axum::routing::delete(delete_phone),
+        )
         .route("/v1/sites/{site_code}/directory", post(upsert_did))
-        .route("/v1/sites/{site_code}/directory/{did}", axum::routing::delete(delete_did))
-        .route("/v1/sites/{site_code}/trunkgroups", post(upsert_trunk_group))
-        .route("/v1/sites/{site_code}/trunkgroups/{id}", axum::routing::delete(delete_trunk_group))
+        .route(
+            "/v1/sites/{site_code}/directory/{did}",
+            axum::routing::delete(delete_did),
+        )
+        .route(
+            "/v1/sites/{site_code}/trunkgroups",
+            post(upsert_trunk_group),
+        )
+        .route(
+            "/v1/sites/{site_code}/trunkgroups/{id}",
+            axum::routing::delete(delete_trunk_group),
+        )
         .route("/v1/sites/{site_code}/dialplans", post(upsert_dial_plan))
-        .route("/v1/sites/{site_code}/dialplans/{id}", axum::routing::delete(delete_dial_plan))
+        .route(
+            "/v1/sites/{site_code}/dialplans/{id}",
+            axum::routing::delete(delete_dial_plan),
+        )
         .route("/v1/sites/{site_code}/config", put(put_site_config))
         // SBC routing entities (partitions / calling_search_spaces /
         // route_patterns / route_lists), JSON pass-through by id.
@@ -52,9 +67,18 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::delete(delete_routing),
         )
         // Global templates + materialization (config-admin tokens).
-        .route("/v1/templates/{kind}/{id}", put(put_template).delete(delete_template))
-        .route("/v1/templates/{kind}/{id}/sites/{site_code}", put(assign_template))
-        .route("/v1/templates/{kind}/{id}/materialize", post(materialize_template))
+        .route(
+            "/v1/templates/{kind}/{id}",
+            put(put_template).delete(delete_template),
+        )
+        .route(
+            "/v1/templates/{kind}/{id}/sites/{site_code}",
+            put(assign_template),
+        )
+        .route(
+            "/v1/templates/{kind}/{id}/materialize",
+            post(materialize_template),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -171,7 +195,14 @@ async fn sync_upload(
     for change in &batch.changes {
         match state
             .store
-            .apply_change(&site_code, change.table, change.op, &change.id, change.payload.as_ref(), &actor)
+            .apply_change(
+                &site_code,
+                change.table,
+                change.op,
+                &change.id,
+                change.payload.as_ref(),
+                &actor,
+            )
             .await
         {
             Ok(epoch) => last_epoch = Some(epoch),
@@ -233,12 +264,19 @@ fn write_error(err: &CentralError) -> Response {
         CentralError::Serialization(_) => (StatusCode::BAD_REQUEST, "bad_payload"),
         CentralError::Storage(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
     };
-    (status, Json(json!({ "error": code, "detail": err.to_string() }))).into_response()
+    (
+        status,
+        Json(json!({ "error": code, "detail": err.to_string() })),
+    )
+        .into_response()
 }
 
 /// 400 with a validation message.
 fn bad_request(detail: impl Into<String>) -> Response {
-    (StatusCode::BAD_REQUEST, Json(json!({ "error": "bad_request", "detail": detail.into() })))
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "bad_request", "detail": detail.into() })),
+    )
         .into_response()
 }
 
@@ -259,13 +297,26 @@ async fn register_site(
     let Some(site) = body.get("site_code").and_then(Value::as_str) else {
         return bad_request("site_code is required");
     };
-    let display = body.get("display_name").and_then(Value::as_str).unwrap_or(site);
+    let display = body
+        .get("display_name")
+        .and_then(Value::as_str)
+        .unwrap_or(site);
     let Some(fqdn) = body.get("fqdn_base").and_then(Value::as_str) else {
         return bad_request("fqdn_base is required");
     };
-    let tz = body.get("timezone").and_then(Value::as_str).unwrap_or("UTC");
-    let status = body.get("status").and_then(Value::as_str).unwrap_or("planned");
-    match state.store.register_site(site, display, fqdn, tz, status).await {
+    let tz = body
+        .get("timezone")
+        .and_then(Value::as_str)
+        .unwrap_or("UTC");
+    let status = body
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("planned");
+    match state
+        .store
+        .register_site(site, display, fqdn, tz, status)
+        .await
+    {
         Ok(()) => (StatusCode::CREATED, Json(json!({ "site_code": site }))).into_response(),
         Err(e) => write_error(&e),
     }
@@ -288,7 +339,11 @@ async fn upsert_phone(
     let Some(mac) = body.get("mac_address").and_then(Value::as_str) else {
         return bad_request("mac_address is required");
     };
-    match state.store.upsert_phone(&site, id, &normalize_mac(mac), &body, &actor).await {
+    match state
+        .store
+        .upsert_phone(&site, id, &normalize_mac(mac), &body, &actor)
+        .await
+    {
         Ok(epoch) => ok_epoch(epoch),
         Err(e) => write_error(&e),
     }
@@ -304,7 +359,11 @@ async fn delete_phone(
         Ok(c) => c.sub,
         Err(rej) => return rej.into_response(),
     };
-    match state.store.delete(ConfigTable::Phones, &site, &id, &actor).await {
+    match state
+        .store
+        .delete(ConfigTable::Phones, &site, &id, &actor)
+        .await
+    {
         Ok(epoch) => ok_epoch(epoch),
         Err(e) => write_error(&e),
     }
@@ -328,8 +387,11 @@ async fn upsert_did(
         return bad_request("did is required");
     };
     let str_field = |k: &str| obj.get(k).and_then(Value::as_str).map(str::to_string);
-    let (user, partition, description) =
-        (str_field("user"), str_field("partition"), str_field("description"));
+    let (user, partition, description) = (
+        str_field("user"),
+        str_field("partition"),
+        str_field("description"),
+    );
     // Everything else becomes `extra`.
     let mut extra = obj.clone();
     for k in ["did", "user", "partition", "description"] {
@@ -363,7 +425,11 @@ async fn delete_did(
         Ok(c) => c.sub,
         Err(rej) => return rej.into_response(),
     };
-    match state.store.delete(ConfigTable::DirectoryNumbers, &site, &did, &actor).await {
+    match state
+        .store
+        .delete(ConfigTable::DirectoryNumbers, &site, &did, &actor)
+        .await
+    {
         Ok(epoch) => ok_epoch(epoch),
         Err(e) => write_error(&e),
     }
@@ -385,7 +451,11 @@ async fn upsert_trunk_group(
         Ok(c) => c,
         Err(e) => return bad_request(format!("invalid trunk group: {e}")),
     };
-    match state.store.upsert_json(ConfigTable::TrunkGroups, &site, &cfg.id, &body, &actor).await {
+    match state
+        .store
+        .upsert_json(ConfigTable::TrunkGroups, &site, &cfg.id, &body, &actor)
+        .await
+    {
         Ok(epoch) => ok_epoch(epoch),
         Err(e) => write_error(&e),
     }
@@ -401,7 +471,11 @@ async fn delete_trunk_group(
         Ok(c) => c.sub,
         Err(rej) => return rej.into_response(),
     };
-    match state.store.delete(ConfigTable::TrunkGroups, &site, &id, &actor).await {
+    match state
+        .store
+        .delete(ConfigTable::TrunkGroups, &site, &id, &actor)
+        .await
+    {
         Ok(epoch) => ok_epoch(epoch),
         Err(e) => write_error(&e),
     }
@@ -423,7 +497,11 @@ async fn upsert_dial_plan(
         Ok(c) => c,
         Err(e) => return bad_request(format!("invalid dial plan: {e}")),
     };
-    match state.store.upsert_json(ConfigTable::DialPlans, &site, &cfg.id, &body, &actor).await {
+    match state
+        .store
+        .upsert_json(ConfigTable::DialPlans, &site, &cfg.id, &body, &actor)
+        .await
+    {
         Ok(epoch) => ok_epoch(epoch),
         Err(e) => write_error(&e),
     }
@@ -439,7 +517,11 @@ async fn delete_dial_plan(
         Ok(c) => c.sub,
         Err(rej) => return rej.into_response(),
     };
-    match state.store.delete(ConfigTable::DialPlans, &site, &id, &actor).await {
+    match state
+        .store
+        .delete(ConfigTable::DialPlans, &site, &id, &actor)
+        .await
+    {
         Ok(epoch) => ok_epoch(epoch),
         Err(e) => write_error(&e),
     }
@@ -469,12 +551,18 @@ async fn upsert_routing(
         Err(rej) => return rej.into_response(),
     };
     let Some(table) = routing_table(&kind) else {
-        return bad_request("kind must be partitions, calling_search_spaces, route_patterns, or route_lists");
+        return bad_request(
+            "kind must be partitions, calling_search_spaces, route_patterns, or route_lists",
+        );
     };
     let Some(id) = body.get("id").and_then(Value::as_str) else {
         return bad_request("routing entity id is required");
     };
-    match state.store.upsert_json(table, &site, id, &body, &actor).await {
+    match state
+        .store
+        .upsert_json(table, &site, id, &body, &actor)
+        .await
+    {
         Ok(epoch) => ok_epoch(epoch),
         Err(e) => write_error(&e),
     }
@@ -516,7 +604,13 @@ async fn put_site_config(
     }
     match state
         .store
-        .upsert_json(ConfigTable::SiteTelephonyConfig, &site, "default", &body, &actor)
+        .upsert_json(
+            ConfigTable::SiteTelephonyConfig,
+            &site,
+            "default",
+            &body,
+            &actor,
+        )
         .await
     {
         Ok(epoch) => ok_epoch(epoch),
@@ -586,7 +680,11 @@ async fn assign_template(
         .and_then(|n| i32::try_from(n).ok())
         .unwrap_or(0);
     match state.store.assign_template(kind, &id, &site, ring).await {
-        Ok(()) => (StatusCode::OK, Json(json!({ "site_code": site, "ring": ring }))).into_response(),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({ "site_code": site, "ring": ring })),
+        )
+            .into_response(),
         Err(e) => write_error(&e),
     }
 }
@@ -669,9 +767,11 @@ mod tests {
 
         static KEY: std::sync::OnceLock<TestKey> = std::sync::OnceLock::new();
         KEY.get_or_init(|| {
-            let pkcs8 =
-                EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &SystemRandom::new())
-                    .expect("generate key");
+            let pkcs8 = EcdsaKeyPair::generate_pkcs8(
+                &ECDSA_P256_SHA256_FIXED_SIGNING,
+                &SystemRandom::new(),
+            )
+            .expect("generate key");
             let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref())
                 .expect("parse key");
             let point = pair.public_key().as_ref();
@@ -683,12 +783,18 @@ mod tests {
                 }]
             }))
             .expect("jwks");
-            TestKey { encoding: EncodingKey::from_ec_der(pkcs8.as_ref()), jwks }
+            TestKey {
+                encoding: EncodingKey::from_ec_der(pkcs8.as_ref()),
+                jwks,
+            }
         })
     }
 
     fn now() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_secs()
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs()
     }
 
     /// Mint a token. Overridable bits let each test bend exactly one
@@ -724,7 +830,10 @@ mod tests {
             .execute(&admin_pool)
             .await
             .expect("drop");
-        sqlx::query(&format!("CREATE DATABASE {name}")).execute(&admin_pool).await.expect("create");
+        sqlx::query(&format!("CREATE DATABASE {name}"))
+            .execute(&admin_pool)
+            .await
+            .expect("create");
         let pool = PgPoolOptions::new()
             .max_connections(5)
             .connect_with(opts.database(name))
@@ -736,9 +845,18 @@ mod tests {
     /// Build the router over a scratch store seeded with one site + phone.
     async fn app(admin: &str, name: &str) -> Router {
         let store = scratch_store(admin, name).await;
-        store.register_site("MUHJ", "MUHJ", "muhj.x", "UTC", "active").await.expect("register");
         store
-            .upsert_phone("MUHJ", "p1", "aabbccddeeff", &serde_json::json!({"id": "p1"}), "op")
+            .register_site("MUHJ", "MUHJ", "muhj.x", "UTC", "active")
+            .await
+            .expect("register");
+        store
+            .upsert_phone(
+                "MUHJ",
+                "p1",
+                "aabbccddeeff",
+                &serde_json::json!({"id": "p1"}),
+                "op",
+            )
             .await
             .expect("seed phone");
         let jwks = Arc::new(JwksCache::with_static(test_key().jwks.clone()));
@@ -800,11 +918,18 @@ mod tests {
             }
             None => Body::empty(),
         };
-        let resp = app.clone().oneshot(req.body(body).expect("req")).await.expect("response");
+        let resp = app
+            .clone()
+            .oneshot(req.body(body).expect("req"))
+            .await
+            .expect("response");
         let status = resp.status();
         let bytes = resp.into_body().collect().await.expect("body").to_bytes();
-        let body =
-            if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).expect("json") };
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).expect("json")
+        };
         (status, body)
     }
 
@@ -816,7 +941,9 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn write_surface_authz_validation_and_epochs() {
-        let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else { return };
+        let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else {
+            return;
+        };
         let app = app(&admin, "cca_writes").await; // seeds site MUHJ + phone p1 (epoch 1)
         let admin_tok = admin_token();
 
@@ -914,11 +1041,23 @@ mod tests {
         assert_eq!(s, StatusCode::NOT_FOUND);
 
         // Delete the seeded phone (tombstone), epoch advances; re-delete 404s.
-        let (s, _) =
-            send_req(&app, "DELETE", "/v1/sites/MUHJ/phones/p1", Some(&admin_tok), None).await;
+        let (s, _) = send_req(
+            &app,
+            "DELETE",
+            "/v1/sites/MUHJ/phones/p1",
+            Some(&admin_tok),
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::OK);
-        let (s, _) =
-            send_req(&app, "DELETE", "/v1/sites/MUHJ/phones/p1", Some(&admin_tok), None).await;
+        let (s, _) = send_req(
+            &app,
+            "DELETE",
+            "/v1/sites/MUHJ/phones/p1",
+            Some(&admin_tok),
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::NOT_FOUND, "second delete finds no live row");
 
         // The writes are visible on the sync surface the agent pulls.
@@ -1012,7 +1151,9 @@ mod tests {
 
     #[tokio::test]
     async fn authz_matrix_and_sync_responses() {
-        let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else { return };
+        let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else {
+            return;
+        };
         let app = app(&admin, "cca_authz").await;
 
         // Health needs no auth.
@@ -1115,7 +1256,9 @@ mod tests {
         let (_, b) = send(&app, "/v1/sync/MUHJ/snapshot", Some(&good_token("MUHJ"))).await;
         let has_edge = b["tables"].as_array().expect("tables").iter().any(|t| {
             t["table"] == "phones"
-                && t["rows"].as_array().is_some_and(|r| r.iter().any(|x| x["id"] == "p-edge"))
+                && t["rows"]
+                    .as_array()
+                    .is_some_and(|r| r.iter().any(|x| x["id"] == "p-edge"))
         });
         assert!(has_edge, "uploaded phone present: {b}");
 
@@ -1139,13 +1282,24 @@ mod tests {
     /// tests only reach in-process.
     #[tokio::test]
     async fn http_wire_pull_and_ddil_upload() {
-        let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else { return };
+        let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else {
+            return;
+        };
 
         // Central store behind the booted API.
         let central = scratch_store(&admin, "cca_wire_central").await;
-        central.register_site("MUHJ", "MUHJ", "muhj.x", "UTC", "active").await.expect("register");
         central
-            .upsert_phone("MUHJ", "p1", "aaaaaaaaaaaa", &json!({"id": "p1", "mac_address": "aa:aa:aa:aa:aa:aa"}), "op")
+            .register_site("MUHJ", "MUHJ", "muhj.x", "UTC", "active")
+            .await
+            .expect("register");
+        central
+            .upsert_phone(
+                "MUHJ",
+                "p1",
+                "aaaaaaaaaaaa",
+                &json!({"id": "p1", "mac_address": "aa:aa:aa:aa:aa:aa"}),
+                "op",
+            )
             .await
             .expect("seed p1");
 
@@ -1168,7 +1322,9 @@ mod tests {
             admin_validator: validator_for(ADMIN_SCOPE),
             start_time: Instant::now(),
         }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -1185,43 +1341,54 @@ mod tests {
         // A real site-local DB with the SBC schema for the agent to apply into.
         let local = {
             let opts = PgConnectOptions::from_str(&admin).expect("dsn");
-            let admin_pool =
-                PgPoolOptions::new().max_connections(1).connect_with(opts.clone()).await.expect("admin");
+            let admin_pool = PgPoolOptions::new()
+                .max_connections(1)
+                .connect_with(opts.clone())
+                .await
+                .expect("admin");
             sqlx::query("DROP DATABASE IF EXISTS cca_wire_local WITH (FORCE)")
                 .execute(&admin_pool)
                 .await
                 .expect("drop");
-            sqlx::query("CREATE DATABASE cca_wire_local").execute(&admin_pool).await.expect("create");
+            sqlx::query("CREATE DATABASE cca_wire_local")
+                .execute(&admin_pool)
+                .await
+                .expect("create");
             PgPoolOptions::new()
                 .max_connections(5)
                 .connect_with(opts.database("cca_wire_local"))
                 .await
                 .expect("local connect")
         };
-        sbc_config_store::ensure_schema(&local).await.expect("local schema");
+        sbc_config_store::ensure_schema(&local)
+            .await
+            .expect("local schema");
 
         // First reconcile over HTTP: never-synced → snapshot pull.
-        let outcome = sbc_config_sync::reconcile(
-            &local,
-            &client,
-            &sbc_config_sync::NoopRefresher,
-            "MUHJ",
-        )
-        .await
-        .expect("reconcile over http");
+        let outcome =
+            sbc_config_sync::reconcile(&local, &client, &sbc_config_sync::NoopRefresher, "MUHJ")
+                .await
+                .expect("reconcile over http");
         assert!(
             matches!(outcome, sbc_config_sync::Outcome::Snapshotted { .. }),
             "got {outcome:?}"
         );
-        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM phones WHERE id = 'p1' AND NOT deleted")
-            .fetch_one(&local)
-            .await
-            .expect("count");
+        let n: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM phones WHERE id = 'p1' AND NOT deleted")
+                .fetch_one(&local)
+                .await
+                .expect("count");
         assert_eq!(n, 1, "snapshot pulled the phone over HTTP");
 
         // Central adds a phone → delta pull over HTTP.
         central
-            .upsert_phone("MUHJ", "p2", "bbbbbbbbbbbb", &json!({"id": "p2", "mac_address": "bb:bb:bb:bb:bb:bb"}), "op")
+            .upsert_phone(
+                "MUHJ",
+                "p2",
+                "bbbbbbbbbbbb",
+                &json!({"id": "p2", "mac_address": "bb:bb:bb:bb:bb:bb"}),
+                "op",
+            )
             .await
             .expect("p2");
         sbc_config_sync::reconcile(&local, &client, &sbc_config_sync::NoopRefresher, "MUHJ")
@@ -1235,13 +1402,15 @@ mod tests {
 
         // DDIL: a local edit, then reconcile uploads it over HTTP and
         // central adopts it (local wins).
-        sqlx::query("INSERT INTO phones (id, mac_normalized, data, updated_by) VALUES ($1,$2,$3,'local')")
-            .bind("p-edge")
-            .bind("cccccccccccc")
-            .bind(json!({"id":"p-edge","mac_address":"cc:cc:cc:cc:cc:cc"}))
-            .execute(&local)
-            .await
-            .expect("local edit");
+        sqlx::query(
+            "INSERT INTO phones (id, mac_normalized, data, updated_by) VALUES ($1,$2,$3,'local')",
+        )
+        .bind("p-edge")
+        .bind("cccccccccccc")
+        .bind(json!({"id":"p-edge","mac_address":"cc:cc:cc:cc:cc:cc"}))
+        .execute(&local)
+        .await
+        .expect("local edit");
         sbc_config_sync::reconcile(&local, &client, &sbc_config_sync::NoopRefresher, "MUHJ")
             .await
             .expect("upload over http");

@@ -88,7 +88,9 @@ pub async fn import_site(
         let id: String = row.try_get("id")?;
         let mac: String = row.try_get("mac_normalized")?;
         let data: Value = row.try_get("data")?;
-        central.upsert_phone(site_code, &id, &mac, &data, actor).await?;
+        central
+            .upsert_phone(site_code, &id, &mac, &data, actor)
+            .await?;
         report.phones += 1;
     }
 
@@ -131,7 +133,9 @@ pub async fn import_site(
         for row in &rows {
             let id: String = row.try_get("id")?;
             let data: Value = row.try_get("data")?;
-            central.upsert_json(table, site_code, &id, &data, actor).await?;
+            central
+                .upsert_json(table, site_code, &id, &data, actor)
+                .await?;
             match table {
                 ConfigTable::TrunkGroups => report.trunk_groups += 1,
                 ConfigTable::DialPlans => report.dial_plans += 1,

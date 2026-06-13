@@ -13,9 +13,9 @@ use sbc_config_store::{
     PostgresTrunkGroupStore,
 };
 use sbc_grpc_api::prelude::{
-    CallServiceClient, SbcSyncServiceClient, DialPlanSyncServiceClient,
-    DidMappingSyncServiceClient, RegistrationServiceClient, SystemServiceClient,
-    TrunkHealthServiceClient, TrunkSyncServiceClient,
+    CallServiceClient, DialPlanSyncServiceClient, DidMappingSyncServiceClient,
+    RegistrationServiceClient, SbcSyncServiceClient, SystemServiceClient, TrunkHealthServiceClient,
+    TrunkSyncServiceClient,
 };
 use thiserror::Error;
 use tonic::transport::{Channel, Endpoint};

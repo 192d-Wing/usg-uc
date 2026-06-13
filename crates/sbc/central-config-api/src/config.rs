@@ -64,6 +64,11 @@ impl Config {
             lookup("CENTRAL_OIDC_ISSUER").ok_or(ConfigError::Missing("CENTRAL_OIDC_ISSUER"))?;
         let oidc_audience =
             lookup("CENTRAL_OIDC_AUDIENCE").ok_or(ConfigError::Missing("CENTRAL_OIDC_AUDIENCE"))?;
-        Ok(Self { listen_addr, database_url, oidc_issuer, oidc_audience })
+        Ok(Self {
+            listen_addr,
+            database_url,
+            oidc_issuer,
+            oidc_audience,
+        })
     }
 }

@@ -31,11 +31,11 @@ mod call_service;
 #[cfg(feature = "cluster")]
 mod cluster_service;
 mod config_service;
-mod sbc_sync_service;
 mod dial_plan_sync_service;
 mod did_mapping_sync_service;
 mod health_service;
 mod registration_service;
+mod sbc_sync_service;
 mod system_service;
 mod trunk_health_service;
 mod trunk_status_publish_service;
@@ -51,10 +51,10 @@ use sbc_grpc_api::sbc::call_service_server::CallServiceServer;
 #[cfg(feature = "cluster")]
 use sbc_grpc_api::sbc::cluster_service_server::ClusterServiceServer;
 use sbc_grpc_api::sbc::config_service_server::ConfigServiceServer;
-use sbc_grpc_api::sbc::sbc_sync_service_server::SbcSyncServiceServer;
 use sbc_grpc_api::sbc::dial_plan_sync_service_server::DialPlanSyncServiceServer;
 use sbc_grpc_api::sbc::did_mapping_sync_service_server::DidMappingSyncServiceServer;
 use sbc_grpc_api::sbc::registration_service_server::RegistrationServiceServer;
+use sbc_grpc_api::sbc::sbc_sync_service_server::SbcSyncServiceServer;
 use sbc_grpc_api::sbc::system_service_server::SystemServiceServer;
 use sbc_grpc_api::sbc::trunk_health_service_server::TrunkHealthServiceServer;
 use sbc_grpc_api::sbc::trunk_status_publish_service_server::TrunkStatusPublishServiceServer;
@@ -69,11 +69,11 @@ pub use call_service::CallServiceImpl;
 #[cfg(feature = "cluster")]
 pub use cluster_service::ClusterServiceImpl;
 pub use config_service::ConfigServiceImpl;
-pub use sbc_sync_service::SbcSyncServiceImpl;
 pub use dial_plan_sync_service::DialPlanSyncServiceImpl;
 pub use did_mapping_sync_service::DidMappingSyncServiceImpl;
 pub use health_service::HealthServiceImpl;
 pub use registration_service::RegistrationServiceImpl;
+pub use sbc_sync_service::SbcSyncServiceImpl;
 pub use system_service::SystemServiceImpl;
 pub use trunk_health_service::TrunkHealthServiceImpl;
 pub use trunk_status_publish_service::TrunkStatusPublishServiceImpl;
