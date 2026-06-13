@@ -619,9 +619,14 @@ impl CentralConfigStore {
                 "SELECT data FROM {} WHERE site_code = $1 AND id = $2 AND NOT deleted",
                 table.name()
             );
-            let row =
-                sqlx::query(&sql).bind(site_code).bind(row_id).fetch_optional(&self.pool).await?;
-            row.map(|r| r.try_get::<Value, _>("data")).transpose().map_err(CentralError::from)
+            let row = sqlx::query(&sql)
+                .bind(site_code)
+                .bind(row_id)
+                .fetch_optional(&self.pool)
+                .await?;
+            row.map(|r| r.try_get::<Value, _>("data"))
+                .transpose()
+                .map_err(CentralError::from)
         }
     }
 }

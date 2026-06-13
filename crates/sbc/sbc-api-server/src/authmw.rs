@@ -107,7 +107,10 @@ mod tests {
         let mut h = HeaderMap::new();
         assert_eq!(bearer(&h), None, "no header");
 
-        h.insert(header::AUTHORIZATION, "Bearer  abc.def.ghi ".parse().unwrap());
+        h.insert(
+            header::AUTHORIZATION,
+            "Bearer  abc.def.ghi ".parse().unwrap(),
+        );
         assert_eq!(bearer(&h).as_deref(), Some("abc.def.ghi"), "trimmed token");
 
         h.insert(header::AUTHORIZATION, "Basic dXNlcjpwYXNz".parse().unwrap());

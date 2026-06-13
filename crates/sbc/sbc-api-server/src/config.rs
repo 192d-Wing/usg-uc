@@ -67,8 +67,12 @@ impl Config {
             .map_err(|_| ConfigError::Missing("SBC_DAEMON_HTTP_URL"))?;
 
         // OIDC is optional but issuer+audience must come as a pair.
-        let oidc_issuer = std::env::var("SBC_OIDC_ISSUER").ok().filter(|s| !s.is_empty());
-        let oidc_audience = std::env::var("SBC_OIDC_AUDIENCE").ok().filter(|s| !s.is_empty());
+        let oidc_issuer = std::env::var("SBC_OIDC_ISSUER")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let oidc_audience = std::env::var("SBC_OIDC_AUDIENCE")
+            .ok()
+            .filter(|s| !s.is_empty());
         if oidc_issuer.is_some() != oidc_audience.is_some() {
             return Err(ConfigError::Invalid {
                 var: "SBC_OIDC_ISSUER/SBC_OIDC_AUDIENCE",

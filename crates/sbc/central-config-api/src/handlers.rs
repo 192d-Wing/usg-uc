@@ -35,12 +35,18 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/sync/{site_code}/upload", post(sync_upload))
         // Operator surface (config-admin tokens). GET reads + writes.
         .route("/v1/sites", get(list_sites).post(register_site))
-        .route("/v1/sites/{site_code}/phones", get(list_phones).post(upsert_phone))
+        .route(
+            "/v1/sites/{site_code}/phones",
+            get(list_phones).post(upsert_phone),
+        )
         .route(
             "/v1/sites/{site_code}/phones/{id}",
             get(get_phone).delete(delete_phone),
         )
-        .route("/v1/sites/{site_code}/directory", get(list_directory).post(upsert_did))
+        .route(
+            "/v1/sites/{site_code}/directory",
+            get(list_directory).post(upsert_did),
+        )
         .route(
             "/v1/sites/{site_code}/directory/{did}",
             get(get_directory).delete(delete_did),
@@ -61,10 +67,16 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1/sites/{site_code}/dialplans/{id}",
             get(get_dial_plan).delete(delete_dial_plan),
         )
-        .route("/v1/sites/{site_code}/config", get(get_site_config).put(put_site_config))
+        .route(
+            "/v1/sites/{site_code}/config",
+            get(get_site_config).put(put_site_config),
+        )
         // SBC routing entities (partitions / calling_search_spaces /
         // route_patterns / route_lists), JSON pass-through by id.
-        .route("/v1/sites/{site_code}/routing/{kind}", get(list_routing).post(upsert_routing))
+        .route(
+            "/v1/sites/{site_code}/routing/{kind}",
+            get(list_routing).post(upsert_routing),
+        )
         .route(
             "/v1/sites/{site_code}/routing/{kind}/{id}",
             get(get_routing).delete(delete_routing),
@@ -294,7 +306,12 @@ fn ok_epoch(epoch: i64) -> Response {
 // `{ "items": [payload…] }`; single-row GETs return the payload or 404.
 
 /// List a table's live rows for a site as `{ "items": [...] }`.
-async fn do_list(state: &AppState, headers: &HeaderMap, site: &str, table: ConfigTable) -> Response {
+async fn do_list(
+    state: &AppState,
+    headers: &HeaderMap,
+    site: &str,
+    table: ConfigTable,
+) -> Response {
     if let Err(rej) = authorize_operator(&state.admin_validator, headers).await {
         return rej.into_response();
     }
@@ -336,44 +353,88 @@ async fn list_sites(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     }
 }
 
-async fn list_phones(State(s): State<Arc<AppState>>, Path(site): Path<String>, h: HeaderMap) -> Response {
+async fn list_phones(
+    State(s): State<Arc<AppState>>,
+    Path(site): Path<String>,
+    h: HeaderMap,
+) -> Response {
     do_list(&s, &h, &site, ConfigTable::Phones).await
 }
-async fn get_phone(State(s): State<Arc<AppState>>, Path((site, id)): Path<(String, String)>, h: HeaderMap) -> Response {
+async fn get_phone(
+    State(s): State<Arc<AppState>>,
+    Path((site, id)): Path<(String, String)>,
+    h: HeaderMap,
+) -> Response {
     do_get(&s, &h, &site, ConfigTable::Phones, &id).await
 }
-async fn list_directory(State(s): State<Arc<AppState>>, Path(site): Path<String>, h: HeaderMap) -> Response {
+async fn list_directory(
+    State(s): State<Arc<AppState>>,
+    Path(site): Path<String>,
+    h: HeaderMap,
+) -> Response {
     do_list(&s, &h, &site, ConfigTable::DirectoryNumbers).await
 }
-async fn get_directory(State(s): State<Arc<AppState>>, Path((site, did)): Path<(String, String)>, h: HeaderMap) -> Response {
+async fn get_directory(
+    State(s): State<Arc<AppState>>,
+    Path((site, did)): Path<(String, String)>,
+    h: HeaderMap,
+) -> Response {
     do_get(&s, &h, &site, ConfigTable::DirectoryNumbers, &did).await
 }
-async fn list_trunk_groups(State(s): State<Arc<AppState>>, Path(site): Path<String>, h: HeaderMap) -> Response {
+async fn list_trunk_groups(
+    State(s): State<Arc<AppState>>,
+    Path(site): Path<String>,
+    h: HeaderMap,
+) -> Response {
     do_list(&s, &h, &site, ConfigTable::TrunkGroups).await
 }
-async fn get_trunk_group(State(s): State<Arc<AppState>>, Path((site, id)): Path<(String, String)>, h: HeaderMap) -> Response {
+async fn get_trunk_group(
+    State(s): State<Arc<AppState>>,
+    Path((site, id)): Path<(String, String)>,
+    h: HeaderMap,
+) -> Response {
     do_get(&s, &h, &site, ConfigTable::TrunkGroups, &id).await
 }
-async fn list_dial_plans(State(s): State<Arc<AppState>>, Path(site): Path<String>, h: HeaderMap) -> Response {
+async fn list_dial_plans(
+    State(s): State<Arc<AppState>>,
+    Path(site): Path<String>,
+    h: HeaderMap,
+) -> Response {
     do_list(&s, &h, &site, ConfigTable::DialPlans).await
 }
-async fn get_dial_plan(State(s): State<Arc<AppState>>, Path((site, id)): Path<(String, String)>, h: HeaderMap) -> Response {
+async fn get_dial_plan(
+    State(s): State<Arc<AppState>>,
+    Path((site, id)): Path<(String, String)>,
+    h: HeaderMap,
+) -> Response {
     do_get(&s, &h, &site, ConfigTable::DialPlans, &id).await
 }
-async fn list_routing(State(s): State<Arc<AppState>>, Path((site, kind)): Path<(String, String)>, h: HeaderMap) -> Response {
+async fn list_routing(
+    State(s): State<Arc<AppState>>,
+    Path((site, kind)): Path<(String, String)>,
+    h: HeaderMap,
+) -> Response {
     match routing_table(&kind) {
         Some(t) => do_list(&s, &h, &site, t).await,
         None => bad_request("unknown routing kind"),
     }
 }
-async fn get_routing(State(s): State<Arc<AppState>>, Path((site, kind, id)): Path<(String, String, String)>, h: HeaderMap) -> Response {
+async fn get_routing(
+    State(s): State<Arc<AppState>>,
+    Path((site, kind, id)): Path<(String, String, String)>,
+    h: HeaderMap,
+) -> Response {
     match routing_table(&kind) {
         Some(t) => do_get(&s, &h, &site, t, &id).await,
         None => bad_request("unknown routing kind"),
     }
 }
 /// `GET /v1/sites/{site}/config` — the site telephony settings document.
-async fn get_site_config(State(s): State<Arc<AppState>>, Path(site): Path<String>, h: HeaderMap) -> Response {
+async fn get_site_config(
+    State(s): State<Arc<AppState>>,
+    Path(site): Path<String>,
+    h: HeaderMap,
+) -> Response {
     do_get(&s, &h, &site, ConfigTable::SiteTelephonyConfig, "default").await
 }
 
@@ -1251,18 +1312,46 @@ mod tests {
         let (s, b) = send_req(&app, "GET", "/v1/sites/MUHJ/phones", Some(&admin_tok), None).await;
         assert_eq!(s, StatusCode::OK);
         let items = b["items"].as_array().expect("items");
-        assert!(items.iter().any(|p| p["id"] == "p2"), "p1 was deleted, p2 listed: {b}");
+        assert!(
+            items.iter().any(|p| p["id"] == "p2"),
+            "p1 was deleted, p2 listed: {b}"
+        );
 
-        let (s, b) = send_req(&app, "GET", "/v1/sites/MUHJ/phones/p2", Some(&admin_tok), None).await;
+        let (s, b) = send_req(
+            &app,
+            "GET",
+            "/v1/sites/MUHJ/phones/p2",
+            Some(&admin_tok),
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(b["id"], "p2");
 
-        let (s, _) = send_req(&app, "GET", "/v1/sites/MUHJ/phones/ghost", Some(&admin_tok), None).await;
+        let (s, _) = send_req(
+            &app,
+            "GET",
+            "/v1/sites/MUHJ/phones/ghost",
+            Some(&admin_tok),
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::NOT_FOUND);
 
         // A GET still requires the admin scope (a sync token is rejected).
-        let (s, _) = send_req(&app, "GET", "/v1/sites/MUHJ/phones", Some(&good_token("MUHJ")), None).await;
-        assert_eq!(s, StatusCode::FORBIDDEN, "config-sync token can't use the operator read surface");
+        let (s, _) = send_req(
+            &app,
+            "GET",
+            "/v1/sites/MUHJ/phones",
+            Some(&good_token("MUHJ")),
+            None,
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::FORBIDDEN,
+            "config-sync token can't use the operator read surface"
+        );
     }
 
     #[tokio::test]
