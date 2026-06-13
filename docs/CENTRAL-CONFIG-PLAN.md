@@ -53,11 +53,11 @@ flowchart TB
 
     subgraph site["PER SITE × 184 (e.g. MUHJ)"]
         sync["sbc-config-sync<br/>(per-site pod, jittered poll,<br/>/metrics staleness)"]
-        localpg[("local Postgres<br/>shard replica;<br/>central-origin rows +<br/>updated_by='local' edits")]
+        localpg[("local Postgres<br/>shard replica —<br/>central-origin rows plus<br/>updated_by='local' edits")]
         daemon["sbc-daemon"]
         prov["sbc-provision-server"]
         siteapi["sbc-api-server<br/>(local writes during DDIL →<br/>updated_by='local')"]
-        sync -- "apply delta/snapshot (one txn);<br/>preserves local-origin rows" --> localpg
+        sync -- "apply delta/snapshot (one txn) —<br/>preserves local-origin rows" --> localpg
         sync -. "collect local edits" .- localpg
         daemon --> localpg
         prov --> localpg
@@ -66,7 +66,7 @@ flowchart TB
 
     sync -- "PULL: GET /sync/{site}/epoch · delta · snapshot" --> api
     sync -- "PUSH (on reconnect): POST /sync/{site}/upload<br/>local edits — local wins" --> api
-    api -. "OIDC config-sync token; site_code claim<br/>must match path (own shard only)" .- sync
+    api -. "OIDC config-sync token, site_code claim<br/>must match path (own shard only)" .- sync
 ```
 
 Key properties:
@@ -386,11 +386,11 @@ sequenceDiagram
     Agent->>API: POST /sync/{site}/upload (local edits)
     API->>CDB: apply (epoch++, journal) — local wins
     API-->>Agent: { epoch }
-    Agent->>LDB: re-stamp uploaded rows -> 'central'
-    Agent->>API: GET /sync/{site}/delta?since=…
-    API-->>Agent: changes (incl. now-central edits + others)
+    Agent->>LDB: re-stamp uploaded rows to 'central'
+    Agent->>API: GET /sync/{site}/delta?since=N
+    API-->>Agent: changes (now-central edits plus others)
     Agent->>LDB: apply (preserves any newer 'local' rows)
-    Note over LDB,CDB: converged; edge edits live fleet-wide
+    Note over LDB,CDB: converged — edge edits live fleet-wide
 ```
 
 Edge cases handled: a fresh local edit made *during* the upload keeps its
