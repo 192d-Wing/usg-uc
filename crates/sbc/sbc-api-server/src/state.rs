@@ -91,9 +91,15 @@ pub struct AppState {
     /// Management-plane authenticator (admin login + stateless tokens).
     /// Shared, replica-safe via a common signing key.
     pub auth: Arc<uc_auth::Authenticator>,
+
+    /// Optional operator OIDC validator. When configured, the auth
+    /// middleware also accepts `config-admin` bearer tokens, so the
+    /// dashboard authenticates once for both the central and per-site APIs.
+    pub oidc: Option<Arc<proto_jwt::Validator>>,
 }
 
 impl AppState {
+    #[allow(clippy::too_many_lines)] // flat wiring of all stores + clients
     pub async fn build(cfg: &Config) -> Result<Arc<Self>, StateError> {
         info!(database_url = %scrub_dsn(&cfg.database_url), "connecting to postgres");
         let phones = Arc::new(
@@ -174,6 +180,29 @@ impl AppState {
         );
         info!("management-plane authentication enabled");
 
+        // Optional operator OIDC: accept the same config-admin tokens the
+        // central config API takes, so the dashboard signs in once.
+        let oidc = match (&cfg.oidc_issuer, &cfg.oidc_audience) {
+            (Some(issuer), Some(audience)) => {
+                let http = reqwest::Client::builder()
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new());
+                let jwks = Arc::new(proto_jwt::JwksCache::new(http, issuer.clone()));
+                let validator = proto_jwt::Validator::new(
+                    jwks,
+                    proto_jwt::ValidatorConfig {
+                        issuer: issuer.clone(),
+                        audiences: vec![audience.clone()],
+                        required_scope: crate::authmw::ADMIN_SCOPE,
+                        leeway_secs: 30,
+                    },
+                );
+                info!(issuer = %issuer, "operator OIDC bearer auth enabled");
+                Some(Arc::new(validator))
+            }
+            _ => None,
+        };
+
         Ok(Arc::new(Self {
             phones,
             directory,
@@ -196,6 +225,7 @@ impl AppState {
             daemon_http_base: cfg.daemon_http_url.trim_end_matches('/').to_string(),
             start_time: std::time::Instant::now(),
             auth,
+            oidc,
         }))
     }
 }

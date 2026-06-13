@@ -7,10 +7,9 @@ import TopNavigation from '@cloudscape-design/components/top-navigation';
 import { Mode } from '@cloudscape-design/global-styles';
 
 import { Sidebar } from './components/Sidebar';
-import { AuthGate } from './components/AuthGate';
-import { api, UNAUTHORIZED_EVENT } from './api';
+import { OidcGate } from './components/OidcGate';
 import { SiteProvider, SiteSelector } from './SiteContext';
-import { handleCallback, logout as centralLogout } from './auth/oidc';
+import { handleCallback, logout } from './auth/oidc';
 import { getStoredMode, persistMode } from './theme';
 import { Dashboard } from './pages/Dashboard';
 import { Phones } from './pages/Phones';
@@ -63,19 +62,8 @@ function MainApp() {
     persistMode(next);
   };
 
-  const signOut = () => {
-    api
-      .post('/auth/logout', {})
-      .catch(() => {
-        // Session may already be gone; show login either way.
-      })
-      .finally(() => {
-        globalThis.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
-      });
-  };
-
   return (
-    <AuthGate>
+    <OidcGate>
       <SiteProvider>
         <TopNavigation
           identity={{
@@ -96,16 +84,9 @@ function MainApp() {
               onClick: toggleTheme,
             },
             {
-              type: 'menu-dropdown',
+              type: 'button',
               text: 'Sign out',
-              items: [
-                { id: 'local', text: 'Sign out (this site)' },
-                { id: 'central', text: 'Sign out (central config)' },
-              ],
-              onItemClick: ({ detail }) => {
-                if (detail.id === 'central') centralLogout();
-                else signOut();
-              },
+              onClick: () => logout(),
             },
           ]}
         />
@@ -134,6 +115,6 @@ function MainApp() {
         }
         />
       </SiteProvider>
-    </AuthGate>
+    </OidcGate>
   );
 }

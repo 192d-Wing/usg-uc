@@ -342,11 +342,19 @@ epoch), which the journal handles naturally and lets you do staged rollout
   enforcement at one choke point. (The four SBC routing entities are JSON
   pass-through with no typed schema — same as the per-site api-server — so
   their routes require only an `id`.)
-- Still to do: point the `usg-sbc-dashboard` SPA at the central API. The
+- **Done:** the `usg-sbc-dashboard` SPA now manages config through the
+  central API (site-scoped, with a site selector); runtime views
+  (registrations, CDRs, system, users) stay on the per-site `sbc-api`. The
   per-site `sbc-api-server` keeps a config write path **on purpose** — it
   is how a site edits its own config during a partition (§7); those writes
   are marked `updated_by = 'local'` and reconciled upward, rather than being
   forbidden.
+- **Single sign-on:** `sbc-api-server` now also accepts the operator's
+  `config-admin` OIDC token (env `SBC_OIDC_ISSUER`/`SBC_OIDC_AUDIENCE`,
+  Helm `sbcApi.oidc`), alongside its legacy cookie/HMAC login. The
+  dashboard authenticates once (OIDC) and uses one token for both the
+  central config API and every site's runtime API — the earlier dual-auth
+  interim is resolved.
 
 ---
 
@@ -448,7 +456,7 @@ Because materialization is per-site, fleet-wide changes get rings for free:
 > via OIDC client-credentials with token refresh. Deploy:
 > `deploy/helm/central-config`, the `sbc` chart's `sbcConfigSync`
 > component, and `deploy/keycloak/central-config-clients.md`. Remaining:
-> production HA-Postgres wiring, the dashboard SPA cutover, and an optional
+> production HA-Postgres wiring and an optional
 > operator-approval gate on uploads.
 
 ### Phase 0 — Foundations (no behavior change)

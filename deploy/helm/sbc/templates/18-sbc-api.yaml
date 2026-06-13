@@ -70,6 +70,15 @@ spec:
                   name: {{ .Values.sbcPostgres.existingSecret.name }}
                   key: {{ .Values.sbcPostgres.existingSecret.key | default "dsn" }}
             {{- end }}
+            {{- if .Values.sbcApi.oidc.issuer }}
+            # Operator OIDC: accept the same config-admin bearer tokens the
+            # central config API takes, so the dashboard signs in once. The
+            # legacy admin login keeps working alongside this.
+            - name: SBC_OIDC_ISSUER
+              value: {{ .Values.sbcApi.oidc.issuer | quote }}
+            - name: SBC_OIDC_AUDIENCE
+              value: {{ .Values.sbcApi.oidc.audience | quote }}
+            {{- end }}
             # Management-plane auth (fail-closed: the pod won't start
             # without these). Shared signing key so any replica validates
             # any replica's tokens.

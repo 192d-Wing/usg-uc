@@ -16,6 +16,7 @@ use std::process::ExitCode;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+mod authmw;
 mod config;
 mod handlers;
 mod state;

@@ -1,14 +1,17 @@
-// Minimal fetch wrapper for the SBC's /api/v1 surface. Used by all pages.
-// Same-origin in production (dashboard served by the sbc-frontend nginx pod,
-// which reverse-proxies /api to sbc-api); the Vite dev server proxies /api
-// (see vite.config.ts).
+// Minimal fetch wrapper for the per-site sbc-api `/api/v1` surface — the
+// site-local RUNTIME data (registrations, CDRs, system health, users, phone
+// reboot). Config entities go through ./centralApi instead.
 //
-// Auth: sbc-api issues an HttpOnly sbc_session cookie on login, sent
-// automatically on same-origin requests. A 401 on any call fires
-// UNAUTHORIZED_EVENT so the auth gate can show the login view.
+// Auth: a single operator OIDC bearer token (the same one ./centralApi uses).
+// sbc-api now accepts that token (config-admin scope) alongside its legacy
+// cookie. A missing/expired token redirects to the IdP via login().
+
+import { getAccessToken, login } from './auth/oidc';
 
 const API_BASE = '/api/v1';
 
+// Retained for import compatibility; the OIDC flow redirects via login()
+// rather than dispatching this event.
 export const UNAUTHORIZED_EVENT = 'sbc:unauthorized';
 
 export class ApiError extends Error {
@@ -23,13 +26,22 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = await getAccessToken();
+  if (!token) {
+    void login();
+    throw new ApiError(401, path, 'redirecting to sign-in');
+  }
   const url = `${API_BASE}${path}`;
   const res = await fetch(url, {
     ...init,
-    headers: { 'Content-Type': 'application/json', ...init?.headers },
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+      ...init?.headers,
+    },
   });
-  if (res.status === 401 && path !== '/auth/login') {
-    globalThis.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+  if (res.status === 401) {
+    void login();
   }
   if (!res.ok) {
     let detail = '';

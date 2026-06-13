@@ -158,8 +158,9 @@ pub fn router(state: Arc<AppState>) -> Router {
     // also covers the reverse-proxy catch-all (which forwards unowned
     // paths to the daemon) — a nest-level layer would miss it. Exemptions
     // are full paths: health probes, sbc-api's own version, and login.
-    let auth_layer = uc_auth::AuthLayer::new(
+    let auth_layer = crate::authmw::AuthState::new(
         Arc::clone(&state.auth),
+        state.oidc.clone(),
         &[
             "/healthz",
             "/readyz",
@@ -177,7 +178,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(api_proxy)
         .layer(axum::middleware::from_fn_with_state(
             auth_layer,
-            uc_auth::require_auth,
+            crate::authmw::require_auth,
         ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)

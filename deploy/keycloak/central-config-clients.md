@@ -55,6 +55,16 @@ claim — an operator is a fleet admin and names the site in the path. A
 site (that requires `config-sync` + a matching `site_code`), and a
 `config-sync` token cannot write.
 
+**Single sign-on for the dashboard.** The same `config-admin` token also
+authorizes the per-site `sbc-api-server` runtime endpoints (registrations,
+CDRs, system, users, phone reboot): when `SBC_OIDC_ISSUER`/
+`SBC_OIDC_AUDIENCE` are set (Helm `sbcApi.oidc`), sbc-api accepts these
+tokens alongside its legacy cookie/HMAC admin login. So the operator signs
+in once and the dashboard uses one token for both the central config API
+and every site's runtime API. The token's `aud` must therefore satisfy
+both validators — set the central audience (`usg-uc-config`) on the
+operator client and configure `sbcApi.oidc.audience` to match.
+
 ```jsonc
 {
   "clientId": "usg-uc-config-admin",

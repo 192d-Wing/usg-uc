@@ -168,6 +168,13 @@ sbcApi:
   resources:
     requests: { cpu: "50m",  memory: "64Mi"  }
     limits:   { cpu: "500m", memory: "256Mi" }
+  # Operator OIDC: when issuer+audience are set, sbc-api also accepts the
+  # config-admin bearer tokens the central config API takes, so the
+  # dashboard authenticates once. The legacy admin login still works.
+  # Match the central-config chart's api.oidc.{issuer,audience}.
+  oidc:
+    issuer: ""
+    audience: "usg-uc-config"
 
 # sbc-provision-server — stand-alone phone-provisioning pod (PR6).
 # Owns /provision/<MAC>.{cfg,xml}: reads the phone record from Postgres
