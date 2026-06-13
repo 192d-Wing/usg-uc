@@ -23,6 +23,11 @@ api:
   oidc:
     issuer: ""
     audience: "usg-uc-config"
+    # Inline PEM of an extra CA to trust for the JWKS fetch — set when the
+    # IdP is fronted by an internal CA the bundled webpki roots don't
+    # include. When set, the chart mounts it and passes
+    # CENTRAL_OIDC_EXTRA_CA_CERT_FILE to the container.
+    extraCaCert: ""
 
 # Central Postgres. The central DB is the one datastore that must not lose
 # writes, so production must be HA + PITR-backed.

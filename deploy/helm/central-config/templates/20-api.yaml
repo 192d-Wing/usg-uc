@@ -50,6 +50,10 @@ spec:
               value: {{ required "api.oidc.issuer is required" .Values.api.oidc.issuer | quote }}
             - name: CENTRAL_OIDC_AUDIENCE
               value: {{ .Values.api.oidc.audience | quote }}
+            {{- if .Values.api.oidc.extraCaCert }}
+            - name: CENTRAL_OIDC_EXTRA_CA_CERT_FILE
+              value: "/etc/ssl/extra-ca/ca.pem"
+            {{- end }}
           ports:
             - { name: http, containerPort: {{ .Values.api.listenPort }}, protocol: TCP }
           livenessProbe:
@@ -66,6 +70,30 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: { drop: ["ALL"] }
+          {{- if .Values.api.oidc.extraCaCert }}
+          volumeMounts:
+            - { name: extra-ca, mountPath: /etc/ssl/extra-ca, readOnly: true }
+          {{- end }}
+      {{- if .Values.api.oidc.extraCaCert }}
+      volumes:
+        - name: extra-ca
+          configMap:
+            name: {{ include "central-config.fullname" . }}-oidc-ca
+      {{- end }}
+{{- if .Values.api.oidc.extraCaCert }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "central-config.fullname" . }}-oidc-ca
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "central-config.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+data:
+  ca.pem: |
+    {{- .Values.api.oidc.extraCaCert | nindent 4 }}
+{{- end }}
 ---
 apiVersion: v1
 kind: Service
