@@ -73,12 +73,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # =============================================================================
 FROM alpine:3.21 AS runtime
 
+# NB: user/group must not be 'sync' — that's a reserved Alpine system
+# account and `adduser sync` fails.
 RUN apk add --no-cache ca-certificates \
-    && addgroup -g 1000 sync \
-    && adduser -D -u 1000 -G sync -s /bin/sh sync
+    && addgroup -g 1000 configsync \
+    && adduser -D -u 1000 -G configsync -s /bin/sh configsync
 
 COPY --from=builder /tmp/sbc-config-sync /usr/local/bin/sbc-config-sync
 
-USER sync
+USER configsync
 
 ENTRYPOINT ["/usr/local/bin/sbc-config-sync"]
