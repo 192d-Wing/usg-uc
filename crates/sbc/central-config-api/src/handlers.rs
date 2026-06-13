@@ -32,6 +32,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/sync/{site_code}/epoch", get(sync_epoch))
         .route("/v1/sync/{site_code}/delta", get(sync_delta))
         .route("/v1/sync/{site_code}/snapshot", get(sync_snapshot))
+        .route("/v1/sync/{site_code}/upload", post(sync_upload))
         // Operator write surface (config-admin tokens).
         .route("/v1/sites", post(register_site))
         .route("/v1/sites/{site_code}/phones", post(upsert_phone))
@@ -138,6 +139,49 @@ async fn sync_snapshot(
         Ok(snap) => Json(snap).into_response(),
         Err(e) => store_error(&site_code, "snapshot", &e),
     }
+}
+
+/// `POST /v1/sync/{site}/upload` — a site uploads the local edits it made
+/// while partitioned (DDIL reconcile). Authorized by the **site's own**
+/// `config-sync` token (the same site-scoped check as the read surface),
+/// so a base can adopt changes only into its own shard. Central applies
+/// them in order — local wins — and they become central-origin, flowing
+/// back to the site (now converged) and onward to the fleet. Returns the
+/// resulting epoch.
+async fn sync_upload(
+    State(state): State<Arc<AppState>>,
+    Path(site_code): Path<String>,
+    headers: HeaderMap,
+    Json(batch): Json<central_config_store::UploadBatch>,
+) -> Response {
+    let claims = match authorize_site(&state.sync_validator, &headers, &site_code).await {
+        Ok(c) => c,
+        Err(rej) => return rej.into_response(),
+    };
+    // Attribute the adoption to the uploading site's service account.
+    let actor = format!("site:{}", claims.sub);
+    let mut last_epoch = None;
+    for change in &batch.changes {
+        match state
+            .store
+            .apply_change(&site_code, change.table, change.op, &change.id, change.payload.as_ref(), &actor)
+            .await
+        {
+            Ok(epoch) => last_epoch = Some(epoch),
+            // A delete of an already-absent row is fine during reconcile
+            // (idempotent re-upload); keep going.
+            Err(CentralError::NotFound) => {}
+            Err(e) => return store_error(&site_code, "upload", &e),
+        }
+    }
+    let epoch = match last_epoch {
+        Some(e) => e,
+        None => match state.store.epoch(&site_code).await {
+            Ok(e) => e,
+            Err(e) => return store_error(&site_code, "upload", &e),
+        },
+    };
+    Json(json!({ "epoch": epoch, "applied": batch.changes.len() })).into_response()
 }
 
 /// Map a store error to an HTTP response. An unknown site is a clean 404;
@@ -958,5 +1002,41 @@ mod tests {
         let (s, b) = send(&app, "/v1/sync/GHST/epoch", Some(&good_token("GHST"))).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
         assert_eq!(b["error"], "unknown_site");
+
+        // Upload (DDIL reconcile): a site uploads a local edit to its OWN
+        // shard with its config-sync token → adopted, epoch bumps.
+        let upload = json!({ "changes": [
+            { "table": "phones", "id": "p-edge", "op": "upsert",
+              "payload": { "id": "p-edge", "mac_address": "ab:cd:ef:00:11:22" } }
+        ]});
+        let (s, b) = send_req(
+            &app,
+            "POST",
+            "/v1/sync/MUHJ/upload",
+            Some(&good_token("MUHJ")),
+            Some(upload.clone()),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b["applied"], 1);
+
+        // The uploaded row is now served on the snapshot.
+        let (_, b) = send(&app, "/v1/sync/MUHJ/snapshot", Some(&good_token("MUHJ"))).await;
+        let has_edge = b["tables"].as_array().expect("tables").iter().any(|t| {
+            t["table"] == "phones"
+                && t["rows"].as_array().is_some_and(|r| r.iter().any(|x| x["id"] == "p-edge"))
+        });
+        assert!(has_edge, "uploaded phone present: {b}");
+
+        // A token for another site cannot upload into MUHJ's shard.
+        let (s, _) = send_req(
+            &app,
+            "POST",
+            "/v1/sync/MUHJ/upload",
+            Some(&good_token("MPLS")),
+            Some(upload),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "cross-site upload rejected");
     }
 }

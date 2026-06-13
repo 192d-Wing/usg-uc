@@ -14,10 +14,12 @@
 //! (`updated_by = 'local'`, `revision = 0`). Deletes are tombstones.
 
 use serde_json::Value;
-use sqlx::{Postgres, Transaction};
+use sqlx::{Postgres, Row, Transaction};
 
-use central_config_store::{Change, ChangeOp, ConfigTable, Snapshot};
+use central_config_store::{Change, ChangeOp, ConfigTable, Snapshot, UploadChange};
 use sbc_config_store::{DirectoryNumber, PostgresPhoneStore};
+
+use serde_json::{Map, json};
 
 use crate::error::{SyncError, SyncResult};
 
@@ -54,8 +56,11 @@ pub async fn apply_snapshot(
 ) -> SyncResult<()> {
     let mut tx = pool.begin().await?;
     for table in &snapshot.tables {
-        // Single-shard local DB: clearing the whole table is the shard.
-        let sql = format!("DELETE FROM {}", table.table.name());
+        // Replace the central-origin rows only; local-origin rows (edits
+        // made while partitioned, updated_by = 'local') are preserved so
+        // DDIL autonomy survives a snapshot reload. They'll be uploaded
+        // back to central separately.
+        let sql = format!("DELETE FROM {} WHERE updated_by <> 'local'", table.table.name());
         sqlx::query(&sql).execute(&mut *tx).await?;
         for row in &table.rows {
             upsert_local(&mut tx, table.table, site_code, &row.id, &row.payload, snapshot.epoch)
@@ -132,7 +137,8 @@ async fn upsert_local(
                      deleted        = FALSE,
                      updated_by     = EXCLUDED.updated_by,
                      site_code      = EXCLUDED.site_code,
-                     updated_at     = NOW()",
+                     updated_at     = NOW()
+                 WHERE phones.updated_by <> 'local'",
             )
             .bind(id)
             .bind(&mac_normalized)
@@ -164,7 +170,8 @@ async fn upsert_local(
                      deleted     = FALSE,
                      updated_by  = EXCLUDED.updated_by,
                      site_code   = EXCLUDED.site_code,
-                     updated_at  = NOW()",
+                     updated_at  = NOW()
+                 WHERE directory_numbers.updated_by <> 'local'",
             )
             .bind(&dn.did)
             .bind(&dn.user)
@@ -179,7 +186,7 @@ async fn upsert_local(
         }
         json_table => {
             let sql = format!(
-                "INSERT INTO {} (id, data, revision, deleted, updated_by, site_code)
+                "INSERT INTO {tbl} (id, data, revision, deleted, updated_by, site_code)
                  VALUES ($1, $2, $3, FALSE, $4, $5)
                  ON CONFLICT (id) DO UPDATE SET
                      data       = EXCLUDED.data,
@@ -187,8 +194,9 @@ async fn upsert_local(
                      deleted    = FALSE,
                      updated_by = EXCLUDED.updated_by,
                      site_code  = EXCLUDED.site_code,
-                     updated_at = NOW()",
-                json_table.name()
+                     updated_at = NOW()
+                 WHERE {tbl}.updated_by <> 'local'",
+                tbl = json_table.name(),
             );
             sqlx::query(&sql)
                 .bind(id)
@@ -213,9 +221,11 @@ async fn tombstone_local(
     revision: i64,
 ) -> SyncResult<()> {
     let id_col = if table == ConfigTable::DirectoryNumbers { "did" } else { "id" };
+    // `updated_by <> 'local'` preserves a local edit: central must not
+    // tombstone a row the site changed while partitioned.
     let sql = format!(
         "UPDATE {} SET deleted = TRUE, revision = $1, updated_by = $2, site_code = $3, updated_at = NOW()
-         WHERE {} = $4",
+         WHERE {} = $4 AND updated_by <> 'local'",
         table.name(),
         id_col
     );
@@ -226,6 +236,141 @@ async fn tombstone_local(
         .bind(id)
         .execute(&mut **tx)
         .await?;
+    Ok(())
+}
+
+/// Collect the site's pending local edits as upload changes.
+///
+/// These are rows written locally while partitioned
+/// (`updated_by = 'local'`), pushed to central on reconnect. Live rows
+/// become upserts; tombstones become deletes.
+///
+/// # Errors
+/// [`SyncError::Local`] on query failure.
+pub async fn collect_local_changes(
+    pool: &sqlx::PgPool,
+    _site_code: &str,
+) -> SyncResult<Vec<UploadChange>> {
+    let mut out = Vec::new();
+
+    // Phones: payload is the stored Phone JSON (`data`).
+    for row in sqlx::query("SELECT id, data, deleted FROM phones WHERE updated_by = 'local'")
+        .fetch_all(pool)
+        .await?
+    {
+        let id: String = row.try_get("id")?;
+        let deleted: bool = row.try_get("deleted")?;
+        out.push(if deleted {
+            UploadChange { table: ConfigTable::Phones, id, op: ChangeOp::Delete, payload: None }
+        } else {
+            UploadChange {
+                table: ConfigTable::Phones,
+                id,
+                op: ChangeOp::Upsert,
+                payload: Some(row.try_get::<Value, _>("data")?),
+            }
+        });
+    }
+
+    // Directory numbers: reconstruct the canonical { did, user?, … } payload.
+    for row in sqlx::query(
+        "SELECT did, sip_user, partition, description, extra, deleted
+         FROM directory_numbers WHERE updated_by = 'local'",
+    )
+    .fetch_all(pool)
+    .await?
+    {
+        let did: String = row.try_get("did")?;
+        let deleted: bool = row.try_get("deleted")?;
+        if deleted {
+            out.push(UploadChange {
+                table: ConfigTable::DirectoryNumbers,
+                id: did,
+                op: ChangeOp::Delete,
+                payload: None,
+            });
+            continue;
+        }
+        let mut obj = Map::new();
+        obj.insert("did".into(), json!(did));
+        for (col, key) in [("sip_user", "user"), ("partition", "partition"), ("description", "description")] {
+            if let Some(v) = row.try_get::<Option<String>, _>(col)? {
+                obj.insert(key.into(), json!(v));
+            }
+        }
+        if let Some(extra) = row.try_get::<Value, _>("extra")?.as_object() {
+            for (k, v) in extra {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        out.push(UploadChange {
+            table: ConfigTable::DirectoryNumbers,
+            id: did,
+            op: ChangeOp::Upsert,
+            payload: Some(Value::Object(obj)),
+        });
+    }
+
+    // JSONB pass-through tables.
+    for table in [
+        ConfigTable::TrunkGroups,
+        ConfigTable::DialPlans,
+        ConfigTable::CucmPartitions,
+        ConfigTable::CucmCallingSearchSpaces,
+        ConfigTable::CucmRoutePatterns,
+        ConfigTable::CucmRouteLists,
+        ConfigTable::SiteTelephonyConfig,
+    ] {
+        let sql = format!("SELECT id, data, deleted FROM {} WHERE updated_by = 'local'", table.name());
+        for row in sqlx::query(&sql).fetch_all(pool).await? {
+            let id: String = row.try_get("id")?;
+            let deleted: bool = row.try_get("deleted")?;
+            out.push(if deleted {
+                UploadChange { table, id, op: ChangeOp::Delete, payload: None }
+            } else {
+                UploadChange {
+                    table,
+                    id,
+                    op: ChangeOp::Upsert,
+                    payload: Some(row.try_get::<Value, _>("data")?),
+                }
+            });
+        }
+    }
+
+    Ok(out)
+}
+
+/// Clear the `'local'` marker on rows central has just adopted.
+///
+/// Re-stamps them `'central'` (with the central `epoch` as revision) so
+/// they converge and aren't re-uploaded next cycle. Only flips rows still
+/// marked local, so a fresh edit made during the upload is preserved.
+///
+/// # Errors
+/// [`SyncError::Local`] on query failure.
+pub async fn restamp_uploaded(
+    pool: &sqlx::PgPool,
+    changes: &[UploadChange],
+    epoch: i64,
+) -> SyncResult<()> {
+    let mut tx = pool.begin().await?;
+    for change in changes {
+        let id_col = if change.table == ConfigTable::DirectoryNumbers { "did" } else { "id" };
+        let sql = format!(
+            "UPDATE {} SET updated_by = $1, revision = $2
+             WHERE {} = $3 AND updated_by = 'local'",
+            change.table.name(),
+            id_col
+        );
+        sqlx::query(&sql)
+            .bind(CENTRAL_ORIGIN)
+            .bind(epoch)
+            .bind(&change.id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 

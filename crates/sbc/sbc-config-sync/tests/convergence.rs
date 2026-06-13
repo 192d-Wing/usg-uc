@@ -39,6 +39,27 @@ impl ConfigSource for DirectSource {
     async fn snapshot(&self, site: &str) -> SyncResult<Snapshot> {
         self.0.snapshot(site).await.map_err(|e| sbc_config_sync::SyncError::Central(e.to_string()))
     }
+    async fn upload(
+        &self,
+        site: &str,
+        changes: &[central_config_store::UploadChange],
+    ) -> SyncResult<i64> {
+        // Mirror the central API's upload handler: apply each change to
+        // the shard (local wins), idempotent on NotFound deletes.
+        let mut last = self.0.epoch(site).await.unwrap_or(0);
+        for c in changes {
+            match self
+                .0
+                .apply_change(site, c.table, c.op, &c.id, c.payload.as_ref(), "site:test")
+                .await
+            {
+                Ok(e) => last = e,
+                Err(central_config_store::CentralError::NotFound) => {}
+                Err(e) => return Err(sbc_config_sync::SyncError::Central(e.to_string())),
+            }
+        }
+        Ok(last)
+    }
 }
 
 async fn admin_pool(admin: &str) -> PgPool {
@@ -155,6 +176,63 @@ async fn converges_via_snapshot_then_deltas() {
             .await
             .expect("p2 origin");
     assert_eq!(p2_origin, "central");
+}
+
+#[tokio::test]
+async fn ddil_local_edit_survives_and_syncs_up() {
+    let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else { return };
+
+    let central = CentralConfigStore::from_pool(make_db(&admin, "scs_ddil_central").await)
+        .await
+        .expect("central migrate");
+    central.register_site(SITE, "MUHJ", "muhj.x", "UTC", "active").await.expect("register");
+    central
+        .upsert_phone(SITE, "p1", "aaaaaaaaaaaa", &json!({"id": "p1", "mac_address": "aa:aa:aa:aa:aa:aa"}), "op")
+        .await
+        .expect("central p1");
+    let source = DirectSource(central);
+
+    let local = make_db(&admin, "scs_ddil_local").await;
+    sbc_config_store::ensure_schema(&local).await.expect("local schema");
+    reconcile(&local, &source, SITE).await.expect("initial sync"); // pulls p1
+
+    // --- link goes down; the site makes local edits ---
+    // A new phone the field operator added, and an edit to p1 — both
+    // stamped updated_by='local' as the site-local API would.
+    sqlx::query("INSERT INTO phones (id, mac_normalized, data, updated_by) VALUES ($1,$2,$3,'local')")
+        .bind("p-field").bind("bbbbbbbbbbbb")
+        .bind(json!({"id":"p-field","mac_address":"bb:bb:bb:bb:bb:bb","label":"forward TOC"}))
+        .execute(&local).await.expect("local add");
+    sqlx::query("UPDATE phones SET data = $1, updated_by='local', revision=0 WHERE id='p1'")
+        .bind(json!({"id":"p1","mac_address":"aa:aa:aa:aa:aa:aa","label":"edited at edge"}))
+        .execute(&local).await.expect("local edit");
+
+    // Meanwhile central changes something unrelated (another phone).
+    source.0
+        .upsert_phone(SITE, "p-hq", "cccccccccccc", &json!({"id":"p-hq","mac_address":"cc:cc:cc:cc:cc:cc"}), "op")
+        .await.expect("central p-hq");
+
+    // --- link returns: reconcile pushes local edits up, then pulls ---
+    reconcile(&local, &source, SITE).await.expect("reconnect reconcile");
+
+    // The local edits propagated to central (local wins).
+    let snap = source.0.snapshot(SITE).await.expect("central snapshot");
+    let phones: std::collections::HashMap<String, serde_json::Value> = snap
+        .tables.iter().find(|t| t.table == ConfigTable::Phones).expect("phones")
+        .rows.iter().map(|r| (r.id.clone(), r.payload.clone())).collect();
+    assert!(phones.contains_key("p-field"), "new local phone reached central");
+    assert_eq!(phones["p1"]["label"], "edited at edge", "local edit of p1 won at central");
+    assert!(phones.contains_key("p-hq"), "central's own change still present");
+
+    // Locally everything converged and nothing is left marked 'local'.
+    let still_local: i64 = sqlx::query_scalar("SELECT count(*) FROM phones WHERE updated_by='local'")
+        .fetch_one(&local).await.expect("count local");
+    assert_eq!(still_local, 0, "uploaded edits re-stamped central-origin");
+    assert_eq!(local_phone_ids(&local).await, vec!["p-field", "p-hq", "p1"]);
+    // The central change pulled down too.
+    let hq: i64 = sqlx::query_scalar("SELECT count(*) FROM phones WHERE id='p-hq' AND NOT deleted")
+        .fetch_one(&local).await.expect("hq");
+    assert_eq!(hq, 1);
 }
 
 #[tokio::test]

@@ -232,6 +232,29 @@ pub struct MaterializeReport {
     pub sites: Vec<SiteMaterialization>,
 }
 
+/// One change a site uploads to central on reconnect (a local edit made
+/// during a partition). Same shape as a journal [`Change`] minus the
+/// epoch — central assigns the epoch when it adopts the change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadChange {
+    /// Which table the row lives in.
+    pub table: ConfigTable,
+    /// The row's identifier (`id`, or `did`).
+    pub id: String,
+    /// `upsert` (with `payload`) or `delete`.
+    pub op: ChangeOp,
+    /// The row's canonical JSON payload for an upsert; `None` for a delete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
+}
+
+/// The body of a site's upload request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadBatch {
+    /// Local edits to adopt into the shard, applied in order.
+    pub changes: Vec<UploadChange>,
+}
+
 /// One row in a [`Snapshot`]: its identifier and canonical JSON payload.
 /// The id is carried explicitly because some payloads (e.g. site
 /// telephony config) don't embed it, and the applying agent keys on it.

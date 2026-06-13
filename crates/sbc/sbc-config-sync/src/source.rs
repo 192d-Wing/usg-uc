@@ -7,13 +7,15 @@
 //! a network. [`reconcile`] itself is the convergence policy: snapshot
 //! when we've never synced or have regressed, otherwise apply a delta.
 
-use central_config_store::{DeltaResult, Snapshot};
+use central_config_store::{DeltaResult, Snapshot, UploadBatch, UploadChange};
 use reqwest::StatusCode;
 
-use crate::apply::{applied_epoch, apply_delta, apply_snapshot};
+use crate::apply::{
+    applied_epoch, apply_delta, apply_snapshot, collect_local_changes, restamp_uploaded,
+};
 use crate::error::{SyncError, SyncResult};
 
-/// The three reads the agent pulls from the central API.
+/// The reads the agent pulls from central, plus the upload it pushes.
 pub trait ConfigSource {
     /// The site's current shard epoch.
     fn epoch(&self, site_code: &str) -> impl Future<Output = SyncResult<i64>> + Send;
@@ -25,6 +27,13 @@ pub trait ConfigSource {
     ) -> impl Future<Output = SyncResult<DeltaResult>> + Send;
     /// The full live shard at the current epoch.
     fn snapshot(&self, site_code: &str) -> impl Future<Output = SyncResult<Snapshot>> + Send;
+    /// Upload local edits (made while partitioned) for central to adopt;
+    /// returns the resulting epoch.
+    fn upload(
+        &self,
+        site_code: &str,
+        changes: &[UploadChange],
+    ) -> impl Future<Output = SyncResult<i64>> + Send;
 }
 
 /// What a reconcile cycle did — for logging and metrics.
@@ -70,6 +79,16 @@ pub async fn reconcile<S: ConfigSource + Sync>(
     source: &S,
     site_code: &str,
 ) -> SyncResult<Outcome> {
+    // DDIL reconcile: push any local edits made while partitioned up to
+    // central first (local wins), then re-stamp them central-origin so they
+    // converge and aren't re-uploaded. Only after they're adopted do we pull
+    // — so a delta/snapshot can't clobber an edit central hasn't seen yet.
+    let pending = collect_local_changes(pool, site_code).await?;
+    if !pending.is_empty() {
+        let epoch = source.upload(site_code, &pending).await?;
+        restamp_uploaded(pool, &pending, epoch).await?;
+    }
+
     let local = applied_epoch(pool, site_code).await?;
     let central = source.epoch(site_code).await?;
 
@@ -151,5 +170,18 @@ impl ConfigSource for CentralClient {
     async fn snapshot(&self, site_code: &str) -> SyncResult<Snapshot> {
         let url = format!("{}/v1/sync/{site_code}/snapshot", self.base_url);
         self.get_json(&url).await
+    }
+
+    async fn upload(&self, site_code: &str, changes: &[UploadChange]) -> SyncResult<i64> {
+        let url = format!("{}/v1/sync/{site_code}/upload", self.base_url);
+        let batch = UploadBatch { changes: changes.to_vec() };
+        let resp = self.http.post(&url).bearer_auth(&self.bearer).json(&batch).send().await?;
+        let status = resp.status();
+        if status != StatusCode::OK {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(SyncError::Central(format!("{status} from {url}: {body}")));
+        }
+        let r: EpochResp = resp.json().await?;
+        Ok(r.epoch)
     }
 }

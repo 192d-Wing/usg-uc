@@ -41,44 +41,52 @@ across ~184 sites, with distributed read capability at each site.
 flowchart TB
     subgraph central["CENTRAL (one region, HA pair)"]
         dashboard["usg-sbc-dashboard<br/>(fleet views + site selector)"]
-        api["central-config-api<br/>(REST, validation, sync endpoints)"]
-        kc["Keycloak OIDC<br/>(operator roles + per-site svc accounts)"]
-        pg[("Postgres<br/>list-partitioned by site_code (~184)<br/>─────────────<br/>sites (registry)<br/>phones<br/>directory_numbers<br/>trunk_groups<br/>dial_plans<br/>site_telephony_config<br/>config_journal (deltas)")]
-        dashboard --> api
+        api["central-config-api<br/>(operator writes + validation,<br/>sync read + upload,<br/>template materialization)"]
+        kc["Keycloak OIDC<br/>(config-admin operators +<br/>per-site config-sync svc accts)"]
+        pg[("central Postgres<br/>list-partitioned by site_code (~184)<br/>─────────────<br/>sites · phones · directory_numbers<br/>trunk_groups · dial_plans<br/>site_telephony_config · cucm_*<br/>config_journal (deltas) · did_registry<br/>config_templates + assignments")]
+        importer["central-config-import<br/>(onboard: site DB → shard)"]
+        dashboard -- "config-admin" --> api
         kc -. "authn/authz" .- api
         api --> pg
+        importer --> pg
     end
 
     subgraph site["PER SITE × 184 (e.g. MUHJ)"]
-        sync["sbc-config-sync<br/>(new pod, jittered poll)"]
-        localpg[("local Postgres<br/>(existing tables,<br/>now a shard replica)")]
+        sync["sbc-config-sync<br/>(per-site pod, jittered poll,<br/>/metrics staleness)"]
+        localpg[("local Postgres<br/>shard replica;<br/>central-origin rows +<br/>updated_by='local' edits")]
         daemon["sbc-daemon"]
         prov["sbc-provision-server"]
-        siteapi["sbc-api-server<br/>(config = read-only)"]
-        trunkagent["sbc-trunk-agent"]
-        sync -- "applies deltas<br/>(one txn)" --> localpg
-        sync -- "gRPC refresh" --> daemon
+        siteapi["sbc-api-server<br/>(local writes during DDIL →<br/>updated_by='local')"]
+        sync -- "apply delta/snapshot (one txn);<br/>preserves local-origin rows" --> localpg
+        sync -. "collect local edits" .- localpg
         daemon --> localpg
         prov --> localpg
         siteapi --> localpg
-        trunkagent --> localpg
     end
 
-    sync -- "HTTPS pull<br/>GET /sync/{site}/delta?since={epoch}<br/>(OIDC client-credentials or mTLS,<br/>internal CA)" --> api
+    sync -- "PULL: GET /sync/{site}/epoch · delta · snapshot" --> api
+    sync -- "PUSH (on reconnect): POST /sync/{site}/upload<br/>local edits — local wins" --> api
+    api -. "OIDC config-sync token; site_code claim<br/>must match path (own shard only)" .- sync
 ```
 
 Key properties:
 
-- **Pull, not push.** Each site polls the central API for deltas since its
-  last applied epoch. Pull rides through flaky links, NAT, and re-seeds after
-  arbitrary downtime without replication-slot management. (Lab experience:
-  stale AAAA records, internal CA, intermittent reachability — long-lived
-  logical-replication connections would fight all of that.)
+- **Pull for reads, push for local edits.** Each site polls central for
+  deltas since its last applied epoch (pull rides through flaky links, NAT,
+  and re-seeds after arbitrary downtime — no replication slots). On
+  reconnect it *pushes* any edits made while partitioned via `/upload`,
+  which central adopts (local wins) before the site pulls — so DDIL
+  autonomy is preserved, not clobbered. (Lab experience: stale AAAA records,
+  internal CA, intermittent reachability — long-lived logical-replication
+  connections would fight all of that.)
 - **The local Postgres is the distributed read capability.** No new edge
   datastore; the existing tables become a materialized copy of that site's
-  shard.
-- **Site code is the security boundary.** A site's credential can only fetch
-  its own shard; it is structurally impossible to receive another site's rows.
+  shard. Rows carry `updated_by` — `'central'` (synced) vs `'local'`
+  (edited at the edge); the apply engine never overwrites a `'local'` row.
+- **Site code is the security boundary.** One OIDC `config-sync` credential
+  per site, its `site_code` claim pinned to one shard; a site can read and
+  upload only its own rows, never another's, and never fleet templates.
+  Operators use a separate `config-admin` scope for fleet-wide writes.
 
 ---
 
@@ -208,16 +216,23 @@ GET /v1/sync/{site_code}/delta?since={epoch}   # since defaults to 0
           when `since` is ahead of the shard (client regressed); re-snapshot
 
 GET /v1/sync/{site_code}/snapshot
-    → { "epoch": 4012, "tables": [ {table, rows: [payload…]}… ] }
+    → { "epoch": 4012, "tables": [ {table, rows: [{id, payload}…]}… ] }
+
+POST /v1/sync/{site_code}/upload          # DDIL reconcile (local → central)
+    body: { "changes": [ {table, id, op, payload?}… ] }
+    → { "epoch": 4015, "applied": 3 }
+        adopts edits the site made while partitioned; local wins
 ```
 
-Both delta outcomes return HTTP 200 with a `kind`-tagged body — the client
-matches on `kind` rather than on status codes. (The journal is retained
-indefinitely, so a delta never falls off a lower pruning horizon; the only
-re-snapshot trigger is a client whose `since` exceeds the current epoch.)
-Implemented by [`central-config-api`](../crates/sbc/central-config-api),
-over the [`central-config-store`](../crates/sbc/central-config-store)
-transactional layer.
+The three reads return HTTP 200; the delta outcomes carry a `kind`-tagged
+body (`delta` to apply, or `must_snapshot` when the client's `since`
+exceeds the current epoch — the journal is retained indefinitely, so a
+delta never falls off a lower horizon). `upload` is authorized by the
+**same** site-scoped check as the reads, so a base can adopt changes only
+into its own shard. Implemented by
+[`central-config-api`](../crates/sbc/central-config-api), over the
+[`central-config-store`](../crates/sbc/central-config-store) transactional
+layer.
 
 Auth (implemented): per-site service account — OIDC client-credentials
 against Keycloak (`usg-uc-site-sync` client, one credential per site,
@@ -245,26 +260,40 @@ pod per base.
   snapshot (whole-shard replace), then resume deltas.
 - Crash-safe and idempotent: re-applying a delta is harmless (upserts +
   tombstones keyed by row id); applied rows are stamped
-  `updated_by = 'central'`, leaving local break-glass writes
-  (`updated_by = 'local'`) untouched.
-- The convergence policy (`reconcile`) is exercised end-to-end in tests via
-  an in-process `ConfigSource` over the real `CentralConfigStore` — snapshot
-  bootstrap, incremental deltas, tombstones, and regression recovery.
+  `updated_by = 'central'`, and the apply engine **never overwrites a
+  `updated_by = 'local'` row** (`... WHERE updated_by <> 'local'` on every
+  upsert/tombstone, and snapshot reload deletes only central-origin rows).
+- **DDIL reconcile (each cycle, before pulling):** collect local edits
+  (`updated_by = 'local'` rows — live → upsert, tombstoned → delete), push
+  them to `/upload`; on adoption, re-stamp them `'central'` with the
+  returned epoch so they converge and aren't re-uploaded. Pulling only
+  *after* the upload means a delta/snapshot can't clobber an edit central
+  hasn't seen yet. Local wins.
+- A `/metrics` endpoint (`applied_epoch`, `central_epoch`,
+  `staleness_epochs`, `last_success_timestamp_seconds`, `reconcile_total`,
+  `errors_total`) plus `/healthz` + `/readyz` for central staleness
+  dashboards.
+- Exercised end-to-end in tests via an in-process `ConfigSource` over the
+  real `CentralConfigStore`: snapshot bootstrap, incremental deltas,
+  tombstones, regression recovery, and the full DDIL round trip (edit at
+  the edge during a partition → upload on reconnect → central adopts →
+  converges, with central's own concurrent change still pulled down).
 
-**Deferred to a follow-up** (not blocking the pull/apply core): calling the
-daemon's gRPC refresh after an apply (so dial-plan/trunk changes take effect
-without a restart — same hook `sbc-api-server` uses), and a `/metrics`
-endpoint (`applied_epoch`, `central_epoch`, `last_success_ts`,
-`sync_errors_total`) for central staleness dashboards.
+**Deferred to a follow-up** (not blocking sync): calling the daemon's gRPC
+refresh after an apply (so dial-plan/trunk changes take effect without a
+restart — same hook `sbc-api-server` uses). Today applied changes land in
+the local Postgres and the daemon picks them up on its normal config-reload
+path.
 
 ### 5.3 Failure behavior
 
 | Failure | Behavior |
 | --- | --- |
 | WAN down | Site serves last-applied config indefinitely; phones provision, calls route. Staleness metric climbs centrally. |
-| Central DB down | Same as WAN down for all sites; writes blocked (acceptable — writes are operator actions). |
-| Site Postgres lost | Sync agent detects empty `sync_state` → snapshot restore. Recovery = minutes, no central coordination. |
-| Partial delta apply | Impossible by construction (single transaction). |
+| Local edits during the outage (DDIL) | The site writes locally (`updated_by = 'local'`); the apply engine preserves those rows. On reconnect they're uploaded to central (local wins) and converge. |
+| Central DB down | Same as WAN down for all sites; central writes blocked (acceptable — operator actions), site reads/edits continue. |
+| Site Postgres lost | Sync agent detects empty `sync_state` → snapshot restore. Recovery = minutes, no central coordination. (Uncommitted local-only edits are lost with the DB — same as any single-node loss.) |
+| Partial delta/upload apply | Impossible by construction (single transaction each; `/upload` is idempotent on re-send). |
 
 ### 5.4 Global templates with per-site overlay
 
@@ -304,27 +333,77 @@ epoch), which the journal handles naturally and lets you do staged rollout
   `DialPlanConfig`) before commit — the JSONB pass-through finally gets
   enforcement at one choke point. (CUCM-entity validation is the same
   pattern, to add as those write routes land.)
-- Still to do: point the `usg-sbc-dashboard` SPA at the central API and
-  flip the per-site `sbc-api-server` to **read-only** for config entities
-  (it keeps serving live status, registrations, call state — site-local
-  runtime data, not config).
+- Still to do: point the `usg-sbc-dashboard` SPA at the central API. The
+  per-site `sbc-api-server` keeps a config write path **on purpose** — it
+  is how a site edits its own config during a partition (§7); those writes
+  are marked `updated_by = 'local'` and reconciled upward, rather than being
+  forbidden.
 
 ---
 
-## 7. Break-glass: local writes during prolonged partition
+## 7. DDIL autonomy: local edits during a partition (implemented)
 
-A site cut off for days may need an urgent change (new phone, dial-plan fix).
+A site cut off from central for hours or days must still be able to change
+its own config — add a phone at a forward node, fix a dial-plan entry — and
+have those changes **stick** rather than be wiped when the link returns.
+The chosen policy is *local wins and syncs up*: the edge is authoritative
+for its own shard during the outage, and its edits propagate to central on
+reconnect (where they flow back out, now central-origin, and onward to the
+fleet if applicable).
 
-- The site api-server keeps its write code path behind an explicit
-  **override mode** (flag + audit banner in the dashboard).
-- Local writes set `origin='local-override'` in a site-local journal and **do
-  not** advance the synced epoch.
-- On reconnect, the sync agent uploads the local journal to the central API
-  as *proposed changes*; an operator reconciles (accept into central, or
-  reject — central then overwrites local on next delta). Central always wins
-  by default; local overrides are temporary by design.
-- Phase 4 ships override mode disabled-by-default; enabling it is a
-  per-site Helm flag for sites with known-bad links.
+How it works (no separate "override mode" — it's the normal write path):
+
+- The site writes to its local Postgres through the existing
+  `sbc-api-server`. Site-local writes are stamped `updated_by = 'local'`,
+  `revision = 0`, distinguishing them from synced rows (`'central'`).
+- The sync agent's apply engine **never overwrites a `'local'` row**: every
+  delta upsert/tombstone carries `... WHERE updated_by <> 'local'`, and a
+  snapshot reload deletes only central-origin rows. So central traffic for
+  *other* rows still applies, but the edge's own edits survive.
+- Each reconcile cycle, **before** pulling, the agent collects the
+  `'local'` rows and `POST`s them to `/v1/sync/{site}/upload` (authorized by
+  the site's own `config-sync` token — own shard only). Central adopts them
+  through the normal transactional path (epoch + revision + journal), so
+  they become central-origin and a conflicting central edit is overwritten
+  (local wins). The agent then re-stamps the uploaded rows `'central'`
+  locally so they converge and aren't re-sent.
+
+```mermaid
+sequenceDiagram
+    participant Op as Field operator
+    participant Site as sbc-api-server (site)
+    participant LDB as local Postgres
+    participant Agent as sbc-config-sync
+    participant API as central-config-api
+    participant CDB as central Postgres
+
+    Note over Site,Agent: link to central is DOWN
+    Op->>Site: add phone / edit dial-plan
+    Site->>LDB: write (updated_by='local')
+    Agent-->>API: poll fails — keep last-applied, retry
+    Note over Agent,API: link RETURNS
+    Agent->>LDB: collect updated_by='local' edits
+    Agent->>API: POST /sync/{site}/upload (local edits)
+    API->>CDB: apply (epoch++, journal) — local wins
+    API-->>Agent: { epoch }
+    Agent->>LDB: re-stamp uploaded rows -> 'central'
+    Agent->>API: GET /sync/{site}/delta?since=…
+    API-->>Agent: changes (incl. now-central edits + others)
+    Agent->>LDB: apply (preserves any newer 'local' rows)
+    Note over LDB,CDB: converged; edge edits live fleet-wide
+```
+
+Edge cases handled: a fresh local edit made *during* the upload keeps its
+`'local'` marker (re-stamp only flips rows still local) and is sent next
+cycle; a re-sent upload is idempotent (delete of an already-absent row is a
+no-op); losing the site Postgres entirely loses only uncommitted local-only
+edits, same as any single-node failure (recovery is a snapshot restore).
+
+**Not yet built:** an operator *review/approval* gate before central adopts
+a site's upload. Today adoption is automatic (local wins outright). If a
+deployment wants human reconciliation for certain entities, that becomes a
+"proposed changes" queue on the upload endpoint — a natural extension of
+the same mechanism.
 
 ---
 
@@ -347,15 +426,19 @@ Because materialization is per-site, fleet-wide changes get rings for free:
 > (`central-config-api` operator surface) flows through the transactional
 > store (`central-config-store`: epoch + revision + journal) and is pulled
 > and applied at each site by `sbc-config-sync` into the site-local
-> Postgres the SBC daemon reads. Crates: `central-config-store` (txn layer
-> + sync reads + templates), `central-config-api` (sync + operator HTTP +
-> dual-scope OIDC), `sbc-config-sync` (pull/apply agent + metrics),
+> Postgres the SBC daemon reads. Crates: `central-config-store`
+> (transactional layer, sync reads, templates), `central-config-api`
+> (sync, operator HTTP, dual-scope OIDC), `sbc-config-sync` (pull/apply
+> agent, metrics),
 > `central-config-import` (onboarding), plus the `sbc-config-store` Phase-0
-> envelope. Deploy: `deploy/helm/central-config`, the `sbc` chart's
-> `sbcConfigSync` component, and `deploy/keycloak/central-config-clients
-> .md`. Remaining: production HA-Postgres wiring, the dashboard SPA
-> cutover, flipping per-site `sbc-api-server` config writes to read-only,
-> the break-glass override path (§7), and the agent's daemon-gRPC
+> envelope. **DDIL autonomy (§7) is implemented**: sites edit their own
+> config while partitioned (`updated_by='local'`), the apply engine
+> preserves those rows, and they upload to central on reconnect (local
+> wins) and converge — covered by an end-to-end round-trip test. Deploy:
+> `deploy/helm/central-config`, the `sbc` chart's `sbcConfigSync`
+> component, and `deploy/keycloak/central-config-clients.md`. Remaining:
+> production HA-Postgres wiring, the dashboard SPA cutover, an optional
+> operator-approval gate on uploads, and the agent's daemon-gRPC
 > refresh-after-apply (today changes land in local Postgres and the daemon
 > picks them up on its normal config-reload path).
 

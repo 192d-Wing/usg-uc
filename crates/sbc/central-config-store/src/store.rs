@@ -356,6 +356,61 @@ impl CentralConfigStore {
         Ok(epoch)
     }
 
+    /// Apply one change to a site's shard, dispatching by table and op.
+    /// Used by the site-upload path (DDIL reconcile): a delete tombstones;
+    /// an upsert is routed to the typed phone/DID writers (extracting the
+    /// MAC / DID columns from the payload) or the generic JSON writer.
+    /// Returns the new shard epoch.
+    ///
+    /// # Errors
+    /// [`CentralError::Serialization`] if an upsert payload is missing or
+    /// malformed for its table, plus the usual write errors.
+    pub async fn apply_change(
+        &self,
+        site_code: &str,
+        table: ConfigTable,
+        op: ChangeOp,
+        id: &str,
+        payload: Option<&Value>,
+        actor: &str,
+    ) -> CentralResult<i64> {
+        if op == ChangeOp::Delete {
+            return self.delete(table, site_code, id, actor).await;
+        }
+        let payload = payload.ok_or_else(|| {
+            CentralError::Serialization(format!("upsert for {}/{id} has no payload", table.name()))
+        })?;
+        match table {
+            ConfigTable::Phones => {
+                let mac = payload.get("mac_address").and_then(Value::as_str).ok_or_else(|| {
+                    CentralError::Serialization(format!("phone {id} payload missing mac_address"))
+                })?;
+                self.upsert_phone(site_code, id, &normalize_mac(mac), payload, actor).await
+            }
+            ConfigTable::DirectoryNumbers => {
+                let obj = payload.as_object().ok_or_else(|| {
+                    CentralError::Serialization(format!("DID {id} payload is not an object"))
+                })?;
+                let field = |k: &str| obj.get(k).and_then(Value::as_str);
+                let mut extra = obj.clone();
+                for k in ["did", "user", "partition", "description"] {
+                    extra.remove(k);
+                }
+                self.upsert_did(
+                    site_code,
+                    id,
+                    field("user"),
+                    field("partition"),
+                    field("description"),
+                    &extra,
+                    actor,
+                )
+                .await
+            }
+            json_table => self.upsert_json(json_table, site_code, id, payload, actor).await,
+        }
+    }
+
     // ------------------------------------------------------- sync reads
 
     /// The site's current shard epoch — the cheap staleness probe.
@@ -567,6 +622,12 @@ fn did_payload(
         obj.insert(k.clone(), v.clone());
     }
     Value::Object(obj)
+}
+
+/// Normalize a MAC the same way the phone store and sync agent do: strip
+/// `:`/`-`, lowercase.
+fn normalize_mac(mac: &str) -> String {
+    mac.replace([':', '-'], "").to_lowercase()
 }
 
 /// `true` for the JSONB pass-through tables (everything except the two
