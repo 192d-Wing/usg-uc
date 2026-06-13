@@ -12,6 +12,7 @@ use tokio::time::{MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use sbc_config_sync::refresh::{AnyRefresher, GrpcRefresher};
 use sbc_config_sync::{
     Auth, AuthConfig, CentralClient, Config, Outcome, SyncStatus, TokenProvider, reconcile, status,
 };
@@ -59,6 +60,22 @@ async fn main() -> ExitCode {
     };
     let client = CentralClient::new(http, cfg.central_url.clone(), auth);
 
+    // Optional best-effort daemon refresh after each apply. Without a URL,
+    // the daemon picks changes up on its normal restart/reload path.
+    let refresher = match std::env::var("SYNC_DAEMON_GRPC_URL") {
+        Ok(url) if !url.is_empty() => match GrpcRefresher::connect(&url) {
+            Ok(r) => {
+                info!(url = %url, "daemon refresh enabled");
+                AnyRefresher::Grpc(Box::new(r))
+            }
+            Err(e) => {
+                warn!(error = %e, "bad SYNC_DAEMON_GRPC_URL; daemon refresh disabled");
+                AnyRefresher::Noop
+            }
+        },
+        _ => AnyRefresher::Noop,
+    };
+
     // Metrics/health server, sharing status with the reconcile loop.
     let sync_status = SyncStatus::new(&cfg.site_code);
     match tokio::net::TcpListener::bind(cfg.metrics_addr).await {
@@ -92,7 +109,7 @@ async fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             _ = ticker.tick() => {
-                match reconcile(&pool, &client, &cfg.site_code).await {
+                match reconcile(&pool, &client, &refresher, &cfg.site_code).await {
                     Ok(outcome) => {
                         match &outcome {
                             Outcome::UpToDate { epoch } =>

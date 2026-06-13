@@ -16,6 +16,7 @@ use crate::apply::{
     applied_epoch, apply_delta, apply_snapshot, collect_local_changes, restamp_uploaded,
 };
 use crate::error::{SyncError, SyncResult};
+use crate::refresh::{RefreshItem, Refresher};
 
 /// The reads the agent pulls from central, plus the upload it pushes.
 pub trait ConfigSource {
@@ -76,9 +77,10 @@ pub enum Outcome {
 ///
 /// # Errors
 /// [`SyncError`] if a read or the apply transaction fails.
-pub async fn reconcile<S: ConfigSource + Sync>(
+pub async fn reconcile<S: ConfigSource + Sync, R: Refresher + Sync>(
     pool: &sqlx::PgPool,
     source: &S,
+    refresher: &R,
     site_code: &str,
 ) -> SyncResult<Outcome> {
     // DDIL reconcile: push any local edits made while partitioned up to
@@ -99,24 +101,44 @@ pub async fn reconcile<S: ConfigSource + Sync>(
         Some(a) if a < central => match source.delta(site_code, a).await? {
             DeltaResult::Delta { from, to, changes } => {
                 let n = changes.len();
+                // Best-effort daemon refresh for the entities that changed.
+                let items: Vec<RefreshItem> = changes
+                    .iter()
+                    .map(|c| RefreshItem { table: c.table, id: c.row_id.clone(), op: c.op })
+                    .collect();
                 apply_delta(pool, site_code, &changes, to).await?;
+                refresher.refresh(&items).await;
                 Ok(Outcome::DeltaApplied { from, to, changes: n })
             }
-            DeltaResult::MustSnapshot { .. } => snapshot_path(pool, source, site_code).await,
+            DeltaResult::MustSnapshot { .. } => snapshot_path(pool, source, refresher, site_code).await,
         },
         // None (never synced) or local ahead of central (regressed).
-        _ => snapshot_path(pool, source, site_code).await,
+        _ => snapshot_path(pool, source, refresher, site_code).await,
     }
 }
 
-async fn snapshot_path<S: ConfigSource + Sync>(
+async fn snapshot_path<S: ConfigSource + Sync, R: Refresher + Sync>(
     pool: &sqlx::PgPool,
     source: &S,
+    refresher: &R,
     site_code: &str,
 ) -> SyncResult<Outcome> {
     let snap = source.snapshot(site_code).await?;
     let rows = snap.tables.iter().map(|t| t.rows.len()).sum();
+    // Refresh every live row the snapshot loaded (best-effort upserts).
+    let items: Vec<RefreshItem> = snap
+        .tables
+        .iter()
+        .flat_map(|t| {
+            t.rows.iter().map(move |r| RefreshItem {
+                table: t.table,
+                id: r.id.clone(),
+                op: central_config_store::ChangeOp::Upsert,
+            })
+        })
+        .collect();
     apply_snapshot(pool, site_code, &snap).await?;
+    refresher.refresh(&items).await;
     Ok(Outcome::Snapshotted { epoch: snap.epoch, rows })
 }
 

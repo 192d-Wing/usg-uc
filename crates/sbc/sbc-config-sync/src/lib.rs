@@ -20,12 +20,14 @@
 pub mod apply;
 pub mod config;
 pub mod error;
+pub mod refresh;
 pub mod source;
 pub mod status;
 pub mod token;
 
 pub use config::{AuthConfig, Config};
 pub use error::{SyncError, SyncResult};
+pub use refresh::{GrpcRefresher, NoopRefresher, RefreshItem, Refresher};
 pub use source::{CentralClient, ConfigSource, Outcome, reconcile};
 pub use status::SyncStatus;
 pub use token::{Auth, TokenProvider};

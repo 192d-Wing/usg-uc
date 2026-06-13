@@ -12,7 +12,7 @@
 //!     cargo test -p sbc-config-sync --test convergence
 //! ```
 
-#![allow(clippy::expect_used)]
+#![allow(clippy::expect_used, clippy::significant_drop_tightening)]
 
 use std::str::FromStr;
 
@@ -21,7 +21,24 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
 
 use central_config_store::{CentralConfigStore, ConfigTable, DeltaResult, Snapshot};
-use sbc_config_sync::{ConfigSource, Outcome, SyncResult, reconcile};
+use sbc_config_sync::{
+    ConfigSource, NoopRefresher, Outcome, RefreshItem, Refresher, SyncResult, reconcile,
+};
+
+/// Records the items reconcile asks the daemon to refresh.
+#[derive(Default)]
+struct RecordingRefresher {
+    seen: std::sync::Mutex<Vec<(String, String)>>, // (table, id)
+}
+
+impl Refresher for RecordingRefresher {
+    async fn refresh(&self, items: &[RefreshItem]) {
+        let mut g = self.seen.lock().expect("lock");
+        for i in items {
+            g.push((i.table.name().to_string(), i.id.clone()));
+        }
+    }
+}
 
 const SITE: &str = "MUHJ";
 
@@ -129,13 +146,13 @@ async fn converges_via_snapshot_then_deltas() {
     sbc_config_store::ensure_schema(&local).await.expect("local schema");
 
     // First reconcile: never synced → full snapshot.
-    let outcome = reconcile(&local, &source, SITE).await.expect("first reconcile");
+    let outcome = reconcile(&local, &source, &NoopRefresher, SITE).await.expect("first reconcile");
     assert!(matches!(outcome, Outcome::Snapshotted { rows: 3, .. }), "got {outcome:?}");
     assert_eq!(local_phone_ids(&local).await, vec!["p1"]);
     assert_eq!(local_applied_epoch(&local).await, Some(3));
 
     // Idempotent: nothing changed centrally → up to date, no work.
-    let outcome = reconcile(&local, &source, SITE).await.expect("noop reconcile");
+    let outcome = reconcile(&local, &source, &NoopRefresher, SITE).await.expect("noop reconcile");
     assert!(matches!(outcome, Outcome::UpToDate { epoch: 3 }), "got {outcome:?}");
 
     // Central mutates: add a phone, delete the DID, update p1.
@@ -152,7 +169,7 @@ async fn converges_via_snapshot_then_deltas() {
         .expect("p1 update");
 
     // Next reconcile: delta path applies all three.
-    let outcome = reconcile(&local, &source, SITE).await.expect("delta reconcile");
+    let outcome = reconcile(&local, &source, &NoopRefresher, SITE).await.expect("delta reconcile");
     assert!(matches!(outcome, Outcome::DeltaApplied { from: 3, to: 6, changes: 3 }), "got {outcome:?}");
     assert_eq!(local_phone_ids(&local).await, vec!["p1", "p2"]);
 
@@ -194,7 +211,7 @@ async fn ddil_local_edit_survives_and_syncs_up() {
 
     let local = make_db(&admin, "scs_ddil_local").await;
     sbc_config_store::ensure_schema(&local).await.expect("local schema");
-    reconcile(&local, &source, SITE).await.expect("initial sync"); // pulls p1
+    reconcile(&local, &source, &NoopRefresher, SITE).await.expect("initial sync"); // pulls p1
 
     // --- link goes down; the site makes local edits ---
     // A new phone the field operator added, and an edit to p1 — both
@@ -213,7 +230,7 @@ async fn ddil_local_edit_survives_and_syncs_up() {
         .await.expect("central p-hq");
 
     // --- link returns: reconcile pushes local edits up, then pulls ---
-    reconcile(&local, &source, SITE).await.expect("reconnect reconcile");
+    reconcile(&local, &source, &NoopRefresher, SITE).await.expect("reconnect reconcile");
 
     // The local edits propagated to central (local wins).
     let snap = source.0.snapshot(SITE).await.expect("central snapshot");
@@ -251,7 +268,7 @@ async fn regressed_local_recovers_via_snapshot() {
 
     let local = make_db(&admin, "scs_regress_local").await;
     sbc_config_store::ensure_schema(&local).await.expect("local schema");
-    reconcile(&local, &source, SITE).await.expect("initial");
+    reconcile(&local, &source, &NoopRefresher, SITE).await.expect("initial");
     assert_eq!(local_applied_epoch(&local).await, Some(1));
 
     // Simulate a regression: local sync_state claims a future epoch (e.g.
@@ -264,8 +281,46 @@ async fn regressed_local_recovers_via_snapshot() {
         .await
         .expect("bump local epoch");
 
-    let outcome = reconcile(&local, &source, SITE).await.expect("regress reconcile");
+    let outcome = reconcile(&local, &source, &NoopRefresher, SITE).await.expect("regress reconcile");
     assert!(matches!(outcome, Outcome::Snapshotted { epoch: 1, rows: 1 }), "got {outcome:?}");
     assert_eq!(local_applied_epoch(&local).await, Some(1), "epoch corrected back down");
     assert_eq!(local_phone_ids(&local).await, vec!["p1"]);
+}
+
+#[tokio::test]
+async fn reconcile_refreshes_changed_entities() {
+    let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else { return };
+
+    let central = CentralConfigStore::from_pool(make_db(&admin, "scs_refresh_central").await)
+        .await
+        .expect("central migrate");
+    central.register_site(SITE, "MUHJ", "muhj.x", "UTC", "active").await.expect("register");
+    central
+        .upsert_json(ConfigTable::DialPlans, SITE, "main", &json!({"id": "main", "entries": []}), "op")
+        .await
+        .expect("dialplan");
+    central
+        .upsert_json(ConfigTable::TrunkGroups, SITE, "us", &json!({"id": "us"}), "op")
+        .await
+        .expect("tg");
+    let source = DirectSource(central);
+
+    let local = make_db(&admin, "scs_refresh_local").await;
+    sbc_config_store::ensure_schema(&local).await.expect("local schema");
+    let rec = RecordingRefresher::default();
+
+    // Snapshot bootstrap refreshes the two live routing/trunk rows.
+    reconcile(&local, &source, &rec, SITE).await.expect("snapshot");
+    {
+        let seen = rec.seen.lock().expect("lock");
+        assert!(seen.contains(&("dial_plans".into(), "main".into())), "snapshot refresh: {seen:?}");
+        assert!(seen.contains(&("trunk_groups".into(), "us".into())));
+    }
+    rec.seen.lock().expect("lock").clear();
+
+    // A delta refreshes exactly what changed: one trunk-group delete.
+    source.0.delete(ConfigTable::TrunkGroups, SITE, "us", "op").await.expect("del tg");
+    reconcile(&local, &source, &rec, SITE).await.expect("delta");
+    let seen = rec.seen.lock().expect("lock");
+    assert_eq!(seen.as_slice(), &[("trunk_groups".to_string(), "us".to_string())], "delta refresh");
 }

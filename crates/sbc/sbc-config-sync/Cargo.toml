@@ -37,6 +37,10 @@ central-config-store = { path = "../central-config-store" }
 sbc-config-store = { workspace = true }
 # HTTP client for the central sync API. rustls only.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# gRPC clients for the best-effort daemon refresh after an apply (so
+# dial-plan/trunk/routing changes take effect without a daemon restart).
+sbc-grpc-api = { workspace = true }
+tonic = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
