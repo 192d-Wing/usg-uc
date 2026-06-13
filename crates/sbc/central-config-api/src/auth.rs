@@ -13,6 +13,8 @@ use axum::response::{IntoResponse, Response};
 use proto_jwt::{Claims, ValidateError, Validator};
 use serde_json::json;
 
+use crate::policy::{Action, Subject};
+
 /// Why a sync request was refused. Maps to RFC 6750 challenge semantics.
 #[derive(Debug)]
 pub enum AuthRejection {
@@ -24,6 +26,9 @@ pub enum AuthRejection {
     /// Token is valid but its `site_code` claim doesn't match the path
     /// (or is absent) → 403. The token simply isn't for this shard.
     WrongSite,
+    /// Token is valid but the subject's roles/sites don't grant the
+    /// requested action on the target site (ABAC) → 403.
+    Forbidden,
 }
 
 impl IntoResponse for AuthRejection {
@@ -44,6 +49,12 @@ impl IntoResponse for AuthRejection {
                 StatusCode::FORBIDDEN,
                 Json(json!({ "error": "wrong_site",
                     "detail": "token site_code does not match the requested site" })),
+            )
+                .into_response(),
+            Self::Forbidden => (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "forbidden",
+                    "detail": "the token's roles/sites do not grant this action" })),
             )
                 .into_response(),
         }
@@ -84,23 +95,34 @@ pub async fn authorize_site(
     }
 }
 
-/// Validate an operator token for the write surface. The `admin_validator`
-/// already requires the `config-admin` scope; this returns the claims so a
-/// handler can attribute the write to `claims.sub`. An operator is a fleet
-/// admin — there is no per-site claim check (writes name the site in the
-/// path).
+/// Validate an operator token and authorize a single ABAC [`Action`] on a
+/// target site. The `admin_validator` first enforces the coarse
+/// [`OPERATOR_SCOPE`](crate::state::OPERATOR_SCOPE) gate; then the token's
+/// `roles`/`sites` claims must grant `action` on `site` (see
+/// [`crate::policy`]). For fleet-level entities (the site registry,
+/// templates) pass `site = None`.
+///
+/// Returns the validated [`Claims`] on success so a handler can attribute
+/// the change to `claims.sub`.
 ///
 /// # Errors
-/// [`AuthRejection`] for a missing/invalid token or one lacking the admin
-/// scope.
-pub async fn authorize_operator(
+/// [`AuthRejection`] for a missing/invalid token, a token lacking the
+/// operator scope, or one whose roles/sites don't grant the action.
+pub async fn authorize_action(
     validator: &Validator,
     headers: &HeaderMap,
+    action: Action,
+    site: Option<&str>,
 ) -> Result<Claims, AuthRejection> {
     let token = bearer(headers)
         .ok_or_else(|| AuthRejection::Unauthorized("missing bearer token".to_string()))?;
-    validator.validate(token).await.map_err(|e| match e {
+    let claims = validator.validate(token).await.map_err(|e| match e {
         ValidateError::InsufficientScope => AuthRejection::InsufficientScope,
         other => AuthRejection::Unauthorized(other.to_string()),
-    })
+    })?;
+    if Subject::from_claims(&claims).permits(action, site) {
+        Ok(claims)
+    } else {
+        Err(AuthRejection::Forbidden)
+    }
 }

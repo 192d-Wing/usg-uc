@@ -15,6 +15,7 @@ use tracing_subscriber::EnvFilter;
 mod auth;
 mod config;
 mod handlers;
+mod policy;
 mod state;
 
 #[tokio::main(flavor = "multi_thread")]

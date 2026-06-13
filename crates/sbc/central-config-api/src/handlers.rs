@@ -20,7 +20,8 @@ use tracing::warn;
 
 use central_config_store::{CentralError, ConfigTable, DeltaResult};
 
-use crate::auth::{authorize_operator, authorize_site};
+use crate::auth::{authorize_action, authorize_site};
+use crate::policy::{Action, Entity, Verb};
 use crate::state::AppState;
 
 /// Build the router.
@@ -305,6 +306,21 @@ fn ok_epoch(epoch: i64) -> Response {
 // Operator-authorized GET reads for the dashboard. Lists return
 // `{ "items": [payload…] }`; single-row GETs return the payload or 404.
 
+/// The ABAC [`Entity`] a site-scoped config table belongs to.
+const fn entity_for_table(table: ConfigTable) -> Entity {
+    match table {
+        ConfigTable::Phones => Entity::Phones,
+        ConfigTable::DirectoryNumbers => Entity::Directory,
+        ConfigTable::TrunkGroups => Entity::TrunkGroups,
+        ConfigTable::DialPlans => Entity::DialPlans,
+        ConfigTable::SiteTelephonyConfig => Entity::SiteConfig,
+        ConfigTable::SbcPartitions
+        | ConfigTable::SbcCallingSearchSpaces
+        | ConfigTable::SbcRoutePatterns
+        | ConfigTable::SbcRouteLists => Entity::Routing,
+    }
+}
+
 /// List a table's live rows for a site as `{ "items": [...] }`.
 async fn do_list(
     state: &AppState,
@@ -312,7 +328,8 @@ async fn do_list(
     site: &str,
     table: ConfigTable,
 ) -> Response {
-    if let Err(rej) = authorize_operator(&state.admin_validator, headers).await {
+    let action = Action::new(entity_for_table(table), Verb::Read);
+    if let Err(rej) = authorize_action(&state.admin_validator, headers, action, Some(site)).await {
         return rej.into_response();
     }
     match state.store.list_rows(table, site).await {
@@ -332,7 +349,8 @@ async fn do_get(
     table: ConfigTable,
     id: &str,
 ) -> Response {
-    if let Err(rej) = authorize_operator(&state.admin_validator, headers).await {
+    let action = Action::new(entity_for_table(table), Verb::Read);
+    if let Err(rej) = authorize_action(&state.admin_validator, headers, action, Some(site)).await {
         return rej.into_response();
     }
     match state.store.get_row(table, site, id).await {
@@ -344,7 +362,8 @@ async fn do_get(
 
 /// `GET /v1/sites` — list registered sites (the dashboard's site selector).
 async fn list_sites(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if let Err(rej) = authorize_operator(&state.admin_validator, &headers).await {
+    let action = Action::new(Entity::Sites, Verb::Read);
+    if let Err(rej) = authorize_action(&state.admin_validator, &headers, action, None).await {
         return rej.into_response();
     }
     match state.store.list_sites().await {
@@ -444,7 +463,8 @@ async fn register_site(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(rej) = authorize_operator(&state.admin_validator, &headers).await {
+    let action = Action::new(Entity::Sites, Verb::Write);
+    if let Err(rej) = authorize_action(&state.admin_validator, &headers, action, None).await {
         return rej.into_response();
     }
     let Some(site) = body.get("site_code").and_then(Value::as_str) else {
@@ -482,7 +502,9 @@ async fn upsert_phone(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+    let action = Action::new(Entity::Phones, Verb::Write);
+    let actor = match authorize_action(&state.admin_validator, &headers, action, Some(&site)).await
+    {
         Ok(c) => c.sub,
         Err(rej) => return rej.into_response(),
     };
@@ -508,7 +530,9 @@ async fn delete_phone(
     Path((site, id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+    let action = Action::new(Entity::Phones, Verb::Write);
+    let actor = match authorize_action(&state.admin_validator, &headers, action, Some(&site)).await
+    {
         Ok(c) => c.sub,
         Err(rej) => return rej.into_response(),
     };
@@ -529,7 +553,9 @@ async fn upsert_did(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+    let action = Action::new(Entity::Directory, Verb::Write);
+    let actor = match authorize_action(&state.admin_validator, &headers, action, Some(&site)).await
+    {
         Ok(c) => c.sub,
         Err(rej) => return rej.into_response(),
     };
@@ -574,7 +600,9 @@ async fn delete_did(
     Path((site, did)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+    let action = Action::new(Entity::Directory, Verb::Write);
+    let actor = match authorize_action(&state.admin_validator, &headers, action, Some(&site)).await
+    {
         Ok(c) => c.sub,
         Err(rej) => return rej.into_response(),
     };
@@ -596,7 +624,9 @@ async fn upsert_trunk_group(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+    let action = Action::new(Entity::TrunkGroups, Verb::Write);
+    let actor = match authorize_action(&state.admin_validator, &headers, action, Some(&site)).await
+    {
         Ok(c) => c.sub,
         Err(rej) => return rej.into_response(),
     };
@@ -620,7 +650,9 @@ async fn delete_trunk_group(
     Path((site, id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+    let action = Action::new(Entity::TrunkGroups, Verb::Write);
+    let actor = match authorize_action(&state.admin_validator, &headers, action, Some(&site)).await
+    {
         Ok(c) => c.sub,
         Err(rej) => return rej.into_response(),
     };
@@ -642,7 +674,9 @@ async fn upsert_dial_plan(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+    let action = Action::new(Entity::DialPlans, Verb::Write);
+    let actor = match authorize_action(&state.admin_validator, &headers, action, Some(&site)).await
+    {
         Ok(c) => c.sub,
         Err(rej) => return rej.into_response(),
     };
@@ -666,7 +700,9 @@ async fn delete_dial_plan(
     Path((site, id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+    let action = Action::new(Entity::DialPlans, Verb::Write);
+    let actor = match authorize_action(&state.admin_validator, &headers, action, Some(&site)).await
+    {
         Ok(c) => c.sub,
         Err(rej) => return rej.into_response(),
     };
@@ -699,7 +735,9 @@ async fn upsert_routing(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+    let action = Action::new(Entity::Routing, Verb::Write);
+    let actor = match authorize_action(&state.admin_validator, &headers, action, Some(&site)).await
+    {
         Ok(c) => c.sub,
         Err(rej) => return rej.into_response(),
     };
@@ -727,7 +765,9 @@ async fn delete_routing(
     Path((site, kind, id)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+    let action = Action::new(Entity::Routing, Verb::Write);
+    let actor = match authorize_action(&state.admin_validator, &headers, action, Some(&site)).await
+    {
         Ok(c) => c.sub,
         Err(rej) => return rej.into_response(),
     };
@@ -748,7 +788,9 @@ async fn put_site_config(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+    let action = Action::new(Entity::SiteConfig, Verb::Write);
+    let actor = match authorize_action(&state.admin_validator, &headers, action, Some(&site)).await
+    {
         Ok(c) => c.sub,
         Err(rej) => return rej.into_response(),
     };
@@ -778,7 +820,8 @@ async fn put_template(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let actor = match authorize_operator(&state.admin_validator, &headers).await {
+    let action = Action::new(Entity::Templates, Verb::Write);
+    let actor = match authorize_action(&state.admin_validator, &headers, action, None).await {
         Ok(c) => c.sub,
         Err(rej) => return rej.into_response(),
     };
@@ -799,7 +842,8 @@ async fn delete_template(
     Path((kind, id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(rej) = authorize_operator(&state.admin_validator, &headers).await {
+    let action = Action::new(Entity::Templates, Verb::Write);
+    if let Err(rej) = authorize_action(&state.admin_validator, &headers, action, None).await {
         return rej.into_response();
     }
     let kind = match parse_kind(&kind) {
@@ -820,7 +864,8 @@ async fn assign_template(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(rej) = authorize_operator(&state.admin_validator, &headers).await {
+    let action = Action::new(Entity::Templates, Verb::Write);
+    if let Err(rej) = authorize_action(&state.admin_validator, &headers, action, None).await {
         return rej.into_response();
     }
     let kind = match parse_kind(&kind) {
@@ -857,7 +902,8 @@ async fn materialize_template(
     Query(q): Query<MaterializeQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(rej) = authorize_operator(&state.admin_validator, &headers).await {
+    let action = Action::new(Entity::Templates, Verb::Write);
+    if let Err(rej) = authorize_action(&state.admin_validator, &headers, action, None).await {
         return rej.into_response();
     }
     let kind = match parse_kind(&kind) {
@@ -900,7 +946,7 @@ mod tests {
     use central_config_store::CentralConfigStore;
 
     use super::*;
-    use crate::state::{ADMIN_SCOPE, AppState, SYNC_SCOPE};
+    use crate::state::{ADMIN_SCOPE, AppState, OPERATOR_SCOPE, SYNC_SCOPE};
 
     const TEST_KID: &str = "test-key-1";
     const TEST_ISSUER: &str = "https://idp.example.mil/realms/config";
@@ -953,6 +999,19 @@ mod tests {
     /// Mint a token. Overridable bits let each test bend exactly one
     /// dimension (scope, site, audience, expiry).
     fn mint(site_code: Option<&str>, scope: &str, aud: &str, exp: u64) -> String {
+        mint_full(site_code, scope, aud, exp, &[], &[])
+    }
+
+    /// Mint a token, additionally carrying ABAC `roles`/`sites` claims (for
+    /// operator-surface tests). Empty slices omit the claims.
+    fn mint_full(
+        site_code: Option<&str>,
+        scope: &str,
+        aud: &str,
+        exp: u64,
+        roles: &[&str],
+        sites: &[&str],
+    ) -> String {
         let mut claims = serde_json::Map::new();
         claims.insert("sub".into(), "svc-sync".into());
         claims.insert("iss".into(), TEST_ISSUER.into());
@@ -962,6 +1021,12 @@ mod tests {
         if let Some(s) = site_code {
             claims.insert("site_code".into(), s.into());
         }
+        if !roles.is_empty() {
+            claims.insert("roles".into(), json!(roles));
+        }
+        if !sites.is_empty() {
+            claims.insert("sites".into(), json!(sites));
+        }
         let mut header = Header::new(jsonwebtoken::Algorithm::ES256);
         header.kid = Some(TEST_KID.to_string());
         encode(&header, &Value::Object(claims), &test_key().encoding).expect("encode token")
@@ -970,6 +1035,19 @@ mod tests {
     /// A valid token for `site` with the right scope/audience, far expiry.
     fn good_token(site: &str) -> String {
         mint(Some(site), SYNC_SCOPE, TEST_AUDIENCE, now() + 3600)
+    }
+
+    /// An operator token carrying the base operator scope plus ABAC
+    /// `roles`/`sites` claims (the granular IAM-style path).
+    fn operator_token(roles: &[&str], sites: &[&str]) -> String {
+        mint_full(
+            None,
+            OPERATOR_SCOPE,
+            TEST_AUDIENCE,
+            now() + 3600,
+            roles,
+            sites,
+        )
     }
 
     async fn scratch_store(admin: &str, name: &str) -> CentralConfigStore {
@@ -1027,7 +1105,7 @@ mod tests {
         router(Arc::new(AppState {
             store,
             sync_validator: validator_for(SYNC_SCOPE),
-            admin_validator: validator_for(ADMIN_SCOPE),
+            admin_validator: validator_for(OPERATOR_SCOPE),
             start_time: Instant::now(),
         }))
     }
@@ -1086,9 +1164,12 @@ mod tests {
         (status, body)
     }
 
-    /// An operator token (config-admin scope, no site claim).
+    /// A legacy full-fleet operator token: the base operator scope plus the
+    /// `config-admin` scope, no `roles`/`sites`. ABAC treats it as a fleet
+    /// admin, so it still has full access (back-compat path).
     fn admin_token() -> String {
-        mint(None, ADMIN_SCOPE, TEST_AUDIENCE, now() + 3600)
+        let scope = format!("{OPERATOR_SCOPE} {ADMIN_SCOPE}");
+        mint(None, &scope, TEST_AUDIENCE, now() + 3600)
     }
 
     #[tokio::test]
@@ -1525,7 +1606,7 @@ mod tests {
         let app = router(Arc::new(AppState {
             store: central.clone(),
             sync_validator: validator_for(SYNC_SCOPE),
-            admin_validator: validator_for(ADMIN_SCOPE),
+            admin_validator: validator_for(OPERATOR_SCOPE),
             start_time: Instant::now(),
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1628,5 +1709,164 @@ mod tests {
             .find(|t| t.table == ConfigTable::Phones)
             .is_some_and(|t| t.rows.iter().any(|r| r.id == "p-edge"));
         assert!(has_edge, "local edit uploaded to central over HTTP");
+    }
+
+    /// ABAC over the operator surface: roles decide the action, the `sites`
+    /// allowlist decides where, and fleet-level entities need the `*` grant.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn abac_roles_and_site_scope() {
+        let Ok(admin) = std::env::var("CENTRAL_STORE_TEST_DSN") else {
+            return;
+        };
+        let app = app(&admin, "cca_abac").await; // seeds MUHJ + phone p1
+
+        // Unique MAC per id (MACs are unique within a site's shard).
+        let phone = |id: &str| {
+            let h = id.bytes().fold(0u16, |a, b| a.wrapping_add(u16::from(b)));
+            json!({"id": id,
+                "mac_address": format!("12:34:56:78:{:02x}:{:02x}", (h >> 8) & 0xff, h & 0xff)})
+        };
+        let dialplan = |id: &str| json!({"id": id, "entries": []});
+
+        // fleet-admin role: writes anywhere + registers sites.
+        let fleet = operator_token(&["fleet-admin"], &["*"]);
+        let (s, _) = send_req(
+            &app,
+            "POST",
+            "/v1/sites/MUHJ/phones",
+            Some(&fleet),
+            Some(phone("p-fleet")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "fleet-admin writes MUHJ");
+        let (s, _) = send_req(
+            &app,
+            "POST",
+            "/v1/sites",
+            Some(&fleet),
+            Some(json!({"site_code": "MPLS", "fqdn_base": "mpls.x"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "fleet-admin registers a site");
+
+        // site-admin scoped to MUHJ: writes its own site, denied elsewhere
+        // and denied the fleet-level site registry.
+        let muhj_admin = operator_token(&["site-admin"], &["MUHJ"]);
+        let (s, _) = send_req(
+            &app,
+            "POST",
+            "/v1/sites/MUHJ/phones",
+            Some(&muhj_admin),
+            Some(phone("p-muhj")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "site-admin writes its own site");
+        let (s, b) = send_req(
+            &app,
+            "POST",
+            "/v1/sites/MPLS/phones",
+            Some(&muhj_admin),
+            Some(phone("p-x")),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::FORBIDDEN,
+            "site-admin can't touch another site"
+        );
+        assert_eq!(b["error"], "forbidden");
+        let (s, _) = send_req(
+            &app,
+            "POST",
+            "/v1/sites",
+            Some(&muhj_admin),
+            Some(json!({"site_code": "ZZZZ", "fqdn_base": "z.x"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "site-admin is not a fleet admin");
+
+        // auditor scoped to MUHJ: reads MUHJ, can't write, can't read another
+        // site (not in allowlist).
+        let auditor = operator_token(&["auditor"], &["MUHJ"]);
+        let (s, _) = send_req(&app, "GET", "/v1/sites/MUHJ/phones", Some(&auditor), None).await;
+        assert_eq!(s, StatusCode::OK, "auditor reads its site");
+        let (s, _) = send_req(
+            &app,
+            "POST",
+            "/v1/sites/MUHJ/phones",
+            Some(&auditor),
+            Some(phone("p-nope")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "auditor cannot write");
+        let (s, _) = send_req(&app, "GET", "/v1/sites/MPLS/phones", Some(&auditor), None).await;
+        assert_eq!(
+            s,
+            StatusCode::FORBIDDEN,
+            "auditor can't read outside its allowlist"
+        );
+
+        // phones-admin: phones yes, dial plans no (entity-scoped role).
+        let phones_admin = operator_token(&["phones-admin"], &["MUHJ"]);
+        let (s, _) = send_req(
+            &app,
+            "POST",
+            "/v1/sites/MUHJ/phones",
+            Some(&phones_admin),
+            Some(phone("p-pa")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "phones-admin writes phones");
+        let (s, _) = send_req(
+            &app,
+            "POST",
+            "/v1/sites/MUHJ/dialplans",
+            Some(&phones_admin),
+            Some(dialplan("dp1")),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::FORBIDDEN,
+            "phones-admin can't touch dial plans"
+        );
+
+        // Raw IAM-style role pattern emitted by the IdP: `dialplans:write`.
+        let dp_writer = operator_token(&["dialplans:write"], &["MUHJ"]);
+        let (s, _) = send_req(
+            &app,
+            "POST",
+            "/v1/sites/MUHJ/dialplans",
+            Some(&dp_writer),
+            Some(dialplan("dp2")),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::OK,
+            "raw dialplans:write pattern grants the write"
+        );
+
+        // Operator scope but no roles/sites → reaches the API, denied every
+        // action.
+        let bare = operator_token(&[], &[]);
+        let (s, b) = send_req(&app, "GET", "/v1/sites/MUHJ/phones", Some(&bare), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(b["error"], "forbidden");
+
+        // Roles but missing the base operator scope → rejected at the gate
+        // (insufficient_scope), before ABAC even runs.
+        let no_scope = mint_full(
+            None,
+            "openid",
+            TEST_AUDIENCE,
+            now() + 3600,
+            &["fleet-admin"],
+            &["*"],
+        );
+        let (s, b) = send_req(&app, "GET", "/v1/sites/MUHJ/phones", Some(&no_scope), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(b["error"], "insufficient_scope");
     }
 }

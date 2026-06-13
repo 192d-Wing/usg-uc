@@ -14,10 +14,18 @@ use crate::config::Config;
 /// carry. A protocol constant, not operator-tunable.
 pub const SYNC_SCOPE: &str = "config-sync";
 
-/// The OAuth scope an operator token must carry to write config (the
-/// dashboard / admin tooling). Distinct from [`SYNC_SCOPE`]: a site's
-/// pull credential can never write, and an operator credential can never
-/// masquerade as a site's sync agent.
+/// The base OAuth scope every operator token must carry to reach the
+/// operator surface (the dashboard / admin tooling). This is only the
+/// coarse "may use the operator API" gate; *what* an operator may do is
+/// decided per-request by ABAC ([`crate::policy`]) from the token's `roles`
+/// and `sites` claims. Distinct from [`SYNC_SCOPE`]: a site's pull
+/// credential can never reach this surface, and an operator credential can
+/// never masquerade as a site's sync agent.
+pub const OPERATOR_SCOPE: &str = "config";
+
+/// Legacy full-fleet operator scope. A token carrying this is treated by
+/// ABAC as a fleet admin (`*:*` on every site), so existing `config-admin`
+/// credentials keep working without `roles`/`sites` claims.
 pub const ADMIN_SCOPE: &str = "config-admin";
 
 /// State init errors.
@@ -35,9 +43,10 @@ pub struct AppState {
     /// Validates site service-account tokens (requires [`SYNC_SCOPE`]) for
     /// the `/v1/sync` surface.
     pub sync_validator: Arc<Validator>,
-    /// Validates operator tokens (requires [`ADMIN_SCOPE`]) for the write
-    /// surface. Shares the same issuer/audience/JWKS as `sync_validator`;
-    /// only the required scope differs.
+    /// Validates operator tokens (requires [`OPERATOR_SCOPE`]) for the
+    /// operator surface. Shares the same issuer/audience/JWKS as
+    /// `sync_validator`; only the required scope differs. Per-action
+    /// authorization is then applied by [`crate::policy`].
     pub admin_validator: Arc<Validator>,
     /// Process start, for uptime in the health endpoint.
     pub start_time: Instant,
@@ -73,7 +82,7 @@ impl AppState {
         Ok(Arc::new(Self {
             store,
             sync_validator: validator_for(SYNC_SCOPE),
-            admin_validator: validator_for(ADMIN_SCOPE),
+            admin_validator: validator_for(OPERATOR_SCOPE),
             start_time: Instant::now(),
         }))
     }

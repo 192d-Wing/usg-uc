@@ -12,7 +12,11 @@ export type SbcRuntimeConfig = {
   oidcIssuer: string;
   /** OIDC public client id for the dashboard (PKCE). */
   oidcClientId: string;
-  /** Space-separated scopes; must include `config-admin`. */
+  /**
+   * Space-separated scopes; must include the base operator scope `config`.
+   * What the operator may actually do is decided per-request by ABAC from
+   * the token's `roles`/`sites` claims (Keycloak mappers), not by scope.
+   */
   oidcScopes: string;
 };
 
@@ -28,7 +32,10 @@ const DEFAULTS: SbcRuntimeConfig = {
   centralBase: '/v1',
   oidcIssuer: 'http://localhost:8081/realms/usg',
   oidcClientId: 'usg-uc-config-admin',
-  oidcScopes: 'openid config-admin',
+  // `config` is the base operator gate (every operator gets it). `config-admin`
+  // is requested too but issued by the IdP only to entitled fleet admins (an
+  // optional client scope); it grants fleet-wide ABAC and the sbc-api SSO.
+  oidcScopes: 'openid config config-admin',
 };
 
 let cached: SbcRuntimeConfig | null = null;

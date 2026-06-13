@@ -54,6 +54,16 @@ pub struct Claims {
     /// `{site_code}` in the request path.
     #[serde(default)]
     pub site_code: Option<String>,
+    /// Operator capability roles (central config ABAC). Granular roles
+    /// like `fleet-admin`, `phones-admin`, `auditor`; each maps to a set
+    /// of allowed actions. Empty on non-operator tokens.
+    #[serde(default)]
+    pub roles: Vec<String>,
+    /// Operator site allowlist (central config ABAC): the canonical site
+    /// codes this operator's roles apply to, or `["*"]` for the whole
+    /// fleet. Empty grants no sites.
+    #[serde(default)]
+    pub sites: Vec<String>,
     /// Space-separated OAuth scopes.
     #[serde(default)]
     pub scope: Option<String>,
@@ -297,6 +307,8 @@ mod tests {
             dn: None,
             sip_domain: None,
             site_code: None,
+            roles: Vec::new(),
+            sites: Vec::new(),
             scope: Some("openid sipping profile".into()),
         };
         assert!(!claims.has_scope("sip"));
