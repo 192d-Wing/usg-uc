@@ -36,6 +36,8 @@ FROM chef AS planner
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
+# central-config-store embeds these via sqlx::migrate! at compile time.
+COPY deploy/central-db deploy/central-db
 
 RUN cargo chef prepare --recipe-path recipe.json
 
@@ -57,6 +59,8 @@ COPY --from=cacher /app/target /app/target
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
+# central-config-store embeds these via sqlx::migrate! at compile time.
+COPY deploy/central-db deploy/central-db
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
