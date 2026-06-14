@@ -115,16 +115,22 @@ async fn healthz() -> impl IntoResponse {
 /// Readiness: the database is reachable and the JWKS cache is primed.
 /// Unready (503) keeps the pod out of rotation until it can serve.
 async fn readyz(State(state): State<Arc<AppState>>) -> Response {
+    // Readiness gates only on the critical deps: the primary DB and a primed
+    // JWKS. The read replica is best-effort (reported, not gating) — a
+    // replica/node outage must not pull the API out of rotation, since the
+    // primary serves every path and `snapshot` falls back to it.
     let db_ok = state.store.ping().await.is_ok();
     let jwks_ok = state.sync_validator.jwks().ready().await;
+    let replica_ok = state.store.replica_ready().await;
     if db_ok && jwks_ok {
-        Json(json!({ "status": "ready",
+        Json(json!({ "status": "ready", "replica": replica_ok,
             "uptime_secs": state.start_time.elapsed().as_secs() }))
         .into_response()
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "status": "unready", "db": db_ok, "jwks": jwks_ok })),
+            Json(json!({ "status": "unready", "db": db_ok, "jwks": jwks_ok,
+                "replica": replica_ok })),
         )
             .into_response()
     }
