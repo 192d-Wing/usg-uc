@@ -74,12 +74,22 @@ impl<'a> StoreConfig<'a> {
 /// Build a lazily-connected pool from a DSN, stamping `application_name`.
 /// Lazy so a momentarily-unreachable replica doesn't block startup; the
 /// primary's reachability is still proven by the migration step.
-fn build_pool(url: &str, max_connections: u32, application_name: &str) -> CentralResult<PgPool> {
+/// `acquire_timeout` bounds how long a connection checkout waits — set short
+/// on the replica so a down replica fails fast (snapshot then falls back to
+/// the primary) instead of blocking on the default 30s.
+fn build_pool(
+    url: &str,
+    max_connections: u32,
+    application_name: &str,
+    acquire_timeout: Option<std::time::Duration>,
+) -> CentralResult<PgPool> {
     let opts: PgConnectOptions = url.parse()?;
     let opts = opts.application_name(application_name);
-    Ok(PgPoolOptions::new()
-        .max_connections(max_connections)
-        .connect_lazy_with(opts))
+    let mut builder = PgPoolOptions::new().max_connections(max_connections);
+    if let Some(t) = acquire_timeout {
+        builder = builder.acquire_timeout(t);
+    }
+    Ok(builder.connect_lazy_with(opts))
 }
 
 /// Pooled handle to the central config database.
@@ -117,12 +127,24 @@ impl CentralConfigStore {
     /// # Errors
     /// [`CentralError::Storage`] on a bad DSN, pool, or migration failure.
     pub async fn connect_with(cfg: StoreConfig<'_>) -> CentralResult<Self> {
-        let primary = build_pool(cfg.primary_url, cfg.max_connections, cfg.application_name)?;
+        let primary = build_pool(
+            cfg.primary_url,
+            cfg.max_connections,
+            cfg.application_name,
+            None,
+        )?;
         let has_replica = cfg.replica_url.is_some();
         let replica = match cfg.replica_url {
             Some(url) => {
                 let app = format!("{} (ro)", cfg.application_name);
-                build_pool(url, cfg.max_connections, &app)?
+                // Short acquire timeout: a down replica must fail fast so
+                // snapshot falls back to the primary instead of hanging.
+                build_pool(
+                    url,
+                    cfg.max_connections,
+                    &app,
+                    Some(std::time::Duration::from_secs(4)),
+                )?
             }
             None => primary.clone(),
         };
@@ -179,10 +201,13 @@ impl CentralConfigStore {
         if !self.has_replica {
             return true;
         }
-        sqlx::query_scalar::<_, i32>("SELECT 1")
-            .fetch_one(&self.replica)
-            .await
-            .is_ok()
+        // Hard 1s bound so a readiness probe never blocks on a down replica
+        // (the pool's own acquire timeout is longer, for real reads).
+        let probe = sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(&self.replica);
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), probe).await,
+            Ok(Ok(_))
+        )
     }
 
     // ---------------------------------------------------------- registry

@@ -64,6 +64,8 @@ spec:
             httpGet: { path: /readyz, port: http }
             initialDelaySeconds: 5
             periodSeconds: 15
+            # readyz may spend up to ~1s bounding a down-replica probe.
+            timeoutSeconds: 3
           resources:
             {{- toYaml .Values.api.resources | nindent 12 }}
           securityContext:
