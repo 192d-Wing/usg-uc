@@ -94,6 +94,10 @@ fn build_pool(url: &str, max_connections: u32, application_name: &str) -> Centra
 pub struct CentralConfigStore {
     primary: PgPool,
     replica: PgPool,
+    /// Whether `replica` is a genuinely separate endpoint (vs a clone of
+    /// `primary`). Gates the snapshot replica→primary fallback so a
+    /// single-node deployment doesn't pointlessly retry the same pool.
+    has_replica: bool,
 }
 
 impl CentralConfigStore {
@@ -114,6 +118,7 @@ impl CentralConfigStore {
     /// [`CentralError::Storage`] on a bad DSN, pool, or migration failure.
     pub async fn connect_with(cfg: StoreConfig<'_>) -> CentralResult<Self> {
         let primary = build_pool(cfg.primary_url, cfg.max_connections, cfg.application_name)?;
+        let has_replica = cfg.replica_url.is_some();
         let replica = match cfg.replica_url {
             Some(url) => {
                 let app = format!("{} (ro)", cfg.application_name);
@@ -123,7 +128,11 @@ impl CentralConfigStore {
         };
         // Migrations run on the primary only; the replica is read-only.
         crate::schema::ensure_schema(&primary).await?;
-        Ok(Self { primary, replica })
+        Ok(Self {
+            primary,
+            replica,
+            has_replica,
+        })
     }
 
     /// Build from an existing pool, running pending migrations. The pool
@@ -136,6 +145,7 @@ impl CentralConfigStore {
         Ok(Self {
             replica: pool.clone(),
             primary: pool,
+            has_replica: false,
         })
     }
 
@@ -146,20 +156,33 @@ impl CentralConfigStore {
         &self.primary
     }
 
-    /// Cheap round-trip to confirm the database is reachable (for
-    /// readiness probes). Checks both the primary and the replica; with no
-    /// replica configured the second check hits the same pool.
+    /// Cheap round-trip on the **primary** — the critical dependency for
+    /// readiness. The replica is deliberately *not* checked here: a replica
+    /// (or its node) being down must not take the API out of rotation, since
+    /// the primary can serve every path (and `snapshot` falls back to it).
+    /// Use [`replica_ready`](Self::replica_ready) for best-effort reporting.
     ///
     /// # Errors
-    /// [`CentralError::Storage`] if either query fails.
+    /// [`CentralError::Storage`] if the primary query fails.
     pub async fn ping(&self) -> CentralResult<()> {
         sqlx::query_scalar::<_, i32>("SELECT 1")
             .fetch_one(&self.primary)
             .await?;
+        Ok(())
+    }
+
+    /// Best-effort replica health, for observability only (never gates
+    /// readiness). Returns `true` when no separate replica is configured
+    /// (reads are served by the primary).
+    #[must_use]
+    pub async fn replica_ready(&self) -> bool {
+        if !self.has_replica {
+            return true;
+        }
         sqlx::query_scalar::<_, i32>("SELECT 1")
             .fetch_one(&self.replica)
-            .await?;
-        Ok(())
+            .await
+            .is_ok()
     }
 
     // ---------------------------------------------------------- registry
@@ -605,13 +628,34 @@ impl CentralConfigStore {
     /// # Errors
     /// [`CentralError::UnknownSite`] or [`CentralError::Storage`].
     pub async fn snapshot(&self, site_code: &str) -> CentralResult<Snapshot> {
-        // Served from the replica: snapshot is the heaviest read (full
+        // Preferred on the replica: snapshot is the heaviest read (full
         // shard materialization) and is self-consistent within its own
         // repeatable-read transaction, so replica lag only means a slightly
         // older — but coherent — epoch + rows. The client then resumes
         // deltas from `snapshot.epoch` against the primary, so a lagging
         // replica can never make it miss a change.
-        let mut tx = self.replica.begin().await?;
+        //
+        // Graceful degrade: if the replica is unreachable (e.g. all replicas
+        // down, `-ro` has no endpoints), fall back to the primary so sync
+        // pulls keep working during a replica/node outage.
+        if self.has_replica {
+            match self.snapshot_on(&self.replica, site_code).await {
+                Ok(snap) => return Ok(snap),
+                // A genuine UnknownSite is the same on either node; don't mask
+                // it by re-querying the primary.
+                Err(e @ CentralError::UnknownSite(_)) => return Err(e),
+                Err(e) => {
+                    tracing::warn!(error = %e,
+                        "snapshot via replica failed; falling back to primary");
+                }
+            }
+        }
+        self.snapshot_on(&self.primary, site_code).await
+    }
+
+    /// Materialize a snapshot from a specific pool (see [`snapshot`](Self::snapshot)).
+    async fn snapshot_on(&self, pool: &PgPool, site_code: &str) -> CentralResult<Snapshot> {
+        let mut tx = pool.begin().await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             .execute(&mut *tx)
             .await?;
