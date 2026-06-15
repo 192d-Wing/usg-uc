@@ -364,9 +364,19 @@ sbcConfigSync:
   # How often to poll the central /epoch probe (seconds). A per-site
   # jitter is added in-agent so 184 agents don't poll in lockstep.
   intervalSecs: 60
-  # Secret holding the OIDC service-account bearer token (config-sync
-  # scope, this site's site_code claim). Defaults to a Secret named
-  # <release>-config-sync with key "token".
+  # Auth — two modes:
+  # 1. OIDC client-credentials (preferred): set oidc.tokenUrl + clientId and
+  #    provide the client secret via a Secret. The agent fetches + refreshes
+  #    its own access tokens. Use the in-cluster Keycloak URL to avoid the
+  #    edge TLS/CA (tokens still carry the canonical issuer).
+  oidc:
+    tokenUrl: ""   # e.g. http://keycloak.icam.svc.cluster.local/realms/dcim/protocol/openid-connect/token
+    clientId: ""   # e.g. usg-uc-site-sync-oopl-001
+    clientSecret:
+      name: ""              # defaults to <release>-config-sync
+      key: client-secret
+  # 2. Static bearer token (break-glass/tests): used only when oidc.tokenUrl
+  #    is empty. Secret named <release>-config-sync, key "token".
   tokenSecret:
     name: ""
     key: token
