@@ -20,6 +20,28 @@ server {
         proxy_read_timeout 60s;
     }
 
+    # Central config API — phones/directory/trunk groups/dial plans/routing/
+    # config (site-scoped, OIDC-bearer). Proxied same-origin to the
+    # fleet-wide central-config-api. Runtime data (/api) stays on the daemon.
+    location /v1/ {
+        proxy_pass         http://${SBC_CENTRAL_API_UPSTREAM};
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout 60s;
+    }
+
+    # Runtime config for the SPA (envsubst at container start). Supplies the
+    # OIDC issuer/client for the central-config sign-in. Empty issuer makes
+    # the SPA fall back to its built-in defaults (central features inert).
+    location = /config.js {
+        default_type application/javascript;
+        add_header Cache-Control "no-cache";
+        return 200 "window.SBC_CONFIG={centralBase:'/v1',oidcIssuer:'${SBC_OIDC_ISSUER}',oidcClientId:'${SBC_OIDC_CLIENT_ID}',oidcScopes:'${SBC_OIDC_SCOPES}'};";
+    }
+
     # Phone provisioning. SBC_PROVISION_UPSTREAM resolves to either the
     # stand-alone sbc-provision-server pod (when sbcProvision.enabled)
     # or back to sbc-api / the daemon (which still has the legacy code

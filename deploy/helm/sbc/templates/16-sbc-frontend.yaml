@@ -94,6 +94,20 @@ spec:
             # interprets as a malformed variable reference. The visible
             # symptom was nginx refusing to start with
             # `pcre2_compile() failed: missing closing parenthesis`.
+            # Central config API upstream for the dashboard's /v1 proxy.
+            # Defaults to the local sbc-api (harmless if /v1 is unused) so
+            # proxy_pass is always a valid host; point at central-config-api
+            # to enable the operator config surface.
+            - name: SBC_CENTRAL_API_UPSTREAM
+              value: {{ .Values.sbcFrontend.centralApiUpstream | default (printf "%s-sbc-api.%s.svc.cluster.local:80" (include "sbc.fullname" .) .Release.Namespace) | quote }}
+            # OIDC for the central-config sign-in (config.js). Empty = the SPA
+            # uses its built-in defaults (central sign-in inert).
+            - name: SBC_OIDC_ISSUER
+              value: {{ .Values.sbcFrontend.oidc.issuer | default "" | quote }}
+            - name: SBC_OIDC_CLIENT_ID
+              value: {{ .Values.sbcFrontend.oidc.clientId | default "" | quote }}
+            - name: SBC_OIDC_SCOPES
+              value: {{ .Values.sbcFrontend.oidc.scopes | default "" | quote }}
             - name: NGINX_ENVSUBST_FILTER
               value: "^SBC_"
           ports:
