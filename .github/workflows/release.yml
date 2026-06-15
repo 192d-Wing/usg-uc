@@ -60,6 +60,7 @@ jobs:
           - { name: sbc-announcement-server, dockerfile: crates/sbc/sbc-announcement-server/Dockerfile, context: . }
           - { name: sbc-trunk-agent, dockerfile: crates/sbc/sbc-trunk-agent/Dockerfile, context: . }
           - { name: central-config-api, dockerfile: crates/sbc/central-config-api/Dockerfile, context: . }
+          - { name: central-config-import, dockerfile: crates/sbc/central-config-import/Dockerfile, context: . }
           - { name: sbc-config-sync, dockerfile: crates/sbc/sbc-config-sync/Dockerfile, context: . }
           - { name: sbc-dashboard, dockerfile: crates/sbc/sbc-dashboard/Dockerfile, context: crates/sbc/sbc-dashboard }
         platform:
@@ -142,7 +143,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [sbc-daemon, sbc-api-server, sbc-provision-server, sbc-client-config-server, sbc-announcement-server, sbc-trunk-agent, central-config-api, sbc-config-sync, sbc-dashboard]
+        image: [sbc-daemon, sbc-api-server, sbc-provision-server, sbc-client-config-server, sbc-announcement-server, sbc-trunk-agent, central-config-api, central-config-import, sbc-config-sync, sbc-dashboard]
     steps:
       - name: Download digests
         uses: actions/download-artifact@v4
