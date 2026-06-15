@@ -5536,8 +5536,8 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "radius-proto"
-version = "0.7.0"
-source = "git+https://gitlab.com/192d-wing/usg-radius.git#4ca9e95a5dba6f076e21f0694b6bd0e713420969"
+version = "0.9.3"
+source = "git+https://github.com/192d-Wing/usg-radius.git#48e87273ca0d3f5267e135e1594018067edeeaec"
 dependencies = [
  "hmac",
  "md-5",

@@ -32,7 +32,7 @@ thiserror.workspace = true
 bytes.workspace = true
 
 # RADIUS protocol (RFC 2865, RFC 2866) - using usg-radius project
-radius-proto = { git = "https://gitlab.com/192d-wing/usg-radius.git", optional = true }
+radius-proto = { git = "https://github.com/192d-Wing/usg-radius.git", optional = true }
 
 # Diameter protocol (RFC 6733)
 diameter = { version = "0.7", optional = true }
