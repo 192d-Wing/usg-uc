@@ -61,13 +61,25 @@ spec:
             # Central config API base URL (no trailing slash).
             - name: SYNC_CENTRAL_URL
               value: {{ required "sbcConfigSync.centralUrl is required" .Values.sbcConfigSync.centralUrl | quote }}
-            # OIDC service-account bearer token (config-sync scope,
-            # site_code claim). Supplied via Secret.
+            # Auth: OIDC client-credentials (agent fetches + refreshes its
+            # own tokens) when oidc.tokenUrl is set, else a static token.
+            {{- if .Values.sbcConfigSync.oidc.tokenUrl }}
+            - name: SYNC_OIDC_TOKEN_URL
+              value: {{ .Values.sbcConfigSync.oidc.tokenUrl | quote }}
+            - name: SYNC_OIDC_CLIENT_ID
+              value: {{ required "sbcConfigSync.oidc.clientId is required when oidc.tokenUrl is set" .Values.sbcConfigSync.oidc.clientId | quote }}
+            - name: SYNC_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.sbcConfigSync.oidc.clientSecret.name | default (printf "%s-config-sync" (include "sbc.fullname" .)) }}
+                  key: {{ .Values.sbcConfigSync.oidc.clientSecret.key | default "client-secret" }}
+            {{- else }}
             - name: SYNC_BEARER_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.sbcConfigSync.tokenSecret.name | default (printf "%s-config-sync" (include "sbc.fullname" .)) }}
                   key: {{ .Values.sbcConfigSync.tokenSecret.key | default "token" }}
+            {{- end }}
             - name: SYNC_INTERVAL_SECS
               value: {{ .Values.sbcConfigSync.intervalSecs | quote }}
             - name: SYNC_METRICS_ADDR
