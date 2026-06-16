@@ -78,7 +78,7 @@
       "standardFlowEnabled": false,
       "directAccessGrantsEnabled": false,
       "attributes": { "access.token.lifespan": "900" },
-      "defaultClientScopes": ["config-sync"],
+      "defaultClientScopes": ["basic", "config-sync"],
       "optionalClientScopes": [],
       "protocolMappers": [
         {
@@ -99,7 +99,7 @@
       "attributes": { "pkce.code.challenge.method": "S256" },
       "redirectUris": ["https://sbc.oopl.dev.mil/*"],
       "webOrigins": ["https://sbc.oopl.dev.mil"],
-      "defaultClientScopes": ["config"],
+      "defaultClientScopes": ["basic", "config"],
       "optionalClientScopes": ["config-admin"]
     }
   ]
