@@ -78,6 +78,13 @@ spec:
               value: {{ .Values.sbcApi.oidc.issuer | quote }}
             - name: SBC_OIDC_AUDIENCE
               value: {{ .Values.sbcApi.oidc.audience | quote }}
+            {{- if .Values.sbcClientConfig.extraCaCert }}
+            # Trust the internal CA for the JWKS fetch (same cert the daemon
+            # uses); without it the OIDC issuer behind the internal-CA edge
+            # can't be verified and every bearer 401s.
+            - name: SBC_OIDC_EXTRA_CA_CERT_FILE
+              value: "/etc/ssl/extra-ca/oopl-ca.pem"
+            {{- end }}
             {{- end }}
             # Management-plane auth (fail-closed: the pod won't start
             # without these). Shared signing key so any replica validates
@@ -119,6 +126,16 @@ spec:
             capabilities:
               drop: [ALL]
               add: [NET_BIND_SERVICE]
+          {{- if and .Values.sbcApi.oidc.issuer .Values.sbcClientConfig.extraCaCert }}
+          volumeMounts:
+            - { name: extra-ca, mountPath: /etc/ssl/extra-ca, readOnly: true }
+          {{- end }}
+      {{- if and .Values.sbcApi.oidc.issuer .Values.sbcClientConfig.extraCaCert }}
+      volumes:
+        - name: extra-ca
+          configMap:
+            name: {{ include "sbc.fullname" . }}-client-config-ca
+      {{- end }}
 ---
 apiVersion: v1
 kind: Service

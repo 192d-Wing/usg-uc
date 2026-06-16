@@ -184,7 +184,30 @@ impl AppState {
         // central config API takes, so the dashboard signs in once.
         let oidc = match (&cfg.oidc_issuer, &cfg.oidc_audience) {
             (Some(issuer), Some(audience)) => {
-                let http = reqwest::Client::builder()
+                // Trust an extra CA for the JWKS fetch when the IdP is
+                // fronted by an internal CA (SBC_OIDC_EXTRA_CA_CERT_FILE),
+                // mirroring the daemon. Without it the rustls webpki roots
+                // can't verify e.g. icam.oopl.dev.mil and every bearer 401s.
+                let mut http_builder = reqwest::Client::builder();
+                if let Ok(path) = std::env::var("SBC_OIDC_EXTRA_CA_CERT_FILE")
+                    && !path.trim().is_empty()
+                {
+                    match std::fs::read(&path) {
+                        Ok(pem) => match reqwest::Certificate::from_pem(&pem) {
+                            Ok(cert) => {
+                                info!(path, "loaded extra CA certificate for OIDC JWKS fetch");
+                                http_builder = http_builder.add_root_certificate(cert);
+                            }
+                            Err(e) => {
+                                tracing::error!(path, error = %e, "failed to parse SBC_OIDC_EXTRA_CA_CERT_FILE");
+                            }
+                        },
+                        Err(e) => {
+                            tracing::error!(path, error = %e, "failed to read SBC_OIDC_EXTRA_CA_CERT_FILE");
+                        }
+                    }
+                }
+                let http = http_builder
                     .build()
                     .unwrap_or_else(|_| reqwest::Client::new());
                 let jwks = Arc::new(proto_jwt::JwksCache::new(http, issuer.clone()));
