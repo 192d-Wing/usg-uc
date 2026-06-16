@@ -86,6 +86,17 @@ sbcFrontend:
   resources:
     requests: { cpu: "20m",  memory: "32Mi"  }
     limits:   { cpu: "100m", memory: "128Mi" }
+  # Central config API upstream for the dashboard's same-origin /v1 proxy,
+  # e.g. central-config-central-config-api.central-config.svc.cluster.local:80
+  # Empty → defaults to this site's sbc-api (operator config surface then
+  # unavailable, which is fine for sites without the central plane).
+  centralApiUpstream: ""
+  # OIDC for the dashboard's central-config sign-in, injected into the SPA
+  # via /config.js. Leave issuer empty for sites that don't use central.
+  oidc:
+    issuer: ""                           # e.g. https://icam.oopl.dev.mil/realms/dcim
+    clientId: "usg-uc-config-admin"
+    scopes: "openid config config-admin"
 
 # sbc-postgres — per-site Postgres for SBC config entities. PR1 stores
 # directory_numbers here; phones/trunks/dial-plans follow in subsequent
