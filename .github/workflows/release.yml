@@ -96,7 +96,7 @@ jobs:
 
       - name: Image metadata (labels)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ matrix.image.name }}
 
@@ -163,7 +163,7 @@ jobs:
 
       - name: Image metadata (tags)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ matrix.image }}
           tags: |
