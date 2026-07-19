@@ -6,7 +6,6 @@
 //! deny-by-default middleware; everything else under `/api/v1` requires a
 //! valid bearer token or API key.
 
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,21 +27,6 @@ pub struct LoginRequest {
 const MAX_LOGIN_ATTEMPTS: u32 = 5;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 
-/// Returns the real client IP.  Prefers the `X-Real-IP` header that
-/// nginx sets to `$remote_addr` (the TCP peer *it* sees — not
-/// spoofable by the HTTP client).  Falls back to `ConnectInfo` for
-/// direct access or testing.
-fn extract_client_ip(
-    headers: &axum::http::HeaderMap,
-    connect_info: &axum::extract::ConnectInfo<std::net::SocketAddr>,
-) -> IpAddr {
-    headers
-        .get("x-real-ip")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<IpAddr>().ok())
-        .unwrap_or_else(|| connect_info.0.ip())
-}
-
 /// `POST /api/v1/auth/login` — verify admin credentials, mint a token.
 ///
 /// Returns the token in the body (for `Authorization: Bearer` clients) and
@@ -53,7 +37,11 @@ pub async fn login(
     headers: axum::http::HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Response {
-    let client_ip = extract_client_ip(&headers, &connect_info);
+    // Resolve the real client IP: honor nginx's X-Real-IP only when the
+    // TCP peer is a trusted proxy, so a direct caller can't forge it and
+    // evade (or poison) the per-IP rate limiter.
+    let client_ip =
+        sbc_http_util::resolve_client_ip(&headers, connect_info.0.ip(), &state.trusted_proxies);
 
     // Rate-limit: reject if this IP has exceeded MAX_LOGIN_ATTEMPTS
     // within the sliding window.  Also evict stale entries to prevent
@@ -64,14 +52,15 @@ pub async fn login(
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         limiter.retain(|_, (_, window_start)| window_start.elapsed() < RATE_LIMIT_WINDOW * 2);
-        if let Some(&(count, window_start)) = limiter.get(&client_ip) {
-            if window_start.elapsed() < RATE_LIMIT_WINDOW && count >= MAX_LOGIN_ATTEMPTS {
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    Json(serde_json::json!({"error": "too many login attempts, try again later"})),
-                )
-                    .into_response();
-            }
+        if let Some(&(count, window_start)) = limiter.get(&client_ip)
+            && window_start.elapsed() < RATE_LIMIT_WINDOW
+            && count >= MAX_LOGIN_ATTEMPTS
+        {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "too many login attempts, try again later"})),
+            )
+                .into_response();
         }
     }
 

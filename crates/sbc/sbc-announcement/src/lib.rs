@@ -17,11 +17,36 @@ use bytes::Bytes;
 use include_dir::{Dir, include_dir};
 use proto_rtp::RtpHeader;
 use proto_rtp::RtpPacket;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 use uc_codecs::G711Ulaw;
+
+/// Returns `true` if `ip` must not be used as an RTP/media or ICE
+/// candidate destination.
+///
+/// Rejects loopback, multicast, and link-local addresses, which could
+/// be used to probe the pod's local network or amplify traffic
+/// (SSRF-like redirection). The address is canonicalized first so
+/// IPv4-mapped IPv6 forms (e.g. `::ffff:127.0.0.1`, `::ffff:224.0.0.1`)
+/// cannot slip past the IPv4-oriented checks.
+///
+/// Shared by `sbc-announcement-server` (gRPC `rtp_destination`) and the
+/// daemon's ICE agent (remote candidate addresses) so the two guards
+/// can't drift apart.
+///
+/// ## NIST 800-53 Rev5 Controls
+///
+/// - **SC-7**: Boundary Protection
+#[must_use]
+pub const fn is_disallowed_media_ip(ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    ip.is_loopback()
+        || ip.is_multicast()
+        || matches!(ip, IpAddr::V4(v4) if v4.is_link_local())
+        || matches!(ip, IpAddr::V6(v6) if v6.is_unicast_link_local())
+}
 
 /// Embedded audio files from the project's `audio_files`/ directory.
 /// Files should be raw PCM: signed 16-bit little-endian, mono, 8000Hz.
@@ -620,5 +645,25 @@ mod tests {
         let dest = extract_rtp_dest_from_sdp(sdp).unwrap();
         assert_eq!(dest.to_string(), "203.0.113.5:49170");
         assert!(extract_rtp_dest_from_sdp("v=0\r\n").is_none());
+    }
+
+    #[test]
+    fn test_is_disallowed_media_ip() {
+        let bad = |s: &str| is_disallowed_media_ip(s.parse::<IpAddr>().unwrap());
+        // Loopback / multicast / link-local in native forms.
+        assert!(bad("127.0.0.1"));
+        assert!(bad("::1"));
+        assert!(bad("224.0.0.1"));
+        assert!(bad("ff02::1"));
+        assert!(bad("169.254.10.20"));
+        assert!(bad("fe80::1"));
+        // IPv4-mapped IPv6 must not bypass the IPv4-oriented checks.
+        assert!(bad("::ffff:127.0.0.1"));
+        assert!(bad("::ffff:169.254.10.20"));
+        assert!(bad("::ffff:224.0.0.1"));
+        // Ordinary routable addresses are allowed.
+        assert!(!bad("203.0.113.5"));
+        assert!(!bad("8.8.8.8"));
+        assert!(!bad("2001:db8::1"));
     }
 }

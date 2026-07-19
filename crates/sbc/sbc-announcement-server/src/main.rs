@@ -181,27 +181,11 @@ impl AnnouncementService for AnnouncementServiceImpl {
 
         // Reject dangerous RTP destinations: loopback, link-local, and
         // multicast addresses could be used to probe the pod's local
-        // network or amplify traffic.  Canonicalize first so IPv4-mapped
-        // IPv6 addresses (::ffff:127.0.0.1) don't bypass the checks.
-        let dest_ip = destination.ip().to_canonical();
-        if dest_ip.is_loopback() {
+        // network or amplify traffic. Shared with the daemon's ICE agent
+        // so the two guards stay in lockstep.
+        if sbc_announcement::is_disallowed_media_ip(destination.ip()) {
             return Err(Status::invalid_argument(
-                "rtp_destination must not be a loopback address",
-            ));
-        }
-        if dest_ip.is_multicast() {
-            return Err(Status::invalid_argument(
-                "rtp_destination must not be a multicast address",
-            ));
-        }
-        if matches!(dest_ip, std::net::IpAddr::V4(v4) if v4.is_link_local()) {
-            return Err(Status::invalid_argument(
-                "rtp_destination must not be a link-local address",
-            ));
-        }
-        if matches!(dest_ip, std::net::IpAddr::V6(v6) if v6.is_unicast_link_local()) {
-            return Err(Status::invalid_argument(
-                "rtp_destination must not be a link-local address",
+                "rtp_destination must not be a loopback, link-local, or multicast address",
             ));
         }
 

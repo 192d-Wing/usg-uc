@@ -816,12 +816,12 @@ fn validate_dial_plan_fields(cfg: &sbc_config::schema::DialPlanConfig) -> Result
         if has_ascii_control(&entry.pattern_value) {
             return Err("dial plan entry pattern_value contains control characters".to_string());
         }
-        if let Some(ref dest) = entry.static_destination {
-            if has_ascii_control(dest) {
-                return Err(
-                    "dial plan entry static_destination contains control characters".to_string(),
-                );
-            }
+        if let Some(ref dest) = entry.static_destination
+            && has_ascii_control(dest)
+        {
+            return Err(
+                "dial plan entry static_destination contains control characters".to_string(),
+            );
         }
     }
     Ok(())

@@ -916,17 +916,17 @@ impl MediaPipeline {
 
         if is_a_leg {
             session_ctx.a_leg_remote = Some(address);
-            if let Some(ref target) = session_ctx.a_leg_target {
-                if let Ok(mut guard) = target.write() {
-                    *guard = address.into();
-                }
+            if let Some(ref target) = session_ctx.a_leg_target
+                && let Ok(mut guard) = target.write()
+            {
+                *guard = address.into();
             }
         } else {
             session_ctx.b_leg_remote = Some(address);
-            if let Some(ref target) = session_ctx.b_leg_target {
-                if let Ok(mut guard) = target.write() {
-                    *guard = address.into();
-                }
+            if let Some(ref target) = session_ctx.b_leg_target
+                && let Ok(mut guard) = target.write()
+            {
+                *guard = address.into();
             }
         }
 

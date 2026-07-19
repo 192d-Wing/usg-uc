@@ -6026,10 +6026,12 @@ version = "0.9.0"
 dependencies = [
  "axum",
  "hyper",
+ "ipnet",
  "proto-jwt",
  "reqwest 0.12.28",
  "sbc-config-store",
  "sbc-grpc-api",
+ "sbc-http-util",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -6212,6 +6214,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sbc-http-util"
+version = "0.9.0"
+dependencies = [
+ "http",
+ "ipnet",
+]
+
+[[package]]
 name = "sbc-integration-tests"
 version = "0.9.0"
 dependencies = [
@@ -6244,6 +6254,7 @@ dependencies = [
  "hmac",
  "ipnet",
  "sbc-config-store",
+ "sbc-http-util",
  "serde",
  "serde_json",
  "sha2",

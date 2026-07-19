@@ -184,13 +184,13 @@ pub async fn create_css(
             );
         }
     };
-    if let Some(p) = body.get("partitions") {
-        if !p.is_array() {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"success": false, "error": "partitions must be an array"})),
-            );
-        }
+    if let Some(p) = body.get("partitions")
+        && !p.is_array()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"success": false, "error": "partitions must be an array"})),
+        );
     }
     if let Err(e) = state.css.upsert(&id, &body).await {
         return (

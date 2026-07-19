@@ -2282,7 +2282,7 @@ impl SipStack {
         // in-flight (INVITE processing), wait for it to finish before
         // giving up.
         let mut corr = self.call_correlation.read().await;
-        if corr.a_leg.get(&sip_call_id).is_none()
+        if !corr.a_leg.contains_key(&sip_call_id)
             && self.in_flight_invites.read().await.contains(&sip_call_id)
         {
             drop(corr);

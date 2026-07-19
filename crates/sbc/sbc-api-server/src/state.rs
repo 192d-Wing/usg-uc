@@ -105,6 +105,12 @@ pub struct AppState {
     pub login_rate_limiter: Arc<
         std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
     >,
+
+    /// Networks from which the `X-Real-IP` header is trusted (the nginx
+    /// pod range). Used to resolve the real client IP for the login rate
+    /// limiter without letting a direct caller spoof it. Empty = trust
+    /// the header unconditionally.
+    pub trusted_proxies: Arc<Vec<ipnet::IpNet>>,
 }
 
 impl AppState {
@@ -189,6 +195,16 @@ impl AppState {
         );
         info!("management-plane authentication enabled");
 
+        if cfg.trusted_proxies.is_empty() {
+            tracing::warn!(
+                "SBC_TRUSTED_PROXIES unset — X-Real-IP is trusted unconditionally; a caller \
+                 reaching this pod directly (bypassing nginx) can forge its source IP and evade \
+                 the login rate limiter. Set it to the frontend nginx pod network."
+            );
+        } else {
+            info!(trusted_proxies = ?cfg.trusted_proxies, "X-Real-IP trusted only from these networks");
+        }
+
         // Optional operator OIDC: accept the same config-admin tokens the
         // central config API takes, so the dashboard signs in once.
         let oidc = match (&cfg.oidc_issuer, &cfg.oidc_audience) {
@@ -262,6 +278,7 @@ impl AppState {
             auth,
             oidc,
             login_rate_limiter: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            trusted_proxies: Arc::new(cfg.trusted_proxies.clone()),
         }))
     }
 }

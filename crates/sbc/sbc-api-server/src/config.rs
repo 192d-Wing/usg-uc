@@ -45,6 +45,15 @@ pub struct Config {
     pub oidc_issuer: Option<String>,
     /// Accepted OIDC audience (required iff `oidc_issuer` is set).
     pub oidc_audience: Option<String>,
+
+    /// Networks (CIDRs) from which an `X-Real-IP` header is trusted —
+    /// the frontend nginx pod range. Parsed from `SBC_TRUSTED_PROXIES`
+    /// (comma-separated). The login rate limiter keys on the real
+    /// client IP only when the request's TCP peer is one of these; a
+    /// caller connecting directly to this pod (bypassing nginx) can't
+    /// forge its address. Empty = trust `X-Real-IP` unconditionally
+    /// (a startup warning is logged).
+    pub trusted_proxies: Vec<ipnet::IpNet>,
 }
 
 impl Config {
@@ -80,6 +89,14 @@ impl Config {
             });
         }
 
+        let trusted_proxies = sbc_http_util::parse_cidr_list(
+            &std::env::var("SBC_TRUSTED_PROXIES").unwrap_or_default(),
+        )
+        .map_err(|reason| ConfigError::Invalid {
+            var: "SBC_TRUSTED_PROXIES",
+            reason,
+        })?;
+
         Ok(Self {
             listen_addr,
             database_url,
@@ -87,6 +104,7 @@ impl Config {
             daemon_http_url,
             oidc_issuer,
             oidc_audience,
+            trusted_proxies,
         })
     }
 }

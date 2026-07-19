@@ -87,19 +87,31 @@ async fn main() -> ExitCode {
         phones,
         provisioning,
         start_time: std::time::Instant::now(),
-        provision_secret: cfg.provision_secret.map(|s| Arc::new(s)),
+        provision_secret: cfg.provision_secret.map(Arc::new),
     };
 
     // Source-network restriction (defense in depth behind the Cilium
     // NetworkPolicy). Health/version probes come from the node, not the
     // phone subnet, so they bypass the check.
-    let allowed = Arc::new(cfg.allowed_cidrs.clone());
-    if allowed.is_empty() {
+    let restriction = SourceRestriction {
+        allowed: Arc::new(cfg.allowed_cidrs.clone()),
+        trusted_proxies: Arc::new(cfg.trusted_proxies.clone()),
+    };
+    if restriction.allowed.is_empty() {
         info!(
             "SBC_PROVISION_ALLOWED_CIDRS unset — app-layer source restriction disabled (NetworkPolicy only)"
         );
     } else {
-        info!(cidrs = ?allowed, "provisioning restricted to source networks");
+        info!(cidrs = ?restriction.allowed, "provisioning restricted to source networks");
+        if restriction.trusted_proxies.is_empty() {
+            warn!(
+                "SBC_TRUSTED_PROXIES unset — X-Real-IP is trusted unconditionally; a caller \
+                 reaching this pod directly (bypassing nginx) can forge an allowed source IP and \
+                 defeat the source-network check. Set it to the frontend nginx pod network."
+            );
+        } else {
+            info!(trusted_proxies = ?restriction.trusted_proxies, "X-Real-IP trusted only from these networks");
+        }
     }
 
     let app = Router::new()
@@ -114,7 +126,7 @@ async fn main() -> ExitCode {
         // to nginx's SPA fallback.
         .route("/TCS7000A.xml", get(serve_teo_global))
         .layer(axum::middleware::from_fn_with_state(
-            allowed,
+            restriction,
             restrict_source,
         ))
         .with_state(state)
@@ -162,17 +174,32 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Rejects provisioning requests whose originating client IP (from the
-/// `X-Forwarded-For` header set by nginx) is outside the allowed source
-/// networks. A no-op when no CIDRs are configured.
+/// Middleware state for [`restrict_source`]: the source allowlist plus
+/// the trusted-proxy networks used to decide when `X-Real-IP` is
+/// trustworthy.
+#[derive(Clone)]
+struct SourceRestriction {
+    allowed: Arc<Vec<ipnet::IpNet>>,
+    trusted_proxies: Arc<Vec<ipnet::IpNet>>,
+}
+
+/// Rejects provisioning requests whose originating client IP is outside
+/// the allowed source networks. A no-op when no CIDRs are configured.
+///
+/// The client IP comes from nginx's `X-Real-IP` header, but only when
+/// the request's TCP peer is a configured trusted proxy — otherwise a
+/// caller reaching this pod directly could forge an allowed source IP.
+/// When no trusted proxies are configured the header is trusted
+/// unconditionally (a startup warning is logged) and the check falls
+/// back to the direct peer only when the header is absent.
 ///
 /// ## NIST 800-53 Rev5: SC-7 (Boundary Protection)
 async fn restrict_source(
-    axum::extract::State(allowed): axum::extract::State<Arc<Vec<ipnet::IpNet>>>,
+    axum::extract::State(cfg): axum::extract::State<SourceRestriction>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if allowed.is_empty() {
+    if cfg.allowed.is_empty() {
         return next.run(req).await;
     }
     // Probes (kubelet) and version come from the node, not the phone
@@ -182,29 +209,29 @@ async fn restrict_source(
         return next.run(req).await;
     }
 
-    // Use X-Real-IP (nginx sets this to $remote_addr, replacing any
-    // client-supplied value — not spoofable through the proxy).
-    // X-Forwarded-For is unsuitable here because $proxy_add_x_forwarded_for
-    // appends to client-supplied values, so the leftmost entry is
-    // attacker-controlled.  Fall back to ConnectInfo for direct access.
-    let client_ip = req
-        .headers()
-        .get("x-real-ip")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
-        .or_else(|| {
-            req.extensions()
-                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-                .map(|ci| ci.0.ip())
-        });
+    // Fail closed if the connection has no peer info (should never happen
+    // with into_make_service_with_connect_info, but don't allowlist a
+    // request whose source we can't establish).
+    let Some(peer) = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip())
+    else {
+        warn!("provisioning request with no connection info; denying");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "source network not permitted"})),
+        )
+            .into_response();
+    };
 
-    let permitted = client_ip.is_some_and(|ip| allowed.iter().any(|net| net.contains(&ip)));
-    if permitted {
+    let client_ip = sbc_http_util::resolve_client_ip(req.headers(), peer, &cfg.trusted_proxies);
+    if cfg.allowed.iter().any(|net| net.contains(&client_ip)) {
         return next.run(req).await;
     }
 
     warn!(
-        ?client_ip,
+        %client_ip,
         "provisioning request from disallowed source network"
     );
     (

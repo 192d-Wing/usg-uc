@@ -76,6 +76,7 @@ members = [
     "crates/sbc/central-config-import",
     "crates/sbc/sbc-config-sync",
     "crates/sbc/sbc-grpc-api",
+    "crates/sbc/sbc-http-util",
     "crates/sbc/sbc-announcement",
     "crates/sbc/sbc-trunk-services",
     "crates/sbc/sbc-daemon",
@@ -153,6 +154,7 @@ validator = { version = "0.20", features = ["derive"] }
 bytes = "1.11.1"
 socket2 = { version = "0.6", features = ["all"] }
 nix = { version = "0.31", features = ["net"] }
+ipnet = "2"
 
 # Embedded static files
 include_dir = "0.7"
@@ -224,6 +226,7 @@ proto-stir-shaken = { path = "crates/proto/proto-stir-shaken" }
 sbc-config = { path = "crates/sbc/sbc-config" }
 sbc-config-store = { path = "crates/sbc/sbc-config-store" }
 sbc-grpc-api = { path = "crates/sbc/sbc-grpc-api" }
+sbc-http-util = { path = "crates/sbc/sbc-http-util" }
 sbc-announcement = { path = "crates/sbc/sbc-announcement" }
 sbc-trunk-services = { path = "crates/sbc/sbc-trunk-services" }
 

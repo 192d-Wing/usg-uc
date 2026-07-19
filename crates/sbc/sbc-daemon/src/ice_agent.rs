@@ -211,12 +211,8 @@ impl IceManager {
         candidate: Candidate,
     ) -> Result<(), IceManagerError> {
         let sock_addr = candidate.address();
-        let ip = sock_addr.ip().to_canonical();
-        if ip.is_loopback()
-            || ip.is_multicast()
-            || matches!(ip, std::net::IpAddr::V4(v4) if v4.is_link_local())
-            || matches!(ip, std::net::IpAddr::V6(v6) if v6.is_unicast_link_local())
-        {
+        let ip = sock_addr.ip();
+        if sbc_announcement::is_disallowed_media_ip(ip) {
             warn!(
                 call_id = %call_id,
                 address = %ip,

@@ -20,6 +20,8 @@ workspace = true
 # Shared SBC pieces
 sbc-config-store = { workspace = true }
 sbc-grpc-api = { workspace = true }
+# Trusted-proxy-aware client-IP resolution (shared with sbc-provision-server).
+sbc-http-util = { workspace = true }
 uc-auth = { workspace = true }
 # OIDC bearer validation so operators authenticate once (the same
 # config-admin tokens the central config API accepts).
@@ -60,3 +62,4 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 
 uuid = { version = "1", features = ["v4"] }
 thiserror.workspace = true
+ipnet.workspace = true
