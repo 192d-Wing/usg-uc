@@ -81,8 +81,7 @@ pub async fn session(
     headers: axum::http::HeaderMap,
 ) -> Response {
     // Legacy cookie / HMAC / API key.
-    let legacy_ok =
-        uc_auth::extract_credential(&headers).is_some_and(|c| state.auth.authorize(&c));
+    let legacy_ok = uc_auth::extract_credential(&headers).is_some_and(|c| state.auth.authorize(&c));
 
     // OIDC bearer token (operator SSO via Keycloak).
     let oidc_ok = if !legacy_ok {

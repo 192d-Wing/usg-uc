@@ -116,8 +116,7 @@ impl DialPattern {
             Self::Exact(pattern) => number == pattern,
             Self::Prefix(prefix) => number.starts_with(prefix),
             Self::Wildcard(pattern) => Self::match_wildcard(pattern, number),
-            Self::Regex(pattern) => regex::Regex::new(pattern)
-                .is_ok_and(|re| re.is_match(number)),
+            Self::Regex(pattern) => regex::Regex::new(pattern).is_ok_and(|re| re.is_match(number)),
             Self::Any => true,
         }
     }

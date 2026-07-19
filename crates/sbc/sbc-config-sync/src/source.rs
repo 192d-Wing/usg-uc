@@ -90,9 +90,7 @@ pub async fn reconcile<S: ConfigSource + Sync, R: Refresher + Sync>(
     // Capture the DB clock before collecting so restamp_uploaded can guard
     // against local edits made during the upload round-trip (TOCTOU).
     let collected_at: chrono::DateTime<chrono::Utc> =
-        sqlx::query_scalar("SELECT NOW()")
-            .fetch_one(pool)
-            .await?;
+        sqlx::query_scalar("SELECT NOW()").fetch_one(pool).await?;
     let pending = collect_local_changes(pool, site_code).await?;
     if !pending.is_empty() {
         let epoch = source.upload(site_code, &pending).await?;

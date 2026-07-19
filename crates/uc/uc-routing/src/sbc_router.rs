@@ -243,9 +243,9 @@ impl SbcRouter {
 
     /// Returns `true` if any blocked pattern in `partition_id` matches `digits`.
     fn is_blocked_in_partition(&self, partition_id: &str, digits: &str) -> bool {
-        self.route_patterns.iter().any(|rp| {
-            rp.partition_id() == partition_id && rp.is_blocked() && rp.matches(digits)
-        })
+        self.route_patterns
+            .iter()
+            .any(|rp| rp.partition_id() == partition_id && rp.is_blocked() && rp.matches(digits))
     }
 
     /// Returns enabled, non-blocked patterns in the given partition that match `digits`.

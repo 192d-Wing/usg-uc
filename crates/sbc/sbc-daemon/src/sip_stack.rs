@@ -424,7 +424,11 @@ impl SipStack {
     fn allocate_rtp_port(&self) -> u16 {
         loop {
             let current = self.next_rtp_port.load(Ordering::Relaxed);
-            let next = if current >= 40_000 { 20_000 } else { current + 2 };
+            let next = if current >= 40_000 {
+                20_000
+            } else {
+                current + 2
+            };
             if self
                 .next_rtp_port
                 .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
