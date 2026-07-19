@@ -96,6 +96,12 @@ pub struct AppState {
     /// middleware also accepts `config-admin` bearer tokens, so the
     /// dashboard authenticates once for both the central and per-site APIs.
     pub oidc: Option<Arc<proto_jwt::Validator>>,
+
+    /// In-memory rate limiter for login attempts, keyed by client IP.
+    /// Maps to (attempt_count, window_start).
+    pub login_rate_limiter: Arc<
+        std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
+    >,
 }
 
 impl AppState {
@@ -249,6 +255,7 @@ impl AppState {
             start_time: std::time::Instant::now(),
             auth,
             oidc,
+            login_rate_limiter: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }))
     }
 }

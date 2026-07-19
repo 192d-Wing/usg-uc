@@ -87,7 +87,7 @@ export function PhoneDetail() {
             actions={
               <Button
                 onClick={() =>
-                  id && api.post(`/phones/${id}/reboot`, {}).catch((e) => setError(String(e)))
+                  id && api.post(`/phones/${encodeURIComponent(id)}/reboot`, {}).catch((e) => setError(String(e)))
                 }
               >
                 Reboot phone

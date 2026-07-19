@@ -6,7 +6,9 @@
 //! deny-by-default middleware; everything else under `/api/v1` requires a
 //! valid bearer token or API key.
 
+use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::State;
@@ -23,11 +25,53 @@ pub struct LoginRequest {
     password: String,
 }
 
+const MAX_LOGIN_ATTEMPTS: u32 = 5;
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+
+fn extract_client_ip(headers: &axum::http::HeaderMap) -> IpAddr {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.trim().parse().ok())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse().ok())
+        })
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+}
+
 /// `POST /api/v1/auth/login` — verify admin credentials, mint a token.
 ///
 /// Returns the token in the body (for `Authorization: Bearer` clients) and
 /// as an `HttpOnly; Secure; SameSite=Strict` cookie (for the dashboard).
-pub async fn login(State(state): State<Arc<AppState>>, Json(body): Json<LoginRequest>) -> Response {
+pub async fn login(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<LoginRequest>,
+) -> Response {
+    let client_ip = extract_client_ip(&headers);
+
+    // Rate-limit: reject if this IP has exceeded MAX_LOGIN_ATTEMPTS
+    // within the sliding window.
+    {
+        let limiter = state
+            .login_rate_limiter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(&(count, window_start)) = limiter.get(&client_ip) {
+            if window_start.elapsed() < RATE_LIMIT_WINDOW && count >= MAX_LOGIN_ATTEMPTS {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({"error": "too many login attempts, try again later"})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     // argon2 verification is deliberately slow; keep it off the async
     // executor threads.
     let auth = Arc::clone(&state.auth);
@@ -40,12 +84,34 @@ pub async fn login(State(state): State<Arc<AppState>>, Json(body): Json<LoginReq
 
     let Some(token) = token else {
         warn!(user = %body.username, "failed admin login");
+        // Increment rate-limit counter for this IP.
+        {
+            let mut limiter = state
+                .login_rate_limiter
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let entry = limiter.entry(client_ip).or_insert((0, Instant::now()));
+            if entry.1.elapsed() >= RATE_LIMIT_WINDOW {
+                *entry = (1, Instant::now());
+            } else {
+                entry.0 += 1;
+            }
+        }
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "invalid credentials" })),
         )
             .into_response();
     };
+
+    // Successful login — reset rate-limit counter for this IP.
+    {
+        let mut limiter = state
+            .login_rate_limiter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        limiter.remove(&client_ip);
+    }
 
     let max_age = state.auth.token_ttl_secs();
     // Secure: TLS terminates at the ingress, so the browser connection is

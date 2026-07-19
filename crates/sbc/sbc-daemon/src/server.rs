@@ -780,11 +780,23 @@ impl Server {
                                 "Received message"
                             );
 
-                            // Process through SIP stack
-                            let result = sip_stack.process_message(&msg.data, msg.source, zone_name.as_deref()).await;
-
-                            // Handle the processing result
-                            Self::handle_result(result, transport.as_ref(), &stats).await;
+                            // Process through SIP stack in a separate task
+                            // so slow operations (e.g. JWKS refresh) do not
+                            // block the receive loop.
+                            {
+                                let sip_stack = sip_stack.clone();
+                                let transport = transport.clone();
+                                let stats = stats.clone();
+                                let zone = zone_name.clone();
+                                let data = msg.data;
+                                let source = msg.source;
+                                tokio::spawn(async move {
+                                    let result = sip_stack
+                                        .process_message(&data, source, zone.as_deref())
+                                        .await;
+                                    Self::handle_result(result, transport.as_ref(), &stats).await;
+                                });
+                            }
                         }
                         Err(e) => {
                             if shutdown.is_shutdown_requested() {
@@ -916,14 +928,15 @@ impl Server {
 
     /// Accept loop for a SIP-over-TLS listener.
     ///
-    /// Note: the TLS handshake runs inline in `accept()`, so one slow
-    /// handshake briefly stalls new connections on this listener. The
-    /// per-IP rate limiter bounds the damage; revisit if it shows up.
+    /// The raw TCP accept runs inline so the loop stays responsive; the TLS
+    /// handshake is spawned with a 10-second timeout so one slow client
+    /// cannot stall new connections on this listener.
     async fn tls_accept_loop(listener: Arc<TlsListener>, ctx: StreamLoopContext) {
         info!(address = %listener.local_addr(), "SIP TLS accept loop started");
         loop {
-            match listener.accept().await {
-                Ok((transport, peer)) => {
+            // Step 1: accept the raw TCP connection (fast, no crypto).
+            match listener.accept_tcp().await {
+                Ok((tcp_stream, peer)) => {
                     let permit = match ctx.conn_semaphore.clone().try_acquire_owned() {
                         Ok(p) => p,
                         Err(_) => {
@@ -931,10 +944,29 @@ impl Server {
                             continue;
                         }
                     };
-                    debug!(peer = %peer, "Accepted SIP TLS connection");
+                    // Step 2: spawn the TLS handshake so the accept loop
+                    // continues immediately.
                     let conn_ctx = ctx.clone();
+                    let listener_clone = listener.clone();
                     tokio::spawn(async move {
-                        Self::stream_connection_loop(Arc::new(transport), peer, conn_ctx).await;
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            listener_clone.complete_handshake(tcp_stream),
+                        )
+                        .await
+                        {
+                            Ok(Ok(transport)) => {
+                                debug!(peer = %peer, "TLS handshake completed");
+                                Self::stream_connection_loop(Arc::new(transport), peer, conn_ctx)
+                                    .await;
+                            }
+                            Ok(Err(e)) => {
+                                warn!(peer = %peer, error = %e, "TLS handshake failed");
+                            }
+                            Err(_) => {
+                                warn!(peer = %peer, "TLS handshake timed out (10s), dropping");
+                            }
+                        }
                         drop(permit);
                     });
                 }
@@ -942,8 +974,7 @@ impl Server {
                     if ctx.shutdown.is_shutdown_requested() {
                         break;
                     }
-                    // Failed handshakes land here too — log and keep accepting.
-                    warn!(error = %e, "TLS accept failed");
+                    warn!(error = %e, "TLS TCP accept failed");
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
             }
@@ -963,8 +994,13 @@ impl Server {
         let mut buf = bytes::BytesMut::new();
 
         loop {
-            match transport.recv().await {
-                Ok(chunk) => {
+            match tokio::time::timeout(std::time::Duration::from_secs(300), transport.recv()).await
+            {
+                Err(_elapsed) => {
+                    warn!(peer = %peer, "Stream connection idle timeout (300s), closing");
+                    break;
+                }
+                Ok(Ok(chunk)) => {
                     buf.extend_from_slice(&chunk.data);
                     if buf.len() > uc_transport::MAX_STREAM_MESSAGE_SIZE {
                         warn!(
@@ -1004,11 +1040,11 @@ impl Server {
                         Self::handle_result(result, transport.as_ref(), &ctx.stats).await;
                     }
                 }
-                Err(uc_transport::TransportError::ConnectionClosed) => {
+                Ok(Err(uc_transport::TransportError::ConnectionClosed)) => {
                     debug!(peer = %peer, "Stream connection closed by peer");
                     break;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     if !ctx.shutdown.is_shutdown_requested() {
                         warn!(peer = %peer, error = %e, "Stream receive error, closing connection");
                     }
@@ -1028,11 +1064,22 @@ impl Server {
                 destination,
             } => {
                 let response_bytes = message.to_bytes();
-                if let Err(e) = transport.send(&response_bytes, &destination).await {
-                    warn!(error = %e, "Failed to send response");
-                } else {
-                    stats.messages_sent.fetch_add(1, Ordering::Relaxed);
-                    debug!(destination = %destination, "Response sent");
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    transport.send(&response_bytes, &destination),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        stats.messages_sent.fetch_add(1, Ordering::Relaxed);
+                        debug!(destination = %destination, "Response sent");
+                    }
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "Failed to send response");
+                    }
+                    Err(_) => {
+                        warn!(destination = %destination, "Send response timed out (30s)");
+                    }
                 }
             }
             ProcessResult::Forward {
@@ -1040,11 +1087,22 @@ impl Server {
                 destination,
             } => {
                 let request_bytes = message.to_bytes();
-                if let Err(e) = transport.send(&request_bytes, &destination).await {
-                    warn!(error = %e, "Failed to forward request");
-                } else {
-                    stats.messages_sent.fetch_add(1, Ordering::Relaxed);
-                    debug!(destination = %destination, "Request forwarded");
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    transport.send(&request_bytes, &destination),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        stats.messages_sent.fetch_add(1, Ordering::Relaxed);
+                        debug!(destination = %destination, "Request forwarded");
+                    }
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "Failed to forward request");
+                    }
+                    Err(_) => {
+                        warn!(destination = %destination, "Forward request timed out (30s)");
+                    }
                 }
             }
             ProcessResult::Multiple(results) => {

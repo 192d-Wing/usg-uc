@@ -35,6 +35,13 @@ pub struct Config {
     /// unrestricted at the app layer. The client IP is read from
     /// `X-Forwarded-For` (set by the frontend nginx).
     pub allowed_cidrs: Vec<ipnet::IpNet>,
+
+    /// Shared secret for HMAC-based device authentication. When set,
+    /// provisioning requests must carry `?token=<hex-hmac>` where the HMAC
+    /// is `HMAC-SHA256(secret, mac_address)`. Parsed from
+    /// `SBC_PROVISION_SECRET`. When absent, provisioning is unauthenticated
+    /// (a warning is logged at startup).
+    pub provision_secret: Option<String>,
 }
 
 impl Config {
@@ -74,12 +81,17 @@ impl Config {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        let provision_secret = std::env::var("SBC_PROVISION_SECRET")
+            .ok()
+            .filter(|s| !s.is_empty());
+
         Ok(Self {
             listen_addr,
             database_url,
             provision_host,
             provision_port,
             allowed_cidrs,
+            provision_secret,
         })
     }
 }

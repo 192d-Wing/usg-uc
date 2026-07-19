@@ -8,6 +8,12 @@ server {
     listen 8080;
     server_name _;
 
+    # --- Security headers (C10) ---
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ${OIDC_ISSUER}; frame-ancestors 'none'" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
     # SPA bundle — long-cache hashed assets, no-cache index.html.
     root /usr/share/nginx/html;
     index index.html;
@@ -46,10 +52,15 @@ server {
 
     # Runtime config injected at container start (envsubst). Supplies the
     # OIDC issuer/client for the central config sign-in.
+    #
+    # M13: Values are emitted as a JSON object and parsed with JSON.parse()
+    # to avoid injection via unescaped env-var content in a JS literal.
+    # The env vars must not contain unescaped double-quotes; the entrypoint
+    # script should validate this.
     location = /config.js {
         default_type application/javascript;
         add_header Cache-Control "no-cache";
-        return 200 "window.SBC_CONFIG={centralBase:'/v1',oidcIssuer:'${OIDC_ISSUER}',oidcClientId:'${OIDC_CLIENT_ID}',oidcScopes:'${OIDC_SCOPES}'};";
+        return 200 "window.SBC_CONFIG=JSON.parse('{\"centralBase\":\"/v1\",\"oidcIssuer\":\"${OIDC_ISSUER}\",\"oidcClientId\":\"${OIDC_CLIENT_ID}\",\"oidcScopes\":\"${OIDC_SCOPES}\"}');";
     }
 
     # Phone provisioning — Yealink/Polycom HTTP config fetch. Same upstream

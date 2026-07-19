@@ -357,8 +357,31 @@ impl TrunkMonitor {
                 debug!(trunk_id, source = %from, "Ignoring datagram from unexpected source");
                 continue;
             }
-            if !String::from_utf8_lossy(&buf[..n]).contains(call_id.as_str()) {
+            let text = String::from_utf8_lossy(&buf[..n]);
+            // Must be a SIP response (not a request).
+            if !text.starts_with("SIP/2.0") {
+                debug!(trunk_id, "Ignoring non-SIP-response datagram");
+                continue;
+            }
+            // Must carry our Call-ID.
+            if !text.contains(call_id.as_str()) {
                 debug!(trunk_id, "Ignoring SIP message with foreign Call-ID");
+                continue;
+            }
+            // CSeq method must match OPTIONS.
+            let cseq_ok = text.lines().any(|line| {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("CSeq:") {
+                    rest.trim().ends_with("OPTIONS")
+                } else {
+                    false
+                }
+            });
+            if !cseq_ok {
+                debug!(
+                    trunk_id,
+                    "Ignoring SIP response with non-matching CSeq method"
+                );
                 continue;
             }
             break n;

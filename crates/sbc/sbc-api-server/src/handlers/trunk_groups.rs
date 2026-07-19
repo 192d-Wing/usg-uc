@@ -137,9 +137,14 @@ pub async fn delete_group(
         && !matches!(e, sbc_config_store::ConfigStoreError::NotFound)
     {
         warn!(group_id, error = %e, "trunk group delete failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "failed to persist changes"})),
+        )
+            .into_response();
     }
     notify_remove(&state, &group_id).await;
-    Json(serde_json::json!({"success": true, "group_id": group_id}))
+    Json(serde_json::json!({"success": true, "group_id": group_id})).into_response()
 }
 
 pub async fn add_trunk(
@@ -163,7 +168,12 @@ pub async fn add_trunk(
             }
         }
     }
-    persist(&state, &group_id, &group_json).await;
+    if !persist(&state, &group_id, &group_json).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"success": false, "error": "failed to persist changes"})),
+        );
+    }
     notify_sync(&state, &group_id).await;
     redact::trunk(&mut body);
     (
@@ -211,7 +221,12 @@ pub async fn update_trunk(
         }
     }
     let mut updated = trunk.clone();
-    persist(&state, &group_id, &group_json).await;
+    if !persist(&state, &group_id, &group_json).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"success": false, "error": "failed to persist changes"})),
+        );
+    }
     notify_sync(&state, &group_id).await;
     redact::trunk(&mut updated);
     (
@@ -228,8 +243,15 @@ pub async fn delete_trunk(
         if let Some(trunks) = group_json.get_mut("trunks").and_then(|v| v.as_array_mut()) {
             trunks.retain(|t| t.get("id").and_then(|v| v.as_str()) != Some(&trunk_id));
         }
-        persist(&state, &group_id, &group_json).await;
+        if !persist(&state, &group_id, &group_json).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to persist changes"})),
+            )
+                .into_response();
+        }
         notify_sync(&state, &group_id).await;
     }
     Json(serde_json::json!({"success": true, "group_id": group_id, "trunk_id": trunk_id}))
+        .into_response()
 }

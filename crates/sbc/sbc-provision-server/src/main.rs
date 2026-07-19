@@ -14,12 +14,14 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use hmac::{Hmac, Mac};
 use sbc_config_store::PostgresPhoneStore;
+use sha2::Sha256;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -34,6 +36,8 @@ struct AppState {
     phones: Arc<PostgresPhoneStore>,
     provisioning: Arc<ProvisioningServer>,
     start_time: std::time::Instant,
+    /// Shared secret for HMAC device auth. `None` = unauthenticated.
+    provision_secret: Option<Arc<String>>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -72,10 +76,18 @@ async fn main() -> ExitCode {
     ));
     info!(host = %cfg.provision_host, port = cfg.provision_port, "ProvisioningServer ready");
 
+    if cfg.provision_secret.is_none() {
+        warn!(
+            "SBC_PROVISION_SECRET not set — phone provisioning is unauthenticated; \
+               any host that can reach this endpoint can fetch phone configs"
+        );
+    }
+
     let state = AppState {
         phones,
         provisioning,
         start_time: std::time::Instant::now(),
+        provision_secret: cfg.provision_secret.map(|s| Arc::new(s)),
     };
 
     // Source-network restriction (defense in depth behind the Cilium
@@ -136,9 +148,12 @@ async fn main() -> ExitCode {
         }
     };
 
-    if let Err(e) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
+    if let Err(e) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
     {
         error!(error = %e, "server error");
         return ExitCode::from(5);
@@ -167,17 +182,20 @@ async fn restrict_source(
         return next.run(req).await;
     }
 
+    // Check ConnectInfo first (the real TCP peer — trusted), then fall
+    // back to X-Forwarded-For only as a secondary signal when behind a
+    // known proxy (ConnectInfo would be the proxy's IP in that case).
     let client_ip = req
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        // Leftmost entry is the originating client as nginx saw it.
-        .and_then(|s| s.split(',').next())
-        .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip())
         .or_else(|| {
-            req.extensions()
-                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-                .map(|ci| ci.0.ip())
+            req.headers()
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                // Leftmost entry is the originating client as nginx saw it.
+                .and_then(|s| s.split(',').next())
+                .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
         });
 
     let permitted = client_ip.is_some_and(|ip| allowed.iter().any(|net| net.contains(&ip)));
@@ -231,13 +249,25 @@ async fn serve_teo_global() -> impl IntoResponse {
         .unwrap_or_default()
 }
 
+/// Query parameters for provisioning requests.
+#[derive(Debug, serde::Deserialize)]
+struct ProvisionQuery {
+    /// HMAC-SHA256 token for device authentication.
+    #[serde(default)]
+    token: Option<String>,
+}
+
 /// Serve a per-MAC phone provisioning config.
 ///
 /// Logic is a faithful port of the daemon's old `serve_phone_config`
 /// (`api_server.rs` in commits up to 0852812): extract MAC from filename,
 /// normalize, look up phone by normalized MAC, render via vendor
 /// generator, return with the right Content-Type per extension.
-async fn serve_phone_config(State(state): State<AppState>, Path(path): Path<String>) -> Response {
+async fn serve_phone_config(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    Query(query): Query<ProvisionQuery>,
+) -> Response {
     // Filename forms across vendors:
     //   <mac>.cfg           Polycom VVX/Edge
     //   <mac>.xml           Cisco MPP/9800
@@ -247,6 +277,26 @@ async fn serve_phone_config(State(state): State<AppState>, Path(path): Path<Stri
     let stem = filename.split('.').next().unwrap_or(filename);
     let mac_token = stem.split('-').next().unwrap_or(stem);
     let mac_key = mac_token.replace([':', '-'], "").to_lowercase();
+
+    // Verify HMAC device token when a provision secret is configured.
+    if let Some(ref secret) = state.provision_secret {
+        let valid = query.token.as_deref().is_some_and(|token| {
+            let Ok(token_bytes) = hex::decode(token) else {
+                return false;
+            };
+            let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+                .expect("HMAC accepts any key length");
+            mac.update(mac_key.as_bytes());
+            mac.verify_slice(&token_bytes).is_ok()
+        });
+        if !valid {
+            warn!(mac = %mac_key, "provisioning request with invalid or missing device token");
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(axum::body::Body::from("invalid device token"))
+                .unwrap_or_default();
+        }
+    }
 
     let phone = match state.phones.get_by_mac(&mac_key).await {
         Ok(p) => p,
@@ -262,9 +312,7 @@ async fn serve_phone_config(State(state): State<AppState>, Path(path): Path<Stri
             warn!(mac = %mac_key, error = %e, "phone lookup failed");
             return Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(axum::body::Body::from(format!(
-                    "phone store lookup failed: {e}"
-                )))
+                .body(axum::body::Body::from("internal server error"))
                 .unwrap_or_default();
         }
     };
@@ -282,11 +330,12 @@ async fn serve_phone_config(State(state): State<AppState>, Path(path): Path<Stri
                 .body(axum::body::Body::from(config_text))
                 .unwrap_or_default()
         }
-        Err(e) => Response::builder()
-            .status(StatusCode::UNPROCESSABLE_ENTITY)
-            .body(axum::body::Body::from(format!(
-                "Cannot generate config: {e}"
-            )))
-            .unwrap_or_default(),
+        Err(e) => {
+            warn!(mac = %mac_key, error = %e, "config generation failed");
+            Response::builder()
+                .status(StatusCode::UNPROCESSABLE_ENTITY)
+                .body(axum::body::Body::from("internal server error"))
+                .unwrap_or_default()
+        }
     }
 }

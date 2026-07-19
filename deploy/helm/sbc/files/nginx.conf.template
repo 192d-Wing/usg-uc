@@ -2,6 +2,12 @@ server {
     listen 8080;
     server_name _;
 
+    # --- Security headers (C10) ---
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ${SBC_OIDC_ISSUER}; frame-ancestors 'none'" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
     root /usr/share/nginx/html;
     index index.html;
 
@@ -36,10 +42,15 @@ server {
     # Runtime config for the SPA (envsubst at container start). Supplies the
     # OIDC issuer/client for the central-config sign-in. Empty issuer makes
     # the SPA fall back to its built-in defaults (central features inert).
+    #
+    # M13: Values are emitted as a JSON object and parsed with JSON.parse()
+    # to avoid injection via unescaped env-var content in a JS literal.
+    # The env vars must not contain unescaped double-quotes; the entrypoint
+    # script should validate this.
     location = /config.js {
         default_type application/javascript;
         add_header Cache-Control "no-cache";
-        return 200 "window.SBC_CONFIG={centralBase:'/v1',oidcIssuer:'${SBC_OIDC_ISSUER}',oidcClientId:'${SBC_OIDC_CLIENT_ID}',oidcScopes:'${SBC_OIDC_SCOPES}'};";
+        return 200 "window.SBC_CONFIG=JSON.parse('{\"centralBase\":\"/v1\",\"oidcIssuer\":\"${SBC_OIDC_ISSUER}\",\"oidcClientId\":\"${SBC_OIDC_CLIENT_ID}\",\"oidcScopes\":\"${SBC_OIDC_SCOPES}\"}');";
     }
 
     # Phone provisioning. SBC_PROVISION_UPSTREAM resolves to either the

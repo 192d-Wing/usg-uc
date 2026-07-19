@@ -198,6 +198,10 @@ struct MediaSessionContext {
     relay_handles: Vec<JoinHandle<()>>,
     /// Shutdown sender for relay tasks.
     relay_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    /// Shared A-leg target address (read by relay tasks, updated by `set_remote_address`).
+    a_leg_target: Option<Arc<std::sync::RwLock<std::net::SocketAddr>>>,
+    /// Shared B-leg target address (read by relay tasks, updated by `set_remote_address`).
+    b_leg_target: Option<Arc<std::sync::RwLock<std::net::SocketAddr>>>,
     /// Transcoder for codec conversion (if A-leg and B-leg use different codecs).
     transcoder: Option<Transcoder>,
     /// A-leg negotiated codec.
@@ -546,7 +550,13 @@ impl MediaPipeline {
 
         // Allocate port pairs for A-leg and B-leg
         let (a_rtp, _a_rtcp) = self.port_allocator.allocate_pair().await?;
-        let (b_rtp, _b_rtcp) = self.port_allocator.allocate_pair().await?;
+        let (b_rtp, _b_rtcp) = match self.port_allocator.allocate_pair().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.port_allocator.release_pair(a_rtp).await;
+                return Err(e);
+            }
+        };
 
         let a_leg_ssrc = generate_ssrc();
         let b_leg_ssrc = generate_ssrc();
@@ -569,6 +579,8 @@ impl MediaPipeline {
                 .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
             relay_handles: Vec::new(),
             relay_shutdown: None,
+            a_leg_target: None,
+            b_leg_target: None,
             transcoder: None,
             a_leg_codec: None,
             b_leg_codec: None,
@@ -904,8 +916,18 @@ impl MediaPipeline {
 
         if is_a_leg {
             session_ctx.a_leg_remote = Some(address);
+            if let Some(ref target) = session_ctx.a_leg_target {
+                if let Ok(mut guard) = target.write() {
+                    *guard = address.into();
+                }
+            }
         } else {
             session_ctx.b_leg_remote = Some(address);
+            if let Some(ref target) = session_ctx.b_leg_target {
+                if let Ok(mut guard) = target.write() {
+                    *guard = address.into();
+                }
+            }
         }
 
         debug!(
@@ -1023,6 +1045,8 @@ impl MediaPipeline {
 
         ctx.relay_handles = vec![handle_ab, handle_ba];
         ctx.relay_shutdown = Some(shutdown_tx);
+        ctx.a_leg_target = Some(a_target);
+        ctx.b_leg_target = Some(b_target);
 
         info!(
             call_id = %call_id,
@@ -1061,10 +1085,30 @@ impl MediaPipeline {
         Ok(())
     }
 
-    /// Removes a media session.
+    /// Removes a media session, stopping any running relay tasks, releasing
+    /// allocated ports, and cleaning up associated DTLS connections.
     pub async fn remove_session(&self, call_id: &str) -> Result<(), MediaPipelineError> {
         let mut sessions = self.sessions.write().await;
-        if sessions.remove(call_id).is_some() {
+        if let Some(mut ctx) = sessions.remove(call_id) {
+            // Stop relay tasks (mirrors stop_relay logic)
+            if let Some(tx) = ctx.relay_shutdown.take() {
+                let _ = tx.send(true);
+            }
+            for handle in ctx.relay_handles.drain(..) {
+                handle.abort();
+            }
+
+            // Release allocated port pairs
+            self.port_allocator.release_pair(ctx.a_leg_local_port).await;
+            self.port_allocator.release_pair(ctx.b_leg_local_port).await;
+
+            // Drop sessions lock before acquiring dtls_connections lock
+            drop(sessions);
+
+            // Remove DTLS connections keyed by this call_id
+            let mut connections = self.dtls_connections.write().await;
+            connections.retain(|key, _| !key.starts_with(&format!("{call_id}:")));
+
             info!(call_id = %call_id, "Media session removed");
             Ok(())
         } else {

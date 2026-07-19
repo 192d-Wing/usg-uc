@@ -29,7 +29,10 @@ pub async fn add_entry(
         }
         Err(e) => {
             warn!(plan_id, error = %e, "dial plan get failed");
-            serde_json::json!({"id": plan_id, "entries": []})
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("dial plan store error: {e}")})),
+            );
         }
     };
     if let Some(obj) = doc.as_object_mut() {
@@ -43,6 +46,10 @@ pub async fn add_entry(
     }
     if let Err(e) = state.dial_plans.upsert(&plan_id, &doc).await {
         warn!(plan_id, error = %e, "dial plan upsert failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "failed to persist changes"})),
+        );
     }
     notify_dial_plan_sync(&state, &plan_id).await;
     (
@@ -71,11 +78,21 @@ pub async fn delete_entry(
             if became_empty {
                 if let Err(e) = state.dial_plans.delete(&plan_id).await {
                     warn!(plan_id, error = %e, "dial plan delete failed");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": "failed to persist changes"})),
+                    )
+                        .into_response();
                 }
                 notify_dial_plan_remove(&state, &plan_id).await;
             } else {
                 if let Err(e) = state.dial_plans.upsert(&plan_id, &doc).await {
                     warn!(plan_id, error = %e, "dial plan upsert failed");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": "failed to persist changes"})),
+                    )
+                        .into_response();
                 }
                 notify_dial_plan_sync(&state, &plan_id).await;
             }
@@ -88,6 +105,7 @@ pub async fn delete_entry(
         "plan_id": plan_id,
         "entry_id": entry_id,
     }))
+    .into_response()
 }
 
 async fn notify_dial_plan_sync(state: &Arc<AppState>, plan_id: &str) {

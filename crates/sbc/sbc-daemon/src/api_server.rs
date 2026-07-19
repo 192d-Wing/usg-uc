@@ -29,6 +29,9 @@
 //! - **SC-12**: Cryptographic Key Establishment and Management (certificate rotation)
 //! - **SC-13**: Cryptographic Protection (CNSA 2.0 compliant TLS)
 
+use axum::http::Request;
+use axum::middleware::Next;
+use axum::response::Response;
 use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
@@ -50,6 +53,46 @@ use uc_transport::cert_reload::ReloadableTlsAcceptor;
 
 use crate::server::ServerStats;
 use crate::shutdown::ShutdownSignal;
+
+/// Token read once from `SBC_API_TOKEN` at startup. When set, API data
+/// endpoints require `Authorization: Bearer <token>`. Health probes are
+/// exempt. When unset, no auth is enforced (backwards-compatible, but a
+/// warning is logged at startup).
+static API_TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+fn expected_api_token() -> &'static Option<String> {
+    API_TOKEN.get_or_init(|| {
+        let tok = std::env::var("SBC_API_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty());
+        if tok.is_none() {
+            warn!(
+                "SBC_API_TOKEN not set — daemon REST API is unauthenticated. \
+                   Set SBC_API_TOKEN to require bearer-token auth on data endpoints."
+            );
+        }
+        tok
+    })
+}
+
+async fn api_auth_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
+    if let Some(expected) = expected_api_token() {
+        let authorized = req
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .is_some_and(|t| t == expected);
+        if !authorized {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "valid Bearer token required"})),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
 
 /// API server configuration.
 #[derive(Debug, Clone)]
@@ -517,28 +560,10 @@ impl ApiServer {
     /// frontend, and has been removed from this router.
     pub fn router(&self) -> Router {
         let api_routes = Router::new()
-            // Registration deletes still come through HTTP today;
-            // sbc-api hits CallService gRPC for list/get but the delete
-            // path goes via DeleteRegistration RPC now too. Kept here
-            // as a defense-in-depth — sbc-api's gRPC handler routes to
-            // this anyway, but operator tools that bypass sbc-api still
-            // have a way in. TODO: remove once we're confident nothing
-            // hits the daemon directly.
-            //
-            // Read-only dial-plan views (still no gRPC reader).
             .route("/dialplans", get(get_dial_plans))
             .route("/dialplans/{plan_id}/entries", get(get_dial_plan_entries))
-            // CDR list (no gRPC equivalent yet).
             .route("/cdrs", get(get_cdrs))
-            // (trunk-health and trunk-registration routes moved to
-            // sbc-api in PR9; backed by daemon's TrunkHealthService gRPC.)
-            // (user CRUD moved to sbc-api in PR10; PostgresUserStore is
-            // hit directly from sbc-api instead of via the daemon.)
-            // (SBC routing CRUD — partitions, CSS, route patterns,
-            // route lists — moved to sbc-api in PR11; sbc-api owns the
-            // Postgres writes and the daemon's live router catches up
-            // via the new SbcSyncService gRPC.)
-            ;
+            .layer(axum::middleware::from_fn(api_auth_middleware));
 
         Router::new()
             // Kubelet probes — the daemon pod's own liveness/readiness.

@@ -28,6 +28,14 @@
 
 #![cfg(feature = "grpc")]
 
+// TODO(M19): Add authentication rejection tests once gRPC auth interceptors
+// are implemented (see C1). Tests should verify that:
+//   - Unauthenticated requests to protected RPCs return UNAUTHENTICATED (16).
+//   - Requests with expired/invalid tokens return UNAUTHENTICATED.
+//   - Requests with valid tokens but insufficient roles return
+//     PERMISSION_DENIED (7).
+//   - Health and reflection RPCs remain accessible without auth.
+
 // ============================================================================
 // Proto Message Tests
 // ============================================================================

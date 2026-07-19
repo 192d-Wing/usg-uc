@@ -21,6 +21,7 @@ keeps the chart self-contained and dependency-free, which matters for
 the 184-site air-gapped deploy pattern (see BOOTSTRAP.md).
 */}}
 {{- if .Values.sbcPostgres.enabled }}
+{{- $_ := required "sbcPostgres.password must be set to a non-empty value when sbcPostgres.enabled is true" .Values.sbcPostgres.password }}
 apiVersion: v1
 kind: Secret
 metadata:

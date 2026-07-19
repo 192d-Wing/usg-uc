@@ -11,6 +11,17 @@
 //
 // NOTE: the redirect/callback/refresh flow needs a live Keycloak to verify
 // end-to-end; it is exercised here only by type-checking and build.
+//
+// SECURITY LIMITATION (C9): Tokens are stored in sessionStorage, which is
+// accessible to any JS running in the same origin. An XSS vulnerability
+// would allow an attacker to exfiltrate the access and refresh tokens.
+//
+// Mitigation plan:
+//   1. CSP headers restrict script sources (see nginx.conf.template).
+//   2. Future: migrate to a Backend-For-Frontend (BFF) pattern where the
+//      server holds tokens in HttpOnly, Secure, SameSite=Strict cookies
+//      and the browser never sees raw tokens. This eliminates the XSS
+//      token-theft vector entirely.
 
 import { runtimeConfig } from '../runtimeConfig';
 

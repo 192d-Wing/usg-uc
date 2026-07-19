@@ -88,6 +88,16 @@
 /// SBC services. It is used by the gRPC reflection service to allow clients
 /// to discover available services and methods at runtime.
 ///
+/// # Security
+///
+/// **The reflection service exposes the full schema of every compiled proto,
+/// including admin-only RPCs (Shutdown, ReloadTls, InitiateFailover, etc.).**
+/// In production deployments, reflection MUST only be enabled behind
+/// authentication so that unauthenticated clients cannot enumerate the
+/// admin API surface. Prefer enabling the `reflection` feature only in
+/// development/staging builds, or gate the reflection endpoint behind
+/// the same auth interceptor that protects admin RPCs.
+///
 /// # Usage
 ///
 /// ```ignore

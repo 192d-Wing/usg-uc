@@ -6,6 +6,9 @@ use std::collections::HashMap;
 
 /// Runs the status command.
 pub fn run(args: &Args) {
+    eprintln!("WARNING: status command is not yet implemented (stub)");
+    eprintln!("All values below are simulated — no live SBC connection");
+
     let formatter = OutputFormatter::new(args.format);
 
     // In production, would query the SBC API

@@ -1,6 +1,7 @@
 //! Output formatting for CLI.
 
 use crate::args::OutputFormat;
+use serde_json::json;
 use std::collections::HashMap;
 
 /// Formats output based on the specified format.
@@ -19,7 +20,16 @@ impl OutputFormatter {
     pub fn format_kv(&self, key: &str, value: &str) -> String {
         match self.format {
             OutputFormat::Text => format!("{key}: {value}"),
-            OutputFormat::Json => format!(r#""{key}": "{value}""#),
+            OutputFormat::Json => {
+                let obj = json!({ key: value });
+                // Render just the inner "key": "value" without the braces.
+                let s = serde_json::to_string(&obj).unwrap_or_default();
+                // Strip leading '{' and trailing '}'
+                s.trim_start_matches('{')
+                    .trim_end_matches('}')
+                    .trim()
+                    .to_string()
+            }
             OutputFormat::Table => format!("| {key:<20} | {value:<40} |"),
         }
     }
@@ -33,11 +43,11 @@ impl OutputFormatter {
                 .collect::<Vec<_>>()
                 .join("\n"),
             OutputFormat::Json => {
-                let pairs: Vec<String> = map
+                let obj: serde_json::Map<String, serde_json::Value> = map
                     .iter()
-                    .map(|(k, v)| format!(r#"  "{k}": "{v}""#))
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                     .collect();
-                format!("{{\n{}\n}}", pairs.join(",\n"))
+                serde_json::to_string_pretty(&obj).unwrap_or_else(|_| "{}".to_string())
             }
             OutputFormat::Table => {
                 use std::fmt::Write;
@@ -61,9 +71,7 @@ impl OutputFormatter {
                 let indicator = if healthy { "✓" } else { "✗" };
                 format!("{indicator} {status}")
             }
-            OutputFormat::Json => {
-                format!(r#"{{"status": "{status}", "healthy": {healthy}}}"#)
-            }
+            OutputFormat::Json => json!({"status": status, "healthy": healthy}).to_string(),
             OutputFormat::Table => {
                 let indicator = if healthy { "HEALTHY" } else { "UNHEALTHY" };
                 format!("| {status:<20} | {indicator:<40} |")
@@ -75,7 +83,7 @@ impl OutputFormatter {
     pub fn format_error(&self, message: &str) -> String {
         match self.format {
             OutputFormat::Text => format!("Error: {message}"),
-            OutputFormat::Json => format!(r#"{{"error": "{message}"}}"#),
+            OutputFormat::Json => json!({"error": message}).to_string(),
             OutputFormat::Table => format!("| ERROR | {message:<40} |"),
         }
     }
@@ -89,8 +97,11 @@ impl OutputFormatter {
                 .collect::<Vec<_>>()
                 .join("\n"),
             OutputFormat::Json => {
-                let json_items: Vec<String> = items.iter().map(|i| format!(r#""{i}""#)).collect();
-                format!("[{}]", json_items.join(", "))
+                let arr: Vec<serde_json::Value> = items
+                    .iter()
+                    .map(|i| serde_json::Value::String(i.to_string()))
+                    .collect();
+                serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
             }
             OutputFormat::Table => items
                 .iter()

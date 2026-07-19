@@ -365,7 +365,12 @@ impl Runtime {
         // ignored — capture it here so the API server honors the TOML setting.
         #[cfg(feature = "grpc")]
         let grpc_config = config.grpc.clone().unwrap_or_default();
-        let api_listen_override = config.transport.api_listen;
+        let api_listen_override = self
+            .args
+            .listen
+            .as_ref()
+            .and_then(|s| s.parse().ok())
+            .or(config.transport.api_listen);
         let api_tls_listen = config.transport.api_tls_listen;
         let api_tls_paths: Option<(std::path::PathBuf, std::path::PathBuf)> = config
             .security
@@ -476,11 +481,39 @@ impl Runtime {
         // initdb + accept-connections is ~30s), the daemon waits it out
         // instead of permanently falling back to None.
         if let Ok(pg_url) = std::env::var("SBC_POSTGRES_URL") {
-            match connect_with_retry("directory", || {
-                sbc_config_store::PostgresDirectoryNumberStore::new(&pg_url)
-            })
-            .await
-            {
+            // Connect all Postgres stores in parallel so worst-case
+            // startup is ~60s (one retry budget) instead of ~8x60s
+            // when every store retries sequentially.
+            let (dir_res, phone_res, trunk_res, dial_res, part_res, css_res, rp_res, rl_res) = tokio::join!(
+                connect_with_retry("directory", || {
+                    sbc_config_store::PostgresDirectoryNumberStore::new(&pg_url)
+                }),
+                connect_with_retry("phones", || {
+                    sbc_config_store::PostgresPhoneStore::new(&pg_url)
+                }),
+                connect_with_retry("trunk_groups", || {
+                    sbc_config_store::PostgresTrunkGroupStore::new(&pg_url)
+                }),
+                connect_with_retry("dial_plans", || {
+                    sbc_config_store::PostgresDialPlanStore::new(&pg_url)
+                }),
+                connect_with_retry("partitions", || {
+                    sbc_config_store::PostgresPartitionStore::new(&pg_url)
+                }),
+                connect_with_retry("calling_search_spaces", || {
+                    sbc_config_store::PostgresCallingSearchSpaceStore::new(&pg_url)
+                }),
+                connect_with_retry("route_patterns", || {
+                    sbc_config_store::PostgresRoutePatternStore::new(&pg_url)
+                }),
+                connect_with_retry("route_lists", || {
+                    sbc_config_store::PostgresRouteListStore::new(&pg_url)
+                }),
+            );
+
+            // Handle results and run migrations for stores that have
+            // JSON predecessors.
+            match dir_res {
                 Ok(store) => {
                     let store_arc = Arc::new(store);
                     let json_path = std::path::Path::new("/var/lib/sbc/directory_numbers.json");
@@ -502,11 +535,7 @@ impl Runtime {
                 }
             }
 
-            match connect_with_retry("phones", || {
-                sbc_config_store::PostgresPhoneStore::new(&pg_url)
-            })
-            .await
-            {
+            match phone_res {
                 Ok(store) => {
                     let store_arc = Arc::new(store);
                     let json_path = std::path::Path::new("/var/lib/sbc/phones.json");
@@ -526,11 +555,7 @@ impl Runtime {
                 }
             }
 
-            match connect_with_retry("trunk_groups", || {
-                sbc_config_store::PostgresTrunkGroupStore::new(&pg_url)
-            })
-            .await
-            {
+            match trunk_res {
                 Ok(store) => {
                     let store_arc = Arc::new(store);
                     let json_path = std::path::Path::new("/var/lib/sbc/trunk_groups.json");
@@ -558,11 +583,7 @@ impl Runtime {
             // SbcRouter and were lost on every restart. No migration step
             // needed; just stand up the store and let the post-Arc replay
             // block re-sync any persisted plans into the router.
-            match connect_with_retry("dial_plans", || {
-                sbc_config_store::PostgresDialPlanStore::new(&pg_url)
-            })
-            .await
-            {
+            match dial_res {
                 Ok(store) => {
                     app_state.dial_plan_store = Some(Arc::new(store));
                     info!("Dial-plan store initialized (PostgreSQL)");
@@ -577,22 +598,14 @@ impl Runtime {
             // JSON predecessor (these lived in-memory only), so just
             // stand up the four stores and let the replay block below
             // re-sync them into the SbcRouter.
-            match connect_with_retry("partitions", || {
-                sbc_config_store::PostgresPartitionStore::new(&pg_url)
-            })
-            .await
-            {
+            match part_res {
                 Ok(s) => {
                     app_state.partition_store = Some(Arc::new(s));
                     info!("Partition store initialized (PostgreSQL)");
                 }
                 Err(e) => warn!(error = %e, "PostgresPartitionStore init exhausted retries"),
             }
-            match connect_with_retry("calling_search_spaces", || {
-                sbc_config_store::PostgresCallingSearchSpaceStore::new(&pg_url)
-            })
-            .await
-            {
+            match css_res {
                 Ok(s) => {
                     app_state.css_store = Some(Arc::new(s));
                     info!("CSS store initialized (PostgreSQL)");
@@ -601,22 +614,14 @@ impl Runtime {
                     warn!(error = %e, "PostgresCallingSearchSpaceStore init exhausted retries");
                 }
             }
-            match connect_with_retry("route_patterns", || {
-                sbc_config_store::PostgresRoutePatternStore::new(&pg_url)
-            })
-            .await
-            {
+            match rp_res {
                 Ok(s) => {
                     app_state.route_pattern_store = Some(Arc::new(s));
                     info!("Route-pattern store initialized (PostgreSQL)");
                 }
                 Err(e) => warn!(error = %e, "PostgresRoutePatternStore init exhausted retries"),
             }
-            match connect_with_retry("route_lists", || {
-                sbc_config_store::PostgresRouteListStore::new(&pg_url)
-            })
-            .await
-            {
+            match rl_res {
                 Ok(s) => {
                     app_state.route_list_store = Some(Arc::new(s));
                     info!("Route-list store initialized (PostgreSQL)");
@@ -1045,9 +1050,9 @@ impl Runtime {
         let drain_result = self.shutdown.shutdown_gracefully().await;
 
         if drain_result.drained {
-            info!(
+            warn!(
                 duration_ms = drain_result.drain_duration_ms,
-                "All connections drained successfully"
+                "Connection tracking not yet implemented; drain status is approximate"
             );
         } else {
             warn!(

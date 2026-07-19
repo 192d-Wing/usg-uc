@@ -24,7 +24,7 @@ use proto_stun::{StunClass, StunMessage};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use tokio::sync::RwLock;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 /// ICE agent manager configuration.
 #[derive(Debug, Clone)]
@@ -201,11 +201,31 @@ impl IceManager {
     }
 
     /// Adds a remote candidate to a session.
+    ///
+    /// Rejects candidates whose address is loopback, link-local, or
+    /// multicast to prevent SSRF-like redirection of STUN/media traffic
+    /// to internal infrastructure.
     pub async fn add_remote_candidate(
         &self,
         call_id: &str,
         candidate: Candidate,
     ) -> Result<(), IceManagerError> {
+        let sock_addr = candidate.address();
+        let ip = sock_addr.ip();
+        if ip.is_loopback()
+            || ip.is_multicast()
+            || matches!(ip, std::net::IpAddr::V4(v4) if v4.is_link_local())
+        {
+            warn!(
+                call_id = %call_id,
+                address = %ip,
+                "Rejecting remote ICE candidate with disallowed address"
+            );
+            return Err(IceManagerError::CandidateError(format!(
+                "candidate address {ip} is loopback/link-local/multicast"
+            )));
+        }
+
         let mut sessions = self.sessions.write().await;
         let context = sessions
             .get_mut(call_id)
@@ -214,7 +234,7 @@ impl IceManager {
         debug!(
             call_id = %call_id,
             candidate_type = ?candidate.candidate_type(),
-            address = %candidate.address(),
+            address = %sock_addr,
             "Adding remote candidate"
         );
 

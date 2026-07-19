@@ -123,9 +123,14 @@ pub async fn delete(
         && !matches!(e, sbc_config_store::ConfigStoreError::NotFound)
     {
         warn!(did, error = %e, "directory delete failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "failed to persist changes"})),
+        )
+            .into_response();
     }
     notify_did_remove(&state, &did).await;
-    Json(serde_json::json!({"success": true, "did": did}))
+    Json(serde_json::json!({"success": true, "did": did})).into_response()
 }
 
 async fn notify_did_sync(state: &Arc<AppState>, did: &str) {

@@ -13,7 +13,9 @@ categories.workspace = true
 default = []
 # Enable cluster management service
 cluster = []
-# Enable gRPC reflection service support
+# Enable gRPC reflection service support.
+# SECURITY: reflection exposes the full admin API schema to any client that
+# can reach the gRPC port. Only enable in dev/staging, or gate behind auth.
 reflection = ["tonic-reflection"]
 
 [dependencies]

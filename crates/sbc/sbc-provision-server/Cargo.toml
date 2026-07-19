@@ -34,3 +34,6 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror.workspace = true
 ipnet = "2"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
