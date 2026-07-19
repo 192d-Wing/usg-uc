@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-07-19
+
+### Security
+
+- **Path traversal rejection** — reverse-proxy catch-all now rejects dot-segment (`..`/`.`) paths (`sbc-api-server`)
+- **Error detail suppression** — proxy upstream-failure responses no longer leak internal error strings
+- **IP source validation** — provision server falls back to `ConnectInfo` peer address when `X-Forwarded-For` is absent
+- **OIDC session check** — `/api/v1/auth/session` now validates OIDC bearer tokens alongside legacy HMAC, so Keycloak SSO users see correct authentication status
+
+### Fixed
+
+- **Regex dial-plan matching** — replaced `true` stub with real `regex::Regex` evaluation in `DialPattern::Regex` (`uc-routing`)
+- **UTF-8 panic in number transforms** — `StripDigits` and `ReplacePrefix` now use `char_indices` instead of byte-index slicing (`uc-routing`)
+- **Blocked route patterns** — blocked patterns now reject calls outright instead of being silently skipped, matching expected telecom semantics (`uc-routing`)
+- **Via header copy** — SIP responses now copy all Via headers per RFC 3261, not just the first (`sbc-daemon`)
+- **NaN/Infinity guard** — `burst_multiplier` validation rejects non-finite floats (`sbc-config`)
+- **Keycloak `basic` scope** — OIDC client config now includes the `basic` scope so operator tokens carry the `sub` claim
+
+### Changed
+
+- **RTP port allocation** — replaced hardcoded port 20000 with an atomic wrap-around allocator (20000–40000 range) (`sbc-daemon`)
+- **TCP/TLS connection cap** — accept loops bounded by a shared `Semaphore(10_000)` to prevent resource exhaustion (`sbc-daemon`)
+- **Blocking DNS** — `to_socket_addrs()` moved off the async executor via `block_in_place` (`sbc-daemon`)
+- **Config sync TOCTOU guard** — `restamp_uploaded` uses a `collected_at` timestamp so concurrent local edits during the upload round-trip are not clobbered (`sbc-config-sync`)
+- **Config reload warning** — SIGHUP handler now logs that live Server/SipStack retain their original config snapshots (`sbc-daemon`)
+- **Postgres sslmode** — DSN `sslmode` is now configurable via `values.yaml` instead of being hardcoded to `disable` (`deploy/helm`)
+
 ### Added
 
 #### Enterprise Management Features (In Progress)
