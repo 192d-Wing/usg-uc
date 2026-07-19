@@ -80,8 +80,29 @@ pub async fn session(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let valid = uc_auth::extract_credential(&headers).is_some_and(|c| state.auth.authorize(&c));
-    if valid {
+    // Legacy cookie / HMAC / API key.
+    let legacy_ok = uc_auth::extract_credential(&headers).is_some_and(|c| state.auth.authorize(&c));
+
+    // OIDC bearer token (operator SSO via Keycloak).
+    let oidc_ok = if !legacy_ok {
+        if let Some(validator) = &state.oidc {
+            let token = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(|t| t.trim().to_string());
+            match token {
+                Some(t) => validator.validate(&t).await.is_ok(),
+                None => false,
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if legacy_ok || oidc_ok {
         Json(serde_json::json!({ "authenticated": true })).into_response()
     } else {
         (

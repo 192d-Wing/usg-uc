@@ -173,7 +173,12 @@ async fn restrict_source(
         .and_then(|v| v.to_str().ok())
         // Leftmost entry is the originating client as nginx saw it.
         .and_then(|s| s.split(',').next())
-        .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok());
+        .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
+        .or_else(|| {
+            req.extensions()
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|ci| ci.0.ip())
+        });
 
     let permitted = client_ip.is_some_and(|ip| allowed.iter().any(|net| net.contains(&ip)));
     if permitted {

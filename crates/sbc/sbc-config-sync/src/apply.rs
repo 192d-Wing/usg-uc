@@ -397,6 +397,7 @@ pub async fn restamp_uploaded(
     pool: &sqlx::PgPool,
     changes: &[UploadChange],
     epoch: i64,
+    collected_at: chrono::DateTime<chrono::Utc>,
 ) -> SyncResult<()> {
     let mut tx = pool.begin().await?;
     for change in changes {
@@ -405,9 +406,12 @@ pub async fn restamp_uploaded(
         } else {
             "id"
         };
+        // Only restamp rows whose updated_at predates the collection snapshot;
+        // rows edited after the collect keep updated_by = 'local' so the next
+        // cycle picks them up again instead of silently clobbering them.
         let sql = format!(
             "UPDATE {} SET updated_by = $1, revision = $2
-             WHERE {} = $3 AND updated_by = 'local'",
+             WHERE {} = $3 AND updated_by = 'local' AND updated_at <= $4",
             change.table.name(),
             id_col
         );
@@ -415,6 +419,7 @@ pub async fn restamp_uploaded(
             .bind(CENTRAL_ORIGIN)
             .bind(epoch)
             .bind(&change.id)
+            .bind(collected_at)
             .execute(&mut *tx)
             .await?;
     }

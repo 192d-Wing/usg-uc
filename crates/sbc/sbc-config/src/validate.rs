@@ -243,9 +243,9 @@ fn validate_rate_limit(config: &crate::schema::RateLimitConfig) -> ConfigResult<
             });
         }
 
-        if config.burst_multiplier < 1.0 {
+        if !config.burst_multiplier.is_finite() || config.burst_multiplier < 1.0 {
             return Err(ConfigError::Validation {
-                message: "burst_multiplier must be >= 1.0".to_string(),
+                message: "burst_multiplier must be a finite number >= 1.0".to_string(),
             });
         }
     }

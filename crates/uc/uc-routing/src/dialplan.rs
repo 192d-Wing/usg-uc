@@ -41,16 +41,21 @@ impl NumberTransform {
         match self {
             Self::None => number.to_string(),
             Self::StripPrefix { count } => {
-                if number.len() > *count {
-                    number[*count..].to_string()
+                // Use char boundary to avoid panicking on multi-byte UTF-8.
+                let boundary = number
+                    .char_indices()
+                    .nth(*count)
+                    .map_or(number.len(), |(i, _)| i);
+                if boundary < number.len() {
+                    number[boundary..].to_string()
                 } else {
                     number.to_string()
                 }
             }
             Self::AddPrefix { prefix } => format!("{prefix}{number}"),
             Self::ReplacePrefix { from, to } => {
-                if number.starts_with(from) {
-                    format!("{}{}", to, &number[from.len()..])
+                if let Some(rest) = number.strip_prefix(from.as_str()) {
+                    format!("{to}{rest}")
                 } else {
                     number.to_string()
                 }
@@ -111,10 +116,7 @@ impl DialPattern {
             Self::Exact(pattern) => number == pattern,
             Self::Prefix(prefix) => number.starts_with(prefix),
             Self::Wildcard(pattern) => Self::match_wildcard(pattern, number),
-            Self::Regex(_pattern) => {
-                // Would use regex crate in production
-                true
-            }
+            Self::Regex(pattern) => regex::Regex::new(pattern).is_ok_and(|re| re.is_match(number)),
             Self::Any => true,
         }
     }

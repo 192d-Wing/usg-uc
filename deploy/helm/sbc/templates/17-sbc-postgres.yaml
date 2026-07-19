@@ -35,7 +35,7 @@ stringData:
   POSTGRES_USER: {{ .Values.sbcPostgres.username | quote }}
   POSTGRES_PASSWORD: {{ .Values.sbcPostgres.password | quote }}
   # Daemon reads this exact key (SBC_POSTGRES_URL semantics).
-  dsn: "postgres://{{ .Values.sbcPostgres.username }}:{{ .Values.sbcPostgres.password }}@{{ include "sbc.fullname" . }}-postgres.{{ .Release.Namespace }}.svc.cluster.local:5432/{{ .Values.sbcPostgres.database }}?sslmode=disable"
+  dsn: "postgres://{{ .Values.sbcPostgres.username }}:{{ .Values.sbcPostgres.password }}@{{ include "sbc.fullname" . }}-postgres.{{ .Release.Namespace }}.svc.cluster.local:5432/{{ .Values.sbcPostgres.database }}?sslmode={{ .Values.sbcPostgres.sslmode | default "disable" }}"
 ---
 apiVersion: v1
 kind: Service

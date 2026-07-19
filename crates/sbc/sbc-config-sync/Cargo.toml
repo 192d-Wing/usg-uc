@@ -25,7 +25,8 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror.workspace = true
 
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
+chrono.workspace = true
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono"] }
 # Tiny HTTP server for the /metrics + /healthz + /readyz endpoints the
 # central staleness dashboards scrape.
 axum.workspace = true
