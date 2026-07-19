@@ -366,7 +366,7 @@ impl SipStack {
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
             draining: std::sync::atomic::AtomicBool::new(false),
-            next_rtp_port: std::sync::atomic::AtomicU16::new(20_000),
+            next_rtp_port: std::sync::atomic::AtomicU16::new(32_770),
             allocated_ports: Arc::new(std::sync::Mutex::new(HashSet::new())),
             in_flight_invites: RwLock::new(HashSet::new()),
             config,
@@ -419,7 +419,7 @@ impl SipStack {
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
             draining: std::sync::atomic::AtomicBool::new(false),
-            next_rtp_port: std::sync::atomic::AtomicU16::new(20_000),
+            next_rtp_port: std::sync::atomic::AtomicU16::new(32_770),
             allocated_ports: Arc::new(std::sync::Mutex::new(HashSet::new())),
             in_flight_invites: RwLock::new(HashSet::new()),
             config,
@@ -433,23 +433,26 @@ impl SipStack {
         }
     }
 
-    /// Allocates the next even-numbered RTP port in the 20000-39999 range,
-    /// skipping any port currently in use.
+    /// Allocates the next even-numbered RTP port in the 32770-49998 range,
+    /// skipping any port currently in use.  Range starts above the media
+    /// pipeline's RTP allocator (16384-32768) to avoid port collisions.
     fn allocate_rtp_port(&self) -> u16 {
+        const MIN_PORT: u16 = 32_770;
+        const MAX_PORT: u16 = 49_998;
+        const PAIR_COUNT: u16 = (MAX_PORT - MIN_PORT) / 2 + 1;
         let mut ports = self
             .allocated_ports
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let mut candidate = self.next_rtp_port.load(Ordering::Relaxed);
-        // Try up to 10_000 candidates (the full range) before giving up.
-        for _ in 0..10_000 {
-            if candidate >= 40_000 {
-                candidate = 20_000;
+        for _ in 0..PAIR_COUNT {
+            if candidate > MAX_PORT {
+                candidate = MIN_PORT;
             }
             if !ports.contains(&candidate) {
                 ports.insert(candidate);
-                let next = if candidate + 2 >= 40_000 {
-                    20_000
+                let next = if candidate + 2 > MAX_PORT {
+                    MIN_PORT
                 } else {
                     candidate + 2
                 };
@@ -458,7 +461,6 @@ impl SipStack {
             }
             candidate += 2;
         }
-        // Exhausted — fall back to the counter value (should not happen in practice).
         let fallback = self.next_rtp_port.load(Ordering::Relaxed);
         ports.insert(fallback);
         fallback
@@ -2274,10 +2276,25 @@ impl SipStack {
 
         debug!(call_id = %sip_call_id, "Processing CANCEL");
 
-        // Look up the call via A-leg Call-ID
-        let corr = self.call_correlation.read().await;
+        // Look up the call via A-leg Call-ID.  When messages are spawned
+        // as independent tasks, a CANCEL can arrive before the INVITE's
+        // correlation entry is stored.  If the Call-ID is currently
+        // in-flight (INVITE processing), wait for it to finish before
+        // giving up.
+        let mut corr = self.call_correlation.read().await;
+        if corr.a_leg.get(&sip_call_id).is_none()
+            && self.in_flight_invites.read().await.contains(&sip_call_id)
+        {
+            drop(corr);
+            for _ in 0..20 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                if !self.in_flight_invites.read().await.contains(&sip_call_id) {
+                    break;
+                }
+            }
+            corr = self.call_correlation.read().await;
+        }
         let Some(id) = corr.a_leg.get(&sip_call_id) else {
-            // Unknown call -- just respond 200 OK for the CANCEL
             let response = create_response_from_request(req, StatusCode::OK);
             return ProcessResult::Response {
                 message: SipMessage::Response(response),

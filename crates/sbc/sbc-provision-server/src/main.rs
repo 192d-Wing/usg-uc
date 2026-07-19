@@ -182,20 +182,20 @@ async fn restrict_source(
         return next.run(req).await;
     }
 
-    // Check ConnectInfo first (the real TCP peer — trusted), then fall
-    // back to X-Forwarded-For only as a secondary signal when behind a
-    // known proxy (ConnectInfo would be the proxy's IP in that case).
+    // Prefer X-Forwarded-For (set by the frontend nginx with the real
+    // client IP) over ConnectInfo (which is always the nginx pod's IP in
+    // the standard deployment topology).  Fall back to ConnectInfo only
+    // when no XFF header is present (direct access, health probes).
     let client_ip = req
-        .extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip())
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
         .or_else(|| {
-            req.headers()
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                // Leftmost entry is the originating client as nginx saw it.
-                .and_then(|s| s.split(',').next())
-                .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
+            req.extensions()
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|ci| ci.0.ip())
         });
 
     let permitted = client_ip.is_some_and(|ip| allowed.iter().any(|net| net.contains(&ip)));

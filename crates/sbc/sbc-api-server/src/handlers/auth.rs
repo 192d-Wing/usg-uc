@@ -28,19 +28,8 @@ pub struct LoginRequest {
 const MAX_LOGIN_ATTEMPTS: u32 = 5;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 
-fn extract_client_ip(headers: &axum::http::HeaderMap) -> IpAddr {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .and_then(|s| s.trim().parse().ok())
-        .or_else(|| {
-            headers
-                .get("x-real-ip")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.trim().parse().ok())
-        })
-        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+fn extract_client_ip(connect_info: &axum::extract::ConnectInfo<std::net::SocketAddr>) -> IpAddr {
+    connect_info.0.ip()
 }
 
 /// `POST /api/v1/auth/login` — verify admin credentials, mint a token.
@@ -49,18 +38,20 @@ fn extract_client_ip(headers: &axum::http::HeaderMap) -> IpAddr {
 /// as an `HttpOnly; Secure; SameSite=Strict` cookie (for the dashboard).
 pub async fn login(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(body): Json<LoginRequest>,
 ) -> Response {
-    let client_ip = extract_client_ip(&headers);
+    let client_ip = extract_client_ip(&connect_info);
 
     // Rate-limit: reject if this IP has exceeded MAX_LOGIN_ATTEMPTS
-    // within the sliding window.
+    // within the sliding window.  Also evict stale entries to prevent
+    // unbounded growth of the rate-limiter map.
     {
-        let limiter = state
+        let mut limiter = state
             .login_rate_limiter
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        limiter.retain(|_, (_, window_start)| window_start.elapsed() < RATE_LIMIT_WINDOW * 2);
         if let Some(&(count, window_start)) = limiter.get(&client_ip) {
             if window_start.elapsed() < RATE_LIMIT_WINDOW && count >= MAX_LOGIN_ATTEMPTS {
                 return (

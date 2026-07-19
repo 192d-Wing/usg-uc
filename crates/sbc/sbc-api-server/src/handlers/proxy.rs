@@ -119,6 +119,9 @@ async fn proxy(
     {
         req = req.header(reqwest::header::CONTENT_TYPE, v);
     }
+    if let Some(ref token) = state.daemon_api_token {
+        req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+    }
     if !body.is_empty() {
         req = req.body(body);
     }

@@ -216,7 +216,7 @@ impl CentralConfigStore {
             table.name(),
             table.name()
         );
-        sqlx::query(&sql)
+        let result = sqlx::query(&sql)
             .bind(site_code)
             .bind(template_id)
             .bind(data)
@@ -224,6 +224,9 @@ impl CentralConfigStore {
             .bind(TEMPLATE_ORIGIN)
             .execute(&mut *tx)
             .await?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
         journal(
             &mut tx,
             site_code,
@@ -263,13 +266,16 @@ impl CentralConfigStore {
              WHERE site_code = $3 AND id = $4 AND NOT deleted AND updated_by = $2",
             table.name()
         );
-        sqlx::query(&sql)
+        let result = sqlx::query(&sql)
             .bind(epoch)
             .bind(TEMPLATE_ORIGIN)
             .bind(site_code)
             .bind(template_id)
             .execute(&mut *tx)
             .await?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
         journal(
             &mut tx,
             site_code,

@@ -98,7 +98,14 @@ pub async fn delete_entry(
             }
         }
         Err(sbc_config_store::ConfigStoreError::NotFound) => { /* idempotent */ }
-        Err(e) => warn!(plan_id, error = %e, "dial plan get during delete failed"),
+        Err(e) => {
+            warn!(plan_id, error = %e, "dial plan get during delete failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to read dial plan"})),
+            )
+                .into_response();
+        }
     }
     Json(serde_json::json!({
         "success": true,

@@ -200,6 +200,13 @@ impl AnnouncementService for AnnouncementServiceImpl {
                 ));
             }
         }
+        if let std::net::IpAddr::V6(v6) = dest_ip {
+            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                return Err(Status::invalid_argument(
+                    "rtp_destination must not be a link-local address",
+                ));
+            }
+        }
 
         let (socket, rtp_port) = self
             .bind_rtp()

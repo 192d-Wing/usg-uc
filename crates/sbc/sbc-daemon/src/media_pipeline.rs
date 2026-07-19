@@ -1077,9 +1077,11 @@ impl MediaPipeline {
             handle.abort();
         }
 
-        // Release ports
+        // Release ports and zero them so remove_session won't double-release
         self.port_allocator.release_pair(ctx.a_leg_local_port).await;
         self.port_allocator.release_pair(ctx.b_leg_local_port).await;
+        ctx.a_leg_local_port = 0;
+        ctx.b_leg_local_port = 0;
 
         info!(call_id = %call_id, "RTP relay stopped");
         Ok(())
@@ -1098,9 +1100,13 @@ impl MediaPipeline {
                 handle.abort();
             }
 
-            // Release allocated port pairs
-            self.port_allocator.release_pair(ctx.a_leg_local_port).await;
-            self.port_allocator.release_pair(ctx.b_leg_local_port).await;
+            // Release allocated port pairs (skip if already released by stop_relay)
+            if ctx.a_leg_local_port != 0 {
+                self.port_allocator.release_pair(ctx.a_leg_local_port).await;
+            }
+            if ctx.b_leg_local_port != 0 {
+                self.port_allocator.release_pair(ctx.b_leg_local_port).await;
+            }
 
             // Drop sessions lock before acquiring dtls_connections lock
             drop(sessions);

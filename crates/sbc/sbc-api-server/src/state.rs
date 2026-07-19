@@ -84,6 +84,9 @@ pub struct AppState {
     /// endpoints sbc-api doesn't own.
     pub http_client: reqwest::Client,
     pub daemon_http_base: String,
+    /// Bearer token for authenticating proxied requests to the daemon's
+    /// `/api/v1` routes.  Read from `SBC_API_TOKEN` at startup.
+    pub daemon_api_token: Option<String>,
 
     /// Process start instant, for /system/version uptime reporting.
     pub start_time: std::time::Instant,
@@ -252,6 +255,9 @@ impl AppState {
             sbc_sync,
             http_client,
             daemon_http_base: cfg.daemon_http_url.trim_end_matches('/').to_string(),
+            daemon_api_token: std::env::var("SBC_API_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty()),
             start_time: std::time::Instant::now(),
             auth,
             oidc,
