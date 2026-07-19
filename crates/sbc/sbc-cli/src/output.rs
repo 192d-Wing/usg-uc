@@ -135,7 +135,9 @@ mod tests {
     fn test_format_kv_json() {
         let formatter = OutputFormatter::new(OutputFormat::Json);
         let output = formatter.format_kv("status", "running");
-        assert_eq!(output, r#""status": "running""#);
+        // Compact serde_json rendering (properly escaped, no space after
+        // the colon).
+        assert_eq!(output, r#""status":"running""#);
     }
 
     #[test]
