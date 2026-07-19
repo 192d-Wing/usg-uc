@@ -91,6 +91,12 @@ fn validate_general(config: &crate::schema::GeneralConfig) -> ConfigResult<()> {
         });
     }
 
+    if config.max_registrations == 0 {
+        return Err(ConfigError::Validation {
+            message: "max_registrations must be greater than 0".to_string(),
+        });
+    }
+
     Ok(())
 }
 

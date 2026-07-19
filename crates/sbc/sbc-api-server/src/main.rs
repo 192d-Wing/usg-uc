@@ -84,9 +84,12 @@ async fn main() -> ExitCode {
         }
     };
 
-    if let Err(e) = axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown)
-        .await
+    if let Err(e) = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
     {
         error!(error = %e, "server error");
         return ExitCode::from(5);

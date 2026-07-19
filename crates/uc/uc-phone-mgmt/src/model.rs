@@ -391,6 +391,7 @@ pub struct PhoneLine {
     /// SIP authentication username.
     pub sip_username: String,
     /// SIP authentication password.
+    #[serde(skip_serializing)]
     pub sip_password: String,
     /// SIP registrar/proxy server address.
     pub sip_server: String,
@@ -609,6 +610,7 @@ pub struct DirectoryConfig {
     /// LDAP bind DN (username).
     pub ldap_bind_dn: Option<String>,
     /// LDAP bind password.
+    #[serde(skip_serializing)]
     pub ldap_password: Option<String>,
     /// Use TLS/SSL for LDAP connection.
     pub ldap_tls: bool,

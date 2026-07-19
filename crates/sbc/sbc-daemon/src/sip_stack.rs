@@ -36,7 +36,7 @@ use proto_transaction::{
     ClientInviteTransaction, ClientNonInviteTransaction, ServerInviteTransaction,
     ServerNonInviteTransaction, TransactionKey, TransportType,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
@@ -106,6 +106,11 @@ pub struct SipStack {
     draining: std::sync::atomic::AtomicBool,
     /// RTP port allocator: hands out even-numbered ports in a range.
     next_rtp_port: std::sync::atomic::AtomicU16,
+    /// Set of currently allocated RTP ports for deallocation tracking.
+    allocated_ports: Arc<std::sync::Mutex<HashSet<u16>>>,
+    /// In-flight INVITE Call-IDs: prevents TOCTOU race between the
+    /// retransmit check and the correlation insert.
+    in_flight_invites: RwLock<HashSet<String>>,
 }
 
 /// SIP stack configuration.
@@ -278,6 +283,10 @@ struct CallAddresses {
     /// Remote (callee) tag learned from the first tagged B-leg response.
     /// Completes the dialog identity on both legs.
     dialog_to_tag: Option<String>,
+    /// RTP ports allocated for this call (released on teardown).
+    rtp_ports: Vec<u16>,
+    /// Via branch of the A-leg INVITE (server transaction key for cleanup).
+    a_leg_branch: String,
 }
 
 /// Result of processing a SIP message.
@@ -357,7 +366,9 @@ impl SipStack {
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
             draining: std::sync::atomic::AtomicBool::new(false),
-            next_rtp_port: std::sync::atomic::AtomicU16::new(20_000),
+            next_rtp_port: std::sync::atomic::AtomicU16::new(32_770),
+            allocated_ports: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            in_flight_invites: RwLock::new(HashSet::new()),
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
@@ -408,7 +419,9 @@ impl SipStack {
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
             draining: std::sync::atomic::AtomicBool::new(false),
-            next_rtp_port: std::sync::atomic::AtomicU16::new(20_000),
+            next_rtp_port: std::sync::atomic::AtomicU16::new(32_770),
+            allocated_ports: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            in_flight_invites: RwLock::new(HashSet::new()),
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
@@ -420,23 +433,46 @@ impl SipStack {
         }
     }
 
-    /// Allocates the next even-numbered RTP port, wrapping at 40000 → 20000.
+    /// Allocates the next even-numbered RTP port in the 32770-49998 range,
+    /// skipping any port currently in use.  Range starts above the media
+    /// pipeline's RTP allocator (16384-32768) to avoid port collisions.
     fn allocate_rtp_port(&self) -> u16 {
-        loop {
-            let current = self.next_rtp_port.load(Ordering::Relaxed);
-            let next = if current >= 40_000 {
-                20_000
-            } else {
-                current + 2
-            };
-            if self
-                .next_rtp_port
-                .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                return current;
+        const MIN_PORT: u16 = 32_770;
+        const MAX_PORT: u16 = 49_998;
+        const PAIR_COUNT: u16 = (MAX_PORT - MIN_PORT) / 2 + 1;
+        let mut ports = self
+            .allocated_ports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut candidate = self.next_rtp_port.load(Ordering::Relaxed);
+        for _ in 0..PAIR_COUNT {
+            if candidate > MAX_PORT {
+                candidate = MIN_PORT;
             }
+            if !ports.contains(&candidate) {
+                ports.insert(candidate);
+                let next = if candidate + 2 > MAX_PORT {
+                    MIN_PORT
+                } else {
+                    candidate + 2
+                };
+                self.next_rtp_port.store(next, Ordering::Relaxed);
+                return candidate;
+            }
+            candidate += 2;
         }
+        let fallback = self.next_rtp_port.load(Ordering::Relaxed);
+        ports.insert(fallback);
+        fallback
+    }
+
+    /// Releases a previously allocated RTP port so it can be reused.
+    fn release_rtp_port(&self, port: u16) {
+        let mut ports = self
+            .allocated_ports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ports.remove(&port);
     }
 
     /// Sets the media pipeline for RTP relay.
@@ -916,11 +952,19 @@ impl SipStack {
         {
             let sdp_str = String::from_utf8_lossy(body);
             let local_ip = addrs.local_addr.split(':').next().unwrap_or("0.0.0.0");
-            let local_media = MediaAddress::new(local_ip, 20_002);
+            let rtp_port = self.allocate_rtp_port();
+            let local_media = MediaAddress::new(local_ip, rtp_port);
             let result = self
                 .sdp_rewriter
                 .rewrite_answer_for_a_leg(&sdp_str, &local_media);
             let rewritten = Bytes::from(result.rewritten);
+            // Track the allocated port for release on teardown.
+            {
+                let mut corr = self.call_correlation.write().await;
+                if let Some(a) = corr.addresses.get_mut(internal_id) {
+                    a.rtp_ports.push(rtp_port);
+                }
+            }
             // build_a_leg_response set Content-Length: 0; correct it to
             // the attached body length or the A-leg UA truncates the SDP
             // and the caller gets no early media.
@@ -980,10 +1024,18 @@ impl SipStack {
         if let Some(ref body) = resp.body {
             let sdp_str = String::from_utf8_lossy(body);
             let local_ip = addrs.local_addr.split(':').next().unwrap_or("0.0.0.0");
-            let local_media = MediaAddress::new(local_ip, 20_002);
+            let rtp_port = self.allocate_rtp_port();
+            let local_media = MediaAddress::new(local_ip, rtp_port);
             let result = self
                 .sdp_rewriter
                 .rewrite_answer_for_a_leg(&sdp_str, &local_media);
+            // Track the allocated port for release on teardown.
+            {
+                let mut corr = self.call_correlation.write().await;
+                if let Some(a) = corr.addresses.get_mut(internal_id) {
+                    a.rtp_ports.push(rtp_port);
+                }
+            }
             a_response.body = Some(Bytes::from(result.rewritten));
             a_response
                 .headers
@@ -1063,7 +1115,7 @@ impl SipStack {
                     addrs
                         .failover_trunks
                         .first()
-                        .map_or("default", |_| "default"),
+                        .map_or("default", |t| t.as_str()),
                 )
                 .and_then(|_| resolve_sip_uri_to_addr(&format!("sip:{next_trunk_id}")));
             drop(router);
@@ -1164,6 +1216,18 @@ impl SipStack {
             corr.a_leg.remove(&addrs.a_leg_sip_call_id);
             corr.b_leg.remove(&addrs.b_leg_sip_call_id);
             corr.addresses.remove(internal_id);
+        }
+        // Remove transaction entries for this call (H20).
+        {
+            let mut txns = self.transactions.write().await;
+            let server_key = TransactionKey::server(&addrs.a_leg_branch, "INVITE");
+            let client_key = TransactionKey::client(&addrs.b_leg_branch, "INVITE");
+            txns.server_invite.remove(&server_key);
+            txns.client_invite.remove(&client_key);
+        }
+        // Release allocated RTP ports (C12).
+        for port in &addrs.rtp_ports {
+            self.release_rtp_port(*port);
         }
 
         warn!(
@@ -1289,21 +1353,21 @@ impl SipStack {
             ..register_req
         };
 
-        // Process through AuthenticatedRegistrar
-        let reg_response = {
-            let mut registrar = self.registrar.write().await;
-            match registrar.process_register(&register_req) {
-                Ok(resp) => resp,
-                Err(e) => {
-                    warn!(error = %e, aor = %aor, "Registration processing failed");
-                    return ProcessResult::Response {
-                        message: SipMessage::Response(create_response_from_request(
-                            req,
-                            StatusCode::SERVER_INTERNAL_ERROR,
-                        )),
-                        destination: source,
-                    };
-                }
+        // Process through AuthenticatedRegistrar — hold the registrar
+        // write lock through the location_service sync so both stores are
+        // updated atomically (H5).
+        let mut registrar_guard = self.registrar.write().await;
+        let reg_response = match registrar_guard.process_register(&register_req) {
+            Ok(resp) => resp,
+            Err(e) => {
+                warn!(error = %e, aor = %aor, "Registration processing failed");
+                return ProcessResult::Response {
+                    message: SipMessage::Response(create_response_from_request(
+                        req,
+                        StatusCode::SERVER_INTERNAL_ERROR,
+                    )),
+                    destination: source,
+                };
             }
         };
 
@@ -1388,17 +1452,15 @@ impl SipStack {
                             let _ = loc.add_binding(binding.clone());
                         }
                     }
+                    // Update active count while holding the loc lock.
+                    self.registrations_active
+                        .store(loc.total_bindings() as u64, Ordering::Relaxed);
                 }
+                // Both registrar and location_service are now consistent;
+                // release the registrar guard.
+                drop(registrar_guard);
 
                 self.registrations_total.fetch_add(1, Ordering::Relaxed);
-                // Update active count based on location service
-                self.registrations_active.store(
-                    {
-                        let loc = self.location_service.read().await;
-                        loc.total_bindings() as u64
-                    },
-                    Ordering::Relaxed,
-                );
 
                 info!(
                     aor = %aor,
@@ -1407,6 +1469,7 @@ impl SipStack {
                 );
             }
             401 => {
+                drop(registrar_guard);
                 // Add WWW-Authenticate challenge header
                 if let Some(ref www_auth) = reg_response.www_authenticate {
                     response
@@ -1415,6 +1478,7 @@ impl SipStack {
                 debug!(aor = %aor, "Registration challenged (401)");
             }
             423 => {
+                drop(registrar_guard);
                 // Add Min-Expires header
                 if let Some(min_exp) = reg_response.min_expires {
                     response.add_header(Header::new(
@@ -1425,6 +1489,7 @@ impl SipStack {
                 debug!(aor = %aor, "Registration interval too brief (423)");
             }
             _ => {
+                drop(registrar_guard);
                 warn!(
                     aor = %aor,
                     status = reg_response.status_code,
@@ -1460,7 +1525,8 @@ impl SipStack {
 
         debug!(uri = %req.uri, call_id = %a_leg_call_id, "Processing INVITE");
 
-        // Check for INVITE retransmit — if we already know this Call-ID, absorb it
+        // Check for INVITE retransmit — if we already know this Call-ID,
+        // or it is already being processed (in-flight), absorb it.
         {
             let corr = self.call_correlation.read().await;
             if corr.a_leg.contains_key(&a_leg_call_id) {
@@ -1477,11 +1543,22 @@ impl SipStack {
             debug!(call_id = %a_leg_call_id, "INVITE retransmit (announcement), absorbing");
             return ProcessResult::NoAction;
         }
+        // Mark this Call-ID as in-flight under a write lock so a second
+        // copy arriving before the correlation insert is also absorbed
+        // (TOCTOU fix — H4).
+        {
+            let mut in_flight = self.in_flight_invites.write().await;
+            if !in_flight.insert(a_leg_call_id.clone()) {
+                debug!(call_id = %a_leg_call_id, "INVITE retransmit (in-flight), absorbing");
+                return ProcessResult::NoAction;
+            }
+        }
 
         // Draining (graceful shutdown): refuse new calls, let existing ones
         // finish.
         if self.draining.load(Ordering::Relaxed) {
             info!(call_id = %a_leg_call_id, "Draining — rejecting new INVITE");
+            self.in_flight_invites.write().await.remove(&a_leg_call_id);
             let unavailable = create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
             return ProcessResult::Response {
                 message: SipMessage::Response(unavailable),
@@ -1501,6 +1578,8 @@ impl SipStack {
                     max_calls = self.config.max_calls,
                     "Maximum concurrent calls reached, rejecting INVITE"
                 );
+                drop(calls);
+                self.in_flight_invites.write().await.remove(&a_leg_call_id);
                 let unavailable =
                     create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
                 return ProcessResult::Response {
@@ -1520,6 +1599,7 @@ impl SipStack {
             .unwrap_or(70);
         if incoming_max_forwards == 0 {
             warn!(call_id = %a_leg_call_id, "Max-Forwards exhausted, rejecting INVITE");
+            self.in_flight_invites.write().await.remove(&a_leg_call_id);
             let too_many_hops = create_response_from_request(
                 req,
                 StatusCode::new(483).unwrap_or(StatusCode::SERVER_INTERNAL_ERROR),
@@ -1577,6 +1657,7 @@ impl SipStack {
                         rule = verdict.matched_rule().unwrap_or("-"),
                         "VPS rejected INVITE"
                     );
+                    self.in_flight_invites.write().await.remove(&a_leg_call_id);
                     let rejection = create_response_from_request(
                         req,
                         StatusCode::new(*status_code).unwrap_or(StatusCode::SERVER_INTERNAL_ERROR),
@@ -1592,6 +1673,7 @@ impl SipStack {
                         stage = ?verdict.source(),
                         "VPS dropped INVITE (blocked source)"
                     );
+                    self.in_flight_invites.write().await.remove(&a_leg_call_id);
                     return ProcessResult::NoAction;
                 }
             }
@@ -1730,6 +1812,7 @@ impl SipStack {
 
                 if routed.is_none() {
                     warn!(dest = %dest_aor, "No route found — playing announcement");
+                    self.in_flight_invites.write().await.remove(&a_leg_call_id);
                     return self
                         .play_announcement_to_caller(
                             req,
@@ -1745,6 +1828,7 @@ impl SipStack {
 
         let Some(b_leg_destination) = b_leg_destination else {
             warn!(dest = %dest_aor, "Cannot resolve destination — playing announcement");
+            self.in_flight_invites.write().await.remove(&a_leg_call_id);
             return self
                 .play_announcement_to_caller(
                     req,
@@ -1783,9 +1867,10 @@ impl SipStack {
         let local_sip_addr = format!("{}:{}", local_ip, source.port());
 
         // 6. Rewrite SDP for B-leg (replace A-leg's address with SBC's)
+        let initial_rtp_port = self.allocate_rtp_port();
         let b_leg_sdp = req.body.as_ref().map(|body| {
             let sdp_str = String::from_utf8_lossy(body);
-            let local_media = MediaAddress::new(&local_ip, self.allocate_rtp_port());
+            let local_media = MediaAddress::new(&local_ip, initial_rtp_port);
             let result = self
                 .sdp_rewriter
                 .rewrite_offer_for_b_leg(&sdp_str, &local_media);
@@ -1821,6 +1906,8 @@ impl SipStack {
             Ok(req) => req,
             Err(e) => {
                 error!(error = %e, "Failed to build B-leg INVITE");
+                self.in_flight_invites.write().await.remove(&a_leg_call_id);
+                self.release_rtp_port(initial_rtp_port);
                 let server_err =
                     create_response_from_request(req, StatusCode::SERVER_INTERNAL_ERROR);
                 return ProcessResult::Response {
@@ -1847,6 +1934,14 @@ impl SipStack {
         // 7c. Apply topology hiding to B-leg INVITE
         // (strip internal Via headers, anonymize Contact)
         // TopologyHider modifies headers in-place — will be fully wired in Phase 4
+
+        // Extract A-leg branch early — needed for both CallAddresses (H20
+        // transaction cleanup) and the server transaction key below.
+        let a_branch = req
+            .headers
+            .get_value(&HeaderName::Via)
+            .and_then(|v| extract_param(v, "branch").map(String::from))
+            .unwrap_or_else(generate_branch);
 
         // 8. Store call state and correlation
         {
@@ -1913,18 +2008,19 @@ impl SipStack {
                     b_leg_to,
                     b_leg_branch: b_leg_wire_branch,
                     dialog_to_tag: None,
+                    rtp_ports: vec![initial_rtp_port],
+                    a_leg_branch: a_branch.clone(),
                 },
             );
+        }
+        // INVITE correlation is stored — remove from in-flight set (H4).
+        {
+            let mut in_flight = self.in_flight_invites.write().await;
+            in_flight.remove(&a_leg_call_id);
         }
 
         // 9. Create transactions
         {
-            let a_branch = req
-                .headers
-                .get_value(&HeaderName::Via)
-                .and_then(|v| extract_param(v, "branch").map(String::from))
-                .unwrap_or_else(generate_branch);
-
             let mut txns = self.transactions.write().await;
             txns.sweep_if_needed();
             let now = std::time::Instant::now();
@@ -2052,45 +2148,71 @@ impl SipStack {
         // Build 200 OK for BYE sender
         let ok_response = create_response_from_request(req, StatusCode::OK);
 
-        // Build BYE for the other leg with that leg's dialog identity
-        // (From/To with tags). A BYE carrying only Call-ID + CSeq cannot be
-        // matched to the dialog by the receiving UA, leaking the far leg.
+        // Build the forwarded request for the other leg. If the B-leg
+        // dialog has no To-tag yet (early dialog — no final response
+        // received), send CANCEL instead of BYE (H6). A BYE in an early
+        // dialog is invalid per RFC 3261 §15 and will be rejected by
+        // conformant UAs.
         let (other_call_id, other_dest) = if is_from_a_leg {
             (&addrs.b_leg_sip_call_id, addrs.b_leg_destination)
         } else {
             (&addrs.a_leg_sip_call_id, addrs.a_leg_source)
         };
 
+        let use_cancel = is_from_a_leg && addrs.dialog_to_tag.is_none();
+
         let other_uri = SipUri::new(other_dest.ip().to_string()).with_port(other_dest.port());
-        let mut bye_request = proto_sip::message::SipRequest::new(Method::Bye, other_uri);
-        bye_request.headers.set(HeaderName::CallId, other_call_id);
-        if is_from_a_leg {
-            // SBC is the UAC on the B-leg: From = our INVITE From, To = the
-            // callee with their tag; next CSeq after the INVITE (1).
-            bye_request.headers.set(HeaderName::From, &addrs.b_leg_from);
-            bye_request.headers.set(
-                HeaderName::To,
-                with_tag(&addrs.b_leg_to, addrs.dialog_to_tag.as_deref()),
-            );
-            bye_request.headers.set(HeaderName::CSeq, "2 BYE");
+        let forward_request = if use_cancel {
+            // Early dialog: send CANCEL mirroring the original INVITE
+            // (same Via branch, From, To without tag).
+            let mut cancel_req = proto_sip::message::SipRequest::new(Method::Cancel, other_uri);
+            cancel_req.headers.set(HeaderName::CallId, other_call_id);
+            cancel_req.headers.set(HeaderName::CSeq, "1 CANCEL");
+            cancel_req.headers.set(HeaderName::From, &addrs.b_leg_from);
+            cancel_req.headers.set(HeaderName::To, &addrs.b_leg_to);
+            cancel_req.headers.set(HeaderName::MaxForwards, "70");
+            cancel_req.headers.add(Header::new(
+                HeaderName::Via,
+                format!(
+                    "SIP/2.0/UDP {};branch={}",
+                    addrs.local_addr, addrs.b_leg_branch
+                ),
+            ));
+            cancel_req.headers.set(HeaderName::ContentLength, "0");
+            cancel_req
         } else {
-            // SBC is the UAS on the A-leg: swap the A-leg dialog headers
-            // (our From = the To we answered with, our To = the caller's
-            // From). The SBC→A direction has its own CSeq space.
-            bye_request.headers.set(
-                HeaderName::From,
-                with_tag(&addrs.a_leg_to, addrs.dialog_to_tag.as_deref()),
-            );
-            bye_request.headers.set(HeaderName::To, &addrs.a_leg_from);
-            bye_request.headers.set(HeaderName::CSeq, "1 BYE");
-        }
-        bye_request.headers.set(HeaderName::MaxForwards, "70");
-        let branch = generate_branch();
-        bye_request.headers.add(Header::new(
-            HeaderName::Via,
-            format!("SIP/2.0/UDP {};branch={}", addrs.local_addr, branch),
-        ));
-        bye_request.headers.set(HeaderName::ContentLength, "0");
+            // Confirmed dialog: send BYE with dialog identity.
+            let mut bye_request = proto_sip::message::SipRequest::new(Method::Bye, other_uri);
+            bye_request.headers.set(HeaderName::CallId, other_call_id);
+            if is_from_a_leg {
+                // SBC is the UAC on the B-leg: From = our INVITE From, To = the
+                // callee with their tag; next CSeq after the INVITE (1).
+                bye_request.headers.set(HeaderName::From, &addrs.b_leg_from);
+                bye_request.headers.set(
+                    HeaderName::To,
+                    with_tag(&addrs.b_leg_to, addrs.dialog_to_tag.as_deref()),
+                );
+                bye_request.headers.set(HeaderName::CSeq, "2 BYE");
+            } else {
+                // SBC is the UAS on the A-leg: swap the A-leg dialog headers
+                // (our From = the To we answered with, our To = the caller's
+                // From). The SBC→A direction has its own CSeq space.
+                bye_request.headers.set(
+                    HeaderName::From,
+                    with_tag(&addrs.a_leg_to, addrs.dialog_to_tag.as_deref()),
+                );
+                bye_request.headers.set(HeaderName::To, &addrs.a_leg_from);
+                bye_request.headers.set(HeaderName::CSeq, "1 BYE");
+            }
+            bye_request.headers.set(HeaderName::MaxForwards, "70");
+            let branch = generate_branch();
+            bye_request.headers.add(Header::new(
+                HeaderName::Via,
+                format!("SIP/2.0/UDP {};branch={}", addrs.local_addr, branch),
+            ));
+            bye_request.headers.set(HeaderName::ContentLength, "0");
+            bye_request
+        };
 
         // Clean up call state
         {
@@ -2103,10 +2225,23 @@ impl SipStack {
             corr.b_leg.remove(&addrs.b_leg_sip_call_id);
             corr.addresses.remove(&internal_id);
         }
+        // Remove transaction entries for this call (H20).
+        {
+            let mut txns = self.transactions.write().await;
+            let server_key = TransactionKey::server(&addrs.a_leg_branch, "INVITE");
+            let client_key = TransactionKey::client(&addrs.b_leg_branch, "INVITE");
+            txns.server_invite.remove(&server_key);
+            txns.client_invite.remove(&client_key);
+        }
+        // Release allocated RTP ports (C12).
+        for port in &addrs.rtp_ports {
+            self.release_rtp_port(*port);
+        }
 
         info!(
             call_id = %sip_call_id,
             from_a_leg = is_from_a_leg,
+            early_dialog = use_cancel,
             "Call terminated via BYE"
         );
 
@@ -2116,7 +2251,7 @@ impl SipStack {
                 destination: source,
             },
             ProcessResult::Forward {
-                message: SipMessage::Request(bye_request),
+                message: SipMessage::Request(forward_request),
                 destination: other_dest,
             },
         ])
@@ -2141,10 +2276,25 @@ impl SipStack {
 
         debug!(call_id = %sip_call_id, "Processing CANCEL");
 
-        // Look up the call via A-leg Call-ID
-        let corr = self.call_correlation.read().await;
+        // Look up the call via A-leg Call-ID.  When messages are spawned
+        // as independent tasks, a CANCEL can arrive before the INVITE's
+        // correlation entry is stored.  If the Call-ID is currently
+        // in-flight (INVITE processing), wait for it to finish before
+        // giving up.
+        let mut corr = self.call_correlation.read().await;
+        if !corr.a_leg.contains_key(&sip_call_id)
+            && self.in_flight_invites.read().await.contains(&sip_call_id)
+        {
+            drop(corr);
+            for _ in 0..20 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                if !self.in_flight_invites.read().await.contains(&sip_call_id) {
+                    break;
+                }
+            }
+            corr = self.call_correlation.read().await;
+        }
         let Some(id) = corr.a_leg.get(&sip_call_id) else {
-            // Unknown call -- just respond 200 OK for the CANCEL
             let response = create_response_from_request(req, StatusCode::OK);
             return ProcessResult::Response {
                 message: SipMessage::Response(response),
@@ -2236,6 +2386,18 @@ impl SipStack {
             corr.a_leg.remove(&addrs.a_leg_sip_call_id);
             corr.b_leg.remove(&addrs.b_leg_sip_call_id);
             corr.addresses.remove(&internal_id);
+        }
+        // Remove transaction entries for this call (H20).
+        {
+            let mut txns = self.transactions.write().await;
+            let server_key = TransactionKey::server(&addrs.a_leg_branch, "INVITE");
+            let client_key = TransactionKey::client(&addrs.b_leg_branch, "INVITE");
+            txns.server_invite.remove(&server_key);
+            txns.client_invite.remove(&client_key);
+        }
+        // Release allocated RTP ports (C12).
+        for port in &addrs.rtp_ports {
+            self.release_rtp_port(*port);
         }
 
         info!(call_id = %sip_call_id, "Call cancelled");

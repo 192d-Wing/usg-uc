@@ -1,0 +1,17 @@
+[package]
+name = "sbc-http-util"
+description = "Small shared HTTP helpers for the USG SBC front-facing pods (sbc-api-server, sbc-provision-server): trusted-proxy-aware client-IP resolution."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+http.workspace = true
+ipnet.workspace = true

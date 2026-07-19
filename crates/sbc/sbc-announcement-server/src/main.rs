@@ -179,6 +179,16 @@ impl AnnouncementService for AnnouncementServiceImpl {
             .parse()
             .map_err(|e| Status::invalid_argument(format!("rtp_destination invalid: {e}")))?;
 
+        // Reject dangerous RTP destinations: loopback, link-local, and
+        // multicast addresses could be used to probe the pod's local
+        // network or amplify traffic. Shared with the daemon's ICE agent
+        // so the two guards stay in lockstep.
+        if sbc_announcement::is_disallowed_media_ip(destination.ip()) {
+            return Err(Status::invalid_argument(
+                "rtp_destination must not be a loopback, link-local, or multicast address",
+            ));
+        }
+
         let (socket, rtp_port) = self
             .bind_rtp()
             .await
@@ -291,6 +301,15 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // TODO(H21): Add gRPC authentication (mTLS or token-based) to the
+    // AnnouncementService. Currently any pod that can reach the gRPC port
+    // can trigger announcement playback, which could be abused for RTP
+    // amplification or toll fraud via crafted rtp_destination values.
+    warn!(
+        "AnnouncementService gRPC is unauthenticated — restrict access via \
+         NetworkPolicy until gRPC auth is implemented (H21)"
+    );
 
     info!(
         listen = %config.grpc_listen,

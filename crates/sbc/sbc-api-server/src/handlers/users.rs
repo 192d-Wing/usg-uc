@@ -105,8 +105,17 @@ pub async fn create(
 
 pub async fn get(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> impl IntoResponse {
     match state.users.get_user(&id).await {
-        Ok(user) => Json(serde_json::json!(user)),
-        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+        Ok(user) => Json(serde_json::json!(user)).into_response(),
+        Err(uc_user_mgmt::error::UserMgmtError::UserNotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "user not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 

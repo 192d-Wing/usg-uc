@@ -18,6 +18,8 @@ workspace = true
 
 [dependencies]
 sbc-config-store = { workspace = true }
+# Trusted-proxy-aware client-IP resolution (shared with sbc-api-server).
+sbc-http-util = { workspace = true }
 uc-phone-mgmt.workspace = true
 
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
@@ -33,4 +35,7 @@ tower-http = { workspace = true, features = ["trace"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror.workspace = true
-ipnet = "2"
+ipnet.workspace = true
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"

@@ -14,12 +14,14 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use hmac::{Hmac, Mac};
 use sbc_config_store::PostgresPhoneStore;
+use sha2::Sha256;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -34,6 +36,8 @@ struct AppState {
     phones: Arc<PostgresPhoneStore>,
     provisioning: Arc<ProvisioningServer>,
     start_time: std::time::Instant,
+    /// Shared secret for HMAC device auth. `None` = unauthenticated.
+    provision_secret: Option<Arc<String>>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -72,22 +76,42 @@ async fn main() -> ExitCode {
     ));
     info!(host = %cfg.provision_host, port = cfg.provision_port, "ProvisioningServer ready");
 
+    if cfg.provision_secret.is_none() {
+        warn!(
+            "SBC_PROVISION_SECRET not set — phone provisioning is unauthenticated; \
+               any host that can reach this endpoint can fetch phone configs"
+        );
+    }
+
     let state = AppState {
         phones,
         provisioning,
         start_time: std::time::Instant::now(),
+        provision_secret: cfg.provision_secret.map(Arc::new),
     };
 
     // Source-network restriction (defense in depth behind the Cilium
     // NetworkPolicy). Health/version probes come from the node, not the
     // phone subnet, so they bypass the check.
-    let allowed = Arc::new(cfg.allowed_cidrs.clone());
-    if allowed.is_empty() {
+    let restriction = SourceRestriction {
+        allowed: Arc::new(cfg.allowed_cidrs.clone()),
+        trusted_proxies: Arc::new(cfg.trusted_proxies.clone()),
+    };
+    if restriction.allowed.is_empty() {
         info!(
             "SBC_PROVISION_ALLOWED_CIDRS unset — app-layer source restriction disabled (NetworkPolicy only)"
         );
     } else {
-        info!(cidrs = ?allowed, "provisioning restricted to source networks");
+        info!(cidrs = ?restriction.allowed, "provisioning restricted to source networks");
+        if restriction.trusted_proxies.is_empty() {
+            warn!(
+                "SBC_TRUSTED_PROXIES unset — X-Real-IP is trusted unconditionally; a caller \
+                 reaching this pod directly (bypassing nginx) can forge an allowed source IP and \
+                 defeat the source-network check. Set it to the frontend nginx pod network."
+            );
+        } else {
+            info!(trusted_proxies = ?restriction.trusted_proxies, "X-Real-IP trusted only from these networks");
+        }
     }
 
     let app = Router::new()
@@ -102,7 +126,7 @@ async fn main() -> ExitCode {
         // to nginx's SPA fallback.
         .route("/TCS7000A.xml", get(serve_teo_global))
         .layer(axum::middleware::from_fn_with_state(
-            allowed,
+            restriction,
             restrict_source,
         ))
         .with_state(state)
@@ -136,9 +160,12 @@ async fn main() -> ExitCode {
         }
     };
 
-    if let Err(e) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
+    if let Err(e) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
     {
         error!(error = %e, "server error");
         return ExitCode::from(5);
@@ -147,17 +174,32 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Rejects provisioning requests whose originating client IP (from the
-/// `X-Forwarded-For` header set by nginx) is outside the allowed source
-/// networks. A no-op when no CIDRs are configured.
+/// Middleware state for [`restrict_source`]: the source allowlist plus
+/// the trusted-proxy networks used to decide when `X-Real-IP` is
+/// trustworthy.
+#[derive(Clone)]
+struct SourceRestriction {
+    allowed: Arc<Vec<ipnet::IpNet>>,
+    trusted_proxies: Arc<Vec<ipnet::IpNet>>,
+}
+
+/// Rejects provisioning requests whose originating client IP is outside
+/// the allowed source networks. A no-op when no CIDRs are configured.
+///
+/// The client IP comes from nginx's `X-Real-IP` header, but only when
+/// the request's TCP peer is a configured trusted proxy — otherwise a
+/// caller reaching this pod directly could forge an allowed source IP.
+/// When no trusted proxies are configured the header is trusted
+/// unconditionally (a startup warning is logged) and the check falls
+/// back to the direct peer only when the header is absent.
 ///
 /// ## NIST 800-53 Rev5: SC-7 (Boundary Protection)
 async fn restrict_source(
-    axum::extract::State(allowed): axum::extract::State<Arc<Vec<ipnet::IpNet>>>,
+    axum::extract::State(cfg): axum::extract::State<SourceRestriction>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if allowed.is_empty() {
+    if cfg.allowed.is_empty() {
         return next.run(req).await;
     }
     // Probes (kubelet) and version come from the node, not the phone
@@ -167,26 +209,29 @@ async fn restrict_source(
         return next.run(req).await;
     }
 
-    let client_ip = req
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        // Leftmost entry is the originating client as nginx saw it.
-        .and_then(|s| s.split(',').next())
-        .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
-        .or_else(|| {
-            req.extensions()
-                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-                .map(|ci| ci.0.ip())
-        });
+    // Fail closed if the connection has no peer info (should never happen
+    // with into_make_service_with_connect_info, but don't allowlist a
+    // request whose source we can't establish).
+    let Some(peer) = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip())
+    else {
+        warn!("provisioning request with no connection info; denying");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "source network not permitted"})),
+        )
+            .into_response();
+    };
 
-    let permitted = client_ip.is_some_and(|ip| allowed.iter().any(|net| net.contains(&ip)));
-    if permitted {
+    let client_ip = sbc_http_util::resolve_client_ip(req.headers(), peer, &cfg.trusted_proxies);
+    if cfg.allowed.iter().any(|net| net.contains(&client_ip)) {
         return next.run(req).await;
     }
 
     warn!(
-        ?client_ip,
+        %client_ip,
         "provisioning request from disallowed source network"
     );
     (
@@ -231,13 +276,25 @@ async fn serve_teo_global() -> impl IntoResponse {
         .unwrap_or_default()
 }
 
+/// Query parameters for provisioning requests.
+#[derive(Debug, serde::Deserialize)]
+struct ProvisionQuery {
+    /// HMAC-SHA256 token for device authentication.
+    #[serde(default)]
+    token: Option<String>,
+}
+
 /// Serve a per-MAC phone provisioning config.
 ///
 /// Logic is a faithful port of the daemon's old `serve_phone_config`
 /// (`api_server.rs` in commits up to 0852812): extract MAC from filename,
 /// normalize, look up phone by normalized MAC, render via vendor
 /// generator, return with the right Content-Type per extension.
-async fn serve_phone_config(State(state): State<AppState>, Path(path): Path<String>) -> Response {
+async fn serve_phone_config(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    Query(query): Query<ProvisionQuery>,
+) -> Response {
     // Filename forms across vendors:
     //   <mac>.cfg           Polycom VVX/Edge
     //   <mac>.xml           Cisco MPP/9800
@@ -247,6 +304,26 @@ async fn serve_phone_config(State(state): State<AppState>, Path(path): Path<Stri
     let stem = filename.split('.').next().unwrap_or(filename);
     let mac_token = stem.split('-').next().unwrap_or(stem);
     let mac_key = mac_token.replace([':', '-'], "").to_lowercase();
+
+    // Verify HMAC device token when a provision secret is configured.
+    if let Some(ref secret) = state.provision_secret {
+        let valid = query.token.as_deref().is_some_and(|token| {
+            let Ok(token_bytes) = hex::decode(token) else {
+                return false;
+            };
+            let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+                .expect("HMAC accepts any key length");
+            mac.update(mac_key.as_bytes());
+            mac.verify_slice(&token_bytes).is_ok()
+        });
+        if !valid {
+            warn!(mac = %mac_key, "provisioning request with invalid or missing device token");
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(axum::body::Body::from("invalid device token"))
+                .unwrap_or_default();
+        }
+    }
 
     let phone = match state.phones.get_by_mac(&mac_key).await {
         Ok(p) => p,
@@ -262,9 +339,7 @@ async fn serve_phone_config(State(state): State<AppState>, Path(path): Path<Stri
             warn!(mac = %mac_key, error = %e, "phone lookup failed");
             return Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(axum::body::Body::from(format!(
-                    "phone store lookup failed: {e}"
-                )))
+                .body(axum::body::Body::from("internal server error"))
                 .unwrap_or_default();
         }
     };
@@ -282,11 +357,12 @@ async fn serve_phone_config(State(state): State<AppState>, Path(path): Path<Stri
                 .body(axum::body::Body::from(config_text))
                 .unwrap_or_default()
         }
-        Err(e) => Response::builder()
-            .status(StatusCode::UNPROCESSABLE_ENTITY)
-            .body(axum::body::Body::from(format!(
-                "Cannot generate config: {e}"
-            )))
-            .unwrap_or_default(),
+        Err(e) => {
+            warn!(mac = %mac_key, error = %e, "config generation failed");
+            Response::builder()
+                .status(StatusCode::UNPROCESSABLE_ENTITY)
+                .body(axum::body::Body::from("internal server error"))
+                .unwrap_or_default()
+        }
     }
 }

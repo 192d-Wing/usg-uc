@@ -58,14 +58,19 @@ pub fn restore_passwords(body: &mut Value, existing: Option<&Value>) {
         if !is_marker {
             continue;
         }
-        let id = t.get("id").and_then(|v| v.as_str()).map(String::from);
-        let stored = existing
-            .and_then(|g| g.get("trunks"))
-            .and_then(|v| v.as_array())
-            .and_then(|trunks| {
-                trunks
-                    .iter()
-                    .find(|s| s.get("id").and_then(|v| v.as_str()).map(String::from) == id)
+        let id = t.get("id").and_then(|v| v.as_str());
+        // Only attempt password restoration when both the incoming and
+        // stored trunk have matching non-None ids.
+        let stored = id
+            .and_then(|trunk_id| {
+                existing
+                    .and_then(|g| g.get("trunks"))
+                    .and_then(|v| v.as_array())
+                    .and_then(|trunks| {
+                        trunks
+                            .iter()
+                            .find(|s| s.get("id").and_then(|v| v.as_str()) == Some(trunk_id))
+                    })
             })
             .and_then(|s| s.get("sip_password"))
             .cloned();

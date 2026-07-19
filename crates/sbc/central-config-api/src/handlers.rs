@@ -253,6 +253,24 @@ fn store_error(site: &str, op: &str, err: &CentralError) -> Response {
             Json(json!({ "error": "unknown_site", "site": s })),
         )
             .into_response(),
+        CentralError::NotFound => {
+            (StatusCode::NOT_FOUND, Json(json!({ "error": "not_found" }))).into_response()
+        }
+        CentralError::DidConflict { .. } => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "did_conflict", "detail": err.to_string() })),
+        )
+            .into_response(),
+        CentralError::Conflict(_) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "conflict", "detail": err.to_string() })),
+        )
+            .into_response(),
+        CentralError::Serialization(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "bad_payload", "detail": err.to_string() })),
+        )
+            .into_response(),
         other => {
             warn!(site, op, error = %other, "sync request failed");
             (
@@ -640,6 +658,10 @@ async fn upsert_trunk_group(
         Ok(c) => c,
         Err(e) => return bad_request(format!("invalid trunk group: {e}")),
     };
+    // Semantic validation: reject values the daemon would silently mishandle.
+    if let Err(msg) = validate_trunk_group_fields(&cfg) {
+        return bad_request(msg);
+    }
     match state
         .store
         .upsert_json(ConfigTable::TrunkGroups, &site, &cfg.id, &body, &actor)
@@ -690,6 +712,10 @@ async fn upsert_dial_plan(
         Ok(c) => c,
         Err(e) => return bad_request(format!("invalid dial plan: {e}")),
     };
+    // Semantic validation: reject values the daemon would silently mishandle.
+    if let Err(msg) = validate_dial_plan_fields(&cfg) {
+        return bad_request(msg);
+    }
     match state
         .store
         .upsert_json(ConfigTable::DialPlans, &site, &cfg.id, &body, &actor)
@@ -720,6 +746,85 @@ async fn delete_dial_plan(
         Ok(epoch) => ok_epoch(epoch),
         Err(e) => write_error(&e),
     }
+}
+
+/// Returns `true` if `s` contains any ASCII control character
+/// (0x00-0x1F or 0x7F), including CR and LF.
+fn has_ascii_control(s: &str) -> bool {
+    s.bytes().any(|b| b.is_ascii_control())
+}
+
+/// Valid trunk group selection strategies (mirrors sbc-config/src/validate.rs).
+const VALID_STRATEGIES: &[&str] = &[
+    "priority",
+    "round_robin",
+    "weighted_random",
+    "least_connections",
+    "best_success_rate",
+];
+
+/// Valid trunk transport protocols.
+const VALID_TRUNK_PROTOCOLS: &[&str] = &["udp", "tcp", "tls"];
+
+/// Semantic validation for a trunk group beyond serde schema conformance.
+fn validate_trunk_group_fields(cfg: &sbc_config::schema::TrunkGroupConfig) -> Result<(), String> {
+    if !VALID_STRATEGIES.contains(&cfg.strategy.as_str()) {
+        return Err(format!(
+            "strategy '{}' is not recognized (expected one of: {})",
+            cfg.strategy,
+            VALID_STRATEGIES.join(", ")
+        ));
+    }
+    for trunk in &cfg.trunks {
+        if !VALID_TRUNK_PROTOCOLS.contains(&trunk.protocol.as_str()) {
+            return Err(format!(
+                "trunk '{}': protocol '{}' is not recognized (expected one of: {})",
+                trunk.id,
+                trunk.protocol,
+                VALID_TRUNK_PROTOCOLS.join(", ")
+            ));
+        }
+        if has_ascii_control(&trunk.host) {
+            return Err(format!(
+                "trunk '{}': host contains control characters",
+                trunk.id
+            ));
+        }
+    }
+    if has_ascii_control(&cfg.id) || has_ascii_control(&cfg.name) {
+        return Err("id or name contains control characters".to_string());
+    }
+    Ok(())
+}
+
+/// Valid dial plan directions.
+const VALID_DIRECTIONS: &[&str] = &["inbound", "outbound", "both"];
+
+/// Semantic validation for a dial plan beyond serde schema conformance.
+fn validate_dial_plan_fields(cfg: &sbc_config::schema::DialPlanConfig) -> Result<(), String> {
+    if has_ascii_control(&cfg.id) || has_ascii_control(&cfg.name) {
+        return Err("id or name contains control characters".to_string());
+    }
+    for entry in &cfg.entries {
+        if !VALID_DIRECTIONS.contains(&entry.direction.as_str()) {
+            return Err(format!(
+                "entry direction '{}' is not recognized (expected one of: {})",
+                entry.direction,
+                VALID_DIRECTIONS.join(", ")
+            ));
+        }
+        if has_ascii_control(&entry.pattern_value) {
+            return Err("dial plan entry pattern_value contains control characters".to_string());
+        }
+        if let Some(ref dest) = entry.static_destination
+            && has_ascii_control(dest)
+        {
+            return Err(
+                "dial plan entry static_destination contains control characters".to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Map a `{kind}` routing path segment to its config table.

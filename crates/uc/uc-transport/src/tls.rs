@@ -531,6 +531,52 @@ impl TlsListener {
         Ok((transport, peer_addr.into()))
     }
 
+    /// Accepts the next incoming TCP connection without performing the TLS
+    /// handshake.
+    ///
+    /// Use [`complete_handshake`](Self::complete_handshake) on the returned
+    /// stream to finish the TLS negotiation. Splitting accept from handshake
+    /// lets callers spawn the handshake in a separate task so one slow client
+    /// cannot stall the accept loop.
+    ///
+    /// ## Errors
+    ///
+    /// Returns an error if the TCP accept fails or the listener is closed.
+    pub async fn accept_tcp(&self) -> TransportResult<(TcpStream, SbcSocketAddr)> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TransportError::AlreadyClosed);
+        }
+
+        let (tcp_stream, peer_addr) =
+            self.listener
+                .accept()
+                .await
+                .map_err(|e| TransportError::ReceiveFailed {
+                    reason: format!("accept failed: {e}"),
+                })?;
+
+        debug!(peer = %peer_addr, "accepted TCP connection for TLS (handshake deferred)");
+        Ok((tcp_stream, peer_addr.into()))
+    }
+
+    /// Completes the TLS handshake on an already-accepted TCP stream.
+    ///
+    /// Intended to run inside a spawned task with a timeout so that one
+    /// slow handshake does not block the accept loop.
+    ///
+    /// ## Errors
+    ///
+    /// Returns an error if the TLS handshake fails.
+    pub async fn complete_handshake(&self, tcp_stream: TcpStream) -> TransportResult<TlsTransport> {
+        let tls_stream = self.acceptor.accept(tcp_stream).await.map_err(|e| {
+            TransportError::TlsHandshakeFailed {
+                reason: e.to_string(),
+            }
+        })?;
+
+        TlsTransport::from_stream(TlsStream::Server(tls_stream))
+    }
+
     /// Returns the local address.
     #[must_use]
     pub const fn local_addr(&self) -> &SbcSocketAddr {

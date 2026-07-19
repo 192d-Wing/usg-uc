@@ -44,6 +44,14 @@ pub async fn create_partition(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    if !body.is_object() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({"success": false, "error": "request body must be a JSON object"}),
+            ),
+        );
+    }
     let name = body
         .get("name")
         .and_then(|v| v.as_str())
@@ -110,6 +118,11 @@ pub async fn delete_partition(
         && !matches!(e, sbc_config_store::ConfigStoreError::NotFound)
     {
         warn!(id, error = %e, "delete partition failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "failed to persist changes"})),
+        )
+            .into_response();
     }
     let mut client = state.sbc_sync.clone();
     if let Err(e) = client
@@ -120,7 +133,7 @@ pub async fn delete_partition(
     {
         warn!(id, error = %e, "SbcSyncService.RemovePartition failed");
     }
-    Json(serde_json::json!({"success": true, "id": id}))
+    Json(serde_json::json!({"success": true, "id": id})).into_response()
 }
 
 async fn notify_sync_partition(state: &Arc<AppState>, id: &str) {
@@ -154,6 +167,14 @@ pub async fn create_css(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    if !body.is_object() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({"success": false, "error": "request body must be a JSON object"}),
+            ),
+        );
+    }
     let id = match body.get("id").and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => {
@@ -163,6 +184,14 @@ pub async fn create_css(
             );
         }
     };
+    if let Some(p) = body.get("partitions")
+        && !p.is_array()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"success": false, "error": "partitions must be an array"})),
+        );
+    }
     if let Err(e) = state.css.upsert(&id, &body).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -206,6 +235,11 @@ pub async fn delete_css(
         && !matches!(e, sbc_config_store::ConfigStoreError::NotFound)
     {
         warn!(id, error = %e, "delete css failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "failed to persist changes"})),
+        )
+            .into_response();
     }
     let mut client = state.sbc_sync.clone();
     if let Err(e) = client
@@ -214,7 +248,7 @@ pub async fn delete_css(
     {
         warn!(id, error = %e, "SbcSyncService.RemoveCallingSearchSpace failed");
     }
-    Json(serde_json::json!({"success": true, "id": id}))
+    Json(serde_json::json!({"success": true, "id": id})).into_response()
 }
 
 async fn notify_sync_css(state: &Arc<AppState>, id: &str) {
@@ -245,6 +279,14 @@ pub async fn create_route_pattern(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    if !body.is_object() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({"success": false, "error": "request body must be a JSON object"}),
+            ),
+        );
+    }
     let id = match body.get("id").and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => {
@@ -254,6 +296,18 @@ pub async fn create_route_pattern(
             );
         }
     };
+    if body
+        .get("pattern")
+        .and_then(|v| v.as_str())
+        .is_none_or(|s| s.is_empty())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({"success": false, "error": "pattern is required and must be a non-empty string"}),
+            ),
+        );
+    }
     if let Err(e) = state.route_patterns.upsert(&id, &body).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -297,6 +351,11 @@ pub async fn delete_route_pattern(
         && !matches!(e, sbc_config_store::ConfigStoreError::NotFound)
     {
         warn!(id, error = %e, "delete route_pattern failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "failed to persist changes"})),
+        )
+            .into_response();
     }
     let mut client = state.sbc_sync.clone();
     if let Err(e) = client
@@ -307,7 +366,7 @@ pub async fn delete_route_pattern(
     {
         warn!(id, error = %e, "SbcSyncService.RemoveRoutePattern failed");
     }
-    Json(serde_json::json!({"success": true, "id": id}))
+    Json(serde_json::json!({"success": true, "id": id})).into_response()
 }
 
 async fn notify_sync_route_pattern(state: &Arc<AppState>, id: &str) {
@@ -338,6 +397,14 @@ pub async fn create_route_list(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    if !body.is_object() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({"success": false, "error": "request body must be a JSON object"}),
+            ),
+        );
+    }
     let id = match body.get("id").and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => {
@@ -390,6 +457,11 @@ pub async fn delete_route_list(
         && !matches!(e, sbc_config_store::ConfigStoreError::NotFound)
     {
         warn!(id, error = %e, "delete route_list failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "failed to persist changes"})),
+        )
+            .into_response();
     }
     let mut client = state.sbc_sync.clone();
     if let Err(e) = client
@@ -400,7 +472,7 @@ pub async fn delete_route_list(
     {
         warn!(id, error = %e, "SbcSyncService.RemoveRouteList failed");
     }
-    Json(serde_json::json!({"success": true, "id": id}))
+    Json(serde_json::json!({"success": true, "id": id})).into_response()
 }
 
 async fn notify_sync_route_list(state: &Arc<AppState>, id: &str) {

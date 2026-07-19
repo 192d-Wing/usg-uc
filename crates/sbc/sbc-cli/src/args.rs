@@ -165,6 +165,28 @@ impl Args {
             };
         }
 
+        // Scan remaining args for global flags that appeared after the
+        // subcommand (e.g. `sbc-cli status --json`).  Without this second
+        // pass, trailing flags like --json / --verbose / --api-url were
+        // silently ignored.
+        for arg in iter {
+            match arg.as_str() {
+                "-h" | "--help" => args.help = true,
+                "-V" | "--version" => args.version = true,
+                "-v" | "--verbose" => args.verbose = args.verbose.saturating_add(1),
+                "--json" => args.format = OutputFormat::Json,
+                "--table" => args.format = OutputFormat::Table,
+                // --api-url and --grpc-url require a value; we cannot
+                // easily peek ahead in a for-loop, so these are
+                // intentionally handled only in the leading-flags pass.
+                // Users who place them after the subcommand will see an
+                // "unknown argument" warning.
+                other => {
+                    eprintln!("Warning: unrecognized trailing argument: {other}");
+                }
+            }
+        }
+
         args
     }
 

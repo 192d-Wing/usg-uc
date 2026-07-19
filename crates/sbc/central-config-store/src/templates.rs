@@ -202,15 +202,21 @@ impl CentralConfigStore {
         let table = kind.target_table();
         let mut tx = self.pool().begin().await?;
         let epoch = bump_epoch(&mut tx, site_code).await?;
+        // The WHERE on the UPDATE arm ensures that if an operator override
+        // was written between the row_origin check above and this INSERT,
+        // the UPDATE is a no-op (the override's updated_by != TEMPLATE_ORIGIN,
+        // so the condition fails and the row is left untouched).
         let sql = format!(
             "INSERT INTO {} (site_code, id, data, revision, deleted, updated_by)
              VALUES ($1, $2, $3, $4, FALSE, $5)
              ON CONFLICT (site_code, id) DO UPDATE SET
                  data = EXCLUDED.data, revision = EXCLUDED.revision,
-                 deleted = FALSE, updated_by = EXCLUDED.updated_by, updated_at = NOW()",
+                 deleted = FALSE, updated_by = EXCLUDED.updated_by, updated_at = NOW()
+             WHERE {}.updated_by = $5",
+            table.name(),
             table.name()
         );
-        sqlx::query(&sql)
+        let result = sqlx::query(&sql)
             .bind(site_code)
             .bind(template_id)
             .bind(data)
@@ -218,6 +224,9 @@ impl CentralConfigStore {
             .bind(TEMPLATE_ORIGIN)
             .execute(&mut *tx)
             .await?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
         journal(
             &mut tx,
             site_code,
@@ -248,18 +257,25 @@ impl CentralConfigStore {
         let table = kind.target_table();
         let mut tx = self.pool().begin().await?;
         let epoch = bump_epoch(&mut tx, site_code).await?;
+        // Guard against TOCTOU: only tombstone if the row is still
+        // template-origin. An override written between the row_origin
+        // check and this UPDATE will have a different updated_by, so the
+        // WHERE clause makes this a no-op instead of clobbering it.
         let sql = format!(
             "UPDATE {} SET deleted = TRUE, revision = $1, updated_by = $2, updated_at = NOW()
-             WHERE site_code = $3 AND id = $4 AND NOT deleted",
+             WHERE site_code = $3 AND id = $4 AND NOT deleted AND updated_by = $2",
             table.name()
         );
-        sqlx::query(&sql)
+        let result = sqlx::query(&sql)
             .bind(epoch)
             .bind(TEMPLATE_ORIGIN)
             .bind(site_code)
             .bind(template_id)
             .execute(&mut *tx)
             .await?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
         journal(
             &mut tx,
             site_code,

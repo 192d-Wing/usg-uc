@@ -102,11 +102,26 @@ pub async fn start_remote_announcement(
         match stream.message().await {
             Ok(Some(PlayAnnouncementEvent {
                 event: Some(Event::Bound(bound)),
-            })) => Ok(RemoteAnnouncement {
-                advertised_ip: bound.advertised_ip,
-                rtp_port: bound.rtp_port as u16,
-                stream,
-            }),
+            })) => {
+                if bound.advertised_ip.parse::<std::net::IpAddr>().is_err() {
+                    return Err(format!(
+                        "announcement pod returned invalid advertised_ip: {:?}",
+                        bound.advertised_ip
+                    ));
+                }
+                if bound.rtp_port > u32::from(u16::MAX) {
+                    return Err(format!(
+                        "announcement pod returned out-of-range rtp_port: {}",
+                        bound.rtp_port
+                    ));
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                Ok(RemoteAnnouncement {
+                    advertised_ip: bound.advertised_ip,
+                    rtp_port: bound.rtp_port as u16,
+                    stream,
+                })
+            }
             Ok(other) => Err(format!("expected Bound event, got {other:?}")),
             Err(e) => Err(format!("announcement stream error: {e}")),
         }

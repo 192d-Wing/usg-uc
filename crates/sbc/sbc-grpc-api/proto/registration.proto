@@ -94,6 +94,9 @@ message ContactInfo {
 // Request to list registrations.
 message ListRegistrationsRequest {
     // Maximum number of registrations to return.
+    // Server MUST clamp this value to a sane range (e.g. 1..1000) to prevent
+    // a single request from dumping unbounded data. A value of 0 should be
+    // treated as the server default (e.g. 100).
     int32 limit = 1;
 
     // Offset for pagination.

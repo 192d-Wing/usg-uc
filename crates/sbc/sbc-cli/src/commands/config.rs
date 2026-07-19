@@ -22,6 +22,9 @@ pub fn run(args: &Args, cmd: ConfigCommand) -> CommandResult {
 
 /// Shows current configuration.
 fn show_config(args: &Args) {
+    eprintln!("WARNING: show_config is not yet implemented (stub)");
+    eprintln!("Displaying compiled-in defaults, NOT the running daemon configuration");
+
     let formatter = OutputFormatter::new(args.format);
 
     // In production, would fetch from API
@@ -129,6 +132,9 @@ fn validate_config(args: &Args, path: Option<String>) -> CommandResult {
 
 /// Reloads configuration.
 fn reload_config(args: &Args) {
+    eprintln!("WARNING: reload_config is not yet implemented (stub)");
+    eprintln!("Configuration was NOT reloaded — gRPC/API integration pending");
+
     let formatter = OutputFormatter::new(args.format);
 
     // In production, would send reload signal to daemon via API

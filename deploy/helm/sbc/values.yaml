@@ -148,10 +148,10 @@ sbcPostgres:
     pullPolicy: IfNotPresent
   database: sbc
   username: sbc
-  # Dev default; override with --set sbcPostgres.password=... or use a
-  # values file in CI. NOT a real password in production — set
-  # `enabled: false` + `existingSecret` for prod.
-  password: sbc-dev-only
+  # REQUIRED: set a strong password for production deployments.
+  # Override with --set sbcPostgres.password=... or use a values file.
+  # For production, prefer `enabled: false` + `existingSecret` instead.
+  password: ""
   # Set to "require" or "verify-full" for production deployments.
   sslmode: disable
   persistence:

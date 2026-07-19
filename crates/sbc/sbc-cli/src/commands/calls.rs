@@ -117,6 +117,9 @@ fn terminate_call(args: &Args, call_id: &str) -> CommandResult {
         return Err(CommandError::new("Call ID required"));
     }
 
+    eprintln!("WARNING: call termination is not yet implemented (stub)");
+    eprintln!("Call {call_id} was NOT terminated — gRPC integration pending");
+
     println!("Terminating call: {call_id}");
 
     // In production, would send BYE via API

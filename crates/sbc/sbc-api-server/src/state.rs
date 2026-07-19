@@ -84,6 +84,9 @@ pub struct AppState {
     /// endpoints sbc-api doesn't own.
     pub http_client: reqwest::Client,
     pub daemon_http_base: String,
+    /// Bearer token for authenticating proxied requests to the daemon's
+    /// `/api/v1` routes.  Read from `SBC_API_TOKEN` at startup.
+    pub daemon_api_token: Option<String>,
 
     /// Process start instant, for /system/version uptime reporting.
     pub start_time: std::time::Instant,
@@ -96,6 +99,18 @@ pub struct AppState {
     /// middleware also accepts `config-admin` bearer tokens, so the
     /// dashboard authenticates once for both the central and per-site APIs.
     pub oidc: Option<Arc<proto_jwt::Validator>>,
+
+    /// In-memory rate limiter for login attempts, keyed by client IP.
+    /// Maps to (attempt_count, window_start).
+    pub login_rate_limiter: Arc<
+        std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
+    >,
+
+    /// Networks from which the `X-Real-IP` header is trusted (the nginx
+    /// pod range). Used to resolve the real client IP for the login rate
+    /// limiter without letting a direct caller spoof it. Empty = trust
+    /// the header unconditionally.
+    pub trusted_proxies: Arc<Vec<ipnet::IpNet>>,
 }
 
 impl AppState {
@@ -180,6 +195,16 @@ impl AppState {
         );
         info!("management-plane authentication enabled");
 
+        if cfg.trusted_proxies.is_empty() {
+            tracing::warn!(
+                "SBC_TRUSTED_PROXIES unset — X-Real-IP is trusted unconditionally; a caller \
+                 reaching this pod directly (bypassing nginx) can forge its source IP and evade \
+                 the login rate limiter. Set it to the frontend nginx pod network."
+            );
+        } else {
+            info!(trusted_proxies = ?cfg.trusted_proxies, "X-Real-IP trusted only from these networks");
+        }
+
         // Optional operator OIDC: accept the same config-admin tokens the
         // central config API takes, so the dashboard signs in once.
         let oidc = match (&cfg.oidc_issuer, &cfg.oidc_audience) {
@@ -246,9 +271,14 @@ impl AppState {
             sbc_sync,
             http_client,
             daemon_http_base: cfg.daemon_http_url.trim_end_matches('/').to_string(),
+            daemon_api_token: std::env::var("SBC_API_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty()),
             start_time: std::time::Instant::now(),
             auth,
             oidc,
+            login_rate_limiter: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            trusted_proxies: Arc::new(cfg.trusted_proxies.clone()),
         }))
     }
 }

@@ -223,6 +223,7 @@ impl TrunkRegistrar {
         buf: &mut [u8],
         target: std::net::SocketAddr,
         call_id: &str,
+        cseq_method: &str,
     ) -> Result<usize, String> {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -238,8 +239,28 @@ impl TrunkRegistrar {
                 trace!(source = %from, "Ignoring datagram from unexpected source");
                 continue;
             }
-            if !String::from_utf8_lossy(&buf[..n]).contains(call_id) {
+            let text = String::from_utf8_lossy(&buf[..n]);
+            // Must be a SIP response (not a request).
+            if !text.starts_with("SIP/2.0") {
+                trace!("Ignoring non-SIP-response datagram");
+                continue;
+            }
+            // Must carry our Call-ID.
+            if !text.contains(call_id) {
                 trace!("Ignoring SIP message with foreign Call-ID");
+                continue;
+            }
+            // CSeq method must match the request method.
+            let cseq_ok = text.lines().any(|line| {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("CSeq:") {
+                    rest.trim().ends_with(cseq_method)
+                } else {
+                    false
+                }
+            });
+            if !cseq_ok {
+                trace!("Ignoring SIP response with non-matching CSeq method");
                 continue;
             }
             return Ok(n);
@@ -351,7 +372,7 @@ impl TrunkRegistrar {
         // socket shares port 5060 with the SIP listener, so the first
         // datagram is not necessarily our response.
         let mut buf = [0u8; 4096];
-        let n = Self::recv_matching(&socket, &mut buf, target, &call_id).await?;
+        let n = Self::recv_matching(&socket, &mut buf, target, &call_id, "REGISTER").await?;
 
         trace!(
             trunk_id = %config.trunk_id,
@@ -447,8 +468,8 @@ impl TrunkRegistrar {
                 .await
                 .map_err(|e| format!("Send auth REGISTER failed: {e}"))?;
 
-            // Receive final response (matched by source + Call-ID)
-            let n2 = Self::recv_matching(&socket, &mut buf, target, &call_id).await?;
+            // Receive final response (matched by source + Call-ID + CSeq)
+            let n2 = Self::recv_matching(&socket, &mut buf, target, &call_id, "REGISTER").await?;
 
             trace!(
                 trunk_id = %config.trunk_id,

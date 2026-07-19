@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "central-config-api"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "aws-lc-rs",
  "axum",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "central-config-import"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "central-config-store",
  "sbc-config-store",
@@ -834,7 +834,7 @@ dependencies = [
 
 [[package]]
 name = "central-config-store"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "serde",
@@ -1007,7 +1007,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "client-audio"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "client-types",
@@ -1027,7 +1027,7 @@ dependencies = [
 
 [[package]]
 name = "client-core"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1061,7 +1061,7 @@ dependencies = [
 
 [[package]]
 name = "client-ffi"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "client-audio",
@@ -1098,7 +1098,7 @@ dependencies = [
 
 [[package]]
 name = "client-integration-tests"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "client-audio",
  "client-core",
@@ -1115,7 +1115,7 @@ dependencies = [
 
 [[package]]
 name = "client-provisioning"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -1133,7 +1133,7 @@ dependencies = [
 
 [[package]]
 name = "client-sip-ua"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -1161,7 +1161,7 @@ dependencies = [
 
 [[package]]
 name = "client-types"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "serde",
@@ -5246,14 +5246,14 @@ dependencies = [
 
 [[package]]
 name = "proto-b2bua"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "proto-dialog"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "proto-sip",
  "thiserror 2.0.18",
@@ -5261,7 +5261,7 @@ dependencies = [
 
 [[package]]
 name = "proto-dtls"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5274,7 +5274,7 @@ dependencies = [
 
 [[package]]
 name = "proto-ice"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "proto-stun",
@@ -5288,7 +5288,7 @@ dependencies = [
 
 [[package]]
 name = "proto-jwt"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -5303,7 +5303,7 @@ dependencies = [
 
 [[package]]
 name = "proto-registrar"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -5319,7 +5319,7 @@ dependencies = [
 
 [[package]]
 name = "proto-rtp"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "thiserror 2.0.18",
@@ -5329,7 +5329,7 @@ dependencies = [
 
 [[package]]
 name = "proto-sdp"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
@@ -5340,7 +5340,7 @@ dependencies = [
 
 [[package]]
 name = "proto-sip"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "getrandom 0.4.2",
@@ -5350,7 +5350,7 @@ dependencies = [
 
 [[package]]
 name = "proto-srtp"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "proto-rtp",
@@ -5362,14 +5362,14 @@ dependencies = [
 
 [[package]]
 name = "proto-stir-shaken"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "uc-types",
 ]
 
 [[package]]
 name = "proto-stun"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "thiserror 2.0.18",
@@ -5381,7 +5381,7 @@ dependencies = [
 
 [[package]]
 name = "proto-transaction"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "proto-sip",
  "thiserror 2.0.18",
@@ -5389,7 +5389,7 @@ dependencies = [
 
 [[package]]
 name = "proto-turn"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "proto-stun",
@@ -5996,7 +5996,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-announcement"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "include_dir",
@@ -6008,7 +6008,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-announcement-server"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "rand 0.8.6",
  "sbc-announcement",
@@ -6022,14 +6022,16 @@ dependencies = [
 
 [[package]]
 name = "sbc-api-server"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "axum",
  "hyper",
+ "ipnet",
  "proto-jwt",
  "reqwest 0.12.28",
  "sbc-config-store",
  "sbc-grpc-api",
+ "sbc-http-util",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -6047,10 +6049,11 @@ dependencies = [
 
 [[package]]
 name = "sbc-cli"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "sbc-config",
  "sbc-grpc-api",
+ "serde_json",
  "tokio",
  "tonic",
  "uc-health",
@@ -6060,7 +6063,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-client-config-server"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "aws-lc-rs",
  "axum",
@@ -6081,7 +6084,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-config"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "nix 0.31.3",
  "serde",
@@ -6103,7 +6106,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-config-store"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -6117,7 +6120,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-config-sync"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "axum",
  "central-config-store",
@@ -6138,7 +6141,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-daemon"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "axum",
  "bytes",
@@ -6200,7 +6203,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-grpc-api"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -6211,8 +6214,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sbc-http-util"
+version = "0.9.0"
+dependencies = [
+ "http",
+ "ipnet",
+]
+
+[[package]]
 name = "sbc-integration-tests"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -6236,13 +6247,17 @@ dependencies = [
 
 [[package]]
 name = "sbc-provision-server"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "axum",
+ "hex",
+ "hmac",
  "ipnet",
  "sbc-config-store",
+ "sbc-http-util",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tower",
@@ -6254,7 +6269,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-trunk-agent"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "sbc-config-store",
  "sbc-grpc-api",
@@ -6269,7 +6284,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-trunk-services"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "proto-sip",
@@ -8244,7 +8259,7 @@ checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
 
 [[package]]
 name = "uc-aaa"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "diameter",
@@ -8259,21 +8274,21 @@ dependencies = [
 
 [[package]]
 name = "uc-acl"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "uc-types",
 ]
 
 [[package]]
 name = "uc-api"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "uc-types",
 ]
 
 [[package]]
 name = "uc-audit"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "serde",
@@ -8286,7 +8301,7 @@ dependencies = [
 
 [[package]]
 name = "uc-auth"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "argon2",
  "axum",
@@ -8304,14 +8319,14 @@ dependencies = [
 
 [[package]]
 name = "uc-cdr"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "uc-types",
 ]
 
 [[package]]
 name = "uc-cluster"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -8326,7 +8341,7 @@ dependencies = [
 
 [[package]]
 name = "uc-codecs"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "audiopus",
  "bytes",
@@ -8336,7 +8351,7 @@ dependencies = [
 
 [[package]]
 name = "uc-crypto"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "aws-lc-rs",
  "thiserror 2.0.18",
@@ -8346,7 +8361,7 @@ dependencies = [
 
 [[package]]
 name = "uc-discovery"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "k8s-openapi",
@@ -8375,21 +8390,21 @@ dependencies = [
 
 [[package]]
 name = "uc-dos-protection"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "uc-types",
 ]
 
 [[package]]
 name = "uc-health"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "uc-types",
 ]
 
 [[package]]
 name = "uc-media-engine"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "proto-rtp",
@@ -8403,14 +8418,14 @@ dependencies = [
 
 [[package]]
 name = "uc-metrics"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "uc-types",
 ]
 
 [[package]]
 name = "uc-phone-mgmt"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8421,7 +8436,7 @@ dependencies = [
 
 [[package]]
 name = "uc-policy"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "tracing",
  "uc-types",
@@ -8429,7 +8444,7 @@ dependencies = [
 
 [[package]]
 name = "uc-routing"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "regex",
  "serde",
@@ -8438,7 +8453,7 @@ dependencies = [
 
 [[package]]
 name = "uc-siprec"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "proto-sdp",
  "proto-sip",
@@ -8449,7 +8464,7 @@ dependencies = [
 
 [[package]]
 name = "uc-snmp"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "serde",
@@ -8460,7 +8475,7 @@ dependencies = [
 
 [[package]]
 name = "uc-state-sync"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -8476,7 +8491,7 @@ dependencies = [
 
 [[package]]
 name = "uc-storage"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bb8",
  "bb8-redis",
@@ -8494,7 +8509,7 @@ dependencies = [
 
 [[package]]
 name = "uc-syslog"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "serde",
@@ -8518,7 +8533,7 @@ dependencies = [
 
 [[package]]
 name = "uc-telemetry"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "axum",
  "opentelemetry",
@@ -8535,7 +8550,7 @@ dependencies = [
 
 [[package]]
 name = "uc-transport"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -8558,7 +8573,7 @@ dependencies = [
 
 [[package]]
 name = "uc-types"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -8566,7 +8581,7 @@ dependencies = [
 
 [[package]]
 name = "uc-user-mgmt"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -8585,7 +8600,7 @@ dependencies = [
 
 [[package]]
 name = "uc-vps"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "serde",
@@ -8598,7 +8613,7 @@ dependencies = [
 
 [[package]]
 name = "uc-webrtc"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "proto-dtls",
