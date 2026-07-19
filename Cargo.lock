@@ -8430,6 +8430,7 @@ dependencies = [
 name = "uc-routing"
 version = "0.1.0"
 dependencies = [
+ "regex",
  "serde",
  "uc-types",
 ]

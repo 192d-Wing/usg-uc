@@ -152,6 +152,8 @@ sbcPostgres:
   # values file in CI. NOT a real password in production — set
   # `enabled: false` + `existingSecret` for prod.
   password: sbc-dev-only
+  # Set to "require" or "verify-full" for production deployments.
+  sslmode: disable
   persistence:
     size: 2Gi
     storageClass: ""            # cluster default

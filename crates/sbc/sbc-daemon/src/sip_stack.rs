@@ -104,6 +104,8 @@ pub struct SipStack {
     registrations_total: AtomicU64,
     /// Draining: reject new INVITEs (503) while existing calls finish.
     draining: std::sync::atomic::AtomicBool,
+    /// RTP port allocator: hands out even-numbered ports in a range.
+    next_rtp_port: std::sync::atomic::AtomicU16,
 }
 
 /// SIP stack configuration.
@@ -355,6 +357,7 @@ impl SipStack {
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
             draining: std::sync::atomic::AtomicBool::new(false),
+            next_rtp_port: std::sync::atomic::AtomicU16::new(20_000),
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
@@ -405,6 +408,7 @@ impl SipStack {
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
             draining: std::sync::atomic::AtomicBool::new(false),
+            next_rtp_port: std::sync::atomic::AtomicU16::new(20_000),
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
@@ -413,6 +417,21 @@ impl SipStack {
                 tokio::sync::RwLock::new(std::collections::HashSet::new()),
             ),
             vps: None,
+        }
+    }
+
+    /// Allocates the next even-numbered RTP port, wrapping at 40000 → 20000.
+    fn allocate_rtp_port(&self) -> u16 {
+        loop {
+            let current = self.next_rtp_port.load(Ordering::Relaxed);
+            let next = if current >= 40_000 { 20_000 } else { current + 2 };
+            if self
+                .next_rtp_port
+                .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return current;
+            }
         }
     }
 
@@ -1762,8 +1781,7 @@ impl SipStack {
         // 6. Rewrite SDP for B-leg (replace A-leg's address with SBC's)
         let b_leg_sdp = req.body.as_ref().map(|body| {
             let sdp_str = String::from_utf8_lossy(body);
-            // For now, use a placeholder port -- Phase 4 will allocate real RTP ports
-            let local_media = MediaAddress::new(&local_ip, 20_000);
+            let local_media = MediaAddress::new(&local_ip, self.allocate_rtp_port());
             let result = self
                 .sdp_rewriter
                 .rewrite_offer_for_b_leg(&sdp_str, &local_media);
@@ -2957,9 +2975,9 @@ fn create_response_from_request(
 ) -> proto_sip::message::SipResponse {
     let mut response = proto_sip::message::SipResponse::new(status);
 
-    // Copy Via headers
-    if let Some(via) = req.headers.get_value(&HeaderName::Via) {
-        response.add_header(Header::new(HeaderName::Via, via));
+    // Copy all Via headers (RFC 3261 requires every Via from the request)
+    for via in req.headers.get_all(&HeaderName::Via) {
+        response.add_header(Header::new(HeaderName::Via, &via.value));
     }
 
     // Copy From header
@@ -3109,9 +3127,10 @@ fn resolve_sip_uri_to_addr(uri: &str) -> Option<SbcSocketAddr> {
         return Some(SbcSocketAddr::new_v6(ipv6, port));
     }
 
-    // For hostnames, try DNS resolution (synchronous for now)
+    // For hostnames, resolve via DNS off the async executor.
     let addr_str = format!("{host}:{port}");
-    if let Ok(mut addrs) = addr_str.to_socket_addrs()
+    let resolved = tokio::task::block_in_place(|| addr_str.to_socket_addrs());
+    if let Ok(mut addrs) = resolved
         && let Some(addr) = addrs.next()
     {
         return Some(SbcSocketAddr::from(addr));

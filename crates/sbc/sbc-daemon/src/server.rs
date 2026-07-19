@@ -42,6 +42,7 @@ struct StreamLoopContext {
     global_limiter: Arc<Mutex<RateLimiter>>,
     rate_limit_enabled: bool,
     zone_name: Option<String>,
+    conn_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 /// SBC server state.
@@ -643,6 +644,7 @@ impl Server {
         // Spawn accept loops for stream listeners (SIP over TCP / TLS).
         // Each accepted connection gets its own receive task; responses go
         // back over the connection the request arrived on (RFC 3261 §18).
+        let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(10_000));
         for listener in tcp_listeners {
             let zone_name = self.zone_for_local_ip(listener.local_addr().ip());
             let ctx = StreamLoopContext {
@@ -653,6 +655,7 @@ impl Server {
                 global_limiter: Arc::clone(&self.global_limiter),
                 rate_limit_enabled: self.config.rate_limit.enabled,
                 zone_name,
+                conn_semaphore: Arc::clone(&conn_semaphore),
             };
             handles.push(tokio::spawn(async move {
                 Self::tcp_accept_loop(listener, ctx).await;
@@ -668,6 +671,7 @@ impl Server {
                 global_limiter: Arc::clone(&self.global_limiter),
                 rate_limit_enabled: self.config.rate_limit.enabled,
                 zone_name,
+                conn_semaphore: Arc::clone(&conn_semaphore),
             };
             handles.push(tokio::spawn(async move {
                 Self::tls_accept_loop(listener, ctx).await;
@@ -885,10 +889,18 @@ impl Server {
         loop {
             match listener.accept().await {
                 Ok((transport, peer)) => {
+                    let permit = match ctx.conn_semaphore.clone().try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            warn!(peer = %peer, "TCP connection limit reached, dropping");
+                            continue;
+                        }
+                    };
                     debug!(peer = %peer, "Accepted SIP TCP connection");
                     let conn_ctx = ctx.clone();
                     tokio::spawn(async move {
                         Self::stream_connection_loop(Arc::new(transport), peer, conn_ctx).await;
+                        drop(permit);
                     });
                 }
                 Err(e) => {
@@ -912,10 +924,18 @@ impl Server {
         loop {
             match listener.accept().await {
                 Ok((transport, peer)) => {
+                    let permit = match ctx.conn_semaphore.clone().try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            warn!(peer = %peer, "TLS connection limit reached, dropping");
+                            continue;
+                        }
+                    };
                     debug!(peer = %peer, "Accepted SIP TLS connection");
                     let conn_ctx = ctx.clone();
                     tokio::spawn(async move {
                         Self::stream_connection_loop(Arc::new(transport), peer, conn_ctx).await;
+                        drop(permit);
                     });
                 }
                 Err(e) => {

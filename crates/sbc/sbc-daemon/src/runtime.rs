@@ -1111,6 +1111,7 @@ impl Runtime {
                                 Ok(new_config) => {
                                     *config.write().await = new_config;
                                     info!("Configuration reloaded successfully");
+                                    warn!("Note: running Server and SipStack retain their original config snapshots; a full restart is required for all settings to take effect");
                                 }
                                 Err(e) => {
                                     error!(error = %e, "Failed to reload configuration");

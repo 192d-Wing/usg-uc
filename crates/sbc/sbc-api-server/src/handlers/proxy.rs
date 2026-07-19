@@ -88,6 +88,17 @@ async fn proxy(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Reject path-traversal attempts: Axum percent-decodes the captured
+    // segment, so `%2e%2e` arrives here as `..`.  If we interpolate it
+    // into the upstream URL, reqwest's RFC 3986 resolution collapses the
+    // dot-segments and escapes the /api/v1/ prefix.
+    if path.split('/').any(|seg| seg == "." || seg == "..") {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "invalid path"})),
+        )
+            .into_response();
+    }
     let url = format!("{}/api/v1/{}", state.daemon_http_base, path);
     let mut req = state.http_client.request(method.clone(), &url);
     if !query.is_empty() {
@@ -142,7 +153,6 @@ async fn proxy(
                 StatusCode::BAD_GATEWAY,
                 axum::Json(serde_json::json!({
                     "error": "upstream daemon unreachable",
-                    "detail": e.to_string(),
                 })),
             )
                 .into_response()

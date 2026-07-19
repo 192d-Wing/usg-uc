@@ -186,6 +186,11 @@ impl SbcRouter {
         let mut best_specificity: usize = 0;
 
         for partition_id in css.partitions() {
+            // Blocked patterns reject the call outright — check first.
+            if self.is_blocked_in_partition(partition_id, dialed_digits) {
+                return None;
+            }
+
             let candidates = self.matching_patterns_in_partition(partition_id, dialed_digits);
 
             for rp in candidates {
@@ -233,6 +238,13 @@ impl SbcRouter {
             transformed_number: transformed,
             route_group_ids,
             transforms_applied,
+        })
+    }
+
+    /// Returns `true` if any blocked pattern in `partition_id` matches `digits`.
+    fn is_blocked_in_partition(&self, partition_id: &str, digits: &str) -> bool {
+        self.route_patterns.iter().any(|rp| {
+            rp.partition_id() == partition_id && rp.is_blocked() && rp.matches(digits)
         })
     }
 
@@ -420,16 +432,9 @@ mod tests {
     #[test]
     fn test_route_blocked_premium() {
         let router = setup_sbc_router();
-        // +1900 is blocked — it should not match the +1 LD pattern either,
-        // because the blocked pattern has higher priority (1 < 50), but
-        // the routing algorithm filters out blocked patterns entirely.
-        // The +1 prefix pattern still matches because blocked patterns are
-        // simply skipped.
+        // +1900 is blocked — the call must be rejected outright.
         let result = router.route("+19005551234", Some("css-phone"));
-        assert!(result.is_some());
-        let r = result.unwrap();
-        // The blocked 1900 pattern is skipped, so +1 LD matches.
-        assert_eq!(r.pattern_id, "rp-us-ld");
+        assert!(result.is_none(), "blocked pattern should reject the call");
     }
 
     #[test]
