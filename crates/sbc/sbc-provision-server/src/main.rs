@@ -182,15 +182,15 @@ async fn restrict_source(
         return next.run(req).await;
     }
 
-    // Prefer X-Forwarded-For (set by the frontend nginx with the real
-    // client IP) over ConnectInfo (which is always the nginx pod's IP in
-    // the standard deployment topology).  Fall back to ConnectInfo only
-    // when no XFF header is present (direct access, health probes).
+    // Use X-Real-IP (nginx sets this to $remote_addr, replacing any
+    // client-supplied value — not spoofable through the proxy).
+    // X-Forwarded-For is unsuitable here because $proxy_add_x_forwarded_for
+    // appends to client-supplied values, so the leftmost entry is
+    // attacker-controlled.  Fall back to ConnectInfo for direct access.
     let client_ip = req
         .headers()
-        .get("x-forwarded-for")
+        .get("x-real-ip")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
         .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
         .or_else(|| {
             req.extensions()

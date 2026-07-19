@@ -181,8 +181,9 @@ impl AnnouncementService for AnnouncementServiceImpl {
 
         // Reject dangerous RTP destinations: loopback, link-local, and
         // multicast addresses could be used to probe the pod's local
-        // network or amplify traffic.
-        let dest_ip = destination.ip();
+        // network or amplify traffic.  Canonicalize first so IPv4-mapped
+        // IPv6 addresses (::ffff:127.0.0.1) don't bypass the checks.
+        let dest_ip = destination.ip().to_canonical();
         if dest_ip.is_loopback() {
             return Err(Status::invalid_argument(
                 "rtp_destination must not be a loopback address",
@@ -193,19 +194,15 @@ impl AnnouncementService for AnnouncementServiceImpl {
                 "rtp_destination must not be a multicast address",
             ));
         }
-        if let std::net::IpAddr::V4(v4) = dest_ip {
-            if v4.is_link_local() {
-                return Err(Status::invalid_argument(
-                    "rtp_destination must not be a link-local address",
-                ));
-            }
+        if matches!(dest_ip, std::net::IpAddr::V4(v4) if v4.is_link_local()) {
+            return Err(Status::invalid_argument(
+                "rtp_destination must not be a link-local address",
+            ));
         }
-        if let std::net::IpAddr::V6(v6) = dest_ip {
-            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
-                return Err(Status::invalid_argument(
-                    "rtp_destination must not be a link-local address",
-                ));
-            }
+        if matches!(dest_ip, std::net::IpAddr::V6(v6) if v6.is_unicast_link_local()) {
+            return Err(Status::invalid_argument(
+                "rtp_destination must not be a link-local address",
+            ));
         }
 
         let (socket, rtp_port) = self

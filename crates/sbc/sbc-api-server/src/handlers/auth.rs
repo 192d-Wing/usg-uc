@@ -28,8 +28,19 @@ pub struct LoginRequest {
 const MAX_LOGIN_ATTEMPTS: u32 = 5;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 
-fn extract_client_ip(connect_info: &axum::extract::ConnectInfo<std::net::SocketAddr>) -> IpAddr {
-    connect_info.0.ip()
+/// Returns the real client IP.  Prefers the `X-Real-IP` header that
+/// nginx sets to `$remote_addr` (the TCP peer *it* sees — not
+/// spoofable by the HTTP client).  Falls back to `ConnectInfo` for
+/// direct access or testing.
+fn extract_client_ip(
+    headers: &axum::http::HeaderMap,
+    connect_info: &axum::extract::ConnectInfo<std::net::SocketAddr>,
+) -> IpAddr {
+    headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<IpAddr>().ok())
+        .unwrap_or_else(|| connect_info.0.ip())
 }
 
 /// `POST /api/v1/auth/login` — verify admin credentials, mint a token.
@@ -39,9 +50,10 @@ fn extract_client_ip(connect_info: &axum::extract::ConnectInfo<std::net::SocketA
 pub async fn login(
     State(state): State<Arc<AppState>>,
     connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Response {
-    let client_ip = extract_client_ip(&connect_info);
+    let client_ip = extract_client_ip(&headers, &connect_info);
 
     // Rate-limit: reject if this IP has exceeded MAX_LOGIN_ATTEMPTS
     // within the sliding window.  Also evict stale entries to prevent
