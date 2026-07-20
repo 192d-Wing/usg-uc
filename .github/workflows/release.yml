@@ -96,13 +96,13 @@ jobs:
 
       - name: Image metadata (labels)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ matrix.image.name }}
 
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ${{ matrix.image.context }}
           file: ${{ matrix.image.dockerfile }}
@@ -128,7 +128,7 @@ jobs:
 
       - name: Upload digest
         if: ${{ github.event_name == 'push' || inputs.push }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: digests-${{ matrix.image.name }}-${{ env.PLATFORM_PAIR }}
           path: /tmp/digests/*
@@ -146,7 +146,7 @@ jobs:
         image: [sbc-daemon, sbc-api-server, sbc-provision-server, sbc-client-config-server, sbc-announcement-server, sbc-trunk-agent, central-config-api, central-config-import, sbc-config-sync, sbc-dashboard]
     steps:
       - name: Download digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: /tmp/digests
           pattern: digests-${{ matrix.image }}-*
@@ -163,7 +163,7 @@ jobs:
 
       - name: Image metadata (tags)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ matrix.image }}
           tags: |
