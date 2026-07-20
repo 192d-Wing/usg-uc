@@ -49,10 +49,13 @@ services:
     # NOTE: no -bg — SIPp's background mode makes the foreground process exit,
     # which stops the container so the UAS never answers. Run it foreground as
     # a long-lived answering server (torn down with `compose down`).
+    # -rtp_echo echoes received RTP back through the SBC, exercising the B→A
+    # relay direction too (the UAC drives A→B with -sn uac_pcap).
     command: >
       -sn uas
       -p 5080
       -mi 172.28.2.20
+      -rtp_echo
       -trace_err
       -fd 1s
     networks:
@@ -71,6 +74,14 @@ services:
   sipp-uac:
     image: ctaloi/sipp:latest
     container_name: sipp-uac
+    # Mount the test dir so custom scenarios (e.g. sipp-uac-media.xml, which
+    # plays real RTP) are available at /scenarios/*.
+    volumes:
+      - ./:/scenarios:ro
+    # play_pcap_audio replays RTP at the IP layer via a raw socket (CAP_NET_RAW).
+    # Docker grants NET_RAW by default; declare it so rootless runtimes do too.
+    cap_add:
+      - NET_RAW
     command: >
       172.28.1.10:5060
       -sn uac

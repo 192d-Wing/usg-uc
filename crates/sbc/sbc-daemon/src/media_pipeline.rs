@@ -1181,6 +1181,17 @@ impl TrackedSequence {
 ///
 /// ## NIST 800-53 Rev5: SC-7 (Boundary Protection), SC-8
 #[allow(clippy::too_many_arguments)]
+/// Process-global count of RTP/RTCP packets forwarded across all relay legs.
+/// A working relay increments this; a black-holed one never does. Exposed for
+/// observability and as the media "did audio actually flow" signal.
+static RTP_PACKETS_RELAYED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Returns the total RTP/RTCP packets forwarded by the media relay since start.
+#[must_use]
+pub fn rtp_packets_relayed() -> u64 {
+    RTP_PACKETS_RELAYED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 async fn relay_leg(
     recv_sock: Arc<UdpSocket>,
     send_sock: Arc<UdpSocket>,
@@ -1194,6 +1205,7 @@ async fn relay_leg(
     let mut buf = [0u8; 2048];
     let mut latched: Option<std::net::SocketAddr> = None;
     let mut dropped: u64 = 0;
+    let mut forwarded: u64 = 0;
 
     loop {
         tokio::select! {
@@ -1239,8 +1251,26 @@ async fn relay_leg(
                             Ok(guard) => *guard,
                             Err(_) => continue,
                         };
-                        if let Err(e) = send_sock.send_to(&buf[..n], dest).await {
-                            debug!(error = %e, call_id = %call_id, direction, "Relay send error");
+                        match send_sock.send_to(&buf[..n], dest).await {
+                            Ok(_) => {
+                                forwarded += 1;
+                                RTP_PACKETS_RELAYED
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                // Log once, the moment media actually flows. Fires
+                                // inside the loop (relay tasks are abort()ed on
+                                // teardown, so post-loop code can't be relied on).
+                                // This is the "audio is relaying" signal.
+                                if forwarded == 1 {
+                                    info!(
+                                        call_id = %call_id,
+                                        direction,
+                                        "RTP relay forwarding media"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                debug!(error = %e, call_id = %call_id, direction, "Relay send error");
+                            }
                         }
                     }
                     Err(e) => {
@@ -1255,6 +1285,16 @@ async fn relay_leg(
             }
         }
     }
+
+    // Emit the per-leg forwarded count at info so operators (and the CI harness)
+    // can confirm media actually flowed rather than black-holed.
+    info!(
+        call_id = %call_id,
+        direction,
+        forwarded,
+        dropped,
+        "RTP relay leg finished"
+    );
 }
 
 /// Generates a random SSRC.
@@ -1425,6 +1465,7 @@ mod tests {
             .set_remote_address("call", false, SbcSocketAddr::from(callee_addr))
             .await
             .unwrap();
+        let relayed_before = rtp_packets_relayed();
         pipeline.start_relay("call").await.unwrap();
 
         let a_relay = format!("127.0.0.1:{}", ports.a_leg_rtp_port);
@@ -1446,6 +1487,14 @@ mod tests {
             .expect("caller must receive the relayed B→A packet")
             .unwrap();
         assert_eq!(&buf[..n], b"rtp-b2a");
+
+        // The relay metric must have counted both forwarded packets (fetch_add
+        // lands just after send_to; give it a moment before reading).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            rtp_packets_relayed() >= relayed_before + 2,
+            "rtp_packets_relayed must count forwarded packets"
+        );
 
         pipeline.stop_relay("call").await.unwrap();
     }

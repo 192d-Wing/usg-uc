@@ -3,10 +3,10 @@ name: Integration (SIPp)
 # End-to-end integration test: build the SBC image and run the deploy/test SIPp
 # harness (UAC -> SBC -> UAS) via docker compose.
 #
-# Today this is a SIGNALING gate: it asserts calls complete (INVITE -> 200 ->
-# ACK -> BYE) through the SBC's B2BUA. The RTP-relay/audio assertion lands with
-# the media-relay wire-up (which makes it pass) — the harness config
-# (deploy/test/sbc-test.toml) already sets media_mode = Relay.
+# This is an AUDIO gate: the UAC (-sn uac_pcap) sends real G.711 RTP through the
+# SBC, and the job asserts the SBC actually relayed it (relay legs report a
+# non-zero forwarded count) — not just that signaling completed. A regression
+# that black-holes media fails here.
 on:
   push:
     branches: [main]
@@ -20,8 +20,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  sipp-signaling:
-    name: SIPp signaling smoke test
+  sipp-audio:
+    name: SIPp media relay (audio) test
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -43,11 +43,23 @@ jobs:
           echo "ERROR: SBC did not become healthy"
           exit 1
 
-      - name: Run SIPp UAC smoke test (10 calls)
+      - name: Run SIPp UAC with real RTP (G.711 pcap) — signaling + media
         run: |
           docker compose -f "$COMPOSE" run --rm sipp-uac \
-            172.28.1.10:5060 -sn uac -r 5 -l 10 -m 10 -mi 172.28.2.30 -p 5070 \
-            -d 2000 -recv_timeout 10000 -timeout 40s -trace_err
+            172.28.1.10:5060 -sf /scenarios/sipp-uac-media.xml \
+            -r 5 -l 10 -m 10 -mi 172.28.2.30 -p 5070 \
+            -recv_timeout 10000 -timeout 60s -trace_err
+
+      - name: Assert RTP was actually relayed (audio gate)
+        run: |
+          logs=$(docker compose -f "$COMPOSE" logs sbc 2>&1)
+          echo "$logs" | grep 'RTP relay forwarding media' || true
+          if echo "$logs" | grep -q 'RTP relay forwarding media'; then
+            echo "PASS: media relayed — RTP forwarded through the SBC."
+          else
+            echo "FAIL: no RTP forwarded — call media black-holed."
+            exit 1
+          fi
 
       - name: SBC + UAS logs on failure
         if: failure()
