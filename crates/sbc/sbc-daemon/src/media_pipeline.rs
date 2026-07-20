@@ -1192,6 +1192,9 @@ pub fn rtp_packets_relayed() -> u64 {
     RTP_PACKETS_RELAYED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+// call_id + direction are carried for structured relay logging/metrics; the
+// socket/target set is inherent to a bidirectional forwarder.
+#[allow(clippy::too_many_arguments)]
 async fn relay_leg(
     recv_sock: Arc<UdpSocket>,
     send_sock: Arc<UdpSocket>,
