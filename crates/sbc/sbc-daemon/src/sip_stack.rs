@@ -285,6 +285,11 @@ struct CallAddresses {
     dialog_to_tag: Option<String>,
     /// RTP ports allocated for this call (released on teardown).
     rtp_ports: Vec<u16>,
+    /// Media-relay A-leg (caller-facing) RTP port, when the pipeline anchored
+    /// this call. Advertised to the caller in the A-leg answer SDP so both the
+    /// offer (B-leg port) and answer (A-leg port) point at the relay's sockets.
+    /// `None` when no relay is attached (bare-port fallback).
+    media_a_leg_port: Option<u16>,
     /// Via branch of the A-leg INVITE (server transaction key for cleanup).
     a_leg_branch: String,
 }
@@ -952,19 +957,24 @@ impl SipStack {
         {
             let sdp_str = String::from_utf8_lossy(body);
             let local_ip = addrs.local_addr.split(':').next().unwrap_or("0.0.0.0");
-            let rtp_port = self.allocate_rtp_port();
+            // Advertise the relay's caller-facing port (allocated at INVITE) when
+            // anchored, so the early-media answer matches the eventual 200. The
+            // relay itself starts on the 200 OK. Bare-port fallback otherwise.
+            let rtp_port = if let Some(a_port) = addrs.media_a_leg_port {
+                a_port
+            } else {
+                let p = self.allocate_rtp_port();
+                let mut corr = self.call_correlation.write().await;
+                if let Some(a) = corr.addresses.get_mut(internal_id) {
+                    a.rtp_ports.push(p);
+                }
+                p
+            };
             let local_media = MediaAddress::new(local_ip, rtp_port);
             let result = self
                 .sdp_rewriter
                 .rewrite_answer_for_a_leg(&sdp_str, &local_media);
             let rewritten = Bytes::from(result.rewritten);
-            // Track the allocated port for release on teardown.
-            {
-                let mut corr = self.call_correlation.write().await;
-                if let Some(a) = corr.addresses.get_mut(internal_id) {
-                    a.rtp_ports.push(rtp_port);
-                }
-            }
             // build_a_leg_response set Content-Length: 0; correct it to
             // the attached body length or the A-leg UA truncates the SDP
             // and the caller gets no early media.
@@ -1004,43 +1014,50 @@ impl SipStack {
             }
         }
 
-        // Extract B-leg's RTP address from SDP
-        if let Some(ref body) = resp.body {
-            let sdp_str = String::from_utf8_lossy(body);
-            if let Some(_remote_media) = extract_media_address(&sdp_str) {
-                // Phase 4 will use this to set_remote_address on MediaPipeline
-                debug!(
-                    call_id = %addrs.a_leg_sip_call_id,
-                    "B-leg RTP address extracted from SDP"
-                );
-            }
-        }
-
         // Build 200 OK for A-leg with rewritten SDP, carrying the A-leg
         // dialog's own Via/From/To/CSeq.
         let mut a_response = build_a_leg_response(StatusCode::OK, addrs);
 
-        // Rewrite SDP for A-leg
+        // Rewrite the A-leg answer SDP and, when a relay anchored this call,
+        // learn the callee's remote from the answer and start forwarding RTP in
+        // both directions. The advertised A-leg port is the relay's
+        // caller-facing port allocated at INVITE time.
         if let Some(ref body) = resp.body {
             let sdp_str = String::from_utf8_lossy(body);
             let local_ip = addrs.local_addr.split(':').next().unwrap_or("0.0.0.0");
-            let rtp_port = self.allocate_rtp_port();
+            let rtp_port = if let (Some(pipeline), Some(a_port)) =
+                (&self.media_pipeline, addrs.media_a_leg_port)
+            {
+                let session_key = internal_id.to_string();
+                if let Some(callee_media) = extract_media_address(&sdp_str)
+                    && let Ok(callee_addr) =
+                        format!("{}:{}", callee_media.address, callee_media.port).parse()
+                {
+                    let _ = pipeline
+                        .set_remote_address(&session_key, false, callee_addr)
+                        .await;
+                }
+                if let Err(e) = pipeline.start_relay(&session_key).await {
+                    warn!(error = %e, call_id = %addrs.a_leg_sip_call_id, "start_relay failed");
+                }
+                a_port
+            } else {
+                // No relay attached: bare port (SDP rewritten, media not relayed).
+                let p = self.allocate_rtp_port();
+                let mut corr = self.call_correlation.write().await;
+                if let Some(a) = corr.addresses.get_mut(internal_id) {
+                    a.rtp_ports.push(p);
+                }
+                p
+            };
             let local_media = MediaAddress::new(local_ip, rtp_port);
             let result = self
                 .sdp_rewriter
                 .rewrite_answer_for_a_leg(&sdp_str, &local_media);
-            // Track the allocated port for release on teardown.
-            {
-                let mut corr = self.call_correlation.write().await;
-                if let Some(a) = corr.addresses.get_mut(internal_id) {
-                    a.rtp_ports.push(rtp_port);
-                }
-            }
             a_response.body = Some(Bytes::from(result.rewritten));
             a_response
                 .headers
                 .set(HeaderName::ContentType, "application/sdp");
-            // Update Content-Length
             if let Some(ref body) = a_response.body {
                 a_response
                     .headers
@@ -1874,11 +1891,38 @@ impl SipStack {
         let local_ip = source.ip().to_string(); // Use the address we received on
         let local_sip_addr = format!("{}:{}", local_ip, source.port());
 
-        // 6. Rewrite SDP for B-leg (replace A-leg's address with SBC's)
-        let initial_rtp_port = self.allocate_rtp_port();
+        // 6. Media session + B-leg SDP rewrite. With the media pipeline present,
+        // allocate the relay's A/B ports (backed by real sockets), advertise the
+        // B-leg port to the callee, and set the A-leg (caller) remote from the
+        // caller's offer so RTP forwards once the callee answers. Without a
+        // pipeline, fall back to a bare port (SDP rewritten but no relay).
+        let session_key = internal_call_id.to_string();
+        let (b_leg_rtp_port, media_a_leg_port) = if let Some(ref pipeline) = self.media_pipeline {
+            match pipeline.create_session(&session_key, None).await {
+                Ok(ports) => {
+                    if let Some(ref body) = req.body
+                        && let Some(caller_media) =
+                            extract_media_address(&String::from_utf8_lossy(body))
+                        && let Ok(caller_addr) =
+                            format!("{}:{}", caller_media.address, caller_media.port).parse()
+                    {
+                        let _ = pipeline
+                            .set_remote_address(&session_key, true, caller_addr)
+                            .await;
+                    }
+                    (ports.b_leg_rtp_port, Some(ports.a_leg_rtp_port))
+                }
+                Err(e) => {
+                    warn!(error = %e, "media create_session failed; RTP relay disabled for this call");
+                    (self.allocate_rtp_port(), None)
+                }
+            }
+        } else {
+            (self.allocate_rtp_port(), None)
+        };
         let b_leg_sdp = req.body.as_ref().map(|body| {
             let sdp_str = String::from_utf8_lossy(body);
-            let local_media = MediaAddress::new(&local_ip, initial_rtp_port);
+            let local_media = MediaAddress::new(&local_ip, b_leg_rtp_port);
             let result = self
                 .sdp_rewriter
                 .rewrite_offer_for_b_leg(&sdp_str, &local_media);
@@ -1915,7 +1959,10 @@ impl SipStack {
             Err(e) => {
                 error!(error = %e, "Failed to build B-leg INVITE");
                 self.in_flight_invites.write().await.remove(&a_leg_call_id);
-                self.release_rtp_port(initial_rtp_port);
+                self.release_rtp_port(b_leg_rtp_port);
+                if let Some(ref pipeline) = self.media_pipeline {
+                    let _ = pipeline.remove_session(&session_key).await;
+                }
                 let server_err =
                     create_response_from_request(req, StatusCode::SERVER_INTERNAL_ERROR);
                 return ProcessResult::Response {
@@ -2026,7 +2073,8 @@ impl SipStack {
                     b_leg_to,
                     b_leg_branch: b_leg_wire_branch,
                     dialog_to_tag: None,
-                    rtp_ports: vec![initial_rtp_port],
+                    rtp_ports: vec![b_leg_rtp_port],
+                    media_a_leg_port,
                     a_leg_branch: a_branch.clone(),
                 },
             );
