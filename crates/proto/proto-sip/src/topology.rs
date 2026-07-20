@@ -546,6 +546,51 @@ impl TopologyHider {
         // Note: Record-Route is typically added by the proxy, not rewritten here
     }
 
+    /// Applies topology hiding to a **B2BUA-originated** outbound request.
+    ///
+    /// Unlike [`hide_outbound_request`](Self::hide_outbound_request) (the proxy
+    /// model — it strips internal *intermediate* Via headers and prepends the
+    /// proxy's own), a B2BUA regenerates each leg and emits a **single
+    /// self-generated Via and Contact** already bearing the SBC's address. This
+    /// anonymizes those in place — replacing an internal host with
+    /// `external_host` **without ever removing the sole Via** (which would make
+    /// the request invalid) — and anonymizes the Contact.
+    ///
+    /// The Call-ID is intentionally left untouched: the B2BUA already emits a
+    /// freshly generated per-leg Call-ID (so the internal party's Call-ID is
+    /// never disclosed), and that value is the dialog's correlation key —
+    /// rewriting the header here would desynchronize response correlation.
+    ///
+    /// Intended for the outbound leg that crosses to an untrusted (outside)
+    /// zone, so the internal signaling address is not disclosed to carriers.
+    pub fn hide_b2bua_request(&self, headers: &mut Headers) {
+        if self.config.mode == TopologyHidingMode::None {
+            return;
+        }
+
+        // Via: anonymize the host of any Via bearing an internal address, but
+        // keep the Via itself (a request MUST retain a Via) — so aggressive
+        // mode anonymizes rather than strips here.
+        let vias = headers.via_all_parsed();
+        if !vias.is_empty() {
+            headers.remove(&HeaderName::Via);
+            for via in &vias {
+                let mut anonymized = via.clone();
+                if self.config.is_internal_address(&via.host) {
+                    anonymized.host.clone_from(&self.config.external_host);
+                    anonymized.port = self.config.external_port;
+                    if self.config.hide_via_params {
+                        anonymized.received = None;
+                        anonymized.rport = None;
+                    }
+                }
+                headers.add(Header::new(HeaderName::Via, anonymized.to_string()));
+            }
+        }
+
+        self.rewrite_contacts(headers);
+    }
+
     /// Applies all topology hiding transformations to inbound response headers.
     ///
     /// # Errors
@@ -782,5 +827,89 @@ mod tests {
 
         hider.clear_call_id_mappings();
         assert_eq!(hider.call_id_mapping_count(), 0);
+    }
+
+    /// Builds a B2BUA-style outbound INVITE header set whose single Via and
+    /// Contact bear the SBC's internal pod IP (10.x), plus an internal Call-ID.
+    fn b2bua_headers() -> Headers {
+        let mut h = Headers::new();
+        h.add(Header::new(
+            HeaderName::Via,
+            "SIP/2.0/UDP 10.2.0.5:5060;branch=z9hG4bK-abc123",
+        ));
+        h.add(Header::new(HeaderName::Contact, "<sip:sbc@10.2.0.5:5060>"));
+        h.add(Header::new(HeaderName::CallId, "call-12345@10.2.0.5"));
+        h
+    }
+
+    #[test]
+    fn test_hide_b2bua_basic_anonymizes_but_keeps_via() {
+        let config =
+            TopologyHidingConfig::new("sbc.example.com").with_mode(TopologyHidingMode::Basic);
+        let hider = TopologyHider::new(config);
+        let mut headers = b2bua_headers();
+
+        hider.hide_b2bua_request(&mut headers);
+
+        // The sole Via must survive, with its host anonymized and branch kept.
+        let vias = headers.via_all_parsed();
+        assert_eq!(vias.len(), 1, "the single Via must not be stripped");
+        assert_eq!(vias[0].host, "sbc.example.com");
+        assert_eq!(vias[0].branch, Some("z9hG4bK-abc123".to_string()));
+        // No internal IP leaks anywhere in the Via.
+        assert!(
+            !headers
+                .get(&HeaderName::Via)
+                .unwrap()
+                .value
+                .contains("10.2.0.5")
+        );
+
+        // Contact host anonymized (user preserved).
+        let contact = headers.contact_parsed().unwrap();
+        assert_eq!(contact.uri.host, "sbc.example.com");
+        assert_eq!(contact.uri.user, Some("sbc".to_string()));
+
+        // Call-ID is deliberately left untouched (B2BUA already emits a fresh
+        // per-leg Call-ID; it is the correlation key and must not be rewritten).
+        assert_eq!(
+            headers.get(&HeaderName::CallId).unwrap().value,
+            "call-12345@10.2.0.5"
+        );
+    }
+
+    #[test]
+    fn test_hide_b2bua_full_mode_keeps_single_via() {
+        // "full" maps to Aggressive; the proxy path would STRIP an internal Via,
+        // which for a B2BUA's sole Via would produce an invalid request. The
+        // B2BUA path must anonymize it instead.
+        let config =
+            TopologyHidingConfig::new("sbc.example.com").with_mode(TopologyHidingMode::Aggressive);
+        let hider = TopologyHider::new(config);
+        let mut headers = b2bua_headers();
+
+        hider.hide_b2bua_request(&mut headers);
+
+        let vias = headers.via_all_parsed();
+        assert_eq!(vias.len(), 1, "aggressive mode must not strip the sole Via");
+        assert_eq!(vias[0].host, "sbc.example.com");
+        assert!(headers.contact_parsed().is_some());
+    }
+
+    #[test]
+    fn test_hide_b2bua_none_is_noop() {
+        let config =
+            TopologyHidingConfig::new("sbc.example.com").with_mode(TopologyHidingMode::None);
+        let hider = TopologyHider::new(config);
+        let mut headers = b2bua_headers();
+
+        hider.hide_b2bua_request(&mut headers);
+
+        assert_eq!(headers.via_all_parsed()[0].host, "10.2.0.5");
+        assert_eq!(headers.contact_parsed().unwrap().uri.host, "10.2.0.5");
+        assert_eq!(
+            headers.get(&HeaderName::CallId).unwrap().value,
+            "call-12345@10.2.0.5"
+        );
     }
 }

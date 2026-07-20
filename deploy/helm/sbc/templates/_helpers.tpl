@@ -212,6 +212,18 @@ global_rps = 10000
 per_ip_rps = 10000
 per_user_rps = 50
 burst_multiplier = 2.0
+{{- if .Values.sbcDaemon.topologyHiding.enabled }}
+
+# Topology hiding (SC-7): anonymize the SBC's internal signaling host in the
+# Via/Contact of outbound trunk-facing INVITEs. Applies only to outside-facing
+# (trunk/carrier) legs; inside-facing legs are never rewritten.
+[topology_hiding]
+enabled = true
+mode = {{ .Values.sbcDaemon.topologyHiding.mode | quote }}
+external_host = {{ .Values.sbcDaemon.topologyHiding.externalHost | default (printf "sbc.%s" .Values.site.fqdn_base) | quote }}
+external_port = {{ .Values.sbcDaemon.topologyHiding.externalPort }}
+obfuscate_call_id = {{ .Values.sbcDaemon.topologyHiding.obfuscateCallId }}
+{{- end }}
 
 [logging]
 level = "info"
