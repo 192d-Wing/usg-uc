@@ -1,6 +1,5 @@
 //! Error types for the telemetry module.
 
-use opentelemetry_sdk::trace::TraceError;
 use thiserror::Error;
 
 /// Result type alias for telemetry operations.
@@ -60,13 +59,6 @@ pub enum TelemetryError {
     },
 }
 
-impl From<TraceError> for TelemetryError {
-    fn from(err: TraceError) -> Self {
-        Self::TraceError {
-            reason: err.to_string(),
-        }
-    }
-}
-
-// Note: MetricError is no longer public in opentelemetry_sdk 0.31+
-// Metric errors are converted using TelemetryError::MetricsError { reason: ... } directly
+// Note: TraceError was removed from opentelemetry_sdk::trace in 0.32 (as MetricError
+// was in 0.31). Trace/metric errors are constructed via TelemetryError::TraceError /
+// ::MetricsError { reason: ... } directly rather than through a From impl.
