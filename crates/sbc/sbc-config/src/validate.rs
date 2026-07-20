@@ -1201,8 +1201,6 @@ mod tests {
 ///
 /// Fixtures are extracted from:
 /// - `deploy/config/config.toml`
-/// - `deploy/microk8s/sbc-configmap.yaml` (`data."config.toml"`)
-/// - `deploy/k8s-local/sbc-configmap.yaml` (`data."config.toml"`)
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod deploy_config_tests {
@@ -1263,134 +1261,9 @@ output = "stdout"
 audit_enabled = true
 "#;
 
-    /// `deploy/microk8s/sbc-configmap.yaml` embedded `config.toml`
-    /// (comments stripped).
-    const MICROK8S_CONFIG_TOML: &str = r#"
-[general]
-instance_name = "sbc-microk8s"
-max_calls = 5000
-max_registrations = 10000
-default_internal_zone = "inside"
-
-[[zones]]
-name = "inside"
-signaling_interface = "net1"
-media_interface = "net1"
-
-[[zones]]
-name = "outside"
-signaling_interface = "net2"
-media_interface = "net2"
-external_ip = "stun"
-
-[[zones]]
-name = "oobm"
-signaling_interface = "net3"
-media_interface = "net3"
-
-[transport]
-udp_listen = ["0.0.0.0:5060"]
-tcp_listen = ["0.0.0.0:5060"]
-tls_listen = ["0.0.0.0:5061"]
-stun_refresh_interval_secs = 300
-
-[api]
-listen_addr = "0.0.0.0:80"
-insecure_http = "any"
-
-[media]
-default_mode = "Relay"
-codecs = ["G711Ulaw", "G711Alaw", "G722"]
-rtp_port_min = 16384
-rtp_port_max = 20000
-
-[media.srtp]
-required = false
-
-[rate_limit]
-enabled = true
-global_rps = 50000
-per_ip_rps = 10000
-
-[logging]
-level = "info"
-format = "json"
-output = "stdout"
-"#;
-
-    /// `deploy/k8s-local/sbc-configmap.yaml` embedded `config.toml`
-    /// (comments stripped).
-    const K8S_LOCAL_CONFIG_TOML: &str = r#"
-[general]
-instance_name = "sbc-k8s"
-max_calls = 5000
-max_registrations = 10000
-default_internal_zone = "inside"
-
-[[zones]]
-name = "inside"
-signaling_interface = "net1"
-media_interface = "net1"
-
-[[zones]]
-name = "outside"
-signaling_interface = "net2"
-media_interface = "net2"
-external_ip = "stun"
-
-[[zones]]
-name = "oobm"
-signaling_interface = "net3"
-media_interface = "net3"
-
-[transport]
-udp_listen = ["0.0.0.0:5060"]
-tcp_listen = ["0.0.0.0:5060"]
-tls_listen = ["0.0.0.0:5061"]
-stun_refresh_interval_secs = 300
-
-[api]
-listen_addr = "0.0.0.0:8443"
-
-[media]
-default_mode = "Relay"
-codecs = ["G711Ulaw", "G711Alaw", "G722"]
-rtp_port_min = 16384
-rtp_port_max = 20000
-
-[media.srtp]
-required = false
-
-[rate_limit]
-enabled = true
-global_rps = 50000
-per_ip_rps = 10000
-
-[logging]
-level = "info"
-format = "json"
-output = "stdout"
-"#;
-
     #[test]
     fn test_deploy_config_toml_validates() {
         let config = crate::load_from_str(DEPLOY_CONFIG_TOML).expect("deploy/config/config.toml");
         assert_eq!(config.general.instance_name, "sbc-01");
-    }
-
-    #[test]
-    fn test_microk8s_configmap_validates() {
-        let config =
-            crate::load_from_str(MICROK8S_CONFIG_TOML).expect("deploy/microk8s/sbc-configmap.yaml");
-        assert_eq!(config.general.instance_name, "sbc-microk8s");
-        assert_eq!(config.zones.len(), 3);
-    }
-
-    #[test]
-    fn test_k8s_local_configmap_validates() {
-        let config = crate::load_from_str(K8S_LOCAL_CONFIG_TOML)
-            .expect("deploy/k8s-local/sbc-configmap.yaml");
-        assert_eq!(config.general.instance_name, "sbc-k8s");
-        assert_eq!(config.zones.len(), 3);
     }
 }

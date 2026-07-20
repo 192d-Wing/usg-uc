@@ -67,32 +67,6 @@ docker run -d \
   usg-sbc-daemon:latest
 ```
 
-### Kubernetes (Raw Manifests)
-
-```bash
-# Create namespace and deploy
-kubectl apply -f deploy/kubernetes/namespace.yaml
-kubectl apply -f deploy/kubernetes/rbac.yaml
-kubectl apply -f deploy/kubernetes/configmap.yaml
-kubectl apply -f deploy/kubernetes/deployment.yaml
-kubectl apply -f deploy/kubernetes/service.yaml
-kubectl apply -f deploy/kubernetes/pdb.yaml
-kubectl apply -f deploy/kubernetes/networkpolicy.yaml
-
-# Verify deployment
-kubectl get pods -n sbc-system
-kubectl get svc -n sbc-system
-```
-
-### Local Kind Cluster (developer rig)
-
-For local SBC development on a Linux workstation, see [deploy/k8s-local/README.md](../k8s-local/README.md). Highlights:
-
-- `cd deploy/k8s-local && ./setup.sh` — bootstraps a kind cluster with Multus + MetalLB and bridges a host NIC (default `enp2s0`, override via `.env.local`).
-- `./teardown.sh` to tear it down.
-- Zone IPs default to the top of the detected LAN /24 (`.240` inside, `.241` outside, `.242` oobm); override in `.env.local` if those collide with DHCP.
-- Linux only — Docker Desktop on macOS can't attach a macvlan to a host NIC.
-
 ### Kubernetes (Helm)
 
 ```bash
