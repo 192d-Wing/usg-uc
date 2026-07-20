@@ -351,6 +351,32 @@ impl Server {
             sip_stack.init_topology_hider_from_config(topo);
         }
 
+        // Attach the in-process media pipeline (RTP relay). Ports / mode / SRTP
+        // come from the [media] config; the codec list and RTCP-mux keep the
+        // pipeline defaults. The call flow drives sessions on top of this; without
+        // it, allocated RTP ports are not backed by any socket (media black-holes).
+        //
+        // The config's mode is uc_types::MediaMode; the pipeline uses
+        // uc_media_engine::MediaMode. They share Relay/PassThrough; the config-only
+        // SignalingOnly has no relay-engine equivalent, so it maps to the
+        // least-involved engine mode (PassThrough).
+        let default_mode = match config.media.default_mode {
+            uc_types::MediaMode::Relay => uc_media_engine::MediaMode::Relay,
+            uc_types::MediaMode::PassThrough | uc_types::MediaMode::SignalingOnly => {
+                uc_media_engine::MediaMode::PassThrough
+            }
+        };
+        let media_config = crate::media_pipeline::MediaPipelineConfig {
+            default_mode,
+            srtp_required: config.media.srtp.required,
+            rtp_port_min: config.media.rtp_port_min,
+            rtp_port_max: config.media.rtp_port_max,
+            ..Default::default()
+        };
+        sip_stack.set_media_pipeline(Arc::new(crate::media_pipeline::MediaPipeline::new(
+            media_config,
+        )));
+
         // Initialize Voice Protection System call screening (if configured).
         // The config was validated at load time, so a build failure here is
         // unreachable in practice; refuse to start half-protected if it
