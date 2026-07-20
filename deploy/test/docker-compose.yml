@@ -46,14 +46,15 @@ services:
   sipp-uas:
     image: ctaloi/sipp:latest
     container_name: sipp-uas
+    # NOTE: no -bg — SIPp's background mode makes the foreground process exit,
+    # which stops the container so the UAS never answers. Run it foreground as
+    # a long-lived answering server (torn down with `compose down`).
     command: >
       -sn uas
       -p 5080
       -mi 172.28.2.20
       -trace_err
-      -trace_stat
       -fd 1s
-      -bg
     networks:
       sbc-signaling:
         ipv4_address: 172.28.1.20

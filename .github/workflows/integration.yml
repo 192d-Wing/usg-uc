@@ -1,0 +1,60 @@
+name: Integration (SIPp)
+
+# End-to-end integration test: build the SBC image and run the deploy/test SIPp
+# harness (UAC -> SBC -> UAS) via docker compose.
+#
+# Today this is a SIGNALING gate: it asserts calls complete (INVITE -> 200 ->
+# ACK -> BYE) through the SBC's B2BUA. The RTP-relay/audio assertion lands with
+# the media-relay wire-up (which makes it pass) — the harness config
+# (deploy/test/sbc-test.toml) already sets media_mode = Relay.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Dockerfile'
+      - 'deploy/test/**'
+      - '.github/workflows/integration.yml'
+  workflow_dispatch:
+
+jobs:
+  sipp-signaling:
+    name: SIPp signaling smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      COMPOSE: deploy/test/docker-compose.yml
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build image + start SBC and SIPp UAS
+        run: docker compose -f "$COMPOSE" up -d --build sbc sipp-uas
+
+      - name: Wait for the SBC to become healthy
+        run: |
+          for i in $(seq 1 60); do
+            status=$(docker inspect --format='{{.State.Health.Status}}' sbc-test 2>/dev/null || echo starting)
+            echo "[$i] sbc health: $status"
+            [ "$status" = healthy ] && exit 0
+            sleep 2
+          done
+          echo "ERROR: SBC did not become healthy"
+          exit 1
+
+      - name: Run SIPp UAC smoke test (10 calls)
+        run: |
+          docker compose -f "$COMPOSE" run --rm sipp-uac \
+            172.28.1.10:5060 -sn uac -r 5 -l 10 -m 10 -mi 172.28.2.30 -p 5070 \
+            -d 2000 -recv_timeout 10000 -timeout 40s -trace_err
+
+      - name: SBC + UAS logs on failure
+        if: failure()
+        run: |
+          echo "===== SBC ====="; docker compose -f "$COMPOSE" logs --tail=200 sbc || true
+          echo "===== UAS ====="; docker compose -f "$COMPOSE" logs --tail=50 sipp-uas || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f "$COMPOSE" down -v || true

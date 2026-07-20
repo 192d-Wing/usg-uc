@@ -1,19 +1,11 @@
-# SBC test configuration — three-zone deployment on single NIC with IP aliases
+# SBC test configuration — docker/podman compose harness (deploy/test).
 #
-# Zone topology (all on en0 with alias IPs):
-#   signaling — 192.168.44.129 — SIP signaling (trunks, registrations)
-#   media     — 192.168.44.130 — RTP/SRTP media streams
-#   oobm      — 192.168.44.131 — Out-of-Band Management (REST API, gRPC)
+# Matches deploy/test/docker-compose.yml's dual-interface topology:
+#   signaling net (172.28.1.0/24): SBC 172.28.1.10, UAS 172.28.1.20, UAC 172.28.1.30
+#   media net     (172.28.2.0/24): SBC 172.28.2.10, UAS 172.28.2.20, UAC 172.28.2.30
 #
-# Setup aliases before starting:
-#   sudo ifconfig en0 alias 192.168.44.129 255.255.255.0
-#   sudo ifconfig en0 alias 192.168.44.130 255.255.255.0
-#   sudo ifconfig en0 alias 192.168.44.131 255.255.255.0
-#
-# Remove aliases when done:
-#   sudo ifconfig en0 -alias 192.168.44.129
-#   sudo ifconfig en0 -alias 192.168.44.130
-#   sudo ifconfig en0 -alias 192.168.44.131
+# The SBC binds SIP/API on all interfaces (reachable at 172.28.1.10) and routes
+# every call to the "loopback" trunk group, which points at the SIPp UAS.
 
 [general]
 instance_name = "sbc-test"
@@ -21,51 +13,64 @@ max_calls = 5000
 max_registrations = 10000
 default_internal_zone = "signaling"
 
-# ── Zone Definitions ──────────────────────────────────────
+# ── Zone Definitions (literal container IPs; no STUN in the sandbox) ──
 
 [[zones]]
 name = "signaling"
-signaling_interface = "en0"
-media_interface = "en0"
-external_ip = "stun"
+signaling_interface = "172.28.1.10"
+media_interface = "172.28.2.10"
+external_ip = "172.28.2.10"
 
 [[zones]]
 name = "media"
-signaling_interface = "en0"
-media_interface = "en0"
+signaling_interface = "172.28.1.10"
+media_interface = "172.28.2.10"
 
 [[zones]]
 name = "oobm"
-signaling_interface = "en0"
-media_interface = "en0"
+signaling_interface = "172.28.1.10"
+media_interface = "172.28.2.10"
 
-# ── Transport ─────────────────────────────────────────────
+# ── Transport (bind all interfaces so the container is reachable) ──
 
 [transport]
-# SIP on signaling alias
-udp_listen = ["192.168.44.129:5060"]
-tcp_listen = ["192.168.44.129:5060"]
-tls_listen = ["192.168.44.129:5061"]
-
-# API/UI on OOBM alias only
-api_listen = "192.168.44.131:8080"
-
-stun_refresh_interval_secs = 300
+udp_listen = ["0.0.0.0:5060"]
+tcp_listen = ["0.0.0.0:5060"]
+tls_listen = ["0.0.0.0:5061"]
+api_listen = "0.0.0.0:8080"
 tcp_timeout_secs = 30
 tcp_idle_timeout_secs = 300
 
-# ── Media ─────────────────────────────────────────────────
+# ── Media (range matches the compose port mapping 16384-16484) ──
 
 [media]
 default_mode = "Relay"
 codecs = ["G711Ulaw", "G711Alaw", "G722"]
 rtp_port_min = 16384
-rtp_port_max = 20000
+rtp_port_max = 16484
 
 [media.srtp]
 required = false
 
-# ── Rate Limiting ─────────────────────────────────────────
+# ── Routing: send every call to the loopback trunk (the UAS) ──
+
+[routing]
+use_dial_plan = true
+max_failover_attempts = 1
+default_trunk_group = "loopback"
+
+[[dial_plans]]
+id = "catch-all"
+name = "Route all calls to the loopback UAS"
+
+  [[dial_plans.entries]]
+  direction = "both"
+  pattern_type = "any"
+  pattern_value = ""
+  trunk_group = "loopback"
+  destination_type = "trunk_group"
+
+# ── Rate Limiting ──
 
 [rate_limit]
 enabled = true
@@ -79,17 +84,17 @@ level = "info"
 format = "text"
 output = "stdout"
 
-# ── Trunk Groups ──────────────────────────────────────────
+# ── Trunk Groups: loopback target = the SIPp UAS container ──
 
 [[trunk_groups]]
 id = "loopback"
-name = "Loopback Test Target"
+name = "Loopback Test Target (SIPp UAS)"
 zone = "signaling"
 strategy = "round_robin"
 
   [[trunk_groups.trunks]]
   id = "loopback-1"
-  host = "127.0.0.1"
+  host = "172.28.1.20"
   port = 5080
   protocol = "udp"
   max_calls = 5000
