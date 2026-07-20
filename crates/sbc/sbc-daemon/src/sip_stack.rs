@@ -290,6 +290,9 @@ struct CallAddresses {
     /// offer (B-leg port) and answer (A-leg port) point at the relay's sockets.
     /// `None` when no relay is attached (bare-port fallback).
     media_a_leg_port: Option<u16>,
+    /// SBC-owned media IP advertised in rewritten SDP (relay bind address).
+    /// Resolved once at INVITE so the answer handlers advertise the same host.
+    media_local_ip: String,
     /// Via branch of the A-leg INVITE (server transaction key for cleanup).
     a_leg_branch: String,
 }
@@ -531,6 +534,25 @@ impl SipStack {
         } else {
             fallback.to_string()
         }
+    }
+
+    /// Resolves the SBC's own media IP for a call — the address to bind the RTP
+    /// relay to AND advertise in rewritten SDP. Endpoints send RTP straight to
+    /// this address, so it MUST be SBC-owned: the peer's source IP is only
+    /// correct for signaling (where the Via `received=` param repairs response
+    /// routing), never for media. Uses the zone registry's media interface
+    /// (zones share it in the single-interface / single-pod model). Returns
+    /// `(bind_ip, advertise_string)`; falls back to `fallback` (relay binds
+    /// `0.0.0.0`) when no zone media IP is configured.
+    fn call_media_ip(&self, fallback: std::net::IpAddr) -> (Option<std::net::IpAddr>, String) {
+        if let Some(reg) = &self.zone_registry {
+            for name in reg.zone_names() {
+                if let Some(ip) = reg.media_ip(&name) {
+                    return (Some(ip), ip.to_string());
+                }
+            }
+        }
+        (None, fallback.to_string())
     }
 
     /// Sets the SBC router for CSS/Partition-based call routing.
@@ -956,7 +978,6 @@ impl SipStack {
             && let Some(ref body) = resp.body
         {
             let sdp_str = String::from_utf8_lossy(body);
-            let local_ip = addrs.local_addr.split(':').next().unwrap_or("0.0.0.0");
             // Advertise the relay's caller-facing port (allocated at INVITE) when
             // anchored, so the early-media answer matches the eventual 200. The
             // relay itself starts on the 200 OK. Bare-port fallback otherwise.
@@ -970,7 +991,7 @@ impl SipStack {
                 }
                 p
             };
-            let local_media = MediaAddress::new(local_ip, rtp_port);
+            let local_media = MediaAddress::new(&addrs.media_local_ip, rtp_port);
             let result = self
                 .sdp_rewriter
                 .rewrite_answer_for_a_leg(&sdp_str, &local_media);
@@ -1024,7 +1045,6 @@ impl SipStack {
         // caller-facing port allocated at INVITE time.
         if let Some(ref body) = resp.body {
             let sdp_str = String::from_utf8_lossy(body);
-            let local_ip = addrs.local_addr.split(':').next().unwrap_or("0.0.0.0");
             let rtp_port = if let (Some(pipeline), Some(a_port)) =
                 (&self.media_pipeline, addrs.media_a_leg_port)
             {
@@ -1050,7 +1070,7 @@ impl SipStack {
                 }
                 p
             };
-            let local_media = MediaAddress::new(local_ip, rtp_port);
+            let local_media = MediaAddress::new(&addrs.media_local_ip, rtp_port);
             let result = self
                 .sdp_rewriter
                 .rewrite_answer_for_a_leg(&sdp_str, &local_media);
@@ -1897,8 +1917,14 @@ impl SipStack {
         // caller's offer so RTP forwards once the callee answers. Without a
         // pipeline, fall back to a bare port (SDP rewritten but no relay).
         let session_key = internal_call_id.to_string();
+        // Advertise + bind the SBC's own media IP (never the peer's source IP,
+        // which is only valid for signaling). Endpoints send RTP straight here.
+        let (media_bind_ip, media_ip_str) = self.call_media_ip(source.ip());
         let (b_leg_rtp_port, media_a_leg_port) = if let Some(ref pipeline) = self.media_pipeline {
-            match pipeline.create_session(&session_key, None).await {
+            match pipeline
+                .create_session_with_zones(&session_key, None, media_bind_ip, media_bind_ip)
+                .await
+            {
                 Ok(ports) => {
                     if let Some(ref body) = req.body
                         && let Some(caller_media) =
@@ -1922,7 +1948,7 @@ impl SipStack {
         };
         let b_leg_sdp = req.body.as_ref().map(|body| {
             let sdp_str = String::from_utf8_lossy(body);
-            let local_media = MediaAddress::new(&local_ip, b_leg_rtp_port);
+            let local_media = MediaAddress::new(&media_ip_str, b_leg_rtp_port);
             let result = self
                 .sdp_rewriter
                 .rewrite_offer_for_b_leg(&sdp_str, &local_media);
@@ -2075,6 +2101,7 @@ impl SipStack {
                     dialog_to_tag: None,
                     rtp_ports: vec![b_leg_rtp_port],
                     media_a_leg_port,
+                    media_local_ip: media_ip_str,
                     a_leg_branch: a_branch.clone(),
                 },
             );
