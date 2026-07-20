@@ -1946,9 +1946,7 @@ impl SipStack {
         // scoped to outside-facing legs so inside routing is unaffected. The
         // B2BUA already emits a fresh per-leg Call-ID, so no Call-ID rewrite is
         // needed (and it must not change — it is the correlation key).
-        if b_leg_external
-            && let Some(ref hider) = self.topology_hider
-        {
+        if b_leg_external && let Some(ref hider) = self.topology_hider {
             hider
                 .read()
                 .await

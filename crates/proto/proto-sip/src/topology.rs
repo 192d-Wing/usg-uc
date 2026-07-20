@@ -857,7 +857,13 @@ mod tests {
         assert_eq!(vias[0].host, "sbc.example.com");
         assert_eq!(vias[0].branch, Some("z9hG4bK-abc123".to_string()));
         // No internal IP leaks anywhere in the Via.
-        assert!(!headers.get(&HeaderName::Via).unwrap().value.contains("10.2.0.5"));
+        assert!(
+            !headers
+                .get(&HeaderName::Via)
+                .unwrap()
+                .value
+                .contains("10.2.0.5")
+        );
 
         // Contact host anonymized (user preserved).
         let contact = headers.contact_parsed().unwrap();
