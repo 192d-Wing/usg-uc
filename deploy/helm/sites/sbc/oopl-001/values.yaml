@@ -1,13 +1,13 @@
 # oopl-001 site values — chart v0.7.0, all images pulled from GHCR @ 0.7.0
-# Preserves the existing release's site/bgp/kea/externalDns settings.
+# Preserves the existing release's site/bgp/externalDns settings.
+# DHCP is handled externally by usg-dora (not this chart).
 
 site:
   name: oopl-001
   node: uk8wtwr002
   fqdn_base: oopl.dev.mil
-  lb_pool_cidr: 10.10.10.58/31
-  sbc_lb_ip: 10.10.10.58
-  kea_lb_ip: 10.10.10.59
+  lb_pool_cidr: 10.10.10.80/31
+  sbc_lb_ip: 10.10.10.80
   # v6 anycast mirror of sbc_lb_ip (pihole-anycast convention: v4/32 + v6/128
   # per service). pihole DNS already publishes the matching AAAA.
   lb_pool_cidr6: 2601:443:c200:575::58/128
@@ -20,9 +20,6 @@ bgp:
   advertise_label: k3s-pod-cidrs
 
 externalDns:
-  enabled: false
-
-kea:
   enabled: false
 
 # --- all USG component images: GHCR, tag 0.7.0 (latest release) ---

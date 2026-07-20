@@ -2,7 +2,9 @@
 
 This is the step-by-step to bring a fresh microk8s node from "OS just installed" to "SBC pod Ready + reachable via BGP from upstream router". Every step is per-site and idempotent.
 
-The architecture is **FQDN-first**: clients reach the SBC by name (`sbc.<site>.usg.example.com`), and the name resolves to whatever pod IP Cilium currently assigns. The only stable IP per site is **Kea's** — because the DHCP-relay protocol used by upstream routers is L3-only and won't accept an FQDN.
+The architecture is **FQDN-first**: clients reach the SBC by name (`sbc.<site>.usg.example.com`), which resolves (via ExternalDNS) to the SBC's stable SIP/API LoadBalancer VIP (`site.sbc_lb_ip`), advertised upstream by BGP.
+
+DHCP for phones is **not** part of this chart — it is served by **usg-dora** (a DORA fork), deployed and configured separately. This playbook covers the SBC only.
 
 ## Prerequisites per site
 
@@ -11,7 +13,7 @@ The architecture is **FQDN-first**: clients reach the SBC by name (`sbc.<site>.u
 | Hardware | x86_64 host with single NIC, ≥4 vCPU, ≥8 GiB RAM |
 | OS | Ubuntu 24.04+ (snap-capable) |
 | Upstream router | Supports BGP, can peer with k8s node ASN 65001 |
-| Site `/28` LB pool | Per-site reserved /28 for LoadBalancer Service IPs (Kea + future) |
+| Site `/28` LB pool | Per-site reserved /28 for LoadBalancer Service IPs (SBC SIP/API VIP + future) |
 | DNS infrastructure | A DNS provider ExternalDNS can write to (Route53, CoreDNS-RFC2136, Cloudflare, …) |
 | Site FQDN base | Per-site subdomain you control, e.g. `kfk-001.usg.example.com` |
 | Upstream BGP config | See [§ Upstream router config](#upstream-router-config) |
@@ -115,7 +117,8 @@ ExternalDNS watches Services with the `external-dns.alpha.kubernetes.io/hostname
 
 ## Step 4 — Per-site Helm values
 
-Create `values-<site-id>.yaml`:
+Create `deploy/helm/sites/sbc/<site-id>/values.yaml` (see
+[../sites/README.md](../sites/README.md) for the layout):
 
 ```yaml
 site:
@@ -123,7 +126,7 @@ site:
   node: <k8s-node-hostname>             # e.g. k8-01
   fqdn_base: "<site-id>.usg.example.com"  # zone ExternalDNS writes into
   lb_pool_cidr: "10.50.<X>.0/28"        # site's LoadBalancer IP pool
-  kea_lb_ip: "10.50.<X>.13"             # stable LB IP for DHCP relay target
+  sbc_lb_ip: "10.50.<X>.10"             # stable LB IP for SBC SIP/API
 
 bgp:
   install_cluster_config: true          # set false on second-and-later installs
@@ -139,16 +142,12 @@ image:
   repository: sbc-daemon
   tag: local
   pullPolicy: Never
-
-kea:
-  phone_subnets:
-    - subnet:      "<phone-vlan-cidr>"
-      pool:        ["<dhcp-start>", "<dhcp-end>"]
-      gateway:     "<phone-vlan-gateway>"
-      tftp_server: "sbc.<site-id>.usg.example.com"   # FQDN, not IP
 ```
 
-For 184 sites: render values from a CSV/YAML inventory + a template. Site differences are just `name`, `node`, `fqdn_base`, `lb_pool_cidr`, `kea_lb_ip`, `bgp.upstream.ip`, and the phone subnet block.
+> DHCP (phone subnets, pools, relay/TFTP options) is configured in the
+> **usg-dora** deployment, not here.
+
+For 184 sites: render values from a CSV/YAML inventory + a template. Site differences are just `name`, `node`, `fqdn_base`, `lb_pool_cidr`, `sbc_lb_ip`, and `bgp.upstream.ip`.
 
 ## Step 5 — Build & import the SBC images
 
@@ -211,20 +210,20 @@ For 184 sites: build once on a build host, push the OCI tarballs to each site's 
 ```bash
 sudo microk8s helm3 install sbc-<site-id> deploy/helm/sbc \
   --namespace sbc-system --create-namespace \
-  --values values-<site-id>.yaml
+  --values deploy/helm/sites/sbc/<site-id>/values.yaml
 ```
 
 Verify:
 
 ```bash
-# SBC + Kea pods Ready
+# SBC pods Ready
 sudo microk8s kubectl get pods -n sbc-system
 
-# Kea got its fixed LB IP from the site pool
-sudo microk8s kubectl get svc -n sbc-system | grep kea
-# expect: EXTERNAL-IP == kea_lb_ip from values
+# SBC SIP/API Service got its fixed LB IP from the site pool
+sudo microk8s kubectl get svc -n sbc-system | grep sip
+# expect: EXTERNAL-IP == sbc_lb_ip from values
 
-# Cilium BGP advertising pod CIDR + Kea's LB /32
+# Cilium BGP advertising pod CIDR + the SBC SIP/API VIP /32
 sudo microk8s kubectl exec -n kube-system ds/cilium -c cilium-agent -- \
   cilium bgp routes advertised
 
@@ -250,16 +249,13 @@ address-family ipv4 unicast
 exit-address-family
 ```
 
-Per phone VLAN (DHCP relay to Kea's stable LB IP from values.yaml):
+Phone DHCP is handled by **usg-dora** (external to this chart). Per-VLAN
+`ip helper-address` relay config points at the usg-dora relay target — see the
+usg-dora deployment docs, not this playbook.
 
-```
-interface Vlan<phone-vlan-id>
-  ip helper-address <site.kea_lb_ip>      # e.g. 10.50.1.13 — stable across pod restarts
-```
-
-The Kea LB IP comes from your per-site `lb_pool_cidr` and is pinned by Cilium via the LoadBalancer Service. Verify after install:
+Verify the SBC's SIP/API VIP after install:
 ```bash
-sudo microk8s kubectl -n sbc-system get svc | grep kea
+sudo microk8s kubectl -n sbc-system get svc | grep sip
 ```
 
 ## Troubleshooting
@@ -279,13 +275,13 @@ For each of the 184 sites:
 
 - [ ] Site /28 carved from the SBC supernet, recorded in inventory
 - [ ] Upstream router BGP peer config added (3 lines)
-- [ ] Phone VLAN `ip helper-address` lines added (one per VLAN)
+- [ ] Phone DHCP handled by usg-dora (external) — VLAN `ip helper-address` points at its relay target
 - [ ] microk8s installed + Cilium reinstall completed (Steps 1-2)
 - [ ] `usg-sbc-daemon` image imported into local containerd (Step 5)
 - [ ] (optional) `usg-sbc-announcement-server` image imported if using announcement pod
 - [ ] (optional) `usg-sbc-trunk-agent` image imported if using trunk-agent pod
-- [ ] `values-<site-id>.yaml` committed to inventory repo
+- [ ] `deploy/helm/sites/sbc/<site-id>/values.yaml` committed to inventory repo
 - [ ] `helm install` completes successfully (Step 6)
 - [ ] Upstream router shows pod CIDR via BGP (`show ip bgp <cidr>`)
-- [ ] Test phone DHCPs successfully from Kea
+- [ ] Test phone DHCPs successfully (from usg-dora)
 - [ ] Test trunk REGISTER succeeds

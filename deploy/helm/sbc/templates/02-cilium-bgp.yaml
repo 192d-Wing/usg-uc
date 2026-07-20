@@ -47,7 +47,7 @@ spec:
     - advertisementType: PodCIDR
 {{- end }}
 ---
-# Per-site: advertise this site's LoadBalancer IPs (currently just Kea).
+# Per-site: advertise this site's LoadBalancer IPs (the SBC SIP/API VIP).
 # The /32 is advertised only while the Service is allocated an IP from the
 # pool, so removing the chart removes the advertisement.
 apiVersion: cilium.io/v2
