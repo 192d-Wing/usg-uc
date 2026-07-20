@@ -451,6 +451,22 @@ sbcDaemon:
     # via the *-grpc ClusterIP Service to push SIP-router refresh RPCs.
     grpc_listen: "0.0.0.0:9091"
 
+  # Topology hiding (NIST SC-7): anonymize the SBC's internal signaling host
+  # in the Via/Contact of outbound trunk-facing INVITEs so internal topology
+  # is not disclosed to carriers. Opt-in; applies only to outside-facing legs
+  # (inside-facing legs are never rewritten). Default disabled = no change.
+  topologyHiding:
+    enabled: false
+    # none | signaling_only (anonymize host) | full (also drops display names)
+    mode: signaling_only
+    # Public host presented in the anonymized Via/Contact. Empty defaults to
+    # sbc.<site.fqdn_base>.
+    externalHost: ""
+    externalPort: 5060
+    # The B2BUA already emits a fresh per-leg Call-ID, so Call-ID obfuscation
+    # is not applied to B2BUA legs; kept for config-schema completeness.
+    obfuscateCallId: false
+
 # DHCP is provided externally by usg-dora (a DORA fork), deployed and
 # configured outside this chart — the SBC chart no longer ships a DHCP
 # server. Phone DHCP scopes, relay/helper-address targets, and vendor

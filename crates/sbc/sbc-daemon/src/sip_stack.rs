@@ -1686,6 +1686,11 @@ impl SipStack {
         //    d) Try dial plan router
         //    e) Fall back to announcement
         let failover_trunks: Vec<String> = Vec::new();
+        // Direction of the outbound leg: true when it crosses to an untrusted
+        // (trunk/carrier) destination, false for a registered internal user.
+        // Gates topology hiding so only outside-facing legs are anonymized
+        // (rewriting an inside-facing leg's Via/Contact would misroute it).
+        let mut b_leg_external = false;
         let b_leg_destination = {
             // Check DID → user mapping first (e.g., +12139160002 → jwillman)
             let mapped_user = self.lookup_did(&dest_user).await;
@@ -1822,6 +1827,9 @@ impl SipStack {
                         .await;
                 }
 
+                // Routed to a trunk/carrier — this outbound leg faces an
+                // untrusted zone, so topology hiding (if enabled) applies.
+                b_leg_external = true;
                 routed
             }
         };
@@ -1931,9 +1939,21 @@ impl SipStack {
             }
         }
 
-        // 7c. Apply topology hiding to B-leg INVITE
-        // (strip internal Via headers, anonymize Contact)
-        // TopologyHider modifies headers in-place — will be fully wired in Phase 4
+        // 7c. Apply topology hiding to the B-leg INVITE when it faces an
+        // untrusted (trunk/carrier) zone: anonymize the SBC's internal
+        // signaling host in the Via/Contact so internal topology is not
+        // disclosed to carriers. Opt-in via config (default disabled) and
+        // scoped to outside-facing legs so inside routing is unaffected. The
+        // B2BUA already emits a fresh per-leg Call-ID, so no Call-ID rewrite is
+        // needed (and it must not change — it is the correlation key).
+        if b_leg_external
+            && let Some(ref hider) = self.topology_hider
+        {
+            hider
+                .read()
+                .await
+                .hide_b2bua_request(&mut b_leg_request.headers);
+        }
 
         // Extract A-leg branch early — needed for both CallAddresses (H20
         // transaction cleanup) and the server transaction key below.
