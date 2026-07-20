@@ -98,7 +98,7 @@ Key properties:
 | Directory numbers / DIDs | Site Postgres `directory_numbers` | **Central, sharded** | Fleet-wide number management, E.164 uniqueness checks |
 | Trunk groups + trunks | Site Postgres `trunk_groups` + Helm TOML examples | **Central, sharded** + global templates (§5.4) | Most trunks (e.g. BulkVS) are fleet-shared definitions with per-site selection |
 | Dial plans | Site Postgres `dial_plans` + Helm TOML | **Central, sharded** + global templates | Same: baseline plan is fleet policy, sites get overrides |
-| Site telephony settings (max_calls, codec prefs, default trunk group, voicemail URI…) | Helm `values-<site>.yaml` → TOML ConfigMap | **Central `site_telephony_config`** | Editable without a Helm rollout |
+| Site telephony settings (max_calls, codec prefs, default trunk group, voicemail URI…) | Helm `sites/sbc/<site>/values.yaml` → TOML ConfigMap | **Central `site_telephony_config`** | Editable without a Helm rollout |
 | Zones / interfaces / listen addrs, LB IPs, BGP label, fqdn_base | Helm values | **Stays in Helm** | Infrastructure identity; changes imply a deploy anyway |
 | TLS certs, HMAC/auth secrets, Postgres DSNs | K8s Secrets | **Stays in K8s Secrets** | Never in the config DB |
 | OIDC issuer/client config | Helm values | Stays in Helm (Phase ≥6 may centralize) | Tied to ICAM deployment, changes rarely |

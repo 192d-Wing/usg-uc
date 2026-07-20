@@ -115,7 +115,8 @@ ExternalDNS watches Services with the `external-dns.alpha.kubernetes.io/hostname
 
 ## Step 4 — Per-site Helm values
 
-Create `values-<site-id>.yaml`:
+Create `deploy/helm/sites/sbc/<site-id>/values.yaml` (see
+[../sites/README.md](../sites/README.md) for the layout):
 
 ```yaml
 site:
@@ -211,7 +212,7 @@ For 184 sites: build once on a build host, push the OCI tarballs to each site's 
 ```bash
 sudo microk8s helm3 install sbc-<site-id> deploy/helm/sbc \
   --namespace sbc-system --create-namespace \
-  --values values-<site-id>.yaml
+  --values deploy/helm/sites/sbc/<site-id>/values.yaml
 ```
 
 Verify:
@@ -284,7 +285,7 @@ For each of the 184 sites:
 - [ ] `usg-sbc-daemon` image imported into local containerd (Step 5)
 - [ ] (optional) `usg-sbc-announcement-server` image imported if using announcement pod
 - [ ] (optional) `usg-sbc-trunk-agent` image imported if using trunk-agent pod
-- [ ] `values-<site-id>.yaml` committed to inventory repo
+- [ ] `deploy/helm/sites/sbc/<site-id>/values.yaml` committed to inventory repo
 - [ ] `helm install` completes successfully (Step 6)
 - [ ] Upstream router shows pod CIDR via BGP (`show ip bgp <cidr>`)
 - [ ] Test phone DHCPs successfully from Kea

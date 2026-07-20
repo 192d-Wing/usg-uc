@@ -73,7 +73,7 @@ bgp:
 Join an already-running cluster (e.g. k3s) using **published release images**
 from GHCR. The cluster already has its own CNI/BGP/DNS, so the chart does not
 create cluster BGP config and often disables Kea/ExternalDNS. See
-[values-oopl-001.yaml](values-oopl-001.yaml) for a real example.
+[sites/sbc/oopl-001/values.yaml](../sites/sbc/oopl-001/values.yaml) for a real example.
 
 ```yaml
 image:
@@ -89,7 +89,7 @@ kea:        { enabled: false }
 
 > Every component has its own `image:` block (`sbcFrontend.image`, `sbcApi.image`,
 > …). In Model B, set each to the matching `ghcr.io/192d-wing/<component>:<tag>`
-> — see [values-oopl-001.yaml](values-oopl-001.yaml). In Model A they all default
+> — see [sites/sbc/oopl-001/values.yaml](../sites/sbc/oopl-001/values.yaml). In Model A they all default
 > to `localhost/usg-*:local`.
 
 ---
@@ -115,7 +115,7 @@ kea:        { enabled: false }
 
 ## 4. Write the per-site values file
 
-Create `values-<site-id>.yaml`. The minimal Model-A file:
+Create `deploy/helm/sites/sbc/<site-id>/values.yaml`. The minimal Model-A file:
 
 ```yaml
 site:
@@ -190,7 +190,9 @@ kea:
 | `gateway` | Edge HTTPS | Opt-in Gateway API + cert-manager termination; needs the Gateway API CRDs + cert-manager |
 | `sbcClientConfig.oidc` / `extraCaCert` | Soft-client OIDC | Set `issuer`/`clientId`/`audience`; supply `extraCaCert` when the IdP uses a private CA |
 
-Render these from a CSV/YAML inventory + template for many sites — the only
+Store the file at `deploy/helm/sites/sbc/<site-id>/values.yaml` (see
+[../sites/README.md](../sites/README.md) for the layout convention). Render these
+from a CSV/YAML inventory + template for many sites — the only
 per-site differences are `site.*`, `bgp.upstream.ip`, and the phone-subnet block.
 
 ---
@@ -201,18 +203,18 @@ per-site differences are `site.*`, `bgp.upstream.ip`, and the phone-subnet block
 # Model A (microk8s)
 sudo microk8s helm3 install sbc-<site-id> deploy/helm/sbc \
   --namespace sbc-system --create-namespace \
-  --values values-<site-id>.yaml
+  --values deploy/helm/sites/sbc/<site-id>/values.yaml
 
 # Model B (standard helm on an existing cluster)
 helm install sbc-<site-id> deploy/helm/sbc \
   --namespace sbc-system --create-namespace \
-  --values values-<site-id>.yaml
+  --values deploy/helm/sites/sbc/<site-id>/values.yaml
 ```
 
 Dry-run / template first to inspect the rendered manifests:
 
 ```bash
-helm template sbc-<site-id> deploy/helm/sbc --values values-<site-id>.yaml | less
+helm template sbc-<site-id> deploy/helm/sbc --values deploy/helm/sites/sbc/<site-id>/values.yaml | less
 helm install ... --dry-run --debug
 ```
 
@@ -289,7 +291,7 @@ curl -k https://sbc.<fqdn_base>/api/v1/auth/login \
 
 ```bash
 # Upgrade (e.g. bump image tags or tune config) — edit the values file, then:
-helm upgrade sbc-<site-id> deploy/helm/sbc -n sbc-system --values values-<site-id>.yaml
+helm upgrade sbc-<site-id> deploy/helm/sbc -n sbc-system --values deploy/helm/sites/sbc/<site-id>/values.yaml
 
 # Watch the rollout
 kubectl -n sbc-system rollout status deploy/sbc-<site-id>-frontend
@@ -313,15 +315,16 @@ helm uninstall sbc-<site-id> -n sbc-system
 
 ## 9. Multi-site rollout
 
-For a fleet, treat each site as `values-<site-id>.yaml` committed to an inventory
-repo and rendered from a template. Per-site checklist (condensed from
+For a fleet, treat each site as `deploy/helm/sites/sbc/<site-id>/values.yaml`
+committed to an inventory repo and rendered from a template. Per-site checklist
+(condensed from
 [BOOTSTRAP.md](BOOTSTRAP.md#site-by-site-rollout-checklist)):
 
 - [ ] Site `/28` (or `/31`) carved from the LB supernet, recorded in inventory
 - [ ] Upstream router BGP peer + phone-VLAN `ip helper-address` lines added
 - [ ] Cluster ready (Model A: microk8s + Cilium per BOOTSTRAP; Model B: existing)
 - [ ] Images available on the node (imported for A, pullable for B)
-- [ ] `values-<site-id>.yaml` committed — remember `bgp.install_cluster_config`
+- [ ] `deploy/helm/sites/sbc/<site-id>/values.yaml` committed — remember `bgp.install_cluster_config`
       is `true` for the first site on a cluster, `false` afterwards
 - [ ] `helm install` succeeds; pods Ready
 - [ ] Upstream router shows the pod CIDR + Kea `/32` via BGP
@@ -351,5 +354,5 @@ podman `--network=host`, stale CNI IPAM) live in
 
 - [BOOTSTRAP.md](BOOTSTRAP.md) — greenfield microk8s node → cluster bring-up (Cilium/BGP/ExternalDNS)
 - [values.yaml](values.yaml) — the full, commented configuration surface
-- [values-oopl-001.yaml](values-oopl-001.yaml) — a real Model-B (GHCR / k3s / dual-stack) site
+- [sites/sbc/oopl-001/values.yaml](../sites/sbc/oopl-001/values.yaml) — a real Model-B (GHCR / k3s / dual-stack) site
 - `../central-config/` — the fleet-wide central configuration plane (pairs with `sbcConfigSync`)
