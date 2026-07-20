@@ -1385,6 +1385,71 @@ mod tests {
         assert_eq!(&buf[..n], b"two", "injected packet must not be relayed");
     }
 
+    /// End-to-end relay: the full path the SIP call flow drives
+    /// (`create_session` → `set_remote_address` both legs → `start_relay`) must
+    /// forward RTP in BOTH directions. This is the audio gate — it fails if the
+    /// relay is not actually wired to move packets caller ⇄ SBC ⇄ callee.
+    #[tokio::test]
+    async fn test_full_relay_forwards_both_directions() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        // Stand-ins for the caller (A leg) and callee (B leg) endpoints.
+        let caller = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let callee = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let caller_addr = caller.local_addr().unwrap();
+        let callee_addr = callee.local_addr().unwrap();
+
+        let pipeline = MediaPipeline::new(MediaPipelineConfig {
+            srtp_required: false,
+            ..Default::default()
+        });
+        // Bind the relay's sockets on loopback so 127.0.0.1:<port> reaches them.
+        let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let ports = pipeline
+            .create_session_with_zones(
+                "call",
+                Some(MediaMode::Relay),
+                Some(loopback),
+                Some(loopback),
+            )
+            .await
+            .unwrap();
+
+        // A-leg remote = caller, B-leg remote = callee.
+        pipeline
+            .set_remote_address("call", true, SbcSocketAddr::from(caller_addr))
+            .await
+            .unwrap();
+        pipeline
+            .set_remote_address("call", false, SbcSocketAddr::from(callee_addr))
+            .await
+            .unwrap();
+        pipeline.start_relay("call").await.unwrap();
+
+        let a_relay = format!("127.0.0.1:{}", ports.a_leg_rtp_port);
+        let b_relay = format!("127.0.0.1:{}", ports.b_leg_rtp_port);
+        let mut buf = [0u8; 64];
+
+        // Caller → SBC A-leg port → forwarded to the callee.
+        caller.send_to(b"rtp-a2b", &a_relay).await.unwrap();
+        let (n, _) = timeout(Duration::from_secs(2), callee.recv_from(&mut buf))
+            .await
+            .expect("callee must receive the relayed A→B packet")
+            .unwrap();
+        assert_eq!(&buf[..n], b"rtp-a2b");
+
+        // Callee → SBC B-leg port → forwarded to the caller.
+        callee.send_to(b"rtp-b2a", &b_relay).await.unwrap();
+        let (n, _) = timeout(Duration::from_secs(2), caller.recv_from(&mut buf))
+            .await
+            .expect("caller must receive the relayed B→A packet")
+            .unwrap();
+        assert_eq!(&buf[..n], b"rtp-b2a");
+
+        pipeline.stop_relay("call").await.unwrap();
+    }
+
     /// Port allocator must survive index wraparound and tiny/reversed ranges.
     // rtp/rtcp are the standard protocol names for the port pair.
     #[allow(clippy::similar_names)]
