@@ -24,11 +24,12 @@ Helm release. The architecture is **FQDN-first and L3-routed**:
 - Clients (phones, trunks, operators, soft clients) reach it by **name** —
   `sbc.<site.fqdn_base>` — published to DNS by ExternalDNS, or via a stable
   LoadBalancer VIP (`site.sbc_lb_ip`).
-- The **one** place a fixed IP is mandatory is **Kea** (the DHCP server):
-  upstream routers relay DHCP to `site.kea_lb_ip` via `ip helper-address`, which
-  is L3-only and can't take an FQDN.
+- The SBC SIP/API is reached at a **stable LoadBalancer VIP** (`site.sbc_lb_ip`)
+  from a per-site pool, which the FQDN resolves to.
 - **BGP** advertises the pod CIDR and the site's LoadBalancer pool upstream so
   those IPs are routable.
+- **DHCP is out of scope for this chart** — phones get their addresses from
+  **usg-dora** (a DORA fork), deployed and configured separately.
 
 ### What the chart deploys
 
@@ -40,7 +41,6 @@ Helm release. The architecture is **FQDN-first and L3-routed**:
 | Provisioning | `sbcProvision` | on | Renders `/provision/<MAC>.{cfg,xml}` from Postgres |
 | Client-config | `sbcClientConfig` | on | Soft-client discovery + OIDC `/v1/client-config` |
 | Per-site Postgres | `sbcPostgres` | on | Config store (DIDs, phones, trunk groups, dial plans) |
-| Kea DHCPv4 | `kea` | on | Phone DHCP with TEO/vendor options |
 | Announcement server | `sbcAnnouncement` | **off** | Dedicated announcement RTP playback pod |
 | Trunk agent | `sbcTrunkAgent` | **off** | Carrier REGISTER + OPTIONS health loops (exactly 1 replica) |
 | Config-sync | `sbcConfigSync` | **off** | Pulls this site's shard from the central config plane |
@@ -72,7 +72,7 @@ bgp:
 
 Join an already-running cluster (e.g. k3s) using **published release images**
 from GHCR. The cluster already has its own CNI/BGP/DNS, so the chart does not
-create cluster BGP config and often disables Kea/ExternalDNS. See
+create cluster BGP config and often disables ExternalDNS. See
 [sites/sbc/oopl-001/values.yaml](../sites/sbc/oopl-001/values.yaml) for a real example.
 
 ```yaml
@@ -84,7 +84,6 @@ bgp:
   install_cluster_config: false      # cluster BGP already exists
   advertise_label: k3s-pod-cidrs     # match the existing CiliumBGPPeerConfig selector
 externalDns: { enabled: false }
-kea:        { enabled: false }
 ```
 
 > Every component has its own `image:` block (`sbcFrontend.image`, `sbcApi.image`,
@@ -103,9 +102,8 @@ kea:        { enabled: false }
   or pullable from GHCR (Model B).
 - Per-site network facts recorded in your inventory:
   - Site ID (lowercase, DNS-safe), k8s node hostname, FQDN base
-  - LoadBalancer pool CIDR + the Kea and SBC VIPs within it
+  - LoadBalancer pool CIDR + the SBC SIP/API VIP within it
   - Upstream router IP + ASN, cluster ASN
-  - Phone VLAN CIDR(s), gateway, DHCP pool range, VLAN ID
 - **Out-of-band TLS certs** if terminating SIP-TLS / HTTPS with your own PKI
   (see §6): `kubernetes.io/tls` Secrets created before install.
 - One-time per cluster: **ExternalDNS** installed (Model A, if using FQDN
@@ -123,7 +121,6 @@ site:
   node: k8-01                            # k8s node hostname for this site
   fqdn_base: "kfk-001.usg.example.com"   # zone ExternalDNS writes into
   lb_pool_cidr: "10.50.1.0/28"           # site's LoadBalancer IP pool (BGP-advertised)
-  kea_lb_ip:   "10.50.1.13"              # stable LB IP for DHCP relay target
   sbc_lb_ip:   "10.50.1.10"              # stable LB IP for SIP/API; sbc.<fqdn_base> resolves here
   # Optional dual-stack: leave both empty for v4-only.
   lb_pool_cidr6: ""
@@ -161,23 +158,14 @@ sbcDaemon:
     media_mode: Relay
     srtp_required: true
 
-kea:
-  enabled: true
-  phone_subnets:
-    - subnet:      "10.0.101.0/24"
-      pool:        ["10.0.101.50", "10.0.101.250"]
-      gateway:     "10.0.101.1"
-      tftp_server: "sbc.kfk-001.usg.example.com"   # FQDN, not IP
-      dns_servers: ["10.0.101.1"]                  # DHCP option 6 → per-site CoreDNS
-      vlan_id:     3001                            # TEO option 125 L2QVLAN
-      teo_option_125: { enabled: true }            # false for non-TEO phones
+# DHCP is not part of this chart — phones are served by usg-dora (external).
 ```
 
 ### The values contract, block by block
 
 | Block | Purpose | Notes |
 |-------|---------|-------|
-| `site` | Identity + IPs | `name`, `node`, `fqdn_base`, `lb_pool_cidr`, `kea_lb_ip`, `sbc_lb_ip`; `*6` for IPv6 anycast |
+| `site` | Identity + IPs | `name`, `node`, `fqdn_base`, `lb_pool_cidr`, `sbc_lb_ip`; `*6` for IPv6 anycast |
 | `bgp` | Upstream peering | `install_cluster_config: true` **only on the first site per cluster**; `advertise_label` must match the active `CiliumBGPPeerConfig` selector when joining |
 | `externalDns` | FQDN publish | Annotations are always emitted; `enabled` just controls whether ExternalDNS acts on them |
 | `image` + `<component>.image` | Image refs | Model A: `localhost/*:local` + `Never`; Model B: `ghcr.io/192d-wing/*:<tag>` + `IfNotPresent` |
@@ -186,14 +174,13 @@ kea:
 | `sbcDaemon.config` | SIP tuning | `max_calls`, `max_registrations`, `media_mode`, `srtp_required`, listen addrs (`grpc_listen` must differ from `metrics_listen`) |
 | `sbcDaemon.sipTls` | SIP-over-TLS | `secretName` of a `kubernetes.io/tls` Secret covering the registrar domain; empty = UDP/TCP only |
 | `sbcDaemon.oidc` | REGISTER authz | RFC 8898 bearer-token REGISTER; requires an IdP (see `sbcClientConfig.oidc`) |
-| `kea.phone_subnets` | DHCP | Per subnet: `subnet`, `pool`, `gateway`, `tftp_server` (FQDN), `dns_servers`, `vlan_id`, `teo_option_125` |
 | `gateway` | Edge HTTPS | Opt-in Gateway API + cert-manager termination; needs the Gateway API CRDs + cert-manager |
 | `sbcClientConfig.oidc` / `extraCaCert` | Soft-client OIDC | Set `issuer`/`clientId`/`audience`; supply `extraCaCert` when the IdP uses a private CA |
 
 Store the file at `deploy/helm/sites/sbc/<site-id>/values.yaml` (see
 [../sites/README.md](../sites/README.md) for the layout convention). Render these
 from a CSV/YAML inventory + template for many sites — the only
-per-site differences are `site.*`, `bgp.upstream.ip`, and the phone-subnet block.
+per-site differences are `site.*` and `bgp.upstream.ip`.
 
 ---
 
@@ -252,8 +239,8 @@ NS=sbc-system; REL=sbc-<site-id>
 # Pods + services for this release Ready
 kubectl -n $NS get pods,svc -l app.kubernetes.io/instance=$REL
 
-# Kea holds its fixed LB IP from the site pool
-kubectl -n $NS get svc | grep kea            # EXTERNAL-IP == site.kea_lb_ip
+# SBC SIP/API Service holds its fixed LB IP from the site pool
+kubectl -n $NS get svc | grep sip            # EXTERNAL-IP == site.sbc_lb_ip
 
 # Cilium advertising the pod CIDR + LB pool upstream
 kubectl exec -n kube-system ds/cilium -c cilium-agent -- cilium bgp routes advertised
@@ -266,8 +253,8 @@ On the upstream router:
 
 ```bash
 show ip bgp summary
-show ip bgp <site.kea_lb_ip>/32
-ping <site.kea_lb_ip>
+show ip bgp <site.sbc_lb_ip>/32
+ping <site.sbc_lb_ip>
 ```
 
 Retrieve the generated admin password (when `auth` generated one):
@@ -321,14 +308,14 @@ committed to an inventory repo and rendered from a template. Per-site checklist
 [BOOTSTRAP.md](BOOTSTRAP.md#site-by-site-rollout-checklist)):
 
 - [ ] Site `/28` (or `/31`) carved from the LB supernet, recorded in inventory
-- [ ] Upstream router BGP peer + phone-VLAN `ip helper-address` lines added
+- [ ] Upstream router BGP peer added
 - [ ] Cluster ready (Model A: microk8s + Cilium per BOOTSTRAP; Model B: existing)
 - [ ] Images available on the node (imported for A, pullable for B)
 - [ ] `deploy/helm/sites/sbc/<site-id>/values.yaml` committed — remember `bgp.install_cluster_config`
       is `true` for the first site on a cluster, `false` afterwards
 - [ ] `helm install` succeeds; pods Ready
-- [ ] Upstream router shows the pod CIDR + Kea `/32` via BGP
-- [ ] Test phone DHCPs from Kea; test trunk REGISTER succeeds
+- [ ] Upstream router shows the pod CIDR + SBC SIP/API VIP `/32` via BGP
+- [ ] DHCP served by usg-dora (external); test trunk REGISTER succeeds
 
 ---
 
@@ -342,8 +329,8 @@ podman `--network=host`, stale CNI IPAM) live in
 |---------|--------------|-----|
 | Second site's install fails on a cluster-scoped BGP resource | `bgp.install_cluster_config: true` on a non-first site | Set it to `false`; only the first site owns the cluster BGP config |
 | `sbc-api` / `sbc-provision` pod CrashLoopBackOff at startup | Fail-closed auth with no credential | Set `auth.create: true` (or `existingSecret`); confirm the `<release>-auth` Secret exists |
-| Kea Service has no / wrong `EXTERNAL-IP` | LB pool CIDR not advertised, or `kea_lb_ip` outside `lb_pool_cidr` | Check `site.lb_pool_cidr`/`kea_lb_ip`; verify the `CiliumLoadBalancerIPPool` and BGP advertisement |
-| Phones don't resolve `sbc.<site>` | ExternalDNS disabled or DHCP `dns_servers` wrong | Enable `externalDns` (or pre-create A records); point `kea.phone_subnets[].dns_servers` at the per-site DNS |
+| SBC SIP Service has no / wrong `EXTERNAL-IP` | LB pool CIDR not advertised, or `sbc_lb_ip` outside `lb_pool_cidr` | Check `site.lb_pool_cidr`/`sbc_lb_ip`; verify the `CiliumLoadBalancerIPPool` and BGP advertisement |
+| Phones don't resolve `sbc.<site>` | ExternalDNS disabled, or the DNS server usg-dora hands phones is wrong | Enable `externalDns` (or pre-create A records); fix the DNS option in the usg-dora scope |
 | Soft client REGISTER hangs after DNS returns AAAA | `sbc_lb_ip6` published but not actually routed | Allocate + BGP-advertise a real v6 VIP, or clear `site.*6` for v4-only |
 | SIP-TLS listener logs a warning and only UDP/TCP serve | `sbcDaemon.sipTls.secretName` empty or cert missing | Create the `kubernetes.io/tls` Secret covering the registrar domain and set the name |
 | Daemon can't reach Postgres | `sbcPostgres.password` unset, or external `existingSecret` DSN wrong | Set a password (in-chart) or fix the `dsn` key in the referenced Secret |

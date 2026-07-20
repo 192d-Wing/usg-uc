@@ -2,15 +2,14 @@
 #
 # Architecture:
 #   - SBC pod gets a Cilium-assigned cluster-pool IP (dynamic per restart)
-#   - SBC publishes its FQDN via ExternalDNS (sbc.<site.fqdn_base>) → current pod IP
-#   - Phones/trunks/operators all reach SBC by FQDN, NOT by IP
-#   - Kea (DHCPv4 server) is exposed via a LoadBalancer Service with a fixed
-#     IP from a per-site CiliumLoadBalancerIPPool. This is the one place an
-#     IP is required: upstream router `ip helper-address` config is L3-only
-#     and can't take an FQDN.
+#   - SBC SIP/API is exposed via a LoadBalancer Service with a fixed IP
+#     (site.sbc_lb_ip) from a per-site CiliumLoadBalancerIPPool
+#   - SBC publishes its FQDN via ExternalDNS (sbc.<site.fqdn_base>) → the VIP
+#   - Phones/trunks/operators all reach SBC by FQDN
+#   - DHCP is provided externally by usg-dora (a DORA fork), not this chart
 #   - BGP advertises:
 #       * The cluster pod CIDR (so any pod is reachable at its IP)
-#       * The site's LoadBalancer IP pool (so Kea's LB IP is reachable)
+#       * The site's LoadBalancer IP pool (so the SBC SIP/API VIP is reachable)
 #
 # NIST 800-53 Rev5: CM-2 (baseline), CM-6 (settings), SC-7 (boundary).
 
@@ -19,14 +18,11 @@ site:
   node: k8-01                            # k8s node hostname for this site
   # FQDN base. Resources publish themselves under this domain via ExternalDNS:
   #   sbc.<fqdn_base>   → SBC SIP/HTTP
-  #   kea.<fqdn_base>   → Kea (informational only; DHCP relay still uses IP)
   fqdn_base: "kfk-001.usg.example.com"
   # Per-site LoadBalancer IP pool. Tiny CIDR — only a handful of LB IPs are
-  # needed per site (Kea is the main one). Advertised upstream via BGP.
+  # needed per site (the SBC SIP/API VIP is the main one). Advertised
+  # upstream via BGP.
   lb_pool_cidr: "10.50.1.0/28"
-  # Fixed LB IP for Kea. Set the upstream router's `ip helper-address` on
-  # each phone VLAN's SVI to this address.
-  kea_lb_ip: "10.50.1.13"
   # Fixed LB IP for SBC SIP/API ingress. k8s_gateway can't dereference
   # headless Services through Endpoints (it would require a newer plugin
   # version), so SIP/API Services are LoadBalancer-type with a stable LB
@@ -455,36 +451,10 @@ sbcDaemon:
     # via the *-grpc ClusterIP Service to push SIP-router refresh RPCs.
     grpc_listen: "0.0.0.0:9091"
 
-kea:
-  enabled: true
-  image:
-    repository: docker.io/jonasal/kea-dhcp4
-    tag: "2.6.1"
-  resources:
-    requests: { cpu: "50m",  memory: "64Mi"  }
-    limits:   { cpu: "200m", memory: "256Mi" }
-  phone_subnets:
-    - subnet:      "10.0.101.0/24"
-      pool:        ["10.0.101.50", "10.0.101.250"]
-      gateway:     "10.0.101.1"
-      # FQDN of the SBC's provisioning HTTP endpoint — TEO TSG accepts FQDN
-      # here, so we don't need a stable IP for provisioning.
-      tftp_server: "sbc.xtic.dev.mil"
-      # DHCP option 6 (domain-name-servers). Point phones at the per-site
-      # CoreDNS so they can resolve `sbc.<site>` and `kea.<site>` FQDNs.
-      # Coordinates with the sibling coredns-site chart's
-      # service.loadBalancerIP.
-      dns_servers:
-        - "10.0.101.1"
-      # VLAN ID for the phone VLAN. Emitted into TEO option 125 (L2QVLAN
-      # field) so TSG phones know which 802.1q tag to use after first boot.
-      vlan_id: 3001
-      # DHCP option 125 (VIVSO) — TEO TSG vendor-specific payload. Helper
-      # template builds the hex blob from this subnet's gateway / tftp_server
-      # / vlan_id values. Set `enabled: false` for subnets that don't host
-      # TEO TSG phones.
-      teo_option_125:
-        enabled: true
+# DHCP is provided externally by usg-dora (a DORA fork), deployed and
+# configured outside this chart — the SBC chart no longer ships a DHCP
+# server. Phone DHCP scopes, relay/helper-address targets, and vendor
+# options (TEO option 125, etc.) are owned by the usg-dora deployment.
 
 services:
   sip:     { enabled: true }

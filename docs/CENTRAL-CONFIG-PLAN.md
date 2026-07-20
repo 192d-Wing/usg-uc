@@ -517,7 +517,7 @@ Because materialization is per-site, fleet-wide changes get rings for free:
 - Break-glass override mode (§7) for designated sites.
 - Firmware/template artifact management (phone firmware blobs in object
   storage, referenced by config rows; sync agent pre-fetches per-site).
-- Optional: move OIDC/client-config values central; Kea DHCP reservations
+- Optional: move OIDC/client-config values central; usg-dora DHCP reservations
   generated from `phones` shard.
 
 ---

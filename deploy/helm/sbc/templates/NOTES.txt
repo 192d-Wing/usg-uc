@@ -3,10 +3,10 @@ USG SBC site {{ .Values.site.name | quote }} installed on node {{ .Values.site.n
 
 FQDN-first L3 model:
   - SBC pod has one Cilium-assigned IP; FQDN published via ExternalDNS:
-      sbc.{{ .Values.site.fqdn_base }}  →  current pod IP
-  - Kea has a fixed LoadBalancer IP for DHCP relay (the one stable IP needed):
-      Kea LB IP:  {{ .Values.site.kea_lb_ip }}
-  - All other clients (trunks/phones/operators) reach the SBC by FQDN.
+      sbc.{{ .Values.site.fqdn_base }}  →  SBC SIP/API LoadBalancer VIP
+      SBC SIP/API VIP:  {{ .Values.site.sbc_lb_ip }}
+  - All clients (trunks/phones/operators) reach the SBC by FQDN.
+  - DHCP is provided externally by usg-dora (a DORA fork), not this chart.
 
 UPSTREAM ROUTER ({{ .Values.bgp.upstream.ip }}, AS {{ .Values.bgp.upstream.asn }}) BGP CONFIG:
 
@@ -22,11 +22,9 @@ UPSTREAM ROUTER ({{ .Values.bgp.upstream.ip }}, AS {{ .Values.bgp.upstream.asn }
     neighbor kube-nodes default-originate
   exit-address-family
 
-PER PHONE VLAN (DHCP relay to Kea's stable LB IP):
-{{- range .Values.kea.phone_subnets }}
-  interface Vlan<id-for-{{ .subnet }}>
-    ip helper-address {{ $.Values.site.kea_lb_ip }}
-{{- end }}
+DHCP (phones): served by usg-dora, deployed and configured outside this
+chart. Point each phone VLAN's `ip helper-address` at the usg-dora relay
+target (see the usg-dora deployment, not this chart).
 
 OPERATOR DASHBOARD:
   http://sbc.{{ .Values.site.fqdn_base }}/
@@ -81,8 +79,8 @@ Verify on this cluster:
 
 Verify on upstream router:
   show ip bgp summary
-  show ip bgp {{ .Values.site.kea_lb_ip }}/32
-  ping {{ .Values.site.kea_lb_ip }}
+  show ip bgp {{ .Values.site.sbc_lb_ip }}/32
+  ping {{ .Values.site.sbc_lb_ip }}
 
 Management-plane login (sbc-api / sbc-provision are now authenticated):
 {{- if .Values.auth.adminPasswordHash }}
