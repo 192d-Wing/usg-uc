@@ -1,0 +1,12 @@
+module github.com/192d-Wing/usg-uc/sidecar/dtls-terminator
+
+go 1.26.0
+
+require github.com/pion/dtls/v3 v3.1.5
+
+require (
+	github.com/pion/logging v0.2.4 // indirect
+	github.com/pion/transport/v4 v4.0.2 // indirect
+	golang.org/x/crypto v0.48.0 // indirect
+	golang.org/x/sys v0.41.0 // indirect
+)
