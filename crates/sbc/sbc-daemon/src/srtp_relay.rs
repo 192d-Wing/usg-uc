@@ -40,10 +40,17 @@ mod tests {
     use proto_rtp::{RtpHeader, RtpPacket};
     use proto_srtp::{SrtpDirection, SrtpKeyMaterial, SrtpProfile};
 
-    fn ctx(key: u8, salt: u8, dir: SrtpDirection, ssrc: u32) -> SrtpContext {
+    // Fresh AEAD_AES_256_GCM master key + salt per DTLS-SRTP association.
+    // Generated at runtime (not hard-coded) so the round-trip is key-agnostic.
+    fn random_material() -> (Vec<u8>, Vec<u8>) {
+        let key: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+        let salt: Vec<u8> = (0..12).map(|_| rand::random::<u8>()).collect();
+        (key, salt)
+    }
+
+    fn ctx(key: &[u8], salt: &[u8], dir: SrtpDirection, ssrc: u32) -> SrtpContext {
         let material =
-            SrtpKeyMaterial::new(SrtpProfile::AeadAes256Gcm, vec![key; 32], vec![salt; 12])
-                .unwrap();
+            SrtpKeyMaterial::new(SrtpProfile::AeadAes256Gcm, key.to_vec(), salt.to_vec()).unwrap();
         SrtpContext::new(&material, dir, ssrc).unwrap()
     }
 
@@ -54,10 +61,12 @@ mod tests {
     #[test]
     fn reprotect_rtp_bridges_two_associations() {
         let ssrc = 0x0CAF_E123;
-        let peer_a_send = ctx(0x11, 0x22, SrtpDirection::Outbound, ssrc);
-        let sbc_ingress_a = ctx(0x11, 0x22, SrtpDirection::Inbound, ssrc);
-        let sbc_egress_b = ctx(0x33, 0x44, SrtpDirection::Outbound, ssrc);
-        let peer_b_recv = ctx(0x33, 0x44, SrtpDirection::Inbound, ssrc);
+        let (key_a, salt_a) = random_material();
+        let (key_b, salt_b) = random_material();
+        let peer_a_send = ctx(&key_a, &salt_a, SrtpDirection::Outbound, ssrc);
+        let sbc_ingress_a = ctx(&key_a, &salt_a, SrtpDirection::Inbound, ssrc);
+        let sbc_egress_b = ctx(&key_b, &salt_b, SrtpDirection::Outbound, ssrc);
+        let peer_b_recv = ctx(&key_b, &salt_b, SrtpDirection::Inbound, ssrc);
 
         let payload = vec![0xABu8; 160];
         let packet = RtpPacket::new(RtpHeader::new(0, 1000, 160_000, ssrc), payload.clone());
@@ -81,9 +90,12 @@ mod tests {
     #[test]
     fn reprotect_rtp_rejects_unauthenticated() {
         let ssrc = 0x11u32;
-        let wrong_sender = ctx(0x99, 0x88, SrtpDirection::Outbound, ssrc);
-        let sbc_ingress_a = ctx(0x11, 0x22, SrtpDirection::Inbound, ssrc);
-        let sbc_egress_b = ctx(0x33, 0x44, SrtpDirection::Outbound, ssrc);
+        let (key_wrong, salt_wrong) = random_material();
+        let (key_a, salt_a) = random_material();
+        let (key_b, salt_b) = random_material();
+        let wrong_sender = ctx(&key_wrong, &salt_wrong, SrtpDirection::Outbound, ssrc);
+        let sbc_ingress_a = ctx(&key_a, &salt_a, SrtpDirection::Inbound, ssrc);
+        let sbc_egress_b = ctx(&key_b, &salt_b, SrtpDirection::Outbound, ssrc);
 
         let packet = RtpPacket::new(RtpHeader::new(0, 1, 1, ssrc), vec![0u8; 160]);
         let bad = SrtpProtect::new(&wrong_sender)
