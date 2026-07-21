@@ -1,0 +1,88 @@
+name: Client cross-target
+
+# Locks in portability of the shared client core for the native-client
+# migration (docs/CLIENT-NATIVE-MIGRATION-PLAN.md, Phase 0): the FFI crate and
+# everything below it must keep compiling for mobile/desktop targets.
+#
+# Path-filtered so it runs only when the client stack or the shared libraries it
+# compiles can change — SBC-daemon-only, deploy, docs, and sidecar PRs skip it
+# (and skip waiting on a scarce Windows/macOS runner). The filter deliberately
+# includes the shared `uc-*`/`proto-*` crates and the workspace manifests
+# because this job's whole purpose is catching *shared*-core portability breaks;
+# narrowing it to crates/client/** alone would blind it to those.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/client/**'
+      - 'crates/uc/**'
+      - 'crates/proto/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/client-cross.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/client/**'
+      - 'crates/uc/**'
+      - 'crates/proto/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/client-cross.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  client-cross:
+    name: Client cross-target (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-ios
+            os: macos-latest
+          - target: aarch64-apple-ios-sim
+            os: macos-latest
+          - target: aarch64-linux-android
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # Target caching matters most here: these jobs' bottleneck is the
+      # C/C++ deps (aws-lc-fips, oboe) that Swatinem caches in target/.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cross-${{ matrix.target }}
+      # aws-lc-fips-sys builds the FIPS module with Go; macOS runners do not
+      # ship it on PATH (ubuntu/windows do).
+      - uses: actions/setup-go@v6
+        if: runner.os == 'macOS'
+        with:
+          go-version: stable
+          cache: false
+      - name: Configure Android NDK toolchain
+        if: contains(matrix.target, 'android')
+        run: |
+          PREBUILT="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+          {
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$PREBUILT/bin/aarch64-linux-android26-clang"
+            echo "CC_aarch64_linux_android=$PREBUILT/bin/aarch64-linux-android26-clang"
+            echo "CXX_aarch64_linux_android=$PREBUILT/bin/aarch64-linux-android26-clang++"
+            echo "AR_aarch64_linux_android=$PREBUILT/bin/llvm-ar"
+            # aws-lc-(fips-)sys generates bindings with the host libclang,
+            # which needs the Android sysroot spelled out or it fails on
+            # missing libc headers (stdlib.h).
+            echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android=--sysroot=$PREBUILT/sysroot --target=aarch64-linux-android26"
+            echo "ANDROID_NDK_ROOT=$ANDROID_NDK_LATEST_HOME"
+          } >> "$GITHUB_ENV"
+      - run: cargo check -p client-ffi --target ${{ matrix.target }}
