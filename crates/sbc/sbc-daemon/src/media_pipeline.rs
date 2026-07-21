@@ -1243,19 +1243,6 @@ impl TrackedSequence {
     }
 }
 
-/// One direction of the RTP relay with source validation and symmetric-RTP
-/// latching.
-///
-/// Before latching, only packets whose source IP matches the SDP-negotiated
-/// remote are forwarded (the port may differ behind NAT). The first accepted
-/// packet latches the exact source: subsequent packets must match it, and
-/// the opposite direction's send target is updated so replies go to where
-/// media actually arrives from (RFC 4961 symmetric RTP). Packets from any
-/// other source are dropped and counted — an off-path attacker who learns
-/// the media port can no longer inject into or overwrite the stream.
-///
-/// ## NIST 800-53 Rev5: SC-7 (Boundary Protection), SC-8
-
 /// Which stream a relay leg carries. RTP legs feed the "audio flowing" metric
 /// and log; RTCP legs are counted separately so control traffic doesn't inflate
 /// the audio signal.
@@ -1296,8 +1283,21 @@ pub fn rtcp_packets_relayed() -> u64 {
     RTCP_PACKETS_RELAYED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-// call_id + direction are carried for structured relay logging/metrics; the
-// socket/target set is inherent to a bidirectional forwarder.
+/// One direction of the media relay (RTP or RTCP, per `kind`) with source
+/// validation and symmetric latching.
+///
+/// Before latching, only packets whose source IP matches the SDP-negotiated
+/// remote are forwarded (the port may differ behind NAT). The first accepted
+/// packet latches the exact source: subsequent packets must match it, and the
+/// opposite direction's send target is updated so replies go to where media
+/// actually arrives from (RFC 4961 symmetric RTP). Packets from any other
+/// source are dropped and counted — an off-path attacker who learns the media
+/// port can no longer inject into or overwrite the stream.
+///
+/// `call_id` + `direction` are carried for structured logging/metrics; the
+/// socket/target set is inherent to a bidirectional forwarder.
+///
+/// ## NIST 800-53 Rev5: SC-7 (Boundary Protection), SC-8
 #[allow(clippy::too_many_arguments)]
 async fn relay_leg(
     recv_sock: Arc<UdpSocket>,
@@ -1641,8 +1641,13 @@ mod tests {
         let caller_addr = caller.local_addr().unwrap();
         let callee_addr = callee.local_addr().unwrap();
 
+        // Distinct port range from the other relay test: start_relay now binds
+        // the RTCP pair too, so two default-range relays running concurrently
+        // would fight over the same 127.0.0.1 ports.
         let pipeline = MediaPipeline::new(MediaPipelineConfig {
             srtp_required: false,
+            rtp_port_min: 40_000,
+            rtp_port_max: 40_200,
             ..Default::default()
         });
         let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
