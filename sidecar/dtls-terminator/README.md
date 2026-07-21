@@ -22,8 +22,16 @@ and returns the **exported SRTP keying material** for the Rust side to install.
   DTLS handshake (peer identity checked against the SDP fingerprint), then
   exports the 88-byte `AEAD_AES_256_GCM` SRTP keys.
 
-Not yet here (next steps): the IPC transport (a `net.PacketConn` fed by the Rust
-relay), the service wrapper, and the container/build wiring.
+The `ipc` package adapts that `net.PacketConn` to a channel to the Rust relay:
+`NewPacketConn(NewFramedTransport(conn))` lets `Run` drive DTLS over a stream
+IPC (a Unix-domain socket) exactly as over UDP. Framing is a uint16 length
+prefix per DTLS datagram, decoded by a background reader so a read deadline
+never desyncs a partial frame. The same `FrameTransport` interface fits a gRPC
+bidi stream; a datagram IPC (`unixgram`) needs no framing at all.
+
+Not yet here (next steps): the service wrapper that accepts relay sessions over
+the IPC and the Rust-relay side (DTLS/SRTP demux + record pump), plus the
+container/build wiring.
 
 ## Building / testing in FIPS mode
 
