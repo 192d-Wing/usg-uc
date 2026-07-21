@@ -10,11 +10,13 @@ on:
     branches: [main]
     paths:
       - 'sidecar/dtls-terminator/**'
+      - 'sidecar/srtp-test-peer/**'
       - '.github/workflows/sidecar-dtls.yml'
   pull_request:
     branches: [main]
     paths:
       - 'sidecar/dtls-terminator/**'
+      - 'sidecar/srtp-test-peer/**'
       - '.github/workflows/sidecar-dtls.yml'
   workflow_dispatch:
 
@@ -67,3 +69,42 @@ jobs:
         run: go test -v ./...
         env:
           GODEBUG: fips140=on
+
+  # The srtp-test-peer is a DTLS-SRTP media endpoint used only to exercise the
+  # SBC's termination end to end (it adds pion/srtp). It is NOT a FIPS component
+  # — build it as a normal binary (GOFIPS140 cleared) so pion/srtp stays out of
+  # the FIPS sidecar's dependency tree.
+  peer-build-test:
+    name: SRTP test peer (build + test)
+    runs-on: ubuntu-latest
+    env:
+      GOFIPS140: ''
+    defaults:
+      run:
+        working-directory: sidecar/srtp-test-peer
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+          cache-dependency-path: sidecar/srtp-test-peer/go.sum
+
+      - name: gofmt (must be clean)
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      # Loopback self-test: two peers handshake DTLS-SRTP and exchange real SRTP
+      # media. Validates the peer before it's used against the SBC (F2d-2).
+      - name: Test
+        run: go test -v ./...
