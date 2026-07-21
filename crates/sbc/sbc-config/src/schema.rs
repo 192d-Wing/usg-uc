@@ -408,6 +408,13 @@ pub struct DtlsConfig {
     /// Path to DTLS private key (P-384).
     pub key_path: Option<PathBuf>,
 
+    /// Path to the fingerprint file published by the Go DTLS terminator
+    /// sidecar. In the sidecar architecture the sidecar owns the DTLS cert +
+    /// key and drives the handshake; the SBC reads this file at startup to get
+    /// the fingerprint for the SDP `a=fingerprint`. Preferred over
+    /// `cert_path`/`key_path` when set.
+    pub fingerprint_file: Option<PathBuf>,
+
     /// Hash algorithm for SDP fingerprint.
     pub fingerprint_hash: CnsaHash,
 }
@@ -417,6 +424,7 @@ impl Default for DtlsConfig {
         Self {
             cert_path: None,
             key_path: None,
+            fingerprint_file: None,
             fingerprint_hash: CnsaHash::Sha384,
         }
     }
