@@ -8,9 +8,18 @@
 
 use std::net::SocketAddr;
 
+use proto_srtp::{SrtpKeyMaterial, SrtpProfile};
 use tokio::net::UdpSocket;
 
 use crate::dtls_sidecar::{SidecarError, SidecarEvent, SidecarReader, SidecarWriter};
+
+// RFC 7714 §8.3 — AEAD_AES_256_GCM SRTP transform parameters.
+const SRTP_MASTER_KEY_LEN: usize = 32;
+const SRTP_MASTER_SALT_LEN: usize = 12;
+/// Length of the DTLS-SRTP exported keying material for AEAD_AES_256_GCM:
+/// `client_write_key || server_write_key || client_write_salt || server_write_salt`
+/// (RFC 5764 §4.2). 32 + 32 + 12 + 12 = 88 bytes.
+const EXPORTED_KEYING_LEN: usize = 2 * (SRTP_MASTER_KEY_LEN + SRTP_MASTER_SALT_LEN);
 
 /// Classifies a demuxed media packet by its first byte (RFC 7983): DTLS records
 /// are 20..=63; RTP/RTCP/SRTP are 128..=191; STUN is 0..=3.
@@ -40,6 +49,9 @@ pub enum DtlsRelayError {
     /// The sidecar failed the handshake.
     #[error("sidecar handshake failed: {0}")]
     Sidecar(String),
+    /// The exported keying material was malformed or rejected by proto-srtp.
+    #[error("srtp key material: {0}")]
+    KeyMaterial(String),
 }
 
 /// Max inbound datagram we accept from the media socket. Matched to the
@@ -101,6 +113,58 @@ pub async fn run_handshake_pump(
     }
 }
 
+/// Splits the sidecar's exported DTLS-SRTP keying material into the SBC leg's
+/// `(outbound, inbound)` SRTP master key material.
+///
+/// The `exported` blob is the RFC 5764 §4.2 layout for AEAD_AES_256_GCM:
+/// `client_write_key(32) || server_write_key(32) || client_write_salt(12) ||
+/// server_write_salt(12)`. Which half is the SBC's *outbound* (local) key
+/// depends on the DTLS role: the client uses the `client_write_*` values to
+/// protect its own traffic, the server uses `server_write_*`. `sbc_is_client`
+/// is true when the SBC drove the handshake as DTLS client (peer offered
+/// `a=setup:passive`, so the SBC is `active`).
+///
+/// # Errors
+/// The blob is not exactly [`EXPORTED_KEYING_LEN`] bytes, or proto-srtp rejects
+/// the derived key/salt.
+pub fn srtp_key_material(
+    exported: &[u8],
+    sbc_is_client: bool,
+) -> Result<(SrtpKeyMaterial, SrtpKeyMaterial), DtlsRelayError> {
+    if exported.len() != EXPORTED_KEYING_LEN {
+        return Err(DtlsRelayError::KeyMaterial(format!(
+            "exported keying material is {} bytes, expected {EXPORTED_KEYING_LEN}",
+            exported.len()
+        )));
+    }
+    // RFC 5764 §4.2: keys first (both directions), then salts.
+    let (keys, salts) = exported.split_at(2 * SRTP_MASTER_KEY_LEN);
+    let (client_key, server_key) = keys.split_at(SRTP_MASTER_KEY_LEN);
+    let (client_salt, server_salt) = salts.split_at(SRTP_MASTER_SALT_LEN);
+
+    // Outbound = what the SBC uses to protect its own sent traffic (its
+    // write key); inbound = the peer's write key, for unprotecting.
+    let (out_key, out_salt, in_key, in_salt) = if sbc_is_client {
+        (client_key, client_salt, server_key, server_salt)
+    } else {
+        (server_key, server_salt, client_key, client_salt)
+    };
+
+    let outbound = SrtpKeyMaterial::new(
+        SrtpProfile::AeadAes256Gcm,
+        out_key.to_vec(),
+        out_salt.to_vec(),
+    )
+    .map_err(|e| DtlsRelayError::KeyMaterial(format!("outbound: {e}")))?;
+    let inbound = SrtpKeyMaterial::new(
+        SrtpProfile::AeadAes256Gcm,
+        in_key.to_vec(),
+        in_salt.to_vec(),
+    )
+    .map_err(|e| DtlsRelayError::KeyMaterial(format!("inbound: {e}")))?;
+    Ok((outbound, inbound))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -118,6 +182,48 @@ mod tests {
         assert!(is_dtls_record(63)); // DTLS high
         assert!(!is_dtls_record(64)); // TURN channel
         assert!(!is_dtls_record(128)); // RTP/SRTP
+    }
+
+    // Distinct patterns per RFC 5764 field so the split is identifiable.
+    fn sample_exported() -> Vec<u8> {
+        let mut v = Vec::with_capacity(EXPORTED_KEYING_LEN);
+        v.extend_from_slice(&[0x11u8; SRTP_MASTER_KEY_LEN]); // client_write_key
+        v.extend_from_slice(&[0x22u8; SRTP_MASTER_KEY_LEN]); // server_write_key
+        v.extend_from_slice(&[0x33u8; SRTP_MASTER_SALT_LEN]); // client_write_salt
+        v.extend_from_slice(&[0x44u8; SRTP_MASTER_SALT_LEN]); // server_write_salt
+        v
+    }
+
+    #[test]
+    fn srtp_split_client_role() {
+        // SBC is DTLS client: outbound = client_write_*, inbound = server_write_*.
+        let (out, inb) = srtp_key_material(&sample_exported(), true).unwrap();
+        assert_eq!(out.master_key(), [0x11u8; SRTP_MASTER_KEY_LEN]);
+        assert_eq!(out.master_salt(), [0x33u8; SRTP_MASTER_SALT_LEN]);
+        assert_eq!(inb.master_key(), [0x22u8; SRTP_MASTER_KEY_LEN]);
+        assert_eq!(inb.master_salt(), [0x44u8; SRTP_MASTER_SALT_LEN]);
+    }
+
+    #[test]
+    fn srtp_split_server_role() {
+        // SBC is DTLS server: outbound = server_write_*, inbound = client_write_*.
+        let (out, inb) = srtp_key_material(&sample_exported(), false).unwrap();
+        assert_eq!(out.master_key(), [0x22u8; SRTP_MASTER_KEY_LEN]);
+        assert_eq!(out.master_salt(), [0x44u8; SRTP_MASTER_SALT_LEN]);
+        assert_eq!(inb.master_key(), [0x11u8; SRTP_MASTER_KEY_LEN]);
+        assert_eq!(inb.master_salt(), [0x33u8; SRTP_MASTER_SALT_LEN]);
+    }
+
+    #[test]
+    fn srtp_split_rejects_wrong_length() {
+        assert!(matches!(
+            srtp_key_material(&[0u8; EXPORTED_KEYING_LEN - 1], true),
+            Err(DtlsRelayError::KeyMaterial(_))
+        ));
+        assert!(matches!(
+            srtp_key_material(&[0u8; EXPORTED_KEYING_LEN + 1], false),
+            Err(DtlsRelayError::KeyMaterial(_))
+        ));
     }
 
     // Mock-sidecar framing (matches the Go service protocol).
