@@ -61,10 +61,12 @@ func TestDtlsSrtpMatchingKeys(t *testing.T) {
 	if cerr != nil {
 		t.Fatalf("client handshake: %v", cerr)
 	}
+	defer cres.Close()
 	s := <-sch
 	if s.err != nil {
 		t.Fatalf("server handshake: %v", s.err)
 	}
+	defer s.res.Close()
 
 	if cres.Profile != s.res.Profile {
 		t.Fatalf("SRTP profile mismatch: %v vs %v", cres.Profile, s.res.Profile)

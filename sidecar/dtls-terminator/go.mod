@@ -1,6 +1,6 @@
 module github.com/192d-Wing/usg-uc/sidecar/dtls-terminator
 
-go 1.25.0
+go 1.26.0
 
 require github.com/pion/dtls/v3 v3.1.5
 

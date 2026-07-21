@@ -27,7 +27,9 @@ relay), the service wrapper, and the container/build wiring.
 
 ## Building / testing in FIPS mode
 
-Requires Go **1.24+** (FIPS 140-3 support). The compliance posture is
+Requires Go **1.26+** (the `go` directive in `go.mod`; the module uses the
+`crypto/fips140` reporting API and targets the v1.26.0 module. FIPS 140-3
+support itself landed in Go 1.24). The compliance posture is
 `GODEBUG=fips140=on` (all crypto primitives in the certified module; DTLS's
 protocol-mandated deterministic-IV GCM does not pass the stricter `fips140=only`
 audit — see `srtp-dtls-termination-plan` notes).
