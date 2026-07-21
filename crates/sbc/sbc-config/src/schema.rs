@@ -415,6 +415,12 @@ pub struct DtlsConfig {
     /// `cert_path`/`key_path` when set.
     pub fingerprint_file: Option<PathBuf>,
 
+    /// Path to the Go DTLS terminator sidecar's Unix domain socket. The relay
+    /// opens one connection per terminated leg to drive the DTLS handshake and
+    /// pump records. Required (together with `fingerprint_file`) for the
+    /// sidecar termination path when `srtp.mode = terminate`.
+    pub sidecar_socket: Option<PathBuf>,
+
     /// Hash algorithm for SDP fingerprint.
     pub fingerprint_hash: CnsaHash,
 }
@@ -425,6 +431,7 @@ impl Default for DtlsConfig {
             cert_path: None,
             key_path: None,
             fingerprint_file: None,
+            sidecar_socket: None,
             fingerprint_hash: CnsaHash::Sha384,
         }
     }
