@@ -35,6 +35,21 @@ connection. Wire protocol (typed frames over the IPC): `Hello{fingerprint}` →
 `Start{role, peerFP}` → `Dtls{record}` … → `Ready{profile, srtpKeys}` (or
 `Error`). It refuses to start outside the FIPS module.
 
+## Fingerprint provisioning (the signaling-time contract)
+
+DTLS-SRTP requires the SBC's `a=fingerprint` to be in the SDP offer/answer, at
+**signaling time — before any media/DTLS** (RFC 8122/5763). The fingerprint is
+a call-independent property of the sidecar identity, so the sidecar publishes it
+to a file at startup (`-fingerprint-file`, default `/run/usg/dtls-terminator.fp`,
+written atomically). The SBC reads that file at startup and feeds it to its SDP
+rewriter — the same split rtpengine uses (the media element owns the cert and
+provides its fingerprint for the signaling element's SDP). The per-call
+Unix-socket sessions carry only DTLS records.
+
+Cert rotation must be coordinated: the sidecar holds one identity for its
+lifetime; a restart mints a new fingerprint, so in-flight calls whose SDP
+advertised the old one would fail the handshake.
+
 Not yet here (next steps): the Rust-relay side (DTLS/SRTP demux on the media
 socket + record pump over this IPC, then SRTP protect/unprotect via
 `proto-srtp` → aws-lc-FIPS), plus the container/build wiring.

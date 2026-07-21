@@ -384,11 +384,20 @@ impl Server {
         // fingerprint, not PKI). Fail closed — configuring termination but
         // starting without an identity would silently break secured media.
         if config.media.srtp.mode == sbc_config::SrtpMode::Terminate {
-            let identity = match (&config.media.dtls.cert_path, &config.media.dtls.key_path) {
-                (Some(cert), Some(key)) => {
-                    crate::dtls_identity::DtlsIdentity::from_pem_files(cert, key)
-                }
-                _ => crate::dtls_identity::DtlsIdentity::generate(),
+            // Sidecar architecture: the Go DTLS terminator owns the cert/key and
+            // publishes its fingerprint to a file; read that for the SDP. Fall
+            // back to an operator cert/key or a self-signed cert only for the
+            // legacy in-Rust DTLS path (whose fingerprint won't match a sidecar).
+            // map_or_else with a nested cert/key match reads worse than this.
+            #[allow(clippy::option_if_let_else)]
+            let identity = match &config.media.dtls.fingerprint_file {
+                Some(fp_file) => crate::dtls_identity::DtlsIdentity::from_fingerprint_file(fp_file),
+                None => match (&config.media.dtls.cert_path, &config.media.dtls.key_path) {
+                    (Some(cert), Some(key)) => {
+                        crate::dtls_identity::DtlsIdentity::from_pem_files(cert, key)
+                    }
+                    _ => crate::dtls_identity::DtlsIdentity::generate(),
+                },
             };
             match identity {
                 Ok(id) => {

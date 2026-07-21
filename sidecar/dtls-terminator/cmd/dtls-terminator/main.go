@@ -28,6 +28,8 @@ import (
 func main() {
 	sockPath := flag.String("socket", "/run/usg/dtls-terminator.sock",
 		"Unix-domain socket to accept relay sessions on")
+	fpFile := flag.String("fingerprint-file", "/run/usg/dtls-terminator.fp",
+		"file to publish the SDP fingerprint to (read by the SBC at signaling time)")
 	flag.Parse()
 
 	// Refuse to run outside the FIPS module — the entire reason this sidecar
@@ -42,6 +44,14 @@ func main() {
 		log.Fatalf("generate DTLS identity: %v", err)
 	}
 	log.Printf("DTLS identity fingerprint: %s", identity.Fingerprint())
+
+	// Publish the fingerprint for the SBC to read at signaling time (it must
+	// appear in the SDP a=fingerprint before any media/DTLS). Do this before
+	// accepting sessions so the file exists once we are up.
+	if err := service.WriteFingerprintFile(*fpFile, identity.Fingerprint()); err != nil {
+		log.Fatalf("publish fingerprint to %s: %v", *fpFile, err)
+	}
+	log.Printf("published fingerprint to %s", *fpFile)
 
 	// Bind the listening socket (replacing any stale one).
 	_ = os.Remove(*sockPath)
