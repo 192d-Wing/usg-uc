@@ -9,11 +9,17 @@
 package main
 
 import (
+	"context"
 	"crypto/fips140"
+	"errors"
 	"flag"
 	"log"
 	"net"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
 
 	dtlssession "github.com/192d-Wing/usg-uc/sidecar/dtls-terminator"
 	"github.com/192d-Wing/usg-uc/sidecar/dtls-terminator/service"
@@ -43,19 +49,41 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen %s: %v", *sockPath, err)
 	}
-	defer func() { _ = ln.Close() }()
 	log.Printf("dtls-terminator listening on %s (FIPS module %s)", *sockPath, fips140.Version())
 
+	// Graceful shutdown: on SIGINT/SIGTERM stop accepting and drain in-flight
+	// sessions (closing the listener unblocks Accept with net.ErrClosed and
+	// removes the socket file).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		log.Print("shutdown signal received: closing listener and draining sessions")
+		_ = ln.Close()
+	}()
+
+	var wg sync.WaitGroup
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				break // listener closed by shutdown
+			}
+			// Transient error (e.g. fd exhaustion): back off instead of
+			// spinning at 100% CPU retrying immediately.
 			log.Printf("accept: %v", err)
+			time.Sleep(50 * time.Millisecond)
 			continue
 		}
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			if err := service.HandleSession(conn, identity); err != nil {
 				log.Printf("session error: %v", err)
 			}
 		}()
 	}
+
+	wg.Wait()
+	log.Print("all sessions drained; exiting")
 }
