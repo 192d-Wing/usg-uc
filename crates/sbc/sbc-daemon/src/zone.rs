@@ -129,6 +129,21 @@ impl ResolvedZoneRegistry {
         self.zones.keys().next().cloned()
     }
 
+    /// Returns the name of the first carrier/external-facing zone — one with an
+    /// external IP source configured (a literal external IP or a `stun` source).
+    /// Used to pick the media interface advertised to trunks on outbound
+    /// (untrusted) legs. `None` if no zone is external-facing (single-side
+    /// deployment), in which case the caller falls back to the ingress zone.
+    ///
+    /// With multiple external-facing zones the choice is unspecified (HashMap
+    /// order); production carrier deployments configure exactly one.
+    pub fn external_facing_zone(&self) -> Option<String> {
+        self.zones
+            .iter()
+            .find(|(_, e)| e.external_ip_source.is_some())
+            .map(|(name, _)| name.clone())
+    }
+
     /// Updates the external IP for a zone (called from STUN or Via received=).
     pub async fn update_external_ip(&self, zone_name: &str, ip: IpAddr) {
         if let Some(entry) = self.zones.get(zone_name) {
@@ -358,6 +373,23 @@ mod tests {
             fallback.is_some(),
             "unmatched IP should fall back, not return None"
         );
+    }
+
+    #[test]
+    fn test_external_facing_zone() {
+        let reg = ResolvedZoneRegistry::from_resolved(make_test_zones());
+        // "external" has external_ip_source set; "internal" does not.
+        assert_eq!(reg.external_facing_zone(), Some("external".to_string()));
+
+        // No external-facing zone → None (single-side deployment).
+        let internal_only = ResolvedZoneRegistry::from_resolved(vec![ResolvedZone {
+            name: "internal".to_string(),
+            signaling_ip: "10.0.1.10".parse().unwrap(),
+            media_ip: "10.0.1.10".parse().unwrap(),
+            external_ip: None,
+            external_ip_source: None,
+        }]);
+        assert_eq!(internal_only.external_facing_zone(), None);
     }
 
     #[test]

@@ -290,9 +290,13 @@ struct CallAddresses {
     /// offer (B-leg port) and answer (A-leg port) point at the relay's sockets.
     /// `None` when no relay is attached (bare-port fallback).
     media_a_leg_port: Option<u16>,
-    /// SBC-owned media IP advertised in rewritten SDP (relay bind address).
-    /// Resolved once at INVITE so the answer handlers advertise the same host.
-    media_local_ip: String,
+    /// SBC-owned media IP advertised to the **caller** in the A-leg answer SDP
+    /// (183/200) — the ingress zone's media interface, where the relay's
+    /// caller-facing socket is bound. Resolved once at INVITE so the answer
+    /// handlers advertise the same host the relay listens on. The callee-facing
+    /// (egress zone) media IP is only needed when building the B-leg offer, so
+    /// it is used inline at INVITE and not stored here.
+    media_a_leg_ip: String,
     /// Via branch of the A-leg INVITE (server transaction key for cleanup).
     a_leg_branch: String,
 }
@@ -536,16 +540,28 @@ impl SipStack {
         }
     }
 
-    /// Resolves the SBC's own media IP for a call — the address to bind the RTP
-    /// relay to AND advertise in rewritten SDP. Endpoints send RTP straight to
-    /// this address, so it MUST be SBC-owned: the peer's source IP is only
-    /// correct for signaling (where the Via `received=` param repairs response
-    /// routing), never for media. Uses the zone registry's media interface
-    /// (zones share it in the single-interface / single-pod model). Returns
-    /// `(bind_ip, advertise_string)`; falls back to `fallback` (relay binds
-    /// `0.0.0.0`) when no zone media IP is configured.
-    fn call_media_ip(&self, fallback: std::net::IpAddr) -> (Option<std::net::IpAddr>, String) {
+    /// Resolves the SBC's own media IP for one leg of a call — the address to
+    /// bind that leg's RTP relay socket to AND advertise in its rewritten SDP.
+    /// Endpoints send RTP straight to this address, so it MUST be SBC-owned: the
+    /// peer's source IP is only correct for signaling (where the Via `received=`
+    /// param repairs response routing), never for media.
+    ///
+    /// Prefers the named `zone`'s media interface (so the caller-facing leg
+    /// advertises the ingress zone and the trunk-facing leg advertises the
+    /// egress zone); falls back to the first configured zone, then to `fallback`
+    /// (relay binds `0.0.0.0`) when no zone media IP is available. Returns
+    /// `(bind_ip, advertise_string)`.
+    fn zone_media_bind(
+        &self,
+        zone: Option<&str>,
+        fallback: std::net::IpAddr,
+    ) -> (Option<std::net::IpAddr>, String) {
         if let Some(reg) = &self.zone_registry {
+            if let Some(name) = zone
+                && let Some(ip) = reg.media_ip(name)
+            {
+                return (Some(ip), ip.to_string());
+            }
             for name in reg.zone_names() {
                 if let Some(ip) = reg.media_ip(&name) {
                     return (Some(ip), ip.to_string());
@@ -553,6 +569,24 @@ impl SipStack {
             }
         }
         (None, fallback.to_string())
+    }
+
+    /// Picks the zone whose media interface faces the **callee** (B-leg). On an
+    /// outbound leg that crosses to a trunk/carrier (`b_leg_external`), that is
+    /// the carrier-facing zone (the one with an external IP configured) so the
+    /// SBC advertises its outside media address to the carrier; otherwise the
+    /// call stays inside and the callee is reached from the same (ingress) zone
+    /// as the caller. Falls back to the ingress zone when no external-facing
+    /// zone is configured.
+    fn egress_media_zone(&self, ingress: Option<&str>, b_leg_external: bool) -> Option<String> {
+        if b_leg_external {
+            self.zone_registry
+                .as_ref()
+                .and_then(|reg| reg.external_facing_zone())
+                .or_else(|| ingress.map(String::from))
+        } else {
+            ingress.map(String::from)
+        }
     }
 
     /// Sets the SBC router for CSS/Partition-based call routing.
@@ -790,7 +824,7 @@ impl SipStack {
         &self,
         data: &Bytes,
         source: SbcSocketAddr,
-        _receiving_zone: Option<&str>,
+        receiving_zone: Option<&str>,
     ) -> ProcessResult {
         // Parse the SIP message
         let message = match SipMessage::parse(data) {
@@ -814,13 +848,19 @@ impl SipStack {
         );
 
         match message {
-            SipMessage::Request(_) => self.process_request(message, source).await,
+            SipMessage::Request(_) => self.process_request(message, source, receiving_zone).await,
             SipMessage::Response(_) => self.process_response(message, source).await,
         }
     }
 
-    /// Processes a SIP request.
-    async fn process_request(&self, message: SipMessage, source: SbcSocketAddr) -> ProcessResult {
+    /// Processes a SIP request. `receiving_zone` is the zone the request arrived
+    /// on (used by INVITE to pick the caller-facing media interface).
+    async fn process_request(
+        &self,
+        message: SipMessage,
+        source: SbcSocketAddr,
+        receiving_zone: Option<&str>,
+    ) -> ProcessResult {
         let SipMessage::Request(ref req) = message else {
             return ProcessResult::Error {
                 reason: "Expected request".to_string(),
@@ -839,7 +879,7 @@ impl SipStack {
 
         match method {
             Method::Register => self.handle_register(message, source).await,
-            Method::Invite => self.handle_invite(message, source).await,
+            Method::Invite => self.handle_invite(message, source, receiving_zone).await,
             Method::Ack => self.handle_ack(message).await,
             Method::Bye => self.handle_bye(message, source).await,
             Method::Cancel => self.handle_cancel(message, source).await,
@@ -991,7 +1031,7 @@ impl SipStack {
                 }
                 p
             };
-            let local_media = MediaAddress::new(&addrs.media_local_ip, rtp_port);
+            let local_media = MediaAddress::new(&addrs.media_a_leg_ip, rtp_port);
             let result = self
                 .sdp_rewriter
                 .rewrite_answer_for_a_leg(&sdp_str, &local_media);
@@ -1070,7 +1110,7 @@ impl SipStack {
                 }
                 p
             };
-            let local_media = MediaAddress::new(&addrs.media_local_ip, rtp_port);
+            let local_media = MediaAddress::new(&addrs.media_a_leg_ip, rtp_port);
             let result = self
                 .sdp_rewriter
                 .rewrite_answer_for_a_leg(&sdp_str, &local_media);
@@ -1551,7 +1591,12 @@ impl SipStack {
     /// 4. Rewrite SDP with SBC's address for media anchoring
     /// 5. Build B-leg INVITE with new headers
     /// 6. Return Multiple(100 Trying + Forward B-leg INVITE)
-    async fn handle_invite(&self, message: SipMessage, source: SbcSocketAddr) -> ProcessResult {
+    async fn handle_invite(
+        &self,
+        message: SipMessage,
+        source: SbcSocketAddr,
+        receiving_zone: Option<&str>,
+    ) -> ProcessResult {
         let SipMessage::Request(ref req) = message else {
             return ProcessResult::Error {
                 reason: "Expected request".to_string(),
@@ -1917,12 +1962,19 @@ impl SipStack {
         // caller's offer so RTP forwards once the callee answers. Without a
         // pipeline, fall back to a bare port (SDP rewritten but no relay).
         let session_key = internal_call_id.to_string();
-        // Advertise + bind the SBC's own media IP (never the peer's source IP,
-        // which is only valid for signaling). Endpoints send RTP straight here.
-        let (media_bind_ip, media_ip_str) = self.call_media_ip(source.ip());
+        // Advertise + bind the SBC's own media IP per leg (never the peer's
+        // source IP, which is only valid for signaling). The caller-facing
+        // (A-leg) socket uses the ingress zone's media interface; the
+        // callee-facing (B-leg) socket uses the egress zone's — the carrier zone
+        // on outbound trunk legs, else the same ingress zone. In a single-zone
+        // deployment both collapse to that zone's media IP (unchanged behavior).
+        let egress_zone = self.egress_media_zone(receiving_zone, b_leg_external);
+        let (a_media_bind, a_media_ip_str) = self.zone_media_bind(receiving_zone, source.ip());
+        let (b_media_bind, b_media_ip_str) =
+            self.zone_media_bind(egress_zone.as_deref(), source.ip());
         let (b_leg_rtp_port, media_a_leg_port) = if let Some(ref pipeline) = self.media_pipeline {
             match pipeline
-                .create_session_with_zones(&session_key, None, media_bind_ip, media_bind_ip)
+                .create_session_with_zones(&session_key, None, a_media_bind, b_media_bind)
                 .await
             {
                 Ok(ports) => {
@@ -1948,7 +2000,7 @@ impl SipStack {
         };
         let b_leg_sdp = req.body.as_ref().map(|body| {
             let sdp_str = String::from_utf8_lossy(body);
-            let local_media = MediaAddress::new(&media_ip_str, b_leg_rtp_port);
+            let local_media = MediaAddress::new(&b_media_ip_str, b_leg_rtp_port);
             let result = self
                 .sdp_rewriter
                 .rewrite_offer_for_b_leg(&sdp_str, &local_media);
@@ -2101,7 +2153,7 @@ impl SipStack {
                     dialog_to_tag: None,
                     rtp_ports: vec![b_leg_rtp_port],
                     media_a_leg_port,
-                    media_local_ip: media_ip_str,
+                    media_a_leg_ip: a_media_ip_str,
                     a_leg_branch: a_branch.clone(),
                 },
             );
@@ -3587,6 +3639,61 @@ mod tests {
 
         assert_eq!(stack.dialog_count().await, 0);
         assert_eq!(stack.call_count().await, 0);
+    }
+
+    #[test]
+    fn per_zone_media_ip_selects_ingress_and_egress() {
+        use crate::zone::ResolvedZoneRegistry;
+        use sbc_config::interface::ResolvedZone;
+
+        let mut stack = SipStack::new(SipStackConfig::default());
+        stack.set_zone_registry(Arc::new(ResolvedZoneRegistry::from_resolved(vec![
+            ResolvedZone {
+                name: "inside".to_string(),
+                signaling_ip: "10.0.1.10".parse().unwrap(),
+                media_ip: "10.0.1.20".parse().unwrap(),
+                external_ip: None,
+                external_ip_source: None,
+            },
+            ResolvedZone {
+                name: "outside".to_string(),
+                signaling_ip: "203.0.113.5".parse().unwrap(),
+                media_ip: "203.0.113.6".parse().unwrap(),
+                external_ip: Some("203.0.113.6".parse().unwrap()),
+                external_ip_source: Some("203.0.113.6".to_string()),
+            },
+        ])));
+
+        let fallback: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+
+        // A-leg (caller) advertises + binds the INGRESS zone's media interface.
+        let (a_bind, a_adv) = stack.zone_media_bind(Some("inside"), fallback);
+        assert_eq!(a_adv, "10.0.1.20");
+        assert_eq!(a_bind, "10.0.1.20".parse::<std::net::IpAddr>().ok());
+
+        // Outbound trunk leg → egress zone is the carrier-facing (external) zone,
+        // so the B-leg advertises the outside media interface.
+        let egress = stack.egress_media_zone(Some("inside"), true);
+        assert_eq!(egress.as_deref(), Some("outside"));
+        let (_, b_adv) = stack.zone_media_bind(egress.as_deref(), fallback);
+        assert_eq!(b_adv, "203.0.113.6");
+
+        // Internal (non-external) call → egress stays on the ingress zone.
+        assert_eq!(
+            stack.egress_media_zone(Some("inside"), false).as_deref(),
+            Some("inside")
+        );
+
+        // No zone registry → bind None (relay binds 0.0.0.0), advertise fallback,
+        // and egress falls back to the ingress zone name.
+        let bare = SipStack::new(SipStackConfig::default());
+        let (bind, adv) = bare.zone_media_bind(Some("inside"), fallback);
+        assert_eq!(bind, None);
+        assert_eq!(adv, "192.0.2.1");
+        assert_eq!(
+            bare.egress_media_zone(Some("inside"), true).as_deref(),
+            Some("inside")
+        );
     }
 
     #[tokio::test]
