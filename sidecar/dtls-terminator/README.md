@@ -29,9 +29,15 @@ prefix per DTLS datagram, decoded by a background reader so a read deadline
 never desyncs a partial frame. The same `FrameTransport` interface fits a gRPC
 bidi stream; a datagram IPC (`unixgram`) needs no framing at all.
 
-Not yet here (next steps): the service wrapper that accepts relay sessions over
-the IPC and the Rust-relay side (DTLS/SRTP demux + record pump), plus the
-container/build wiring.
+The `service` package + `cmd/dtls-terminator` are the runnable sidecar: it
+listens on a Unix-domain socket and terminates one DTLS-SRTP leg per
+connection. Wire protocol (typed frames over the IPC): `Hello{fingerprint}` →
+`Start{role, peerFP}` → `Dtls{record}` … → `Ready{profile, srtpKeys}` (or
+`Error`). It refuses to start outside the FIPS module.
+
+Not yet here (next steps): the Rust-relay side (DTLS/SRTP demux on the media
+socket + record pump over this IPC, then SRTP protect/unprotect via
+`proto-srtp` → aws-lc-FIPS), plus the container/build wiring.
 
 ## Building / testing in FIPS mode
 
