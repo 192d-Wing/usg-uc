@@ -71,7 +71,7 @@ pub use interface::{ResolvedZone, resolve_zones};
 pub use schema::TelemetryConfig;
 pub use schema::{
     DialPlanConfig, DialPlanEntryConfig, HeaderManipulationConfig, ManipulationRuleConfig,
-    RoutingConfig, SbcConfig, TopologyHidingConfig, TrunkConfigSchema, TrunkGroupConfig,
+    RoutingConfig, SbcConfig, SrtpMode, TopologyHidingConfig, TrunkConfigSchema, TrunkGroupConfig,
     TrunkManipulationRuleConfig, ZoneConfig,
 };
 

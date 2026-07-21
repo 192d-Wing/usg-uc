@@ -72,6 +72,9 @@ pub struct SipStack {
     sdp_rewriter: SdpRewriter,
     /// Media pipeline for RTP relay (optional, set after construction).
     media_pipeline: Option<Arc<crate::media_pipeline::MediaPipeline>>,
+    /// The SBC's DTLS-SRTP identity. `Some` only when `srtp.mode = terminate`;
+    /// its presence gates advertising the SBC fingerprint in rewritten SDP.
+    dtls_identity: Option<Arc<crate::dtls_identity::DtlsIdentity>>,
     /// Call router for dial plan matching and trunk selection.
     router: Option<RwLock<Router>>,
     /// SBC-compatible router for CSS/Partition-based routing.
@@ -297,6 +300,10 @@ struct CallAddresses {
     /// (egress zone) media IP is only needed when building the B-leg offer, so
     /// it is used inline at INVITE and not stored here.
     media_a_leg_ip: String,
+    /// The caller's offered DTLS `a=setup` role (from the A-leg INVITE offer),
+    /// used to pick the SBC's answering role in the A-leg 183/200 SDP when
+    /// terminating DTLS-SRTP. `None` for non-DTLS offers or pass-through.
+    dtls_caller_setup: Option<crate::sdp_dtls::SetupRole>,
     /// Via branch of the A-leg INVITE (server transaction key for cleanup).
     a_leg_branch: String,
 }
@@ -371,6 +378,7 @@ impl SipStack {
             call_correlation: RwLock::new(CallCorrelation::default()),
             sdp_rewriter: SdpRewriter::new(B2buaMode::MediaRelay),
             media_pipeline: None,
+            dtls_identity: None,
             router: None,
             sbc_router: None,
             header_manipulator: None,
@@ -424,6 +432,7 @@ impl SipStack {
             call_correlation: RwLock::new(CallCorrelation::default()),
             sdp_rewriter: SdpRewriter::new(B2buaMode::MediaRelay),
             media_pipeline: None,
+            dtls_identity: None,
             router: None,
             sbc_router: None,
             header_manipulator: None,
@@ -490,6 +499,28 @@ impl SipStack {
     /// Sets the media pipeline for RTP relay.
     pub fn set_media_pipeline(&mut self, pipeline: Arc<crate::media_pipeline::MediaPipeline>) {
         self.media_pipeline = Some(pipeline);
+    }
+
+    /// Sets the SBC's DTLS-SRTP identity, enabling DTLS-SRTP termination
+    /// (advertising the SBC's own fingerprint in rewritten SDP). Set only when
+    /// `srtp.mode = terminate`.
+    pub fn set_dtls_identity(&mut self, identity: Arc<crate::dtls_identity::DtlsIdentity>) {
+        self.dtls_identity = Some(identity);
+    }
+
+    /// Applies DTLS-SRTP termination rewriting to an A-leg answer SDP: when the
+    /// SBC terminates DTLS (`dtls_identity` set), advertise the SBC's own
+    /// fingerprint with the answering `a=setup` role derived from the caller's
+    /// offer (RFC 5763). A no-op for pass-through or non-DTLS answers.
+    fn rewrite_answer_dtls(&self, sdp: String, addrs: &CallAddresses) -> String {
+        if let Some(identity) = &self.dtls_identity {
+            let role = addrs
+                .dtls_caller_setup
+                .map_or(crate::sdp_dtls::SetupRole::Passive, |s| s.answer_role());
+            crate::sdp_dtls::rewrite_local_dtls(&sdp, identity.sdp_fingerprint(), role)
+        } else {
+            sdp
+        }
     }
 
     /// Enables RFC 8898 Bearer-token REGISTER authorization. When set,
@@ -1035,7 +1066,7 @@ impl SipStack {
             let result = self
                 .sdp_rewriter
                 .rewrite_answer_for_a_leg(&sdp_str, &local_media);
-            let rewritten = Bytes::from(result.rewritten);
+            let rewritten = Bytes::from(self.rewrite_answer_dtls(result.rewritten, addrs));
             // build_a_leg_response set Content-Length: 0; correct it to
             // the attached body length or the A-leg UA truncates the SDP
             // and the caller gets no early media.
@@ -1114,7 +1145,9 @@ impl SipStack {
             let result = self
                 .sdp_rewriter
                 .rewrite_answer_for_a_leg(&sdp_str, &local_media);
-            a_response.body = Some(Bytes::from(result.rewritten));
+            a_response.body = Some(Bytes::from(
+                self.rewrite_answer_dtls(result.rewritten, addrs),
+            ));
             a_response
                 .headers
                 .set(HeaderName::ContentType, "application/sdp");
@@ -1998,13 +2031,32 @@ impl SipStack {
         } else {
             (self.allocate_rtp_port(), None)
         };
+        // DTLS-SRTP termination (when `srtp.mode = terminate`, i.e.
+        // `dtls_identity` is set): learn the caller's offered DTLS params (its
+        // `a=setup` picks the SBC's answering role for the A-leg 183/200), and
+        // on the B-leg offer advertise the SBC's own fingerprint with actpass
+        // (the SBC is the offerer toward the callee). Otherwise SDP is untouched.
+        let dtls_caller_setup = req
+            .body
+            .as_ref()
+            .and_then(|body| crate::sdp_dtls::parse_peer_dtls(&String::from_utf8_lossy(body)))
+            .and_then(|d| d.setup);
+
         let b_leg_sdp = req.body.as_ref().map(|body| {
             let sdp_str = String::from_utf8_lossy(body);
             let local_media = MediaAddress::new(&b_media_ip_str, b_leg_rtp_port);
-            let result = self
+            let mut rewritten = self
                 .sdp_rewriter
-                .rewrite_offer_for_b_leg(&sdp_str, &local_media);
-            result.rewritten
+                .rewrite_offer_for_b_leg(&sdp_str, &local_media)
+                .rewritten;
+            if let Some(identity) = &self.dtls_identity {
+                rewritten = crate::sdp_dtls::rewrite_local_dtls(
+                    &rewritten,
+                    identity.sdp_fingerprint(),
+                    crate::sdp_dtls::SetupRole::ActPass,
+                );
+            }
+            rewritten
         });
 
         // 7. Build B-leg INVITE
@@ -2154,6 +2206,7 @@ impl SipStack {
                     rtp_ports: vec![b_leg_rtp_port],
                     media_a_leg_port,
                     media_a_leg_ip: a_media_ip_str,
+                    dtls_caller_setup,
                     a_leg_branch: a_branch.clone(),
                 },
             );
