@@ -377,6 +377,37 @@ impl Server {
             media_config,
         )));
 
+        // DTLS-SRTP termination identity: when `srtp.mode = terminate`, the SBC
+        // is a DTLS endpoint on each leg and must present its own certificate.
+        // Load an operator-provided cert/key if configured, else generate an
+        // ephemeral self-signed P-384 identity (DTLS-SRTP validates by SDP
+        // fingerprint, not PKI). Fail closed — configuring termination but
+        // starting without an identity would silently break secured media.
+        if config.media.srtp.mode == sbc_config::SrtpMode::Terminate {
+            let identity = match (&config.media.dtls.cert_path, &config.media.dtls.key_path) {
+                (Some(cert), Some(key)) => {
+                    crate::dtls_identity::DtlsIdentity::from_pem_files(cert, key)
+                }
+                _ => crate::dtls_identity::DtlsIdentity::generate(),
+            };
+            match identity {
+                Ok(id) => {
+                    tracing::info!(
+                        fingerprint = %id.sdp_fingerprint(),
+                        "DTLS-SRTP termination enabled"
+                    );
+                    sip_stack.set_dtls_identity(Arc::new(id));
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to build DTLS identity — aborting startup");
+                    #[allow(clippy::panic)]
+                    {
+                        panic!("DTLS-SRTP termination configured but identity unavailable: {e}");
+                    }
+                }
+            }
+        }
+
         // Initialize Voice Protection System call screening (if configured).
         // The config was validated at load time, so a build failure here is
         // unreachable in practice; refuse to start half-protected if it

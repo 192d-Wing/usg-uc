@@ -352,6 +352,24 @@ impl Default for MediaConfig {
     }
 }
 
+/// How the SBC handles SRTP-secured media.
+///
+/// - `Passthrough`: the media relay forwards SRTP/DTLS opaquely; the endpoints
+///   perform DTLS-SRTP directly with each other (the SBC never sees plaintext).
+///   This is the default and works with the transparent relay today.
+/// - `Terminate`: the SBC is a DTLS endpoint on each leg — it completes the
+///   DTLS-SRTP handshake, decrypts inbound media, and re-encrypts for the far
+///   leg. Required for transcoding, recording, or lawful intercept, and lets
+///   the SBC bridge legs with mismatched crypto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SrtpMode {
+    /// Relay SRTP/DTLS opaquely; endpoints secure media end-to-end.
+    #[default]
+    Passthrough,
+    /// Terminate DTLS-SRTP at the SBC (decrypt + re-encrypt per leg).
+    Terminate,
+}
+
 /// SRTP configuration.
 ///
 /// ## CNSA 2.0 Compliance
@@ -365,6 +383,9 @@ pub struct SrtpConfig {
 
     /// SRTP profile (CNSA 2.0: only AES-256-GCM).
     pub profile: CnsaSrtpProfile,
+
+    /// Whether the SBC terminates DTLS-SRTP or relays it opaquely.
+    pub mode: SrtpMode,
 }
 
 impl Default for SrtpConfig {
@@ -372,6 +393,7 @@ impl Default for SrtpConfig {
         Self {
             required: true,
             profile: CnsaSrtpProfile::AeadAes256Gcm,
+            mode: SrtpMode::Passthrough,
         }
     }
 }

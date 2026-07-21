@@ -68,9 +68,13 @@ tower.workspace = true
 tower-http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pki-types.workspace = true
+# Self-signed P-384 cert generation for the SBC's DTLS-SRTP identity. aws_lc_rs
+# backend matches the workspace crypto provider (rustls aws-lc-rs); no `ring`.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
 # JWKS / OIDC-metadata fetch for Bearer REGISTER validation (rustls, optional
 # extra CA for the internal IdP). Mirrors sbc-client-config-server.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
