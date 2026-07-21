@@ -147,15 +147,19 @@ func (f *framedConn) SendFrame(p []byte) error {
 	if len(p) == 0 || len(p) > maxFrame {
 		return fmt.Errorf("ipc: invalid frame length %d (max %d)", len(p), maxFrame)
 	}
-	var hdr [2]byte
-	binary.BigEndian.PutUint16(hdr[:], uint16(len(p)))
+	// Marshal the length prefix and payload into one buffer and issue a single
+	// Write. Two separate Writes could put the header on the wire and then fail
+	// (a write deadline firing, or a transient error, between them), leaving the
+	// peer's length-prefixed reader waiting for a payload that never comes —
+	// desyncing the stream. One Write collapses that gap: a deadline now either
+	// fails the whole frame or writes it whole.
+	frame := make([]byte, 2+len(p))
+	binary.BigEndian.PutUint16(frame[:2], uint16(len(p)))
+	copy(frame[2:], p)
 
 	f.writeMu.Lock()
 	defer f.writeMu.Unlock()
-	if _, err := f.c.Write(hdr[:]); err != nil {
-		return err
-	}
-	_, err := f.c.Write(p)
+	_, err := f.c.Write(frame)
 	return err
 }
 

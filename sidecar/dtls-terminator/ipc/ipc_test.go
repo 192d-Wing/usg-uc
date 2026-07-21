@@ -69,6 +69,38 @@ func TestHandshakeOverFramedIPC(t *testing.T) {
 		len(cres.SRTPKeys), cres.Profile)
 }
 
+// SendFrame emits each length-prefixed frame as a single write that RecvFrame
+// reads back intact and in order — guarding the framing against a header/payload
+// split.
+func TestFrameRoundTrip(t *testing.T) {
+	sConn, cConn := unixPair(t)
+	sender := ipc.NewFramedTransport(sConn)
+	receiver := ipc.NewFramedTransport(cConn)
+	defer sender.Close()
+	defer receiver.Close()
+
+	// A DTLS record header, a longer payload, and the 1-byte minimum frame.
+	payloads := [][]byte{
+		{0x16, 0xfe, 0xfd},
+		[]byte("a longer dtls-ish record payload"),
+		{0x01},
+	}
+	for _, p := range payloads {
+		if err := sender.SendFrame(p); err != nil {
+			t.Fatalf("SendFrame(%x): %v", p, err)
+		}
+	}
+	for _, want := range payloads {
+		got, err := receiver.RecvFrame()
+		if err != nil {
+			t.Fatalf("RecvFrame: %v", err)
+		}
+		if string(got) != string(want) {
+			t.Fatalf("frame mismatch: got %x want %x", got, want)
+		}
+	}
+}
+
 // unixPair returns the two ends of a connected Unix-domain stream socket.
 func unixPair(t *testing.T) (net.Conn, net.Conn) {
 	t.Helper()
