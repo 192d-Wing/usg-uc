@@ -52,10 +52,15 @@ func TestSessionRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 3. Run the relay-side DTLS CLIENT; records flow as Dtls frames.
+	// 3. Run the relay-side DTLS CLIENT; records flow as Dtls frames. The
+	// control channel captures non-Dtls frames (Ready/Error) so they can't be
+	// swallowed by pion's background reader, which shares this transport (in the
+	// real relay a single reader dispatches by type; here pion and the Ready
+	// read would otherwise race for frames off the same ft).
+	control := make(chan []byte, 4)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	pc := ipc.NewPacketConn(dtlsChannel{ft})
+	pc := ipc.NewPacketConn(controlDtlsChannel{inner: ft, control: control})
 	cres, err := dtlssession.Run(ctx, pc, pc.PeerAddr(), dtlssession.Params{
 		Identity:        relayPeerID,
 		Role:            dtlssession.RoleClient,
@@ -66,17 +71,15 @@ func TestSessionRoundTrip(t *testing.T) {
 	}
 	defer cres.Close()
 
-	// 4. Read frames until Ready (skip trailing Dtls), then compare keys.
+	// 4. Read the control channel for Ready (Dtls records were consumed by pion).
 	var readyKeys []byte
-	for {
-		raw, err := recvWithin(t, ft, 10*time.Second)
-		if err != nil {
-			t.Fatalf("awaiting Ready: %v", err)
+	select {
+	case raw := <-control:
+		typ, body, derr := splitFrame(raw)
+		if derr != nil {
+			t.Fatal(derr)
 		}
-		typ, body, _ := splitFrame(raw)
 		switch typ {
-		case msgDtls:
-			continue // trailing handshake/close record
 		case msgError:
 			t.Fatalf("service returned error: %s", body)
 		case msgReady:
@@ -86,9 +89,10 @@ func TestSessionRoundTrip(t *testing.T) {
 			}
 			readyKeys = keys
 		default:
-			t.Fatalf("unexpected message type %d", typ)
+			t.Fatalf("unexpected control message type %d", typ)
 		}
-		break
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout awaiting Ready")
 	}
 
 	if len(readyKeys) == 0 || string(readyKeys) != string(cres.SRTPKeys) {
@@ -99,6 +103,40 @@ func TestSessionRoundTrip(t *testing.T) {
 	}
 	t.Logf("PASS: service round-trip — %d-byte matching SRTP keys", len(readyKeys))
 }
+
+// controlDtlsChannel is a test FrameTransport that hands DTLS records to pion
+// (like the production dtlsChannel) but, instead of erroring on a non-Dtls
+// frame, stashes it on `control` and keeps reading. That keeps the service's
+// Ready/Error frames from being swallowed by pion's background reader, which
+// shares this transport in the test.
+type controlDtlsChannel struct {
+	inner   ipc.FrameTransport
+	control chan []byte
+}
+
+func (d controlDtlsChannel) RecvFrame() ([]byte, error) {
+	for {
+		raw, err := d.inner.RecvFrame()
+		if err != nil {
+			return nil, err
+		}
+		t, body, err := splitFrame(raw)
+		if err != nil {
+			return nil, err
+		}
+		if t == msgDtls {
+			return body, nil
+		}
+		d.control <- raw // Ready/Error → the control reader
+	}
+}
+
+func (d controlDtlsChannel) SendFrame(p []byte) error          { return d.inner.SendFrame(frame(msgDtls, p)) }
+func (d controlDtlsChannel) SetReadDeadline(t time.Time) error { return d.inner.SetReadDeadline(t) }
+func (d controlDtlsChannel) SetWriteDeadline(t time.Time) error {
+	return d.inner.SetWriteDeadline(t)
+}
+func (d controlDtlsChannel) Close() error { return d.inner.Close() }
 
 func recvWithin(t *testing.T, ft ipc.FrameTransport, d time.Duration) ([]byte, error) {
 	t.Helper()
