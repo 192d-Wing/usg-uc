@@ -60,6 +60,7 @@ mod args;
 #[cfg(feature = "cluster")]
 mod cluster;
 mod dtls_identity;
+mod dtls_relay;
 mod dtls_sidecar;
 #[cfg(feature = "grpc")]
 mod grpc_server;
