@@ -16,8 +16,9 @@
 use proto_dtls::{DtlsConfig, DtlsConnection, DtlsRole, DtlsState, SrtpKeyingMaterial};
 use proto_rtp::{RtpHeader, RtpPacket, SequenceTracker};
 
-use crate::dtls_relay::establish_srtp_leg;
+use crate::dtls_relay::{EstablishedLeg, establish_srtp_leg};
 use crate::dtls_sidecar::{Role, SidecarReader, SidecarWriter};
+use crate::srtp_relay::{TerminateRelayLeg, forward_dtls_to_sidecar, pump_sidecar_dtls_to_peer};
 use proto_srtp::{
     SrtpContext, SrtpDirection, SrtpKeyMaterial, SrtpProfile, SrtpProtect, SrtpUnprotect,
 };
@@ -1261,6 +1262,94 @@ impl MediaPipeline {
         Ok(())
     }
 
+    /// Starts a DTLS-SRTP **terminating** relay for a call: drives the DTLS
+    /// handshake on each leg's media socket (via the sidecar), and once both
+    /// complete, relays media by unprotecting on the ingress leg and
+    /// re-protecting for the egress leg — the SBC is a crypto endpoint on both
+    /// legs.
+    ///
+    /// The handshakes can take seconds, so they run in a spawned supervisor and
+    /// this returns promptly (like `start_relay`); media flows once both legs
+    /// are established. Call teardown (`stop_relay`) signals the shutdown watch,
+    /// which stops the supervisor's relay/DTLS tasks and drops the sidecar
+    /// connections.
+    ///
+    /// # Errors
+    /// Terminate mode not configured, missing remotes, or socket bind failure.
+    pub async fn start_relay_terminate(
+        &self,
+        call_id: &str,
+        a_leg: LegDtlsParams,
+        b_leg: LegDtlsParams,
+    ) -> Result<(), MediaPipelineError> {
+        let sidecar_socket = self.config.dtls_sidecar_socket.clone().ok_or_else(|| {
+            MediaPipelineError::DtlsHandshakeFailed("no DTLS sidecar socket configured".into())
+        })?;
+        let own_fingerprint = self.config.dtls_fingerprint.clone().ok_or_else(|| {
+            MediaPipelineError::DtlsHandshakeFailed("no DTLS fingerprint configured".into())
+        })?;
+
+        let mut sessions = self.sessions.write().await;
+        let ctx = sessions
+            .get_mut(call_id)
+            .ok_or(MediaPipelineError::SessionNotFound)?;
+
+        let a_remote: std::net::SocketAddr = ctx
+            .a_leg_remote
+            .ok_or_else(|| MediaPipelineError::BindFailed("A-leg remote not set".into()))?
+            .into();
+        let b_remote: std::net::SocketAddr = ctx
+            .b_leg_remote
+            .ok_or_else(|| MediaPipelineError::BindFailed("B-leg remote not set".into()))?
+            .into();
+        let a_bind = format!("{}:{}", ctx.a_leg_bind_ip, ctx.a_leg_local_port);
+        let b_bind = format!("{}:{}", ctx.b_leg_bind_ip, ctx.b_leg_local_port);
+        let a_ssrc = ctx.a_leg_ssrc;
+        let b_ssrc = ctx.b_leg_ssrc;
+
+        let a_socket = Arc::new(
+            UdpSocket::bind(&a_bind)
+                .await
+                .map_err(|e| MediaPipelineError::BindFailed(format!("{a_bind}: {e}")))?,
+        );
+        let b_socket = Arc::new(
+            UdpSocket::bind(&b_bind)
+                .await
+                .map_err(|e| MediaPipelineError::BindFailed(format!("{b_bind}: {e}")))?,
+        );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let a_target = Arc::new(std::sync::RwLock::new(a_remote));
+        let b_target = Arc::new(std::sync::RwLock::new(b_remote));
+
+        let supervisor = tokio::spawn(terminate_supervisor(TerminateSetup {
+            call_id: call_id.to_string(),
+            sidecar_socket,
+            own_fingerprint,
+            a_socket,
+            b_socket,
+            a_remote,
+            b_remote,
+            a_ssrc,
+            b_ssrc,
+            a_leg,
+            b_leg,
+            a_target: Arc::clone(&a_target),
+            b_target: Arc::clone(&b_target),
+            shutdown: shutdown_rx,
+        }));
+
+        // The supervisor handle stands in for the relay tasks it spawns; those
+        // stop via the shutdown watch (task abort does not cascade to children).
+        ctx.relay_handles = vec![supervisor];
+        ctx.relay_shutdown = Some(shutdown_tx);
+        ctx.a_leg_target = Some(a_target);
+        ctx.b_leg_target = Some(b_target);
+
+        info!(call_id = %call_id, "DTLS-SRTP terminating relay starting (handshakes in progress)");
+        Ok(())
+    }
+
     /// Stops the RTP relay for a call and releases ports.
     pub async fn stop_relay(&self, call_id: &str) -> Result<(), MediaPipelineError> {
         let mut sessions = self.sessions.write().await;
@@ -1407,6 +1496,162 @@ pub fn rtp_packets_relayed() -> u64 {
 #[must_use]
 pub fn rtcp_packets_relayed() -> u64 {
     RTCP_PACKETS_RELAYED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Per-leg DTLS parameters for a terminating relay ([`MediaPipeline::start_relay_terminate`]).
+pub struct LegDtlsParams {
+    /// The peer's SDP `a=fingerprint`, verified during the handshake.
+    pub peer_fingerprint: String,
+    /// The SBC's DTLS role for this leg (derived from `a=setup`).
+    pub role: Role,
+}
+
+/// Everything the terminate supervisor owns for one call (bundled so the spawn
+/// and the supervisor signature stay manageable).
+struct TerminateSetup {
+    call_id: String,
+    sidecar_socket: std::path::PathBuf,
+    own_fingerprint: String,
+    a_socket: Arc<UdpSocket>,
+    b_socket: Arc<UdpSocket>,
+    a_remote: std::net::SocketAddr,
+    b_remote: std::net::SocketAddr,
+    a_ssrc: u32,
+    b_ssrc: u32,
+    a_leg: LegDtlsParams,
+    b_leg: LegDtlsParams,
+    a_target: Arc<std::sync::RwLock<std::net::SocketAddr>>,
+    b_target: Arc<std::sync::RwLock<std::net::SocketAddr>>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+}
+
+/// Drives both legs' DTLS handshakes concurrently, then spawns the bidirectional
+/// SRTP relay and the post-handshake DTLS pump tasks. If either handshake fails,
+/// no media is relayed (fail-closed). All spawned tasks stop on the shutdown
+/// watch (task abort does not cascade to children, so teardown signals it).
+async fn terminate_supervisor(s: TerminateSetup) {
+    let (a_res, b_res) = tokio::join!(
+        establish_srtp_leg(
+            &s.a_socket,
+            s.a_remote,
+            &s.sidecar_socket,
+            &s.own_fingerprint,
+            &s.a_leg.peer_fingerprint,
+            s.a_leg.role,
+        ),
+        establish_srtp_leg(
+            &s.b_socket,
+            s.b_remote,
+            &s.sidecar_socket,
+            &s.own_fingerprint,
+            &s.b_leg.peer_fingerprint,
+            s.b_leg.role,
+        ),
+    );
+    let (a_est, b_est) = match (a_res, b_res) {
+        (Ok(a), Ok(b)) => (a, b),
+        (a, b) => {
+            warn!(
+                call_id = %s.call_id,
+                a_err = ?a.err(), b_err = ?b.err(),
+                "DTLS termination handshake failed; media not relayed"
+            );
+            return;
+        }
+    };
+
+    let EstablishedLeg {
+        inbound: a_in,
+        outbound: a_out,
+        reader: a_reader,
+        writer: a_writer,
+    } = a_est;
+    let EstablishedLeg {
+        inbound: b_in,
+        outbound: b_out,
+        reader: b_reader,
+        writer: b_writer,
+    } = b_est;
+
+    // Four SRTP contexts. The ssrc only seeds per-stream replay state — the AEAD
+    // nonce uses the packet's SSRC (see proto-srtp) — so the leg ssrc is fine.
+    let ctxs = (
+        SrtpContext::new(&a_in, SrtpDirection::Inbound, s.a_ssrc),
+        SrtpContext::new(&a_out, SrtpDirection::Outbound, s.a_ssrc),
+        SrtpContext::new(&b_in, SrtpDirection::Inbound, s.b_ssrc),
+        SrtpContext::new(&b_out, SrtpDirection::Outbound, s.b_ssrc),
+    );
+    let (a_ingress, a_egress, b_ingress, b_egress) = match ctxs {
+        (Ok(ai), Ok(ae), Ok(bi), Ok(be)) => (ai, ae, bi, be),
+        _ => {
+            warn!(call_id = %s.call_id, "SRTP context creation failed; media not relayed");
+            return;
+        }
+    };
+
+    // Peer→sidecar DTLS (post-handshake rekey) demuxed by each relay leg.
+    let (a_dtls_tx, a_dtls_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    let (b_dtls_tx, b_dtls_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+
+    // A→B: unprotect A's media, re-protect for B.
+    tokio::spawn(
+        TerminateRelayLeg {
+            recv_sock: Arc::clone(&s.a_socket),
+            send_sock: Arc::clone(&s.b_socket),
+            ingress: a_ingress,
+            egress: b_egress,
+            expected_remote: s.a_remote,
+            recv_target: Arc::clone(&s.a_target),
+            forward_target: Arc::clone(&s.b_target),
+            dtls_out: Some(a_dtls_tx),
+            call_id: s.call_id.clone(),
+            direction: "A→B",
+        }
+        .run(s.shutdown.clone()),
+    );
+    // B→A: unprotect B's media, re-protect for A.
+    tokio::spawn(
+        TerminateRelayLeg {
+            recv_sock: Arc::clone(&s.b_socket),
+            send_sock: Arc::clone(&s.a_socket),
+            ingress: b_ingress,
+            egress: a_egress,
+            expected_remote: s.b_remote,
+            recv_target: Arc::clone(&s.b_target),
+            forward_target: Arc::clone(&s.a_target),
+            dtls_out: Some(b_dtls_tx),
+            call_id: s.call_id.clone(),
+            direction: "B→A",
+        }
+        .run(s.shutdown.clone()),
+    );
+
+    // Post-handshake DTLS pumps own the sidecar halves, keeping each association
+    // open for the whole call (finding #2).
+    tokio::spawn(forward_dtls_to_sidecar(
+        a_dtls_rx,
+        a_writer,
+        s.shutdown.clone(),
+    ));
+    tokio::spawn(forward_dtls_to_sidecar(
+        b_dtls_rx,
+        b_writer,
+        s.shutdown.clone(),
+    ));
+    tokio::spawn(pump_sidecar_dtls_to_peer(
+        a_reader,
+        Arc::clone(&s.a_socket),
+        Arc::clone(&s.a_target),
+        s.shutdown.clone(),
+    ));
+    tokio::spawn(pump_sidecar_dtls_to_peer(
+        b_reader,
+        Arc::clone(&s.b_socket),
+        Arc::clone(&s.b_target),
+        s.shutdown.clone(),
+    ));
+
+    info!(call_id = %s.call_id, "DTLS-SRTP termination established; relaying media");
 }
 
 /// One direction of the media relay (RTP or RTCP, per `kind`) with source
@@ -2164,5 +2409,171 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, MediaPipelineError::DtlsHandshakeFailed(_)));
+    }
+
+    // End-to-end terminate relay over a mock sidecar (no real DTLS): both legs
+    // "handshake" (the mock returns known SRTP keys after one pumped record),
+    // then real SRTP media protected by peer A crosses the SBC and is recovered
+    // by peer B. Exercises start_relay_terminate + the supervisor + both
+    // TerminateRelayLeg tasks with the crypto wired end to end.
+    #[tokio::test]
+    async fn terminate_relay_end_to_end() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        async fn wr<W: AsyncWriteExt + Unpin>(w: &mut W, t: u8, body: &[u8]) {
+            let n = 1 + body.len();
+            let mut f = Vec::with_capacity(2 + n);
+            f.extend_from_slice(&(n as u16).to_be_bytes());
+            f.push(t);
+            f.extend_from_slice(body);
+            w.write_all(&f).await.unwrap();
+        }
+        async fn rd<R: AsyncReadExt + Unpin>(r: &mut R) {
+            let mut h = [0u8; 2];
+            r.read_exact(&mut h).await.unwrap();
+            let mut b = vec![0u8; usize::from(u16::from_be_bytes(h))];
+            r.read_exact(&mut b).await.unwrap();
+        }
+        fn srtp_ctx(key: &[u8], salt: &[u8], dir: SrtpDirection, ssrc: u32) -> SrtpContext {
+            let m = SrtpKeyMaterial::new(SrtpProfile::AeadAes256Gcm, key.to_vec(), salt.to_vec())
+                .unwrap();
+            SrtpContext::new(&m, dir, ssrc).unwrap()
+        }
+
+        let fp = "sha-384 SIDECAR";
+        // Known exported keying material (RFC 5764 layout), generated at runtime.
+        let blob: Vec<u8> = (0..88).map(|_| rand::random::<u8>()).collect();
+        let client_key = blob[0..32].to_vec();
+        let server_key = blob[32..64].to_vec();
+        let client_salt = blob[64..76].to_vec();
+        let server_salt = blob[76..88].to_vec();
+
+        // One mock sidecar UDS, accepts both legs' connections; each returns the
+        // same Ready(blob) after Hello/Start/one Dtls.
+        let sock = std::env::temp_dir().join(format!("usg-e2e-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let blob2 = blob.clone();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let blob = blob2.clone();
+                tokio::spawn(async move {
+                    let (mut r, mut w) = stream.into_split();
+                    wr(&mut w, 1, fp.as_bytes()).await; // Hello
+                    rd(&mut r).await; // Start
+                    rd(&mut r).await; // forwarded DTLS trigger
+                    let mut ready = vec![0u8, 8];
+                    ready.extend_from_slice(&blob);
+                    wr(&mut w, 4, &ready).await; // Ready(profile=8, keys)
+                    // Hold the connection open for the call.
+                    let mut sink = [0u8; 64];
+                    let _ = r.read(&mut sink).await;
+                });
+            }
+        });
+
+        let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        // Unique high port range per run so parallel pipeline tests (which all
+        // default to 16384) don't collide on bind.
+        let port_base = 24_000_u16.wrapping_add((rand::random::<u16>() % 8_000) & !1);
+        let pipeline = MediaPipeline::new(MediaPipelineConfig {
+            srtp_required: false,
+            terminate_dtls: true,
+            dtls_sidecar_socket: Some(sock.clone()),
+            dtls_fingerprint: Some(fp.to_string()),
+            rtp_port_min: port_base,
+            rtp_port_max: port_base + 200,
+            ..Default::default()
+        });
+        let ports = pipeline
+            .create_session_with_zones(
+                "call",
+                Some(MediaMode::Relay),
+                Some(loopback),
+                Some(loopback),
+            )
+            .await
+            .unwrap();
+
+        let peer_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a_relay = format!("127.0.0.1:{}", ports.a_leg_rtp_port);
+        let b_relay = format!("127.0.0.1:{}", ports.b_leg_rtp_port);
+        pipeline
+            .set_remote_address("call", true, peer_a.local_addr().unwrap().into())
+            .await
+            .unwrap();
+        pipeline
+            .set_remote_address("call", false, peer_b.local_addr().unwrap().into())
+            .await
+            .unwrap();
+
+        // SBC is DTLS server on both legs: each peer (DTLS client) protects with
+        // the client_write key; the SBC re-protects for the far peer with the
+        // server_write key, which that peer unprotects.
+        pipeline
+            .start_relay_terminate(
+                "call",
+                LegDtlsParams {
+                    peer_fingerprint: "sha-384 A".into(),
+                    role: Role::Server,
+                },
+                LegDtlsParams {
+                    peer_fingerprint: "sha-384 B".into(),
+                    role: Role::Server,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Trigger both handshakes (a DTLS-classified record on each media port).
+        peer_a.send_to(&[22u8, 1, 2], &a_relay).await.unwrap();
+        peer_b.send_to(&[22u8, 1, 2], &b_relay).await.unwrap();
+
+        let media_ssrc = 0x0001_2345;
+        let peer_a_send = srtp_ctx(
+            &client_key,
+            &client_salt,
+            SrtpDirection::Outbound,
+            media_ssrc,
+        );
+        let peer_b_recv = srtp_ctx(
+            &server_key,
+            &server_salt,
+            SrtpDirection::Inbound,
+            media_ssrc,
+        );
+
+        // Retry A→B media until it crosses (handshakes may still be completing).
+        let payload = vec![0x5Au8; 160];
+        let mut buf = [0u8; 512];
+        let mut received = None;
+        for i in 0..40u32 {
+            let pkt = RtpPacket::new(
+                RtpHeader::new(0, 100 + i as u16, 900, media_ssrc),
+                payload.clone(),
+            );
+            let srtp = SrtpProtect::new(&peer_a_send).protect_rtp(&pkt).unwrap();
+            peer_a.send_to(&srtp, &a_relay).await.unwrap();
+            if let Ok(Ok((n, _))) = tokio::time::timeout(
+                std::time::Duration::from_millis(150),
+                peer_b.recv_from(&mut buf),
+            )
+            .await
+            {
+                received = Some(n);
+                break;
+            }
+        }
+        let n = received.expect("peer B never received terminated media");
+        let out = SrtpUnprotect::new(&peer_b_recv)
+            .unprotect_rtp(&buf[..n])
+            .unwrap();
+        assert_eq!(out.payload.as_ref(), payload.as_slice());
+
+        let _ = pipeline.stop_relay("call").await;
+        let _ = std::fs::remove_file(&sock);
     }
 }

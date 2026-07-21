@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::dtls_relay::is_dtls_record;
+use crate::dtls_sidecar::{SidecarEvent, SidecarReader, SidecarWriter};
 
 /// Re-protects one RTP packet crossing the SBC: unprotect with the ingress
 /// leg's context (decrypt what the arriving peer sent), then protect with the
@@ -158,6 +159,63 @@ impl TerminateRelayLeg {
                     break;
                 }
             }
+        }
+    }
+}
+
+/// Forwards post-handshake DTLS records (peer-initiated rekey/alerts, demuxed
+/// off the media socket by [`TerminateRelayLeg`]) to the sidecar. Owns the
+/// [`SidecarWriter`] so the sidecar connection stays open for the whole call
+/// (the DTLS association must outlive key export); ends on shutdown, a closed
+/// channel, or a sidecar write error.
+pub async fn forward_dtls_to_sidecar(
+    mut records: mpsc::Receiver<Vec<u8>>,
+    mut writer: SidecarWriter,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            msg = records.recv() => match msg {
+                Some(record) => {
+                    if let Err(e) = writer.send_dtls(&record).await {
+                        debug!(error = %e, "forwarding DTLS to sidecar failed");
+                        break;
+                    }
+                }
+                None => break,
+            },
+            _ = shutdown.changed() => break,
+        }
+    }
+}
+
+/// Pumps DTLS records the sidecar emits *after* the handshake (sidecar-initiated
+/// rekey) back to the peer on the media socket. Owns the [`SidecarReader`] so the
+/// connection stays open for the call; ends on shutdown or a reader error. A
+/// terminal `Ready`/`Error` (unexpected post-handshake) also ends it.
+pub async fn pump_sidecar_dtls_to_peer(
+    mut reader: SidecarReader,
+    sock: Arc<UdpSocket>,
+    peer: Arc<RwLock<SocketAddr>>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            event = reader.read() => match event {
+                Ok(SidecarEvent::Dtls(record)) => {
+                    let dest = match peer.read() {
+                        Ok(g) => *g,
+                        Err(_) => break,
+                    };
+                    let _ = sock.send_to(&record, dest).await;
+                }
+                Ok(_) => break,
+                Err(e) => {
+                    debug!(error = %e, "sidecar reader ended");
+                    break;
+                }
+            },
+            _ = shutdown.changed() => break,
         }
     }
 }
