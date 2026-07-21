@@ -304,6 +304,11 @@ struct CallAddresses {
     /// used to pick the SBC's answering role in the A-leg 183/200 SDP when
     /// terminating DTLS-SRTP. `None` for non-DTLS offers or pass-through.
     dtls_caller_setup: Option<crate::sdp_dtls::SetupRole>,
+    /// The caller's DTLS `a=fingerprint` (from the A-leg INVITE offer). Persisted
+    /// from INVITE because the A-leg DTLS handshake is driven at answer time
+    /// (200 OK), when the original offer is no longer in hand. `None` for
+    /// non-DTLS offers or pass-through.
+    dtls_caller_fingerprint: Option<String>,
     /// Via branch of the A-leg INVITE (server transaction key for cleanup).
     a_leg_branch: String,
 }
@@ -520,6 +525,22 @@ impl SipStack {
             crate::sdp_dtls::rewrite_local_dtls(&sdp, identity.sdp_fingerprint(), role)
         } else {
             sdp
+        }
+    }
+
+    /// The SBC's DTLS role for a leg whose peer offered `peer_setup`. The SBC
+    /// answers each terminated leg (RFC 5763), so the answering `a=setup`
+    /// decides: a `passive` answer makes the SBC the DTLS server, an `active`
+    /// answer the client. A peer that omitted `a=setup` is treated as `actpass`
+    /// (the offerer default) → the SBC answers `passive` (server), matching
+    /// [`Self::rewrite_answer_dtls`]. Used to drive the per-leg handshake.
+    fn sbc_dtls_role(peer_setup: Option<crate::sdp_dtls::SetupRole>) -> crate::dtls_sidecar::Role {
+        use crate::sdp_dtls::SetupRole;
+        match peer_setup.map_or(SetupRole::Passive, SetupRole::answer_role) {
+            SetupRole::Active => crate::dtls_sidecar::Role::Client,
+            // answer_role() yields only Active/Passive; Passive (and, defensively,
+            // ActPass) means the SBC is the DTLS server.
+            SetupRole::Passive | SetupRole::ActPass => crate::dtls_sidecar::Role::Server,
         }
     }
 
@@ -2036,11 +2057,12 @@ impl SipStack {
         // `a=setup` picks the SBC's answering role for the A-leg 183/200), and
         // on the B-leg offer advertise the SBC's own fingerprint with actpass
         // (the SBC is the offerer toward the callee). Otherwise SDP is untouched.
-        let dtls_caller_setup = req
+        let caller_dtls = req
             .body
             .as_ref()
-            .and_then(|body| crate::sdp_dtls::parse_peer_dtls(&String::from_utf8_lossy(body)))
-            .and_then(|d| d.setup);
+            .and_then(|body| crate::sdp_dtls::parse_peer_dtls(&String::from_utf8_lossy(body)));
+        let dtls_caller_setup = caller_dtls.as_ref().and_then(|d| d.setup);
+        let dtls_caller_fingerprint = caller_dtls.map(|d| d.fingerprint);
 
         let b_leg_sdp = req.body.as_ref().map(|body| {
             let sdp_str = String::from_utf8_lossy(body);
@@ -2207,6 +2229,7 @@ impl SipStack {
                     media_a_leg_port,
                     media_a_leg_ip: a_media_ip_str,
                     dtls_caller_setup,
+                    dtls_caller_fingerprint,
                     a_leg_branch: a_branch.clone(),
                 },
             );
@@ -4498,5 +4521,28 @@ mod tests {
             stack.topology_hider.is_none(),
             "Disabled topology hider should be None"
         );
+    }
+
+    #[test]
+    fn sbc_dtls_role_answers_the_peer() {
+        use crate::dtls_sidecar::Role;
+        use crate::sdp_dtls::SetupRole;
+        // Caller offered actpass → SBC answers passive → DTLS server.
+        assert!(matches!(
+            SipStack::sbc_dtls_role(Some(SetupRole::ActPass)),
+            Role::Server
+        ));
+        // Peer active → SBC passive → server.
+        assert!(matches!(
+            SipStack::sbc_dtls_role(Some(SetupRole::Active)),
+            Role::Server
+        ));
+        // Peer passive → SBC active → client.
+        assert!(matches!(
+            SipStack::sbc_dtls_role(Some(SetupRole::Passive)),
+            Role::Client
+        ));
+        // No a=setup → treated as actpass (offerer default) → server.
+        assert!(matches!(SipStack::sbc_dtls_role(None), Role::Server));
     }
 }
