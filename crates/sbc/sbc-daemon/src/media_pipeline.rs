@@ -1523,6 +1523,7 @@ mod tests {
             forward_target,
             "test-call".to_string(),
             "A→B",
+            RelayKind::Rtp,
             shutdown_rx,
         ));
 
