@@ -1,0 +1,69 @@
+name: Sidecar DTLS (Go/FIPS)
+
+# Builds and tests the Go DTLS-SRTP terminator sidecar in FIPS 140-3 mode using
+# the Go Cryptographic Module (GOFIPS140). Every crypto primitive must run in
+# the certified module — the TestFIPSModeActive gate fails the job otherwise.
+#
+# Path-filtered so it only runs on sidecar changes, independent of the Rust CI.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'sidecar/dtls-terminator/**'
+      - '.github/workflows/sidecar-dtls.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'sidecar/dtls-terminator/**'
+      - '.github/workflows/sidecar-dtls.yml'
+  workflow_dispatch:
+
+# FIPS module selection is build-time. v1.26.0 is the module frozen from Go
+# 1.26; building with it turns FIPS mode on by default.
+env:
+  GOFIPS140: v1.26.0
+
+jobs:
+  fips-build-test:
+    name: Go/FIPS build + test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sidecar/dtls-terminator
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v5
+        with:
+          # The go.mod directive is 1.26 (uses crypto/fips140 reporting + the
+          # v1.26.0 module). check-latest avoids a silently older patch.
+          go-version: '1.26'
+          check-latest: true
+          cache-dependency-path: sidecar/dtls-terminator/go.sum
+
+      - name: Toolchain + FIPS selection
+        run: |
+          go version
+          echo "GOFIPS140=$(go env GOFIPS140)"
+
+      - name: gofmt (must be clean)
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build (FIPS)
+        run: go build ./...
+
+      # GODEBUG=fips140=on is redundant given the GOFIPS140 build (which enables
+      # FIPS by default) but pins the runtime posture explicitly. The
+      # TestFIPSModeActive gate asserts fips140.Enabled() so a non-FIPS binary
+      # fails the job rather than silently passing.
+      - name: Test (FIPS 140-3, fips140=on)
+        run: go test -v ./...
+        env:
+          GODEBUG: fips140=on

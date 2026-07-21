@@ -8,6 +8,17 @@ import (
 	"time"
 )
 
+// TestFIPSModeActive is the FIPS gate: this sidecar must be built with
+// GOFIPS140 and run in FIPS mode so every crypto primitive uses the certified
+// Go module. Run: GOFIPS140=v1.26.0 GODEBUG=fips140=on go test ./...
+func TestFIPSModeActive(t *testing.T) {
+	if !fips140.Enabled() {
+		t.Fatal("FIPS mode is not active — build with GOFIPS140=v1.26.0 " +
+			"and run with GODEBUG=fips140=on")
+	}
+	t.Logf("FIPS module version %q", fips140.Version())
+}
+
 func udpConn(t *testing.T) *net.UDPConn {
 	t.Helper()
 	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
