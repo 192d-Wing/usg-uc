@@ -190,6 +190,10 @@ struct MediaSessionContext {
     a_leg_local_port: u16,
     /// B-leg local RTP port.
     b_leg_local_port: u16,
+    /// A-leg local RTCP port (RTP port + 1; serviced for non-muxed endpoints).
+    a_leg_rtcp_port: u16,
+    /// B-leg local RTCP port (RTP port + 1; serviced for non-muxed endpoints).
+    b_leg_rtcp_port: u16,
     /// A-leg bind IP (from zone, or 0.0.0.0).
     a_leg_bind_ip: std::net::IpAddr,
     /// B-leg bind IP (from zone, or 0.0.0.0).
@@ -548,9 +552,11 @@ impl MediaPipeline {
 
         let session = MediaSession::new(config);
 
-        // Allocate port pairs for A-leg and B-leg
-        let (a_rtp, _a_rtcp) = self.port_allocator.allocate_pair().await?;
-        let (b_rtp, _b_rtcp) = match self.port_allocator.allocate_pair().await {
+        // Allocate port pairs for A-leg and B-leg. The RTCP port (RTP + 1) is
+        // serviced for non-muxed endpoints; muxed RTCP shares the RTP port and
+        // rides the RTP relay opaquely.
+        let (a_rtp, a_rtcp) = self.port_allocator.allocate_pair().await?;
+        let (b_rtp, b_rtcp) = match self.port_allocator.allocate_pair().await {
             Ok(pair) => pair,
             Err(e) => {
                 self.port_allocator.release_pair(a_rtp).await;
@@ -573,6 +579,8 @@ impl MediaPipeline {
             b_leg_ssrc,
             a_leg_local_port: a_rtp,
             b_leg_local_port: b_rtp,
+            a_leg_rtcp_port: a_rtcp,
+            b_leg_rtcp_port: b_rtcp,
             a_leg_bind_ip: a_leg_media_ip
                 .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
             b_leg_bind_ip: b_leg_media_ip
@@ -1019,7 +1027,7 @@ impl MediaPipeline {
         let a_target = Arc::new(std::sync::RwLock::new(a_addr));
         let b_target = Arc::new(std::sync::RwLock::new(b_addr));
 
-        // Spawn A→B relay task
+        // Spawn A→B RTP relay task
         let handle_ab = tokio::spawn(relay_leg(
             Arc::clone(&a_socket),
             Arc::clone(&b_socket),
@@ -1028,10 +1036,11 @@ impl MediaPipeline {
             Arc::clone(&b_target),
             call_id.to_string(),
             "A→B",
+            RelayKind::Rtp,
             shutdown_rx.clone(),
         ));
 
-        // Spawn B→A relay task
+        // Spawn B→A RTP relay task
         let handle_ba = tokio::spawn(relay_leg(
             Arc::clone(&b_socket),
             Arc::clone(&a_socket),
@@ -1040,10 +1049,73 @@ impl MediaPipeline {
             Arc::clone(&a_target),
             call_id.to_string(),
             "B→A",
-            shutdown_rx,
+            RelayKind::Rtp,
+            shutdown_rx.clone(),
         ));
 
-        ctx.relay_handles = vec![handle_ab, handle_ba];
+        let mut relay_handles = vec![handle_ab, handle_ba];
+
+        // RTCP relay for non-muxed endpoints: forward the RTP-port+1 pair so
+        // sender/receiver reports traverse the SBC. Muxed RTCP already rides the
+        // RTP relay above. Best-effort — a port-overflow or bind failure disables
+        // RTCP forwarding for this call but leaves audio untouched. RTCP remotes
+        // default to the RTP remote's port + 1 and then latch symmetrically.
+        let rtcp_started = if let (Some(a_rtcp_rport), Some(b_rtcp_rport)) =
+            (a_addr.port().checked_add(1), b_addr.port().checked_add(1))
+        {
+            let a_rtcp_bind = format!("{}:{}", ctx.a_leg_bind_ip, ctx.a_leg_rtcp_port);
+            let b_rtcp_bind = format!("{}:{}", ctx.b_leg_bind_ip, ctx.b_leg_rtcp_port);
+            match (
+                UdpSocket::bind(&a_rtcp_bind).await,
+                UdpSocket::bind(&b_rtcp_bind).await,
+            ) {
+                (Ok(a_rtcp_sock), Ok(b_rtcp_sock)) => {
+                    let a_rtcp_sock = Arc::new(a_rtcp_sock);
+                    let b_rtcp_sock = Arc::new(b_rtcp_sock);
+                    let a_rtcp_addr = std::net::SocketAddr::new(a_addr.ip(), a_rtcp_rport);
+                    let b_rtcp_addr = std::net::SocketAddr::new(b_addr.ip(), b_rtcp_rport);
+                    let a_rtcp_target = Arc::new(std::sync::RwLock::new(a_rtcp_addr));
+                    let b_rtcp_target = Arc::new(std::sync::RwLock::new(b_rtcp_addr));
+
+                    relay_handles.push(tokio::spawn(relay_leg(
+                        Arc::clone(&a_rtcp_sock),
+                        Arc::clone(&b_rtcp_sock),
+                        a_rtcp_addr,
+                        Arc::clone(&a_rtcp_target),
+                        Arc::clone(&b_rtcp_target),
+                        call_id.to_string(),
+                        "A→B",
+                        RelayKind::Rtcp,
+                        shutdown_rx.clone(),
+                    )));
+                    relay_handles.push(tokio::spawn(relay_leg(
+                        b_rtcp_sock,
+                        a_rtcp_sock,
+                        b_rtcp_addr,
+                        b_rtcp_target,
+                        a_rtcp_target,
+                        call_id.to_string(),
+                        "B→A",
+                        RelayKind::Rtcp,
+                        shutdown_rx,
+                    )));
+                    true
+                }
+                (a_res, b_res) => {
+                    warn!(
+                        call_id = %call_id,
+                        a_err = ?a_res.err(),
+                        b_err = ?b_res.err(),
+                        "RTCP relay sockets failed to bind (audio unaffected)"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        ctx.relay_handles = relay_handles;
         ctx.relay_shutdown = Some(shutdown_tx);
         ctx.a_leg_target = Some(a_target);
         ctx.b_leg_target = Some(b_target);
@@ -1052,9 +1124,12 @@ impl MediaPipeline {
             call_id = %call_id,
             a_leg_port = ctx.a_leg_local_port,
             b_leg_port = ctx.b_leg_local_port,
+            a_rtcp_port = ctx.a_leg_rtcp_port,
+            b_rtcp_port = ctx.b_leg_rtcp_port,
+            rtcp_started,
             a_remote = %a_remote,
             b_remote = %b_remote,
-            "RTP relay started"
+            "Media relay started"
         );
 
         Ok(())
@@ -1168,32 +1243,61 @@ impl TrackedSequence {
     }
 }
 
-/// One direction of the RTP relay with source validation and symmetric-RTP
-/// latching.
-///
-/// Before latching, only packets whose source IP matches the SDP-negotiated
-/// remote are forwarded (the port may differ behind NAT). The first accepted
-/// packet latches the exact source: subsequent packets must match it, and
-/// the opposite direction's send target is updated so replies go to where
-/// media actually arrives from (RFC 4961 symmetric RTP). Packets from any
-/// other source are dropped and counted — an off-path attacker who learns
-/// the media port can no longer inject into or overwrite the stream.
-///
-/// ## NIST 800-53 Rev5: SC-7 (Boundary Protection), SC-8
-#[allow(clippy::too_many_arguments)]
-/// Process-global count of RTP/RTCP packets forwarded across all relay legs.
-/// A working relay increments this; a black-holed one never does. Exposed for
+/// Which stream a relay leg carries. RTP legs feed the "audio flowing" metric
+/// and log; RTCP legs are counted separately so control traffic doesn't inflate
+/// the audio signal.
+#[derive(Clone, Copy)]
+enum RelayKind {
+    Rtp,
+    Rtcp,
+}
+
+impl RelayKind {
+    /// Uppercase protocol label for logs.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rtp => "RTP",
+            Self::Rtcp => "RTCP",
+        }
+    }
+}
+
+/// Process-global count of RTP packets forwarded across all relay legs. A
+/// working relay increments this; a black-holed one never does. Exposed for
 /// observability and as the media "did audio actually flow" signal.
 static RTP_PACKETS_RELAYED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Returns the total RTP/RTCP packets forwarded by the media relay since start.
+/// Process-global count of RTCP packets forwarded (non-muxed endpoints only;
+/// muxed RTCP rides the RTP relay and counts as RTP).
+static RTCP_PACKETS_RELAYED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Returns the total RTP packets forwarded by the media relay since start.
 #[must_use]
 pub fn rtp_packets_relayed() -> u64 {
     RTP_PACKETS_RELAYED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-// call_id + direction are carried for structured relay logging/metrics; the
-// socket/target set is inherent to a bidirectional forwarder.
+/// Returns the total RTCP packets forwarded by the media relay since start.
+#[must_use]
+pub fn rtcp_packets_relayed() -> u64 {
+    RTCP_PACKETS_RELAYED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// One direction of the media relay (RTP or RTCP, per `kind`) with source
+/// validation and symmetric latching.
+///
+/// Before latching, only packets whose source IP matches the SDP-negotiated
+/// remote are forwarded (the port may differ behind NAT). The first accepted
+/// packet latches the exact source: subsequent packets must match it, and the
+/// opposite direction's send target is updated so replies go to where media
+/// actually arrives from (RFC 4961 symmetric RTP). Packets from any other
+/// source are dropped and counted — an off-path attacker who learns the media
+/// port can no longer inject into or overwrite the stream.
+///
+/// `call_id` + `direction` are carried for structured logging/metrics; the
+/// socket/target set is inherent to a bidirectional forwarder.
+///
+/// ## NIST 800-53 Rev5: SC-7 (Boundary Protection), SC-8
 #[allow(clippy::too_many_arguments)]
 async fn relay_leg(
     recv_sock: Arc<UdpSocket>,
@@ -1203,6 +1307,7 @@ async fn relay_leg(
     forward_target: Arc<std::sync::RwLock<std::net::SocketAddr>>,
     call_id: String,
     direction: &'static str,
+    kind: RelayKind,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut buf = [0u8; 2048];
@@ -1225,10 +1330,11 @@ async fn relay_leg(
                                 warn!(
                                     call_id = %call_id,
                                     direction,
+                                    kind = kind.label(),
                                     source = %src,
                                     expected = %expected_remote,
                                     dropped,
-                                    "Dropping RTP from unexpected source"
+                                    "Dropping packet from unexpected source"
                                 );
                             }
                             continue;
@@ -1257,18 +1363,36 @@ async fn relay_leg(
                         match send_sock.send_to(&buf[..n], dest).await {
                             Ok(_) => {
                                 forwarded += 1;
-                                RTP_PACKETS_RELAYED
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                // Log once, the moment media actually flows. Fires
-                                // inside the loop (relay tasks are abort()ed on
-                                // teardown, so post-loop code can't be relied on).
-                                // This is the "audio is relaying" signal.
-                                if forwarded == 1 {
-                                    info!(
-                                        call_id = %call_id,
-                                        direction,
-                                        "RTP relay forwarding media"
-                                    );
+                                // Count + log once, the moment traffic actually
+                                // flows. Fires inside the loop (relay tasks are
+                                // abort()ed on teardown, so post-loop code can't
+                                // be relied on). The RTP first-forward line is the
+                                // "audio is relaying" signal the CI gate greps for;
+                                // RTCP is counted separately so it doesn't inflate
+                                // the audio metric.
+                                match kind {
+                                    RelayKind::Rtp => {
+                                        RTP_PACKETS_RELAYED
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if forwarded == 1 {
+                                            info!(
+                                                call_id = %call_id,
+                                                direction,
+                                                "RTP relay forwarding media"
+                                            );
+                                        }
+                                    }
+                                    RelayKind::Rtcp => {
+                                        RTCP_PACKETS_RELAYED
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if forwarded == 1 {
+                                            debug!(
+                                                call_id = %call_id,
+                                                direction,
+                                                "RTCP relay forwarding"
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -1294,9 +1418,10 @@ async fn relay_leg(
     info!(
         call_id = %call_id,
         direction,
+        kind = kind.label(),
         forwarded,
         dropped,
-        "RTP relay leg finished"
+        "Relay leg finished"
     );
 }
 
@@ -1398,6 +1523,7 @@ mod tests {
             forward_target,
             "test-call".to_string(),
             "A→B",
+            RelayKind::Rtp,
             shutdown_rx,
         ));
 
@@ -1500,6 +1626,78 @@ mod tests {
         );
 
         pipeline.stop_relay("call").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_relay_forwards_non_muxed() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        // Stand-ins for the caller (A leg) and callee (B leg) endpoints. Their
+        // RTCP is modeled on the same sockets; the relay accepts the first RTCP
+        // packet by source IP, then latches the exact source (symmetric RTCP).
+        let caller = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let callee = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let caller_addr = caller.local_addr().unwrap();
+        let callee_addr = callee.local_addr().unwrap();
+
+        // Distinct port range from the other relay test: start_relay now binds
+        // the RTCP pair too, so two default-range relays running concurrently
+        // would fight over the same 127.0.0.1 ports.
+        let pipeline = MediaPipeline::new(MediaPipelineConfig {
+            srtp_required: false,
+            rtp_port_min: 40_000,
+            rtp_port_max: 40_200,
+            ..Default::default()
+        });
+        let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let ports = pipeline
+            .create_session_with_zones(
+                "rtcp-call",
+                Some(MediaMode::Relay),
+                Some(loopback),
+                Some(loopback),
+            )
+            .await
+            .unwrap();
+        pipeline
+            .set_remote_address("rtcp-call", true, SbcSocketAddr::from(caller_addr))
+            .await
+            .unwrap();
+        pipeline
+            .set_remote_address("rtcp-call", false, SbcSocketAddr::from(callee_addr))
+            .await
+            .unwrap();
+
+        let rtcp_before = rtcp_packets_relayed();
+        pipeline.start_relay("rtcp-call").await.unwrap();
+
+        // RTCP relay sockets live at RTP port + 1.
+        let a_rtcp = format!("127.0.0.1:{}", ports.a_leg_rtp_port + 1);
+        let b_rtcp = format!("127.0.0.1:{}", ports.b_leg_rtp_port + 1);
+        let mut buf = [0u8; 64];
+
+        // The B→A RTCP send target defaults to callee_rtp_port+1; latch it to the
+        // callee's real socket first by sending a report from the callee side.
+        callee.send_to(b"rtcp-b0", &b_rtcp).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Caller RTCP → SBC A-leg RTCP port → forwarded to the latched callee.
+        caller.send_to(b"rtcp-a2b", &a_rtcp).await.unwrap();
+        let (n, _) = timeout(Duration::from_secs(2), callee.recv_from(&mut buf))
+            .await
+            .expect("callee must receive the relayed A→B RTCP packet")
+            .unwrap();
+        assert_eq!(&buf[..n], b"rtcp-a2b");
+
+        // RTCP counts on its own metric, never the RTP "audio flowing" one.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            rtcp_packets_relayed() > rtcp_before,
+            "rtcp_packets_relayed must count forwarded RTCP"
+        );
+
+        pipeline.stop_relay("rtcp-call").await.unwrap();
     }
 
     /// Port allocator must survive index wraparound and tiny/reversed ranges.
