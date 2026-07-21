@@ -7,11 +7,25 @@
 //! keys are returned and the caller switches to the SRTP relay (next phase).
 
 use std::net::SocketAddr;
+use std::path::Path;
+use std::time::Duration;
 
 use proto_srtp::{SrtpKeyMaterial, SrtpProfile};
 use tokio::net::UdpSocket;
 
-use crate::dtls_sidecar::{SidecarError, SidecarEvent, SidecarReader, SidecarWriter};
+use crate::dtls_sidecar::{
+    Role, SidecarClient, SidecarError, SidecarEvent, SidecarReader, SidecarWriter,
+};
+
+/// RFC 5764 SRTP protection profile value for `SRTP_AEAD_AES_256_GCM` — the
+/// only profile the sidecar offers (CNSA 2.0).
+pub const SRTP_AEAD_AES_256_GCM: u16 = 8;
+
+/// Upper bound on the DTLS handshake pump. Defense-in-depth: even if the sidecar
+/// neither completes nor reports an error (wedged), the leg fails instead of
+/// hanging. A healthy DTLS handshake (with retransmits) completes well within
+/// this; it is not the per-flight timeout.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 // RFC 7714 §8.3 — AEAD_AES_256_GCM SRTP transform parameters.
 const SRTP_MASTER_KEY_LEN: usize = 32;
@@ -165,8 +179,79 @@ pub fn srtp_key_material(
     Ok((outbound, inbound))
 }
 
+/// A terminated leg after a successful DTLS handshake: the derived SRTP key
+/// material for each direction plus the live sidecar connection halves.
+///
+/// The `reader`/`writer` are intentionally handed back rather than dropped: the
+/// DTLS association must live for the whole call (deferred review finding #2 —
+/// dropping it right after key export makes pion emit `close_notify`, which a
+/// peer may treat as teardown). The caller keeps them in the session and pumps
+/// any post-handshake DTLS (rekey/alerts) demuxed off the media socket, closing
+/// them only at call end.
+#[derive(Debug)]
+pub struct EstablishedLeg {
+    /// SRTP master key material the SBC uses to protect its outbound media.
+    pub outbound: SrtpKeyMaterial,
+    /// SRTP master key material the SBC uses to unprotect inbound media.
+    pub inbound: SrtpKeyMaterial,
+    /// Live read half of the sidecar session (post-handshake DTLS in).
+    pub reader: SidecarReader,
+    /// Live write half of the sidecar session (post-handshake DTLS out).
+    pub writer: SidecarWriter,
+}
+
+/// Drives a full terminate-mode DTLS-SRTP handshake for one leg: connects to
+/// the sidecar (verifying its live fingerprint matches `own_fingerprint`),
+/// starts the handshake in the given `role`, pumps records over `media` until
+/// the sidecar reports `Ready`, then derives the leg's SRTP key material.
+///
+/// `signaling_peer` is the peer's SDP media address, used to send the first
+/// outbound flight before the peer's source is latched (see
+/// [`run_handshake_pump`]).
+///
+/// # Errors
+/// Sidecar connect/fingerprint failure, a handshake error, a negotiated
+/// profile other than `SRTP_AEAD_AES_256_GCM`, or malformed keying material.
+pub async fn establish_srtp_leg(
+    media: &UdpSocket,
+    signaling_peer: SocketAddr,
+    sidecar_socket: &Path,
+    own_fingerprint: &str,
+    peer_fingerprint: &str,
+    role: Role,
+) -> Result<EstablishedLeg, DtlsRelayError> {
+    let mut client = SidecarClient::connect(sidecar_socket, own_fingerprint).await?;
+    client.start(role, peer_fingerprint).await?;
+    let (mut reader, mut writer) = client.into_split();
+
+    let keys = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        run_handshake_pump(media, signaling_peer, &mut reader, &mut writer),
+    )
+    .await
+    .map_err(|_| DtlsRelayError::Sidecar("DTLS handshake timed out".into()))??;
+
+    if keys.profile != SRTP_AEAD_AES_256_GCM {
+        return Err(DtlsRelayError::KeyMaterial(format!(
+            "sidecar negotiated SRTP profile {}, expected AEAD_AES_256_GCM ({SRTP_AEAD_AES_256_GCM})",
+            keys.profile
+        )));
+    }
+
+    // The SBC is DTLS client iff it took the `active` role (peer was passive).
+    let sbc_is_client = matches!(role, Role::Client);
+    let (outbound, inbound) = srtp_key_material(&keys.srtp_keys, sbc_is_client)?;
+
+    Ok(EstablishedLeg {
+        outbound,
+        inbound,
+        reader,
+        writer,
+    })
+}
+
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::dtls_sidecar::{Role, SidecarClient};
@@ -306,6 +391,71 @@ mod tests {
             .expect("peer recv timed out")
             .unwrap();
         assert_eq!(&buf[..n], b"sidecar-record");
+
+        sidecar.await.unwrap();
+    }
+
+    // End-to-end driver over a mock sidecar + UDP peer: connect (fingerprint
+    // verify) -> start -> pump -> Ready(profile=8) -> derive SRTP material for
+    // the SBC-as-server role, returning the live halves.
+    #[tokio::test]
+    async fn establish_leg_derives_material_and_keeps_halves() {
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let sock = std::env::temp_dir().join(format!("usg-dtls-estab-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let own_fp = "sha-384 SIDECAR";
+
+        let sock2 = sock.clone();
+        let sidecar = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut r, mut w) = stream.into_split();
+            write_typed(&mut w, MSG_HELLO, own_fp.as_bytes()).await;
+            let (t, start) = read_typed(&mut r).await; // Start(role, peer_fp)
+            assert_eq!(t, MSG_START);
+            assert_eq!(start[0], Role::Server as u8);
+            assert_eq!(&start[1..], b"sha-384 PEER");
+            let (t, _) = read_typed(&mut r).await; // forwarded peer DTLS
+            assert_eq!(t, MSG_DTLS);
+            write_typed(&mut w, MSG_DTLS, b"srv").await;
+            let mut ready = vec![
+                (SRTP_AEAD_AES_256_GCM >> 8) as u8,
+                (SRTP_AEAD_AES_256_GCM & 0xff) as u8,
+            ];
+            ready.extend_from_slice(&sample_exported());
+            write_typed(&mut w, MSG_READY, &ready).await;
+            let _ = std::fs::remove_file(&sock2);
+        });
+
+        peer.send_to(&[22u8, 9, 9], relay_addr).await.unwrap();
+
+        let leg = tokio::time::timeout(
+            Duration::from_secs(5),
+            establish_srtp_leg(
+                &relay,
+                peer_addr,
+                &sock,
+                own_fp,
+                "sha-384 PEER",
+                Role::Server,
+            ),
+        )
+        .await
+        .expect("establish timed out")
+        .expect("establish failed");
+
+        // SBC is DTLS server: outbound = server_write_* (0x22/0x44),
+        // inbound = client_write_* (0x11/0x33).
+        assert_eq!(leg.outbound.master_key(), [0x22u8; SRTP_MASTER_KEY_LEN]);
+        assert_eq!(leg.outbound.master_salt(), [0x44u8; SRTP_MASTER_SALT_LEN]);
+        assert_eq!(leg.inbound.master_key(), [0x11u8; SRTP_MASTER_KEY_LEN]);
+        assert_eq!(leg.inbound.master_salt(), [0x33u8; SRTP_MASTER_SALT_LEN]);
+        // reader/writer are returned live (typed fields) rather than dropped at
+        // key export — deferred finding #2.
 
         sidecar.await.unwrap();
     }
