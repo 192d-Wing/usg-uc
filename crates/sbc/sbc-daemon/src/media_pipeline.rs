@@ -15,6 +15,9 @@
 
 use proto_dtls::{DtlsConfig, DtlsConnection, DtlsRole, DtlsState, SrtpKeyingMaterial};
 use proto_rtp::{RtpHeader, RtpPacket, SequenceTracker};
+
+use crate::dtls_relay::establish_srtp_leg;
+use crate::dtls_sidecar::{Role, SidecarReader, SidecarWriter};
 use proto_srtp::{
     SrtpContext, SrtpDirection, SrtpKeyMaterial, SrtpProfile, SrtpProtect, SrtpUnprotect,
 };
@@ -45,6 +48,16 @@ pub struct MediaPipelineConfig {
     pub rtp_port_min: u16,
     /// Maximum RTP port for allocation.
     pub rtp_port_max: u16,
+    /// Whether the SBC terminates DTLS-SRTP (vs. relaying it opaquely). When
+    /// true, each terminated leg drives a DTLS handshake via the sidecar and
+    /// the relay does SRTP protect/unprotect; the two `dtls_*` fields below
+    /// must be set.
+    pub terminate_dtls: bool,
+    /// Path to the DTLS terminator sidecar's Unix socket (terminate mode).
+    pub dtls_sidecar_socket: Option<std::path::PathBuf>,
+    /// The SBC's own SDP fingerprint (published by the sidecar), used to verify
+    /// the sidecar's live identity on each per-leg connection (terminate mode).
+    pub dtls_fingerprint: Option<String>,
 }
 
 impl Default for MediaPipelineConfig {
@@ -61,6 +74,9 @@ impl Default for MediaPipelineConfig {
             ],
             rtp_port_min: 16_384,
             rtp_port_max: 32_768,
+            terminate_dtls: false,
+            dtls_sidecar_socket: None,
+            dtls_fingerprint: None,
         }
     }
 }
@@ -212,6 +228,12 @@ struct MediaSessionContext {
     a_leg_codec: Option<NegotiatedCodec>,
     /// B-leg negotiated codec.
     b_leg_codec: Option<NegotiatedCodec>,
+    /// Live A-leg sidecar DTLS session halves (terminate mode). Held for the
+    /// whole call so the DTLS association is not torn down at key export
+    /// (deferred finding #2); dropped with the session at teardown.
+    dtls_sidecar_a: Option<(SidecarReader, SidecarWriter)>,
+    /// Live B-leg sidecar DTLS session halves (terminate mode).
+    dtls_sidecar_b: Option<(SidecarReader, SidecarWriter)>,
 }
 
 /// Allocated port info returned from `create_session`.
@@ -592,6 +614,8 @@ impl MediaPipeline {
             transcoder: None,
             a_leg_codec: None,
             b_leg_codec: None,
+            dtls_sidecar_a: None,
+            dtls_sidecar_b: None,
         };
 
         let mut sessions = self.sessions.write().await;
@@ -728,6 +752,108 @@ impl MediaPipeline {
         );
 
         Ok(())
+    }
+
+    /// Terminates DTLS-SRTP for one leg via the Go terminator sidecar.
+    ///
+    /// Drives the DTLS handshake over `media_socket` (the caller owns the socket
+    /// and hands it off for the handshake), derives the leg's SRTP contexts, and
+    /// stores them plus the live sidecar session halves in the session. The
+    /// halves are kept for the whole call so the DTLS association is not torn
+    /// down at key export (deferred review finding #2); they drop at teardown.
+    ///
+    /// `signaling_peer` is the peer's SDP media address (the destination for the
+    /// first outbound flight, before the peer's source is latched);
+    /// `peer_fingerprint` is the peer's `a=fingerprint`; `role` is the SBC's
+    /// DTLS role for this leg (derived from `a=setup`).
+    ///
+    /// # Errors
+    /// Terminate mode not configured (`dtls_sidecar_socket` / `dtls_fingerprint`
+    /// unset), the handshake fails, or SRTP context creation fails.
+    pub async fn terminate_leg_dtls(
+        &self,
+        call_id: &str,
+        is_a_leg: bool,
+        media_socket: &UdpSocket,
+        signaling_peer: std::net::SocketAddr,
+        peer_fingerprint: &str,
+        role: Role,
+    ) -> Result<(), MediaPipelineError> {
+        let sidecar_socket = self.config.dtls_sidecar_socket.as_ref().ok_or_else(|| {
+            MediaPipelineError::DtlsHandshakeFailed(
+                "terminate mode: no DTLS sidecar socket configured".to_string(),
+            )
+        })?;
+        let own_fingerprint = self.config.dtls_fingerprint.as_deref().ok_or_else(|| {
+            MediaPipelineError::DtlsHandshakeFailed(
+                "terminate mode: no DTLS fingerprint configured".to_string(),
+            )
+        })?;
+
+        let leg = establish_srtp_leg(
+            media_socket,
+            signaling_peer,
+            sidecar_socket,
+            own_fingerprint,
+            peer_fingerprint,
+            role,
+        )
+        .await
+        .map_err(|e| MediaPipelineError::DtlsHandshakeFailed(e.to_string()))?;
+
+        // SSRC for this leg (falls back if the session vanished mid-handshake;
+        // the store below then fails cleanly with DtlsConnectionNotFound).
+        let ssrc = {
+            let sessions = self.sessions.read().await;
+            sessions.get(call_id).map_or(0x1234_5678, |s| {
+                if is_a_leg { s.a_leg_ssrc } else { s.b_leg_ssrc }
+            })
+        };
+
+        let outbound = SrtpContext::new(&leg.outbound, SrtpDirection::Outbound, ssrc)
+            .map_err(|e| MediaPipelineError::SrtpContextCreationFailed(e.to_string()))?;
+        let inbound = SrtpContext::new(&leg.inbound, SrtpDirection::Inbound, ssrc)
+            .map_err(|e| MediaPipelineError::SrtpContextCreationFailed(e.to_string()))?;
+
+        let mut sessions = self.sessions.write().await;
+        let session_ctx = sessions
+            .get_mut(call_id)
+            .ok_or(MediaPipelineError::DtlsConnectionNotFound)?;
+        if is_a_leg {
+            session_ctx.srtp_outbound_a = Some(outbound);
+            session_ctx.srtp_inbound_a = Some(inbound);
+            session_ctx.dtls_sidecar_a = Some((leg.reader, leg.writer));
+        } else {
+            session_ctx.srtp_outbound_b = Some(outbound);
+            session_ctx.srtp_inbound_b = Some(inbound);
+            session_ctx.dtls_sidecar_b = Some((leg.reader, leg.writer));
+        }
+
+        info!(
+            call_id = %call_id,
+            is_a_leg,
+            ssrc,
+            "DTLS-SRTP leg terminated via sidecar"
+        );
+        Ok(())
+    }
+
+    /// Test-only: whether a leg has both SRTP contexts and the live sidecar
+    /// halves stored (i.e. `terminate_leg_dtls` completed for it).
+    #[cfg(test)]
+    async fn test_leg_srtp_active(&self, call_id: &str, is_a_leg: bool) -> bool {
+        let sessions = self.sessions.read().await;
+        sessions.get(call_id).is_some_and(|s| {
+            if is_a_leg {
+                s.srtp_outbound_a.is_some()
+                    && s.srtp_inbound_a.is_some()
+                    && s.dtls_sidecar_a.is_some()
+            } else {
+                s.srtp_outbound_b.is_some()
+                    && s.srtp_inbound_b.is_some()
+                    && s.dtls_sidecar_b.is_some()
+            }
+        })
     }
 
     /// Creates SRTP contexts from DTLS keying material.
@@ -1935,5 +2061,108 @@ mod tests {
         let ssrc2 = generate_ssrc();
         // SSRCs should be different (high probability)
         assert_ne!(ssrc1, ssrc2);
+    }
+
+    // Drives terminate_leg_dtls end-to-end over a mock sidecar + UDP peer and
+    // asserts the leg's SRTP contexts and live sidecar halves are stored.
+    #[tokio::test]
+    async fn terminate_leg_stores_srtp_contexts() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        async fn wr<W: AsyncWriteExt + Unpin>(w: &mut W, t: u8, body: &[u8]) {
+            let n = 1 + body.len();
+            let mut f = Vec::with_capacity(2 + n);
+            f.extend_from_slice(&(n as u16).to_be_bytes());
+            f.push(t);
+            f.extend_from_slice(body);
+            w.write_all(&f).await.unwrap();
+        }
+        async fn rd<R: AsyncReadExt + Unpin>(r: &mut R) -> u8 {
+            let mut h = [0u8; 2];
+            r.read_exact(&mut h).await.unwrap();
+            let n = usize::from(u16::from_be_bytes(h));
+            let mut b = vec![0u8; n];
+            r.read_exact(&mut b).await.unwrap();
+            b[0]
+        }
+
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let sock = std::env::temp_dir().join(format!("usg-mp-term-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let fp = "sha-384 SIDECAR";
+
+        let sock2 = sock.clone();
+        let sidecar = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut r, mut w) = stream.into_split();
+            wr(&mut w, 1, fp.as_bytes()).await; // Hello
+            assert_eq!(rd(&mut r).await, 2); // Start
+            assert_eq!(rd(&mut r).await, 3); // forwarded peer DTLS
+            wr(&mut w, 3, b"srv").await; // Dtls
+            let mut ready = vec![0u8, 8]; // profile 8 = AEAD_AES_256_GCM
+            ready.extend_from_slice(&[7u8; 88]);
+            wr(&mut w, 4, &ready).await; // Ready
+            let _ = std::fs::remove_file(&sock2);
+        });
+
+        let pipeline = MediaPipeline::new(MediaPipelineConfig {
+            srtp_required: false,
+            terminate_dtls: true,
+            dtls_sidecar_socket: Some(sock.clone()),
+            dtls_fingerprint: Some(fp.to_string()),
+            ..Default::default()
+        });
+        pipeline
+            .create_session_with_zones("call", Some(MediaMode::Relay), None, None)
+            .await
+            .unwrap();
+
+        // Peer's first DTLS record (first byte 22 = handshake).
+        peer.send_to(&[22u8, 1, 2], relay_addr).await.unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pipeline.terminate_leg_dtls(
+                "call",
+                true,
+                &relay,
+                peer_addr,
+                "sha-384 PEER",
+                Role::Server,
+            ),
+        )
+        .await
+        .expect("terminate timed out")
+        .expect("terminate failed");
+
+        assert!(pipeline.test_leg_srtp_active("call", true).await);
+        assert!(!pipeline.test_leg_srtp_active("call", false).await);
+        sidecar.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminate_leg_errors_without_sidecar_config() {
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = relay.local_addr().unwrap();
+        // terminate_dtls set but no socket/fingerprint configured.
+        let pipeline = MediaPipeline::new(MediaPipelineConfig {
+            terminate_dtls: true,
+            ..Default::default()
+        });
+        pipeline
+            .create_session_with_zones("call", Some(MediaMode::Relay), None, None)
+            .await
+            .unwrap();
+        let err = pipeline
+            .terminate_leg_dtls("call", true, &relay, peer, "sha-384 PEER", Role::Server)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MediaPipelineError::DtlsHandshakeFailed(_)));
     }
 }

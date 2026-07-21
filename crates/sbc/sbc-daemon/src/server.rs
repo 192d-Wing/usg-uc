@@ -366,11 +366,28 @@ impl Server {
                 uc_media_engine::MediaMode::PassThrough
             }
         };
+        // Terminate mode: hand the pipeline the sidecar socket + the SBC's own
+        // SDP fingerprint (published by the sidecar) so it can verify the
+        // sidecar's live identity on each per-leg connection. The fingerprint is
+        // read from the same file the DTLS identity below uses.
+        let terminate_dtls = config.media.srtp.mode == sbc_config::SrtpMode::Terminate;
+        let dtls_fingerprint = terminate_dtls
+            .then(|| {
+                config.media.dtls.fingerprint_file.as_ref().and_then(|f| {
+                    crate::dtls_identity::DtlsIdentity::from_fingerprint_file(f)
+                        .ok()
+                        .map(|id| id.sdp_fingerprint().to_string())
+                })
+            })
+            .flatten();
         let media_config = crate::media_pipeline::MediaPipelineConfig {
             default_mode,
             srtp_required: config.media.srtp.required,
             rtp_port_min: config.media.rtp_port_min,
             rtp_port_max: config.media.rtp_port_max,
+            terminate_dtls,
+            dtls_sidecar_socket: config.media.dtls.sidecar_socket.clone(),
+            dtls_fingerprint,
             ..Default::default()
         };
         sip_stack.set_media_pipeline(Arc::new(crate::media_pipeline::MediaPipeline::new(
