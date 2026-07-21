@@ -7,12 +7,18 @@
 //! frames), and receives `Ready(profile, SRTP keys)`. The relay owns the media
 //! socket and demuxes DTLS vs SRTP; this client only speaks the IPC side.
 //!
+//! Setup (`connect` → `start`) happens on [`SidecarClient`]; then
+//! [`SidecarClient::into_split`] yields independent [`SidecarReader`] /
+//! [`SidecarWriter`] halves so the relay can read sidecar events while
+//! concurrently forwarding inbound DTLS records in a `select!` pump.
+//!
 //! Wire framing mirrors the sidecar: each message is a big-endian `u16` length
 //! prefix over `[type:1][body]`. Frames are written in a single `write_all` so
 //! a partial frame can never desync the stream.
 
 use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -20,6 +26,10 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 /// Max DTLS datagram carried over the channel (matches the sidecar).
 const MAX_FRAME: usize = 4096;
+
+/// Bounds connect + the sidecar's initial Hello so a hung sidecar can't wedge
+/// the relay while it sets up a leg.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Message types — must match the Go `service` protocol.
 const MSG_HELLO: u8 = 1;
@@ -60,7 +70,7 @@ pub enum SidecarError {
     /// Transport I/O error.
     #[error("sidecar io: {0}")]
     Io(#[from] io::Error),
-    /// Protocol violation (bad frame/type/length).
+    /// Protocol violation (bad frame/type/length) or a timeout.
     #[error("sidecar protocol: {0}")]
     Protocol(String),
     /// The sidecar's live fingerprint differs from the file-provisioned one
@@ -74,7 +84,7 @@ pub enum SidecarError {
     },
 }
 
-/// A per-leg connection to the DTLS terminator sidecar.
+/// A per-leg connection to the DTLS terminator sidecar, during setup.
 #[derive(Debug)]
 pub struct SidecarClient {
     reader: OwnedReadHalf,
@@ -83,15 +93,24 @@ pub struct SidecarClient {
 
 impl SidecarClient {
     /// Connects to the sidecar, reads its `Hello`, and verifies the live
-    /// fingerprint matches the file-provisioned one advertised in SDP.
+    /// fingerprint matches the file-provisioned one advertised in SDP. Bounded
+    /// by [`CONNECT_TIMEOUT`].
     ///
     /// # Errors
-    /// Connection/IO failure, a non-Hello first frame, or a fingerprint mismatch.
+    /// Connection/IO failure, timeout, a non-Hello first frame, or a
+    /// fingerprint mismatch.
     pub async fn connect(socket: &Path, expected_fingerprint: &str) -> Result<Self, SidecarError> {
-        let (reader, writer) = UnixStream::connect(socket).await?.into_split();
-        let mut client = Self { reader, writer };
+        let setup = async {
+            let (mut reader, writer) = UnixStream::connect(socket).await?.into_split();
+            let hello = read_frame(&mut reader).await?;
+            Ok::<_, SidecarError>((reader, writer, hello))
+        };
+        let (reader, writer, hello) = tokio::time::timeout(CONNECT_TIMEOUT, setup)
+            .await
+            .map_err(|_| {
+                SidecarError::Protocol("timed out connecting to sidecar / awaiting Hello".into())
+            })??;
 
-        let hello = client.read_frame().await?;
         let (t, body) = split_frame(&hello)?;
         if t != MSG_HELLO {
             return Err(SidecarError::Protocol(format!(
@@ -105,7 +124,7 @@ impl SidecarClient {
                 live,
             });
         }
-        Ok(client)
+        Ok(Self { reader, writer })
     }
 
     /// Sends `Start` to begin the DTLS handshake for this leg.
@@ -116,23 +135,38 @@ impl SidecarClient {
         let mut body = Vec::with_capacity(1 + peer_fingerprint.len());
         body.push(role as u8);
         body.extend_from_slice(peer_fingerprint.as_bytes());
-        self.write_frame(MSG_START, &body).await
+        write_frame(&mut self.writer, MSG_START, &body).await
     }
 
-    /// Sends one inbound DTLS record (demuxed from the media socket).
-    ///
-    /// # Errors
-    /// Transport failure, or a record exceeding the frame limit.
-    pub async fn send_dtls(&mut self, record: &[u8]) -> Result<(), SidecarError> {
-        self.write_frame(MSG_DTLS, record).await
+    /// Splits into independent read/write halves for the media-socket pump, so
+    /// the relay can read sidecar events while concurrently forwarding inbound
+    /// DTLS records (each half is `&mut`-borrowed separately in a `select!`).
+    #[must_use]
+    pub fn into_split(self) -> (SidecarReader, SidecarWriter) {
+        (
+            SidecarReader {
+                reader: self.reader,
+            },
+            SidecarWriter {
+                writer: self.writer,
+            },
+        )
     }
+}
 
+/// Read half of a sidecar session: sidecar → relay events.
+#[derive(Debug)]
+pub struct SidecarReader {
+    reader: OwnedReadHalf,
+}
+
+impl SidecarReader {
     /// Reads the next event: a DTLS record to forward, or the final Ready/Error.
     ///
     /// # Errors
     /// Transport failure or a malformed frame.
     pub async fn read(&mut self) -> Result<SidecarEvent, SidecarError> {
-        let frame = self.read_frame().await?;
+        let frame = read_frame(&mut self.reader).await?;
         let (t, body) = split_frame(&frame)?;
         match t {
             MSG_DTLS => Ok(SidecarEvent::Dtls(body.to_vec())),
@@ -154,34 +188,50 @@ impl SidecarClient {
             ))),
         }
     }
+}
 
-    async fn read_frame(&mut self) -> Result<Vec<u8>, SidecarError> {
-        let mut hdr = [0u8; 2];
-        self.reader.read_exact(&mut hdr).await?;
-        let n = usize::from(u16::from_be_bytes(hdr));
-        if n == 0 || n > MAX_FRAME {
-            return Err(SidecarError::Protocol(format!("invalid frame length {n}")));
-        }
-        let mut buf = vec![0u8; n];
-        self.reader.read_exact(&mut buf).await?;
-        Ok(buf)
-    }
+/// Write half of a sidecar session: relay → sidecar DTLS records.
+#[derive(Debug)]
+pub struct SidecarWriter {
+    writer: OwnedWriteHalf,
+}
 
-    async fn write_frame(&mut self, t: u8, body: &[u8]) -> Result<(), SidecarError> {
-        let n = 1 + body.len();
-        if n > MAX_FRAME {
-            return Err(SidecarError::Protocol(format!("frame too large: {n}")));
-        }
-        // Build the whole frame and issue a single write — a partial frame can
-        // never appear on the wire (deadline-safe by construction).
-        let mut frame = Vec::with_capacity(2 + n);
-        #[allow(clippy::cast_possible_truncation)] // n <= MAX_FRAME (4096) fits u16
-        frame.extend_from_slice(&(n as u16).to_be_bytes());
-        frame.push(t);
-        frame.extend_from_slice(body);
-        self.writer.write_all(&frame).await?;
-        Ok(())
+impl SidecarWriter {
+    /// Sends one inbound DTLS record (demuxed from the media socket).
+    ///
+    /// # Errors
+    /// Transport failure, or a record exceeding the frame limit.
+    pub async fn send_dtls(&mut self, record: &[u8]) -> Result<(), SidecarError> {
+        write_frame(&mut self.writer, MSG_DTLS, record).await
     }
+}
+
+async fn read_frame(reader: &mut OwnedReadHalf) -> Result<Vec<u8>, SidecarError> {
+    let mut hdr = [0u8; 2];
+    reader.read_exact(&mut hdr).await?;
+    let n = usize::from(u16::from_be_bytes(hdr));
+    if n == 0 || n > MAX_FRAME {
+        return Err(SidecarError::Protocol(format!("invalid frame length {n}")));
+    }
+    let mut buf = vec![0u8; n];
+    reader.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+async fn write_frame(writer: &mut OwnedWriteHalf, t: u8, body: &[u8]) -> Result<(), SidecarError> {
+    let n = 1 + body.len();
+    if n > MAX_FRAME {
+        return Err(SidecarError::Protocol(format!("frame too large: {n}")));
+    }
+    // Build the whole frame and issue a single write — a partial frame can never
+    // appear on the wire (deadline-safe by construction).
+    let mut frame = Vec::with_capacity(2 + n);
+    #[allow(clippy::cast_possible_truncation)] // n <= MAX_FRAME (4096) fits u16
+    frame.extend_from_slice(&(n as u16).to_be_bytes());
+    frame.push(t);
+    frame.extend_from_slice(body);
+    writer.write_all(&frame).await?;
+    Ok(())
 }
 
 fn split_frame(frame: &[u8]) -> Result<(u8, &[u8]), SidecarError> {
@@ -246,13 +296,14 @@ mod tests {
 
         let mut client = SidecarClient::connect(&sock, fp).await.unwrap();
         client.start(Role::Client, "sha-384 PEER").await.unwrap();
-        client.send_dtls(b"client-record").await.unwrap();
+        let (mut reader, mut writer) = client.into_split();
+        writer.send_dtls(b"client-record").await.unwrap();
 
-        match client.read().await.unwrap() {
+        match reader.read().await.unwrap() {
             SidecarEvent::Dtls(r) => assert_eq!(r, b"server-record"),
             other => panic!("want Dtls, got {other:?}"),
         }
-        match client.read().await.unwrap() {
+        match reader.read().await.unwrap() {
             SidecarEvent::Ready { profile, srtp_keys } => {
                 assert_eq!(profile, 8);
                 assert_eq!(srtp_keys.len(), 88);
