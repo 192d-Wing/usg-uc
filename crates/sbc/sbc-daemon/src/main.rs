@@ -71,6 +71,7 @@ mod sdp_dtls;
 mod server;
 mod shutdown;
 mod sip_stack;
+mod srtp_relay;
 mod zone;
 
 // Extracted subsystems, re-exported under their old module paths so call
