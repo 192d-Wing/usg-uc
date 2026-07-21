@@ -544,6 +544,76 @@ impl SipStack {
         }
     }
 
+    /// Derives the per-leg DTLS-SRTP terminate params for a call, or `None` to
+    /// relay opaquely. Termination requires the SBC to terminate
+    /// (`has_dtls_identity`) **and both legs to offer DTLS**: the caller's
+    /// fingerprint captured at INVITE, the callee's parsed from its answer.
+    /// Pure so the terminate/opaque decision is unit-testable.
+    fn terminate_params(
+        has_dtls_identity: bool,
+        caller_fingerprint: Option<&String>,
+        caller_setup: Option<crate::sdp_dtls::SetupRole>,
+        answer_sdp: &str,
+    ) -> Option<(
+        crate::media_pipeline::LegDtlsParams,
+        crate::media_pipeline::LegDtlsParams,
+    )> {
+        if !has_dtls_identity {
+            return None;
+        }
+        let caller_fp = caller_fingerprint?;
+        let callee = crate::sdp_dtls::parse_peer_dtls(answer_sdp)?;
+        Some((
+            crate::media_pipeline::LegDtlsParams {
+                peer_fingerprint: caller_fp.clone(),
+                role: Self::sbc_dtls_role(caller_setup),
+            },
+            crate::media_pipeline::LegDtlsParams {
+                peer_fingerprint: callee.fingerprint,
+                role: Self::sbc_dtls_role(callee.setup),
+            },
+        ))
+    }
+
+    /// Starts the media relay for a call at 200-OK time: DTLS-SRTP termination
+    /// when [`Self::terminate_params`] applies, else the opaque forwarding relay
+    /// (plain RTP or SRTP pass-through). Errors are logged, not propagated —
+    /// media failure must not fail call setup.
+    async fn start_media_relay(
+        &self,
+        pipeline: &crate::media_pipeline::MediaPipeline,
+        session_key: &str,
+        addrs: &CallAddresses,
+        answer_sdp: &str,
+    ) {
+        let params = Self::terminate_params(
+            self.dtls_identity.is_some(),
+            addrs.dtls_caller_fingerprint.as_ref(),
+            addrs.dtls_caller_setup,
+            answer_sdp,
+        );
+        if let Some((a_leg, b_leg)) = params {
+            if let Err(e) = pipeline
+                .start_relay_terminate(session_key, a_leg, b_leg)
+                .await
+            {
+                warn!(error = %e, call_id = %addrs.a_leg_sip_call_id, "start_relay_terminate failed");
+            }
+            return;
+        }
+        if self.dtls_identity.is_some() {
+            // Terminate configured but a leg offered no fingerprint; SRTP↔RTP
+            // interworking is not yet supported, so relay opaquely.
+            warn!(
+                call_id = %addrs.a_leg_sip_call_id,
+                "DTLS termination configured but a leg offered no fingerprint; relaying opaquely"
+            );
+        }
+        if let Err(e) = pipeline.start_relay(session_key).await {
+            warn!(error = %e, call_id = %addrs.a_leg_sip_call_id, "start_relay failed");
+        }
+    }
+
     /// Enables RFC 8898 Bearer-token REGISTER authorization. When set,
     /// `handle_register` validates the OIDC access token and binds the `dn`
     /// claim to the AOR before accepting the registration.
@@ -1149,9 +1219,8 @@ impl SipStack {
                         .set_remote_address(&session_key, false, callee_addr)
                         .await;
                 }
-                if let Err(e) = pipeline.start_relay(&session_key).await {
-                    warn!(error = %e, call_id = %addrs.a_leg_sip_call_id, "start_relay failed");
-                }
+                self.start_media_relay(pipeline, &session_key, addrs, &sdp_str)
+                    .await;
                 a_port
             } else {
                 // No relay attached: bare port (SDP rewritten, media not relayed).
@@ -4544,5 +4613,36 @@ mod tests {
         ));
         // No a=setup → treated as actpass (offerer default) → server.
         assert!(matches!(SipStack::sbc_dtls_role(None), Role::Server));
+    }
+
+    #[test]
+    fn terminate_params_requires_identity_and_both_fingerprints() {
+        use crate::dtls_sidecar::Role;
+        use crate::sdp_dtls::SetupRole;
+        let answer_dtls = "v=0\r\nm=audio 5004 UDP/TLS/RTP/SAVP 8\r\n\
+            a=setup:active\r\na=fingerprint:sha-384 BB:CC\r\n";
+        let answer_plain = "v=0\r\nm=audio 5004 RTP/AVP 8\r\n";
+        let caller_fp = "sha-384 AA".to_string();
+
+        // Terminate + both legs offered DTLS → Some, with roles derived from each
+        // peer's setup (caller actpass → SBC server; callee active → SBC server).
+        let (a, b) = SipStack::terminate_params(
+            true,
+            Some(&caller_fp),
+            Some(SetupRole::ActPass),
+            answer_dtls,
+        )
+        .expect("both legs DTLS → terminate");
+        assert_eq!(a.peer_fingerprint, "sha-384 AA");
+        assert!(matches!(a.role, Role::Server));
+        assert_eq!(b.peer_fingerprint, "sha-384 BB:CC");
+        assert!(matches!(b.role, Role::Server));
+
+        // Not terminating (no SBC identity) → opaque.
+        assert!(SipStack::terminate_params(false, Some(&caller_fp), None, answer_dtls).is_none());
+        // Caller never offered DTLS → opaque.
+        assert!(SipStack::terminate_params(true, None, None, answer_dtls).is_none());
+        // Callee's answer carries no fingerprint → opaque (interworking unsupported).
+        assert!(SipStack::terminate_params(true, Some(&caller_fp), None, answer_plain).is_none());
     }
 }
