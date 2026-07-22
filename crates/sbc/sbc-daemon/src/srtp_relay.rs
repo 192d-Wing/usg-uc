@@ -144,6 +144,10 @@ impl TerminateRelayLeg {
                     };
                     match self.send_sock.send_to(&reprotected, dest).await {
                         Ok(_) => {
+                            // Count terminated-leg media on the same black-hole
+                            // metric the opaque relay uses, so DTLS-terminated
+                            // calls aren't reported as mute when audio flows.
+                            crate::media_pipeline::record_rtp_relayed();
                             forwarded += 1;
                             if forwarded == 1 {
                                 info!(call_id = %self.call_id, direction = self.direction, "SRTP relay forwarding media");

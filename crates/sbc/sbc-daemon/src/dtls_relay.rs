@@ -68,9 +68,12 @@ pub enum DtlsRelayError {
     KeyMaterial(String),
 }
 
-/// Max inbound datagram we accept from the media socket. Matched to the
-/// sidecar's IPC frame limit so a DTLS record the sidecar would accept is never
-/// UDP-truncated on the way in.
+/// Max inbound datagram we accept from the media socket. Kept strictly below the
+/// sidecar's IPC frame limit ([`crate::dtls_sidecar::MAX_FRAME`]) so a full
+/// received record always fits a frame once the 1-byte type tag is prepended —
+/// a record of exactly this size used to be rejected as `frame too large`
+/// (1 + 4096 > 4096) and fail the leg. DTLS fragments handshake messages to the
+/// path MTU (~1200 bytes), so 4 KiB is ample for any real record.
 const RECV_BUF: usize = 4096;
 
 /// Pumps DTLS handshake records between the media socket and the sidecar until
@@ -103,11 +106,22 @@ pub async fn run_handshake_pump(
             // Media socket -> demux -> sidecar (inbound DTLS records).
             recv = media.recv_from(&mut buf) => {
                 let (n, src) = recv?;
-                if n > 0 && is_dtls_record(buf[0]) {
+                // Source filter: before latching accept only the SDP peer's IP;
+                // after, only the exact latched source (symmetric). Without this
+                // an off-path attacker who knows the published media address could
+                // spray byte-20..63 datagrams to re-latch the outbound flight away
+                // from the real peer and stall the handshake (DoS). Mirrors the
+                // filter the terminate relay leg applies post-handshake.
+                let acceptable = latched.map_or_else(
+                    || src.ip() == signaling_peer.ip(),
+                    |latched_src| src == latched_src,
+                );
+                if n > 0 && acceptable && is_dtls_record(buf[0]) {
                     latched = Some(src);
                     writer.send_dtls(&buf[..n]).await?;
                 }
-                // Non-DTLS: no SRTP flows before the handshake; drop.
+                // Non-DTLS or unexpected source: no SRTP flows before the
+                // handshake; drop.
             }
             // Sidecar -> media socket (outbound DTLS records) / Ready / Error.
             event = reader.read() => {

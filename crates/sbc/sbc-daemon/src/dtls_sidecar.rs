@@ -25,8 +25,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
-/// Max DTLS datagram carried over the channel (matches the sidecar).
-const MAX_FRAME: usize = 4096;
+/// Max IPC frame body (`[type:1][record]`) carried over the channel; must match
+/// the sidecar's `maxFrame`. Set above the media recv buffer
+/// ([`crate::dtls_relay::RECV_BUF`] = 4096) so a full-size DTLS record still
+/// fits once the 1-byte type tag is prepended (1 + 4096 = 4097).
+pub const MAX_FRAME: usize = 8192;
 
 /// Bounds connect + the sidecar's initial Hello so a hung sidecar can't wedge
 /// the relay while it sets up a leg.
@@ -403,6 +406,30 @@ mod tests {
         assert!(
             matches!(&event, SidecarEvent::Dtls(r) if r == b"abc"),
             "want Dtls(abc), got {event:?}"
+        );
+    }
+
+    // Regression for M7: a DTLS record the size of the relay's media recv buffer
+    // (RECV_BUF = 4096) must fit an IPC frame — with the old MAX_FRAME == 4096
+    // this was rejected as "frame too large" (1 + 4096 = 4097 > 4096) and failed
+    // the whole leg.
+    #[tokio::test]
+    async fn max_size_record_frames_without_off_by_one() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let (_ar, a_w) = a.into_split();
+        let (b_r, _bw) = b.into_split();
+        let mut writer = SidecarWriter { writer: a_w };
+        let mut reader = SidecarReader {
+            reader: b_r,
+            buf: BytesMut::new(),
+        };
+
+        let record = vec![22u8; 4096];
+        writer.send_dtls(&record).await.unwrap();
+        let event = reader.read().await.unwrap();
+        assert!(
+            matches!(&event, SidecarEvent::Dtls(r) if r.len() == 4096),
+            "want a 4096-byte Dtls record, got {event:?}"
         );
     }
 }
