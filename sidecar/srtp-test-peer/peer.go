@@ -16,6 +16,7 @@ import (
 	"time"
 
 	dtlssession "github.com/192d-Wing/usg-uc/sidecar/dtls-terminator"
+	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/srtp/v3"
 )
@@ -32,12 +33,19 @@ const (
 // isDTLS reports whether a packet's first byte marks a DTLS record (RFC 7983).
 func isDTLS(b byte) bool { return b >= 20 && b <= 63 }
 
+// isRTCP reports whether a demuxed (non-DTLS) media packet is RTCP rather than
+// RTP, per RFC 5761: the payload-type byte (marker bit masked) falls in 64..=95.
+// The header is cleartext in both SRTP and SRTCP.
+func isRTCP(p []byte) bool { return len(p) >= 2 && p[1]&0x7f >= 64 && p[1]&0x7f <= 95 }
+
 // PeerResult reports what one peer observed.
 type PeerResult struct {
-	Fingerprint string
-	Sent        int
-	Received    int
-	Profile     uint16
+	Fingerprint  string
+	Sent         int
+	Received     int
+	SentRTCP     int
+	ReceivedRTCP int
+	Profile      uint16
 }
 
 // demuxConn is a net.PacketConn over a UDP socket that yields ONLY DTLS records
@@ -99,6 +107,23 @@ func splitKeys(exported []byte, isClient bool) (outKey, outSalt, inKey, inSalt [
 		return clientKey, clientSalt, serverKey, serverSalt
 	}
 	return serverKey, serverSalt, clientKey, clientSalt
+}
+
+// sendRTCP encrypts and sends one muxed SRTCP Receiver Report to remote, using
+// this peer's outbound SRTP context.
+func sendRTCP(sock *net.UDPConn, remote *net.UDPAddr, out *srtp.Context, ssrc uint32) error {
+	raw, err := (&rtcp.ReceiverReport{SSRC: ssrc}).Marshal()
+	if err != nil {
+		return fmt.Errorf("marshal rtcp: %w", err)
+	}
+	enc, err := out.EncryptRTCP(nil, raw, nil)
+	if err != nil {
+		return fmt.Errorf("encrypt rtcp: %w", err)
+	}
+	if _, err := sock.WriteToUDP(enc, remote); err != nil {
+		return err
+	}
+	return nil
 }
 
 // RunPeer completes a DTLS-SRTP handshake with `remote` (the SBC relay's media
@@ -170,12 +195,18 @@ func RunPeer(ctx context.Context, role dtlssession.Role, sock *net.UDPConn, remo
 
 	result := &PeerResult{Fingerprint: id.Fingerprint(), Profile: uint16(res.Profile)}
 
-	// Receiver: decrypt inbound SRTP until the socket closes.
+	// Receiver: decrypt inbound media until the socket closes, demuxing SRTP
+	// media from muxed SRTCP (RFC 5761) so each is unprotected with the right
+	// transform — this is what validates the SBC's SRTCP re-protect.
 	recvDone := make(chan struct{})
 	go func() {
 		defer close(recvDone)
 		for rec := range srtpIn {
-			if _, derr := inCtx.DecryptRTP(nil, rec, nil); derr == nil {
+			if isRTCP(rec) {
+				if _, derr := inCtx.DecryptRTCP(nil, rec, nil); derr == nil {
+					result.ReceivedRTCP++
+				}
+			} else if _, derr := inCtx.DecryptRTP(nil, rec, nil); derr == nil {
 				result.Received++
 			}
 		}
@@ -206,6 +237,15 @@ func RunPeer(ctx context.Context, role dtlssession.Role, sock *net.UDPConn, remo
 			return nil, werr
 		}
 		result.Sent++
+
+		// Interleave a muxed SRTCP Receiver Report every 10 packets so the SBC's
+		// SRTCP re-protect path (RFC 7714 §9.4) is exercised alongside SRTP.
+		if seq%10 == 9 {
+			if err := sendRTCP(sock, remote, outCtx, ssrc); err != nil {
+				return nil, err
+			}
+			result.SentRTCP++
+		}
 		time.Sleep(5 * time.Millisecond)
 	}
 
