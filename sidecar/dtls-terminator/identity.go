@@ -36,8 +36,15 @@ func GenerateIdentity() (*Identity, error) {
 	if err != nil {
 		return nil, fmt.Errorf("generate P-384 key: %w", err)
 	}
+	// RFC 5280 recommends a unique, unpredictable serial (up to 20 octets). The
+	// cert is bound by its SDP fingerprint (RFC 8122), not chain-validated, so a
+	// fixed serial is harmless here — but a random 128-bit one is the norm.
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, fmt.Errorf("generate certificate serial: %w", err)
+	}
 	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
+		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: "usg-sbc-dtls"},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(365 * 24 * time.Hour),

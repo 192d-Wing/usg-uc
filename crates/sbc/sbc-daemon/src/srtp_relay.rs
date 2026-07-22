@@ -101,7 +101,11 @@ impl TerminateRelayLeg {
         let mut buf = [0u8; 2048];
         let mut latched: Option<SocketAddr> = None;
         let mut forwarded: u64 = 0;
-        let mut dropped: u64 = 0;
+        // Kept separate so an off-path spoofing attempt (SC-7 boundary event) is
+        // distinguishable from crypto/keying breakage or sidecar backpressure.
+        let mut dropped_source: u64 = 0;
+        let mut dropped_auth: u64 = 0;
+        let mut dropped_dtls: u64 = 0;
 
         loop {
             tokio::select! {
@@ -124,11 +128,11 @@ impl TerminateRelayLeg {
                         |latched_src| src == latched_src,
                     );
                     if !acceptable {
-                        dropped += 1;
-                        if dropped == 1 || dropped.is_multiple_of(1000) {
+                        dropped_source += 1;
+                        if dropped_source == 1 || dropped_source.is_multiple_of(1000) {
                             warn!(
                                 call_id = %self.call_id, direction = self.direction,
-                                source = %src, expected = %self.expected_remote, dropped,
+                                source = %src, expected = %self.expected_remote, dropped_source,
                                 "SRTP relay dropping packet from unexpected source"
                             );
                         }
@@ -145,8 +149,17 @@ impl TerminateRelayLeg {
                     // alert) → sidecar; otherwise SRTP media or muxed SRTCP →
                     // reprotect for the far leg and forward.
                     if is_dtls_record(buf[0]) {
-                        if let Some(tx) = &self.dtls_out {
-                            let _ = tx.send(buf[..n].to_vec()).await;
+                        // Non-blocking send: awaiting on this bounded channel would
+                        // let sidecar backpressure head-of-line block all media
+                        // forwarding on this leg. A dropped rekey record is
+                        // retransmitted by DTLS, so dropping is safe.
+                        if let Some(tx) = &self.dtls_out
+                            && tx.try_send(buf[..n].to_vec()).is_err()
+                        {
+                            dropped_dtls += 1;
+                            if dropped_dtls == 1 || dropped_dtls.is_multiple_of(1000) {
+                                warn!(call_id = %self.call_id, direction = self.direction, dropped_dtls, "sidecar DTLS channel full/closed; dropping rekey record");
+                            }
                         }
                         continue;
                     }
@@ -162,9 +175,9 @@ impl TerminateRelayLeg {
                         Err(e) => {
                             // Auth/replay/short-packet failures are dropped, never
                             // forwarded — the SBC must not emit unauthenticated media.
-                            dropped += 1;
-                            if dropped == 1 || dropped.is_multiple_of(1000) {
-                                warn!(error = %e, call_id = %self.call_id, direction = self.direction, is_rtcp, dropped, "SRTP/SRTCP unprotect failed; dropping");
+                            dropped_auth += 1;
+                            if dropped_auth == 1 || dropped_auth.is_multiple_of(1000) {
+                                warn!(error = %e, call_id = %self.call_id, direction = self.direction, is_rtcp, dropped_auth, "SRTP/SRTCP unprotect failed; dropping");
                             }
                             continue;
                         }
