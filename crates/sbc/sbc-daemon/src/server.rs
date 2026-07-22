@@ -72,6 +72,9 @@ pub struct Server {
     global_limiter: Arc<Mutex<RateLimiter>>,
     /// Resolved zone registry (None if no zones configured).
     zone_registry: Option<Arc<crate::zone::ResolvedZoneRegistry>>,
+    /// Receiver for DTLS-SRTP media-failure signals (terminate mode). Drained by
+    /// a task spawned in `start` that tears down each failed call. `take`n once.
+    media_failure_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
     /// Cluster manager (when cluster feature is enabled).
     #[cfg(feature = "cluster")]
     cluster: Option<Arc<ClusterManager>>,
@@ -94,7 +97,7 @@ impl Server {
 
         let sip_config = Self::build_sip_config(&config);
         let mut sip_stack = SipStack::new(sip_config);
-        Self::init_sip_stack_from_config(&mut sip_stack, &config);
+        let media_failure_rx = Self::init_sip_stack_from_config(&mut sip_stack, &config);
         if let Some(bearer) = Self::build_bearer_authenticator(&config) {
             sip_stack.set_bearer_authenticator(bearer);
         }
@@ -115,6 +118,7 @@ impl Server {
             rate_limiter,
             global_limiter,
             zone_registry: None,
+            media_failure_rx,
             #[cfg(feature = "cluster")]
             cluster: None,
         }
@@ -169,7 +173,7 @@ impl Server {
         } else {
             SipStack::new(sip_config)
         };
-        Self::init_sip_stack_from_config(&mut sip_stack, &config);
+        let media_failure_rx = Self::init_sip_stack_from_config(&mut sip_stack, &config);
         if let Some(bearer) = Self::build_bearer_authenticator(&config) {
             sip_stack.set_bearer_authenticator(bearer);
         }
@@ -191,6 +195,7 @@ impl Server {
             rate_limiter,
             global_limiter,
             zone_registry: None,
+            media_failure_rx,
             cluster,
         }
     }
@@ -327,7 +332,10 @@ impl Server {
     }
 
     /// Initializes SipStack routing, manipulation, and topology hiding from config.
-    fn init_sip_stack_from_config(sip_stack: &mut SipStack, config: &SbcConfig) {
+    fn init_sip_stack_from_config(
+        sip_stack: &mut SipStack,
+        config: &SbcConfig,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<String>> {
         // Initialize router from config (if routing section present)
         if let Some(ref routing) = config.routing {
             sip_stack.init_router_from_config(routing, &config.dial_plans, &config.trunk_groups);
@@ -397,6 +405,15 @@ impl Server {
         } else {
             None
         };
+        // Media-failure teardown channel (terminate mode only): the pipeline
+        // signals a call id here when a leg's DTLS handshake fails at runtime; the
+        // server's drain task (spawned in `start`) tears that call down.
+        let (media_failure_tx, media_failure_rx) = if terminate_dtls {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let media_config = crate::media_pipeline::MediaPipelineConfig {
             default_mode,
             srtp_required: config.media.srtp.required,
@@ -405,6 +422,7 @@ impl Server {
             terminate_dtls,
             dtls_sidecar_socket: config.media.dtls.sidecar_socket.clone(),
             dtls_fingerprint: dtls_fingerprint.clone(),
+            media_failure_tx,
             ..Default::default()
         };
         sip_stack.set_media_pipeline(Arc::new(crate::media_pipeline::MediaPipeline::new(
@@ -447,6 +465,8 @@ impl Server {
                 }
             }
         }
+
+        media_failure_rx
     }
 
     /// Returns the cluster manager if available.
@@ -504,6 +524,30 @@ impl Server {
         // Bind stream listeners (SIP over TCP / TLS)
         self.bind_tcp_listeners().await?;
         self.bind_tls_listeners().await?;
+
+        // DTLS-SRTP media-failure teardown: drain call ids whose handshake failed
+        // at runtime and BYE both legs (fail-closed). Needs a bound UDP transport
+        // to send from; the SBC binds a single wildcard listener, so any works.
+        if let Some(mut rx) = self.media_failure_rx.take() {
+            let sip_stack = Arc::clone(&self.sip_stack);
+            let transport = self.udp_transports.read().await.first().map(Arc::clone);
+            match transport {
+                Some(transport) => {
+                    tokio::spawn(async move {
+                        while let Some(call_id) = rx.recv().await {
+                            for (bytes, dest) in
+                                sip_stack.terminate_call_on_media_failure(&call_id).await
+                            {
+                                if let Err(e) = transport.send(&bytes, &dest).await {
+                                    warn!(error = %e, call_id, dest = %dest, "media-failure BYE send failed");
+                                }
+                            }
+                        }
+                    });
+                }
+                None => warn!("media-failure teardown disabled: no UDP transport bound"),
+            }
+        }
 
         // Seed the live-transport count at bind time (before the API server
         // starts serving readiness), so the readiness probe never sees a

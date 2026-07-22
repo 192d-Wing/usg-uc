@@ -618,6 +618,126 @@ impl SipStack {
         }
     }
 
+    /// Builds a BYE for one leg of a confirmed dialog from stored dialog state.
+    /// `target_b_leg` sends to the callee (SBC as UAC on the B-leg); otherwise to
+    /// the caller (SBC as UAS on the A-leg). Mirrors the BYE construction in
+    /// [`Self::handle_bye`] so an SBC-initiated teardown is dialog-correct.
+    fn build_leg_bye(addrs: &CallAddresses, target_b_leg: bool) -> proto_sip::message::SipRequest {
+        let (dest, other_call_id) = if target_b_leg {
+            (&addrs.b_leg_destination, &addrs.b_leg_sip_call_id)
+        } else {
+            (&addrs.a_leg_source, &addrs.a_leg_sip_call_id)
+        };
+        let uri = SipUri::new(dest.ip().to_string()).with_port(dest.port());
+        let mut bye = proto_sip::message::SipRequest::new(Method::Bye, uri);
+        bye.headers.set(HeaderName::CallId, other_call_id);
+        if target_b_leg {
+            // SBC is the UAC on the B-leg: From = our INVITE From, To = the callee
+            // with their tag; next CSeq after the INVITE (1).
+            bye.headers.set(HeaderName::From, &addrs.b_leg_from);
+            bye.headers.set(
+                HeaderName::To,
+                with_tag(&addrs.b_leg_to, addrs.dialog_to_tag.as_deref()),
+            );
+            bye.headers.set(HeaderName::CSeq, "2 BYE");
+        } else {
+            // SBC is the UAS on the A-leg: From = the To we answered with (+tag),
+            // To = the caller's From. The SBC→A direction has its own CSeq space.
+            bye.headers.set(
+                HeaderName::From,
+                with_tag(&addrs.a_leg_to, addrs.dialog_to_tag.as_deref()),
+            );
+            bye.headers.set(HeaderName::To, &addrs.a_leg_from);
+            bye.headers.set(HeaderName::CSeq, "1 BYE");
+        }
+        bye.headers.set(HeaderName::MaxForwards, "70");
+        let branch = generate_branch();
+        bye.headers.add(Header::new(
+            HeaderName::Via,
+            format!("SIP/2.0/UDP {};branch={}", addrs.local_addr, branch),
+        ));
+        bye.headers.set(HeaderName::ContentLength, "0");
+        bye
+    }
+
+    /// Removes all state for a call the SBC is tearing down (dialog correlation,
+    /// call record, INVITE transactions, RTP ports, media session).
+    async fn cleanup_terminated_call(&self, internal_id: &CallId, addrs: &CallAddresses) {
+        {
+            let mut calls = self.calls.write().await;
+            calls.calls.remove(internal_id);
+        }
+        {
+            let mut corr = self.call_correlation.write().await;
+            corr.a_leg.remove(&addrs.a_leg_sip_call_id);
+            corr.b_leg.remove(&addrs.b_leg_sip_call_id);
+            corr.addresses.remove(internal_id);
+        }
+        {
+            let mut txns = self.transactions.write().await;
+            let server_key = TransactionKey::server(&addrs.a_leg_branch, "INVITE");
+            let client_key = TransactionKey::client(&addrs.b_leg_branch, "INVITE");
+            txns.server_invite.remove(&server_key);
+            txns.client_invite.remove(&client_key);
+        }
+        for port in &addrs.rtp_ports {
+            self.release_rtp_port(*port);
+        }
+        if let Some(ref pipeline) = self.media_pipeline {
+            let key = internal_id.to_string();
+            let _ = pipeline.stop_relay(&key).await;
+            let _ = pipeline.remove_session(&key).await;
+        }
+    }
+
+    /// Tears down a call whose DTLS-SRTP media handshake failed at runtime (after
+    /// the 200 OK): the SBC initiated the teardown, so it BYEs **both** legs
+    /// (neither peer sends one). Returns the serialized BYEs paired with their
+    /// destinations for the caller to send; the call state is removed here.
+    /// Empty if the call is already gone or the dialog never confirmed.
+    pub async fn terminate_call_on_media_failure(
+        &self,
+        call_id: &str,
+    ) -> Vec<(bytes::Bytes, SbcSocketAddr)> {
+        let internal_id = CallId::from(call_id);
+        let addrs = {
+            let corr = self.call_correlation.read().await;
+            match corr.addresses.get(&internal_id) {
+                Some(a) => a.clone(),
+                None => return Vec::new(),
+            }
+        };
+
+        // A clean BYE needs the confirmed dialog's remote tag. Media only starts
+        // after the 200 OK (which learns it), so this normally holds; if it does
+        // not, tear the state down without emitting an invalid BYE.
+        if addrs.dialog_to_tag.is_none() {
+            warn!(
+                call_id,
+                "media failure before dialog confirmed; cleaning up without BYE"
+            );
+            self.cleanup_terminated_call(&internal_id, &addrs).await;
+            return Vec::new();
+        }
+
+        let a_bye = Self::build_leg_bye(&addrs, false);
+        let b_bye = Self::build_leg_bye(&addrs, true);
+        self.cleanup_terminated_call(&internal_id, &addrs).await;
+
+        warn!(
+            call_id,
+            "DTLS-SRTP media failed after answer; tearing down call (BYE both legs)"
+        );
+
+        vec![
+            (SipMessage::Request(a_bye).to_bytes(), addrs.a_leg_source),
+            (
+                SipMessage::Request(b_bye).to_bytes(),
+                addrs.b_leg_destination,
+            ),
+        ]
+    }
+
     /// Enables RFC 8898 Bearer-token REGISTER authorization. When set,
     /// `handle_register` validates the OIDC access token and binds the `dn`
     /// claim to the AOR before accepting the registration.
@@ -4648,5 +4768,110 @@ mod tests {
         assert!(SipStack::terminate_params(true, None, None, answer_dtls).is_none());
         // Callee's answer carries no fingerprint → opaque (interworking unsupported).
         assert!(SipStack::terminate_params(true, Some(&caller_fp), None, answer_plain).is_none());
+    }
+
+    // A confirmed B2BUA dialog (remote tag learned), for the media-failure
+    // teardown tests.
+    fn confirmed_call_addresses() -> CallAddresses {
+        CallAddresses {
+            a_leg_source: SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(10, 0, 0, 1), 5060),
+            b_leg_destination: SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(10, 0, 0, 2), 5060),
+            a_leg_sip_call_id: "aleg-callid".to_string(),
+            b_leg_sip_call_id: "bleg-callid".to_string(),
+            local_addr: "10.0.0.9:5060".to_string(),
+            failover_trunks: vec![],
+            a_leg_via: vec!["SIP/2.0/UDP 10.0.0.1;branch=z9hG4bK-a".to_string()],
+            a_leg_from: "<sip:caller@10.0.0.1>;tag=callertag".to_string(),
+            a_leg_to: "<sip:callee@sbc>".to_string(),
+            a_leg_cseq: "1 INVITE".to_string(),
+            b_leg_from: "<sip:sbc@10.0.0.9>;tag=sbctag".to_string(),
+            b_leg_to: "<sip:callee@10.0.0.2>".to_string(),
+            b_leg_branch: "z9hG4bK-b".to_string(),
+            dialog_to_tag: Some("calleetag".to_string()),
+            rtp_ports: vec![16_384, 16_385],
+            media_a_leg_port: Some(16_384),
+            media_a_leg_ip: "10.0.0.9".to_string(),
+            dtls_caller_setup: None,
+            dtls_caller_fingerprint: None,
+            a_leg_branch: "z9hG4bK-a".to_string(),
+        }
+    }
+
+    #[test]
+    fn build_leg_bye_is_dialog_correct_for_both_legs() {
+        let addrs = confirmed_call_addresses();
+
+        // A-leg BYE: SBC as UAS toward the caller. From = our answered To + our
+        // (callee) tag, To = the caller's From, CSeq in the A-leg space.
+        let a = String::from_utf8(
+            SipMessage::Request(SipStack::build_leg_bye(&addrs, false))
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(a.starts_with("BYE "), "{a}");
+        assert!(a.contains("10.0.0.1"), "A-leg BYE targets the caller: {a}");
+        assert!(a.contains("aleg-callid"));
+        assert!(a.contains("1 BYE"));
+        assert!(a.contains("tag=calleetag")); // our From tag
+        assert!(a.contains("callertag")); // caller's tag in To
+
+        // B-leg BYE: SBC as UAC toward the callee. From = our INVITE From, To =
+        // the callee + their tag, CSeq 2 (after the INVITE).
+        let b = String::from_utf8(
+            SipMessage::Request(SipStack::build_leg_bye(&addrs, true))
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(b.contains("10.0.0.2"), "B-leg BYE targets the callee: {b}");
+        assert!(b.contains("bleg-callid"));
+        assert!(b.contains("2 BYE"));
+        assert!(b.contains("tag=sbctag")); // our From tag
+        assert!(b.contains("tag=calleetag")); // callee's tag in To
+    }
+
+    #[tokio::test]
+    async fn terminate_call_on_media_failure_byes_both_legs_and_cleans_up() {
+        let stack = SipStack::new(SipStackConfig {
+            domain: "sbc.test".to_string(),
+            ..Default::default()
+        });
+
+        let internal = CallId::new("call-1");
+        let addrs = confirmed_call_addresses();
+        {
+            let mut corr = stack.call_correlation.write().await;
+            corr.a_leg
+                .insert(addrs.a_leg_sip_call_id.clone(), internal.clone());
+            corr.b_leg
+                .insert(addrs.b_leg_sip_call_id.clone(), internal.clone());
+            corr.addresses.insert(internal.clone(), addrs.clone());
+        }
+
+        let byes = stack.terminate_call_on_media_failure("call-1").await;
+        assert_eq!(byes.len(), 2, "must BYE both legs");
+        assert_eq!(byes[0].1.to_string(), addrs.a_leg_source.to_string());
+        assert_eq!(byes[1].1.to_string(), addrs.b_leg_destination.to_string());
+
+        // Call state is removed.
+        let corr = stack.call_correlation.read().await;
+        assert!(corr.addresses.get(&internal).is_none());
+        assert!(corr.a_leg.get(&addrs.a_leg_sip_call_id).is_none());
+        assert!(corr.b_leg.get(&addrs.b_leg_sip_call_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn terminate_call_on_media_failure_is_a_noop_for_unknown_call() {
+        let stack = SipStack::new(SipStackConfig {
+            domain: "sbc.test".to_string(),
+            ..Default::default()
+        });
+        assert!(
+            stack
+                .terminate_call_on_media_failure("nope")
+                .await
+                .is_empty()
+        );
     }
 }
