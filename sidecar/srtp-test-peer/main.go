@@ -48,6 +48,8 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
+	// Publish our bound address so a harness can point the SBC's relay at us.
+	fmt.Printf("LOCAL %s\n", sock.LocalAddr().String())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
