@@ -394,7 +394,9 @@ mod tests {
         for seq in [0xFFFEu16, 0xFFFF, 0x0000, 0x0001, 0x0002] {
             let pkt = RtpPacket::new(RtpHeader::new(0, seq, 160_000, ssrc), vec![0x5Au8; 160]);
             let protected = SrtpProtect::new(&sender).protect_rtp(&pkt).unwrap();
-            let out = SrtpUnprotect::new(&receiver).unprotect_rtp(&protected).unwrap();
+            let out = SrtpUnprotect::new(&receiver)
+                .unprotect_rtp(&protected)
+                .unwrap();
             assert_eq!(out.header.sequence_number, seq, "seq {seq:#06x} round-trip");
         }
     }
@@ -417,9 +419,12 @@ mod tests {
 
         // Forge a far-future packet: sealed under a DIFFERENT key so it fails
         // authentication at the receiver, but its cleartext header seq is 60000.
-        let wrong_material =
-            SrtpKeyMaterial::new(SrtpProfile::AeadAes256Gcm, vec![0x99u8; 32], vec![0x88u8; 12])
-                .unwrap();
+        let wrong_material = SrtpKeyMaterial::new(
+            SrtpProfile::AeadAes256Gcm,
+            vec![0x99u8; 32],
+            vec![0x88u8; 12],
+        )
+        .unwrap();
         let attacker = SrtpContext::new(&wrong_material, SrtpDirection::Outbound, ssrc).unwrap();
         let forged = {
             let pkt = RtpPacket::new(RtpHeader::new(0, 60000, 160_000, ssrc), vec![0u8; 160]);

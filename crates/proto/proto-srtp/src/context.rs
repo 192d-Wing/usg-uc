@@ -221,11 +221,12 @@ impl SrtpContext {
     ///
     /// [`compute_rtp_index`]: Self::compute_rtp_index
     pub fn update_rtp_state(&self, index: u64) {
-        let highest_index =
-            (self.rtp_roc.load(Ordering::Acquire) << 16) | self.rtp_highest_seq.load(Ordering::Acquire);
+        let highest_index = (self.rtp_roc.load(Ordering::Acquire) << 16)
+            | self.rtp_highest_seq.load(Ordering::Acquire);
         if index > highest_index {
             self.rtp_roc.store(index >> 16, Ordering::Release);
-            self.rtp_highest_seq.store(index & 0xFFFF, Ordering::Release);
+            self.rtp_highest_seq
+                .store(index & 0xFFFF, Ordering::Release);
         }
     }
 
