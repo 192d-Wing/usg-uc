@@ -56,9 +56,11 @@ pub struct MediaPipelineConfig {
     pub terminate_dtls: bool,
     /// Path to the DTLS terminator sidecar's Unix socket (terminate mode).
     pub dtls_sidecar_socket: Option<std::path::PathBuf>,
-    /// The SBC's own SDP fingerprint (published by the sidecar), used to verify
-    /// the sidecar's live identity on each per-leg connection (terminate mode).
-    pub dtls_fingerprint: Option<String>,
+    /// Source of the SBC's own SDP fingerprint (published by the sidecar), used
+    /// to verify the sidecar's live identity on each per-leg connection
+    /// (terminate mode). A file-backed source re-reads on demand so a sidecar
+    /// restart is picked up rather than verified against a stale fingerprint.
+    pub dtls_fingerprint: Option<Arc<crate::dtls_identity::DtlsFingerprintSource>>,
 }
 
 impl Default for MediaPipelineConfig {
@@ -785,17 +787,22 @@ impl MediaPipeline {
                 "terminate mode: no DTLS sidecar socket configured".to_string(),
             )
         })?;
-        let own_fingerprint = self.config.dtls_fingerprint.as_deref().ok_or_else(|| {
-            MediaPipelineError::DtlsHandshakeFailed(
-                "terminate mode: no DTLS fingerprint configured".to_string(),
-            )
-        })?;
+        let own_fingerprint = self
+            .config
+            .dtls_fingerprint
+            .as_ref()
+            .ok_or_else(|| {
+                MediaPipelineError::DtlsHandshakeFailed(
+                    "terminate mode: no DTLS fingerprint configured".to_string(),
+                )
+            })?
+            .current();
 
         let leg = establish_srtp_leg(
             media_socket,
             signaling_peer,
             sidecar_socket,
-            own_fingerprint,
+            &own_fingerprint,
             peer_fingerprint,
             role,
         )
@@ -1285,9 +1292,16 @@ impl MediaPipeline {
         let sidecar_socket = self.config.dtls_sidecar_socket.clone().ok_or_else(|| {
             MediaPipelineError::DtlsHandshakeFailed("no DTLS sidecar socket configured".into())
         })?;
-        let own_fingerprint = self.config.dtls_fingerprint.clone().ok_or_else(|| {
-            MediaPipelineError::DtlsHandshakeFailed("no DTLS fingerprint configured".into())
-        })?;
+        // Read the current fingerprint (a file-backed source re-reads here) so a
+        // call started after a sidecar restart verifies against the live identity.
+        let own_fingerprint = self
+            .config
+            .dtls_fingerprint
+            .as_ref()
+            .ok_or_else(|| {
+                MediaPipelineError::DtlsHandshakeFailed("no DTLS fingerprint configured".into())
+            })?
+            .current();
 
         let mut sessions = self.sessions.write().await;
         let ctx = sessions
@@ -2360,7 +2374,9 @@ mod tests {
             srtp_required: false,
             terminate_dtls: true,
             dtls_sidecar_socket: Some(sock.clone()),
-            dtls_fingerprint: Some(fp.to_string()),
+            dtls_fingerprint: Some(Arc::new(
+                crate::dtls_identity::DtlsFingerprintSource::from_static(fp.to_string()),
+            )),
             ..Default::default()
         });
         pipeline
@@ -2482,7 +2498,9 @@ mod tests {
             srtp_required: false,
             terminate_dtls: true,
             dtls_sidecar_socket: Some(sock.clone()),
-            dtls_fingerprint: Some(fp.to_string()),
+            dtls_fingerprint: Some(Arc::new(
+                crate::dtls_identity::DtlsFingerprintSource::from_static(fp.to_string()),
+            )),
             rtp_port_min: port_base,
             rtp_port_max: port_base + 200,
             ..Default::default()
@@ -2719,7 +2737,9 @@ mod tests {
             srtp_required: false,
             terminate_dtls: true,
             dtls_sidecar_socket: Some(uds.clone()),
-            dtls_fingerprint: Some(sbc_fp.clone()),
+            dtls_fingerprint: Some(Arc::new(
+                crate::dtls_identity::DtlsFingerprintSource::from_static(sbc_fp.clone()),
+            )),
             rtp_port_min: port_base,
             rtp_port_max: port_base + 200,
             ..Default::default()

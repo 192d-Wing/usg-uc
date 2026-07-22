@@ -366,20 +366,37 @@ impl Server {
                 uc_media_engine::MediaMode::PassThrough
             }
         };
-        // Terminate mode: hand the pipeline the sidecar socket + the SBC's own
-        // SDP fingerprint (published by the sidecar) so it can verify the
-        // sidecar's live identity on each per-leg connection. The fingerprint is
-        // read from the same file the DTLS identity below uses.
+        // Terminate mode: build ONE DTLS fingerprint source shared by the SDP
+        // advertisement (SipStack) and the sidecar-verify path (pipeline), so
+        // both always reflect the same identity. A file-backed source re-reads on
+        // demand, letting the daemon self-heal after a sidecar restart instead of
+        // advertising a fingerprint cached once at startup (which every handshake
+        // would then reject until the pod restarts).
         let terminate_dtls = config.media.srtp.mode == sbc_config::SrtpMode::Terminate;
-        let dtls_fingerprint = terminate_dtls
-            .then(|| {
-                config.media.dtls.fingerprint_file.as_ref().and_then(|f| {
-                    crate::dtls_identity::DtlsIdentity::from_fingerprint_file(f)
-                        .ok()
-                        .map(|id| id.sdp_fingerprint().to_string())
-                })
-            })
-            .flatten();
+        // Fail closed: the daemon terminates DTLS *only* via the sidecar (there is
+        // no in-Rust handshake path), so both the socket and the sidecar-published
+        // fingerprint file are mandatory in terminate mode. Refuse to start rather
+        // than advertise the SBC fingerprint and accept secured calls it can never
+        // relay — that would black-hole every such call while it looks connected.
+        if terminate_dtls
+            && (config.media.dtls.sidecar_socket.is_none()
+                || config.media.dtls.fingerprint_file.is_none())
+        {
+            tracing::error!(
+                "srtp.mode = Terminate requires [media.dtls] sidecar_socket and fingerprint_file — aborting startup"
+            );
+            #[allow(clippy::panic)]
+            {
+                panic!(
+                    "DTLS-SRTP termination configured but sidecar_socket/fingerprint_file missing"
+                );
+            }
+        }
+        let dtls_fingerprint = if terminate_dtls {
+            Some(Arc::new(build_dtls_fingerprint_source(&config.media.dtls)))
+        } else {
+            None
+        };
         let media_config = crate::media_pipeline::MediaPipelineConfig {
             default_mode,
             srtp_required: config.media.srtp.required,
@@ -387,51 +404,19 @@ impl Server {
             rtp_port_max: config.media.rtp_port_max,
             terminate_dtls,
             dtls_sidecar_socket: config.media.dtls.sidecar_socket.clone(),
-            dtls_fingerprint,
+            dtls_fingerprint: dtls_fingerprint.clone(),
             ..Default::default()
         };
         sip_stack.set_media_pipeline(Arc::new(crate::media_pipeline::MediaPipeline::new(
             media_config,
         )));
 
-        // DTLS-SRTP termination identity: when `srtp.mode = terminate`, the SBC
-        // is a DTLS endpoint on each leg and must present its own certificate.
-        // Load an operator-provided cert/key if configured, else generate an
-        // ephemeral self-signed P-384 identity (DTLS-SRTP validates by SDP
-        // fingerprint, not PKI). Fail closed — configuring termination but
-        // starting without an identity would silently break secured media.
-        if config.media.srtp.mode == sbc_config::SrtpMode::Terminate {
-            // Sidecar architecture: the Go DTLS terminator owns the cert/key and
-            // publishes its fingerprint to a file; read that for the SDP. Fall
-            // back to an operator cert/key or a self-signed cert only for the
-            // legacy in-Rust DTLS path (whose fingerprint won't match a sidecar).
-            // map_or_else with a nested cert/key match reads worse than this.
-            #[allow(clippy::option_if_let_else)]
-            let identity = match &config.media.dtls.fingerprint_file {
-                Some(fp_file) => crate::dtls_identity::DtlsIdentity::from_fingerprint_file(fp_file),
-                None => match (&config.media.dtls.cert_path, &config.media.dtls.key_path) {
-                    (Some(cert), Some(key)) => {
-                        crate::dtls_identity::DtlsIdentity::from_pem_files(cert, key)
-                    }
-                    _ => crate::dtls_identity::DtlsIdentity::generate(),
-                },
-            };
-            match identity {
-                Ok(id) => {
-                    tracing::info!(
-                        fingerprint = %id.sdp_fingerprint(),
-                        "DTLS-SRTP termination enabled"
-                    );
-                    sip_stack.set_dtls_identity(Arc::new(id));
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to build DTLS identity — aborting startup");
-                    #[allow(clippy::panic)]
-                    {
-                        panic!("DTLS-SRTP termination configured but identity unavailable: {e}");
-                    }
-                }
-            }
+        if let Some(source) = dtls_fingerprint {
+            tracing::info!(
+                fingerprint = %source.current(),
+                "DTLS-SRTP termination enabled"
+            );
+            sip_stack.set_dtls_fingerprint_source(source);
         }
 
         // Initialize Voice Protection System call screening (if configured).
@@ -1388,6 +1373,43 @@ fn parse_content_length(headers: &[u8]) -> usize {
         }
     }
     0
+}
+
+/// Builds the DTLS-SRTP fingerprint source for terminate mode.
+///
+/// Sidecar architecture: the Go terminator publishes its fingerprint to a file,
+/// which is re-read live so a sidecar restart is picked up. Falls back to an
+/// operator cert/key or a self-signed cert (fixed fingerprint) only for the
+/// legacy in-Rust DTLS path. **Fail-closed**: panics if termination is
+/// configured but no valid identity is available — starting half-configured
+/// would silently black-hole every secured call.
+fn build_dtls_fingerprint_source(
+    dtls: &sbc_config::schema::DtlsConfig,
+) -> crate::dtls_identity::DtlsFingerprintSource {
+    use crate::dtls_identity::{DtlsFingerprintSource, DtlsIdentity};
+
+    // map_or_else with the nested cert/key match reads worse than this.
+    #[allow(clippy::option_if_let_else)]
+    let built = if let Some(fp_file) = &dtls.fingerprint_file {
+        DtlsFingerprintSource::from_file(fp_file)
+    } else {
+        let identity = match (&dtls.cert_path, &dtls.key_path) {
+            (Some(cert), Some(key)) => DtlsIdentity::from_pem_files(cert, key),
+            _ => DtlsIdentity::generate(),
+        };
+        identity.map(|id| DtlsFingerprintSource::from_static(id.sdp_fingerprint().to_string()))
+    };
+
+    match built {
+        Ok(source) => source,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to build DTLS identity — aborting startup");
+            #[allow(clippy::panic)]
+            {
+                panic!("DTLS-SRTP termination configured but identity unavailable: {e}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

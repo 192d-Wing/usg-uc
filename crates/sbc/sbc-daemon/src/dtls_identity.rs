@@ -11,7 +11,8 @@
 //! - **SC-13**: Cryptographic Protection (P-384 / SHA-384, CNSA 2.0)
 
 use proto_dtls::fingerprint::CertificateFingerprint;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// Errors building the SBC's DTLS identity.
 #[derive(Debug, thiserror::Error)]
@@ -134,6 +135,83 @@ impl DtlsIdentity {
     }
 }
 
+/// A live source of the SBC's DTLS-SRTP SDP fingerprint.
+///
+/// In the sidecar architecture the Go terminator owns the certificate and
+/// publishes its SHA-384 fingerprint to a file, rewriting it if it restarts with
+/// a fresh identity (the native sidecar runs `restartPolicy: Always`). Reading
+/// that file **on demand** — rather than caching the value once at startup —
+/// lets the daemon self-heal after a sidecar restart: new calls advertise, and
+/// verify the sidecar against, the *current* identity instead of a permanently
+/// stale one that would fail every subsequent handshake until the pod restarts.
+/// For the legacy in-Rust cert / self-signed path the fingerprint is fixed.
+#[derive(Debug)]
+pub enum DtlsFingerprintSource {
+    /// Fixed fingerprint (operator-provided cert or generated self-signed).
+    Static(String),
+    /// Sidecar-published fingerprint file, re-read on demand. `last_good` holds
+    /// the most recent successful read so a transient failure (e.g. the file
+    /// briefly absent mid-rewrite during a sidecar restart) falls back to it
+    /// rather than dropping the fingerprint entirely.
+    File {
+        /// Path the sidecar publishes its fingerprint to.
+        path: PathBuf,
+        /// Most recent successfully-read fingerprint.
+        last_good: Mutex<String>,
+    },
+}
+
+impl DtlsFingerprintSource {
+    /// Builds a file-backed source, reading the current fingerprint once so a
+    /// good value is available immediately (and startup fails closed if the
+    /// sidecar has not published a valid fingerprint yet).
+    ///
+    /// # Errors
+    /// The file cannot be read or does not contain an RFC 8122 fingerprint.
+    pub fn from_file(path: &Path) -> Result<Self, DtlsIdentityError> {
+        let fp = DtlsIdentity::from_fingerprint_file(path)?
+            .sdp_fingerprint()
+            .to_string();
+        Ok(Self::File {
+            path: path.to_path_buf(),
+            last_good: Mutex::new(fp),
+        })
+    }
+
+    /// A fixed fingerprint source (legacy cert / self-signed path).
+    #[must_use]
+    pub fn from_static(fingerprint: String) -> Self {
+        Self::Static(fingerprint)
+    }
+
+    /// The current SDP fingerprint to advertise / verify the sidecar against.
+    ///
+    /// For a file-backed source this re-reads the file, refreshing (and, on a
+    /// read failure, falling back to) the last good value — so a sidecar that
+    /// restarted with a new identity is picked up on the next call.
+    #[must_use]
+    #[allow(clippy::option_if_let_else)] // map_or_else across the two guards reads worse
+    pub fn current(&self) -> String {
+        match self {
+            Self::Static(fp) => fp.clone(),
+            Self::File { path, last_good } => match DtlsIdentity::from_fingerprint_file(path) {
+                Ok(id) => {
+                    let fp = id.sdp_fingerprint().to_string();
+                    last_good
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone_from(&fp);
+                    fp
+                }
+                Err(_) => last_good
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -182,5 +260,31 @@ mod tests {
         assert!(DtlsIdentity::from_fingerprint_file(&path).is_err());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_source_reflects_sidecar_restart() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("usg-dtls-src-{}.fp", std::process::id()));
+        std::fs::write(&path, "sha-384 AA:BB\n").unwrap();
+
+        let src = DtlsFingerprintSource::from_file(&path).unwrap();
+        assert_eq!(src.current(), "sha-384 AA:BB");
+
+        // The sidecar "restarts" and republishes a fresh identity: current()
+        // must reflect it (self-heal), not a stale cached value.
+        std::fs::write(&path, "sha-384 CC:DD\n").unwrap();
+        assert_eq!(src.current(), "sha-384 CC:DD");
+
+        // A transient read failure (file briefly gone mid-rewrite) falls back to
+        // the last good value rather than dropping the fingerprint.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(src.current(), "sha-384 CC:DD");
+    }
+
+    #[test]
+    fn static_source_is_fixed() {
+        let src = DtlsFingerprintSource::from_static("sha-384 FF:EE".to_string());
+        assert_eq!(src.current(), "sha-384 FF:EE");
     }
 }

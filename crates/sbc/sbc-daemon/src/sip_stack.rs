@@ -74,7 +74,7 @@ pub struct SipStack {
     media_pipeline: Option<Arc<crate::media_pipeline::MediaPipeline>>,
     /// The SBC's DTLS-SRTP identity. `Some` only when `srtp.mode = terminate`;
     /// its presence gates advertising the SBC fingerprint in rewritten SDP.
-    dtls_identity: Option<Arc<crate::dtls_identity::DtlsIdentity>>,
+    dtls_fingerprint_source: Option<Arc<crate::dtls_identity::DtlsFingerprintSource>>,
     /// Call router for dial plan matching and trunk selection.
     router: Option<RwLock<Router>>,
     /// SBC-compatible router for CSS/Partition-based routing.
@@ -383,7 +383,7 @@ impl SipStack {
             call_correlation: RwLock::new(CallCorrelation::default()),
             sdp_rewriter: SdpRewriter::new(B2buaMode::MediaRelay),
             media_pipeline: None,
-            dtls_identity: None,
+            dtls_fingerprint_source: None,
             router: None,
             sbc_router: None,
             header_manipulator: None,
@@ -437,7 +437,7 @@ impl SipStack {
             call_correlation: RwLock::new(CallCorrelation::default()),
             sdp_rewriter: SdpRewriter::new(B2buaMode::MediaRelay),
             media_pipeline: None,
-            dtls_identity: None,
+            dtls_fingerprint_source: None,
             router: None,
             sbc_router: None,
             header_manipulator: None,
@@ -506,23 +506,27 @@ impl SipStack {
         self.media_pipeline = Some(pipeline);
     }
 
-    /// Sets the SBC's DTLS-SRTP identity, enabling DTLS-SRTP termination
-    /// (advertising the SBC's own fingerprint in rewritten SDP). Set only when
-    /// `srtp.mode = terminate`.
-    pub fn set_dtls_identity(&mut self, identity: Arc<crate::dtls_identity::DtlsIdentity>) {
-        self.dtls_identity = Some(identity);
+    /// Sets the SBC's DTLS-SRTP fingerprint source, enabling DTLS-SRTP
+    /// termination (advertising the SBC's own fingerprint in rewritten SDP). A
+    /// file-backed source re-reads on demand so a sidecar restart is picked up.
+    /// Set only when `srtp.mode = terminate`.
+    pub fn set_dtls_fingerprint_source(
+        &mut self,
+        source: Arc<crate::dtls_identity::DtlsFingerprintSource>,
+    ) {
+        self.dtls_fingerprint_source = Some(source);
     }
 
     /// Applies DTLS-SRTP termination rewriting to an A-leg answer SDP: when the
-    /// SBC terminates DTLS (`dtls_identity` set), advertise the SBC's own
+    /// SBC terminates DTLS (fingerprint source set), advertise the SBC's own
     /// fingerprint with the answering `a=setup` role derived from the caller's
     /// offer (RFC 5763). A no-op for pass-through or non-DTLS answers.
     fn rewrite_answer_dtls(&self, sdp: String, addrs: &CallAddresses) -> String {
-        if let Some(identity) = &self.dtls_identity {
+        if let Some(source) = &self.dtls_fingerprint_source {
             let role = addrs
                 .dtls_caller_setup
                 .map_or(crate::sdp_dtls::SetupRole::Passive, |s| s.answer_role());
-            crate::sdp_dtls::rewrite_local_dtls(&sdp, identity.sdp_fingerprint(), role)
+            crate::sdp_dtls::rewrite_local_dtls(&sdp, &source.current(), role)
         } else {
             sdp
         }
@@ -587,7 +591,7 @@ impl SipStack {
         answer_sdp: &str,
     ) {
         let params = Self::terminate_params(
-            self.dtls_identity.is_some(),
+            self.dtls_fingerprint_source.is_some(),
             addrs.dtls_caller_fingerprint.as_ref(),
             addrs.dtls_caller_setup,
             answer_sdp,
@@ -601,7 +605,7 @@ impl SipStack {
             }
             return;
         }
-        if self.dtls_identity.is_some() {
+        if self.dtls_fingerprint_source.is_some() {
             // Terminate configured but a leg offered no fingerprint; SRTP↔RTP
             // interworking is not yet supported, so relay opaquely.
             warn!(
@@ -2140,10 +2144,10 @@ impl SipStack {
                 .sdp_rewriter
                 .rewrite_offer_for_b_leg(&sdp_str, &local_media)
                 .rewritten;
-            if let Some(identity) = &self.dtls_identity {
+            if let Some(source) = &self.dtls_fingerprint_source {
                 rewritten = crate::sdp_dtls::rewrite_local_dtls(
                     &rewritten,
-                    identity.sdp_fingerprint(),
+                    &source.current(),
                     crate::sdp_dtls::SetupRole::ActPass,
                 );
             }
