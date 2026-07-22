@@ -1,3 +1,17 @@
+{{- /*
+   The DTLS terminator runs as a native sidecar (an initContainer with
+   restartPolicy: Always), which is only honored once the SidecarContainers
+   feature reached GA in Kubernetes 1.29. On older clusters the field is either
+   rejected or the container is treated as an ordinary init container that never
+   exits — deadlocking the pod in Init. Fail rendering with a clear message
+   rather than let an operator silently lose the SBC when they enable this.
+   (`helm template` without a live cluster: pass --kube-version >=1.29.)
+*/ -}}
+{{- if .Values.sbcDaemon.dtlsTerminate.enabled }}
+{{- if semverCompare "<1.29.0-0" .Capabilities.KubeVersion.Version }}
+{{- fail (printf "sbcDaemon.dtlsTerminate.enabled requires Kubernetes >= 1.29 (native sidecar containers GA); cluster is %s" .Capabilities.KubeVersion.Version) }}
+{{- end }}
+{{- end }}
 # SBC daemon — single replica per site, single pod IP from Cilium's cluster
 # pool. No Multus, no secondary CNIs. The pod's IP is BGP-advertised via the
 # cluster PodCIDR advertisement. The daemon binds 0.0.0.0:5060 (single
@@ -57,6 +71,54 @@ spec:
           volumeMounts:
             - { name: config-template, mountPath: /etc/sbc-template, readOnly: true }
             - { name: config-rendered, mountPath: /etc/sbc-rendered }
+        {{- if .Values.sbcDaemon.dtlsTerminate.enabled }}
+        # DTLS-SRTP terminator as a native sidecar (restartPolicy: Always): it
+        # starts before the sbc container and runs for the pod's life. The
+        # startupProbe gates sbc-daemon on the sidecar actually serving on its
+        # socket (which implies the fingerprint file is published — the sidecar
+        # writes it before it listens), so the daemon's terminate-mode identity
+        # load never races the sidecar. Runs as gid 1000 to match the pod fsGroup
+        # so it can write the shared emptyDir.
+        - name: dtls-terminator
+          image: "{{ .Values.sbcDaemon.dtlsTerminate.image.repository }}:{{ .Values.sbcDaemon.dtlsTerminate.image.tag }}"
+          imagePullPolicy: {{ .Values.sbcDaemon.dtlsTerminate.image.pullPolicy }}
+          restartPolicy: Always
+          args:
+            - "-socket"
+            - "/run/usg/dtls-terminator.sock"
+            - "-fingerprint-file"
+            - "/run/usg/dtls-terminator.fp"
+          # `-healthcheck` connects to the socket and reads the Hello frame the
+          # sidecar sends on accept, proving the accept loop is live — stronger
+          # than testing the socket file (which lingers after a crash).
+          startupProbe:
+            exec:
+              command: ["/usr/local/bin/dtls-terminator", "-healthcheck", "-socket", "/run/usg/dtls-terminator.sock"]
+            initialDelaySeconds: 1
+            periodSeconds: 2
+            failureThreshold: 30
+          # Restart a wedged sidecar (e.g. fd exhaustion serving new legs). A
+          # restart mints a fresh identity + fingerprint; the daemon self-heals by
+          # re-reading the fingerprint file per call, so calls recover without a
+          # full pod restart.
+          livenessProbe:
+            exec:
+              command: ["/usr/local/bin/dtls-terminator", "-healthcheck", "-socket", "/run/usg/dtls-terminator.sock"]
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities: { drop: [ALL] }
+          resources:
+            {{- toYaml .Values.sbcDaemon.dtlsTerminate.resources | nindent 12 }}
+          volumeMounts:
+            - { name: dtls-run, mountPath: /run/usg }
+        {{- end }}
       containers:
         - name: sbc
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -157,6 +219,11 @@ spec:
             - { name: config-rendered, mountPath: /etc/sbc/config.toml, subPath: config.toml, readOnly: true }
             - { name: data, mountPath: /var/lib/sbc }
             - { name: logs, mountPath: /var/log/sbc }
+            {{- if .Values.sbcDaemon.dtlsTerminate.enabled }}
+            # Shared with the terminator sidecar: read the fingerprint file +
+            # connect to the DTLS socket. Read-write so the UDS connect works.
+            - { name: dtls-run, mountPath: /run/usg }
+            {{- end }}
             {{- if and .Values.sbcDaemon.oidc.enabled .Values.sbcClientConfig.extraCaCert }}
             - { name: extra-ca, mountPath: /etc/ssl/extra-ca, readOnly: true }
             {{- end }}
@@ -178,6 +245,13 @@ spec:
           {{- end }}
         - name: logs
           emptyDir: {}
+        {{- if .Values.sbcDaemon.dtlsTerminate.enabled }}
+        # Shared between the terminator sidecar (writes the fingerprint file +
+        # listens on the socket) and the daemon (reads/connects). Ephemeral —
+        # regenerated each pod start with the sidecar's fresh identity.
+        - name: dtls-run
+          emptyDir: {}
+        {{- end }}
         {{- if and .Values.sbcDaemon.oidc.enabled .Values.sbcClientConfig.extraCaCert }}
         - name: extra-ca
           configMap:

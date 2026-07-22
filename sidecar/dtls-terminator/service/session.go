@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"time"
 
@@ -35,6 +37,12 @@ func HandleSession(conn net.Conn, identity *dtlssession.Identity) error {
 	_ = ft.SetReadDeadline(time.Now().Add(startTimeout))
 	raw, err := ft.RecvFrame()
 	if err != nil {
+		// A peer that hangs up before sending Start — e.g. the liveness probe,
+		// which connects only to read our Hello and then closes — is not an error.
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+			errors.Is(err, net.ErrClosed) {
+			return nil
+		}
 		return fmt.Errorf("read Start: %w", err)
 	}
 	_ = ft.SetReadDeadline(time.Time{})
