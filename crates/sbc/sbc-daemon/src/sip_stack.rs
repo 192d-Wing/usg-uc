@@ -4856,9 +4856,9 @@ mod tests {
 
         // Call state is removed.
         let corr = stack.call_correlation.read().await;
-        assert!(corr.addresses.get(&internal).is_none());
-        assert!(corr.a_leg.get(&addrs.a_leg_sip_call_id).is_none());
-        assert!(corr.b_leg.get(&addrs.b_leg_sip_call_id).is_none());
+        assert!(!corr.addresses.contains_key(&internal));
+        assert!(!corr.a_leg.contains_key(&addrs.a_leg_sip_call_id));
+        assert!(!corr.b_leg.contains_key(&addrs.b_leg_sip_call_id));
     }
 
     #[tokio::test]
