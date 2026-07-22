@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       # setup-uv publishes no floating major tag — pin the full version.
-      - uses: astral-sh/setup-uv@v8.2.0
+      - uses: astral-sh/setup-uv@v9.0.0
       # Zensical is pre-1.0 — pin and bump deliberately.
       - run: uvx zensical==0.0.45 build
       - uses: actions/upload-pages-artifact@v5
