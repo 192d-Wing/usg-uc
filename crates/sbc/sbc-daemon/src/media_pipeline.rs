@@ -1500,6 +1500,14 @@ static RTP_PACKETS_RELAYED: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// muxed RTCP rides the RTP relay and counts as RTP).
 static RTCP_PACKETS_RELAYED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Records one forwarded RTP packet. Called by both the opaque relay leg and the
+/// DTLS-terminate relay leg so the black-hole metric ("did audio actually flow")
+/// covers terminated calls too — otherwise terminate-mode media would read as a
+/// permanent black-hole even when audio flows fine.
+pub fn record_rtp_relayed() {
+    RTP_PACKETS_RELAYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Returns the total RTP packets forwarded by the media relay since start.
 #[must_use]
 pub fn rtp_packets_relayed() -> u64 {

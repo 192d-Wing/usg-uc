@@ -111,6 +111,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen %s: %v", *sockPath, err)
 	}
+	// net.Listen creates the socket without group write (umask). Grant it so the
+	// sbc container can connect via the shared pod fsGroup (gid 1000) rather than
+	// relying on both containers coincidentally running the same owner uid —
+	// which silently breaks if the sbc container's runAsUser ever changes.
+	if err := os.Chmod(*sockPath, 0o660); err != nil {
+		log.Fatalf("chmod %s: %v", *sockPath, err)
+	}
 	log.Printf("dtls-terminator listening on %s (FIPS module %s)", *sockPath, fips140.Version())
 
 	// Graceful shutdown: on SIGINT/SIGTERM stop accepting and drain in-flight

@@ -22,10 +22,13 @@ import (
 	"time"
 )
 
-// maxFrame bounds a single DTLS datagram carried over the channel. DTLS uses a
-// conservative MTU (~1200 bytes); 4 KiB is generous headroom and caps the
-// per-frame allocation against a hostile/garbled length prefix.
-const maxFrame = 4096
+// maxFrame bounds the IPC frame body ([type:1][record]) carried over the
+// channel; it must match the Rust relay's MAX_FRAME. It is set above the relay's
+// 4 KiB media recv buffer so a full-size DTLS record still fits once the 1-byte
+// type tag is prepended (1 + 4096 = 4097). DTLS fragments handshake messages to
+// a conservative MTU (~1200 bytes) in practice; the cap guards the per-frame
+// allocation against a hostile/garbled length prefix.
+const maxFrame = 8192
 
 // FrameTransport carries whole DTLS datagrams between the sidecar and the Rust
 // relay. Each frame is exactly one datagram.
