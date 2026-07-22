@@ -1514,6 +1514,13 @@ pub fn rtp_packets_relayed() -> u64 {
     RTP_PACKETS_RELAYED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Records one forwarded RTCP packet. Called by the opaque non-muxed RTCP leg
+/// and by the DTLS-terminate relay for muxed SRTCP, so RTCP is counted without
+/// inflating the RTP "audio flowed" signal.
+pub fn record_rtcp_relayed() {
+    RTCP_PACKETS_RELAYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Returns the total RTCP packets forwarded by the media relay since start.
 #[must_use]
 pub fn rtcp_packets_relayed() -> u64 {

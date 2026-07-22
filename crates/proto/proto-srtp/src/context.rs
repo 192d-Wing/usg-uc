@@ -43,8 +43,14 @@ pub struct SrtpContext {
     rtp_index: AtomicU64,
     /// RTCP packet index.
     rtcp_index: AtomicU64,
-    /// Replay protection window (bitmap-based, no heap allocation).
-    replay_window: Mutex<ReplayWindow>,
+    /// RTP replay protection window (bitmap-based, no heap allocation).
+    rtp_replay_window: Mutex<ReplayWindow>,
+    /// RTCP replay protection window. RFC 3711 §3.3.2 requires SRTP and SRTCP to
+    /// keep *independent* replay lists: their index spaces are unrelated (the RTP
+    /// index is a 48-bit value that climbs fast, the RTCP index a 31-bit counter
+    /// from 0), so sharing one window would let a handful of RTP packets push the
+    /// highest index far past every SRTCP index and reject all RTCP as "too old".
+    rtcp_replay_window: Mutex<ReplayWindow>,
 }
 
 impl SrtpContext {
@@ -76,7 +82,8 @@ impl SrtpContext {
             rtp_highest_seq: AtomicU64::new(0),
             rtp_index: AtomicU64::new(0),
             rtcp_index: AtomicU64::new(0),
-            replay_window: Mutex::new(ReplayWindow::new()),
+            rtp_replay_window: Mutex::new(ReplayWindow::new()),
+            rtcp_replay_window: Mutex::new(ReplayWindow::new()),
         })
     }
 
@@ -246,33 +253,54 @@ impl SrtpContext {
         Ok(index as u32)
     }
 
-    /// Read-only replay check. Call this **before** authenticating the packet:
-    /// it reports whether `index` is a replay or too old without mutating the
-    /// window. Per RFC 3711 §3.3.2 the replay list must only be advanced after
-    /// the packet authenticates — otherwise a forged packet (the RTP header,
-    /// and thus its sequence number, is cleartext) could poison the window and
-    /// wedge the stream. Pair with [`commit_replay`](Self::commit_replay).
+    /// Read-only RTP replay check. Call this **before** authenticating the
+    /// packet: it reports whether `index` is a replay or too old without mutating
+    /// the window. Per RFC 3711 §3.3.2 the replay list must only be advanced
+    /// after the packet authenticates — otherwise a forged packet (the RTP
+    /// header, and thus its sequence number, is cleartext) could poison the
+    /// window and wedge the stream. Pair with [`commit_rtp_replay`](Self::commit_rtp_replay).
     ///
     /// ## Errors
     ///
     /// Returns an error if replay is detected or the index is outside the window.
-    pub fn check_replay(&self, index: u64) -> SrtpResult<()> {
-        let window = self
-            .replay_window
+    pub fn check_rtp_replay(&self, index: u64) -> SrtpResult<()> {
+        self.rtp_replay_window
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        window.check(index)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .check(index)
     }
 
-    /// Commits an authenticated packet's `index` to the replay window. Call this
-    /// **only after** the AEAD tag verifies (and after a prior
-    /// [`check_replay`](Self::check_replay) returned `Ok`).
-    pub fn commit_replay(&self, index: u64) {
-        let mut window = self
-            .replay_window
+    /// Commits an authenticated RTP packet's `index` to the RTP replay window.
+    /// Call this **only after** the AEAD tag verifies (and after a prior
+    /// [`check_rtp_replay`](Self::check_rtp_replay) returned `Ok`).
+    pub fn commit_rtp_replay(&self, index: u64) {
+        self.rtp_replay_window
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        window.commit(index);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .commit(index);
+    }
+
+    /// Read-only SRTCP replay check (pre-auth), against the RTCP replay window —
+    /// a separate index space from RTP (see the field docs). Pair with
+    /// [`commit_rtcp_replay`](Self::commit_rtcp_replay).
+    ///
+    /// ## Errors
+    ///
+    /// Returns an error if replay is detected or the index is outside the window.
+    pub fn check_rtcp_replay(&self, index: u64) -> SrtpResult<()> {
+        self.rtcp_replay_window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .check(index)
+    }
+
+    /// Commits an authenticated SRTCP packet's `index` to the RTCP replay window.
+    /// Call this **only after** the AEAD tag verifies.
+    pub fn commit_rtcp_replay(&self, index: u64) {
+        self.rtcp_replay_window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .commit(index);
     }
 
     /// Computes the nonce for AES-GCM encryption.
@@ -472,6 +500,30 @@ mod tests {
         // Wrap with packet loss across 0xFFFF (first post-wrap seq seen is 0x0500,
         // well above the old 0x1000 rollover threshold): still advances the ROC.
         assert_eq!(est(0x0003_FFF0, 0x0500), 0x0004_0500);
+    }
+
+    // Regression for C-M1: RTP and RTCP keep independent replay windows, so a
+    // burst of RTP (which pushes the RTP window far ahead) does not cause a
+    // low-index SRTCP packet to be rejected as "too old" — a shared window would
+    // after ~64 RTP packets — while each window still enforces its own replays.
+    #[test]
+    fn rtp_and_rtcp_replay_windows_are_independent() {
+        let ctx = test_context();
+
+        // Advance the RTP replay window well past its 64-entry size.
+        for i in 0..100u64 {
+            ctx.check_rtp_replay(i).unwrap();
+            ctx.commit_rtp_replay(i);
+        }
+
+        // A low RTCP index is still accepted (separate window)...
+        assert!(ctx.check_rtcp_replay(0).is_ok());
+        ctx.commit_rtcp_replay(0);
+        assert!(ctx.check_rtcp_replay(1).is_ok());
+        // ...but RTCP replay is still enforced within its own window.
+        assert!(ctx.check_rtcp_replay(0).is_err());
+        // ...and the RTP window still rejects an already-seen RTP index.
+        assert!(ctx.check_rtp_replay(99).is_err());
     }
 
     #[test]
