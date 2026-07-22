@@ -1,0 +1,67 @@
+name: SRTP audio gate
+
+# End-to-end DTLS-SRTP termination gate: runs the real Go sidecar plus two real
+# pion-based DTLS-SRTP media peers against sbc-daemon in terminate mode and
+# asserts audio crosses the SBC (decrypt-on-ingress / re-encrypt-on-egress).
+#
+# This is the ONLY test that exercises proto-srtp against a standard SRTP
+# implementation (pion/srtp), so it catches wire-interop regressions that
+# self-contained unit tests cannot — e.g. a non-standard SRTP KDF.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/proto/proto-srtp/**'
+      - 'crates/uc/uc-crypto/**'
+      - 'crates/sbc/sbc-daemon/**'
+      - 'sidecar/**'
+      - '.github/workflows/srtp-audio.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/proto/proto-srtp/**'
+      - 'crates/uc/uc-crypto/**'
+      - 'crates/sbc/sbc-daemon/**'
+      - 'sidecar/**'
+      - '.github/workflows/srtp-audio.yml'
+  workflow_dispatch:
+
+jobs:
+  srtp-audio:
+    name: SRTP audio (real DTLS-SRTP interop)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev protobuf-compiler libasound2-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: srtp-audio
+
+      # The sidecar is built with the FIPS module (it owns the DTLS handshake);
+      # the media peer is a plain test tool (pion/srtp), built non-FIPS.
+      - name: Build the Go sidecar + DTLS-SRTP media peer
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          ( cd sidecar/dtls-terminator && GOFIPS140=v1.26.0 go build -o "$RUNNER_TEMP/bin/sidecar" ./cmd/dtls-terminator )
+          ( cd sidecar/srtp-test-peer && go build -o "$RUNNER_TEMP/bin/peer" . )
+
+      # The gate test is #[ignore]d (it needs the built binaries); run it
+      # explicitly with the binary paths. It spawns the sidecar + two peers,
+      # drives a terminated call, and asserts both peers recover relayed audio.
+      - name: Run the srtp-audio gate
+        env:
+          SIDECAR_BIN: ${{ runner.temp }}/bin/sidecar
+          PEER_BIN: ${{ runner.temp }}/bin/peer
+        run: cargo test -p sbc-daemon --bin sbc-daemon srtp_audio_end_to_end_real -- --ignored --nocapture
