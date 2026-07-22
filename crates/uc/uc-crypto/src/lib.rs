@@ -64,6 +64,7 @@
 #![allow(clippy::option_if_let_else)]
 
 pub mod aead;
+pub mod cipher;
 pub mod ecdh;
 pub mod ecdsa;
 pub mod error;
