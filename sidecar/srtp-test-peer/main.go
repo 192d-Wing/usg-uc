@@ -57,7 +57,8 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
-	fmt.Printf("RESULT sent=%d received=%d profile=%d\n", res.Sent, res.Received, res.Profile)
+	fmt.Printf("RESULT sent=%d received=%d rtcp_sent=%d rtcp_received=%d profile=%d\n",
+		res.Sent, res.Received, res.SentRTCP, res.ReceivedRTCP, res.Profile)
 	if res.Received == 0 {
 		os.Exit(1) // no media crossed the SBC
 	}

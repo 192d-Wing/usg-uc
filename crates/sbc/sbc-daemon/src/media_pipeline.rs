@@ -2674,7 +2674,8 @@ mod tests {
         }
     }
 
-    async fn peer_received(peer: &mut PeerProc) -> usize {
+    /// Returns `(rtp_received, rtcp_received)` from the peer's RESULT line.
+    async fn peer_received(peer: &mut PeerProc) -> (usize, usize) {
         loop {
             let line =
                 tokio::time::timeout(std::time::Duration::from_secs(35), peer.lines.next_line())
@@ -2683,12 +2684,20 @@ mod tests {
                     .expect("peer stdout io")
                     .expect("peer closed stdout before RESULT");
             if let Some(rest) = line.strip_prefix("RESULT ") {
-                // "sent=40 received=NN profile=8"
+                // "sent=40 received=NN rtcp_sent=X rtcp_received=MM profile=8"
+                let mut rtp = None;
+                let mut rtcp = None;
                 for tok in rest.split_whitespace() {
-                    if let Some(n) = tok.strip_prefix("received=") {
-                        return n.parse().expect("parse received count");
+                    if let Some(n) = tok.strip_prefix("rtcp_received=") {
+                        rtcp = Some(n.parse().expect("parse rtcp_received count"));
+                    } else if let Some(n) = tok.strip_prefix("received=") {
+                        rtp = Some(n.parse().expect("parse received count"));
                     }
                 }
+                return (
+                    rtp.expect("RESULT missing received="),
+                    rtcp.expect("RESULT missing rtcp_received="),
+                );
             }
         }
     }
@@ -2797,9 +2806,10 @@ mod tests {
             .await
             .unwrap();
 
-        // 5. Both peers must recover relayed audio (SBC decrypted + re-encrypted).
-        let recv_a = peer_received(&mut a).await;
-        let recv_b = peer_received(&mut b).await;
+        // 5. Both peers must recover relayed audio AND relayed SRTCP (the SBC
+        // decrypted + re-encrypted each on the correct transform).
+        let (rtp_a, rtcp_a) = peer_received(&mut a).await;
+        let (rtp_b, rtcp_b) = peer_received(&mut b).await;
         let _ = a.child.wait().await;
         let _ = b.child.wait().await;
         let _ = pipeline.stop_relay("call").await;
@@ -2807,8 +2817,12 @@ mod tests {
         let _ = std::fs::remove_file(&uds);
         let _ = std::fs::remove_file(&fp_file);
 
-        eprintln!("srtp-audio gate: peer A received {recv_a}, peer B received {recv_b}");
-        assert!(recv_a > 0, "peer A recovered no relayed audio");
-        assert!(recv_b > 0, "peer B recovered no relayed audio");
+        eprintln!("srtp-audio gate: A rtp={rtp_a} rtcp={rtcp_a}, B rtp={rtp_b} rtcp={rtcp_b}");
+        assert!(rtp_a > 0, "peer A recovered no relayed audio");
+        assert!(rtp_b > 0, "peer B recovered no relayed audio");
+        // SRTCP interop (RFC 7714 §9.4): the SBC re-protected muxed SRTCP and the
+        // far peer's pion/srtp decrypted it — the H6 path the unit tests can't cover.
+        assert!(rtcp_a > 0, "peer A recovered no relayed SRTCP");
+        assert!(rtcp_b > 0, "peer B recovered no relayed SRTCP");
     }
 }
