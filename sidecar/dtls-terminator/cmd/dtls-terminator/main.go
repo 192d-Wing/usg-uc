@@ -13,6 +13,7 @@ import (
 	"crypto/fips140"
 	"errors"
 	"flag"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -25,12 +26,63 @@ import (
 	"github.com/192d-Wing/usg-uc/sidecar/dtls-terminator/service"
 )
 
+// maxFrame bounds a health-probe read; mirrors the IPC frame limit.
+const maxFrame = 4096
+
+// msgHelloType is the wire type byte of the sidecar's Hello frame (see
+// service/protocol.go msgHello). Duplicated here so the health probe stays a
+// standalone client that does not import the session internals.
+const msgHelloType = 1
+
+// runHealthcheck connects to the sidecar socket and reads the Hello frame it
+// sends on every accepted connection. Success proves the accept loop is live and
+// serving (not merely that the socket file exists — which lingers after a crash).
+// Returns a process exit code.
+func runHealthcheck(sockPath string) int {
+	conn, err := net.DialTimeout("unix", sockPath, 3*time.Second)
+	if err != nil {
+		log.Printf("healthcheck: dial %s: %v", sockPath, err)
+		return 1
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+
+	var hdr [2]byte
+	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+		log.Printf("healthcheck: read Hello length: %v", err)
+		return 1
+	}
+	n := int(hdr[0])<<8 | int(hdr[1])
+	if n < 1 || n > maxFrame {
+		log.Printf("healthcheck: bad Hello frame length %d", n)
+		return 1
+	}
+	body := make([]byte, n)
+	if _, err := io.ReadFull(conn, body); err != nil {
+		log.Printf("healthcheck: read Hello body: %v", err)
+		return 1
+	}
+	if body[0] != msgHelloType {
+		log.Printf("healthcheck: expected Hello, got message type %d", body[0])
+		return 1
+	}
+	return 0
+}
+
 func main() {
 	sockPath := flag.String("socket", "/run/usg/dtls-terminator.sock",
 		"Unix-domain socket to accept relay sessions on")
 	fpFile := flag.String("fingerprint-file", "/run/usg/dtls-terminator.fp",
 		"file to publish the SDP fingerprint to (read by the SBC at signaling time)")
+	healthcheck := flag.Bool("healthcheck", false,
+		"probe mode: connect to -socket, verify the sidecar is serving, and exit 0/1")
 	flag.Parse()
+
+	// Health-probe mode (Kubernetes startup/liveness): a lightweight client that
+	// does not need the FIPS module or an identity of its own.
+	if *healthcheck {
+		os.Exit(runHealthcheck(*sockPath))
+	}
 
 	// Refuse to run outside the FIPS module — the entire reason this sidecar
 	// exists is FIPS-validated DTLS-SRTP.
