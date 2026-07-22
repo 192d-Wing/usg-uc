@@ -2643,14 +2643,12 @@ mod tests {
 
     async fn peer_received(peer: &mut PeerProc) -> usize {
         loop {
-            let line = tokio::time::timeout(
-                std::time::Duration::from_secs(35),
-                peer.lines.next_line(),
-            )
-            .await
-            .expect("timeout awaiting peer RESULT")
-            .expect("peer stdout io")
-            .expect("peer closed stdout before RESULT");
+            let line =
+                tokio::time::timeout(std::time::Duration::from_secs(35), peer.lines.next_line())
+                    .await
+                    .expect("timeout awaiting peer RESULT")
+                    .expect("peer stdout io")
+                    .expect("peer closed stdout before RESULT");
             if let Some(rest) = line.strip_prefix("RESULT ") {
                 // "sent=40 received=NN profile=8"
                 for tok in rest.split_whitespace() {
@@ -2703,11 +2701,12 @@ mod tests {
         // Wait for the sidecar to publish its fingerprint + bind the socket.
         let mut sbc_fp = String::new();
         for _ in 0..200 {
-            if let Ok(s) = std::fs::read_to_string(&fp_file) {
-                if !s.trim().is_empty() && uds.exists() {
-                    sbc_fp = s.trim().to_string();
-                    break;
-                }
+            if let Ok(s) = std::fs::read_to_string(&fp_file)
+                && !s.trim().is_empty()
+                && uds.exists()
+            {
+                sbc_fp = s.trim().to_string();
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -2726,7 +2725,12 @@ mod tests {
             ..Default::default()
         });
         let ports = pipeline
-            .create_session_with_zones("call", Some(MediaMode::Relay), Some(loopback), Some(loopback))
+            .create_session_with_zones(
+                "call",
+                Some(MediaMode::Relay),
+                Some(loopback),
+                Some(loopback),
+            )
             .await
             .unwrap();
 
