@@ -164,42 +164,68 @@ impl SrtpContext {
         Ok(index)
     }
 
-    /// Computes the RTP packet index from sequence number (for inbound).
+    /// Computes the 48-bit RTP packet index for an inbound `seq`, estimating the
+    /// rollover counter (ROC) relative to the highest sequence seen so far.
     ///
-    /// Handles rollover counter calculation per RFC 3711.
+    /// This mirrors RFC 3711 §3.3.1 and the libsrtp/pion `srtp_index_guess`
+    /// reference so the SBC and its peers agree on the index across reordering
+    /// and 16-bit rollover. The delta `seq - highest_seq` is a **signed**
+    /// comparison (both promoted to `i32`), *not* a `u16`-wrapping one:
+    ///
+    /// - `highest_seq < 2^15` and `seq - highest_seq > 2^15` → `seq` is a late
+    ///   packet from before the last wrap → `roc - 1`.
+    /// - `highest_seq >= 2^15` and `highest_seq - 2^15 > seq` → `seq` has wrapped
+    ///   past `0xFFFF` into the next ROC → `roc + 1`.
+    /// - otherwise `roc`.
+    ///
+    /// Using `u16`-wrapping subtraction here instead of the signed form silently
+    /// mis-estimates the ROC for a slightly-reordered packet (low half) and for
+    /// the last in-order packet before a wrap (high half) — wrong index → wrong
+    /// GCM nonce → dropped audio.
     pub fn compute_rtp_index(&self, seq: u16) -> u64 {
+        // 2^15 — the half-sequence-space median from RFC 3711 §3.3.1.
+        const MEDIAN: i32 = 0x8000;
+
         let roc = self.rtp_roc.load(Ordering::Acquire);
         let highest_seq = self.rtp_highest_seq.load(Ordering::Acquire) as u16;
 
-        let v = if highest_seq < 0x8000 {
-            if seq.wrapping_sub(highest_seq) > 0x8000 {
-                // Rollback
+        // Signed (i32) delta, matching libsrtp's int-promoted comparison.
+        let s = i32::from(seq);
+        let s_l = i32::from(highest_seq);
+
+        let v = if s_l < MEDIAN {
+            if s - s_l > MEDIAN {
+                // `seq` is a late packet from before the last rollover.
                 roc.saturating_sub(1)
             } else {
                 roc
             }
-        } else if seq.wrapping_sub(highest_seq) > 0x8000 {
-            // Rollover
+        } else if s_l - MEDIAN > s {
+            // `seq` has wrapped past 0xFFFF into the next rollover.
             roc + 1
         } else {
             roc
         };
 
-        (v << 16) | (seq as u64)
+        (v << 16) | u64::from(seq)
     }
 
-    /// Updates the RTP state after successful decryption.
-    pub fn update_rtp_state(&self, seq: u16) {
-        let highest_seq = self.rtp_highest_seq.load(Ordering::Acquire) as u16;
-
-        if seq > highest_seq || (seq < 0x1000 && highest_seq > 0xF000) {
-            // New highest sequence
-            self.rtp_highest_seq.store(seq as u64, Ordering::Release);
-
-            // Check for rollover
-            if seq < 0x1000 && highest_seq > 0xF000 {
-                self.rtp_roc.fetch_add(1, Ordering::SeqCst);
-            }
+    /// Advances the receiver's ROC / highest-sequence state to include an
+    /// authenticated packet's 48-bit `index` (from [`compute_rtp_index`]).
+    ///
+    /// Driving this from the full index — rather than re-deriving rollover from
+    /// `seq` thresholds — keeps the stored `(roc, highest_seq)` in exact lockstep
+    /// with the index estimator, so a wrap is tracked correctly even when packets
+    /// are lost across the `0xFFFF` boundary. Only advances on a new maximum;
+    /// reordered/older packets leave the state unchanged.
+    ///
+    /// [`compute_rtp_index`]: Self::compute_rtp_index
+    pub fn update_rtp_state(&self, index: u64) {
+        let highest_index =
+            (self.rtp_roc.load(Ordering::Acquire) << 16) | self.rtp_highest_seq.load(Ordering::Acquire);
+        if index > highest_index {
+            self.rtp_roc.store(index >> 16, Ordering::Release);
+            self.rtp_highest_seq.store(index & 0xFFFF, Ordering::Release);
         }
     }
 
@@ -219,17 +245,33 @@ impl SrtpContext {
         Ok(index as u32)
     }
 
-    /// Checks and updates replay protection.
+    /// Read-only replay check. Call this **before** authenticating the packet:
+    /// it reports whether `index` is a replay or too old without mutating the
+    /// window. Per RFC 3711 §3.3.2 the replay list must only be advanced after
+    /// the packet authenticates — otherwise a forged packet (the RTP header,
+    /// and thus its sequence number, is cleartext) could poison the window and
+    /// wedge the stream. Pair with [`commit_replay`](Self::commit_replay).
     ///
     /// ## Errors
     ///
-    /// Returns an error if replay is detected.
+    /// Returns an error if replay is detected or the index is outside the window.
     pub fn check_replay(&self, index: u64) -> SrtpResult<()> {
+        let window = self
+            .replay_window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        window.check(index)
+    }
+
+    /// Commits an authenticated packet's `index` to the replay window. Call this
+    /// **only after** the AEAD tag verifies (and after a prior
+    /// [`check_replay`](Self::check_replay) returned `Ok`).
+    pub fn commit_replay(&self, index: u64) {
         let mut window = self
             .replay_window
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        window.check_and_update(index)
+        window.commit(index);
     }
 
     /// Computes the nonce for AES-GCM encryption.
@@ -302,37 +344,51 @@ impl ReplayWindow {
         }
     }
 
-    fn check_and_update(&mut self, index: u64) -> SrtpResult<()> {
+    /// Read-only replay check: is `index` acceptable (new, or in-window and not
+    /// yet seen)? Does not mutate — [`commit`](Self::commit) applies the update
+    /// once the packet has authenticated.
+    fn check(&self, index: u64) -> SrtpResult<()> {
+        if !self.initialized || index > self.highest {
+            return Ok(());
+        }
+        let delta = self.highest - index;
+        if delta >= REPLAY_WINDOW_SIZE {
+            // Too old — outside the window.
+            Err(SrtpError::ReplayDetected { index })
+        } else if self.bitmap & (1 << delta) != 0 {
+            // Already received.
+            Err(SrtpError::ReplayDetected { index })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Records an authenticated `index` as received. Must only be called after
+    /// [`check`](Self::check) accepted it and the packet authenticated.
+    fn commit(&mut self, index: u64) {
         if !self.initialized {
             self.highest = index;
             self.bitmap = 1; // bit 0 = highest
             self.initialized = true;
-            return Ok(());
+            return;
         }
 
         if index > self.highest {
-            // New highest — shift bitmap to make room
+            // New highest — shift bitmap to make room.
             let shift = index - self.highest;
             if shift >= REPLAY_WINDOW_SIZE {
                 self.bitmap = 0;
             } else {
                 self.bitmap <<= shift;
             }
-            self.bitmap |= 1; // Mark new highest as received
+            self.bitmap |= 1; // Mark new highest as received.
             self.highest = index;
-            Ok(())
         } else {
             let delta = self.highest - index;
-            if delta >= REPLAY_WINDOW_SIZE {
-                // Too old — outside the window
-                Err(SrtpError::ReplayDetected { index })
-            } else if self.bitmap & (1 << delta) != 0 {
-                // Already received
-                Err(SrtpError::ReplayDetected { index })
-            } else {
-                // Within window and not seen — mark as received
+            if delta < REPLAY_WINDOW_SIZE {
+                // Within window — mark as received. (Out-of-window indices were
+                // already rejected by `check`; guard anyway to avoid a shift overflow.)
                 self.bitmap |= 1 << delta;
-                Ok(())
             }
         }
     }
@@ -341,6 +397,17 @@ impl ReplayWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl ReplayWindow {
+        /// Test helper mirroring the old combined check-and-update semantics:
+        /// check, and commit only if acceptable. Production splits these so the
+        /// window is advanced only after authentication (RFC 3711 §3.3.2).
+        fn check_and_commit(&mut self, index: u64) -> SrtpResult<()> {
+            self.check(index)?;
+            self.commit(index);
+            Ok(())
+        }
+    }
 
     fn test_context() -> SrtpContext {
         let material =
@@ -375,24 +442,55 @@ mod tests {
         assert_eq!(&nonce[2..6], &[0x12, 0x34, 0x56, 0x78]);
     }
 
+    // Regression for the ROC estimator (RFC 3711 §3.3.1 / libsrtp
+    // `srtp_index_guess`). Asserts exact 48-bit indices — a round-trip test
+    // alone hides the bug because two endpoints running the same broken
+    // estimator agree with each other; only the absolute values (which a
+    // compliant peer computes) and reordering expose it.
+    #[test]
+    fn compute_rtp_index_matches_reference_estimator() {
+        // Force the receiver's highest 48-bit index, then estimate `seq`.
+        let est = |highest_index: u64, seq: u16| {
+            let ctx = test_context();
+            ctx.update_rtp_state(highest_index);
+            ctx.compute_rtp_index(seq)
+        };
+
+        // (highest roc, highest seq, incoming seq) -> expected 48-bit index.
+        // In-order, low half.
+        assert_eq!(est(0x0001_0100, 0x0101), 0x0001_0101);
+        // Slightly reordered in the low half: stays in the same ROC (a u16-wrapping
+        // delta would wrongly drop it to roc-1).
+        assert_eq!(est(0x0005_0100, 0x00FE), 0x0005_00FE);
+        // Last in-order packet before the wrap (high half): still roc.
+        assert_eq!(est(0x0003_FFFE, 0xFFFF), 0x0003_FFFF);
+        // The wrap itself: 0x0000 after 0xFFFF advances the ROC.
+        assert_eq!(est(0x0003_FFFF, 0x0000), 0x0004_0000);
+        // Reordered (earlier) packet in the high half: same ROC, not roc+1.
+        assert_eq!(est(0x0003_C350, 49998), 0x0003_C34E);
+        // Wrap with packet loss across 0xFFFF (first post-wrap seq seen is 0x0500,
+        // well above the old 0x1000 rollover threshold): still advances the ROC.
+        assert_eq!(est(0x0003_FFF0, 0x0500), 0x0004_0500);
+    }
+
     #[test]
     fn test_replay_window() {
         let mut window = ReplayWindow::new();
 
         // First packet should succeed
-        assert!(window.check_and_update(100).is_ok());
+        assert!(window.check_and_commit(100).is_ok());
 
         // Same packet should fail
-        assert!(window.check_and_update(100).is_err());
+        assert!(window.check_and_commit(100).is_err());
 
         // Next packet should succeed
-        assert!(window.check_and_update(101).is_ok());
+        assert!(window.check_and_commit(101).is_ok());
 
         // Old packet within window should succeed (first time)
-        assert!(window.check_and_update(99).is_ok());
+        assert!(window.check_and_commit(99).is_ok());
 
         // Very old packet should fail
-        assert!(window.check_and_update(0).is_err());
+        assert!(window.check_and_commit(0).is_err());
     }
 
     #[test]
@@ -400,25 +498,25 @@ mod tests {
         let mut window = ReplayWindow::new();
 
         // Insert packet at index 100
-        assert!(window.check_and_update(100).is_ok());
+        assert!(window.check_and_commit(100).is_ok());
 
         // Index 37 = 100 - 63 = exactly at window boundary (valid)
-        assert!(window.check_and_update(37).is_ok());
+        assert!(window.check_and_commit(37).is_ok());
 
         // Index 36 = 100 - 64 = just outside window (too old)
-        assert!(window.check_and_update(36).is_err());
+        assert!(window.check_and_commit(36).is_err());
 
         // Large jump: new highest at 200
-        assert!(window.check_and_update(200).is_ok());
+        assert!(window.check_and_commit(200).is_ok());
 
         // Old packet 100 is now 100 positions behind — outside 64-bit window
-        assert!(window.check_and_update(100).is_err());
+        assert!(window.check_and_commit(100).is_err());
 
         // Packet 137 = 200 - 63 = exactly at new window boundary (valid)
-        assert!(window.check_and_update(137).is_ok());
+        assert!(window.check_and_commit(137).is_ok());
 
         // Duplicate of 137 should fail
-        assert!(window.check_and_update(137).is_err());
+        assert!(window.check_and_commit(137).is_err());
     }
 
     #[test]
@@ -427,20 +525,20 @@ mod tests {
 
         // Fill some history
         for i in 0..10 {
-            assert!(window.check_and_update(i).is_ok());
+            assert!(window.check_and_commit(i).is_ok());
         }
 
         // Jump beyond the window — all old state should be cleared
-        assert!(window.check_and_update(1000).is_ok());
+        assert!(window.check_and_commit(1000).is_ok());
 
         // Duplicate of 1000 should fail
-        assert!(window.check_and_update(1000).is_err());
+        assert!(window.check_and_commit(1000).is_err());
 
         // Old indices 0-9 are far outside the window
-        assert!(window.check_and_update(5).is_err());
+        assert!(window.check_and_commit(5).is_err());
 
         // Index within the new window (but never seen) should succeed
-        assert!(window.check_and_update(999).is_ok());
-        assert!(window.check_and_update(937).is_ok()); // 1000 - 63
+        assert!(window.check_and_commit(999).is_ok());
+        assert!(window.check_and_commit(937).is_ok()); // 1000 - 63
     }
 }

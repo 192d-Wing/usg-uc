@@ -39,7 +39,7 @@ impl<'a> SrtpProtect<'a> {
         let index = self
             .context
             .compute_rtp_index(packet.header.sequence_number);
-        self.context.update_rtp_state(packet.header.sequence_number);
+        self.context.update_rtp_state(index);
 
         let nonce = self
             .context
@@ -71,7 +71,7 @@ impl<'a> SrtpProtect<'a> {
     /// Returns an error if encryption fails.
     pub fn protect_rtp_parts(&self, header: &RtpHeader, payload: &[u8]) -> SrtpResult<Bytes> {
         let index = self.context.compute_rtp_index(header.sequence_number);
-        self.context.update_rtp_state(header.sequence_number);
+        self.context.update_rtp_state(index);
 
         let nonce = self
             .context
@@ -110,7 +110,7 @@ impl<'a> SrtpProtect<'a> {
         scratch: &mut Vec<u8>,
     ) -> SrtpResult<Bytes> {
         let index = self.context.compute_rtp_index(header.sequence_number);
-        self.context.update_rtp_state(header.sequence_number);
+        self.context.update_rtp_state(index);
 
         let nonce = self
             .context
@@ -203,6 +203,9 @@ impl<'a> SrtpUnprotect<'a> {
             })?;
 
         let index = self.context.compute_rtp_index(header.sequence_number);
+        // Read-only replay check before auth; the window is only advanced after
+        // the tag verifies (RFC 3711 §3.3.2) so a forged cleartext-header packet
+        // cannot poison it.
         self.context.check_replay(index)?;
 
         let nonce = self
@@ -218,7 +221,9 @@ impl<'a> SrtpUnprotect<'a> {
             .open(&nonce, aad, ciphertext)
             .map_err(|_| SrtpError::AuthenticationFailed)?;
 
-        self.context.update_rtp_state(header.sequence_number);
+        // Authenticated — now it is safe to advance replay + rollover state.
+        self.context.commit_replay(index);
+        self.context.update_rtp_state(index);
 
         Ok(RtpPacket::new(header, plaintext))
     }
@@ -254,6 +259,8 @@ impl<'a> SrtpUnprotect<'a> {
         }
 
         let index = (index_word & 0x7FFFFFFF) as u64;
+        // Read-only replay check before auth; committed only after the tag
+        // verifies (RFC 3711 §3.3.2).
         self.context.check_replay(index)?;
 
         let aad = &data[..8];
@@ -269,6 +276,9 @@ impl<'a> SrtpUnprotect<'a> {
             .cached_rtcp_key()
             .open(&nonce, aad, ciphertext)
             .map_err(|_| SrtpError::AuthenticationFailed)?;
+
+        // Authenticated — safe to advance the replay window.
+        self.context.commit_replay(index);
 
         let mut output = BytesMut::with_capacity(8 + plaintext.len());
         output.put(&data[..8]);
@@ -348,5 +358,84 @@ mod tests {
 
         let result = SrtpUnprotect::new(&receiver).unprotect_rtp(&protected);
         assert!(matches!(result, Err(SrtpError::ReplayDetected { .. })));
+    }
+
+    // Regression for the inverted ROC estimator (C-H2): once highest_seq crosses
+    // 0x8000, a reordered (earlier) packet must still authenticate. Reordering is
+    // what exposes the bug in a round-trip — in-order traffic hides it because
+    // both endpoints would mis-estimate the ROC identically.
+    #[test]
+    fn reorder_after_median_still_decrypts() {
+        let (sender, receiver) = test_contexts();
+        let ssrc = 0xDEADBEEF;
+        let seal = |seq: u16| {
+            let pkt = RtpPacket::new(RtpHeader::new(0, seq, 160_000, ssrc), vec![0xABu8; 160]);
+            SrtpProtect::new(&sender).protect_rtp(&pkt).unwrap()
+        };
+
+        // Sender emits in order across the median: highest advances 0x8FFE -> 0x9000.
+        let low = seal(0x8FFE);
+        let high = seal(0x9000);
+
+        // Receiver sees the later packet first, then the reordered earlier one.
+        let u_high = SrtpUnprotect::new(&receiver).unprotect_rtp(&high).unwrap();
+        assert_eq!(u_high.header.sequence_number, 0x9000);
+        // Must still decrypt after reordering — the regression being guarded.
+        let u_low = SrtpUnprotect::new(&receiver).unprotect_rtp(&low).unwrap();
+        assert_eq!(u_low.header.sequence_number, 0x8FFE);
+    }
+
+    // In-order 16-bit rollover round-trips (correctness guard for the
+    // index-based update_rtp_state change).
+    #[test]
+    fn in_order_rollover_round_trips() {
+        let (sender, receiver) = test_contexts();
+        let ssrc = 0xDEADBEEF;
+        for seq in [0xFFFEu16, 0xFFFF, 0x0000, 0x0001, 0x0002] {
+            let pkt = RtpPacket::new(RtpHeader::new(0, seq, 160_000, ssrc), vec![0x5Au8; 160]);
+            let protected = SrtpProtect::new(&sender).protect_rtp(&pkt).unwrap();
+            let out = SrtpUnprotect::new(&receiver).unprotect_rtp(&protected).unwrap();
+            assert_eq!(out.header.sequence_number, seq, "seq {seq:#06x} round-trip");
+        }
+    }
+
+    // Regression for replay-before-auth (C-H1): a forged packet whose cleartext
+    // header carries a far-future sequence number must NOT advance the replay
+    // window, or every subsequent genuine packet would be rejected as "too old".
+    #[test]
+    fn forged_packet_does_not_wedge_replay_window() {
+        let (sender, receiver) = test_contexts();
+        let ssrc = 0xDEADBEEF;
+        let seal = |seq: u16| {
+            let pkt = RtpPacket::new(RtpHeader::new(0, seq, 160_000, ssrc), vec![0xABu8; 160]);
+            SrtpProtect::new(&sender).protect_rtp(&pkt).unwrap()
+        };
+
+        // A genuine packet decrypts and sets the window highest to 1000.
+        let g1 = seal(1000);
+        assert!(SrtpUnprotect::new(&receiver).unprotect_rtp(&g1).is_ok());
+
+        // Forge a far-future packet: sealed under a DIFFERENT key so it fails
+        // authentication at the receiver, but its cleartext header seq is 60000.
+        let wrong_material =
+            SrtpKeyMaterial::new(SrtpProfile::AeadAes256Gcm, vec![0x99u8; 32], vec![0x88u8; 12])
+                .unwrap();
+        let attacker = SrtpContext::new(&wrong_material, SrtpDirection::Outbound, ssrc).unwrap();
+        let forged = {
+            let pkt = RtpPacket::new(RtpHeader::new(0, 60000, 160_000, ssrc), vec![0u8; 160]);
+            SrtpProtect::new(&attacker).protect_rtp(&pkt).unwrap()
+        };
+        assert!(matches!(
+            SrtpUnprotect::new(&receiver).unprotect_rtp(&forged),
+            Err(SrtpError::AuthenticationFailed)
+        ));
+
+        // The forged packet must not have poisoned the window: the next genuine
+        // in-window packet still decrypts.
+        let g2 = seal(1001);
+        assert!(
+            SrtpUnprotect::new(&receiver).unprotect_rtp(&g2).is_ok(),
+            "genuine packet after a forged one must still decrypt"
+        );
     }
 }
