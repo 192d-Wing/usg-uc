@@ -20,6 +20,7 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
+use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -146,6 +147,7 @@ impl SidecarClient {
         (
             SidecarReader {
                 reader: self.reader,
+                buf: BytesMut::new(),
             },
             SidecarWriter {
                 writer: self.writer,
@@ -158,15 +160,27 @@ impl SidecarClient {
 #[derive(Debug)]
 pub struct SidecarReader {
     reader: OwnedReadHalf,
+    /// Bytes read from the socket but not yet consumed as a whole frame. Held
+    /// here (not in a stack local) so [`SidecarReader::read`] is
+    /// cancellation-safe: when it is the `select!` branch that loses the race,
+    /// a partially-read frame stays buffered here instead of being discarded and
+    /// desyncing the stream on the next call.
+    buf: BytesMut,
 }
 
 impl SidecarReader {
     /// Reads the next event: a DTLS record to forward, or the final Ready/Error.
     ///
+    /// **Cancellation-safe** — safe to use directly as a `tokio::select!` branch.
+    /// A frame that spans multiple reads (or a sibling branch firing mid-read)
+    /// never loses bytes: reads accumulate into a persistent buffer via the
+    /// cancel-safe [`AsyncReadExt::read_buf`], so `read_exact`'s "consumed bytes
+    /// vanish when the future is dropped" hazard cannot occur here.
+    ///
     /// # Errors
     /// Transport failure or a malformed frame.
     pub async fn read(&mut self) -> Result<SidecarEvent, SidecarError> {
-        let frame = read_frame(&mut self.reader).await?;
+        let frame = self.read_frame().await?;
         let (t, body) = split_frame(&frame)?;
         match t {
             MSG_DTLS => Ok(SidecarEvent::Dtls(body.to_vec())),
@@ -186,6 +200,31 @@ impl SidecarReader {
             other => Err(SidecarError::Protocol(format!(
                 "unexpected message type {other}"
             ))),
+        }
+    }
+
+    /// Reads one length-prefixed frame, returning the `[type:1][body]` payload
+    /// (length prefix stripped). Buffers across cancel-safe `read_buf` calls so a
+    /// dropped future never loses in-flight bytes.
+    async fn read_frame(&mut self) -> Result<Vec<u8>, SidecarError> {
+        loop {
+            // Serve a complete frame straight from the buffer if we have one.
+            if self.buf.len() >= 2 {
+                let n = usize::from(u16::from_be_bytes([self.buf[0], self.buf[1]]));
+                if n == 0 || n > MAX_FRAME {
+                    return Err(SidecarError::Protocol(format!("invalid frame length {n}")));
+                }
+                if self.buf.len() >= 2 + n {
+                    let _len_prefix = self.buf.split_to(2);
+                    let body = self.buf.split_to(n);
+                    return Ok(body.to_vec());
+                }
+            }
+            // Need more bytes: read_buf is cancel-safe and appends into self.buf,
+            // so nothing is lost if this await is cancelled by a select! sibling.
+            if self.reader.read_buf(&mut self.buf).await? == 0 {
+                return Err(SidecarError::Io(io::ErrorKind::UnexpectedEof.into()));
+            }
         }
     }
 }
@@ -332,5 +371,38 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SidecarError::FingerprintMismatch { .. }));
+    }
+
+    // Regression for H7: a `read` cancelled after consuming a partial frame must
+    // not lose those bytes (read_exact-in-select! would desync the stream). The
+    // outcome is deterministic regardless of scheduling: the frame is incomplete
+    // (only 1 of >=3 bytes delivered), so the timed read can never complete — it
+    // must leave what it consumed in the buffer for the next read to reassemble.
+    #[tokio::test]
+    async fn reader_buffers_partial_frame_across_cancellation() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let (_ar, mut aw) = a.into_split();
+        let (br, _bw) = b.into_split();
+        let mut reader = SidecarReader {
+            reader: br,
+            buf: BytesMut::new(),
+        };
+
+        // Deliver only the first byte of the 2-byte length prefix, then cancel a
+        // read mid-frame.
+        aw.write_all(&[0x00]).await.unwrap();
+        let cancelled = tokio::time::timeout(Duration::from_millis(50), reader.read()).await;
+        assert!(cancelled.is_err(), "read should time out mid-frame");
+
+        // Deliver the rest: length = 4 -> [type=DTLS][b"abc"]. The buffered first
+        // byte must still be there for the frame to reassemble correctly.
+        aw.write_all(&[0x04, MSG_DTLS, b'a', b'b', b'c'])
+            .await
+            .unwrap();
+        let event = reader.read().await.unwrap();
+        assert!(
+            matches!(&event, SidecarEvent::Dtls(r) if r == b"abc"),
+            "want Dtls(abc), got {event:?}"
+        );
     }
 }
