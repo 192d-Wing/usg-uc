@@ -165,9 +165,21 @@ rtp_port_max = 32768
 [media.srtp]
 required = {{ .Values.sbcDaemon.config.srtp_required }}
 profile = "AeadAes256Gcm"
+{{- if .Values.sbcDaemon.dtlsTerminate.enabled }}
+# Terminate DTLS-SRTP at the SBC (decrypt + re-encrypt per leg). The Go
+# terminator sidecar owns the cert + drives the handshake over the socket below.
+mode = "Terminate"
+{{- end }}
 
 [media.dtls]
 fingerprint_hash = "Sha384"
+{{- if .Values.sbcDaemon.dtlsTerminate.enabled }}
+# Shared with the sidecar container via the /run/usg emptyDir: the daemon reads
+# the fingerprint file at startup for the SDP a=fingerprint and opens the socket
+# per terminated leg.
+sidecar_socket = "/run/usg/dtls-terminator.sock"
+fingerprint_file = "/run/usg/dtls-terminator.fp"
+{{- end }}
 
 [security]
 curve = "P384"

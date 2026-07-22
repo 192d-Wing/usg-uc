@@ -439,6 +439,22 @@ sbcDaemon:
     audience: "sbc"
     # WWW-Authenticate realm in 401 Bearer challenges. Empty = instance name.
     realm: ""
+  # DTLS-SRTP termination. When enabled the SBC becomes a DTLS endpoint on each
+  # media leg (decrypt-on-ingress / re-encrypt-on-egress) instead of relaying
+  # SRTP opaquely — required for transcoding, recording, or lawful intercept.
+  # A FIPS Go sidecar (native-sidecar container) owns the DTLS cert + drives the
+  # handshake; it shares an emptyDir at /run/usg with the daemon (the Unix
+  # socket + the fingerprint file the daemon advertises in SDP). Enabling this
+  # also sets media.srtp.mode = Terminate + the sidecar paths in config.toml.
+  dtlsTerminate:
+    enabled: false
+    image:
+      repository: localhost/usg-dtls-terminator
+      tag: local
+      pullPolicy: Never
+    resources:
+      requests: { cpu: "100m", memory: "64Mi" }
+      limits:   { cpu: "1",    memory: "256Mi" }
   config:
     max_calls: 5000
     max_registrations: 10000
