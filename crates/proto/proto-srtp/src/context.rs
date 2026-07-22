@@ -313,21 +313,19 @@ impl SrtpContext {
     /// This value is then XORed with the session salt.
     #[must_use]
     pub fn compute_nonce(&self, salt: &[u8], ssrc: u32, index: u64) -> [u8; 12] {
-        let mut nonce = [0u8; 12];
+        // RFC 7714 §8.1 IV: (2 zero octets || SSRC || 48-bit packet index),
+        // XORed with the session salt. Built directly from the SSRC and index
+        // (not a zero-filled scratch buffer) so the value is plainly derived
+        // from its inputs.
+        let ssrc = ssrc.to_be_bytes();
+        let idx = index.to_be_bytes();
+        let mut nonce = [
+            0, 0, ssrc[0], ssrc[1], ssrc[2], ssrc[3], idx[2], idx[3], idx[4], idx[5], idx[6],
+            idx[7],
+        ];
 
-        // Build the initial value
-        // Bytes 0-1: zeros
-        // Bytes 2-5: SSRC
-        nonce[2..6].copy_from_slice(&ssrc.to_be_bytes());
-        // Bytes 6-11: 48-bit packet index
-        let index_bytes = index.to_be_bytes();
-        nonce[6..12].copy_from_slice(&index_bytes[2..8]);
-
-        // XOR with salt
-        for (i, byte) in nonce.iter_mut().enumerate() {
-            if i < salt.len() {
-                *byte ^= salt[i];
-            }
+        for (n, s) in nonce.iter_mut().zip(salt) {
+            *n ^= *s;
         }
 
         nonce
