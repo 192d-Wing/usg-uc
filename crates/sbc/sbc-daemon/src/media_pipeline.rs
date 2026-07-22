@@ -2576,4 +2576,204 @@ mod tests {
         let _ = pipeline.stop_relay("call").await;
         let _ = std::fs::remove_file(&sock);
     }
+
+    // ---- srtp-audio gate (real DTLS handshake, real SRTP media) ----------
+    // Spawns the REAL Go sidecar + two REAL DTLS-SRTP media peers and drives a
+    // terminated call: each peer completes a real DTLS handshake with the SBC
+    // (pumped through the Rust relay to the sidecar), then sends SRTP media that
+    // the SBC decrypts on ingress and re-encrypts on egress for the far peer.
+    // Both peers must recover relayed audio. Ignored by default (needs the built
+    // binaries); the srtp-audio CI job runs it with SIDECAR_BIN + PEER_BIN set.
+    //
+    // The SBC is the DTLS *client* on both legs so the peers (servers) don't send
+    // to the SBC's media port before start_relay_terminate binds it (which would
+    // draw ICMP-unreachable and abort their handshake).
+    struct PeerProc {
+        child: tokio::process::Child,
+        fingerprint: String,
+        local: std::net::SocketAddr,
+        lines: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    }
+
+    async fn read_peer_header(bin: &str, sbc_port: u16, sbc_fp: &str, ssrc: u32) -> PeerProc {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::process::Command;
+
+        let mut child = Command::new(bin)
+            .args([
+                "-role",
+                "server",
+                "-remote",
+                &format!("127.0.0.1:{sbc_port}"),
+                "-peer-fp",
+                sbc_fp,
+                "-count",
+                "40",
+                "-ssrc",
+                &ssrc.to_string(),
+            ])
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn peer");
+        let stdout = child.stdout.take().expect("peer stdout");
+        let mut lines = BufReader::new(stdout).lines();
+        let mut fp: Option<String> = None;
+        let mut local: Option<std::net::SocketAddr> = None;
+        while fp.is_none() || local.is_none() {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line())
+                .await
+                .expect("timeout reading peer header")
+                .expect("peer stdout io")
+                .expect("peer closed stdout before header");
+            if let Some(v) = line.strip_prefix("FINGERPRINT ") {
+                fp = Some(v.to_string());
+            } else if let Some(v) = line.strip_prefix("LOCAL ") {
+                local = Some(v.parse().expect("parse LOCAL addr"));
+            }
+        }
+        PeerProc {
+            child,
+            fingerprint: fp.unwrap(),
+            local: local.unwrap(),
+            lines,
+        }
+    }
+
+    async fn peer_received(peer: &mut PeerProc) -> usize {
+        loop {
+            let line =
+                tokio::time::timeout(std::time::Duration::from_secs(35), peer.lines.next_line())
+                    .await
+                    .expect("timeout awaiting peer RESULT")
+                    .expect("peer stdout io")
+                    .expect("peer closed stdout before RESULT");
+            if let Some(rest) = line.strip_prefix("RESULT ") {
+                // "sent=40 received=NN profile=8"
+                for tok in rest.split_whitespace() {
+                    if let Some(n) = tok.strip_prefix("received=") {
+                        return n.parse().expect("parse received count");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "spawns the real sidecar + peer binaries; run via the srtp-audio CI job with SIDECAR_BIN + PEER_BIN set"]
+    async fn srtp_audio_end_to_end_real() {
+        use tokio::process::Command;
+
+        // Surfaces the relay's warnings (e.g. an SRTP unprotect failure) if the
+        // gate ever fails in CI. Quiet by default; raise with RUST_LOG.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("sbc_daemon=warn")),
+            )
+            .with_test_writer()
+            .try_init();
+
+        let sidecar_bin = std::env::var("SIDECAR_BIN").expect("SIDECAR_BIN not set");
+        let peer_bin = std::env::var("PEER_BIN").expect("PEER_BIN not set");
+
+        let tmp = std::env::temp_dir();
+        let pid = std::process::id();
+        let uds = tmp.join(format!("srtp-audio-{pid}.sock"));
+        let fp_file = tmp.join(format!("srtp-audio-{pid}.fp"));
+        let _ = std::fs::remove_file(&uds);
+        let _ = std::fs::remove_file(&fp_file);
+
+        // 1. Real sidecar.
+        let mut sidecar = Command::new(&sidecar_bin)
+            .args([
+                "-socket",
+                uds.to_str().unwrap(),
+                "-fingerprint-file",
+                fp_file.to_str().unwrap(),
+            ])
+            .env("GODEBUG", "fips140=on")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sidecar");
+
+        // Wait for the sidecar to publish its fingerprint + bind the socket.
+        let mut sbc_fp = String::new();
+        for _ in 0..200 {
+            if let Ok(s) = std::fs::read_to_string(&fp_file)
+                && !s.trim().is_empty()
+                && uds.exists()
+            {
+                sbc_fp = s.trim().to_string();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!sbc_fp.is_empty(), "sidecar never published a fingerprint");
+
+        // 2. Terminate-mode pipeline (unique high port range to avoid collisions).
+        let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let port_base = 26_000_u16.wrapping_add((rand::random::<u16>() % 6_000) & !1);
+        let pipeline = MediaPipeline::new(MediaPipelineConfig {
+            srtp_required: false,
+            terminate_dtls: true,
+            dtls_sidecar_socket: Some(uds.clone()),
+            dtls_fingerprint: Some(sbc_fp.clone()),
+            rtp_port_min: port_base,
+            rtp_port_max: port_base + 200,
+            ..Default::default()
+        });
+        let ports = pipeline
+            .create_session_with_zones(
+                "call",
+                Some(MediaMode::Relay),
+                Some(loopback),
+                Some(loopback),
+            )
+            .await
+            .unwrap();
+
+        // 3. Two real peers (DTLS servers), each pointed at its SBC media leg.
+        let mut a = read_peer_header(&peer_bin, ports.a_leg_rtp_port, &sbc_fp, 0x1111_1111).await;
+        let mut b = read_peer_header(&peer_bin, ports.b_leg_rtp_port, &sbc_fp, 0x2222_2222).await;
+
+        // 4. Point the relay at each peer, then terminate (SBC = DTLS client).
+        pipeline
+            .set_remote_address("call", true, a.local.into())
+            .await
+            .unwrap();
+        pipeline
+            .set_remote_address("call", false, b.local.into())
+            .await
+            .unwrap();
+        pipeline
+            .start_relay_terminate(
+                "call",
+                LegDtlsParams {
+                    peer_fingerprint: a.fingerprint.clone(),
+                    role: Role::Client,
+                },
+                LegDtlsParams {
+                    peer_fingerprint: b.fingerprint.clone(),
+                    role: Role::Client,
+                },
+            )
+            .await
+            .unwrap();
+
+        // 5. Both peers must recover relayed audio (SBC decrypted + re-encrypted).
+        let recv_a = peer_received(&mut a).await;
+        let recv_b = peer_received(&mut b).await;
+        let _ = a.child.wait().await;
+        let _ = b.child.wait().await;
+        let _ = pipeline.stop_relay("call").await;
+        let _ = sidecar.kill().await;
+        let _ = std::fs::remove_file(&uds);
+        let _ = std::fs::remove_file(&fp_file);
+
+        eprintln!("srtp-audio gate: peer A received {recv_a}, peer B received {recv_b}");
+        assert!(recv_a > 0, "peer A recovered no relayed audio");
+        assert!(recv_b > 0, "peer B recovered no relayed audio");
+    }
 }
