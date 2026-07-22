@@ -1338,6 +1338,42 @@ impl MediaPipeline {
                 .map_err(|e| MediaPipelineError::BindFailed(format!("{b_bind}: {e}")))?,
         );
 
+        // Best-effort separate-port SRTCP relay (RTP port + 1) for endpoints that
+        // did not negotiate rtcp-mux. Muxed SRTCP already rides the media relay; a
+        // bind failure here disables only non-muxed RTCP, never audio. RTCP remotes
+        // default to the RTP remote's port + 1 and latch symmetrically.
+        let rtcp = match (
+            a_remote.port().checked_add(1),
+            b_remote.port().checked_add(1),
+        ) {
+            (Some(a_rtcp_rport), Some(b_rtcp_rport)) => {
+                let a_rtcp_bind = format!("{}:{}", ctx.a_leg_bind_ip, ctx.a_leg_rtcp_port);
+                let b_rtcp_bind = format!("{}:{}", ctx.b_leg_bind_ip, ctx.b_leg_rtcp_port);
+                match (
+                    UdpSocket::bind(&a_rtcp_bind).await,
+                    UdpSocket::bind(&b_rtcp_bind).await,
+                ) {
+                    (Ok(a_rtcp_sock), Ok(b_rtcp_sock)) => {
+                        let a_rtcp_remote = std::net::SocketAddr::new(a_remote.ip(), a_rtcp_rport);
+                        let b_rtcp_remote = std::net::SocketAddr::new(b_remote.ip(), b_rtcp_rport);
+                        Some(TerminateRtcp {
+                            a_socket: Arc::new(a_rtcp_sock),
+                            b_socket: Arc::new(b_rtcp_sock),
+                            a_remote: a_rtcp_remote,
+                            b_remote: b_rtcp_remote,
+                            a_target: Arc::new(std::sync::RwLock::new(a_rtcp_remote)),
+                            b_target: Arc::new(std::sync::RwLock::new(b_rtcp_remote)),
+                        })
+                    }
+                    (a_res, b_res) => {
+                        warn!(call_id = %call_id, a_err = ?a_res.err(), b_err = ?b_res.err(), "terminate RTCP sockets failed to bind (audio unaffected)");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let a_target = Arc::new(std::sync::RwLock::new(a_remote));
         let b_target = Arc::new(std::sync::RwLock::new(b_remote));
@@ -1358,6 +1394,7 @@ impl MediaPipeline {
             b_target: Arc::clone(&b_target),
             shutdown: shutdown_rx,
             media_failure_tx: self.config.media_failure_tx.clone(),
+            rtcp,
         }));
 
         // The supervisor handle stands in for the relay tasks it spawns; those
@@ -1542,6 +1579,18 @@ pub struct LegDtlsParams {
     pub role: Role,
 }
 
+/// Sockets + addresses for the separate RTCP (RTP-port + 1) relay, used only by
+/// endpoints that did NOT negotiate rtcp-mux. Muxed SRTCP rides the media relay
+/// (see [`TerminateRelayLeg`]); this bundle services the non-muxed case.
+struct TerminateRtcp {
+    a_socket: Arc<UdpSocket>,
+    b_socket: Arc<UdpSocket>,
+    a_remote: std::net::SocketAddr,
+    b_remote: std::net::SocketAddr,
+    a_target: Arc<std::sync::RwLock<std::net::SocketAddr>>,
+    b_target: Arc<std::sync::RwLock<std::net::SocketAddr>>,
+}
+
 /// Everything the terminate supervisor owns for one call (bundled so the spawn
 /// and the supervisor signature stay manageable).
 struct TerminateSetup {
@@ -1562,6 +1611,9 @@ struct TerminateSetup {
     /// Signalled with `call_id` if a leg's handshake fails, so the call is torn
     /// down rather than left up with dead media.
     media_failure_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Separate-port SRTCP relay for non-muxed endpoints. `None` when the RTCP
+    /// sockets could not be bound (audio is unaffected; only non-muxed RTCP is).
+    rtcp: Option<TerminateRtcp>,
 }
 
 /// Drives both legs' DTLS handshakes concurrently, then spawns the bidirectional
@@ -1696,6 +1748,53 @@ async fn terminate_supervisor(s: TerminateSetup) {
         Arc::clone(&s.b_target),
         s.shutdown.clone(),
     ));
+
+    // Separate-port SRTCP relay for non-muxed endpoints. Fresh SRTP contexts from
+    // the SAME keying material (independent replay windows); on the RTCP port
+    // every packet is SRTCP, so TerminateRelayLeg re-protects it via the RTCP
+    // path. Muxed RTCP already rides the media relay above.
+    if let Some(rtcp) = s.rtcp {
+        let rtcp_ctxs = (
+            SrtpContext::new(&a_in, SrtpDirection::Inbound, s.a_ssrc),
+            SrtpContext::new(&a_out, SrtpDirection::Outbound, s.a_ssrc),
+            SrtpContext::new(&b_in, SrtpDirection::Inbound, s.b_ssrc),
+            SrtpContext::new(&b_out, SrtpDirection::Outbound, s.b_ssrc),
+        );
+        if let (Ok(a_rin), Ok(a_reg), Ok(b_rin), Ok(b_reg)) = rtcp_ctxs {
+            tokio::spawn(
+                TerminateRelayLeg {
+                    recv_sock: Arc::clone(&rtcp.a_socket),
+                    send_sock: Arc::clone(&rtcp.b_socket),
+                    ingress: a_rin,
+                    egress: b_reg,
+                    expected_remote: rtcp.a_remote,
+                    recv_target: Arc::clone(&rtcp.a_target),
+                    forward_target: Arc::clone(&rtcp.b_target),
+                    dtls_out: None,
+                    call_id: s.call_id.clone(),
+                    direction: "A→B RTCP",
+                }
+                .run(s.shutdown.clone()),
+            );
+            tokio::spawn(
+                TerminateRelayLeg {
+                    recv_sock: rtcp.b_socket,
+                    send_sock: rtcp.a_socket,
+                    ingress: b_rin,
+                    egress: a_reg,
+                    expected_remote: rtcp.b_remote,
+                    recv_target: rtcp.b_target,
+                    forward_target: rtcp.a_target,
+                    dtls_out: None,
+                    call_id: s.call_id.clone(),
+                    direction: "B→A RTCP",
+                }
+                .run(s.shutdown.clone()),
+            );
+        } else {
+            warn!(call_id = %s.call_id, "RTCP SRTP context creation failed; non-muxed RTCP not relayed");
+        }
+    }
 
     info!(call_id = %s.call_id, "DTLS-SRTP termination established; relaying media");
 }
