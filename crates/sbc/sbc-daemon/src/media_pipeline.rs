@@ -61,6 +61,11 @@ pub struct MediaPipelineConfig {
     /// (terminate mode). A file-backed source re-reads on demand so a sidecar
     /// restart is picked up rather than verified against a stale fingerprint.
     pub dtls_fingerprint: Option<Arc<crate::dtls_identity::DtlsFingerprintSource>>,
+    /// Signalled with a call's session id when its DTLS-SRTP handshake fails at
+    /// runtime — after the call was answered — so the SIP layer can tear the call
+    /// down (BYE both legs) instead of leaving it up with black-holed media.
+    /// Fail-closed for the async failure that startup validation can't catch.
+    pub media_failure_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl Default for MediaPipelineConfig {
@@ -80,6 +85,7 @@ impl Default for MediaPipelineConfig {
             terminate_dtls: false,
             dtls_sidecar_socket: None,
             dtls_fingerprint: None,
+            media_failure_tx: None,
         }
     }
 }
@@ -1351,6 +1357,7 @@ impl MediaPipeline {
             a_target: Arc::clone(&a_target),
             b_target: Arc::clone(&b_target),
             shutdown: shutdown_rx,
+            media_failure_tx: self.config.media_failure_tx.clone(),
         }));
 
         // The supervisor handle stands in for the relay tasks it spawns; those
@@ -1552,6 +1559,9 @@ struct TerminateSetup {
     a_target: Arc<std::sync::RwLock<std::net::SocketAddr>>,
     b_target: Arc<std::sync::RwLock<std::net::SocketAddr>>,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    /// Signalled with `call_id` if a leg's handshake fails, so the call is torn
+    /// down rather than left up with dead media.
+    media_failure_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 /// Drives both legs' DTLS handshakes concurrently, then spawns the bidirectional
@@ -1583,8 +1593,15 @@ async fn terminate_supervisor(s: TerminateSetup) {
             warn!(
                 call_id = %s.call_id,
                 a_err = ?a.err(), b_err = ?b.err(),
-                "DTLS termination handshake failed; media not relayed"
+                "DTLS termination handshake failed; tearing down call"
             );
+            // Fail-closed: the call was already answered, so leaving it up means
+            // black-holed media on a connected call. Signal the SIP layer to BYE
+            // both legs. (Best-effort: a dropped receiver just reverts to the
+            // old fail-open behaviour.)
+            if let Some(tx) = &s.media_failure_tx {
+                let _ = tx.send(s.call_id.clone());
+            }
             return;
         }
     };
