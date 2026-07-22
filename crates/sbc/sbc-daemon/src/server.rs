@@ -373,6 +373,25 @@ impl Server {
         // advertising a fingerprint cached once at startup (which every handshake
         // would then reject until the pod restarts).
         let terminate_dtls = config.media.srtp.mode == sbc_config::SrtpMode::Terminate;
+        // Fail closed: the daemon terminates DTLS *only* via the sidecar (there is
+        // no in-Rust handshake path), so both the socket and the sidecar-published
+        // fingerprint file are mandatory in terminate mode. Refuse to start rather
+        // than advertise the SBC fingerprint and accept secured calls it can never
+        // relay — that would black-hole every such call while it looks connected.
+        if terminate_dtls
+            && (config.media.dtls.sidecar_socket.is_none()
+                || config.media.dtls.fingerprint_file.is_none())
+        {
+            tracing::error!(
+                "srtp.mode = Terminate requires [media.dtls] sidecar_socket and fingerprint_file — aborting startup"
+            );
+            #[allow(clippy::panic)]
+            {
+                panic!(
+                    "DTLS-SRTP termination configured but sidecar_socket/fingerprint_file missing"
+                );
+            }
+        }
         let dtls_fingerprint = if terminate_dtls {
             Some(Arc::new(build_dtls_fingerprint_source(&config.media.dtls)))
         } else {
