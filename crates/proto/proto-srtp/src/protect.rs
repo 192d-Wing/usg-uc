@@ -134,7 +134,12 @@ impl<'a> SrtpProtect<'a> {
         Ok(output.freeze())
     }
 
-    /// Protects (encrypts) an RTCP packet.
+    /// Protects (encrypts) an RTCP packet as AEAD SRTCP (RFC 7714 §9.4).
+    ///
+    /// Wire layout: `RTCP header (8) || ciphertext+tag || E-flag+SRTCP-index (4)`.
+    /// The AEAD associated data is the 8-byte RTCP header **concatenated with the
+    /// 4-byte E+index trailer** — both are authenticated but not encrypted, and
+    /// the trailer must be covered or a modified index would go undetected.
     ///
     /// # Errors
     /// Returns an error if encryption fails.
@@ -146,28 +151,31 @@ impl<'a> SrtpProtect<'a> {
         }
 
         let index = self.context.next_rtcp_index()?;
-
-        let aad = &rtcp_data[..8];
-        let plaintext = &rtcp_data[8..];
+        // E flag (encrypted) set + 31-bit SRTCP index; part of the AAD.
+        let e_index = (0x8000_0000 | index).to_be_bytes();
 
         let ssrc = u32::from_be_bytes([rtcp_data[4], rtcp_data[5], rtcp_data[6], rtcp_data[7]]);
         let nonce = self
             .context
-            .compute_nonce(self.context.rtcp_salt(), ssrc, index as u64);
+            .compute_nonce(self.context.rtcp_salt(), ssrc, u64::from(index));
+
+        // AAD = RTCP header (first 8 octets) || E+SRTCP-index trailer.
+        let mut aad = [0u8; 12];
+        aad[..8].copy_from_slice(&rtcp_data[..8]);
+        aad[8..].copy_from_slice(&e_index);
 
         let ciphertext = self
             .context
             .cached_rtcp_key()
-            .seal(&nonce, aad, plaintext)
+            .seal(&nonce, &aad, &rtcp_data[8..])
             .map_err(|_| SrtpError::EncryptionFailed {
                 reason: "SRTCP encryption failed".to_string(),
             })?;
 
-        let mut output = BytesMut::with_capacity(aad.len() + ciphertext.len() + 4);
-        output.put(aad);
+        let mut output = BytesMut::with_capacity(8 + ciphertext.len() + 4);
+        output.put(&rtcp_data[..8]);
         output.put(ciphertext.as_slice());
-        // E flag (1) + index (31 bits)
-        output.put_u32(0x80000000 | index);
+        output.put(&e_index[..]);
 
         Ok(output.freeze())
     }
@@ -206,7 +214,7 @@ impl<'a> SrtpUnprotect<'a> {
         // Read-only replay check before auth; the window is only advanced after
         // the tag verifies (RFC 3711 §3.3.2) so a forged cleartext-header packet
         // cannot poison it.
-        self.context.check_replay(index)?;
+        self.context.check_rtp_replay(index)?;
 
         let nonce = self
             .context
@@ -222,13 +230,17 @@ impl<'a> SrtpUnprotect<'a> {
             .map_err(|_| SrtpError::AuthenticationFailed)?;
 
         // Authenticated — now it is safe to advance replay + rollover state.
-        self.context.commit_replay(index);
+        self.context.commit_rtp_replay(index);
         self.context.update_rtp_state(index);
 
         Ok(RtpPacket::new(header, plaintext))
     }
 
-    /// Unprotects (decrypts) an SRTCP packet.
+    /// Unprotects (decrypts) an AEAD SRTCP packet (RFC 7714 §9.4).
+    ///
+    /// Inverse of [`SrtpProtect::protect_rtcp`]: the `E-flag+SRTCP-index` is the
+    /// last 4 octets, the AEAD ciphertext (payload + tag) sits between the 8-byte
+    /// header and that trailer, and the AAD is `header || E+index`.
     ///
     /// # Errors
     /// Returns an error if decryption or authentication fails.
@@ -236,19 +248,20 @@ impl<'a> SrtpUnprotect<'a> {
     pub async fn unprotect_rtcp(&self, data: &[u8]) -> SrtpResult<Bytes> {
         let auth_tag_len = self.context.profile().auth_tag_len();
 
+        // header(8) + ciphertext(>=tag) + E+SRTCP-index(4).
         if data.len() < 8 + auth_tag_len + 4 {
             return Err(SrtpError::InvalidPacket {
                 reason: "SRTCP packet too short".to_string(),
             });
         }
 
-        let trailer_offset = data.len() - 4 - auth_tag_len;
-        let index_bytes = &data[trailer_offset..trailer_offset + 4];
+        // The E-flag + 31-bit SRTCP index is the trailing 4 octets.
+        let index_start = data.len() - 4;
         let index_word = u32::from_be_bytes([
-            index_bytes[0],
-            index_bytes[1],
-            index_bytes[2],
-            index_bytes[3],
+            data[index_start],
+            data[index_start + 1],
+            data[index_start + 2],
+            data[index_start + 3],
         ]);
 
         let e_flag = (index_word & 0x80000000) != 0;
@@ -258,27 +271,30 @@ impl<'a> SrtpUnprotect<'a> {
             });
         }
 
-        let index = (index_word & 0x7FFFFFFF) as u64;
+        let index = u64::from(index_word & 0x7FFF_FFFF);
         // Read-only replay check before auth; committed only after the tag
-        // verifies (RFC 3711 §3.3.2).
-        self.context.check_replay(index)?;
-
-        let aad = &data[..8];
-        let ciphertext = &data[8..trailer_offset];
+        // verifies (RFC 3711 §3.3.2). RTCP has its own replay window.
+        self.context.check_rtcp_replay(index)?;
 
         let ssrc = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
         let nonce = self
             .context
             .compute_nonce(self.context.rtcp_salt(), ssrc, index);
 
+        // AAD = RTCP header (first 8 octets) || E+SRTCP-index trailer.
+        let mut aad = [0u8; 12];
+        aad[..8].copy_from_slice(&data[..8]);
+        aad[8..].copy_from_slice(&data[index_start..]);
+
+        let ciphertext = &data[8..index_start];
         let plaintext = self
             .context
             .cached_rtcp_key()
-            .open(&nonce, aad, ciphertext)
+            .open(&nonce, &aad, ciphertext)
             .map_err(|_| SrtpError::AuthenticationFailed)?;
 
-        // Authenticated — safe to advance the replay window.
-        self.context.commit_replay(index);
+        // Authenticated — safe to advance the RTCP replay window.
+        self.context.commit_rtcp_replay(index);
 
         let mut output = BytesMut::with_capacity(8 + plaintext.len());
         output.put(&data[..8]);

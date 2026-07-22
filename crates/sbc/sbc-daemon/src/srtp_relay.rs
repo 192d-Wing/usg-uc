@@ -38,9 +38,33 @@ pub fn reprotect_rtp(
     SrtpProtect::new(egress).protect_rtp(&rtp)
 }
 
-// NOTE: the SRTCP re-protect (`unprotect_rtcp`/`protect_rtcp`) lands with the
-// RTCP relay leg, where it can be tested against a real SRTCP exchange rather
-// than shipped untested here.
+/// Re-protects one SRTCP packet crossing the SBC — the mirror of
+/// [`reprotect_rtp`] for the RTCP control leg: unprotect with the ingress
+/// context, then protect with the egress context. (`unprotect_rtcp` is `async`
+/// in proto-srtp, hence the await.)
+///
+/// # Errors
+/// Unprotect failure (auth/replay/short packet) or protect failure.
+pub async fn reprotect_rtcp(
+    ingress: &SrtpContext,
+    egress: &SrtpContext,
+    srtcp_packet: &[u8],
+) -> SrtpResult<Bytes> {
+    let rtcp = SrtpUnprotect::new(ingress)
+        .unprotect_rtcp(srtcp_packet)
+        .await?;
+    SrtpProtect::new(egress).protect_rtcp(&rtcp)
+}
+
+/// RFC 5761 rtcp-mux demux: on a port carrying both RTP and RTCP, a packet is
+/// RTCP when its second byte (the payload-type field, marker bit masked off) is
+/// in `64..=95` — the range RTP payload types avoid precisely so the two can be
+/// told apart. The RTP/RTCP header (including this byte) is cleartext in both
+/// SRTP and SRTCP, so this classifies the still-encrypted packet.
+#[must_use]
+fn is_rtcp_packet(pkt: &[u8]) -> bool {
+    pkt.len() >= 2 && (64..=95).contains(&(pkt[1] & 0x7f))
+}
 
 /// One direction of a terminated media relay: reads SRTP from `recv_sock`,
 /// re-protects it for the far leg, and sends it on `send_sock`. Post-handshake
@@ -117,7 +141,9 @@ impl TerminateRelayLeg {
                         }
                     }
 
-                    // Demux: post-handshake DTLS (rekey/alert) → sidecar; SRTP → reprotect.
+                    // Demux (RFC 7983 + RFC 5761): post-handshake DTLS (rekey/
+                    // alert) → sidecar; otherwise SRTP media or muxed SRTCP →
+                    // reprotect for the far leg and forward.
                     if is_dtls_record(buf[0]) {
                         if let Some(tx) = &self.dtls_out {
                             let _ = tx.send(buf[..n].to_vec()).await;
@@ -125,14 +151,20 @@ impl TerminateRelayLeg {
                         continue;
                     }
 
-                    let reprotected = match reprotect_rtp(&self.ingress, &self.egress, &buf[..n]) {
+                    let is_rtcp = is_rtcp_packet(&buf[..n]);
+                    let reprotected = if is_rtcp {
+                        reprotect_rtcp(&self.ingress, &self.egress, &buf[..n]).await
+                    } else {
+                        reprotect_rtp(&self.ingress, &self.egress, &buf[..n])
+                    };
+                    let reprotected = match reprotected {
                         Ok(pkt) => pkt,
                         Err(e) => {
                             // Auth/replay/short-packet failures are dropped, never
                             // forwarded — the SBC must not emit unauthenticated media.
                             dropped += 1;
                             if dropped == 1 || dropped.is_multiple_of(1000) {
-                                warn!(error = %e, call_id = %self.call_id, direction = self.direction, dropped, "SRTP unprotect failed; dropping");
+                                warn!(error = %e, call_id = %self.call_id, direction = self.direction, is_rtcp, dropped, "SRTP/SRTCP unprotect failed; dropping");
                             }
                             continue;
                         }
@@ -144,13 +176,19 @@ impl TerminateRelayLeg {
                     };
                     match self.send_sock.send_to(&reprotected, dest).await {
                         Ok(_) => {
-                            // Count terminated-leg media on the same black-hole
-                            // metric the opaque relay uses, so DTLS-terminated
-                            // calls aren't reported as mute when audio flows.
-                            crate::media_pipeline::record_rtp_relayed();
-                            forwarded += 1;
-                            if forwarded == 1 {
-                                info!(call_id = %self.call_id, direction = self.direction, "SRTP relay forwarding media");
+                            if is_rtcp {
+                                // Muxed SRTCP rides the media port; count it on the
+                                // RTCP metric so it doesn't inflate the audio signal.
+                                crate::media_pipeline::record_rtcp_relayed();
+                            } else {
+                                // Count terminated-leg media on the same black-hole
+                                // metric the opaque relay uses, so DTLS-terminated
+                                // calls aren't reported as mute when audio flows.
+                                crate::media_pipeline::record_rtp_relayed();
+                                forwarded += 1;
+                                if forwarded == 1 {
+                                    info!(call_id = %self.call_id, direction = self.direction, "SRTP relay forwarding media");
+                                }
                             }
                         }
                         Err(e) => {
@@ -400,6 +438,96 @@ mod tests {
             .await
             .is_err()
         );
+
+        let _ = sd_tx.send(true);
+        let _ = handle.await;
+    }
+
+    // SBC bridges SRTCP across two associations (mirror of the RTP test): peer-A
+    // protects → SBC unprotects (A-ingress) + re-protects (B-egress) → peer-B
+    // recovers the original RTCP.
+    #[tokio::test]
+    async fn reprotect_rtcp_bridges_two_associations() {
+        let ssrc = 0x0CAF_E123;
+        let (key_a, salt_a) = random_material();
+        let (key_b, salt_b) = random_material();
+        let peer_a_send = ctx(&key_a, &salt_a, SrtpDirection::Outbound, ssrc);
+        let sbc_ingress_a = ctx(&key_a, &salt_a, SrtpDirection::Inbound, ssrc);
+        let sbc_egress_b = ctx(&key_b, &salt_b, SrtpDirection::Outbound, ssrc);
+        let peer_b_recv = ctx(&key_b, &salt_b, SrtpDirection::Inbound, ssrc);
+
+        // Minimal RTCP SR (PT 200): [V|PT][len][ssrc][one word].
+        let rtcp = vec![
+            0x80, 200, 0x00, 0x02, 0x0C, 0xAF, 0xE1, 0x23, 0xAA, 0xBB, 0xCC, 0xDD,
+        ];
+        assert!(is_rtcp_packet(&rtcp), "PT 200 must classify as RTCP");
+
+        let srtcp_a = SrtpProtect::new(&peer_a_send).protect_rtcp(&rtcp).unwrap();
+        let srtcp_b = reprotect_rtcp(&sbc_ingress_a, &sbc_egress_b, &srtcp_a)
+            .await
+            .unwrap();
+        // The A-leg ciphertext must not survive onto the B leg (keys differ).
+        assert_ne!(srtcp_a.as_ref(), srtcp_b.as_ref());
+        let out = SrtpUnprotect::new(&peer_b_recv)
+            .unprotect_rtcp(&srtcp_b)
+            .await
+            .unwrap();
+        assert_eq!(out.as_ref(), rtcp.as_slice());
+    }
+
+    // A muxed SRTCP packet received by the relay leg is re-protected via the RTCP
+    // path (not the RTP path) and delivered to the far peer, who recovers it.
+    #[tokio::test]
+    async fn terminate_relay_leg_reprotects_muxed_srtcp() {
+        let relay_recv = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay_send = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let far = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_recv_addr = relay_recv.local_addr().unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let far_addr = far.local_addr().unwrap();
+
+        let ssrc = 0x4444_u32;
+        let (key_a, salt_a) = random_material();
+        let (key_b, salt_b) = random_material();
+        let peer_send = ctx(&key_a, &salt_a, SrtpDirection::Outbound, ssrc);
+        let ingress = ctx(&key_a, &salt_a, SrtpDirection::Inbound, ssrc);
+        let egress = ctx(&key_b, &salt_b, SrtpDirection::Outbound, ssrc);
+        let far_recv = ctx(&key_b, &salt_b, SrtpDirection::Inbound, ssrc);
+
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let leg = TerminateRelayLeg {
+            recv_sock: Arc::clone(&relay_recv),
+            send_sock: Arc::clone(&relay_send),
+            ingress,
+            egress,
+            expected_remote: peer_addr,
+            recv_target: Arc::new(RwLock::new(peer_addr)),
+            forward_target: Arc::new(RwLock::new(far_addr)),
+            dtls_out: None,
+            call_id: "call".into(),
+            direction: "A→B",
+        };
+        let handle = tokio::spawn(leg.run(sd_rx));
+
+        // RTCP RR (PT 201).
+        let rtcp = vec![
+            0x80, 201, 0x00, 0x02, 0x44, 0x44, 0x44, 0x44, 0x01, 0x02, 0x03, 0x04,
+        ];
+        let srtcp = SrtpProtect::new(&peer_send).protect_rtcp(&rtcp).unwrap();
+        peer.send_to(&srtcp, relay_recv_addr).await.unwrap();
+
+        let mut buf = [0u8; 512];
+        let (n, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), far.recv_from(&mut buf))
+                .await
+                .expect("far recv timed out")
+                .unwrap();
+        let out = SrtpUnprotect::new(&far_recv)
+            .unprotect_rtcp(&buf[..n])
+            .await
+            .unwrap();
+        assert_eq!(out.as_ref(), rtcp.as_slice());
 
         let _ = sd_tx.send(true);
         let _ = handle.await;
