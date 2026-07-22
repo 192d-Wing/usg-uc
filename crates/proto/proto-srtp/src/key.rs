@@ -7,6 +7,7 @@
 
 use crate::SrtpProfile;
 use crate::error::{SrtpError, SrtpResult};
+use zeroize::Zeroize;
 
 /// Master key material for SRTP.
 ///
@@ -147,9 +148,10 @@ impl std::fmt::Debug for SrtpKeyMaterial {
 
 impl Drop for SrtpKeyMaterial {
     fn drop(&mut self) {
-        // Zeroize sensitive material
-        self.master_key.fill(0);
-        self.master_salt.fill(0);
+        // Volatile, non-elidable wipe (the compiler may optimize away a plain
+        // `fill(0)` on a buffer that is about to be dropped).
+        self.master_key.zeroize();
+        self.master_salt.zeroize();
     }
 }
 
@@ -230,10 +232,10 @@ impl std::fmt::Debug for SessionKeys {
 
 impl Drop for SessionKeys {
     fn drop(&mut self) {
-        self.rtp_key.fill(0);
-        self.rtp_salt.fill(0);
-        self.rtcp_key.fill(0);
-        self.rtcp_salt.fill(0);
+        self.rtp_key.zeroize();
+        self.rtp_salt.zeroize();
+        self.rtcp_key.zeroize();
+        self.rtcp_salt.zeroize();
     }
 }
 

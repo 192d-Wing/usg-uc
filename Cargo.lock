@@ -5358,6 +5358,7 @@ dependencies = [
  "tracing",
  "uc-crypto",
  "uc-types",
+ "zeroize",
 ]
 
 [[package]]

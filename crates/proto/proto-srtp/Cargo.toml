@@ -16,6 +16,7 @@ proto-rtp = { path = "../proto-rtp" }
 thiserror.workspace = true
 tracing.workspace = true
 bytes.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true

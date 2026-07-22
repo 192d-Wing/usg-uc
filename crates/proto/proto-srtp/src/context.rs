@@ -22,6 +22,14 @@ pub enum SrtpDirection {
 ///
 /// AES key schedules are expanded once at construction and cached in
 /// `CachedAeadKey` instances, avoiding ~100ns of key expansion per packet.
+///
+/// **One SSRC per context.** The ROC estimator, highest-sequence tracker, and
+/// replay window are a single shared sequence space (the AEAD nonce takes the
+/// packet's own SSRC, so crypto is unaffected). Feeding packets from more than
+/// one SSRC — bundled audio+video, RTX/FEC, a mid-call SSRC change — would
+/// interleave their sequence numbers into that shared state and cause spurious
+/// replay/auth drops. The SBC terminates one audio stream per leg, so this holds;
+/// a multi-SSRC consumer must use a context per SSRC.
 pub struct SrtpContext {
     /// Session keys (raw bytes, kept for accessors).
     keys: SessionKeys,
