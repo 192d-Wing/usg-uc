@@ -75,6 +75,12 @@ pub struct Server {
     /// Receiver for DTLS-SRTP media-failure signals (terminate mode). Drained by
     /// a task spawned in `start` that tears down each failed call. `take`n once.
     media_failure_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    /// The remote media-plane client, when the media plane runs out of process
+    /// (`SBC_MEDIA_CONTROLLER_URL` set). Held so `start` can drain its
+    /// `WatchMediaEvents` stream — the out-of-process equivalent of
+    /// [`Self::media_failure_rx`]. `None` in the in-process (monolith) mode.
+    #[cfg(feature = "grpc")]
+    remote_media: Option<Arc<sbc_media_core::grpc_media_controller::GrpcMediaController>>,
     /// Cluster manager (when cluster feature is enabled).
     #[cfg(feature = "cluster")]
     cluster: Option<Arc<ClusterManager>>,
@@ -119,6 +125,8 @@ impl Server {
             global_limiter,
             zone_registry: None,
             media_failure_rx,
+            #[cfg(feature = "grpc")]
+            remote_media: None,
             #[cfg(feature = "cluster")]
             cluster: None,
         }
@@ -196,6 +204,8 @@ impl Server {
             global_limiter,
             zone_registry: None,
             media_failure_rx,
+            #[cfg(feature = "grpc")]
+            remote_media: None,
             cluster,
         }
     }
@@ -359,83 +369,98 @@ impl Server {
             sip_stack.init_topology_hider_from_config(topo);
         }
 
-        // Attach the in-process media pipeline (RTP relay). Ports / mode / SRTP
-        // come from the [media] config; the codec list and RTCP-mux keep the
-        // pipeline defaults. The call flow drives sessions on top of this; without
-        // it, allocated RTP ports are not backed by any socket (media black-holes).
-        //
-        // The config's mode is uc_types::MediaMode; the pipeline uses
-        // uc_media_engine::MediaMode. They share Relay/PassThrough; the config-only
-        // SignalingOnly has no relay-engine equivalent, so it maps to the
-        // least-involved engine mode (PassThrough).
-        let default_mode = match config.media.default_mode {
-            uc_types::MediaMode::Relay => uc_media_engine::MediaMode::Relay,
-            uc_types::MediaMode::PassThrough | uc_types::MediaMode::SignalingOnly => {
-                uc_media_engine::MediaMode::PassThrough
-            }
-        };
-        // Terminate mode: build ONE DTLS fingerprint source shared by the SDP
-        // advertisement (SipStack) and the sidecar-verify path (pipeline), so
-        // both always reflect the same identity. A file-backed source re-reads on
-        // demand, letting the daemon self-heal after a sidecar restart instead of
-        // advertising a fingerprint cached once at startup (which every handshake
-        // would then reject until the pod restarts).
-        let terminate_dtls = config.media.srtp.mode == sbc_config::SrtpMode::Terminate;
-        // Fail closed: the daemon terminates DTLS *only* via the sidecar (there is
-        // no in-Rust handshake path), so both the socket and the sidecar-published
-        // fingerprint file are mandatory in terminate mode. Refuse to start rather
-        // than advertise the SBC fingerprint and accept secured calls it can never
-        // relay — that would black-hole every such call while it looks connected.
-        if terminate_dtls
-            && (config.media.dtls.sidecar_socket.is_none()
-                || config.media.dtls.fingerprint_file.is_none())
-        {
-            tracing::error!(
-                "srtp.mode = Terminate requires [media.dtls] sidecar_socket and fingerprint_file — aborting startup"
-            );
-            #[allow(clippy::panic)]
-            {
-                panic!(
-                    "DTLS-SRTP termination configured but sidecar_socket/fingerprint_file missing"
-                );
-            }
-        }
-        let dtls_fingerprint = if terminate_dtls {
-            Some(Arc::new(build_dtls_fingerprint_source(&config.media.dtls)))
-        } else {
-            None
-        };
-        // Media-failure teardown channel (terminate mode only): the pipeline
-        // signals a call id here when a leg's DTLS handshake fails at runtime; the
-        // server's drain task (spawned in `start`) tears that call down.
-        let (media_failure_tx, media_failure_rx) = if terminate_dtls {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
-        let media_config = sbc_media_core::media_pipeline::MediaPipelineConfig {
-            default_mode,
-            srtp_required: config.media.srtp.required,
-            rtp_port_min: config.media.rtp_port_min,
-            rtp_port_max: config.media.rtp_port_max,
-            terminate_dtls,
-            dtls_sidecar_socket: config.media.dtls.sidecar_socket.clone(),
-            dtls_fingerprint: dtls_fingerprint.clone(),
-            media_failure_tx,
-            ..Default::default()
-        };
-        sip_stack.set_media_pipeline(Arc::new(
-            sbc_media_core::media_pipeline::MediaPipeline::new(media_config),
-        ));
-
-        if let Some(source) = dtls_fingerprint {
+        // Media plane. When SBC_MEDIA_CONTROLLER_URL is set (grpc builds), the
+        // media plane runs out of process: `wire_remote_media` connects the gRPC
+        // controller (and fetches the fingerprint for SDP) before `start`, so the
+        // in-process pipeline is skipped here and there is no in-process
+        // media-failure channel — the gRPC WatchMediaEvents stream replaces it.
+        // In the monolith (default) the in-process pipeline is attached below;
+        // without it, allocated RTP ports are not backed by any socket (media
+        // black-holes).
+        let media_failure_rx = if Self::remote_media_url().is_some() {
             tracing::info!(
-                fingerprint = %source.current(),
-                "DTLS-SRTP termination enabled"
+                "Remote media plane configured (SBC_MEDIA_CONTROLLER_URL); \
+                 in-process pipeline skipped — wired via gRPC before start"
             );
-            sip_stack.set_dtls_fingerprint_source(source);
-        }
+            None
+        } else {
+            // Ports / mode / SRTP come from the [media] config; the codec list and
+            // RTCP-mux keep the pipeline defaults.
+            //
+            // The config's mode is uc_types::MediaMode; the pipeline uses
+            // uc_media_engine::MediaMode. They share Relay/PassThrough; the
+            // config-only SignalingOnly has no relay-engine equivalent, so it maps
+            // to the least-involved engine mode (PassThrough).
+            let default_mode = match config.media.default_mode {
+                uc_types::MediaMode::Relay => uc_media_engine::MediaMode::Relay,
+                uc_types::MediaMode::PassThrough | uc_types::MediaMode::SignalingOnly => {
+                    uc_media_engine::MediaMode::PassThrough
+                }
+            };
+            // Terminate mode: build ONE DTLS fingerprint source shared by the SDP
+            // advertisement (SipStack) and the sidecar-verify path (pipeline), so
+            // both always reflect the same identity. A file-backed source re-reads
+            // on demand, letting the daemon self-heal after a sidecar restart
+            // instead of advertising a fingerprint cached once at startup (which
+            // every handshake would then reject until the pod restarts).
+            let terminate_dtls = config.media.srtp.mode == sbc_config::SrtpMode::Terminate;
+            // Fail closed: the daemon terminates DTLS *only* via the sidecar (there
+            // is no in-Rust handshake path), so both the socket and the sidecar-
+            // published fingerprint file are mandatory in terminate mode. Refuse to
+            // start rather than advertise the SBC fingerprint and accept secured
+            // calls it can never relay — that would black-hole every such call.
+            if terminate_dtls
+                && (config.media.dtls.sidecar_socket.is_none()
+                    || config.media.dtls.fingerprint_file.is_none())
+            {
+                tracing::error!(
+                    "srtp.mode = Terminate requires [media.dtls] sidecar_socket and fingerprint_file — aborting startup"
+                );
+                #[allow(clippy::panic)]
+                {
+                    panic!(
+                        "DTLS-SRTP termination configured but sidecar_socket/fingerprint_file missing"
+                    );
+                }
+            }
+            let dtls_fingerprint = if terminate_dtls {
+                Some(Arc::new(build_dtls_fingerprint_source(&config.media.dtls)))
+            } else {
+                None
+            };
+            // Media-failure teardown channel (terminate mode only): the pipeline
+            // signals a call id here when a leg's DTLS handshake fails at runtime;
+            // the server's drain task (spawned in `start`) tears that call down.
+            let (media_failure_tx, media_failure_rx) = if terminate_dtls {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+            let media_config = sbc_media_core::media_pipeline::MediaPipelineConfig {
+                default_mode,
+                srtp_required: config.media.srtp.required,
+                rtp_port_min: config.media.rtp_port_min,
+                rtp_port_max: config.media.rtp_port_max,
+                terminate_dtls,
+                dtls_sidecar_socket: config.media.dtls.sidecar_socket.clone(),
+                dtls_fingerprint: dtls_fingerprint.clone(),
+                media_failure_tx,
+                ..Default::default()
+            };
+            sip_stack.set_media_pipeline(Arc::new(
+                sbc_media_core::media_pipeline::MediaPipeline::new(media_config),
+            ));
+
+            if let Some(source) = dtls_fingerprint {
+                tracing::info!(
+                    fingerprint = %source.current(),
+                    "DTLS-SRTP termination enabled"
+                );
+                sip_stack.set_dtls_fingerprint_source(source);
+            }
+            media_failure_rx
+        };
 
         // Initialize Voice Protection System call screening (if configured).
         // The config was validated at load time, so a build failure here is
@@ -467,6 +492,84 @@ impl Server {
         }
 
         media_failure_rx
+    }
+
+    /// The out-of-process media plane's gRPC URL, or `None` for the in-process
+    /// (monolith) media plane. Set via `SBC_MEDIA_CONTROLLER_URL`
+    /// (e.g. `http://sbc-media:9096`). Only honored in `grpc` builds.
+    #[cfg(feature = "grpc")]
+    fn remote_media_url() -> Option<String> {
+        std::env::var("SBC_MEDIA_CONTROLLER_URL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    #[cfg(not(feature = "grpc"))]
+    fn remote_media_url() -> Option<String> {
+        None
+    }
+
+    /// Connects the out-of-process media plane, if configured. Called between
+    /// construction and [`Self::start`], while the `sip_stack` `Arc` is still
+    /// uniquely held (so [`Arc::get_mut`] succeeds — same window as
+    /// [`Self::set_zone_registry`]).
+    ///
+    /// Attaches a [`GrpcMediaController`](sbc_media_core::grpc_media_controller::GrpcMediaController)
+    /// as the media pipeline and, when the pod is in DTLS-terminate mode, fetches
+    /// its fingerprint to advertise in SDP. The controller is retained so
+    /// [`Self::start`] can drain its `WatchMediaEvents` stream. A no-op (and no
+    /// requirement) in the in-process mode.
+    ///
+    /// # Errors
+    /// Fail-closed: returns an error if the configured media plane cannot be
+    /// reached, so signaling does not start pointing at a dead media plane.
+    #[cfg(feature = "grpc")]
+    pub async fn wire_remote_media(&mut self) -> Result<(), ServerError> {
+        let Some(url) = Self::remote_media_url() else {
+            return Ok(());
+        };
+        use sbc_media_core::dtls_identity::DtlsFingerprintSource;
+        use sbc_media_core::grpc_media_controller::GrpcMediaController;
+
+        info!(url, "Connecting to remote media plane");
+        let controller = Arc::new(GrpcMediaController::connect(url.clone()).await.map_err(
+            |e| ServerError::ConfigError {
+                message: format!("remote media plane {url} unreachable: {e}"),
+            },
+        )?);
+
+        // Fetch the SBC's DTLS fingerprint to advertise in SDP. The pod returns
+        // an error when it is not in terminate mode; treat that as "no fingerprint
+        // to advertise" rather than a startup failure.
+        let fingerprint = match controller.fetch_dtls_fingerprint().await {
+            Ok(fp) => {
+                info!(fingerprint = %fp, "Remote media plane DTLS-SRTP termination enabled");
+                Some(Arc::new(DtlsFingerprintSource::from_static(fp)))
+            }
+            Err(e) => {
+                info!(reason = %e, "Remote media plane has no DTLS fingerprint (non-terminate mode)");
+                None
+            }
+        };
+
+        let stack =
+            Arc::get_mut(&mut self.sip_stack).ok_or_else(|| ServerError::InternalError {
+                message: "cannot attach remote media: sip_stack Arc already shared".to_string(),
+            })?;
+        stack.set_media_pipeline(controller.clone());
+        if let Some(source) = fingerprint {
+            stack.set_dtls_fingerprint_source(source);
+        }
+        self.remote_media = Some(controller);
+        Ok(())
+    }
+
+    /// No-op in non-grpc builds (the media plane is always in-process).
+    #[cfg(not(feature = "grpc"))]
+    #[allow(clippy::unused_async, clippy::missing_const_for_fn)]
+    pub async fn wire_remote_media(&mut self) -> Result<(), ServerError> {
+        Ok(())
     }
 
     /// Returns the cluster manager if available.
@@ -546,6 +649,56 @@ impl Server {
                     });
                 }
                 None => warn!("media-failure teardown disabled: no UDP transport bound"),
+            }
+        }
+
+        // Out-of-process equivalent of the mpsc drain above: subscribe to the
+        // remote media plane's WatchMediaEvents stream and BYE the calls it
+        // reports as failed. Best-effort — if the stream drops (pod restart),
+        // teardown of subsequently-failed calls stops until the daemon restarts;
+        // that mirrors the in-process channel's best-effort semantics.
+        #[cfg(feature = "grpc")]
+        if let Some(controller) = self.remote_media.clone() {
+            let sip_stack = Arc::clone(&self.sip_stack);
+            let transport = self.udp_transports.read().await.first().map(Arc::clone);
+            match transport {
+                Some(transport) => {
+                    tokio::spawn(async move {
+                        use sbc_grpc_api::sbc::media_event::Event;
+                        let mut stream = match controller.watch_media_events().await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!(error = %e, "failed to open remote media event stream");
+                                return;
+                            }
+                        };
+                        loop {
+                            match stream.message().await {
+                                Ok(Some(event)) => {
+                                    let Some(Event::Failure(f)) = event.event else {
+                                        continue;
+                                    };
+                                    for (bytes, dest) in
+                                        sip_stack.terminate_call_on_media_failure(&f.call_id).await
+                                    {
+                                        if let Err(e) = transport.send(&bytes, &dest).await {
+                                            warn!(error = %e, call_id = f.call_id, dest = %dest, "media-failure BYE send failed");
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    warn!("remote media event stream closed by media plane");
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "remote media event stream error");
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                }
+                None => warn!("remote media event drain disabled: no UDP transport bound"),
             }
         }
 

@@ -390,6 +390,17 @@ impl Runtime {
             server.set_zone_registry(Arc::clone(registry));
         }
 
+        // Attach the out-of-process media plane if configured
+        // (SBC_MEDIA_CONTROLLER_URL). Must run here, while the SipStack Arc is
+        // still uniquely held (as set_zone_registry above relies on), and before
+        // start() spawns the transport handlers that clone it.
+        server
+            .wire_remote_media()
+            .await
+            .map_err(|e| RuntimeError::ServerFailed {
+                reason: e.to_string(),
+            })?;
+
         server
             .start()
             .await
