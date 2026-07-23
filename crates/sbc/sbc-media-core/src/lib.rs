@@ -43,4 +43,6 @@ pub mod srtp_relay;
 #[cfg(feature = "grpc")]
 pub mod grpc_media_controller;
 #[cfg(feature = "grpc")]
+pub mod grpc_media_pool;
+#[cfg(feature = "grpc")]
 pub mod grpc_media_server;
