@@ -127,3 +127,61 @@ jobs:
       - name: Teardown
         if: always()
         run: docker compose -f "$COMPOSE" down -v || true
+
+  # The split, scaled to a POOL: sbc-daemon load-balances calls across TWO
+  # sbc-media nodes (distinct IPs). Proves calls DISTRIBUTE — both nodes must
+  # relay media — which only works if the daemon per-call steers SDP to the
+  # least-loaded node it picked.
+  sipp-audio-pool:
+    name: SIPp media relay (audio) test — pool (2 nodes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      COMPOSE: deploy/test/docker-compose.pool.yml
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build image + start signaling, 2 media nodes, and SIPp UAS
+        run: docker compose -f "$COMPOSE" up -d --build sbc-signaling sbc-media-1 sbc-media-2 sipp-uas
+
+      - name: Wait for the signaling plane to become healthy
+        run: |
+          for i in $(seq 1 60); do
+            status=$(docker inspect --format='{{.State.Health.Status}}' sbc-signaling 2>/dev/null || echo starting)
+            echo "[$i] sbc-signaling health: $status"
+            [ "$status" = healthy ] && exit 0
+            sleep 2
+          done
+          echo "ERROR: sbc-signaling did not become healthy"
+          exit 1
+
+      - name: Run SIPp UAC with real RTP (G.711 pcap) — across the pool
+        run: |
+          docker compose -f "$COMPOSE" run --rm sipp-uac \
+            172.28.1.10:5060 -sf /scenarios/sipp-uac-media.xml \
+            -r 5 -l 20 -m 20 -mi 172.28.2.30 -p 5070 \
+            -recv_timeout 10000 -timeout 60s -trace_err
+
+      - name: Assert BOTH nodes relayed media (calls distributed across the pool)
+        run: |
+          n1=$(docker compose -f "$COMPOSE" logs sbc-media-1 2>&1 | grep -c 'RTP relay forwarding media' || true)
+          n2=$(docker compose -f "$COMPOSE" logs sbc-media-2 2>&1 | grep -c 'RTP relay forwarding media' || true)
+          echo "sbc-media-1 relayed: $n1 call(s); sbc-media-2 relayed: $n2 call(s)"
+          if [ "$n1" -gt 0 ] && [ "$n2" -gt 0 ]; then
+            echo "PASS: calls distributed — both media nodes relayed RTP."
+          else
+            echo "FAIL: calls did not spread across the pool (n1=$n1 n2=$n2)."
+            exit 1
+          fi
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          echo "===== sbc-signaling ====="; docker compose -f "$COMPOSE" logs --tail=200 sbc-signaling || true
+          echo "===== sbc-media-1 ====="; docker compose -f "$COMPOSE" logs --tail=100 sbc-media-1 || true
+          echo "===== sbc-media-2 ====="; docker compose -f "$COMPOSE" logs --tail=100 sbc-media-2 || true
+          echo "===== UAS ====="; docker compose -f "$COMPOSE" logs --tail=50 sipp-uas || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f "$COMPOSE" down -v || true

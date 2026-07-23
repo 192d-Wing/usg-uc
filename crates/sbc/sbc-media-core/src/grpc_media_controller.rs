@@ -29,7 +29,9 @@ use uc_types::address::SbcSocketAddr;
 /// A [`MediaController`] backed by a gRPC connection to an out-of-process media
 /// plane. Cheap to clone-per-call: the inner tonic client shares one HTTP/2
 /// channel, so the `&self` trait methods clone it to obtain the `&mut` each RPC
-/// needs without serializing calls.
+/// needs without serializing calls. `Clone` is likewise cheap (shares the
+/// channel) — used to hand one connection to both the pool and its event drain.
+#[derive(Clone)]
 pub struct GrpcMediaController {
     client: MediaControllerServiceClient<Channel>,
 }
