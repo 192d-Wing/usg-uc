@@ -66,6 +66,12 @@ pub struct MediaPipelineConfig {
     /// down (BYE both legs) instead of leaving it up with black-holed media.
     /// Fail-closed for the async failure that startup validation can't catch.
     pub media_failure_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// This node's advertised media IP, returned per session so the signaling
+    /// layer can steer SDP to it (Phase 3 media-node pool). `None` in the
+    /// in-process / co-located deployments, where signaling uses its own zone
+    /// media IP; a standalone `sbc-media` node sets it (e.g. from
+    /// `SBC_MEDIA_ADVERTISED_IP`).
+    pub advertised_media_ip: Option<std::net::IpAddr>,
 }
 
 impl Default for MediaPipelineConfig {
@@ -86,6 +92,7 @@ impl Default for MediaPipelineConfig {
             dtls_sidecar_socket: None,
             dtls_fingerprint: None,
             media_failure_tx: None,
+            advertised_media_ip: None,
         }
     }
 }
@@ -252,6 +259,16 @@ pub struct AllocatedPorts {
     pub a_leg_rtp_port: u16,
     /// B-leg RTP port.
     pub b_leg_rtp_port: u16,
+    /// The media node's advertised IP for SDP media-address steering (Phase 3):
+    /// where the relay actually lives, so callers send RTP to THIS node. `None`
+    /// means the signaling layer falls back to its own zone/local media IP
+    /// (the monolith and co-located-split behaviour) — a standalone media node
+    /// reports its advertised IP here so signaling advertises it per call.
+    pub media_ip: Option<std::net::IpAddr>,
+    /// The media node's DTLS-SRTP fingerprint to advertise in SDP `a=fingerprint`
+    /// (terminate mode). Per-session because each node has its own identity;
+    /// `None` = not terminating, or use the signaling-side source.
+    pub dtls_fingerprint: Option<String>,
 }
 
 /// The control-plane boundary the SIP signaling layer uses to drive media.
@@ -745,6 +762,10 @@ impl MediaPipeline {
         Ok(AllocatedPorts {
             a_leg_rtp_port: a_rtp,
             b_leg_rtp_port: b_rtp,
+            media_ip: self.config.advertised_media_ip,
+            // The SBC's own fingerprint to advertise (terminate mode only). A
+            // file-backed source re-reads here so a sidecar restart is picked up.
+            dtls_fingerprint: self.config.dtls_fingerprint.as_ref().map(|s| s.current()),
         })
     }
 

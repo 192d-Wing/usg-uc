@@ -160,6 +160,8 @@ impl MediaControllerService for MediaControllerServer {
         Ok(Response::new(pb::AllocatedPorts {
             a_leg_rtp_port: u32::from(ports.a_leg_rtp_port),
             b_leg_rtp_port: u32::from(ports.b_leg_rtp_port),
+            media_ip: ports.media_ip.map(|ip| ip.to_string()),
+            dtls_fingerprint: ports.dtls_fingerprint,
         }))
     }
 
