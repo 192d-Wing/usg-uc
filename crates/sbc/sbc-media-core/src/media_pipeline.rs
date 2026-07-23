@@ -2928,33 +2928,29 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[ignore = "spawns the real sidecar + peer binaries; run via the srtp-audio CI job with SIDECAR_BIN + PEER_BIN set"]
-    async fn srtp_audio_end_to_end_real() {
-        use tokio::process::Command;
-
-        // Surfaces the relay's warnings (e.g. an SRTP unprotect failure) if the
-        // gate ever fails in CI. Quiet by default; raise with RUST_LOG.
+    /// Surfaces the relay's warnings (e.g. an SRTP unprotect failure) if a gate
+    /// ever fails in CI. Quiet by default; raise with RUST_LOG.
+    fn init_gate_tracing() {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("sbc_daemon=warn")),
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("sbc_media_core=warn")),
             )
             .with_test_writer()
             .try_init();
+    }
 
-        let sidecar_bin = std::env::var("SIDECAR_BIN").expect("SIDECAR_BIN not set");
-        let peer_bin = std::env::var("PEER_BIN").expect("PEER_BIN not set");
-
-        let tmp = std::env::temp_dir();
-        let pid = std::process::id();
-        let uds = tmp.join(format!("srtp-audio-{pid}.sock"));
-        let fp_file = tmp.join(format!("srtp-audio-{pid}.fp"));
-        let _ = std::fs::remove_file(&uds);
-        let _ = std::fs::remove_file(&fp_file);
-
-        // 1. Real sidecar.
-        let mut sidecar = Command::new(&sidecar_bin)
+    /// Spawns the real DTLS-SRTP terminator sidecar and waits for it to publish
+    /// its fingerprint + bind its UDS. Returns the (`kill_on_drop`) child and the
+    /// published SBC fingerprint.
+    async fn spawn_sidecar(
+        sidecar_bin: &str,
+        uds: &std::path::Path,
+        fp_file: &std::path::Path,
+    ) -> (tokio::process::Child, String) {
+        let _ = std::fs::remove_file(uds);
+        let _ = std::fs::remove_file(fp_file);
+        let child = tokio::process::Command::new(sidecar_bin)
             .args([
                 "-socket",
                 uds.to_str().unwrap(),
@@ -2966,10 +2962,9 @@ mod tests {
             .spawn()
             .expect("spawn sidecar");
 
-        // Wait for the sidecar to publish its fingerprint + bind the socket.
         let mut sbc_fp = String::new();
         for _ in 0..200 {
-            if let Ok(s) = std::fs::read_to_string(&fp_file)
+            if let Ok(s) = std::fs::read_to_string(fp_file)
                 && !s.trim().is_empty()
                 && uds.exists()
             {
@@ -2979,6 +2974,24 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(!sbc_fp.is_empty(), "sidecar never published a fingerprint");
+        (child, sbc_fp)
+    }
+
+    #[tokio::test]
+    #[ignore = "spawns the real sidecar + peer binaries; run via the srtp-audio CI job with SIDECAR_BIN + PEER_BIN set"]
+    async fn srtp_audio_end_to_end_real() {
+        init_gate_tracing();
+
+        let sidecar_bin = std::env::var("SIDECAR_BIN").expect("SIDECAR_BIN not set");
+        let peer_bin = std::env::var("PEER_BIN").expect("PEER_BIN not set");
+
+        let tmp = std::env::temp_dir();
+        let pid = std::process::id();
+        let uds = tmp.join(format!("srtp-audio-{pid}.sock"));
+        let fp_file = tmp.join(format!("srtp-audio-{pid}.fp"));
+
+        // 1. Real sidecar.
+        let (mut sidecar, sbc_fp) = spawn_sidecar(&sidecar_bin, &uds, &fp_file).await;
 
         // 2. Terminate-mode pipeline (unique high port range to avoid collisions).
         let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
@@ -3050,5 +3063,139 @@ mod tests {
         // far peer's pion/srtp decrypted it — the H6 path the unit tests can't cover.
         assert!(rtcp_a > 0, "peer A recovered no relayed SRTCP");
         assert!(rtcp_b > 0, "peer B recovered no relayed SRTCP");
+    }
+
+    /// The DTLS-SRTP interop gate, driven across the signaling↔media SPLIT: the
+    /// same real sidecar + pion peers, but every control operation
+    /// (GetDtlsFingerprint, create_session, set_remote_address,
+    /// start_relay_terminate, stop_relay) goes over gRPC through
+    /// [`GrpcMediaController`] → [`MediaControllerServer`] → the pipeline. Proves
+    /// the gRPC control plane drives DTLS-SRTP termination end-to-end — including
+    /// that the fingerprint signaling advertises is the one fetched over
+    /// `GetDtlsFingerprint`, not read from a shared file.
+    #[cfg(feature = "grpc")]
+    #[tokio::test]
+    #[ignore = "spawns the real sidecar + peer binaries; run via the srtp-audio CI job (grpc) with SIDECAR_BIN + PEER_BIN set"]
+    async fn srtp_audio_end_to_end_split() {
+        use crate::grpc_media_controller::GrpcMediaController;
+        use crate::grpc_media_server::MediaControllerServer;
+        use sbc_grpc_api::sbc::media_controller_service_server::MediaControllerServiceServer;
+
+        init_gate_tracing();
+
+        let sidecar_bin = std::env::var("SIDECAR_BIN").expect("SIDECAR_BIN not set");
+        let peer_bin = std::env::var("PEER_BIN").expect("PEER_BIN not set");
+
+        let tmp = std::env::temp_dir();
+        let pid = std::process::id();
+        // Distinct paths + port range from the _real test: both are #[ignore]d and
+        // may run in the same process (same pid) concurrently.
+        let uds = tmp.join(format!("srtp-split-{pid}.sock"));
+        let fp_file = tmp.join(format!("srtp-split-{pid}.fp"));
+
+        // 1. Real sidecar — owned by the media plane in the split.
+        let (mut sidecar, sbc_fp) = spawn_sidecar(&sidecar_bin, &uds, &fp_file).await;
+
+        // 2. Terminate-mode pipeline, hosted behind the gRPC MediaControllerServer
+        // (the sbc-media process). The fingerprint source + failure channel are the
+        // same ones the media pod wires.
+        let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let port_base = 28_000_u16.wrapping_add((rand::random::<u16>() % 4_000) & !1);
+        let fp_source = Arc::new(crate::dtls_identity::DtlsFingerprintSource::from_static(
+            sbc_fp.clone(),
+        ));
+        let (failure_tx, failure_rx) = tokio::sync::mpsc::unbounded_channel();
+        let pipeline = Arc::new(MediaPipeline::new(MediaPipelineConfig {
+            srtp_required: false,
+            terminate_dtls: true,
+            dtls_sidecar_socket: Some(uds.clone()),
+            dtls_fingerprint: Some(fp_source.clone()),
+            media_failure_tx: Some(failure_tx),
+            rtp_port_min: port_base,
+            rtp_port_max: port_base + 200,
+            ..Default::default()
+        }));
+        let server = MediaControllerServer::new(pipeline, Some(fp_source), failure_rx);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let grpc_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(MediaControllerServiceServer::new(server))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        // 3. The signaling-side client drives everything over gRPC.
+        let client = GrpcMediaController::connect(format!("http://{grpc_addr}"))
+            .await
+            .unwrap();
+
+        // 3a. The fingerprint signaling would stamp into SDP, fetched over gRPC.
+        let advertised_fp = client.fetch_dtls_fingerprint().await.unwrap();
+        assert_eq!(
+            advertised_fp, sbc_fp,
+            "GetDtlsFingerprint returned an identity that differs from the sidecar's"
+        );
+
+        // 3b. Allocate the session's media ports over gRPC.
+        let ports = client
+            .create_session_with_zones(
+                "call",
+                Some(MediaMode::Relay),
+                Some(loopback),
+                Some(loopback),
+            )
+            .await
+            .unwrap();
+
+        // 4. Two real peers (DTLS servers), each pointed at its SBC media leg,
+        // verifying against the gRPC-fetched fingerprint.
+        let mut a =
+            read_peer_header(&peer_bin, ports.a_leg_rtp_port, &advertised_fp, 0x3333_3333).await;
+        let mut b =
+            read_peer_header(&peer_bin, ports.b_leg_rtp_port, &advertised_fp, 0x4444_4444).await;
+
+        // 5. Point the relay at each peer and terminate — all over gRPC.
+        client
+            .set_remote_address("call", true, a.local.into())
+            .await
+            .unwrap();
+        client
+            .set_remote_address("call", false, b.local.into())
+            .await
+            .unwrap();
+        client
+            .start_relay_terminate(
+                "call",
+                LegDtlsParams {
+                    peer_fingerprint: a.fingerprint.clone(),
+                    role: Role::Client,
+                },
+                LegDtlsParams {
+                    peer_fingerprint: b.fingerprint.clone(),
+                    role: Role::Client,
+                },
+            )
+            .await
+            .unwrap();
+
+        // 6. Both peers must recover relayed audio AND SRTCP across the split.
+        let (rtp_a, rtcp_a) = peer_received(&mut a).await;
+        let (rtp_b, rtcp_b) = peer_received(&mut b).await;
+        let _ = a.child.wait().await;
+        let _ = b.child.wait().await;
+        let _ = client.stop_relay("call").await;
+        let _ = sidecar.kill().await;
+        let _ = std::fs::remove_file(&uds);
+        let _ = std::fs::remove_file(&fp_file);
+
+        eprintln!(
+            "srtp-audio split gate: A rtp={rtp_a} rtcp={rtcp_a}, B rtp={rtp_b} rtcp={rtcp_b}"
+        );
+        assert!(rtp_a > 0, "peer A recovered no relayed audio (split)");
+        assert!(rtp_b > 0, "peer B recovered no relayed audio (split)");
+        assert!(rtcp_a > 0, "peer A recovered no relayed SRTCP (split)");
+        assert!(rtcp_b > 0, "peer B recovered no relayed SRTCP (split)");
     }
 }

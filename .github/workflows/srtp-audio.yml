@@ -59,11 +59,15 @@ jobs:
           ( cd sidecar/dtls-terminator && GOFIPS140=v1.26.0 go build -o "$RUNNER_TEMP/bin/sidecar" ./cmd/dtls-terminator )
           ( cd sidecar/srtp-test-peer && go build -o "$RUNNER_TEMP/bin/peer" . )
 
-      # The gate test is #[ignore]d (it needs the built binaries); run it
-      # explicitly with the binary paths. It spawns the sidecar + two peers,
+      # The gate tests are #[ignore]d (they need the built binaries); run them
+      # explicitly with the binary paths. Each spawns the sidecar + two peers,
       # drives a terminated call, and asserts both peers recover relayed audio.
-      - name: Run the srtp-audio gate
+      # The prefix `srtp_audio_end_to_end` matches BOTH:
+      #   _real  — drives the pipeline in-process (the monolith relay);
+      #   _split — drives it over the gRPC MediaController (the signaling↔media
+      #            split), so `--features grpc` is required to compile it.
+      - name: Run the srtp-audio gates (in-process + split)
         env:
           SIDECAR_BIN: ${{ runner.temp }}/bin/sidecar
           PEER_BIN: ${{ runner.temp }}/bin/peer
-        run: cargo test -p sbc-media-core srtp_audio_end_to_end_real -- --ignored --nocapture
+        run: cargo test -p sbc-media-core --features grpc srtp_audio_end_to_end -- --ignored --nocapture
