@@ -254,6 +254,110 @@ pub struct AllocatedPorts {
     pub b_leg_rtp_port: u16,
 }
 
+/// The control-plane boundary the SIP signaling layer uses to drive media.
+///
+/// This is the seam for splitting the media plane out of the daemon: the SIP
+/// stack depends on `dyn MediaController`, not on the concrete [`MediaPipeline`],
+/// so an out-of-process (e.g. gRPC) implementation can drop in later. Every
+/// method is `call_id`-addressed and takes/returns serializable data — no live
+/// sockets or in-process handles cross this boundary.
+#[async_trait::async_trait]
+pub trait MediaController: Send + Sync {
+    /// Allocates a media session's RTP/RTCP port pairs (per-zone bind IPs) and
+    /// returns the caller/callee RTP ports to advertise in SDP. Called at INVITE.
+    async fn create_session_with_zones(
+        &self,
+        call_id: &str,
+        mode: Option<MediaMode>,
+        a_leg_media_ip: Option<std::net::IpAddr>,
+        b_leg_media_ip: Option<std::net::IpAddr>,
+    ) -> Result<AllocatedPorts, MediaPipelineError>;
+
+    /// Sets a leg's remote RTP address (caller at INVITE, callee at 200 OK).
+    async fn set_remote_address(
+        &self,
+        call_id: &str,
+        is_a_leg: bool,
+        address: SbcSocketAddr,
+    ) -> Result<(), MediaPipelineError>;
+
+    /// Starts the opaque forwarding relay (plain RTP or SRTP pass-through).
+    async fn start_relay(&self, call_id: &str) -> Result<(), MediaPipelineError>;
+
+    /// Starts the DTLS-SRTP terminating relay for both legs.
+    async fn start_relay_terminate(
+        &self,
+        call_id: &str,
+        a_leg: LegDtlsParams,
+        b_leg: LegDtlsParams,
+    ) -> Result<(), MediaPipelineError>;
+
+    /// Stops a call's relay tasks and releases its media resources.
+    async fn stop_relay(&self, call_id: &str) -> Result<(), MediaPipelineError>;
+
+    /// Removes all state for a call's media session.
+    async fn remove_session(&self, call_id: &str) -> Result<(), MediaPipelineError>;
+
+    /// Allocates a standalone RTP/RTCP port pair (for announcement playback),
+    /// returning `(rtp, rtcp)`. Replaces reaching into the internal allocator.
+    async fn allocate_ports(&self) -> Result<(u16, u16), MediaPipelineError>;
+}
+
+#[async_trait::async_trait]
+impl MediaController for MediaPipeline {
+    async fn create_session_with_zones(
+        &self,
+        call_id: &str,
+        mode: Option<MediaMode>,
+        a_leg_media_ip: Option<std::net::IpAddr>,
+        b_leg_media_ip: Option<std::net::IpAddr>,
+    ) -> Result<AllocatedPorts, MediaPipelineError> {
+        // Inherent method (method resolution prefers it over this trait method).
+        MediaPipeline::create_session_with_zones(
+            self,
+            call_id,
+            mode,
+            a_leg_media_ip,
+            b_leg_media_ip,
+        )
+        .await
+    }
+
+    async fn set_remote_address(
+        &self,
+        call_id: &str,
+        is_a_leg: bool,
+        address: SbcSocketAddr,
+    ) -> Result<(), MediaPipelineError> {
+        MediaPipeline::set_remote_address(self, call_id, is_a_leg, address).await
+    }
+
+    async fn start_relay(&self, call_id: &str) -> Result<(), MediaPipelineError> {
+        MediaPipeline::start_relay(self, call_id).await
+    }
+
+    async fn start_relay_terminate(
+        &self,
+        call_id: &str,
+        a_leg: LegDtlsParams,
+        b_leg: LegDtlsParams,
+    ) -> Result<(), MediaPipelineError> {
+        MediaPipeline::start_relay_terminate(self, call_id, a_leg, b_leg).await
+    }
+
+    async fn stop_relay(&self, call_id: &str) -> Result<(), MediaPipelineError> {
+        MediaPipeline::stop_relay(self, call_id).await
+    }
+
+    async fn remove_session(&self, call_id: &str) -> Result<(), MediaPipelineError> {
+        MediaPipeline::remove_session(self, call_id).await
+    }
+
+    async fn allocate_ports(&self) -> Result<(u16, u16), MediaPipelineError> {
+        self.port_allocator().allocate_pair().await
+    }
+}
+
 /// Negotiated codec info for one leg.
 #[derive(Debug, Clone)]
 pub struct NegotiatedCodec {

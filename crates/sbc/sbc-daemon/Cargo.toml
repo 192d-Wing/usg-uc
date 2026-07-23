@@ -60,6 +60,7 @@ uc-discovery = { workspace = true, optional = true }
 uc-storage = { workspace = true, optional = true }
 uc-state-sync = { workspace = true, optional = true }
 tokio.workspace = true
+async-trait.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 bytes.workspace = true

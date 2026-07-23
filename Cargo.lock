@@ -6135,6 +6135,7 @@ dependencies = [
 name = "sbc-daemon"
 version = "0.9.0"
 dependencies = [
+ "async-trait",
  "axum",
  "bytes",
  "hyper",
