@@ -70,3 +70,60 @@ jobs:
       - name: Teardown
         if: always()
         run: docker compose -f "$COMPOSE" down -v || true
+
+  # Same audio gate, but against the signaling↔media SPLIT topology: sbc-daemon
+  # runs signaling-only and drives a separate sbc-media process over gRPC. Proves
+  # real RTP crosses the two-process boundary (create_session / set_remote /
+  # start_relay driven over gRPC, relay running in sbc-media).
+  sipp-audio-split:
+    name: SIPp media relay (audio) test — split
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      COMPOSE: deploy/test/docker-compose.split.yml
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build image + start signaling, media, and SIPp UAS
+        run: docker compose -f "$COMPOSE" up -d --build sbc-signaling sbc-media sipp-uas
+
+      - name: Wait for the signaling plane to become healthy
+        run: |
+          for i in $(seq 1 60); do
+            status=$(docker inspect --format='{{.State.Health.Status}}' sbc-signaling 2>/dev/null || echo starting)
+            echo "[$i] sbc-signaling health: $status"
+            [ "$status" = healthy ] && exit 0
+            sleep 2
+          done
+          echo "ERROR: sbc-signaling did not become healthy"
+          exit 1
+
+      - name: Run SIPp UAC with real RTP (G.711 pcap) — across the split
+        run: |
+          docker compose -f "$COMPOSE" run --rm sipp-uac \
+            172.28.1.10:5060 -sf /scenarios/sipp-uac-media.xml \
+            -r 5 -l 10 -m 10 -mi 172.28.2.30 -p 5070 \
+            -recv_timeout 10000 -timeout 60s -trace_err
+
+      - name: Assert RTP was relayed by the media plane (audio gate)
+        run: |
+          # The relay runs in sbc-media now, so the forwarding log is there.
+          logs=$(docker compose -f "$COMPOSE" logs sbc-media 2>&1)
+          echo "$logs" | grep 'RTP relay forwarding media' || true
+          if echo "$logs" | grep -q 'RTP relay forwarding media'; then
+            echo "PASS: media relayed across the split — RTP forwarded by sbc-media."
+          else
+            echo "FAIL: no RTP forwarded by sbc-media — split media black-holed."
+            exit 1
+          fi
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          echo "===== sbc-signaling ====="; docker compose -f "$COMPOSE" logs --tail=200 sbc-signaling || true
+          echo "===== sbc-media ====="; docker compose -f "$COMPOSE" logs --tail=200 sbc-media || true
+          echo "===== UAS ====="; docker compose -f "$COMPOSE" logs --tail=50 sipp-uas || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f "$COMPOSE" down -v || true

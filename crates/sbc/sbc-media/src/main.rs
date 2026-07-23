@@ -262,6 +262,7 @@ async fn main() -> ExitCode {
         info!("shutdown signal received");
     };
 
+    info!(listen = %config.grpc_listen, "MediaControllerService listening");
     let result = Server::builder()
         .add_service(MediaControllerServiceServer::new(service))
         .add_service(HealthServer::new(AlwaysServing))

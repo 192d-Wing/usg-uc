@@ -81,7 +81,7 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo chef cook --release --recipe-path recipe.json \
-    --package sbc-daemon --package sbc-cli \
+    --package sbc-daemon --package sbc-cli --package sbc-media \
     --features sbc-daemon/grpc
 
 # =============================================================================
@@ -99,10 +99,11 @@ COPY audio_files/ audio_files/
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo build --release --package sbc-daemon --package sbc-cli \
+    cargo build --release --package sbc-daemon --package sbc-cli --package sbc-media \
     --features sbc-daemon/grpc \
     && cp target/release/sbc-daemon /tmp/sbc-daemon \
-    && cp target/release/sbc-cli /tmp/sbc-cli
+    && cp target/release/sbc-cli /tmp/sbc-cli \
+    && cp target/release/sbc-media /tmp/sbc-media
 
 # =============================================================================
 # Stage 3: Runtime
@@ -130,6 +131,10 @@ RUN mkdir -p /etc/sbc /var/lib/sbc /var/log/sbc \
 # in the builder stage so this COPY survives cache misses).
 COPY --from=builder /tmp/sbc-daemon /usr/local/bin/
 COPY --from=builder /tmp/sbc-cli /usr/local/bin/
+# The out-of-process media plane (signaling↔media split). The same image runs
+# either the monolith (sbc-daemon, default entrypoint) or, in a split
+# deployment, sbc-daemon as signaling-only + sbc-media as the media pod.
+COPY --from=builder /tmp/sbc-media /usr/local/bin/
 
 # Copy default configuration
 COPY deploy/config/config.toml /etc/sbc/config.toml
@@ -137,7 +142,7 @@ COPY deploy/config/config.toml /etc/sbc/config.toml
 # Set ownership and grant CAP_NET_BIND_SERVICE as a file capability so the
 # non-root user (UID 1000) can bind to privileged ports without needing
 # ambient capabilities at the pod level.
-RUN chown -R sbc:sbc /usr/local/bin/sbc-daemon /usr/local/bin/sbc-cli \
+RUN chown -R sbc:sbc /usr/local/bin/sbc-daemon /usr/local/bin/sbc-cli /usr/local/bin/sbc-media \
     && setcap 'cap_net_bind_service=+ep' /usr/local/bin/sbc-daemon
 
 # Switch to non-root user

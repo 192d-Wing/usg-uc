@@ -1,0 +1,138 @@
+# USG SBC Stress Test Environment — Split signaling/media
+#
+# The Phase-2 signaling↔media split: sbc-daemon runs signaling-only and drives a
+# separate sbc-media process over gRPC, instead of relaying in-process.
+#
+# Topology (decoupled, distinct IPs — mirrors two Kubernetes pods):
+#   - sbc-signaling (172.28.1.10 sig / 172.28.2.10 media): SIP + API only.
+#   - sbc-media     (172.28.2.11 media): the RTP relay + gRPC control plane.
+# The daemon reaches sbc-media's gRPC at 172.28.2.11:9096 and advertises
+# sbc-media's media IP (172.28.2.11) in SDP (see sbc-test-split.toml), so callers
+# send RTP straight to sbc-media's relay. The daemon retries the gRPC connect at
+# startup, so bring-up order is not fragile.
+#
+# Usage:
+#   docker compose -f deploy/test/docker-compose.split.yml up --build
+#
+# Split-topology counterpart of docker-compose.yml (the monolith).
+
+services:
+  # ── SBC signaling plane (SIP only; media is remote) ────────────
+  sbc-signaling:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: usg-sbc-split:test
+    container_name: sbc-signaling
+    environment:
+      # Drive the out-of-process media plane at sbc-media's media-net IP.
+      SBC_MEDIA_CONTROLLER_URL: "http://172.28.2.11:9096"
+    ports:
+      - "5060:5060/udp"        # SIP signaling
+      - "5060:5060/tcp"
+      - "8080:8080/tcp"        # REST API
+    volumes:
+      - ./sbc-test-split.toml:/etc/sbc/config.toml:ro
+    networks:
+      sbc-signaling:
+        ipv4_address: 172.28.1.10
+      sbc-media:
+        ipv4_address: 172.28.2.10
+    depends_on:
+      # Start the media pod first; wire_remote_media still retries the gRPC
+      # connect until its listener is up.
+      sbc-media:
+        condition: service_started
+    healthcheck:
+      # Healthy only after wire_remote_media connects sbc-media and start() runs.
+      test: ["CMD", "/usr/local/bin/sbc-cli", "health", "--quiet"]
+      interval: 5s
+      timeout: 3s
+      retries: 8
+      start_period: 20s
+
+  # ── SBC media plane (RTP relay + gRPC control) ─────────────────
+  sbc-media:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: usg-sbc-split:test
+    container_name: sbc-media
+    entrypoint: ["/usr/local/bin/sbc-media"]
+    environment:
+      SBC_MEDIA_GRPC_LISTEN: "0.0.0.0:9096"
+      SBC_MEDIA_RTP_PORT_MIN: "16384"
+      SBC_MEDIA_RTP_PORT_MAX: "16484"
+      SBC_MEDIA_DEFAULT_MODE: "relay"
+      # SIPp drives plain RTP (no DTLS-SRTP), matching the monolith audio gate.
+      SBC_MEDIA_SRTP_REQUIRED: "false"
+    ports:
+      - "16384-16484:16384-16484/udp"  # RTP media (relayed by sbc-media)
+    networks:
+      sbc-media:
+        ipv4_address: 172.28.2.11
+
+  # ── SIPp UAS (answers calls) ───────────────────────────────────
+  sipp-uas:
+    image: ctaloi/sipp:latest
+    container_name: sipp-uas
+    command: >
+      -sn uas
+      -p 5080
+      -mi 172.28.2.20
+      -rtp_echo
+      -trace_err
+      -fd 1s
+    networks:
+      sbc-signaling:
+        ipv4_address: 172.28.1.20
+      sbc-media:
+        ipv4_address: 172.28.2.20
+    depends_on:
+      sbc-signaling:
+        condition: service_healthy
+
+  # ── SIPp UAC (generates load) ──────────────────────────────────
+  sipp-uac:
+    image: ctaloi/sipp:latest
+    container_name: sipp-uac
+    volumes:
+      - ./:/scenarios:ro
+    cap_add:
+      - NET_RAW
+    command: >
+      172.28.1.10:5060
+      -sn uac
+      -r 10
+      -rp 1000
+      -l 100
+      -m 1000
+      -mi 172.28.2.30
+      -p 5070
+      -trace_err
+      -trace_stat
+      -fd 1s
+      -d 5000
+      -recv_timeout 10000
+    networks:
+      sbc-signaling:
+        ipv4_address: 172.28.1.30
+      sbc-media:
+        ipv4_address: 172.28.2.30
+    depends_on:
+      sbc-signaling:
+        condition: service_healthy
+      sipp-uas:
+        condition: service_started
+
+networks:
+  sbc-signaling:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.1.0/24
+  sbc-media:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.2.0/24
