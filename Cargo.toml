@@ -80,6 +80,7 @@ members = [
     "crates/sbc/sbc-announcement",
     "crates/sbc/sbc-trunk-services",
     "crates/sbc/sbc-media-core",
+    "crates/sbc/sbc-media",
     "crates/sbc/sbc-daemon",
     "crates/sbc/sbc-api-server",
     "crates/sbc/sbc-provision-server",

@@ -1,0 +1,29 @@
+[package]
+name = "sbc-media"
+description = "SBC media plane pod. Hosts the gRPC MediaControllerService over a MediaPipeline: the sbc-daemon signaling process drives per-call RTP/SRTP relays and DTLS-SRTP termination here, out of the signaling process. Stateless per-call; owns the media sockets and the DTLS sidecar."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "sbc-media"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio-stream = "0.1"
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["json"] }
+
+tonic.workspace = true
+sbc-grpc-api.workspace = true
+# The media plane itself (pipeline, relay, DTLS identity, MediaControllerServer).
+sbc-media-core = { workspace = true, features = ["grpc"] }
+uc-media-engine.workspace = true
