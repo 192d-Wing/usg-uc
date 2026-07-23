@@ -533,11 +533,33 @@ impl Server {
         use sbc_media_core::grpc_media_controller::GrpcMediaController;
 
         info!(url, "Connecting to remote media plane");
-        let controller = Arc::new(GrpcMediaController::connect(url.clone()).await.map_err(
-            |e| ServerError::ConfigError {
-                message: format!("remote media plane {url} unreachable: {e}"),
-            },
-        )?);
+        // Retry the connect: the media plane and signaling are commonly brought
+        // up together (co-located containers / a two-container pod), so the pod
+        // may not be listening yet at signaling startup. Fail-closed only after
+        // the deadline — a media plane that never comes up must stop signaling
+        // rather than run with no media path.
+        const CONNECT_ATTEMPTS: u32 = 30;
+        const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+        let controller = {
+            let mut attempt = 1;
+            loop {
+                match GrpcMediaController::connect(url.clone()).await {
+                    Ok(client) => break Arc::new(client),
+                    Err(e) if attempt < CONNECT_ATTEMPTS => {
+                        warn!(url, attempt, error = %e, "remote media plane not ready; retrying");
+                        attempt += 1;
+                        tokio::time::sleep(CONNECT_BACKOFF).await;
+                    }
+                    Err(e) => {
+                        return Err(ServerError::ConfigError {
+                            message: format!(
+                                "remote media plane {url} unreachable after {attempt} attempts: {e}"
+                            ),
+                        });
+                    }
+                }
+            }
+        };
 
         // Fetch the SBC's DTLS fingerprint to advertise in SDP. The pod returns
         // an error when it is not in terminate mode; treat that as "no fingerprint
