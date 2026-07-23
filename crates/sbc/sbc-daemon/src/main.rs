@@ -63,6 +63,8 @@ mod dtls_identity;
 mod dtls_relay;
 mod dtls_sidecar;
 #[cfg(feature = "grpc")]
+mod grpc_media_controller;
+#[cfg(feature = "grpc")]
 mod grpc_server;
 mod ice_agent;
 mod media_pipeline;

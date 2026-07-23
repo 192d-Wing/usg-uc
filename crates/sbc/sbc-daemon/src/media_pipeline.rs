@@ -2093,6 +2093,11 @@ pub enum MediaPipelineError {
     PortExhausted,
     /// Failed to bind UDP socket.
     BindFailed(String),
+    /// A control-plane RPC to an out-of-process media controller failed
+    /// (transport error, or a server-side error with no closer variant).
+    /// Only produced by the gRPC [`MediaController`] client; the in-process
+    /// [`MediaPipeline`] never returns it.
+    Rpc(String),
 }
 
 impl std::fmt::Display for MediaPipelineError {
@@ -2108,6 +2113,7 @@ impl std::fmt::Display for MediaPipelineError {
             Self::DecryptionFailed(e) => write!(f, "Decryption failed: {e}"),
             Self::PortExhausted => write!(f, "RTP port range exhausted"),
             Self::BindFailed(e) => write!(f, "Failed to bind UDP socket: {e}"),
+            Self::Rpc(e) => write!(f, "Media controller RPC failed: {e}"),
         }
     }
 }
