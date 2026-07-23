@@ -1663,6 +1663,28 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 ---
 
+## Backlog
+
+### Media HA — glitchless in-call failover (hot-standby tier)
+
+Deferred HA tier for the signaling↔media split / standalone media-node pool
+(the split is complete; the media-node pool is the next epic). The default HA
+path is signaling-aware BYE+redial, then media re-anchor via re-INVITE (a
+coarse-state replication agent — replicate the *recipe* to rebuild the session,
+not the per-packet crypto state). This item is the heavier tier above that.
+
+**Reserve for a later, separate HA epic only if a carrier SLA forces it:**
+
+> If a hard SLA demands glitchless in-call survival: 1:1 active/standby pairs
+> with a shared media identity (same cert) + floating media IP (VIP takeover via
+> gratuitous ARP) + per-packet SRTP context shipping to the standby. On failure
+> the standby owns the same IP and continues decrypting — no re-INVITE, just a
+> few dropped packets from replay-window staleness (an audible click). Cost: 2×
+> media nodes, floating-IP infra, and per-packet replication traffic. It doesn't
+> compose well with an N-node pool (it's pairs, not a pool).
+
+---
+
 ## Known TODOs in Code
 
 | Location | Description | Priority | Status |
