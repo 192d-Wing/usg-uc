@@ -6242,6 +6242,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sbc-media"
+version = "0.9.0"
+dependencies = [
+ "sbc-grpc-api",
+ "sbc-media-core",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "uc-media-engine",
+]
+
+[[package]]
 name = "sbc-media-core"
 version = "0.9.0"
 dependencies = [
