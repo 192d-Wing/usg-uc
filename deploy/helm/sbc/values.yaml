@@ -483,6 +483,20 @@ sbcDaemon:
     # is not applied to B2BUA legs; kept for config-schema completeness.
     obfuscateCallId: false
 
+# ── Signaling↔media split (co-located, Phase 2) ──
+# When enabled, the sbc-media binary runs as a SECOND container in the daemon
+# pod and the daemon drives it over loopback gRPC (running signaling-only). The
+# pod shares one network namespace, so the daemon advertises the pod IP for RTP
+# and no SDP media-address steering is needed. In DTLS-terminate mode the
+# terminator sidecar sits alongside sbc-media (shared dtls-run volume).
+# Disabled (default) = the in-process monolith. A standalone media-node POOL
+# with distinct IPs + SDP steering is a later phase.
+mediaSplit:
+  enabled: false
+  resources:
+    requests: { cpu: "500m", memory: "256Mi" }
+    limits:   { cpu: "2",    memory: "1Gi"   }
+
 # DHCP is provided externally by usg-dora (a DORA fork), deployed and
 # configured outside this chart — the SBC chart no longer ships a DHCP
 # server. Phone DHCP scopes, relay/helper-address targets, and vendor

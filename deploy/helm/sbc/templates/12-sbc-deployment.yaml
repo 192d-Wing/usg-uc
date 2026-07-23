@@ -156,6 +156,14 @@ spec:
             - name: SBC_ANNOUNCEMENT_URL
               value: "http://{{ include "sbc.fullname" . }}-announcement.{{ .Release.Namespace }}.svc.cluster.local:9095"
             {{- end }}
+            {{- if .Values.mediaSplit.enabled }}
+            # Signaling↔media split: the media plane runs as a co-located
+            # sbc-media container (same pod, shared network namespace). Drive it
+            # over loopback gRPC; the daemon then runs signaling-only and skips
+            # its in-process media pipeline entirely.
+            - name: SBC_MEDIA_CONTROLLER_URL
+              value: "http://127.0.0.1:9096"
+            {{- end }}
             {{- if .Values.sbcTrunkAgent.enabled }}
             # Trunk-agent pod is deployed — disable the daemon's own
             # registration + OPTIONS loops to avoid double-REGISTERing
@@ -230,6 +238,53 @@ spec:
             {{- if .Values.sbcDaemon.sipTls.secretName }}
             - { name: sip-tls, mountPath: /etc/sbc/sip-tls, readOnly: true }
             {{- end }}
+        {{- if .Values.mediaSplit.enabled }}
+        # ── Media plane (signaling↔media split, co-located) ──
+        # The sbc-media binary from the SAME image, as a second container in this
+        # pod. Sharing the pod network namespace means: the daemon drives it over
+        # loopback gRPC (SBC_MEDIA_CONTROLLER_URL above), and the daemon advertises
+        # the shared pod IP in SDP — so RTP lands on this container's relay socket
+        # with no SDP media-address steering (that is the standalone media-node
+        # pool, a later phase). In DTLS-terminate mode the terminator sidecar
+        # (below, gated on sbcDaemon.dtlsTerminate.enabled) sits alongside it and
+        # they share the dtls-run volume.
+        - name: sbc-media
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/sbc-media"]
+          env:
+            - name: SBC_MEDIA_GRPC_LISTEN
+              value: "0.0.0.0:9096"
+            # Match the daemon's [media] rtp_port_min/max (config helper literals).
+            - name: SBC_MEDIA_RTP_PORT_MIN
+              value: "16384"
+            - name: SBC_MEDIA_RTP_PORT_MAX
+              value: "32768"
+            # Parsed case-insensitively; the daemon config uses "Relay".
+            - name: SBC_MEDIA_DEFAULT_MODE
+              value: {{ .Values.sbcDaemon.config.media_mode | quote }}
+            - name: SBC_MEDIA_SRTP_REQUIRED
+              value: {{ .Values.sbcDaemon.config.srtp_required | quote }}
+            {{- if .Values.sbcDaemon.dtlsTerminate.enabled }}
+            - name: SBC_MEDIA_TERMINATE_DTLS
+              value: "true"
+            - name: SBC_MEDIA_DTLS_SIDECAR_SOCKET
+              value: "/run/usg/dtls-terminator.sock"
+            - name: SBC_MEDIA_DTLS_FINGERPRINT_FILE
+              value: "/run/usg/dtls-terminator.fp"
+            {{- end }}
+          ports:
+            - { name: media-grpc, containerPort: 9096, protocol: TCP }
+          resources:
+            {{- toYaml .Values.mediaSplit.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.sbcDaemon.securityContext | nindent 12 }}
+          {{- if .Values.sbcDaemon.dtlsTerminate.enabled }}
+          volumeMounts:
+            # Read the sidecar's fingerprint file + connect its DTLS socket.
+            - { name: dtls-run, mountPath: /run/usg }
+          {{- end }}
+        {{- end }}
       volumes:
         - name: config-template
           configMap:
