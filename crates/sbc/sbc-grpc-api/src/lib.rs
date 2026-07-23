@@ -273,6 +273,20 @@ pub mod prelude {
         RemoveRoutePatternRequest, SyncCallingSearchSpaceRequest, SyncPartitionRequest,
         SyncRouteListRequest, SyncRoutePatternRequest, SyncSbcResponse,
     };
+
+    // Media controller service — SBC signaling → standalone media process
+    // control plane (Phase 2 of the signaling↔media split). One-to-one with
+    // the in-process `MediaController` trait; drives per-call RTP/SRTP relays
+    // and server-streams media-plane failure events back to signaling.
+    pub use super::sbc::media_controller_service_client::MediaControllerServiceClient;
+    pub use super::sbc::media_controller_service_server::{
+        MediaControllerService, MediaControllerServiceServer,
+    };
+    pub use super::sbc::{
+        AllocatedPorts, CallRef, CreateSessionRequest, DtlsFingerprint, DtlsRole, LegDtlsParams,
+        MediaEvent, MediaFailure, MediaMode, PortPair, SetRemoteAddressRequest,
+        StartRelayTerminateRequest, media_event,
+    };
 }
 
 #[cfg(test)]

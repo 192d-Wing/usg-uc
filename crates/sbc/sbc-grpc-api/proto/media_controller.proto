@@ -1,0 +1,152 @@
+// SBC Media Controller Service
+//
+// Control plane between the SBC signaling process (client) and the standalone
+// media process (server) — Phase 2 of splitting the media plane out of
+// sbc-daemon. One-to-one with the in-process `MediaController` trait
+// (crates/sbc/sbc-daemon/src/media_pipeline.rs). Every RPC is call_id-addressed
+// and carries only serializable data; the media process owns all media UDP
+// sockets and the DTLS-SRTP sidecar, so no live sockets cross this boundary.
+//
+// Lifecycle of one call:
+//   1. INVITE      → CreateSession (allocate ports) + SetRemoteAddress (caller).
+//   2. 200 OK      → SetRemoteAddress (callee) + StartRelay | StartRelayTerminate.
+//   3. BYE/CANCEL  → StopRelay + RemoveSession.
+// The signaling process holds one long-lived WatchMediaEvents stream to learn
+// about media-plane failures (e.g. a post-answer DTLS handshake failure) and
+// tear the affected call down.
+//
+// NIST 800-53 Rev5: SC-7 (media terminated/controlled at the boundary),
+// SC-8 (DTLS-SRTP negotiated per leg), AU-6 (media-failure events logged).
+syntax = "proto3";
+
+package sbc.api.v1;
+
+import "google/protobuf/empty.proto";
+
+// The control plane the SIP signaling layer uses to drive media relays.
+service MediaControllerService {
+    // INVITE: allocate a session's RTP/RTCP port pairs; returns the caller and
+    // callee RTP ports to advertise in SDP. Blocking on the signaling hot path.
+    rpc CreateSession(CreateSessionRequest) returns (AllocatedPorts);
+
+    // Set a leg's remote RTP address (caller at INVITE, callee at 200 OK).
+    rpc SetRemoteAddress(SetRemoteAddressRequest) returns (google.protobuf.Empty);
+
+    // 200 OK: start the opaque forwarding relay (plain RTP / SRTP pass-through).
+    rpc StartRelay(CallRef) returns (google.protobuf.Empty);
+
+    // 200 OK: start the DTLS-SRTP terminating relay for both legs.
+    rpc StartRelayTerminate(StartRelayTerminateRequest) returns (google.protobuf.Empty);
+
+    // BYE/CANCEL/error: stop a call's relay tasks and release its media resources.
+    rpc StopRelay(CallRef) returns (google.protobuf.Empty);
+
+    // Remove all state for a call's media session.
+    rpc RemoveSession(CallRef) returns (google.protobuf.Empty);
+
+    // Allocate a standalone RTP/RTCP port pair (for announcement playback).
+    rpc AllocatePorts(google.protobuf.Empty) returns (PortPair);
+
+    // Fetch the SBC's current DTLS-SRTP fingerprint (RFC 8122 form). Needed
+    // because the media process owns the identity; the signaling process stamps
+    // it into the SDP a=fingerprint line. Signaling caches this and refreshes
+    // when the control stream reconnects.
+    rpc GetDtlsFingerprint(google.protobuf.Empty) returns (DtlsFingerprint);
+
+    // Reverse channel: media process -> signaling. Server-streams media-plane
+    // events. The signaling process opens one long-lived stream at startup.
+    rpc WatchMediaEvents(google.protobuf.Empty) returns (stream MediaEvent);
+}
+
+// --- shared ---
+
+// Bare call reference (SIP Call-ID / session key) for the address-less RPCs.
+message CallRef {
+    string call_id = 1;
+}
+
+// Media handling for a session. Mirrors uc_media_engine::MediaMode; UNSPECIFIED
+// corresponds to the Rust `None` (media process applies its configured default).
+enum MediaMode {
+    MEDIA_MODE_UNSPECIFIED = 0;
+    // Terminate media on both sides (can transcode / SRTP).
+    MEDIA_MODE_RELAY = 1;
+    // Forward with IP/port rewrite only.
+    MEDIA_MODE_PASS_THROUGH = 2;
+    // Early-media relay (relay before final answer).
+    MEDIA_MODE_EARLY_RELAY = 3;
+}
+
+// The SBC's DTLS role for a leg. Values match dtls_sidecar::Role.
+enum DtlsRole {
+    // SBC is the DTLS server (peer offered a=setup:active).
+    DTLS_ROLE_SERVER = 0;
+    // SBC is the DTLS client (peer is a=setup:passive).
+    DTLS_ROLE_CLIENT = 1;
+}
+
+// --- requests / responses ---
+
+message CreateSessionRequest {
+    string call_id = 1;
+    // UNSPECIFIED = Rust None (media process default).
+    MediaMode mode = 2;
+    // Per-zone media bind IP for each leg; absent = pipeline default bind.
+    optional string a_leg_media_ip = 3;
+    optional string b_leg_media_ip = 4;
+}
+
+// Mirrors media_pipeline::AllocatedPorts. RTCP port is implicit (RTP + 1).
+message AllocatedPorts {
+    uint32 a_leg_rtp_port = 1;
+    uint32 b_leg_rtp_port = 2;
+}
+
+message SetRemoteAddressRequest {
+    string call_id = 1;
+    bool is_a_leg = 2;
+    // Remote RTP endpoint as "ip:port" (cf. announcement.proto rtp_destination).
+    string address = 3;
+}
+
+// Mirrors media_pipeline::LegDtlsParams.
+message LegDtlsParams {
+    // Peer's SDP a=fingerprint in full RFC 8122 form ("sha-384 AB:CD:...").
+    string peer_fingerprint = 1;
+    // The SBC's DTLS role for this leg.
+    DtlsRole role = 2;
+}
+
+message StartRelayTerminateRequest {
+    string call_id = 1;
+    LegDtlsParams a_leg = 2;
+    LegDtlsParams b_leg = 3;
+}
+
+// allocate_ports() -> (rtp, rtcp).
+message PortPair {
+    uint32 rtp_port = 1;
+    uint32 rtcp_port = 2;
+}
+
+message DtlsFingerprint {
+    // Full RFC 8122 form ("sha-384 AB:CD:...").
+    string fingerprint = 1;
+}
+
+// --- reverse event stream ---
+
+// A media-plane event. The oneof envelope matches the repo's multi-variant
+// streaming convention (cf. announcement.proto PlayAnnouncementEvent).
+message MediaEvent {
+    oneof event {
+        MediaFailure failure = 1;
+    }
+}
+
+// A call's media failed (e.g. a DTLS handshake failed after the call was
+// answered, which would otherwise leave the call up with black-holed media).
+// The signaling process tears down both legs. Carries only the call id today.
+message MediaFailure {
+    string call_id = 1;
+}
