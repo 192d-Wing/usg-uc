@@ -1,0 +1,156 @@
+# USG SBC Stress Test Environment — media-node POOL (Phase 3)
+#
+# A standalone media-node POOL: sbc-daemon runs signaling-only and load-balances
+# calls across TWO sbc-media nodes over gRPC. Each node has a distinct IP and
+# reports it (SBC_MEDIA_ADVERTISED_IP); the daemon steers each call's SDP to the
+# node it chose (least-loaded), so RTP reaches that node's relay.
+#
+# Topology:
+#   - sbc-signaling (172.28.1.10 sig / 172.28.2.10 media): SIP + API only.
+#   - sbc-media-1   (172.28.2.11): relay + gRPC control.
+#   - sbc-media-2   (172.28.2.12): relay + gRPC control.
+# The daemon connects to both (SBC_MEDIA_CONTROLLER_URLS) and retries at startup.
+#
+# Usage:
+#   docker compose -f deploy/test/docker-compose.pool.yml up --build
+#
+# Pool counterpart of docker-compose.split.yml (single remote node).
+
+services:
+  # ── SBC signaling plane (SIP only; media is a remote pool) ─────
+  sbc-signaling:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: usg-sbc-split:test
+    container_name: sbc-signaling
+    environment:
+      # Two media nodes → the daemon builds a load-balanced pool.
+      SBC_MEDIA_CONTROLLER_URLS: "http://172.28.2.11:9096,http://172.28.2.12:9096"
+    ports:
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
+      - "8080:8080/tcp"
+    volumes:
+      # Plain monolith config; the daemon's own zone media IP is 172.28.2.10
+      # (no relay there) — media reaches a node only via per-call SDP steering.
+      - ./sbc-test.toml:/etc/sbc/config.toml:ro
+    networks:
+      sbc-signaling:
+        ipv4_address: 172.28.1.10
+      sbc-media:
+        ipv4_address: 172.28.2.10
+    depends_on:
+      sbc-media-1:
+        condition: service_started
+      sbc-media-2:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/sbc-cli", "health", "--quiet"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 25s
+
+  # ── Media node 1 ───────────────────────────────────────────────
+  sbc-media-1:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: usg-sbc-split:test
+    container_name: sbc-media-1
+    entrypoint: ["/usr/local/bin/sbc-media"]
+    environment:
+      SBC_MEDIA_GRPC_LISTEN: "0.0.0.0:9096"
+      SBC_MEDIA_RTP_PORT_MIN: "16384"
+      SBC_MEDIA_RTP_PORT_MAX: "16484"
+      SBC_MEDIA_DEFAULT_MODE: "relay"
+      SBC_MEDIA_SRTP_REQUIRED: "false"
+      SBC_MEDIA_ADVERTISED_IP: "172.28.2.11"
+    networks:
+      sbc-media:
+        ipv4_address: 172.28.2.11
+
+  # ── Media node 2 ───────────────────────────────────────────────
+  sbc-media-2:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: usg-sbc-split:test
+    container_name: sbc-media-2
+    entrypoint: ["/usr/local/bin/sbc-media"]
+    environment:
+      SBC_MEDIA_GRPC_LISTEN: "0.0.0.0:9096"
+      SBC_MEDIA_RTP_PORT_MIN: "16384"
+      SBC_MEDIA_RTP_PORT_MAX: "16484"
+      SBC_MEDIA_DEFAULT_MODE: "relay"
+      SBC_MEDIA_SRTP_REQUIRED: "false"
+      SBC_MEDIA_ADVERTISED_IP: "172.28.2.12"
+    networks:
+      sbc-media:
+        ipv4_address: 172.28.2.12
+
+  # ── SIPp UAS (answers calls) ───────────────────────────────────
+  sipp-uas:
+    image: ctaloi/sipp:latest
+    container_name: sipp-uas
+    command: >
+      -sn uas
+      -p 5080
+      -mi 172.28.2.20
+      -rtp_echo
+      -trace_err
+      -fd 1s
+    networks:
+      sbc-signaling:
+        ipv4_address: 172.28.1.20
+      sbc-media:
+        ipv4_address: 172.28.2.20
+    depends_on:
+      sbc-signaling:
+        condition: service_healthy
+
+  # ── SIPp UAC (generates load) ──────────────────────────────────
+  sipp-uac:
+    image: ctaloi/sipp:latest
+    container_name: sipp-uac
+    volumes:
+      - ./:/scenarios:ro
+    cap_add:
+      - NET_RAW
+    command: >
+      172.28.1.10:5060
+      -sn uac
+      -r 10
+      -rp 1000
+      -l 100
+      -m 1000
+      -mi 172.28.2.30
+      -p 5070
+      -trace_err
+      -trace_stat
+      -fd 1s
+      -d 5000
+      -recv_timeout 10000
+    networks:
+      sbc-signaling:
+        ipv4_address: 172.28.1.30
+      sbc-media:
+        ipv4_address: 172.28.2.30
+    depends_on:
+      sbc-signaling:
+        condition: service_healthy
+      sipp-uas:
+        condition: service_started
+
+networks:
+  sbc-signaling:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.1.0/24
+  sbc-media:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.2.0/24
