@@ -14,7 +14,7 @@ workspace = true
 
 [features]
 default = []
-grpc = ["dep:sbc-grpc-api", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:prost-types", "dep:tokio-stream"]
+grpc = ["dep:sbc-grpc-api", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:prost-types", "dep:tokio-stream", "sbc-media-core/grpc"]
 grpc-reflection = ["grpc", "sbc-grpc-api?/reflection", "dep:tonic-reflection"]
 cluster = ["uc-cluster", "uc-discovery", "uc-storage", "uc-state-sync", "proto-registrar/storage", "sbc-config/cluster", "sbc-grpc-api?/cluster"]
 redis = ["uc-storage/redis"]
@@ -53,6 +53,8 @@ uc-phone-mgmt.workspace = true
 socket2.workspace = true
 sbc-announcement.workspace = true
 sbc-trunk-services.workspace = true
+# The media plane (RTP/SRTP relay, DTLS-SRTP termination, MediaController client).
+sbc-media-core.workspace = true
 
 # Clustering dependencies (optional)
 uc-cluster = { workspace = true, optional = true }

@@ -59,24 +59,21 @@ mod api_server;
 mod args;
 #[cfg(feature = "cluster")]
 mod cluster;
-mod dtls_identity;
-mod dtls_relay;
-mod dtls_sidecar;
-#[cfg(feature = "grpc")]
-mod grpc_media_controller;
-#[cfg(feature = "grpc")]
-mod grpc_media_server;
 #[cfg(feature = "grpc")]
 mod grpc_server;
 mod ice_agent;
-mod media_pipeline;
 mod runtime;
 mod sdp_dtls;
 mod server;
 mod shutdown;
 mod sip_stack;
-mod srtp_relay;
 mod zone;
+
+// The media plane (RTP/SRTP relay, DTLS-SRTP termination, the MediaController
+// gRPC boundary) now lives in the sbc-media-core crate so the sbc-media binary
+// can host it out of process. sbc-daemon links it (see Cargo.toml) for the
+// shared boundary types and the GrpcMediaController client, referenced as
+// `sbc_media_core::…` from server.rs and sip_stack.rs.
 
 // Extracted subsystems, re-exported under their old module paths so call
 // sites keep reading `crate::announcement::…` / `crate::trunk_monitor::…`.
