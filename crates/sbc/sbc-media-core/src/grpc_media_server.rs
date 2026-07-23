@@ -20,7 +20,7 @@ use crate::dtls_sidecar::Role;
 use crate::media_pipeline::{LegDtlsParams, MediaPipeline, MediaPipelineError};
 use sbc_grpc_api::sbc as pb;
 use sbc_grpc_api::sbc::media_controller_service_server::MediaControllerService;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -137,12 +137,6 @@ fn parse_addr(value: &str) -> Result<SbcSocketAddr, Status> {
         .map_err(|e| Status::invalid_argument(format!("invalid address {value:?}: {e}")))
 }
 
-fn parse_ip(value: &str) -> Result<IpAddr, Status> {
-    value
-        .parse::<IpAddr>()
-        .map_err(|e| Status::invalid_argument(format!("invalid ip {value:?}: {e}")))
-}
-
 #[tonic::async_trait]
 impl MediaControllerService for MediaControllerServer {
     async fn create_session(
@@ -150,11 +144,15 @@ impl MediaControllerService for MediaControllerServer {
         req: Request<pb::CreateSessionRequest>,
     ) -> Result<Response<pb::AllocatedPorts>, Status> {
         let r = req.into_inner();
-        let a_ip = r.a_leg_media_ip.as_deref().map(parse_ip).transpose()?;
-        let b_ip = r.b_leg_media_ip.as_deref().map(parse_ip).transpose()?;
+        // A media NODE binds its relay sockets on ITS OWN interface, not the
+        // signaling daemon's zone media IP (which the request carries but which
+        // isn't assigned on this host — binding it fails with EADDRNOTAVAIL).
+        // Use this node's advertised IP, or wildcard (0.0.0.0) when unset
+        // (co-located, where the daemon and node share the pod IP).
+        let bind = self.pipeline.advertised_media_ip();
         let ports = self
             .pipeline
-            .create_session_with_zones(&r.call_id, from_proto_mode(r.mode), a_ip, b_ip)
+            .create_session_with_zones(&r.call_id, from_proto_mode(r.mode), bind, bind)
             .await
             .map_err(|e| to_status(&e))?;
         Ok(Response::new(pb::AllocatedPorts {

@@ -1617,6 +1617,14 @@ impl MediaPipeline {
     pub fn port_allocator(&self) -> &RtpPortAllocator {
         &self.port_allocator
     }
+
+    /// This node's advertised media IP, if configured. A standalone media node
+    /// binds its relay sockets on this (it lives on its own host, not the
+    /// signaling daemon's zone media interface).
+    #[must_use]
+    pub fn advertised_media_ip(&self) -> Option<std::net::IpAddr> {
+        self.config.advertised_media_ip
+    }
 }
 
 /// Soft cap on tracked SSRCs: eviction of idle entries starts here.
