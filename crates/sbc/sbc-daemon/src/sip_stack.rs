@@ -71,7 +71,7 @@ pub struct SipStack {
     /// SDP rewriter for media anchoring.
     sdp_rewriter: SdpRewriter,
     /// Media pipeline for RTP relay (optional, set after construction).
-    media_pipeline: Option<Arc<crate::media_pipeline::MediaPipeline>>,
+    media_pipeline: Option<Arc<dyn crate::media_pipeline::MediaController>>,
     /// The SBC's DTLS-SRTP identity. `Some` only when `srtp.mode = terminate`;
     /// its presence gates advertising the SBC fingerprint in rewritten SDP.
     dtls_fingerprint_source: Option<Arc<crate::dtls_identity::DtlsFingerprintSource>>,
@@ -501,8 +501,13 @@ impl SipStack {
         ports.remove(&port);
     }
 
-    /// Sets the media pipeline for RTP relay.
-    pub fn set_media_pipeline(&mut self, pipeline: Arc<crate::media_pipeline::MediaPipeline>) {
+    /// Sets the media controller (RTP/SRTP relay). Takes `dyn MediaController`
+    /// so the signaling layer is decoupled from the concrete in-process pipeline
+    /// (an out-of-process implementation can be injected here later).
+    pub fn set_media_pipeline(
+        &mut self,
+        pipeline: Arc<dyn crate::media_pipeline::MediaController>,
+    ) {
         self.media_pipeline = Some(pipeline);
     }
 
@@ -585,7 +590,7 @@ impl SipStack {
     /// media failure must not fail call setup.
     async fn start_media_relay(
         &self,
-        pipeline: &crate::media_pipeline::MediaPipeline,
+        pipeline: &dyn crate::media_pipeline::MediaController,
         session_key: &str,
         addrs: &CallAddresses,
         answer_sdp: &str,
@@ -1343,7 +1348,7 @@ impl SipStack {
                         .set_remote_address(&session_key, false, callee_addr)
                         .await;
                 }
-                self.start_media_relay(pipeline, &session_key, addrs, &sdp_str)
+                self.start_media_relay(&**pipeline, &session_key, addrs, &sdp_str)
                     .await;
                 a_port
             } else {
@@ -3271,11 +3276,7 @@ impl SipStack {
             // In-process playback: bind the announcement RTP socket now
             // to discover the actual port before building the SDP.
             let preferred_port = if let Some(ref pipeline) = self.media_pipeline {
-                pipeline
-                    .port_allocator()
-                    .allocate_pair()
-                    .await
-                    .map_or(0, |(rtp, _)| rtp)
+                pipeline.allocate_ports().await.map_or(0, |(rtp, _)| rtp)
             } else {
                 0
             };

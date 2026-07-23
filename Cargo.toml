@@ -137,6 +137,9 @@ toml = "1.1"
 # Error handling
 thiserror = "2.0"
 
+# Async trait methods (dyn-compatible; used for the MediaController boundary)
+async-trait = "0.1"
+
 # Logging and tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
