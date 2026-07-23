@@ -17,6 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/trunk_health.proto",
         "proto/sbc_sync.proto",
         "proto/announcement.proto",
+        "proto/media_controller.proto",
     ];
 
     // Recompile if any proto file changes
