@@ -6,10 +6,13 @@
 # Topology (decoupled, distinct IPs — mirrors two Kubernetes pods):
 #   - sbc-signaling (172.28.1.10 sig / 172.28.2.10 media): SIP + API only.
 #   - sbc-media     (172.28.2.11 media): the RTP relay + gRPC control plane.
-# The daemon reaches sbc-media's gRPC at 172.28.2.11:9096 and advertises
-# sbc-media's media IP (172.28.2.11) in SDP (see sbc-test-split.toml), so callers
-# send RTP straight to sbc-media's relay. The daemon retries the gRPC connect at
-# startup, so bring-up order is not fragile.
+# The daemon reaches sbc-media's gRPC at 172.28.2.11:9096. Phase-3 SDP steering:
+# sbc-media REPORTS its advertised media IP (SBC_MEDIA_ADVERTISED_IP=172.28.2.11)
+# per session, and the daemon advertises THAT in SDP — so RTP reaches sbc-media's
+# relay. Note the daemon uses the plain sbc-test.toml (its own zone media IP is
+# 172.28.2.10, where NO relay lives), so this is a genuine steering test: media
+# crosses only because the daemon honors the node-reported IP, not a config hack.
+# The daemon retries the gRPC connect at startup, so bring-up order is not fragile.
 #
 # Usage:
 #   docker compose -f deploy/test/docker-compose.split.yml up --build
@@ -32,7 +35,9 @@ services:
       - "5060:5060/tcp"
       - "8080:8080/tcp"        # REST API
     volumes:
-      - ./sbc-test-split.toml:/etc/sbc/config.toml:ro
+      # The plain monolith config — its zone media IP is the daemon's own
+      # (172.28.2.10). Media reaches sbc-media only via Phase-3 SDP steering.
+      - ./sbc-test.toml:/etc/sbc/config.toml:ro
     networks:
       sbc-signaling:
         ipv4_address: 172.28.1.10
@@ -66,6 +71,8 @@ services:
       SBC_MEDIA_DEFAULT_MODE: "relay"
       # SIPp drives plain RTP (no DTLS-SRTP), matching the monolith audio gate.
       SBC_MEDIA_SRTP_REQUIRED: "false"
+      # Phase-3 steering: report this node's media IP so the daemon advertises it.
+      SBC_MEDIA_ADVERTISED_IP: "172.28.2.11"
     ports:
       - "16384-16484:16384-16484/udp"  # RTP media (relayed by sbc-media)
     networks:

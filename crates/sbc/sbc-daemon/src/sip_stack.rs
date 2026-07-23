@@ -2223,8 +2223,8 @@ impl SipStack {
         // on outbound trunk legs, else the same ingress zone. In a single-zone
         // deployment both collapse to that zone's media IP (unchanged behavior).
         let egress_zone = self.egress_media_zone(receiving_zone, b_leg_external);
-        let (a_media_bind, a_media_ip_str) = self.zone_media_bind(receiving_zone, source.ip());
-        let (b_media_bind, b_media_ip_str) =
+        let (a_media_bind, mut a_media_ip_str) = self.zone_media_bind(receiving_zone, source.ip());
+        let (b_media_bind, mut b_media_ip_str) =
             self.zone_media_bind(egress_zone.as_deref(), source.ip());
         let (b_leg_rtp_port, media_a_leg_port) = if let Some(ref pipeline) = self.media_pipeline {
             match pipeline
@@ -2232,6 +2232,14 @@ impl SipStack {
                 .await
             {
                 Ok(ports) => {
+                    // Phase 3 media steering: when the media node reports its own
+                    // advertised IP (a standalone media-node pool), advertise THAT
+                    // to both legs — the relay lives on the node, not here. Absent
+                    // (monolith / co-located split), keep our zone media IP.
+                    if let Some(node_ip) = ports.media_ip {
+                        a_media_ip_str = node_ip.to_string();
+                        b_media_ip_str.clone_from(&a_media_ip_str);
+                    }
                     if let Some(ref body) = req.body
                         && let Some(caller_media) =
                             extract_media_address(&String::from_utf8_lossy(body))

@@ -100,6 +100,12 @@ message CreateSessionRequest {
 message AllocatedPorts {
     uint32 a_leg_rtp_port = 1;
     uint32 b_leg_rtp_port = 2;
+    // This media node's advertised IP for SDP steering (Phase 3). Absent = the
+    // signaling layer uses its own zone/local media IP.
+    optional string media_ip = 3;
+    // The node's DTLS-SRTP fingerprint to advertise (terminate mode). Absent =
+    // not terminating / use the signaling-side source.
+    optional string dtls_fingerprint = 4;
 }
 
 message SetRemoteAddressRequest {

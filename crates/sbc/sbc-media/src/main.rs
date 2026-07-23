@@ -16,13 +16,16 @@
 //!   range (defaults 16384 / 32768, the pipeline defaults).
 //! - `SBC_MEDIA_DEFAULT_MODE` — `relay` (default) or `pass-through`.
 //! - `SBC_MEDIA_SRTP_REQUIRED` — `true` (default) / `false`.
+//! - `SBC_MEDIA_ADVERTISED_IP` — this node's media IP, returned per session so
+//!   the signaling daemon steers SDP to it (standalone media-node pool). Unset
+//!   in the co-located deployment (signaling advertises the shared pod IP).
 //! - `SBC_MEDIA_TERMINATE_DTLS` — `true` to terminate DTLS-SRTP. When set, both
 //!   of the following are REQUIRED (fail-closed, matching the daemon):
 //!   - `SBC_MEDIA_DTLS_SIDECAR_SOCKET` — the DTLS terminator sidecar's UDS path.
 //!   - `SBC_MEDIA_DTLS_FINGERPRINT_FILE` — the file the sidecar publishes its
 //!     SHA-384 fingerprint to; served to signaling over `GetDtlsFingerprint`.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::ExitCode;
@@ -55,6 +58,10 @@ struct Config {
     terminate_dtls: bool,
     dtls_sidecar_socket: Option<PathBuf>,
     dtls_fingerprint_file: Option<PathBuf>,
+    /// This node's advertised media IP, returned per session so signaling steers
+    /// SDP to it (Phase 3 media-node pool). Unset in the co-located deployment,
+    /// where signaling advertises the shared pod IP from its own zone config.
+    advertised_media_ip: Option<IpAddr>,
 }
 
 fn env_bool(key: &str, default: bool) -> Result<bool, String> {
@@ -111,6 +118,12 @@ impl Config {
             );
         }
 
+        let advertised_media_ip = std::env::var("SBC_MEDIA_ADVERTISED_IP")
+            .ok()
+            .map(|s| s.parse::<IpAddr>())
+            .transpose()
+            .map_err(|e| format!("SBC_MEDIA_ADVERTISED_IP invalid: {e}"))?;
+
         Ok(Self {
             grpc_listen,
             rtp_port_min: env_port("SBC_MEDIA_RTP_PORT_MIN", 16_384)?,
@@ -120,6 +133,7 @@ impl Config {
             terminate_dtls,
             dtls_sidecar_socket,
             dtls_fingerprint_file,
+            advertised_media_ip,
         })
     }
 }
@@ -178,6 +192,7 @@ fn build_server(config: &Config) -> Result<MediaControllerServer, String> {
     let media_config = MediaPipelineConfig {
         default_mode: config.default_mode,
         srtp_required: config.srtp_required,
+        advertised_media_ip: config.advertised_media_ip,
         rtp_port_min: config.rtp_port_min,
         rtp_port_max: config.rtp_port_max,
         terminate_dtls: config.terminate_dtls,

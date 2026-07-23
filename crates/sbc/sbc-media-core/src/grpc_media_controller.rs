@@ -166,6 +166,15 @@ impl MediaController for GrpcMediaController {
         Ok(AllocatedPorts {
             a_leg_rtp_port: port_from_u32(resp.a_leg_rtp_port, "a_leg_rtp_port")?,
             b_leg_rtp_port: port_from_u32(resp.b_leg_rtp_port, "b_leg_rtp_port")?,
+            media_ip: resp
+                .media_ip
+                .as_deref()
+                .map(|s| s.parse::<IpAddr>())
+                .transpose()
+                .map_err(|e| {
+                    MediaPipelineError::Rpc(format!("invalid media_ip from media node: {e}"))
+                })?,
+            dtls_fingerprint: resp.dtls_fingerprint,
         })
     }
 
@@ -277,6 +286,7 @@ mod tests {
                 _ => Ok(Response::new(pb::AllocatedPorts {
                     a_leg_rtp_port: 40000,
                     b_leg_rtp_port: 40002,
+                    ..Default::default()
                 })),
             }
         }
