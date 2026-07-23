@@ -6163,6 +6163,7 @@ dependencies = [
  "sbc-config",
  "sbc-config-store",
  "sbc-grpc-api",
+ "sbc-media-core",
  "sbc-trunk-services",
  "serde",
  "serde_json",
@@ -6237,6 +6238,29 @@ dependencies = [
  "uc-policy",
  "uc-routing",
  "uc-storage",
+ "uc-types",
+]
+
+[[package]]
+name = "sbc-media-core"
+version = "0.9.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "proto-dtls",
+ "proto-rtp",
+ "proto-srtp",
+ "rand 0.8.6",
+ "rcgen",
+ "sbc-grpc-api",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "uc-codecs",
+ "uc-media-engine",
  "uc-types",
 ]
 
@@ -7811,6 +7835,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

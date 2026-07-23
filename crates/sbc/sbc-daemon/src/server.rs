@@ -414,7 +414,7 @@ impl Server {
         } else {
             (None, None)
         };
-        let media_config = crate::media_pipeline::MediaPipelineConfig {
+        let media_config = sbc_media_core::media_pipeline::MediaPipelineConfig {
             default_mode,
             srtp_required: config.media.srtp.required,
             rtp_port_min: config.media.rtp_port_min,
@@ -425,9 +425,9 @@ impl Server {
             media_failure_tx,
             ..Default::default()
         };
-        sip_stack.set_media_pipeline(Arc::new(crate::media_pipeline::MediaPipeline::new(
-            media_config,
-        )));
+        sip_stack.set_media_pipeline(Arc::new(
+            sbc_media_core::media_pipeline::MediaPipeline::new(media_config),
+        ));
 
         if let Some(source) = dtls_fingerprint {
             tracing::info!(
@@ -1429,8 +1429,8 @@ fn parse_content_length(headers: &[u8]) -> usize {
 /// would silently black-hole every secured call.
 fn build_dtls_fingerprint_source(
     dtls: &sbc_config::schema::DtlsConfig,
-) -> crate::dtls_identity::DtlsFingerprintSource {
-    use crate::dtls_identity::{DtlsFingerprintSource, DtlsIdentity};
+) -> sbc_media_core::dtls_identity::DtlsFingerprintSource {
+    use sbc_media_core::dtls_identity::{DtlsFingerprintSource, DtlsIdentity};
 
     // map_or_else with the nested cert/key match reads worse than this.
     #[allow(clippy::option_if_let_else)]

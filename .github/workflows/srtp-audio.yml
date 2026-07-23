@@ -1,8 +1,8 @@
 name: SRTP audio gate
 
 # End-to-end DTLS-SRTP termination gate: runs the real Go sidecar plus two real
-# pion-based DTLS-SRTP media peers against sbc-daemon in terminate mode and
-# asserts audio crosses the SBC (decrypt-on-ingress / re-encrypt-on-egress).
+# pion-based DTLS-SRTP media peers against the sbc-media-core relay in terminate
+# mode and asserts audio crosses the SBC (decrypt-on-ingress / re-encrypt-on-egress).
 #
 # This is the ONLY test that exercises proto-srtp against a standard SRTP
 # implementation (pion/srtp), so it catches wire-interop regressions that
@@ -13,6 +13,7 @@ on:
     paths:
       - 'crates/proto/proto-srtp/**'
       - 'crates/uc/uc-crypto/**'
+      - 'crates/sbc/sbc-media-core/**'
       - 'crates/sbc/sbc-daemon/**'
       - 'sidecar/**'
       - '.github/workflows/srtp-audio.yml'
@@ -21,6 +22,7 @@ on:
     paths:
       - 'crates/proto/proto-srtp/**'
       - 'crates/uc/uc-crypto/**'
+      - 'crates/sbc/sbc-media-core/**'
       - 'crates/sbc/sbc-daemon/**'
       - 'sidecar/**'
       - '.github/workflows/srtp-audio.yml'
@@ -64,4 +66,4 @@ jobs:
         env:
           SIDECAR_BIN: ${{ runner.temp }}/bin/sidecar
           PEER_BIN: ${{ runner.temp }}/bin/peer
-        run: cargo test -p sbc-daemon --bin sbc-daemon srtp_audio_end_to_end_real -- --ignored --nocapture
+        run: cargo test -p sbc-media-core srtp_audio_end_to_end_real -- --ignored --nocapture

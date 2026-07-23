@@ -79,6 +79,7 @@ members = [
     "crates/sbc/sbc-http-util",
     "crates/sbc/sbc-announcement",
     "crates/sbc/sbc-trunk-services",
+    "crates/sbc/sbc-media-core",
     "crates/sbc/sbc-daemon",
     "crates/sbc/sbc-api-server",
     "crates/sbc/sbc-provision-server",
@@ -232,6 +233,7 @@ sbc-grpc-api = { path = "crates/sbc/sbc-grpc-api" }
 sbc-http-util = { path = "crates/sbc/sbc-http-util" }
 sbc-announcement = { path = "crates/sbc/sbc-announcement" }
 sbc-trunk-services = { path = "crates/sbc/sbc-trunk-services" }
+sbc-media-core = { path = "crates/sbc/sbc-media-core" }
 
 # gRPC/Protobuf
 prost = "0.13"

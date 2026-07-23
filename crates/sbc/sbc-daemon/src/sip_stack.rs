@@ -71,10 +71,10 @@ pub struct SipStack {
     /// SDP rewriter for media anchoring.
     sdp_rewriter: SdpRewriter,
     /// Media pipeline for RTP relay (optional, set after construction).
-    media_pipeline: Option<Arc<dyn crate::media_pipeline::MediaController>>,
+    media_pipeline: Option<Arc<dyn sbc_media_core::media_pipeline::MediaController>>,
     /// The SBC's DTLS-SRTP identity. `Some` only when `srtp.mode = terminate`;
     /// its presence gates advertising the SBC fingerprint in rewritten SDP.
-    dtls_fingerprint_source: Option<Arc<crate::dtls_identity::DtlsFingerprintSource>>,
+    dtls_fingerprint_source: Option<Arc<sbc_media_core::dtls_identity::DtlsFingerprintSource>>,
     /// Call router for dial plan matching and trunk selection.
     router: Option<RwLock<Router>>,
     /// SBC-compatible router for CSS/Partition-based routing.
@@ -506,7 +506,7 @@ impl SipStack {
     /// (an out-of-process implementation can be injected here later).
     pub fn set_media_pipeline(
         &mut self,
-        pipeline: Arc<dyn crate::media_pipeline::MediaController>,
+        pipeline: Arc<dyn sbc_media_core::media_pipeline::MediaController>,
     ) {
         self.media_pipeline = Some(pipeline);
     }
@@ -517,7 +517,7 @@ impl SipStack {
     /// Set only when `srtp.mode = terminate`.
     pub fn set_dtls_fingerprint_source(
         &mut self,
-        source: Arc<crate::dtls_identity::DtlsFingerprintSource>,
+        source: Arc<sbc_media_core::dtls_identity::DtlsFingerprintSource>,
     ) {
         self.dtls_fingerprint_source = Some(source);
     }
@@ -543,13 +543,15 @@ impl SipStack {
     /// answer the client. A peer that omitted `a=setup` is treated as `actpass`
     /// (the offerer default) → the SBC answers `passive` (server), matching
     /// [`Self::rewrite_answer_dtls`]. Used to drive the per-leg handshake.
-    fn sbc_dtls_role(peer_setup: Option<crate::sdp_dtls::SetupRole>) -> crate::dtls_sidecar::Role {
+    fn sbc_dtls_role(
+        peer_setup: Option<crate::sdp_dtls::SetupRole>,
+    ) -> sbc_media_core::dtls_sidecar::Role {
         use crate::sdp_dtls::SetupRole;
         match peer_setup.map_or(SetupRole::Passive, SetupRole::answer_role) {
-            SetupRole::Active => crate::dtls_sidecar::Role::Client,
+            SetupRole::Active => sbc_media_core::dtls_sidecar::Role::Client,
             // answer_role() yields only Active/Passive; Passive (and, defensively,
             // ActPass) means the SBC is the DTLS server.
-            SetupRole::Passive | SetupRole::ActPass => crate::dtls_sidecar::Role::Server,
+            SetupRole::Passive | SetupRole::ActPass => sbc_media_core::dtls_sidecar::Role::Server,
         }
     }
 
@@ -564,8 +566,8 @@ impl SipStack {
         caller_setup: Option<crate::sdp_dtls::SetupRole>,
         answer_sdp: &str,
     ) -> Option<(
-        crate::media_pipeline::LegDtlsParams,
-        crate::media_pipeline::LegDtlsParams,
+        sbc_media_core::media_pipeline::LegDtlsParams,
+        sbc_media_core::media_pipeline::LegDtlsParams,
     )> {
         if !has_dtls_identity {
             return None;
@@ -573,11 +575,11 @@ impl SipStack {
         let caller_fp = caller_fingerprint?;
         let callee = crate::sdp_dtls::parse_peer_dtls(answer_sdp)?;
         Some((
-            crate::media_pipeline::LegDtlsParams {
+            sbc_media_core::media_pipeline::LegDtlsParams {
                 peer_fingerprint: caller_fp.clone(),
                 role: Self::sbc_dtls_role(caller_setup),
             },
-            crate::media_pipeline::LegDtlsParams {
+            sbc_media_core::media_pipeline::LegDtlsParams {
                 peer_fingerprint: callee.fingerprint,
                 role: Self::sbc_dtls_role(callee.setup),
             },
@@ -590,7 +592,7 @@ impl SipStack {
     /// media failure must not fail call setup.
     async fn start_media_relay(
         &self,
-        pipeline: &dyn crate::media_pipeline::MediaController,
+        pipeline: &dyn sbc_media_core::media_pipeline::MediaController,
         session_key: &str,
         addrs: &CallAddresses,
         answer_sdp: &str,
@@ -4719,8 +4721,8 @@ mod tests {
 
     #[test]
     fn sbc_dtls_role_answers_the_peer() {
-        use crate::dtls_sidecar::Role;
         use crate::sdp_dtls::SetupRole;
+        use sbc_media_core::dtls_sidecar::Role;
         // Caller offered actpass → SBC answers passive → DTLS server.
         assert!(matches!(
             SipStack::sbc_dtls_role(Some(SetupRole::ActPass)),
@@ -4742,8 +4744,8 @@ mod tests {
 
     #[test]
     fn terminate_params_requires_identity_and_both_fingerprints() {
-        use crate::dtls_sidecar::Role;
         use crate::sdp_dtls::SetupRole;
+        use sbc_media_core::dtls_sidecar::Role;
         let answer_dtls = "v=0\r\nm=audio 5004 UDP/TLS/RTP/SAVP 8\r\n\
             a=setup:active\r\na=fingerprint:sha-384 BB:CC\r\n";
         let answer_plain = "v=0\r\nm=audio 5004 RTP/AVP 8\r\n";

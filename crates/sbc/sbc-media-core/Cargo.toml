@@ -1,0 +1,46 @@
+[package]
+name = "sbc-media-core"
+description = "SBC media plane: RTP/SRTP relay, DTLS-SRTP termination, and the gRPC MediaController boundary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# The gRPC MediaController client + server over the sbc-grpc-api proto. Off by
+# default so a build that only needs the in-process pipeline stays lean.
+grpc = ["dep:sbc-grpc-api", "dep:tonic", "dep:tokio-stream"]
+
+[dependencies]
+proto-dtls.workspace = true
+proto-rtp.workspace = true
+proto-srtp.workspace = true
+uc-codecs.workspace = true
+uc-media-engine.workspace = true
+uc-types.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+# Self-signed P-384 cert generation for the SBC's DTLS-SRTP identity. aws_lc_rs
+# backend matches the workspace crypto provider; no `ring`.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
+# SSRC / test-key generation.
+rand = "0.8"
+
+# gRPC dependencies (optional; enabled by the `grpc` feature).
+sbc-grpc-api = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+tokio-stream = { version = "0.1", optional = true, features = ["net", "sync"] }
+
+[dev-dependencies]
+# Test-only: subscriber init in the media_pipeline interop tests.
+tracing-subscriber.workspace = true
