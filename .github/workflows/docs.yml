@@ -22,7 +22,7 @@ jobs:
     name: Build site
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # setup-uv publishes no floating major tag — pin the full version.
       - uses: astral-sh/setup-uv@v8.2.0
       # Zensical is pre-1.0 — pin and bump deliberately.
