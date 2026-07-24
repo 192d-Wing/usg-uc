@@ -185,3 +185,69 @@ jobs:
       - name: Teardown
         if: always()
         run: docker compose -f "$COMPOSE" down -v || true
+
+  # Pool HA: kill one media node MID-RUN and prove new calls survive by routing
+  # to the other node. Uses the same 2-node compose. A call that the pool sends
+  # to the dead node gets a transport error and is re-routed (health/route-away);
+  # subsequently the dead node is skipped — so post-kill calls all land on the
+  # survivor, which relays MORE media than it did before the kill.
+  sipp-audio-pool-failover:
+    name: SIPp media pool — node failover (route-away)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      COMPOSE: deploy/test/docker-compose.pool.yml
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build image + start signaling, 2 media nodes, and SIPp UAS
+        run: docker compose -f "$COMPOSE" up -d --build sbc-signaling sbc-media-1 sbc-media-2 sipp-uas
+
+      - name: Wait for the signaling plane to become healthy
+        run: |
+          for i in $(seq 1 60); do
+            status=$(docker inspect --format='{{.State.Health.Status}}' sbc-signaling 2>/dev/null || echo starting)
+            echo "[$i] sbc-signaling health: $status"
+            [ "$status" = healthy ] && exit 0
+            sleep 2
+          done
+          echo "ERROR: sbc-signaling did not become healthy"; exit 1
+
+      - name: Warm-up calls (both nodes serve), then record node-1 baseline
+        run: |
+          docker compose -f "$COMPOSE" run --rm sipp-uac \
+            172.28.1.10:5060 -sf /scenarios/sipp-uac-media.xml \
+            -r 5 -l 20 -m 20 -mi 172.28.2.30 -p 5070 \
+            -recv_timeout 10000 -timeout 60s -trace_err
+          before=$(docker compose -f "$COMPOSE" logs sbc-media-1 2>&1 | grep -c 'RTP relay forwarding media' || true)
+          echo "node-1 relayed before kill: $before"
+          echo "BEFORE=$before" >> "$GITHUB_ENV"
+
+      - name: Kill media node 2
+        run: docker compose -f "$COMPOSE" kill sbc-media-2
+
+      - name: Post-kill calls must survive on node 1
+        run: |
+          docker compose -f "$COMPOSE" run --rm sipp-uac \
+            172.28.1.10:5060 -sf /scenarios/sipp-uac-media.xml \
+            -r 5 -l 20 -m 20 -mi 172.28.2.30 -p 5070 \
+            -recv_timeout 10000 -timeout 60s -trace_err
+          after=$(docker compose -f "$COMPOSE" logs sbc-media-1 2>&1 | grep -c 'RTP relay forwarding media' || true)
+          echo "node-1 relayed after kill: $after (was $BEFORE)"
+          if [ "$after" -gt "$BEFORE" ]; then
+            echo "PASS: node 1 took over — post-kill calls routed to the survivor."
+          else
+            echo "FAIL: node 1 did not take over post-kill calls (before=$BEFORE after=$after)."
+            exit 1
+          fi
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          echo "===== sbc-signaling ====="; docker compose -f "$COMPOSE" logs --tail=200 sbc-signaling || true
+          echo "===== sbc-media-1 ====="; docker compose -f "$COMPOSE" logs --tail=100 sbc-media-1 || true
+          echo "===== sbc-media-2 ====="; docker compose -f "$COMPOSE" logs --tail=100 sbc-media-2 || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f "$COMPOSE" down -v || true
