@@ -1665,6 +1665,45 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 ## Backlog
 
+### Media-node pool — remaining HA & scaling
+
+The signaling↔media split (#99–#108) and the standalone media-node pool
+(#109–#113) are merged and gate-proven: the daemon load-balances calls across N
+`sbc-media` nodes (least-loaded + `call_id` affinity), steers each call's SDP to
+its node, routes **new** calls away from a dead node, and BYE-tears-down a dead
+node's **in-flight** calls (the SRA "BYE tier"). Four audio gates are green
+(monolith, single-node split, 2-node pool, node-failover). These are the
+remaining pieces to make the pool fully production-hardened:
+
+- **Re-INVITE re-anchor (graceful SRA tier).** The biggest one. On a node death,
+  move each affected call's media to a healthy node *without a redial*: create a
+  session on the new node, then send a re-INVITE (RFC 3264 re-offer) to both legs
+  with the new node's SDP (IP/port, and fingerprint in terminate mode); media
+  resumes after a ~sub-second re-handshake instead of the endpoint redialing.
+  Upgrades #113's BYE (same detect→enumerate→act foundation, re-INVITE instead of
+  BYE). Needs B2BUA re-offer generation for an established dialog. Replicate the
+  *recipe* (leg addrs, codecs, mode) — the coarse-state agent — not per-packet
+  crypto state; ride `uc-state-sync` for signaling-node HA. (The heavier
+  hot-standby tier below is the SLA-gated alternative.)
+- **Active health probing + long-held-call gate.** Today node-down detection is
+  route-away-triggered (a new call hitting the dead node) — prompt under load but
+  not during idle. Add a background gRPC-Health probe per node for prompt
+  detection, and a CI gate with long-held calls that kills a node mid-call and
+  asserts the in-flight calls are torn down (the BYE path end-to-end).
+- **Degraded startup.** `wire_remote_media` is fail-closed on *all* configured
+  nodes; allow the daemon to start with a subset when some are down at boot
+  (require ≥1), and add missing nodes as they recover.
+- **Per-session DTLS fingerprint for multi-node terminate pools.** The daemon
+  fetches node-0's fingerprint at startup; for distinct per-node identities it
+  must advertise the per-call node's fingerprint. `AllocatedPorts.dtls_fingerprint`
+  is already plumbed (3a) — consume it per-call in the SDP rewrite. (Plain-RTP
+  pools and single nodes are already exact.)
+- **k8s EndpointSlice discovery + standalone-pool Helm.** Node list is static
+  (`SBC_MEDIA_CONTROLLER_URLS`) today; discover pool members from a headless
+  Service's EndpointSlices so scaling is automatic, and add the standalone
+  media-node `Deployment` (`replicas: N`) to the chart (co-located same-pod mode
+  shipped in #107).
+
 ### Media HA — glitchless in-call failover (hot-standby tier)
 
 Deferred HA tier for the signaling↔media split / standalone media-node pool
