@@ -19,30 +19,43 @@ use crate::grpc_media_controller::GrpcMediaController;
 use crate::media_pipeline::{AllocatedPorts, LegDtlsParams, MediaController, MediaPipelineError};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::sync::RwLock;
+use tracing::warn;
 use uc_media_engine::MediaMode;
 use uc_types::address::SbcSocketAddr;
 
-/// One media node in the pool: its gRPC client plus an approximate active-session
-/// count used for least-loaded selection.
+/// How often the health-reset task optimistically re-enables nodes marked
+/// unhealthy, so a recovered node rejoins selection (and a still-down one is
+/// simply re-marked on its next failed use).
+const HEALTH_RESET_INTERVAL: Duration = Duration::from_secs(30);
+
+/// One media node in the pool: its gRPC client, an approximate active-session
+/// count (least-loaded selection), and a health flag (route-away on failure).
 struct PoolNode {
     client: GrpcMediaController,
     /// Active sessions assigned to this node. Approximate (updated with `Relaxed`
     /// ordering, and selection races are tolerated) — good enough to balance.
     active: AtomicUsize,
+    /// Cleared when a control RPC to this node fails at the transport layer
+    /// (node down); selection skips unhealthy nodes. Optimistically re-set every
+    /// [`HEALTH_RESET_INTERVAL`] so a recovered node rejoins.
+    healthy: AtomicBool,
 }
 
-/// A [`MediaController`] over a pool of media nodes with `call_id`-affinity and
-/// least-loaded selection.
+/// A [`MediaController`] over a pool of media nodes with `call_id`-affinity,
+/// least-loaded selection, and route-away from unhealthy nodes.
 pub struct MediaPool {
-    nodes: Vec<PoolNode>,
+    nodes: Arc<Vec<PoolNode>>,
     /// `call_id → node index`. The authoritative record of which node owns a call.
     affinity: RwLock<HashMap<String, usize>>,
 }
 
 impl MediaPool {
-    /// Builds a pool over `clients` (one per media node).
+    /// Builds a pool over `clients` (one per media node) and spawns its
+    /// health-reset task.
     ///
     /// # Errors
     /// Returns an error if `clients` is empty — a pool needs at least one node.
@@ -52,14 +65,33 @@ impl MediaPool {
                 "media pool requires at least one node".to_string(),
             ));
         }
-        Ok(Self {
-            nodes: clients
+        let nodes: Arc<Vec<PoolNode>> = Arc::new(
+            clients
                 .into_iter()
                 .map(|client| PoolNode {
                     client,
                     active: AtomicUsize::new(0),
+                    healthy: AtomicBool::new(true),
                 })
                 .collect(),
+        );
+        // Optimistic recovery: periodically re-enable unhealthy nodes so a node
+        // that came back rejoins selection. A still-down node just gets re-marked
+        // on its next failed use (create_session routes away), so this needs no
+        // active health RPC.
+        let monitored = Arc::clone(&nodes);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(HEALTH_RESET_INTERVAL);
+            ticker.tick().await; // consume the immediate first tick
+            loop {
+                ticker.tick().await;
+                for node in monitored.iter() {
+                    node.healthy.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+        Ok(Self {
+            nodes,
             affinity: RwLock::new(HashMap::new()),
         })
     }
@@ -70,21 +102,23 @@ impl MediaPool {
         self.nodes.len()
     }
 
-    /// Picks the least-loaded node (lowest active-session count; ties → lowest
-    /// index). Selection reads atomics without a lock, so under a burst two
-    /// concurrent selects may pick the same node — a bounded, self-correcting
-    /// imbalance, not a correctness issue.
-    fn select(&self) -> usize {
-        let mut best = 0;
-        let mut best_load = self.nodes[0].active.load(Ordering::Relaxed);
-        for (idx, node) in self.nodes.iter().enumerate().skip(1) {
+    /// Picks the least-loaded **healthy** node (lowest active-session count; ties
+    /// → lowest index), or `None` if every node is currently marked unhealthy.
+    /// Reads atomics without a lock, so a burst of concurrent selects may pick
+    /// the same node — a bounded, self-correcting imbalance, not a correctness
+    /// issue.
+    fn select(&self) -> Option<usize> {
+        let mut best: Option<(usize, usize)> = None; // (idx, load)
+        for (idx, node) in self.nodes.iter().enumerate() {
+            if !node.healthy.load(Ordering::Relaxed) {
+                continue;
+            }
             let load = node.active.load(Ordering::Relaxed);
-            if load < best_load {
-                best = idx;
-                best_load = load;
+            if best.is_none_or(|(_, best_load)| load < best_load) {
+                best = Some((idx, load));
             }
         }
-        best
+        best.map(|(idx, _)| idx)
     }
 
     /// The node owning `call_id`, or [`MediaPipelineError::SessionNotFound`].
@@ -116,22 +150,39 @@ impl MediaController for MediaPool {
                 .await;
         }
 
-        let idx = self.select();
-        // Reserve the slot before the RPC so concurrent selects see the load;
-        // release it if creation fails.
-        self.nodes[idx].active.fetch_add(1, Ordering::Relaxed);
-        match self.nodes[idx]
-            .client
-            .create_session_with_zones(call_id, mode, a_leg_media_ip, b_leg_media_ip)
-            .await
-        {
-            Ok(ports) => {
-                self.affinity.write().await.insert(call_id.to_string(), idx);
-                Ok(ports)
-            }
-            Err(e) => {
-                self.nodes[idx].active.fetch_sub(1, Ordering::Relaxed);
-                Err(e)
+        // Try the least-loaded healthy node; on a TRANSPORT failure (node down,
+        // surfaced as MediaPipelineError::Rpc) mark it unhealthy and route the
+        // call to another node. Each failure removes one node from selection, so
+        // the loop ends when a node succeeds or all are unhealthy. Non-transport
+        // errors (bad request, exhausted, etc.) are the node's real answer and
+        // are returned as-is.
+        loop {
+            let Some(idx) = self.select() else {
+                return Err(MediaPipelineError::Rpc(
+                    "no healthy media node available".to_string(),
+                ));
+            };
+            // Reserve the slot before the RPC so concurrent selects see the load;
+            // release it if this node fails.
+            self.nodes[idx].active.fetch_add(1, Ordering::Relaxed);
+            match self.nodes[idx]
+                .client
+                .create_session_with_zones(call_id, mode, a_leg_media_ip, b_leg_media_ip)
+                .await
+            {
+                Ok(ports) => {
+                    self.affinity.write().await.insert(call_id.to_string(), idx);
+                    return Ok(ports);
+                }
+                Err(MediaPipelineError::Rpc(e)) => {
+                    self.nodes[idx].active.fetch_sub(1, Ordering::Relaxed);
+                    self.nodes[idx].healthy.store(false, Ordering::Relaxed);
+                    warn!(node = idx, error = %e, "media node unreachable; routing away");
+                }
+                Err(other) => {
+                    self.nodes[idx].active.fetch_sub(1, Ordering::Relaxed);
+                    return Err(other);
+                }
             }
         }
     }
@@ -185,8 +236,10 @@ impl MediaController for MediaPool {
 
     async fn allocate_ports(&self) -> Result<(u16, u16), MediaPipelineError> {
         // Announcement playback is not a call, so it carries no affinity; just
-        // place it on the least-loaded node.
-        let idx = self.select();
+        // place it on the least-loaded healthy node.
+        let idx = self.select().ok_or_else(|| {
+            MediaPipelineError::Rpc("no healthy media node available".to_string())
+        })?;
         self.nodes[idx].client.allocate_ports().await
     }
 }
@@ -330,5 +383,36 @@ mod tests {
             pool.affinity.read().await.get("c3").copied().unwrap(),
             c1_ip
         );
+    }
+
+    #[tokio::test]
+    async fn routes_away_from_unhealthy_node() {
+        let pool = two_node_pool().await;
+        // Mark node 0 unhealthy (as create_session would on a transport failure);
+        // every new session must now land on node 1 (127.0.0.2).
+        pool.nodes[0].healthy.store(false, Ordering::Relaxed);
+        for call in ["c1", "c2", "c3"] {
+            let s = pool
+                .create_session_with_zones(call, None, None, None)
+                .await
+                .unwrap();
+            assert_eq!(s.media_ip.unwrap().to_string(), "127.0.0.2");
+            assert_eq!(pool.affinity.read().await.get(call).copied().unwrap(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn all_unhealthy_yields_no_node_error() {
+        let pool = two_node_pool().await;
+        for node in pool.nodes.iter() {
+            node.healthy.store(false, Ordering::Relaxed);
+        }
+        let err = pool
+            .create_session_with_zones("c", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MediaPipelineError::Rpc(_)));
+        // allocate_ports likewise has nowhere to go.
+        assert!(pool.allocate_ports().await.is_err());
     }
 }
