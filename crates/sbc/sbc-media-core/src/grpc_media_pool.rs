@@ -22,7 +22,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 use tracing::warn;
 use uc_media_engine::MediaMode;
 use uc_types::address::SbcSocketAddr;
@@ -51,15 +51,23 @@ pub struct MediaPool {
     nodes: Arc<Vec<PoolNode>>,
     /// `call_id → node index`. The authoritative record of which node owns a call.
     affinity: RwLock<HashMap<String, usize>>,
+    /// Emits a call's id when the node hosting it is detected down, so the SIP
+    /// layer tears the call down (BYE both legs — the endpoints redial onto a
+    /// healthy node). Same channel shape as the in-process `media_failure_tx`.
+    media_failure_tx: Option<mpsc::UnboundedSender<String>>,
 }
 
 impl MediaPool {
     /// Builds a pool over `clients` (one per media node) and spawns its
-    /// health-reset task.
+    /// health-reset task. `media_failure_tx` receives the call ids whose node
+    /// went down (for signaling-side teardown); `None` disables that.
     ///
     /// # Errors
     /// Returns an error if `clients` is empty — a pool needs at least one node.
-    pub fn new(clients: Vec<GrpcMediaController>) -> Result<Self, MediaPipelineError> {
+    pub fn new(
+        clients: Vec<GrpcMediaController>,
+        media_failure_tx: Option<mpsc::UnboundedSender<String>>,
+    ) -> Result<Self, MediaPipelineError> {
         if clients.is_empty() {
             return Err(MediaPipelineError::Rpc(
                 "media pool requires at least one node".to_string(),
@@ -93,7 +101,42 @@ impl MediaPool {
         Ok(Self {
             nodes,
             affinity: RwLock::new(HashMap::new()),
+            media_failure_tx,
         })
+    }
+
+    /// Marks node `idx` down and tears down every in-flight call hosted on it:
+    /// drops each from the affinity map and emits its id on `media_failure_tx`
+    /// so the SIP layer BYEs it (their media is gone with the node). New calls
+    /// route away via [`Self::select`].
+    async fn fail_node(&self, idx: usize) {
+        self.nodes[idx].healthy.store(false, Ordering::Relaxed);
+        let doomed: Vec<String> = {
+            let mut affinity = self.affinity.write().await;
+            let doomed: Vec<String> = affinity
+                .iter()
+                .filter(|&(_, &node)| node == idx)
+                .map(|(call, _)| call.clone())
+                .collect();
+            for call in &doomed {
+                affinity.remove(call);
+            }
+            doomed
+        };
+        // The node holds no sessions from our view now.
+        self.nodes[idx].active.store(0, Ordering::Relaxed);
+        if !doomed.is_empty() {
+            warn!(
+                node = idx,
+                calls = doomed.len(),
+                "media node down; tearing down its in-flight calls"
+            );
+            if let Some(tx) = &self.media_failure_tx {
+                for call in doomed {
+                    let _ = tx.send(call);
+                }
+            }
+        }
     }
 
     /// Number of nodes in the pool.
@@ -175,9 +218,10 @@ impl MediaController for MediaPool {
                     return Ok(ports);
                 }
                 Err(MediaPipelineError::Rpc(e)) => {
-                    self.nodes[idx].active.fetch_sub(1, Ordering::Relaxed);
-                    self.nodes[idx].healthy.store(false, Ordering::Relaxed);
                     warn!(node = idx, error = %e, "media node unreachable; routing away");
+                    // Mark down + BYE any in-flight calls it was hosting, then
+                    // retry this call on another node (loop).
+                    self.fail_node(idx).await;
                 }
                 Err(other) => {
                     self.nodes[idx].active.fetch_sub(1, Ordering::Relaxed);
@@ -287,12 +331,12 @@ mod tests {
         // node binds its advertised_media_ip for the relay (see grpc_media_server).
         let a = spawn_node("127.0.0.1").await;
         let b = spawn_node("127.0.0.2").await;
-        MediaPool::new(vec![a, b]).unwrap()
+        MediaPool::new(vec![a, b], None).unwrap()
     }
 
     #[tokio::test]
     async fn empty_pool_rejected() {
-        assert!(MediaPool::new(vec![]).is_err());
+        assert!(MediaPool::new(vec![], None).is_err());
     }
 
     #[tokio::test]
@@ -414,5 +458,26 @@ mod tests {
         assert!(matches!(err, MediaPipelineError::Rpc(_)));
         // allocate_ports likewise has nowhere to go.
         assert!(pool.allocate_ports().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn node_down_byes_its_in_flight_calls() {
+        let a = spawn_node("127.0.0.1").await;
+        let b = spawn_node("127.0.0.2").await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let pool = MediaPool::new(vec![a, b], Some(tx)).unwrap();
+
+        pool.create_session_with_zones("c1", None, None, None)
+            .await
+            .unwrap();
+        let node = pool.affinity.read().await.get("c1").copied().unwrap();
+
+        // The node hosting c1 goes down: c1 is dropped from affinity, its slot
+        // released, and its id emitted so the SIP layer BYEs it.
+        pool.fail_node(node).await;
+        assert!(pool.node_for("c1").await.is_err());
+        assert!(!pool.nodes[node].healthy.load(Ordering::Relaxed));
+        assert_eq!(pool.nodes[node].active.load(Ordering::Relaxed), 0);
+        assert_eq!(rx.recv().await.unwrap(), "c1");
     }
 }
