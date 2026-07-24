@@ -608,9 +608,17 @@ impl Server {
                 Arc::new(clients[0].clone())
             } else {
                 info!(nodes = clients.len(), "Media-node pool active");
+                // A node crashing takes its in-flight calls with it: the pool
+                // emits those call ids here, and start()'s drain BYEs them so the
+                // endpoints redial onto a healthy node. (New calls route away
+                // automatically.) Reuses the in-process media-failure drain.
+                let (failure_tx, failure_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                self.media_failure_rx = Some(failure_rx);
                 Arc::new(
-                    MediaPool::new(clients.clone()).map_err(|e| ServerError::ConfigError {
-                        message: format!("failed to build media pool: {e}"),
+                    MediaPool::new(clients.clone(), Some(failure_tx)).map_err(|e| {
+                        ServerError::ConfigError {
+                            message: format!("failed to build media pool: {e}"),
+                        }
                     })?,
                 )
             };
