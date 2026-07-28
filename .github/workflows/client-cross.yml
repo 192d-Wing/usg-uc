@@ -65,7 +65,7 @@ jobs:
           shared-key: cross-${{ matrix.target }}
       # aws-lc-fips-sys builds the FIPS module with Go; macOS runners do not
       # ship it on PATH (ubuntu/windows do).
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         if: runner.os == 'macOS'
         with:
           go-version: stable
