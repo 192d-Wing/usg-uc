@@ -667,6 +667,66 @@ impl SipStack {
         bye
     }
 
+    /// Builds an in-dialog **re-INVITE** toward one leg, re-offering media at
+    /// `sdp_offer` — used by media re-anchor to move a call to a healthy media
+    /// node without a redial (RFC 3264 re-offer). Mirrors [`Self::build_leg_bye`]'s
+    /// dialog addressing (To/From/Call-ID per leg), adds a `Contact` refreshing
+    /// the SBC's dialog target and the SDP offer body. `cseq` is the next
+    /// sequence number in the SBC's request stream toward that leg.
+    ///
+    /// NOTE (Phase 3, re-anchor): this is the outbound half. The full loop —
+    /// handling the endpoint's 200 OK answer (its media address) + ACK + wiring
+    /// the new node — is not yet activated; BYE remains the live failover until
+    /// it is. Kept `#[allow(dead_code)]` until the orchestrator lands.
+    #[allow(dead_code)]
+    fn build_leg_reinvite(
+        addrs: &CallAddresses,
+        target_b_leg: bool,
+        cseq: u32,
+        sdp_offer: &[u8],
+    ) -> proto_sip::message::SipRequest {
+        let (dest, other_call_id) = if target_b_leg {
+            (&addrs.b_leg_destination, &addrs.b_leg_sip_call_id)
+        } else {
+            (&addrs.a_leg_source, &addrs.a_leg_sip_call_id)
+        };
+        let uri = SipUri::new(dest.ip().to_string()).with_port(dest.port());
+        let mut inv = proto_sip::message::SipRequest::new(Method::Invite, uri);
+        inv.headers.set(HeaderName::CallId, other_call_id);
+        if target_b_leg {
+            // SBC is the UAC on the B-leg: From = our INVITE From, To = the callee
+            // with their tag (same dialog as the original INVITE).
+            inv.headers.set(HeaderName::From, &addrs.b_leg_from);
+            inv.headers.set(
+                HeaderName::To,
+                with_tag(&addrs.b_leg_to, addrs.dialog_to_tag.as_deref()),
+            );
+        } else {
+            // SBC is the UAS on the A-leg: From = the To we answered with (+tag),
+            // To = the caller's From.
+            inv.headers.set(
+                HeaderName::From,
+                with_tag(&addrs.a_leg_to, addrs.dialog_to_tag.as_deref()),
+            );
+            inv.headers.set(HeaderName::To, &addrs.a_leg_from);
+        }
+        inv.headers.set(HeaderName::CSeq, format!("{cseq} INVITE"));
+        inv.headers.set(HeaderName::MaxForwards, "70");
+        let branch = generate_branch();
+        inv.headers.add(Header::new(
+            HeaderName::Via,
+            format!("SIP/2.0/UDP {};branch={}", addrs.local_addr, branch),
+        ));
+        // Target-refresh Contact: subsequent in-dialog requests come back to us.
+        inv.headers
+            .set(HeaderName::Contact, format!("<sip:{}>", addrs.local_addr));
+        inv.headers.set(HeaderName::ContentType, "application/sdp");
+        inv.headers
+            .set(HeaderName::ContentLength, sdp_offer.len().to_string());
+        inv.body = Some(Bytes::copy_from_slice(sdp_offer));
+        inv
+    }
+
     /// Removes all state for a call the SBC is tearing down (dialog correlation,
     /// call record, INVITE transactions, RTP ports, media session).
     async fn cleanup_terminated_call(&self, internal_id: &CallId, addrs: &CallAddresses) {
@@ -4840,6 +4900,50 @@ mod tests {
         assert!(b.contains("2 BYE"));
         assert!(b.contains("tag=sbctag")); // our From tag
         assert!(b.contains("tag=calleetag")); // callee's tag in To
+    }
+
+    #[test]
+    fn build_leg_reinvite_is_in_dialog_and_carries_the_offer() {
+        let addrs = confirmed_call_addresses();
+        let sdp = b"v=0\r\no=- 1 1 IN IP4 172.28.2.12\r\nc=IN IP4 172.28.2.12\r\nm=audio 16400 RTP/AVP 0\r\n";
+
+        // A-leg re-INVITE: SBC as UAS toward the caller, same dialog as the BYE,
+        // carrying the new media offer.
+        let a_req = SipStack::build_leg_reinvite(&addrs, false, 2, sdp);
+        assert_eq!(a_req.method, Method::Invite);
+        let a = String::from_utf8(SipMessage::Request(a_req).to_bytes().to_vec()).unwrap();
+        assert!(a.starts_with("INVITE "), "{a}");
+        assert!(
+            a.contains("10.0.0.1"),
+            "A-leg re-INVITE targets the caller: {a}"
+        );
+        assert!(a.contains("aleg-callid"));
+        assert!(a.contains("2 INVITE"));
+        assert!(a.contains("tag=calleetag")); // our From tag (same dialog)
+        assert!(a.contains("callertag")); // caller's tag in To
+        assert!(a.contains("application/sdp"));
+        assert!(a.contains("Contact:"));
+        assert!(
+            a.contains("172.28.2.12"),
+            "carries the new node's media offer: {a}"
+        );
+
+        // B-leg re-INVITE: SBC as UAC toward the callee.
+        let b = String::from_utf8(
+            SipMessage::Request(SipStack::build_leg_reinvite(&addrs, true, 3, sdp))
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(b.starts_with("INVITE "));
+        assert!(
+            b.contains("10.0.0.2"),
+            "B-leg re-INVITE targets the callee: {b}"
+        );
+        assert!(b.contains("bleg-callid"));
+        assert!(b.contains("3 INVITE"));
+        assert!(b.contains("tag=calleetag")); // callee's tag in To
+        assert!(b.contains("172.28.2.12"));
     }
 
     #[tokio::test]
