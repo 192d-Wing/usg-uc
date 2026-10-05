@@ -343,6 +343,14 @@ impl GrpcServer {
     fn configure_tls(&self) -> Result<Option<ServerTlsConfig>, GrpcServerError> {
         let (cert_path, key_path) = match (&self.config.tls_cert_path, &self.config.tls_key_path) {
             (Some(cert), Some(key)) => (cert, key),
+            // mTLS cannot be satisfied without a server certificate: refuse
+            // to start rather than serve in plaintext.
+            (None, None) if self.config.require_mtls => {
+                return Err(GrpcServerError::TlsError {
+                    reason: "require_mtls is true but tls_cert_path and tls_key_path are not set"
+                        .to_string(),
+                });
+            }
             (None, None) => return Ok(None),
             _ => {
                 return Err(GrpcServerError::TlsError {
@@ -385,5 +393,39 @@ impl GrpcServer {
         }
 
         Ok(Some(tls_config))
+    }
+}
+
+#[cfg(all(test, not(feature = "cluster")))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::server::ServerStats;
+    use uc_metrics::SbcMetrics;
+
+    fn server_with(config: GrpcConfig) -> GrpcServer {
+        let state = Arc::new(AppState::new(
+            SbcMetrics::standard(),
+            Arc::new(ServerStats::default()),
+        ));
+        GrpcServer::new(config, state, ShutdownSignal::new())
+    }
+
+    #[test]
+    fn require_mtls_without_certificate_is_an_error() {
+        let config = GrpcConfig {
+            require_mtls: true,
+            ..GrpcConfig::default()
+        };
+        assert!(matches!(
+            server_with(config).configure_tls(),
+            Err(GrpcServerError::TlsError { .. })
+        ));
+    }
+
+    #[test]
+    fn no_tls_and_no_mtls_requirement_stays_plaintext() {
+        let config = GrpcConfig::default();
+        assert!(matches!(server_with(config).configure_tls(), Ok(None)));
     }
 }
