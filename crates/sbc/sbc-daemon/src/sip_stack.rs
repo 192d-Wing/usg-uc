@@ -3737,10 +3737,11 @@ fn resolve_sip_uri_to_addr(uri: &str) -> Option<SbcSocketAddr> {
 /// - `"Alice" <sip:alice@example.com>;tag=1234`
 /// - `sip:alice@example.com`
 fn extract_uri_from_header(header_value: &str) -> String {
+    // Search for '>' only after the '<': a display name may itself contain '>'.
     if let Some(start) = header_value.find('<')
-        && let Some(end) = header_value.find('>')
+        && let Some(len) = header_value[start + 1..].find('>')
     {
-        return header_value[start + 1..end].to_string();
+        return header_value[start + 1..start + 1 + len].to_string();
     }
     // No angle brackets — take the value before any parameters
     header_value
@@ -4535,6 +4536,17 @@ mod tests {
             extract_uri_from_header("sip:alice@example.com;tag=1234"),
             "sip:alice@example.com"
         );
+    }
+
+    #[test]
+    fn extract_uri_from_header_tolerates_close_bracket_before_open() {
+        // A '>' inside the display name precedes the '<' of the name-addr.
+        assert_eq!(
+            extract_uri_from_header("\">\" <sip:alice@example.com>;tag=1234"),
+            "sip:alice@example.com"
+        );
+        // Unbalanced brackets must not panic.
+        assert_eq!(extract_uri_from_header(">x<"), ">x<");
     }
 
     #[test]
