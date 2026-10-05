@@ -1071,6 +1071,45 @@ pub async fn sync_trunk_group_to_router(state: &Arc<AppState>, group_json: &serd
     tracing::info!(trunk_group = id, css = ?css_id, "Synced trunk group to SIP stack router");
 }
 
+/// Builds a router `DialPlan` from the JSON entries of an API dial plan.
+fn dial_plan_from_entries(plan_id: &str, entries: &[serde_json::Value]) -> uc_routing::DialPlan {
+    let mut plan = uc_routing::DialPlan::new(plan_id, plan_id);
+    for (idx, entry) in entries.iter().enumerate() {
+        let trunk_group = entry
+            .get("trunk_group_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let pattern_value = entry
+            .get("pattern")
+            .or_else(|| entry.get("pattern_value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(".*");
+        let pattern_type = entry
+            .get("pattern_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("prefix");
+        let priority = entry
+            .get("priority")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1) as u32;
+
+        // Same pattern_type vocabulary as config dial plans and route patterns.
+        // An absent pattern or the legacy ".*" default stays a catch-all.
+        let pattern = match pattern_type {
+            "any" => uc_routing::DialPattern::Any,
+            _ if matches!(pattern_value, ".*" | "*" | "") => uc_routing::DialPattern::Any,
+            "exact" => uc_routing::DialPattern::exact(pattern_value),
+            "wildcard" => uc_routing::DialPattern::wildcard(pattern_value),
+            _ => uc_routing::DialPattern::prefix(pattern_value),
+        };
+        let entry_id = format!("{plan_id}-{idx}");
+        let dp_entry =
+            uc_routing::DialPlanEntry::new(entry_id, pattern, trunk_group).with_priority(priority);
+        plan.add_entry(dp_entry);
+    }
+    plan
+}
+
 /// Syncs a dial plan entry to the SipStack router.
 pub async fn sync_dial_plan_to_router(
     state: &Arc<AppState>,
@@ -1081,27 +1120,7 @@ pub async fn sync_dial_plan_to_router(
         return;
     };
 
-    let mut plan = uc_routing::DialPlan::new(plan_id, plan_id);
-    for (idx, entry) in entries.iter().enumerate() {
-        let trunk_group = entry
-            .get("trunk_group_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let _pattern_value = entry
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .unwrap_or(".*");
-        let priority = entry
-            .get("priority")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(1) as u32;
-
-        let pattern = uc_routing::DialPattern::Any;
-        let entry_id = format!("{plan_id}-{idx}");
-        let dp_entry =
-            uc_routing::DialPlanEntry::new(entry_id, pattern, trunk_group).with_priority(priority);
-        plan.add_entry(dp_entry);
-    }
+    let plan = dial_plan_from_entries(plan_id, entries);
 
     sip_stack.add_dial_plan_to_router(plan).await;
     tracing::info!(
@@ -1392,6 +1411,38 @@ mod tests {
         let metrics = SbcMetrics::standard();
         let stats = Arc::new(ServerStats::default());
         Arc::new(AppState::new(metrics, stats))
+    }
+
+    #[test]
+    fn dial_plan_sync_honours_entry_pattern() {
+        let entries = [
+            serde_json::json!({"pattern": "+1", "trunk_group_id": "us"}),
+            serde_json::json!({"pattern": "911", "pattern_type": "exact", "trunk_group_id": "es"}),
+            serde_json::json!({"pattern": "1XXX", "pattern_type": "wildcard", "trunk_group_id": "ext"}),
+        ];
+        let plan = dial_plan_from_entries("p", &entries);
+
+        assert_eq!(plan.match_number("+15551234567").unwrap().trunk_group, "us");
+        assert_eq!(plan.match_number("911").unwrap().trunk_group, "es");
+        assert_eq!(plan.match_number("1234").unwrap().trunk_group, "ext");
+        // Numbers outside every configured pattern must not match.
+        assert!(plan.match_number("0119005551234").is_none());
+        assert!(plan.match_number("9110").is_none());
+    }
+
+    #[test]
+    fn dial_plan_sync_keeps_explicit_catch_all() {
+        for entry in [
+            serde_json::json!({"trunk_group_id": "any"}),
+            serde_json::json!({"pattern": ".*", "trunk_group_id": "any"}),
+            serde_json::json!({"pattern_type": "any", "trunk_group_id": "any"}),
+        ] {
+            let plan = dial_plan_from_entries("p", &[entry]);
+            assert_eq!(
+                plan.match_number("0119005551234").unwrap().trunk_group,
+                "any"
+            );
+        }
     }
 
     fn test_server() -> ApiServer {

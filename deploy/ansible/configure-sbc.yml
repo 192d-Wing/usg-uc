@@ -12,6 +12,9 @@
 #   ansible-playbook -i inventory.yml configure-sbc.yml
 #   ansible-playbook -i inventory.yml configure-sbc.yml -e sbc_api_url=http://localhost:8080/api/v1
 #   ansible-playbook -i inventory.yml configure-sbc.yml --tags trunks
+#
+# Trunk credentials are read from the environment, never committed:
+#   SBC_TRUNK_SIP_USERNAME, SBC_TRUNK_SIP_PASSWORD
 #   ansible-playbook -i inventory.yml configure-sbc.yml --tags users
 
 - name: Configure USG SBC
@@ -58,8 +61,8 @@
             zone: outside
             register_enabled: true
             register_expires: 25
-            sip_username: "611956_test"
-            sip_password: "ciscocisco12-"
+            sip_username: "{{ lookup('env', 'SBC_TRUNK_SIP_USERNAME') }}"
+            sip_password: "{{ lookup('env', 'SBC_TRUNK_SIP_PASSWORD') }}"
             sip_domain: sip.bulkvs.com
             options_ping_enabled: true
             options_ping_interval: 30
