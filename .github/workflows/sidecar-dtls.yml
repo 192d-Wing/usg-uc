@@ -33,7 +33,7 @@ jobs:
       run:
         working-directory: sidecar/dtls-terminator
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v5
         with:
@@ -83,7 +83,7 @@ jobs:
       run:
         working-directory: sidecar/srtp-test-peer
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v5
         with:
