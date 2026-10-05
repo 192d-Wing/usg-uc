@@ -15,7 +15,7 @@
     "@cloudscape-design/global-styles": "^1.0.60",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
-    "react-router-dom": "^7.17.0"
+    "react-router-dom": "^7.18.4"
   },
   "devDependencies": {
     "@types/react": "^19.2.17",
