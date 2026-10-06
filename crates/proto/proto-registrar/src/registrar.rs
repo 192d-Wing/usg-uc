@@ -665,8 +665,17 @@ impl AuthenticatedRegistrar {
             );
 
             match auth_result {
-                AuthResult::Success { .. } => {
-                    // Authentication successful, proceed with registration
+                AuthResult::Success { username, .. } => {
+                    // RFC 3261 §10.3 step 4: the authenticated identity must
+                    // be authorised for this AOR. Users may register only
+                    // their own address-of-record (user part is case-sensitive,
+                    // §19.1.4).
+                    if aor_user(&request.aor) != Some(username.as_str()) {
+                        return Ok(RegisterResponse::error(
+                            403,
+                            "Forbidden: credentials do not match address-of-record",
+                        ));
+                    }
                 }
                 AuthResult::ChallengeRequired { challenge } => {
                     return Ok(RegisterResponse::unauthorized(&challenge));
@@ -722,9 +731,27 @@ impl AuthenticatedRegistrar {
     }
 }
 
+/// Returns the user part of an address-of-record (`sip:user@host` → `user`),
+/// or `None` when it has no user part.
+fn aor_user(aor: &str) -> Option<&str> {
+    let without_scheme = aor
+        .strip_prefix("sips:")
+        .or_else(|| aor.strip_prefix("sip:"))
+        .unwrap_or(aor);
+    without_scheme.split_once('@').map(|(user, _)| user)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authentication::{AuthAlgorithm, AuthQop};
+
+    #[test]
+    fn aor_user_extracts_user_part() {
+        assert_eq!(aor_user("sip:alice@example.com"), Some("alice"));
+        assert_eq!(aor_user("sips:alice@example.com:5061"), Some("alice"));
+        assert_eq!(aor_user("sip:example.com"), None);
+    }
 
     fn test_register_request(aor: &str, contact: &str) -> RegisterRequest {
         RegisterRequest {
@@ -738,6 +765,62 @@ mod tests {
             authorization: None,
             method: "REGISTER".to_string(),
         }
+    }
+
+    /// Builds a valid Digest Authorization header for `username` against the
+    /// nonce in `challenge`, the way a real UA would.
+    fn digest_authorization(challenge: &str, username: &str, password: &str) -> String {
+        let field = |name: &str| {
+            let key = format!("{name}=\"");
+            let start = challenge.find(&key).unwrap() + key.len();
+            challenge[start..].split('"').next().unwrap().to_string()
+        };
+        let (realm, nonce) = (field("realm"), field("nonce"));
+        let response =
+            crate::authentication::compute_digest_response(&crate::authentication::DigestParams {
+                username,
+                realm: &realm,
+                password,
+                method: "REGISTER",
+                uri: "sip:example.com",
+                nonce: &nonce,
+                algorithm: AuthAlgorithm::Sha256,
+                qop: Some(AuthQop::Auth),
+                nc: Some(1),
+                cnonce: Some("cnonce1"),
+                entity_body: None,
+            });
+        format!(
+            "Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", \
+             uri=\"sip:example.com\", response=\"{response}\", algorithm=SHA-256, \
+             qop=auth, nc=00000001, cnonce=\"cnonce1\""
+        )
+    }
+
+    /// RFC 3261 §10.3 step 4: the authenticated user may only register their
+    /// own address-of-record.
+    #[test]
+    fn authenticated_user_cannot_register_another_aor() {
+        let config = RegistrarConfig::new()
+            .with_realm("example.com")
+            .with_auth_required(true);
+        let mut registrar = AuthenticatedRegistrar::new(config)
+            .with_password_lookup(|u, _| (u == "alice").then(|| "secret".to_string()));
+
+        for (aor, expected) in [("sip:bob@example.com", 403), ("sip:alice@example.com", 200)] {
+            let challenge = registrar
+                .process_register(&test_register_request(aor, "sip:x@10.0.0.5:5060"))
+                .unwrap();
+            assert_eq!(challenge.status_code, 401);
+            let www = challenge.www_authenticate.clone().unwrap();
+
+            let mut request = test_register_request(aor, "sip:x@10.0.0.5:5060");
+            request.authorization = Some(digest_authorization(&www, "alice", "secret"));
+            let response = registrar.process_register(&request).unwrap();
+            assert_eq!(response.status_code, expected, "aor {aor}: {response:?}");
+        }
+        assert!(registrar.location().has_bindings("sip:alice@example.com"));
+        assert!(!registrar.location().has_bindings("sip:bob@example.com"));
     }
 
     #[test]
