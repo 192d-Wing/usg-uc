@@ -812,6 +812,12 @@ impl SipStack {
         self.bearer = Some(bearer);
     }
 
+    /// Whether REGISTER requests are authenticated at all (bearer token or
+    /// digest). When false, any peer can bind any address-of-record.
+    pub fn register_auth_enabled(&self) -> bool {
+        self.bearer.is_some() || self.config.require_auth
+    }
+
     /// Sets the Voice Protection System engine for call screening.
     pub fn set_vps_engine(&mut self, engine: uc_vps::VpsEngine) {
         self.vps = Some(tokio::sync::Mutex::new(engine));
@@ -4163,6 +4169,16 @@ mod tests {
             }
             other => panic!("Expected 483 response, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn register_auth_enabled_reflects_config() {
+        assert!(!SipStack::new(SipStackConfig::default()).register_auth_enabled());
+        let digest = SipStackConfig {
+            require_auth: true,
+            ..SipStackConfig::default()
+        };
+        assert!(SipStack::new(digest).register_auth_enabled());
     }
 
     #[tokio::test]
