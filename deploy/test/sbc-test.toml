@@ -98,3 +98,19 @@ strategy = "round_robin"
   port = 5080
   protocol = "udp"
   max_calls = 5000
+
+# ── Trunk Group: the SIPp UAC (test caller). Not a routing target; listing it
+# makes 172.28.1.30 an admitted INVITE source (calls are only accepted from
+# configured trunks or registered endpoints). ──
+
+[[trunk_groups]]
+id = "sipp-uac"
+name = "SIPp UAC (admitted caller)"
+zone = "signaling"
+strategy = "priority"
+
+  [[trunk_groups.trunks]]
+  id = "sipp-uac-1"
+  host = "172.28.1.30"
+  port = 5070
+  protocol = "udp"

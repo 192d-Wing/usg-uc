@@ -955,6 +955,15 @@ impl SipStack {
             }
 
             router.add_trunk_group(group);
+
+            // Config-file trunks are admitted INVITE sources too (the API
+            // path does this in register_inbound_trunk). No CSS for these.
+            let map = self.inbound_trunk_map.get_mut();
+            for t_config in &tg_config.trunks {
+                for ip in resolve_trunk_host_ips(&t_config.host) {
+                    map.insert(ip, (tg_config.id.clone(), None));
+                }
+            }
         }
 
         // Load dial plans
@@ -3207,23 +3216,8 @@ impl SipStack {
     ) {
         let mut map = self.inbound_trunk_map.write().await;
         for (host, _port) in hosts {
-            // Resolve hostname to IP
-            let addr_str = format!("{host}:0");
-            if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
-                map.insert(
-                    addr.ip(),
-                    (trunk_group_id.to_string(), css_id.map(String::from)),
-                );
-            } else {
-                use std::net::ToSocketAddrs;
-                if let Ok(mut addrs) = addr_str.to_socket_addrs()
-                    && let Some(addr) = addrs.find(std::net::SocketAddr::is_ipv4)
-                {
-                    map.insert(
-                        addr.ip(),
-                        (trunk_group_id.to_string(), css_id.map(String::from)),
-                    );
-                }
+            for ip in resolve_trunk_host_ips(host) {
+                map.insert(ip, (trunk_group_id.to_string(), css_id.map(String::from)));
             }
         }
         info!(trunk_group = trunk_group_id, css = ?css_id, hosts = hosts.len(), "Registered inbound trunk for CSS routing");
@@ -3782,6 +3776,20 @@ fn parse_manipulation_action(action: &str, header: &str, value: &str) -> Manipul
 ///
 /// Parses the host and port from URIs like `sip:user@host:port` or `sip:host`.
 /// Defaults to port 5060 if not specified.
+/// Resolves a trunk host (IP literal or hostname) to every address it names.
+/// A hostname is resolved synchronously; failures yield an empty list.
+fn resolve_trunk_host_ips(host: &str) -> Vec<std::net::IpAddr> {
+    use std::net::ToSocketAddrs;
+
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return vec![ip.to_canonical()];
+    }
+    format!("{host}:0")
+        .to_socket_addrs()
+        .map(|addrs| addrs.map(|a| a.ip().to_canonical()).collect())
+        .unwrap_or_default()
+}
+
 fn resolve_sip_uri_to_addr(uri: &str) -> Option<SbcSocketAddr> {
     use std::net::ToSocketAddrs;
 
@@ -4877,6 +4885,17 @@ mod tests {
 
         // Router should be set
         assert!(stack.router.is_some());
+        // Config-file trunks are admitted sources for INVITE.
+        assert!(
+            stack
+                .is_admitted_source(std::net::Ipv4Addr::LOCALHOST.into())
+                .await
+        );
+        assert!(
+            !stack
+                .is_admitted_source(std::net::Ipv4Addr::new(10, 9, 9, 9).into())
+                .await
+        );
     }
 
     #[tokio::test]
