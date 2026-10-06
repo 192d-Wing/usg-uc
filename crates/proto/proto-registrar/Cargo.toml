@@ -23,7 +23,7 @@ thiserror = "2.0"
 # SHA-256 / SHA-512-256 through the same aws-lc-rs module the rest of the
 # workspace uses.
 md5 = "0.7"
-aws-lc-rs.workspace = true
+aws-lc-rs = { workspace = true, default-features = false, features = ["aws-lc-sys"] }
 
 # Optional storage dependencies
 serde = { workspace = true, features = ["derive"], optional = true }
