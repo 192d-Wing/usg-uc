@@ -615,29 +615,32 @@ impl Authenticator {
     }
 }
 
-/// Generates a cryptographically random nonce.
-fn generate_random_nonce() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
+/// Returns `n` CSPRNG bytes as lowercase hex.
+fn random_hex(n: usize) -> String {
+    use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+    use std::fmt::Write;
 
-    // Combine timestamp with random data for uniqueness
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-
-    // Use simple random generation without external crates
-    // In production, use a proper CSPRNG
-    let random_part: u64 = {
-        // Simple PRNG based on timestamp and memory address
-        let addr = &raw const timestamp as u64;
-        timestamp as u64 ^ addr.wrapping_mul(0x517cc1b727220a95)
-    };
-
-    format!("{:016x}{:016x}", timestamp as u64, random_part)
+    let mut bytes = vec![0u8; n];
+    // SystemRandom only fails if the OS entropy source is unavailable; a
+    // nonce from a failed fill would be all zeros, so refuse instead.
+    #[allow(clippy::expect_used)]
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .expect("system CSPRNG unavailable");
+    bytes.iter().fold(String::with_capacity(n * 2), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
-/// Generates an opaque value.
+/// Generates a cryptographically random 128-bit nonce.
+fn generate_random_nonce() -> String {
+    random_hex(16)
+}
+
+/// Generates a random opaque value, independent of the nonce.
 fn generate_opaque() -> String {
-    generate_random_nonce()[..16].to_string()
+    random_hex(8)
 }
 
 /// Parameters for digest response computation.
@@ -739,6 +742,31 @@ mod tests {
 
         assert_ne!(nonce1, nonce2);
         assert_eq!(auth.nonce_count(), 2);
+    }
+
+    /// Nonces must come from a CSPRNG: consecutive values share no
+    /// clock-derived prefix, and the opaque is not a slice of the nonce.
+    #[test]
+    fn nonce_is_not_clock_derived() {
+        let a = generate_random_nonce();
+        let b = generate_random_nonce();
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, b);
+        // The leading 64 bits must not be the wall clock in nanoseconds.
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let hour_ns = 3_600_000_000_000u64;
+        let lead = u64::from_str_radix(&a[..16], 16).unwrap();
+        assert!(
+            lead.abs_diff(now_ns) > hour_ns,
+            "nonce prefix is the clock: {a}"
+        );
+        let mut auth = Authenticator::new();
+        let challenge = auth.create_challenge("example.com");
+        let opaque = challenge.opaque.unwrap();
+        assert!(!challenge.nonce.starts_with(&opaque));
     }
 
     #[test]
