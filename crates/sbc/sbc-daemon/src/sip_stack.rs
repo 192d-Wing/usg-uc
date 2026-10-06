@@ -30,7 +30,7 @@ use proto_sip::manipulation::{
     ManipulationPolicy, ManipulationRule,
 };
 use proto_sip::uri::SipUri;
-use proto_sip::{Header, HeaderName, Method, SipMessage, StatusCode};
+use proto_sip::{Header, HeaderName, Method, SipMessage, SipRequest, StatusCode};
 use proto_sip::{TopologyHider, TopologyHidingConfig as SipTopologyConfig, TopologyHidingMode};
 use proto_transaction::{
     ClientInviteTransaction, ClientNonInviteTransaction, ServerInviteTransaction,
@@ -2626,9 +2626,9 @@ impl SipStack {
         } else if let Some(id) = corr.b_leg.get(&sip_call_id) {
             (id.clone(), false)
         } else {
-            // Unknown call — just respond 200 OK
+            // Unknown dialog: 481 (RFC 3261 §15.1.2).
             debug!(call_id = %sip_call_id, "BYE for unknown call");
-            let response = create_response_from_request(req, StatusCode::OK);
+            let response = create_response_from_request(req, StatusCode::CALL_DOES_NOT_EXIST);
             return ProcessResult::Response {
                 message: SipMessage::Response(response),
                 destination: source,
@@ -2636,7 +2636,7 @@ impl SipStack {
         };
 
         let Some(a) = corr.addresses.get(&internal_id) else {
-            let response = create_response_from_request(req, StatusCode::OK);
+            let response = create_response_from_request(req, StatusCode::CALL_DOES_NOT_EXIST);
             return ProcessResult::Response {
                 message: SipMessage::Response(response),
                 destination: source,
@@ -2644,6 +2644,22 @@ impl SipStack {
         };
         let addrs = a.clone();
         drop(corr);
+
+        // The BYE must come from the dialog peer on that leg and carry that
+        // leg's tags; a Call-ID alone is caller-chosen and visible on the wire.
+        if let Some(status) = bye_dialog_mismatch(req, &addrs, is_from_a_leg, source) {
+            warn!(
+                call_id = %sip_call_id,
+                source = %source,
+                status = status.code(),
+                "Rejecting BYE that does not match the dialog"
+            );
+            let response = create_response_from_request(req, status);
+            return ProcessResult::Response {
+                message: SipMessage::Response(response),
+                destination: source,
+            };
+        }
 
         // Terminate the call
         {
@@ -3776,6 +3792,51 @@ fn parse_manipulation_action(action: &str, header: &str, value: &str) -> Manipul
 ///
 /// Parses the host and port from URIs like `sip:user@host:port` or `sip:host`.
 /// Defaults to port 5060 if not specified.
+/// Checks a BYE against the dialog it claims (RFC 3261 §12.2.2): the sender's
+/// From tag must be that leg's remote tag, its To tag (when the dialog is
+/// confirmed) our local tag, and the source IP must be the leg's peer.
+/// Returns the status to answer with on a mismatch.
+fn bye_dialog_mismatch(
+    req: &SipRequest,
+    addrs: &CallAddresses,
+    is_from_a_leg: bool,
+    source: SbcSocketAddr,
+) -> Option<StatusCode> {
+    let from_tag = req
+        .headers
+        .get_value(&HeaderName::From)
+        .and_then(|v| extract_param(v, "tag"));
+    let to_tag = req
+        .headers
+        .get_value(&HeaderName::To)
+        .and_then(|v| extract_param(v, "tag"));
+
+    // (remote tag, our tag, peer address) as seen from the leg the BYE came in on.
+    let (expected_from, expected_to, peer) = if is_from_a_leg {
+        (
+            extract_param(&addrs.a_leg_from, "tag"),
+            addrs.dialog_to_tag.as_deref(),
+            addrs.a_leg_source,
+        )
+    } else {
+        (
+            addrs.dialog_to_tag.as_deref(),
+            extract_param(&addrs.b_leg_from, "tag"),
+            addrs.b_leg_destination,
+        )
+    };
+
+    let tags_ok =
+        from_tag == expected_from && expected_to.is_none_or(|t| to_tag.is_none_or(|got| got == t));
+    if !tags_ok {
+        return Some(StatusCode::CALL_DOES_NOT_EXIST);
+    }
+    if source.ip().to_canonical() != peer.ip().to_canonical() {
+        return Some(StatusCode::FORBIDDEN);
+    }
+    None
+}
+
 /// Resolves a trunk host (IP literal or hostname) to every address it names.
 /// A hostname is resolved synchronously; failures yield an empty list.
 fn resolve_trunk_host_ips(host: &str) -> Vec<std::net::IpAddr> {
@@ -4581,6 +4642,102 @@ mod tests {
         assert_eq!(stack.call_count().await, 0);
     }
 
+    /// Sets up a registered bob and an INVITE from alice (A-leg Call-ID
+    /// `call-bye-guard@test`, From tag `g1`), returning alice's address.
+    async fn call_from_alice(stack: &SipStack) -> SbcSocketAddr {
+        stack
+            .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
+            .await;
+        let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK041\r\n\
+            From: <sip:bob@sbc.local>;tag=r4\r\n\
+            To: <sip:bob@sbc.local>\r\n\
+            Call-ID: reg-bob-guard@test\r\n\
+            CSeq: 1 REGISTER\r\n\
+            Contact: <sip:bob@127.0.0.1:5060>\r\n\
+            Expires: 3600\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+        let bob = SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060);
+        stack
+            .process_message(&Bytes::from_static(register), bob, None)
+            .await;
+        let invite = b"INVITE sip:bob@sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK042\r\n\
+            From: <sip:alice@example.com>;tag=g1\r\n\
+            To: <sip:bob@sbc.local>\r\n\
+            Call-ID: call-bye-guard@test\r\n\
+            CSeq: 1 INVITE\r\n\
+            Contact: <sip:alice@192.168.1.1:5060>\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+        let alice = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 168, 1, 1), 5060);
+        stack
+            .process_message(&Bytes::from_static(invite), alice, None)
+            .await;
+        assert_eq!(stack.call_count().await, 1);
+        alice
+    }
+
+    fn guard_bye(from_tag: &str) -> Vec<u8> {
+        format!(
+            "BYE sip:bob@sbc.local SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK043\r\n\
+             From: <sip:alice@example.com>;tag={from_tag}\r\n\
+             To: <sip:bob@sbc.local>\r\n\
+             Call-ID: call-bye-guard@test\r\n\
+             CSeq: 2 BYE\r\n\
+             Content-Length: 0\r\n\
+             \r\n"
+        )
+        .into_bytes()
+    }
+
+    fn single_status(result: &ProcessResult) -> u16 {
+        match result {
+            ProcessResult::Response { message, .. } => match message {
+                SipMessage::Response(resp) => resp.status.code(),
+                SipMessage::Request(_) => panic!("expected a response"),
+            },
+            other => panic!("expected a single response, got {other:?}"),
+        }
+    }
+
+    /// A BYE whose From tag does not match the dialog is 481 and leaves the
+    /// call up (RFC 3261 §12.2.2).
+    #[tokio::test]
+    async fn test_bye_with_wrong_tag_is_rejected() {
+        let stack = SipStack::new(SipStackConfig::default());
+        let alice = call_from_alice(&stack).await;
+        let result = stack
+            .process_message(&Bytes::from(guard_bye("forged")), alice, None)
+            .await;
+        assert_eq!(single_status(&result), 481);
+        assert_eq!(
+            stack.call_count().await,
+            1,
+            "call must survive a forged BYE"
+        );
+    }
+
+    /// A BYE with the right tags from an address that is not the dialog
+    /// peer's is refused and leaves the call up.
+    #[tokio::test]
+    async fn test_bye_from_wrong_source_is_rejected() {
+        let stack = SipStack::new(SipStackConfig::default());
+        let _alice = call_from_alice(&stack).await;
+        let elsewhere = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(10, 9, 9, 9), 5060);
+        let result = stack
+            .process_message(&Bytes::from(guard_bye("g1")), elsewhere, None)
+            .await;
+        assert_eq!(single_status(&result), 403);
+        assert_eq!(
+            stack.call_count().await,
+            1,
+            "call must survive an off-path BYE"
+        );
+    }
+
     #[tokio::test]
     async fn test_cancel_pending_invite() {
         let config = SipStackConfig::default();
@@ -4715,7 +4872,7 @@ mod tests {
         let config = SipStackConfig::default();
         let stack = SipStack::new(config);
 
-        // BYE for unknown call — should just get 200 OK
+        // BYE for unknown call — 481 Call/Transaction Does Not Exist (§15.1.2)
         let bye = b"BYE sip:bob@sbc.local SIP/2.0\r\n\
             Via: SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK030\r\n\
             From: <sip:alice@example.com>;tag=u1\r\n\
@@ -4732,7 +4889,7 @@ mod tests {
         match result {
             ProcessResult::Response { message, .. } => {
                 if let SipMessage::Response(resp) = message {
-                    assert_eq!(resp.status, StatusCode::OK, "Unknown BYE should get 200 OK");
+                    assert_eq!(resp.status.code(), 481, "Unknown BYE must get 481");
                 }
             }
             _ => panic!("Expected Response for unknown BYE"),
