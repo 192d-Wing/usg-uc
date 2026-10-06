@@ -955,6 +955,15 @@ impl SipStack {
             }
 
             router.add_trunk_group(group);
+
+            // Config-file trunks are admitted INVITE sources too (the API
+            // path does this in register_inbound_trunk). No CSS for these.
+            let map = self.inbound_trunk_map.get_mut();
+            for t_config in &tg_config.trunks {
+                for ip in resolve_trunk_host_ips(&t_config.host) {
+                    map.insert(ip, (tg_config.id.clone(), None));
+                }
+            }
         }
 
         // Load dial plans
@@ -1920,6 +1929,23 @@ impl SipStack {
         let a_leg_call_id = req.headers.call_id().unwrap_or("unknown").to_string();
 
         debug!(uri = %req.uri, call_id = %a_leg_call_id, "Processing INVITE");
+
+        // Source admission: only configured trunks and currently registered
+        // endpoints may place calls. Checked before any per-call state exists.
+        //
+        // ## NIST 800-53 Rev5: AC-3 (Access Enforcement)
+        if !self.is_admitted_source(source.ip()).await {
+            warn!(
+                call_id = %a_leg_call_id,
+                source = %source,
+                "INVITE from a source that is neither a trunk nor registered, rejecting"
+            );
+            let forbidden = create_response_from_request(req, StatusCode::FORBIDDEN);
+            return ProcessResult::Response {
+                message: SipMessage::Response(forbidden),
+                destination: source,
+            };
+        }
 
         // Check for INVITE retransmit — if we already know this Call-ID,
         // or it is already being processed (in-flight), absorb it.
@@ -3190,23 +3216,8 @@ impl SipStack {
     ) {
         let mut map = self.inbound_trunk_map.write().await;
         for (host, _port) in hosts {
-            // Resolve hostname to IP
-            let addr_str = format!("{host}:0");
-            if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
-                map.insert(
-                    addr.ip(),
-                    (trunk_group_id.to_string(), css_id.map(String::from)),
-                );
-            } else {
-                use std::net::ToSocketAddrs;
-                if let Ok(mut addrs) = addr_str.to_socket_addrs()
-                    && let Some(addr) = addrs.find(std::net::SocketAddr::is_ipv4)
-                {
-                    map.insert(
-                        addr.ip(),
-                        (trunk_group_id.to_string(), css_id.map(String::from)),
-                    );
-                }
+            for ip in resolve_trunk_host_ips(host) {
+                map.insert(ip, (trunk_group_id.to_string(), css_id.map(String::from)));
             }
         }
         info!(trunk_group = trunk_group_id, css = ?css_id, hosts = hosts.len(), "Registered inbound trunk for CSS routing");
@@ -3218,6 +3229,26 @@ impl SipStack {
         source_ip: std::net::IpAddr,
     ) -> Option<(String, Option<String>)> {
         self.inbound_trunk_map.read().await.get(&source_ip).cloned()
+    }
+
+    /// Whether an INVITE from `source_ip` may be admitted: the address must
+    /// belong to a configured trunk or to a current (unexpired) registration.
+    async fn is_admitted_source(&self, source_ip: std::net::IpAddr) -> bool {
+        let ip = source_ip.to_canonical();
+        if self.inbound_trunk_map.read().await.contains_key(&ip) {
+            return true;
+        }
+        let loc = self.location_service.read().await;
+        loc.aors().any(|aor| {
+            loc.lookup(aor).iter().any(|binding| {
+                binding
+                    .contact_uri()
+                    .parse::<SipUri>()
+                    .ok()
+                    .and_then(|uri| uri.host.parse::<std::net::IpAddr>().ok())
+                    .is_some_and(|contact_ip| contact_ip.to_canonical() == ip)
+            })
+        })
     }
 
     /// Adds a DID → username mapping for inbound call routing.
@@ -3745,6 +3776,20 @@ fn parse_manipulation_action(action: &str, header: &str, value: &str) -> Manipul
 ///
 /// Parses the host and port from URIs like `sip:user@host:port` or `sip:host`.
 /// Defaults to port 5060 if not specified.
+/// Resolves a trunk host (IP literal or hostname) to every address it names.
+/// A hostname is resolved synchronously; failures yield an empty list.
+fn resolve_trunk_host_ips(host: &str) -> Vec<std::net::IpAddr> {
+    use std::net::ToSocketAddrs;
+
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return vec![ip.to_canonical()];
+    }
+    format!("{host}:0")
+        .to_socket_addrs()
+        .map(|addrs| addrs.map(|a| a.ip().to_canonical()).collect())
+        .unwrap_or_default()
+}
+
 fn resolve_sip_uri_to_addr(uri: &str) -> Option<SbcSocketAddr> {
     use std::net::ToSocketAddrs;
 
@@ -4084,6 +4129,10 @@ mod tests {
     async fn test_invite_max_forwards_exhausted() {
         let config = SipStackConfig::default();
         let stack = SipStack::new(config);
+        // The caller is a configured trunk, so the INVITE passes source admission.
+        stack
+            .register_inbound_trunk("test-trunk", None, &[("127.0.0.1".to_string(), 5060)])
+            .await;
 
         let invite = b"INVITE sip:9999@sbc.local SIP/2.0\r\n\
             Via: SIP/2.0/UDP client.example.com:5060;branch=z9hG4bKmf0\r\n\
@@ -4222,10 +4271,106 @@ mod tests {
         );
     }
 
+    /// An INVITE from an address that is neither a configured trunk nor a
+    /// current registration must be refused, not routed or answered.
+    #[tokio::test]
+    async fn test_invite_from_unknown_source_is_forbidden() {
+        let stack = SipStack::new(SipStackConfig::default());
+
+        let invite = b"INVITE sip:0119005551234@sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 203.0.113.9:5060;branch=z9hG4bKadm1\r\n\
+            From: <sip:mallory@example.com>;tag=adm1\r\n\
+            To: <sip:0119005551234@sbc.local>\r\n\
+            Call-ID: admission1@example.com\r\n\
+            CSeq: 1 INVITE\r\n\
+            Contact: <sip:mallory@203.0.113.9:5060>\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+
+        let source = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(203, 0, 113, 9), 5060);
+        let result = stack
+            .process_message(&Bytes::from_static(invite), source, None)
+            .await;
+
+        match result {
+            ProcessResult::Response { message, .. } => {
+                let SipMessage::Response(resp) = message else {
+                    panic!("Expected response message");
+                };
+                assert_eq!(resp.status.code(), 403, "unknown source must get 403");
+            }
+            other => panic!("Expected a single 403 response, got {other:?}"),
+        }
+        assert!(stack.in_flight_invites.read().await.is_empty());
+    }
+
+    /// The same INVITE is admitted once its source is a configured trunk.
+    #[tokio::test]
+    async fn test_invite_from_trunk_source_is_admitted() {
+        let stack = SipStack::new(SipStackConfig::default());
+        stack
+            .register_inbound_trunk("carrier", None, &[("203.0.113.9".to_string(), 5060)])
+            .await;
+
+        let invite = b"INVITE sip:9999@sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 203.0.113.9:5060;branch=z9hG4bKadm2\r\n\
+            From: <sip:carrier@example.com>;tag=adm2\r\n\
+            To: <sip:9999@sbc.local>\r\n\
+            Call-ID: admission2@example.com\r\n\
+            CSeq: 1 INVITE\r\n\
+            Contact: <sip:carrier@203.0.113.9:5060>\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+
+        let source = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(203, 0, 113, 9), 5060);
+        let result = stack
+            .process_message(&Bytes::from_static(invite), source, None)
+            .await;
+
+        if let ProcessResult::Response { message, .. } = &result
+            && let SipMessage::Response(resp) = message
+        {
+            assert_ne!(resp.status.code(), 403, "trunk source must be admitted");
+        }
+    }
+
+    /// A currently registered endpoint is admitted from its registered
+    /// address, and refused from a different one.
+    #[tokio::test]
+    async fn test_invite_from_registered_source_is_admitted() {
+        let stack = SipStack::new(SipStackConfig::default());
+
+        let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 198.51.100.7:5060;branch=z9hG4bKadm3\r\n\
+            From: <sip:bob@sbc.local>;tag=adm3\r\n\
+            To: <sip:bob@sbc.local>\r\n\
+            Call-ID: admission3-reg@example.com\r\n\
+            CSeq: 1 REGISTER\r\n\
+            Contact: <sip:bob@198.51.100.7:5060>\r\n\
+            Expires: 3600\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+        let bob = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 7), 5060);
+        stack
+            .process_message(&Bytes::from_static(register), bob, None)
+            .await;
+
+        assert!(stack.is_admitted_source(bob.ip()).await);
+        assert!(
+            !stack
+                .is_admitted_source(std::net::Ipv4Addr::new(198, 51, 100, 8).into())
+                .await
+        );
+    }
+
     #[tokio::test]
     async fn test_invite_unresolvable_destination() {
         let config = SipStackConfig::default();
         let stack = SipStack::new(config);
+        // The caller is a configured trunk, so the INVITE passes source admission.
+        stack
+            .register_inbound_trunk("test-trunk", None, &[("127.0.0.1".to_string(), 5060)])
+            .await;
 
         // INVITE to unresolvable host → should get 200 OK (announcement playback)
         let invite = b"INVITE sip:bob@nonexistent.invalid SIP/2.0\r\n\
@@ -4263,6 +4408,10 @@ mod tests {
     async fn test_invite_to_registered_user() {
         let config = SipStackConfig::default();
         let stack = SipStack::new(config);
+        // The caller is a configured trunk, so the INVITE passes source admission.
+        stack
+            .register_inbound_trunk("test-trunk", None, &[("192.168.1.100".to_string(), 5060)])
+            .await;
 
         // First, register bob at 127.0.0.1:5060
         let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
@@ -4360,6 +4509,10 @@ mod tests {
     async fn test_bye_from_a_leg() {
         let config = SipStackConfig::default();
         let stack = SipStack::new(config);
+        // The caller is a configured trunk, so the INVITE passes source admission.
+        stack
+            .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
+            .await;
 
         // Register bob
         let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
@@ -4432,6 +4585,10 @@ mod tests {
     async fn test_cancel_pending_invite() {
         let config = SipStackConfig::default();
         let stack = SipStack::new(config);
+        // The caller is a configured trunk, so the INVITE passes source admission.
+        stack
+            .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
+            .await;
 
         // Register bob
         let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
@@ -4728,6 +4885,17 @@ mod tests {
 
         // Router should be set
         assert!(stack.router.is_some());
+        // Config-file trunks are admitted sources for INVITE.
+        assert!(
+            stack
+                .is_admitted_source(std::net::Ipv4Addr::LOCALHOST.into())
+                .await
+        );
+        assert!(
+            !stack
+                .is_admitted_source(std::net::Ipv4Addr::new(10, 9, 9, 9).into())
+                .await
+        );
     }
 
     #[tokio::test]
