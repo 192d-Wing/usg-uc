@@ -1412,8 +1412,7 @@ impl SipStack {
             {
                 let session_key = internal_id.to_string();
                 if let Some(callee_media) = extract_media_address(&sdp_str)
-                    && let Ok(callee_addr) =
-                        format!("{}:{}", callee_media.address, callee_media.port).parse()
+                    && let Some(callee_addr) = admitted_media_addr(&callee_media)
                 {
                     let _ = pipeline
                         .set_remote_address(&session_key, false, callee_addr)
@@ -2329,8 +2328,7 @@ impl SipStack {
                     if let Some(ref body) = req.body
                         && let Some(caller_media) =
                             extract_media_address(&String::from_utf8_lossy(body))
-                        && let Ok(caller_addr) =
-                            format!("{}:{}", caller_media.address, caller_media.port).parse()
+                        && let Some(caller_addr) = admitted_media_addr(&caller_media)
                     {
                         let _ = pipeline
                             .set_remote_address(&session_key, true, caller_addr)
@@ -3297,10 +3295,21 @@ impl SipStack {
         // Extract the caller's RTP destination from their SDP offer up
         // front: the remote announcement pod needs it before we can
         // build our 200 OK.
-        let caller_rtp_dest = req.body.as_ref().and_then(|body| {
-            let sdp_str = String::from_utf8_lossy(body);
-            crate::announcement::extract_rtp_dest_from_sdp(&sdp_str)
-        });
+        let caller_rtp_dest = req
+            .body
+            .as_ref()
+            .and_then(|body| {
+                let sdp_str = String::from_utf8_lossy(body);
+                crate::announcement::extract_rtp_dest_from_sdp(&sdp_str)
+            })
+            .filter(|dest| {
+                let allowed = !sbc_announcement::is_disallowed_media_ip(dest.ip())
+                    && !dest.ip().is_unspecified();
+                if !allowed {
+                    warn!(destination = %dest, "Ignoring disallowed media address in SDP");
+                }
+                allowed
+            });
 
         let call_id = req.headers.call_id().unwrap_or("unknown").to_string();
 
@@ -3776,6 +3785,20 @@ fn parse_manipulation_action(action: &str, header: &str, value: &str) -> Manipul
 ///
 /// Parses the host and port from URIs like `sip:user@host:port` or `sip:host`.
 /// Defaults to port 5060 if not specified.
+/// Turns an SDP `c=`/`m=` address into a relay target, refusing addresses a
+/// peer must not be able to make the SBC send to: loopback, link-local,
+/// multicast and unspecified. Hostnames are not resolved.
+fn admitted_media_addr(media: &MediaAddress) -> Option<SbcSocketAddr> {
+    let ip: std::net::IpAddr = media.address.parse().ok()?;
+    if sbc_announcement::is_disallowed_media_ip(ip) || ip.is_unspecified() {
+        warn!(address = %media.address, port = media.port, "Ignoring disallowed media address in SDP");
+        return None;
+    }
+    Some(SbcSocketAddr::from(std::net::SocketAddr::new(
+        ip, media.port,
+    )))
+}
+
 /// Resolves a trunk host (IP literal or hostname) to every address it names.
 /// A hostname is resolved synchronously; failures yield an empty list.
 fn resolve_trunk_host_ips(host: &str) -> Vec<std::net::IpAddr> {
@@ -4737,6 +4760,41 @@ mod tests {
             }
             _ => panic!("Expected Response for unknown BYE"),
         }
+    }
+
+    #[test]
+    fn admitted_media_addr_rejects_local_and_group_addresses() {
+        let m = |a: &str| MediaAddress::new(a.to_string(), 4000);
+        assert_eq!(
+            admitted_media_addr(&m("203.0.113.5")),
+            Some(SbcSocketAddr::from(
+                "203.0.113.5:4000".parse::<std::net::SocketAddr>().unwrap()
+            ))
+        );
+        assert_eq!(
+            admitted_media_addr(&m("2001:db8::7")),
+            Some(SbcSocketAddr::from(
+                "[2001:db8::7]:4000"
+                    .parse::<std::net::SocketAddr>()
+                    .unwrap()
+            ))
+        );
+        for bad in [
+            "127.0.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "169.254.9.9",
+            "::1",
+            "::",
+            "ff02::1",
+        ] {
+            assert!(
+                admitted_media_addr(&m(bad)).is_none(),
+                "{bad} must be refused"
+            );
+        }
+        // Hostnames are not resolved.
+        assert!(admitted_media_addr(&m("media.example.com")).is_none());
     }
 
     #[test]
