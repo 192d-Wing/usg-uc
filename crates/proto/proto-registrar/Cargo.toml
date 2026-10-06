@@ -19,6 +19,11 @@ bearer = ["dep:proto-jwt", "dep:tracing"]
 
 [dependencies]
 thiserror = "2.0"
+# Digest authentication hashes: MD5 for legacy interop (RFC 7616 §3.2),
+# SHA-256 / SHA-512-256 through the same aws-lc-rs module the rest of the
+# workspace uses.
+md5 = "0.7"
+aws-lc-rs.workspace = true
 
 # Optional storage dependencies
 serde = { workspace = true, features = ["derive"], optional = true }

@@ -582,7 +582,14 @@ impl Authenticator {
             entity_body,
         });
 
-        if expected.to_lowercase() == creds.response.to_lowercase() {
+        // Constant-time comparison of the hex digests.
+        let presented = creds.response.to_lowercase();
+        if aws_lc_rs::constant_time::verify_slices_are_equal(
+            expected.as_bytes(),
+            presented.as_bytes(),
+        )
+        .is_ok()
+        {
             AuthResult::Success {
                 username: creds.username.clone(),
                 auth_info: None, // Could compute rspauth here
@@ -696,28 +703,26 @@ fn hash_string(s: &str, algorithm: AuthAlgorithm) -> String {
     hash_bytes(s.as_bytes(), algorithm)
 }
 
-/// Hashes bytes using the specified algorithm.
+/// Hashes bytes using the specified algorithm, returning lowercase hex.
 fn hash_bytes(data: &[u8], algorithm: AuthAlgorithm) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use std::fmt::Write;
 
-    // Note: In production, use proper cryptographic hash functions.
-    // This is a placeholder that demonstrates the structure.
-    // The actual implementation should use sha2 or similar crate.
+    let to_hex = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+                let _ = write!(s, "{b:02x}");
+                s
+            })
+    };
 
     match algorithm {
-        AuthAlgorithm::Md5 => {
-            // MD5 placeholder - use md5 crate in production
-            let mut hasher = DefaultHasher::new();
-            data.hash(&mut hasher);
-            format!("{:032x}", hasher.finish())
+        AuthAlgorithm::Md5 => format!("{:x}", md5::compute(data)),
+        AuthAlgorithm::Sha256 => {
+            to_hex(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, data).as_ref())
         }
-        AuthAlgorithm::Sha256 | AuthAlgorithm::Sha512_256 => {
-            // SHA-256/SHA-512-256 placeholder - use sha2 crate in production
-            let mut hasher = DefaultHasher::new();
-            data.hash(&mut hasher);
-            // SHA-256 produces 64 hex chars
-            format!("{:064x}", hasher.finish())
+        AuthAlgorithm::Sha512_256 => {
+            to_hex(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA512_256, data).as_ref())
         }
     }
 }
@@ -832,6 +837,43 @@ mod tests {
             }
             _ => panic!("Expected ChallengeRequired"),
         }
+    }
+
+    /// RFC 2617 §3.5 worked example (MD5, qop=auth).
+    #[test]
+    fn digest_response_matches_rfc2617_example() {
+        let response = compute_digest_response(&DigestParams {
+            username: "Mufasa",
+            realm: "testrealm@host.com",
+            password: "Circle Of Life",
+            method: "GET",
+            uri: "/dir/index.html",
+            nonce: "dcd98b7102dd2f0e8b11d0f600bfb0c093",
+            algorithm: AuthAlgorithm::Md5,
+            qop: Some(AuthQop::Auth),
+            nc: Some(1),
+            cnonce: Some("0a4f113b"),
+            entity_body: None,
+        });
+        assert_eq!(response, "6629fae49393a05397450978507c4ef1");
+    }
+
+    /// The SHA-2 variants must be the real hash functions (FIPS 180-4 "abc"
+    /// vectors), not a placeholder.
+    #[test]
+    fn hash_bytes_uses_real_sha2() {
+        assert_eq!(
+            hash_bytes(b"abc", AuthAlgorithm::Sha256),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hash_bytes(b"abc", AuthAlgorithm::Sha512_256),
+            "53048e2681941ef99b2e29b76b4c7dabe4c2d0c634fc6d46e0e2f13107e7af23"
+        );
+        assert_eq!(
+            hash_bytes(b"abc", AuthAlgorithm::Md5),
+            "900150983cd24fb0d6963f7d28e17f72"
+        );
     }
 
     #[test]
