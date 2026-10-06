@@ -207,6 +207,10 @@ sbcProvision:
   # (rely on the NetworkPolicy / LB source ranges only).
   allowedSourceCidrs: []
     # - "10.0.100.0/24"
+  # The server refuses to start when neither allowedSourceCidrs nor
+  # SBC_PROVISION_SECRET is set, because rendered phone configs carry SIP
+  # and directory credentials. Set this to true only to run it open anyway.
+  allowUnauthenticated: false
 
 # sbc-client-config-server — soft-client discovery + provisioning pod
 # (docs/CLIENT-PROVISIONING-OIDC.md). Serves the unauthenticated
