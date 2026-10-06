@@ -5308,6 +5308,7 @@ dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
  "jsonwebtoken",
+ "md5 0.7.0",
  "proto-jwt",
  "serde",
  "serde_json",
