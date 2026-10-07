@@ -644,24 +644,24 @@ fn generate_opaque() -> String {
 }
 
 /// Parameters for digest response computation.
-struct DigestParams<'a> {
-    username: &'a str,
-    realm: &'a str,
-    password: &'a str,
-    method: &'a str,
-    uri: &'a str,
-    nonce: &'a str,
-    algorithm: AuthAlgorithm,
-    qop: Option<AuthQop>,
-    nc: Option<u32>,
-    cnonce: Option<&'a str>,
-    entity_body: Option<&'a [u8]>,
+pub(crate) struct DigestParams<'a> {
+    pub(crate) username: &'a str,
+    pub(crate) realm: &'a str,
+    pub(crate) password: &'a str,
+    pub(crate) method: &'a str,
+    pub(crate) uri: &'a str,
+    pub(crate) nonce: &'a str,
+    pub(crate) algorithm: AuthAlgorithm,
+    pub(crate) qop: Option<AuthQop>,
+    pub(crate) nc: Option<u32>,
+    pub(crate) cnonce: Option<&'a str>,
+    pub(crate) entity_body: Option<&'a [u8]>,
 }
 
 /// Computes the digest response.
 ///
 /// Uses SHA-256 by default for CNSA 2.0 compliance.
-fn compute_digest_response(params: &DigestParams<'_>) -> String {
+pub(crate) fn compute_digest_response(params: &DigestParams<'_>) -> String {
     let algorithm = params.algorithm;
     let qop = params.qop;
     let nc = params.nc;
