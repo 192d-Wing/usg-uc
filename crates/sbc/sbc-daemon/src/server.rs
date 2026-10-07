@@ -108,6 +108,7 @@ impl Server {
         if let Some(bearer) = Self::build_bearer_authenticator(&config) {
             sip_stack.set_bearer_authenticator(bearer);
         }
+        Self::warn_if_register_unauthenticated(&sip_stack);
         let sip_stack = Arc::new(sip_stack);
         let rate_limiter = Self::build_rate_limiter(&config);
         let global_limiter = Self::build_global_limiter(&config);
@@ -186,6 +187,7 @@ impl Server {
         if let Some(bearer) = Self::build_bearer_authenticator(&config) {
             sip_stack.set_bearer_authenticator(bearer);
         }
+        Self::warn_if_register_unauthenticated(&sip_stack);
         let sip_stack = Arc::new(sip_stack);
 
         let rate_limiter = Self::build_rate_limiter(&config);
@@ -218,6 +220,17 @@ impl Server {
             domain: config.general.instance_name.clone(),
             max_calls: config.general.max_calls,
             ..SipStackConfig::default()
+        }
+    }
+
+    /// Logs a prominent warning when nothing authenticates REGISTER: in that
+    /// state any peer can bind any address-of-record and receive its calls.
+    fn warn_if_register_unauthenticated(sip_stack: &SipStack) {
+        if !sip_stack.register_auth_enabled() {
+            warn!(
+                "REGISTER is UNAUTHENTICATED: any peer can register any user. \
+                 Set SBC_AUTH_MODE=bearer (with SBC_OIDC_ISSUER) to require tokens."
+            );
         }
     }
 
