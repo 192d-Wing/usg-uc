@@ -11,6 +11,11 @@ pub enum ConfigError {
     Missing(&'static str),
     #[error("invalid {var}: {reason}")]
     Invalid { var: &'static str, reason: String },
+    #[error(
+        "provisioning would be unauthenticated: set SBC_PROVISION_SECRET or \
+         SBC_PROVISION_ALLOWED_CIDRS, or SBC_PROVISION_ALLOW_UNAUTHENTICATED=true to accept that"
+    )]
+    Unguarded,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +102,14 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty());
 
+        let allow_unauthenticated = std::env::var("SBC_PROVISION_ALLOW_UNAUTHENTICATED")
+            .is_ok_and(|v| v.eq_ignore_ascii_case("true"));
+        check_guards(
+            provision_secret.as_deref(),
+            &allowed_cidrs,
+            allow_unauthenticated,
+        )?;
+
         Ok(Self {
             listen_addr,
             database_url,
@@ -106,5 +119,41 @@ impl Config {
             trusted_proxies,
             provision_secret,
         })
+    }
+}
+
+/// Refuses a configuration under which phone configs (which carry SIP and
+/// directory credentials) would be served to anyone who can reach the
+/// port, unless the operator opted into that explicitly.
+const fn check_guards(
+    secret: Option<&str>,
+    allowed_cidrs: &[ipnet::IpNet],
+    allow_unauthenticated: bool,
+) -> Result<(), ConfigError> {
+    if secret.is_none() && allowed_cidrs.is_empty() && !allow_unauthenticated {
+        return Err(ConfigError::Unguarded);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unguarded_config_is_rejected_unless_opted_in() {
+        assert!(matches!(
+            check_guards(None, &[], false),
+            Err(ConfigError::Unguarded)
+        ));
+        assert!(check_guards(None, &[], true).is_ok());
+    }
+
+    #[test]
+    fn either_guard_is_sufficient() {
+        let lan: ipnet::IpNet = "10.0.100.0/24".parse().unwrap();
+        assert!(check_guards(Some("s3cret"), &[], false).is_ok());
+        assert!(check_guards(None, &[lan], false).is_ok());
     }
 }
