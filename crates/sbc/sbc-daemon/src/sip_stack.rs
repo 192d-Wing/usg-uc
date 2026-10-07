@@ -839,6 +839,23 @@ impl SipStack {
         self.zone_registry = Some(registry);
     }
 
+    /// The host and port the SBC advertises as itself (Via sent-by and
+    /// Contact) on an outbound leg: the egress zone's external IP when it has
+    /// one, else that zone's signaling IP, else the configured domain. The
+    /// port is the standard SIP port; the zone registry carries no port.
+    fn b_leg_signaling_addr(&self, ingress: Option<&str>, b_leg_external: bool) -> (String, u16) {
+        const SIP_PORT: u16 = 5060;
+        let host = self.zone_registry.as_ref().and_then(|reg| {
+            let zone = self
+                .egress_media_zone(ingress, b_leg_external)
+                .or_else(|| reg.zone_names().into_iter().next())?;
+            reg.external_ip(&zone)
+                .or_else(|| reg.signaling_ip(&zone))
+                .map(|ip| ip.to_string())
+        });
+        (host.unwrap_or_else(|| self.config.domain.clone()), SIP_PORT)
+    }
+
     /// Returns the effective signaling IP for a zone, falling back to source IP.
     fn zone_signaling_ip(&self, zone: Option<&str>, fallback: std::net::IpAddr) -> String {
         if let (Some(name), Some(reg)) = (zone, &self.zone_registry) {
@@ -2297,9 +2314,10 @@ impl SipStack {
             error!(error = %e, "Failed to transition call to Routing");
         }
 
-        // 5. Determine SBC's local address for SDP rewriting
-        let local_ip = source.ip().to_string(); // Use the address we received on
-        let local_sip_addr = format!("{}:{}", local_ip, source.port());
+        // 5. The SBC's own signaling address for the B-leg Via/Contact (and
+        // for every later in-dialog request on that leg).
+        let (local_ip, local_port) = self.b_leg_signaling_addr(receiving_zone, b_leg_external);
+        let local_sip_addr = format!("{local_ip}:{local_port}");
 
         // 6. Media session + B-leg SDP rewrite. With the media pipeline present,
         // allocate the relay's A/B ports (backed by real sockets), advertise the
@@ -2389,7 +2407,7 @@ impl SipStack {
         }
 
         let mut builder = RequestBuilder::invite(b_leg_uri)
-            .via_auto("UDP", &local_ip, Some(source.port()))
+            .via_auto("UDP", &local_ip, Some(local_port))
             .from_auto(
                 SipUri::new(&self.config.domain).with_user(&self.config.instance_name),
                 None,
@@ -2398,7 +2416,7 @@ impl SipStack {
             .call_id(&b_leg_sip_call_id)
             .cseq(1)
             .max_forwards(b_leg_max_forwards)
-            .contact_uri(SipUri::new(&local_ip).with_port(source.port()));
+            .contact_uri(SipUri::new(&local_ip).with_port(local_port));
 
         if let Some(ref sdp) = b_leg_sdp {
             builder = builder.body_sdp(sdp.as_bytes().to_vec());
@@ -4081,6 +4099,17 @@ mod tests {
 
         let fallback: std::net::IpAddr = "192.0.2.1".parse().unwrap();
 
+        // B-leg Via/Contact: trunk legs advertise the external zone's public
+        // IP; internal legs the ingress zone's signaling IP.
+        assert_eq!(
+            stack.b_leg_signaling_addr(Some("inside"), true),
+            ("203.0.113.6".to_string(), 5060)
+        );
+        assert_eq!(
+            stack.b_leg_signaling_addr(Some("inside"), false),
+            ("10.0.1.10".to_string(), 5060)
+        );
+
         // A-leg (caller) advertises + binds the INGRESS zone's media interface.
         let (a_bind, a_adv) = stack.zone_media_bind(Some("inside"), fallback);
         assert_eq!(a_adv, "10.0.1.20");
@@ -4522,6 +4551,19 @@ mod tests {
                         std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
                         "B-leg should go to bob's registered address"
                     );
+                    // The B-leg must advertise the SBC, never the caller's address.
+                    let SipMessage::Request(b_leg) = message else {
+                        panic!("Forward should be a request");
+                    };
+                    let via = b_leg.headers.get_value(&HeaderName::Via).unwrap();
+                    let contact = b_leg.headers.get_value(&HeaderName::Contact).unwrap();
+                    for (name, value) in [("Via", via), ("Contact", contact)] {
+                        assert!(
+                            !value.contains("192.168.1.100"),
+                            "{name} leaks the caller's address: {value}"
+                        );
+                        assert!(value.contains("sbc.local:5060"), "{name}: {value}");
+                    }
                 } else {
                     panic!("Second result should be Forward (B-leg INVITE)");
                 }
