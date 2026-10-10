@@ -1,24 +1,24 @@
-//! Opus FFI bindings using audiopus.
+//! Opus FFI bindings using `opusic-c`.
 //!
 //! This module provides actual Opus encoding/decoding via libopus FFI.
 //! Enable with the `opus-ffi` feature flag.
 //!
-//! Requires libopus to be installed on the system:
-//! - macOS: `brew install opus`
-//! - Ubuntu/Debian: `apt install libopus-dev`
-//! - RHEL/Fedora: `dnf install opus-devel`
+//! `opusic-c` bundles libopus and builds it with CMake, so no system
+//! libopus is required (the build host needs `cmake`).
 
 #![cfg(feature = "opus-ffi")]
 
 use crate::error::{CodecError, CodecResult};
 use crate::opus::{OpusApplication, OpusConfig};
 use crate::{AudioCodec, PayloadType};
-use audiopus::coder::{Decoder as OpusDecoder, Encoder as OpusEncoder};
-use audiopus::{Application, Bitrate, Channels, SampleRate, Signal};
+use opusic_c::{
+    Application, Bitrate, Channels, Decoder as OpusDecoder, Encoder as OpusEncoder, ErrorCode,
+    InbandFec, SampleRate, Signal,
+};
 use std::sync::Mutex;
 
-/// Convert our application mode to audiopus Application.
-fn to_audiopus_application(app: OpusApplication) -> Application {
+/// Convert our application mode to opusic-c Application.
+fn to_opus_application(app: OpusApplication) -> Application {
     match app {
         OpusApplication::Voip => Application::Voip,
         OpusApplication::Audio => Application::Audio,
@@ -26,8 +26,8 @@ fn to_audiopus_application(app: OpusApplication) -> Application {
     }
 }
 
-/// Convert sample rate to audiopus SampleRate.
-fn to_audiopus_sample_rate(rate: u32) -> CodecResult<SampleRate> {
+/// Convert sample rate to opusic-c SampleRate.
+fn to_opus_sample_rate(rate: u32) -> CodecResult<SampleRate> {
     match rate {
         8000 => Ok(SampleRate::Hz8000),
         12000 => Ok(SampleRate::Hz12000),
@@ -38,8 +38,8 @@ fn to_audiopus_sample_rate(rate: u32) -> CodecResult<SampleRate> {
     }
 }
 
-/// Convert channels to audiopus Channels.
-fn to_audiopus_channels(channels: u8) -> CodecResult<Channels> {
+/// Convert channels to opusic-c Channels.
+fn to_opus_channels(channels: u8) -> CodecResult<Channels> {
     match channels {
         1 => Ok(Channels::Mono),
         2 => Ok(Channels::Stereo),
@@ -47,9 +47,16 @@ fn to_audiopus_channels(channels: u8) -> CodecResult<Channels> {
     }
 }
 
+/// Builds an `InvalidConfig` error from a failed encoder CTL call.
+fn config_err(what: &str, e: ErrorCode) -> CodecError {
+    CodecError::InvalidConfig {
+        reason: format!("failed to set {what}: {}", e.message()),
+    }
+}
+
 /// Opus encoder with FFI bindings to libopus.
 pub struct FfiOpusEncoder {
-    /// The underlying audiopus encoder.
+    /// The underlying opusic-c encoder.
     encoder: Mutex<OpusEncoder>,
     /// Configuration.
     config: OpusConfig,
@@ -71,13 +78,13 @@ impl FfiOpusEncoder {
     pub fn new(config: OpusConfig) -> CodecResult<Self> {
         config.validate()?;
 
-        let sample_rate = to_audiopus_sample_rate(config.sample_rate)?;
-        let channels = to_audiopus_channels(config.channels)?;
-        let application = to_audiopus_application(config.application);
+        let sample_rate = to_opus_sample_rate(config.sample_rate)?;
+        let channels = to_opus_channels(config.channels)?;
+        let application = to_opus_application(config.application);
 
-        let mut encoder = OpusEncoder::new(sample_rate, channels, application).map_err(|e| {
+        let mut encoder = OpusEncoder::new(channels, sample_rate, application).map_err(|e| {
             CodecError::InvalidConfig {
-                reason: format!("failed to create Opus encoder: {e}"),
+                reason: format!("failed to create Opus encoder: {}", e.message()),
             }
         })?;
 
@@ -92,10 +99,8 @@ impl FfiOpusEncoder {
     /// Configures the encoder with the specified settings.
     fn configure_encoder(encoder: &mut OpusEncoder, config: &OpusConfig) -> CodecResult<()> {
         encoder
-            .set_bitrate(Bitrate::BitsPerSecond(config.bitrate as i32))
-            .map_err(|e| CodecError::InvalidConfig {
-                reason: format!("failed to set bitrate: {e}"),
-            })?;
+            .set_bitrate(Bitrate::Value(config.bitrate))
+            .map_err(|e| config_err("bitrate", e))?;
 
         let signal = match config.signal {
             crate::opus::OpusSignal::Auto => Signal::Auto,
@@ -104,47 +109,38 @@ impl FfiOpusEncoder {
         };
         encoder
             .set_signal(signal)
-            .map_err(|e| CodecError::InvalidConfig {
-                reason: format!("failed to set signal type: {e}"),
-            })?;
+            .map_err(|e| config_err("signal type", e))?;
 
         encoder
             .set_complexity(config.complexity)
-            .map_err(|e| CodecError::InvalidConfig {
-                reason: format!("failed to set complexity: {e}"),
-            })?;
+            .map_err(|e| config_err("complexity", e))?;
+
+        // Mode1 is the classic LBRR in-band FEC (OPUS_SET_INBAND_FEC(1)),
+        // matching the previous binding's boolean `set_inband_fec(true)`.
+        let fec = if config.fec {
+            InbandFec::Mode1
+        } else {
+            InbandFec::Off
+        };
+        encoder
+            .set_inband_fec(fec)
+            .map_err(|e| config_err("FEC", e))?;
 
         encoder
-            .set_inband_fec(config.fec)
-            .map_err(|e| CodecError::InvalidConfig {
-                reason: format!("failed to set FEC: {e}"),
-            })?;
-
-        encoder
-            .set_packet_loss_perc(config.packet_loss_perc)
-            .map_err(|e| CodecError::InvalidConfig {
-                reason: format!("failed to set packet loss percentage: {e}"),
-            })?;
+            .set_packet_loss(config.packet_loss_perc)
+            .map_err(|e| config_err("packet loss percentage", e))?;
 
         encoder
             .set_vbr(config.vbr)
-            .map_err(|e| CodecError::InvalidConfig {
-                reason: format!("failed to set VBR: {e}"),
-            })?;
+            .map_err(|e| config_err("VBR", e))?;
 
         encoder
             .set_vbr_constraint(config.vbr_constraint)
-            .map_err(|e| CodecError::InvalidConfig {
-                reason: format!("failed to set VBR constraint: {e}"),
-            })?;
+            .map_err(|e| config_err("VBR constraint", e))?;
 
-        // DTX: use raw CTL request (OPUS_SET_DTX_REQUEST = 4016)
-        // audiopus doesn't expose a typed set_dtx() method.
         encoder
-            .set_encoder_ctl_request(4016, i32::from(config.dtx))
-            .map_err(|e| CodecError::InvalidConfig {
-                reason: format!("failed to set DTX: {e}"),
-            })?;
+            .set_dtx(config.dtx)
+            .map_err(|e| config_err("DTX", e))?;
 
         Ok(())
     }
@@ -156,22 +152,21 @@ impl FfiOpusEncoder {
     /// # Errors
     /// Returns an error if the operation fails.
     pub fn encode(&self, pcm: &[i16], output: &mut [u8]) -> CodecResult<usize> {
-        let result = {
-            let encoder = self
-                .encoder
-                .lock()
-                .map_err(|_| CodecError::EncodingFailed {
-                    reason: "failed to acquire encoder lock".to_string(),
-                })?;
+        let mut encoder = self
+            .encoder
+            .lock()
+            .map_err(|_| CodecError::EncodingFailed {
+                reason: "failed to acquire encoder lock".to_string(),
+            })?;
 
-            encoder
-                .encode(pcm, output)
-                .map_err(|e| CodecError::EncodingFailed {
-                    reason: format!("Opus encoding failed: {e}"),
-                })?
-        };
-
-        Ok(result)
+        // opusic-c types PCM as u16; the bit pattern is what libopus reads
+        // as opus_int16, so a Pod cast is exact and allocation-free.
+        let pcm_u16: &[u16] = bytemuck::cast_slice(pcm);
+        encoder
+            .encode_to_slice(pcm_u16, output)
+            .map_err(|e| CodecError::EncodingFailed {
+                reason: format!("Opus encoding failed: {}", e.message()),
+            })
     }
 
     /// Returns the configured sample rate.
@@ -192,7 +187,7 @@ impl FfiOpusEncoder {
 
 /// Opus decoder with FFI bindings to libopus.
 pub struct FfiOpusDecoder {
-    /// The underlying audiopus decoder.
+    /// The underlying opusic-c decoder.
     decoder: Mutex<OpusDecoder>,
     /// Sample rate for decoding.
     sample_rate: u32,
@@ -215,12 +210,12 @@ impl FfiOpusDecoder {
     /// # Errors
     /// Returns an error if the operation fails.
     pub fn new(sample_rate: u32, channels: u8) -> CodecResult<Self> {
-        let sample_rate_enum = to_audiopus_sample_rate(sample_rate)?;
-        let channels_enum = to_audiopus_channels(channels)?;
+        let sample_rate_enum = to_opus_sample_rate(sample_rate)?;
+        let channels_enum = to_opus_channels(channels)?;
 
-        let decoder = OpusDecoder::new(sample_rate_enum, channels_enum).map_err(|e| {
+        let decoder = OpusDecoder::new(channels_enum, sample_rate_enum).map_err(|e| {
             CodecError::InvalidConfig {
-                reason: format!("failed to create Opus decoder: {e}"),
+                reason: format!("failed to create Opus decoder: {}", e.message()),
             }
         })?;
 
@@ -231,13 +226,11 @@ impl FfiOpusDecoder {
         })
     }
 
-    /// Decodes Opus to PCM samples.
-    ///
-    /// Returns the number of samples decoded.
-    ///
-    /// # Errors
-    /// Returns an error if the operation fails.
-    pub fn decode(&self, encoded: &[u8], output: &mut [i16]) -> CodecResult<usize> {
+    /// Runs `opus_decode`; an empty `encoded` slice signals packet loss
+    /// (libopus PLC / in-band FEC path). Returns total samples across channels.
+    fn decode_inner(&self, encoded: &[u8], output: &mut [i16], fec: bool) -> CodecResult<usize> {
+        // opus_decode returns frames per channel; multiply by channels for
+        // total samples. The lock guard is scoped so it drops before return.
         let frames = {
             let mut decoder = self
                 .decoder
@@ -246,16 +239,29 @@ impl FfiOpusDecoder {
                     reason: "failed to acquire decoder lock".to_string(),
                 })?;
 
-            // Use FEC=false for normal decoding
-            // opus_decode returns frames per channel; multiply by channels for total samples
-            decoder.decode(Some(encoded), output, false).map_err(|e| {
-                CodecError::DecodingFailed {
-                    reason: format!("Opus decoding failed: {e}"),
-                }
-            })?
+            let output_u16: &mut [u16] = bytemuck::cast_slice_mut(output);
+            decoder
+                .decode_to_slice(encoded, output_u16, fec)
+                .map_err(|e| CodecError::DecodingFailed {
+                    reason: format!(
+                        "Opus {}decoding failed: {}",
+                        if fec { "FEC " } else { "" },
+                        e.message()
+                    ),
+                })?
         };
 
         Ok(frames * self.channels as usize)
+    }
+
+    /// Decodes Opus to PCM samples.
+    ///
+    /// Returns the number of samples decoded.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    pub fn decode(&self, encoded: &[u8], output: &mut [i16]) -> CodecResult<usize> {
+        self.decode_inner(encoded, output, false)
     }
 
     /// Decodes with Forward Error Correction for lost packets.
@@ -265,24 +271,7 @@ impl FfiOpusDecoder {
     /// # Errors
     /// Returns an error if the operation fails.
     pub fn decode_fec(&self, output: &mut [i16]) -> CodecResult<usize> {
-        let frames = {
-            let mut decoder = self
-                .decoder
-                .lock()
-                .map_err(|_| CodecError::DecodingFailed {
-                    reason: "failed to acquire decoder lock".to_string(),
-                })?;
-
-            // Pass None for lost packet, use FEC=true
-            // opus_decode returns frames per channel; multiply by channels for total samples
-            decoder
-                .decode(None::<&[u8]>, output, true)
-                .map_err(|e| CodecError::DecodingFailed {
-                    reason: format!("Opus FEC decoding failed: {e}"),
-                })?
-        };
-
-        Ok(frames * self.channels as usize)
+        self.decode_inner(&[], output, true)
     }
 
     /// Returns the configured sample rate.

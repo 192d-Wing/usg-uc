@@ -11,19 +11,22 @@ categories.workspace = true
 
 [features]
 default = []
-# Enable Opus FFI bindings (requires libopus installed on the system)
-# macOS: brew install opus
-# Ubuntu/Debian: apt install libopus-dev
-# RHEL/Fedora: dnf install opus-devel
-opus-ffi = ["dep:audiopus"]
+# Enable Opus FFI bindings. `opusic-c` bundles and builds libopus (needs
+# `cmake` on the build host); no system libopus is required. To link a
+# system libopus instead, disable its `bundled` feature and set OPUS_LIB_DIR.
+opus-ffi = ["dep:opusic-c", "dep:bytemuck"]
 
 [dependencies]
 uc-types.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
 
-# Optional Opus FFI bindings
-audiopus = { version = "0.2", optional = true }
+# Optional Opus FFI bindings (maintained libopus 1.6 binding; replaces the
+# unmaintained audiopus/audiopus_sys pair, RUSTSEC-2026-0150).
+opusic-c = { version = "1.6", optional = true }
+# Safe i16 <-> u16 slice casts: opusic-c's PCM API is typed u16 while the
+# codec trait (and libopus itself) use i16. This crate forbids unsafe code.
+bytemuck = { version = "1.25", optional = true }
 
 [lints]
 workspace = true
