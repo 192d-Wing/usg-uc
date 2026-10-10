@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ## [Unreleased]
 
+### Security
+
+- **cryptoki 0.7 → 0.12** — fixes RUSTSEC-2026-0286 (out-of-bounds read decoding `CKA_ALLOWED_MECHANISMS`) in the PKCS#11 smart-card certificate enumeration (`client-core`). Also drops the unmaintained `paste` crate from the lockfile
+- **cargo-audit clean** — CI installs `libopus-dev` so the `opus-ffi` feature links the system libopus instead of running `audiopus_sys`'s unmaintained source build; `.cargo/audit.toml` documents the remaining GTK3-pinned advisories
+
 ### Changed
 
 - **Path-scoped CI** — PRs lint/test only the crate groups they touch (`crates/sbc`, `crates/client`); changes to the shared `uc-*`/`proto-*` core, workspace manifests, or the workflow widen to the full workspace, and pushes to `main` always run everything. A single `CI OK` status gates the result (`.github/workflows/ci.yml`)

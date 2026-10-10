@@ -742,7 +742,7 @@ impl CertificateStore {
         &self,
         module_path: &str,
     ) -> CertStoreResult<Vec<CertificateInfo>> {
-        use cryptoki::context::{CInitializeArgs, Pkcs11};
+        use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
         use cryptoki::object::{Attribute, AttributeType, ObjectClass};
         use std::panic;
 
@@ -757,7 +757,9 @@ impl CertificateStore {
             })?;
 
             // Try to initialize - some libraries may already be initialized
-            match pkcs11.initialize(CInitializeArgs::OsThreads) {
+            // CKF_OS_LOCKING_OK: let the module use OS locking primitives (what
+            // cryptoki 0.7's `CInitializeArgs::OsThreads` meant).
+            match pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK)) {
                 Ok(())
                 | Err(cryptoki::error::Error::Pkcs11(
                     cryptoki::error::RvError::CryptokiAlreadyInitialized,

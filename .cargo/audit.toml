@@ -9,6 +9,17 @@ ignore = [
     # native clients (docs/CLIENT-NATIVE-MIGRATION-PLAN.md). Re-evaluate
     # when the Tauri client is retired or tauri moves off gtk3.
     "RUSTSEC-2024-0429",
+    # proc-macro-error unmaintained; reached only through glib-macros 0.18,
+    # the same legacy Tauri/GTK3 pin as RUSTSEC-2024-0429 above. It is a
+    # build-time proc-macro helper with no runtime code in the binary.
+    # Re-evaluate together with RUSTSEC-2024-0429.
+    "RUSTSEC-2024-0370",
+    # audiopus_sys unmaintained (its vendored-source build breaks on CMake
+    # 4). We never run that build: CI installs libopus-dev and the crate's
+    # build.rs links the system libopus via pkg-config first. The `opus-ffi`
+    # feature that pulls it in is off by default. Follow-up to migrate to
+    # the maintained `opusic-c` binding is tracked in BACKLOG.md.
+    "RUSTSEC-2026-0150",
     # rsa Marvin timing side-channel. The rsa crate is never compiled: it
     # enters the lockfile only as an optional dependency of sqlx-mysql,
     # which no feature enables (uc-storage uses sqlx/postgres only) —
