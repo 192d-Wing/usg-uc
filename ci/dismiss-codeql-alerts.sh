@@ -37,7 +37,7 @@ STRESS="Load-test tooling under deploy/test that runs only inside the test compo
 # rust/hard-coded-cryptographic-value inside #[cfg(test)] modules
 for n in 15 16 17 18 97 139 140 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 \
          35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 \
-         57 64 91 133 134 86 87 92 93 90 81 135 136 82 137; do
+         57 62 64 91 133 134 86 87 92 93 90 81 135 136 82 137; do
   dismiss "$n" "used in tests" "$TEST_MODULE"
 done
 # examples/
