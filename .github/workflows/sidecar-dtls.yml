@@ -20,6 +20,11 @@ on:
       - '.github/workflows/sidecar-dtls.yml'
   workflow_dispatch:
 
+# CodeQL actions/missing-workflow-permissions: this workflow only checks out
+# and builds; it never writes to the repo, packages, or PRs.
+permissions:
+  contents: read
+
 # FIPS module selection is build-time. v1.26.0 is the module frozen from Go
 # 1.26; building with it turns FIPS mode on by default.
 env:
