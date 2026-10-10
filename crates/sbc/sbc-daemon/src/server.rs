@@ -391,13 +391,7 @@ impl Server {
         // In the monolith (default) the in-process pipeline is attached below;
         // without it, allocated RTP ports are not backed by any socket (media
         // black-holes).
-        let media_failure_rx = if !Self::remote_media_urls().is_empty() {
-            tracing::info!(
-                "Remote media plane configured (SBC_MEDIA_CONTROLLER_URL); \
-                 in-process pipeline skipped — wired via gRPC before start"
-            );
-            None
-        } else {
+        let media_failure_rx = if Self::remote_media_urls().is_empty() {
             // Ports / mode / SRTP come from the [media] config; the codec list and
             // RTCP-mux keep the pipeline defaults.
             //
@@ -474,6 +468,12 @@ impl Server {
                 sip_stack.set_dtls_fingerprint_source(source);
             }
             media_failure_rx
+        } else {
+            tracing::info!(
+                "Remote media plane configured (SBC_MEDIA_CONTROLLER_URL); \
+                 in-process pipeline skipped — wired via gRPC before start"
+            );
+            None
         };
 
         // Initialize Voice Protection System call screening (if configured).
@@ -718,21 +718,20 @@ impl Server {
         if let Some(mut rx) = self.media_failure_rx.take() {
             let sip_stack = Arc::clone(&self.sip_stack);
             let transport = self.udp_transports.read().await.first().map(Arc::clone);
-            match transport {
-                Some(transport) => {
-                    tokio::spawn(async move {
-                        while let Some(call_id) = rx.recv().await {
-                            for (bytes, dest) in
-                                sip_stack.terminate_call_on_media_failure(&call_id).await
-                            {
-                                if let Err(e) = transport.send(&bytes, &dest).await {
-                                    warn!(error = %e, call_id, dest = %dest, "media-failure BYE send failed");
-                                }
+            if let Some(transport) = transport {
+                tokio::spawn(async move {
+                    while let Some(call_id) = rx.recv().await {
+                        for (bytes, dest) in
+                            sip_stack.terminate_call_on_media_failure(&call_id).await
+                        {
+                            if let Err(e) = transport.send(&bytes, &dest).await {
+                                warn!(error = %e, call_id, dest = %dest, "media-failure BYE send failed");
                             }
                         }
-                    });
-                }
-                None => warn!("media-failure teardown disabled: no UDP transport bound"),
+                    }
+                });
+            } else {
+                warn!("media-failure teardown disabled: no UDP transport bound");
             }
         }
 
@@ -1167,7 +1166,7 @@ impl Server {
                                 // Mark this transport dead so readiness can
                                 // reflect it (the daemon must not stay green
                                 // while deaf on a listener).
-                                stats.live_transports.fetch_update(
+                                stats.live_transports.try_update(
                                     Ordering::SeqCst,
                                     Ordering::SeqCst,
                                     |v| v.checked_sub(1),
@@ -1253,12 +1252,11 @@ impl Server {
         loop {
             match listener.accept().await {
                 Ok((transport, peer)) => {
-                    let permit = match ctx.conn_semaphore.clone().try_acquire_owned() {
-                        Ok(p) => p,
-                        Err(_) => {
-                            warn!(peer = %peer, "TCP connection limit reached, dropping");
-                            continue;
-                        }
+                    let permit = if let Ok(p) = ctx.conn_semaphore.clone().try_acquire_owned() {
+                        p
+                    } else {
+                        warn!(peer = %peer, "TCP connection limit reached, dropping");
+                        continue;
                     };
                     debug!(peer = %peer, "Accepted SIP TCP connection");
                     let conn_ctx = ctx.clone();
@@ -1289,12 +1287,11 @@ impl Server {
             // Step 1: accept the raw TCP connection (fast, no crypto).
             match listener.accept_tcp().await {
                 Ok((tcp_stream, peer)) => {
-                    let permit = match ctx.conn_semaphore.clone().try_acquire_owned() {
-                        Ok(p) => p,
-                        Err(_) => {
-                            warn!(peer = %peer, "TLS connection limit reached, dropping");
-                            continue;
-                        }
+                    let permit = if let Ok(p) = ctx.conn_semaphore.clone().try_acquire_owned() {
+                        p
+                    } else {
+                        warn!(peer = %peer, "TLS connection limit reached, dropping");
+                        continue;
                     };
                     // Step 2: spawn the TLS handshake so the accept loop
                     // continues immediately.

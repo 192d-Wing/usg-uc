@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ## [Unreleased]
 
+### Changed
+
+- **Path-scoped CI** — PRs lint/test only the crate groups they touch (`crates/sbc`, `crates/client`); changes to the shared `uc-*`/`proto-*` core, workspace manifests, or the workflow widen to the full workspace, and pushes to `main` always run everything. A single `CI OK` status gates the result (`.github/workflows/ci.yml`)
+- **Independent release tags** — SBC images are cut from `sbc-v*` (`release-sbc.yml`, formerly `release.yml` on `v*`); a new `release-client.yml` builds the soft-client desktop binaries and `client-ffi` libraries from `client-v*`. Bare `v*` tags no longer trigger a release
+- **Integration tests** no longer run for client-only PRs (`integration.yml`)
+
 ## [0.9.0] — 2026-07-19
 
 ### Security

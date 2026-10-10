@@ -469,7 +469,7 @@ impl SipStack {
         let mut ports = self
             .allocated_ports
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut candidate = self.next_rtp_port.load(Ordering::Relaxed);
         for _ in 0..PAIR_COUNT {
             if candidate > MAX_PORT {
@@ -497,7 +497,7 @@ impl SipStack {
         let mut ports = self
             .allocated_ports
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         ports.remove(&port);
     }
 
@@ -528,9 +528,10 @@ impl SipStack {
     /// offer (RFC 5763). A no-op for pass-through or non-DTLS answers.
     fn rewrite_answer_dtls(&self, sdp: String, addrs: &CallAddresses) -> String {
         if let Some(source) = &self.dtls_fingerprint_source {
-            let role = addrs
-                .dtls_caller_setup
-                .map_or(crate::sdp_dtls::SetupRole::Passive, |s| s.answer_role());
+            let role = addrs.dtls_caller_setup.map_or(
+                crate::sdp_dtls::SetupRole::Passive,
+                super::sdp_dtls::SetupRole::answer_role,
+            );
             crate::sdp_dtls::rewrite_local_dtls(&sdp, &source.current(), role)
         } else {
             sdp

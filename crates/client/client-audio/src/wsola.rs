@@ -302,8 +302,8 @@ impl WsolaPlc {
             for i in 0..template_len {
                 let t = f64::from(self.buf[template_start + i]);
                 let s = f64::from(self.buf[search_start + offset + i]);
-                corr += t * s;
-                energy += s * s;
+                corr = f64::mul_add(t, s, corr);
+                energy = f64::mul_add(s, s, energy);
             }
 
             // Normalize by candidate energy to prevent bias toward loud segments

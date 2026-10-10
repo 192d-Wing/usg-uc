@@ -367,7 +367,7 @@ impl DtlsConnection {
     pub async fn recv_timeout(&self, duration: Duration) -> DtlsResult<Bytes> {
         timeout(duration, self.recv())
             .await
-            .map_or(Err(DtlsError::Timeout), |result| result)
+            .unwrap_or(Err(DtlsError::Timeout))
     }
 
     /// Closes the DTLS connection.

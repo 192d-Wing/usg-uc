@@ -216,7 +216,7 @@ impl AudioProcessor {
             self.agc.release // Increasing gain (quiet signal) → slow
         };
 
-        self.current_gain += (desired_gain - self.current_gain) * alpha;
+        self.current_gain = (desired_gain - self.current_gain).mul_add(alpha, self.current_gain);
         self.current_gain = self
             .current_gain
             .clamp(self.agc.min_gain, self.agc.max_gain);

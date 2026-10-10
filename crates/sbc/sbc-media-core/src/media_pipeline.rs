@@ -330,14 +330,7 @@ impl MediaController for MediaPipeline {
         b_leg_media_ip: Option<std::net::IpAddr>,
     ) -> Result<AllocatedPorts, MediaPipelineError> {
         // Inherent method (method resolution prefers it over this trait method).
-        MediaPipeline::create_session_with_zones(
-            self,
-            call_id,
-            mode,
-            a_leg_media_ip,
-            b_leg_media_ip,
-        )
-        .await
+        Self::create_session_with_zones(self, call_id, mode, a_leg_media_ip, b_leg_media_ip).await
     }
 
     async fn set_remote_address(
@@ -346,11 +339,11 @@ impl MediaController for MediaPipeline {
         is_a_leg: bool,
         address: SbcSocketAddr,
     ) -> Result<(), MediaPipelineError> {
-        MediaPipeline::set_remote_address(self, call_id, is_a_leg, address).await
+        Self::set_remote_address(self, call_id, is_a_leg, address).await
     }
 
     async fn start_relay(&self, call_id: &str) -> Result<(), MediaPipelineError> {
-        MediaPipeline::start_relay(self, call_id).await
+        Self::start_relay(self, call_id).await
     }
 
     async fn start_relay_terminate(
@@ -359,15 +352,15 @@ impl MediaController for MediaPipeline {
         a_leg: LegDtlsParams,
         b_leg: LegDtlsParams,
     ) -> Result<(), MediaPipelineError> {
-        MediaPipeline::start_relay_terminate(self, call_id, a_leg, b_leg).await
+        Self::start_relay_terminate(self, call_id, a_leg, b_leg).await
     }
 
     async fn stop_relay(&self, call_id: &str) -> Result<(), MediaPipelineError> {
-        MediaPipeline::stop_relay(self, call_id).await
+        Self::stop_relay(self, call_id).await
     }
 
     async fn remove_session(&self, call_id: &str) -> Result<(), MediaPipelineError> {
-        MediaPipeline::remove_session(self, call_id).await
+        Self::remove_session(self, call_id).await
     }
 
     async fn allocate_ports(&self) -> Result<(u16, u16), MediaPipelineError> {
@@ -1812,12 +1805,12 @@ async fn terminate_supervisor(s: TerminateSetup) {
         SrtpContext::new(&b_in, SrtpDirection::Inbound, s.b_ssrc),
         SrtpContext::new(&b_out, SrtpDirection::Outbound, s.b_ssrc),
     );
-    let (a_ingress, a_egress, b_ingress, b_egress) = match ctxs {
-        (Ok(ai), Ok(ae), Ok(bi), Ok(be)) => (ai, ae, bi, be),
-        _ => {
-            warn!(call_id = %s.call_id, "SRTP context creation failed; media not relayed");
-            return;
-        }
+    let (a_ingress, a_egress, b_ingress, b_egress) = if let (Ok(ai), Ok(ae), Ok(bi), Ok(be)) = ctxs
+    {
+        (ai, ae, bi, be)
+    } else {
+        warn!(call_id = %s.call_id, "SRTP context creation failed; media not relayed");
+        return;
     };
 
     // Peer→sidecar DTLS (post-handshake rekey) demuxed by each relay leg.

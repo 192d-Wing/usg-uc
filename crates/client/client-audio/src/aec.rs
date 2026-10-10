@@ -316,9 +316,12 @@ impl AecProcessor {
 
         // Update ERLE estimate
         if frame_input_power > self.cfg.min_farend_energy {
-            self.input_power += ERLE_SMOOTHING * (frame_input_power - self.input_power);
-            self.output_power +=
-                ERLE_SMOOTHING * (frame_output_power.max(NLMS_DELTA) - self.output_power);
+            self.input_power =
+                ERLE_SMOOTHING.mul_add(frame_input_power - self.input_power, self.input_power);
+            self.output_power = ERLE_SMOOTHING.mul_add(
+                frame_output_power.max(NLMS_DELTA) - self.output_power,
+                self.output_power,
+            );
             if self.output_power > NLMS_DELTA {
                 self.erle_db = 10.0 * (self.input_power / self.output_power).log10();
             }

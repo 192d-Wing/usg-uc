@@ -389,12 +389,12 @@ impl TrunkCacState {
     /// Decrements session and bandwidth counters.
     fn release_call(&self, bandwidth_kbps: u32) {
         self.current_sessions
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(1))
             })
             .ok();
         self.current_bandwidth_kbps
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(bandwidth_kbps as u64))
             })
             .ok();

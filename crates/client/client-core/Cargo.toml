@@ -65,7 +65,7 @@ directories.workspace = true
 # Note: Platform-specific features are enabled via target-specific dependencies below
 uc-crypto = { path = "../../uc/uc-crypto", optional = true }
 hostname = { version = "0.4", optional = true }
-whoami = { version = "1.5", optional = true }
+whoami = { version = "1.6", optional = true }
 
 # Windows smart card/PKI support + keyring with native backend
 [target.'cfg(windows)'.dependencies]
