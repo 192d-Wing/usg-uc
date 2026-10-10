@@ -21,6 +21,108 @@ env:
   # failing the build.
 
 jobs:
+  # Path-scoped CI. The workspace holds three independent stacks on top of a
+  # shared core (crates/uc + crates/proto):
+  #
+  #   sbc    = crates/sbc/**      (daemon, api/provision/config servers, ...)
+  #   client = crates/client/**   (soft client core, FFI, Tauri GUI)
+  #
+  # A PR that touches only one stack cannot change the lint/test outcome of
+  # the other, or of the shared core (features are unified with
+  # --all-features in every job, and dependency versions live in Cargo.lock,
+  # which counts as "shared"). So PRs lint/test only the stacks they touch.
+  # Anything that can affect the whole graph — the shared core, workspace
+  # manifests, toolchain, this workflow — widens the scope to everything.
+  #
+  # Pushes to main always run the full workspace so main's status stays an
+  # honest signal (e.g. a floating `stable` toolchain landing a new deny
+  # lint in a crate no recent PR touched).
+  #
+  # Mechanism: this job emits a `--exclude <crate>` list derived from
+  # `cargo metadata` (no hand-maintained crate lists to drift), which the
+  # clippy/test/docs jobs append to their `--workspace` invocation. Jobs are
+  # conditioned on `rust == 'true'` rather than on workflow-level `paths:`
+  # filters so the `CI OK` gate below is always reported and can be the one
+  # required status check.
+  changes:
+    name: Detect changed areas
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      # true when any Rust job needs to run at all (docs/deploy-only PRs: false)
+      rust: ${{ steps.scope.outputs.rust }}
+      # true when the client stack is in scope (controls the GTK/WebKit/ALSA
+      # system dependencies, which only the client crates need)
+      client: ${{ steps.scope.outputs.client }}
+      # `--exclude a --exclude b ...` for the out-of-scope crates ('' = all)
+      exclude: ${{ steps.scope.outputs.exclude }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v3
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          filters: |
+            shared:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'clippy.toml'
+              - 'rustfmt.toml'
+              - '.cargo/**'
+              - 'crates/uc/**'
+              - 'crates/proto/**'
+              - '.github/workflows/ci.yml'
+            sbc:
+              - 'crates/sbc/**'
+            client:
+              - 'crates/client/**'
+      - name: Compute workspace scope
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          SHARED: ${{ steps.filter.outputs.shared }}
+          SBC: ${{ steps.filter.outputs.sbc }}
+          CLIENT: ${{ steps.filter.outputs.client }}
+        run: |
+          set -euo pipefail
+          # Full workspace on push-to-main or when the shared core changed.
+          if [[ "$EVENT" != "pull_request" || "$SHARED" == "true" ]]; then
+            echo "rust=true"   >> "$GITHUB_OUTPUT"
+            echo "client=true" >> "$GITHUB_OUTPUT"
+            echo "exclude="    >> "$GITHUB_OUTPUT"
+            echo "scope: full workspace"
+            exit 0
+          fi
+          if [[ "$SBC" != "true" && "$CLIENT" != "true" ]]; then
+            echo "rust=false"  >> "$GITHUB_OUTPUT"
+            echo "client=false" >> "$GITHUB_OUTPUT"
+            echo "exclude="    >> "$GITHUB_OUTPUT"
+            echo "scope: no Rust changes"
+            exit 0
+          fi
+          # Only app stacks changed: exclude the shared core plus every app
+          # stack that did not change. (The shared core still gets *compiled*
+          # as a dependency; it just isn't linted/tested again.)
+          skip=(uc proto)
+          [[ "$SBC"    != "true" ]] && skip+=(sbc)
+          [[ "$CLIENT" != "true" ]] && skip+=(client)
+          exclude=""
+          for group in "${skip[@]}"; do
+            for pkg in $(cargo metadata --format-version 1 --no-deps \
+                | jq -r --arg g "/crates/$group/" \
+                    '.packages[] | select(.manifest_path | contains($g)) | .name'); do
+              exclude+=" --exclude $pkg"
+            done
+          done
+          echo "rust=true"        >> "$GITHUB_OUTPUT"
+          echo "client=$CLIENT"   >> "$GITHUB_OUTPUT"
+          echo "exclude=$exclude" >> "$GITHUB_OUTPUT"
+          echo "scope: skipping groups: ${skip[*]}"
+          echo "exclude:$exclude"
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -34,6 +136,8 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -42,7 +146,10 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev libssl-dev protobuf-compiler
+          sudo apt-get install -y libssl-dev protobuf-compiler
+      - name: Install client system dependencies (GTK/WebKit/ALSA)
+        if: needs.changes.outputs.client == 'true'
+        run: sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev
       # Swatinem caches ~/.cargo + target across runs (and degrades gracefully
       # when the GitHub cache backend is unavailable). Clippy is the canonical
       # "does the whole workspace type-check" job — no separate build job
@@ -50,18 +157,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci
-      - run: cargo clippy --all-targets --all-features
+      - run: cargo clippy --workspace --all-targets --all-features ${{ needs.changes.outputs.exclude }}
 
   test:
     name: Test
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev libssl-dev protobuf-compiler
+          sudo apt-get install -y libssl-dev protobuf-compiler
+      - name: Install client system dependencies (GTK/WebKit/ALSA)
+        if: needs.changes.outputs.client == 'true'
+        run: sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci
@@ -72,8 +184,8 @@ jobs:
       # parallelism, no per-binary startup). It skips doctests, so run those
       # separately. Compiling the tests here also covers the "does it build"
       # signal the old standalone build job provided.
-      - run: cargo nextest run --workspace --all-features
-      - run: cargo test --workspace --all-features --doc
+      - run: cargo nextest run --workspace --all-features ${{ needs.changes.outputs.exclude }}
+      - run: cargo test --workspace --all-features --doc ${{ needs.changes.outputs.exclude }}
 
   # NOTE: the client cross-target portability job lives in its own
   # path-filtered workflow (.github/workflows/client-cross.yml) so it runs only
@@ -94,17 +206,22 @@ jobs:
   docs:
     name: Documentation
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev libssl-dev protobuf-compiler
+          sudo apt-get install -y libssl-dev protobuf-compiler
+      - name: Install client system dependencies (GTK/WebKit/ALSA)
+        if: needs.changes.outputs.client == 'true'
+        run: sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci
-      - run: cargo doc --no-deps --all-features
+      - run: cargo doc --workspace --no-deps --all-features ${{ needs.changes.outputs.exclude }}
 
   coverage:
     name: Code Coverage
@@ -137,3 +254,23 @@ jobs:
           fail_ci_if_error: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  # Single always-reported status for branch protection. Scoped jobs that
+  # were skipped count as passing; a failed or cancelled job fails the gate.
+  # Point the required status check at "CI OK" rather than at individual jobs,
+  # since those are now skipped for out-of-scope PRs.
+  ci-ok:
+    name: CI OK
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [changes, fmt, clippy, test, docs]
+    steps:
+      - name: Check job results
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          if echo "$RESULTS" | jq -e '[.[] | .result] | any(. == "failure" or . == "cancelled")' > /dev/null; then
+            echo "::error::one or more required jobs failed"
+            exit 1
+          fi

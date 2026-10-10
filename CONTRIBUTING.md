@@ -25,6 +25,21 @@ Use [Semantic Versioning 2.0.0](https://semver.org/).
 
 Pre-release versions use format: `X.Y.Z-alpha.N`, `X.Y.Z-beta.N`, `X.Y.Z-rc.N`
 
+### Release tags
+
+Each deliverable is released from its own tag prefix so the SBC, the soft
+client, and the docs site can ship on independent cadences from one repo:
+
+| Prefix       | Example          | Workflow                              | Produces                                   |
+|--------------|------------------|---------------------------------------|--------------------------------------------|
+| `sbc-v*`     | `sbc-v0.9.1`     | `.github/workflows/release-sbc.yml`   | multi-arch SBC pod images on GHCR          |
+| `client-v*`  | `client-v0.2.0`  | `.github/workflows/release-client.yml`| GitHub Release with desktop + FFI binaries |
+| `docs-v*`    | `docs-v0.9.1`    | `.github/workflows/docs.yml`          | GitHub Pages site                          |
+
+A bare `v*` tag triggers nothing. The workspace `version` in `Cargo.toml` is
+still shared; bump it when the SBC ships, and bump the `client-gui-tauri` /
+`tauri.conf.json` version when the client ships.
+
 ---
 
 ## 3. Commit Messages

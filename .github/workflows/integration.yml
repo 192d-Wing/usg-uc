@@ -12,8 +12,15 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # SBC-only: the compose stack builds the sbc image, so client-stack PRs
+    # (crates/client/**) have nothing to exercise here.
     paths:
-      - 'crates/**'
+      - 'crates/sbc/**'
+      - 'crates/uc/**'
+      - 'crates/proto/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
       - 'Dockerfile'
       - 'deploy/test/**'
       - '.github/workflows/integration.yml'
