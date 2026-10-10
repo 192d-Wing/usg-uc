@@ -28,7 +28,8 @@
 //!
 //! ## Feature Flags
 //!
-//! - `opus-ffi`: Enable Opus FFI bindings (requires libopus installed)
+//! - `opus-ffi`: Enable Opus FFI bindings (bundles and builds libopus via
+//!   `opusic-c`; needs `cmake` on the build host)
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

@@ -10,12 +10,6 @@ BulkVS in the Simulator).
 
 ## Dependency hygiene
 
-- [ ] **Replace `audiopus` with `opusic-c`** — `audiopus_sys` is unmaintained
-  (RUSTSEC-2026-0150, vendored build breaks on CMake 4). Mitigated for now by
-  linking the system libopus (CI installs `libopus-dev`; `.cargo/audit.toml`
-  ignores the advisory). The port is confined to
-  `crates/uc/uc-codecs/src/opus_ffi.rs` (~660 lines behind the non-default
-  `opus-ffi` feature). `opusic-c` 1.x is maintained and bundles libopus.
 - [ ] **GTK3 advisories** (RUSTSEC-2024-0429 glib, RUSTSEC-2024-0370
   proc-macro-error) clear themselves when `client-gui-tauri` is retired for
   the native clients.

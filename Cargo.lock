@@ -367,25 +367,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
-name = "audiopus"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3743519567e9135cf6f9f1a509851cb0c8e4cb9d66feb286668afb1923bec458"
-dependencies = [
- "audiopus_sys",
-]
-
-[[package]]
-name = "audiopus_sys"
-version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "927791de46f70facea982dbfaf19719a41ce6064443403be631a85de6a58fff9"
-dependencies = [
- "log",
- "pkg-config",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4662,6 +4643,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
+name = "opusic-c"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89f8e9c909466f15e60277212cc4fec082c68a5e1c9f6e373eee716fec2fed47"
+dependencies = [
+ "opusic-sys",
+]
+
+[[package]]
+name = "opusic-sys"
+version = "0.7.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9d1ecdf206421bc74343ab3bb2f30ad2abbfee41fa341f7181fecbaf957769a"
+dependencies = [
+ "cmake",
+]
+
+[[package]]
 name = "ordered-float"
 version = "2.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8408,8 +8407,9 @@ dependencies = [
 name = "uc-codecs"
 version = "0.9.0"
 dependencies = [
- "audiopus",
+ "bytemuck",
  "bytes",
+ "opusic-c",
  "thiserror 2.0.21",
  "uc-types",
 ]
