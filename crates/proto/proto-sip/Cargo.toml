@@ -16,9 +16,9 @@ digest-auth = ["dep:md5"]
 
 [dependencies]
 thiserror = "2.0"
-bytes = "1.11"
+bytes = "1.12"
 md5 = { version = "0.7", optional = true }
-getrandom = "0.4.2"
+getrandom = "0.4.3"
 
 [lints.rust]
 unsafe_code = "forbid"
