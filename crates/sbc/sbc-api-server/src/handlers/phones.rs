@@ -130,7 +130,11 @@ pub async fn create(
 
 pub async fn get(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> impl IntoResponse {
     match state.phones.get(&id).await {
-        Ok(phone) => serde_json::to_value(&phone).map_or_else(|_| Json(serde_json::json!({"error": "serialize failed"})), Json)
+        Ok(phone) => serde_json::to_value(&phone)
+            .map_or_else(
+                |_| Json(serde_json::json!({"error": "serialize failed"})),
+                Json,
+            )
             .into_response(),
         Err(sbc_config_store::ConfigStoreError::NotFound) => (
             StatusCode::NOT_FOUND,

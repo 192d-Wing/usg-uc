@@ -919,7 +919,8 @@ fn decode_loop(
 
                         // Smooth exponential ramp toward target gain
                         let target_gain = if gain_gate_open { PLAYBACK_GAIN } else { 1.0 };
-                        current_gain = (target_gain - current_gain).mul_add(GAIN_RAMP_SPEED, current_gain);
+                        current_gain =
+                            (target_gain - current_gain).mul_add(GAIN_RAMP_SPEED, current_gain);
 
                         // Apply gain in-place and track post-gain peak in a single pass
                         let mut frame_post_peak: i16 = 0;

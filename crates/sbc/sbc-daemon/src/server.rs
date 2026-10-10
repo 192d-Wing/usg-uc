@@ -730,7 +730,9 @@ impl Server {
                         }
                     }
                 });
-            } else { warn!("media-failure teardown disabled: no UDP transport bound") }
+            } else {
+                warn!("media-failure teardown disabled: no UDP transport bound")
+            }
         }
 
         // Out-of-process equivalent of the mpsc drain above: subscribe to EACH
@@ -1250,7 +1252,9 @@ impl Server {
         loop {
             match listener.accept().await {
                 Ok((transport, peer)) => {
-                    let permit = if let Ok(p) = ctx.conn_semaphore.clone().try_acquire_owned() { p } else {
+                    let permit = if let Ok(p) = ctx.conn_semaphore.clone().try_acquire_owned() {
+                        p
+                    } else {
                         warn!(peer = %peer, "TCP connection limit reached, dropping");
                         continue;
                     };
@@ -1283,7 +1287,9 @@ impl Server {
             // Step 1: accept the raw TCP connection (fast, no crypto).
             match listener.accept_tcp().await {
                 Ok((tcp_stream, peer)) => {
-                    let permit = if let Ok(p) = ctx.conn_semaphore.clone().try_acquire_owned() { p } else {
+                    let permit = if let Ok(p) = ctx.conn_semaphore.clone().try_acquire_owned() {
+                        p
+                    } else {
                         warn!(peer = %peer, "TLS connection limit reached, dropping");
                         continue;
                     };

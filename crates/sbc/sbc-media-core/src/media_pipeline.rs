@@ -330,14 +330,7 @@ impl MediaController for MediaPipeline {
         b_leg_media_ip: Option<std::net::IpAddr>,
     ) -> Result<AllocatedPorts, MediaPipelineError> {
         // Inherent method (method resolution prefers it over this trait method).
-        Self::create_session_with_zones(
-            self,
-            call_id,
-            mode,
-            a_leg_media_ip,
-            b_leg_media_ip,
-        )
-        .await
+        Self::create_session_with_zones(self, call_id, mode, a_leg_media_ip, b_leg_media_ip).await
     }
 
     async fn set_remote_address(
@@ -1812,7 +1805,10 @@ async fn terminate_supervisor(s: TerminateSetup) {
         SrtpContext::new(&b_in, SrtpDirection::Inbound, s.b_ssrc),
         SrtpContext::new(&b_out, SrtpDirection::Outbound, s.b_ssrc),
     );
-    let (a_ingress, a_egress, b_ingress, b_egress) = if let (Ok(ai), Ok(ae), Ok(bi), Ok(be)) = ctxs { (ai, ae, bi, be) } else {
+    let (a_ingress, a_egress, b_ingress, b_egress) = if let (Ok(ai), Ok(ae), Ok(bi), Ok(be)) = ctxs
+    {
+        (ai, ae, bi, be)
+    } else {
         warn!(call_id = %s.call_id, "SRTP context creation failed; media not relayed");
         return;
     };

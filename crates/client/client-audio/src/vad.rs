@@ -176,7 +176,8 @@ impl VoiceActivityDetector {
     fn adapt_noise_floor(&mut self, energy: f32) {
         // Only adapt if energy is reasonable (not a burst of noise)
         if energy < self.noise_floor * self.cfg.speech_threshold_ratio {
-            self.noise_floor = (energy - self.noise_floor).mul_add(self.cfg.noise_floor_adapt_rate, self.noise_floor);
+            self.noise_floor = (energy - self.noise_floor)
+                .mul_add(self.cfg.noise_floor_adapt_rate, self.noise_floor);
             self.noise_floor = self
                 .noise_floor
                 .clamp(MIN_ENERGY_THRESHOLD, self.cfg.max_noise_floor);

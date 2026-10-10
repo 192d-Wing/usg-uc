@@ -351,11 +351,12 @@ impl CentralConfigStore {
                     owner,
                 });
             }
-        } else if let Err(e) = sqlx::query("INSERT INTO did_registry (did, site_code) VALUES ($1, $2)")
-            .bind(did)
-            .bind(site_code)
-            .execute(&mut *tx)
-            .await
+        } else if let Err(e) =
+            sqlx::query("INSERT INTO did_registry (did, site_code) VALUES ($1, $2)")
+                .bind(did)
+                .bind(site_code)
+                .execute(&mut *tx)
+                .await
         {
             // A unique constraint violation (23505) means another
             // transaction raced us and claimed the DID first.
