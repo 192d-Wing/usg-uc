@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+  pull-requests: read
+
 env:
   CARGO_TERM_COLOR: always
   # Incremental compilation is counter-productive in CI (cold target dirs,
