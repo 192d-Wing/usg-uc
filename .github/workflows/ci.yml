@@ -266,6 +266,9 @@ jobs:
   ci-ok:
     name: CI OK
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     if: always()
     needs: [changes, fmt, clippy, test, docs]
     steps:
