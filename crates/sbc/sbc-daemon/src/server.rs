@@ -731,7 +731,7 @@ impl Server {
                     }
                 });
             } else {
-                warn!("media-failure teardown disabled: no UDP transport bound")
+                warn!("media-failure teardown disabled: no UDP transport bound");
             }
         }
 
