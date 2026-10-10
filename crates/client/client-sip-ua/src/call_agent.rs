@@ -3485,7 +3485,7 @@ impl CallAgent {
         let via = response.headers.get_value(&HeaderName::Via)?;
         let start = via.find("branch=")? + "branch=".len();
         let rest = &via[start..];
-        let end = rest.find([';', ',', ' ', '\t']).map_or(rest.len(), |i| i);
+        let end = rest.find([';', ',', ' ', '\t']).unwrap_or(rest.len());
         Some(rest[..end].to_string())
     }
 

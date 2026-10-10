@@ -299,7 +299,7 @@ pub async fn create_route_pattern(
     if body
         .get("pattern")
         .and_then(|v| v.as_str())
-        .is_none_or(|s| s.is_empty())
+        .is_none_or(str::is_empty)
     {
         return (
             StatusCode::BAD_REQUEST,

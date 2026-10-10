@@ -511,7 +511,7 @@ fn decode_loop(
     );
 
     // DTMF diagnostics mode (set DUMP_DTMF=1)
-    let dtmf_diag = std::env::var(DUMP_DTMF_ENV).ok().is_some_and(|v| v == "1");
+    let dtmf_diag = std::env::var(DUMP_DTMF_ENV).is_ok_and(|v| v == "1");
 
     // Optional audio dump file for debugging (set DUMP_DECODED_AUDIO=1 or DUMP_DTMF=1)
     let mut audio_dump: Option<std::io::BufWriter<std::fs::File>> = std::env::var(DUMP_ENV_VAR)
@@ -919,7 +919,7 @@ fn decode_loop(
 
                         // Smooth exponential ramp toward target gain
                         let target_gain = if gain_gate_open { PLAYBACK_GAIN } else { 1.0 };
-                        current_gain += (target_gain - current_gain) * GAIN_RAMP_SPEED;
+                        current_gain = (target_gain - current_gain).mul_add(GAIN_RAMP_SPEED, current_gain);
 
                         // Apply gain in-place and track post-gain peak in a single pass
                         let mut frame_post_peak: i16 = 0;
@@ -1109,7 +1109,7 @@ fn decode_loop(
                             for (i, sample) in fill_buf.iter_mut().enumerate() {
                                 #[allow(clippy::cast_precision_loss)]
                                 let t = i as f32 / len_f;
-                                let gain = 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
+                                let gain = f32::midpoint(1.0, (std::f32::consts::PI * t).cos());
                                 #[allow(clippy::cast_possible_truncation)]
                                 {
                                     *sample = (f32::from(last_output_sample) * gain) as i16;

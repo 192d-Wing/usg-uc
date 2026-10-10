@@ -351,27 +351,25 @@ impl CentralConfigStore {
                     owner,
                 });
             }
-        } else {
-            if let Err(e) = sqlx::query("INSERT INTO did_registry (did, site_code) VALUES ($1, $2)")
-                .bind(did)
-                .bind(site_code)
-                .execute(&mut *tx)
-                .await
+        } else if let Err(e) = sqlx::query("INSERT INTO did_registry (did, site_code) VALUES ($1, $2)")
+            .bind(did)
+            .bind(site_code)
+            .execute(&mut *tx)
+            .await
+        {
+            // A unique constraint violation (23505) means another
+            // transaction raced us and claimed the DID first.
+            if e.as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref()
+                == Some("23505")
             {
-                // A unique constraint violation (23505) means another
-                // transaction raced us and claimed the DID first.
-                if e.as_database_error()
-                    .and_then(sqlx::error::DatabaseError::code)
-                    .as_deref()
-                    == Some("23505")
-                {
-                    return Err(CentralError::DidConflict {
-                        did: did.to_string(),
-                        owner: "unknown (concurrent claim)".to_string(),
-                    });
-                }
-                return Err(CentralError::from(e));
+                return Err(CentralError::DidConflict {
+                    did: did.to_string(),
+                    owner: "unknown (concurrent claim)".to_string(),
+                });
             }
+            return Err(CentralError::from(e));
         }
 
         let extra_json = Value::Object(extra.clone());

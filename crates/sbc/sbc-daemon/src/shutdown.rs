@@ -233,7 +233,7 @@ impl ConnectionTracker {
         // ~4 billion and make is_drained() permanently false.
         let _ = self
             .active_calls
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1));
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1));
     }
 
     /// Returns the active call count.
@@ -252,7 +252,7 @@ impl ConnectionTracker {
         // ~4 billion and make is_drained() permanently false.
         let _ = self
             .active_transactions
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1));
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1));
     }
 
     /// Returns the active transaction count.
@@ -271,7 +271,7 @@ impl ConnectionTracker {
         // ~4 billion and make is_drained() permanently false.
         let _ = self
             .pending_registrations
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1));
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1));
     }
 
     /// Returns the pending registration count.

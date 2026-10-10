@@ -101,7 +101,7 @@ pub struct AppState {
     pub oidc: Option<Arc<proto_jwt::Validator>>,
 
     /// In-memory rate limiter for login attempts, keyed by client IP.
-    /// Maps to (attempt_count, window_start).
+    /// Maps to (`attempt_count`, `window_start`).
     pub login_rate_limiter: Arc<
         std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
     >,

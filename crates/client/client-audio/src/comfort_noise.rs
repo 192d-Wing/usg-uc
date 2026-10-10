@@ -186,7 +186,7 @@ impl ComfortNoiseGenerator {
         for lag in 0..=order {
             let mut sum = 0.0_f64;
             for i in lag..n {
-                sum += f64::from(noise_pcm[i]) * f64::from(noise_pcm[i - lag]);
+                sum = f64::mul_add(f64::from(noise_pcm[i]), f64::from(noise_pcm[i - lag]), sum);
             }
             r[lag] = sum;
         }
@@ -207,7 +207,7 @@ impl ComfortNoiseGenerator {
             // Compute reflection coefficient k[i]
             let mut lambda = 0.0_f64;
             for j in 1..i {
-                lambda += a_prev[j] * r[i - j];
+                lambda = f64::mul_add(a_prev[j], r[i - j], lambda);
             }
             lambda = -(r[i] + lambda) / error;
 
@@ -264,7 +264,7 @@ impl ComfortNoiseGenerator {
             // All-pole synthesis: y[n] = x[n] - a1*y[n-1] - a2*y[n-2] - ...
             let mut y = excitation;
             for k in 0..order {
-                y -= self.lpc_coeffs[k] * self.lpc_memory[k];
+                y = self.lpc_coeffs[k].mul_add(-self.lpc_memory[k], y);
             }
 
             // Shift memory

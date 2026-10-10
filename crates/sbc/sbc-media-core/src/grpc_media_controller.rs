@@ -171,7 +171,7 @@ impl MediaController for GrpcMediaController {
             media_ip: resp
                 .media_ip
                 .as_deref()
-                .map(|s| s.parse::<IpAddr>())
+                .map(str::parse::<IpAddr>)
                 .transpose()
                 .map_err(|e| {
                     MediaPipelineError::Rpc(format!("invalid media_ip from media node: {e}"))

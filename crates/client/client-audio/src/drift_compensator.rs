@@ -111,20 +111,18 @@ impl DriftCompensator {
         }
 
         // --- Active phase: EMA smooth and correct ---
-        self.smoothed_depth += self.cfg.smoothing_alpha * (current_depth_ms - self.smoothed_depth);
+        self.smoothed_depth = self.cfg.smoothing_alpha.mul_add(current_depth_ms - self.smoothed_depth, self.smoothed_depth);
 
         let error = self.smoothed_depth - self.target_depth;
 
         if error > self.cfg.dead_zone_ms {
             // Buffer growing → produce fewer output samples to consume faster
             // Negative accumulator → negative adjustment
-            self.fractional_accumulator -=
-                (error - self.cfg.dead_zone_ms) * self.cfg.correction_gain;
+            self.fractional_accumulator = (error - self.cfg.dead_zone_ms).mul_add(-self.cfg.correction_gain, self.fractional_accumulator);
         } else if error < -self.cfg.dead_zone_ms {
             // Buffer shrinking → produce more output samples to slow consumption
             // Positive accumulator → positive adjustment
-            self.fractional_accumulator -=
-                (error + self.cfg.dead_zone_ms) * self.cfg.correction_gain;
+            self.fractional_accumulator = (error + self.cfg.dead_zone_ms).mul_add(-self.cfg.correction_gain, self.fractional_accumulator);
         } else {
             // Within dead zone — slowly decay accumulator to avoid residual bias
             self.fractional_accumulator *= 0.99;

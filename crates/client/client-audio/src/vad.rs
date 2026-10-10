@@ -176,7 +176,7 @@ impl VoiceActivityDetector {
     fn adapt_noise_floor(&mut self, energy: f32) {
         // Only adapt if energy is reasonable (not a burst of noise)
         if energy < self.noise_floor * self.cfg.speech_threshold_ratio {
-            self.noise_floor += (energy - self.noise_floor) * self.cfg.noise_floor_adapt_rate;
+            self.noise_floor = (energy - self.noise_floor).mul_add(self.cfg.noise_floor_adapt_rate, self.noise_floor);
             self.noise_floor = self
                 .noise_floor
                 .clamp(MIN_ENERGY_THRESHOLD, self.cfg.max_noise_floor);
@@ -200,7 +200,7 @@ fn compute_rms_and_zcr(pcm: &[i16]) -> (f32, f32) {
     let mut prev = pcm[0];
 
     for &s in &pcm[1..] {
-        sum_sq += f64::from(s) * f64::from(s);
+        sum_sq = f64::mul_add(f64::from(s), f64::from(s), sum_sq);
         if (prev >= 0) != (s >= 0) {
             crossings += 1;
         }
