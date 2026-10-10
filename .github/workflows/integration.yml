@@ -26,6 +26,11 @@ on:
       - '.github/workflows/integration.yml'
   workflow_dispatch:
 
+# CodeQL actions/missing-workflow-permissions: this workflow only checks out
+# and builds; it never writes to the repo, packages, or PRs.
+permissions:
+  contents: read
+
 jobs:
   sipp-audio:
     name: SIPp media relay (audio) test
