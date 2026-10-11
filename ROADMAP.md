@@ -2,33 +2,35 @@
 
 This document outlines the development roadmap for the USG Session Border Controller.
 
+> **Status legend.** `✅` = implemented. Each SBC-side item is additionally tagged **[wired: sbc-daemon]**, **[wired: sbc-media-core]**, **[wired: soft client]**, **[library-only]** (implemented and tested in a `proto-*`/`uc-*` crate, no shipped binary calls it) or **[planned]**. An untagged ✅ in the soft-client sections describes the client. "Wired" means a shipped binary has a call site for it.
+
 ## Completed Phases
 
 ### ✅ Phase 1-2: Foundation & Transport
 
 - Workspace structure with 27 crates in 9 layers
-- Foundation crates: `sbc-types`, `sbc-crypto`, `sbc-audit`, `sbc-config`
+- Foundation crates: `uc-types`, `uc-crypto`, `uc-audit`, `sbc-config`
 - CNSA 2.0 cryptographic compliance enforcement
 - NIST 800-53 Rev5 audit logging infrastructure
-- Transport crates: `sbc-transport`, `sbc-dtls`
+- Transport crates: `uc-transport`, `proto-dtls`
 
 ### ✅ Phase 3: Protocol Core
 
 - `proto-sip`: RFC 3261 SIP message parsing and generation (standalone, reusable)
-- `sbc-sdp`: SDP offer/answer model
-- `sbc-rtp`: RTP packet handling
-- `sbc-srtp`: Custom CNSA 2.0 compliant SRTP (AES-256-GCM, SHA-384 KDF)
+- `proto-sdp`: SDP offer/answer model
+- `proto-rtp`: RTP packet handling
+- `proto-srtp`: Custom CNSA 2.0 compliant SRTP (AEAD_AES_256_GCM; RFC 3711 AES-CM key derivation) [wired: sbc-media-core]
 
 ### ✅ Phase 4: NAT/ICE
 
-- `sbc-stun`: STUN client/server
-- `sbc-turn`: TURN relay
-- `sbc-ice`: Full ICE implementation (RFC 8445)
+- `proto-stun`: STUN client/server (client srflx discovery [wired: sbc-daemon]; server [library-only])
+- `proto-turn`: TURN relay [library-only]
+- `proto-ice`: Full ICE implementation (RFC 8445) [library-only]
 
 ### ✅ Phase 5: Media Engine
 
-- `sbc-codecs`: Opus, G.711 (pure Rust), G.722 codec support
-- `sbc-media-engine`: Media relay and pass-through modes
+- `uc-codecs`: Opus, G.711 (pure Rust), G.722 codec support
+- `uc-media-engine`: Media relay and pass-through modes [wired: sbc-media-core]
 
 ### ✅ Phase 6: SIP Application (Extracted to proto-* crates)
 
@@ -37,22 +39,22 @@ This document outlines the development roadmap for the USG Session Border Contro
 - `proto-dialog`: RFC 3261 §12 dialogs, RFC 3515 REFER, RFC 4028 session timers, forking support
 - `proto-b2bua`: RFC 7092 B2BUA modes, RFC 5853 SBC, SDP rewriting, topology hiding
 - `proto-registrar`: RFC 3261 §10 registration, RFC 5626 outbound, RFC 5627 GRUU
-- `sbc-transaction`, `sbc-dialog`, `sbc-b2bua`, `sbc-registrar`: Thin wrappers re-exporting proto-* crates
+- Consumption: `proto-sip`, `proto-transaction`, `proto-b2bua`, `proto-registrar` [wired: sbc-daemon]; `proto-dialog` [library-only] (the daemon keeps its own per-call correlation state)
 
 ### ✅ Phase 7: Security Services
 
-- `sbc-stir-shaken`: STIR/SHAKEN with ES384 only (CNSA 2.0)
-- `sbc-acl`: Access control lists with CIDR network matching
-- `sbc-dos-protection`: Token bucket rate limiting
+- `proto-stir-shaken`: STIR/SHAKEN with ES384 only (CNSA 2.0) [library-only] — no shipped binary depends on it; the daemon does not parse `Identity`
+- `uc-acl`: Access control lists with CIDR network matching [library-only]
+- `uc-dos-protection`: Token bucket rate limiting [wired: sbc-daemon]
 
 ### ✅ Phase 8: Orchestration & Management
 
-- `sbc-policy`: Policy engine with conditions, actions, rules
-- `sbc-routing`: Dial plans, trunk management, LCR, failover
-- `sbc-cdr`: Call Detail Records with JSON/CSV export
-- `sbc-api`: REST API framework
-- `sbc-metrics`: Prometheus metrics
-- `sbc-health`: Kubernetes liveness/readiness probes
+- `uc-policy`: Policy engine with conditions, actions, rules [library-only]
+- `uc-routing`: Dial plans, trunk management, LCR, failover [wired: sbc-daemon]
+- `uc-cdr`: Call Detail Records with JSON/CSV export [library-only]
+- `uc-api`: REST API framework [library-only] — the daemon's REST API is hand-rolled axum routes
+- `uc-metrics`: Prometheus metrics [wired: sbc-daemon]
+- `uc-health`: Kubernetes liveness/readiness probes [wired: sbc-daemon]
 
 ### ✅ Phase 9: Binaries & Integration
 
@@ -80,51 +82,51 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **Goal**: Connect SIP components into working call flow
 
-- ✅ Integrate proto-sip with transport layer
-- ✅ Wire sbc-transaction for request/response handling
-- ✅ Connect sbc-dialog for call state management
-- ✅ Enable sbc-b2bua for call bridging
-- ✅ Integrate sbc-registrar for user registration
+- ✅ Integrate proto-sip with transport layer [wired: sbc-daemon]
+- ✅ Wire proto-transaction for request/response handling [wired: sbc-daemon] — transactions driven (Timer A/B/E/F/G/H, 2xx retransmission, 481 for unmatched in-dialog, re-INVITE/UPDATE relay, RFC 4028 header relay) as of 2026-10-11
+- ✅ proto-dialog `Dialog`/`DialogId` types [library-only] — call state is the daemon's own `CallCorrelation`, the `DialogStore` is never populated
+- ✅ Enable proto-b2bua for call bridging [wired: sbc-daemon]
+- ✅ Integrate proto-registrar for user registration [wired: sbc-daemon]
 
 ### ✅ Phase 12: Media Pipeline
 
 **Goal**: Enable RTP/SRTP media relay
 
-- ✅ Connect sbc-rtp with UDP transport
-- ✅ Integrate sbc-srtp for encrypted media
-- ✅ Wire sbc-media-engine for relay/pass-through
-- ✅ Add DTLS-SRTP key exchange via sbc-dtls
-- ✅ Enable codec transcoding via sbc-codecs
+- ✅ Connect proto-rtp with UDP transport [wired: sbc-media-core]
+- ✅ Integrate proto-srtp for encrypted media [wired: sbc-media-core]
+- ✅ Wire uc-media-engine for relay/pass-through [wired: sbc-media-core]
+- ✅ Add DTLS-SRTP key exchange via proto-dtls [wired: sbc-media-core]
+- ✅ Codec transcoding via uc-codecs [library-only] — a G.711↔G.722 `Transcoder` exists in sbc-media-core but `set_negotiated_codecs` has no caller and `transcode()` is never invoked on the relay path; no Opus transcoding
 
 ### ✅ Phase 13: ICE/NAT Traversal
 
 **Goal**: Full NAT traversal support
 
-- ✅ Integrate sbc-stun for connectivity checks
-- ✅ Enable sbc-turn for relay allocation
-- ✅ Connect sbc-ice for candidate gathering/selection
-- ✅ Add ICE-lite mode for server-side optimization
+- ✅ proto-stun client for server-reflexive address discovery [wired: sbc-daemon] (zone external-IP discovery); STUN connectivity checks [library-only]
+- ✅ proto-turn relay allocation [library-only] — dependency declared, never imported
+- ✅ proto-ice candidate gathering/selection [library-only] — the daemon's `ice_agent.rs` `IceManager` is never constructed; no `a=ice-*` SDP handling
+- ✅ ICE-lite mode [library-only] — flag exists only in the unused `IceManager`
 
 ### ✅ Phase 14: REST API Server
 
 **Goal**: HTTP management interface
 
-- ✅ Add HTTP server to sbc-daemon (axum)
-- ✅ Expose sbc-api routes for management
-- ✅ Implement sbc-metrics Prometheus endpoint
-- ✅ Add sbc-health HTTP probes (/healthz, /readyz)
-- ✅ CDR export endpoints (list, export, stats, search, purge)
+- ✅ Add HTTP server to sbc-daemon (axum) [wired: sbc-daemon]
+- ✅ Management routes [wired: sbc-daemon] — hand-rolled axum routes (dial plans, health, metrics); `uc-api` is a declared dependency but unused
+- ✅ Implement uc-metrics Prometheus endpoint [wired: sbc-daemon]
+- ✅ Add uc-health HTTP probes (/healthz, /readyz) [wired: sbc-daemon]
+- CDR export endpoints (list, export, stats, search, purge) [planned] — only `GET /cdrs` exists and returns an empty list; `uc-cdr` is not a dependency
 
 ### ✅ Phase 15: Production Hardening
 
 **Goal**: Production-ready deployment
 
-- ✅ Implement graceful shutdown with connection draining
-- ✅ Add configuration hot-reload via SIGHUP
-- ✅ Enable TLS for API server (HTTPS with CNSA 2.0 compliant config)
-- ✅ Implement rate limiting per sbc-dos-protection
-- ✅ Add distributed tracing (OpenTelemetry) via `uc-telemetry` crate
-- ✅ Enable TLS certificate rotation via `ReloadableTlsAcceptor`
+- ✅ Implement graceful shutdown with connection draining [wired: sbc-daemon] (active-call drain; per-connection tracking is still approximate)
+- ✅ Add configuration hot-reload via SIGHUP [wired: sbc-daemon]
+- ✅ Enable TLS for API server (HTTPS with CNSA 2.0 compliant config) [wired: sbc-daemon]
+- ✅ Implement rate limiting per uc-dos-protection [wired: sbc-daemon]
+- ✅ Add distributed tracing (OpenTelemetry) via `uc-telemetry` crate [wired: sbc-daemon]
+- ✅ Enable TLS certificate rotation via `ReloadableTlsAcceptor` [wired: sbc-daemon]
 
 ### ✅ Phase 16: Deployment & Operations
 
@@ -144,7 +146,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **Goal**: Make placeholder implementations functional
 
-**DTLS Integration** (sbc-dtls) ✅
+**DTLS Integration** (proto-dtls) ✅ [wired: sbc-media-core]
 
 - ✅ Custom DTLS 1.2 implementation with aws-lc-rs (replaced webrtc-dtls)
 - ✅ DTLS record layer with AES-256-GCM encryption
@@ -156,14 +158,14 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ Anti-replay protection with sliding window
 - ✅ Cookie-based DoS protection (HelloVerifyRequest)
 
-**ICE Candidate Gathering** (sbc-ice) ✅
+**ICE Candidate Gathering** (proto-ice) ✅ [library-only]
 
 - ✅ STUN client implementation for server-reflexive candidates
 - ✅ TURN client implementation for relay candidates
 - ✅ Candidate gathering state machine in ICE agent
 - ✅ TURN authentication support
 
-**Codec Implementations** (sbc-codecs) ✅
+**Codec Implementations** (uc-codecs) ✅ (G.711/G.722/Opus codecs; transcoding not on the relay path, see Phase 12)
 
 - ✅ G.722 ADPCM encoder/decoder (pure Rust implementation)
 - ✅ QMF filter banks for sub-band splitting
@@ -178,35 +180,43 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **Goal**: Complete remaining RFC compliance gaps
 
-**Reliable Provisional Responses** (RFC 3262) ✅
+**Reliable Provisional Responses** (RFC 3262) ✅ [library-only]
+
+_The daemon has no PRACK handler and deliberately does not advertise `100rel`._
 
 - ✅ 100rel extension support in proto-transaction
 - ✅ PRACK method transaction state machine (ReliableProvisionalTracker)
 - ✅ RAck header parsing and validation
 - ✅ Provisional response retransmission with T1/T2 timers
 
-**Event Framework** (RFC 6665) ✅
+**Event Framework** (RFC 6665) ✅ [library-only]
+
+_SUBSCRIBE/NOTIFY are not dispatched by the daemon (405, or 481 when in-dialog)._
 
 - ✅ SUBSCRIBE/NOTIFY dialog support in proto-dialog
 - ✅ Subscription and Notifier state management
 - ✅ Event package definitions (presence, dialog, message-summary, refer, reg)
 - ✅ SubscriptionStateHeader parsing and formatting
 
-**REGISTER Response** (RFC 3261 §10.3) ✅
+**REGISTER Response** (RFC 3261 §10.3) ✅ [wired: sbc-daemon]
 
 - ✅ format_contacts() echoes registered contacts with expiry
 - ✅ remaining_seconds() for binding time-to-expiry
 - ✅ Service-Route header support in RegisterResponse
 - ✅ Path header support in RegisterRequest/Response
 
-**Early Media** (RFC 3960) ✅
+**Early Media** (RFC 3960) ✅ [library-only]
+
+_The daemon relays 183-with-SDP by rewriting the SDP inline; `EarlyMediaHandler`/`EarlyMediaMode` are not referenced._
 
 - ✅ EarlyMediaHandler for 183 Session Progress
 - ✅ EarlyMediaMode: None, LocalRingback, Relay, Gate
 - ✅ Per-leg early media session tracking
 - ✅ Mode-based early media disposition
 
-**ICE Connectivity Checks** (RFC 8445 §6.2) ✅
+**ICE Connectivity Checks** (RFC 8445 §6.2) ✅ [library-only]
+
+_Reachable only through the daemon's unused `IceManager`._
 
 - ✅ STUN-based connectivity check implementation in proto-ice
 - ✅ ConnectivityChecker with triggered check queue
@@ -214,7 +224,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ USE-CANDIDATE nomination and role conflict (487) handling
 - ✅ CheckResult states: Success, Failure, Timeout, RoleConflict, InvalidCredentials
 
-**ICE Consent & Keepalives** (RFC 8445 §9-10, RFC 7675) ✅
+**ICE Consent & Keepalives** (RFC 8445 §9-10, RFC 7675) ✅ [library-only]
 
 - ✅ ConsentTracker with 5-second check interval
 - ✅ 30-second consent timeout per RFC 7675
@@ -222,7 +232,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ ConsentKeepaliveManager combining consent and keepalive logic
 - ✅ ConsentState: Pending, Granted, Expired
 
-**DTLS-SRTP Key Export** (RFC 5764) ✅
+**DTLS-SRTP Key Export** (RFC 5764) ✅ [wired: sbc-media-core]
 
 - ✅ SrtpKeyExporter for keying material derivation
 - ✅ EXTRACTOR-dtls_srtp label per RFC 5764 §4.2
@@ -236,36 +246,40 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **P0 Critical - DTLS Security** (RFC 6347 §4.2.4, §4.2.6) ✅
 
-- ✅ Certificate chain verification with trusted CA store
-- ✅ Self-signed certificate fingerprint validation for WebRTC
+- ✅ Certificate chain verification with trusted CA store [library-only]
+- ✅ Self-signed certificate fingerprint validation for WebRTC [wired: sbc-media-core] (SDP-fingerprint-pinned DTLS-SRTP in terminate mode)
 - ✅ Finished message verification with PRF-based verify_data
 - ✅ CNSA 2.0 compliant (SHA-384, P-384/P-521 only)
 
-**P0 Critical - ICE Consent** (RFC 7675 §6) ✅
+**P0 Critical - ICE Consent** (RFC 7675 §6) ✅ [library-only]
 
 - ✅ Consent revocation with explicit state management
 - ✅ Revocation reasons (UserInitiated, SecurityConcern, etc.)
 - ✅ Immediate media transmission stop on revocation
 
-**P0 Critical - TURN Indications** (RFC 5766 §9, §12) ✅
+**P0 Critical - TURN Indications** (RFC 5766 §9, §12) ✅ [library-only]
 
 - ✅ Send indication for client-to-peer data
 - ✅ Data indication for peer-to-client data
 - ✅ XOR-PEER-ADDRESS and DATA attribute handling
 
-**P0 Critical - SIP Redirect** (RFC 3261 §13.2.2.4) ✅
+**P0 Critical - SIP Redirect** (RFC 3261 §13.2.2.4) ✅ [library-only]
+
+_The daemon treats a 3xx as a terminal non-2xx final (ACKed and relayed to the caller); it does not follow Contact._
 
 - ✅ 3xx response processing with Contact parsing
 - ✅ Priority-based target selection (q-value)
 - ✅ Loop detection and max redirect limits
 
-**P1 High - Flow Maintenance** (RFC 5626 §5.2) ✅
+**P1 High - Flow Maintenance** (RFC 5626 §5.2) ✅ [library-only]
+
+_The daemon parses `reg-id` on REGISTER contacts; no flow manager, flow tokens or keepalives._
 
 - ✅ Multi-transport keepalive (STUN, CRLF, WebSocket)
 - ✅ Flow state machine (Active, Probing, Suspect, Failed)
 - ✅ Flow token generation and tracking
 
-**P1 High - Aggressive Nomination** (RFC 8445 §7.2.2) ✅
+**P1 High - Aggressive Nomination** (RFC 8445 §7.2.2) ✅ [library-only]
 
 - ✅ USE-CANDIDATE in every check for controlling agent
 - ✅ Configuration flag and automatic application
@@ -273,21 +287,25 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **P1 High - Media Modification** (RFC 3264 §8.4) ✅
 
-- ✅ Offer/answer validation rules
-- ✅ Direction negotiation table
-- ✅ Hold/resume support
-- ✅ Stream enable/disable (port=0)
+- ✅ Offer/answer validation rules [library-only]
+- ✅ Direction negotiation table [library-only]
+- ✅ Hold/resume support [wired: sbc-daemon] (relayed transparently via re-INVITE/UPDATE as of 2026-10-11)
+- ✅ Stream enable/disable (port=0) [library-only]
 
-**P1 High - Long-Term Credential** (RFC 5389 §10.2) ✅
+**P1 High - Long-Term Credential** (RFC 5389 §10.2) ✅ [library-only]
+
+_The daemon's STUN use is an unauthenticated client Binding for srflx discovery._
 
 - ✅ Challenge-response authentication flow
 - ✅ Nonce generation with HMAC signatures
 - ✅ Stale nonce detection and refresh
 - ✅ CNSA 2.0 compliant (SHA-384 instead of MD5)
 
-### ✅ Phase 18.6: P2 Medium Priority RFC Compliance
+### ✅ Phase 18.6: P2 Medium Priority RFC Compliance [library-only]
 
 **Goal**: Address medium priority RFC compliance gaps for feature completeness
+
+_All four sub-blocks (GRUU routing, RTCP scheduler, event-package validation, SDP repeat times) live in `proto-*` crates with no sbc-daemon or sbc-media-core call site; the media plane relays RTCP opaquely._
 
 **P2 Medium - Proxy GRUU Routing** (RFC 5627 §5.1) ✅
 
@@ -319,9 +337,11 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ Parsing and generation roundtrip
 - ✅ Validation (interval, duration, offsets)
 
-### ✅ Phase 18.7: P3 Low Priority RFC Compliance
+### ✅ Phase 18.7: P3 Low Priority RFC Compliance [library-only]
 
 **Goal**: Address low priority RFC compliance gaps (edge cases)
+
+_Multicast negotiation, RTP translators/mixers and §16.6 proxy forwarding are not used by the daemon (it is a B2BUA, not a proxy)._
 
 **P3 Low - Multicast Streams** (RFC 3264 §6.2) ✅
 
@@ -356,7 +376,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **Goal**: Production-grade SIP security
 
-**SIP Digest Authentication** (RFC 3261 Section 22) ✅
+**SIP Digest Authentication** (RFC 3261 Section 22) ✅ [wired: sbc-daemon]
 
 - ✅ HTTP Digest computation (MD5, SHA-256, SHA-512-256) in proto-sip
 - ✅ Nonce generation and validation in proto-registrar
@@ -365,7 +385,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ Stale nonce detection and renewal
 - ✅ AuthenticatedRegistrar combining registrar + authenticator
 
-**Topology Hiding** (RFC 3323/RFC 5765) ✅
+**Topology Hiding** (RFC 3323/RFC 5765) ✅ [wired: sbc-daemon] (`TopologyHider` applied to the external B-leg when configured; the B2BUA issues a fresh Call-ID per leg)
 
 - ✅ TopologyHidingConfig in proto-b2bua
 - ✅ TopologyHider in proto-sip with Basic/Aggressive modes
@@ -374,7 +394,9 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ Record-Route manipulation with external host substitution
 - ✅ Call-ID obfuscation with bidirectional mapping
 
-**SRTP-SDES Key Exchange** (RFC 4568) ✅
+**SRTP-SDES Key Exchange** (RFC 4568) ✅ [library-only]
+
+_Neither sbc-daemon nor sbc-media-core handles `a=crypto`; only DTLS-SRTP is wired._
 
 - ✅ Parse crypto attributes from SDP (CryptoAttribute struct)
 - ✅ CipherSuite enum (AES_CM_128_HMAC_SHA1_80/32, AEAD_AES_128/256_GCM)
@@ -388,7 +410,9 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **New Crate**: `uc-webrtc`
 
-**WebSocket SIP Transport** (RFC 7118)
+**WebSocket SIP Transport** (RFC 7118) [library-only]
+
+_The daemon binds UDP, TCP and TLS listeners only._
 
 - ✅ WebSocket transport in `uc-transport/websocket.rs`
 - ✅ SIP-over-WebSocket framing (text frames for SIP messages)
@@ -396,7 +420,9 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ WebSocket ping/pong keepalives
 - ✅ WebSocketListener for accepting connections
 
-**WebRTC Gateway** (`uc-webrtc` crate)
+**WebRTC Gateway** (`uc-webrtc` crate) [library-only]
+
+_`uc-webrtc` is not a dependency of any shipped sbc binary._
 
 - ✅ `WebRtcGateway` for SIP-to-WebRTC call bridging
 - ✅ `SdpMunger` for WebRTC SDP compatibility
@@ -410,26 +436,32 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **Goal**: Enterprise-grade SBC functionality
 
-**Header Manipulation Engine**
+**Header Manipulation Engine** [wired: sbc-daemon] (global and per-trunk rules loaded from config, applied on the outbound INVITE)
 
 - ✅ Configurable header rewrite rules (`proto-sip/manipulation.rs`)
 - ✅ Regular expression substitution (basic pattern support)
 - ✅ Header insertion/deletion policies
 - ✅ Per-trunk header manipulation
 
-**Call Recording & Forking** (RFC 7865/7866)
+**Call Recording & Forking** (RFC 7865/7866) [library-only]
+
+_`uc-siprec` is not a dependency of any shipped sbc binary._
 
 - ✅ SIPREC support for call recording (`uc-siprec` crate)
 - ✅ Media forking to recording server
 - ✅ Metadata generation for recordings (XML per RFC 7865)
 
-**QoS & Traffic Management**
+**QoS & Traffic Management** [library-only]
+
+_No sbc binary sets DSCP/TOS on its sockets; `uc-policy` (CAC) is not a dependency._
 
 - ✅ DSCP marking for SIP/RTP packets (`uc-transport/qos.rs`)
 - ✅ Bandwidth management per trunk
 - ✅ Call admission control by capacity (`uc-policy/cac.rs`)
 
-**DNS Integration** (`uc-dns` crate) ✅
+**DNS Integration** (`uc-dns` crate) ✅ [library-only]
+
+_`uc-dns` is not a dependency of any shipped sbc binary; trunk targets are static host:port._
 
 - ✅ ENUM lookup (RFC 6116) with number-to-domain conversion
 - ✅ DNS SRV for SIP routing (RFC 3263) with weighted selection
@@ -444,32 +476,36 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **New Crates**
 
-- ✅ `uc-cluster`: Core clustering primitives (nodes, membership, failover, quorum)
-- ✅ `uc-discovery`: Service discovery (static, DNS SRV/A, Kubernetes)
-- ✅ `uc-storage`: Storage backends (in-memory, Redis, PostgreSQL)
-- ✅ `uc-state-sync`: State replication engine with CRDTs
-- ✅ `uc-aaa`: AAA integration (RADIUS and Diameter clients)
-- ✅ `uc-snmp`: SNMP trap generation
-- ✅ `uc-syslog`: RFC 5424 syslog forwarding
+- ✅ `uc-cluster`: Core clustering primitives (nodes, membership, failover, quorum) — membership [wired: sbc-daemon]; failover [library-only]
+- ✅ `uc-discovery`: Service discovery (static, DNS SRV/A, Kubernetes) — static default [wired: sbc-daemon]; DNS/Kubernetes/gossip [library-only]
+- ✅ `uc-storage`: Storage backends (in-memory, Redis, PostgreSQL) [wired: sbc-daemon]
+- ✅ `uc-state-sync`: State replication engine with CRDTs [library-only] — optional dependency, never imported
+- ✅ `uc-aaa`: AAA integration (RADIUS and Diameter clients) [library-only]
+- ✅ `uc-snmp`: SNMP trap generation [library-only]
+- ✅ `uc-syslog`: RFC 5424 syslog forwarding [library-only]
 
 **Cluster Management**
 
+_Only `ClusterMembership` and `AsyncLocationService` are constructed by the daemon's `ClusterManager`; the items below marked library-only have no daemon call site (gRPC `InitiateFailover`/`UndoFailover` return unimplemented)._
+
 - ✅ `NodeId`, `NodeRole` (Primary/Secondary/Witness), `NodeState` types
-- ✅ `ClusterMembership` with quorum policies (Majority, All, Count, Weighted)
-- ✅ `FailoverCoordinator` with automatic and manual failover
-- ✅ `SessionTakeoverHandler` trait for session migration
-- ✅ Heartbeat-based health monitoring with suspect/dead thresholds
-- ✅ Failover strategies: PreferSameZone, PreferSameRegion, LeastLoaded, Priority
+- ✅ `ClusterMembership` with quorum policies (Majority, All, Count, Weighted) [wired: sbc-daemon]
+- ✅ `FailoverCoordinator` with automatic and manual failover [library-only]
+- ✅ `SessionTakeoverHandler` trait for session migration [library-only]
+- ✅ Heartbeat-based health monitoring with suspect/dead thresholds [library-only]
+- ✅ Failover strategies: PreferSameZone, PreferSameRegion, LeastLoaded, Priority [library-only]
 
 **Service Discovery**
 
-- ✅ `StaticDiscovery` for configured peer lists
-- ✅ `DnsDiscovery` with SRV and A/AAAA lookup via hickory-resolver
-- ✅ `KubernetesDiscovery` with Kubernetes Endpoints API (feature-gated)
-- ✅ `GossipProtocol` for SWIM-style failure detection
-- ✅ Weighted peer selection per RFC 2782
+_The daemon constructs `DiscoveryManager` with `DiscoveryConfig::default()` (static, empty peer list); no config path selects DNS, Kubernetes or gossip._
 
-**Storage Backends**
+- ✅ `StaticDiscovery` for configured peer lists [wired: sbc-daemon] (default, no peers configured)
+- ✅ `DnsDiscovery` with SRV and A/AAAA lookup via hickory-resolver [library-only]
+- ✅ `KubernetesDiscovery` with Kubernetes Endpoints API (feature-gated) [library-only]
+- ✅ `GossipProtocol` for SWIM-style failure detection [library-only]
+- ✅ Weighted peer selection per RFC 2782 [library-only]
+
+**Storage Backends** [wired: sbc-daemon] (cluster feature)
 
 - ✅ `StorageBackend` trait with get/set/delete/keys/increment
 - ✅ `InMemoryBackend` with TTL support and pattern matching
@@ -477,14 +513,16 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ `PostgresBackend` with sqlx and auto-migration (feature = "postgres")
 - ✅ `AsyncLocationService` in proto-registrar for cache-aside storage integration
 
-**State Synchronization**
+**State Synchronization** [library-only]
 
 - ✅ CRDT implementations: `GCounter`, `PNCounter`, `LWWRegister`
 - ✅ `StateReplicator` with sync/async/semi-sync modes
 - ✅ `ReplicationMessage` protocol for wire format
 - ✅ `StateSnapshot` for bulk state transfer with chunking
 
-**External Integrations**
+**External Integrations** [library-only]
+
+_Reachable only as optional `sbc-config` feature dependencies; no daemon call site._
 
 - ✅ `RadiusClient` for RADIUS authentication and accounting (using `radius-proto` from usg-radius)
 - ✅ `DiameterClient` for Diameter authentication (3GPP Cx/Dx interface for IMS)
@@ -499,7 +537,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 **Configuration Integration**
 
 - ✅ `sbc-config` feature flags: cluster, aaa, snmp, syslog
-- ✅ Cluster API routes in `uc-api` (status, members, failover, drain, sync)
+- ✅ Cluster API routes in `uc-api` (status, members, failover, drain, sync) [library-only] — the daemon exposes cluster state via gRPC `ClusterService` and a REST cluster-health hook, not `uc-api`
 
 **Integration Tests** (`sbc-integration-tests`)
 
@@ -523,7 +561,9 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **New Crate**: `uc-t38`
 
-**T.38 Fax Relay** (RFC 4612)
+**T.38 Fax Relay** (RFC 4612) [library-only]
+
+_`uc-t38` is not a dependency of any shipped sbc binary._
 
 - ✅ T.38 over UDPTL transport with redundancy/FEC
 - ✅ Audio-to-T.38 gateway with signal detection (CNG/CED)
@@ -533,7 +573,9 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ T38Session management with state machine
 - ✅ Goertzel algorithm for tone detection
 
-**SIP over SCTP** (RFC 4168, RFC 9260)
+**SIP over SCTP** (RFC 4168, RFC 9260) [library-only]
+
+_The daemon has no SCTP listener; this and Phase 25 describe the `uc-transport` implementation._
 
 - ✅ Pure Rust SCTP implementation in `uc-transport/sctp/`:
   - `chunk.rs`: All RFC 9260 chunk types (DATA, INIT, SACK, etc.)
@@ -568,7 +610,7 @@ This document outlines the development roadmap for the USG Session Border Contro
 
 **Tests**: 25 new tests (T.38 crate), 137+ tests (SCTP)
 
-### ✅ Phase 25: SCTP RFC 9260 Full Compliance
+### ✅ Phase 25: SCTP RFC 9260 Full Compliance [library-only]
 
 **Goal**: Complete RFC 9260 compliance for production-grade SCTP
 
@@ -1538,8 +1580,8 @@ This document outlines the development roadmap for the USG Session Border Contro
 - ✅ `grpc_server` module with service implementations
 - ✅ `GrpcServer` struct for lifecycle management
 - ✅ `ConfigServiceImpl`, `SystemServiceImpl`, `HealthServiceImpl`
-- ✅ `CallServiceImpl`: ListCalls, GetCall, TerminateCall, GetCallStats, WatchCalls
-- ✅ `RegistrationServiceImpl`: ListRegistrations, GetRegistration, DeleteRegistration, GetRegistrationStats
+- ✅ `CallServiceImpl`: ListCalls [wired: sbc-daemon]; GetCall, TerminateCall, WatchCalls [planned] (return unimplemented/placeholder); GetCallStats [planned] (counters hard-coded to 0 except active)
+- ✅ `RegistrationServiceImpl`: ListRegistrations, DeleteRegistration, GetRegistrationStats [wired: sbc-daemon]; GetRegistration [planned] (lookup not implemented)
 - ✅ TLS/mTLS support via `ServerTlsConfig`
 - ✅ Feature-gated behind `grpc` feature flag
 - ✅ Integrated into Runtime with graceful shutdown
@@ -1681,7 +1723,10 @@ remaining pieces to make the pool fully production-hardened:
   with the new node's SDP (IP/port, and fingerprint in terminate mode); media
   resumes after a ~sub-second re-handshake instead of the endpoint redialing.
   Upgrades #113's BYE (same detect→enumerate→act foundation, re-INVITE instead of
-  BYE). Needs B2BUA re-offer generation for an established dialog. Replicate the
+  BYE). B2BUA re-offer generation for an established dialog now exists
+  (`build_leg_in_dialog_request` / `handle_in_dialog_request` /
+  `handle_reinvite_response`, 2026-10-11); the remaining gap is the SRA trigger
+  wiring (node-death → new-node session → SBC-originated re-INVITE to both legs). Replicate the
   *recipe* (leg addrs, codecs, mode) — the coarse-state agent — not per-packet
   crypto state; ride `uc-state-sync` for signaling-node HA. (The heavier
   hot-standby tier below is the SLA-gated alternative.)
@@ -1743,41 +1788,43 @@ not the per-packet crypto state). This item is the heavier tier above that.
 
 ## RFC Compliance Status
 
-| RFC | Title | Status |
-|-----|-------|--------|
-| RFC 2474 | Differentiated Services | ✅ Implemented (DSCP marking) |
-| RFC 2617 | HTTP Digest Authentication | ✅ Implemented (MD5, SHA-256, SHA-512-256) |
-| RFC 3261 | SIP Core | ✅ Enhanced (~98% compliant, redirect + proxy forwarding) |
-| RFC 3264 | Offer/Answer | ✅ Enhanced (media modification, multicast streams) |
-| RFC 3550 | RTP | ✅ Enhanced (RTCP timing, translators/mixers) |
-| RFC 3711 | SRTP | ✅ Implemented (CNSA 2.0) |
-| RFC 4412 | SIP Priority | ✅ Implemented (emergency call priority) |
-| RFC 4566 | SDP | ✅ Enhanced (repeat times r= line) |
-| RFC 4568 | SDES Key Exchange | ✅ Implemented (crypto attribute parsing) |
-| RFC 4594 | DSCP Configuration | ✅ Implemented (QoS policy manager) |
-| RFC 5389 | STUN | ✅ Enhanced (long-term credential) |
-| RFC 5626 | SIP Outbound | ✅ Enhanced (flow maintenance) |
-| RFC 5627 | GRUU | ✅ Enhanced (proxy GRUU routing) |
-| RFC 5764 | DTLS-SRTP | ✅ Implemented (key export) |
-| RFC 5766 | TURN | ✅ Enhanced (Send/Data indications) |
-| RFC 5853 | SBC Requirements | ✅ Implemented |
-| RFC 6347 | DTLS 1.2 | ✅ Enhanced (certificate verification, Finished validation) |
-| RFC 6665 | SIP Events | ✅ Enhanced (event package validation) |
-| RFC 7092 | B2BUA Taxonomy | ✅ Implemented |
-| RFC 7675 | STUN Consent | ✅ Enhanced (consent revocation) |
-| RFC 7865 | SIPREC Metadata | ✅ Implemented (recording metadata XML) |
-| RFC 7866 | SIPREC Protocol | ✅ Implemented (session recording) |
-| RFC 8445 | ICE | ✅ Enhanced (aggressive nomination, consent, keepalives) |
-| RFC 8224 | STIR | ✅ Implemented (ES384) |
-| RFC 8225 | PASSporT | ✅ Implemented (ES384) |
-| RFC 9260 | SCTP | ✅ Complete (100% compliant - all chunks, state machine, timers, congestion control) |
-| RFC 4168 | SIP over SCTP | 🚧 Partial (transport layer complete) |
-| RFC 6951 | UDP Encapsulation for SCTP | ✅ Implemented |
-| RFC 3758 | PR-SCTP | ✅ Implemented (FORWARD-TSN chunk) |
-| RFC 5061 | SCTP Dynamic Address | ✅ Implemented (ASCONF/ASCONF-ACK chunks) |
-| RFC 6525 | SCTP Stream Reset | ✅ Implemented (RE-CONFIG chunk) |
-| RFC 4895 | SCTP Authentication | ✅ Implemented (AUTH chunk encode/decode) |
-| RFC 4820 | SCTP PAD Chunk | ✅ Implemented (PMTU probing support) |
+"Status" describes the most complete implementation in the workspace; "Shipped in" names the binary that actually exercises it (or `library` when only a `proto-*`/`uc-*` crate implements it).
+
+| RFC | Title | Status | Shipped in |
+|-----|-------|--------|------------|
+| RFC 2474 | Differentiated Services | ✅ Implemented (DSCP marking) | library |
+| RFC 2617 | HTTP Digest Authentication | ✅ Implemented (MD5, SHA-256, SHA-512-256) | sbc-daemon (digest REGISTER auth) |
+| RFC 3261 | SIP Core | ✅ Enhanced (~98% compliant, redirect + proxy forwarding) | sbc-daemon (INVITE/ACK/BYE/CANCEL/OPTIONS/REGISTER/UPDATE, §17 transactions, §14 re-INVITE, 481 for unknown in-dialog); redirect + proxy forwarding: library |
+| RFC 3264 | Offer/Answer | ✅ Enhanced (media modification, multicast streams) | sbc-daemon (offer/answer relay, hold/resume via re-INVITE); validation tables + multicast: library |
+| RFC 3550 | RTP | ✅ Enhanced (RTCP timing, translators/mixers) | sbc-media-core (RTP/RTCP relay); scheduler + translators/mixers: library |
+| RFC 3711 | SRTP | ✅ Implemented (CNSA 2.0) | sbc-media-core |
+| RFC 4412 | SIP Priority | ✅ Implemented (emergency call priority) | library (no Resource-Priority handling in any sbc binary) |
+| RFC 4566 | SDP | ✅ Enhanced (repeat times r= line) | sbc-daemon (SDP rewrite); repeat times: library |
+| RFC 4568 | SDES Key Exchange | ✅ Implemented (crypto attribute parsing) | library (only DTLS-SRTP is wired) |
+| RFC 4594 | DSCP Configuration | ✅ Implemented (QoS policy manager) | library |
+| RFC 5389 | STUN | ✅ Enhanced (long-term credential) | sbc-daemon (client srflx discovery); long-term credential + server: library |
+| RFC 5626 | SIP Outbound | ✅ Enhanced (flow maintenance) | sbc-daemon (reg-id parse only); flow maintenance: library |
+| RFC 5627 | GRUU | ✅ Enhanced (proxy GRUU routing) | library |
+| RFC 5764 | DTLS-SRTP | ✅ Implemented (key export) | sbc-media-core |
+| RFC 5766 | TURN | ✅ Enhanced (Send/Data indications) | library |
+| RFC 5853 | SBC Requirements | ✅ Implemented | sbc-daemon |
+| RFC 6347 | DTLS 1.2 | ✅ Enhanced (certificate verification, Finished validation) | sbc-media-core (fingerprint-pinned); CA-chain verification: library |
+| RFC 6665 | SIP Events | ✅ Enhanced (event package validation) | library |
+| RFC 7092 | B2BUA Taxonomy | ✅ Implemented | sbc-daemon |
+| RFC 7675 | STUN Consent | ✅ Enhanced (consent revocation) | library |
+| RFC 7865 | SIPREC Metadata | ✅ Implemented (recording metadata XML) | library |
+| RFC 7866 | SIPREC Protocol | ✅ Implemented (session recording) | library |
+| RFC 8445 | ICE | ✅ Enhanced (aggressive nomination, consent, keepalives) | library (daemon IceManager never constructed) |
+| RFC 8224 | STIR | ✅ Implemented (ES384) | library (no shipped consumer of proto-stir-shaken) |
+| RFC 8225 | PASSporT | ✅ Implemented (ES384) | library (no shipped consumer of proto-stir-shaken) |
+| RFC 9260 | SCTP | ✅ Complete (100% compliant - all chunks, state machine, timers, congestion control) | library (uc-transport) |
+| RFC 4168 | SIP over SCTP | 🚧 Partial (transport layer complete) | library (no SCTP listener in sbc-daemon) |
+| RFC 6951 | UDP Encapsulation for SCTP | ✅ Implemented | library (uc-transport) |
+| RFC 3758 | PR-SCTP | ✅ Implemented (FORWARD-TSN chunk) | library (uc-transport) |
+| RFC 5061 | SCTP Dynamic Address | ✅ Implemented (ASCONF/ASCONF-ACK chunks) | library (uc-transport) |
+| RFC 6525 | SCTP Stream Reset | ✅ Implemented (RE-CONFIG chunk) | library (uc-transport) |
+| RFC 4895 | SCTP Authentication | ✅ Implemented (AUTH chunk encode/decode) | library (uc-transport) |
+| RFC 4820 | SCTP PAD Chunk | ✅ Implemented (PMTU probing support) | library (uc-transport) |
 
 ---
 
@@ -1800,7 +1847,7 @@ not the per-packet crypto state). This item is the heavier tier above that.
 - ✅ SC-5: DoS Protection
 - ✅ SC-7: Boundary Protection
 - ✅ SC-13: Cryptographic Protection
-- ✅ IA-9: Service Identification (STIR/SHAKEN)
+- IA-9: Service Identification (STIR/SHAKEN) [planned] — `proto-stir-shaken` has no shipped consumer; the daemon does not verify `Identity`
 - ✅ IR-4: Incident Handling
 
 ---

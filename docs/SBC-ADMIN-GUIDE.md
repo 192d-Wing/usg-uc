@@ -5,14 +5,14 @@
 The USG SBC is a SIP Session Border Controller that provides:
 
 - **B2BUA call control** — Back-to-back user agent with full call state management
-- **SIP registration** — Digest authentication, binding storage, location service
+- **SIP registration** — Binding storage and location service; REGISTER authentication via OIDC Bearer tokens (`SBC_AUTH_MODE=bearer`). Digest auth is compiled in but not configurable from `sbc.toml`; REGISTER is unauthenticated unless bearer mode is enabled.
 - **Call routing** — Dial plans with pattern matching, number transforms, trunk selection
 - **Media relay** — RTP/SRTP relay with codec transcoding
 - **Header manipulation** — Per-trunk and global SIP header rewriting
 - **Topology hiding** — Via/Contact/Call-ID anonymization
 - **Rate limiting** — Per-IP and global DoS protection
-- **gRPC management API** — Real-time call and registration monitoring
-- **High availability** — Optional clustering with Redis/PostgreSQL state replication
+- **gRPC management API** — Real-time call and registration monitoring (requires `--features grpc`)
+- **High availability** — Optional shared registration state in Redis/PostgreSQL (requires `--features cluster`; automatic failover and call-state replication are planned — see [CLUSTERING.md](CLUSTERING.md))
 
 ### Architecture
 
@@ -145,10 +145,10 @@ tcp_listen = ["[::]:5060"]
 # skipped at startup with a warning (the daemon serves UDP/TCP only).
 tls_listen = ["[::]:5061"]
 
-# WebSocket listen addresses
+# WebSocket / Secure WebSocket listen addresses.
+# Parsed by sbc-config but NOT bound by sbc-daemon (planned); the
+# uc-transport WebSocket transport is library-only today.
 ws_listen = ["0.0.0.0:8080"]
-
-# Secure WebSocket listen addresses
 wss_listen = ["0.0.0.0:8443"]
 ```
 
@@ -172,15 +172,12 @@ listener.
 
 The SBC acts as a B2BUA registrar, storing user bindings in an in-memory location service. When clustering is enabled, bindings are replicated to Redis or PostgreSQL.
 
-Registration is automatic — any SIP UA that sends a REGISTER request will have its bindings stored. Two authentication modes can be enabled: OIDC Bearer tokens (RFC 8898, `SBC_AUTH_MODE=bearer` — the mode used by the soft client's sign-in flow) or digest authentication.
+Registration is automatic — any SIP UA that sends a REGISTER request will have its bindings stored. The only authentication mode that can be enabled on a running daemon is OIDC Bearer tokens (RFC 8898, `SBC_AUTH_MODE=bearer` plus `SBC_OIDC_ISSUER` — the mode used by the soft client's sign-in flow). Without it the daemon logs `REGISTER is UNAUTHENTICATED: any peer can register any user` at startup.
 
 ### Authentication
 
-Authentication is configured in the SBC startup code. The SipStackConfig supports:
-
-- `require_auth: bool` — whether REGISTER requires digest credentials
-- `auth_realm: String` — the digest auth realm
-- `auth_credentials: HashMap<String, String>` — username-to-password map
+- **Bearer (wired)**: set `SBC_AUTH_MODE=bearer` and `SBC_OIDC_ISSUER` (optionally an extra CA for the internal IdP). Tokens are validated via `proto-jwt` (JWKS cache). Note: the validator currently accepts `RS256`, `PS256`, `ES256` and `ES384` tokens.
+- **Digest (not configurable)**: the `SipStackConfig` fields `require_auth`, `auth_realm` and `auth_credentials` exist in `sbc-daemon/src/sip_stack.rs`, but `build_sip_config` never populates them from `sbc.toml` or the environment, so digest REGISTER auth cannot be turned on without a code change (planned).
 
 ---
 
@@ -363,7 +360,7 @@ strategy = "least_connections"   # selection strategy
   id = "bulkvs-1"
   host = "sip.bulkvs.com"
   port = 5060
-  protocol = "udp"               # udp, tcp, or tls
+  protocol = "udp"               # udp, tcp, or tls — see note below
   priority = 1                   # lower = preferred
   weight = 70                    # for weighted selection
   max_calls = 200                # capacity limit
@@ -387,6 +384,8 @@ strategy = "least_connections"   # selection strategy
   priority = 2                   # lower priority = used for failover
   max_calls = 100
 ```
+
+> **Trunk `protocol`**: `tcp`/`tls` currently only change the trunk URI scheme (`sip:` vs `sips:`) in the router. Forwarded requests are transmitted on the transport the A-leg arrived on (`server.rs`, `transport.send`); the daemon does not open outbound TCP/TLS client connections to trunks (planned).
 
 ### Selection Strategies
 
@@ -417,35 +416,48 @@ When a trunk accumulates `max_failures` consecutive failures, it enters cooldown
 # Media relay mode: "Relay" (full B2BUA) or "PassThrough" (direct)
 default_mode = "Relay"
 
-# Supported codecs in preference order
-codecs = ["opus", "g722", "pcmu", "pcma"]
+# Supported codecs in preference order (uc-types CodecId variant names)
+codecs = ["Opus", "G722", "G711Ulaw", "G711Alaw"]
 
 # RTP port range for media relay
 rtp_port_min = 16384
 rtp_port_max = 32768
 
 [media.srtp]
-# Require SRTP encryption (CNSA 2.0: AEAD_AES_256_GCM)
+# Require SRTP encryption (CNSA 2.0: AEAD_AES_256_GCM is the only profile)
 required = true
-profile = "AEAD_AES_256_GCM"
+profile = "AeadAes256Gcm"        # only value; the relay rejects any other profile
+# "Relay" passes DTLS-SRTP through end-to-end; "Terminate" has the SBC
+# terminate DTLS-SRTP on each leg (requires [media.dtls] sidecar_socket
+# and fingerprint_file — the daemon aborts at startup otherwise).
+mode = "Relay"
 
 [media.dtls]
-# DTLS certificate for SRTP key exchange
+# Optional operator-provided DTLS identity; when unset the SBC generates a
+# self-signed P-384 certificate at startup.
 cert_path = "/etc/sbc/dtls-cert.pem"
 key_path = "/etc/sbc/dtls-key.pem"
-fingerprint_hash = "sha-384"
+fingerprint_hash = "Sha384"      # Sha384 (default) or Sha512
+# Required when srtp.mode = "Terminate": the Go DTLS-SRTP terminator
+# sidecar's Unix socket and the file it publishes its fingerprint to.
+sidecar_socket = "/run/sbc/dtls-sidecar.sock"
+fingerprint_file = "/run/sbc/dtls-fingerprint"
 ```
+
+Values for `profile`, `fingerprint_hash` and `codecs` are the Rust enum variant names (see `deploy/config/config.toml` for the canonical example).
 
 ### Codec Transcoding
 
 When the A-leg and B-leg negotiate different codecs, the SBC automatically transcodes between them. Supported codecs:
 
-| Codec | Payload Type | Clock Rate | Bandwidth |
-|-------|-------------|------------|-----------|
-| G.711 u-law (PCMU) | 0 | 8 kHz | 64 kbps |
-| G.711 A-law (PCMA) | 8 | 8 kHz | 64 kbps |
-| G.722 | 9 | 16 kHz | 64 kbps |
-| Opus | 111 (dynamic) | 48 kHz | 6-510 kbps |
+| Codec | Config name | Payload Type | Clock Rate | Bandwidth |
+|-------|-------------|-------------|------------|-----------|
+| G.711 u-law (PCMU) | `G711Ulaw` | 0 | 8 kHz | 64 kbps |
+| G.711 A-law (PCMA) | `G711Alaw` | 8 | 8 kHz | 64 kbps |
+| G.722 | `G722` | 9 | 16 kHz | 64 kbps |
+| Opus | `Opus` | 111 (dynamic) | 48 kHz | 6-510 kbps |
+
+Transcoding is implemented in `sbc-media-core` (`media_pipeline.rs`, `Transcoder`) and runs in the daemon's in-process media plane or the `sbc-media` pod.
 
 ---
 
@@ -529,11 +541,18 @@ obfuscate_call_id = true         # replace internal Call-IDs
 [security]
 tls_cert_path = "/etc/sbc/tls-cert.pem"
 tls_key_path = "/etc/sbc/tls-key.pem"
-tls_min_version = "1.3"         # CNSA 2.0 requires TLS 1.3
-curve = "P-384"                  # CNSA 2.0 curve
-require_client_cert = false      # Enable mTLS
-ca_bundle_path = "/etc/sbc/ca-bundle.pem"
+min_tls_version = "1.3"         # "1.2" or "1.3"; validated only (see note)
+curve = "P384"                   # P384 or P521; validated only (see note)
+require_mtls = false             # parsed; NOT applied to SIP-TLS (see note)
 ```
+
+Notes on what the daemon actually does with these keys:
+
+- `tls_cert_path` / `tls_key_path` (wired): used for SIP-over-TLS listeners (`transport.tls_listen`) and REST HTTPS. Must be set together.
+- SIP-TLS listeners are always **TLS 1.3 only** (`uc-transport::tls::create_server_config`); `min_tls_version` is checked by `sbc-config` validation but not read at runtime. Cipher suites are not restricted beyond the protocol version. The REST HTTPS listener uses rustls defaults (TLS 1.2 permitted).
+- `curve` only constrains the configuration enum; the key type of the loaded certificate is not checked (P-256/RSA certificates are accepted by rustls).
+- `require_mtls` is parsed but the SIP-TLS listener is built with `with_no_client_auth()` — SIP client-certificate authentication is planned. mTLS **is** enforced for the gRPC listener via `[grpc] require_mtls`.
+- There is no `security.ca_bundle_path` key (one exists under `[stir_shaken]`, which the daemon does not use).
 
 ### Rate Limiting
 
@@ -542,15 +561,15 @@ ca_bundle_path = "/etc/sbc/ca-bundle.pem"
 enabled = true
 global_rps = 10000              # Global requests per second
 per_ip_rps = 100                # Per source IP
-per_user_rps = 50               # Per authenticated user
+per_user_rps = 50               # Parsed but NOT applied by sbc-daemon (planned)
 burst_multiplier = 2.0          # Allow short bursts
 ```
 
-When rate limits are exceeded:
+`global_rps` and `per_ip_rps` feed two `uc-dos-protection` token-bucket limiters in `sbc-daemon/src/server.rs`. `general.max_calls` additionally rejects INVITEs with 503 once the concurrent-call limit is reached. When rate limits are exceeded:
 
-- **Throttle**: Suggested delay (logged but not enforced)
-- **Reject**: Message silently dropped
-- **Block**: Source temporarily blocked
+- **Throttle**: Suggested delay (logged at debug level, message still processed)
+- **Reject**: Message silently dropped (`rate_limited` stat incremented)
+- **Block**: Message dropped and the source remains blocked for the limiter's block duration
 
 ---
 
@@ -559,11 +578,13 @@ When rate limits are exceeded:
 ```toml
 [logging]
 level = "info"                   # trace, debug, info, warn, error
-format = "json"                  # json or text
-output = "stdout"                # stdout or file path
-audit_enabled = false
+format = "json"                  # parsed, not applied by sbc-daemon (planned)
+output = "stdout"                # parsed, not applied by sbc-daemon (planned)
+audit_enabled = false            # parsed, not applied — no audit sink is wired (planned)
 audit_path = "/var/log/sbc/audit.log"
 ```
+
+The daemon's log level is driven by the `-v` flags and `RUST_LOG`; output is always `tracing` to stdout. The `uc-audit` crate (structured, hash-chained audit records) exists but is not used by any shipped binary.
 
 ---
 
@@ -571,37 +592,49 @@ audit_path = "/var/log/sbc/audit.log"
 
 ### Health Endpoints
 
-The SBC exposes REST endpoints on port 8080 (default):
+`sbc-daemon` itself serves only kubelet probes and two read-only resources on `transport.api_listen` (default port 8080):
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /healthz` | Liveness check |
-| `GET /readyz` | Readiness check |
-| `GET /api/v1/system/health` | Detailed health status |
-| `GET /metrics` | Prometheus metrics |
-| `GET /api/v1/system/stats` | Call/registration statistics |
+| Endpoint | Served by | Description |
+|----------|-----------|-------------|
+| `GET /healthz` | sbc-daemon | Liveness check |
+| `GET /readyz` | sbc-daemon | Readiness check |
+| `GET /api/v1/dialplans`, `GET /api/v1/dialplans/{id}/entries` | sbc-daemon | Read-only view of the live dial plans |
+| `GET /api/v1/cdrs` | sbc-daemon | Read-only CDR list |
+| `GET /api/v1/system/health` | sbc-api-server | Detailed health status |
+| `GET /api/v1/system/stats` | sbc-api-server | Call/registration statistics |
+| `GET /api/v1/system/metrics` | sbc-api-server | Prometheus metrics |
+| `GET /api/v1/system/tls`, `POST /api/v1/system/tls/reload` | sbc-api-server | TLS status / certificate reload |
+
+System health, stats and metrics (and all configuration CRUD) moved to the `sbc-api-server` pod, which talks to the daemon over gRPC. There is no root `/metrics` path.
 
 ### gRPC Management API
 
-Enable with `--features grpc`:
+Requires `--features grpc`:
 
 ```toml
 [grpc]
 enabled = true
-listen_addr = "0.0.0.0:50051"
-tls_enabled = false
+listen_addr = "0.0.0.0:9090"     # default; Helm/CLI examples use 9091
+tls_cert_path = "/etc/sbc/grpc-cert.pem"   # optional; TLS off when unset
+tls_key_path = "/etc/sbc/grpc-key.pem"
+tls_ca_path = "/etc/sbc/grpc-ca.pem"       # client CA for mTLS
+require_mtls = false             # enforced for gRPC when true
 max_connections = 100
+request_timeout_secs = 30
+enable_reflection = false        # requires --features grpc-reflection
 ```
 
-Available gRPC services:
+Available gRPC services and their wiring state:
 
-- **CallService** — List, get, terminate calls; watch call events
-- **RegistrationService** — List, get, delete registrations; stats
-- **ConfigService** — Get, update, validate, reload configuration
-- **SystemService** — Version, stats, metrics, TLS reload, shutdown
+- **CallService** — `ListCalls`, `GetCall`, `GetCallStats`, `WatchCalls` wired; `TerminateCall` returns `UNIMPLEMENTED`
+- **RegistrationService** — `ListRegistrations`, `GetRegistration`, `DeleteRegistration`, `GetRegistrationStats` wired
+- **ConfigService** — `GetConfig`, `ValidateConfig` wired; `UpdateConfig` and `ReloadConfig` return `UNIMPLEMENTED`
+- **SystemService** — `GetVersion`, `GetStats`, `GetMetrics`, `ReloadTls`, `GetTlsStatus` wired; `Shutdown` returns `UNIMPLEMENTED`
+- **Health** — standard gRPC health check (includes cluster components with `--features cluster`)
 - **TrunkHealthService** — List trunk health and registration status (reads from in-process monitor or `sbc-trunk-agent` snapshot, transparently)
 - **TrunkStatusPublishService** — Receives status snapshots from `sbc-trunk-agent` (consumed by the agent pod, not by operators directly)
-- **ClusterService** — Cluster status, node management, failover (with `--features cluster`)
+- **TrunkSyncService**, **DialPlanSyncService**, **DidMappingSyncService**, **SbcSyncService** — push trunk-group / dial-plan / DID / partition-CSS-route-pattern-route-list changes from `sbc-api-server` into the live router
+- **ClusterService** (with `--features cluster`) — `GetClusterStatus`, `ListNodes`, `GetNodeStatus`, `DrainNode`, `WatchCluster` wired; `InitiateFailover` and `UndoFailover` return `UNIMPLEMENTED`
 
 ---
 
@@ -710,31 +743,32 @@ No indicator is printed when trunk services run in-process (default mode).
 
 ## Clustering (Optional)
 
-Enable with `--features cluster`:
+Requires `--features cluster` (plus `redis` / `postgres` for those backends; `--features full` enables everything). Without the feature the `[cluster]` and `[storage]` sections are ignored. What is wired today is **shared registration state** in the storage backend plus cluster health reporting; heartbeat, automatic failover, session takeover and call-state replication are planned. See [CLUSTERING.md](CLUSTERING.md) for the full status table.
 
 ```toml
 [cluster]
+enabled = true
 cluster_id = "production"
 node_id = "sbc-01"
-node_role = "primary"            # primary, secondary, standby, witness
+role = "primary"                 # primary, secondary, witness (key is `role`, not `node_role`)
 
-[cluster.heartbeat]
+[cluster.heartbeat]              # parsed, not used yet (planned)
 interval_ms = 1000
 suspect_threshold = 3
 dead_threshold = 5
 
-[cluster.replication]
+[cluster.replication]            # parsed, not used yet (planned)
 mode = "semi_synchronous"       # synchronous, asynchronous, semi_synchronous
 batch_size = 100
 
-[cluster.failover]
+[cluster.failover]               # parsed, not used yet (planned)
 auto_failover = true
 failure_detection_timeout_ms = 5000
 drain_timeout_ms = 30000
 strategy = "prefer_same_zone"    # prefer_same_zone, prefer_same_region, least_loaded, priority
 
-[storage]
-backend = "redis"
+[storage]                        # wired
+backend = "redis"                # memory, redis, postgres
 key_prefix = "sbc:"
 
 [storage.redis]
@@ -750,7 +784,7 @@ pool_size = 10
 | Signal | Action |
 |--------|--------|
 | `SIGTERM` / `SIGINT` | Graceful shutdown (drain connections, flush state) |
-| `SIGHUP` | Configuration hot-reload (TLS certs, rate limits) |
+| `SIGHUP` | Re-reads `sbc.toml` into the daemon's shared config snapshot only. The running `Server` and `SipStack` keep their original settings (the daemon logs that a restart is required). TLS certificate reload is done via gRPC `SystemService.ReloadTls` or `sbc-api-server` `POST /api/v1/system/tls/reload`, not SIGHUP. |
 
 ---
 
@@ -760,25 +794,25 @@ pool_size = 10
 
 The SBC is designed for CNSA 2.0 compliance:
 
-- TLS 1.3 with P-384 ECDSA certificates
-- SRTP with AEAD_AES_256_GCM (256-bit)
-- DTLS-SRTP key exchange with SHA-384 fingerprint
+- SIP-over-TLS is TLS 1.3 only (cipher suites are not further restricted; P-384 certificate type is recommended but not enforced)
+- SRTP with AEAD_AES_256_GCM (256-bit) — the only profile the media plane accepts
+- DTLS-SRTP (DTLS 1.2, Go terminator sidecar) with SHA-384 fingerprint and a self-signed P-384 SBC identity
 
 See [CNSA-2-COMPLIANCE.md](CNSA-2-COMPLIANCE.md) for details.
 
 ### NIST 800-53 Rev5 Controls
 
-The SBC implements controls from NIST 800-53 Rev5:
+The SBC implements controls from NIST 800-53 Rev5 (wiring state in parentheses):
 
-- **AC-4**: Information flow enforcement (routing, topology hiding)
-- **AU-2**: Audit logging
-- **CM-2/CM-6**: Configuration management
-- **IA-2/IA-3**: Authentication (digest auth, mTLS)
-- **SC-5**: DoS protection (rate limiting)
-- **SC-7**: Boundary protection (topology hiding)
-- **SC-8**: Transmission confidentiality (TLS/SRTP)
-- **SC-13**: Cryptographic protection (CNSA 2.0)
-- **SC-24**: Fail in known state (graceful shutdown, cluster failover)
+- **AC-3/AC-4**: Source admission (trunk IP or active registration) and routing / topology hiding (wired)
+- **AU-2**: Audit logging (planned — `uc-audit` is library-only; only `tracing` logs today)
+- **CM-2/CM-6**: Configuration management (wired)
+- **IA-2**: REGISTER authentication (wired for OIDC Bearer via `SBC_AUTH_MODE=bearer`; digest not configurable; SIP mTLS planned)
+- **SC-5**: DoS protection (rate limiting, `max_calls` admission — wired)
+- **SC-7**: Boundary protection (topology hiding — wired)
+- **SC-8**: Transmission confidentiality (TLS 1.3 SIP listeners, AEAD SRTP — wired)
+- **SC-13**: Cryptographic protection (FIPS aws-lc-rs provider — wired)
+- **SC-24**: Fail in known state (single-node graceful shutdown wired; cluster failover planned)
 
 See [NIST-800-53-CONTROLS.md](NIST-800-53-CONTROLS.md) for details.
 
