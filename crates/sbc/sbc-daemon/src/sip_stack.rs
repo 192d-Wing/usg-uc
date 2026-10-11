@@ -29,9 +29,11 @@ use proto_sip::manipulation::{
     HeaderManipulator, ManipulationAction, ManipulationContext, ManipulationDirection,
     ManipulationPolicy, ManipulationRule,
 };
+use proto_sip::message::{SipRequest, SipResponse};
 use proto_sip::uri::SipUri;
 use proto_sip::{Header, HeaderName, Method, SipMessage, StatusCode};
 use proto_sip::{TopologyHider, TopologyHidingConfig as SipTopologyConfig, TopologyHidingMode};
+use proto_transaction::timer::TimerType;
 use proto_transaction::{
     ClientInviteTransaction, ClientNonInviteTransaction, ServerInviteTransaction,
     ServerNonInviteTransaction, TransactionKey, TransportType,
@@ -39,6 +41,7 @@ use proto_transaction::{
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uc_routing::{
@@ -114,6 +117,9 @@ pub struct SipStack {
     /// In-flight INVITE Call-IDs: prevents TOCTOU race between the
     /// retransmit check and the correlation insert.
     in_flight_invites: RwLock<HashSet<String>>,
+    /// 2xx responses to INVITEs the SBC answered as UAS, retransmitted until
+    /// ACKed (RFC 3261 §13.3.1.4). Keyed by the SIP Call-ID of that leg.
+    pending_2xx: RwLock<HashMap<String, Pending2xx>>,
 }
 
 /// SIP stack configuration.
@@ -171,39 +177,59 @@ struct TransactionStore {
 struct ServerInviteState {
     transaction: ServerInviteTransaction,
     source: SbcSocketAddr,
-    created_at: std::time::Instant,
+    created_at: Instant,
+    /// Last response sent on this transaction: re-sent on an INVITE
+    /// retransmission (RFC 3261 §17.2.1) and, for a non-2xx final, on
+    /// Timer G until the ACK arrives.
+    last_response: Option<SipMessage>,
 }
 
 /// State for server non-INVITE transaction.
 struct ServerNonInviteState {
     transaction: ServerNonInviteTransaction,
     source: SbcSocketAddr,
-    created_at: std::time::Instant,
+    created_at: Instant,
+    /// Last response sent; re-sent on a request retransmission (§17.2.2).
+    last_response: Option<SipMessage>,
 }
 
 /// State for client INVITE transaction.
 struct ClientInviteState {
     transaction: ClientInviteTransaction,
     destination: SbcSocketAddr,
-    created_at: std::time::Instant,
+    created_at: Instant,
+    /// The INVITE on the wire, retransmitted on Timer A (§17.1.1.2).
+    request: SipMessage,
+    /// ACK for a non-2xx final (§17.1.1.3), re-sent when that final is
+    /// retransmitted.
+    ack: Option<SipMessage>,
+    /// Call this INVITE belongs to (Timer B fails it).
+    call: CallId,
 }
 
 /// State for client non-INVITE transaction.
 struct ClientNonInviteState {
     transaction: ClientNonInviteTransaction,
     destination: SbcSocketAddr,
-    created_at: std::time::Instant,
+    created_at: Instant,
+    /// The request on the wire, retransmitted on Timer E (§17.1.2.2).
+    request: SipMessage,
+    /// Call this request belongs to, when it is a relayed in-dialog request
+    /// (Timer F fails it toward the originator).
+    call: Option<CallId>,
 }
 
 impl TransactionStore {
-    /// Sweep threshold: once any map exceeds this, expired entries are
-    /// purged on the next insert. Bounds memory against INVITE floods —
-    /// transaction entries were never removed otherwise.
+    /// Sweep threshold: once any map exceeds this, stale entries are purged
+    /// on the next insert. Bounds memory against INVITE floods.
     const SWEEP_THRESHOLD: usize = 1024;
 
-    /// RFC 3261 Timer-derived transaction lifetime (64*T1 = 32s, doubled
-    /// for safety margin).
-    const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(64);
+    /// Backstop lifetime for a transaction that never reached Terminated.
+    /// Terminated ones are pruned by `poll_timers` as their RFC 3261 timers
+    /// fire; this only catches state machines that stalled. It must exceed
+    /// any legitimate transaction — a server INVITE stays in Proceeding for
+    /// as long as the callee rings — so it is minutes, not 64*T1.
+    const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(600);
 
     /// Removes transactions older than [`Self::MAX_AGE`] once any map has
     /// grown past [`Self::SWEEP_THRESHOLD`]. Amortized O(1) per insert.
@@ -224,6 +250,18 @@ impl TransactionStore {
         self.server_non_invite.retain(|_, s| young(s.created_at));
         self.client_invite.retain(|_, s| young(s.created_at));
         self.client_non_invite.retain(|_, s| young(s.created_at));
+    }
+
+    /// Drops transactions whose state machine has reached Terminated.
+    fn prune_terminated(&mut self) {
+        self.server_invite
+            .retain(|_, s| !s.transaction.is_terminated());
+        self.server_non_invite
+            .retain(|_, s| !s.transaction.is_terminated());
+        self.client_invite
+            .retain(|_, s| !s.transaction.is_terminated());
+        self.client_non_invite
+            .retain(|_, s| !s.transaction.is_terminated());
     }
 }
 
@@ -309,9 +347,68 @@ struct CallAddresses {
     /// (200 OK), when the original offer is no longer in hand. `None` for
     /// non-DTLS offers or pass-through.
     dtls_caller_fingerprint: Option<String>,
-    /// Via branch of the A-leg INVITE (server transaction key for cleanup).
-    a_leg_branch: String,
+    /// SBC-owned media IP and port advertised to the **callee** in the B-leg
+    /// offer; re-used when the caller re-offers mid-dialog.
+    media_b_leg_ip: String,
+    media_b_leg_port: u16,
+    /// Set once the B-leg answered (first 2xx seen). A later 2xx is a
+    /// retransmission: re-ACK only, do not restart media.
+    b_leg_answered: bool,
+    /// Next CSeq for SBC-originated requests toward each leg. The B-leg
+    /// INVITE used 1; the SBC→caller direction has its own sequence space.
+    a_leg_local_cseq: u32,
+    b_leg_local_cseq: u32,
+    /// Last SDP the SBC sent to each leg (the answer to the caller, the offer
+    /// to the callee); replayed to answer a body-less session refresh.
+    a_leg_last_sdp: Option<Bytes>,
+    b_leg_last_sdp: Option<Bytes>,
+    /// Mid-dialog re-INVITE/UPDATE currently being relayed across the legs.
+    pending_reinvite: Option<PendingReinvite>,
+    /// ACK sent for the last relayed re-INVITE's 2xx (keyed by that
+    /// re-INVITE's client branch) — re-sent if the 2xx is retransmitted.
+    last_reinvite_ack: Option<(String, SipMessage, SbcSocketAddr)>,
 }
+
+/// A mid-dialog re-INVITE (RFC 3261 §14) or UPDATE (RFC 3311) received on one
+/// leg and forwarded to the other; the originator is answered when the far
+/// leg answers.
+#[derive(Clone)]
+struct PendingReinvite {
+    /// `true` when the caller (A-leg) originated it.
+    from_a_leg: bool,
+    /// INVITE or UPDATE.
+    method: Method,
+    /// The originator's Via stack, From, To and CSeq — its response must
+    /// carry these verbatim.
+    orig_via: Vec<String>,
+    orig_from: String,
+    orig_to: String,
+    orig_cseq: String,
+    /// Top Via branch of the forwarded request (client transaction key).
+    fwd_branch: String,
+    /// CSeq number of the forwarded request (its ACK carries it).
+    fwd_cseq: u32,
+    /// The originator's offered DTLS `a=setup`; picks the SBC's answering
+    /// role when terminating DTLS-SRTP.
+    offer_setup: Option<crate::sdp_dtls::SetupRole>,
+}
+
+/// A 2xx the SBC sent as UAS for an INVITE, retransmitted until the ACK
+/// arrives: 2xx reliability is the TU's job, not the transaction layer's
+/// (RFC 3261 §13.3.1.4).
+struct Pending2xx {
+    response: SipMessage,
+    destination: SbcSocketAddr,
+    /// CSeq number of the INVITE answered (the ACK must carry it).
+    cseq: u32,
+    call: CallId,
+    interval: std::time::Duration,
+    next_at: Instant,
+    deadline: Instant,
+}
+
+/// Methods the SBC accepts (OPTIONS `Allow` and 405 responses).
+const ALLOWED_METHODS: &str = "INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER, UPDATE";
 
 /// Result of processing a SIP message.
 #[derive(Debug)]
@@ -394,6 +491,7 @@ impl SipStack {
             next_rtp_port: std::sync::atomic::AtomicU16::new(32_770),
             allocated_ports: Arc::new(std::sync::Mutex::new(HashSet::new())),
             in_flight_invites: RwLock::new(HashSet::new()),
+            pending_2xx: RwLock::new(HashMap::new()),
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
@@ -448,6 +546,7 @@ impl SipStack {
             next_rtp_port: std::sync::atomic::AtomicU16::new(32_770),
             allocated_ports: Arc::new(std::sync::Mutex::new(HashSet::new())),
             in_flight_invites: RwLock::new(HashSet::new()),
+            pending_2xx: RwLock::new(HashMap::new()),
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
@@ -647,7 +746,8 @@ impl SipStack {
                 HeaderName::To,
                 with_tag(&addrs.b_leg_to, addrs.dialog_to_tag.as_deref()),
             );
-            bye.headers.set(HeaderName::CSeq, "2 BYE");
+            bye.headers
+                .set(HeaderName::CSeq, format!("{} BYE", addrs.b_leg_local_cseq));
         } else {
             // SBC is the UAS on the A-leg: From = the To we answered with (+tag),
             // To = the caller's From. The SBC→A direction has its own CSeq space.
@@ -656,7 +756,8 @@ impl SipStack {
                 with_tag(&addrs.a_leg_to, addrs.dialog_to_tag.as_deref()),
             );
             bye.headers.set(HeaderName::To, &addrs.a_leg_from);
-            bye.headers.set(HeaderName::CSeq, "1 BYE");
+            bye.headers
+                .set(HeaderName::CSeq, format!("{} BYE", addrs.a_leg_local_cseq));
         }
         bye.headers.set(HeaderName::MaxForwards, "70");
         let branch = generate_branch();
@@ -668,23 +769,19 @@ impl SipStack {
         bye
     }
 
-    /// Builds an in-dialog **re-INVITE** toward one leg, re-offering media at
-    /// `sdp_offer` — used by media re-anchor to move a call to a healthy media
-    /// node without a redial (RFC 3264 re-offer). Mirrors [`Self::build_leg_bye`]'s
-    /// dialog addressing (To/From/Call-ID per leg), adds a `Contact` refreshing
-    /// the SBC's dialog target and the SDP offer body. `cseq` is the next
-    /// sequence number in the SBC's request stream toward that leg.
-    ///
-    /// NOTE (Phase 3, re-anchor): this is the outbound half. The full loop —
-    /// handling the endpoint's 200 OK answer (its media address) + ACK + wiring
-    /// the new node — is not yet activated; BYE remains the live failover until
-    /// it is. Kept `#[allow(dead_code)]` until the orchestrator lands.
-    #[allow(dead_code)]
-    fn build_leg_reinvite(
+    /// Builds an in-dialog request (re-INVITE, UPDATE or ACK) toward one leg,
+    /// optionally carrying an SDP body. Mirrors [`Self::build_leg_bye`]'s
+    /// dialog addressing (To/From/Call-ID per leg); INVITE/UPDATE also carry a
+    /// `Contact` refreshing the SBC's dialog target. `cseq` is the sequence
+    /// number in the SBC's request stream toward that leg (for ACK, the
+    /// INVITE's). Used to relay mid-dialog session changes (RFC 3261 §14,
+    /// RFC 3311) and by media re-anchor (RFC 3264 re-offer).
+    fn build_leg_in_dialog_request(
         addrs: &CallAddresses,
         target_b_leg: bool,
+        method: &Method,
         cseq: u32,
-        sdp_offer: &[u8],
+        body: Option<&[u8]>,
     ) -> proto_sip::message::SipRequest {
         let (dest, other_call_id) = if target_b_leg {
             (&addrs.b_leg_destination, &addrs.b_leg_sip_call_id)
@@ -692,7 +789,8 @@ impl SipStack {
             (&addrs.a_leg_source, &addrs.a_leg_sip_call_id)
         };
         let uri = SipUri::new(dest.ip().to_string()).with_port(dest.port());
-        let mut inv = proto_sip::message::SipRequest::new(Method::Invite, uri);
+        let method_name = method.to_string();
+        let mut inv = proto_sip::message::SipRequest::new(method.clone(), uri);
         inv.headers.set(HeaderName::CallId, other_call_id);
         if target_b_leg {
             // SBC is the UAC on the B-leg: From = our INVITE From, To = the callee
@@ -711,21 +809,877 @@ impl SipStack {
             );
             inv.headers.set(HeaderName::To, &addrs.a_leg_from);
         }
-        inv.headers.set(HeaderName::CSeq, format!("{cseq} INVITE"));
+        inv.headers
+            .set(HeaderName::CSeq, format!("{cseq} {method_name}"));
         inv.headers.set(HeaderName::MaxForwards, "70");
         let branch = generate_branch();
         inv.headers.add(Header::new(
             HeaderName::Via,
             format!("SIP/2.0/UDP {};branch={}", addrs.local_addr, branch),
         ));
-        // Target-refresh Contact: subsequent in-dialog requests come back to us.
-        inv.headers
-            .set(HeaderName::Contact, format!("<sip:{}>", addrs.local_addr));
-        inv.headers.set(HeaderName::ContentType, "application/sdp");
-        inv.headers
-            .set(HeaderName::ContentLength, sdp_offer.len().to_string());
-        inv.body = Some(Bytes::copy_from_slice(sdp_offer));
+        if *method != Method::Ack {
+            // Target-refresh Contact: subsequent in-dialog requests come back to us.
+            inv.headers
+                .set(HeaderName::Contact, format!("<sip:{}>", addrs.local_addr));
+        }
+        match body {
+            Some(sdp) if !sdp.is_empty() => {
+                inv.headers.set(HeaderName::ContentType, "application/sdp");
+                inv.headers
+                    .set(HeaderName::ContentLength, sdp.len().to_string());
+                inv.body = Some(Bytes::copy_from_slice(sdp));
+            }
+            _ => {
+                inv.headers.set(HeaderName::ContentLength, "0");
+            }
+        }
         inv
+    }
+
+    // ------------------------------------------------------------------
+    // Transaction layer (RFC 3261 §17) and 2xx reliability (§13.3.1.4).
+    //
+    // The state machines live in `proto-transaction`; this stack opens one
+    // per request it receives or sends, feeds it every message and timer
+    // tick, and re-sends from the copies kept alongside.
+    // ------------------------------------------------------------------
+
+    /// If `req` retransmits a request already in the server transaction store
+    /// (RFC 3261 §17.2.3: top Via branch + CSeq method), returns what to do
+    /// about it — re-send the last response, or nothing while the first copy
+    /// is still being processed. `None` means the request is new.
+    async fn answer_request_retransmit(
+        &self,
+        req: &SipRequest,
+        source: SbcSocketAddr,
+    ) -> Option<ProcessResult> {
+        let branch = req.headers.via_branch()?;
+        let key = TransactionKey::server(&branch, req.method.to_string());
+        let mut txns = self.transactions.write().await;
+        let (resend, last) = if req.method == Method::Invite {
+            let st = txns.server_invite.get_mut(&key)?;
+            (
+                st.transaction.receive_request().unwrap_or(false),
+                st.last_response.clone(),
+            )
+        } else {
+            let st = txns.server_non_invite.get_mut(&key)?;
+            (
+                st.transaction.receive_request().unwrap_or(false),
+                st.last_response.clone(),
+            )
+        };
+        drop(txns);
+        debug!(method = %req.method, branch = %branch, resend, "Request retransmission");
+        match (resend, last) {
+            (true, Some(message)) => Some(ProcessResult::Response {
+                message,
+                destination: source,
+            }),
+            _ => Some(ProcessResult::NoAction),
+        }
+    }
+
+    /// Opens a server transaction for a newly received request so later
+    /// retransmissions are answered from the stored response and a non-2xx
+    /// INVITE final is retransmitted on Timer G until ACKed.
+    async fn open_server_transaction(&self, req: &SipRequest, source: SbcSocketAddr) {
+        let Some(branch) = req.headers.via_branch() else {
+            return;
+        };
+        let key = TransactionKey::server(&branch, req.method.to_string());
+        let now = Instant::now();
+        let mut txns = self.transactions.write().await;
+        txns.sweep_if_needed();
+        if req.method == Method::Invite {
+            txns.server_invite
+                .entry(key.clone())
+                .or_insert_with(|| ServerInviteState {
+                    transaction: ServerInviteTransaction::new(key, TransportType::Unreliable),
+                    source,
+                    created_at: now,
+                    last_response: None,
+                });
+        } else {
+            txns.server_non_invite
+                .entry(key.clone())
+                .or_insert_with(|| ServerNonInviteState {
+                    transaction: ServerNonInviteTransaction::new(key, TransportType::Unreliable),
+                    source,
+                    created_at: now,
+                    last_response: None,
+                });
+        }
+    }
+
+    /// Bookkeeping for everything a handler puts on the wire: responses are
+    /// recorded on their server transaction, forwarded requests open a client
+    /// transaction that retransmits and times them out.
+    async fn track_result(&self, result: &ProcessResult) {
+        match result {
+            ProcessResult::Response { message, .. } => self.record_server_response(message).await,
+            ProcessResult::Forward {
+                message,
+                destination,
+            } => self.open_client_transaction(message, *destination).await,
+            ProcessResult::Multiple(results) => {
+                for r in results {
+                    Box::pin(self.track_result(r)).await;
+                }
+            }
+            ProcessResult::NoAction | ProcessResult::Error { .. } => {}
+        }
+    }
+
+    /// Feeds a response the TU is sending to its server transaction (matched
+    /// by the response's top Via branch + CSeq method, which mirror the
+    /// request's) and keeps a copy for retransmission.
+    async fn record_server_response(&self, message: &SipMessage) {
+        let SipMessage::Response(resp) = message else {
+            return;
+        };
+        let Some(branch) = resp.headers.via_branch() else {
+            return;
+        };
+        let Some(cseq) = resp.headers.cseq_parsed() else {
+            return;
+        };
+        let code = resp.status.code();
+        let key = TransactionKey::server(&branch, cseq.method.to_string());
+        let mut txns = self.transactions.write().await;
+        if cseq.method == Method::Invite {
+            if let Some(st) = txns.server_invite.get_mut(&key) {
+                let _ = st.transaction.send_response(code);
+                st.last_response = Some(message.clone());
+            }
+        } else if let Some(st) = txns.server_non_invite.get_mut(&key) {
+            let _ = st.transaction.send_response(code);
+            st.last_response = Some(message.clone());
+        }
+    }
+
+    /// Opens a client transaction for a request the SBC is sending. ACK has
+    /// none (§17.1.1.3). The stored copy is retransmitted on Timer A/E; Timer
+    /// B/F fails the call or relayed request it belongs to.
+    async fn open_client_transaction(&self, message: &SipMessage, destination: SbcSocketAddr) {
+        let SipMessage::Request(req) = message else {
+            return;
+        };
+        if req.method == Method::Ack {
+            return;
+        }
+        let Some(branch) = req.headers.via_branch() else {
+            return;
+        };
+        let call = {
+            let corr = self.call_correlation.read().await;
+            let id = req.headers.call_id().unwrap_or("");
+            corr.b_leg.get(id).or_else(|| corr.a_leg.get(id)).cloned()
+        };
+        let key = TransactionKey::client(&branch, req.method.to_string());
+        let now = Instant::now();
+        let mut txns = self.transactions.write().await;
+        txns.sweep_if_needed();
+        if req.method == Method::Invite {
+            let Some(call) = call else {
+                return;
+            };
+            txns.client_invite
+                .entry(key.clone())
+                .or_insert_with(|| ClientInviteState {
+                    transaction: ClientInviteTransaction::new(key, TransportType::Unreliable),
+                    destination,
+                    created_at: now,
+                    request: message.clone(),
+                    ack: None,
+                    call,
+                });
+        } else {
+            txns.client_non_invite
+                .entry(key.clone())
+                .or_insert_with(|| ClientNonInviteState {
+                    transaction: ClientNonInviteTransaction::new(key, TransportType::Unreliable),
+                    destination,
+                    created_at: now,
+                    request: message.clone(),
+                    call,
+                });
+        }
+    }
+
+    /// Builds the ACK for a non-2xx final to a client INVITE (RFC 3261
+    /// §17.1.1.3): the INVITE's Request-URI, Call-ID, From and CSeq number,
+    /// the To from the response, and a single Via equal to the INVITE's top
+    /// Via — same branch, since this ACK belongs to that transaction.
+    fn build_non2xx_ack(invite: &SipRequest, resp: &SipResponse) -> SipMessage {
+        let mut ack = SipRequest::new(Method::Ack, invite.uri.clone());
+        if let Some(via) = invite.headers.get_value(&HeaderName::Via) {
+            ack.headers.add(Header::new(HeaderName::Via, via));
+        }
+        for name in [
+            HeaderName::From,
+            HeaderName::CallId,
+            HeaderName::MaxForwards,
+        ] {
+            if let Some(v) = invite.headers.get_value(&name) {
+                ack.headers.set(name, v);
+            }
+        }
+        let to = resp
+            .headers
+            .get_value(&HeaderName::To)
+            .or_else(|| invite.headers.get_value(&HeaderName::To))
+            .unwrap_or_default();
+        ack.headers.set(HeaderName::To, to);
+        let seq = invite.headers.cseq_parsed().map_or(1, |c| c.sequence);
+        ack.headers.set(HeaderName::CSeq, format!("{seq} ACK"));
+        ack.headers.set(HeaderName::ContentLength, "0");
+        SipMessage::Request(ack)
+    }
+
+    /// Starts retransmitting a 2xx the SBC sent for an INVITE until the ACK
+    /// arrives (RFC 3261 §13.3.1.4: every T1, doubling up to T2, giving up
+    /// after 64*T1). Keyed by the SIP Call-ID of the leg it was sent on.
+    async fn arm_2xx_retransmit(
+        &self,
+        leg_call_id: &str,
+        call: &CallId,
+        response: &SipMessage,
+        destination: SbcSocketAddr,
+        cseq: u32,
+    ) {
+        let now = Instant::now();
+        let t1 = proto_transaction::DEFAULT_T1;
+        self.pending_2xx.write().await.insert(
+            leg_call_id.to_string(),
+            Pending2xx {
+                response: response.clone(),
+                destination,
+                cseq,
+                call: call.clone(),
+                interval: t1,
+                next_at: now + t1,
+                deadline: now + t1 * 64,
+            },
+        );
+    }
+
+    /// Drives every transaction's timers (RFC 3261 §17) plus the TU-level 2xx
+    /// retransmission (§13.3.1.4), returning what must go on the wire: Timer
+    /// A/E/G re-sends, Timer B/F timeouts turned into 408s, and BYEs for 2xx
+    /// responses that were never ACKed. The daemon calls this every ~100 ms
+    /// (a fraction of T1).
+    pub async fn poll_timers(&self) -> Vec<ProcessResult> {
+        let mut out = Vec::new();
+        let mut timed_out: Vec<(String, CallId)> = Vec::new();
+        {
+            let mut txns = self.transactions.write().await;
+            for (key, st) in &mut txns.client_invite {
+                match st.transaction.check_timers() {
+                    Some(TimerType::TimerA) => out.push(ProcessResult::Forward {
+                        message: st.request.clone(),
+                        destination: st.destination,
+                    }),
+                    Some(TimerType::TimerB) => {
+                        timed_out.push((key.branch.clone(), st.call.clone()));
+                    }
+                    _ => {}
+                }
+            }
+            for (key, st) in &mut txns.client_non_invite {
+                match st.transaction.check_timers() {
+                    Some(TimerType::TimerE) => out.push(ProcessResult::Forward {
+                        message: st.request.clone(),
+                        destination: st.destination,
+                    }),
+                    Some(TimerType::TimerF) => {
+                        if let Some(call) = &st.call {
+                            timed_out.push((key.branch.clone(), call.clone()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for (key, st) in &mut txns.server_invite {
+                match st.transaction.check_timers() {
+                    Some(TimerType::TimerG) => {
+                        if let Some(r) = &st.last_response {
+                            out.push(ProcessResult::Response {
+                                message: r.clone(),
+                                destination: st.source,
+                            });
+                        }
+                    }
+                    Some(TimerType::TimerH) => warn!(
+                        branch = %key.branch,
+                        "No ACK for non-2xx final; INVITE server transaction timed out"
+                    ),
+                    _ => {}
+                }
+            }
+            for st in txns.server_non_invite.values_mut() {
+                let _ = st.transaction.check_timers();
+            }
+            txns.prune_terminated();
+        }
+
+        let mut timeouts = Vec::new();
+        for (branch, call) in timed_out {
+            timeouts.extend(self.fail_timed_out_request(&branch, &call).await);
+        }
+        // The 408s ride their server transactions; the BYEs get client ones.
+        for r in &timeouts {
+            self.track_result(r).await;
+        }
+        out.extend(timeouts);
+        out.extend(self.retransmit_pending_2xx().await);
+        out
+    }
+
+    /// A request the SBC forwarded got no final response (Timer B/F). For the
+    /// initial INVITE the call fails with 408 toward the caller. For a relayed
+    /// re-INVITE/UPDATE the originator gets the 408 — which ends the dialog at
+    /// its end (RFC 5057 §5.2) — the silent leg is BYEd and the call released.
+    async fn fail_timed_out_request(&self, branch: &str, call: &CallId) -> Vec<ProcessResult> {
+        let addrs = {
+            let corr = self.call_correlation.read().await;
+            match corr.addresses.get(call) {
+                Some(a) => a.clone(),
+                None => return Vec::new(),
+            }
+        };
+        let timeout = StatusCode::REQUEST_TIMEOUT;
+
+        if let Some(p) = addrs
+            .pending_reinvite
+            .as_ref()
+            .filter(|p| p.fwd_branch == branch)
+        {
+            warn!(
+                call_id = %addrs.a_leg_sip_call_id,
+                method = %p.method,
+                "Relayed in-dialog request got no response; releasing call"
+            );
+            let (resp, dest) = Self::build_reinvite_response(timeout, p, &addrs);
+            let bye = Self::build_leg_bye(&addrs, p.from_a_leg);
+            let bye_dest = if p.from_a_leg {
+                addrs.b_leg_destination
+            } else {
+                addrs.a_leg_source
+            };
+            self.cleanup_terminated_call(call, &addrs).await;
+            return vec![
+                ProcessResult::Response {
+                    message: resp,
+                    destination: dest,
+                },
+                ProcessResult::Forward {
+                    message: SipMessage::Request(bye),
+                    destination: bye_dest,
+                },
+            ];
+        }
+
+        if branch == addrs.b_leg_branch {
+            warn!(
+                call_id = %addrs.a_leg_sip_call_id,
+                "No final response from B-leg (Timer B); failing call with 408"
+            );
+            {
+                let mut calls = self.calls.write().await;
+                if let Some(c) = calls.calls.get_mut(call) {
+                    c.fail(timeout.code(), timeout.reason_phrase());
+                }
+            }
+            let resp = build_a_leg_response(timeout, &addrs);
+            self.cleanup_terminated_call(call, &addrs).await;
+            return vec![ProcessResult::Response {
+                message: SipMessage::Response(resp),
+                destination: addrs.a_leg_source,
+            }];
+        }
+
+        Vec::new()
+    }
+
+    /// Re-sends 2xx responses whose ACK has not arrived; a 2xx still
+    /// un-ACKed after 64*T1 ends the call with a BYE to both legs (RFC 3261
+    /// §13.3.1.4).
+    async fn retransmit_pending_2xx(&self) -> Vec<ProcessResult> {
+        let now = Instant::now();
+        let t2 = proto_transaction::DEFAULT_T2;
+        let mut out = Vec::new();
+        let mut expired = Vec::new();
+        {
+            let mut pending = self.pending_2xx.write().await;
+            for (leg_call_id, p) in pending.iter_mut() {
+                if now >= p.deadline {
+                    expired.push((leg_call_id.clone(), p.call.clone()));
+                } else if now >= p.next_at {
+                    out.push(ProcessResult::Response {
+                        message: p.response.clone(),
+                        destination: p.destination,
+                    });
+                    p.interval = (p.interval * 2).min(t2);
+                    p.next_at = now + p.interval;
+                }
+            }
+            for (id, _) in &expired {
+                pending.remove(id);
+            }
+        }
+        for (leg_call_id, call) in expired {
+            let addrs = {
+                let corr = self.call_correlation.read().await;
+                match corr.addresses.get(&call) {
+                    Some(a) => a.clone(),
+                    None => continue,
+                }
+            };
+            warn!(
+                call_id = %leg_call_id,
+                "2xx never ACKed; terminating call (RFC 3261 §13.3.1.4)"
+            );
+            if addrs.dialog_to_tag.is_some() {
+                out.push(ProcessResult::Forward {
+                    message: SipMessage::Request(Self::build_leg_bye(&addrs, false)),
+                    destination: addrs.a_leg_source,
+                });
+                out.push(ProcessResult::Forward {
+                    message: SipMessage::Request(Self::build_leg_bye(&addrs, true)),
+                    destination: addrs.b_leg_destination,
+                });
+            }
+            self.cleanup_terminated_call(&call, &addrs).await;
+        }
+        out
+    }
+
+    // ------------------------------------------------------------------
+    // Mid-dialog session changes: re-INVITE (RFC 3261 §14), UPDATE (RFC
+    // 3311), session refresh (RFC 4028).
+    // ------------------------------------------------------------------
+
+    /// Handles UPDATE (RFC 3311). Only in-dialog UPDATEs are meaningful to a
+    /// B2BUA; one without a To tag matches no dialog (481).
+    async fn handle_update(&self, message: SipMessage, source: SbcSocketAddr) -> ProcessResult {
+        let SipMessage::Request(ref req) = message else {
+            return ProcessResult::Error {
+                reason: "Expected request".to_string(),
+            };
+        };
+        if req.headers.to_tag().is_none() {
+            let response = create_response_from_request(req, StatusCode::CALL_DOES_NOT_EXIST);
+            return ProcessResult::Response {
+                message: SipMessage::Response(response),
+                destination: source,
+            };
+        }
+        self.handle_in_dialog_request(req, source).await
+    }
+
+    /// Relays a mid-dialog re-INVITE or UPDATE from one leg to the other. The
+    /// originator's new offer is re-anchored at the SBC's media address toward
+    /// the far leg; the far leg's answer comes back re-anchored toward the
+    /// originator, and the relay's remote addresses follow both — so
+    /// hold/resume, codec changes and RFC 4028 refreshes work end to end. A
+    /// body-less refresh is answered locally with the SDP last sent to that
+    /// leg. One re-INVITE at a time crosses the B2BUA (491 otherwise, §14.2).
+    async fn handle_in_dialog_request(
+        &self,
+        req: &SipRequest,
+        source: SbcSocketAddr,
+    ) -> ProcessResult {
+        let method = req.method.clone();
+        let sip_call_id = req.headers.call_id().unwrap_or("").to_string();
+        let respond = |status: StatusCode| ProcessResult::Response {
+            message: SipMessage::Response(create_response_from_request(req, status)),
+            destination: source,
+        };
+
+        // 1. Match the dialog: Call-ID on either leg, and the request's From
+        //    tag must be that leg's remote tag (a forged request with a
+        //    guessed Call-ID gets 481, not a relayed session change).
+        let (internal_id, from_a_leg, addrs) = {
+            let corr = self.call_correlation.read().await;
+            let found = corr
+                .a_leg
+                .get(&sip_call_id)
+                .map(|id| (id.clone(), true))
+                .or_else(|| corr.b_leg.get(&sip_call_id).map(|id| (id.clone(), false)));
+            let Some(found) =
+                found.and_then(|(id, a)| corr.addresses.get(&id).map(|ad| (id, a, ad.clone())))
+            else {
+                debug!(method = %method, call_id = %sip_call_id, "In-dialog request for unknown dialog, 481");
+                return respond(StatusCode::CALL_DOES_NOT_EXIST);
+            };
+            found
+        };
+        let remote_tag = if from_a_leg {
+            extract_param(&addrs.a_leg_from, "tag").map(String::from)
+        } else {
+            addrs.dialog_to_tag.clone()
+        };
+        if addrs.dialog_to_tag.is_none()
+            || remote_tag.is_none()
+            || req.headers.from_tag() != remote_tag
+        {
+            warn!(method = %method, call_id = %sip_call_id, "In-dialog request does not match the dialog's tags, 481");
+            return respond(StatusCode::CALL_DOES_NOT_EXIST);
+        }
+
+        // 2. Glare (§14.2): a second session change while one is in flight.
+        if addrs.pending_reinvite.is_some() {
+            info!(method = %method, call_id = %sip_call_id, "Session change already pending, 491");
+            return respond(StatusCode::REQUEST_PENDING);
+        }
+
+        // 3. Body-less refresh (RFC 4028 §7.4): answer locally. A 200 to an
+        //    INVITE must carry an offer (§14.2), so replay the SDP this leg
+        //    last got from us; the ACK's answer is not needed by the relay.
+        let Some(body) = req.body.as_ref().filter(|b| !b.is_empty()) else {
+            let mut ok = create_response_from_request(req, StatusCode::OK);
+            // RFC 4028 §9: the 2xx names the refresher — the requester keeps
+            // refreshing — and requires `timer` when the requester supports it.
+            if let Some(se) = req.headers.get_value(&HeaderName::SessionExpires) {
+                let se = if se.contains("refresher=") {
+                    se.to_string()
+                } else {
+                    format!("{se};refresher=uac")
+                };
+                ok.headers.set(HeaderName::SessionExpires, se);
+                if lists_timer_option(&req.headers, &HeaderName::Supported) {
+                    ok.headers.set(HeaderName::Require, "timer");
+                }
+            }
+            if method == Method::Invite {
+                ok.headers
+                    .set(HeaderName::Contact, format!("<sip:{}>", addrs.local_addr));
+                let last = if from_a_leg {
+                    &addrs.a_leg_last_sdp
+                } else {
+                    &addrs.b_leg_last_sdp
+                };
+                if let Some(sdp) = last {
+                    ok.headers.set(HeaderName::ContentType, "application/sdp");
+                    ok.headers
+                        .set(HeaderName::ContentLength, sdp.len().to_string());
+                    ok.body = Some(sdp.clone());
+                }
+            }
+            let ok = SipMessage::Response(ok);
+            if method == Method::Invite {
+                self.arm_2xx_retransmit(
+                    &sip_call_id,
+                    &internal_id,
+                    &ok,
+                    source,
+                    req.headers.cseq_parsed().map_or(1, |c| c.sequence),
+                )
+                .await;
+            }
+            info!(method = %method, call_id = %sip_call_id, "Session refresh answered locally");
+            return ProcessResult::Response {
+                message: ok,
+                destination: source,
+            };
+        };
+
+        // 4. The originator's new offer: follow its media address (a hold
+        //    with c=0.0.0.0 is not an address and leaves the relay as is),
+        //    then re-anchor the offer at the SBC's address facing the far leg.
+        let sdp_str = String::from_utf8_lossy(body);
+        let session_key = internal_id.to_string();
+        if let Some(ref pipeline) = self.media_pipeline
+            && let Some(media) = extract_media_address(&sdp_str)
+            && let Some(addr) = admitted_media_addr(&media)
+        {
+            let _ = pipeline
+                .set_remote_address(&session_key, from_a_leg, addr)
+                .await;
+        }
+        let local_media = if from_a_leg {
+            MediaAddress::new(&addrs.media_b_leg_ip, addrs.media_b_leg_port)
+        } else {
+            MediaAddress::new(&addrs.media_a_leg_ip, a_leg_media_port(&addrs))
+        };
+        let mut offer = self
+            .sdp_rewriter
+            .rewrite_reinvite(&sdp_str, &local_media)
+            .rewritten;
+        if let Some(fp) = &self.dtls_fingerprint_source {
+            offer = crate::sdp_dtls::rewrite_local_dtls(
+                &offer,
+                &fp.current(),
+                crate::sdp_dtls::SetupRole::ActPass,
+            );
+        }
+        let offer_setup = crate::sdp_dtls::parse_peer_dtls(&sdp_str).and_then(|d| d.setup);
+
+        // 5. Forward on the other leg as the next request in the SBC's own
+        //    sequence space there.
+        let (dest, fwd_cseq) = if from_a_leg {
+            (addrs.b_leg_destination, addrs.b_leg_local_cseq)
+        } else {
+            (addrs.a_leg_source, addrs.a_leg_local_cseq)
+        };
+        let mut fwd = Self::build_leg_in_dialog_request(
+            &addrs,
+            from_a_leg,
+            &method,
+            fwd_cseq,
+            Some(offer.as_bytes()),
+        );
+        relay_session_timer_request_headers(&req.headers, &mut fwd.headers);
+        let fwd_branch = fwd.headers.via_branch().unwrap_or_default();
+
+        // 6. Remember what is in flight.
+        {
+            let mut corr = self.call_correlation.write().await;
+            if let Some(a) = corr.addresses.get_mut(&internal_id) {
+                if from_a_leg {
+                    a.b_leg_local_cseq += 1;
+                    a.b_leg_last_sdp = Some(Bytes::from(offer));
+                } else {
+                    a.a_leg_local_cseq += 1;
+                    a.a_leg_last_sdp = Some(Bytes::from(offer));
+                }
+                a.pending_reinvite = Some(PendingReinvite {
+                    from_a_leg,
+                    method: method.clone(),
+                    orig_via: req
+                        .headers
+                        .get_all(&HeaderName::Via)
+                        .map(|h| h.value.clone())
+                        .collect(),
+                    orig_from: req
+                        .headers
+                        .get_value(&HeaderName::From)
+                        .unwrap_or_default()
+                        .to_string(),
+                    orig_to: req
+                        .headers
+                        .get_value(&HeaderName::To)
+                        .unwrap_or_default()
+                        .to_string(),
+                    orig_cseq: req.headers.cseq().unwrap_or_default().to_string(),
+                    fwd_branch,
+                    fwd_cseq,
+                    offer_setup,
+                });
+            }
+        }
+
+        info!(
+            method = %method,
+            call_id = %sip_call_id,
+            from_a_leg,
+            "Relaying mid-dialog session change to the other leg"
+        );
+
+        let mut results = Vec::with_capacity(2);
+        if method == Method::Invite {
+            results.push(ProcessResult::Response {
+                message: SipMessage::Response(create_response_from_request(
+                    req,
+                    StatusCode::TRYING,
+                )),
+                destination: source,
+            });
+        }
+        results.push(ProcessResult::Forward {
+            message: SipMessage::Request(fwd),
+            destination: dest,
+        });
+        ProcessResult::Multiple(results)
+    }
+
+    /// Handles the far leg's response to a relayed re-INVITE/UPDATE: the
+    /// answer is re-anchored toward the originator and the relay learns the
+    /// answerer's new media address; a relayed re-INVITE's 2xx is ACKed on
+    /// the far leg and the originator's 2xx retransmitted until it ACKs. A
+    /// 408/481 means the far leg's dialog is gone (RFC 5057 §5.2): the
+    /// originator gets it and the call is released.
+    async fn handle_reinvite_response(
+        &self,
+        resp: &SipResponse,
+        internal_id: &CallId,
+        addrs: &CallAddresses,
+        pending: &PendingReinvite,
+    ) -> ProcessResult {
+        let code = resp.status.code();
+        if code == 100 {
+            return ProcessResult::NoAction;
+        }
+        let (mut relayed, orig_dest) = Self::build_reinvite_response(resp.status, pending, addrs);
+        if code < 200 {
+            return ProcessResult::Response {
+                message: relayed,
+                destination: orig_dest,
+            };
+        }
+
+        // Final response: the session change is no longer pending.
+        {
+            let mut corr = self.call_correlation.write().await;
+            if let Some(a) = corr.addresses.get_mut(internal_id) {
+                a.pending_reinvite = None;
+            }
+        }
+
+        if code >= 300 {
+            if code == 408 || code == 481 {
+                warn!(
+                    call_id = %addrs.a_leg_sip_call_id,
+                    status = code,
+                    "Far leg's dialog is gone; releasing call"
+                );
+                self.cleanup_terminated_call(internal_id, addrs).await;
+            } else {
+                info!(
+                    call_id = %addrs.a_leg_sip_call_id,
+                    status = code,
+                    "Session change rejected by far leg; relaying to originator"
+                );
+            }
+            return ProcessResult::Response {
+                message: relayed,
+                destination: orig_dest,
+            };
+        }
+
+        // 2xx: re-anchor the answer toward the originator.
+        let SipMessage::Response(ok) = &mut relayed else {
+            unreachable!("build_reinvite_response builds a response")
+        };
+        relay_session_timer_response_headers(&resp.headers, &mut ok.headers);
+        ok.headers
+            .set(HeaderName::Contact, format!("<sip:{}>", addrs.local_addr));
+        let mut answer_sdp = None;
+        if let Some(body) = resp.body.as_ref().filter(|b| !b.is_empty()) {
+            let sdp_str = String::from_utf8_lossy(body);
+            let session_key = internal_id.to_string();
+            if let Some(ref pipeline) = self.media_pipeline
+                && let Some(media) = extract_media_address(&sdp_str)
+                && let Some(addr) = admitted_media_addr(&media)
+            {
+                let _ = pipeline
+                    .set_remote_address(&session_key, !pending.from_a_leg, addr)
+                    .await;
+            }
+            let local_media = if pending.from_a_leg {
+                MediaAddress::new(&addrs.media_a_leg_ip, a_leg_media_port(addrs))
+            } else {
+                MediaAddress::new(&addrs.media_b_leg_ip, addrs.media_b_leg_port)
+            };
+            let mut answer = self
+                .sdp_rewriter
+                .rewrite_answer_for_a_leg(&sdp_str, &local_media)
+                .rewritten;
+            if let Some(fp) = &self.dtls_fingerprint_source {
+                let role = pending.offer_setup.map_or(
+                    crate::sdp_dtls::SetupRole::Passive,
+                    crate::sdp_dtls::SetupRole::answer_role,
+                );
+                answer = crate::sdp_dtls::rewrite_local_dtls(&answer, &fp.current(), role);
+            }
+            let answer = Bytes::from(answer);
+            ok.headers.set(HeaderName::ContentType, "application/sdp");
+            ok.headers
+                .set(HeaderName::ContentLength, answer.len().to_string());
+            ok.body = Some(answer.clone());
+            answer_sdp = Some(answer);
+        }
+
+        let mut results = vec![ProcessResult::Response {
+            message: relayed.clone(),
+            destination: orig_dest,
+        }];
+        let mut ack_record = None;
+        if pending.method == Method::Invite {
+            // ACK the far leg's 2xx (same CSeq number as the re-INVITE) and
+            // keep it for the far leg's retransmissions; retransmit our own
+            // 2xx to the originator until it ACKs.
+            let ack = Self::build_leg_in_dialog_request(
+                addrs,
+                pending.from_a_leg,
+                &Method::Ack,
+                pending.fwd_cseq,
+                None,
+            );
+            let ack_dest = if pending.from_a_leg {
+                addrs.b_leg_destination
+            } else {
+                addrs.a_leg_source
+            };
+            let ack = SipMessage::Request(ack);
+            ack_record = Some((pending.fwd_branch.clone(), ack.clone(), ack_dest));
+            results.push(ProcessResult::Forward {
+                message: ack,
+                destination: ack_dest,
+            });
+            let orig_call_id = if pending.from_a_leg {
+                &addrs.a_leg_sip_call_id
+            } else {
+                &addrs.b_leg_sip_call_id
+            };
+            self.arm_2xx_retransmit(
+                orig_call_id,
+                internal_id,
+                &relayed,
+                orig_dest,
+                cseq_number(&pending.orig_cseq),
+            )
+            .await;
+        }
+        {
+            let mut corr = self.call_correlation.write().await;
+            if let Some(a) = corr.addresses.get_mut(internal_id) {
+                if let Some(sdp) = answer_sdp {
+                    if pending.from_a_leg {
+                        a.a_leg_last_sdp = Some(sdp);
+                    } else {
+                        a.b_leg_last_sdp = Some(sdp);
+                    }
+                }
+                if ack_record.is_some() {
+                    a.last_reinvite_ack = ack_record;
+                }
+            }
+        }
+
+        info!(
+            call_id = %addrs.a_leg_sip_call_id,
+            method = %pending.method,
+            from_a_leg = pending.from_a_leg,
+            "Session change completed across both legs"
+        );
+        ProcessResult::Multiple(results)
+    }
+
+    /// Builds the response toward the originator of a relayed re-INVITE/UPDATE,
+    /// carrying its own Via stack, From, To, Call-ID and CSeq (the far leg's
+    /// headers belong to the other dialog). Returns it with its destination.
+    fn build_reinvite_response(
+        status: StatusCode,
+        pending: &PendingReinvite,
+        addrs: &CallAddresses,
+    ) -> (SipMessage, SbcSocketAddr) {
+        let mut r = SipResponse::new(status);
+        for via in &pending.orig_via {
+            r.headers.add(Header::new(HeaderName::Via, via));
+        }
+        r.headers.set(HeaderName::From, &pending.orig_from);
+        r.headers.set(HeaderName::To, &pending.orig_to);
+        let (call_id, dest) = if pending.from_a_leg {
+            (&addrs.a_leg_sip_call_id, addrs.a_leg_source)
+        } else {
+            (&addrs.b_leg_sip_call_id, addrs.b_leg_destination)
+        };
+        r.headers.set(HeaderName::CallId, call_id);
+        r.headers.set(HeaderName::CSeq, &pending.orig_cseq);
+        r.headers.set(HeaderName::ContentLength, "0");
+        (SipMessage::Response(r), dest)
     }
 
     /// Removes all state for a call the SBC is tearing down (dialog correlation,
@@ -741,13 +1695,12 @@ impl SipStack {
             corr.b_leg.remove(&addrs.b_leg_sip_call_id);
             corr.addresses.remove(internal_id);
         }
-        {
-            let mut txns = self.transactions.write().await;
-            let server_key = TransactionKey::server(&addrs.a_leg_branch, "INVITE");
-            let client_key = TransactionKey::client(&addrs.b_leg_branch, "INVITE");
-            txns.server_invite.remove(&server_key);
-            txns.client_invite.remove(&client_key);
-        }
+        // INVITE transactions are left to run out (Timer D/H/I) so late
+        // retransmissions are still absorbed; `poll_timers` prunes them.
+        self.pending_2xx
+            .write()
+            .await
+            .retain(|_, p| &p.call != internal_id);
         for port in &addrs.rtp_ports {
             self.release_rtp_port(*port);
         }
@@ -1193,10 +2146,15 @@ impl SipStack {
             "Processing SIP message"
         );
 
-        match message {
+        let result = match message {
             SipMessage::Request(_) => self.process_request(message, source, receiving_zone).await,
             SipMessage::Response(_) => self.process_response(message, source).await,
-        }
+        };
+        // Everything a handler puts on the wire rides a transaction: responses
+        // are recorded for retransmission, forwarded requests get a client
+        // transaction that retransmits and times them out (RFC 3261 §17).
+        self.track_result(&result).await;
+        result
     }
 
     /// Processes a SIP request. `receiving_zone` is the zone the request arrived
@@ -1223,6 +2181,16 @@ impl SipStack {
             "Received SIP request"
         );
 
+        // Transaction layer (RFC 3261 §17.2): a retransmitted request is
+        // answered from its server transaction, never re-processed. ACK has
+        // no server transaction of its own.
+        if method != Method::Ack {
+            if let Some(answer) = self.answer_request_retransmit(req, source).await {
+                return answer;
+            }
+            self.open_server_transaction(req, source).await;
+        }
+
         match method {
             Method::Register => self.handle_register(message, source).await,
             Method::Invite => self.handle_invite(message, source, receiving_zone).await,
@@ -1230,14 +2198,19 @@ impl SipStack {
             Method::Bye => self.handle_bye(message, source).await,
             Method::Cancel => self.handle_cancel(message, source).await,
             Method::Options => self.handle_options(message, source).await,
+            Method::Update => self.handle_update(message, source).await,
             _ => self.handle_other_request(message, source).await,
         }
     }
 
     /// Processes a SIP response.
     ///
-    /// In B2BUA mode, matches the response to the B-leg client transaction,
-    /// then forwards an appropriate response to the A-leg.
+    /// The response is first matched to the client transaction that sent the
+    /// request (RFC 3261 §17.1.3: top Via branch + CSeq method). The
+    /// transaction absorbs retransmitted finals and ACKs non-2xx INVITE
+    /// finals (§17.1.1.3). What passes is handed to the B2BUA: the initial
+    /// INVITE's responses are relayed to the A-leg; responses to a relayed
+    /// re-INVITE/UPDATE go back to whichever leg originated it.
     async fn process_response(&self, message: SipMessage, source: SbcSocketAddr) -> ProcessResult {
         let SipMessage::Response(ref resp) = message else {
             return ProcessResult::Error {
@@ -1255,45 +2228,125 @@ impl SipStack {
             "Received SIP response"
         );
 
-        // Look up the B-leg Call-ID in correlation map
-        let corr = self.call_correlation.read().await;
-        let Some(id) = corr.b_leg.get(&sip_call_id) else {
-            debug!(call_id = %sip_call_id, "Response for unknown B-leg Call-ID, ignoring");
+        let Some(branch) = resp.headers.via_branch() else {
+            debug!(call_id = %sip_call_id, "Response without Via branch, ignoring");
             return ProcessResult::NoAction;
         };
-        let internal_id = id.clone();
+        let Some(cseq) = resp.headers.cseq_parsed() else {
+            debug!(call_id = %sip_call_id, "Response without CSeq, ignoring");
+            return ProcessResult::NoAction;
+        };
 
+        // 1. Transaction layer. Matching on Call-ID alone would let anyone who
+        //    learned a Call-ID inject a forged 200 OK; the branch must match a
+        //    request this SBC actually sent.
+        let mut ack_action = None;
+        {
+            let mut txns = self.transactions.write().await;
+            let key = TransactionKey::client(&branch, cseq.method.to_string());
+            if cseq.method == Method::Invite {
+                match txns.client_invite.get_mut(&key) {
+                    Some(st) => {
+                        let passed = st
+                            .transaction
+                            .receive_response(status_code)
+                            .unwrap_or(false);
+                        if status_code >= 300 {
+                            // ACK every non-2xx final, and again for each
+                            // retransmission of it (§17.1.1.3).
+                            let SipMessage::Request(ref invite) = st.request else {
+                                unreachable!("client INVITE transaction stores a request")
+                            };
+                            let ack = st
+                                .ack
+                                .get_or_insert_with(|| Self::build_non2xx_ack(invite, resp))
+                                .clone();
+                            ack_action = Some(ProcessResult::Forward {
+                                message: ack,
+                                destination: st.destination,
+                            });
+                        }
+                        // 2xx always reaches the TU: their retransmissions
+                        // are the dialog layer's to re-ACK (§13.2.2.4).
+                        if !passed && !(200..300).contains(&status_code) {
+                            debug!(call_id = %sip_call_id, status = status_code, "Retransmitted final response absorbed");
+                            return ack_action.unwrap_or(ProcessResult::NoAction);
+                        }
+                    }
+                    None if (200..300).contains(&status_code) => {
+                        // Transaction already gone (2xx terminates it): a
+                        // late 200 retransmission, handled by the TU below.
+                    }
+                    None => {
+                        debug!(call_id = %sip_call_id, branch = %branch, "Response matches no client INVITE transaction, ignoring");
+                        return ProcessResult::NoAction;
+                    }
+                }
+            } else {
+                let Some(st) = txns.client_non_invite.get_mut(&key) else {
+                    debug!(call_id = %sip_call_id, method = %cseq.method, "Response matches no client transaction, ignoring");
+                    return ProcessResult::NoAction;
+                };
+                if !st
+                    .transaction
+                    .receive_response(status_code)
+                    .unwrap_or(false)
+                {
+                    return ProcessResult::NoAction;
+                }
+            }
+        }
+
+        // 2. Transaction user: find the call this leg belongs to.
+        let corr = self.call_correlation.read().await;
+        let (internal_id, is_b_leg) = if let Some(id) = corr.b_leg.get(&sip_call_id) {
+            (id.clone(), true)
+        } else if let Some(id) = corr.a_leg.get(&sip_call_id) {
+            (id.clone(), false)
+        } else {
+            debug!(call_id = %sip_call_id, "Response for unknown dialog (e.g. 200 to our BYE)");
+            drop(corr);
+            return ack_action.unwrap_or(ProcessResult::NoAction);
+        };
         let Some(a) = corr.addresses.get(&internal_id) else {
             warn!(call_id = %sip_call_id, "No addresses for call");
-            return ProcessResult::NoAction;
+            drop(corr);
+            return ack_action.unwrap_or(ProcessResult::NoAction);
         };
         let mut addrs = a.clone();
         drop(corr);
 
-        // Transaction validation (RFC 3261 §17.1.3): the response's top Via
-        // branch must match our B-leg client transaction and the CSeq method
-        // must be INVITE. Matching on Call-ID alone let anyone who learned
-        // the B-leg Call-ID inject a forged 200 OK.
-        let via_branch_ok = resp
-            .headers
-            .get_value(&HeaderName::Via)
-            .and_then(|v| extract_param(v, "branch"))
-            .is_some_and(|branch| branch == addrs.b_leg_branch);
-        if !via_branch_ok {
-            debug!(
-                call_id = %sip_call_id,
-                "Response Via branch does not match client transaction, ignoring"
-            );
-            return ProcessResult::NoAction;
+        // 2a. Response to a relayed mid-dialog re-INVITE/UPDATE.
+        if let Some(pending) = addrs
+            .pending_reinvite
+            .clone()
+            .filter(|p| p.fwd_branch == branch)
+        {
+            let tu = self
+                .handle_reinvite_response(resp, &internal_id, &addrs, &pending)
+                .await;
+            return match ack_action {
+                Some(ack) => ProcessResult::Multiple(vec![ack, tu]),
+                None => tu,
+            };
         }
-        let cseq_method_invite = resp
-            .headers
-            .cseq()
-            .map(str::trim)
-            .is_some_and(|c| c.ends_with("INVITE"));
-        if !cseq_method_invite {
-            debug!(call_id = %sip_call_id, "Non-INVITE response on call, ignoring");
-            return ProcessResult::NoAction;
+
+        // 2b. Retransmitted 2xx to a relayed re-INVITE: re-ACK it (§13.2.2.4).
+        if cseq.method == Method::Invite
+            && (200..300).contains(&status_code)
+            && let Some((ack_branch, ack, dest)) = addrs.last_reinvite_ack.as_ref()
+            && *ack_branch == branch
+        {
+            return ProcessResult::Forward {
+                message: ack.clone(),
+                destination: *dest,
+            };
+        }
+
+        // 2c. Anything else must be a response to the initial B-leg INVITE.
+        if !is_b_leg || cseq.method != Method::Invite || branch != addrs.b_leg_branch {
+            debug!(call_id = %sip_call_id, "Response not for the initial INVITE, ignoring");
+            return ack_action.unwrap_or(ProcessResult::NoAction);
         }
 
         // Learn the remote (callee) tag from the first tagged response —
@@ -1333,9 +2386,15 @@ impl SipStack {
                 .await;
         }
 
-        // 4xx/5xx/6xx error — forward to A-leg, cleanup
-        self.handle_error_response(resp, status_code, &internal_id, &addrs)
-            .await
+        // 4xx/5xx/6xx error — forward to A-leg (the ACK toward the B-leg was
+        // produced by the transaction layer above), cleanup
+        let tu = self
+            .handle_error_response(resp, status_code, &internal_id, &addrs)
+            .await;
+        match ack_action {
+            Some(ack) => ProcessResult::Multiple(vec![ack, tu]),
+            None => tu,
+        }
     }
 
     /// Handles 1xx provisional response from B-leg (180 Ringing, 183 Session Progress).
@@ -1413,6 +2472,18 @@ impl SipStack {
         internal_id: &CallId,
         addrs: &CallAddresses,
     ) -> ProcessResult {
+        // A retransmitted 200 (our ACK was lost): re-ACK only (RFC 3261
+        // §13.2.2.4). The A-leg 200 is retransmitted by the 2xx timer, and
+        // the media relay must not be started twice.
+        if addrs.b_leg_answered {
+            debug!(call_id = %addrs.a_leg_sip_call_id, "Retransmitted 200 OK from B-leg, re-sending ACK");
+            let ack = Self::build_leg_in_dialog_request(addrs, true, &Method::Ack, 1, None);
+            return ProcessResult::Forward {
+                message: SipMessage::Request(ack),
+                destination: addrs.b_leg_destination,
+            };
+        }
+
         // Activate the call
         {
             let mut calls = self.calls.write().await;
@@ -1424,6 +2495,9 @@ impl SipStack {
         // Build 200 OK for A-leg with rewritten SDP, carrying the A-leg
         // dialog's own Via/From/To/CSeq.
         let mut a_response = build_a_leg_response(StatusCode::OK, addrs);
+        // RFC 4028: the session-timer outcome the callee negotiated travels
+        // back to the caller, who may become the refresher.
+        relay_session_timer_response_headers(&resp.headers, &mut a_response.headers);
 
         // Rewrite the A-leg answer SDP and, when a relay anchored this call,
         // learn the callee's remote from the answer and start forwarding RTP in
@@ -1471,6 +2545,16 @@ impl SipStack {
             }
         }
 
+        // Remember the answer for body-less refreshes, and that the B-leg
+        // has answered (later 2xx are retransmissions).
+        {
+            let mut corr = self.call_correlation.write().await;
+            if let Some(a) = corr.addresses.get_mut(internal_id) {
+                a.b_leg_answered = true;
+                a.a_leg_last_sdp.clone_from(&a_response.body);
+            }
+        }
+
         // Build ACK for B-leg. The ACK belongs to the B-leg dialog: it
         // must carry the INVITE's From (our tag), the To with the callee's
         // tag, and the INVITE's CSeq number with method ACK (RFC 3261
@@ -1504,9 +2588,20 @@ impl SipStack {
             "Call connected: 200 OK → A-leg, ACK → B-leg"
         );
 
+        // The 200 toward the caller is retransmitted until ACKed (§13.3.1.4).
+        let a_message = SipMessage::Response(a_response);
+        self.arm_2xx_retransmit(
+            &addrs.a_leg_sip_call_id,
+            internal_id,
+            &a_message,
+            addrs.a_leg_source,
+            cseq_number(&addrs.a_leg_cseq),
+        )
+        .await;
+
         ProcessResult::Multiple(vec![
             ProcessResult::Response {
-                message: SipMessage::Response(a_response),
+                message: a_message,
                 destination: addrs.a_leg_source,
             },
             ProcessResult::Forward {
@@ -1639,14 +2734,6 @@ impl SipStack {
             corr.a_leg.remove(&addrs.a_leg_sip_call_id);
             corr.b_leg.remove(&addrs.b_leg_sip_call_id);
             corr.addresses.remove(internal_id);
-        }
-        // Remove transaction entries for this call (H20).
-        {
-            let mut txns = self.transactions.write().await;
-            let server_key = TransactionKey::server(&addrs.a_leg_branch, "INVITE");
-            let client_key = TransactionKey::client(&addrs.b_leg_branch, "INVITE");
-            txns.server_invite.remove(&server_key);
-            txns.client_invite.remove(&client_key);
         }
         // Release allocated RTP ports (C12).
         for port in &addrs.rtp_ports {
@@ -1952,6 +3039,13 @@ impl SipStack {
         let a_leg_call_id = req.headers.call_id().unwrap_or("unknown").to_string();
 
         debug!(uri = %req.uri, call_id = %a_leg_call_id, "Processing INVITE");
+
+        // Mid-dialog INVITE (To carries a tag): a re-INVITE on an established
+        // dialog (RFC 3261 §14), relayed to the other leg — or 481 when no
+        // dialog matches (§12.2.2). Admission is the dialog match itself.
+        if req.headers.to_tag().is_some() {
+            return self.handle_in_dialog_request(req, source).await;
+        }
 
         // Source admission: only configured trunks and currently registered
         // endpoints may place calls. Checked before any per-call state exists.
@@ -2441,6 +3535,11 @@ impl SipStack {
             }
         };
 
+        // RFC 4028 session timers negotiate end to end through the B2BUA:
+        // carry the caller's timer support and Session-Expires/Min-SE so the
+        // callee can pick the refresher; the SBC relays the refreshes.
+        relay_session_timer_request_headers(&req.headers, &mut b_leg_request.headers);
+
         // 7b. Apply header manipulation to B-leg INVITE
         if let Some(ref manipulator) = self.header_manipulator {
             let context =
@@ -2468,14 +3567,6 @@ impl SipStack {
                 .await
                 .hide_b2bua_request(&mut b_leg_request.headers);
         }
-
-        // Extract A-leg branch early — needed for both CallAddresses (H20
-        // transaction cleanup) and the server transaction key below.
-        let a_branch = req
-            .headers
-            .get_value(&HeaderName::Via)
-            .and_then(|v| extract_param(v, "branch").map(String::from))
-            .unwrap_or_else(generate_branch);
 
         // 8. Store call state and correlation
         {
@@ -2547,7 +3638,15 @@ impl SipStack {
                     media_a_leg_ip: a_media_ip_str,
                     dtls_caller_setup,
                     dtls_caller_fingerprint,
-                    a_leg_branch: a_branch.clone(),
+                    media_b_leg_ip: b_media_ip_str,
+                    media_b_leg_port: b_leg_rtp_port,
+                    b_leg_answered: false,
+                    a_leg_local_cseq: 1,
+                    b_leg_local_cseq: 2,
+                    a_leg_last_sdp: None,
+                    b_leg_last_sdp: b_leg_sdp.map(Bytes::from),
+                    pending_reinvite: None,
+                    last_reinvite_ack: None,
                 },
             );
         }
@@ -2557,37 +3656,9 @@ impl SipStack {
             in_flight.remove(&a_leg_call_id);
         }
 
-        // 9. Create transactions
-        {
-            let mut txns = self.transactions.write().await;
-            txns.sweep_if_needed();
-            let now = std::time::Instant::now();
-            let server_key = TransactionKey::server(&a_branch, "INVITE");
-            txns.server_invite.insert(
-                server_key,
-                ServerInviteState {
-                    transaction: ServerInviteTransaction::new(
-                        TransactionKey::server(&a_branch, "INVITE"),
-                        TransportType::Unreliable,
-                    ),
-                    source,
-                    created_at: now,
-                },
-            );
-
-            let client_key = TransactionKey::client(&b_leg_branch, "INVITE");
-            txns.client_invite.insert(
-                client_key,
-                ClientInviteState {
-                    transaction: ClientInviteTransaction::new(
-                        TransactionKey::client(&b_leg_branch, "INVITE"),
-                        TransportType::Unreliable,
-                    ),
-                    destination: b_leg_destination,
-                    created_at: now,
-                },
-            );
-        }
+        // 9. Transactions: the server INVITE transaction was opened in
+        //    `process_request`; the B-leg client transaction opens when the
+        //    forwarded INVITE below is tracked by `process_message`.
 
         info!(
             call_id = %a_leg_call_id,
@@ -2610,6 +3681,10 @@ impl SipStack {
     }
 
     /// Handles ACK request.
+    ///
+    /// An ACK for a non-2xx final shares the INVITE's branch and completes
+    /// that server transaction (RFC 3261 §17.2.1). An ACK for a 2xx is its
+    /// own transaction and stops the TU's 2xx retransmission (§13.3.1.4).
     async fn handle_ack(&self, message: SipMessage) -> ProcessResult {
         let SipMessage::Request(ref req) = message else {
             return ProcessResult::Error {
@@ -2617,10 +3692,30 @@ impl SipStack {
             };
         };
 
-        debug!(uri = %req.uri, "Processing ACK");
+        let call_id = req.headers.call_id().unwrap_or("").to_string();
+        debug!(uri = %req.uri, call_id = %call_id, "Processing ACK");
 
-        // ACK for 2xx completes dialog establishment
-        // ACK for non-2xx is absorbed by transaction layer
+        if let Some(branch) = req.headers.via_branch() {
+            let mut txns = self.transactions.write().await;
+            if let Some(st) = txns
+                .server_invite
+                .get_mut(&TransactionKey::server(&branch, "INVITE"))
+            {
+                let _ = st.transaction.receive_ack();
+                debug!(call_id = %call_id, "ACK completed non-2xx INVITE transaction");
+                return ProcessResult::NoAction;
+            }
+        }
+
+        let cseq = req.headers.cseq_parsed().map(|c| c.sequence);
+        let mut pending = self.pending_2xx.write().await;
+        if pending
+            .get(&call_id)
+            .is_some_and(|p| cseq.is_none_or(|n| n == p.cseq))
+        {
+            pending.remove(&call_id);
+            debug!(call_id = %call_id, "ACK received for 2xx; retransmission stopped");
+        }
         ProcessResult::NoAction
     }
 
@@ -2649,9 +3744,11 @@ impl SipStack {
         } else if let Some(id) = corr.b_leg.get(&sip_call_id) {
             (id.clone(), false)
         } else {
-            // Unknown call — just respond 200 OK
-            debug!(call_id = %sip_call_id, "BYE for unknown call");
-            let response = create_response_from_request(req, StatusCode::OK);
+            // No dialog matches: 481 Call/Transaction Does Not Exist
+            // (RFC 3261 §15.1.2). A 200 here would hide a stale dialog from
+            // the far end and let a forged BYE look successful.
+            debug!(call_id = %sip_call_id, "BYE for unknown dialog, 481");
+            let response = create_response_from_request(req, StatusCode::CALL_DOES_NOT_EXIST);
             return ProcessResult::Response {
                 message: SipMessage::Response(response),
                 destination: source,
@@ -2659,7 +3756,7 @@ impl SipStack {
         };
 
         let Some(a) = corr.addresses.get(&internal_id) else {
-            let response = create_response_from_request(req, StatusCode::OK);
+            let response = create_response_from_request(req, StatusCode::CALL_DOES_NOT_EXIST);
             return ProcessResult::Response {
                 message: SipMessage::Response(response),
                 destination: source,
@@ -2730,7 +3827,9 @@ impl SipStack {
                     HeaderName::To,
                     with_tag(&addrs.b_leg_to, addrs.dialog_to_tag.as_deref()),
                 );
-                bye_request.headers.set(HeaderName::CSeq, "2 BYE");
+                bye_request
+                    .headers
+                    .set(HeaderName::CSeq, format!("{} BYE", addrs.b_leg_local_cseq));
             } else {
                 // SBC is the UAS on the A-leg: swap the A-leg dialog headers
                 // (our From = the To we answered with, our To = the caller's
@@ -2740,7 +3839,9 @@ impl SipStack {
                     with_tag(&addrs.a_leg_to, addrs.dialog_to_tag.as_deref()),
                 );
                 bye_request.headers.set(HeaderName::To, &addrs.a_leg_from);
-                bye_request.headers.set(HeaderName::CSeq, "1 BYE");
+                bye_request
+                    .headers
+                    .set(HeaderName::CSeq, format!("{} BYE", addrs.a_leg_local_cseq));
             }
             bye_request.headers.set(HeaderName::MaxForwards, "70");
             let branch = generate_branch();
@@ -2762,14 +3863,6 @@ impl SipStack {
             corr.a_leg.remove(&addrs.a_leg_sip_call_id);
             corr.b_leg.remove(&addrs.b_leg_sip_call_id);
             corr.addresses.remove(&internal_id);
-        }
-        // Remove transaction entries for this call (H20).
-        {
-            let mut txns = self.transactions.write().await;
-            let server_key = TransactionKey::server(&addrs.a_leg_branch, "INVITE");
-            let client_key = TransactionKey::client(&addrs.b_leg_branch, "INVITE");
-            txns.server_invite.remove(&server_key);
-            txns.client_invite.remove(&client_key);
         }
         // Release allocated RTP ports (C12).
         for port in &addrs.rtp_ports {
@@ -2833,7 +3926,9 @@ impl SipStack {
             corr = self.call_correlation.read().await;
         }
         let Some(id) = corr.a_leg.get(&sip_call_id) else {
-            let response = create_response_from_request(req, StatusCode::OK);
+            // No INVITE transaction to cancel: 481 (RFC 3261 §9.2).
+            debug!(call_id = %sip_call_id, "CANCEL matches no pending INVITE, 481");
+            let response = create_response_from_request(req, StatusCode::CALL_DOES_NOT_EXIST);
             return ProcessResult::Response {
                 message: SipMessage::Response(response),
                 destination: source,
@@ -2842,7 +3937,7 @@ impl SipStack {
         let internal_id = id.clone();
 
         let Some(a) = corr.addresses.get(&internal_id) else {
-            let response = create_response_from_request(req, StatusCode::OK);
+            let response = create_response_from_request(req, StatusCode::CALL_DOES_NOT_EXIST);
             return ProcessResult::Response {
                 message: SipMessage::Response(response),
                 destination: source,
@@ -2925,14 +4020,6 @@ impl SipStack {
             corr.b_leg.remove(&addrs.b_leg_sip_call_id);
             corr.addresses.remove(&internal_id);
         }
-        // Remove transaction entries for this call (H20).
-        {
-            let mut txns = self.transactions.write().await;
-            let server_key = TransactionKey::server(&addrs.a_leg_branch, "INVITE");
-            let client_key = TransactionKey::client(&addrs.b_leg_branch, "INVITE");
-            txns.server_invite.remove(&server_key);
-            txns.client_invite.remove(&client_key);
-        }
         // Release allocated RTP ports (C12).
         for port in &addrs.rtp_ports {
             self.release_rtp_port(*port);
@@ -2970,10 +4057,7 @@ impl SipStack {
         let mut response = create_response_from_request(req, StatusCode::OK);
 
         // Add Allow header with supported methods
-        response.add_header(Header::new(
-            HeaderName::Allow,
-            "INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER",
-        ));
+        response.add_header(Header::new(HeaderName::Allow, ALLOWED_METHODS));
 
         // Add Accept header as custom
         response.add_header(Header::new(
@@ -2999,14 +4083,28 @@ impl SipStack {
             };
         };
 
+        // An in-dialog request (tagged To) for a dialog this SBC does not
+        // have gets 481, not 405 (RFC 3261 §12.2.2).
+        if req.headers.to_tag().is_some() {
+            let call_id = req.headers.call_id().unwrap_or("");
+            let corr = self.call_correlation.read().await;
+            let known = corr.a_leg.contains_key(call_id) || corr.b_leg.contains_key(call_id);
+            drop(corr);
+            if !known {
+                debug!(method = %req.method, call_id, "In-dialog request for unknown dialog, 481");
+                let response = create_response_from_request(req, StatusCode::CALL_DOES_NOT_EXIST);
+                return ProcessResult::Response {
+                    message: SipMessage::Response(response),
+                    destination: source,
+                };
+            }
+        }
+
         warn!(method = %req.method, "Unsupported method");
 
         // Create 405 Method Not Allowed
         let mut response = create_response_from_request(req, StatusCode::METHOD_NOT_ALLOWED);
-        response.add_header(Header::new(
-            HeaderName::Allow,
-            "INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER",
-        ));
+        response.add_header(Header::new(HeaderName::Allow, ALLOWED_METHODS));
 
         ProcessResult::Response {
             message: SipMessage::Response(response),
@@ -3747,6 +4845,68 @@ fn with_tag(header_value: &str, tag: Option<&str>) -> String {
     }
 }
 
+/// The SBC's caller-facing RTP port: the relay's A-leg port when the media
+/// pipeline anchored the call, else the bare port allocated at answer time
+/// (second entry of `rtp_ports`), else the B-leg port (nothing is relayed in
+/// that fallback, so the value only needs to be a port the SBC owns).
+fn a_leg_media_port(addrs: &CallAddresses) -> u16 {
+    addrs
+        .media_a_leg_port
+        .or_else(|| addrs.rtp_ports.get(1).copied())
+        .unwrap_or(addrs.media_b_leg_port)
+}
+
+/// The sequence number of a `CSeq` header value such as `"314 INVITE"`.
+fn cseq_number(cseq: &str) -> u32 {
+    cseq.split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(1)
+}
+
+/// True when a `Supported`/`Require` header value lists the `timer` option
+/// tag (RFC 4028 §7.1).
+fn lists_timer_option(headers: &proto_sip::header::Headers, name: &HeaderName) -> bool {
+    headers.get_all(name).any(|h| {
+        h.value
+            .split(',')
+            .any(|tag| tag.trim().eq_ignore_ascii_case("timer"))
+    })
+}
+
+/// Copies the RFC 4028 negotiation headers of a request across the B2BUA:
+/// `Session-Expires`/`Min-SE` verbatim and `Supported: timer` when the
+/// originator listed it. Only the `timer` option tag is relayed — other
+/// capabilities (e.g. `100rel`) are not implemented end to end by this SBC
+/// and must not be advertised on its behalf.
+fn relay_session_timer_request_headers(
+    from: &proto_sip::header::Headers,
+    to: &mut proto_sip::header::Headers,
+) {
+    for name in [HeaderName::SessionExpires, HeaderName::MinSe] {
+        if let Some(v) = from.get_value(&name) {
+            to.set(name, v);
+        }
+    }
+    if lists_timer_option(from, &HeaderName::Supported) {
+        to.set(HeaderName::Supported, "timer");
+    }
+}
+
+/// Copies the RFC 4028 outcome of a 2xx across the B2BUA: `Session-Expires`
+/// (with the chosen refresher) and `Require: timer` when the answerer set it.
+fn relay_session_timer_response_headers(
+    from: &proto_sip::header::Headers,
+    to: &mut proto_sip::header::Headers,
+) {
+    if let Some(v) = from.get_value(&HeaderName::SessionExpires) {
+        to.set(HeaderName::SessionExpires, v);
+    }
+    if lists_timer_option(from, &HeaderName::Require) {
+        to.set(HeaderName::Require, "timer");
+    }
+}
+
 /// Builds a response toward the A-leg carrying the A-leg dialog's own
 /// Via/From/To/CSeq/Call-ID (forwarding the B-leg's headers verbatim makes
 /// the response unmatchable for the A-leg UA).
@@ -3759,9 +4919,15 @@ fn build_a_leg_response(
         response.headers.add(Header::new(HeaderName::Via, via));
     }
     response.headers.set(HeaderName::From, &addrs.a_leg_from);
+    // A UAS tags To on every non-100 response (RFC 3261 §8.2.6.2). Before the
+    // callee answered there is no learned tag, e.g. a 408 on Timer B.
+    let local_tag = addrs
+        .dialog_to_tag
+        .clone()
+        .or_else(|| (status.code() != 100).then(generate_tag));
     response.headers.set(
         HeaderName::To,
-        with_tag(&addrs.a_leg_to, addrs.dialog_to_tag.as_deref()),
+        with_tag(&addrs.a_leg_to, local_tag.as_deref()),
     );
     response
         .headers
@@ -4797,7 +5963,7 @@ mod tests {
         let config = SipStackConfig::default();
         let stack = SipStack::new(config);
 
-        // BYE for unknown call — should just get 200 OK
+        // BYE for a dialog this SBC does not have: 481 (RFC 3261 §15.1.2)
         let bye = b"BYE sip:bob@sbc.local SIP/2.0\r\n\
             Via: SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK030\r\n\
             From: <sip:alice@example.com>;tag=u1\r\n\
@@ -4814,7 +5980,11 @@ mod tests {
         match result {
             ProcessResult::Response { message, .. } => {
                 if let SipMessage::Response(resp) = message {
-                    assert_eq!(resp.status, StatusCode::OK, "Unknown BYE should get 200 OK");
+                    assert_eq!(
+                        resp.status,
+                        StatusCode::CALL_DOES_NOT_EXIST,
+                        "Unknown BYE should get 481"
+                    );
                 }
             }
             _ => panic!("Expected Response for unknown BYE"),
@@ -5161,7 +6331,15 @@ mod tests {
             media_a_leg_ip: "10.0.0.9".to_string(),
             dtls_caller_setup: None,
             dtls_caller_fingerprint: None,
-            a_leg_branch: "z9hG4bK-a".to_string(),
+            media_b_leg_ip: "10.0.0.9".to_string(),
+            media_b_leg_port: 16_386,
+            b_leg_answered: true,
+            a_leg_local_cseq: 1,
+            b_leg_local_cseq: 2,
+            a_leg_last_sdp: None,
+            b_leg_last_sdp: None,
+            pending_reinvite: None,
+            last_reinvite_ack: None,
         }
     }
 
@@ -5206,7 +6384,8 @@ mod tests {
 
         // A-leg re-INVITE: SBC as UAS toward the caller, same dialog as the BYE,
         // carrying the new media offer.
-        let a_req = SipStack::build_leg_reinvite(&addrs, false, 2, sdp);
+        let a_req =
+            SipStack::build_leg_in_dialog_request(&addrs, false, &Method::Invite, 2, Some(sdp));
         assert_eq!(a_req.method, Method::Invite);
         let a = String::from_utf8(SipMessage::Request(a_req).to_bytes().to_vec()).unwrap();
         assert!(a.starts_with("INVITE "), "{a}");
@@ -5227,9 +6406,15 @@ mod tests {
 
         // B-leg re-INVITE: SBC as UAC toward the callee.
         let b = String::from_utf8(
-            SipMessage::Request(SipStack::build_leg_reinvite(&addrs, true, 3, sdp))
-                .to_bytes()
-                .to_vec(),
+            SipMessage::Request(SipStack::build_leg_in_dialog_request(
+                &addrs,
+                true,
+                &Method::Invite,
+                3,
+                Some(sdp),
+            ))
+            .to_bytes()
+            .to_vec(),
         )
         .unwrap();
         assert!(b.starts_with("INVITE "));
@@ -5241,6 +6426,865 @@ mod tests {
         assert!(b.contains("3 INVITE"));
         assert!(b.contains("tag=calleetag")); // callee's tag in To
         assert!(b.contains("172.28.2.12"));
+    }
+
+    // ------------------------------------------------------------------
+    // Transaction driving and mid-dialog relay (issue #117)
+    // ------------------------------------------------------------------
+
+    use std::fmt::Write as _;
+
+    const ALICE_SDP: &str = "v=0\r\no=- 1 1 IN IP4 192.168.1.1\r\ns=-\r\nc=IN IP4 192.168.1.1\r\nt=0 0\r\nm=audio 4000 RTP/AVP 0\r\na=sendrecv\r\n";
+    const BOB_SDP: &str = "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 5000 RTP/AVP 0\r\na=sendrecv\r\n";
+
+    fn alice() -> SbcSocketAddr {
+        SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(192, 168, 1, 1), 5060)
+    }
+
+    fn bob() -> SbcSocketAddr {
+        SbcSocketAddr::new_v4(std::net::Ipv4Addr::LOCALHOST, 5060)
+    }
+
+    /// A request from alice (A-leg) on the test call's dialog.
+    fn alice_request(method: &str, cseq: u32, to_tag: Option<&str>, body: Option<&str>) -> Bytes {
+        let to = to_tag.map_or_else(
+            || "<sip:bob@sbc.local>".to_string(),
+            |t| format!("<sip:bob@sbc.local>;tag={t}"),
+        );
+        let mut msg = format!(
+            "{method} sip:bob@sbc.local SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK-alice-{cseq}-{method}\r\n\
+             From: <sip:alice@example.com>;tag=i1\r\n\
+             To: {to}\r\n\
+             Call-ID: call-relay@test\r\n\
+             CSeq: {cseq} {method}\r\n\
+             Contact: <sip:alice@192.168.1.1:5060>\r\n\
+             Supported: timer\r\n\
+             Session-Expires: 1800\r\n"
+        );
+        match body {
+            Some(b) => drop(write!(
+                msg,
+                "Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{b}",
+                b.len()
+            )),
+            None => msg.push_str("Content-Length: 0\r\n\r\n"),
+        }
+        Bytes::from(msg)
+    }
+
+    /// A response from the far end to a request the SBC forwarded it,
+    /// mirroring that request's Via/From/To/Call-ID/CSeq (what a UAS does).
+    fn response_to(
+        req: &proto_sip::message::SipRequest,
+        status: u16,
+        to_tag: Option<&str>,
+        body: Option<&str>,
+    ) -> Bytes {
+        let mut msg = format!("SIP/2.0 {status} Whatever\r\n");
+        for via in req.headers.get_all(&HeaderName::Via) {
+            let _ = write!(msg, "Via: {}\r\n", via.value);
+        }
+        let to = req.headers.get_value(&HeaderName::To).unwrap();
+        let to = match to_tag {
+            Some(t) if !to.contains("tag=") => format!("{to};tag={t}"),
+            _ => to.to_string(),
+        };
+        let _ = write!(
+            msg,
+            "From: {}\r\nTo: {to}\r\nCall-ID: {}\r\nCSeq: {}\r\n",
+            req.headers.get_value(&HeaderName::From).unwrap(),
+            req.headers.call_id().unwrap(),
+            req.headers.cseq().unwrap(),
+        );
+        match body {
+            Some(b) => drop(write!(
+                msg,
+                "Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{b}",
+                b.len()
+            )),
+            None => msg.push_str("Content-Length: 0\r\n\r\n"),
+        }
+        Bytes::from(msg)
+    }
+
+    /// An in-dialog request from bob (B-leg) toward the SBC, built from the
+    /// dialog the forwarded INVITE established (bob's tag is `bobtag`).
+    fn bob_request(
+        b_invite: &proto_sip::message::SipRequest,
+        method: &str,
+        cseq: u32,
+        body: Option<&str>,
+    ) -> Bytes {
+        let from = format!(
+            "{};tag=bobtag",
+            b_invite.headers.get_value(&HeaderName::To).unwrap()
+        );
+        let to = b_invite.headers.get_value(&HeaderName::From).unwrap();
+        let mut msg = format!(
+            "{method} sip:sbc@sbc.local:5060 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-bob-{cseq}-{method}\r\n\
+             From: {from}\r\nTo: {to}\r\nCall-ID: {}\r\nCSeq: {cseq} {method}\r\n\
+             Contact: <sip:bob@127.0.0.1:5060>\r\n",
+            b_invite.headers.call_id().unwrap()
+        );
+        match body {
+            Some(b) => drop(write!(
+                msg,
+                "Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{b}",
+                b.len()
+            )),
+            None => msg.push_str("Content-Length: 0\r\n\r\n"),
+        }
+        Bytes::from(msg)
+    }
+
+    fn flatten(result: ProcessResult) -> Vec<ProcessResult> {
+        match result {
+            ProcessResult::Multiple(v) => v.into_iter().flat_map(flatten).collect(),
+            ProcessResult::NoAction => Vec::new(),
+            other => vec![other],
+        }
+    }
+
+    fn forwarded<'a>(
+        results: &'a [ProcessResult],
+        method: &Method,
+    ) -> Option<(&'a proto_sip::message::SipRequest, SbcSocketAddr)> {
+        results.iter().find_map(|r| match r {
+            ProcessResult::Forward {
+                message: SipMessage::Request(req),
+                destination,
+            } if req.method == *method => Some((req, *destination)),
+            _ => None,
+        })
+    }
+
+    fn responded(
+        results: &[ProcessResult],
+        status: u16,
+    ) -> Option<(&proto_sip::message::SipResponse, SbcSocketAddr)> {
+        results.iter().find_map(|r| match r {
+            ProcessResult::Response {
+                message: SipMessage::Response(resp),
+                destination,
+            } if resp.status.code() == status => Some((resp, *destination)),
+            _ => None,
+        })
+    }
+
+    /// Registers bob, admits alice's trunk, and sends alice's INVITE; returns
+    /// the stack and the INVITE the SBC forwarded to bob.
+    async fn ringing_call() -> (SipStack, proto_sip::message::SipRequest) {
+        let stack = SipStack::new(SipStackConfig::default());
+        stack
+            .register_inbound_trunk("test-trunk", None, &[("192.168.1.1".to_string(), 5060)])
+            .await;
+        let register = b"REGISTER sip:sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-reg\r\n\
+            From: <sip:bob@sbc.local>;tag=r1\r\n\
+            To: <sip:bob@sbc.local>\r\n\
+            Call-ID: reg-bob@relay\r\n\
+            CSeq: 1 REGISTER\r\n\
+            Contact: <sip:bob@127.0.0.1:5060>\r\n\
+            Expires: 3600\r\n\
+            Content-Length: 0\r\n\
+            \r\n";
+        stack
+            .process_message(&Bytes::from_static(register), bob(), None)
+            .await;
+
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 1, None, Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert!(responded(&results, 100).is_some(), "100 Trying to alice");
+        let (b_invite, dest) = forwarded(&results, &Method::Invite).expect("INVITE forwarded");
+        assert_eq!(dest, bob());
+        assert!(
+            b_invite
+                .headers
+                .get_value(&HeaderName::Supported)
+                .is_some_and(|s| s.contains("timer")),
+            "RFC 4028 support relayed on the B-leg INVITE"
+        );
+        assert_eq!(
+            b_invite.headers.get_value(&HeaderName::SessionExpires),
+            Some("1800")
+        );
+        (stack, b_invite.clone())
+    }
+
+    /// `ringing_call` answered by bob (200 with SDP, tag `bobtag`) and ACKed
+    /// by alice: a confirmed dialog on both legs.
+    async fn established_call() -> (SipStack, proto_sip::message::SipRequest) {
+        let (stack, b_invite) = ringing_call().await;
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(&b_invite, 200, Some("bobtag"), Some(BOB_SDP)),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        let (ok, dest) = responded(&results, 200).expect("200 relayed to alice");
+        assert_eq!(dest, alice());
+        assert_eq!(ok.headers.call_id(), Some("call-relay@test"));
+        assert_eq!(ok.headers.cseq(), Some("1 INVITE"));
+        assert_eq!(ok.headers.to_tag().as_deref(), Some("bobtag"));
+        let (ack, dest) = forwarded(&results, &Method::Ack).expect("ACK to bob");
+        assert_eq!(dest, bob());
+        assert_eq!(ack.headers.cseq(), Some("1 ACK"));
+        assert_eq!(
+            stack.pending_2xx.read().await.len(),
+            1,
+            "200 awaits alice's ACK"
+        );
+
+        let ack = alice_request("ACK", 1, Some("bobtag"), None);
+        assert!(matches!(
+            stack.process_message(&ack, alice(), None).await,
+            ProcessResult::NoAction
+        ));
+        assert!(
+            stack.pending_2xx.read().await.is_empty(),
+            "ACK stops 2xx retransmission"
+        );
+        (stack, b_invite)
+    }
+
+    #[tokio::test]
+    async fn reinvite_from_caller_round_trips_hold_and_resume() {
+        let (stack, b_invite) = established_call().await;
+        let hold_sdp = ALICE_SDP.replace("a=sendrecv", "a=sendonly");
+
+        // Hold: alice re-INVITEs with sendonly → 100 to alice, re-INVITE to bob
+        // in the B-leg dialog with the SBC's next CSeq there.
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 2, Some("bobtag"), Some(&hold_sdp)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert!(responded(&results, 100).is_some());
+        let (b_reinvite, dest) = forwarded(&results, &Method::Invite).expect("re-INVITE to bob");
+        assert_eq!(dest, bob());
+        assert_eq!(b_reinvite.headers.call_id(), b_invite.headers.call_id());
+        assert_eq!(b_reinvite.headers.cseq(), Some("2 INVITE"));
+        assert_eq!(b_reinvite.headers.to_tag().as_deref(), Some("bobtag"));
+        assert_eq!(
+            b_reinvite.headers.get_value(&HeaderName::From),
+            b_invite.headers.get_value(&HeaderName::From),
+            "same B-leg dialog"
+        );
+        let body = String::from_utf8_lossy(b_reinvite.body.as_ref().unwrap()).to_string();
+        assert!(
+            body.contains("a=sendonly"),
+            "hold survives the rewrite: {body}"
+        );
+        assert!(
+            !body.contains("m=audio 4000 "),
+            "media re-anchored at the SBC's B-leg port: {body}"
+        );
+        assert!(b_reinvite.headers.get_value(&HeaderName::Contact).is_some());
+
+        // Bob answers the re-INVITE → 200 to alice (her dialog's headers), ACK to bob.
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(b_reinvite, 200, None, Some(BOB_SDP)),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        let (ok, dest) = responded(&results, 200).expect("200 relayed to alice");
+        assert_eq!(dest, alice());
+        assert_eq!(ok.headers.cseq(), Some("2 INVITE"));
+        assert_eq!(ok.headers.call_id(), Some("call-relay@test"));
+        assert!(
+            ok.headers
+                .get_value(&HeaderName::Via)
+                .unwrap()
+                .contains("z9hG4bK-alice-2-INVITE"),
+            "alice's own Via"
+        );
+        assert!(ok.body.is_some(), "answer SDP relayed");
+        let (ack, dest) = forwarded(&results, &Method::Ack).expect("ACK to bob");
+        assert_eq!(dest, bob());
+        assert_eq!(ack.headers.cseq(), Some("2 ACK"));
+        assert_eq!(ack.headers.call_id(), b_invite.headers.call_id());
+
+        // Alice ACKs; the pending change is cleared.
+        stack
+            .process_message(
+                &alice_request("ACK", 2, Some("bobtag"), None),
+                alice(),
+                None,
+            )
+            .await;
+        assert!(stack.pending_2xx.read().await.is_empty());
+
+        // Resume: next re-INVITE uses the next B-leg CSeq.
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 3, Some("bobtag"), Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let (b_reinvite, _) = forwarded(&results, &Method::Invite).expect("resume re-INVITE");
+        assert_eq!(b_reinvite.headers.cseq(), Some("3 INVITE"));
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(b_reinvite, 200, None, Some(BOB_SDP)),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        assert!(responded(&results, 200).is_some());
+        assert_eq!(
+            forwarded(&results, &Method::Ack).unwrap().0.headers.cseq(),
+            Some("3 ACK")
+        );
+
+        // A later BYE from alice continues the B-leg sequence.
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("BYE", 4, Some("bobtag"), None),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert!(responded(&results, 200).is_some());
+        let (bye, _) = forwarded(&results, &Method::Bye).expect("BYE to bob");
+        assert_eq!(bye.headers.cseq(), Some("4 BYE"));
+        assert_eq!(stack.call_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn reinvite_from_callee_is_relayed_to_caller() {
+        let (stack, b_invite) = established_call().await;
+        let hold_sdp = BOB_SDP.replace("a=sendrecv", "a=sendonly");
+
+        let results = flatten(
+            stack
+                .process_message(
+                    &bob_request(&b_invite, "INVITE", 7, Some(&hold_sdp)),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        let (_, dest) = responded(&results, 100).expect("100 to bob");
+        assert_eq!(dest, bob());
+        let (a_reinvite, dest) = forwarded(&results, &Method::Invite).expect("re-INVITE to alice");
+        assert_eq!(dest, alice());
+        assert_eq!(a_reinvite.headers.call_id(), Some("call-relay@test"));
+        assert_eq!(
+            a_reinvite.headers.cseq(),
+            Some("1 INVITE"),
+            "SBC's first request toward alice"
+        );
+        assert_eq!(
+            a_reinvite.headers.to_tag().as_deref(),
+            Some("i1"),
+            "alice's tag in To"
+        );
+        assert_eq!(
+            a_reinvite.headers.from_tag().as_deref(),
+            Some("bobtag"),
+            "SBC's A-leg tag in From"
+        );
+        let body = String::from_utf8_lossy(a_reinvite.body.as_ref().unwrap()).to_string();
+        assert!(body.contains("a=sendonly"));
+
+        // Alice answers → 200 to bob in his dialog, ACK to alice.
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(a_reinvite, 200, None, Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let (ok, dest) = responded(&results, 200).expect("200 relayed to bob");
+        assert_eq!(dest, bob());
+        assert_eq!(ok.headers.cseq(), Some("7 INVITE"));
+        assert_eq!(ok.headers.call_id(), b_invite.headers.call_id());
+        let (ack, dest) = forwarded(&results, &Method::Ack).expect("ACK to alice");
+        assert_eq!(dest, alice());
+        assert_eq!(ack.headers.cseq(), Some("1 ACK"));
+        assert_eq!(ack.headers.call_id(), Some("call-relay@test"));
+
+        // Bob's ACK clears the 2xx retransmission on his leg.
+        stack
+            .process_message(&bob_request(&b_invite, "ACK", 7, None), bob(), None)
+            .await;
+        assert!(stack.pending_2xx.read().await.is_empty());
+
+        // A BYE from alice afterwards continues the SBC→alice sequence (2).
+        let results = flatten(
+            stack
+                .process_message(&bob_request(&b_invite, "BYE", 8, None), bob(), None)
+                .await,
+        );
+        let (bye, dest) = forwarded(&results, &Method::Bye).expect("BYE to alice");
+        assert_eq!(dest, alice());
+        assert_eq!(bye.headers.cseq(), Some("2 BYE"));
+    }
+
+    #[tokio::test]
+    async fn body_less_refresh_is_answered_locally() {
+        let (stack, _) = established_call().await;
+
+        // UPDATE without SDP (RFC 4028 refresh): 200 with Session-Expires, nothing forwarded.
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("UPDATE", 2, Some("bobtag"), None),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert_eq!(results.len(), 1);
+        let (ok, dest) = responded(&results, 200).expect("200 to UPDATE");
+        assert_eq!(dest, alice());
+        assert_eq!(ok.headers.cseq(), Some("2 UPDATE"));
+        assert_eq!(
+            ok.headers.get_value(&HeaderName::SessionExpires),
+            Some("1800;refresher=uac")
+        );
+        assert_eq!(ok.headers.get_value(&HeaderName::Require), Some("timer"));
+        assert!(ok.body.is_none());
+
+        // Body-less re-INVITE: 200 carries the SDP alice last got from us.
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 3, Some("bobtag"), None),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert_eq!(results.len(), 1, "no 100 Trying needed, nothing forwarded");
+        let (ok, _) = responded(&results, 200).expect("200 to refresh INVITE");
+        assert!(ok.body.is_some(), "200 to an INVITE carries an offer");
+        assert_eq!(
+            ok.headers.get_value(&HeaderName::ContentType),
+            Some("application/sdp")
+        );
+        assert_eq!(stack.pending_2xx.read().await.len(), 1);
+        stack
+            .process_message(
+                &alice_request("ACK", 3, Some("bobtag"), None),
+                alice(),
+                None,
+            )
+            .await;
+        assert!(stack.pending_2xx.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_with_sdp_is_relayed_without_ack() {
+        let (stack, b_invite) = established_call().await;
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("UPDATE", 2, Some("bobtag"), Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert!(
+            responded(&results, 100).is_none(),
+            "no provisional for UPDATE"
+        );
+        let (b_update, dest) = forwarded(&results, &Method::Update).expect("UPDATE to bob");
+        assert_eq!(dest, bob());
+        assert_eq!(b_update.headers.cseq(), Some("2 UPDATE"));
+        assert_eq!(b_update.headers.call_id(), b_invite.headers.call_id());
+
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(b_update, 200, None, Some(BOB_SDP)),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        let (ok, dest) = responded(&results, 200).expect("200 to alice");
+        assert_eq!(dest, alice());
+        assert_eq!(ok.headers.cseq(), Some("2 UPDATE"));
+        assert!(
+            forwarded(&results, &Method::Ack).is_none(),
+            "UPDATE has no ACK"
+        );
+        assert!(
+            stack.pending_2xx.read().await.is_empty(),
+            "non-INVITE 2xx is not retransmitted by the TU"
+        );
+    }
+
+    #[tokio::test]
+    async fn glare_reinvite_gets_491_and_rejection_is_relayed() {
+        let (stack, _) = established_call().await;
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 2, Some("bobtag"), Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let (b_reinvite, _) = forwarded(&results, &Method::Invite).unwrap();
+        let b_reinvite = b_reinvite.clone();
+
+        // A second change while the first is in flight: 491 Request Pending.
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("UPDATE", 3, Some("bobtag"), Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert!(responded(&results, 491).is_some(), "RFC 3261 §14.2 glare");
+
+        // Bob rejects the re-INVITE: the SBC ACKs him and relays the 488 to
+        // alice; the call stays up.
+        let results = flatten(
+            stack
+                .process_message(&response_to(&b_reinvite, 488, None, None), bob(), None)
+                .await,
+        );
+        let (ack, dest) = forwarded(&results, &Method::Ack).expect("ACK for non-2xx");
+        assert_eq!(dest, bob());
+        assert_eq!(ack.headers.cseq(), Some("2 ACK"));
+        assert_eq!(
+            ack.headers.via_branch(),
+            b_reinvite.headers.via_branch(),
+            "non-2xx ACK belongs to the INVITE transaction (same branch)"
+        );
+        let (rej, dest) = responded(&results, 488).expect("488 relayed");
+        assert_eq!(dest, alice());
+        assert_eq!(rej.headers.cseq(), Some("2 INVITE"));
+        assert_eq!(stack.call_count().await, 1);
+
+        // Now a new change is accepted again.
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 4, Some("bobtag"), Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert!(forwarded(&results, &Method::Invite).is_some());
+    }
+
+    #[tokio::test]
+    async fn in_dialog_requests_for_unknown_dialogs_get_481() {
+        let (stack, _) = established_call().await;
+        let src = alice();
+        for (method, body) in [
+            ("INVITE", Some(ALICE_SDP)),
+            ("UPDATE", None),
+            ("INFO", None),
+            ("BYE", None),
+        ] {
+            let msg = format!(
+                "{method} sip:bob@sbc.local SIP/2.0\r\n\
+                 Via: SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK-unk-{method}\r\n\
+                 From: <sip:alice@example.com>;tag=zz\r\n\
+                 To: <sip:bob@sbc.local>;tag=nope\r\n\
+                 Call-ID: no-such-dialog@test\r\n\
+                 CSeq: 9 {method}\r\n\
+                 Content-Length: {}\r\n\r\n{}",
+                body.map_or(0, str::len),
+                body.unwrap_or("")
+            );
+            let results = flatten(stack.process_message(&Bytes::from(msg), src, None).await);
+            assert!(
+                responded(&results, 481).is_some(),
+                "{method} for unknown dialog → 481"
+            );
+        }
+        // CANCEL that matches no INVITE transaction (RFC 3261 §9.2).
+        let cancel = b"CANCEL sip:bob@sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK-unk-CANCEL\r\n\
+            From: <sip:alice@example.com>;tag=zz\r\n\
+            To: <sip:bob@sbc.local>\r\n\
+            Call-ID: no-such-invite@test\r\n\
+            CSeq: 1 CANCEL\r\n\
+            Content-Length: 0\r\n\r\n";
+        let results = flatten(
+            stack
+                .process_message(&Bytes::from_static(cancel), src, None)
+                .await,
+        );
+        assert!(responded(&results, 481).is_some());
+
+        // Right Call-ID, wrong From tag: not this dialog either.
+        let forged = alice_request("INVITE", 5, Some("bobtag"), Some(ALICE_SDP));
+        let forged = Bytes::from(String::from_utf8_lossy(&forged).replace("tag=i1", "tag=evil"));
+        let results = flatten(stack.process_message(&forged, src, None).await);
+        assert!(
+            responded(&results, 481).is_some(),
+            "forged in-dialog request → 481"
+        );
+        assert_eq!(stack.call_count().await, 1, "call untouched");
+    }
+
+    #[tokio::test]
+    async fn non_2xx_final_from_callee_is_acked_and_its_retransmits_absorbed() {
+        let (stack, b_invite) = ringing_call().await;
+
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(&b_invite, 486, Some("bobtag"), None),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        let (ack, dest) = forwarded(&results, &Method::Ack).expect("486 is ACKed (§17.1.1.3)");
+        assert_eq!(dest, bob());
+        assert_eq!(ack.headers.cseq(), Some("1 ACK"));
+        assert_eq!(ack.headers.via_branch(), b_invite.headers.via_branch());
+        assert_eq!(ack.headers.to_tag().as_deref(), Some("bobtag"));
+        let (busy, dest) = responded(&results, 486).expect("486 relayed to alice");
+        assert_eq!(dest, alice());
+        assert_eq!(busy.headers.call_id(), Some("call-relay@test"));
+        assert_eq!(stack.call_count().await, 0);
+
+        // Bob retransmits the 486 (our ACK was lost): ACK again, but alice
+        // must not get a second 486 from the TU.
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(&b_invite, 486, Some("bobtag"), None),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        assert!(forwarded(&results, &Method::Ack).is_some(), "re-ACK");
+        assert!(responded(&results, 486).is_none(), "TU not re-driven");
+
+        // Alice retransmits her INVITE before ACKing: the server transaction
+        // answers with the stored 486 instead of starting a new call.
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 1, None, Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert!(responded(&results, 486).is_some(), "stored final re-sent");
+        assert!(forwarded(&results, &Method::Invite).is_none());
+        assert_eq!(stack.call_count().await, 0);
+
+        // Alice's ACK (same branch as her INVITE) completes the transaction;
+        // a further INVITE retransmit is then absorbed silently.
+        let ack = alice_request("ACK", 1, Some("bobtag"), None);
+        let ack = Bytes::from(
+            String::from_utf8_lossy(&ack).replace("z9hG4bK-alice-1-ACK", "z9hG4bK-alice-1-INVITE"),
+        );
+        assert!(matches!(
+            stack.process_message(&ack, alice(), None).await,
+            ProcessResult::NoAction
+        ));
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 1, None, Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert!(results.is_empty(), "absorbed in Confirmed: {results:?}");
+    }
+
+    #[tokio::test]
+    async fn invite_retransmit_while_proceeding_resends_100_trying() {
+        let (stack, _) = ringing_call().await;
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 1, None, Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        assert_eq!(results.len(), 1, "{results:?}");
+        let (_, dest) = responded(&results, 100).expect("last provisional re-sent (§17.2.1)");
+        assert_eq!(dest, alice());
+        assert_eq!(stack.call_count().await, 1, "no second call");
+    }
+
+    #[tokio::test]
+    async fn timers_retransmit_the_invite_and_a_lost_final_response() {
+        let (stack, b_invite) = ringing_call().await;
+
+        // Nothing fires before T1.
+        assert!(stack.poll_timers().await.is_empty());
+
+        // Timer A (T1 = 500 ms): the B-leg INVITE is retransmitted unchanged.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let results = stack.poll_timers().await;
+        let (again, dest) = forwarded(&results, &Method::Invite).expect("Timer A retransmit");
+        assert_eq!(dest, bob());
+        assert_eq!(again.headers.via_branch(), b_invite.headers.via_branch());
+        assert_eq!(again.headers.cseq(), Some("1 INVITE"));
+
+        // Bob answers 486; the 486 toward alice is retransmitted on Timer G
+        // until she ACKs (a lost final response).
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(&b_invite, 486, Some("bobtag"), None),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        let (first, _) = responded(&results, 486).unwrap();
+        let first_to = first
+            .headers
+            .get_value(&HeaderName::To)
+            .unwrap()
+            .to_string();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let results = stack.poll_timers().await;
+        let (retrans, dest) = responded(&results, 486).expect("Timer G retransmit");
+        assert_eq!(dest, alice());
+        assert_eq!(
+            retrans.headers.get_value(&HeaderName::To),
+            Some(first_to.as_str()),
+            "identical copy"
+        );
+        assert!(
+            forwarded(&results, &Method::Invite).is_none(),
+            "client transaction completed, no more Timer A"
+        );
+
+        // Alice ACKs → Confirmed → no further retransmission.
+        let ack = alice_request("ACK", 1, Some("bobtag"), None);
+        let ack = Bytes::from(
+            String::from_utf8_lossy(&ack).replace("z9hG4bK-alice-1-ACK", "z9hG4bK-alice-1-INVITE"),
+        );
+        stack.process_message(&ack, alice(), None).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let results = stack.poll_timers().await;
+        assert!(responded(&results, 486).is_none(), "{results:?}");
+    }
+
+    #[tokio::test]
+    async fn two_hundred_is_retransmitted_until_acked() {
+        let (stack, b_invite) = ringing_call().await;
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(&b_invite, 200, Some("bobtag"), Some(BOB_SDP)),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        let (ok, _) = responded(&results, 200).unwrap();
+        let ok_cl = ok
+            .headers
+            .get_value(&HeaderName::ContentLength)
+            .unwrap()
+            .to_string();
+
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let results = stack.poll_timers().await;
+        let (again, dest) = responded(&results, 200).expect("2xx retransmitted (§13.3.1.4)");
+        assert_eq!(dest, alice());
+        assert_eq!(
+            again.headers.get_value(&HeaderName::ContentLength),
+            Some(ok_cl.as_str())
+        );
+        assert!(again.body.is_some());
+
+        // Bob also retransmits his 200 (our ACK lost): re-ACK only, no new 200
+        // to alice and the call is activated once.
+        let results = flatten(
+            stack
+                .process_message(
+                    &response_to(&b_invite, 200, Some("bobtag"), Some(BOB_SDP)),
+                    bob(),
+                    None,
+                )
+                .await,
+        );
+        assert!(forwarded(&results, &Method::Ack).is_some());
+        assert!(responded(&results, 200).is_none());
+
+        stack
+            .process_message(
+                &alice_request("ACK", 1, Some("bobtag"), None),
+                alice(),
+                None,
+            )
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert!(stack.poll_timers().await.is_empty());
+        assert_eq!(stack.call_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn options_allow_lists_update() {
+        let stack = SipStack::new(SipStackConfig::default());
+        let options = b"OPTIONS sip:sbc.local SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK-opt\r\n\
+            From: <sip:alice@example.com>;tag=1\r\n\
+            To: <sip:sbc.local>\r\n\
+            Call-ID: opt@test\r\n\
+            CSeq: 1 OPTIONS\r\n\
+            Content-Length: 0\r\n\r\n";
+        let results = flatten(
+            stack
+                .process_message(&Bytes::from_static(options), alice(), None)
+                .await,
+        );
+        let (ok, _) = responded(&results, 200).unwrap();
+        assert!(
+            ok.headers
+                .get_value(&HeaderName::Allow)
+                .unwrap()
+                .contains("UPDATE")
+        );
     }
 
     #[tokio::test]
