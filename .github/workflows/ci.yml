@@ -195,10 +195,12 @@ jobs:
   # path-filtered workflow (.github/workflows/client-cross.yml) so it runs only
   # when the client stack / shared libs change, instead of on every PR.
 
+  # Blocking since 2026-10-10 (clean after #136/#137). A new advisory in a
+  # transitive dep fails PRs until it is fixed or documented in
+  # .cargo/audit.toml.
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -270,7 +272,7 @@ jobs:
       contents: read
       pull-requests: read
     if: always()
-    needs: [changes, fmt, clippy, test, docs]
+    needs: [changes, fmt, clippy, test, docs, audit]
     steps:
       - name: Check job results
         env:

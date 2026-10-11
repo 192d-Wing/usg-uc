@@ -26,10 +26,17 @@
 use crate::{AppError, AppResult};
 use bytes::BytesMut;
 use proto_sip::message::{SipMessage, SipRequest, SipResponse};
+// Only the debug-only `InsecureCertVerifier` needs these; gating them keeps
+// release builds warning-free.
+#[cfg(debug_assertions)]
+use rustls::DigitallySignedStruct;
+#[cfg(debug_assertions)]
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+#[cfg(debug_assertions)]
+use rustls::pki_types::UnixTime;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::sign::CertifiedKey;
-use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use rustls::{ClientConfig, RootCertStore, SignatureScheme};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::SocketAddr;

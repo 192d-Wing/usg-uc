@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ### Security
 
+- **No untrusted-CA override in release builds** — the provisioning HTTP client's accept-any-certificate mode (`CaTrust::Insecure`) and the sign-in "continue anyway" prompt now exist only under `debug_assertions`, matching the SIP TLS transport. Release clients must install a private CA via `[provisioning] extra_ca_cert_file` (`client-provisioning`, `client-gui-tauri`)
+- **Security Audit is blocking** — the `cargo audit` job is part of the `CI OK` gate
 - **Opus binding → `opusic-c`** — the `opus-ffi` feature now uses the maintained `opusic-c` 1.6 binding (bundled libopus 1.6.1, CMake 4 compatible) instead of the unmaintained `audiopus`/`audiopus_sys` (RUSTSEC-2026-0150). No system libopus needed; the audit ignore is removed (`uc-codecs`)
 - **cryptoki 0.7 → 0.12** — fixes RUSTSEC-2026-0286 (out-of-bounds read decoding `CKA_ALLOWED_MECHANISMS`) in the PKCS#11 smart-card certificate enumeration (`client-core`). Also drops the unmaintained `paste` crate from the lockfile
 - **cargo-audit clean** — CI installs `libopus-dev` so the `opus-ffi` feature links the system libopus instead of running `audiopus_sys`'s unmaintained source build; `.cargo/audit.toml` documents the remaining GTK3-pinned advisories

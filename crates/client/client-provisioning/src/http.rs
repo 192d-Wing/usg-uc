@@ -19,7 +19,10 @@ pub enum CaTrust {
     System,
     /// OS trust store plus the given extra CA PEM (the internal IdP CA).
     ExtraPem(PathBuf),
-    /// Accept any certificate. **Development only.**
+    /// Accept any certificate. **Development only** — this variant does not
+    /// exist in release builds (mirrors `CertVerificationMode::Insecure` in
+    /// `client-core`), so fielded clients cannot bypass TLS validation.
+    #[cfg(debug_assertions)]
     Insecure,
 }
 
@@ -48,6 +51,7 @@ pub fn build_http_client(trust: &CaTrust) -> Result<reqwest::Client, Provisionin
             })?;
             builder = builder.add_root_certificate(cert);
         }
+        #[cfg(debug_assertions)]
         CaTrust::Insecure => {
             builder = builder.danger_accept_invalid_certs(true);
         }
