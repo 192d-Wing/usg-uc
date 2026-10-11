@@ -992,6 +992,20 @@ impl Server {
         }
         drop(transports);
 
+        // Transaction timer loop: RFC 3261 §17 retransmissions and timeouts
+        // plus §13.3.1.4 2xx retransmission. Re-sends go out the first UDP
+        // socket (the one receive loops also answer from when zones share a
+        // bind).
+        if let Some(transport) = self.udp_transports.read().await.first().map(Arc::clone) {
+            let sip_stack = Arc::clone(&self.sip_stack);
+            let stats = Arc::clone(&self.stats);
+            handles.push(tokio::spawn(async move {
+                Self::transaction_timer_loop(sip_stack, transport, stats).await;
+            }));
+        } else {
+            warn!("No UDP transport bound; SIP retransmission timers are not driven");
+        }
+
         // Spawn accept loops for stream listeners (SIP over TCP / TLS).
         // Each accepted connection gets its own receive task; responses go
         // back over the connection the request arrived on (RFC 3261 §18).
@@ -1465,6 +1479,26 @@ impl Server {
             }
             ProcessResult::Error { reason } => {
                 warn!(reason = %reason, "Error processing message");
+            }
+        }
+    }
+
+    /// Ticks the SIP stack's transaction timers every 100 ms (a fraction of
+    /// T1 = 500 ms) and puts the resulting retransmissions, timeouts and
+    /// teardowns on the wire. Like the receive loops it has no shutdown arm:
+    /// BYEs sent while draining still need their retransmissions, and
+    /// `Server::run` aborts the task once draining completes.
+    async fn transaction_timer_loop(
+        sip_stack: Arc<SipStack>,
+        transport: Arc<UdpTransport>,
+        stats: Arc<ServerStats>,
+    ) {
+        let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(100));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            for result in sip_stack.poll_timers().await {
+                Self::handle_result(result, transport.as_ref(), &stats).await;
             }
         }
     }

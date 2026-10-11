@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ## [Unreleased]
 
+### Added
+
+- **Mid-dialog re-INVITE and UPDATE relay** — the daemon now relays re-INVITE (RFC 3261 §14) and UPDATE (RFC 3311) across both legs of a B2BUA call, re-anchoring the new offer and answer through the media relay and following each leg's new RTP address, so hold/resume, codec changes and RFC 4028 session refreshes work end to end. Body-less refreshes are answered locally; a second change while one is in flight gets 491; `Supported: timer`, `Session-Expires` and `Min-SE` are carried through the initial INVITE and the 2xx (`sbc-daemon`, closes #117)
+
+### Fixed
+
+- **SIP transaction layer is driven** — the daemon now steps the `proto-transaction` state machines it creates: a timer task retransmits forwarded INVITEs (Timer A), non-2xx finals toward the caller (Timer G) and 2xx responses until ACKed (RFC 3261 §13.3.1.4); an unanswered B-leg INVITE fails the call with 408 (Timer B); retransmitted requests are answered from the stored response instead of being re-processed; every non-2xx final from the far end is ACKed (§17.1.1.3) and retransmitted finals are absorbed, so a lost ACK no longer leaves the far end retransmitting for 32 s or restarts the media relay (`sbc-daemon`)
+- **481 for unmatched in-dialog requests** — BYE, re-INVITE, UPDATE and other tagged requests for a dialog the SBC does not have, and CANCEL for an unknown INVITE, now get 481 Call/Transaction Does Not Exist instead of 200 OK or 405 (RFC 3261 §9.2, §12.2.2, §15.1.2) (`sbc-daemon`)
+
 ### Security
 
 - **No untrusted-CA override in release builds** — the provisioning HTTP client's accept-any-certificate mode (`CaTrust::Insecure`) and the sign-in "continue anyway" prompt now exist only under `debug_assertions`, matching the SIP TLS transport. Release clients must install a private CA via `[provisioning] extra_ca_cert_file` (`client-provisioning`, `client-gui-tauri`)
