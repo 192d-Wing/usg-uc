@@ -6,7 +6,7 @@ Implementation notes:
 
 - Matching is implemented in `uc-routing::SbcRouter` and is wired into `sbc-daemon` (`sip_stack.rs`): the inbound trunk's source IP is mapped to its trunk group and `css_id`, and the dialed digits are routed through the CSS before falling back to dial-plan routing.
 - The REST API for partitions, CSS, route patterns, route lists and trunk groups is served by **`sbc-api-server`** (default port 8080), not by `sbc-daemon`. Changes are pushed to the daemon over gRPC (`SbcSyncService`, `TrunkSyncService`), which updates the live router.
-- `uc-routing::RoutePattern` carries its own number `transform` (applied inside `SbcRouter::route`), but the REST/gRPC sync into the daemon does not set it (only `id`, `pattern`, `pattern_type`, `partition_id`, `route_group_id`, `route_list_id`, `description`, `priority`, `blocked` are read). Per-pattern transforms are therefore library-only today.
+- `uc-routing::RoutePattern` carries its own number `transform`, applied inside `SbcRouter::route` before the route list/group is resolved. The REST API accepts it as `transform_type` / `transform_value` (validated on create/update) and the daemon's sync path (`apply_route_pattern_to_router`) sets it on the pattern.
 
 ## Pattern Types
 
@@ -67,6 +67,8 @@ Matches **all numbers** unconditionally. Used as a catch-all or default route.
 | `blocked` | No | `true` rejects any call matching this pattern in this partition (checked before normal matches) |
 | `description` | No | Human-readable description |
 | `priority` | No | Lower number = higher priority (default: 100) |
+| `transform_type` | No | Digit manipulation applied to the dialled number before routing: `none` (default), `strip_prefix`, `add_prefix`, `replace_prefix`, `replace`. Same spelling as dial-plan entries. |
+| `transform_value` | With a transform | `strip_prefix`: number of leading digits to remove (> 0). `add_prefix`: digits to prepend. `replace_prefix`: `from|to`. `replace`: the whole replacement number. The API rejects a missing or malformed value with 400. |
 
 ## Routing Chain
 
@@ -145,7 +147,21 @@ If scores are equal, the `priority` field breaks the tie (lower = preferred). A 
 
 ### Strip +1 prefix and route
 
-Route patterns created through the API carry no number transform (see Implementation notes). To strip `+1`, use a dial plan entry with a `strip_prefix` transform for calls that take the dial-plan path, or apply the transform at the downstream trunk. Per-pattern transforms via the API are planned.
+To strip a dialled `+1` before the call reaches the trunk, give the pattern a transform:
+
+```json
+{
+  "id": "rp-us-e164",
+  "pattern": "+1",
+  "pattern_type": "prefix",
+  "partition_id": "pt-pstn",
+  "route_group_id": "rg-carrier",
+  "transform_type": "strip_prefix",
+  "transform_value": "2"
+}
+```
+
+`+15551234567` is then routed as `5551234567`. Use `add_prefix` to put a `+1` back on, `replace_prefix` (`"011|+"`) to convert an international dial prefix to E.164, or `replace` to send every match to one fixed number.
 
 ## API Examples
 
