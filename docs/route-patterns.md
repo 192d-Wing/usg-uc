@@ -2,6 +2,12 @@
 
 Route patterns define how the SBC matches and routes inbound calls. When a call arrives on a trunk with a Calling Search Space (CSS) assigned, the SBC evaluates the called number against route patterns in the CSS's partitions.
 
+Implementation notes:
+
+- Matching is implemented in `uc-routing::SbcRouter` and is wired into `sbc-daemon` (`sip_stack.rs`): the inbound trunk's source IP is mapped to its trunk group and `css_id`, and the dialed digits are routed through the CSS before falling back to dial-plan routing.
+- The REST API for partitions, CSS, route patterns, route lists and trunk groups is served by **`sbc-api-server`** (default port 8080), not by `sbc-daemon`. Changes are pushed to the daemon over gRPC (`SbcSyncService`, `TrunkSyncService`), which updates the live router.
+- `uc-routing::RoutePattern` carries its own number `transform` (applied inside `SbcRouter::route`), but the REST/gRPC sync into the daemon does not set it (only `id`, `pattern`, `pattern_type`, `partition_id`, `route_group_id`, `route_list_id`, `description`, `priority`, `blocked` are read). Per-pattern transforms are therefore library-only today.
+
 ## Pattern Types
 
 ### Prefix (default)
@@ -44,16 +50,21 @@ Uses special characters for flexible matching:
 
 Matches **all numbers** unconditionally. Used as a catch-all or default route.
 
+### Regex (library-only)
+
+`uc-routing::DialPattern::Regex` exists in the routing library, but the API-to-daemon sync (`apply_route_pattern_to_router`) does not accept a `regex` pattern type — it falls back to `prefix`. Regex patterns cannot currently be created through the REST API.
+
 ## Route Pattern Fields
 
 | Field | Required | Description |
 |-------|----------|-------------|
 | `id` | Yes | Unique identifier (e.g., `rp-emergency`) |
 | `pattern` | Yes | The pattern string (see types above) |
-| `pattern_type` | No | `prefix` (default), `exact`, `wildcard`, or `any` |
+| `pattern_type` | No | `prefix` (default), `exact`, `wildcard`, or `any`. Unknown values (including `regex`) fall back to `prefix` when applied to the daemon. |
 | `partition_id` | Yes | Partition this pattern belongs to |
 | `route_group_id` | No | Trunk group to route matched calls to |
-| `route_list_id` | No | Route list for failover (overrides route_group_id) |
+| `route_list_id` | No | Route list (ordered route groups; overrides route_group_id). See the failover note below. |
+| `blocked` | No | `true` rejects any call matching this pattern in this partition (checked before normal matches) |
 | `description` | No | Human-readable description |
 | `priority` | No | Lower number = higher priority (default: 100) |
 
@@ -65,21 +76,29 @@ flowchart TD
     tg --> css["Calling Search Space<br>(ordered list of Partitions)"]
     css --> p1["Partition 1 — Route Patterns<br>(matched by specificity then priority)"]
     p1 -->|match| rg["Route Group<br>(direct trunk selection)"]
-    p1 -->|match| rl["Route List<br>(failover: try Route Groups in order)"]
+    p1 -->|match| rl["Route List<br>(ordered Route Groups — daemon uses the first only)"]
     p1 -->|no match| p2["Partition 2 — Route Patterns …"]
     p2 -->|no match| ann["Announcement<br>(&quot;Number Not In Service&quot;)"]
 ```
 
 ## Pattern Specificity
 
-When multiple patterns match, the most specific wins:
+Partitions are walked in CSS order and **the first partition containing any match wins**; later partitions are not consulted. Within that partition, when multiple patterns match, the highest specificity *score* wins. The score is a heuristic (`SbcRouter::pattern_specificity`), not a strict class ordering:
 
-1. **Exact** (highest priority)
-2. **Prefix** (longer prefix beats shorter)
-3. **Wildcard** (more literal characters beats fewer)
-4. **Any** (lowest priority, catch-all)
+| Type | Score |
+|------|-------|
+| **Exact** | 2 × pattern length |
+| **Prefix** | pattern length |
+| **Wildcard** | number of literal characters before the first `X` or `.` |
+| **Any** / **Regex** | 0 |
 
-If specificity is equal, the `priority` field breaks the tie (lower = preferred).
+In practice this yields Exact > Prefix > Wildcard > Any for patterns of similar length, but a long prefix can outscore a short exact pattern (e.g. `+1213916` prefix scores 8, `911` exact scores 6).
+
+If scores are equal, the `priority` field breaks the tie (lower = preferred). A `blocked` pattern matching the digits in the current partition rejects the call before any other pattern is considered.
+
+### Route List Failover (partially wired)
+
+`SbcRouter::route` returns the route list's members in order, but **`sbc-daemon` currently sends the call only to the first route group** (`sip_stack.rs`, `route_group_ids.first()`); subsequent members are not retried on failure. Trunk-level failover inside a trunk group (priority order, `routing.max_failover_attempts`) does work. Retrying across route-list members is planned.
 
 ## Examples
 
@@ -110,7 +129,7 @@ If specificity is equal, the `priority` field breaks the tie (lower = preferred)
 }
 ```
 
-### Catch-all with route list failover
+### Catch-all with route list (first member used today)
 
 ```json
 {
@@ -126,9 +145,11 @@ If specificity is equal, the `priority` field breaks the tie (lower = preferred)
 
 ### Strip +1 prefix and route
 
-Create the route pattern, then use a dial plan entry with a `strip_prefix` transform to remove the `+1` before forwarding to the destination.
+Route patterns created through the API carry no number transform (see Implementation notes). To strip `+1`, use a dial plan entry with a `strip_prefix` transform for calls that take the dial-plan path, or apply the transform at the downstream trunk. Per-pattern transforms via the API are planned.
 
 ## API Examples
+
+These endpoints are served by **`sbc-api-server`** (the address below is an sbc-api instance), and are synced to the daemon over gRPC. `sbc-daemon` itself only exposes read-only `/api/v1/dialplans` and `/api/v1/cdrs` plus `/healthz` and `/readyz`. A `/api/v1/routelists` resource exists alongside the ones shown.
 
 ### Create a partition
 

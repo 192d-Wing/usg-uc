@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ### Fixed
 
+- **Compliance documents reconciled with what ships** — `PROTO_RFC_COMPLIANCE.md`, `docs/RFC_COMPLIANCE_GAPS.md`, `docs/NIST-800-53-CONTROLS.md`, `docs/CNSA-2-COMPLIANCE.md`, `docs/CLUSTERING.md`, `docs/route-patterns.md`, `docs/SBC-ADMIN-GUIDE.md` and `ROADMAP.md` now label every "Full"/"Complete"/"Implemented" entry as *Wired* (naming the binary), *Library-only* or *Planned*, use the real `proto-*`/`uc-*` crate names, and correct config keys and enum spellings that did not match `sbc-config` (closes #118)
 - **SIP transaction layer is driven** — the daemon now steps the `proto-transaction` state machines it creates: a timer task retransmits forwarded INVITEs (Timer A), non-2xx finals toward the caller (Timer G) and 2xx responses until ACKed (RFC 3261 §13.3.1.4); an unanswered B-leg INVITE fails the call with 408 (Timer B); retransmitted requests are answered from the stored response instead of being re-processed; every non-2xx final from the far end is ACKed (§17.1.1.3) and retransmitted finals are absorbed, so a lost ACK no longer leaves the far end retransmitting for 32 s or restarts the media relay (`sbc-daemon`)
 - **481 for unmatched in-dialog requests** — BYE, re-INVITE, UPDATE and other tagged requests for a dialog the SBC does not have, and CANCEL for an unknown INVITE, now get 481 Call/Transaction Does Not Exist instead of 200 OK or 405 (RFC 3261 §9.2, §12.2.2, §15.1.2) (`sbc-daemon`)
 
