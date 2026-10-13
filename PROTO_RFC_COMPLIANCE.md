@@ -7,7 +7,7 @@
 
 > **Status legend.** *Wired (sbc-daemon | sbc-media-core | soft client)* — a shipped binary has a call site for this (the binary is named). *Library-only* — implemented and tested in a `proto-*`/`uc-*` crate, but no shipped binary calls it. *Planned* — not implemented. A row that says only "Full"/"Complete" describes crate-level capability; the wiring column/annotation says what the running SBC actually does.
 
-**Dependency facts behind the wiring labels** (from `Cargo.toml`): `sbc-daemon` depends on proto-sip, proto-transaction, proto-dialog, proto-b2bua, proto-registrar, proto-jwt, proto-rtp, proto-srtp, proto-dtls, proto-stun, proto-turn, proto-ice and `sbc-media-core` — but **not** proto-sdp or proto-stir-shaken. `sbc-media-core` (linked into `sbc-daemon` and `sbc-media`) depends on proto-dtls, proto-rtp, proto-srtp. `client-sip-ua` lists proto-sdp, proto-registrar, proto-stun and proto-turn but has no source references to them. Nothing depends on proto-stir-shaken. `sbc-daemon/src/ice_agent.rs` (`IceManager`) is declared but never constructed. SBC DTLS-SRTP termination is a Go sidecar (`sbc-media-core/src/dtls_sidecar.rs`), not proto-dtls.
+**Dependency facts behind the wiring labels** (from `Cargo.toml`): `sbc-daemon` depends on proto-sip, proto-transaction, proto-dialog, proto-b2bua, proto-registrar, proto-jwt, proto-rtp, proto-srtp, proto-dtls, proto-stun and `sbc-media-core` — but **not** proto-sdp or proto-stir-shaken. `sbc-media-core` (linked into `sbc-daemon` and `sbc-media`) depends on proto-dtls, proto-rtp, proto-srtp. `client-sip-ua` lists proto-sdp, proto-registrar, proto-stun and proto-turn but has no source references to them. Nothing depends on proto-stir-shaken. The SBC does not run ICE (it anchors media and latches symmetrically). SBC DTLS-SRTP termination is a Go sidecar (`sbc-media-core/src/dtls_sidecar.rs`), not proto-dtls.
 
 ---
 
@@ -221,7 +221,7 @@
 
 **Primary Standard:** RFC 5766 / RFC 8656
 
-**Wiring note:** **Library-only.** The only caller is proto-ice's `IceAgent` (relay candidate gathering when `IceConfig.turn_servers` is non-empty). The soft client always uses `IceConfig::default()` (`set_ice_config` has no production callers; `settings.rs` `turn_server` is unused), and the sbc-daemon `IceManager` is never constructed. No `proto_turn` references exist in `crates/sbc` or `crates/client`.
+**Wiring note:** **Library-only.** The only caller is proto-ice's `IceAgent` (relay candidate gathering when `IceConfig.turn_servers` is non-empty). The soft client configures STUN servers from settings but no TURN server (the settings schema carries no TURN password), and the SBC does not run ICE. No `proto_turn` references exist in `crates/sbc` or `crates/client`.
 
 ### RFCs Referenced
 
@@ -249,13 +249,13 @@
 
 **Primary Standard:** RFC 8445 (supersedes RFC 5245)
 
-**Wiring note:** **Wired (soft client only)** — `client-sip-ua/ice_handler.rs` constructs `IceAgent` and `media_session.rs` drives `IceHandler::for_outbound`/`for_inbound`; host candidates only (no STUN/TURN servers configured). `sbc-daemon/src/ice_agent.rs` (`IceManager`) exists but is never constructed, so ICE is not active in the SBC.
+**Wiring note:** **Wired (soft client only)** — `client-sip-ua/ice_handler.rs` constructs `IceAgent`, gathers host (and, when a STUN server is configured in `[network]` settings, server-reflexive) candidates, and runs connectivity checks with nomination on the media socket; `media_session.rs` falls back to the SDP address on ICE mismatch or failure. The SBC does not run ICE by design (media anchoring with symmetric latching).
 
 ### RFCs Referenced
 
 | RFC | Title | Status |
 |-----|-------|--------|
-| **RFC 8445** | ICE | **Full** — candidate types and priority (§5.1.2), pair priority (§6.1.2.3), checklist initialization (§6.1.2.6), connectivity checks (§6-7), role conflict (§7.3.1.1), aggressive nomination (§7.2.2), keepalives (§10), retransmission (§14.3). **Wired (soft client only, host candidates)**; sbc-daemon `ice_agent.rs` dead |
+| **RFC 8445** | ICE | **Full** — candidate types and priority (§5.1.2), pair priority (§6.1.2.3), checklist initialization (§6.1.2.6), connectivity checks (§6-7), role conflict (§7.3.1.1), aggressive nomination (§7.2.2), keepalives (§10), retransmission (§14.3). **Wired (soft client only)**; the SBC does not run ICE |
 | **RFC 5245** | ICE (legacy) | Referenced |
 | **RFC 7675** | Consent Freshness | **Full** — 5s interval, 30s timeout, consent revocation (§6), MUST cease sending. **Library-only** — `consent.rs` is not driven by `IceAgent` or any binary |
 | **RFC 8839** | SDP for ICE | Referenced — soft client parses `a=candidate`/ufrag/pwd itself (`IceHandler::parse_sdp_candidate`, `call_manager.rs`) |
@@ -277,7 +277,7 @@
 
 ### Gaps
 - No `TODO`/`FIXME` found
-- sbc-daemon ICE (`ice_agent.rs`) is not constructed by any runtime path
+- The SBC does not run ICE (by design: media anchoring with symmetric latching); ICE is a soft-client feature
 
 ---
 
@@ -463,7 +463,7 @@
 ### Wiring Gaps (crate capability not reached by any shipped binary)
 - **proto-sdp**, **proto-turn**, **proto-stir-shaken** — entire crates library-only
 - **proto-dialog** — only `refer.rs` reaches a binary (soft client); dialog store, session timer, subscriptions, forking unused
-- **proto-ice** — soft client only (host candidates); sbc-daemon `ice_agent.rs` never constructed; RFC 7675 consent unused
+- **proto-ice** — soft client only (checks, nomination; STUN via settings); the SBC does not run ICE; RFC 7675 consent and §10 keepalives unused
 - **proto-dtls** — soft client only; SBC DTLS termination is the Go sidecar
 - **proto-sip** proxy/routing/redirect/options modules, Path header; **proto-transaction** PRACK; **proto-registrar** GRUU/Path/Service-Route/flow manager; **proto-b2bua** early-media module; **proto-rtp** translator/mixer/scheduler/collision detector
 - **sbc-daemon** relays only REGISTER/INVITE/ACK/BYE/CANCEL/OPTIONS/UPDATE; REFER, SUBSCRIBE/NOTIFY, PRACK, MESSAGE, INFO, PUBLISH receive 405
