@@ -66,6 +66,7 @@ pub fn validate_config(config: &SbcConfig) -> ConfigResult<()> {
     validate_transport(&config.transport)?;
     validate_media(&config.media)?;
     validate_security(&config.security)?;
+    validate_logging(&config.logging)?;
     validate_stir_shaken(&config.stir_shaken)?;
     validate_rate_limit(&config.rate_limit)?;
     validate_vps(config)?;
@@ -111,6 +112,18 @@ fn validate_transport(config: &crate::schema::TransportConfig) -> ConfigResult<(
     if total_listeners == 0 {
         return Err(ConfigError::Validation {
             message: "at least one listen address must be configured".to_string(),
+        });
+    }
+
+    // The WebSocket transport (RFC 7118) does not terminate TLS itself, so a
+    // `wss_listen` entry would silently be plain WS. Refuse it rather than
+    // advertise security that is not there.
+    if !config.wss_listen.is_empty() {
+        return Err(ConfigError::Validation {
+            message: "transport.wss_listen is not supported by this build: the WebSocket \
+                      transport does not terminate TLS. Terminate TLS at a reverse proxy and \
+                      use transport.ws_listen, or use transport.tls_listen."
+                .to_string(),
         });
     }
 
@@ -183,15 +196,59 @@ fn validate_security(config: &crate::schema::SecurityConfig) -> ConfigResult<()>
 
     // CNSA 2.0: Validate TLS version
     match config.min_tls_version.as_str() {
-        "1.3" => Ok(()),
-        "1.2" => {
-            // TLS 1.2 is allowed but 1.3 is preferred
-            Ok(())
+        "1.3" | "1.2" => {}
+        _ => {
+            return Err(ConfigError::CnsaViolation {
+                message: "minimum TLS version must be 1.2 or 1.3".to_string(),
+            });
         }
-        _ => Err(ConfigError::CnsaViolation {
-            message: "minimum TLS version must be 1.2 or 1.3".to_string(),
-        }),
     }
+
+    // Mutual TLS needs server credentials and a CA to verify clients against.
+    if config.require_mtls {
+        if config.tls_cert_path.is_none() {
+            return Err(ConfigError::Validation {
+                message: "security.require_mtls needs security.tls_cert_path / tls_key_path"
+                    .to_string(),
+            });
+        }
+        if config.tls_ca_path.is_none() {
+            return Err(ConfigError::Validation {
+                message: "security.require_mtls needs security.tls_ca_path (PEM bundle of \
+                          CAs that issue client certificates)"
+                    .to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_logging(config: &crate::schema::LoggingConfig) -> ConfigResult<()> {
+    match config.level.to_ascii_lowercase().as_str() {
+        "trace" | "debug" | "info" | "warn" | "error" => {}
+        other => {
+            return Err(ConfigError::Validation {
+                message: format!(
+                    "logging.level must be trace, debug, info, warn or error (got {other:?})"
+                ),
+            });
+        }
+    }
+    match config.format.to_ascii_lowercase().as_str() {
+        "json" | "text" => {}
+        other => {
+            return Err(ConfigError::Validation {
+                message: format!("logging.format must be json or text (got {other:?})"),
+            });
+        }
+    }
+    if config.output.trim().is_empty() {
+        return Err(ConfigError::Validation {
+            message: "logging.output must be stdout, stderr or a file path".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_stir_shaken(config: &crate::schema::StirShakenConfig) -> ConfigResult<()> {
@@ -710,6 +767,72 @@ mod tests {
             msg.contains(needle),
             "error '{msg}' should mention '{needle}'"
         );
+    }
+
+    #[test]
+    fn wss_listen_is_rejected_as_unsupported() {
+        let mut config = SbcConfig::default();
+        config.transport.wss_listen = vec!["0.0.0.0:7443".parse().unwrap()];
+        let err = validate_config(&config).unwrap_err().to_string();
+        assert!(err.contains("wss_listen"), "{err}");
+        config.transport.wss_listen.clear();
+        config.transport.ws_listen = vec!["0.0.0.0:7080".parse().unwrap()];
+        assert!(
+            validate_config(&config).is_ok(),
+            "plain ws_listen is supported"
+        );
+    }
+
+    #[test]
+    fn require_mtls_needs_certificate_and_client_ca() {
+        let mut config = SbcConfig::default();
+        config.security.require_mtls = true;
+        assert!(
+            validate_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("tls_cert_path")
+        );
+        config.security.tls_cert_path = Some("/etc/sbc/tls.crt".into());
+        config.security.tls_key_path = Some("/etc/sbc/tls.key".into());
+        assert!(
+            validate_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("tls_ca_path")
+        );
+        config.security.tls_ca_path = Some("/etc/sbc/clients-ca.pem".into());
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn logging_fields_are_validated() {
+        let mut config = SbcConfig::default();
+        config.logging.format = "yaml".to_string();
+        assert!(
+            validate_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("logging.format")
+        );
+        config.logging.format = "text".to_string();
+        config.logging.level = "loud".to_string();
+        assert!(
+            validate_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("logging.level")
+        );
+        config.logging.level = "warn".to_string();
+        config.logging.output = " ".to_string();
+        assert!(
+            validate_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("logging.output")
+        );
+        config.logging.output = "/var/log/sbc/sbc.log".to_string();
+        assert!(validate_config(&config).is_ok());
     }
 
     #[test]

@@ -19,11 +19,11 @@ Crate names below are the real workspace crates (`crates/uc/uc-*`, `crates/proto
 
 | Control | Title | Status | Implementation |
 |---------|-------|--------|----------------|
-| AU-2 | Event Logging | Library-only | `uc-audit::event` defines auditable events. No `crates/sbc` binary depends on `uc-audit`; the daemon emits `tracing` logs only. `logging.audit_enabled` / `logging.audit_path` are parsed by `sbc-config` but not read by `sbc-daemon`. |
-| AU-3 | Content of Audit Records | Library-only | `uc-audit::record` structured records; not wired. |
-| AU-4 | Audit Log Storage Capacity | Library-only | `uc-audit::sink` configurable sinks; not wired. |
-| AU-8 | Time Stamps | Library-only | `uc-audit::record` UTC timestamps; not wired. |
-| AU-9 | Protection of Audit Information | Library-only | `uc-audit::record` SHA-384 hash chain; not wired. |
+| AU-2 | Event Logging | **Wired (sbc-daemon)**, opt-in | With `logging.audit_enabled`, `sbc-daemon` initialises `uc-audit` (`runtime.rs`) and records startup/shutdown, REGISTER authentication outcomes, INVITE admission/VPS rejections, call establishment/termination and rate-limit rejections (`sip_stack.rs`, `server.rs`). Off by default. |
+| AU-3 | Content of Audit Records | **Wired (sbc-daemon)**, opt-in | `uc-audit::record` structured records (sequence, UTC timestamp, typed event, hash chain) written for every event above. |
+| AU-4 | Audit Log Storage Capacity | **Wired (sbc-daemon)**, opt-in | `uc-audit::sink::FileSink` appends JSON lines to `logging.audit_path`; without a path records go to the tracing output (target `audit`). Rotation/retention is the platform's. |
+| AU-8 | Time Stamps | **Wired (sbc-daemon)**, opt-in | `uc-audit::record` UTC timestamps on every record. |
+| AU-9 | Protection of Audit Information | **Wired (sbc-daemon)**, opt-in | `uc-audit::record` SHA-384 hash chain across records (`AuditRecord::verify`); file permissions are the platform's. |
 | AU-10 | Non-repudiation | Planned | Cryptographic signing of audit records |
 
 ### CM - Configuration Management
@@ -47,7 +47,7 @@ Crate names below are the real workspace crates (`crates/uc/uc-*`, `crates/proto
 |---------|-------|--------|----------------|
 | SC-5 | Denial of Service Protection | **Wired (sbc-daemon)** | `uc-dos-protection::RateLimiter` per-source-IP and global limiters (`sbc-daemon/src/server.rs`); `general.max_calls` admission control (503) in `sip_stack.rs`. `rate_limit.per_user_rps` is parsed but not applied. |
 | SC-7 | Boundary Protection | **Wired (sbc-daemon)** | `proto-sip::TopologyHider` initialised from `[topology_hiding]` and applied to external B-legs (`sbc-daemon/src/sip_stack.rs`). |
-| SC-8 | Transmission Confidentiality | **Wired (sbc-daemon, sbc-media-core)** | SIP-over-TLS listeners use `uc-transport::tls::create_server_config` (TLS 1.3 only); listeners are skipped with a warning when `security.tls_cert_path` is unset. SRTP relay/termination accepts only `AEAD_AES_256_GCM` (`sbc-media-core/src/srtp_relay.rs`, `dtls_relay.rs`). The REST HTTPS listener (`api_server.rs`) uses rustls defaults (TLS 1.2 permitted). |
+| SC-8 | Transmission Confidentiality | **Wired (sbc-daemon, sbc-media-core)** | SIP-over-TLS listeners use `uc-transport::tls::create_server_config_with` (TLS 1.3 only by default; `security.min_tls_version = "1.2"` admits 1.2; `security.require_mtls` + `tls_ca_path` requires client certificates); listeners are skipped with a warning when `security.tls_cert_path` is unset. SRTP relay/termination accepts only `AEAD_AES_256_GCM` (`sbc-media-core/src/srtp_relay.rs`, `dtls_relay.rs`). The REST HTTPS listener (`api_server.rs`) uses rustls defaults (TLS 1.2 permitted). |
 | SC-12 | Cryptographic Key Establishment | Library-only (`uc-crypto::ecdh`, `uc-crypto::hkdf`) | No shipped binary or `proto-*` crate calls the ECDH/HKDF helpers. Key establishment in the shipped path is TLS 1.3 (rustls) and DTLS-SRTP performed by the external Go DTLS sidecar (`sbc-media-core/src/dtls_sidecar.rs`). |
 | SC-13 | Cryptographic Protection | **Wired (sbc-daemon, sbc-media-core)** | rustls aws-lc-rs FIPS provider installed at startup (`sbc-daemon/src/main.rs`; workspace `rustls` features `fips`). `uc-crypto` exposes only SHA-384/512, AES-256, P-384 and is used by `proto-srtp`/`proto-dtls`. |
 | SC-23 | Session Authenticity | Partial | TLS 1.3 SIP listeners wired (see SC-8). STIR/SHAKEN (`proto-stir-shaken`) is Library-only. |
@@ -87,7 +87,7 @@ Control implementations are verified through:
 
 1. **Unit Tests**: Each module has tests validating correct behavior (e.g. `sbc-config/src/validate.rs`, `sbc-daemon/src/sip_stack.rs` admission tests).
 2. **Integration Tests**: `crates/sbc/sbc-integration-tests`. There is no `tests/compliance/` directory.
-3. **Audit Logging**: Planned. No audit sink is wired into a shipped binary (see AU-2); security events are currently visible only in `tracing` output.
+3. **Audit Logging**: Wired, opt-in via `logging.audit_enabled` (see AU-2). Without it, security events are visible only in `tracing` output.
 
 ## References
 

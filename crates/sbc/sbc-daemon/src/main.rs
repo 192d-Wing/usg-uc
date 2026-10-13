@@ -99,8 +99,11 @@ fn main() {
         return;
     }
 
-    // Initialize tracing subscriber
-    init_tracing(args.verbose);
+    // Logging follows [logging] in the configuration file when one exists;
+    // -v flags raise the level above it. A broken config file is reported
+    // by Runtime::new below, after logging is up.
+    let logging = peek_logging_config(&args);
+    init_tracing(args.verbose, &logging);
 
     // Install the process-level rustls CryptoProvider (aws-lc, FIPS). With
     // multiple provider crate features enabled rustls cannot pick one
@@ -138,24 +141,62 @@ fn main() {
     });
 }
 
-/// Initializes the tracing subscriber with appropriate log level.
-fn init_tracing(verbose: u8) {
+/// Reads only the `[logging]` section of the configuration file so the
+/// subscriber can be set up before anything else logs. Falls back to the
+/// defaults when the file is missing or unreadable (the full load in
+/// `Runtime::new` reports the actual error).
+fn peek_logging_config(args: &Args) -> sbc_config::schema::LoggingConfig {
+    let path = args.effective_config_path();
+    if path.exists() {
+        sbc_config::load_from_file(&path)
+            .map(|c| c.logging)
+            .unwrap_or_default()
+    } else {
+        sbc_config::schema::LoggingConfig::default()
+    }
+}
+
+/// Initializes the tracing subscriber from `[logging]`: `level` (overridden
+/// upwards by `-v`/`-vv`, and by `RUST_LOG` when set), `format` (`json` or
+/// `text`) and `output` (`stdout`, `stderr` or a file that is appended to).
+fn init_tracing(verbose: u8, logging: &sbc_config::schema::LoggingConfig) {
     use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
     let level = match verbose {
-        0 => "info",
-        1 => "debug",
-        _ => "trace",
+        0 => logging.level.to_ascii_lowercase(),
+        1 => "debug".to_string(),
+        _ => "trace".to_string(),
     };
-
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("sbc={level},warn")));
 
-    tracing_subscriber::fmt()
+    let writer = match logging.output.trim() {
+        "" | "stdout" => BoxMakeWriter::new(std::io::stdout),
+        "stderr" => BoxMakeWriter::new(std::io::stderr),
+        path => match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(file) => BoxMakeWriter::new(std::sync::Mutex::new(file)),
+            Err(e) => {
+                eprintln!("cannot open logging.output {path}: {e}; logging to stderr");
+                BoxMakeWriter::new(std::io::stderr)
+            }
+        },
+    };
+
+    let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
         .with_thread_ids(true)
         .with_file(true)
         .with_line_number(true)
-        .init();
+        .with_writer(writer);
+    if logging.format.eq_ignore_ascii_case("json") {
+        builder.json().init();
+    } else {
+        builder.init();
+    }
 }

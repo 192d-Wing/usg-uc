@@ -40,7 +40,7 @@
 | **RFC 4566** | SDP | Referenced |
 | **RFC 6086** | INFO Method | Method enum entry. Library-only — daemon returns 405 |
 | **RFC 6665** | SIP Events (SUBSCRIBE/NOTIFY) | Method enum entries, header support. Library-only — daemon returns 405; client only reads Subscription-State on REFER NOTIFY |
-| **RFC 7118** | WebSocket Transport for SIP | Transport: WS/WSS. Library-only — `uc-transport` `websocket` feature not enabled by any binary |
+| **RFC 7118** | WebSocket Transport for SIP | Transport: WS/WSS. Wired (sbc-daemon `transport.ws_listen`, plain WS); WSS planned — the transport does not terminate TLS |
 | **RFC 8224** | STIR Identity | Header name defined. Library-only |
 
 ### Key Files
@@ -552,7 +552,7 @@
 | RFC 6665 | SIP Events | proto-sip, proto-dialog | library |
 | RFC 6910 | Auto-Configuration | proto-dialog | library |
 | RFC 7092 | B2BUA Taxonomy | proto-b2bua | sbc-daemon |
-| RFC 7118 | WebSocket Transport for SIP | proto-sip | library |
+| RFC 7118 | WebSocket Transport for SIP | proto-sip, uc-transport | sbc-daemon (ws); wss library |
 | RFC 7614 | Location Conveyance | proto-dialog | library |
 | RFC 7627 | Extended Master Secret | proto-dtls | soft client |
 | RFC 7675 | Consent Freshness | proto-ice | library |

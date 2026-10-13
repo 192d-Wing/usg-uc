@@ -24,12 +24,27 @@ use tracing::{debug, error, info, warn};
 use uc_dos_protection::{RateLimitAction, RateLimiter, RateLimiterConfig};
 use uc_health::{HealthChecker, HealthCheckerConfig};
 use uc_metrics::{MetricRegistry, SbcMetrics};
-use uc_transport::Transport;
 use uc_transport::listener::ListenerConfig;
 use uc_transport::tcp::TcpListener;
 use uc_transport::tls::TlsListener;
 use uc_transport::udp::UdpTransport;
+use uc_transport::websocket::WebSocketListener;
+use uc_transport::{StreamTransport, Transport};
 use uc_types::address::{SbcSocketAddr, TransportType};
+
+/// Records a rate-limit rejection on the audit trail (no-op when auditing is
+/// off). `request_count` is not tracked by the limiter, so it is reported as
+/// the threshold that was crossed.
+fn audit_rate_limit(source_ip: std::net::IpAddr, limit_name: &str, threshold: u64) {
+    uc_audit::log_event(uc_audit::AuditEvent::RateLimitTriggered(
+        uc_audit::event::RateLimitTriggered {
+            source_ip,
+            limit_name: limit_name.to_string(),
+            request_count: threshold,
+            threshold,
+        },
+    ));
+}
 
 /// Shared handles a stream (TCP/TLS) accept loop and its per-connection
 /// receive loops need for their lifetime.
@@ -63,6 +78,8 @@ pub struct Server {
     tcp_listeners: RwLock<Vec<Arc<TcpListener>>>,
     /// TLS listeners for SIP signaling (`transport.tls_listen`).
     tls_listeners: RwLock<Vec<Arc<TlsListener>>>,
+    /// WebSocket listeners for SIP signaling (`transport.ws_listen`, RFC 7118).
+    ws_listeners: RwLock<Vec<Arc<WebSocketListener>>>,
     /// SIP stack for message processing.
     sip_stack: Arc<SipStack>,
     /// Per-source rate limiter for `DoS` protection.
@@ -105,6 +122,7 @@ impl Server {
         let sip_config = Self::build_sip_config(&config);
         let mut sip_stack = SipStack::new(sip_config);
         let media_failure_rx = Self::init_sip_stack_from_config(&mut sip_stack, &config);
+        Self::init_user_rate_limiter(&mut sip_stack, &config);
         if let Some(bearer) = Self::build_bearer_authenticator(&config) {
             sip_stack.set_bearer_authenticator(bearer);
         }
@@ -122,6 +140,7 @@ impl Server {
             udp_transports: RwLock::new(Vec::new()),
             tcp_listeners: RwLock::new(Vec::new()),
             tls_listeners: RwLock::new(Vec::new()),
+            ws_listeners: RwLock::new(Vec::new()),
             sip_stack,
             rate_limiter,
             global_limiter,
@@ -184,6 +203,7 @@ impl Server {
             SipStack::new(sip_config)
         };
         let media_failure_rx = Self::init_sip_stack_from_config(&mut sip_stack, &config);
+        Self::init_user_rate_limiter(&mut sip_stack, &config);
         if let Some(bearer) = Self::build_bearer_authenticator(&config) {
             sip_stack.set_bearer_authenticator(bearer);
         }
@@ -202,6 +222,7 @@ impl Server {
             udp_transports: RwLock::new(Vec::new()),
             tcp_listeners: RwLock::new(Vec::new()),
             tls_listeners: RwLock::new(Vec::new()),
+            ws_listeners: RwLock::new(Vec::new()),
             sip_stack,
             rate_limiter,
             global_limiter,
@@ -315,6 +336,31 @@ impl Server {
             "RFC 8898 Bearer-token REGISTER authorization enabled"
         );
         Some(Arc::new(BearerAuthenticator::new(validator, realm)))
+    }
+
+    /// Installs the per-user limiter (`rate_limit.per_user_rps`) on the SIP
+    /// stack. It runs after parsing, keyed by the From user, so one identity
+    /// cannot exhaust the per-IP allowance shared with other users behind
+    /// the same NAT. `0` disables it.
+    fn init_user_rate_limiter(sip_stack: &mut SipStack, config: &SbcConfig) {
+        if !config.rate_limit.enabled || config.rate_limit.per_user_rps == 0 {
+            return;
+        }
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let burst = (f64::from(config.rate_limit.per_user_rps)
+            * f64::from(config.rate_limit.burst_multiplier)) as u32;
+        sip_stack.set_user_rate_limiter(uc_dos_protection::KeyedRateLimiter::new(
+            config.rate_limit.per_user_rps,
+            burst.max(1),
+        ));
+        info!(
+            per_user_rps = config.rate_limit.per_user_rps,
+            "Per-user rate limiting configured"
+        );
     }
 
     /// Builds the per-source rate limiter from config.
@@ -708,9 +754,10 @@ impl Server {
         // Bind UDP listeners
         self.bind_udp_listeners().await?;
 
-        // Bind stream listeners (SIP over TCP / TLS)
+        // Bind stream listeners (SIP over TCP / TLS / WebSocket)
         self.bind_tcp_listeners().await?;
         self.bind_tls_listeners().await?;
+        self.bind_ws_listeners().await?;
 
         // DTLS-SRTP media-failure teardown: drain call ids whose handshake failed
         // at runtime and BYE both legs (fail-closed). Needs a bound UDP transport
@@ -793,7 +840,8 @@ impl Server {
         // spurious 0 during the window before run() spawns the loops.
         let bound = self.udp_transports.read().await.len()
             + self.tcp_listeners.read().await.len()
-            + self.tls_listeners.read().await.len();
+            + self.tls_listeners.read().await.len()
+            + self.ws_listeners.read().await.len();
         self.stats
             .live_transports
             .store(bound as u64, Ordering::SeqCst);
@@ -914,12 +962,40 @@ impl Server {
             .map_err(|e| tls_error(format!("loading {}: {e}", cert_path.display())))?;
         let private_key = uc_transport::tls::load_private_key(key_path)
             .map_err(|e| tls_error(format!("loading {}: {e}", key_path.display())))?;
+        // security.min_tls_version and security.require_mtls (with
+        // security.tls_ca_path) are enforced here; validate_config already
+        // guaranteed the combinations are coherent.
+        let min_version =
+            uc_transport::tls::MinTlsVersion::parse(&self.config.security.min_tls_version)
+                .ok_or_else(|| {
+                    tls_error(format!(
+                        "unsupported security.min_tls_version {:?}",
+                        self.config.security.min_tls_version
+                    ))
+                })?;
+        let client_ca = if self.config.security.require_mtls {
+            let ca_path = self.config.security.tls_ca_path.as_ref().ok_or_else(|| {
+                tls_error("security.require_mtls needs security.tls_ca_path".to_string())
+            })?;
+            Some(
+                uc_transport::tls::load_root_store(ca_path)
+                    .map_err(|e| tls_error(format!("loading {}: {e}", ca_path.display())))?,
+            )
+        } else {
+            None
+        };
+        let options = uc_transport::tls::TlsServerOptions {
+            min_version,
+            client_ca,
+        };
         let server_config = Arc::new(
-            uc_transport::tls::create_server_config(cert_chain, private_key)
+            uc_transport::tls::create_server_config_with(cert_chain, private_key, options)
                 .map_err(|e| tls_error(format!("building TLS server config: {e}")))?,
         );
         info!(
             cert = %cert_path.display(),
+            min_tls_version = %self.config.security.min_tls_version,
+            mtls = self.config.security.require_mtls,
             "TLS server credentials loaded for SIP listeners"
         );
 
@@ -945,6 +1021,30 @@ impl Server {
         Ok(())
     }
 
+    /// Binds SIP-over-WebSocket listeners from `transport.ws_listen`
+    /// (RFC 7118). Plain `ws` only: the WebSocket transport does not
+    /// terminate TLS, and `validate_config` rejects `wss_listen`.
+    async fn bind_ws_listeners(&mut self) -> Result<(), ServerError> {
+        let mut listeners = self.ws_listeners.write().await;
+        for socket_addr in &self.config.transport.ws_listen {
+            let addr = SbcSocketAddr::from(*socket_addr);
+            match WebSocketListener::bind(&addr, false).await {
+                Ok(listener) => {
+                    info!(address = %listener.local_addr(), "WebSocket listener bound");
+                    listeners.push(Arc::new(listener));
+                }
+                Err(e) => {
+                    error!(address = %addr, error = %e, "Failed to bind WebSocket listener");
+                    return Err(ServerError::BindFailed {
+                        address: addr.to_string(),
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Runs the main event loop.
     pub async fn run(&mut self) -> Result<(), ServerError> {
         info!("Entering async event loop");
@@ -953,7 +1053,9 @@ impl Server {
         let transports = self.udp_transports.read().await;
         let tcp_listeners: Vec<_> = self.tcp_listeners.read().await.clone();
         let tls_listeners: Vec<_> = self.tls_listeners.read().await.clone();
-        let transport_count = transports.len() + tcp_listeners.len() + tls_listeners.len();
+        let ws_listeners: Vec<_> = self.ws_listeners.read().await.clone();
+        let transport_count =
+            transports.len() + tcp_listeners.len() + tls_listeners.len() + ws_listeners.len();
 
         if transport_count == 0 {
             warn!("No transports bound, exiting event loop");
@@ -1040,6 +1142,22 @@ impl Server {
             };
             handles.push(tokio::spawn(async move {
                 Self::tls_accept_loop(listener, ctx).await;
+            }));
+        }
+        for listener in ws_listeners {
+            let zone_name = self.zone_for_local_ip(listener.local_addr().ip());
+            let ctx = StreamLoopContext {
+                shutdown: self.shutdown.clone(),
+                stats: Arc::clone(&self.stats),
+                sip_stack: Arc::clone(&self.sip_stack),
+                rate_limiter: Arc::clone(&self.rate_limiter),
+                global_limiter: Arc::clone(&self.global_limiter),
+                rate_limit_enabled: self.config.rate_limit.enabled,
+                zone_name,
+                conn_semaphore: Arc::clone(&conn_semaphore),
+            };
+            handles.push(tokio::spawn(async move {
+                Self::ws_accept_loop(listener, ctx).await;
             }));
         }
 
@@ -1221,6 +1339,8 @@ impl Server {
                 source = %source_ip,
                 "Global rate limit exceeded, rejecting message"
             );
+            let threshold = u64::from(global_limiter.lock().await.config().rps);
+            audit_rate_limit(source_ip, "global_rps", threshold);
             return false;
         }
 
@@ -1246,6 +1366,8 @@ impl Server {
                     source = %source_ip,
                     "Rate limit exceeded, rejecting message"
                 );
+                let threshold = u64::from(rate_limiter.lock().await.config().rps);
+                audit_rate_limit(source_ip, "per_ip_rps", threshold);
                 false
             }
             RateLimitAction::Block { duration_secs } => {
@@ -1284,6 +1406,37 @@ impl Server {
                         break;
                     }
                     warn!(error = %e, "TCP accept failed");
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    /// Accept loop for a SIP-over-WebSocket listener (RFC 7118). Each
+    /// WebSocket message is a complete SIP message; the stream loop's
+    /// Content-Length framing passes them through unchanged.
+    async fn ws_accept_loop(listener: Arc<WebSocketListener>, ctx: StreamLoopContext) {
+        info!(address = %listener.local_addr(), "SIP WebSocket accept loop started");
+        loop {
+            match listener.accept().await {
+                Ok(transport) => {
+                    let Ok(permit) = ctx.conn_semaphore.clone().try_acquire_owned() else {
+                        warn!("WebSocket connection limit reached, dropping");
+                        continue;
+                    };
+                    let peer = *transport.peer_addr();
+                    debug!(peer = %peer, "Accepted SIP WebSocket connection");
+                    let conn_ctx = ctx.clone();
+                    tokio::spawn(async move {
+                        Self::stream_connection_loop(Arc::new(transport), peer, conn_ctx).await;
+                        drop(permit);
+                    });
+                }
+                Err(e) => {
+                    if ctx.shutdown.is_shutdown_requested() {
+                        break;
+                    }
+                    warn!(error = %e, "WebSocket accept failed");
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
             }
