@@ -26,6 +26,9 @@ fn test_config_from_toml() {
         default_mode = "PassThrough"
 
         [security]
+        tls_cert_path = "/etc/sbc/tls.crt"
+        tls_key_path = "/etc/sbc/tls.key"
+        tls_ca_path = "/etc/sbc/client-ca.pem"
         require_mtls = true
     "#;
 
@@ -34,6 +37,24 @@ fn test_config_from_toml() {
     assert_eq!(config.general.max_calls, 5000);
     assert_eq!(config.media.default_mode, MediaMode::PassThrough);
     assert!(config.security.require_mtls);
+    assert_eq!(
+        config.security.tls_ca_path.as_deref(),
+        Some(std::path::Path::new("/etc/sbc/client-ca.pem"))
+    );
+}
+
+#[test]
+fn test_require_mtls_without_ca_is_rejected() {
+    // Mutual TLS cannot be enforced without a CA to verify clients against,
+    // so the configuration is refused instead of silently accepted.
+    let toml = r#"
+        [security]
+        tls_cert_path = "/etc/sbc/tls.crt"
+        tls_key_path = "/etc/sbc/tls.key"
+        require_mtls = true
+    "#;
+    let err = load_from_str(toml).unwrap_err().to_string();
+    assert!(err.contains("tls_ca_path"), "{err}");
 }
 
 #[test]
