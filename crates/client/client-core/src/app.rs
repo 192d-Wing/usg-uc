@@ -1387,9 +1387,11 @@ fn ice_config_from_settings(network: &crate::settings::NetworkSettings) -> proto
 mod tests {
     #[test]
     fn ice_config_follows_network_settings() {
-        let mut network = crate::settings::NetworkSettings::default();
-        network.aggressive_nomination = true;
-        network.stun_server = Some("stun:127.0.0.1:3479".to_string());
+        let mut network = crate::settings::NetworkSettings {
+            aggressive_nomination: true,
+            stun_server: Some("stun:127.0.0.1:3479".to_string()),
+            ..Default::default()
+        };
         let cfg = super::ice_config_from_settings(&network);
         assert!(cfg.aggressive_nomination);
         assert_eq!(cfg.stun_servers, vec!["127.0.0.1:3479".parse().unwrap()]);
