@@ -27,6 +27,8 @@ type RoutePattern = {
   priority?: number;
   blocked?: boolean;
   pattern_type?: string;
+  transform_type?: string | null;
+  transform_value?: string | null;
 };
 
 type PartitionOpt = { id: string; name?: string };
@@ -34,6 +36,14 @@ type RouteListOpt = { id: string; name?: string };
 type TrunkGroupOpt = { id: string; name?: string };
 
 type SelectOpt = { value: string; label: string };
+
+const TRANSFORM_TYPE_OPTIONS: SelectOpt[] = [
+  { value: 'none', label: 'None' },
+  { value: 'strip_prefix', label: 'Strip leading digits (value = count)' },
+  { value: 'add_prefix', label: 'Prepend digits (value = prefix)' },
+  { value: 'replace_prefix', label: 'Replace prefix (value = from|to)' },
+  { value: 'replace', label: 'Replace whole number (value = number)' },
+];
 
 const PATTERN_TYPE_OPTIONS: SelectOpt[] = [
   { value: 'prefix', label: 'Prefix (matches digits starting with pattern)' },
@@ -88,6 +98,8 @@ type FormState = {
   route_group: SelectOpt | null;
   description: string;
   priority: string;
+  transform_type: SelectOpt;
+  transform_value: string;
 };
 
 const EMPTY_FORM: FormState = {
@@ -100,6 +112,8 @@ const EMPTY_FORM: FormState = {
   route_group: null,
   description: '',
   priority: '0',
+  transform_type: TRANSFORM_TYPE_OPTIONS[0],
+  transform_value: '',
 };
 
 const TARGET_KIND_OPTIONS: SelectOpt[] = [
@@ -205,6 +219,10 @@ export function RoutePatterns() {
       route_group: optByValue(tgOpts, target.route_group_id),
       description: target.description ?? '',
       priority: String(target.priority ?? 0),
+      transform_type:
+        TRANSFORM_TYPE_OPTIONS.find((o) => o.value === (target.transform_type ?? 'none')) ??
+        TRANSFORM_TYPE_OPTIONS[0],
+      transform_value: target.transform_value ?? '',
     });
     setModalError(null);
     setModalMode('edit');
@@ -229,6 +247,20 @@ export function RoutePatterns() {
       setModalError('Priority must be a number.');
       return;
     }
+    const transformType = form.transform_type.value;
+    const transformValue = form.transform_value.trim();
+    if (transformType !== 'none' && !transformValue) {
+      setModalError('Transform value is required for the selected transform.');
+      return;
+    }
+    if (transformType === 'strip_prefix' && !/^[1-9]\d*$/.test(transformValue)) {
+      setModalError('Strip leading digits needs a positive digit count.');
+      return;
+    }
+    if (transformType === 'replace_prefix' && !/^[^|]+\|.*$/.test(transformValue)) {
+      setModalError('Replace prefix needs a value of the form from|to.');
+      return;
+    }
     setBusy(true);
     setModalError(null);
     const body: Record<string, unknown> = {
@@ -238,6 +270,8 @@ export function RoutePatterns() {
       partition_id: form.partition.value,
       priority: priorityNum,
       description: form.description.trim() || undefined,
+      transform_type: transformType === 'none' ? undefined : transformType,
+      transform_value: transformType === 'none' ? undefined : transformValue,
     };
     if (form.target_kind === 'route_list' && form.route_list) {
       body.route_list_id = form.route_list.value;
@@ -431,6 +465,26 @@ export function RoutePatterns() {
               }
               placeholder="Pick a route group"
               empty="No trunk groups defined"
+            />
+          </FormField>
+        )}
+        <FormField
+          label="Digit manipulation"
+          description="Applied to the dialled digits before routing (same semantics as dial-plan entries)."
+        >
+          <Select
+            selectedOption={form.transform_type}
+            onChange={({ detail }) =>
+              setForm({ ...form, transform_type: detail.selectedOption as SelectOpt })
+            }
+            options={TRANSFORM_TYPE_OPTIONS}
+          />
+        </FormField>
+        {form.transform_type.value !== 'none' && (
+          <FormField label="Transform value" description="Count, prefix, from|to, or replacement number.">
+            <Input
+              value={form.transform_value}
+              onChange={({ detail }) => setForm({ ...form, transform_value: detail.value })}
             />
           </FormField>
         )}

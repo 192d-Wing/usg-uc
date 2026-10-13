@@ -1233,9 +1233,49 @@ pub async fn apply_route_pattern_to_router(state: &Arc<AppState>, body: &serde_j
     {
         rp = rp.with_block(true);
     }
+    rp = rp.with_transform(number_transform_from_json(body));
     let mut router = router.write().await;
     router.remove_route_pattern(id);
     router.add_route_pattern(rp);
+}
+
+/// Reads a route pattern's digit manipulation from its JSON document.
+///
+/// Uses the same spelling as dial-plan entries (`sbc-config`
+/// `DialPlanEntryConfig`): `transform_type` is one of `none` (default),
+/// `strip_prefix` (`transform_value` = digit count), `add_prefix`
+/// (`transform_value` = digits to prepend), `replace_prefix`
+/// (`transform_value` = `"from|to"`) or `replace` (`transform_value` = the
+/// whole replacement number). Anything malformed yields `None`, so a bad
+/// document never changes the dialled digits silently.
+fn number_transform_from_json(body: &serde_json::Value) -> uc_routing::NumberTransform {
+    use uc_routing::NumberTransform;
+    let kind = body
+        .get("transform_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("none");
+    let value = body
+        .get("transform_value")
+        .map(|v| match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default();
+    match kind {
+        "strip_prefix" => value
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .map_or(NumberTransform::None, NumberTransform::strip_prefix),
+        "add_prefix" if !value.is_empty() => NumberTransform::add_prefix(&value),
+        "replace_prefix" => match value.split_once('|') {
+            Some((from, to)) if !from.is_empty() => NumberTransform::replace_prefix(from, to),
+            _ => NumberTransform::None,
+        },
+        "replace" if !value.is_empty() => NumberTransform::Replace { number: value },
+        _ => NumberTransform::None,
+    }
 }
 
 /// Apply a JSON route-list body, including its ordered members.
@@ -1443,6 +1483,91 @@ mod tests {
                 "any"
             );
         }
+    }
+
+    /// A router with one CSS (`css`) over one partition (`p`), as the sync
+    /// path would have built from the API's partition/CSS documents.
+    fn routed_state() -> Arc<AppState> {
+        let metrics = SbcMetrics::standard();
+        let server_stats = Arc::new(ServerStats::default());
+        let mut state = AppState::new(metrics, server_stats);
+        let mut router = uc_routing::SbcRouter::new();
+        router.add_partition(uc_routing::Partition::new("p", "Partition"));
+        let mut css = uc_routing::CallingSearchSpace::new("css", "CSS");
+        css.add_partition("p");
+        router.add_css(css);
+        state.sbc_router = Some(Arc::new(tokio::sync::RwLock::new(router)));
+        Arc::new(state)
+    }
+
+    #[tokio::test]
+    async fn route_pattern_sync_applies_transform() {
+        let state = routed_state();
+        for (id, body, dialled, expect) in [
+            (
+                "strip",
+                serde_json::json!({"id": "strip", "pattern": "9", "partition_id": "p",
+                    "route_group_id": "rg", "transform_type": "strip_prefix", "transform_value": "1"}),
+                "95551234",
+                "5551234",
+            ),
+            (
+                "add",
+                serde_json::json!({"id": "add", "pattern": "555", "partition_id": "p",
+                    "route_group_id": "rg", "transform_type": "add_prefix", "transform_value": "+1"}),
+                "5551234",
+                "+15551234",
+            ),
+            (
+                "swap",
+                serde_json::json!({"id": "swap", "pattern": "011", "partition_id": "p",
+                    "route_group_id": "rg", "transform_type": "replace_prefix", "transform_value": "011|+"}),
+                "011441234",
+                "+441234",
+            ),
+            (
+                "fixed",
+                serde_json::json!({"id": "fixed", "pattern": "0", "pattern_type": "exact", "partition_id": "p",
+                    "route_group_id": "rg", "transform_type": "replace", "transform_value": "2000"}),
+                "0",
+                "2000",
+            ),
+        ] {
+            apply_route_pattern_to_router(&state, &body).await;
+            let router = state.sbc_router.as_ref().unwrap().read().await;
+            let result = router.route(dialled, Some("css")).expect("pattern matches");
+            assert_eq!(result.pattern_id, id);
+            assert_eq!(result.transformed_number, expect, "{id}");
+            assert_eq!(result.route_group_ids, vec!["rg".to_string()]);
+            drop(router);
+        }
+    }
+
+    #[test]
+    fn malformed_transforms_become_none() {
+        use uc_routing::NumberTransform;
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"transform_type": "none"}),
+            serde_json::json!({"transform_type": "strip_prefix", "transform_value": "0"}),
+            serde_json::json!({"transform_type": "strip_prefix", "transform_value": "abc"}),
+            serde_json::json!({"transform_type": "add_prefix"}),
+            serde_json::json!({"transform_type": "replace_prefix", "transform_value": "nodelimiter"}),
+            serde_json::json!({"transform_type": "replace_prefix", "transform_value": "|to"}),
+            serde_json::json!({"transform_type": "bogus", "transform_value": "1"}),
+        ] {
+            assert!(
+                matches!(number_transform_from_json(&body), NumberTransform::None),
+                "{body}"
+            );
+        }
+        // A numeric JSON value for strip_prefix is accepted too.
+        assert!(matches!(
+            number_transform_from_json(
+                &serde_json::json!({"transform_type": "strip_prefix", "transform_value": 2})
+            ),
+            NumberTransform::StripPrefix { count: 2 }
+        ));
     }
 
     fn test_server() -> ApiServer {

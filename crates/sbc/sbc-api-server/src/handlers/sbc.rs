@@ -308,6 +308,12 @@ pub async fn create_route_pattern(
             ),
         );
     }
+    if let Err(e) = validate_route_pattern_transform(&body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"success": false, "error": e})),
+        );
+    }
     if let Err(e) = state.route_patterns.upsert(&id, &body).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -321,6 +327,48 @@ pub async fn create_route_pattern(
     )
 }
 
+/// Validates the optional digit-manipulation fields of a route pattern so a
+/// document the daemon would silently ignore is rejected at the API instead.
+/// Spelling matches dial-plan entries: `transform_type` ∈ `none`,
+/// `strip_prefix` (value: positive digit count), `add_prefix` (value: digits),
+/// `replace_prefix` (value: `from|to`, `from` non-empty), `replace` (value:
+/// the replacement number).
+fn validate_route_pattern_transform(body: &serde_json::Value) -> Result<(), String> {
+    let kind = match body.get("transform_type") {
+        None | Some(serde_json::Value::Null) => return Ok(()),
+        Some(serde_json::Value::String(s)) => s.as_str(),
+        Some(_) => return Err("transform_type must be a string".to_string()),
+    };
+    let value = match body.get("transform_value") {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        Some(_) => return Err("transform_value must be a string".to_string()),
+    };
+    match kind {
+        "none" | "" => Ok(()),
+        "strip_prefix" => match value.trim().parse::<usize>() {
+            Ok(n) if n > 0 => Ok(()),
+            _ => Err(
+                "strip_prefix needs transform_value = number of digits to strip (> 0)".to_string(),
+            ),
+        },
+        "add_prefix" | "replace" if !value.is_empty() => Ok(()),
+        "add_prefix" => Err("add_prefix needs transform_value = digits to prepend".to_string()),
+        "replace_prefix" => match value.split_once('|') {
+            Some((from, _)) if !from.is_empty() => Ok(()),
+            _ => Err(
+                "replace_prefix needs transform_value = \"from|to\" with a non-empty from"
+                    .to_string(),
+            ),
+        },
+        "replace" => Err("replace needs transform_value = the replacement number".to_string()),
+        other => Err(format!(
+            "unknown transform_type {other:?}; expected none, strip_prefix, add_prefix, replace_prefix or replace"
+        )),
+    }
+}
+
 pub async fn update_route_pattern(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -329,6 +377,12 @@ pub async fn update_route_pattern(
     let mut doc = body;
     if let serde_json::Value::Object(ref mut obj) = doc {
         obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
+    }
+    if let Err(e) = validate_route_pattern_transform(&doc) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"success": false, "error": e})),
+        );
     }
     if let Err(e) = state.route_patterns.upsert(&id, &doc).await {
         return (
@@ -484,5 +538,42 @@ async fn notify_sync_route_list(state: &Arc<AppState>, id: &str) {
         .await
     {
         warn!(id, error = %e, "SbcSyncService.SyncRouteList failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_route_pattern_transform;
+
+    #[test]
+    fn transform_validation_accepts_well_formed_documents() {
+        for body in [
+            serde_json::json!({"id": "a", "pattern": "9"}),
+            serde_json::json!({"transform_type": "none"}),
+            serde_json::json!({"transform_type": "strip_prefix", "transform_value": "1"}),
+            serde_json::json!({"transform_type": "strip_prefix", "transform_value": 3}),
+            serde_json::json!({"transform_type": "add_prefix", "transform_value": "+1"}),
+            serde_json::json!({"transform_type": "replace_prefix", "transform_value": "011|+"}),
+            serde_json::json!({"transform_type": "replace", "transform_value": "2000"}),
+        ] {
+            assert!(validate_route_pattern_transform(&body).is_ok(), "{body}");
+        }
+    }
+
+    #[test]
+    fn transform_validation_rejects_malformed_documents() {
+        for body in [
+            serde_json::json!({"transform_type": 5}),
+            serde_json::json!({"transform_type": "strip_prefix"}),
+            serde_json::json!({"transform_type": "strip_prefix", "transform_value": "0"}),
+            serde_json::json!({"transform_type": "strip_prefix", "transform_value": "x"}),
+            serde_json::json!({"transform_type": "add_prefix"}),
+            serde_json::json!({"transform_type": "replace_prefix", "transform_value": "+"}),
+            serde_json::json!({"transform_type": "replace_prefix", "transform_value": "|to"}),
+            serde_json::json!({"transform_type": "replace", "transform_value": ""}),
+            serde_json::json!({"transform_type": "bogus"}),
+        ] {
+            assert!(validate_route_pattern_transform(&body).is_err(), "{body}");
+        }
     }
 }
