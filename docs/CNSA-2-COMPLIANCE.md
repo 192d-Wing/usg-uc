@@ -21,7 +21,7 @@ CNSA 2.0 defines cryptographic algorithms approved for protecting classified inf
 | Digital Signatures | ECDSA P-384 | P-384 | `uc-crypto::ecdsa::P384KeyPair` | Library-only (no shipped caller; TLS/DTLS signatures are done by rustls / the DTLS sidecar) |
 | Key Exchange | ECDH P-384 | P-384 | `uc-crypto::ecdh::P384EphemeralKeyPair` | Library-only (no shipped caller) |
 | Key Derivation | HKDF-SHA384 | - | `uc-crypto::hkdf::hkdf_sha384` | Library-only (no shipped caller; SRTP uses the RFC 3711 KDF, see below) |
-| TLS | TLS 1.3 | - | rustls with aws-lc-rs (`uc-transport::tls`) | Wired (sbc-daemon SIP-TLS listeners, soft client). Protocol version is restricted to 1.3; cipher suites are **not** restricted (see SIP/TLS). |
+| TLS | TLS 1.3 | - | rustls with aws-lc-rs (`uc-transport::tls`) | Wired (sbc-daemon SIP-TLS listeners, soft client). Protocol version is 1.3 only unless `security.min_tls_version = "1.2"`; cipher suites are **not** restricted (see SIP/TLS). |
 
 ### Forbidden Algorithms
 
@@ -92,17 +92,17 @@ fn validate_cnsa_curve(curve: CnsaCurve) {
 }
 ```
 
-Status: Wired (sbc-daemon runs `validate_config` at load). `security.min_tls_version` is validated (must be `"1.2"` or `"1.3"`) but **no runtime code reads it**; the SIP TLS listener is TLS 1.3-only regardless, and the REST HTTPS listener uses rustls defaults regardless. `security.curve` is validated as an enum but **no code checks the key type of the loaded certificate**.
+Status: Wired (sbc-daemon runs `validate_config` at load). `security.min_tls_version` (`"1.3"` default, `"1.2"` allowed) is applied to the SIP-TLS listeners (`uc-transport::tls::create_server_config_with`); the REST HTTPS listener uses rustls defaults regardless. `security.curve` is validated as an enum but **no code checks the key type of the loaded certificate**.
 
 ## Protocol-Specific Compliance
 
 ### SIP/TLS
 
-- **TLS Version**: Wired (sbc-daemon). SIP-over-TLS listeners are built with `uc_transport::tls::create_server_config`, which sets `with_protocol_versions(&[TLS13])` — TLS 1.3 only. Listeners are skipped (with a warning) when `security.tls_cert_path`/`tls_key_path` are unset.
+- **TLS Version**: Wired (sbc-daemon). SIP-over-TLS listeners are built with `uc_transport::tls::create_server_config_with` — TLS 1.3 only by default, TLS 1.2+1.3 when `security.min_tls_version = "1.2"`. Listeners are skipped (with a warning) when `security.tls_cert_path`/`tls_key_path` are unset.
 - **Cipher Suite**: **Not restricted** beyond the protocol version. `create_server_config`/`create_client_config` use `aws_lc_rs::default_provider()` without a `cipher_suites` or `kx_groups` filter, so `TLS_AES_128_GCM_SHA256`, `TLS_CHACHA20_POLY1305_SHA256`, X25519 and P-256 remain negotiable alongside `TLS_AES_256_GCM_SHA384`/P-384. Restricting to the CNSA suite is Planned.
 - **REST HTTPS** (`sbc-daemon/src/api_server.rs`): uses `rustls::ServerConfig::builder()` with the process default provider — TLS 1.2 is permitted (workspace `rustls` enables the `tls12` feature) and suites are unrestricted. Planned: route through `uc-transport::tls`.
 - **Certificates**: P-384 ECDSA is the operational requirement, but it is **not enforced**; rustls accepts any certificate/key it can parse (P-256, RSA).
-- **Client mTLS**: `security.require_mtls` is parsed but the SIP listener uses `with_no_client_auth()`. Only the gRPC listener (`[grpc] require_mtls`) enforces client certificates.
+- **Client mTLS**: Wired (sbc-daemon). `security.require_mtls` makes the SIP-TLS listener require a client certificate chaining to `security.tls_ca_path` (WebPKI verifier); `validate_config` rejects the flag without a CA bundle. The gRPC listener enforces its own `[grpc] require_mtls`.
 - **Implementation**: rustls with aws-lc-rs backend (`uc-transport`). The soft client (`client-core/src/sip_transport.rs`) also pins TLS 1.3 only.
 
 ### SRTP

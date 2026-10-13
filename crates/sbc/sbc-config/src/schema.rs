@@ -452,11 +452,17 @@ pub struct SecurityConfig {
     /// Elliptic curve for key generation (CNSA 2.0).
     pub curve: CnsaCurve,
 
-    /// Minimum TLS version (CNSA 2.0: TLS 1.3 preferred).
+    /// Minimum TLS version for SIP-over-TLS listeners: "1.3" (CNSA 2.0
+    /// default) or "1.2" (also accepts TLS 1.2 clients).
     pub min_tls_version: String,
 
-    /// Require mutual TLS for SIP.
+    /// Require mutual TLS for SIP: TLS clients must present a certificate
+    /// chaining to `tls_ca_path`.
     pub require_mtls: bool,
+
+    /// PEM bundle of CA certificates trusted for client certificates.
+    /// Required when `require_mtls` is set.
+    pub tls_ca_path: Option<PathBuf>,
 }
 
 impl Default for SecurityConfig {
@@ -467,6 +473,7 @@ impl Default for SecurityConfig {
             curve: CnsaCurve::P384,
             min_tls_version: "1.3".to_string(),
             require_mtls: false,
+            tls_ca_path: None,
         }
     }
 }
@@ -560,10 +567,10 @@ pub struct LoggingConfig {
     /// Log level (trace, debug, info, warn, error).
     pub level: String,
 
-    /// Output format (json, text).
+    /// Output format: "json" or "text".
     pub format: String,
 
-    /// Output destination (stdout, file path).
+    /// Output destination: "stdout", "stderr" or a file path (appended).
     pub output: String,
 
     /// Enable audit logging.

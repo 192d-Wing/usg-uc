@@ -410,15 +410,15 @@ _Neither sbc-daemon nor sbc-media-core handles `a=crypto`; only DTLS-SRTP is wir
 
 **New Crate**: `uc-webrtc`
 
-**WebSocket SIP Transport** (RFC 7118) [library-only]
+**WebSocket SIP Transport** (RFC 7118) [wired: sbc-daemon] (plain `ws`)
 
-_The daemon binds UDP, TCP and TLS listeners only._
+_`transport.ws_listen` binds SIP-over-WebSocket listeners; `wss_listen` is rejected by `validate_config` because the transport does not terminate TLS._
 
-- ✅ WebSocket transport in `uc-transport/websocket.rs`
-- ✅ SIP-over-WebSocket framing (text frames for SIP messages)
-- ✅ Secure WebSocket (WSS) support
-- ✅ WebSocket ping/pong keepalives
-- ✅ WebSocketListener for accepting connections
+- ✅ WebSocket transport in `uc-transport/websocket.rs` [wired: sbc-daemon]
+- ✅ SIP-over-WebSocket framing (text frames for SIP messages) [wired: sbc-daemon]
+- ✅ Secure WebSocket (WSS) support [planned] — `accept` wraps the plain TCP stream; no TLS termination
+- ✅ WebSocket ping/pong keepalives [library-only]
+- ✅ WebSocketListener for accepting connections [wired: sbc-daemon]
 
 **WebRTC Gateway** (`uc-webrtc` crate) [library-only]
 

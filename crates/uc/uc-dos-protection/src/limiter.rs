@@ -195,6 +195,64 @@ impl BlockEntry {
     }
 }
 
+/// Token bucket rate limiter keyed by an opaque identity such as a SIP user
+/// (`rate_limit.per_user_rps`), one bucket per key.
+///
+/// Unlike [`RateLimiter`] it has no block list: a user over its rate is
+/// rejected for that request only, so a legitimate but chatty endpoint is
+/// slowed, not locked out. The key map is bounded like the per-IP map.
+#[derive(Debug)]
+pub struct KeyedRateLimiter {
+    config: RateLimiterConfig,
+    buckets: HashMap<String, TokenBucket>,
+    last_sweep: Instant,
+}
+
+impl KeyedRateLimiter {
+    /// Creates a keyed limiter allowing `rps` requests per second with
+    /// `burst` tokens of headroom per key.
+    pub fn new(rps: u32, burst: u32) -> Self {
+        Self {
+            config: RateLimiterConfig::new(rps, burst),
+            buckets: HashMap::new(),
+            last_sweep: Instant::now(),
+        }
+    }
+
+    /// Consumes one token for `key`, returning `Allow` or `Reject`.
+    pub fn check(&mut self, key: &str) -> RateLimitAction {
+        if !self.buckets.contains_key(key) && self.buckets.len() >= MAX_TRACKED_SOURCES {
+            if self.last_sweep.elapsed() >= SWEEP_INTERVAL {
+                self.buckets
+                    .retain(|_, bucket| !bucket.is_idle(BUCKET_IDLE_TIMEOUT));
+                self.last_sweep = Instant::now();
+            }
+            if self.buckets.len() >= MAX_TRACKED_SOURCES {
+                return RateLimitAction::Reject;
+            }
+        }
+        let bucket = self
+            .buckets
+            .entry(key.to_string())
+            .or_insert_with(|| TokenBucket::new(self.config.burst));
+        if bucket.try_consume(&self.config).0 {
+            RateLimitAction::Allow
+        } else {
+            RateLimitAction::Reject
+        }
+    }
+
+    /// Number of keys currently tracked.
+    pub fn tracked_keys(&self) -> usize {
+        self.buckets.len()
+    }
+
+    /// The configured per-key rate (requests per second).
+    pub fn rps(&self) -> u32 {
+        self.config.rps
+    }
+}
+
 /// Token bucket rate limiter.
 #[derive(Debug)]
 pub struct RateLimiter {
@@ -370,6 +428,19 @@ impl Default for RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyed_limiter_isolates_users_and_rejects_over_burst() {
+        let mut limiter = KeyedRateLimiter::new(1, 2);
+        assert_eq!(limiter.rps(), 1);
+        assert!(limiter.check("alice").is_allowed());
+        assert!(limiter.check("alice").is_allowed());
+        // Third request within the same instant exceeds the 2-token burst.
+        assert!(limiter.check("alice").is_rejected());
+        // Another user has an untouched bucket.
+        assert!(limiter.check("bob").is_allowed());
+        assert_eq!(limiter.tracked_keys(), 2);
+    }
     use std::net::Ipv4Addr;
 
     fn test_ip() -> IpAddr {

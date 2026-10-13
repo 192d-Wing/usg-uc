@@ -145,11 +145,10 @@ tcp_listen = ["[::]:5060"]
 # skipped at startup with a warning (the daemon serves UDP/TCP only).
 tls_listen = ["[::]:5061"]
 
-# WebSocket / Secure WebSocket listen addresses.
-# Parsed by sbc-config but NOT bound by sbc-daemon (planned); the
-# uc-transport WebSocket transport is library-only today.
+# SIP over WebSocket (RFC 7118), plain ws only. The WebSocket transport
+# does not terminate TLS, so `wss_listen` is rejected by validate_config:
+# terminate TLS at a reverse proxy in front of ws_listen, or use tls_listen.
 ws_listen = ["0.0.0.0:8080"]
-wss_listen = ["0.0.0.0:8443"]
 ```
 
 If no listeners are configured, the SBC binds to `[::]:5060` (IPv6 with IPv4 fallback).
@@ -541,18 +540,18 @@ obfuscate_call_id = true         # replace internal Call-IDs
 [security]
 tls_cert_path = "/etc/sbc/tls-cert.pem"
 tls_key_path = "/etc/sbc/tls-key.pem"
-min_tls_version = "1.3"         # "1.2" or "1.3"; validated only (see note)
+min_tls_version = "1.3"         # "1.3" (default) or "1.2"; applied to SIP-TLS listeners
 curve = "P384"                   # P384 or P521; validated only (see note)
-require_mtls = false             # parsed; NOT applied to SIP-TLS (see note)
+require_mtls = false             # SIP-TLS clients must present a certificate (needs tls_ca_path)
+# tls_ca_path = "/etc/sbc/client-ca.pem"   # PEM bundle of CAs issuing client certificates
 ```
 
 Notes on what the daemon actually does with these keys:
 
 - `tls_cert_path` / `tls_key_path` (wired): used for SIP-over-TLS listeners (`transport.tls_listen`) and REST HTTPS. Must be set together.
-- SIP-TLS listeners are always **TLS 1.3 only** (`uc-transport::tls::create_server_config`); `min_tls_version` is checked by `sbc-config` validation but not read at runtime. Cipher suites are not restricted beyond the protocol version. The REST HTTPS listener uses rustls defaults (TLS 1.2 permitted).
+- `min_tls_version` (wired): SIP-TLS listeners accept TLS 1.3 only by default; `"1.2"` also admits TLS 1.2 clients. Cipher suites are not restricted beyond the protocol version. The REST HTTPS listener uses rustls defaults (TLS 1.2 permitted) and is not affected by this key.
 - `curve` only constrains the configuration enum; the key type of the loaded certificate is not checked (P-256/RSA certificates are accepted by rustls).
-- `require_mtls` is parsed but the SIP-TLS listener is built with `with_no_client_auth()` — SIP client-certificate authentication is planned. mTLS **is** enforced for the gRPC listener via `[grpc] require_mtls`.
-- There is no `security.ca_bundle_path` key (one exists under `[stir_shaken]`, which the daemon does not use).
+- `require_mtls` (wired for SIP-TLS and gRPC): the SIP-TLS listener requires a client certificate chaining to `tls_ca_path`; `validate_config` rejects `require_mtls = true` without `tls_cert_path` and `tls_ca_path`. The gRPC listener has its own `[grpc] require_mtls` / `tls_ca_path`.
 
 ### Rate Limiting
 
@@ -561,7 +560,7 @@ Notes on what the daemon actually does with these keys:
 enabled = true
 global_rps = 10000              # Global requests per second
 per_ip_rps = 100                # Per source IP
-per_user_rps = 50               # Parsed but NOT applied by sbc-daemon (planned)
+per_user_rps = 50               # Per From user (after parsing); 0 disables. Over the rate → 503 + Retry-After: 1
 burst_multiplier = 2.0          # Allow short bursts
 ```
 
@@ -578,13 +577,13 @@ burst_multiplier = 2.0          # Allow short bursts
 ```toml
 [logging]
 level = "info"                   # trace, debug, info, warn, error
-format = "json"                  # parsed, not applied by sbc-daemon (planned)
-output = "stdout"                # parsed, not applied by sbc-daemon (planned)
-audit_enabled = false            # parsed, not applied — no audit sink is wired (planned)
-audit_path = "/var/log/sbc/audit.log"
+format = "json"                  # json or text
+output = "stdout"                # stdout, stderr, or a file path (appended)
+audit_enabled = false            # NIST AU-2 audit trail (uc-audit, SHA-384 hash-chained records)
+audit_path = "/var/log/sbc/audit.log"   # JSON lines; omit to emit audit records on the log (target "audit")
 ```
 
-The daemon's log level is driven by the `-v` flags and `RUST_LOG`; output is always `tracing` to stdout. The `uc-audit` crate (structured, hash-chained audit records) exists but is not used by any shipped binary.
+`level` is the base log level; `-v` / `-vv` raise it to debug / trace and `RUST_LOG`, when set, overrides the filter entirely. The subscriber is configured from this section before anything else logs. With `audit_enabled`, the daemon records startup/shutdown, REGISTER authentication outcomes (bearer or digest), INVITE admission and VPS rejections, call establishment and termination (with duration and reason), and rate-limit rejections; each record carries a sequence number and a SHA-384 hash chain for tamper evidence (`uc-audit`).
 
 ---
 
