@@ -4,7 +4,7 @@
 //! a secure media session for voice calls.
 
 use crate::dtls_handler::{DtlsEvent, DtlsHandler};
-use crate::ice_handler::{IceEvent, IceHandler};
+use crate::ice_handler::{IceEvent, IceHandler, is_ice_mismatch};
 use crate::{SipUaError, SipUaResult};
 use proto_dtls::SrtpKeyingMaterial;
 use proto_ice::{IceConfig, IceCredentials};
@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{RwLock, mpsc};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Media session state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,7 +230,8 @@ impl MediaSession {
         let socket = Arc::new(socket);
         self.socket = Some(socket.clone());
 
-        // Set socket on DTLS handler
+        // ICE checks and DTLS share the media socket (RFC 8445 §2.2).
+        self.ice_handler.set_socket(socket.clone());
         self.dtls_handler.set_socket(socket);
 
         // Update state and notify
@@ -275,25 +276,46 @@ impl MediaSession {
     pub async fn establish(&mut self, remote_fingerprint: Option<&str>) -> SipUaResult<()> {
         info!("Establishing media session connectivity");
 
-        // Start ICE checks
         self.set_state(MediaSessionState::Connecting).await;
-        self.ice_handler.start_checks().await?;
 
-        // Wait for ICE to connect
-        // In a real implementation, we'd process events from ice_rx
-        // For now, use the selected pair if available
+        // RFC 8445 §5.1.1: ICE applies only when the SDP default destination
+        // is one of the peer's candidates. A B2BUA that re-anchors c=/m= at
+        // itself while relaying the far party's ICE attributes produces an
+        // ICE mismatch; media then goes to the default destination directly,
+        // without spending the check phase on unreachable candidates.
+        let default_destination = self.remote_addr;
+        let remote_candidates = self.ice_handler.remote_candidates();
+        let mismatch = default_destination.is_some_and(|d| is_ice_mismatch(d, &remote_candidates))
+            || remote_candidates.is_empty();
 
-        // Get selected ICE pair
-        let (local_addr, remote_addr) = self
-            .ice_handler
-            .selected_pair()
-            .ok_or_else(|| SipUaError::IceError("No ICE candidates available".to_string()))?;
+        let (local_addr, remote_addr) = if mismatch {
+            let remote = default_destination.ok_or_else(|| {
+                SipUaError::IceError("no ICE candidates and no SDP media address".to_string())
+            })?;
+            info!(
+                remote = %remote,
+                "ICE mismatch (default destination is not a peer candidate); using SDP address"
+            );
+            (self.local_addr, remote)
+        } else {
+            match self.ice_handler.start_checks().await {
+                Ok(Some(pair)) => pair,
+                Ok(None) => {
+                    let remote = default_destination.ok_or_else(|| {
+                        SipUaError::IceError("ICE failed and no SDP media address".to_string())
+                    })?;
+                    warn!(remote = %remote, "ICE failed; falling back to SDP media address");
+                    (self.local_addr, remote)
+                }
+                Err(e) => return Err(e),
+            }
+        };
 
         self.remote_addr = Some(remote_addr);
         info!(
             local = %local_addr,
             remote = %remote_addr,
-            "ICE connectivity established"
+            "Media path selected"
         );
 
         // Start DTLS handshake

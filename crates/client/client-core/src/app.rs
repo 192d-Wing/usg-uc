@@ -285,6 +285,13 @@ impl ClientApp {
         }
         call_manager.set_preferred_devices(audio.input_device.clone(), audio.output_device.clone());
 
+        // ICE: STUN servers and nomination mode come from [network] settings.
+        // TURN needs a password the settings schema does not carry yet, so
+        // relay candidates stay unconfigured.
+        call_manager.set_ice_config(ice_config_from_settings(
+            &settings_manager.settings().network,
+        ));
+
         // Create SIP transport
         let (transport_event_tx, transport_event_rx) = mpsc::channel(32);
         let sip_transport = SipTransport::new(transport_event_tx)
@@ -1329,8 +1336,82 @@ impl ClientApp {
     }
 }
 
+/// Builds the ICE configuration from the persisted network settings.
+///
+/// `stun_server` accepts `stun:host[:port]` or `host[:port]` (default port
+/// 3478) and is resolved once here; an unresolvable server is logged and
+/// skipped so a bad setting cannot prevent calls (host candidates still
+/// work). `enable_ice = false` yields a configuration with no servers; the
+/// media session still falls back to the SDP address when checks cannot run.
+fn ice_config_from_settings(network: &crate::settings::NetworkSettings) -> proto_ice::IceConfig {
+    use std::net::ToSocketAddrs;
+    let mut config = proto_ice::IceConfig {
+        aggressive_nomination: network.aggressive_nomination,
+        ..proto_ice::IceConfig::default()
+    };
+    if !network.enable_ice {
+        return config;
+    }
+    if let Some(uri) = network
+        .stun_server
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    {
+        let host_port = uri.strip_prefix("stun:").unwrap_or(uri);
+        let has_port = host_port.matches(':').count() == 1
+            && host_port
+                .rsplit(':')
+                .next()
+                .is_some_and(|p| p.parse::<u16>().is_ok());
+        let target = if has_port {
+            host_port.to_string()
+        } else {
+            format!("{host_port}:3478")
+        };
+        match target.to_socket_addrs() {
+            Ok(mut addrs) => match addrs.next() {
+                Some(addr) => {
+                    info!(server = %uri, resolved = %addr, "STUN server configured for ICE");
+                    config.stun_servers.push(addr);
+                }
+                None => warn!(server = %uri, "STUN server resolved to no addresses; ignored"),
+            },
+            Err(e) => warn!(server = %uri, error = %e, "STUN server did not resolve; ignored"),
+        }
+    }
+    config
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ice_config_follows_network_settings() {
+        let mut network = crate::settings::NetworkSettings {
+            aggressive_nomination: true,
+            stun_server: Some("stun:127.0.0.1:3479".to_string()),
+            ..Default::default()
+        };
+        let cfg = super::ice_config_from_settings(&network);
+        assert!(cfg.aggressive_nomination);
+        assert_eq!(cfg.stun_servers, vec!["127.0.0.1:3479".parse().unwrap()]);
+
+        // Default STUN port, scheme optional.
+        network.stun_server = Some("127.0.0.1".to_string());
+        assert_eq!(
+            super::ice_config_from_settings(&network).stun_servers,
+            vec!["127.0.0.1:3478".parse().unwrap()]
+        );
+
+        // ICE disabled: no servers regardless of the setting.
+        network.enable_ice = false;
+        assert!(
+            super::ice_config_from_settings(&network)
+                .stun_servers
+                .is_empty()
+        );
+    }
+
     use super::*;
 
     #[tokio::test]

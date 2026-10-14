@@ -292,6 +292,12 @@ impl IceAgent {
         &self.checklist
     }
 
+    /// Gets the check list mutably (for the driver to record nominations
+    /// and selections learned from the peer's checks).
+    pub fn checklist_mut(&mut self) -> &mut CheckList {
+        &mut self.checklist
+    }
+
     /// Returns the tie-breaker value.
     pub fn tie_breaker(&self) -> u64 {
         self.tie_breaker
