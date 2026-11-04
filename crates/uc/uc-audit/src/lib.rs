@@ -113,18 +113,36 @@ struct AuditHandle {
     /// Milliseconds since `epoch` of the last drop report, plus one (0 =
     /// never reported).
     last_drop_report_ms: AtomicU64,
+    /// Milliseconds since `epoch` of the most recent drop, plus one (0 =
+    /// never dropped). Unlike `last_drop_report_ms` this is not rate-limited,
+    /// so health checks can tell whether drops are recent.
+    last_drop_ms: AtomicU64,
     epoch: Instant,
 }
 
 impl AuditHandle {
+    /// Milliseconds since `epoch`, plus one (0 is reserved for "never").
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1)
+    }
+
+    /// Counts one dropped record and stamps the drop time.
+    ///
+    /// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
+    fn record_drop(&self, writer_dead: bool) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        self.last_drop_ms.store(self.now_ms(), Ordering::Relaxed);
+        self.report_drop(writer_dead);
+    }
+
     /// Logs dropped records at error level, at most once per
     /// [`DROP_REPORT_INTERVAL`]. Lock-free; the caller never waits.
     ///
     /// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
     fn report_drop(&self, writer_dead: bool) {
-        let now_ms = u64::try_from(self.epoch.elapsed().as_millis())
-            .unwrap_or(u64::MAX)
-            .saturating_add(1);
+        let now_ms = self.now_ms();
         let last = self.last_drop_report_ms.load(Ordering::Relaxed);
         let interval_ms = u64::try_from(DROP_REPORT_INTERVAL.as_millis()).unwrap_or(u64::MAX);
         if last != 0 && now_ms.saturating_sub(last) < interval_ms {
@@ -221,6 +239,7 @@ pub fn init_with_sink(sink: Box<dyn sink::AuditSink>) -> Result<(), AuditError> 
             dropped: AtomicU64::new(0),
             writer_alive: AtomicBool::new(true),
             last_drop_report_ms: AtomicU64::new(0),
+            last_drop_ms: AtomicU64::new(0),
             epoch: Instant::now(),
         })
         .map_err(|_| AuditError::AlreadyInitialized)?;
@@ -248,14 +267,8 @@ pub fn log_event(event: AuditEvent) {
     let job = Job::Record(Box::new(event), chrono::Utc::now());
     match handle.tx.try_send(job) {
         Ok(()) => {}
-        Err(TrySendError::Full(_)) => {
-            handle.dropped.fetch_add(1, Ordering::Relaxed);
-            handle.report_drop(false);
-        }
-        Err(TrySendError::Disconnected(_)) => {
-            handle.dropped.fetch_add(1, Ordering::Relaxed);
-            handle.report_drop(true);
-        }
+        Err(TrySendError::Full(_)) => handle.record_drop(false),
+        Err(TrySendError::Disconnected(_)) => handle.record_drop(true),
     }
 }
 
@@ -280,6 +293,25 @@ pub fn dropped_records() -> u64 {
     AUDIT_LOGGER
         .get()
         .map_or(0, |h| h.dropped.load(Ordering::Relaxed))
+}
+
+/// Time since the most recent dropped audit record.
+///
+/// `None` when no logger is initialized or nothing has been dropped. Lets health checks
+/// report recent loss as degraded and recover once drops stop, while
+/// [`dropped_records`] stays cumulative.
+///
+/// ## NIST 800-53 Rev5: AU-5 (Response to Audit Logging Process Failures)
+#[must_use]
+pub fn last_drop_elapsed() -> Option<Duration> {
+    let handle = AUDIT_LOGGER.get()?;
+    elapsed_since(handle.last_drop_ms.load(Ordering::Relaxed), handle.now_ms())
+}
+
+/// Elapsed time between two `+1`-encoded millisecond stamps; `None` when
+/// `last_ms` is 0 (never).
+fn elapsed_since(last_ms: u64, now_ms: u64) -> Option<Duration> {
+    (last_ms != 0).then(|| Duration::from_millis(now_ms.saturating_sub(last_ms)))
 }
 
 /// Waits up to `timeout` for queued records to reach the sink and be
@@ -421,6 +453,16 @@ mod tests {
             prev = r.hash_chain;
         }
         assert_eq!(dropped_records(), 0);
+        assert_eq!(last_drop_elapsed(), None);
+    }
+
+    #[test]
+    fn elapsed_since_encodes_never_as_none() {
+        assert_eq!(elapsed_since(0, 5_000), None);
+        assert_eq!(elapsed_since(1, 1), Some(Duration::ZERO));
+        assert_eq!(elapsed_since(1_001, 6_001), Some(Duration::from_secs(5)));
+        // Clock never goes backwards, but a racing store must not underflow.
+        assert_eq!(elapsed_since(9_000, 8_000), Some(Duration::ZERO));
     }
 
     #[cfg(feature = "test-capture")]

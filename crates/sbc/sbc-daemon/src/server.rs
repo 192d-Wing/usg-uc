@@ -100,6 +100,10 @@ pub struct Server {
     /// Empty in the in-process (monolith) mode.
     #[cfg(feature = "grpc")]
     remote_media: Vec<sbc_media_core::grpc_media_controller::GrpcMediaController>,
+    /// The media-node pool when more than one node is configured, so a node
+    /// whose event stream drops is marked down at once (see `start`).
+    #[cfg(feature = "grpc")]
+    media_pool: Option<Arc<sbc_media_core::grpc_media_pool::MediaPool>>,
     /// Cluster manager (when cluster feature is enabled).
     #[cfg(feature = "cluster")]
     cluster: Option<Arc<ClusterManager>>,
@@ -149,6 +153,8 @@ impl Server {
             media_failure_rx,
             #[cfg(feature = "grpc")]
             remote_media: Vec::new(),
+            #[cfg(feature = "grpc")]
+            media_pool: None,
             #[cfg(feature = "cluster")]
             cluster: None,
         }
@@ -231,6 +237,8 @@ impl Server {
             media_failure_rx,
             #[cfg(feature = "grpc")]
             remote_media: Vec::new(),
+            #[cfg(feature = "grpc")]
+            media_pool: None,
             cluster,
         }
     }
@@ -698,13 +706,13 @@ impl Server {
                 // automatically.) Reuses the in-process media-failure drain.
                 let (failure_tx, failure_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                 self.media_failure_rx = Some(failure_rx);
-                Arc::new(
-                    MediaPool::new(clients.clone(), Some(failure_tx)).map_err(|e| {
-                        ServerError::ConfigError {
-                            message: format!("failed to build media pool: {e}"),
-                        }
-                    })?,
-                )
+                let pool = Arc::new(MediaPool::new(clients.clone(), Some(failure_tx)).map_err(
+                    |e| ServerError::ConfigError {
+                        message: format!("failed to build media pool: {e}"),
+                    },
+                )?);
+                self.media_pool = Some(Arc::clone(&pool));
+                pool
             };
 
         let stack =
@@ -819,12 +827,23 @@ impl Server {
                     for (node, controller) in self.remote_media.iter().cloned().enumerate() {
                         let sip_stack = Arc::clone(&self.sip_stack);
                         let transport = Arc::clone(&transport);
+                        let pool = self.media_pool.clone();
                         tokio::spawn(async move {
                             use sbc_grpc_api::sbc::media_event::Event;
+                            // A dropped event stream means the node is gone (or
+                            // restarting): mark it down at once so new calls
+                            // route away instead of queuing on its channel for a
+                            // connect timeout each (NIST 800-53 Rev5: SC-5, CP-10).
+                            let mark_down = || async {
+                                if let Some(pool) = &pool {
+                                    pool.mark_node_down(node).await;
+                                }
+                            };
                             let mut stream = match controller.watch_media_events().await {
                                 Ok(s) => s,
                                 Err(e) => {
                                     warn!(node, error = %e, "failed to open media node event stream");
+                                    mark_down().await;
                                     return;
                                 }
                             };
@@ -845,10 +864,12 @@ impl Server {
                                     }
                                     Ok(None) => {
                                         warn!(node, "media node event stream closed");
+                                        mark_down().await;
                                         break;
                                     }
                                     Err(e) => {
                                         warn!(node, error = %e, "media node event stream error");
+                                        mark_down().await;
                                         break;
                                     }
                                 }
@@ -1300,7 +1321,12 @@ impl Server {
                                 let source = msg.source;
                                 tokio::spawn(async move {
                                     let result = sip_stack
-                                        .process_message(&data, source, zone.as_deref())
+                                        .process_message_on(
+                                            &data,
+                                            source,
+                                            zone.as_deref(),
+                                            uc_types::address::TransportType::Udp,
+                                        )
                                         .await;
                                     Self::handle_result(result, &transport, &stats, &sip_stack)
                                         .await;
@@ -1577,7 +1603,14 @@ impl Server {
 
                         let result = ctx
                             .sip_stack
-                            .process_message(&frame, peer, ctx.zone_name.as_deref())
+                            // RFC 3261 §17: responses and forwards ride this
+                            // stream, so its transactions use reliable timers.
+                            .process_message_on(
+                                &frame,
+                                peer,
+                                ctx.zone_name.as_deref(),
+                                transport.transport_type(),
+                            )
                             .await;
                         Self::handle_result(result, &transport, &ctx.stats, &ctx.sip_stack).await;
                     }

@@ -41,7 +41,7 @@ use proto_transaction::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -51,6 +51,7 @@ use uc_routing::{
     TrunkOutcome, TrunkProtocol,
 };
 use uc_types::address::SbcSocketAddr;
+use uc_types::address::TransportType as AddrTransport;
 
 /// SIP stack for processing SIP messages.
 pub struct SipStack {
@@ -60,6 +61,9 @@ pub struct SipStack {
     dialogs: RwLock<DialogStore>,
     /// Call store (B2BUA).
     calls: RwLock<CallStore>,
+    /// `general.max_calls` slots held by stored calls plus INVITEs being
+    /// admitted (see [`CallSlot`]). Always `>= calls.len()`.
+    admitted_calls: Arc<AtomicUsize>,
     /// Authenticated registrar for REGISTER handling with digest auth.
     registrar: RwLock<AuthenticatedRegistrar>,
     /// RFC 8898 Bearer-token REGISTER authorizer (OIDC JWT). When `Some`,
@@ -367,10 +371,78 @@ struct DialogStore {
 }
 
 /// Store for active calls (B2BUA).
+///
+/// Each call holds the admission slot it was admitted with, so the slot is
+/// released exactly when the call leaves the store (SC-5).
 #[derive(Default)]
 struct CallStore {
     /// Calls indexed by call ID.
-    calls: HashMap<CallId, Call>,
+    calls: HashMap<CallId, CallEntry>,
+}
+
+/// A stored call and the `general.max_calls` slot it holds.
+struct CallEntry {
+    call: Call,
+    _slot: CallSlot,
+}
+
+impl CallStore {
+    fn get_mut(&mut self, id: &CallId) -> Option<&mut Call> {
+        self.calls.get_mut(id).map(|e| &mut e.call)
+    }
+
+    fn insert(&mut self, id: CallId, call: Call, slot: CallSlot) {
+        self.calls.insert(id, CallEntry { call, _slot: slot });
+    }
+
+    /// Removes a call; dropping the entry releases its admission slot.
+    fn remove(&mut self, id: &CallId) {
+        self.calls.remove(id);
+    }
+
+    fn len(&self) -> usize {
+        self.calls.len()
+    }
+}
+
+/// One reserved `general.max_calls` admission slot. Taken atomically at
+/// INVITE admission and released on drop, so every rejection or failure
+/// path before the call is stored (and the call's removal afterwards)
+/// frees it without per-path code.
+///
+/// ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+struct CallSlot(Arc<AtomicUsize>);
+
+impl Drop for CallSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Transaction timer mode for a SIP transport: connection-oriented
+/// transports (TCP, TLS, WS, WSS, SCTP) are reliable, UDP is not.
+///
+/// ## RFC 3261 §17.1.1.2, §17.1.2.2, §17.2.1
+const fn txn_transport(t: AddrTransport) -> TransportType {
+    if t.is_connection_oriented() {
+        TransportType::Reliable
+    } else {
+        TransportType::Unreliable
+    }
+}
+
+/// Reserves one slot on `counter` if fewer than `ceiling` are held. The
+/// check and the increment are one CAS, so concurrent INVITEs cannot
+/// overshoot the ceiling.
+///
+/// ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+fn try_reserve_slot(counter: &Arc<AtomicUsize>, ceiling: usize) -> Option<CallSlot> {
+    counter
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            (cur < ceiling).then_some(cur + 1)
+        })
+        .ok()
+        .map(|_| CallSlot(Arc::clone(counter)))
 }
 
 /// Correlates A-leg and B-leg SIP Call-IDs with internal B2BUA CallIds.
@@ -895,6 +967,7 @@ impl SipStack {
             transactions: RwLock::new(TransactionStore::default()),
             dialogs: RwLock::new(DialogStore::default()),
             calls: RwLock::new(CallStore::default()),
+            admitted_calls: Arc::new(AtomicUsize::new(0)),
             registrar: RwLock::new(registrar),
             bearer: None,
             location_service,
@@ -954,6 +1027,7 @@ impl SipStack {
             transactions: RwLock::new(TransactionStore::default()),
             dialogs: RwLock::new(DialogStore::default()),
             calls: RwLock::new(CallStore::default()),
+            admitted_calls: Arc::new(AtomicUsize::new(0)),
             registrar: RwLock::new(registrar),
             bearer: None,
             location_service,
@@ -1325,7 +1399,13 @@ impl SipStack {
     /// Opens a server transaction for a newly received request so later
     /// retransmissions are answered from the stored response and a non-2xx
     /// INVITE final is retransmitted on Timer G until ACKed.
-    async fn open_server_transaction(&self, req: &SipRequest, source: SbcSocketAddr) {
+    async fn open_server_transaction(
+        &self,
+        req: &SipRequest,
+        source: SbcSocketAddr,
+        transport: AddrTransport,
+    ) {
+        let txn_transport = txn_transport(transport);
         let Some(branch) = req.headers.via_branch() else {
             return;
         };
@@ -1347,7 +1427,9 @@ impl SipStack {
             txns.server_invite.insert(
                 key.clone(),
                 ServerInviteState {
-                    transaction: ServerInviteTransaction::new(key, TransportType::Unreliable),
+                    // RFC 3261 §17.2.1: Timer G (final-response
+                    // retransmission) runs only on unreliable transports.
+                    transaction: ServerInviteTransaction::new(key, txn_transport),
                     source,
                     created_at: now,
                     last_response: None,
@@ -1365,7 +1447,9 @@ impl SipStack {
             txns.server_non_invite.insert(
                 key.clone(),
                 ServerNonInviteState {
-                    transaction: ServerNonInviteTransaction::new(key, TransportType::Unreliable),
+                    // RFC 3261 §17.2.2: Timer J is zero on reliable
+                    // transports.
+                    transaction: ServerNonInviteTransaction::new(key, txn_transport),
                     source,
                     created_at: now,
                     last_response: None,
@@ -1378,16 +1462,22 @@ impl SipStack {
     /// Bookkeeping for everything a handler puts on the wire: responses are
     /// recorded on their server transaction, forwarded requests open a client
     /// transaction that retransmits and times them out.
-    async fn track_result(&self, result: &ProcessResult) {
+    ///
+    /// `transport` is the transport the result is sent on; it selects
+    /// reliable or unreliable transaction timers (RFC 3261 §17.1).
+    async fn track_result(&self, result: &ProcessResult, transport: AddrTransport) {
         match result {
             ProcessResult::Response { message, .. } => self.record_server_response(message).await,
             ProcessResult::Forward {
                 message,
                 destination,
-            } => self.open_client_transaction(message, *destination).await,
+            } => {
+                self.open_client_transaction(message, *destination, transport)
+                    .await;
+            }
             ProcessResult::Multiple(results) => {
                 for r in results {
-                    Box::pin(self.track_result(r)).await;
+                    Box::pin(self.track_result(r, transport)).await;
                 }
             }
             ProcessResult::NoAction | ProcessResult::Error { .. } => {}
@@ -1424,7 +1514,15 @@ impl SipStack {
     /// Opens a client transaction for a request the SBC is sending. ACK has
     /// none (§17.1.1.3). The stored copy is retransmitted on Timer A/E; Timer
     /// B/F fails the call or relayed request it belongs to.
-    async fn open_client_transaction(&self, message: &SipMessage, destination: SbcSocketAddr) {
+    ///
+    /// ## RFC 3261 §17.1.1.2, §17.1.2.2: Timers A and E run only on
+    /// unreliable transports; Timers B and F run on all.
+    async fn open_client_transaction(
+        &self,
+        message: &SipMessage,
+        destination: SbcSocketAddr,
+        transport: AddrTransport,
+    ) {
         let SipMessage::Request(req) = message else {
             return;
         };
@@ -1450,12 +1548,7 @@ impl SipStack {
             txns.client_invite
                 .entry(key.clone())
                 .or_insert_with(|| ClientInviteState {
-                    // POAM: client INVITE transactions are always built as
-                    // Unreliable, so Timer A also runs on TCP/TLS. RFC 3261
-                    // §17.1.1.2: Timer A must not run on reliable transports
-                    // (it sends duplicate INVITEs over TCP). Pass the real
-                    // transport type here.
-                    transaction: ClientInviteTransaction::new(key, TransportType::Unreliable),
+                    transaction: ClientInviteTransaction::new(key, txn_transport(transport)),
                     destination,
                     created_at: now,
                     request: message.clone(),
@@ -1468,7 +1561,7 @@ impl SipStack {
             txns.client_non_invite
                 .entry(key.clone())
                 .or_insert_with(|| ClientNonInviteState {
-                    transaction: ClientNonInviteTransaction::new(key, TransportType::Unreliable),
+                    transaction: ClientNonInviteTransaction::new(key, txn_transport(transport)),
                     destination,
                     created_at: now,
                     request: message.clone(),
@@ -1604,8 +1697,10 @@ impl SipStack {
             timeouts.extend(self.fail_timed_out_request(&branch, &call).await);
         }
         // The 408s ride their server transactions; the BYEs get client ones.
+        // Timer-loop results go out on the UDP timer socket, so their
+        // transactions are unreliable (correct B-leg transport is POA&M-5).
         for r in &timeouts {
-            self.track_result(r).await;
+            self.track_result(r, AddrTransport::Udp).await;
         }
         out.extend(timeouts);
         out.extend(self.retransmit_pending_2xx().await);
@@ -1672,7 +1767,7 @@ impl SipStack {
             audit_call_terminated(&addrs, uc_audit::event::TerminationReason::Timeout);
             {
                 let mut calls = self.calls.write().await;
-                if let Some(c) = calls.calls.get_mut(call) {
+                if let Some(c) = calls.get_mut(call) {
                     c.fail(timeout.code(), timeout.reason_phrase());
                 }
             }
@@ -1765,7 +1860,7 @@ impl SipStack {
             audit_call_terminated(&addrs, uc_audit::event::TerminationReason::Failed);
             {
                 let mut calls = self.calls.write().await;
-                if let Some(c) = calls.calls.get_mut(&call) {
+                if let Some(c) = calls.get_mut(&call) {
                     c.fail(unavailable.code(), unavailable.reason_phrase());
                 }
             }
@@ -1776,8 +1871,9 @@ impl SipStack {
                 destination: addrs.a_leg_source,
             }]
         };
+        // Sent on the UDP timer socket (see `poll_timers`).
         for r in &out {
-            self.track_result(r).await;
+            self.track_result(r, AddrTransport::Udp).await;
         }
         out
     }
@@ -2271,7 +2367,7 @@ impl SipStack {
     async fn cleanup_terminated_call(&self, internal_id: &CallId, trunk_failed: bool) {
         {
             let mut calls = self.calls.write().await;
-            calls.calls.remove(internal_id);
+            calls.remove(internal_id);
         }
         self.finish_call_record(internal_id, trunk_failed).await;
         // INVITE transactions are left to run out (Timer D/H/I) so late
@@ -2814,7 +2910,7 @@ impl SipStack {
 
     /// Number of active B2BUA calls (drain progress).
     pub async fn active_call_count(&self) -> usize {
-        self.calls.read().await.calls.len()
+        self.calls.read().await.len()
     }
 
     /// Sets the zone registry for zone-aware SIP processing.
@@ -3148,7 +3244,7 @@ impl SipStack {
         self.async_location_service.is_some()
     }
 
-    /// Processes an incoming SIP message.
+    /// Processes an incoming SIP message received over UDP.
     ///
     /// `receiving_zone` is the zone name this message arrived on (if zones configured).
     pub async fn process_message(
@@ -3156,6 +3252,22 @@ impl SipStack {
         data: &Bytes,
         source: SbcSocketAddr,
         receiving_zone: Option<&str>,
+    ) -> ProcessResult {
+        self.process_message_on(data, source, receiving_zone, AddrTransport::Udp)
+            .await
+    }
+
+    /// Processes an incoming SIP message received on `transport`. The
+    /// result is sent back on the same transport, so the transactions it
+    /// opens are reliable or unreliable to match (RFC 3261 §17).
+    ///
+    /// `receiving_zone` is the zone name this message arrived on (if zones configured).
+    pub async fn process_message_on(
+        &self,
+        data: &Bytes,
+        source: SbcSocketAddr,
+        receiving_zone: Option<&str>,
+        transport: AddrTransport,
     ) -> ProcessResult {
         // Parse the SIP message
         let message = match SipMessage::parse(data) {
@@ -3179,13 +3291,16 @@ impl SipStack {
         );
 
         let result = match message {
-            SipMessage::Request(_) => self.process_request(message, source, receiving_zone).await,
+            SipMessage::Request(_) => {
+                self.process_request(message, source, receiving_zone, transport)
+                    .await
+            }
             SipMessage::Response(_) => self.process_response(message, source).await,
         };
         // Everything a handler puts on the wire rides a transaction: responses
         // are recorded for retransmission, forwarded requests get a client
         // transaction that retransmits and times them out (RFC 3261 §17).
-        self.track_result(&result).await;
+        self.track_result(&result, transport).await;
         result
     }
 
@@ -3196,6 +3311,7 @@ impl SipStack {
         message: SipMessage,
         source: SbcSocketAddr,
         receiving_zone: Option<&str>,
+        transport: AddrTransport,
     ) -> ProcessResult {
         let SipMessage::Request(ref req) = message else {
             return ProcessResult::Error {
@@ -3223,7 +3339,7 @@ impl SipStack {
             if let Some(rejected) = self.user_rate_limit(req, source).await {
                 return rejected;
             }
-            self.open_server_transaction(req, source).await;
+            self.open_server_transaction(req, source, transport).await;
         }
 
         match method {
@@ -3444,7 +3560,7 @@ impl SipStack {
         // Update call state
         {
             let mut calls = self.calls.write().await;
-            if let Some(call) = calls.calls.get_mut(internal_id) {
+            if let Some(call) = calls.get_mut(internal_id) {
                 let _ = call.receive_provisional(status_code);
             }
         }
@@ -3536,7 +3652,7 @@ impl SipStack {
         // Activate the call
         {
             let mut calls = self.calls.write().await;
-            if let Some(call) = calls.calls.get_mut(internal_id) {
+            if let Some(call) = calls.get_mut(internal_id) {
                 let _ = call.activate();
             }
         }
@@ -3697,7 +3813,7 @@ impl SipStack {
         // No failover available — fail the call
         {
             let mut calls = self.calls.write().await;
-            if let Some(call) = calls.calls.get_mut(internal_id) {
+            if let Some(call) = calls.get_mut(internal_id) {
                 call.fail(status_code, resp.reason_phrase());
             }
         }
@@ -3718,7 +3834,7 @@ impl SipStack {
         // slot go with the correlation record.
         {
             let mut calls = self.calls.write().await;
-            calls.calls.remove(internal_id);
+            calls.remove(internal_id);
         }
         self.finish_call_record(internal_id, is_failover_status(status_code))
             .await;
@@ -4211,8 +4327,13 @@ impl SipStack {
         // Emergency calls may also use `emergency_reserve_calls` above it,
         // never more; normal calls never reach the reserve.
         //
+        // The slot is reserved atomically here and held in `call_slot` until
+        // the call is stored (step 8); every earlier return drops it, which
+        // releases it. One shared counter keeps the reserve semantics: normal
+        // calls stop at `max_calls`, emergency calls use ordinary slots first.
+        //
         // ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection); 47 CFR 9.16
-        {
+        let call_slot = {
             let ceiling = if emergency {
                 self.config
                     .max_calls
@@ -4220,8 +4341,10 @@ impl SipStack {
             } else {
                 self.config.max_calls
             };
-            let calls = self.calls.read().await;
-            if calls.calls.len() >= ceiling as usize {
+            let Some(slot) = try_reserve_slot(
+                &self.admitted_calls,
+                usize::try_from(ceiling).unwrap_or(usize::MAX),
+            ) else {
                 warn!(
                     call_id = %a_leg_call_id,
                     max_calls = self.config.max_calls,
@@ -4229,7 +4352,6 @@ impl SipStack {
                     emergency,
                     "Maximum concurrent calls reached, rejecting INVITE"
                 );
-                drop(calls);
                 self.in_flight_invites.write().await.remove(&a_leg_call_id);
                 let unavailable =
                     create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
@@ -4237,8 +4359,9 @@ impl SipStack {
                     message: SipMessage::Response(unavailable),
                     destination: source,
                 };
-            }
-        }
+            };
+            slot
+        };
 
         // Loop protection (RFC 3261 §16.3): honor the incoming Max-Forwards
         // and propagate it decremented — previously every hop reset it to
@@ -4736,7 +4859,7 @@ impl SipStack {
         // 8. Store call state and correlation
         {
             let mut calls = self.calls.write().await;
-            calls.calls.insert(internal_call_id.clone(), call);
+            calls.insert(internal_call_id.clone(), call, call_slot);
         }
         {
             let mut corr = self.call_correlation.write().await;
@@ -4938,7 +5061,7 @@ impl SipStack {
         // Terminate the call
         {
             let mut calls = self.calls.write().await;
-            if let Some(call) = calls.calls.get_mut(&internal_id) {
+            if let Some(call) = calls.get_mut(&internal_id) {
                 let _ = call.start_termination();
             }
         }
@@ -5027,7 +5150,7 @@ impl SipStack {
         // are released with the correlation record, exactly once.
         {
             let mut calls = self.calls.write().await;
-            calls.calls.remove(&internal_id);
+            calls.remove(&internal_id);
         }
         self.finish_call_record(&internal_id, false).await;
 
@@ -5119,7 +5242,7 @@ impl SipStack {
         // Fail the call
         {
             let mut calls = self.calls.write().await;
-            if let Some(call) = calls.calls.get_mut(&internal_id) {
+            if let Some(call) = calls.get_mut(&internal_id) {
                 call.fail(487, "Request Terminated");
             }
         }
@@ -5183,7 +5306,7 @@ impl SipStack {
         // with the correlation record, exactly once.
         {
             let mut calls = self.calls.write().await;
-            calls.calls.remove(&internal_id);
+            calls.remove(&internal_id);
         }
         self.finish_call_record(&internal_id, false).await;
 
@@ -5288,9 +5411,16 @@ impl SipStack {
         self.dialogs.read().await.dialogs.len()
     }
 
+    /// `general.max_calls` slots currently held (stored calls plus INVITEs
+    /// being admitted).
+    #[cfg(test)]
+    fn admitted_call_slots(&self) -> usize {
+        self.admitted_calls.load(Ordering::Acquire)
+    }
+
     /// Returns the number of active calls.
     pub async fn call_count(&self) -> usize {
-        self.calls.read().await.calls.len()
+        self.calls.read().await.len()
     }
 
     /// Lists all active calls with summary info (for gRPC ListCalls).
@@ -5305,7 +5435,7 @@ impl SipStack {
                 let addrs = corr.addresses.get(id);
                 CallSummary {
                     call_id: id.to_string(),
-                    state: format!("{:?}", call.state()),
+                    state: format!("{:?}", call.call.state()),
                     a_leg_call_id: addrs
                         .map(|a| a.a_leg_sip_call_id.clone())
                         .unwrap_or_default(),
@@ -8725,6 +8855,8 @@ mod tests {
             assert_eq!(n, 0, "VPS callee slot released");
         }
         assert!(stack.call_correlation.read().await.addresses.is_empty());
+        assert_eq!(stack.admitted_call_slots(), 0, "max_calls slots released");
+        assert_eq!(stack.call_count().await, 0);
     }
 
     fn vps_with_callee_cap(cap: u32) -> uc_vps::VpsEngine {
@@ -8973,6 +9105,443 @@ mod tests {
         );
         assert!(forwarded(&results, &Method::Invite).is_none());
         assert_all_released(&stack).await;
+    }
+
+    #[test]
+    fn txn_transport_maps_connection_oriented_to_reliable() {
+        // RFC 3261 §17.1.1.2 / §17.1.2.2: only UDP gets Timers A/E/G.
+        assert_eq!(txn_transport(AddrTransport::Udp), TransportType::Unreliable);
+        for t in [
+            AddrTransport::Tcp,
+            AddrTransport::Tls,
+            AddrTransport::WebSocket,
+            AddrTransport::WebSocketSecure,
+            AddrTransport::Sctp,
+        ] {
+            assert_eq!(txn_transport(t), TransportType::Reliable, "{t:?}");
+        }
+    }
+
+    async fn place_call_on(
+        stack: &SipStack,
+        call_id: &str,
+        transport: AddrTransport,
+    ) -> Vec<ProcessResult> {
+        flatten(
+            stack
+                .process_message_on(
+                    &caller_request("INVITE", DIALED, call_id, 1, None, Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                    transport,
+                )
+                .await,
+        )
+    }
+
+    #[tokio::test]
+    async fn reliable_invite_client_txn_has_no_timer_a_but_times_out_on_timer_b() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let results = place_call_on(&stack, "tcp-a@test", AddrTransport::Tcp).await;
+        assert!(forwarded(&results, &Method::Invite).is_some());
+        {
+            let txns = stack.transactions.read().await;
+            let st = txns
+                .client_invite
+                .values()
+                .next()
+                .expect("client INVITE txn");
+            assert_eq!(st.transaction.transport(), TransportType::Reliable);
+            // Timer B (64*T1 = 32 s) is the only armed timer.
+            let deadline = st.transaction.next_timer_deadline().expect("Timer B armed");
+            let after = deadline.saturating_duration_since(st.transaction.created_at());
+            assert!(
+                after >= std::time::Duration::from_secs(31),
+                "next timer is Timer B, not A: {after:?}"
+            );
+        }
+        // Past T1 and 2*T1: no INVITE retransmission on TCP.
+        tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+        let results = stack.poll_timers().await;
+        assert!(
+            forwarded(&results, &Method::Invite).is_none(),
+            "Timer A ran on TCP: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reliable_server_invite_txn_has_no_timer_g() {
+        // RFC 3261 §17.2.1: a final response is not retransmitted on TCP.
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let results = place_call_on(&stack, "tcp-g@test", AddrTransport::Tcp).await;
+        let (b_invite, dest) = forwarded(&results, &Method::Invite).unwrap();
+        let (b_invite, dest) = (b_invite.clone(), dest);
+        let out = flatten(
+            stack
+                .process_message(&response_to(&b_invite, 486, Some("t"), None), dest, None)
+                .await,
+        );
+        assert!(responded(&out, 486).is_some(), "{out:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let results = stack.poll_timers().await;
+        assert!(responded(&results, 486).is_none(), "Timer G ran on TCP");
+    }
+
+    #[tokio::test]
+    async fn udp_invite_client_txn_still_retransmits_timer_a() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let results = place_call_on(&stack, "udp-a@test", AddrTransport::Udp).await;
+        assert!(forwarded(&results, &Method::Invite).is_some());
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let results = stack.poll_timers().await;
+        assert!(
+            forwarded(&results, &Method::Invite).is_some(),
+            "Timer A retransmit on UDP"
+        );
+    }
+
+    /// Places a call over `transport` then CANCELs it over the same
+    /// transport; returns what the timers produce 600 ms later.
+    async fn cancel_on(transport: AddrTransport) -> Vec<ProcessResult> {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let id = "nict@test";
+        place_call_on(&stack, id, transport).await;
+        let out = flatten(
+            stack
+                .process_message_on(
+                    &caller_request("CANCEL", DIALED, id, 1, None, None),
+                    alice(),
+                    None,
+                    transport,
+                )
+                .await,
+        );
+        assert!(forwarded(&out, &Method::Cancel).is_some(), "{out:?}");
+        assert!(
+            !stack.transactions.read().await.client_non_invite.is_empty(),
+            "client CANCEL txn"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        stack.poll_timers().await
+    }
+
+    #[tokio::test]
+    async fn reliable_non_invite_client_txn_has_no_timer_e() {
+        let results = cancel_on(AddrTransport::Tls).await;
+        assert!(
+            forwarded(&results, &Method::Cancel).is_none(),
+            "{results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_non_invite_client_txn_still_retransmits_timer_e() {
+        let results = cancel_on(AddrTransport::Udp).await;
+        assert!(
+            forwarded(&results, &Method::Cancel).is_some(),
+            "{results:?}"
+        );
+    }
+
+    #[test]
+    fn call_slot_reservation_is_bounded_and_released_on_drop() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let a = try_reserve_slot(&counter, 2).expect("slot 1");
+        let b = try_reserve_slot(&counter, 2).expect("slot 2");
+        assert!(try_reserve_slot(&counter, 2).is_none(), "ceiling reached");
+        // A higher (emergency) ceiling shares the same counter.
+        let e = try_reserve_slot(&counter, 3).expect("reserve slot");
+        assert_eq!(counter.load(Ordering::Acquire), 3);
+        drop((a, b, e));
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+        assert!(try_reserve_slot(&counter, 0).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_admission_never_exceeds_max_calls() {
+        const N: u32 = 3;
+        let config = SipStackConfig {
+            max_calls: N,
+            emergency_reserve_calls: 0,
+            ..SipStackConfig::default()
+        };
+        let stack = Arc::new(trunk_stack_cfg(config, 1000, ("none", ""), None).await);
+        let tasks: Vec<_> = (0..4 * N)
+            .map(|i| {
+                let stack = Arc::clone(&stack);
+                tokio::spawn(async move { place_call(&stack, &format!("cc-{i}@test")).await })
+            })
+            .collect();
+        let mut admitted = 0;
+        let mut rejected = 0;
+        for t in tasks {
+            let r = t.await.unwrap();
+            if forwarded(&r, &Method::Invite).is_some() {
+                admitted += 1;
+            } else if responded(&r, 503).is_some() {
+                rejected += 1;
+            }
+        }
+        assert!(admitted <= N, "overshoot: {admitted} > {N}");
+        assert_eq!(admitted + rejected, 4 * N);
+        let calls = stack.call_count().await;
+        assert!(calls <= N as usize);
+        assert_eq!(stack.admitted_call_slots(), calls);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_emergency_admission_bounded_by_reserve() {
+        const N: u32 = 2;
+        const R: u32 = 2;
+        let config = SipStackConfig {
+            max_calls: N,
+            emergency_reserve_calls: R,
+            ..SipStackConfig::default()
+        };
+        let stack = Arc::new(trunk_stack_cfg(config, 1000, ("none", ""), None).await);
+        let tasks: Vec<_> = (0..16u32)
+            .map(|i| {
+                let stack = Arc::clone(&stack);
+                tokio::spawn(async move {
+                    let emergency = i % 2 == 0;
+                    let user = if emergency { "911" } else { DIALED };
+                    let r = place_call_to(&stack, user, &format!("ce-{i}@test")).await;
+                    (emergency, forwarded(&r, &Method::Invite).is_some())
+                })
+            })
+            .collect();
+        let (mut normal, mut total) = (0, 0);
+        for t in tasks {
+            let (emergency, ok) = t.await.unwrap();
+            if ok {
+                total += 1;
+                if !emergency {
+                    normal += 1;
+                }
+            }
+        }
+        assert!(normal <= N, "normal calls used the reserve: {normal}");
+        assert!(total <= N + R, "overshoot: {total}");
+        assert_eq!(stack.admitted_call_slots(), stack.call_count().await);
+    }
+
+    #[tokio::test]
+    async fn slot_released_on_every_rejection_path() {
+        let config = SipStackConfig {
+            max_calls: 10,
+            ..SipStackConfig::default()
+        };
+        let stack = trunk_stack_cfg(config, 1, ("none", ""), None).await;
+
+        // 483: Max-Forwards exhausted (after admission).
+        let mf0 = String::from_utf8_lossy(&caller_request(
+            "INVITE",
+            DIALED,
+            "mf0@test",
+            1,
+            None,
+            Some(ALICE_SDP),
+        ))
+        .replacen("CSeq:", "Max-Forwards: 0\r\nCSeq:", 1);
+        let r = flatten(
+            stack
+                .process_message(&Bytes::from(mf0), alice(), None)
+                .await,
+        );
+        assert!(responded(&r, 483).is_some(), "{r:?}");
+        assert_eq!(stack.admitted_call_slots(), 0, "483 path");
+
+        // All trunks full: 503 + Retry-After after routing.
+        place_call(&stack, "f1@test").await;
+        place_call(&stack, "f2@test").await;
+        assert_eq!(stack.admitted_call_slots(), 2);
+        let r = place_call(&stack, "f3@test").await;
+        assert!(responded(&r, 503).is_some(), "{r:?}");
+        assert_eq!(stack.admitted_call_slots(), 2, "trunk-full path");
+        assert_eq!(stack.call_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn slot_released_on_global_max_calls_rejection() {
+        let config = SipStackConfig {
+            max_calls: 1,
+            emergency_reserve_calls: 0,
+            ..SipStackConfig::default()
+        };
+        let stack = trunk_stack_cfg(config, 10, ("none", ""), None).await;
+        place_call(&stack, "g1@test").await;
+        for i in 0..3 {
+            let r = place_call(&stack, &format!("g-over{i}@test")).await;
+            assert!(responded(&r, 503).is_some());
+        }
+        assert_eq!(stack.admitted_call_slots(), 1);
+        // CANCEL frees it and the next call is admitted.
+        stack
+            .process_message(
+                &caller_request("CANCEL", DIALED, "g1@test", 1, None, None),
+                alice(),
+                None,
+            )
+            .await;
+        assert_eq!(stack.admitted_call_slots(), 0);
+        let r = place_call(&stack, "g2@test").await;
+        assert!(forwarded(&r, &Method::Invite).is_some());
+    }
+
+    // ---- QA additions (POA&M-10/11) ----
+
+    #[tokio::test]
+    async fn qa_slot_released_on_vps_callee_cap_reject() {
+        let stack = trunk_stack(10, ("none", ""), Some(vps_with_callee_cap(1))).await;
+        let r1 = place_call(&stack, "qv1@test").await;
+        assert!(forwarded(&r1, &Method::Invite).is_some());
+        assert_eq!(stack.admitted_call_slots(), 1);
+        for i in 0..3 {
+            let r = place_call(&stack, &format!("qv-rej{i}@test")).await;
+            assert!(
+                responded(&r, uc_vps::CONCURRENCY_CAP_STATUS).is_some(),
+                "{r:?}"
+            );
+            assert_eq!(stack.admitted_call_slots(), 1, "VPS reject leaked a slot");
+        }
+        assert_eq!(stack.call_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn qa_slot_released_on_all_trunks_down_503() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        stack.set_trunk_reachable("t1", false).await;
+        stack.set_trunk_reachable("t2", false).await;
+        for i in 0..3 {
+            let r = place_call(&stack, &format!("qd{i}@test")).await;
+            assert!(responded(&r, 503).is_some(), "{r:?}");
+        }
+        assert_eq!(stack.admitted_call_slots(), 0, "routing-failure path");
+        assert_eq!(stack.call_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn qa_slot_invariant_holds_for_malformed_sdp_offer() {
+        // Whatever the SDP path decides (reject or pass-through), the slot
+        // counter must equal the stored calls afterwards.
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        for (i, body) in [
+            "garbage\r\n",
+            "v=0\r\nm=audio notaport RTP/AVP 0\r\n",
+            "v=0\r\nc=IN IP4\r\n",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let _ = flatten(
+                stack
+                    .process_message(
+                        &caller_request(
+                            "INVITE",
+                            DIALED,
+                            &format!("qs{i}@test"),
+                            1,
+                            None,
+                            Some(body),
+                        ),
+                        alice(),
+                        None,
+                    )
+                    .await,
+            );
+            assert_eq!(
+                stack.admitted_call_slots(),
+                stack.call_count().await,
+                "body {i}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn qa_concurrent_emergency_only_burst_fills_exactly_to_ceiling() {
+        const N: u32 = 2;
+        const R: u32 = 3;
+        let config = SipStackConfig {
+            max_calls: N,
+            emergency_reserve_calls: R,
+            ..SipStackConfig::default()
+        };
+        let stack = Arc::new(trunk_stack_cfg(config, 1000, ("none", ""), None).await);
+        for round in 0..5u32 {
+            let tasks: Vec<_> = (0..24u32)
+                .map(|i| {
+                    let stack = Arc::clone(&stack);
+                    tokio::spawn(async move {
+                        let r = place_call_to(&stack, "911", &format!("qe-{round}-{i}@test")).await;
+                        forwarded(&r, &Method::Invite).is_some()
+                    })
+                })
+                .collect();
+            let mut ok = 0u32;
+            for t in tasks {
+                if t.await.unwrap() {
+                    ok += 1;
+                }
+            }
+            let expected = if round == 0 { N + R } else { 0 };
+            assert_eq!(ok, expected, "round {round}");
+            assert_eq!(stack.call_count().await, (N + R) as usize);
+            assert_eq!(stack.admitted_call_slots(), (N + R) as usize);
+        }
+        // Once the reserve is in use a normal call is still refused.
+        let r = place_call(&stack, "qe-normal@test").await;
+        assert!(responded(&r, 503).is_some());
+    }
+
+    fn qa_options(n: u32) -> Bytes {
+        Bytes::from(format!(
+            "OPTIONS sip:sbc.local SIP/2.0\r\n\
+             Via: SIP/2.0/TCP 192.168.1.1:5060;branch=z9hG4bK-qopt-{n}\r\n\
+             From: <sip:alice@example.com>;tag=q{n}\r\n\
+             To: <sip:sbc.local>\r\n\
+             Call-ID: qopt-{n}@test\r\n\
+             CSeq: 1 OPTIONS\r\n\
+             Content-Length: 0\r\n\r\n"
+        ))
+    }
+
+    #[tokio::test]
+    async fn qa_reliable_server_non_invite_txn_has_zero_timer_j() {
+        // RFC 3261 §17.2.2: Timer J is 0 on reliable transports, so the
+        // server NIT terminates right after the final response.
+        let stack = SipStack::new(SipStackConfig::default());
+        let out = flatten(
+            stack
+                .process_message_on(&qa_options(1), alice(), None, AddrTransport::Tcp)
+                .await,
+        );
+        assert!(responded(&out, 200).is_some(), "{out:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let timers = stack.poll_timers().await;
+        assert!(
+            responded(&timers, 200).is_none(),
+            "no NIT response retransmit on TCP"
+        );
+        assert!(
+            stack.transactions.read().await.server_non_invite.is_empty(),
+            "TCP server NIT should be gone (Timer J = 0)"
+        );
+    }
+
+    #[tokio::test]
+    async fn qa_udp_server_non_invite_txn_absorbs_retransmit_during_timer_j() {
+        let stack = SipStack::new(SipStackConfig::default());
+        let first = flatten(stack.process_message(&qa_options(2), alice(), None).await);
+        assert!(responded(&first, 200).is_some());
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        stack.poll_timers().await;
+        assert!(
+            !stack.transactions.read().await.server_non_invite.is_empty(),
+            "UDP server NIT kept for Timer J"
+        );
+        // Retransmission is answered from the stored response.
+        let again = flatten(stack.process_message(&qa_options(2), alice(), None).await);
+        assert!(responded(&again, 200).is_some(), "{again:?}");
     }
 
     #[tokio::test]
