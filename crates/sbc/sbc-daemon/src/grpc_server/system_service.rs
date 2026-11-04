@@ -90,6 +90,7 @@ impl SystemService for SystemServiceImpl {
         let req = request.into_inner();
         info!(prefix = %req.prefix, "gRPC GetMetrics");
 
+        self.state.refresh_daemon_metrics();
         let metrics_text = self.state.metrics.export();
         let response = GetMetricsResponse {
             metrics: metrics_text,

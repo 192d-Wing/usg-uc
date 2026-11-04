@@ -63,7 +63,9 @@
 - No `TODO`/`FIXME` related to standards gaps found
 - Compact header forms (§7.3.3) supported for core headers (parse-only; the daemon/client framers special-case only `l:`)
 - sbc-daemon relays only REGISTER/INVITE/ACK/BYE/CANCEL/OPTIONS/UPDATE; all other methods receive 405
-- sbc-daemon trunk failover (RFC 3263 §4.3): 408/Timer B/503 plus local-policy 500/502/504; transport send errors do not trigger failover; a trunk's 503 `Retry-After` is ignored (fixed `cooldown_secs`). See `docs/RFC_COMPLIANCE_GAPS.md`
+- sbc-daemon trunk failover (RFC 3263 §4.3): 408/Timer B/503 plus local-policy 500/502/504; a transport error on the first send of a B-leg INVITE also fails over immediately; a trunk's 503 `Retry-After` (§21.5.4, §20.33) sets the trunk cooldown, clamped to `general.trunk_retry_after_max_secs` (RFC-001 resolved). See `docs/RFC_COMPLIANCE_GAPS.md`
+- sbc-daemon client INVITE transactions are always `Unreliable`, so Timer A also runs on TCP/TLS (RFC 3261 §17.1.1.2 gap, POA&M-10)
+- The `general.max_calls` admission-ceiling 503 carries no `Retry-After`
 
 ---
 

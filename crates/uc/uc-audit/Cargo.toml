@@ -11,6 +11,8 @@ categories.workspace = true
 
 [features]
 default = []
+# Thread-local capture of logged events for tests (`uc_audit::capture`).
+test-capture = []
 
 [dependencies]
 uc-types = { workspace = true, features = ["serde"] }

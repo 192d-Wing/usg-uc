@@ -44,13 +44,14 @@ The **Wiring** column says which shipped binary calls the code: `sbc-daemon` (SI
 
 | Behaviour | Status | Wiring | Notes |
 |-----------|--------|--------|-------|
-| Failover to next trunk on 503 / timeout (RFC 3263 §4.3) | Partial | Wired (sbc-daemon) | `sip_stack.rs` `is_failover_status`, `try_failover`. 408, Timer B and 503 trigger failover; an unresolvable trunk URI also does. **Transport send errors do not** (POA&M-2 in NIST-800-53-CONTROLS.md). Tests `failover_on_503_retries_next_trunk_with_same_sdp`, `timer_b_fails_over_then_408_when_exhausted`, `qa_every_failover_status_moves_call_to_second_trunk` |
+| Failover to next trunk on 503 / timeout / transport error (RFC 3263 §4.3, RFC 3261 §8.1.3.1) | Complete | Wired (sbc-daemon) | `sip_stack.rs` `is_failover_status`, `try_failover`, `on_invite_sent`. 408, Timer B and 503 trigger failover; an unresolvable trunk URI also does. A transport error on the first send of a B-leg INVITE (UDP send error, TCP/TLS connect/handshake/write failure, 30 s send timeout) fails over immediately, once per attempt; with no trunk left the caller gets 503 (§8.1.3.1). Retransmission, ACK, CANCEL and in-dialog send failures are log-only. POA&M-2 closed. Tests `failover_on_503_retries_next_trunk_with_same_sdp`, `timer_b_fails_over_then_408_when_exhausted`, `qa_every_failover_status_moves_call_to_second_trunk`, `send_failure_fails_over_once_without_waiting_for_timer_b`, `send_failure_with_no_trunk_left_answers_503_and_releases`, `qa_send_failure_of_cancel_ack_and_in_dialog_is_log_only`, `slow_first_send_failing_after_timer_a_still_fails_over_once`. The `server.rs` wiring from a real socket error to `on_invite_sent` has no socket-level test |
 | Failover on 500/502/504 | Local policy | Wired (sbc-daemon) | Beyond RFC 3263 §4.3; B2BUA policy. Same tests |
 | No failover on other 4xx / 6xx, or after 2xx / reliable 18x with SDP | Complete | Wired (sbc-daemon) | Tests `callee_reject_does_not_fail_over`, `qa_client_and_global_errors_never_fail_over`, `no_failover_after_reliable_early_media`, `qa_failover_still_happens_after_unreliable_or_sdp_less_18x`. A reliable 18x **without** SDP does not commit the call; the caller's early dialog with the first trunk is abandoned on failover (RFC-003, RFC 3262) |
 | Failover request construction (§8.1.1, §17.1.1) | Complete | Wired (sbc-daemon) | New Call-ID, branch, From tag, CSeq, untagged To; non-2xx ACKed on the failed trunk first. R-URI host/scheme and Via transport are not derived from the target trunk (RFC-005, POA&M-5) |
-| Trunk 503 Retry-After (§21.5.4) | Missing | — | Ignored; cooldown is always `cooldown_secs` (RFC-001) |
+| Trunk 503 Retry-After (§21.5.4, §20.33) | Complete | Wired (sbc-daemon) | **RFC-001 (PR 155) resolved.** `sip_stack.rs` `retry_after_cooldown`: delta-seconds sets the trunk cooldown, honoured down to 1 s and clamped to `general.trunk_retry_after_max_secs` (default 300, 1..=3600); a trailing `( comment )` (nested, quoted-pairs) and `;params` are accepted and ignored; missing, 0 or malformed values (`1e9`, `120x`, `120 abc`, unbalanced comments) fall back to `cooldown_secs`. Applied on failover and on a final 503. Tests `retry_after_cooldown_honoured_clamped_or_fallback`, `failover_503_retry_after_sets_trunk_cooldown`, `final_503_without_failover_honours_retry_after`, `qa_failover_503_retry_after_short_and_with_comment` |
 | Relayed downstream 503 when failover is exhausted | Gap | Wired (sbc-daemon) | The last trunk's 503 is relayed unchanged, so an upstream may treat the SBC as overloaded (RFC-002) |
 | SBC-generated 503 + Retry-After (§21.5.4) | Complete | Wired (sbc-daemon) | All trunks full/down: `503`, `Retry-After: 5` (test `trunk_at_max_calls_is_skipped_then_503_when_all_full`). `general.max_registrations` exceeded: `503`, `Retry-After: 60` (tests `max_registrations_rejects_new_bindings_but_allows_refresh`, `qa_max_registrations_counts_bindings_and_allows_deregistration_forms`) |
+| Admission-ceiling 503 (`general.max_calls`, + emergency reserve) | Gap | Wired (sbc-daemon) | The 503 sent when `general.max_calls` (or `max_calls + emergency_reserve_calls` for an emergency call) is reached carries **no `Retry-After`** (§21.5.4 SHOULD), so callers, including emergency callers, may redial at once |
 | Translated number in B-leg R-URI user and To (§8.1.1, §25.1) | Complete | Wired (sbc-daemon) | Restricted to unreserved/user-unreserved characters, max 64; otherwise 500. Tests `translated_number_is_on_b_leg_request_uri_and_to`, `qa_header_injection_in_translated_number_is_rejected`, `qa_translated_number_on_failover_invite_wire_bytes` |
 
 ---
@@ -64,13 +65,15 @@ The **Wiring** column says which shipped binary calls the code: `sbc-daemon` (SI
 | §17.1.1 | INVITE Client Transaction | Complete | Wired (sbc-daemon, soft client) | `client.rs` FSM (`sip_stack.rs`, `call_agent.rs`) |
 | §17.1.2 | Non-INVITE Client Transaction | Complete | Wired (sbc-daemon, soft client) | `client.rs` FSM (`sip_stack.rs`, `registration.rs`) |
 | §17.1.3 | Matching Responses | Complete | Wired (sbc-daemon) | `TransactionKey::client` |
-| §17.1.4 | Handling Transport Errors | Partial | Library-only | Basic error propagation; no binary feeds transport errors into the FSM |
+| §17.1.4 | Handling Transport Errors | Partial | Wired (sbc-daemon), partial | Basic error propagation in the library FSM. sbc-daemon handles a first-send transport error on a B-leg INVITE in `sip_stack.rs` `on_invite_sent` (removes the client transaction, then fails over or answers 503), not through the FSM; other client transactions are not informed of transport errors |
 | §17.2.1 | INVITE Server Transaction | Complete | Wired (sbc-daemon) | `server.rs` FSM |
 | §17.2.2 | Non-INVITE Server Transaction | Complete | Wired (sbc-daemon) | `server.rs` FSM |
 | §17.2.3 | Matching Requests | Complete | Wired (sbc-daemon) | `TransactionKey::server`; retransmissions absorbed |
 | §17.2.4 | Handling Transport Errors | Partial | Library-only | Basic error propagation |
 
 Timers: the daemon acts on Timer A/B/E/F/G/H in `poll_timers` and prunes transactions terminated by Timer D/I/J/K. The soft client does not poll transaction timers.
+
+**Gap (§17.1.1.2):** daemon client INVITE transactions are always built as `TransportType::Unreliable`, so Timer A retransmits INVITEs on TCP/TLS too, where it must not run. `// POAM:` in `sip_stack.rs`; POA&M-10 in NIST-800-53-CONTROLS.md.
 
 ### RFC 3262 Section Mapping (100rel)
 

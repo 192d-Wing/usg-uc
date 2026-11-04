@@ -87,6 +87,12 @@ pub enum AuditEvent {
 
     /// System shutdown.
     SystemShutdown(SystemShutdown),
+
+    /// A call failed over from one trunk to the next.
+    TrunkFailover(TrunkFailover),
+
+    /// A trunk became reachable or unreachable.
+    TrunkReachabilityChanged(TrunkReachabilityChanged),
 }
 
 impl AuditEvent {
@@ -104,7 +110,10 @@ impl AuditEvent {
             Self::DosDetected(_)
             | Self::StirShakenVerification(_)
             | Self::RateLimitTriggered(_) => AuditEventType::Security,
-            Self::SystemStartup(_) | Self::SystemShutdown(_) => AuditEventType::System,
+            Self::SystemStartup(_)
+            | Self::SystemShutdown(_)
+            | Self::TrunkFailover(_)
+            | Self::TrunkReachabilityChanged(_) => AuditEventType::System,
         }
     }
 }
@@ -210,6 +219,12 @@ pub struct AuthorizationDecision {
     pub granted: bool,
     /// Policy that made the decision.
     pub policy: String,
+    /// Source IP address of the request, when known (additive; absent in
+    /// records written before it existed).
+    ///
+    /// ## NIST 800-53 Rev5: AU-3 (Content of Audit Records)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ip: Option<IpAddr>,
 }
 
 /// Configuration change type.
@@ -334,6 +349,58 @@ pub struct SystemShutdown {
     pub graceful: bool,
 }
 
+/// Why a call failed over to the next trunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailoverReason {
+    /// The trunk answered with a failover status (408/5xx).
+    Status(u16),
+    /// No response before Timer B (RFC 3261 §17.1.1.2).
+    Timeout,
+    /// The INVITE could not be sent (RFC 3261 §8.1.3.1).
+    TransportError,
+}
+
+/// Trunk failover event.
+///
+/// ## NIST 800-53 Rev5: CP-8 (Telecommunications Services), AU-2
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrunkFailover {
+    /// Call identifier (A-leg Call-ID).
+    pub call_id: CallId,
+    /// Trunk group of the failed trunk.
+    pub group_id: String,
+    /// Trunk that failed.
+    pub failed_trunk_id: String,
+    /// Why the trunk failed.
+    pub reason: FailoverReason,
+    /// Trunk tried next.
+    pub next_trunk_id: String,
+}
+
+/// Where a trunk reachability change was detected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReachabilitySource {
+    /// Local SIP OPTIONS health probe.
+    Options,
+    /// Trunk-services agent status publish.
+    Agent,
+}
+
+/// Trunk reachability change event.
+///
+/// ## NIST 800-53 Rev5: CP-8 (Telecommunications Services), AU-2
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrunkReachabilityChanged {
+    /// Trunk identifier.
+    pub trunk_id: String,
+    /// New reachability.
+    pub reachable: bool,
+    /// Detector of the change.
+    pub source: ReachabilitySource,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -365,5 +432,60 @@ mod tests {
         let json = serde_json::to_string(&event).expect("serialize event");
         assert!(json.contains("authentication_attempt"));
         assert!(json.contains("alice"));
+    }
+
+    fn as_authz(event: AuditEvent) -> Option<AuthorizationDecision> {
+        match event {
+            AuditEvent::AuthorizationDecision(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn authorization_decision_source_ip_is_additive() {
+        let old = r#"{"type":"authorization_decision","identity":"a","resource":"sip:911@x","action":"INVITE","granted":false,"policy":"vps"}"#;
+        let d = as_authz(serde_json::from_str(old).unwrap()).unwrap();
+        assert_eq!(d.source_ip, None);
+        let none = serde_json::to_string(&AuditEvent::AuthorizationDecision(d.clone())).unwrap();
+        assert!(!none.contains("source_ip"));
+
+        let with = AuditEvent::AuthorizationDecision(AuthorizationDecision {
+            source_ip: Some("192.0.2.7".parse().unwrap()),
+            ..d
+        });
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains(r#""source_ip":"192.0.2.7""#));
+        let back = as_authz(serde_json::from_str(&json).unwrap()).unwrap();
+        assert_eq!(back.source_ip, Some("192.0.2.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn trunk_events_serialize_and_categorize() {
+        let failover = AuditEvent::TrunkFailover(TrunkFailover {
+            call_id: CallId::new("c\"1"),
+            group_id: "g".to_string(),
+            failed_trunk_id: "t1".to_string(),
+            reason: FailoverReason::Status(503),
+            next_trunk_id: "t2".to_string(),
+        });
+        assert_eq!(failover.event_type(), AuditEventType::System);
+        let json = serde_json::to_string(&failover).unwrap();
+        assert!(json.contains(r#""type":"trunk_failover""#));
+        assert!(json.contains(r#""reason":{"status":503}"#));
+        assert!(json.contains(r#"c\"1"#), "call_id JSON-escaped: {json}");
+        let t = serde_json::to_string(&FailoverReason::TransportError).unwrap();
+        assert_eq!(t, r#""transport_error""#);
+
+        let reach = AuditEvent::TrunkReachabilityChanged(TrunkReachabilityChanged {
+            trunk_id: "t1".to_string(),
+            reachable: false,
+            source: ReachabilitySource::Options,
+        });
+        assert_eq!(reach.event_type(), AuditEventType::System);
+        let json = serde_json::to_string(&reach).unwrap();
+        assert!(json.contains(r#""type":"trunk_reachability_changed""#));
+        assert!(json.contains(r#""source":"options""#));
+        let back: AuditEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, AuditEvent::TrunkReachabilityChanged(r) if !r.reachable));
     }
 }

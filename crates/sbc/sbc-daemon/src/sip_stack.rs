@@ -33,6 +33,7 @@ use proto_sip::message::{SipRequest, SipResponse};
 use proto_sip::uri::SipUri;
 use proto_sip::{Header, HeaderName, Method, SipMessage, StatusCode};
 use proto_sip::{TopologyHider, TopologyHidingConfig as SipTopologyConfig, TopologyHidingMode};
+use proto_transaction::client::ClientInviteState as ClientInvitePhase;
 use proto_transaction::timer::TimerType;
 use proto_transaction::{
     ClientInviteTransaction, ClientNonInviteTransaction, ServerInviteTransaction,
@@ -45,9 +46,9 @@ use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uc_routing::{
-    DestinationType, DialPattern, DialPlan, DialPlanEntry, Direction, NumberTransform, Router,
-    RouterConfig, RoutingError, SelectionStrategy, Trunk, TrunkConfig, TrunkGroup, TrunkOutcome,
-    TrunkProtocol,
+    Admission, DestinationType, DialPattern, DialPlan, DialPlanEntry, Direction, NumberTransform,
+    Router, RouterConfig, RoutingError, SelectionStrategy, Trunk, TrunkConfig, TrunkGroup,
+    TrunkOutcome, TrunkProtocol,
 };
 use uc_types::address::SbcSocketAddr;
 
@@ -111,6 +112,11 @@ pub struct SipStack {
     registrations_total: AtomicU64,
     /// Draining: reject new INVITEs (503) while existing calls finish.
     draining: std::sync::atomic::AtomicBool,
+    /// Emergency INVITEs admitted past screening (47 CFR 9.16 bypass).
+    /// Exported as a metric so an emergency flood is visible (SI-4).
+    emergency_admissions: AtomicU64,
+    /// B-leg INVITE branches whose send succeeded (see `on_invite_sent`).
+    first_send_ok: FirstSendLedger,
     /// RTP port allocator: hands out even-numbered ports in a range.
     next_rtp_port: std::sync::atomic::AtomicU16,
     /// Set of currently allocated RTP ports for deallocation tracking.
@@ -151,6 +157,17 @@ pub struct SipStackConfig {
     /// past it gets 503 + Retry-After; refreshes and de-registrations are
     /// always accepted.
     pub max_registrations: u32,
+    /// Extra concurrent calls above `max_calls` that only emergency calls
+    /// may use (`general.emergency_reserve_calls`). Emergency INVITEs past
+    /// `max_calls + emergency_reserve_calls` get 503 (SC-5).
+    pub emergency_reserve_calls: u32,
+    /// Emergency numbers (`[vps] emergency_numbers`): may use the
+    /// emergency reserve above `max_calls` and trunk `max_calls`, and skip
+    /// VPS number/caller screening (47 CFR 9.16).
+    pub emergency_numbers: uc_vps::EmergencyNumbers,
+    /// Bound on a trunk's 503 `Retry-After` honoured as its cooldown
+    /// (`general.trunk_retry_after_max_secs`, RFC 3261 §21.5.4).
+    pub trunk_retry_after_max_secs: u32,
 }
 
 impl Default for SipStackConfig {
@@ -164,7 +181,10 @@ impl Default for SipStackConfig {
             require_auth: false,
             auth_credentials: HashMap::new(),
             max_calls: 1000,
+            emergency_reserve_calls: sbc_config::schema::default_emergency_reserve(1000),
             max_registrations: 50_000,
+            emergency_numbers: uc_vps::EmergencyNumbers::new(&uc_vps::default_emergency_numbers()),
+            trunk_retry_after_max_secs: sbc_config::schema::DEFAULT_TRUNK_RETRY_AFTER_MAX_SECS,
         }
     }
 }
@@ -221,6 +241,64 @@ struct ClientInviteState {
     ack: Option<SipMessage>,
     /// Call this INVITE belongs to (Timer B fails it).
     call: CallId,
+    /// The first send's outcome has not been reported yet; only that send
+    /// failing triggers failover (see `SipStack::on_invite_sent`).
+    initial_send_pending: bool,
+    /// Timer A has re-sent the INVITE, so a send failure may be the
+    /// retransmission's rather than the first send's.
+    retransmitted: bool,
+}
+
+/// Slots in [`FirstSendLedger`]; bounded (SC-5), independent of load.
+const FIRST_SEND_SLOTS: usize = 1024;
+
+/// Lock-free record of B-leg INVITE branches whose send succeeded, so a
+/// failure reported after Timer A can be told apart: a retransmission
+/// failure after a good first send stays log-only, a slow first send that
+/// fails after Timer A still fails over (Decision 4).
+///
+/// Each branch hashes (keyed `RandomState`, attacker-chosen branches cannot
+/// target a slot) to one `AtomicU64` slot holding the hash. A slot can be
+/// overwritten by a later branch; the record is then lost and that branch's
+/// failure is treated as a first-send failure (fails over), which is the
+/// safe direction.
+///
+/// ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection), CP-8
+struct FirstSendLedger {
+    hasher: std::collections::hash_map::RandomState,
+    slots: Box<[AtomicU64]>,
+}
+
+impl FirstSendLedger {
+    fn new() -> Self {
+        Self {
+            hasher: std::collections::hash_map::RandomState::new(),
+            slots: (0..FIRST_SEND_SLOTS).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    /// Non-zero keyed hash of `branch` and its slot index.
+    fn locate(&self, branch: &str) -> (usize, u64) {
+        use std::hash::BuildHasher;
+        let h = self.hasher.hash_one(branch) | 1;
+        // The remainder is < FIRST_SEND_SLOTS, so it always fits a usize.
+        let idx = usize::try_from(h % FIRST_SEND_SLOTS as u64).unwrap_or(0);
+        (idx, h)
+    }
+
+    fn record(&self, branch: &str) {
+        let (idx, h) = self.locate(branch);
+        if let Some(slot) = self.slots.get(idx) {
+            slot.store(h, Ordering::Release);
+        }
+    }
+
+    fn contains(&self, branch: &str) -> bool {
+        let (idx, h) = self.locate(branch);
+        self.slots
+            .get(idx)
+            .is_some_and(|slot| slot.load(Ordering::Acquire) == h)
+    }
 }
 
 /// State for client non-INVITE transaction.
@@ -409,6 +487,8 @@ struct TrunkLease {
     trunk_id: String,
     /// When the slot was taken (INVITE sent), for setup-time statistics.
     started: Instant,
+    /// Emergency calls take slots past `max_calls`, failover included.
+    admission: Admission,
 }
 
 /// A call routed to a trunk: the reserved slot, where to send the INVITE,
@@ -470,13 +550,111 @@ fn is_safe_b_leg_user(user: &str) -> bool {
 /// fails over) as next-server triggers. Failing over on 500, 502 and 504
 /// is local B2BUA policy beyond RFC 3263; the B-leg retry is a new UAC
 /// request, so it is permitted. A trunk URI that does not resolve also
-/// moves to the next target.
-///
-/// POAM: transport send errors on the B-leg (RFC 3263 §4.3) do not trigger
-/// failover; transports do not report send failures back to the SIP stack,
-/// so such a call fails only via Timer B.
+/// moves to the next target, and so does a failed first send of the
+/// INVITE (RFC 3261 §8.1.3.1, see `SipStack::on_invite_sent`).
 const fn is_failover_status(status: u16) -> bool {
     matches!(status, 408 | 500 | 502 | 503 | 504)
+}
+
+/// Why the current B-leg attempt of a call failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailoverCause {
+    /// A failover final status, with the trunk's bounded `Retry-After`
+    /// (503 only).
+    Status(u16, Option<std::time::Duration>),
+    /// Timer B (RFC 3261 §17.1.1.2).
+    Timeout,
+    /// The first send of the INVITE failed (RFC 3261 §8.1.3.1).
+    TransportError,
+}
+
+impl FailoverCause {
+    fn audit_reason(self) -> uc_audit::event::FailoverReason {
+        match self {
+            Self::Status(code, _) => uc_audit::event::FailoverReason::Status(code),
+            Self::Timeout => uc_audit::event::FailoverReason::Timeout,
+            Self::TransportError => uc_audit::event::FailoverReason::TransportError,
+        }
+    }
+}
+
+/// The cooldown a trunk's 503 asks for: its `Retry-After` delta-seconds
+/// (RFC 3261 §20.33; a trailing comment or `;duration` is ignored), clamped
+/// to `max_secs`. `None` (use `cooldown_secs`) when the header is absent,
+/// not delta-seconds, or 0. After the digits and optional LWS, only the end
+/// of the value, a balanced `( comment )` (then optional LWS and end or
+/// `;params`), or `;params` may follow (RFC 3261 §25.1
+/// `Retry-After = delta-seconds [ comment ] *( SEMI retry-param )`), so
+/// `1e9`, `120 abc`, `120 )` or `120 (unclosed` are invalid rather than read
+/// as a number.
+///
+/// RFC 3261 §21.5.4: a client SHOULD honour Retry-After on 503. The clamp
+/// keeps a hostile or buggy trunk from taking itself out indefinitely.
+///
+/// ## NIST 800-53 Rev5: SI-10 (Information Input Validation), SC-5
+fn retry_after_cooldown(resp: &SipResponse, max_secs: u32) -> Option<std::time::Duration> {
+    let value = resp
+        .headers
+        .get_value(&HeaderName::RetryAfter)?
+        .trim_start();
+    let digits = value
+        .bytes()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(value.len());
+    let delta = value.get(..digits).filter(|d| !d.is_empty())?;
+    if !retry_after_tail_ok(value.as_bytes().get(digits..).unwrap_or_default()) {
+        return None;
+    }
+    // Leading digits only: anything longer than u64 saturates (and is
+    // clamped below anyway).
+    let secs = delta.parse::<u64>().unwrap_or(u64::MAX);
+    if secs == 0 {
+        return None;
+    }
+    Some(std::time::Duration::from_secs(
+        secs.min(u64::from(max_secs.max(1))),
+    ))
+}
+
+/// What may follow Retry-After's delta-seconds: `LWS [ comment LWS ]`, then
+/// the end of the value or `;`. A comment nests and honours `\` quoted-pairs
+/// (RFC 3261 §25.1); an unbalanced one is rejected.
+fn retry_after_tail_ok(tail: &[u8]) -> bool {
+    let is_lws = |b: &u8| matches!(b, b' ' | b'\t' | b'\r' | b'\n');
+    let skip_lws = |t: &[u8], from: usize| {
+        t.get(from..)
+            .and_then(|rest| rest.iter().position(|b| !is_lws(b)))
+            .map_or(t.len(), |p| from + p)
+    };
+    let mut i = skip_lws(tail, 0);
+    if tail.get(i) == Some(&b'(') {
+        let mut depth = 0usize;
+        let mut escaped = false;
+        let mut closed = None;
+        for (j, &b) in tail.iter().enumerate().skip(i) {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match b {
+                b'\\' => escaped = true,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        closed = Some(j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = closed else {
+            return false;
+        };
+        i = skip_lws(tail, end + 1);
+    }
+    matches!(tail.get(i), None | Some(&b';'))
 }
 
 /// Replaces (or appends) `;name=value` on a header value, outside any
@@ -517,17 +695,19 @@ fn replace_header_param(header_value: &str, name: &str, value: &str) -> String {
 fn acquire_next_target(
     router: &mut Router,
     targets: &mut Vec<(String, String)>,
+    admission: Admission,
 ) -> Option<(TrunkLease, String)> {
     let mut consumed = 0;
     let mut found = None;
     for (group_id, trunk_id) in targets.iter() {
         consumed += 1;
-        if let Some(uri) = router.acquire_trunk(group_id, trunk_id) {
+        if let Some(uri) = router.acquire_trunk_for(group_id, trunk_id, admission) {
             found = Some((
                 TrunkLease {
                     group_id: group_id.clone(),
                     trunk_id: trunk_id.clone(),
                     started: Instant::now(),
+                    admission,
                 },
                 uri,
             ));
@@ -568,6 +748,28 @@ fn audit_invite_denied(req: &SipRequest, source: SbcSocketAddr, policy: &str) {
             action: "INVITE".to_string(),
             granted: false,
             policy: policy.to_string(),
+            source_ip: Some(source.ip()),
+        },
+    ));
+}
+
+/// `AuthorizationDecision` (granted) for an emergency call admitted past
+/// the capacity and VPS limits (47 CFR 9.16), so every bypass is on the
+/// audit trail with its source.
+///
+/// ## NIST 800-53 Rev5: AU-2, AU-3, SC-5
+fn audit_emergency_bypass(req: &SipRequest, source: SbcSocketAddr) {
+    audit(uc_audit::AuditEvent::AuthorizationDecision(
+        uc_audit::event::AuthorizationDecision {
+            identity: req
+                .headers
+                .get_value(&HeaderName::From)
+                .map_or_else(|| source.to_string(), extract_uri_from_header),
+            resource: req.uri.to_string(),
+            action: "INVITE".to_string(),
+            granted: true,
+            policy: "emergency-bypass".to_string(),
+            source_ip: Some(source.ip()),
         },
     ));
 }
@@ -709,6 +911,8 @@ impl SipStack {
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
             draining: std::sync::atomic::AtomicBool::new(false),
+            emergency_admissions: AtomicU64::new(0),
+            first_send_ok: FirstSendLedger::new(),
             next_rtp_port: std::sync::atomic::AtomicU16::new(32_770),
             allocated_ports: Arc::new(std::sync::Mutex::new(HashSet::new())),
             in_flight_invites: RwLock::new(HashSet::new()),
@@ -765,6 +969,8 @@ impl SipStack {
             registrations_active: AtomicU64::new(0),
             registrations_total: AtomicU64::new(0),
             draining: std::sync::atomic::AtomicBool::new(false),
+            emergency_admissions: AtomicU64::new(0),
+            first_send_ok: FirstSendLedger::new(),
             next_rtp_port: std::sync::atomic::AtomicU16::new(32_770),
             allocated_ports: Arc::new(std::sync::Mutex::new(HashSet::new())),
             in_flight_invites: RwLock::new(HashSet::new()),
@@ -1244,12 +1450,19 @@ impl SipStack {
             txns.client_invite
                 .entry(key.clone())
                 .or_insert_with(|| ClientInviteState {
+                    // POAM: client INVITE transactions are always built as
+                    // Unreliable, so Timer A also runs on TCP/TLS. RFC 3261
+                    // §17.1.1.2: Timer A must not run on reliable transports
+                    // (it sends duplicate INVITEs over TCP). Pass the real
+                    // transport type here.
                     transaction: ClientInviteTransaction::new(key, TransportType::Unreliable),
                     destination,
                     created_at: now,
                     request: message.clone(),
                     ack: None,
                     call,
+                    initial_send_pending: true,
+                    retransmitted: false,
                 });
         } else {
             txns.client_non_invite
@@ -1333,10 +1546,16 @@ impl SipStack {
             let mut txns = self.transactions.write().await;
             for (key, st) in &mut txns.client_invite {
                 match st.transaction.check_timers() {
-                    Some(TimerType::TimerA) => out.push(ProcessResult::Forward {
-                        message: st.request.clone(),
-                        destination: st.destination,
-                    }),
+                    Some(TimerType::TimerA) => {
+                        // A later failure may be this retransmission's; the
+                        // first-send ledger decides (see on_invite_sent). The
+                        // first-send flag stays set until that send reports.
+                        st.retransmitted = true;
+                        out.push(ProcessResult::Forward {
+                            message: st.request.clone(),
+                            destination: st.destination,
+                        });
+                    }
                     Some(TimerType::TimerB) => {
                         timed_out.push((key.branch.clone(), st.call.clone()));
                     }
@@ -1440,7 +1659,10 @@ impl SipStack {
         if branch == addrs.b_leg_branch {
             // RFC 3261 §17.1.1.2: Timer B is a 408; the trunk failed the
             // call, so try the next one first.
-            if let Some(retry) = self.try_failover(call, &addrs, None).await {
+            if let Some(retry) = self
+                .try_failover(call, &addrs, FailoverCause::Timeout)
+                .await
+            {
                 return vec![retry];
             }
             warn!(
@@ -1463,6 +1685,101 @@ impl SipStack {
         }
 
         Vec::new()
+    }
+
+    /// Reports the outcome of putting a forwarded request on the wire.
+    /// Only the first send of a call's initial B-leg INVITE matters: if it
+    /// failed (UDP send error, TCP/TLS connect, handshake or write failure,
+    /// send timeout) the call fails over to the next trunk now instead of
+    /// waiting 32 s for Timer B, or gets a 503 when none is left (RFC 3261
+    /// §8.1.3.1: a transport error is a 503; RFC 3263 §4.3). The failed
+    /// trunk counts a failure (`max_failures`) but is not cooled down.
+    ///
+    /// Retransmissions, ACK, CANCEL, in-dialog requests and re-INVITEs stay
+    /// log-only. The dead attempt's client transaction is dropped so its
+    /// Timer A/B cannot fire, and the attempt is current only while
+    /// `b_leg_branch` names it, so it cannot fail over twice.
+    ///
+    /// Returned results are already tracked; the caller only sends them.
+    ///
+    /// ## NIST 800-53 Rev5: CP-8 (Telecommunications Services), SI-17
+    pub async fn on_invite_sent(&self, message: &SipMessage, sent: bool) -> Vec<ProcessResult> {
+        let SipMessage::Request(req) = message else {
+            return Vec::new();
+        };
+        if req.method != Method::Invite {
+            return Vec::new();
+        }
+        let Some(branch) = req.headers.via_branch() else {
+            return Vec::new();
+        };
+        // A successful send only marks the branch in the lock-free ledger:
+        // no transactions lock on the common path (PERF-001).
+        if sent {
+            self.first_send_ok.record(&branch);
+            return Vec::new();
+        }
+        let key = TransactionKey::client(&branch, Method::Invite.to_string());
+        let call = {
+            let mut txns = self.transactions.write().await;
+            let Some(st) = txns.client_invite.get_mut(&key) else {
+                return Vec::new();
+            };
+            // After Timer A, a failure on a branch whose send already
+            // succeeded is the retransmission's: log-only. Otherwise the
+            // first send failed (possibly slowly, past Timer A on TCP/TLS).
+            if st.retransmitted && self.first_send_ok.contains(&branch) {
+                st.initial_send_pending = false;
+                return Vec::new();
+            }
+            // The first failure report clears the flag: exactly once.
+            if !std::mem::take(&mut st.initial_send_pending)
+                || st.transaction.state() != ClientInvitePhase::Calling
+            {
+                return Vec::new();
+            }
+            st.call.clone()
+        };
+        let addrs = {
+            let corr = self.call_correlation.read().await;
+            match corr.addresses.get(&call) {
+                Some(a) if a.b_leg_branch == branch && !a.b_leg_answered => a.clone(),
+                _ => return Vec::new(),
+            }
+        };
+        // Stop Timer A/B on the dead attempt.
+        self.transactions.write().await.client_invite.remove(&key);
+        warn!(
+            call_id = %addrs.a_leg_sip_call_id,
+            destination = %addrs.b_leg_destination,
+            "B-leg INVITE could not be sent; failing over"
+        );
+
+        let out = if let Some(retry) = self
+            .try_failover(&call, &addrs, FailoverCause::TransportError)
+            .await
+        {
+            vec![retry]
+        } else {
+            let unavailable = StatusCode::SERVICE_UNAVAILABLE;
+            audit_call_terminated(&addrs, uc_audit::event::TerminationReason::Failed);
+            {
+                let mut calls = self.calls.write().await;
+                if let Some(c) = calls.calls.get_mut(&call) {
+                    c.fail(unavailable.code(), unavailable.reason_phrase());
+                }
+            }
+            let resp = build_a_leg_response(unavailable, &addrs);
+            self.cleanup_terminated_call(&call, true).await;
+            vec![ProcessResult::Response {
+                message: SipMessage::Response(resp),
+                destination: addrs.a_leg_source,
+            }]
+        };
+        for r in &out {
+            self.track_result(r).await;
+        }
+        out
     }
 
     /// Re-sends 2xx responses whose ACK has not arrived; a 2xx still
@@ -2054,6 +2371,36 @@ impl SipStack {
             .set_trunk_reachable(trunk_id, reachable)
     }
 
+    /// Applies a detected reachability change (OPTIONS monitor or agent
+    /// publish) to trunk selection, logs it and records it on the audit
+    /// trail. Returns how many router trunks matched `trunk_id`.
+    ///
+    /// ## NIST 800-53 Rev5: AU-2, CP-8 (Telecommunications Services)
+    pub async fn apply_trunk_reachability_change(
+        &self,
+        trunk_id: &str,
+        reachable: bool,
+        source: uc_audit::event::ReachabilitySource,
+    ) -> usize {
+        let n = self.set_trunk_reachable(trunk_id, reachable).await;
+        info!(
+            trunk_id = %trunk_id,
+            reachable,
+            router_trunks = n,
+            source = ?source,
+            "Trunk reachability changed"
+        );
+        // The router lock is released; the audit hand-off does not block.
+        audit(uc_audit::AuditEvent::TrunkReachabilityChanged(
+            uc_audit::event::TrunkReachabilityChanged {
+                trunk_id: trunk_id.to_string(),
+                reachable,
+                source,
+            },
+        ));
+        n
+    }
+
     /// Active (reserved) calls on a trunk, if the router knows it.
     pub async fn trunk_active_calls(&self, group_id: &str, trunk_id: &str) -> Option<u32> {
         let router = self.router.as_ref()?;
@@ -2071,7 +2418,12 @@ impl SipStack {
     /// first, then the dial plan. Reserves a `max_calls` slot on the chosen
     /// trunk; a trunk whose URI does not resolve counts as failed and the
     /// next failover target is tried.
-    async fn route_to_trunk(&self, dest_user: &str, css: Option<&str>) -> TrunkRouting {
+    async fn route_to_trunk(
+        &self,
+        dest_user: &str,
+        css: Option<&str>,
+        admission: Admission,
+    ) -> TrunkRouting {
         let Some(router_lock) = self.router.as_ref() else {
             warn!("No router configured on SIP stack");
             return TrunkRouting::NoRoute;
@@ -2095,7 +2447,11 @@ impl SipStack {
                     css = ?css,
                     "Routed via SBC CSS/Partition"
                 );
-                match router.route_to_groups(&result.transformed_number, &result.route_group_ids) {
+                match router.route_to_groups_for(
+                    &result.transformed_number,
+                    &result.route_group_ids,
+                    admission,
+                ) {
                     Ok(d) => decision = Some(d),
                     Err(RoutingError::AllTrunksFailed { trunks_tried }) if trunks_tried > 0 => {
                         matched_trunks = true;
@@ -2107,7 +2463,7 @@ impl SipStack {
             }
             if decision.is_none() && !matched_trunks {
                 debug!(dest = %dest_user, "Attempting dial plan routing");
-                match router.route(dest_user) {
+                match router.route_for(dest_user, admission) {
                     Ok(d) => decision = Some(d),
                     Err(RoutingError::AllTrunksFailed { trunks_tried }) if trunks_tried > 0 => {
                         matched_trunks = true;
@@ -2130,6 +2486,7 @@ impl SipStack {
             group_id: decision.trunk_group_id,
             trunk_id: decision.trunk_id,
             started: Instant::now(),
+            admission,
         };
         let translated = decision.destination;
         let mut failover = decision.failover_targets;
@@ -2172,7 +2529,7 @@ impl SipStack {
             let next = {
                 let mut router = router_lock.write().await;
                 router.release_trunk(&lease.group_id, &lease.trunk_id, TrunkOutcome::Failed);
-                acquire_next_target(&mut router, &mut failover)
+                acquire_next_target(&mut router, &mut failover, admission)
             };
             match next {
                 Some((l, u)) => {
@@ -2185,14 +2542,20 @@ impl SipStack {
     }
 
     /// Retries the initial INVITE on the next usable failover trunk after
-    /// the current trunk failed it (`status` is the final response, `None`
-    /// for Timer B). Returns `None` when no failover applies, so the caller
-    /// fails the call as before.
+    /// the current trunk failed it (`cause`: final status, Timer B, or a
+    /// failed first send). Returns `None` when no failover applies, so the
+    /// caller fails the call as before.
     ///
     /// Failover is skipped once the callee answered or a reliable 18x with
     /// SDP reached the caller (the early media is committed to this trunk).
     /// The old slot is released as failed and, on 503, the trunk goes into
-    /// cooldown (RFC 3261 §21.5.4, RFC 3263 §4.3).
+    /// cooldown for its bounded `Retry-After`, else `cooldown_secs` (RFC
+    /// 3261 §21.5.4, RFC 3263 §4.3). Each failover is audited
+    /// (`TrunkFailover`).
+    ///
+    /// Only the attempt that is still current fails over: the swap below
+    /// checks `b_leg_branch`, so a late Timer B or a second report for an
+    /// attempt already failed over finds no match.
     ///
     /// ## NIST 800-53 Rev5: CP-8 (Telecommunications Services), SC-5
     // POAM: the failover INVITE keeps the original Request-URI scheme/host
@@ -2204,7 +2567,7 @@ impl SipStack {
         &self,
         internal_id: &CallId,
         addrs: &CallAddresses,
-        status: Option<u16>,
+        cause: FailoverCause,
     ) -> Option<ProcessResult> {
         if addrs.b_leg_answered || addrs.early_media_committed {
             return None;
@@ -2218,7 +2581,11 @@ impl SipStack {
 
         let mut remaining = addrs.failover_targets.clone();
         let (lease, new_dest) = loop {
-            let next = acquire_next_target(&mut *router_lock.write().await, &mut remaining)?;
+            let next = acquire_next_target(
+                &mut *router_lock.write().await,
+                &mut remaining,
+                old_lease.admission,
+            )?;
             // DNS (if any) runs outside the router lock.
             if let Some(dest) = resolve_sip_uri_to_addr(&next.1) {
                 break (next.0, dest);
@@ -2294,19 +2661,28 @@ impl SipStack {
         {
             let mut router = router_lock.write().await;
             router.release_trunk(&failed.group_id, &failed.trunk_id, TrunkOutcome::Failed);
-            if status == Some(503) {
-                router.cooldown_trunk(&failed.group_id, &failed.trunk_id);
+            if let FailoverCause::Status(503, retry_after) = cause {
+                router.cooldown_trunk(&failed.group_id, &failed.trunk_id, retry_after);
             }
         }
-        // POAM: trunk failover has no dedicated uc-audit event type yet; it
-        // is logged at warn. Add `TrunkFailover` to uc_audit::event (AU-2).
         warn!(
             call_id = %addrs.a_leg_sip_call_id,
             failed_trunk = %old_lease.trunk_id,
-            status = status.map_or_else(|| "timeout".to_string(), |s| s.to_string()),
+            cause = ?cause,
             next_trunk = %lease.trunk_id,
             "Trunk failover: retrying INVITE on next trunk"
         );
+        // NIST 800-53 Rev5: AU-2, CP-8 — no lock is held here; the audit
+        // hand-off is a non-blocking queue push.
+        audit(uc_audit::AuditEvent::TrunkFailover(
+            uc_audit::event::TrunkFailover {
+                call_id: uc_types::identifier::CallId::new(addrs.a_leg_sip_call_id.clone()),
+                group_id: failed.group_id.clone(),
+                failed_trunk_id: failed.trunk_id.clone(),
+                reason: cause.audit_reason(),
+                next_trunk_id: lease.trunk_id.clone(),
+            },
+        ));
         Some(ProcessResult::Forward {
             message: SipMessage::Request(request),
             destination: new_dest,
@@ -2421,6 +2797,13 @@ impl SipStack {
     /// Sets the Voice Protection System engine for call screening.
     pub fn set_vps_engine(&mut self, engine: uc_vps::VpsEngine) {
         self.vps = Some(tokio::sync::Mutex::new(engine));
+    }
+
+    /// Emergency INVITEs admitted through the emergency bypass so far.
+    ///
+    /// ## NIST 800-53 Rev5: SI-4 (System Monitoring), SC-5
+    pub fn emergency_admissions(&self) -> u64 {
+        self.emergency_admissions.load(Ordering::Relaxed)
     }
 
     /// Enters draining mode: new INVITEs are rejected with 503 while
@@ -2573,6 +2956,7 @@ impl SipStack {
                     .with_priority(t_config.priority)
                     .with_weight(t_config.weight)
                     .with_max_calls(t_config.max_calls)
+                    .with_emergency_reserve_calls(t_config.effective_emergency_reserve_calls())
                     .with_cooldown_secs(u64::from(t_config.cooldown_secs))
                     .with_max_failures(t_config.max_failures);
 
@@ -3293,9 +3677,18 @@ impl SipStack {
     ) -> ProcessResult {
         // A trunk failure (408/5xx, not a callee reject) fails over to the
         // next trunk of the route before the caller hears about it.
+        let retry_after = if status_code == 503 {
+            retry_after_cooldown(resp, self.config.trunk_retry_after_max_secs)
+        } else {
+            None
+        };
         if is_failover_status(status_code)
             && let Some(retry) = self
-                .try_failover(internal_id, addrs, Some(status_code))
+                .try_failover(
+                    internal_id,
+                    addrs,
+                    FailoverCause::Status(status_code, retry_after),
+                )
                 .await
         {
             return retry;
@@ -3335,7 +3728,7 @@ impl SipStack {
             router
                 .write()
                 .await
-                .cooldown_trunk(&lease.group_id, &lease.trunk_id);
+                .cooldown_trunk(&lease.group_id, &lease.trunk_id, retry_after);
         }
 
         warn!(
@@ -3533,6 +3926,7 @@ impl SipStack {
                         action: "REGISTER".to_string(),
                         granted: false,
                         policy: "max-registrations".to_string(),
+                        source_ip: Some(source.ip()),
                     },
                 ));
                 let mut unavailable =
@@ -3794,16 +4188,45 @@ impl SipStack {
             };
         }
 
+        // Emergency calls (dialed Request-URI user, before any translation)
+        // are not refused while held normal calls fill `general.max_calls`
+        // or trunk `max_calls`: they may use a bounded emergency reserve
+        // above each, and skip VPS number/caller screening. Source
+        // admission (above), authentication, operator source-IP blocks and
+        // the transport flood limiter still apply; every bypass is audited.
+        //
+        // ## 47 CFR 9.16; NIST 800-53 Rev5: SC-5, AU-2
+        let emergency = self
+            .config
+            .emergency_numbers
+            .matches(req.uri.user.as_deref().unwrap_or(""));
+        let admission = if emergency {
+            Admission::Emergency
+        } else {
+            Admission::Normal
+        };
+
         // Admission control: reject new calls beyond the configured ceiling
         // (general.max_calls) instead of allocating unbounded state.
+        // Emergency calls may also use `emergency_reserve_calls` above it,
+        // never more; normal calls never reach the reserve.
         //
-        // ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+        // ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection); 47 CFR 9.16
         {
+            let ceiling = if emergency {
+                self.config
+                    .max_calls
+                    .saturating_add(self.config.emergency_reserve_calls)
+            } else {
+                self.config.max_calls
+            };
             let calls = self.calls.read().await;
-            if calls.calls.len() >= self.config.max_calls as usize {
+            if calls.calls.len() >= ceiling as usize {
                 warn!(
                     call_id = %a_leg_call_id,
                     max_calls = self.config.max_calls,
+                    ceiling,
+                    emergency,
                     "Maximum concurrent calls reached, rejecting INVITE"
                 );
                 drop(calls);
@@ -3878,7 +4301,11 @@ impl SipStack {
             let (verdict, reserved) = vps.lock().await.screen_and_reserve(&attempt);
             vps_callee = reserved;
             match verdict.action() {
-                uc_vps::VpsAction::Allow => {}
+                uc_vps::VpsAction::Allow => {
+                    if verdict.source() == uc_vps::VerdictSource::EmergencyBypass {
+                        info!(call_id = %a_leg_call_id, "Emergency call: VPS screening bypassed");
+                    }
+                }
                 uc_vps::VpsAction::Reject {
                     status_code,
                     reason,
@@ -3910,12 +4337,27 @@ impl SipStack {
                     warn!(
                         call_id = %a_leg_call_id,
                         stage = ?verdict.source(),
+                        emergency,
                         "VPS dropped INVITE (blocked source)"
                     );
+                    // A dropped emergency call is always audited; other
+                    // silent drops are not (flood amplification).
+                    if emergency {
+                        audit_invite_denied(req, source, "vps:blocklist");
+                    }
                     self.in_flight_invites.write().await.remove(&a_leg_call_id);
                     return ProcessResult::NoAction;
                 }
             }
+        }
+
+        // Audited (and counted) once the emergency call has passed the
+        // bounded reserve and the operator source-IP blocklist.
+        //
+        // ## 47 CFR 9.16; NIST 800-53 Rev5: AU-2, SI-4
+        if emergency {
+            audit_emergency_bypass(req, source);
+            self.emergency_admissions.fetch_add(1, Ordering::Relaxed);
         }
 
         // 3. Look up destination:
@@ -4012,7 +4454,7 @@ impl SipStack {
                 }
 
                 match self
-                    .route_to_trunk(&dest_user, css_id_owned.as_deref())
+                    .route_to_trunk(&dest_user, css_id_owned.as_deref(), admission)
                     .await
                 {
                     TrunkRouting::Routed(route) => {
@@ -8130,7 +8572,18 @@ mod tests {
         transform: (&str, &str),
         vps: Option<uc_vps::VpsEngine>,
     ) -> SipStack {
-        let mut stack = SipStack::new(SipStackConfig::default());
+        trunk_stack_cfg(SipStackConfig::default(), max_calls, transform, vps).await
+    }
+
+    /// [`trunk_stack`] with a stack config. The dial plan also sends `9…`
+    /// (emergency 911) to "carriers" untranslated.
+    async fn trunk_stack_cfg(
+        config: SipStackConfig,
+        max_calls: u32,
+        transform: (&str, &str),
+        vps: Option<uc_vps::VpsEngine>,
+    ) -> SipStack {
+        let mut stack = SipStack::new(config);
         let routing = sbc_config::RoutingConfig {
             use_dial_plan: true,
             max_failover_attempts: 3,
@@ -8140,16 +8593,28 @@ mod tests {
             id: "plan".to_string(),
             name: "Plan".to_string(),
             active: true,
-            entries: vec![sbc_config::DialPlanEntryConfig {
-                direction: "both".to_string(),
-                pattern_type: "prefix".to_string(),
-                pattern_value: "+1".to_string(),
-                trunk_group: "carriers".to_string(),
-                transform_type: transform.0.to_string(),
-                transform_value: transform.1.to_string(),
-                priority: 1,
-                ..Default::default()
-            }],
+            entries: vec![
+                sbc_config::DialPlanEntryConfig {
+                    direction: "both".to_string(),
+                    pattern_type: "prefix".to_string(),
+                    pattern_value: "+1".to_string(),
+                    trunk_group: "carriers".to_string(),
+                    transform_type: transform.0.to_string(),
+                    transform_value: transform.1.to_string(),
+                    priority: 1,
+                    ..Default::default()
+                },
+                sbc_config::DialPlanEntryConfig {
+                    direction: "both".to_string(),
+                    pattern_type: "prefix".to_string(),
+                    pattern_value: "9".to_string(),
+                    trunk_group: "carriers".to_string(),
+                    transform_type: "none".to_string(),
+                    transform_value: String::new(),
+                    priority: 2,
+                    ..Default::default()
+                },
+            ],
         }];
         let trunk = |id: &str, host: &str, priority: u32| sbc_config::TrunkConfigSchema {
             id: id.to_string(),
@@ -9170,6 +9635,927 @@ mod tests {
                 .await
                 .0,
             503
+        );
+    }
+
+    // ── POA&M quick wins: emergency bypass, Retry-After, send failover, audit ──
+
+    fn authz_events(
+        events: &[uc_audit::AuditEvent],
+    ) -> Vec<uc_audit::event::AuthorizationDecision> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                uc_audit::AuditEvent::AuthorizationDecision(d) => Some(d.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn failover_events(events: &[uc_audit::AuditEvent]) -> Vec<uc_audit::event::TrunkFailover> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                uc_audit::AuditEvent::TrunkFailover(f) => Some(f.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn place_call_to(stack: &SipStack, user: &str, call_id: &str) -> Vec<ProcessResult> {
+        flatten(
+            stack
+                .process_message(
+                    &caller_request("INVITE", user, call_id, 1, None, Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                )
+                .await,
+        )
+    }
+
+    async fn cooldown_remaining(stack: &SipStack, trunk: &str) -> Option<std::time::Duration> {
+        stack
+            .router()
+            .expect("router")
+            .read()
+            .await
+            .get_trunk_group("carriers")
+            .and_then(|g| g.get_trunk(trunk))
+            .and_then(uc_routing::Trunk::cooldown_until)
+            .map(|t| t.saturating_duration_since(Instant::now()))
+    }
+
+    fn with_retry_after(resp: &Bytes, value: &str) -> Bytes {
+        Bytes::from(String::from_utf8_lossy(resp).replacen(
+            "Content-Length:",
+            &format!("Retry-After: {value}\r\nContent-Length:"),
+            1,
+        ))
+    }
+
+    #[tokio::test]
+    async fn emergency_call_placed_while_callee_cap_max_calls_and_trunks_full() {
+        let config = SipStackConfig {
+            max_calls: 1,
+            ..SipStackConfig::default()
+        };
+        let stack = trunk_stack_cfg(config, 1, ("none", ""), Some(vps_with_callee_cap(1))).await;
+        // One ordinary call fills general.max_calls and t1's max_calls.
+        let r1 = place_call(&stack, "normal@em").await;
+        assert_eq!(forwarded(&r1, &Method::Invite).unwrap().1, t1());
+        // The VPS cap for 911 is already full (held emergency call).
+        stack.vps.as_ref().unwrap().lock().await.call_started("911");
+        assert_eq!(stack.vps_callee_concurrent_calls("911").await, Some(1));
+
+        // An ordinary call is refused by general.max_calls.
+        let r2 = place_call(&stack, "normal2@em").await;
+        assert!(responded(&r2, 503).is_some());
+
+        let capture = uc_audit::capture::start();
+        let r3 = place_call_to(&stack, "911", "e1@em").await;
+        let (inv, dest) = forwarded(&r3, &Method::Invite).expect("911 placed");
+        assert_eq!(dest, t1(), "trunk max_calls does not block 911");
+        assert_eq!(inv.uri.user.as_deref(), Some("911"));
+        assert_eq!(active(&stack, "t1").await, 2, "slot still counted");
+        assert_eq!(
+            stack.vps_callee_concurrent_calls("911").await,
+            Some(1),
+            "emergency call reserves no VPS slot"
+        );
+        let authz = authz_events(&capture.events());
+        assert_eq!(authz.len(), 1, "{authz:?}");
+        assert!(authz[0].granted);
+        assert_eq!(authz[0].policy, "emergency-bypass");
+        assert_eq!(authz[0].source_ip, Some(alice().ip()));
+        assert_eq!(authz[0].action, "INVITE");
+
+        // A second 911 while the first is held also goes through; t1's
+        // reserve (10% of 1, min 1) is used up, so it takes t2.
+        let r4 = place_call_to(&stack, "911", "e2@em").await;
+        assert_eq!(forwarded(&r4, &Method::Invite).unwrap().1, t2());
+
+        // CANCEL releases the emergency trunk slot symmetrically.
+        stack
+            .process_message(
+                &caller_request("CANCEL", "911", "e1@em", 1, None, None),
+                alice(),
+                None,
+            )
+            .await;
+        assert_eq!(active(&stack, "t1").await, 1);
+    }
+
+    #[tokio::test]
+    async fn emergency_reserve_bounds_global_max_calls() {
+        // SEC-001 / Decision 6: max_calls=2 plus a reserve of 2.
+        let config = SipStackConfig {
+            max_calls: 2,
+            emergency_reserve_calls: 2,
+            ..SipStackConfig::default()
+        };
+        let stack = trunk_stack_cfg(config, 100, ("none", ""), None).await;
+        // An emergency call below max_calls takes an ordinary slot.
+        let e0 = place_call_to(&stack, "911", "g-e0@em").await;
+        assert!(forwarded(&e0, &Method::Invite).is_some());
+        let n1 = place_call(&stack, "g-n1@em").await;
+        assert!(forwarded(&n1, &Method::Invite).is_some());
+        // At max_calls: normal calls cannot consume the reserve.
+        for i in 0..3 {
+            let n = place_call(&stack, &format!("g-nx{i}@em")).await;
+            assert!(
+                responded(&n, 503).is_some(),
+                "normal call {i} used the reserve"
+            );
+        }
+        // Emergency calls fill the reserve exactly.
+        for i in 0..2 {
+            let e = place_call_to(&stack, "911", &format!("g-e{}@em", i + 1)).await;
+            assert!(forwarded(&e, &Method::Invite).is_some(), "reserve slot {i}");
+        }
+        // max_calls + reserve reached: 503, and no bypass audited.
+        let capture = uc_audit::capture::start();
+        let over = place_call_to(&stack, "911", "g-over@em").await;
+        assert!(forwarded(&over, &Method::Invite).is_none());
+        assert!(responded(&over, 503).is_some());
+        assert!(authz_events(&capture.events()).is_empty());
+        assert_eq!(stack.emergency_admissions(), 3);
+    }
+
+    #[tokio::test]
+    async fn emergency_reserve_bounds_trunk_max_calls() {
+        // Trunks t1/t2 with max_calls=1 and the default reserve (1 each).
+        let stack = trunk_stack(1, ("none", ""), None).await;
+        let n1 = place_call(&stack, "t-n1@em").await;
+        assert_eq!(forwarded(&n1, &Method::Invite).unwrap().1, t1());
+        let n2 = place_call(&stack, "t-n2@em").await;
+        assert_eq!(forwarded(&n2, &Method::Invite).unwrap().1, t2());
+        // Both trunks at max_calls: a normal call cannot use the reserve.
+        let n3 = place_call(&stack, "t-n3@em").await;
+        assert!(responded(&n3, 503).is_some());
+        // Emergency calls use each trunk's reserve, then skip to the next.
+        let e1 = place_call_to(&stack, "911", "t-e1@em").await;
+        assert_eq!(forwarded(&e1, &Method::Invite).unwrap().1, t1());
+        let e2 = place_call_to(&stack, "911", "t-e2@em").await;
+        assert_eq!(forwarded(&e2, &Method::Invite).unwrap().1, t2());
+        // Every trunk at max_calls + reserve: 503.
+        let e3 = place_call_to(&stack, "911", "t-e3@em").await;
+        assert!(forwarded(&e3, &Method::Invite).is_none());
+        assert!(responded(&e3, 503).is_some());
+        assert_eq!(active(&stack, "t1").await, 2);
+        assert_eq!(active(&stack, "t2").await, 2);
+        // Still no room for a normal call.
+        let n4 = place_call(&stack, "t-n4@em").await;
+        assert!(responded(&n4, 503).is_some());
+    }
+
+    #[tokio::test]
+    async fn emergency_bypasses_vps_deny_rules_only_for_emergency_numbers() {
+        let vps = uc_vps::VpsEngine::new(&uc_vps::VpsConfig {
+            enabled: true,
+            default_action: uc_vps::VpsDefaultAction::Deny,
+            tdos: uc_vps::TdosConfig {
+                per_source_cps: 0,
+                register_per_source_rps: 0,
+                ..uc_vps::TdosConfig::default()
+            },
+            ..uc_vps::VpsConfig::default()
+        })
+        .unwrap();
+        let stack = trunk_stack(10, ("none", ""), Some(vps)).await;
+        // Caller-number block (number policy, bypassed for 911).
+        stack
+            .vps
+            .as_ref()
+            .unwrap()
+            .lock()
+            .await
+            .block_caller_prefix("alice", None);
+        let normal = place_call(&stack, "deny@em").await;
+        assert!(forwarded(&normal, &Method::Invite).is_none());
+        let em = place_call_to(&stack, "911", "deny-e@em").await;
+        assert!(
+            forwarded(&em, &Method::Invite).is_some(),
+            "caller blocklist and default-deny do not stop 911"
+        );
+        // Not a prefix match.
+        let not_em = place_call_to(&stack, "9111", "deny-9111@em").await;
+        assert!(forwarded(&not_em, &Method::Invite).is_none());
+    }
+
+    #[tokio::test]
+    async fn operator_source_ip_block_still_rejects_emergency_calls() {
+        // Decision 7: an operator source-IP block applies to 911 too.
+        let stack = trunk_stack(10, ("none", ""), Some(vps_with_callee_cap(10))).await;
+        stack
+            .vps
+            .as_ref()
+            .unwrap()
+            .lock()
+            .await
+            .block_source(alice().ip(), None);
+        let capture = uc_audit::capture::start();
+        let em = place_call_to(&stack, "911", "blk-e@em").await;
+        assert!(forwarded(&em, &Method::Invite).is_none());
+        let authz = authz_events(&capture.events());
+        assert_eq!(authz.len(), 1, "{authz:?}");
+        assert!(!authz[0].granted);
+        assert_eq!(authz[0].policy, "vps:blocklist");
+        assert_eq!(authz[0].source_ip, Some(alice().ip()));
+        assert_eq!(stack.emergency_admissions(), 0);
+    }
+
+    #[tokio::test]
+    async fn emergency_does_not_bypass_source_admission_or_trunk_reachability() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        // Source admission (ACL): an unknown source dialing 911 is refused.
+        let capture = uc_audit::capture::start();
+        let stranger = SbcSocketAddr::new_v4(std::net::Ipv4Addr::new(203, 0, 113, 9), 5060);
+        let r = flatten(
+            stack
+                .process_message(
+                    &caller_request("INVITE", "911", "acl@em", 1, None, Some(ALICE_SDP)),
+                    stranger,
+                    None,
+                )
+                .await,
+        );
+        assert!(responded(&r, 403).is_some());
+        let authz = authz_events(&capture.events());
+        assert_eq!(authz.len(), 1);
+        assert_eq!(authz[0].policy, "source-admission");
+        assert_eq!(authz[0].source_ip, Some(stranger.ip()));
+        drop(capture);
+
+        // Unreachable / cooling trunks are still skipped.
+        stack.set_trunk_reachable("t1", false).await;
+        stack.set_trunk_reachable("t2", false).await;
+        let r = place_call_to(&stack, "911", "down@em").await;
+        assert!(forwarded(&r, &Method::Invite).is_none());
+        assert!(responded(&r, 503).is_some());
+    }
+
+    #[tokio::test]
+    async fn empty_emergency_list_disables_the_bypass() {
+        let config = SipStackConfig {
+            max_calls: 1,
+            emergency_numbers: uc_vps::EmergencyNumbers::default(),
+            ..SipStackConfig::default()
+        };
+        let stack = trunk_stack_cfg(config, 10, ("none", ""), None).await;
+        place_call(&stack, "fill@em").await;
+        let r = place_call_to(&stack, "911", "nolist@em").await;
+        assert!(responded(&r, 503).is_some());
+    }
+
+    fn response_with_retry_after(value: Option<&str>) -> SipResponse {
+        let mut resp = SipResponse::new(StatusCode::SERVICE_UNAVAILABLE);
+        if let Some(v) = value {
+            resp.headers.set(HeaderName::RetryAfter, v);
+        }
+        resp
+    }
+
+    #[test]
+    fn retry_after_cooldown_honoured_clamped_or_fallback() {
+        let secs = |v: Option<&str>| {
+            retry_after_cooldown(&response_with_retry_after(v), 300).map(|d| d.as_secs())
+        };
+        assert_eq!(secs(Some("120")), Some(120));
+        assert_eq!(secs(Some("120(maintenance)")), Some(120));
+        assert_eq!(secs(Some("120\t;duration=10")), Some(120));
+        assert_eq!(secs(Some("1")), Some(1), "no cooldown_secs floor");
+        assert_eq!(secs(Some(" 120 (maintenance);duration=10")), Some(120));
+        assert_eq!(secs(Some("120;duration=10")), Some(120));
+        assert_eq!(secs(Some("120 (a (nested) \\) ok)  ")), Some(120));
+        assert_eq!(secs(Some("301")), Some(300));
+        assert_eq!(secs(Some("4294967296")), Some(300));
+        assert_eq!(secs(Some("99999999999999999999999999")), Some(300));
+        for fallback in [
+            None,
+            Some("0"),
+            Some("abc"),
+            Some(""),
+            Some("-5"),
+            Some("(soon)"),
+            Some("1e9"),
+            Some("12abc"),
+            Some("120x"),
+            Some("18446744073709551616x"),
+            Some("120 abc"),
+            Some("120 1e9"),
+            Some("120 )"),
+            Some("120 (unclosed"),
+            Some("120 (a) b"),
+        ] {
+            assert_eq!(secs(fallback), None, "{fallback:?}");
+        }
+        assert_eq!(
+            retry_after_cooldown(&response_with_retry_after(Some("50")), 10).map(|d| d.as_secs()),
+            Some(10)
+        );
+        // Hostile input never panics and never exceeds the clamp.
+        for v in [
+            "\u{0}",
+            "9\u{301}",
+            "１２",
+            "1e9",
+            "+1",
+            "  ",
+            "18446744073709551616x",
+        ] {
+            let d = retry_after_cooldown(&response_with_retry_after(Some(v)), 300);
+            assert!(d.is_none_or(|d| d.as_secs() <= 300), "{v:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn failover_503_retry_after_sets_trunk_cooldown() {
+        for (value, lo, hi) in [
+            (Some("120"), 118, 120),
+            (Some("4294967296"), 298, 300),
+            (None, 28, 30),
+            (Some("0"), 28, 30),
+            (Some("garbage"), 28, 30),
+        ] {
+            let stack = trunk_stack(10, ("none", ""), None).await;
+            let results = place_call(&stack, "ra@test").await;
+            let (first, _) = forwarded(&results, &Method::Invite).unwrap();
+            let first = first.clone();
+            let mut resp = response_to(&first, 503, Some("t1tag"), None);
+            if let Some(v) = value {
+                resp = with_retry_after(&resp, v);
+            }
+            let out = flatten(stack.process_message(&resp, t1(), None).await);
+            assert_eq!(forwarded(&out, &Method::Invite).unwrap().1, t2());
+            let left = cooldown_remaining(&stack, "t1").await.expect("cooling");
+            assert!(
+                (lo..=hi).contains(&left.as_secs()),
+                "{value:?}: cooldown {left:?} not in {lo}..={hi}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn final_503_without_failover_honours_retry_after() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let results = place_call(&stack, "ra-final@test").await;
+        let (first, _) = forwarded(&results, &Method::Invite).unwrap();
+        let first = first.clone();
+        let out = flatten(
+            stack
+                .process_message(&response_to(&first, 500, Some("x"), None), t1(), None)
+                .await,
+        );
+        let (retry, _) = forwarded(&out, &Method::Invite).unwrap();
+        let retry = retry.clone();
+        let resp = with_retry_after(&response_to(&retry, 503, Some("y"), None), "45");
+        let out = flatten(stack.process_message(&resp, t2(), None).await);
+        assert!(responded(&out, 503).is_some(), "last error relayed");
+        let left = cooldown_remaining(&stack, "t2").await.expect("t2 cooling");
+        assert!((43..=45).contains(&left.as_secs()), "{left:?}");
+    }
+
+    #[tokio::test]
+    async fn retransmission_send_failure_after_successful_first_send_is_log_only() {
+        // PERF-001: a successful send returns before any lock, recording the
+        // branch in the first-send ledger, so a retransmit failure is
+        // log-only.
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let results = place_call(&stack, "rtx@test").await;
+        let (first, _) = forwarded(&results, &Method::Invite).unwrap();
+        let first = SipMessage::Request(first.clone());
+        assert!(stack.on_invite_sent(&first, true).await.is_empty());
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let timers = stack.poll_timers().await;
+        let (rtx, dest) = forwarded(&timers, &Method::Invite).expect("Timer A retransmit");
+        assert_eq!(dest, t1());
+        let rtx = SipMessage::Request(rtx.clone());
+        assert!(stack.on_invite_sent(&rtx, false).await.is_empty());
+        assert_eq!(active(&stack, "t1").await, 1);
+        assert_eq!(active(&stack, "t2").await, 0);
+    }
+
+    #[tokio::test]
+    async fn slow_first_send_failing_after_timer_a_still_fails_over_once() {
+        // RFC-003: on TCP/TLS the first send can report after Timer A
+        // (500 ms). Its failure is still a first-send failure.
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let results = place_call(&stack, "slow@test").await;
+        let (first, _) = forwarded(&results, &Method::Invite).unwrap();
+        let first = SipMessage::Request(first.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let timers = stack.poll_timers().await;
+        assert!(
+            forwarded(&timers, &Method::Invite).is_some(),
+            "Timer A fired"
+        );
+        let out = flatten(ProcessResult::Multiple(
+            stack.on_invite_sent(&first, false).await,
+        ));
+        let (_, dest) = forwarded(&out, &Method::Invite).expect("immediate failover");
+        assert_eq!(dest, t2());
+        assert_eq!(active(&stack, "t1").await, 0);
+        assert_eq!(active(&stack, "t2").await, 1);
+        // The retransmission's failure on the dead attempt is ignored.
+        assert!(stack.on_invite_sent(&first, false).await.is_empty());
+        assert_eq!(active(&stack, "t2").await, 1);
+    }
+
+    #[tokio::test]
+    async fn send_failure_fails_over_once_without_waiting_for_timer_b() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let results = place_call(&stack, "sf@test").await;
+        let (first, dest) = forwarded(&results, &Method::Invite).unwrap();
+        assert_eq!(dest, t1());
+        let first = SipMessage::Request(first.clone());
+        let old_branch = match &first {
+            SipMessage::Request(r) => r.headers.via_branch().unwrap(),
+            SipMessage::Response(_) => unreachable!(),
+        };
+
+        let capture = uc_audit::capture::start();
+        let out = flatten(ProcessResult::Multiple(
+            stack.on_invite_sent(&first, false).await,
+        ));
+        let (retry, dest) = forwarded(&out, &Method::Invite).expect("immediate failover");
+        assert_eq!(dest, t2());
+        let retry = SipMessage::Request(retry.clone());
+        assert_eq!(active(&stack, "t1").await, 0);
+        assert_eq!(active(&stack, "t2").await, 1);
+        assert_eq!(
+            trunk_state(&stack, "t1").await,
+            uc_routing::TrunkState::Available,
+            "a transport error does not cool the trunk down"
+        );
+        let t1_failures = stack
+            .router()
+            .unwrap()
+            .read()
+            .await
+            .get_trunk_group("carriers")
+            .and_then(|g| g.get_trunk("t1"))
+            .map(|t| t.stats().consecutive_failures);
+        assert_eq!(t1_failures, Some(1), "counts as TrunkOutcome::Failed");
+        let fo = failover_events(&capture.events());
+        assert_eq!(fo.len(), 1);
+        assert_eq!(fo[0].failed_trunk_id, "t1");
+        assert_eq!(fo[0].next_trunk_id, "t2");
+        assert_eq!(fo[0].group_id, "carriers");
+        assert_eq!(
+            fo[0].reason,
+            uc_audit::event::FailoverReason::TransportError
+        );
+
+        // No double failover: a second report for the old attempt and its
+        // Timer B are no-ops.
+        assert!(stack.on_invite_sent(&first, false).await.is_empty());
+        let call = stack
+            .call_correlation
+            .read()
+            .await
+            .addresses
+            .keys()
+            .next()
+            .cloned()
+            .unwrap();
+        assert!(
+            stack
+                .fail_timed_out_request(&old_branch, &call)
+                .await
+                .is_empty()
+        );
+        // The dead attempt's transaction is gone: no Timer A toward t1.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let timers = stack.poll_timers().await;
+        assert!(
+            timers.iter().all(|r| !matches!(
+                r,
+                ProcessResult::Forward { destination, .. } if *destination == t1()
+            )),
+            "{timers:?}"
+        );
+        // The new attempt's first send succeeded; a later (retransmission)
+        // failure is log-only.
+        assert!(stack.on_invite_sent(&retry, true).await.is_empty());
+        assert!(stack.on_invite_sent(&retry, false).await.is_empty());
+        assert_eq!(failover_events(&capture.events()).len(), 1);
+        assert_eq!(active(&stack, "t2").await, 1);
+    }
+
+    #[tokio::test]
+    async fn send_failure_with_no_trunk_left_answers_503_and_releases() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let results = place_call(&stack, "sf2@test").await;
+        let first = SipMessage::Request(forwarded(&results, &Method::Invite).unwrap().0.clone());
+        let out = flatten(ProcessResult::Multiple(
+            stack.on_invite_sent(&first, false).await,
+        ));
+        let retry = SipMessage::Request(forwarded(&out, &Method::Invite).unwrap().0.clone());
+        let out = flatten(ProcessResult::Multiple(
+            stack.on_invite_sent(&retry, false).await,
+        ));
+        let (_, dest) = responded(&out, 503).expect("503 to the caller (RFC 3261 §8.1.3.1)");
+        assert_eq!(dest, alice());
+        assert!(forwarded(&out, &Method::Invite).is_none());
+        assert_all_released(&stack).await;
+    }
+
+    #[tokio::test]
+    async fn send_result_ignored_for_non_initial_invites() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        // Unknown branch.
+        let stray = SipMessage::Request(
+            SipMessage::parse(&caller_request("INVITE", DIALED, "x@t", 1, None, None))
+                .ok()
+                .and_then(|m| match m {
+                    SipMessage::Request(r) => Some(r),
+                    SipMessage::Response(_) => None,
+                })
+                .unwrap(),
+        );
+        assert!(stack.on_invite_sent(&stray, false).await.is_empty());
+        // Non-INVITE (BYE) and responses.
+        let bye =
+            SipMessage::parse(&caller_request("BYE", DIALED, "x@t", 2, Some("t"), None)).unwrap();
+        assert!(stack.on_invite_sent(&bye, false).await.is_empty());
+        let results = place_call(&stack, "ok@test").await;
+        let first = SipMessage::Request(forwarded(&results, &Method::Invite).unwrap().0.clone());
+        // A response already arrived (Proceeding): no failover.
+        let first_req = match &first {
+            SipMessage::Request(r) => r.clone(),
+            SipMessage::Response(_) => unreachable!(),
+        };
+        stack
+            .process_message(
+                &response_to(&first_req, 180, Some("t1tag"), None),
+                t1(),
+                None,
+            )
+            .await;
+        assert!(stack.on_invite_sent(&first, false).await.is_empty());
+        assert_eq!(active(&stack, "t1").await, 1);
+    }
+
+    #[tokio::test]
+    async fn denials_carry_source_ip_in_audit() {
+        // number-translation-invalid
+        let stack = trunk_stack(10, ("add_prefix", "@evil;"), None).await;
+        let capture = uc_audit::capture::start();
+        place_call(&stack, "xl@audit").await;
+        let authz = authz_events(&capture.events());
+        assert_eq!(authz.len(), 1);
+        assert_eq!(authz[0].policy, "number-translation-invalid");
+        assert_eq!(authz[0].source_ip, Some(alice().ip()));
+        assert!(!authz[0].granted);
+        drop(capture);
+
+        // no-usable-trunk
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        stack.set_trunk_reachable("t1", false).await;
+        stack.set_trunk_reachable("t2", false).await;
+        let capture = uc_audit::capture::start();
+        place_call(&stack, "down@audit").await;
+        let authz = authz_events(&capture.events());
+        assert_eq!(authz.len(), 1);
+        assert_eq!(authz[0].policy, "no-usable-trunk");
+        assert_eq!(authz[0].source_ip, Some(alice().ip()));
+        drop(capture);
+
+        // max-registrations
+        let stack = SipStack::new(SipStackConfig {
+            max_registrations: 1,
+            ..SipStackConfig::default()
+        });
+        register_status(&stack, &register_msg("u1", "ra-u1", 1, 3600)).await;
+        let capture = uc_audit::capture::start();
+        let (code, _) = register_status(&stack, &register_msg("u2", "ra-u2", 1, 3600)).await;
+        assert_eq!(code, 503);
+        let authz = authz_events(&capture.events());
+        assert_eq!(authz.len(), 1);
+        assert_eq!(authz[0].policy, "max-registrations");
+        assert_eq!(authz[0].source_ip, Some(bob().ip()));
+    }
+
+    #[tokio::test]
+    async fn reachability_change_is_audited() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let capture = uc_audit::capture::start();
+        let n = stack
+            .apply_trunk_reachability_change(
+                "t1",
+                false,
+                uc_audit::event::ReachabilitySource::Options,
+            )
+            .await;
+        assert_eq!(n, 1);
+        stack
+            .apply_trunk_reachability_change("t1", true, uc_audit::event::ReachabilitySource::Agent)
+            .await;
+        let events: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                uc_audit::AuditEvent::TrunkReachabilityChanged(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].trunk_id, "t1");
+        assert!(!events[0].reachable);
+        assert_eq!(
+            events[0].source,
+            uc_audit::event::ReachabilitySource::Options
+        );
+        assert!(events[1].reachable);
+        assert_eq!(events[1].source, uc_audit::event::ReachabilitySource::Agent);
+        assert_eq!(
+            trunk_state(&stack, "t1").await,
+            uc_routing::TrunkState::Available
+        );
+    }
+
+    #[tokio::test]
+    async fn status_failover_is_audited_with_status_reason() {
+        let capture = uc_audit::capture::start();
+        let (_stack, out) = first_trunk_answers(503, "fo-audit@qa").await;
+        assert!(forwarded(&out, &Method::Invite).is_some());
+        let fo = failover_events(&capture.events());
+        assert_eq!(fo.len(), 1);
+        assert_eq!(fo[0].reason, uc_audit::event::FailoverReason::Status(503));
+        assert_eq!(fo[0].call_id.as_str(), "fo-audit@qa");
+    }
+
+    // ── QA (poam-quick-wins): extra coverage ──
+
+    /// `trunk_stack_cfg` with catch-all routes so 933/112/`+911`/`(911)`
+    /// reach the trunk group (the base plan only routes `+1` and `9`).
+    async fn qa_catchall_stack(
+        config: SipStackConfig,
+        max_calls: u32,
+        vps: Option<uc_vps::VpsEngine>,
+    ) -> SipStack {
+        let mut stack = SipStack::new(config);
+        let routing = sbc_config::RoutingConfig {
+            use_dial_plan: true,
+            max_failover_attempts: 3,
+            default_trunk_group: "carriers".to_string(),
+        };
+        let entry = |prefix: &str, priority: u32| sbc_config::DialPlanEntryConfig {
+            direction: "both".to_string(),
+            pattern_type: "prefix".to_string(),
+            pattern_value: prefix.to_string(),
+            trunk_group: "carriers".to_string(),
+            transform_type: "none".to_string(),
+            transform_value: String::new(),
+            priority,
+            ..Default::default()
+        };
+        let dial_plans = vec![sbc_config::DialPlanConfig {
+            id: "plan".to_string(),
+            name: "Plan".to_string(),
+            active: true,
+            entries: vec![entry("+", 1), entry("9", 2), entry("1", 3), entry("(", 4)],
+        }];
+        let trunk = |id: &str, host: &str, priority: u32| sbc_config::TrunkConfigSchema {
+            id: id.to_string(),
+            host: host.to_string(),
+            port: 5060,
+            protocol: "udp".to_string(),
+            priority,
+            max_calls,
+            max_failures: 3,
+            ..Default::default()
+        };
+        let groups = vec![sbc_config::TrunkGroupConfig {
+            id: "carriers".to_string(),
+            name: "Carriers".to_string(),
+            strategy: "priority".to_string(),
+            trunks: vec![trunk("t1", "127.0.0.2", 1), trunk("t2", "127.0.0.3", 2)],
+            zone: None,
+        }];
+        stack.init_router_from_config(&routing, &dial_plans, &groups);
+        if let Some(engine) = vps {
+            stack.set_vps_engine(engine);
+        }
+        stack
+            .register_inbound_trunk("pbx", None, &[("192.168.1.1".to_string(), 5060)])
+            .await;
+        stack
+    }
+
+    /// Every default emergency number, and its separator/`+` spellings, is
+    /// placed with the VPS per-callee cap full, `general.max_calls` full and
+    /// every trunk at `max_calls`; each is audited with source_ip.
+    #[tokio::test]
+    async fn qa_each_default_emergency_number_placed_with_all_caps_full() {
+        let spellings = [
+            "911", "933", "112", "+911", "+933", "+112", "9-1-1", "9.1.1", "(911)", "9-3-3",
+            "1-1-2",
+        ];
+        for (i, user) in spellings.iter().enumerate() {
+            let config = SipStackConfig {
+                max_calls: 2,
+                ..SipStackConfig::default()
+            };
+            let stack = qa_catchall_stack(config, 1, Some(vps_with_callee_cap(1))).await;
+            // Fill t1 and t2 max_calls and general.max_calls.
+            assert!(
+                forwarded(
+                    &place_call_to(&stack, "+15550000001", &format!("f1-{i}@qa")).await,
+                    &Method::Invite
+                )
+                .is_some()
+            );
+            assert!(
+                forwarded(
+                    &place_call_to(&stack, "+15550000002", &format!("f2-{i}@qa")).await,
+                    &Method::Invite
+                )
+                .is_some()
+            );
+            assert!(
+                responded(
+                    &place_call_to(&stack, "+15550000003", &format!("f3-{i}@qa")).await,
+                    503
+                )
+                .is_some()
+            );
+            // VPS per-callee cap full for the canonical numbers.
+            for n in ["911", "933", "112"] {
+                stack.vps.as_ref().unwrap().lock().await.call_started(n);
+            }
+            let capture = uc_audit::capture::start();
+            let r = place_call_to(&stack, user, &format!("em-{i}@qa")).await;
+            assert!(
+                forwarded(&r, &Method::Invite).is_some(),
+                "{user}: emergency call must be placed, got {r:?}"
+            );
+            let authz = authz_events(&capture.events());
+            assert_eq!(authz.len(), 1, "{user}: {authz:?}");
+            assert_eq!(authz[0].policy, "emergency-bypass");
+            assert!(authz[0].granted);
+            assert_eq!(authz[0].source_ip, Some(alice().ip()));
+        }
+    }
+
+    /// Near-misses are not exempt: with capacity full they get 503 and no
+    /// emergency-bypass audit.
+    #[tokio::test]
+    async fn qa_emergency_near_misses_are_not_exempt() {
+        for (i, user) in [
+            "9110", "91", "9-1-1-1", "9111", "1911", "+1911", "988", "11",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let config = SipStackConfig {
+                max_calls: 1,
+                ..SipStackConfig::default()
+            };
+            let stack = qa_catchall_stack(config, 1, None).await;
+            assert!(
+                forwarded(
+                    &place_call(&stack, &format!("nf-{i}@qa")).await,
+                    &Method::Invite
+                )
+                .is_some()
+            );
+            let capture = uc_audit::capture::start();
+            let r = place_call_to(&stack, user, &format!("nm-{i}@qa")).await;
+            assert!(
+                forwarded(&r, &Method::Invite).is_none(),
+                "{user} must not bypass"
+            );
+            assert!(responded(&r, 503).is_some(), "{user}: {r:?}");
+            assert!(
+                authz_events(&capture.events())
+                    .iter()
+                    .all(|d| d.policy != "emergency-bypass"),
+                "{user}"
+            );
+        }
+    }
+
+    /// An emergency call still respects trunk cooldown (not only reachability).
+    #[tokio::test]
+    async fn qa_emergency_still_respects_trunk_cooldown() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        {
+            let router = stack.router().unwrap();
+            let mut r = router.write().await;
+            r.cooldown_trunk("carriers", "t1", Some(std::time::Duration::from_secs(60)));
+            r.cooldown_trunk("carriers", "t2", Some(std::time::Duration::from_secs(60)));
+        }
+        let r = place_call_to(&stack, "911", "cool@em").await;
+        assert!(forwarded(&r, &Method::Invite).is_none());
+        assert!(responded(&r, 503).is_some());
+    }
+
+    /// Retry-After of 1 s and with comment/params, end to end on failover.
+    #[tokio::test]
+    async fn qa_failover_503_retry_after_short_and_with_comment() {
+        for (value, lo, hi) in [
+            ("1", 0, 1),
+            ("120 (maintenance);duration=10", 118, 120),
+            ("3601", 298, 300),
+            ("-1", 28, 30),
+        ] {
+            let stack = trunk_stack(10, ("none", ""), None).await;
+            let results = place_call(&stack, "ra2@test").await;
+            let first = forwarded(&results, &Method::Invite).unwrap().0.clone();
+            let resp = with_retry_after(&response_to(&first, 503, Some("t1tag"), None), value);
+            let out = flatten(stack.process_message(&resp, t1(), None).await);
+            assert_eq!(forwarded(&out, &Method::Invite).unwrap().1, t2());
+            let left = cooldown_remaining(&stack, "t1").await.expect("cooling");
+            assert!(
+                (lo..=hi).contains(&left.as_secs()),
+                "{value:?}: {left:?} not in {lo}..={hi}"
+            );
+        }
+    }
+
+    /// Timer B failover is audited with reason Timeout.
+    #[tokio::test]
+    async fn qa_timer_b_failover_is_audited_with_timeout_reason() {
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let results = place_call(&stack, "tb@qa").await;
+        let first = forwarded(&results, &Method::Invite).unwrap().0.clone();
+        let branch = first.headers.via_branch().unwrap();
+        let call = stack
+            .call_correlation
+            .read()
+            .await
+            .addresses
+            .keys()
+            .next()
+            .cloned()
+            .unwrap();
+        let capture = uc_audit::capture::start();
+        let out = flatten(ProcessResult::Multiple(
+            stack.fail_timed_out_request(&branch, &call).await,
+        ));
+        assert_eq!(forwarded(&out, &Method::Invite).unwrap().1, t2());
+        let fo = failover_events(&capture.events());
+        assert_eq!(fo.len(), 1);
+        assert_eq!(fo[0].reason, uc_audit::event::FailoverReason::Timeout);
+        assert_eq!(fo[0].failed_trunk_id, "t1");
+        assert_eq!(fo[0].next_trunk_id, "t2");
+    }
+
+    /// Send failures of CANCEL, ACK and in-dialog requests are log-only.
+    #[tokio::test]
+    async fn qa_send_failure_of_cancel_ack_and_in_dialog_is_log_only() {
+        // CANCEL toward the trunk.
+        let stack = trunk_stack(10, ("none", ""), None).await;
+        let results = place_call(&stack, "cx@qa").await;
+        let first = forwarded(&results, &Method::Invite).unwrap().0.clone();
+        stack
+            .process_message(&response_to(&first, 100, None, None), t1(), None)
+            .await;
+        let out = flatten(
+            stack
+                .process_message(
+                    &caller_request("CANCEL", DIALED, "cx@qa", 1, None, None),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let capture = uc_audit::capture::start();
+        if let Some((cancel, _)) = forwarded(&out, &Method::Cancel) {
+            let cancel = SipMessage::Request(cancel.clone());
+            assert!(stack.on_invite_sent(&cancel, false).await.is_empty());
+        }
+        // The INVITE's own (late) send failure after CANCEL: no new trunk.
+        let r = stack
+            .on_invite_sent(&SipMessage::Request(first.clone()), false)
+            .await;
+        assert!(forwarded(&flatten(ProcessResult::Multiple(r)), &Method::Invite).is_none());
+        assert!(failover_events(&capture.events()).is_empty());
+        drop(capture);
+
+        // ACK and re-INVITE in an established dialog.
+        let (stack, _b_invite) = established_call().await;
+        let capture = uc_audit::capture::start();
+        let results = flatten(
+            stack
+                .process_message(
+                    &alice_request("INVITE", 2, Some("bobtag"), Some(ALICE_SDP)),
+                    alice(),
+                    None,
+                )
+                .await,
+        );
+        let (reinv, _) = forwarded(&results, &Method::Invite).expect("re-INVITE to bob");
+        let reinv = SipMessage::Request(reinv.clone());
+        assert!(stack.on_invite_sent(&reinv, false).await.is_empty());
+        let ack = SipMessage::parse(&alice_request("ACK", 1, Some("bobtag"), None)).unwrap();
+        assert!(stack.on_invite_sent(&ack, false).await.is_empty());
+        assert!(failover_events(&capture.events()).is_empty());
+        assert!(
+            !stack.call_correlation.read().await.addresses.is_empty(),
+            "dialog kept"
         );
     }
 }

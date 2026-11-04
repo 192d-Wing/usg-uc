@@ -190,6 +190,22 @@ pub struct ZoneConfig {
     pub external_ip: Option<String>,
 }
 
+/// Default `general.trunk_retry_after_max_secs`.
+pub const DEFAULT_TRUNK_RETRY_AFTER_MAX_SECS: u32 = 300;
+
+/// Largest accepted `general.trunk_retry_after_max_secs`.
+pub const MAX_TRUNK_RETRY_AFTER_SECS: u32 = 3600;
+
+/// Default emergency headroom above a `max_calls` limit: 10% of it,
+/// at least 1. Used when `emergency_reserve_calls` is not set.
+///
+/// ## 47 CFR 9.16; NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+#[must_use]
+pub const fn default_emergency_reserve(max_calls: u32) -> u32 {
+    let tenth = max_calls / 10;
+    if tenth == 0 { 1 } else { tenth }
+}
+
 /// General SBC settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -200,16 +216,49 @@ pub struct GeneralConfig {
     /// Cluster ID if running in a cluster.
     pub cluster_id: Option<String>,
 
-    /// Maximum concurrent calls.
+    /// Maximum concurrent calls on this node. A normal INVITE over the limit
+    /// gets 503 with no `Retry-After` (emergency calls may use
+    /// `emergency_reserve_calls` beyond it, and a refused emergency caller
+    /// may redial at once).
     pub max_calls: u32,
+
+    /// Extra concurrent calls above `max_calls` that only emergency calls
+    /// (`vps.emergency_numbers`) may use. A normal call is refused (503)
+    /// at `max_calls`; an emergency call is refused (503) only at
+    /// `max_calls + emergency_reserve_calls`, so held calls cannot block
+    /// 911 while an emergency flood stays bounded. Defaults to 10% of
+    /// `max_calls` (at least 1); must be 1..=`max_calls` when set.
+    ///
+    /// ## 47 CFR 9.16; NIST 800-53 Rev5: SC-5
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emergency_reserve_calls: Option<u32>,
 
     /// Maximum concurrent registrations.
     pub max_registrations: u32,
+
+    /// Upper bound, in seconds, on a trunk's `Retry-After` honoured as its
+    /// cooldown after a 503 (RFC 3261 §21.5.4), so a hostile or buggy peer
+    /// cannot take a trunk out indefinitely. Range 1-3600, default 300. A
+    /// missing, invalid or zero `Retry-After` uses the trunk's
+    /// `cooldown_secs`.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5, CP-8
+    pub trunk_retry_after_max_secs: u32,
 
     /// Default zone for internal registrations (phones, softclients).
     /// Must reference a defined zone name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_internal_zone: Option<String>,
+}
+
+impl GeneralConfig {
+    /// Emergency headroom above `max_calls` in effect (configured or
+    /// the 10% default).
+    #[must_use]
+    pub fn effective_emergency_reserve_calls(&self) -> u32 {
+        self.emergency_reserve_calls
+            .unwrap_or_else(|| default_emergency_reserve(self.max_calls))
+    }
 }
 
 impl Default for GeneralConfig {
@@ -218,7 +267,9 @@ impl Default for GeneralConfig {
             instance_name: "sbc-01".to_string(),
             cluster_id: None,
             max_calls: 10000,
+            emergency_reserve_calls: None,
             max_registrations: 50000,
+            trunk_retry_after_max_secs: DEFAULT_TRUNK_RETRY_AFTER_MAX_SECS,
             default_internal_zone: None,
         }
     }
@@ -827,6 +878,15 @@ pub struct TrunkConfigSchema {
     /// reached, routing skips the trunk; if every trunk is full or down the
     /// INVITE gets 503 with `Retry-After`. Must be > 0.
     pub max_calls: u32,
+    /// Extra calls above `max_calls` on this trunk that only emergency
+    /// calls may use: routing skips the trunk for a normal call at
+    /// `max_calls` and for an emergency call at `max_calls +
+    /// emergency_reserve_calls` (503 when no trunk is left). Defaults to
+    /// 10% of `max_calls` (at least 1); must be 1..=`max_calls` when set.
+    ///
+    /// ## 47 CFR 9.16; NIST 800-53 Rev5: SC-5
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emergency_reserve_calls: Option<u32>,
     /// Cooldown period (seconds) after `max_failures` consecutive failed
     /// calls (timeout, transport error, 5xx), or immediately after a 503.
     pub cooldown_secs: u32,
@@ -839,6 +899,16 @@ pub struct TrunkConfigSchema {
     pub options_ping_interval_secs: u32,
 }
 
+impl TrunkConfigSchema {
+    /// Emergency headroom above `max_calls` in effect (configured or
+    /// the 10% default).
+    #[must_use]
+    pub fn effective_emergency_reserve_calls(&self) -> u32 {
+        self.emergency_reserve_calls
+            .unwrap_or_else(|| default_emergency_reserve(self.max_calls))
+    }
+}
+
 impl Default for TrunkConfigSchema {
     fn default() -> Self {
         Self {
@@ -849,6 +919,7 @@ impl Default for TrunkConfigSchema {
             priority: 1,
             weight: 100,
             max_calls: 100,
+            emergency_reserve_calls: None,
             cooldown_secs: 30,
             max_failures: 5,
             options_ping_enabled: false,

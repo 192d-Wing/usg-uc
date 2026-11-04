@@ -329,3 +329,80 @@ fn qa_helm_rendered_sbc_config_validates() {
         }
     }
 }
+
+// ── POA&M quick wins: emergency list, Retry-After bound ────────────────
+
+#[test]
+fn emergency_numbers_default_when_vps_section_omits_them() {
+    let config = load_from_str("[vps]\nenabled = true\n").unwrap();
+    assert_eq!(
+        config.vps.unwrap().emergency_numbers,
+        vec!["911", "933", "112"]
+    );
+    assert_eq!(
+        sbc_config::schema::VpsConfig::default().emergency_numbers,
+        vec!["911", "933", "112"]
+    );
+}
+
+#[test]
+fn emergency_numbers_configurable_and_validated() {
+    let config = load_from_str("[vps]\nemergency_numbers = [\"911\", \"*99#\"]\n").unwrap();
+    assert_eq!(config.vps.unwrap().emergency_numbers, vec!["911", "*99#"]);
+    // Empty is accepted (the daemon warns at startup).
+    assert!(load_from_str("[vps]\nemergency_numbers = []\n").is_ok());
+    for bad in ["\"\"", "\"9-1-1\"", "\"911@evil\"", "\"+\""] {
+        let toml = format!("[vps]\nemergency_numbers = [{bad}]\n");
+        let err = load_from_str(&toml).expect_err(bad).to_string();
+        assert!(err.contains("emergency_numbers"), "{bad}: {err}");
+    }
+    let many = (0..33)
+        .map(|i| format!("\"{i}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert!(load_from_str(&format!("[vps]\nemergency_numbers = [{many}]\n")).is_err());
+}
+
+#[test]
+fn trunk_retry_after_max_secs_default_and_range() {
+    assert_eq!(default_config().general.trunk_retry_after_max_secs, 300);
+    let ok = load_from_str("[general]\ntrunk_retry_after_max_secs = 3600\n").unwrap();
+    assert_eq!(ok.general.trunk_retry_after_max_secs, 3600);
+    for bad in ["0", "3601", "-1"] {
+        assert!(
+            load_from_str(&format!("[general]\ntrunk_retry_after_max_secs = {bad}\n")).is_err(),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn router_emergency_admission_and_cooldown_override() {
+    use std::time::Duration;
+    use uc_routing::{Admission, Router, RouterConfig, Trunk, TrunkConfig, TrunkGroup};
+
+    let mut router = Router::new(
+        RouterConfig::default()
+            .with_dial_plan(false)
+            .with_default_trunk_group("g"),
+    );
+    let mut group = TrunkGroup::new("g", "G");
+    group.add_trunk(Trunk::new(
+        TrunkConfig::new("a", "a.example.com").with_max_calls(1),
+    ));
+    router.add_trunk_group(group);
+    router.route("1").unwrap();
+    assert!(router.route("1").is_err(), "a is at max_calls");
+    assert_eq!(
+        router
+            .route_for("911", Admission::Emergency)
+            .unwrap()
+            .trunk_id,
+        "a"
+    );
+    router.cooldown_trunk("g", "a", Some(Duration::from_secs(120)));
+    assert!(
+        router.route_for("911", Admission::Emergency).is_err(),
+        "cooldown still applies to emergency calls"
+    );
+}
