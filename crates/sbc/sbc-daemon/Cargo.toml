@@ -27,7 +27,9 @@ sbc-config = { path = "../sbc-config", features = ["telemetry"] }
 sbc-config-store = { workspace = true }
 uc-health.workspace = true
 uc-metrics.workspace = true
-uc-transport.workspace = true
+uc-transport = { workspace = true, features = ["websocket"] }
+uc-audit.workspace = true
+chrono.workspace = true
 uc-telemetry.workspace = true
 proto-sip = { workspace = true, features = ["digest-auth"] }
 proto-transaction.workspace = true

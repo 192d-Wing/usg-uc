@@ -53,21 +53,113 @@ pub fn create_server_config(
     cert_chain: Vec<CertificateDer<'static>>,
     private_key: PrivateKeyDer<'static>,
 ) -> TransportResult<ServerConfig> {
-    // Use aws-lc-rs provider for FIPS compliance
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    create_server_config_with(cert_chain, private_key, TlsServerOptions::default())
+}
 
-    let config = ServerConfig::builder_with_provider(Arc::new(provider))
-        .with_protocol_versions(&[&rustls::version::TLS13])
+/// Minimum protocol version a TLS server accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MinTlsVersion {
+    /// TLS 1.2 and 1.3 (1.3 is still preferred by negotiation).
+    V1_2,
+    /// TLS 1.3 only (CNSA 2.0 default).
+    #[default]
+    V1_3,
+}
+
+impl MinTlsVersion {
+    /// Parses the configuration spelling (`"1.2"` / `"1.3"`).
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "1.2" => Some(Self::V1_2),
+            "1.3" => Some(Self::V1_3),
+            _ => None,
+        }
+    }
+}
+
+/// Server-side TLS policy beyond the certificate: the protocol floor and,
+/// for mutual TLS, the CA store client certificates must chain to.
+#[derive(Debug, Default)]
+pub struct TlsServerOptions {
+    /// Lowest protocol version accepted.
+    pub min_version: MinTlsVersion,
+    /// When set, clients must present a certificate issued by one of these
+    /// roots (mutual TLS); otherwise no client certificate is requested.
+    pub client_ca: Option<rustls::RootCertStore>,
+}
+
+/// Creates a TLS server configuration with an explicit policy.
+///
+/// Uses the aws-lc-rs (FIPS) provider. With `client_ca` set, the handshake
+/// requires and verifies a client certificate (`WebPKI` rules against the
+/// given roots), which is how `security.require_mtls` is enforced for SIP.
+///
+/// ## Errors
+///
+/// Returns an error if the protocol versions, client verifier or
+/// certificate cannot be configured.
+pub fn create_server_config_with(
+    cert_chain: Vec<CertificateDer<'static>>,
+    private_key: PrivateKeyDer<'static>,
+    options: TlsServerOptions,
+) -> TransportResult<ServerConfig> {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let versions: &[&'static rustls::SupportedProtocolVersion] = match options.min_version {
+        MinTlsVersion::V1_3 => &[&rustls::version::TLS13],
+        MinTlsVersion::V1_2 => &[&rustls::version::TLS12, &rustls::version::TLS13],
+    };
+
+    let builder = ServerConfig::builder_with_provider(Arc::clone(&provider))
+        .with_protocol_versions(versions)
         .map_err(|e| TransportError::TlsHandshakeFailed {
-            reason: format!("failed to set TLS 1.3: {e}"),
-        })?
-        .with_no_client_auth()
+            reason: format!("failed to set TLS protocol versions: {e}"),
+        })?;
+
+    let builder = match options.client_ca {
+        Some(roots) => {
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(roots),
+                provider,
+            )
+            .build()
+            .map_err(|e| TransportError::TlsCertificateError {
+                reason: format!("client CA store rejected: {e}"),
+            })?;
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    };
+
+    builder
         .with_single_cert(cert_chain, private_key)
         .map_err(|e| TransportError::TlsCertificateError {
             reason: e.to_string(),
-        })?;
+        })
+}
 
-    Ok(config)
+/// Loads a PEM bundle of CA certificates into a root store (for mutual TLS).
+///
+/// ## Errors
+///
+/// Returns an error if the file cannot be read, holds no certificates, or a
+/// certificate is rejected by the store.
+pub fn load_root_store(path: &std::path::Path) -> TransportResult<rustls::RootCertStore> {
+    let certs = load_certs(path)?;
+    if certs.is_empty() {
+        return Err(TransportError::TlsCertificateError {
+            reason: format!("{} contains no certificates", path.display()),
+        });
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in certs {
+        roots
+            .add(cert)
+            .map_err(|e| TransportError::TlsCertificateError {
+                reason: format!("{}: {e}", path.display()),
+            })?;
+    }
+    Ok(roots)
 }
 
 /// Creates a CNSA 2.0 compliant TLS client configuration.
@@ -619,6 +711,14 @@ impl std::fmt::Debug for TlsListener {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn min_tls_version_parses_configuration_spelling() {
+        assert_eq!(MinTlsVersion::parse("1.3"), Some(MinTlsVersion::V1_3));
+        assert_eq!(MinTlsVersion::parse(" 1.2 "), Some(MinTlsVersion::V1_2));
+        assert_eq!(MinTlsVersion::parse("1.0"), None);
+        assert_eq!(MinTlsVersion::default(), MinTlsVersion::V1_3);
+    }
 
     #[test]
     fn test_cnsa_compliant_client_config() {

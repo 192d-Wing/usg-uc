@@ -120,6 +120,9 @@ pub struct SipStack {
     /// 2xx responses to INVITEs the SBC answered as UAS, retransmitted until
     /// ACKed (RFC 3261 §13.3.1.4). Keyed by the SIP Call-ID of that leg.
     pending_2xx: RwLock<HashMap<String, Pending2xx>>,
+    /// Per-user request limiter (`rate_limit.per_user_rps`), keyed by the
+    /// From user. `None` when disabled.
+    user_limiter: Option<tokio::sync::Mutex<uc_dos_protection::KeyedRateLimiter>>,
 }
 
 /// SIP stack configuration.
@@ -367,6 +370,60 @@ struct CallAddresses {
     /// ACK sent for the last relayed re-INVITE's 2xx (keyed by that
     /// re-INVITE's client branch) — re-sent if the 2xx is retransmitted.
     last_reinvite_ack: Option<(String, SipMessage, SbcSocketAddr)>,
+    /// When the B-leg answered (for the audit trail's call duration).
+    established_at: Option<Instant>,
+}
+
+/// Records a call-lifecycle event on the audit trail (NIST AU-2); a no-op
+/// when `logging.audit_enabled` is off.
+fn audit(event: uc_audit::AuditEvent) {
+    uc_audit::log_event(event);
+}
+
+/// `CallTerminated` for a call, with its duration since answer (0 when it
+/// never got answered).
+fn audit_call_terminated(addrs: &CallAddresses, reason: uc_audit::event::TerminationReason) {
+    audit(uc_audit::AuditEvent::CallTerminated(
+        uc_audit::event::CallTerminated {
+            call_id: uc_types::identifier::CallId::new(addrs.a_leg_sip_call_id.clone()),
+            duration_secs: addrs.established_at.map_or(0, |t| t.elapsed().as_secs()),
+            reason,
+        },
+    ));
+}
+
+/// `AuthorizationDecision` for a rejected INVITE (admission or VPS policy).
+fn audit_invite_denied(req: &SipRequest, source: SbcSocketAddr, policy: &str) {
+    audit(uc_audit::AuditEvent::AuthorizationDecision(
+        uc_audit::event::AuthorizationDecision {
+            identity: req
+                .headers
+                .get_value(&HeaderName::From)
+                .map_or_else(|| source.to_string(), extract_uri_from_header),
+            resource: req.uri.to_string(),
+            action: "INVITE".to_string(),
+            granted: false,
+            policy: policy.to_string(),
+        },
+    ));
+}
+
+/// `AuthenticationAttempt` for a REGISTER outcome.
+fn audit_register_auth(
+    aor: &str,
+    source: SbcSocketAddr,
+    method: uc_audit::event::AuthMethod,
+    failure_reason: Option<String>,
+) {
+    audit(uc_audit::AuditEvent::AuthenticationAttempt(
+        uc_audit::event::AuthenticationAttempt {
+            identity: aor.to_string(),
+            source_ip: source.ip(),
+            success: failure_reason.is_none(),
+            failure_reason,
+            method,
+        },
+    ));
 }
 
 /// A mid-dialog re-INVITE (RFC 3261 §14) or UPDATE (RFC 3311) received on one
@@ -492,6 +549,7 @@ impl SipStack {
             allocated_ports: Arc::new(std::sync::Mutex::new(HashSet::new())),
             in_flight_invites: RwLock::new(HashSet::new()),
             pending_2xx: RwLock::new(HashMap::new()),
+            user_limiter: None,
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
@@ -547,6 +605,7 @@ impl SipStack {
             allocated_ports: Arc::new(std::sync::Mutex::new(HashSet::new())),
             in_flight_invites: RwLock::new(HashSet::new()),
             pending_2xx: RwLock::new(HashMap::new()),
+            user_limiter: None,
             config,
             zone_registry: None,
             inbound_trunk_map: RwLock::new(std::collections::HashMap::new()),
@@ -1185,6 +1244,7 @@ impl SipStack {
                 call_id = %addrs.a_leg_sip_call_id,
                 "No final response from B-leg (Timer B); failing call with 408"
             );
+            audit_call_terminated(&addrs, uc_audit::event::TerminationReason::Timeout);
             {
                 let mut calls = self.calls.write().await;
                 if let Some(c) = calls.calls.get_mut(call) {
@@ -1240,6 +1300,7 @@ impl SipStack {
                 call_id = %leg_call_id,
                 "2xx never ACKed; terminating call (RFC 3261 §13.3.1.4)"
             );
+            audit_call_terminated(&addrs, uc_audit::event::TerminationReason::Failed);
             if addrs.dialog_to_tag.is_some() {
                 out.push(ProcessResult::Forward {
                     message: SipMessage::Request(Self::build_leg_bye(&addrs, false)),
@@ -1749,6 +1810,7 @@ impl SipStack {
             call_id,
             "DTLS-SRTP media failed after answer; tearing down call (BYE both legs)"
         );
+        audit_call_terminated(&addrs, uc_audit::event::TerminationReason::Failed);
 
         vec![
             (SipMessage::Request(a_bye).to_bytes(), addrs.a_leg_source),
@@ -1770,6 +1832,49 @@ impl SipStack {
     /// digest). When false, any peer can bind any address-of-record.
     pub fn register_auth_enabled(&self) -> bool {
         self.bearer.is_some() || self.config.require_auth
+    }
+
+    /// Enables per-user request limiting (`rate_limit.per_user_rps`).
+    pub fn set_user_rate_limiter(&mut self, limiter: uc_dos_protection::KeyedRateLimiter) {
+        self.user_limiter = Some(tokio::sync::Mutex::new(limiter));
+    }
+
+    /// Applies the per-user limiter to a request: `Some(503)` when the From
+    /// user is over its rate (RFC 3261 §21.5.4 with `Retry-After`), `None`
+    /// to proceed. ACK is never limited (it completes a transaction already
+    /// admitted). Requests without a From user are not keyed.
+    async fn user_rate_limit(
+        &self,
+        req: &SipRequest,
+        source: SbcSocketAddr,
+    ) -> Option<ProcessResult> {
+        let limiter = self.user_limiter.as_ref()?;
+        if req.method == Method::Ack {
+            return None;
+        }
+        let user = req.headers.from_parsed().and_then(|f| f.uri.user)?;
+        let (action, threshold) = {
+            let mut l = limiter.lock().await;
+            (l.check(&user), l.rps())
+        };
+        if action.is_allowed() {
+            return None;
+        }
+        warn!(%user, source = %source, method = %req.method, "Per-user rate limit exceeded, 503");
+        uc_audit::log_event(uc_audit::AuditEvent::RateLimitTriggered(
+            uc_audit::event::RateLimitTriggered {
+                source_ip: source.ip(),
+                limit_name: format!("per_user_rps:{user}"),
+                request_count: u64::from(threshold),
+                threshold: u64::from(threshold),
+            },
+        ));
+        let mut response = create_response_from_request(req, StatusCode::SERVICE_UNAVAILABLE);
+        response.headers.set(HeaderName::RetryAfter, "1");
+        Some(ProcessResult::Response {
+            message: SipMessage::Response(response),
+            destination: source,
+        })
     }
 
     /// Sets the Voice Protection System engine for call screening.
@@ -2188,6 +2293,9 @@ impl SipStack {
             if let Some(answer) = self.answer_request_retransmit(req, source).await {
                 return answer;
             }
+            if let Some(rejected) = self.user_rate_limit(req, source).await {
+                return rejected;
+            }
             self.open_server_transaction(req, source).await;
         }
 
@@ -2552,8 +2660,15 @@ impl SipStack {
             if let Some(a) = corr.addresses.get_mut(internal_id) {
                 a.b_leg_answered = true;
                 a.a_leg_last_sdp.clone_from(&a_response.body);
+                a.established_at = Some(Instant::now());
             }
         }
+        audit(uc_audit::AuditEvent::CallEstablished(
+            uc_audit::event::CallEstablished {
+                call_id: uc_types::identifier::CallId::new(addrs.a_leg_sip_call_id.clone()),
+                established_at: chrono::Utc::now(),
+            },
+        ));
 
         // Build ACK for B-leg. The ACK belongs to the B-leg dialog: it
         // must carry the INVITE's From (our tag), the To with the callee's
@@ -2745,6 +2860,7 @@ impl SipStack {
             call_id = %addrs.a_leg_sip_call_id,
             "Call failed, forwarding error to A-leg"
         );
+        audit_call_terminated(addrs, uc_audit::event::TerminationReason::Rejected);
 
         ProcessResult::Response {
             message: SipMessage::Response(a_response),
@@ -2792,8 +2908,20 @@ impl SipStack {
             match bearer.authorize(auth_hdr, aor_user).await {
                 BearerResult::Authorized { dn, .. } => {
                     debug!(%dn, aor = %aor, "REGISTER bearer-authorized (RFC 8898)");
+                    audit_register_auth(&aor, source, uc_audit::event::AuthMethod::Jwt, None);
                 }
                 BearerResult::Challenge { error } => {
+                    // A challenge to a request that carried credentials is a
+                    // failed attempt; without credentials it is just the
+                    // initial challenge.
+                    if auth_hdr.is_some() {
+                        audit_register_auth(
+                            &aor,
+                            source,
+                            uc_audit::event::AuthMethod::Jwt,
+                            Some(format!("{error:?}")),
+                        );
+                    }
                     let mut response = create_response_from_request(req, StatusCode::UNAUTHORIZED);
                     response.add_header(Header::new(
                         HeaderName::WwwAuthenticate,
@@ -2806,6 +2934,12 @@ impl SipStack {
                 }
                 BearerResult::Forbidden { reason } => {
                     warn!(aor = %aor, %reason, "REGISTER bearer authorization denied");
+                    audit_register_auth(
+                        &aor,
+                        source,
+                        uc_audit::event::AuthMethod::Jwt,
+                        Some(reason),
+                    );
                     return ProcessResult::Response {
                         message: SipMessage::Response(create_response_from_request(
                             req,
@@ -2977,9 +3111,20 @@ impl SipStack {
                     bindings = binding_count,
                     "Registration successful"
                 );
+                if self.config.require_auth {
+                    audit_register_auth(&aor, source, uc_audit::event::AuthMethod::Digest, None);
+                }
             }
             401 => {
                 drop(registrar_guard);
+                if req.headers.get_value(&HeaderName::Authorization).is_some() {
+                    audit_register_auth(
+                        &aor,
+                        source,
+                        uc_audit::event::AuthMethod::Digest,
+                        Some("digest credentials rejected".to_string()),
+                    );
+                }
                 // Add WWW-Authenticate challenge header
                 if let Some(ref www_auth) = reg_response.www_authenticate {
                     response
@@ -3057,6 +3202,7 @@ impl SipStack {
                 source = %source,
                 "INVITE from a source that is neither a trunk nor registered, rejecting"
             );
+            audit_invite_denied(req, source, "source-admission");
             let forbidden = create_response_from_request(req, StatusCode::FORBIDDEN);
             return ProcessResult::Response {
                 message: SipMessage::Response(forbidden),
@@ -3195,6 +3341,11 @@ impl SipStack {
                         stage = ?verdict.source(),
                         rule = verdict.matched_rule().unwrap_or("-"),
                         "VPS rejected INVITE"
+                    );
+                    audit_invite_denied(
+                        req,
+                        source,
+                        &format!("vps:{}", verdict.matched_rule().unwrap_or("rate-limit")),
                     );
                     self.in_flight_invites.write().await.remove(&a_leg_call_id);
                     let rejection = create_response_from_request(
@@ -3647,6 +3798,7 @@ impl SipStack {
                     b_leg_last_sdp: b_leg_sdp.map(Bytes::from),
                     pending_reinvite: None,
                     last_reinvite_ack: None,
+                    established_at: None,
                 },
             );
         }
@@ -3875,6 +4027,14 @@ impl SipStack {
             early_dialog = use_cancel,
             "Call terminated via BYE"
         );
+        audit_call_terminated(
+            &addrs,
+            if is_from_a_leg {
+                uc_audit::event::TerminationReason::CallerHangup
+            } else {
+                uc_audit::event::TerminationReason::CalleeHangup
+            },
+        );
 
         ProcessResult::Multiple(vec![
             ProcessResult::Response {
@@ -4026,6 +4186,7 @@ impl SipStack {
         }
 
         info!(call_id = %sip_call_id, "Call cancelled");
+        audit_call_terminated(&addrs, uc_audit::event::TerminationReason::Canceled);
 
         ProcessResult::Multiple(vec![
             ProcessResult::Response {
@@ -6340,6 +6501,7 @@ mod tests {
             b_leg_last_sdp: None,
             pending_reinvite: None,
             last_reinvite_ack: None,
+            established_at: None,
         }
     }
 
@@ -7261,6 +7423,44 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         assert!(stack.poll_timers().await.is_empty());
         assert_eq!(stack.call_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn per_user_rate_limit_answers_503_with_retry_after() {
+        let mut stack = SipStack::new(SipStackConfig::default());
+        stack.set_user_rate_limiter(uc_dos_protection::KeyedRateLimiter::new(1, 1));
+        let options = |user: &str, n: u32| {
+            Bytes::from(format!(
+                "OPTIONS sip:sbc.local SIP/2.0\r\n\
+                 Via: SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK-rl-{user}-{n}\r\n\
+                 From: <sip:{user}@example.com>;tag={n}\r\n\
+                 To: <sip:sbc.local>\r\n\
+                 Call-ID: rl-{user}-{n}@test\r\n\
+                 CSeq: 1 OPTIONS\r\n\
+                 Content-Length: 0\r\n\r\n"
+            ))
+        };
+        let first = flatten(
+            stack
+                .process_message(&options("alice", 1), alice(), None)
+                .await,
+        );
+        assert!(responded(&first, 200).is_some());
+        let second = flatten(
+            stack
+                .process_message(&options("alice", 2), alice(), None)
+                .await,
+        );
+        let (resp, dest) = responded(&second, 503).expect("over the per-user rate");
+        assert_eq!(dest, alice());
+        assert_eq!(resp.headers.get_value(&HeaderName::RetryAfter), Some("1"));
+        // Another user from the same address is unaffected.
+        let other = flatten(
+            stack
+                .process_message(&options("bob", 1), alice(), None)
+                .await,
+        );
+        assert!(responded(&other, 200).is_some());
     }
 
     #[tokio::test]

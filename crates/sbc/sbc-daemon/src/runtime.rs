@@ -107,6 +107,7 @@ impl Runtime {
     pub async fn new(args: Args) -> Result<Self, RuntimeError> {
         // Load configuration
         let config = Self::load_config(&args)?;
+        Self::init_audit(&config, &args);
 
         // Initialize telemetry provider
         let telemetry = Self::init_telemetry(&config)?;
@@ -185,6 +186,45 @@ impl Runtime {
 
         info!("Telemetry provider initialized");
         Ok(Some(provider))
+    }
+
+    /// Starts the audit trail (NIST 800-53 AU-2/AU-3/AU-9) when
+    /// `logging.audit_enabled`: hash-chained JSON-lines at
+    /// `logging.audit_path`, or the tracing output (target `audit`) when no
+    /// path is configured. Records the startup event.
+    fn init_audit(config: &SbcConfig, args: &Args) {
+        if !config.logging.audit_enabled {
+            return;
+        }
+        let result = config.logging.audit_path.as_deref().map_or_else(
+            || {
+                info!("Audit events enabled on the tracing output (target \"audit\")");
+                uc_audit::init()
+            },
+            |path| match uc_audit::sink::FileSink::open(path) {
+                Ok(sink) => {
+                    info!(path = %path.display(), "Audit log enabled");
+                    uc_audit::init_with_sink(Box::new(sink))
+                }
+                Err(e) => {
+                    error!(
+                        path = %path.display(),
+                        error = %e,
+                        "Cannot open audit log; audit events go to the tracing output"
+                    );
+                    uc_audit::init()
+                }
+            },
+        );
+        if let Err(e) = result {
+            debug!(error = %e, "Audit logger already initialised");
+        }
+        uc_audit::log_event(uc_audit::AuditEvent::SystemStartup(
+            uc_audit::event::SystemStartup {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                config_path: args.effective_config_path().display().to_string(),
+            },
+        ));
     }
 
     /// Loads configuration from file or uses defaults.
@@ -1060,6 +1100,12 @@ impl Runtime {
         info!("Initiating graceful shutdown with connection draining");
         let drain_result = self.shutdown.shutdown_gracefully().await;
 
+        uc_audit::log_event(uc_audit::AuditEvent::SystemShutdown(
+            uc_audit::event::SystemShutdown {
+                reason: "shutdown signal".to_string(),
+                graceful: drain_result.drained,
+            },
+        ));
         if drain_result.drained {
             warn!(
                 duration_ms = drain_result.drain_duration_ms,

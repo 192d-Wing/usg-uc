@@ -40,7 +40,7 @@ pub mod limiter;
 pub mod tracker;
 
 pub use error::{DosError, DosResult};
-pub use limiter::{RateLimitAction, RateLimiter, RateLimiterConfig};
+pub use limiter::{KeyedRateLimiter, RateLimitAction, RateLimiter, RateLimiterConfig};
 pub use tracker::{RequestTracker, SourceStats};
 
 /// Default rate limit (requests per second).
