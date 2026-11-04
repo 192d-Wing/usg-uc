@@ -311,13 +311,16 @@ impl Default for TransportConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MediaConfig {
-    /// Default media mode for calls.
+    /// Default media mode for calls. Only `Relay` is accepted: the call path
+    /// always anchors media (validation rejects other values).
     pub default_mode: MediaMode,
 
-    /// Per-realm media mode overrides.
+    /// Per-realm media mode overrides. Not supported (needs media bypass);
+    /// validation rejects a non-empty map.
     pub realm_modes: HashMap<String, MediaMode>,
 
-    /// Enabled codecs in priority order.
+    /// Enabled codecs. Not enforced (no SDP codec filtering or
+    /// transcoding); validation accepts only the default set, in any order.
     pub codecs: Vec<CodecId>,
 
     /// RTP port range start.
@@ -820,12 +823,20 @@ pub struct TrunkConfigSchema {
     pub priority: u32,
     /// Weight for weighted selection.
     pub weight: u32,
-    /// Maximum concurrent calls.
+    /// Maximum concurrent calls through this trunk on this node. When
+    /// reached, routing skips the trunk; if every trunk is full or down the
+    /// INVITE gets 503 with `Retry-After`. Must be > 0.
     pub max_calls: u32,
-    /// Cooldown period after failures (seconds).
+    /// Cooldown period (seconds) after `max_failures` consecutive failed
+    /// calls (timeout, transport error, 5xx), or immediately after a 503.
     pub cooldown_secs: u32,
-    /// Maximum consecutive failures before cooldown.
+    /// Consecutive failed calls before cooldown. Must be > 0.
     pub max_failures: u32,
+    /// Send periodic SIP OPTIONS to this trunk; a trunk that stops answering
+    /// 2xx is skipped by routing until it answers again.
+    pub options_ping_enabled: bool,
+    /// OPTIONS ping interval in seconds (5-3600) when enabled.
+    pub options_ping_interval_secs: u32,
 }
 
 impl Default for TrunkConfigSchema {
@@ -840,6 +851,8 @@ impl Default for TrunkConfigSchema {
             max_calls: 100,
             cooldown_secs: 30,
             max_failures: 5,
+            options_ping_enabled: false,
+            options_ping_interval_secs: 30,
         }
     }
 }

@@ -191,7 +191,7 @@ groups:
 
 ### Grafana Dashboard
 
-Import the provided dashboard from `deploy/grafana/sbc-dashboard.json` (if available) or create panels for:
+No Grafana dashboard is shipped in this repository. Create panels for:
 
 1. **Overview**: Active calls, registrations, RPS
 2. **SIP**: Request/response rates by method/code

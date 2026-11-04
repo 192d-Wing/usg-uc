@@ -40,6 +40,19 @@ The **Wiring** column says which shipped binary calls the code: `sbc-daemon` (SI
 | §20 | Header Fields | Complete | Wired (sbc-daemon, soft client) | 56 `HeaderName` variants in `header.rs` |
 | §22 | Authentication | Complete | Wired (soft client) | `auth.rs` (RFC 2617) used by the soft client as UAC. The daemon's REGISTER digest challenge/verification is proto-registrar's own code (`authentication.rs`), not `proto_sip::auth` |
 
+### sbc-daemon B2BUA trunk routing (RFC 3263 §4.3, RFC 3261 §8.1.1, §21.5.4)
+
+| Behaviour | Status | Wiring | Notes |
+|-----------|--------|--------|-------|
+| Failover to next trunk on 503 / timeout (RFC 3263 §4.3) | Partial | Wired (sbc-daemon) | `sip_stack.rs` `is_failover_status`, `try_failover`. 408, Timer B and 503 trigger failover; an unresolvable trunk URI also does. **Transport send errors do not** (POA&M-2 in NIST-800-53-CONTROLS.md). Tests `failover_on_503_retries_next_trunk_with_same_sdp`, `timer_b_fails_over_then_408_when_exhausted`, `qa_every_failover_status_moves_call_to_second_trunk` |
+| Failover on 500/502/504 | Local policy | Wired (sbc-daemon) | Beyond RFC 3263 §4.3; B2BUA policy. Same tests |
+| No failover on other 4xx / 6xx, or after 2xx / reliable 18x with SDP | Complete | Wired (sbc-daemon) | Tests `callee_reject_does_not_fail_over`, `qa_client_and_global_errors_never_fail_over`, `no_failover_after_reliable_early_media`, `qa_failover_still_happens_after_unreliable_or_sdp_less_18x`. A reliable 18x **without** SDP does not commit the call; the caller's early dialog with the first trunk is abandoned on failover (RFC-003, RFC 3262) |
+| Failover request construction (§8.1.1, §17.1.1) | Complete | Wired (sbc-daemon) | New Call-ID, branch, From tag, CSeq, untagged To; non-2xx ACKed on the failed trunk first. R-URI host/scheme and Via transport are not derived from the target trunk (RFC-005, POA&M-5) |
+| Trunk 503 Retry-After (§21.5.4) | Missing | — | Ignored; cooldown is always `cooldown_secs` (RFC-001) |
+| Relayed downstream 503 when failover is exhausted | Gap | Wired (sbc-daemon) | The last trunk's 503 is relayed unchanged, so an upstream may treat the SBC as overloaded (RFC-002) |
+| SBC-generated 503 + Retry-After (§21.5.4) | Complete | Wired (sbc-daemon) | All trunks full/down: `503`, `Retry-After: 5` (test `trunk_at_max_calls_is_skipped_then_503_when_all_full`). `general.max_registrations` exceeded: `503`, `Retry-After: 60` (tests `max_registrations_rejects_new_bindings_but_allows_refresh`, `qa_max_registrations_counts_bindings_and_allows_deregistration_forms`) |
+| Translated number in B-leg R-URI user and To (§8.1.1, §25.1) | Complete | Wired (sbc-daemon) | Restricted to unreserved/user-unreserved characters, max 64; otherwise 500. Tests `translated_number_is_on_b_leg_request_uri_and_to`, `qa_header_injection_in_translated_number_is_rejected`, `qa_translated_number_on_failover_invite_wire_bytes` |
+
 ---
 
 ## proto-transaction (RFC 3261 §17 + RFC 3262)
@@ -127,7 +140,7 @@ RFC 3261 §17 is wired into sbc-daemon and the soft client. RFC 3262 (PRACK/100r
 | §10.2.1 | Adding Bindings | Complete | Wired (sbc-daemon) | `AuthenticatedRegistrar::process_register` |
 | §10.2.2 | Removing Bindings | Complete | Wired (sbc-daemon) | Expires=0 handling |
 | §10.2.3 | Fetching Bindings | Complete | Wired (sbc-daemon) | `LocationService::lookup` for call routing |
-| §10.3 | Processing REGISTER | Complete | Wired (sbc-daemon) | Full registrar logic incl. 401 challenge; cluster mode uses `AsyncLocationService` |
+| §10.3 | Processing REGISTER | Partial | Wired (sbc-daemon) | Full registrar logic incl. 401 challenge; cluster mode uses `AsyncLocationService`. `max_registrations` admission runs after auth (`process_register_with_admission`). Known pre-existing gaps: RFC-R1-01 processing is not atomic (step 8 all-or-nothing); RFC-R1-02 a duplicate contact yields 500; RFC-R1-03 (partly fixed) `expires=0` removal now matches by binding key (`remove_binding_by_key`; tests `expires_zero_outbound_removes_only_outbound`, `expires_zero_plain_removes_only_plain`, `wildcard_removes_shared_uri_bindings`) and a moved flow (same key, new URI) is subject to the Call-ID/CSeq check (test `moved_flow_with_stale_cseq_is_rejected`), but plain `expires=0` removal still has no Call-ID/CSeq ordering check (step 7); RFC-R1-04 `TooManyContacts` yields 500 instead of a 4xx/503 |
 
 ### RFC 5626 Section Mapping (Outbound)
 

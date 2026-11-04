@@ -5,6 +5,8 @@ This document describes the clustering architecture and configuration for the US
 > **Status legend.** *Wired (sbc-daemon | sbc-media-core | soft client)* — a shipped binary has a call site for this (the binary is named). *Library-only* — implemented and tested in a `proto-*`/`uc-*` crate, but no shipped binary calls it. *Planned* — not implemented. A row that says only "Full"/"Complete" describes crate-level capability; the wiring column/annotation says what the running SBC actually does.
 >
 > **Build requirement.** Everything in this document requires `sbc-daemon` to be built with the `cluster` cargo feature (`--features cluster` or `--features full`; Redis/PostgreSQL additionally need `redis` / `postgres`). The default build (`default = []`) compiles a stub `ClusterManager` and ignores the `[cluster]` and `[storage]` sections entirely (`sbc-daemon/src/cluster.rs`, `sbc-config/src/schema.rs`).
+>
+> **Release image.** The release `Dockerfile` builds `sbc-daemon` with only `--features sbc-daemon/grpc`. The `cluster`, `redis` and `postgres` features are not enabled, so none of the "Wired (`cluster` feature)" rows below are present in the shipped image; they apply only to a custom build with those features.
 
 ## Overview
 

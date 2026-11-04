@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ## [Unreleased]
 
+### Changed (BREAKING, SBC operators)
+
+- **Configuration keys the SBC accepted but ignored are now rejected by `validate_config`** — the daemon refuses to start (CM-6/CM-7) when: `media.default_mode` is anything other than `Relay` (there is no media bypass); `media.realm_modes` has any entries; `media.codecs` differs from the default set `["Opus", "G722", "G711Ulaw", "G711Alaw"]` (order ignored; there is no SDP codec filtering or transcoding); a trunk has `max_calls = 0` or `max_failures = 0`; or `options_ping_interval_secs` is outside 5–3600 while `options_ping_enabled = true`. `sbc-media` exits at startup if `SBC_MEDIA_DEFAULT_MODE` is not `relay`. The `codecs` line was removed from `deploy/test/sbc-test.toml`. Remove or fix these keys before upgrading (`sbc-config`, `sbc-media`)
+
+### Fixed
+
+- **SBC features that could be configured but had no effect now work** — the SBC-router and dial-plan number translation is written into the B-leg Request-URI/To user part; trunk failover is filled in from the remaining trunks in the selected trunk group/route group, and `TrunkMonitor` OPTIONS health drives trunk selection so a down trunk is skipped (new config-file trunk keys `options_ping_enabled` / `options_ping_interval_secs`); per-trunk `max_calls`, `cooldown_secs` and `max_failures` are enforced; VPS `per_callee_max_concurrent` is enforced; `general.max_registrations` is enforced after authentication; the trunk-status publish service is bounded. Call counts are released on every teardown path (failure, CANCEL, timeout, BYE from either side) (`sbc-daemon`, `sbc-config`, `sbc-trunk-services`, `uc-routing`, `uc-vps`, `proto-registrar`)
+
 ### Added
 
 - **Mid-dialog re-INVITE and UPDATE relay** — the daemon now relays re-INVITE (RFC 3261 §14) and UPDATE (RFC 3311) across both legs of a B2BUA call, re-anchoring the new offer and answer through the media relay and following each leg's new RTP address, so hold/resume, codec changes and RFC 4028 session refreshes work end to end. Body-less refreshes are answered locally; a second change while one is in flight gets 491; `Supported: timer`, `Session-Expires` and `Min-SE` are carried through the initial INVITE and the 2xx (`sbc-daemon`, closes #117)

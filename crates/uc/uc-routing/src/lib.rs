@@ -56,7 +56,9 @@ pub use route_list::{RouteList, RouteListMember};
 pub use route_pattern::RoutePattern;
 pub use router::{Router, RouterConfig, RoutingDecision};
 pub use sbc_router::{SbcRouter, SbcRoutingResult};
-pub use trunk::{SelectionStrategy, Trunk, TrunkConfig, TrunkGroup, TrunkProtocol, TrunkState};
+pub use trunk::{
+    SelectionStrategy, Trunk, TrunkConfig, TrunkGroup, TrunkOutcome, TrunkProtocol, TrunkState,
+};
 
 /// Default routing priority.
 pub const DEFAULT_PRIORITY: u32 = 100;

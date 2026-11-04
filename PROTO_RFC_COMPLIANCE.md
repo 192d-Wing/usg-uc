@@ -63,6 +63,7 @@
 - No `TODO`/`FIXME` related to standards gaps found
 - Compact header forms (§7.3.3) supported for core headers (parse-only; the daemon/client framers special-case only `l:`)
 - sbc-daemon relays only REGISTER/INVITE/ACK/BYE/CANCEL/OPTIONS/UPDATE; all other methods receive 405
+- sbc-daemon trunk failover (RFC 3263 §4.3): 408/Timer B/503 plus local-policy 500/502/504; transport send errors do not trigger failover; a trunk's 503 `Retry-After` is ignored (fixed `cooldown_secs`). See `docs/RFC_COMPLIANCE_GAPS.md`
 
 ---
 

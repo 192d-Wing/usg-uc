@@ -30,6 +30,11 @@ const VALID_STRATEGIES: &[&str] = &[
 /// falls back to `udp`.
 const VALID_TRUNK_PROTOCOLS: &[&str] = &["udp", "tcp", "tls"];
 
+/// Bounds for `trunk_groups[].trunks[].options_ping_interval_secs`. The
+/// monitor never pings faster than every 5 s.
+const MIN_OPTIONS_PING_INTERVAL_SECS: u32 = 5;
+const MAX_OPTIONS_PING_INTERVAL_SECS: u32 = 3600;
+
 /// Call/rule directions accepted by the daemon; anything else silently falls
 /// back to `outbound` (dial plans) or `both` (header manipulation).
 const VALID_DIRECTIONS: &[&str] = &["inbound", "outbound", "both"];
@@ -163,11 +168,64 @@ fn validate_media(config: &crate::schema::MediaConfig) -> ConfigResult<()> {
         });
     }
 
+    validate_media_enforced(config)?;
+
     // CNSA 2.0: Validate SRTP profile
     validate_cnsa_srtp(&config.srtp);
 
     // CNSA 2.0: Validate DTLS fingerprint hash
     validate_cnsa_hash(config.dtls.fingerprint_hash);
+
+    Ok(())
+}
+
+/// Rejects media keys this build accepts in the schema but does not act on.
+///
+/// The live call path always anchors media (`Relay`): there is no media
+/// bypass, so `PassThrough`/`SignalingOnly` and per-realm overrides would be
+/// silently ignored. There is no SDP codec filtering or transcoding, so a
+/// non-default codec list would be ignored too.
+///
+/// ## NIST 800-53 Rev5: CM-6 (Configuration Settings), CM-7 (Least Functionality)
+fn validate_media_enforced(config: &crate::schema::MediaConfig) -> ConfigResult<()> {
+    use uc_types::media::MediaMode;
+
+    if config.default_mode != MediaMode::Relay {
+        return Err(ConfigError::Validation {
+            message: format!(
+                "media.default_mode = {:?} is not supported by this build (media is always \
+                 relayed; there is no media bypass); remove it or set it to \"Relay\"",
+                config.default_mode
+            ),
+        });
+    }
+
+    if !config.realm_modes.is_empty() {
+        let mut realms: Vec<&str> = config.realm_modes.keys().map(String::as_str).collect();
+        realms.sort_unstable();
+        return Err(ConfigError::Validation {
+            message: format!(
+                "media.realm_modes is not supported by this build (per-realm media modes need \
+                 media bypass); remove the entries for: {}",
+                realms.join(", ")
+            ),
+        });
+    }
+
+    // Order-insensitive: the list is not used for SDP negotiation, so only
+    // its contents matter for "is this the default".
+    let mut configured = config.codecs.clone();
+    let mut default = crate::schema::MediaConfig::default().codecs;
+    configured.sort_unstable_by_key(|c| format!("{c:?}"));
+    default.sort_unstable_by_key(|c| format!("{c:?}"));
+    if configured != default {
+        return Err(ConfigError::Validation {
+            message: "media.codecs is not enforced by this build (no SDP codec filtering or \
+                      transcoding); remove it or set it to the default list \
+                      [\"Opus\", \"G722\", \"G711Ulaw\", \"G711Alaw\"]"
+                .to_string(),
+        });
+    }
 
     Ok(())
 }
@@ -455,6 +513,46 @@ fn validate_trunks(group: &crate::schema::TrunkGroupConfig) -> ConfigResult<()> 
                 ),
             });
         }
+
+        // max_calls = 0 would make the trunk permanently "at capacity";
+        // max_failures = 0 would put it into cooldown on every failure.
+        // These keys are enforced by routing, so out-of-range values are
+        // rejected rather than accepted and ignored.
+        //
+        // ## NIST 800-53 Rev5: CM-6 (Configuration Settings), SC-5
+        if trunk.max_calls == 0 {
+            return Err(ConfigError::Validation {
+                message: format!(
+                    "trunk '{}' (group '{}'): max_calls must be greater than 0",
+                    trunk.id, group.id
+                ),
+            });
+        }
+        if trunk.max_failures == 0 {
+            return Err(ConfigError::Validation {
+                message: format!(
+                    "trunk '{}' (group '{}'): max_failures must be greater than 0",
+                    trunk.id, group.id
+                ),
+            });
+        }
+
+        // The OPTIONS monitor clamps to >= 5 s; reject values it would
+        // silently change rather than ignore them.
+        if trunk.options_ping_enabled
+            && !(MIN_OPTIONS_PING_INTERVAL_SECS..=MAX_OPTIONS_PING_INTERVAL_SECS)
+                .contains(&trunk.options_ping_interval_secs)
+        {
+            return Err(ConfigError::Validation {
+                message: format!(
+                    "trunk '{}' (group '{}'): options_ping_interval_secs must be between {} and {}",
+                    trunk.id,
+                    group.id,
+                    MIN_OPTIONS_PING_INTERVAL_SECS,
+                    MAX_OPTIONS_PING_INTERVAL_SECS
+                ),
+            });
+        }
     }
 
     Ok(())
@@ -712,6 +810,7 @@ mod tests {
         RoutingConfig, TopologyHidingConfig, TrunkConfigSchema, TrunkGroupConfig,
         TrunkManipulationRuleConfig, ZoneConfig,
     };
+    use uc_types::media::MediaMode;
 
     fn zone(name: &str) -> ZoneConfig {
         ZoneConfig {
@@ -1318,6 +1417,96 @@ mod tests {
     }
 
     // ── STIR/SHAKEN ────────────────────────────────────────────────
+
+    #[test]
+    fn test_repo_deploy_configs_validate() {
+        for rel in ["deploy/config/config.toml", "deploy/test/sbc-test.toml"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../..")
+                .join(rel);
+            let text = std::fs::read_to_string(&path).expect(rel);
+            let config = crate::load_from_str(&text).expect(rel);
+            let result = validate_config(&config);
+            assert!(result.is_ok(), "{rel} must validate: {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_media_default_mode_must_be_relay() {
+        for mode in [MediaMode::PassThrough, MediaMode::SignalingOnly] {
+            let mut config = SbcConfig::default();
+            config.media.default_mode = mode;
+            assert_rejected(&config, "media.default_mode");
+        }
+    }
+
+    #[test]
+    fn test_media_realm_modes_rejected() {
+        let mut config = SbcConfig::default();
+        config
+            .media
+            .realm_modes
+            .insert("external".to_string(), MediaMode::Relay);
+        assert_rejected(&config, "media.realm_modes");
+        assert_rejected(&config, "external");
+    }
+
+    #[test]
+    fn test_media_codecs_must_equal_default_set() {
+        use uc_types::codec::CodecId;
+
+        let mut config = SbcConfig::default();
+        config.media.codecs.reverse();
+        validate_config(&config).expect("reordered default codecs are accepted");
+
+        config.media.codecs = vec![CodecId::G711Ulaw, CodecId::G711Alaw, CodecId::G722];
+        assert_rejected(&config, "media.codecs");
+
+        config.media.codecs = vec![
+            CodecId::Opus,
+            CodecId::G722,
+            CodecId::G711Ulaw,
+            CodecId::G711Alaw,
+            CodecId::G711Alaw,
+        ];
+        assert_rejected(&config, "media.codecs");
+    }
+
+    #[test]
+    fn test_trunk_limits_must_be_positive() {
+        let mut config = SbcConfig::default();
+        let mut group = trunk_group("tg");
+        group.trunks[0].max_calls = 0;
+        config.trunk_groups = vec![group];
+        assert_rejected(&config, "max_calls");
+
+        let mut group = trunk_group("tg");
+        group.trunks[0].max_failures = 0;
+        config.trunk_groups = vec![group];
+        assert_rejected(&config, "max_failures");
+    }
+
+    #[test]
+    fn test_trunk_options_ping_interval_bounds() {
+        let mut config = SbcConfig::default();
+        let mut group = trunk_group("tg");
+        group.trunks[0].options_ping_enabled = true;
+        group.trunks[0].options_ping_interval_secs = 30;
+        config.trunk_groups = vec![group.clone()];
+        validate_config(&config).expect("30 s ping interval is valid");
+
+        for bad in [0, 4, 3601] {
+            group.trunks[0].options_ping_interval_secs = bad;
+            config.trunk_groups = vec![group.clone()];
+            assert_rejected(&config, "options_ping_interval_secs");
+        }
+
+        // Not checked while pinging is off.
+        group.trunks[0].options_ping_enabled = false;
+        group.trunks[0].options_ping_interval_secs = 0;
+        config.trunk_groups = vec![group];
+        validate_config(&config).expect("interval ignored when disabled");
+    }
 }
 
 /// Tests that the shipped deploy configurations still validate.
@@ -1388,5 +1577,6 @@ audit_enabled = true
     fn test_deploy_config_toml_validates() {
         let config = crate::load_from_str(DEPLOY_CONFIG_TOML).expect("deploy/config/config.toml");
         assert_eq!(config.general.instance_name, "sbc-01");
+        super::validate_config(&config).expect("deploy/config/config.toml must validate");
     }
 }

@@ -418,6 +418,9 @@ impl Runtime {
             .clone()
             .zip(config.security.tls_key_path.clone());
         let provisioning_config = config.provisioning.clone();
+        // Config-file trunks with `options_ping_enabled` are monitored once
+        // the trunk monitor exists (below).
+        let config_trunk_groups = config.trunk_groups.clone();
 
         // Pass cluster manager to server if available
         #[cfg(feature = "cluster")]
@@ -989,6 +992,18 @@ impl Runtime {
             }
         }
 
+        // OPTIONS health → trunk selection: a trunk that stops answering is
+        // skipped by routing and failover until it answers again. Subscribe
+        // before starting the config-file monitors so no first result is
+        // missed; trunks already started above are reconciled from the
+        // health snapshot when the task starts.
+        if let (Some(monitor), Some(stack)) =
+            (app_state.trunk_monitor.clone(), app_state.sip_stack.clone())
+        {
+            spawn_trunk_health_feed(&monitor, stack, signal.clone());
+            start_config_trunk_monitors(&monitor, &config_trunk_groups, zone_registry.as_deref());
+        }
+
         // Replay trunk groups and DID mappings: sync to router and start services
         {
             let store = app_state.mem_store.read().await;
@@ -1280,6 +1295,96 @@ require_mtls = false
 [logging]
 level = "debug"
 "#
+}
+
+/// Starts OPTIONS monitoring for config-file trunks with
+/// `options_ping_enabled` (API-created trunks start theirs in
+/// `api_server::start_trunk_services`). Pings leave from the trunk group's
+/// zone, else `outside`, else `inside`, matching the API path.
+fn start_config_trunk_monitors(
+    monitor: &crate::trunk_monitor::TrunkMonitor,
+    groups: &[sbc_config::TrunkGroupConfig],
+    zones: Option<&crate::zone::ResolvedZoneRegistry>,
+) {
+    for group in groups {
+        let bind_ip = zones.and_then(|zr| {
+            group
+                .zone
+                .as_deref()
+                .and_then(|z| zr.signaling_ip(z))
+                .or_else(|| zr.signaling_ip("outside"))
+                .or_else(|| zr.signaling_ip("inside"))
+        });
+        for trunk in group.trunks.iter().filter(|t| t.options_ping_enabled) {
+            monitor.monitor_trunk(crate::trunk_monitor::MonitoredTrunk {
+                trunk_id: trunk.id.clone(),
+                host: trunk.host.clone(),
+                port: trunk.port,
+                interval_secs: trunk.options_ping_interval_secs,
+                bind_ip,
+            });
+            info!(trunk_id = %trunk.id, group = %group.id, "Started OPTIONS health monitor from config");
+        }
+    }
+}
+
+/// Applies OPTIONS reachability transitions from the in-process trunk
+/// monitor to the SIP stack's router. One task, owned by the runtime and
+/// stopped on shutdown. On start and on broadcast lag it reconciles from
+/// the full health snapshot.
+///
+/// ## NIST 800-53 Rev5: SC-5, CP-8 (Telecommunications Services)
+fn spawn_trunk_health_feed(
+    monitor: &crate::trunk_monitor::TrunkMonitor,
+    stack: Arc<crate::sip_stack::SipStack>,
+    signal: ShutdownSignal,
+) {
+    let mut rx = monitor.subscribe();
+    let health = monitor.health();
+    tokio::spawn(async move {
+        let resync = |health: Arc<
+            tokio::sync::RwLock<
+                std::collections::HashMap<String, crate::trunk_monitor::TrunkHealthStatus>,
+            >,
+        >,
+                      stack: Arc<crate::sip_stack::SipStack>| async move {
+            let snapshot: Vec<(String, bool)> = health
+                .read()
+                .await
+                .values()
+                .filter(|h| h.total_pings > 0)
+                .map(|h| (h.trunk_id.clone(), h.reachable))
+                .collect();
+            for (trunk_id, reachable) in snapshot {
+                stack.set_trunk_reachable(&trunk_id, reachable).await;
+            }
+        };
+        resync(Arc::clone(&health), Arc::clone(&stack)).await;
+        loop {
+            tokio::select! {
+                () = signal.wait_for_shutdown() => break,
+                event = rx.recv() => match event {
+                    Ok(ev) => {
+                        let n = stack.set_trunk_reachable(&ev.trunk_id, ev.reachable).await;
+                        // POAM: reachability changes have no dedicated uc-audit
+                        // event type yet; logged here (AU-2).
+                        info!(
+                            trunk_id = %ev.trunk_id,
+                            reachable = ev.reachable,
+                            router_trunks = n,
+                            source = "options",
+                            "Trunk reachability changed"
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        warn!(missed, "Trunk health feed lagged; resyncing from snapshot");
+                        resync(Arc::clone(&health), Arc::clone(&stack)).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+            }
+        }
+    });
 }
 
 #[cfg(test)]

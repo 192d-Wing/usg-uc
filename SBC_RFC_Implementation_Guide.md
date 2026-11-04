@@ -65,6 +65,8 @@ This document provides a comprehensive summary of RFCs required for implementing
 - **Deterministic Ordering:** For stateless proxies, must define deterministic ordering for equal-priority SRV records
 - **SIPS URI Handling:** Must enforce TLS-only transport for SIPS URIs
 
+**Current implementation (sbc-daemon):** no NAPTR/SRV; trunk hosts are resolved with A/AAAA only. Failover is across configured trunks in the selected route groups, not SRV targets: 408, Timer B and 503 (RFC 3263 §4.3) plus 500/502/504 (local policy) move the call to the next trunk; transport send errors do not. A 503 puts the trunk into `cooldown_secs` cooldown; the trunk's `Retry-After` is ignored. See `docs/RFC_COMPLIANCE_GAPS.md`.
+
 **CNSA 2.0 Notes:**
 - DNSSEC validation SHOULD be implemented for DNS security
 - Consider using DNS-over-TLS (DoT) or DNS-over-HTTPS (DoH) for DNS query confidentiality

@@ -2,7 +2,7 @@
 
 use crate::dialplan::{DialPlan, DialPlanResult};
 use crate::error::{RoutingError, RoutingResult};
-use crate::trunk::{Trunk, TrunkGroup};
+use crate::trunk::{Trunk, TrunkGroup, TrunkOutcome};
 use std::collections::HashMap;
 
 /// Routing decision.
@@ -10,14 +10,22 @@ use std::collections::HashMap;
 pub struct RoutingDecision {
     /// Dial plan result.
     pub dial_plan_result: Option<DialPlanResult>,
-    /// Selected trunk ID.
+    /// Trunk group the selected trunk belongs to.
+    pub trunk_group_id: String,
+    /// Selected trunk ID. One call slot on this trunk is already reserved;
+    /// release it with [`Router::release_trunk`].
     pub trunk_id: String,
     /// Trunk SIP URI.
     pub trunk_uri: String,
     /// Transformed destination number.
     pub destination: String,
-    /// Failover trunk IDs in order.
+    /// Failover trunk IDs in order (same trunk group as `trunk_id`).
     pub failover_trunks: Vec<String>,
+    /// Failover targets as `(trunk_group_id, trunk_id)` in try order,
+    /// capped at `max_failover_attempts`. Includes `failover_trunks` and,
+    /// for [`Router::route_to_groups`], trunks of the later groups. Nothing
+    /// is reserved on these; take one with [`Router::acquire_trunk`].
+    pub failover_targets: Vec<(String, String)>,
 }
 
 impl RoutingDecision {
@@ -212,6 +220,10 @@ impl Router {
         let trunk_group_id = self.resolve_trunk_group(dial_plan_result.as_ref(), destination)?;
         let (trunk_id, trunk_uri, failover_trunks) =
             self.select_trunk_from_group(&trunk_group_id)?;
+        let failover_targets = failover_trunks
+            .iter()
+            .map(|t| (trunk_group_id.clone(), t.clone()))
+            .collect();
 
         let final_destination = dial_plan_result
             .as_ref()
@@ -224,10 +236,12 @@ impl Router {
 
         Ok(RoutingDecision {
             dial_plan_result,
+            trunk_group_id,
             trunk_id,
             trunk_uri,
             destination: final_destination,
             failover_trunks,
+            failover_targets,
         })
     }
 
@@ -288,10 +302,23 @@ impl Router {
 
         let trunk_uri = trunk.sip_uri();
 
+        // Reserve the slot in the same `&mut self` as the selection so two
+        // concurrent routes cannot both take the last slot (SC-5).
+        // POAM: the trunk `max_calls` reservation is counted per node only; in a cluster of N nodes the
+        // effective limit is N x the configured cap. Cluster-wide accounting is a
+        // follow-up via uc-state-sync.
+        if let Some(t) = trunk_group.get_trunk_mut(&trunk_id) {
+            t.start_call();
+        }
+
         Ok((trunk_id, trunk_uri, failover_trunks))
     }
 
-    /// Routes directly to a specific trunk group.
+    /// Routes directly to a specific trunk group. Reserves a call slot on
+    /// the selected trunk (see [`RoutingDecision::trunk_id`]).
+    ///
+    /// # Errors
+    /// Returns an error if the group does not exist or has no usable trunk.
     pub fn route_to_group(
         &mut self,
         destination: &str,
@@ -299,52 +326,146 @@ impl Router {
     ) -> RoutingResult<RoutingDecision> {
         self.stats.requests += 1;
 
-        // Get trunk count for error message before mutable borrow
-        let trunk_count = self
-            .trunk_groups
-            .get(group_id)
-            .map_or(0, super::trunk::TrunkGroup::trunk_count);
-
-        let trunk_group = self.trunk_groups.get_mut(group_id).ok_or_else(|| {
-            RoutingError::TrunkGroupNotFound {
-                group_id: group_id.to_string(),
-            }
-        })?;
-
-        let trunk_id =
-            trunk_group
-                .select_trunk()
-                .map(String::from)
-                .ok_or(RoutingError::AllTrunksFailed {
-                    trunks_tried: trunk_count,
-                })?;
-
-        let failover_trunks: Vec<String> = trunk_group
-            .failover_order()
-            .into_iter()
-            .filter(|id| *id != trunk_id)
-            .take(self.config.max_failover_attempts)
-            .map(String::from)
+        let (trunk_id, trunk_uri, failover_trunks) = self.select_trunk_from_group(group_id)?;
+        let failover_targets = failover_trunks
+            .iter()
+            .map(|t| (group_id.to_string(), t.clone()))
             .collect();
-
-        let trunk =
-            trunk_group
-                .get_trunk(&trunk_id)
-                .ok_or_else(|| RoutingError::TrunkNotFound {
-                    trunk_id: trunk_id.clone(),
-                })?;
-
-        let trunk_uri = trunk.sip_uri();
 
         self.stats.successes += 1;
 
         Ok(RoutingDecision {
             dial_plan_result: None,
+            trunk_group_id: group_id.to_string(),
             trunk_id,
             trunk_uri,
             destination: destination.to_string(),
             failover_trunks,
+            failover_targets,
         })
+    }
+
+    /// Routes to the first of an ordered list of trunk groups (an SBC route
+    /// list's route groups) that has a usable trunk, reserving a slot on it.
+    /// Usable trunks of the remaining groups follow the selected group's
+    /// own failover trunks in `failover_targets`.
+    ///
+    /// # Errors
+    /// Returns [`RoutingError::NoRoute`] for an empty list and
+    /// [`RoutingError::AllTrunksFailed`] when no group has a usable trunk.
+    pub fn route_to_groups(
+        &mut self,
+        destination: &str,
+        group_ids: &[String],
+    ) -> RoutingResult<RoutingDecision> {
+        if group_ids.is_empty() {
+            return Err(RoutingError::NoRoute {
+                destination: destination.to_string(),
+            });
+        }
+        let mut tried = 0usize;
+        for (idx, group_id) in group_ids.iter().enumerate() {
+            tried += self
+                .trunk_groups
+                .get(group_id.as_str())
+                .map_or(0, TrunkGroup::trunk_count);
+            let Ok(mut decision) = self.route_to_group(destination, group_id) else {
+                continue;
+            };
+            let max = self.config.max_failover_attempts;
+            for later in group_ids.iter().skip(idx + 1) {
+                if decision.failover_targets.len() >= max {
+                    break;
+                }
+                if later == group_id {
+                    continue;
+                }
+                if let Some(group) = self.trunk_groups.get(later.as_str()) {
+                    for t in group.failover_order() {
+                        if decision.failover_targets.len() >= max {
+                            break;
+                        }
+                        decision
+                            .failover_targets
+                            .push((later.clone(), t.to_string()));
+                    }
+                }
+            }
+            return Ok(decision);
+        }
+        Err(RoutingError::AllTrunksFailed {
+            trunks_tried: tried,
+        })
+    }
+
+    /// Reserves a call slot on a specific trunk if it is still usable
+    /// (enabled, reachable, not in cooldown, below `max_calls`). Returns the
+    /// trunk's SIP URI, or `None` when it cannot take the call.
+    pub fn acquire_trunk(&mut self, group_id: &str, trunk_id: &str) -> Option<String> {
+        let trunk = self
+            .trunk_groups
+            .get_mut(group_id)
+            .and_then(|g| g.get_trunk_mut(trunk_id))?;
+        if !trunk.is_usable() {
+            return None;
+        }
+        // POAM: the trunk `max_calls` reservation is counted per node only; in a cluster of N nodes the
+        // effective limit is N x the configured cap. Cluster-wide accounting is a
+        // follow-up via uc-state-sync.
+        trunk.start_call();
+        Some(trunk.sip_uri())
+    }
+
+    /// Releases a slot taken by routing or [`Self::acquire_trunk`]. Call
+    /// exactly once per reservation. Unknown group/trunk IDs (removed at
+    /// runtime) are ignored.
+    pub fn release_trunk(&mut self, group_id: &str, trunk_id: &str, outcome: TrunkOutcome) {
+        if let Some(trunk) = self
+            .trunk_groups
+            .get_mut(group_id)
+            .and_then(|g| g.get_trunk_mut(trunk_id))
+        {
+            trunk.end_call(outcome);
+        }
+    }
+
+    /// Puts a trunk into cooldown immediately (e.g. it answered 503).
+    pub fn cooldown_trunk(&mut self, group_id: &str, trunk_id: &str) {
+        if let Some(trunk) = self
+            .trunk_groups
+            .get_mut(group_id)
+            .and_then(|g| g.get_trunk_mut(trunk_id))
+        {
+            trunk.start_cooldown();
+        }
+    }
+
+    /// Whether any trunk group holds a trunk with this ID.
+    pub fn has_trunk(&self, trunk_id: &str) -> bool {
+        self.trunk_groups
+            .values()
+            .any(|g| g.get_trunk(trunk_id).is_some())
+    }
+
+    /// Applies an OPTIONS-ping reachability result to every trunk with this
+    /// ID, in every group. Returns how many trunks were updated.
+    pub fn set_trunk_reachable(&mut self, trunk_id: &str, reachable: bool) -> usize {
+        let mut n = 0;
+        for group in self.trunk_groups.values_mut() {
+            if let Some(trunk) = group.get_trunk_mut(trunk_id) {
+                trunk.set_reachable(reachable);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Active (reserved) call count on a trunk, if it exists.
+    pub fn trunk_active_calls(&self, group_id: &str, trunk_id: &str) -> Option<u32> {
+        self.trunk_groups
+            .get(group_id)
+            .and_then(|g| g.get_trunk(trunk_id))
+            .map(|t| t.stats().active_calls)
     }
 
     /// Matches against the active dial plan.
@@ -466,7 +587,7 @@ mod tests {
 
         let decision = router.route("+15551234567").unwrap();
         assert!(decision.has_failover());
-        assert!(!decision.failover_trunks.is_empty());
+        assert_ne!(decision.failover_trunks, Vec::<String>::new());
         // us-2 should be in failover list
         assert!(decision.failover_trunks.contains(&"us-2".to_string()));
     }
@@ -564,10 +685,12 @@ mod tests {
     fn test_routing_decision() {
         let decision = RoutingDecision {
             dial_plan_result: None,
+            trunk_group_id: "g".to_string(),
             trunk_id: "trunk-1".to_string(),
             trunk_uri: "sips:example.com:5061".to_string(),
             destination: "+15551234567".to_string(),
             failover_trunks: vec!["trunk-2".to_string()],
+            failover_targets: vec![("g".to_string(), "trunk-2".to_string())],
         };
 
         assert!(decision.has_failover());
@@ -590,5 +713,124 @@ mod tests {
 
         let decision = router.route("+15551234567").unwrap();
         assert_eq!(decision.destination, "15551234567"); // + stripped
+    }
+
+    #[test]
+    fn test_route_reserves_and_release_returns_to_zero() {
+        let mut router = setup_test_router();
+        let d = router.route("+15551234567").unwrap();
+        assert_eq!(d.trunk_group_id, "us-trunks");
+        assert_eq!(router.trunk_active_calls("us-trunks", "us-1"), Some(1));
+        assert_eq!(
+            d.failover_targets,
+            vec![("us-trunks".to_string(), "us-2".to_string())]
+        );
+        for outcome in [
+            TrunkOutcome::Completed { setup_ms: 10 },
+            TrunkOutcome::Failed,
+            TrunkOutcome::Abandoned,
+        ] {
+            assert_eq!(router.trunk_active_calls("us-trunks", "us-1"), Some(1));
+            router.release_trunk("us-trunks", "us-1", outcome);
+            assert_eq!(router.trunk_active_calls("us-trunks", "us-1"), Some(0));
+            router.route("+15551234567").unwrap();
+        }
+        router.release_trunk("us-trunks", "us-1", TrunkOutcome::Abandoned);
+        router.release_trunk("us-trunks", "us-1", TrunkOutcome::Abandoned);
+        assert_eq!(router.trunk_active_calls("us-trunks", "us-1"), Some(0));
+    }
+
+    #[test]
+    fn test_route_skips_full_trunk_then_errors_when_all_full() {
+        let mut router = Router::new(
+            RouterConfig::default()
+                .with_dial_plan(false)
+                .with_default_trunk_group("g"),
+        );
+        let mut group = TrunkGroup::new("g", "G");
+        group.add_trunk(Trunk::new(
+            TrunkConfig::new("a", "a.example.com")
+                .with_priority(1)
+                .with_max_calls(1),
+        ));
+        group.add_trunk(Trunk::new(
+            TrunkConfig::new("b", "b.example.com")
+                .with_priority(2)
+                .with_max_calls(1),
+        ));
+        router.add_trunk_group(group);
+
+        assert_eq!(router.route("1").unwrap().trunk_id, "a");
+        assert_eq!(router.route("1").unwrap().trunk_id, "b");
+        assert!(matches!(
+            router.route("1"),
+            Err(RoutingError::AllTrunksFailed { .. })
+        ));
+        router.release_trunk("g", "a", TrunkOutcome::Abandoned);
+        assert_eq!(router.route("1").unwrap().trunk_id, "a");
+    }
+
+    #[test]
+    fn test_acquire_trunk_respects_usability() {
+        let mut router = setup_test_router();
+        assert!(router.acquire_trunk("us-trunks", "us-2").is_some());
+        assert_eq!(router.trunk_active_calls("us-trunks", "us-2"), Some(1));
+        router.set_trunk_reachable("us-2", false);
+        assert!(router.acquire_trunk("us-trunks", "us-2").is_none());
+        assert!(router.acquire_trunk("us-trunks", "missing").is_none());
+        assert!(router.acquire_trunk("missing", "us-2").is_none());
+    }
+
+    #[test]
+    fn test_set_trunk_reachable_excludes_trunk_from_selection() {
+        let mut router = setup_test_router();
+        assert!(router.has_trunk("us-1"));
+        assert!(!router.has_trunk("no-such-trunk"));
+        assert_eq!(router.set_trunk_reachable("no-such-trunk", false), 0);
+        assert_eq!(router.set_trunk_reachable("us-1", false), 1);
+        let d = router.route("+15551234567").unwrap();
+        assert_eq!(d.trunk_id, "us-2");
+        assert_eq!(d.failover_trunks, Vec::<String>::new());
+        router.release_trunk("us-trunks", "us-2", TrunkOutcome::Abandoned);
+
+        router.set_trunk_reachable("us-1", true);
+        assert_eq!(router.route("+15551234567").unwrap().trunk_id, "us-1");
+    }
+
+    #[test]
+    fn test_route_to_groups_falls_through_and_lists_later_groups() {
+        let mut router = setup_test_router();
+        router.set_trunk_reachable("uk-1", false);
+        let groups = vec!["uk-trunks".to_string(), "us-trunks".to_string()];
+        let d = router.route_to_groups("+15551234567", &groups).unwrap();
+        assert_eq!(d.trunk_group_id, "us-trunks");
+        assert_eq!(d.trunk_id, "us-1");
+
+        router.set_trunk_reachable("uk-1", true);
+        let d = router.route_to_groups("+15551234567", &groups).unwrap();
+        assert_eq!(d.trunk_id, "uk-1");
+        assert_eq!(
+            d.failover_targets,
+            vec![
+                ("us-trunks".to_string(), "us-1".to_string()),
+                ("us-trunks".to_string(), "us-2".to_string()),
+            ]
+        );
+
+        assert!(router.route_to_groups("x", &[]).is_err());
+        router.set_trunk_reachable("uk-1", false);
+        router.set_trunk_reachable("us-1", false);
+        router.set_trunk_reachable("us-2", false);
+        assert!(matches!(
+            router.route_to_groups("x", &groups),
+            Err(RoutingError::AllTrunksFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn test_cooldown_trunk() {
+        let mut router = setup_test_router();
+        router.cooldown_trunk("us-trunks", "us-1");
+        assert_eq!(router.route("+15551234567").unwrap().trunk_id, "us-2");
     }
 }

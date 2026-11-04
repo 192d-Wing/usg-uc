@@ -299,6 +299,39 @@ impl VpsEngine {
         }
     }
 
+    /// Screens a call attempt and, when it is allowed, reserves a
+    /// per-callee concurrency slot in the same step, so the cap check and
+    /// the increment cannot be split by another caller.
+    ///
+    /// Returns the verdict and the callee key that was reserved. A key is
+    /// reserved only when the call is allowed, carries a callee and
+    /// `per_callee_max_concurrent` is non-zero; the caller must pass that
+    /// key to [`Self::call_ended`] exactly once when the call goes away.
+    ///
+    /// ## NIST 800-53 Rev5: SC-5 (Denial-of-Service Protection)
+    pub fn screen_and_reserve(&mut self, attempt: &CallAttempt) -> (VpsVerdict, Option<String>) {
+        let verdict = self.screen_call(attempt);
+        if !verdict.is_allowed()
+            || !self.config.enabled
+            || self.limiter.per_callee_max_concurrent() == 0
+        {
+            return (verdict, None);
+        }
+        // POAM: the per-callee concurrency (`per_callee_max_concurrent`) is counted per node only; in a cluster of N nodes the
+        // effective limit is N x the configured cap. Cluster-wide accounting is a
+        // follow-up via uc-state-sync.
+        let reserved = attempt.callee.clone();
+        if let Some(ref callee) = reserved {
+            self.limiter.call_started(callee);
+        }
+        (verdict, reserved)
+    }
+
+    /// Current concurrent call count for a callee.
+    pub fn callee_concurrent_calls(&self, callee: &str) -> u32 {
+        self.limiter.concurrent_calls(callee)
+    }
+
     /// Records a screened call becoming active (concurrency accounting).
     pub fn call_started(&mut self, callee: &str) {
         self.limiter.call_started(callee);
@@ -496,6 +529,50 @@ mod tests {
 
         engine.call_ended("+12135552000");
         assert!(engine.screen_call(&attempt(ip(3))).is_allowed());
+    }
+
+    #[test]
+    fn test_screen_and_reserve_caps_concurrency() {
+        let config = VpsConfig {
+            tdos: TdosConfig {
+                per_source_cps: 0,
+                per_callee_max_concurrent: 2,
+                ..TdosConfig::default()
+            },
+            ..enabled_config()
+        };
+        let mut engine = VpsEngine::new(&config).unwrap();
+        let (v1, k1) = engine.screen_and_reserve(&attempt(ip(1)));
+        let (v2, k2) = engine.screen_and_reserve(&attempt(ip(2)));
+        assert!(v1.is_allowed() && v2.is_allowed());
+        assert_eq!(k1.as_deref(), Some("+12135552000"));
+        assert!(k2.is_some());
+        assert_eq!(engine.callee_concurrent_calls("+12135552000"), 2);
+
+        // The third concurrent call is rejected and reserves nothing.
+        let (v3, k3) = engine.screen_and_reserve(&attempt(ip(3)));
+        assert_eq!(v3.source(), VerdictSource::ConcurrencyCap);
+        assert!(k3.is_none());
+        assert_eq!(engine.callee_concurrent_calls("+12135552000"), 2);
+
+        engine.call_ended("+12135552000");
+        let (v4, k4) = engine.screen_and_reserve(&attempt(ip(4)));
+        assert!(v4.is_allowed());
+        assert!(k4.is_some());
+    }
+
+    #[test]
+    fn test_screen_and_reserve_without_cap_reserves_nothing() {
+        let mut engine = VpsEngine::new(&enabled_config()).unwrap();
+        let (verdict, key) = engine.screen_and_reserve(&attempt(ip(1)));
+        assert!(verdict.is_allowed());
+        assert!(key.is_none());
+        assert_eq!(engine.callee_concurrent_calls("+12135552000"), 0);
+
+        let mut disabled = VpsEngine::new(&VpsConfig::default()).unwrap();
+        let (verdict, key) = disabled.screen_and_reserve(&attempt(ip(1)));
+        assert!(verdict.is_allowed());
+        assert!(key.is_none());
     }
 
     #[test]
