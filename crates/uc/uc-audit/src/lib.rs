@@ -363,6 +363,17 @@ pub mod capture {
     }
 }
 
+/// Audit subsystem errors.
+#[derive(Debug, thiserror::Error)]
+pub enum AuditError {
+    /// Logger was already initialized.
+    #[error("audit logger already initialized")]
+    AlreadyInitialized,
+    /// The writer thread could not be started.
+    #[error("audit writer thread not started: {0}")]
+    WriterThread(String),
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -433,15 +444,4 @@ mod tests {
         let guard = capture::start();
         assert!(guard.events().is_empty());
     }
-}
-
-/// Audit subsystem errors.
-#[derive(Debug, thiserror::Error)]
-pub enum AuditError {
-    /// Logger was already initialized.
-    #[error("audit logger already initialized")]
-    AlreadyInitialized,
-    /// The writer thread could not be started.
-    #[error("audit writer thread not started: {0}")]
-    WriterThread(String),
 }
