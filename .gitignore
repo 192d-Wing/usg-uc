@@ -29,7 +29,9 @@ coverage/
 /docs/build/
 /site/
 
-.claude/
+.claude/*
+!.claude/agents/
+!.claude/skills/
 pcaps/
 standards/
 ref/crates/sbc/sbc-dashboard/node_modules/
