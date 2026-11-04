@@ -61,7 +61,6 @@ mod args;
 mod cluster;
 #[cfg(feature = "grpc")]
 mod grpc_server;
-mod ice_agent;
 mod runtime;
 mod sdp_dtls;
 mod server;

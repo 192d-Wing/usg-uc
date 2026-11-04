@@ -154,7 +154,7 @@ RFC 3261 §17 is wired into sbc-daemon and the soft client. RFC 3262 (PRACK/100r
 
 ## proto-ice (RFC 8445 + RFC 7675)
 
-The soft client gathers candidates and exchanges them in SDP (`client-sip-ua/src/ice_handler.rs`) but its `start_checks` is a stub, so connectivity checks, nomination, keepalives and consent never run. The daemon's `ice_agent.rs` `IceManager` drives the full agent but is never instantiated. No binary configures STUN/TURN servers for ICE (`IceConfig::default()`).
+The soft client gathers candidates, exchanges them in SDP and runs connectivity checks on the media socket (`client-sip-ua/src/ice_handler.rs`: paced checks, retransmission, role conflict, regular and aggressive nomination, answering the peer's checks), falling back to the SDP `c=`/`m=` address on ICE mismatch (RFC 8445 §5.1.1) or failure. STUN servers and the nomination mode come from `[network]` settings (`client-core/src/app.rs`); TURN is not configurable (no password setting). Keepalives (§10) and consent (RFC 7675) still do not run. The SBC does not use ICE: it anchors media and latches symmetrically; the former dead `ice_agent.rs` was removed.
 
 ### RFC 8445 Section Mapping
 
@@ -225,7 +225,7 @@ The soft client gathers candidates and exchanges them in SDP (`client-sip-ua/src
 | §7.1 | Forming a Request | Complete | Wired (sbc-daemon) | StunMessage builder |
 | §7.2 | Sending a Request | Complete | Wired (sbc-daemon) | StunClient (`zone.rs`) |
 | §7.3 | Receiving a Response | Complete | Wired (sbc-daemon) | Response parsing |
-| §10.1 | Short-Term Credential | Partial | Library-only | USERNAME/INTEGRITY; only reachable from proto-ice connectivity checks, which no binary runs |
+| §10.1 | Short-Term Credential | Partial | Wired (soft client) | USERNAME/INTEGRITY on proto-ice connectivity checks run by `client-sip-ua/src/ice_handler.rs` |
 | §10.2 | Long-Term Credential | Complete | Library-only | `credential.rs`; no caller (proto-turn client does not use it) |
 | §14 | FINGERPRINT Mechanism | Complete | Library-only | CRC-32; `encode_with_fingerprint` only called in tests |
 | §15 | Attribute Definitions | Partial | Wired (sbc-daemon) | Core attributes only |
